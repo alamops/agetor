@@ -1,11 +1,37 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines, IMPORTED_CLAUDE_HELD_ELSEWHERE } from "./db.ts";
+import { basename, isAbsolute, join, resolve } from "node:path";
+import {
+  db,
+  tasks,
+  runs,
+  harnesses,
+  projects,
+  subagents,
+  backlog,
+  dataDir,
+  preferences,
+  agentProfiles,
+  pipelines,
+  IMPORTED_CLAUDE_HELD_ELSEWHERE,
+  IMPORTED_OPENCODE_HELD_ELSEWHERE,
+  type SessionIdColumn,
+} from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
-import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
-import { checkHarness, upgradeHintFor } from "./agent-status.ts";
-import { getDiscoveredEfforts } from "./agent-discovery.ts";
+import {
+  spawnAgent,
+  toClaudeModelArg,
+  claudeModelPickerFamily,
+  opencodeDriverHooks,
+  opencodeEffectiveServerFor,
+  type SpawnAgentArgs,
+  type SpawnedAgent,
+} from "./agents.ts";
+import { cachedCliVersion, checkHarness, upgradeHintFor } from "./agent-status.ts";
+import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
+import { OPENCODE_DEFAULT_MODEL, opencodeMajor } from "../shared/opencode.ts";
+import { importedSessionOf } from "../shared/imported-session.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
 import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
@@ -20,6 +46,7 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
   IDLE_SESSION_REAP_MS,
   MODEL_MIN_CLI_VERSION,
+  OPENCODE_SERVER_MODES,
   SESSION_DIED_STATUS_PREFIX,
   SPAWN_RESPONSE_BUDGET_MS,
   TURN_STALLED_STATUS_PREFIX,
@@ -34,6 +61,7 @@ import {
   type AgentKind,
   type Harness,
   type HarnessStatus,
+  type OpencodeServerMode,
   type TaskType,
 } from "../shared/types.ts";
 import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
@@ -117,7 +145,13 @@ import {
   dropAntigravitySession,
   reattachAntigravitySession,
 } from "./antigravity-tmux.ts";
-import {  dropFxSession,
+import {
+  dropOpencodeSession,
+  reattachOpencodeSession,
+} from "./opencode-tmux.ts";
+import { setOpencodeSubagentEmitter } from "./opencode-subagents.ts";
+import {
+  dropFxSession,
 } from "./fx-acp.ts";
 import { beginLagLabel, setLagStallSink } from "./event-loop-lag.ts";
 import {
@@ -125,7 +159,8 @@ import {
   handleBackgroundTaskNotification,
   orphanRunningSubagents,
   pumpWatcherForHoldCheck,
-  setParkedDiscoveryHandler,  setSubagentEmitter,
+  setParkedDiscoveryHandler,
+  setSubagentEmitter,
   setSubagentSettleHook,
 } from "./claude-subagents.ts";
 import {
@@ -159,6 +194,7 @@ import type {
   FxRecoveryPayload,
   GlobalEvent,
   Pipeline,
+  Run,
   RunEvent,
   RunStatus,
   SentFileEntry,
@@ -357,6 +393,10 @@ export function emitRunEvent(e: RunEvent): void {
 // one listener set and the subagent stream rides the same `/tasks/:id/events`
 // channel the UI already subscribes to.
 setSubagentEmitter(emit);
+// OpenCode subagent tabs (opencode-subagents.ts, D-11) fill from `session
+// export` at turn end rather than a live watcher, but their events ride the
+// same `/tasks/:id/events` channel — same sink.
+setOpencodeSubagentEmitter(emit);
 
 // A held task's terminal run is already `succeeded`, so nothing in the run
 // lifecycle will ever move it out of `running` — the release has to be driven
@@ -794,8 +834,8 @@ export async function reconcileOrphans(): Promise<number> {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; agent: string }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; opencode_session_id: string | null; agent: string }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
   const reattachedTaskIds = new Set<string>();
@@ -805,14 +845,16 @@ export async function reconcileOrphans(): Promise<number> {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // claude-code, codex, cursor, gemini, and antigravity runs can all be reattached
+    // claude-code, codex, cursor, gemini, antigravity, and opencode runs can all be reattached
     // when their detached tmux session is still alive. The reattach key differs
     // by kind: claude needs its JSONL session uuid (`claude_session_id`),
     // codex needs its thread id (`codex_session_id`), cursor needs its
     // `session_id` (`cursor_session_id`), gemini needs its self-issued uuid
     // (`gemini_session_id`), antigravity needs its conversation id
-    // (`antigravity_session_id`) — the per-run log path is derived from the run
-    // id in every case. Note codex's, cursor's, gemini's, antigravity's, and fx's
+    // (`antigravity_session_id`), opencode needs its discovered `ses_…` id
+    // (`opencode_session_id`) — the per-run log path is derived from the run
+    // id in every case. Note codex's, cursor's, gemini's, antigravity's,
+    // opencode's, and fx's
     // sessions only live WHILE their turn is in flight (one process per turn), so a
     // reattachable one of those is by definition one that was still running
     // when agetor restarted. Also: if we already reattached a newer sibling
@@ -824,6 +866,7 @@ export async function reconcileOrphans(): Promise<number> {
       : kind === "cursor" ? row.cursor_session_id
       : kind === "gemini" ? row.gemini_session_id
       : kind === "antigravity" ? row.antigravity_session_id
+      : kind === "opencode" ? row.opencode_session_id
       : null;
     // fx is driven over ACP/stdio, not tmux — nothing to reattach to, so a
     // `running` fx row at boot always takes the orphaned→ready path.
@@ -837,7 +880,7 @@ export async function reconcileOrphans(): Promise<number> {
     // `string` for everything below.
     let canTryReattach = false;
     if (
-      (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity")
+      (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "opencode")
       && task !== null
       && row.tmux_session !== null
       && reattachKey !== null
@@ -889,6 +932,8 @@ export async function reconcileOrphans(): Promise<number> {
               onChunk,
               seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
             })
+          : kind === "opencode"
+          ? await reattachOpencodeTurn(row.id, row.task_id, row.agent, row.tmux_session as string, cwd, onChunk)
           : await reattachAntigravitySession({
               taskId: row.task_id,
               runId: row.id,
@@ -1472,11 +1517,15 @@ async function startTaskInner(
   // still owns the release itself, via the `finally` below.
   let claimTransferred = false;
   try {
-  // An imported Claude session already has its transcript. Run would mint a
-  // fresh session and re-execute the prompt in the user's checkout.
-  if (task.importedClaude) {
+  // An imported Claude Code / OpenCode session already has its transcript.
+  // Run would mint a fresh session and re-execute the prompt in the user's
+  // checkout.
+  const imported = importedSessionOf(task);
+  if (imported) {
     return {
-      error: "imported Claude session — send a message to continue",
+      error: imported.kind === "opencode"
+        ? "imported OpenCode session — send a message to continue"
+        : "imported Claude session — send a message to continue",
       code: "imported-session",
     };
   }
@@ -1524,6 +1573,8 @@ async function startTaskInner(
     // treatment; the stored snapshot (`profile`, and `task.agentProfile`
     // below) keeps the profile's raw `null`.
     const resolvedEffort = profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
+    // A snapshot captured before the field existed reads as "shared".
+    const profileOpencodeServer = profile.opencodeServer ?? "shared";
     const driftedFromRow =
       task.agent !== profile.harness ||
       task.model !== profile.model ||
@@ -1531,6 +1582,7 @@ async function startTaskInner(
       task.mode !== profile.mode ||
       task.speed !== profile.speed ||
       task.maxMode !== profile.maxMode ||
+      task.opencodeServer !== profileOpencodeServer ||
       agentProfileSnapshotDrifted(task.agentProfile ?? null, profile);
     if (driftedFromRow) {
       task = tasks.update(taskId, {
@@ -1540,6 +1592,7 @@ async function startTaskInner(
         mode: profile.mode,
         speed: profile.speed,
         maxMode: profile.maxMode,
+        opencodeServer: profileOpencodeServer,
       }) ?? task;
       task = tasks.setAgentProfile(taskId, profile.id, profile) ?? task;
     }
@@ -1788,22 +1841,26 @@ async function startTaskInner(
     cwd: prepared.cwd,
     onChunk,
     onSessionId: (sessionId) => {
-      runs.update(runId, harness.kind === "claude-code"
-        ? { claudeSessionId: sessionId }
-        : harness.kind === "codex"
-        ? { codexSessionId: sessionId }
-        : harness.kind === "cursor"
-        ? { cursorSessionId: sessionId }
-        : harness.kind === "gemini"
-        ? { geminiSessionId: sessionId }
-        : harness.kind === "antigravity"
-        ? { antigravitySessionId: sessionId }
-        : { fxSessionId: sessionId });
+      runs.update(runId, runSessionIdPatch(harness.kind, sessionId));
     },
     // fx: a mid-turn steer fx didn't take comes back here as the next turn.
     ...(harness.kind === "fx" ? { onSteerDropped: fxSteerDroppedHandler(taskId, runId, harness.id) } : {}),
-    opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, speed: task.speed, maxMode: task.maxMode },
+    opts: {
+      mode: task.mode,
+      model: task.model ?? DEFAULT_MODEL[harness.kind],
+      effort: task.effort,
+      speed: task.speed,
+      maxMode: task.maxMode,
+      // opencode: the version the pre-flight above already probed picks the
+      // CLI line (D-2); the server mode and title ride along (D-3/D-4).
+      ...(harness.kind === "opencode"
+        ? { cliVersion: status.version, opencodeServer: task.opencodeServer, title: task.title }
+        : {}),
+    },
   };
+  // D-19: an OpenCode turn opens with a persisted breadcrumb naming the CLI
+  // line, server mode, model, effort and mode it actually launches with.
+  if (harness.kind === "opencode") onChunk("status", opencodeTurnBreadcrumb(harness, task, status.version));
 
   // Everything from here on — the actual spawn and everything that depends
   // on its result — runs as a detached continuation raced against
@@ -2674,12 +2731,13 @@ function attachDoneHandler(
       // row once it drains, and `recordFxPause` needs to see the queue as it
       // stands right now to decide whether to skip scheduling.
       noteFxRunSettled(task, runId, newStatus);
-      // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
-      // for a task of a different kind).
+      // Spawn the next queued codex/cursor/gemini/antigravity/opencode/fx
+      // follow-up, if any (no-op for a task of a different kind).
       await drainCodexQueue(taskId);
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
       await drainAntigravityQueue(taskId);
+      await drainOpencodeQueue(taskId);
       // Every steer this run accepted has now been reported (dropped ones
       // before `done` resolved) or absorbed — forget the bookkeeping.
       fxPendingSteers.delete(runId);
@@ -2717,12 +2775,13 @@ function attachDoneHandler(
       // fx-only settlement hook — see the matching call/comment in the
       // `.then` branch above.
       noteFxRunSettled(task, runId, newStatus);
-      // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
-      // for a task of a different kind).
+      // Spawn the next queued codex/cursor/gemini/antigravity/opencode/fx
+      // follow-up, if any (no-op for a task of a different kind).
       await drainCodexQueue(taskId);
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
       await drainAntigravityQueue(taskId);
+      await drainOpencodeQueue(taskId);
       // Every steer this run accepted has now been reported (dropped ones
       // before `done` resolved) or absorbed — forget the bookkeeping.
       fxPendingSteers.delete(runId);
@@ -2762,19 +2821,25 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   // alias's HOME/env block changes, so the on-disk JSONL & login differ. Even
   // same-kind alias swaps (claude-work → claude-personal) need a fresh tmux.
   if (before.agent !== after.agent) {
+    // Any queued codex/cursor/gemini/antigravity/opencode/fx follow-ups
+    // belong to the old agent — drop them so a later drain doesn't spawn
+    // them against the new harness. Cleared BEFORE the session teardown
+    // below: OpenCode's graceful drop waits up to 5 s, and an in-flight
+    // turn settling inside that window would otherwise drain the queue
+    // onto the new harness.
+    codexTurnQueue.delete(taskId);
+    cursorTurnQueue.delete(taskId);
+    geminiTurnQueue.delete(taskId);
+    antigravityTurnQueue.delete(taskId);
+    opencodeTurnQueue.delete(taskId);
+    fxTurnQueue.delete(taskId);
     if (beforeKind === "claude-code") await dropSession(taskId);
     else if (beforeKind === "codex") await dropCodexSession(taskId);
     else if (beforeKind === "cursor") await dropCursorSession(taskId);
     else if (beforeKind === "gemini") await dropGeminiSession(taskId);
     else if (beforeKind === "antigravity") await dropAntigravitySession(taskId);
+    else if (beforeKind === "opencode") await dropOpencodeSession(taskId); // graceful C-c, then kill (D-10)
     else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
-    // Any queued codex/cursor/gemini/fx follow-ups belong to the old agent —
-    // drop them so a later drain doesn't spawn them against the new harness.
-    codexTurnQueue.delete(taskId);
-    cursorTurnQueue.delete(taskId);
-    geminiTurnQueue.delete(taskId);
-    antigravityTurnQueue.delete(taskId);
-    fxTurnQueue.delete(taskId);
     // Same reasoning for a pending fx auto-resume schedule: it belongs to
     // the old fx session, and the new agent (fx or otherwise) has nothing to
     // resume (plan §3 T2 item 8). Harmless no-op when there was none.
@@ -2784,10 +2849,18 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // next spawn would error or fall through to verbatim flags. Reset
     // them server-side so direct API edits get the same safety the
     // RunPanel's `onAgentChange` already applies client-side. Same-kind
-    // alias swaps keep the picks — those ids stay valid.
+    // alias swaps keep the picks — those ids stay valid. The OpenCode
+    // server option goes back to its default too (D-4).
     if (afterKind && beforeKind !== afterKind) {
       const nextMode = defaultModeFor(afterKind);
-      tasks.update(taskId, { mode: nextMode, model: null, effort: null, speed: "off", maxMode: false });
+      tasks.update(taskId, {
+        mode: nextMode,
+        model: null,
+        effort: null,
+        speed: "off",
+        maxMode: false,
+        opencodeServer: "shared",
+      });
     }
     return;
   }
@@ -3565,20 +3638,31 @@ async function sendInputInner(
   task: Task,
   line: string,
 ): Promise<SendInputResult> {
-  // The claim column, not the JSON blob. Migration 070 leaves a duplicate's
-  // losing row with `importedClaude` set and `imported_claude_session_id`
-  // NULL; Send would otherwise `--resume` the winner's session.
-  if (
-    task.importedClaude
-    && tasks.importedSessionHeldElsewhere(row.task_id, task.importedClaude.sessionId)
-  ) {
-    return { delivered: false, reason: IMPORTED_CLAUDE_HELD_ELSEWHERE };
-  }
-  if (task.importedClaude?.status === "importing") {
-    return { delivered: false, reason: "still importing this session's history" };
-  }
-  if (task.importedClaude?.status === "failed") {
-    return { delivered: false, reason: task.importedClaude.error ?? "import failed" };
+  // The claim column, not the JSON blob. Migration 070 (and 078 for
+  // OpenCode) leaves a duplicate's losing row with the provenance set and
+  // the claim column NULL; Send would otherwise resume the winner's session.
+  const imported = importedSessionOf(task);
+  if (imported) {
+    const heldElsewhere = imported.kind === "opencode"
+      ? tasks.importedOpencodeSessionHeldElsewhere(row.task_id, imported.sessionId)
+      : tasks.importedSessionHeldElsewhere(row.task_id, imported.sessionId);
+    if (heldElsewhere) {
+      return {
+        delivered: false,
+        reason: imported.kind === "opencode" ? IMPORTED_OPENCODE_HELD_ELSEWHERE : IMPORTED_CLAUDE_HELD_ELSEWHERE,
+      };
+    }
+    if (imported.status === "importing") {
+      return {
+        delivered: false,
+        reason: imported.kind === "opencode"
+          ? "OpenCode history is still importing"
+          : "still importing this session's history",
+      };
+    }
+    if (imported.status === "failed") {
+      return { delivered: false, reason: imported.error ?? "import failed" };
+    }
   }
 
   // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
@@ -3746,6 +3830,15 @@ async function sendInputInner(
   }
   if (kind === "antigravity") {
     const result = await sendAntigravityTurn(row.task_id, line);
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  if (kind === "opencode") {
+    const result = await sendOpencodeTurn(row.task_id, line);
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3925,7 +4018,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorThreadId = findLastCodexSessionId(taskId);
+    const priorThreadId = lastSessionIdForTask(task, "codex_session_id");
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
 
@@ -4074,16 +4167,6 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   }
 }
 
-/** Most-recent codex thread id across the task's runs (for `resume`). */
-function findLastCodexSessionId(taskId: string): string | null {
-  const row = db.query<{ codex_session_id: string }, [string]>(
-    `SELECT codex_session_id FROM runs
-     WHERE task_id = ? AND codex_session_id IS NOT NULL
-     ORDER BY started_at DESC
-     LIMIT 1`,
-  ).get(taskId);
-  return row?.codex_session_id ?? null;
-}
 
 /**
  * Per-task queue of follow-up lines received while a cursor turn is in
@@ -4135,7 +4218,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = findLastCursorSessionId(taskId);
+    const priorSessionId = lastSessionIdForTask(task, "cursor_session_id");
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
 
@@ -4254,16 +4337,6 @@ async function drainCursorQueue(taskId: string): Promise<void> {
   if (next !== undefined) await spawnCursorTurnNow(task, taskId, next);
 }
 
-/** Most-recent cursor session id across the task's runs (for `--resume`). */
-function findLastCursorSessionId(taskId: string): string | null {
-  const row = db.query<{ cursor_session_id: string }, [string]>(
-    `SELECT cursor_session_id FROM runs
-     WHERE task_id = ? AND cursor_session_id IS NOT NULL
-     ORDER BY started_at DESC
-     LIMIT 1`,
-  ).get(taskId);
-  return row?.cursor_session_id ?? null;
-}
 
 /**
  * Per-task queue of follow-up lines received while a gemini turn is in
@@ -4317,7 +4390,7 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = findLastGeminiSessionId(taskId);
+    const priorSessionId = lastSessionIdForTask(task, "gemini_session_id");
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
 
@@ -4433,16 +4506,6 @@ async function drainGeminiQueue(taskId: string): Promise<void> {
   if (next !== undefined) await spawnGeminiTurnNow(task, taskId, next);
 }
 
-/** Most-recent gemini session id across the task's runs (for `--resume`). */
-function findLastGeminiSessionId(taskId: string): string | null {
-  const row = db.query<{ gemini_session_id: string }, [string]>(
-    `SELECT gemini_session_id FROM runs
-     WHERE task_id = ? AND gemini_session_id IS NOT NULL
-     ORDER BY started_at DESC
-     LIMIT 1`,
-  ).get(taskId);
-  return row?.gemini_session_id ?? null;
-}
 
 /**
  * Per-task queue of follow-up lines received while an antigravity turn is in
@@ -4488,7 +4551,7 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = findLastAntigravitySessionId(taskId);
+    const priorSessionId = lastSessionIdForTask(task, "antigravity_session_id");
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
 
@@ -4587,15 +4650,267 @@ async function drainAntigravityQueue(taskId: string): Promise<void> {
   if (next !== undefined) await spawnAntigravityTurnNow(task, taskId, next);
 }
 
-/** Most-recent antigravity conversation id across the task's runs (for `--conversation`). */
-function findLastAntigravitySessionId(taskId: string): string | null {
-  const row = db.query<{ antigravity_session_id: string }, [string]>(
-    `SELECT antigravity_session_id FROM runs
-     WHERE task_id = ? AND antigravity_session_id IS NOT NULL
-     ORDER BY started_at DESC
-     LIMIT 1`,
-  ).get(taskId);
-  return row?.antigravity_session_id ?? null;
+/**
+ * Per-task queue of follow-up lines received while an OpenCode turn is in
+ * flight. `opencode run` is one-shot per turn, so — like antigravity/gemini/
+ * codex — the message is held and a fresh `opencode run -s <id>` turn is
+ * spawned for it once the active turn resolves (`drainOpencodeQueue`, called
+ * from `attachDoneHandler`). Cleared on delete, archive and agent switch.
+ */
+const opencodeTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to an OpenCode task. Each follow-up is its own run row and
+ * its own `opencode run -s <id>` turn. When a turn is already running the
+ * message is queued (its user bubble recorded on the active run); otherwise
+ * it spawns immediately. Returns the run id the message was attached to, or
+ * null on lookup failure — or when `spawnOpencodeTurnNow` declined to mint a
+ * run because `startingTaskIds` was already claimed for this task.
+ */
+async function sendOpencodeTurn(taskId: string, line: string): Promise<string | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  if (task.runId && active.has(task.runId)) {
+    const q = opencodeTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    opencodeTurnQueue.set(taskId, q);
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    runs.appendEvent(runId, "user", data);
+    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    return runId;
+  }
+  return spawnOpencodeTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh OpenCode turn that resumes the task's prior session via
+ * `-s <id>` — the newest `opencode_session_id` recorded by THIS harness
+ * (D-15). New run row, new tmux session (the previous turn's exited). The
+ * CLI line comes from the cached `--version` probe (D-2: a follow-up must
+ * not pay a 2 s probe per message).
+ */
+async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const priorSessionId = lastSessionIdForTask(task, "opencode_session_id");
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: null,
+      opencodeSessionId: priorSessionId,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "opencode";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const cliVersion = await cachedCliVersion(harness);
+    onChunk("status", opencodeTurnBreadcrumb(harness, task, cliVersion));
+    onChunk(
+      "status",
+      priorSessionId
+        ? `resuming OpenCode session ${priorSessionId.slice(0, 8)}…`
+        : "no prior OpenCode session — starting fresh",
+    );
+
+    const { agent } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, { opencodeSessionId: sessionId });
+      },
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        resumeSessionId: priorSessionId,
+        cliVersion,
+        opencodeServer: task.opencodeServer,
+        title: task.title,
+      },
+    });
+    if (!agent) {
+      opencodeTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      opencodeTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    startingTaskIds.delete(taskId);
+  }
+}
+
+/**
+ * After an OpenCode turn resolves, spawn the next queued follow-up (if any)
+ * as a fresh resume turn. No-op while a run is still active for the task, or
+ * if the task's agent was switched away from opencode mid-flight.
+ */
+async function drainOpencodeQueue(taskId: string): Promise<void> {
+  const q = opencodeTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  if (!task || resolveHarness(task.agent)?.kind !== "opencode") {
+    opencodeTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) opencodeTurnQueue.delete(taskId);
+  if (next !== undefined) await spawnOpencodeTurnNow(task, taskId, next);
+}
+
+/**
+ * Reattach to an OpenCode turn whose tmux session survived an agetor restart
+ * (boot reconcile). Wires the same subagent hooks `spawnAgent` does. The
+ * server mode the turn launched with isn't recorded, so a v2 child left
+ * unfinished at settle is treated as still running in the shared service
+ * (`standalone: false` → orphaned, spike A6), never as stopped.
+ */
+async function reattachOpencodeTurn(
+  runId: string,
+  taskId: string,
+  harnessId: string,
+  sessionName: string,
+  cwd: string,
+  onChunk: ReturnType<typeof makeChunkHandler>,
+): Promise<SpawnedAgent | null> {
+  const harness = resolveHarness(harnessId);
+  if (!harness) return null;
+  const major = opencodeMajor(await cachedCliVersion(harness));
+  const { onSubagent, beforeSettle } = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone: false });
+  return reattachOpencodeSession({
+    taskId,
+    runId,
+    sessionName,
+    onChunk,
+    seenLineUuids: runs.seenLineUuidsForTask(taskId),
+    major,
+    onSubagent,
+    beforeSettle,
+  });
+}
+
+/** Display label for an OpenCode model id: the sentinel's "OpenCode
+ *  default", a curated row's label, a discovered label, else the id. */
+function opencodeModelLabel(harness: Harness, model: string | null): string {
+  const id = model ?? OPENCODE_DEFAULT_MODEL;
+  const curated = AGENT_OPTIONS.opencode.models.find((m) => m.id === id);
+  if (curated) return curated.label;
+  const discovered = getHarnessDiscoveredModels(harness.id).find((m) => m.id === id)
+    ?? getDiscoveredModels("opencode").find((m) => m.id === id);
+  return discovered?.label ?? id;
+}
+
+/**
+ * D-19: the opening status line of every OpenCode turn —
+ * `opencode <major>.x · server=<shared|standalone|n/a> · model=<label> ·
+ * effort=<id> · mode=<id>`. The server is the EFFECTIVE one (a harness with
+ * a home always runs Standalone; v1 has none → `n/a`), and the effort is the
+ * one actually passed (the sentinel model carries no variant → `auto`).
+ */
+function opencodeTurnBreadcrumb(harness: Harness, task: Task, cliVersion: string | null): string {
+  const major = opencodeMajor(cliVersion);
+  const server = opencodeEffectiveServerFor(harness, task, cliVersion) ?? "n/a";
+  const model = task.model ?? DEFAULT_MODEL.opencode;
+  const effort = model === OPENCODE_DEFAULT_MODEL ? "auto" : (task.effort?.trim() || "auto");
+  const mode = task.mode ?? defaultModeFor("opencode");
+  return `opencode ${major}.x · server=${server} · model=${opencodeModelLabel(harness, model)} · effort=${effort} · mode=${mode}`;
+}
+
+/**
+ * The task's current harness id — `task.agent` resolved, so a legacy row
+ * that stores a bare kind reads as that kind's built-in id.
+ */
+function taskHarnessId(task: Pick<Task, "agent">): string {
+  return resolveHarness(task.agent)?.id ?? task.agent;
+}
+
+/**
+ * Harness-scoped resume (D-15, docs/plans/add-opencode-harness.md): the
+ * newest session id recorded in `column` across the task's runs **by the
+ * harness `harnessId`**. A same-kind harness switch (the built-in → an
+ * additional account of the same kind) therefore starts fresh instead of
+ * resuming the other account's session, and switching back resumes the
+ * original. A run row's `agent` resolves through `resolveHarness`, so a
+ * legacy row that stored a bare kind matches that kind's built-in id; a row
+ * whose harness no longer exists matches only its raw stored id. Iterates
+ * across runs (not just the latest) because a row may not have had its id
+ * stamped — the prior conversation still resumes from any earlier run.
+ */
+export function findLastSessionIdForHarness(taskId: string, column: SessionIdColumn, harnessId: string): string | null {
+  const resolved = new Map<string, string>();
+  for (const row of runs.sessionIdsForTask(taskId, column)) {
+    let rowHarnessId = resolved.get(row.agent);
+    if (rowHarnessId === undefined) {
+      rowHarnessId = resolveHarness(row.agent)?.id ?? row.agent;
+      resolved.set(row.agent, rowHarnessId);
+    }
+    if (rowHarnessId === harnessId) return row.sessionId;
+  }
+  return null;
+}
+
+/** {@link findLastSessionIdForHarness} for the task's current harness. */
+function lastSessionIdForTask(task: Task, column: SessionIdColumn): string | null {
+  return findLastSessionIdForHarness(task.id, column, taskHarnessId(task));
+}
+
+/** The `runs` field a spawn's discovered/self-issued session id lands in. */
+function runSessionIdPatch(kind: AgentKind, sessionId: string): Partial<Run> {
+  switch (kind) {
+    case "claude-code": return { claudeSessionId: sessionId };
+    case "codex": return { codexSessionId: sessionId };
+    case "cursor": return { cursorSessionId: sessionId };
+    case "gemini": return { geminiSessionId: sessionId };
+    case "antigravity": return { antigravitySessionId: sessionId };
+    case "opencode": return { opencodeSessionId: sessionId };
+    case "fx": return { fxSessionId: sessionId };
+    default: {
+      const unknownKind: never = kind;
+      throw new Error(`no session id column for agent kind ${String(unknownKind)}`);
+    }
+  }
 }
 
 /**
@@ -4904,7 +5219,7 @@ async function spawnFxRun(
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
-    const priorSessionId = findLastFxSessionId(taskId);
+    const priorSessionId = lastSessionIdForTask(task, "fx_session_id");
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
 
@@ -4948,7 +5263,7 @@ async function spawnFxRun(
       // there's nothing left to auto-resume (plan §3 T2 item 7).
       clearFxRecovery(taskId);
     } else {
-      // `resumeFxRecovery` already checked `findLastFxSessionId(taskId)` is
+      // `resumeFxRecovery` already checked `lastSessionIdForTask(task, "fx_session_id")` is
       // non-null before ever calling this — `priorSessionId` here is a
       // fresh re-read of the same query, not the value that check saw, so
       // the `?? ""` stays purely defensive against a same-instant race
@@ -5057,16 +5372,6 @@ async function drainFxQueue(taskId: string): Promise<void> {
   }
 }
 
-/** Most-recent fx session id across the task's runs (for resume). */
-function findLastFxSessionId(taskId: string): string | null {
-  const row = db.query<{ fx_session_id: string }, [string]>(
-    `SELECT fx_session_id FROM runs
-     WHERE task_id = ? AND fx_session_id IS NOT NULL
-     ORDER BY started_at DESC
-     LIMIT 1`,
-  ).get(taskId);
-  return row?.fx_session_id ?? null;
-}
 
 /**
  * The single source of truth for "does this task have a resumable fx pause
@@ -5082,10 +5387,15 @@ function findLastFxSessionId(taskId: string): string | null {
  * ran, just named and reusable now.
  */
 function latestResumableFxPause(taskId: string): { runId: string; payload: FxRecoveryPayload } | null {
-  const latestRun = db.query<{ id: string; status: string }, [string]>(
-    `SELECT id, status FROM runs WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`,
+  const latestRun = db.query<{ id: string; status: string; agent: string }, [string]>(
+    `SELECT id, status, agent FROM runs WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`,
   ).get(taskId);
   if (!latestRun || latestRun.status !== "failed") return null;
+  // Harness-scoped (D-15): a pause recorded by another fx harness belongs to
+  // that account's session, which this harness can't continue — the resume
+  // would pick this harness's own session id (or none).
+  const task = tasks.get(taskId);
+  if (!task || (resolveHarness(latestRun.agent)?.id ?? latestRun.agent) !== taskHarnessId(task)) return null;
 
   const sentinel = runs.lastStatusDataWithPrefix(latestRun.id, FX_RECOVERY_STATUS_PREFIX);
   const payload = sentinel ? parseFxRecoveryPayload(sentinel.slice(FX_RECOVERY_STATUS_PREFIX.length)) : null;
@@ -5455,7 +5765,7 @@ export async function resumeFxRecovery(
       return { ok: false, status: 400, error: "no paused fx response to resume" };
     }
 
-    if (findLastFxSessionId(taskId) === null) {
+    if (lastSessionIdForTask(task, "fx_session_id") === null) {
       return { ok: false, status: 400, error: "no fx session to resume" };
     }
 
@@ -5785,7 +6095,7 @@ async function sendTurnInExistingSession(
     // which run row they belong to.
     const newRunId = randomUUID();
     const now = Date.now();
-    const inheritedSessionId = findLastClaudeSessionId(taskId);
+    const inheritedSessionId = lastSessionIdForTask(task, "claude_session_id");
     runs.insert({
       id: newRunId,
       taskId,
@@ -6045,7 +6355,7 @@ function startContinuationRun(
 
   const newRunId = randomUUID();
   const now = Date.now();
-  const inheritedSessionId = findLastClaudeSessionId(taskId);
+  const inheritedSessionId = lastSessionIdForTask(task, "claude_session_id");
   runs.insert({
     id: newRunId,
     taskId,
@@ -6142,7 +6452,7 @@ async function spawnResumedSessionInner(
   taskId: string,
   line: string,
 ): Promise<{ runId: string; pending?: true }> {
-  const priorSessionId = findLastClaudeSessionId(taskId);
+  const priorSessionId = lastSessionIdForTask(task, "claude_session_id");
   const cwd = task.worktreePath ?? task.workdir;
 
   const newRunId = randomUUID();
@@ -6263,21 +6573,6 @@ async function spawnResumedSessionInner(
   return raced.settled ? { runId: newRunId } : { runId: newRunId, pending: true };
 }
 
-/**
- * Find the most recently-recorded claude_session_id across the task's runs.
- * Iterating across runs (not just the latest) because a row may not have
- * had its sessionId stamped if the JSONL discovery raced — we still want to
- * resume the prior conversation if any earlier run has the id.
- */
-function findLastClaudeSessionId(taskId: string): string | null {
-  const row = db.query<{ claude_session_id: string }, [string]>(
-    `SELECT claude_session_id FROM runs
-     WHERE task_id = ? AND claude_session_id IS NOT NULL
-     ORDER BY started_at DESC
-     LIMIT 1`,
-  ).get(taskId);
-  return row?.claude_session_id ?? null;
-}
 
 export interface CreateTaskInput extends Partial<Task> {
   title: string;
@@ -6313,14 +6608,22 @@ export interface CreateTaskInput extends Partial<Task> {
    * Bind this task to a reusable {@link AgentProfile} at create time
    * (docs/plans/agent-profiles.md). When set to a resolvable profile id,
    * `createTask` overrides the effective `agent`/`model`/`effort`/`mode`/
-   * `speed`/`maxMode` from the profile — any of those six fields also present
-   * in the body are ignored — and stores both the id and a point-in-time
+   * `speed`/`maxMode`/`opencodeServer` from the profile — any of those seven
+   * fields also present in the body are ignored — and stores both the id and a point-in-time
    * `AgentProfileSnapshot` on the new row. Also settable via the inherited
    * `Partial<Task>` field; listed here too so its doc comment lives next to
    * the override it triggers. An unresolvable id fails the whole create with
    * `{ error }` rather than silently falling back to "no agent".
    */
   agentProfileId?: string | null;
+  /**
+   * The OpenCode server mode (D-4). Ignored when a profile (or a pipeline's
+   * start step) supplies one; otherwise a valid value is stored and anything
+   * else reads as `"shared"`. The routes validate it with
+   * `parseOpencodeServerInput` and 400 junk before calling. Stored, and
+   * ignored, on a task of another kind — like `maxMode`.
+   */
+  opencodeServer?: OpencodeServerMode;
   /**
    * Bind this task to a {@link Pipeline} at create time (docs/plans/pipelines.md
    * D1) — mutually exclusive with `agentProfileId` (`{ error }` when both are
@@ -6676,10 +6979,12 @@ export async function createTask(
     effort,
     speed: defaultsProfile ? defaultsProfile.speed : isSpeed(input.speed) ? input.speed : "off",
     maxMode: defaultsProfile ? defaultsProfile.maxMode : input.maxMode === true,
+    // D-4: a bound profile's (or a pipeline start step's) value, else a
+    // valid body value (the route already 400s junk), else "shared".
     opencodeServer: defaultsProfile
       ? (defaultsProfile.opencodeServer ?? "shared")
-      : input.opencodeServer === "standalone"
-        ? "standalone"
+      : input.opencodeServer !== undefined && OPENCODE_SERVER_MODES.includes(input.opencodeServer)
+        ? input.opencodeServer
         : "shared",
     agentProfileId: profile?.id ?? null,
     agentProfile: agentProfileSnapshot,
@@ -6829,6 +7134,7 @@ function enqueueArchiveTeardown(
     else if (kind === "cursor") await dropCursorSession(cur.id);
     else if (kind === "gemini") await dropGeminiSession(cur.id);
     else if (kind === "antigravity") await dropAntigravitySession(cur.id);
+    else if (kind === "opencode") await dropOpencodeSession(cur.id); // graceful C-c, then kill (D-10)
     else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
     // Pipeline step rows share the parent's worktree (D2, docs/plans/pipelines.md)
     // — a step's own archive teardown must never detach it out from under
@@ -6981,6 +7287,8 @@ export async function archiveTask(
   codexTurnQueue.delete(taskId);
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
+  antigravityTurnQueue.delete(taskId);
+  opencodeTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
   // Same for a pending fx auto-resume schedule — an archived task has
   // nothing left to resume (plan §3 T2 item 8).
@@ -7176,6 +7484,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
   antigravityTurnQueue.delete(taskId);
+  opencodeTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
   // Same for a pending fx auto-resume schedule, before the task row itself
   // goes (plan §3 T2 item 8).
@@ -7201,6 +7510,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
     else if (deleteKind === "antigravity") await dropAntigravitySession(taskId);
+    else if (deleteKind === "opencode") await dropOpencodeSession(taskId); // graceful C-c, then kill (D-10)
     else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // A step task's worktree is the shared parent's (D2) — never remove it
     // out from under the parent (or any sibling step) just because one step
@@ -7455,7 +7765,7 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
 
       const recent = runs.listForTask(taskId)[0];
       if (recent) {
-        const data = findLastClaudeSessionId(taskId)
+        const data = lastSessionIdForTask(fresh, "claude_session_id")
           ? "session hibernated after 30m idle — next message will resume it"
           : "session hibernated after 30m idle — no saved session id, next message starts a fresh context";
         // Idempotence backstop: a re-reap regression (e.g. the tmux 3.6a

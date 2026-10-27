@@ -73,6 +73,8 @@ import type {
   HarnessStatus,
   HarnessUsage,
   Isolation,
+  OpencodeServerMode,
+  OpencodeSessionList,
   Pipeline,
   PipelineInput,
   Project,
@@ -516,6 +518,10 @@ export interface AgentProfileInput {
   mode: string | null;
   speed: Speed;
   maxMode: boolean;
+  /** OpenCode's server option (D-4). Omitted ⇒ `"shared"` on create,
+   *  unchanged on PATCH, copied from the source on duplicate; any value but
+   *  `shared`/`standalone` is a 400. */
+  opencodeServer?: OpencodeServerMode;
   instructions: string;
   skills: string[];
 }
@@ -777,6 +783,7 @@ export const api = {
     effort?: string | null;
     speed?: Speed;
     maxMode?: boolean;
+    opencodeServer?: OpencodeServerMode;
     agentProfileId?: string;
     /** Client-minted uuid so the caller can subscribe to this clone's
      *  `clone_progress` AppEvents (via `subscribeCloneProgress`) BEFORE
@@ -1485,6 +1492,24 @@ export const api = {
    *  not failed" and would show that as the failure. */
   retryClaudeSessionImport: (taskId: string) =>
     j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/claude-session/retry`, { method: "POST" }, { retry: false }),
+  /** OpenCode sessions started outside Agetor (D-13), per enabled OpenCode
+   *  harness × registered project. */
+  listOpencodeSessions: () => j<OpencodeSessionList>("/opencode-sessions"),
+  /** Same list, bypassing the scanner's 10 s cache. */
+  recheckOpencodeSessions: () =>
+    j<OpencodeSessionList>("/opencode-sessions/recheck", { method: "POST" }),
+  /** `harnessId` names the OpenCode harness to import under (default: the
+   *  one that listed each session). `retry: false` — a replay after a lost
+   *  response would import the same sessions again. */
+  importOpencodeSessions: (ids: string[], harnessId?: string) =>
+    j<{ results: { id: string; taskId?: string; error?: string }[] }>("/opencode-sessions/import", {
+      method: "POST",
+      body: JSON.stringify(harnessId ? { ids, harnessId } : { ids }),
+    }, { retry: false }),
+  /** Re-run a failed OpenCode history backfill. `retry: false` for the same
+   *  reason as `retryClaudeSessionImport`. */
+  retryOpencodeSessionImport: (taskId: string) =>
+    j<{ ok: true }>(`/tasks/${encodeURIComponent(taskId)}/opencode-session/retry`, { method: "POST" }, { retry: false }),
   /** `GET /db/stats` — file/WAL size, reclaimable bytes, the Compact estimate
    *  and the archived-history retention bookkeeping (Settings → General). */
   getDbStats: () => j<DbStats>("/db/stats"),
@@ -1568,6 +1593,9 @@ export const api = {
     effort?: string | null;
     speed?: Speed;
     maxMode?: boolean;
+    /** OpenCode's server option (D-4); `"shared"` when omitted. A selected
+     *  profile's own value wins. */
+    opencodeServer?: OpencodeServerMode;
     /** Initial column. Defaults to "backlog" if omitted. */
     column?: ColumnId;
     references?: TaskReference[];
@@ -1581,7 +1609,7 @@ export const api = {
      *  alongside `issueUrl`. */
     issueSnapshot?: string;
     /** Id of an {@link AgentProfile} to launch from — the server resolves it
-     *  and overrides `agent`/`model`/`effort`/`mode`/`speed`/`maxMode` from the
+     *  and overrides `agent`/`model`/`effort`/`mode`/`speed`/`maxMode`/`opencodeServer` from the
      *  profile (body-provided values for those fields are ignored); 400 on an
      *  unknown id. */
     agentProfileId?: string | null;
