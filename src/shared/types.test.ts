@@ -12,6 +12,8 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
+  HARNESS_TEMPLATES,
+  MODEL_DEFAULT_EFFORT_KINDS,
   MODEL_EFFORT_SUPPORT,
   MODEL_MIN_CLI_VERSION,
   PERMISSION_MODE_STATUS_PREFIX,
@@ -249,9 +251,9 @@ test("EFFORT_OPTIONS: ultra is first, auto ('Model default') is last", () => {
   expect(last?.label).toBe("Model default");
 });
 
-test("no non-fx kind's MODEL_EFFORT_SUPPORT table lists 'auto' — it is fx-only", () => {
+test("no kind outside MODEL_DEFAULT_EFFORT_KINDS (fx, copilot) lists 'auto' in its MODEL_EFFORT_SUPPORT table", () => {
   for (const kind of KINDS) {
-    if (kind === "fx") continue;
+    if (MODEL_DEFAULT_EFFORT_KINDS.has(kind)) continue;
     for (const ids of Object.values(MODEL_EFFORT_SUPPORT[kind])) {
       expect(ids).not.toContain("auto");
     }
@@ -661,4 +663,86 @@ test("GlobalEvent: the \"fx-auto-resume\" kind type-checks in a discriminated sw
     .toBe("run-status:succeeded");
   expect(describeGlobalEvent({ kind: "files-sent", taskId: "t1", runId: "r1", count: 2, caption: null, proactive: false, ts: 0 }))
     .toBe("files-sent:2");
+});
+
+/* ── GitHub Copilot (docs/plans/github-copilot-harness.md §3.6 / T1) ─────── */
+
+const COPILOT_MODEL_IDS = [
+  "auto",
+  "claude-opus-5.5",
+  "claude-sonnet-5.5",
+  "claude-haiku-5.5",
+  "claude-fable-5.1",
+  "gpt-6.1-sol",
+  "gpt-6-astra",
+  "gpt-6-luna",
+  "gpt-6-sol",
+  "gemini-4-argon",
+  "gemini-3.8-flash",
+  "grok-4.7",
+  "kimi-k3",
+  "mai-code-1.1-flash",
+];
+
+test("copilot: 14 curated models in D9 order with auto first, default model/effort auto", () => {
+  expect(AGENT_OPTIONS.copilot.models.map((m) => m.id)).toEqual(COPILOT_MODEL_IDS);
+  expect(DEFAULT_MODEL.copilot).toBe("auto");
+  expect(DEFAULT_EFFORT.copilot).toBe("auto");
+});
+
+test("copilot: modes are auto / plan / ask (Auto, Plan, Read-only) and Code/Plan maps to auto/plan", () => {
+  expect(AGENT_OPTIONS.copilot.modes.map((m) => [m.id, m.label])).toEqual([
+    ["auto", "Auto"],
+    ["plan", "Plan"],
+    ["ask", "Read-only"],
+  ]);
+  expect(CODE_PLAN_MODE.copilot).toEqual({ code: "auto", plan: "plan" });
+  expect(defaultModeFor("copilot")).toBe("auto");
+  expect(AGENT_OPTIONS.copilot.modes[2]?.hint).toContain("denies file edits");
+  expect(AGENT_OPTIONS.copilot.modes[2]?.hint).toContain("can still report success");
+});
+
+test("copilot: MODEL_EFFORT_SUPPORT keys exactly match the curated models, none offers ultra, every row ends in auto", () => {
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.copilot)).toEqual(COPILOT_MODEL_IDS);
+  for (const [id, ids] of Object.entries(MODEL_EFFORT_SUPPORT.copilot)) {
+    expect(ids).not.toContain("ultra");
+    expect(ids[ids.length - 1]).toBe("auto");
+    expect(ids).toEqual(AGETOR_EFFORT_ORDER.filter((e) => ids.includes(e)));
+    expect(id.length).toBeGreaterThan(0);
+  }
+  expect(MODEL_EFFORT_SUPPORT.copilot.auto).toEqual(AGETOR_EFFORT_ORDER);
+  expect(MODEL_EFFORT_SUPPORT.copilot["mai-code-1.1-flash"]).toEqual(AGETOR_EFFORT_ORDER);
+  expect(MODEL_EFFORT_SUPPORT.copilot["gpt-6-sol"]).toEqual(["max", "xhigh", "high", "medium", "low", "none", "auto"]);
+  expect(MODEL_EFFORT_SUPPORT.copilot["gemini-3.8-flash"]).toEqual(["high", "low", "auto"]);
+});
+
+test("copilot: MODEL_MIN_CLI_VERSION floors follow the changelog table; models without a floor are absent", () => {
+  expect(MODEL_MIN_CLI_VERSION.copilot).toEqual({
+    "kimi-k3": "1.0.79",
+    "claude-fable-5.1": "1.0.83",
+    "gpt-6-astra": "1.0.85",
+    "claude-opus-5.5": "1.0.89",
+    "gpt-6-sol": "1.0.89",
+    "gpt-6-luna": "1.0.89",
+    "gpt-6.1-sol": "1.0.90",
+    "claude-haiku-5.5": "1.0.94",
+    "gemini-4-argon": "1.0.98",
+  });
+  const ids = new Set(COPILOT_MODEL_IDS);
+  for (const key of Object.keys(MODEL_MIN_CLI_VERSION.copilot ?? {})) expect(ids.has(key)).toBe(true);
+});
+
+test("MODEL_DEFAULT_EFFORT_KINDS is exactly fx + copilot, and copilot (unlike codex) keeps a discovered auto", () => {
+  expect([...MODEL_DEFAULT_EFFORT_KINDS].sort()).toEqual(["copilot", "fx"]);
+  expect(CATALOG_SCOPED_KINDS.has("copilot")).toBe(false);
+  expect(supportedEfforts("copilot", "claude-opus-5.5", ["auto", "low"]).map((o) => o.id)).toEqual(["low", "auto"]);
+});
+
+test("HARNESS_TEMPLATES has a copilot-additional entry isolating via COPILOT_HOME", () => {
+  const t = HARNESS_TEMPLATES.find((x) => x.id === "copilot-additional");
+  expect(t?.kind).toBe("copilot");
+  expect(t?.suggestedHarnessId).toBe("copilot-2");
+  expect(t?.home).toBe("{dataDir}/harnesses/copilot-2");
+  expect(t?.description).toContain("COPILOT_HOME");
+  expect(t?.description).toContain("copilot login");
 });

@@ -55,12 +55,18 @@ export function parseFxUsage(json: string): FxUsagePayload | null {
     if (Object.keys(turn).length > 0) out.turn = turn;
   }
 
+  // GitHub Copilot's per-turn AI credits: only a finite, strictly positive
+  // number is meaningful (the driver omits the field otherwise).
+  if (typeof raw.aiCredits === "number" && Number.isFinite(raw.aiCredits) && raw.aiCredits > 0) {
+    out.aiCredits = raw.aiCredits;
+  }
+
   return Object.keys(out).length > 0 ? out : null;
 }
 
 /**
  * Shallow-merge a newly-parsed sentinel onto the previous payload seen for a
- * run: `{...prev, ...next}`. `used`/`size`/`cost` take the latest value seen
+ * run: `{...prev, ...next}`. `used`/`size`/`cost`/`aiCredits` take the latest value seen
  * for each key independently; `turn` is replaced wholesale by a later one
  * rather than merged field-by-field (fx emits `turn` as one complete object
  * per turn, so a partial merge would mix two different turns' numbers).
@@ -94,6 +100,14 @@ function costSuffix(cost: FxUsagePayload["cost"]): string {
   return cost.currency === "USD" ? ` · $${display}` : ` · ${display} ${cost.currency}`;
 }
 
+/** AI-credit amount for the tooltip: up to two decimals, widened to four
+ *  below 0.01 so a small turn doesn't read as "0"; trailing zeros dropped
+ *  ("2.5", "0.0042"). */
+export function formatAiCredits(n: number): string {
+  const digits = n < 0.01 ? 4 : 2;
+  return String(Number(n.toFixed(digits)));
+}
+
 /**
  * The run-row chip's visible text, or `null` when there's nothing to show.
  * `used`+`size` (context-window usage, fx ≥0.0.8's `usage_update`) wins when
@@ -119,7 +133,8 @@ export function fxUsageChipText(u: FxUsagePayload): string | null {
  * known; then a `turn: in <n> · out <n> · cache read <n> · cache write <n> ·
  * reasoning <n>` segment listing only the per-turn fields that are present
  * (so a turn payload carrying only cache fields prints `turn:` with just
- * those). The two segments are joined by ` · ` when both are present.
+ * those). A known `aiCredits` (GitHub Copilot) appends an
+ * `AI credits: <n>` segment. Segments are joined by ` · `.
  */
 export function fxUsageTitle(u: FxUsagePayload): string {
   const segments: string[] = [];
@@ -139,6 +154,8 @@ export function fxUsageTitle(u: FxUsagePayload): string {
     if (typeof u.turn.reasoningTokens === "number") turnBits.push(`reasoning ${u.turn.reasoningTokens}`);
     if (turnBits.length > 0) segments.push(`turn: ${turnBits.join(" · ")}`);
   }
+
+  if (typeof u.aiCredits === "number") segments.push(`AI credits: ${formatAiCredits(u.aiCredits)}`);
 
   return segments.join(" · ");
 }

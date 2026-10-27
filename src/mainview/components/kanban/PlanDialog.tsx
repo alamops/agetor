@@ -62,14 +62,15 @@ interface Props {
    *  the local `text`/`mode` state below back to a fresh baseline. */
   plan: TaskPlan;
   /** The task's resolved harness kind (`RunPanelBody`'s `kind`, already
-   *  derived via `harnessKindOf` at the call site). Cursor plans are
-   *  editable/approvable from this dialog (writes a `.plan.md` file + sends
-   *  an approval message via the mutation routes below); claude-code plans
+   *  derived via `harnessKindOf` at the call site). Cursor and Copilot plans
+   *  are editable/approvable from this dialog (cursor writes a `.plan.md`
+   *  file; copilot writes none and embeds the plan in the approval message;
+   *  both send that message via the mutation routes below); claude-code plans
    *  are read-only history — approval happens live in the tmux modal
    *  (`TmuxPromptCard`'s plan branch in RunPanel.tsx), so this dialog only
    *  ever displays a claude plan's content/status, never edits or approves
    *  it. Every mutation affordance (Edit, Revert, Approve, Save & Approve)
-   *  is gated on `!claude` below. */
+   *  is gated on `!readOnlyHistory` below. */
   agentKind: AgentKind;
   onClose: () => void;
   /** Called with the fresh `Task` after any successful mutation (save,
@@ -87,9 +88,9 @@ interface Props {
 }
 
 /**
- * Modal for a detected plan — Cursor's `createPlanToolCall` or claude-code's
- * `ExitPlanMode`. For a Cursor plan, `pending` is editable and approvable
- * from here (`editable`, below); `approved`/`superseded` render a read-only
+ * Modal for a detected plan — Cursor's `createPlanToolCall`, Copilot's
+ * `copilot_plan` or claude-code's `ExitPlanMode`. For a Cursor/Copilot plan,
+ * `pending` is editable and approvable from here (`editable`, below); `approved`/`superseded` render a read-only
  * view. See `docs/plans/cursor-plan-approval.md` §3-4 for the full
  * approval-flow design this implements. A claude-code plan (`agentKind ===
  * "claude-code"`) is ALWAYS read-only regardless of status — its approval
@@ -108,8 +109,11 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
   // it to `approved`/`rejected`), but there's no in-dialog action that can
   // resolve it, so every edit/approve/revert affordance below is gated on
   // `editable` (= cursor AND pending) rather than bare `pending`.
+  // Cursor and Copilot plans are mutable through this dialog (save / revert /
+  // approve); every other kind (claude-code today) is a read-only viewer.
   const claude = agentKind === "claude-code";
-  const editable = !claude && pending;
+  const readOnlyHistory = agentKind !== "cursor" && agentKind !== "copilot";
+  const editable = !readOnlyHistory && pending;
 
   // Scopes this plan's `MdImage` overrides to the task's own worktree/workdir
   // roots — mirrors `RunEventList`'s `mdImageScope` in RunPanel.tsx, since
@@ -161,7 +165,7 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
   // flipping `dirty` true and trapping the user behind an "unsaved edits"
   // prompt whose only working save route (`saveAndClose`) is a cursor-only
   // mutation that 400s for a claude plan.
-  const dirty = !claude && text !== (plan.editedContent ?? plan.content);
+  const dirty = !readOnlyHistory && text !== (plan.editedContent ?? plan.content);
   // Read-only views (approved OR superseded) show the persisted edit when
   // there is one — previously this only applied to `approved`, so a
   // superseded plan silently hid an `editedContent` draft behind the
@@ -214,7 +218,7 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
     // reachable for a claude plan, but `api.savePlanEdit` is a cursor-only
     // route (rejected by `planCursorKindGuard`), so guard the mutation
     // itself too rather than relying solely on the caller's gate.
-    if (claude) return;
+    if (readOnlyHistory) return;
     if (closeSaving) return;
     setCloseSaving(true);
     setCloseError(null);
@@ -269,7 +273,7 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
     // auto-sends an approval message) and a claude plan's approval already
     // happened live in the tmux modal, so calling this would be a no-op
     // 4xx at best and a wrong second approval message at worst.
-    if (claude || saving || sentButUnconfirmed) return;
+    if (readOnlyHistory || saving || sentButUnconfirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -299,8 +303,8 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
   };
 
   const doSaveAndApprove = async () => {
-    // Same guard as `doApprove` — cursor-only mutation route.
-    if (claude || saving || sentButUnconfirmed) return;
+    // Same guard as `doApprove` — cursor/copilot-only mutation route.
+    if (readOnlyHistory || saving || sentButUnconfirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -325,7 +329,7 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
     // Same guard — a claude plan never has a local draft to discard (see
     // `edited`'s comment above), and `api.savePlanEdit` is a cursor-only
     // route, so this must be a no-op for a claude plan regardless.
-    if (claude) return;
+    if (readOnlyHistory) return;
     setText(plan.content);
     // No persisted draft to clear — a purely-local edit that was never
     // saved, so there's nothing to round-trip through the server.

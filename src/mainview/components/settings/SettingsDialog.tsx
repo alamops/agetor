@@ -142,7 +142,7 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
  *  badge everywhere a harness/template kind is shown. Extend this list (not
  *  the individual call sites) as a kind graduates out of experimental. */
 function isExperimentalKind(kind: AgentKind): boolean {
-  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx";
+  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx" || kind === "copilot";
 }
 
 function stringifyEnv(env: Record<string, string>): string {
@@ -209,6 +209,11 @@ const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: 
     label: "HOME override (absolute path; optional)",
     slug: "fx-2",
     help: "HOME override — fx has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, so fx's state (~/.fx) lands under this path, giving this harness its own account.",
+  },
+  copilot: {
+    label: "COPILOT_HOME override (absolute path; optional)",
+    slug: "copilot-2",
+    help: "Sets COPILOT_HOME on spawn — GitHub Copilot CLI stores its login, config, and session history under this path (a dedicated override, not the real HOME), so a separate path gives this harness its own account. Authenticate by running: COPILOT_HOME=<path> copilot login.",
   },
 };
 
@@ -1904,8 +1909,8 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-3 gap-1 sm:grid-cols-6">
-          {(["claude-code", "codex", "cursor", "gemini", "antigravity", "fx"] as AgentKind[]).map((k) => {
+        <div className="grid grid-cols-3 gap-1 sm:grid-cols-7">
+          {(["claude-code", "codex", "cursor", "gemini", "antigravity", "fx", "copilot"] as AgentKind[]).map((k) => {
             const experimental = isExperimentalKind(k);
             return (
               <Button

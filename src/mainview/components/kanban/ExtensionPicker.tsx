@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Blocks, BookText, ChevronDown, Plug, Puzzle, Sparkles } from "lucide-react";
+import { Blocks, BookText, Bot, ChevronDown, Plug, Puzzle, Sparkles } from "lucide-react";
 import type { AvailableExtension } from "@/lib/api";
 import type { SavedPrompt } from "../../../shared/types.ts";
 import { filterPromptsForPicker } from "@/lib/prompt-picker";
@@ -7,7 +7,7 @@ import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { cn } from "@/lib/utils";
 
 interface Props {
-  /** Available MCP / skill / plugin entries. Empty disables selection but the
+  /** Available MCP / skill / plugin / agent entries. Empty disables selection but the
    *  trigger still renders (with an empty-state hint inside the popover). */
   extensions: AvailableExtension[];
   /** User-global reusable prompt snippets, rendered as a fourth "Saved
@@ -39,9 +39,10 @@ const KINDS = [
   { kind: "mcp", label: "MCP Servers", Icon: Plug },
   { kind: "skill", label: "Skills", Icon: Sparkles },
   { kind: "plugin", label: "Plugins", Icon: Puzzle },
+  { kind: "agent", label: "Agents", Icon: Bot },
 ] as const;
 
-/** A group row is either an MCP/skill/plugin entry or a saved prompt — the
+/** A group row is either an MCP/skill/plugin/agent entry or a saved prompt — the
  *  tag lets the flattened keyboard-nav list and the row renderer dispatch
  *  without conflating the two shapes. */
 type Row = { tag: "ext"; ext: AvailableExtension } | { tag: "prompt"; prompt: SavedPrompt };
@@ -123,7 +124,7 @@ export function ExtensionPicker({
       rows: extensions.filter((e) => e.kind === kind && match(e)).map((ext): Row => ({ tag: "ext", ext })),
     }));
     const promptRows = filterPromptsForPicker(savedPrompts ?? [], query).map((prompt): Row => ({ tag: "prompt", prompt }));
-    // Saved Prompts always renders last, after mcp/skill/plugin.
+    // Saved Prompts always renders last, after mcp/skill/plugin/agent.
     return [...extGroups, { key: "prompt", label: "Saved Prompts", Icon: BookText, rows: promptRows }]
       .filter((g) => g.rows.length > 0);
   }, [extensions, savedPrompts, query]);

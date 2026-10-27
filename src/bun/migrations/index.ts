@@ -102,6 +102,7 @@ import m071 from "./071_claude_session_seen.sql" with { type: "text" };
 import m072 from "./072_task_speed.sql" with { type: "text" };
 import m073 from "./073_harness_profile_mcp_servers.sql" with { type: "text" };
 import m074 from "./074_retire_fx_models.sql" with { type: "text" };
+import m075 from "./075_copilot_harness.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -185,4 +186,5 @@ export const migrations: Migration[] = [
   { id: "072_task_speed", sql: m072 },
   { id: "073_harness_profile_mcp_servers", sql: m073 },
   { id: "074_retire_fx_models", sql: m074 },
+  { id: "075_copilot_harness", sql: m075 },
 ];

@@ -205,8 +205,8 @@ test("unknown model falls back to the agent's DEFAULT_MODEL support set (6.1 Sol
 });
 
 describe("MODEL_MIN_CLI_VERSION", () => {
-  test("only codex has entries; exactly the five GPT-6-family ids, each floor major.minor.patch and each id a real codex model", () => {
-    expect(Object.keys(MODEL_MIN_CLI_VERSION)).toEqual(["codex"]);
+  test("only codex and copilot have entries; codex has exactly the five GPT-6-family ids, each floor major.minor.patch and each id a real codex model", () => {
+    expect(Object.keys(MODEL_MIN_CLI_VERSION).sort()).toEqual(["codex", "copilot"]);
     const codexFloors = MODEL_MIN_CLI_VERSION.codex ?? {};
     expect(Object.keys(codexFloors).sort()).toEqual(
       ["gpt-6-astra", "gpt-6-astra-aeon", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"].sort(),
@@ -264,6 +264,42 @@ test("auto is fx-only — never offered on claude-code, codex, cursor, or gemini
   for (const model of AGENT_OPTIONS.gemini.models) {
     expect(supportedEfforts("gemini", model.id).map((o) => o.id)).not.toContain("auto");
   }
+});
+
+// GitHub Copilot is the second kind (after fx) that offers `auto` ("Model
+// default"); `ultra` stays Codex-only for it too.
+test("copilot offers auto on every curated model and never ultra", () => {
+  for (const model of AGENT_OPTIONS.copilot.models) {
+    const ids = supportedEfforts("copilot", model.id).map((o) => o.id);
+    expect(ids).toContain("auto");
+    expect(ids).not.toContain("ultra");
+  }
+});
+
+test("copilot: curated tables for representative models", () => {
+  expect(supportedEfforts("copilot", "auto").map((o) => o.id))
+    .toEqual(["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"]);
+  expect(supportedEfforts("copilot", "claude-opus-5.5").map((o) => o.id))
+    .toEqual(["max", "xhigh", "high", "medium", "low", "auto"]);
+  expect(supportedEfforts("copilot", "gpt-6-luna").map((o) => o.id))
+    .toEqual(["max", "xhigh", "high", "medium", "low", "none", "auto"]);
+  expect(supportedEfforts("copilot", "kimi-k3").map((o) => o.id)).toEqual(["max", "high", "low", "auto"]);
+});
+
+test("copilot: a discovered-only model id falls back to the auto row's full set", () => {
+  expect(supportedEfforts("copilot", "gpt-5.4-mini").map((o) => o.id))
+    .toEqual(["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"]);
+});
+
+describe("copilot discovered efforts", () => {
+  test("a discovered auto id is kept (copilot is in MODEL_DEFAULT_EFFORT_KINDS)", () => {
+    const ids = supportedEfforts("copilot", "gpt-6.1-sol", ["auto", "high", "low"]).map((o) => o.id);
+    expect(ids).toEqual(["high", "low", "auto"]);
+  });
+
+  test("retainableEfforts keeps auto for copilot", () => {
+    expect(retainableEfforts("copilot", "claude-opus-5.5", ["low"]).has("auto")).toBe(true);
+  });
 });
 
 describe("supportedEfforts with discovered efforts", () => {
