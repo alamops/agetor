@@ -135,10 +135,23 @@ export interface CopilotShellCommandInput {
    * `unset COPILOT_ALLOW_ALL` in the pane before exec. True for Plan and
    * Read-only turns whose harness env does not set it: without it an ambient
    * `COPILOT_ALLOW_ALL=true` in the tmux server's env would silently turn
-   * Read-only into allow-all. `spawnCopilotViaTmux` computes it
-   * (`mode` is plan/ask and `COPILOT_ALLOW_ALL` is not in `opts.env`).
+   * Read-only into allow-all. `spawnCopilotViaTmux` computes it with
+   * `shouldUnsetAllowAll` (any mode but `auto`, and `COPILOT_ALLOW_ALL` is
+   * not in `opts.env`).
    */
   unsetAllowAll: boolean;
+}
+
+/**
+ * Whether the pane must `unset COPILOT_ALLOW_ALL` before exec'ing copilot.
+ * Fail closed: every mode except `auto` gets the guard — not just
+ * `plan`/`ask` — because a task can carry a mode id from another kind (an
+ * fx `yolo` survives `agetor edit --agent copilot`, and a PATCH of `agent`
+ * alone never resets `mode`), and `buildCommand` grants allow-all only for
+ * `auto`. A value the harness env sets explicitly always wins.
+ */
+export function shouldUnsetAllowAll(mode: string | null | undefined, env: Readonly<Record<string, string>>): boolean {
+  return mode !== "auto" && !Object.hasOwn(env, "COPILOT_ALLOW_ALL");
 }
 
 /**
@@ -459,14 +472,17 @@ export function mapCopilotEvent(line: string, lineIndex: number, ctx: CopilotMap
     evt = undefined;
   }
   if (!isRecord(evt) || typeof evt.type !== "string") {
-    chunks.push({ stream: "stderr", data: text, lineUuid: `copilot:raw:${lineIndex}` });
+    chunks.push({ stream: "stderr", data: text, lineUuid: `copilot:raw:${ctx.runId}:${lineIndex}` });
     noteLogin(text);
     return { chunks };
   }
 
   const type = evt.type;
   const data = isRecord(evt.data) ? evt.data : {};
-  const eventId = typeof evt.id === "string" && evt.id ? evt.id : `line:${lineIndex}`;
+  // The line-index fallbacks carry the run id: boot reattach seeds the
+  // TASK-wide seen-uuid set, so a bare `line:<n>` would collide with the same
+  // index of an earlier run of the task and be dropped as already seen.
+  const eventId = typeof evt.id === "string" && evt.id ? evt.id : `line:${ctx.runId}:${lineIndex}`;
   const uuid = `copilot:${eventId}`;
   if (evt.ephemeral === true && !EPHEMERAL_HANDLED.has(type)) return { chunks };
 
@@ -954,7 +970,7 @@ export interface CopilotLaunchOptions {
   sessionId: string;
   /** Resolved `$COPILOT_HOME` (`copilotHome()`), for the plan reader. */
   copilotHome: string;
-  /** Agetor mode id (`auto` / `plan` / `ask`). Plan → plan chunk; plan/ask → COPILOT_ALLOW_ALL unset. */
+  /** Agetor mode id (`auto` / `plan` / `ask`). Plan → plan chunk; anything but auto → COPILOT_ALLOW_ALL unset. */
   mode: string | null;
   /** The task's model id (`auto` enables the "auto picked" status line). */
   model: string | null;
@@ -983,14 +999,13 @@ export async function spawnCopilotViaTmux(opts: CopilotLaunchOptions): Promise<S
   await killSessionByName(sessionName);
 
   const tmux = resolveTmuxBin();
-  const restricted = opts.mode === "plan" || opts.mode === "ask";
   const shell = buildCopilotShellCommand({
     argv: opts.argv,
     promptPath,
     logPath,
     exitPath,
     stripClassicTokens: opts.stripClassicTokens,
-    unsetAllowAll: restricted && !("COPILOT_ALLOW_ALL" in opts.env),
+    unsetAllowAll: shouldUnsetAllowAll(opts.mode, opts.env),
   });
   const envArgs: string[] = [];
   if (process.env.PATH) { envArgs.push("-e", `PATH=${process.env.PATH}`); }

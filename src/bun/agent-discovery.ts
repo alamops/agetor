@@ -1005,8 +1005,10 @@ const COPILOT_PROBE_TIMEOUT_MS = 4_000;
  * entitlements or org policy — so it is a kind-level catalog and copilot is
  * deliberately not in `CATALOG_SCOPED_KINDS`: discovered ids are appended
  * after the curated rows and the curated rows are never hidden.
- * `COPILOT_OFFLINE=true` keeps the probe from reaching for the network, and
- * `env` (a harness's `harnessEnv`, e.g. `COPILOT_HOME`) is merged under it.
+ * `COPILOT_OFFLINE=true` keeps the probe from reaching for the network.
+ * The refresh paths call it with no arguments — a per-harness env could not
+ * change a list that depends only on the binary — so `env` (merged under
+ * `COPILOT_OFFLINE`) and `bin` are test seams.
  * Never throws; an unresolvable binary, non-zero exit or empty output is `[]`.
  */
 async function discoverCopilot(env?: Record<string, string>, bin?: string): Promise<DiscoveredModel[]> {

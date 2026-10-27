@@ -23,6 +23,7 @@ const {
   COPILOT_LOGIN_STATUS_TEXT,
   COPILOT_PLAN_TOOL_NAME,
   buildCopilotShellCommand,
+  shouldUnsetAllowAll,
   copilotExitPath,
   copilotLogPath,
   copilotPlanChunk,
@@ -384,7 +385,7 @@ describe("mapCopilotEvent", () => {
     const ctx = ctxFor();
     const a = mapCopilotEvent("Error: No authentication information found.", 0, ctx);
     expect(a.chunks).toEqual([
-      { stream: "stderr", data: "Error: No authentication information found.", lineUuid: "copilot:raw:0" },
+      { stream: "stderr", data: "Error: No authentication information found.", lineUuid: "copilot:raw:run-1:0" },
       { stream: "status", data: COPILOT_LOGIN_STATUS_TEXT, lineUuid: "copilot:login:run-1" },
     ]);
     const b = mapCopilotEvent("Error: No authentication information found. (again)", 1, ctx);
@@ -435,7 +436,15 @@ describe("mapCopilotEvent", () => {
     expect(a.chunks[0]!.lineUuid).toBe("copilot:stable-id");
     expect(b.chunks[0]!.lineUuid).toBe(a.chunks[0]!.lineUuid);
     const noId = mapCopilotEvent(JSON.stringify({ type: "assistant.message", data: { messageId: "m", content: "x" } }), 7, ctxFor());
-    expect(noId.chunks[0]!.lineUuid).toBe("copilot:line:7");
+    expect(noId.chunks[0]!.lineUuid).toBe("copilot:line:run-1:7");
+    // Reattach seeds a TASK-wide seen set, so two runs of one task must never
+    // share an index-only fallback uuid (id-less JSON and non-JSON lines).
+    const noIdLine = JSON.stringify({ type: "assistant.message", data: { messageId: "m", content: "x" } });
+    const otherRun = mapCopilotEvent(noIdLine, 7, ctxFor({ runId: "run-2" }));
+    expect(otherRun.chunks[0]!.lineUuid).toBe("copilot:line:run-2:7");
+    const raw1 = mapCopilotEvent("plain stderr", 0, ctxFor());
+    const raw2 = mapCopilotEvent("plain stderr", 0, ctxFor({ runId: "run-2" }));
+    expect(raw1.chunks[0]!.lineUuid).not.toBe(raw2.chunks[0]!.lineUuid);
   });
 });
 
@@ -637,6 +646,21 @@ describe("buildCopilotShellCommand", () => {
     const script = buildCopilotShellCommand({ ...base, stripClassicTokens: [], unsetAllowAll: true })[2]!;
     expect(script.startsWith("unset COPILOT_ALLOW_ALL; ")).toBe(true);
     expect(script).not.toContain("ghp_");
+  });
+
+  test("shouldUnsetAllowAll fails closed: every mode but auto unsets an ambient COPILOT_ALLOW_ALL", () => {
+    expect(shouldUnsetAllowAll("auto", { COPILOT_ALLOW_ALL: "true" })).toBe(false);
+    expect(shouldUnsetAllowAll("auto", {})).toBe(false);
+    // Plan, Read-only, and a mode id carried over from another kind (fx's
+    // `yolo` survives `agetor edit --agent copilot`), an unknown id, or null.
+    for (const mode of ["plan", "ask", "yolo", "full-access", "bogus", null, undefined]) {
+      expect(shouldUnsetAllowAll(mode, {})).toBe(true);
+    }
+    // A value the harness env sets explicitly always wins.
+    expect(shouldUnsetAllowAll("ask", { COPILOT_ALLOW_ALL: "false" })).toBe(false);
+    expect(shouldUnsetAllowAll("yolo", { COPILOT_ALLOW_ALL: "true" })).toBe(false);
+    // Only an own key counts, never one inherited from the prototype chain.
+    expect(shouldUnsetAllowAll("ask", Object.create({ COPILOT_ALLOW_ALL: "true" }))).toBe(true);
   });
 
   test("quotes paths with single quotes; argv elements are never interpolated", () => {

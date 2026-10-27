@@ -907,8 +907,9 @@ export function buildCommand(
     // plan-file reader must look where Copilot writes: always pin the home.
     env.COPILOT_HOME = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
     // Allow-all rides the env too (Auto only); a value the harness env map
-    // sets wins in every mode. In Plan/Read-only the driver additionally
-    // unsets an ambient export, which only holds while the key is absent here.
+    // sets wins in every mode. In every other mode the driver additionally
+    // unsets an ambient export (`shouldUnsetAllowAll`), which only holds while
+    // the key is absent here.
     if (mode === "auto" && !("COPILOT_ALLOW_ALL" in env)) {
       env.COPILOT_ALLOW_ALL = "true";
     }

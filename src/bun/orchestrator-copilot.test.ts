@@ -476,6 +476,53 @@ test("reconcileOrphans: a running copilot run with no live session flips to orph
   expect(subagents.hasRunning(taskId)).toBe(false);
 }));
 
+async function insertCopilotSubagentRow(taskId: string, runId: string, callId: string): Promise<string> {
+  const { subagents } = await import("./db.ts");
+  const id = `cp-${runId}-${callId}`;
+  subagents.insertIfAbsent({
+    id,
+    taskId,
+    runId,
+    parentKind: "copilot_subagent",
+    agentType: "explore",
+    description: "stale",
+    spawnDepth: 1,
+    sourcePath: "",
+    toolUseId: callId,
+    status: "running",
+    startedAt: Date.now(),
+    endedAt: null,
+  });
+  return id;
+}
+
+test("reconcileOrphans: a copilot subagent row left running on a TERMINAL run is retired, and a held card is released to review", () => withRealTmux(async () => {
+  const { runs, tasks, subagents } = await import("./db.ts");
+  const { reconcileOrphans } = await import("./orchestrator.ts");
+
+  // Held in `running`: the terminal run succeeded but its in-turn settleAll
+  // never landed, so the row would hold the card forever.
+  const heldTask = await createCopilotTask("hello");
+  const heldRun = await insertRunningCopilotRun(heldTask, "held-session-id");
+  runs.update(heldRun, { status: "succeeded", endedAt: Date.now(), exitCode: 0 });
+  const heldRow = await insertCopilotSubagentRow(heldTask, heldRun, "call_held");
+
+  // Blind spot: the card already left `running` before the restart.
+  const reviewTask = await createCopilotTask("hello");
+  const reviewRun = await insertRunningCopilotRun(reviewTask, "review-session-id");
+  runs.update(reviewRun, { status: "succeeded", endedAt: Date.now(), exitCode: 0 });
+  tasks.update(reviewTask, { column: "review" });
+  const reviewRow = await insertCopilotSubagentRow(reviewTask, reviewRun, "call_review");
+
+  await reconcileOrphans();
+  expect(subagents.get(heldRow)?.status).toBe("orphaned");
+  expect(subagents.get(reviewRow)?.status).toBe("orphaned");
+  expect(subagents.hasRunning(heldTask)).toBe(false);
+  expect(subagents.hasRunning(reviewTask)).toBe(false);
+  await waitFor(() => tasks.get(heldTask)?.column === "review");
+  expect(tasks.get(reviewTask)?.column).toBe("review");
+}));
+
 const hasTmux = Bun.which("tmux") !== null;
 
 (hasTmux ? test : test.skip)("reconcileOrphans: a running copilot run whose tmux session is alive is reattached and settles from the log", () => withRealTmux(async () => {
@@ -487,7 +534,15 @@ const hasTmux = Bun.which("tmux") !== null;
 
   const taskId = await createCopilotTask("hello");
   const sessionId = "11111111-2222-3333-4444-555555555555";
+  // A row an EARLIER run of the task left running (its settleAll never
+  // landed): the reattached turn's sink only owns its own run's rows, so the
+  // boot pass must retire this one.
+  const { runs: runsDb, subagents } = await import("./db.ts");
+  const earlierRun = await insertRunningCopilotRun(taskId, sessionId);
+  runsDb.update(earlierRun, { status: "succeeded", endedAt: Date.now() - 1000, exitCode: 0 });
+  const staleRow = await insertCopilotSubagentRow(taskId, earlierRun, "call_stale");
   const runId = await insertRunningCopilotRun(taskId, sessionId);
+  const liveRow = await insertCopilotSubagentRow(taskId, runId, "call_live");
 
   // A stub `copilot` that prints two events then a `result`, with a pause
   // after the first so the session is alive when reconcile runs.
@@ -525,11 +580,15 @@ const hasTmux = Bun.which("tmux") !== null;
     expect(orphaned).toBe(0);
     expect(runs.get(runId)?.status).toBe("running");
     expect((await statusTexts(taskId)).some((t) => t.includes("reconnected to live session"))).toBe(true);
+    expect(subagents.get(staleRow)?.status).toBe("orphaned");
+    // The live turn's row stays with its own sink until the turn settles.
+    expect(subagents.get(liveRow)?.status).toBe("running");
 
     await waitFor(() => runs.get(runId)?.status === "succeeded", 15_000);
     await waitFor(() => tasks.get(taskId)?.column === "review");
     const assistant = runs.eventsForTask(taskId).filter((e) => e.stream === "assistant").map((e) => e.data);
     expect(assistant).toEqual(["before restart", "after restart"]);
+    expect(subagents.get(liveRow)?.status).toBe("completed");
   } finally {
     Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), "kill-session", "-t", "=" + name]);
   }

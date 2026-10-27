@@ -44,7 +44,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 - **Seven harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx, Antigravity and GitHub Copilot side by side. To use a second account for any of them, add a harness with its own isolated home (`$HOME`, or `COPILOT_HOME` for GitHub Copilot).
 - **Agents (reusable profiles).** Save a harness, model, effort, mode, speed, instructions and skills as a named **Agent**, then launch tasks from it in one click.
 - **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
-- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx, Antigravity and GitHub Copilot, they also include the models your account actually offers, as reported by the CLI. If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
+- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx and Antigravity, they also include the models your account actually offers, as reported by the CLI. For GitHub Copilot, they include the models your installed CLI version knows about (that list doesn't depend on your account). If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
 
 ### Converse
 

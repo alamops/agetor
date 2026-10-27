@@ -216,7 +216,7 @@ sh -c '<guards> "$@" < <prompt> > <log> 2>&1; echo $? > <exit>' sh <argv…>
 ```
 
 - `<guards>` is, for each variable named in `stripClassicTokens` (from `buildCommand`: `GH_TOKEN`/`GITHUB_TOKEN` minus any the harness env sets), `case "${V-}" in ghp_*) unset V;; esac;`. This is D10, evaluated against the **pane's real env** rather than agetor's process env.
-- In Plan and Read-only modes the wrapper also `unset COPILOT_ALLOW_ALL` unless the harness env sets it. *(planner)* Otherwise an ambient export would silently turn Read-only into allow-all.
+- In every mode except Auto the wrapper also `unset COPILOT_ALLOW_ALL` unless the harness env sets it (`shouldUnsetAllowAll`). *(planner; widened from Plan/Read-only in review round 2)* Otherwise an ambient export would silently turn Read-only into allow-all, and failing closed also covers a mode id carried over from another kind (fx's `yolo` survives `agetor edit --agent copilot`).
 - Paths are single-quoted with the driver's `sq()`. Variable names are constants.
 
 **Tailer.** Same as antigravity: `fs.watch` + 150 ms poll + death probe, emitting `SESSION_DIED_STATUS_PREFIX`. Reading from offset 0 is idempotent, because each event's own `id` (uuid) is the `line_uuid` (`copilot:<id>`).

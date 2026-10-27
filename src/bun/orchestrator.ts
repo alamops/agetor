@@ -815,15 +815,17 @@ export async function reconcileOrphans(): Promise<number> {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // claude-code, codex, cursor, gemini, and antigravity runs can all be reattached
-    // when their detached tmux session is still alive. The reattach key differs
-    // by kind: claude needs its JSONL session uuid (`claude_session_id`),
-    // codex needs its thread id (`codex_session_id`), cursor needs its
-    // `session_id` (`cursor_session_id`), gemini needs its self-issued uuid
-    // (`gemini_session_id`), antigravity needs its conversation id
-    // (`antigravity_session_id`) — the per-run log path is derived from the run
-    // id in every case. Note codex's, cursor's, gemini's, antigravity's, and fx's
-    // sessions only live WHILE their turn is in flight (one process per turn), so a
+    // claude-code, codex, cursor, gemini, antigravity, and copilot runs can all
+    // be reattached when their detached tmux session is still alive. The
+    // reattach key differs by kind: claude needs its JSONL session uuid
+    // (`claude_session_id`), codex needs its thread id (`codex_session_id`),
+    // cursor needs its `session_id` (`cursor_session_id`), gemini needs its
+    // self-issued uuid (`gemini_session_id`), antigravity needs its
+    // conversation id (`antigravity_session_id`), copilot needs its self-issued
+    // uuid (`copilot_session_id`) — the per-run log path is derived from the
+    // run id in every case. Note codex's, cursor's, gemini's, antigravity's,
+    // copilot's, and fx's sessions only live WHILE their turn is in flight
+    // (one process per turn; fx is never reattached at all), so a
     // reattachable one of those is by definition one that was still running
     // when agetor restarted. Also: if we already reattached a newer sibling
     // for this task, orphan the older one — only one SessionState can drive
@@ -1025,10 +1027,34 @@ export async function reconcileOrphans(): Promise<number> {
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
-    // Only claude-code writes subagent rows; a codex or cursor task can never
-    // be held, so it never reaches here. Guard the session probe on kind for
-    // clarity.
-    if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
+    const heldKind = resolveHarness(task.agent)?.kind ?? null;
+    if (heldKind !== "claude-code") {
+      // Copilot is the other subagent-row writer, but only through its
+      // per-turn sink: no watcher ever re-arms for a copilot row, so a row
+      // still `running` outside a live turn (its run's in-turn `settleAll`
+      // write failed, or the task's harness changed) can never settle. A
+      // reattached copilot turn owns its OWN run's rows — leave those to its
+      // sink — and every other run's rows are retired through that run's
+      // sink, so the lifecycle events and the held-task release fire exactly
+      // as on a normal settle. Any other kind (claude rows left behind by a
+      // harness switch) has nothing that could ever settle them either.
+      const liveRunId = heldKind === "copilot" && reattachedTaskIds.has(heldId) ? task.runId : null;
+      if (liveRunId) {
+        const staleRunIds = new Set(
+          subagents
+            .listForTask(heldId)
+            .flatMap((r) => (r.status === "running" && r.runId && r.runId !== liveRunId ? [r.runId] : [])),
+        );
+        for (const staleRunId of staleRunIds) {
+          makeCopilotSubagentSink(staleRunId, heldId).settleAll("orphaned");
+          released++;
+        }
+      } else {
+        orphanRunningSubagents(heldId);
+        released++;
+      }
+      continue;
+    }
 
     if (task.column === "running") {
       // Classic held-task path, unchanged: only proceed when the terminal run
