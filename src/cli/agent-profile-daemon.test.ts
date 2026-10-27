@@ -73,10 +73,14 @@ const { cmdShow } = await import("./commands/show.ts");
 let server: { stop: () => void };
 
 beforeAll(async () => {
-  const { startApiServer, API_TOKEN } = await import("../bun/server.ts");
+  // The CLI authenticates with the CLI token — the only credential the core
+  // writes to agetor-core.json — so these suites exercise the route policy as the
+  // real `agetor` binary sees it (docs/plans/master-token-agent-read.md TT15b).
+  const { startApiServer } = await import("../bun/server.ts");
+  const { CLI_TOKEN } = await import("../bun/api-config.ts");
   const { AgetorClient: RealAgetorClient } = await import("./api-client.ts");
   server = startApiServer() as unknown as { stop: () => void };
-  currentClient = new RealAgetorClient({ port: 4598, token: API_TOKEN });
+  currentClient = new RealAgetorClient({ port: 4598, token: CLI_TOKEN });
 });
 
 afterAll(() => {

@@ -268,7 +268,7 @@ flowchart LR
     FX --> WT
 ```
 
-- **One local API.** The desktop UI and the CLI both talk to the core over HTTP and Server-Sent Events. The API listens only on `127.0.0.1`, and every route except `/health` requires a random token generated at each launch.
+- **One local API.** The desktop UI and the CLI both talk to the core over HTTP and Server-Sent Events. The API listens only on `127.0.0.1`, and every route except `/health` requires a random token generated at each launch. There are two such tokens: the app's own webview uses one that is never written to disk, and the `agetor` CLI uses a weaker one that is (see [Security model](#security-model)).
 - **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Cursor and Gemini CLI run once per turn inside `tmux` and resume by session id. fx talks the Agent Client Protocol.
 - **Restart-safe by design.** On boot, Agetor reattaches to any `tmux`-hosted session that is still alive and replays its transcript without duplicates. Runs whose session is gone move back to **Ready**, so no card is left stuck in Running.
 - **Local persistence.** Tasks, runs, events, projects, harnesses and preferences live in a SQLite database with versioned migrations.
@@ -284,7 +284,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 ```
 ~/.agetor/
 ├── agetor.sqlite            # tasks, runs, events, projects, harnesses, agents, preferences
-├── agetor-core.json         # 0600: the running core's port + token (how the CLI connects)
+├── agetor-core.json         # 0600: the running core's port + CLI token (how the CLI connects)
 ├── github-tokens.json       # 0600: git host tokens from Settings → Git Integration
 ├── worktrees/<task-id>/     # per-task git worktrees
 ├── harnesses/<id>/          # isolated $HOME for additional-account harnesses
@@ -317,9 +317,9 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 
 The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md).
 
-**Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` (or `::`) in the container so the published port works. The headless core (`agetor daemon`) accepts only `127.0.0.1`, `0.0.0.0` or `::`, and refuses to start on anything else: the CLI and agent hooks inside the container connect over `127.0.0.1`, which a specific address such as the container's own IP, or `localhost`/`::1` (IPv6-only), would break. The desktop app always stays on `127.0.0.1`.
+**Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` (or `::`) in the container so the published port works. The headless core (`agetor daemon`) accepts only `127.0.0.1`, `0.0.0.0` or `::`, and refuses to start on anything else: the CLI inside the container connects over `127.0.0.1`, which a specific address such as the container's own IP, or `localhost`/`::1` (IPv6-only), would break. The desktop app always stays on `127.0.0.1`.
 
-A wildcard bind is protected **only by the bearer token**, and the API speaks plain HTTP, so that token travels in cleartext. Agetor logs a warning about this at startup. Publish the port to `127.0.0.1` on the host so nothing beyond your machine can reach it, and never publish it more widely. For remote access, use an SSH tunnel or a TLS-terminating proxy:
+A wildcard bind is protected **only by the bearer tokens**, and the API speaks plain HTTP, so they travel in cleartext. Agetor logs a warning about this at startup. Publish the port to `127.0.0.1` on the host so nothing beyond your machine can reach it, and never publish it more widely. For remote access, use an SSH tunnel or a TLS-terminating proxy:
 
 ```bash
 docker run -e AGETOR_API_HOST=0.0.0.0 -p 127.0.0.1:4317:4317 <your-agetor-image>
@@ -335,7 +335,7 @@ services:
       - "127.0.0.1:4317:4317"
 ```
 
-The token changes on every launch and is written to `agetor-core.json` in the data directory.
+The CLI token changes on every launch and is written to `agetor-core.json` in the data directory. The app's own token is never written to disk. A headless core doesn't have the app's native layer, so the routes that need it (terminal tabs, file preview, screenshots, attachments, saving an export bundle, the `tmux` source) answer the CLI token with `403` (`desktop-only`), while routes that only make sense in the desktop app (native file dialogs, opening a path or URL, window focus, updates, quit) keep answering `501`. If you drive a headless core from your own scripts with the file token, only the CLI's routes will work. To reach the others, start the core with `AGETOR_API_TOKEN` set and send that value instead.
 
 </details>
 
@@ -344,7 +344,9 @@ The token changes on every launch and is written to `agetor-core.json` in the da
 ## Security model
 
 - **Agents run with your privileges.** Each harness runs with your full user privileges in the task's directory, exactly as it would if you launched it yourself. Agetor adds no sandbox beyond what the CLI provides. The default modes are hands-off; pick an *Ask* or *Read-only* mode for tasks where you want approvals.
-- **Only local, authenticated access.** The API binds to `127.0.0.1` and requires a random token generated at each launch. A website you visit can't read the token, so it can't drive an agent run.
+- **Your agents can read the CLI's token.** `agetor-core.json` holds the token the `agetor` CLI uses. Any program running as you, your agents included, can read it, just as it can read your other files. That token only does what the CLI does: create and drive tasks, answer prompts, manage harnesses, agents and pipelines. It can't open terminal tabs, show your files in the app, use the native dialogs, or turn off permission isolation. Those need the app's own token, which is never written to disk.
+- **Agetor's macOS permissions stay with Agetor.** Agents and every program Agetor starts in the background (git, harness checks) run as responsible for themselves, so they don't inherit the permissions you granted Agetor, such as Automation or Documents. Only Settings in the app can turn this off, and Agetor asks you again at the next launch.
+- **Only local, authenticated access.** The API binds to `127.0.0.1` and requires a random token generated at each launch. A website you visit can't read its tokens, so it can't drive an agent run.
 - **Untrusted text is labeled.** Issue and PR text pulled into a prompt is marked as untrusted, and the agent is told not to follow instructions found inside it.
 - **Minimal network use.** The only network calls Agetor itself makes are update checks against GitHub Releases, the git host APIs you configure, and quota lookups against your harnesses' own providers.
 

@@ -200,7 +200,7 @@ export async function restartPipelineRest(backend: E2EBackend, id: string): Prom
 
 /**
  * Opens the board and waits until the app's single global-events
- * `EventSource` (`GET /events`) has been requested — toasts are live-only,
+ * stream (`GET /events`) has been requested — toasts are live-only,
  * so a task started before the subscription exists never toasts. Waits on
  * the REQUEST, not a response (same as pipelines-run.spec.ts).
  */

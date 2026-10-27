@@ -83,12 +83,21 @@ const GIT_TIMEOUT_MS = 30_000;
  */
 async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
   // coreSpawn: the repo's own git config is agent-plantable (P2/P3).
-  const proc = coreSpawn(["git", ...args], {
-    cwd,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
+  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+  try {
+    proc = coreSpawn(["git", ...args], {
+      cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
+  } catch (err) {
+    // The spawn itself throws synchronously when `cwd` can't be entered
+    // (e.g. a mode-000 directory → EACCES) or git is missing — keep the
+    // "never throws" contract so the route answers its normal error instead
+    // of an unhandled rejection.
+    return { ok: false, stdout: "", stderr: err instanceof Error ? err.message : String(err), exitCode: -1 };
+  }
   const timer = setTimeout(() => proc.kill(), timeoutMs);
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
