@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Page } from "./fixtures";
-import { putPreference } from "./helpers";
+import { gotoApp, headerSettingsButton } from "./helpers";
 
 /**
  * E2E coverage for auto-enabling an installed built-in harness
@@ -57,21 +57,6 @@ async function enabledOf(request: APIRequestContext, backend: E2EBackend, id: st
   return (await harnessRows(request, backend)).find((h) => h.id === id)?.enabled;
 }
 
-/** `gotoApp` (e2e/helpers.ts) waits for "the" Settings button by a
- *  non-exact role name, which the toast's own "Settings" action also
- *  matches — a strict-mode violation the moment the toast is up. Same
- *  steps, but it waits on the header button by its `title`, which the toast
- *  action doesn't carry. */
-async function gotoAppWithToast(page: Page, request: APIRequestContext, backend: E2EBackend): Promise<void> {
-  await putPreference(request, backend, "onboardingDismissed", "true");
-  await page.goto(backend.bootBase);
-  await expect(headerSettings(page)).toBeVisible();
-}
-
-function headerSettings(page: Page) {
-  return page.getByTitle("Settings", { exact: true });
-}
-
 function toastWith(page: Page, text: string) {
   return page.locator("[data-sonner-toast]").filter({ hasText: text });
 }
@@ -83,7 +68,7 @@ test("an installed Codex is turned on once with a toast, and turning it off stic
   freshBackend,
 }) => {
   test.setTimeout(120_000);
-  await gotoAppWithToast(page, request, freshBackend);
+  await gotoApp(page, freshBackend.bootBase);
 
   const toast = toastWith(page, TOAST_TEXT);
   await expect(toast).toBeVisible({ timeout: CONVERGE_TIMEOUT });
@@ -123,8 +108,8 @@ test("an installed Codex is turned on once with a toast, and turning it off stic
   const context = await browser.newContext();
   try {
     const fresh = await context.newPage();
-    await gotoAppWithToast(fresh, request, freshBackend);
-    await headerSettings(fresh).click();
+    await gotoApp(fresh, freshBackend.bootBase);
+    await headerSettingsButton(fresh).click();
     const reopened = fresh.getByRole("dialog");
     await expect(reopened.getByRole("heading", { name: "Settings" })).toBeVisible();
     await reopened.getByRole("button", { name: "Harnesses", exact: true }).click();

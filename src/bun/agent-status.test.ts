@@ -1051,6 +1051,24 @@ describe("opencode status notices", () => {
     expect(callLines(dir)).toContain("auth list");
   });
 
+  test("v1 sharing a home with OpenCode 2's opencode.db: the shared-data-dir notice replaces the credentials one (live W4 smoke)", async () => {
+    // ANSI-wrapped, on stderr, exit 1 — the way v1 reports it.
+    const bin = plantFakeOpencode(dir, { version: "1.19.4" });
+    const conflicting = path.join(dir, "opencode-conflict");
+    writeFileSync(
+      conflicting,
+      `#!/bin/sh\nif [ "$1" = auth ] && [ "$2" = list ] && [ "$3" != --standalone ]; then echo "$@" >> '${dir}/calls'; printf '\\033[91m\\033[1mError: \\033[0mUnexpected error\\nDatabase is not empty and has no session table\\n' >&2; exit 1; fi\nexec '${bin}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const status = await checkHarness(opencodeHarness(conflicting, "oc-v1-shared"));
+    expect(status.available).toBe(true);
+    expect(status.loggedIn).toBeNull();
+    expect(status.notices).toEqual([
+      "OpenCode 1 can't read the data OpenCode 2 wrote in this home — give this harness its own Home in Settings → Harnesses",
+      "OpenCode 2 is available: `opencode upgrade --major`",
+    ]);
+  });
+
   test("v1 with an environment key: only the upgrade note", async () => {
     const bin = plantFakeOpencode(dir, { version: "1.19.4", authV1: fixture("v1-auth-list-env.txt") });
     const status = await checkHarness(opencodeHarness(bin));

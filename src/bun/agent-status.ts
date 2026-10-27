@@ -509,8 +509,16 @@ export function parseOpencodeAuthList(out: string, major: 1 | 2): boolean | null
   return Number(creds[1]) === 0 && (!env || Number(env[1]) === 0);
 }
 
-/** `true` = no credentials, `false` = some, `null` = the probe failed. */
-type AuthProbeResult = boolean | null;
+/** What OpenCode 1 prints when OpenCode 2's `opencode.db` is in its data dir. */
+const OPENCODE_V1_DB_CONFLICT_RE = /Database is not empty and has no session table/;
+const OPENCODE_V1_DB_CONFLICT = "v1-db-conflict" as const;
+/**
+ * What a harness's `auth list` probe concluded: `true` = no credentials,
+ * `false` = some, `null` = the probe failed, `"v1-db-conflict"` = an OpenCode 1
+ * binary refused to run because OpenCode 2 already created `opencode.db` in the
+ * same home (the probe never read credentials, so it says nothing about them).
+ */
+type AuthProbeResult = boolean | null | typeof OPENCODE_V1_DB_CONFLICT;
 const authCache = new Map<string, { value: AuthProbeResult; expiresAt: number }>();
 
 async function probeOpencodeAuth(
@@ -535,8 +543,13 @@ async function probeOpencodeAuth(
   }
   if (major !== 1) return null;
   const v1 = await probeOutput(bin, ["auth", "list"], env);
-  if (!v1 || v1.code !== 0) return null;
-  return parseOpencodeAuthList(`${v1.stdout}\n${v1.stderr}`, 1);
+  if (!v1) return null;
+  const v1Text = `${v1.stdout}\n${v1.stderr}`;
+  // v1 and v2 can't share one data dir: once v2 has created `opencode.db`,
+  // every v1 command in that home fails with this message (live W4 smoke).
+  if (OPENCODE_V1_DB_CONFLICT_RE.test(v1Text.replace(ANSI_RE, ""))) return OPENCODE_V1_DB_CONFLICT;
+  if (v1.code !== 0) return null;
+  return parseOpencodeAuthList(v1Text, 1);
 }
 
 /**
@@ -563,6 +576,8 @@ async function getCachedOpencodeAuth(
 }
 
 const OPENCODE_NO_CREDENTIALS_NOTICE = "No OpenCode credentials found — run `opencode auth login`";
+const OPENCODE_V1_DB_CONFLICT_NOTICE =
+  "OpenCode 1 can't read the data OpenCode 2 wrote in this home — give this harness its own Home in Settings → Harnesses";
 const OPENCODE_V2_AVAILABLE_NOTICE = "OpenCode 2 is available: `opencode upgrade --major`";
 
 const FX_HELP_MARKER = "coding agent";
@@ -693,7 +708,8 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
   const notices: string[] = [];
   const noCredentials = authProbe ? await authProbe : null;
   if (harness.kind === "opencode" && version !== null) {
-    if (noCredentials === true) notices.push(OPENCODE_NO_CREDENTIALS_NOTICE);
+    if (noCredentials === OPENCODE_V1_DB_CONFLICT) notices.push(OPENCODE_V1_DB_CONFLICT_NOTICE);
+    else if (noCredentials === true) notices.push(OPENCODE_NO_CREDENTIALS_NOTICE);
     if (opencodeMajor(version) === 1) notices.push(OPENCODE_V2_AVAILABLE_NOTICE);
   }
 
