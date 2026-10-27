@@ -156,3 +156,8 @@ Envelope: `{type, timestamp, sessionID, part? , error?}`. `sessionID` is `""` on
 - The two installs and my first un-wrapped `--version` calls created empty `~/.config/opencode`, `~/.local/share/opencode/{log,repos}` (plus one 155-byte `opencode.log` from the `--version` call), `~/.local/state/opencode` and `~/.cache/opencode/bin` in the real home. None of these existed before (investigation I§1d). All were removed again. No OpenCode credentials, sessions or config were ever written there.
 - The isolated v2 background service (`opencode serve --service`, port 49374) was stopped with `opencode service stop`. Every `opencode serve` started for Q8 was killed, and the `oc-spike` tmux server was killed. Orphaned `sleep 40`/`sleep 20` tool children from the v1 `C-c` test were killed.
 - Homebrew `opencode` 2.1.3 (and its `ripgrep` dependency, plus a `pcre2` 10.47→10.49 upgrade) stays installed for the W4 smoke. The v1 npm install lives only in the session scratchpad.
+
+## Owner decisions on the grill contradictions (2026-10-27, during Implementing)
+
+- **G10 / v2 `todowrite`:** accept and document. Map `todowrite` whenever it appears; on v2 the tracker needs `experimental.todo: true` in the user's own OpenCode config. Agetor injects no `OPENCODE_CONFIG_CONTENT`.
+- **G14a / busy sessions:** refined per A8(c). Refuse an unfinished session only when it was also updated within the last 10 minutes; otherwise import it and post the status line `OpenCode reported this session unfinished`.
