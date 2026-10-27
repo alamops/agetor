@@ -1682,10 +1682,21 @@ export const api = {
   createTerminal: (taskId: string) =>
     j<TerminalTab>(`/tasks/${taskId}/terminals`, { method: "POST" }),
   closeTerminal: (id: string) => j<void>(`/terminals/${id}`, { method: "DELETE" }),
-  /** ws:// URL for a terminal's duplex stream. EventSource-style token in the
-   *  query string since WebSockets can't set the Authorization header. */
-  terminalSocketUrl: (id: string) =>
-    `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
+  /** Mint a single-use, 30 s ticket for a terminal's duplex stream and return
+   *  the ws:// URL that redeems it (P7/D13). WebSockets can't set the
+   *  Authorization header, and the master token must never ride a URL, so the
+   *  upgrade carries `?ticket=` instead — bound to this terminal id, consumed
+   *  by the first upgrade. Callers mint a fresh one per connect AND per
+   *  reconnect. `retry: false`: a replayed POST would burn a second ticket,
+   *  and the caller's own reconnect loop is the retry policy. */
+  terminalSocketUrl: async (id: string): Promise<string> => {
+    const { ticket } = await j<{ ticket: string; expiresAt: number }>(
+      `/terminals/${encodeURIComponent(id)}/ws-ticket`,
+      { method: "POST" },
+      { retry: false },
+    );
+    return `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?ticket=${encodeURIComponent(ticket)}`;
+  },
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
   /** Backward page of a task's persisted events, older than `beforeId`
    *  (exclusive) — drives the run panel's "Load earlier" affordance once the

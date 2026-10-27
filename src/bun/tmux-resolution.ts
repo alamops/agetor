@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { dataDir, preferences } from "./db.ts";
-import { disclaimArgv } from "./disclaim.ts";
+import { childEnv, coreSpawn } from "./core-spawn.ts";
 
 export const TMUX_SOURCE_KEY = "tmux_source";
 export type TmuxSource = "system" | "bundled";
@@ -142,28 +142,24 @@ export function tmuxSocketArgs(): string[] {
 }
 
 /**
- * Environment for every tmux client we spawn. `Bun.spawn` WITHOUT an `env`
- * option hands the child the env snapshot Bun captured at process start, not
- * the live `process.env` — so the PATH `rehydratePath()` builds at boot never
- * reached tmux when agetor was launched from Finder/`open -a` (launchd's
- * minimal `/usr/bin:/bin`). tmux then sets the pane's PATH from the CLIENT's
- * PATH, overriding `new-session -e PATH=…`, so `#!/usr/bin/env node` CLIs
- * (codex) died with "env: node: No such file or directory". Every tmux spawn
- * site must pass this as `env`.
- */
-export function tmuxClientEnv(): Record<string, string | undefined> {
-  return { ...process.env };
-}
-
-/**
  * Build the argv for a disclaimed `tmux start-server` on agetor's own
  * socket — pure so it's unit-testable without spawning anything. `tmuxBin`
- * is the caller-resolved tmux binary (`resolveTmuxBin()`); wrapping happens
- * via `disclaimArgv`, which itself returns the argv unchanged when disclaim
- * is disabled/unavailable/non-darwin.
+ * is the caller-resolved tmux binary (`resolveTmuxBin()`). The argv is the
+ * plain tmux command: the disclaim wrapping happens inside `coreSpawn`
+ * (core-spawn.ts), the only place that calls `disclaimArgv`, so wrapping it
+ * here too would exec the helper twice (P3).
  */
 export function buildEnsureServerArgv(tmuxBin: string): string[] {
-  return disclaimArgv([tmuxBin, ...tmuxSocketArgs(), "start-server"]);
+  return [tmuxBin, ...tmuxSocketArgs(), "start-server"];
+}
+
+/** Whether this process already cleared a stale `AGETOR_API_TOKEN` from the
+ *  tmux server's global environment (see `ensureDisclaimedServer`). */
+let staleServerTokenCleared = false;
+
+/** Test seam: forget that the one-time `set-environment -g -u` ran. */
+export function __resetTmuxServerEnvClearedForTest(): void {
+  staleServerTokenCleared = false;
 }
 
 /**
@@ -186,13 +182,27 @@ export async function ensureDisclaimedServer(): Promise<void> {
     // Ignore stdio rather than pipe: `start-server` emits nothing and this is
     // best-effort, so there's no output to capture and a drain-free pipe is
     // pointless. `disclaim`'s exec-replace preserves these fd choices.
-    const proc = Bun.spawn(argv, {
+    const proc = coreSpawn(argv, {
       stdin: "ignore",
       stdout: "ignore",
       stderr: "ignore",
-      env: tmuxClientEnv(),
+      env: childEnv(),
     });
     await proc.exited;
+    if (!staleServerTokenCleared) {
+      staleServerTokenCleared = true;
+      // A server started by an older build inherited the core's env, which
+      // carried AGETOR_API_TOKEN into the server's GLOBAL environment, and
+      // tmux hands that to every new session's panes. `set-environment -g -u`
+      // drops it (a no-op when absent). Once per process: the server is
+      // long-lived, so repeating it before every new session would only add
+      // an exec per launch. Best effort like the rest of this function.
+      const clear = coreSpawn(
+        [resolveTmuxBin(), ...tmuxSocketArgs(), "set-environment", "-g", "-u", "AGETOR_API_TOKEN"],
+        { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: childEnv() },
+      );
+      await clear.exited;
+    }
   } catch {
     // Best-effort — swallow. See doc comment above.
   }
@@ -222,12 +232,12 @@ export async function spawnTmuxNewSession(
 ): Promise<{ status: number | null; stderr: string }> {
   await ensureDisclaimedServer();
   try {
-    const proc = Bun.spawn([tmux, ...args], {
+    const proc = coreSpawn([tmux, ...args], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: tmuxClientEnv(),
-    });
+      env: childEnv(),
+    }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
     const [, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),

@@ -1,3 +1,4 @@
+import { ApiError } from "../api-client.ts";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table } from "../output.ts";
 
@@ -38,7 +39,17 @@ export async function cmdConfig(args: string[], flags: Flags): Promise<void> {
     const value = rest.join(" ");
     // A refused value (e.g. an out-of-range `archivedHistoryRetentionDays`)
     // throws the core's own 400 message, printed by the CLI's error handler.
-    await client.setPreference(key, value);
+    try {
+      await client.setPreference(key, value);
+    } catch (e) {
+      // A value the CLI token may not set (today `disclaimSpawnedAgents false`,
+      // D4/D11) is a 403 `desktop-only`: say so plainly and point at the one
+      // place that can change it, instead of a bare "error: <sentence>".
+      if (e instanceof ApiError && e.status === 403 && e.code === "desktop-only") {
+        throw new Error(`${e.message}\nchange it in Settings → General`);
+      }
+      throw e;
+    }
     // Echo what the core actually stored: a validated key may be normalized
     // on write (`archivedHistoryRetentionDays 0` is stored as "off").
     const stored = (await client.getPreferences())[key] ?? value;

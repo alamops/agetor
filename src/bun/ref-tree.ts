@@ -6,6 +6,7 @@
 // using `diskProjectTree` directly, bypassing refs entirely.
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { coreSpawn } from "./core-spawn.ts";
 
 export interface ProjectTreeEntry {
   name: string;
@@ -159,12 +160,13 @@ const GIT_TIMEOUT_MS = 8_000;
 async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
   let proc: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
   try {
-    proc = Bun.spawn(["git", ...args], {
+    // coreSpawn: the repo's own git config is agent-plantable (P2/P3).
+    proc = coreSpawn(["git", ...args], {
       cwd,
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-    });
+    }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
     const timer = setTimeout(() => proc!.kill(), timeoutMs);
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
@@ -205,12 +207,12 @@ function splitNulTerminated(out: string): string[] {
 async function runCatFileBatch(cwd: string, requestText: string, timeoutMs = GIT_TIMEOUT_MS): Promise<Buffer | null> {
   let proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
   try {
-    proc = Bun.spawn(["git", "cat-file", "--batch"], {
+    proc = coreSpawn(["git", "cat-file", "--batch"], {
       cwd,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
-    });
+    }) as Bun.Subprocess<"pipe", "pipe", "pipe">;
     const timer = setTimeout(() => proc!.kill(), timeoutMs);
     try {
       // `.write()`/`.end()` on a Bun `FileSink` can return promises (e.g.

@@ -54,7 +54,8 @@ beforeAll(async () => {
   ({ db, tasks, runs, preferences, harnesses } = await import("./db.ts"));
   orchestrator = await import("./orchestrator.ts");
   retention = await import("./retention.ts");
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   token = API_TOKEN;
 
   delete process.env.AGETOR_TEST_BLOCK_ROUTE;

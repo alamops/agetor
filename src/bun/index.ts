@@ -3,14 +3,17 @@ import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
-import { DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
-import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
+import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
+import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
-import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
+import { beginLagLabel, startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
+import { DISCLAIM_PREF_KEY } from "./disclaim.ts";
+import { initDisclaimSwitch } from "./disclaim-switch.ts";
+import { coreSpawn } from "./core-spawn.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
@@ -150,10 +153,54 @@ rehydratePath();
 // attribute are actually sampled. Unref'd, so an early boot failure can never
 // be held open by it; every shutdown path calls `stopLagMonitor()`.
 startLagMonitor({ sampleMs: 100 });
-// Must run before reconcileOrphans(): reconciliation issues `has-session`
+
+/**
+ * Launch-time question for a stored `disclaimSpawnedAgents = "false"`
+ * (docs/plans/master-token-agent-read.md P5, D5): the SQLite file is writable
+ * by any process running as the user, an agent included, so a stored "off" is
+ * only a request. Returns true ONLY for "Keep it off"; the default button, the
+ * cancel button and a dialog that can't be shown all mean "turn it back on"
+ * (initDisclaimSwitch fails closed on a throw).
+ *
+ * `showMessageBox` is a synchronous FFI call that blocks the Bun thread until
+ * the user answers — like `openFileDialog` — so it is bracketed with a lag
+ * label to keep the expected stall from being reported as a core hang. It runs
+ * before the first BrowserWindow and before any service starts, so nothing else
+ * is waiting on the thread; if it ever fails to render that early, P5's
+ * fallback is to ask right after window creation instead.
+ */
+async function confirmKeepOff(): Promise<boolean> {
+  const end = beginLagLabel("native message box");
+  try {
+    const { response } = await Utils.showMessageBox({
+      type: "warning",
+      title: "Permission isolation is off",
+      message:
+        "Agents and Agetor's background programs would run with Agetor's macOS permissions.",
+      detail:
+        "It was turned off in Settings, or by something that edited Agetor's database. Keep it off only if you turned it off yourself.",
+      buttons: ["Turn it back on", "Keep it off"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    return response === 1;
+  } finally {
+    end();
+  }
+}
+
+// Decide the disclaim switch BEFORE any agent host starts (P5): it stays ON
+// while the question is open, and only an explicit "Keep it off" turns it off.
+// Must also run before reconcileOrphans(): reconciliation issues `has-session`
 // probes against agetor's tmux socket, and the first tmux command to touch
-// a socket auto-starts its server — un-disclaimed, if this didn't run
-// first — leaving every session that server ever hosts un-disclaimed too.
+// a socket auto-starts its server — un-disclaimed, if ensureDisclaimedServer()
+// didn't run first — leaving every session that server ever hosts un-disclaimed too.
+await initDisclaimSwitch("app", {
+  readPref: () => preferences.get(DISCLAIM_PREF_KEY),
+  writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
+  confirmKeepOff,
+  log: (m) => console.log(m),
+});
 await ensureDisclaimedServer();
 // Subscribe the pipeline runner to the global lifecycle stream BEFORE
 // reconcileOrphans() runs, so a step task's boot-time orphan→ready
@@ -276,7 +323,9 @@ function registerNotifierBundle(): void {
       "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
     if (!existsSync(lsregister)) return;
     // Fire-and-forget; lsregister is fast and idempotent.
-    Bun.spawn([lsregister, "-f", app], { stdout: "ignore", stderr: "ignore" });
+    // coreSpawn: scrubbed env and, when the disclaim switch is on, the same
+    // permission isolation as every other core-launched program (D13).
+    coreSpawn([lsregister, "-f", app], { stdout: "ignore", stderr: "ignore" });
   } catch (err) {
     console.error("[agetor] failed to register notifier bundle with LaunchServices:", err);
   }
@@ -310,7 +359,7 @@ const native: ApiNative = {
     // if a future caller skips the route's own absolute-path check.
     if (!isAbsolute(p)) return false;
     try {
-      Bun.spawn(["open", "-R", p], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+      coreSpawn(["open", "-R", p], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
       return true;
     } catch {
       return false;
@@ -383,7 +432,10 @@ try {
 writeCoreCreds(
   {
     port: apiServer.port!,
-    token: API_TOKEN,
+    // The CLI-scoped token, never the master (D3): this file is readable by
+    // anything running as the user, an agent included. The master reaches only
+    // the webview, via the preload and the window-URL hash below.
+    token: CLI_TOKEN,
     pid: process.pid,
     kind: "app",
     version: pkg.version,

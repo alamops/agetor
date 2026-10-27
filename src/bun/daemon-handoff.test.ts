@@ -47,6 +47,9 @@ test("cli-daemon releases its port on /daemon/shutdown so a new owner can bind",
     expect(await waitUp(port)).toBe(true);
     const creds = readCoreCreds(dir);
     expect(creds?.kind).toBe("cli-daemon");
+    // The handoff authenticates with the CLI token from the file (not the
+    // master, which the daemon keeps in memory): /daemon/shutdown is app+cli.
+    expect(creds?.token).toMatch(/^[0-9a-f]{64}$/);
     expect(await probeLiveCore(creds!)).toBe(true);
 
     // App-side handoff request (mirrors index.ts): ask the daemon to shut down,

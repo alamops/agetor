@@ -155,8 +155,31 @@ function TerminalPane({
       }
     };
 
-    const connect = () => {
-      const sock = new WebSocket(api.terminalSocketUrl(terminalId));
+    // Each connect (first and every reconnect) mints its own single-use
+    // ticket; a failed mint counts as a failed attempt so the bounded loop
+    // below still terminates. `disposed` is re-checked after the await so an
+    // unmount while the ticket POST is in flight never opens a socket.
+    const retryOrGiveUp = () => {
+      if (disposed) return;
+      if (attempts < 3) {
+        attempts++;
+        term.write("\r\n\x1b[2m[disconnected — reconnecting…]\x1b[22m\r\n");
+        reconnectTimer = setTimeout(() => { void connect(); }, 1000);
+      } else {
+        term.write("\r\n\x1b[2m[disconnected]\x1b[22m\r\n");
+      }
+    };
+
+    const connect = async () => {
+      let url: string;
+      try {
+        url = await api.terminalSocketUrl(terminalId);
+      } catch {
+        retryOrGiveUp();
+        return;
+      }
+      if (disposed) return;
+      const sock = new WebSocket(url);
       sock.binaryType = "arraybuffer";
       ws = sock;
       wsRef.current = sock;
@@ -177,24 +200,17 @@ function TerminalPane({
         setReady(true);
       };
       sock.onclose = () => {
-        if (disposed) return;
         // Unexpected drop while the PTY may still be alive (e.g. dev-server
         // restart). The server replays its ring buffer on reattach, so a
         // bounded reconnect restores the session instead of freezing silently.
-        if (attempts < 3) {
-          attempts++;
-          // SGR 2 (faint) rather than a fixed ANSI color code (was 90,
-          // bright-black): faint dims the terminal's own theme-tuned
-          // foreground instead of a hardcoded gray, so it stays legible
-          // without needing a light/dark-specific escape sequence.
-          term.write("\r\n\x1b[2m[disconnected — reconnecting…]\x1b[22m\r\n");
-          reconnectTimer = setTimeout(connect, 1000);
-        } else {
-          term.write("\r\n\x1b[2m[disconnected]\x1b[22m\r\n");
-        }
+        // SGR 2 (faint) rather than a fixed ANSI color code (was 90,
+        // bright-black): faint dims the terminal's own theme-tuned
+        // foreground instead of a hardcoded gray, so it stays legible
+        // without needing a light/dark-specific escape sequence.
+        retryOrGiveUp();
       };
     };
-    connect();
+    void connect();
 
     const dataSub = term.onData((d) => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(d));

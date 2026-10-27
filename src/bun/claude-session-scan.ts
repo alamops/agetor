@@ -15,6 +15,7 @@ import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { effectiveClaudeConfigDir } from "./harness-discovery.ts";
+import { coreSpawn } from "./core-spawn.ts";
 import {
   createClaudeSessionMetaReader,
   claudeProjectDirUnresolved,
@@ -177,11 +178,11 @@ function epochSecondsUtc(raw: string): number | null {
 /** `LC_ALL=C TZ=UTC ps -o lstart=` for `pid`, or null when ps fails. */
 export async function utcProcStart(pid: number): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+    const proc = coreSpawn(["ps", "-o", "lstart=", "-p", String(pid)], {
       env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
       stdout: "pipe",
       stderr: "ignore",
-    });
+    }) as Bun.Subprocess<"ignore", "pipe", "ignore">;
     const text = (await new Response(proc.stdout).text()).trim();
     const code = await proc.exited;
     if (code !== 0 || !text) return null;
@@ -325,11 +326,12 @@ async function spawnClaudeAgents(
     || Bun.which("claude", { PATH: env.PATH ?? process.env.PATH ?? "" })
     || "claude";
   try {
-    const proc = Bun.spawn([bin, "agents", "--json"], {
+    // coreSpawn: the claude binary resolves from an agent-plantable PATH/config.
+    const proc = coreSpawn([bin, "agents", "--json"], {
       env: { ...process.env, ...env, CLAUDE_CONFIG_DIR: configDir },
       stdout: "pipe",
       stderr: "ignore",
-    });
+    }) as Bun.Subprocess<"ignore", "pipe", "ignore">;
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* already gone */ } }, 8_000);
     const text = await new Response(proc.stdout).text();
     const code = await proc.exited;
@@ -506,10 +508,12 @@ function peekFirstCwd(file: string): string | null {
 
 async function gitHeadBranch(cwd: string): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], {
+    // coreSpawn: the transcript's cwd is a repo whose git config an agent can
+    // plant (`core.fsmonitor`); it must not run with Agetor's identity.
+    const proc = coreSpawn(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], {
       stdout: "pipe",
       stderr: "ignore",
-    });
+    }) as Bun.Subprocess<"ignore", "pipe", "ignore">;
     // A folder on a slow or unmounted volume must not hold the list.
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* already gone */ } }, GIT_BRANCH_TIMEOUT_MS);
     try {

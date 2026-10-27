@@ -244,6 +244,13 @@ function isDiscoveredCapabilityPath(relPath: string): boolean {
 }
 
 /**
+ * Loads the live-disk project tree for `root` somewhere other than the core
+ * process (`callerProjectTree` for a CLI-token caller). `shouldRead(rel)` says
+ * which files' content discovery actually parses.
+ */
+export type ProjectTreeLoader = (root: string, shouldRead: (rel: string) => boolean) => Promise<ProjectTree>;
+
+/**
  * Resolve the `ProjectTree` capability discovery should read project-level
  * entries from: `null` when there's no root at all (matches today's "no
  * workdir ⇒ no project entries"); the ref's committed tree — scoped to
@@ -260,10 +267,18 @@ function isDiscoveredCapabilityPath(relPath: string): boolean {
 export async function resolveProjectTree(
   branch: string | null | undefined,
   root: string | null,
+  projectTreeLoader?: ProjectTreeLoader,
 ): Promise<ProjectTree | null> {
   if (root == null) return null;
   const trimmedBranch = branch?.trim();
-  if (!trimmedBranch) return diskProjectTree(root);
+  if (!trimmedBranch) {
+    // Live-disk mode. A caller-supplied loader replaces the in-process read:
+    // the HTTP route passes one for a CLI-token caller so a caller-named
+    // workdir is read by a disclaimed child, not by the core (D24).
+    // `isDiscoveredCapabilityPath` is the `shouldRead` filter — only the files
+    // discovery parses are loaded as content.
+    return projectTreeLoader ? projectTreeLoader(root, isDiscoveredCapabilityPath) : diskProjectTree(root);
+  }
   const tree = await loadRefProjectTree(root, trimmedBranch, { shouldRead: isDiscoveredCapabilityPath });
   return tree ?? emptyProjectTree();
 }
@@ -291,7 +306,7 @@ export async function resolveProjectTree(
  *
  * `branch` is a git ref. When set, project-level entries (everything under
  * `.claude/` or `.codex/` in the repo root, plus `.mcp.json`, plus
- * `.cursor/mcp.json`, plus the cursor/fx skill dirs in `DEFAULT_PATHSPECS`)
+ * `.cursor/mcp.json`, plus the cursor/fx skill dirs in `PROJECT_CAPABILITY_PATHSPECS`, ref-tree.ts)
  * are read from
  * that ref's COMMITTED tree via `ref-tree.ts`'s `loadRefProjectTree`, not
  * from whatever happens to be checked out on disk — so the autocomplete
@@ -686,6 +701,13 @@ interface DiscoveryOpts {
   branch?: string | null;
   harnessHome?: string | null;
   harnessEnv?: Record<string, string> | null;
+  /**
+   * Replaces the in-process live-disk read (`diskProjectTree`) when no
+   * `branch` is set — the route passes `callerProjectTree(…, "cli", …)` for a
+   * CLI-token caller (D24). Ignored in ref mode, which reads git objects, not
+   * the working tree.
+   */
+  projectTreeLoader?: ProjectTreeLoader;
 }
 
 /**
@@ -808,7 +830,7 @@ export async function listAgentCapabilities(opts: DiscoveryOpts): Promise<{
   // memoized, so `listAvailableCommands` re-deriving root internally (when
   // called directly, without this ctx) is a hit.
   const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
-  const projectTree = await resolveProjectTree(opts.branch, root);
+  const projectTree = await resolveProjectTree(opts.branch, root, opts.projectTreeLoader);
   const active = resolveActivePlugins(opts, root, projectTree);
   const commands = await listAvailableCommands(opts, { activePlugins: active, projectTree });
   const skillExts: AvailableExtension[] = commands

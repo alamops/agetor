@@ -27,7 +27,8 @@ let token: string;
 
 beforeAll(async () => {
   await import("./db.ts");
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void };
   token = API_TOKEN;
 });
@@ -55,9 +56,9 @@ test("/files/preview accepts an Authorization: Bearer header", async () => {
   expect(res.status).toBe(200);
 });
 
-test("/files/preview accepts a ?token= query param (the <img> path)", async () => {
+test("/files/preview refuses a ?token= query param (D13: the webview fetches a blob with a header)", async () => {
   const res = await previewWithQueryToken(PNG_FILE);
-  expect(res.status).toBe(200);
+  expect(res.status).toBe(401);
 });
 
 test("/files/preview 400s when path is missing", async () => {

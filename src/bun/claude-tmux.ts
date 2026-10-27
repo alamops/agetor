@@ -26,7 +26,8 @@ import {
   type AskQuestion,
   type TmuxPromptChoice,
 } from "./interactions.ts";
-import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer, tmuxClientEnv } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
+import { childEnv, coreSpawn } from "./core-spawn.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type DriveStep, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
@@ -1629,17 +1630,22 @@ interface RunResult {
  *  `Bun.spawnSync`, which stalled every concurrent request for the duration
  *  of the fork+exec (see docs/plans/fix-task-details-load-delay.md). No
  *  timeout: a wedged tmux client now hangs only the awaiting op, not the
- *  whole process, and adding one was explicitly declined for this change. */
+ *  whole process, and adding one was explicitly declined for this change.
+ *
+ *  Goes through `coreSpawn` like every tmux client call (D22): with the system
+ *  tmux the client binary comes from a PATH an agent can influence, so it must
+ *  not run with Agetor's TCC identity; `childEnv()` also keeps the master API
+ *  token out of the client's env. */
 async function tmux(args: string[], opts: { stdinText?: string } = {}): Promise<RunResult> {
   try {
-    const proc = Bun.spawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
+    const proc = coreSpawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
       stdin: opts.stdinText !== undefined
         ? new TextEncoder().encode(opts.stdinText)
         : "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: tmuxClientEnv(),
-    });
+      env: childEnv(),
+    }) as Bun.Subprocess<"pipe" | "ignore", "pipe", "pipe">;
     const [stdout, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -8119,10 +8125,15 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // forced pins (PATH re-injection, classic-renderer) over the caller env —
   // see that helper for the full rationale.
   //
-  // We no longer inject AGETOR_API_PORT/TOKEN/TASK_ID: with the PreToolUse hook
-  // and the ask_user MCP both gone, nothing in the spawned claude reads them,
-  // and AGETOR_API_TOKEN gates every orchestration route — no reason to expose
-  // it to the agent's environment.
+  // We never inject AGETOR_API_PORT/TOKEN/TASK_ID: with the PreToolUse hook
+  // and the ask_user MCP both gone, nothing in the spawned claude reads them.
+  // The core holds two tokens (the master API token and the CLI token, whose
+  // file is `agetor-core.json`), and no child process gets the master token:
+  // `tmux()` and `ensureDisclaimedServer()` spawn through `coreSpawn`, whose
+  // `childEnv()` scrubs AGETOR_API_TOKEN from the client and server env, and a
+  // server left over from an older build has it unset from its global env on
+  // the first `ensureDisclaimedServer()` call. So the pane's env is exactly
+  // `fullEnv` below plus whatever the tmux server itself carries.
   const launchCommand = pinClaudeConfigDir(opts.argv, buildClaudeSessionEnv(opts.env), opts.configDir);
   const fullEnv = launchCommand.env;
   const tmuxArgs: string[] = ["new-session", "-d", "-s", sessionName, "-c", opts.cwd];

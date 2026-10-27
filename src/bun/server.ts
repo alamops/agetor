@@ -1,11 +1,18 @@
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeSync } from "node:fs";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { WebSocketHandler } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, DEFAULT_API_HOST, formatHostForUrl, getApiPort, nonLoopbackBindWarning } from "./api-config.ts";
 import { removeCoreCreds } from "./core-creds.ts";
+import { applyRoutePolicy, callerOf, desktopOnlyResponse, type ApiCaller } from "./route-policy.ts";
+import { callerProjectTree, gateCallerPath, probePaths } from "./caller-fs.ts";
+import { PROJECT_CAPABILITY_PATHSPECS } from "./ref-tree.ts";
+import { taskDirExists, writeTaskDirFileAtomic } from "./task-dir-fs.ts";
+import { DISCLAIM_PREF_KEY, isDisclaimOffValue } from "./disclaim.ts";
+import { applyDisclaimPreferenceWrite } from "./disclaim-switch.ts";
+import { childEnv } from "./core-spawn.ts";
 import {
   tasks,
   backlog,
@@ -341,6 +348,36 @@ function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
   return refs;
 }
 
+// `refsFromPaths` for `POST /refs/resolve`, the one reference route the CLI
+// token may call (D24): for a CLI caller the stat of each caller-named path runs
+// in a disclaimed child (`probePaths`), never in the core process, so naming a
+// path can't borrow Agetor's macOS grants. Same result shape and same rules as
+// the sync form — only existing absolute paths survive, deduped, with
+// `isDirectory` read from the filesystem. Mapping from probe kinds: `dir` /
+// `file` / `other` are kept (`other` — a socket or device — has isDirectory
+// false, exactly what statSync gives it); `missing` and `denied` are dropped,
+// which is what the in-process form does when statSync throws ENOENT or
+// EPERM/EACCES. The app caller keeps the in-process form untouched.
+async function refsFromPathsForCaller(rawPaths: unknown[], caller: ApiCaller | null): Promise<TaskReference[]> {
+  if (caller !== "cli") return refsFromPaths(rawPaths);
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (const abs of rawPaths) {
+    if (typeof abs !== "string") continue;
+    if (!abs || !path.isAbsolute(abs) || seen.has(abs)) continue;
+    seen.add(abs);
+    candidates.push(abs);
+  }
+  const kinds = await probePaths(candidates, "cli");
+  const refs: TaskReference[] = [];
+  candidates.forEach((abs, i) => {
+    const kind = kinds[i];
+    if (kind === "dir") refs.push({ path: abs, isDirectory: true });
+    else if (kind === "file" || kind === "other") refs.push({ path: abs, isDirectory: false });
+  });
+  return refs;
+}
+
 // Turn the caller-supplied `?name=` for /attachments into a safe basename
 // that can't escape `${dataDir}/attachments/`. Stripping null bytes and path
 // separators before `path.basename` is defense in depth (`path.basename`
@@ -405,7 +442,9 @@ function writeAttachmentAtomic(
 // AGETOR_API_HOST for container use), so CORS is mostly belt-and-suspenders.
 // We still echo the calling origin so the Vite HMR webview
 // (http://localhost:5173) can call us during dev — but never `*`. Foreign
-// origins are also blocked by the token gate, so this is defense-in-depth.
+// origins are also blocked by the token gate (both tokens travel in an
+// `authorization` header, which makes every webview request a preflighted
+// cross-origin one), so this is defense-in-depth.
 // Populated inside `startApiServer` once the runtime port is known.
 
 function corsHeaders(req: Request): Record<string, string> {
@@ -419,25 +458,6 @@ function corsHeaders(req: Request): Record<string, string> {
   };
 }
 
-const API_TOKEN_BYTES = Buffer.from(API_TOKEN);
-
-// Constant-time compare: the headless core can be bound beyond loopback
-// (AGETOR_API_HOST), so don't let response timing leak how much of a guess
-// matched. The length check only reveals the token's (public, fixed) length.
-function tokenMatches(candidate: string | null | undefined): boolean {
-  if (candidate == null) return false;
-  const bytes = Buffer.from(candidate);
-  return bytes.length === API_TOKEN_BYTES.length && timingSafeEqual(bytes, API_TOKEN_BYTES);
-}
-
-function isAuthorized(req: Request): boolean {
-  const header = req.headers.get("authorization");
-  if (header?.startsWith("Bearer ") && tokenMatches(header.slice("Bearer ".length))) return true;
-  // Fallback for EventSource, which can't set headers.
-  const url = new URL(req.url);
-  return tokenMatches(url.searchParams.get("token"));
-}
-
 function unauthorized(req: Request): Response {
   return json(
     { error: "unauthorized" },
@@ -445,6 +465,15 @@ function unauthorized(req: Request): Response {
   );
 }
 
+// Who may call what is decided ONCE, before any handler runs, by the route
+// policy walker (`applyRoutePolicy` over `ROUTE_POLICY`, route-policy.ts): it
+// resolves the caller from the Authorization header (master → "app", CLI token
+// → "cli"; `?token=` only for the CLI token on the three legacy SSE GETs),
+// refuses the CLI token on desktop-only routes and gates CLI-supplied paths
+// (D24). `authed` is what each handler adds on top: "a caller the walker
+// authorized". It stays on every handler so a route that somehow bypassed the
+// walker (or a handler reused outside it) still fails closed with a 401.
+//
 // We type the wrapper loosely so Bun's per-route param typing (it infers
 // `params.id` as `string` for the pattern `/:id`) flows through unchanged.
 // Under `noUncheckedIndexedAccess`, a generic `Record<string,string>` would
@@ -458,8 +487,43 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
   // fallback does instead of 401-ing it.
   return ((req: Request) => {
     if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
-    return isAuthorized(req) ? fn(req) : unauthorized(req);
+    return callerOf(req) !== null ? fn(req) : unauthorized(req);
   }) as F;
+}
+
+// Terminal WebSocket tickets (P7). A WebSocket can't carry an Authorization
+// header and the master token must never appear in a URL (D13), so the webview
+// first POSTs `/terminals/:id/ws-ticket` (desktop-only, header-authenticated)
+// and opens `GET /terminals/:id/ws?ticket=…`. A ticket is 32 random bytes (hex),
+// bound to one terminal id, valid for 30 s and consumed by its first use — it
+// is a lookup key, not a derivation of any credential, so a URL that leaks into
+// a log or history is dead before anyone can replay it.
+const WS_TICKET_TTL_MS = 30_000;
+const wsTickets = new Map<string, { terminalId: string; expiresAt: number }>();
+
+function pruneWsTickets(now: number): void {
+  for (const [ticket, entry] of wsTickets) {
+    if (entry.expiresAt <= now) wsTickets.delete(ticket);
+  }
+}
+
+function mintWsTicket(terminalId: string): { ticket: string; expiresAt: number } {
+  const now = Date.now();
+  pruneWsTickets(now);
+  const ticket = randomBytes(32).toString("hex");
+  const expiresAt = now + WS_TICKET_TTL_MS;
+  wsTickets.set(ticket, { terminalId, expiresAt });
+  return { ticket, expiresAt };
+}
+
+/** Consume `ticket` for `terminalId`: true only for a live, unused ticket minted for that same terminal. */
+function consumeWsTicket(ticket: string | null, terminalId: string): boolean {
+  if (!ticket) return false;
+  const entry = wsTickets.get(ticket);
+  if (!entry) return false;
+  // Single use even on a mismatch: a ticket presented for the wrong terminal is dead too.
+  wsTickets.delete(ticket);
+  return entry.expiresAt > Date.now() && entry.terminalId === terminalId;
 }
 
 /**
@@ -1167,6 +1231,40 @@ const notAvailableHeadless = (req: Request) =>
     { status: 501, headers: corsHeaders(req) },
   );
 
+// A Claude session's folder comes from the transcript, not the request, so the
+// route table can't gate it up front (`pathParamsExempt` on the import route).
+// For a CLI-token caller the importer calls this before its first in-process
+// touch of the folder: the folder is probed in a disclaimed child and a
+// refusal message comes back (D24). The app caller passes no gate.
+function sessionCwdGate(req: Request): { gateCwd?: (cwd: string) => Promise<string | null> } {
+  if (callerOf(req) !== "cli") return {};
+  return { gateCwd: async (cwd) => (await gateCallerPath(cwd, "cli", "exists"))?.error ?? null };
+}
+
+// The policy walker gates a harness's top-level `home`/`bin` for a CLI-token
+// caller, but not the values inside its `env` map — and an env value that is an
+// absolute path (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME`…) names a directory
+// the core later tails or reads in-process. So the same disclaimed probe runs
+// over every absolute-path env value (D24); the first denied one refuses the
+// request with the gate's own 403 body. The app caller is never gated.
+async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): Promise<Response | null> {
+  if (callerOf(req) !== "cli") return null;
+  for (const value of Object.values(env)) {
+    if (!value.startsWith("/")) continue;
+    const refusal = await gateCallerPath(value, "cli", "exists");
+    if (refusal) {
+      const { status, ...body } = refusal;
+      return json(body, { status, headers: corsHeaders(req) });
+    }
+  }
+  return null;
+}
+
+/** Loose shape of the `routes:` object (see the comment at the `applyRoutePolicy` call). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type RouteHandler = (req: any) => Response | Promise<Response>;
+type ServerRoutes = Record<string, RouteHandler | Record<string, RouteHandler>>;
+
 export function startApiServer(deps: { native?: ApiNative; hostname?: string } = {}) {
   const native = deps.native;
   /** Best-effort removal of a task's OS notification; never affects a response. */
@@ -1178,6 +1276,16 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       console.error("[agetor] removeTaskNotification failed:", err);
     }
   };
+  // Test-only (e2e/unit): hold the main thread for `ms` so the core-busy
+  // banner and the event-loop lag monitor can be exercised end to end. Registered
+  // ONLY when AGETOR_TEST_BLOCK_ROUTE=1 was set when this server started (read
+  // once per `startApiServer` call so a test can run an enabled and a disabled
+  // instance side by side) — never in a production process. Disabled, the route
+  // simply isn't in the `routes` object, so the path reaches the `fetch()` 404
+  // fallback exactly like any unregistered one, before any auth check. Enabled,
+  // it is classified `app` in ROUTE_POLICY (`conditional`: the walker's "entry
+  // without a route" check skips it when the flag is off) and token-gated like
+  // every other route.
   const blockRouteEnabled = process.env.AGETOR_TEST_BLOCK_ROUTE === "1";
   const blockEventLoopRoute = authed(async (req: Request) => {
     const body = (await req.json().catch(() => ({}))) as { ms?: unknown };
@@ -1254,13 +1362,19 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
     // keep-alive socket usable; see REFUSED_BODY_DRAIN_MAX_BYTES.
     maxRequestBodySize: REFUSED_BODY_DRAIN_MAX_BYTES,
     websocket: terminalWebSocket,
-    routes: {
-      // Unauthenticated probes only — never returns data.
-      // `app: "agetor"` is a self-identifier the PreToolUse hook script
-      // greps for before trusting the response, so a different service
-      // happening to listen on the same port (4317 is OTLP gRPC's default,
-      // for example) and returning 200 won't accidentally pass the bypass
-      // check. Keep this string stable.
+    // Every route goes through the policy walker (route-policy.ts): it resolves
+    // the caller, refuses the CLI token on desktop-only routes, gates
+    // CLI-supplied paths, and THROWS HERE — the server won't start — when a route
+    // has no ROUTE_POLICY entry (or an entry has no route). The explicit type
+    // keeps the handlers' contextual `req` typing, which a bare generic would
+    // lose; the cast hands Bun its own route typing back.
+    routes: applyRoutePolicy<ServerRoutes>({
+      // Unauthenticated liveness probe — never returns data (`callers:
+      // "public"` in ROUTE_POLICY). `app: "agetor"` is a self-identifier for
+      // its callers (the CLI's creds/daemon probes, the webview's busy-banner
+      // watchdog) so a different service that happens to listen on the same
+      // port (4317 is OTLP gRPC's default, for example) and returns 200 isn't
+      // mistaken for a core. Keep this string stable.
       "/health": (req) => json({ ok: true, app: "agetor" }, { headers: corsHeaders(req) }),
 
       "/defaults": {
@@ -1282,7 +1396,12 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (!path.isAbsolute(p)) {
             return json({ error: "path must be absolute" }, { status: 400, headers: corsHeaders(req) });
           }
-          if (!existsSync(p)) {
+          // For a CLI-token caller the existence check runs in a disclaimed
+          // child (`probePaths`), not in the core (D24) — the walker already
+          // refused a `denied` path, so only "missing" is left to report. For
+          // the app caller `probePaths` is the same in-process stat as before.
+          const kind = (await probePaths([p], callerOf(req) ?? "app"))[0];
+          if (kind === "missing" || kind === "denied") {
             return json({ error: `path does not exist: ${p}` }, { status: 404, headers: corsHeaders(req) });
           }
           const name =
@@ -3662,6 +3781,22 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             if (parseArchivedHistoryRetentionDays(normalized) !== null) requestRetentionPass();
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           }
+          if (req.params.key === DISCLAIM_PREF_KEY) {
+            // The one switch that keeps Agetor's macOS permissions away from
+            // agents and every program the core spawns (D4, D7). The CLI token
+            // is what an agent can read, so it must not be able to turn the
+            // isolation OFF; turning it ON is allowed for anyone. The value
+            // rule lives here, not in the policy table, because the route
+            // itself stays `app+cli` for every other key.
+            if (isDisclaimOffValue(body.value) && callerOf(req) === "cli") {
+              return desktopOnlyResponse(req, corsHeaders);
+            }
+            preferences.set(req.params.key, body.value);
+            // Apply the stored value to the in-memory switch (app: immediately,
+            // D5; headless: stays on, logs when the value is off, D6).
+            applyDisclaimPreferenceWrite(native ? "app" : "headless", body.value, (m) => console.log(m));
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
           preferences.set(req.params.key, body.value);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
@@ -3731,23 +3866,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
         }),
       },
 
-      // Test-only (e2e/unit): hold the main thread for `ms` so the core-busy
-      // banner and the event-loop lag monitor can be exercised end to end.
-      // Live ONLY when AGETOR_TEST_BLOCK_ROUTE=1 was set when this server
-      // started (`blockRouteEnabled`, read once per `startApiServer` call so a
-      // test can run an enabled and a disabled instance side by side) — never
-      // in a production process. Disabled, the handler answers exactly what the
-      // 404 fallback does, before the auth check, so the path is
-      // indistinguishable from an unregistered one. (A conditional object
-      // spread would be the literal "not registered" form, but it types the key
-      // as possibly-undefined, which Bun.serve's route typing rejects.)
-      // Enabled, it is token-gated like every other route.
-      "/test/block-event-loop": {
-        POST: (req: Request) => {
-          if (!blockRouteEnabled) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
-          return blockEventLoopRoute(req);
-        },
-      },
+      // Test-only block route: present only under AGETOR_TEST_BLOCK_ROUTE=1
+      // (see `blockRouteEnabled` above); absent otherwise → the 404 fallback.
+      ...(blockRouteEnabled ? { "/test/block-event-loop": { POST: blockEventLoopRoute } } : {}),
 
       // App info — currently just the version. Read at module-load time
       // from the bundled package.json so the value tracks releases without
@@ -3982,6 +4103,8 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               env[k] = v;
             }
           }
+          const envRefusal = await gateHarnessEnvPaths(req, env);
+          if (envRefusal) return envRefusal;
           // Whether fx sessions load the user's fx profile MCP servers
           // (`_meta.fx.profileMcpServers`, D3/D4). Absent ⇒ on; only fx-kind
           // rows act on it, every kind stores it.
@@ -4109,6 +4232,8 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               }
               env[k] = v;
             }
+            const envRefusal = await gateHarnessEnvPaths(req, env);
+            if (envRefusal) return envRefusal;
             patch.env = env;
           }
           try {
@@ -4855,9 +4980,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             return json({ error: "harness not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const script = toTerminalAppleScript(buildHarnessTerminalCommand(harness));
-          const proc = Bun.spawn(["osascript", "-e", script], {
+          // spawn-exempt(osascript): Terminal.app automation is Agetor's own Automation grant; /usr/bin/osascript is SIP-protected and spawned by absolute path so PATH can't swap it.
+          const proc = Bun.spawn(["/usr/bin/osascript", "-e", script], {
             stdout: "ignore",
             stderr: "pipe",
+            env: childEnv(),
           });
           // Await the launch so the UI gets real feedback. `do script` returns
           // as soon as Terminal accepts the command (it does NOT wait for the
@@ -5003,12 +5130,22 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // degrade to "no capabilities" rather than surface an error the
           // caller can't show. `workdir === null` (no workdir picked yet)
           // keeps today's user-level-only behavior untouched.
+          //
+          // For a CLI-token caller (D24) the stat runs in a disclaimed child
+          // (`probePaths`), never in the core: the walker already refused a
+          // `denied` workdir before this handler, so here only dir vs. not-dir
+          // is left to decide. The app caller keeps the in-process stat.
+          const caller = callerOf(req);
           if (workdir != null) {
             let workdirOk: boolean;
-            try {
-              workdirOk = path.isAbsolute(workdir) && statSync(workdir).isDirectory();
-            } catch {
-              workdirOk = false;
+            if (caller === "cli") {
+              workdirOk = path.isAbsolute(workdir) && (await probePaths([workdir], "cli"))[0] === "dir";
+            } else {
+              try {
+                workdirOk = path.isAbsolute(workdir) && statSync(workdir).isDirectory();
+              } catch {
+                workdirOk = false;
+              }
             }
             if (!workdirOk) {
               return json({ commands: [], extensions: [] }, { headers: corsHeaders(req) });
@@ -5021,6 +5158,15 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               branch,
               harnessHome: harness.home,
               harnessEnv: harness.env,
+              // Live-disk project capability files of a CLI caller's workdir are
+              // read through a disclaimed `tar` child (D24); a ref (`branch`) is
+              // read from git objects and needs no loader.
+              ...(caller === "cli" && !branch
+                ? {
+                    projectTreeLoader: (root: string, shouldRead: (rel: string) => boolean) =>
+                      callerProjectTree(root, "cli", PROJECT_CAPABILITY_PATHSPECS, shouldRead),
+                  }
+                : {}),
             }),
             { headers: corsHeaders(req) },
           );
@@ -5436,7 +5582,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (!body || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== "string")) {
             return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await importClaudeSessions(body.ids, claudeSessionScanOptions());
+          const result = await importClaudeSessions(body.ids, { ...claudeSessionScanOptions(), ...sessionCwdGate(req) });
           return json(result, { headers: corsHeaders(req) });
         }),
       },
@@ -5453,7 +5599,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           const result = await checkoutSessionBranch(
             body.sessionId,
-            claudeSessionScanOptions(),
+            { ...claudeSessionScanOptions(), ...sessionCwdGate(req) },
             typeof body.branch === "string" ? body.branch : undefined,
           );
           return "error" in result
@@ -5739,8 +5885,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // Serve the raw bytes of one file, on one side of a task's diff, so the
       // Diff Modal can render an old-vs-new preview for binary files it knows
       // how to display (images, PDFs) instead of the plain "binary file — no
-      // textual diff" placeholder. Same trust posture as /files/preview:
-      // token-gated + loopback bind (the default; see AGETOR_API_HOST) is the
+      // textual diff" placeholder. Same trust posture as /files/preview
+      // (desktop-only): master-token-gated + loopback bind (the default; see
+      // AGETOR_API_HOST) is the
       // real boundary, the extension allowlist (`binaryPreviewKind`) just
       // keeps this from doubling as a generic blob reader, and
       // `getTaskDiffBlob` rejects any path that would lexically escape the
@@ -5874,9 +6021,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           const script =
             `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\"${socketArgsStr ? " " + socketArgsStr : ""} attach -t \\"${shellEscape(sessionName)}\\""\n` +
             `activate application "Terminal"`;
-          const proc = Bun.spawn(["osascript", "-e", script], {
+          // spawn-exempt(osascript): Terminal.app automation is Agetor's own Automation grant; /usr/bin/osascript is SIP-protected and spawned by absolute path so PATH can't swap it.
+          const proc = Bun.spawn(["/usr/bin/osascript", "-e", script], {
             stdout: "ignore",
             stderr: "ignore",
+            env: childEnv(),
           });
           // Don't block on the AppleScript — Terminal.app opening shouldn't
           // hold the HTTP response open. Log non-zero exits so users with
@@ -6159,7 +6308,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as { paths?: unknown };
           const raw = Array.isArray(body.paths) ? body.paths : [];
-          return json({ refs: refsFromPaths(raw) }, { headers: corsHeaders(req) });
+          return json({ refs: await refsFromPathsForCaller(raw, callerOf(req)) }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -6180,9 +6329,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // worktree that hasn't been materialized yet). Thin wrapper over
       // `listProjectFiles` — see its header for the two listing shapes.
       // Trust posture matches `/projects/branches?path=`: the bearer token +
-      // 127.0.0.1 bind (the default; see AGETOR_API_HOST) is the only
-      // boundary, there's no additional path allow-list, so any absolute
-      // directory the caller names is listable.
+      // 127.0.0.1 bind (the default; see AGETOR_API_HOST) is the boundary,
+      // there's no additional path allow-list, so any absolute directory the
+      // caller names is listable — except that for a CLI-token caller the
+      // route table gates `dir` through a disclaimed probe first (D24).
       // Deliberately has NO `native` dependency (unlike `/refs/pick` above)
       // so it works under `headless.ts` (CLI/e2e), not just the packaged app.
       // `q` (present, even as `q=`) switches to server-side search mode for
@@ -6325,8 +6475,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // `/open-path` above — an absolute path under a token-gated route
       // (127.0.0.1-only by default; see AGETOR_API_HOST) can already be
       // opened with the OS default app, so reading its bytes back adds
-      // nothing a malicious caller couldn't already get. The per-launch token
-      // + the bind address is the actual security boundary; the
+      // nothing a malicious caller couldn't already get. Desktop-only (the CLI
+      // token is refused); the master token + the bind address is the actual
+      // security boundary; the
       // `isImagePath` extension gate exists only to keep this route from
       // doubling as a generic "read any file" endpoint.
       "/files/preview": {
@@ -6379,12 +6530,12 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               ...corsHeaders(req),
               "content-type": contentType,
               // This route serves agent-writable content (e.g. SVG, which can
-              // carry <script>) on the origin whose URL carries the API
-              // token; nosniff + img-only consumption keeps active-content
-              // risk down.
+              // carry <script>) on the API origin; nosniff + img-only
+              // consumption (the webview fetches it with its Authorization
+              // header and shows a blob: URL) keeps active-content risk down.
               // The CSP header below makes that img-only mitigation
               // self-enforcing: a browser ignores CSP on an <img> fetch, but
-              // if this token-bearing URL were ever navigated to or framed
+              // if this URL were ever navigated to or framed
               // instead, `sandbox` + `default-src 'none'` block script
               // execution in an SVG. Agent-authored markdown can now point
               // this route anywhere (plan
@@ -6927,14 +7078,18 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
                 { status: 409, headers: corsHeaders(req) },
               );
             }
-            // A missing worktree must 409 here, BEFORE `mkdirSync` below can
-            // recreate it as an empty stub. `mkdirSync(..., {recursive:
-            // true})` would happily materialize an empty directory at
-            // `task.worktreePath`, which then satisfies `existsSync` and
-            // defeats `sendInput`'s own restore trigger (orchestrator.ts,
-            // `!existsSync(worktreePath)`) — the agent would resume into an
-            // empty directory instead of the real worktree being restored.
-            if (task.worktreePath && !existsSync(task.worktreePath)) {
+            // A missing worktree must 409 here, BEFORE the plan write below
+            // can recreate it as an empty stub. The write creates the plan
+            // file's parent directories (`mkdirParent`), which would happily
+            // materialize an empty directory at `task.worktreePath`, which
+            // then satisfies the existence check and defeats `sendInput`'s own
+            // restore trigger (orchestrator.ts) — the agent would resume into
+            // an empty directory instead of the real worktree being restored.
+            // Both the check and the write go through the task-directory
+            // helpers (D25): the core never touches a task's directory itself
+            // — a disclaimed child of system tools does, whenever the one
+            // disclaim switch is on — whoever triggered the approve.
+            if (task.worktreePath && !(await taskDirExists(task.worktreePath))) {
               return json(
                 {
                   error:
@@ -6950,8 +7105,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             const filename = `${planSlug(plan.name)}_${plan.id}.plan.md`;
             const relPath = path.join(relDir, filename);
             try {
-              mkdirSync(path.join(cwd, relDir), { recursive: true });
-              await Bun.write(path.join(cwd, relPath), content);
+              await writeTaskDirFileAtomic(path.join(cwd, relPath), content, { mkdirParent: true });
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               // Plan stays pending, no message sent — the user can retry.
@@ -7591,8 +7745,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // Confirm-on-quit follow-up. The QuitConfirmDialog POSTs here when the
       // user picks "Quit anyway"; we arm the force-quit flag and re-issue
       // Utils.quit(), which fires `before-quit` again — index.ts sees the
-      // flag and allows the second pass through. Token-gated so a foreign
-      // page that knows the port can't forcibly close the app.
+      // flag and allows the second pass through. Desktop-only (master token,
+      // never the CLI token) so neither a foreign page that knows the port nor
+      // an agent holding the credentials file can forcibly close the app.
       "/app/force-quit": {
         POST: authed((req) => {
           if (!native) return notAvailableHeadless(req);
@@ -7608,7 +7763,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // The HTTP response races process exit. Send synchronously, then
           // queue the quit to fire on the next tick so the response actually
           // reaches the webview before the renderer is torn down. (Even if
-          // it doesn't, the client doesn't care — its EventSource just drops.)
+          // it doesn't, the client doesn't care — its event stream just drops.)
           setTimeout(() => {
             try { native.quit(); } catch { /* electrobun internals may throw on second quit; safe to swallow */ }
           }, 0);
@@ -7620,8 +7775,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // (the app POSTs this to a running cli-daemon before binding) and by
       // `agetor daemon stop`. Removes the creds file, then quits via the
       // native host if present (app mode) or exits the process (headless).
-      // Token-gated like every other mutating route; the setTimeout(…, 0) lets
-      // the 200 flush before the process goes away (same pattern as force-quit).
+      // `app+cli` on purpose: the app's handoff and `agetor daemon stop` both
+      // authenticate with the credentials file's CLI token. The setTimeout(…, 0)
+      // lets the 200 flush before the process goes away (same pattern as
+      // force-quit).
       "/daemon/shutdown": {
         POST: authed((req) => {
           setTimeout(() => {
@@ -7633,9 +7790,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
         }),
       },
 
-      // Terminal tabs for a task. State lives in-memory in terminals.ts; the
-      // live byte stream runs over the WebSocket at /terminals/:id/ws (handled
-      // in `fetch` below, since Bun's routes API doesn't do upgrades).
+      // Terminal tabs for a task (desktop-only). State lives in-memory in
+      // terminals.ts; the live byte stream runs over the WebSocket at
+      // /terminals/:id/ws?ticket=… (handled in `fetch` below, since Bun's routes
+      // API doesn't do upgrades; the ticket comes from POST …/ws-ticket).
       "/tasks/:id/terminals": {
         GET: authed((req) => json(listTerminals(req.params.id), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
@@ -7655,6 +7813,17 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           return ok
             ? new Response(null, { status: 204, headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+      // Single-use ticket for the terminal WebSocket (P7, D13): the webview
+      // POSTs here with its Authorization header (desktop-only — the CLI token
+      // is refused by the policy walker) and opens `/terminals/:id/ws?ticket=…`.
+      "/terminals/:id/ws-ticket": {
+        POST: authed((req) => {
+          if (!getTerminal(req.params.id)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(mintWsTicket(req.params.id), { status: 201, headers: corsHeaders(req) });
         }),
       },
 
@@ -7857,17 +8026,26 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           },
         });
       }),
-    },
+    }, {
+      headless: !native,
+      cors: corsHeaders,
+      gate: gateCallerPath,
+      notAvailableHeadless,
+    }) as never,
     fetch(req, server) {
       if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
       // WebSocket upgrade for a terminal tab's live byte stream. The routes API
-      // can't upgrade, so we match it here. Token-gated via `?token=` like the
-      // SSE endpoints (WebSockets can't set the Authorization header).
+      // can't upgrade, so we match it here. It sits outside the policy table
+      // (P11) and takes ONLY a single-use ticket minted by
+      // `POST /terminals/:id/ws-ticket` (P7): a WebSocket can't set an
+      // Authorization header, and neither token may ride in a URL (D13), so
+      // `?token=` on this path is refused outright.
       const url = new URL(req.url);
       const wsMatch = url.pathname.match(/^\/terminals\/([^/]+)\/ws$/);
       if (wsMatch) {
-        if (!isAuthorized(req)) return unauthorized(req);
+        if (req.method !== "GET") return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         const terminalId = decodeURIComponent(wsMatch[1]!);
+        if (!consumeWsTicket(url.searchParams.get("ticket"), terminalId)) return unauthorized(req);
         // Reject unknown ids before upgrading, rather than upgrading then
         // immediately closing the socket in the `open` handler.
         if (!getTerminal(terminalId)) {

@@ -14,6 +14,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Harness } from "../../shared/types.ts";
+import { coreSpawn } from "../core-spawn.ts";
 
 /**
  * Path to the `.claude.json` claude reads/writes for this harness.
@@ -81,10 +82,11 @@ export async function readKeychainClaudeToken(): Promise<string | null> {
     return null;
   }
   try {
-    const proc = Bun.spawn(
+    // coreSpawn: `security` resolves from PATH, which an agent can plant.
+    const proc = coreSpawn(
       ["security", "find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
       { stdout: "pipe", stderr: "pipe" },
-    );
+    ) as Bun.Subprocess<"ignore", "pipe", "pipe">;
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;

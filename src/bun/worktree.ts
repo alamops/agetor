@@ -3,6 +3,7 @@ import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
+import { coreSpawn } from "./core-spawn.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
@@ -24,22 +25,25 @@ const GIT_TIMEOUT_MS = 30_000;
 /**
  * Run `git` against a working directory. Resolves with `ok` reflecting exit
  * status for a normal invocation — but CAN throw synchronously, since it's a
- * thin wrapper over `Bun.spawn`, which throws when the `git` binary isn't on
- * `PATH` or `cwd` doesn't exist. Callers that need a true non-throwing
+ * thin wrapper over `coreSpawn` (`Bun.spawn` semantics), which throws when the `git`
+ * binary isn't on `PATH` or `cwd` doesn't exist. Callers that need a true non-throwing
  * contract (e.g. `gitWritableRoots`) must wrap their own call in try/catch.
- * Using Bun.spawn directly (not Bun.$) so we don't pay shell-parsing cost or
+ * Spawning directly (not Bun.$) so we don't pay shell-parsing cost or
  * worry about argument quoting on user-supplied paths/branch names.
  *
  * A hard kill fires after `timeoutMs` (default 30 s) so a hung credential
  * prompt or a stalled pack-objects can't block agetor indefinitely.
  */
 async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
-  const proc = Bun.spawn(["git", ...args], {
+  // Through the disclaim wrapper: a repo's own config (`core.fsmonitor`, hooks,
+  // filters) is agent-plantable and must not run with Agetor's macOS identity
+  // (docs/plans/master-token-agent-read.md, P2/P3).
+  const proc = coreSpawn(["git", ...args], {
     cwd,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-  });
+  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
   const timer = setTimeout(() => proc.kill(), timeoutMs);
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
@@ -66,12 +70,15 @@ async function gitRaw(
   cwd: string,
   timeoutMs = GIT_TIMEOUT_MS,
 ): Promise<{ ok: boolean; exitCode: number; bytes: Uint8Array<ArrayBuffer>; stderr: string }> {
-  const proc = Bun.spawn(["git", ...args], {
+  // Through the disclaim wrapper: a repo's own config (`core.fsmonitor`, hooks,
+  // filters) is agent-plantable and must not run with Agetor's macOS identity
+  // (docs/plans/master-token-agent-read.md, P2/P3).
+  const proc = coreSpawn(["git", ...args], {
     cwd,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-  });
+  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
   const timer = setTimeout(() => proc.kill(), timeoutMs);
   try {
     const [buf, stderr, exitCode] = await Promise.all([
