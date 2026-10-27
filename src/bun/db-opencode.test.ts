@@ -195,12 +195,12 @@ function snapshotJson(extra: Record<string, unknown>): Record<string, unknown> {
   };
 }
 
-test("a task snapshot without opencodeServer (frozen before 078) or with an invalid one reads as shared", () => {
+test("a task snapshot without opencodeServer (frozen before 078) keeps it absent (means shared); an invalid one reads as shared", () => {
   const task = tasks.insert(makeTaskRow());
   db.run(`UPDATE tasks SET agent_profile_id = ?, agent_profile = ? WHERE id = ?`, [
     "profile-oc", JSON.stringify(snapshotJson({})), task.id,
   ]);
-  expect(tasks.get(task.id)!.agentProfile!.opencodeServer).toBe("shared");
+  expect(tasks.get(task.id)!.agentProfile!.opencodeServer).toBeUndefined();
 
   db.run(`UPDATE tasks SET agent_profile = ? WHERE id = ?`, [JSON.stringify(snapshotJson({ opencodeServer: 7 })), task.id]);
   expect(tasks.get(task.id)!.agentProfile!.opencodeServer).toBe("shared");
@@ -212,7 +212,7 @@ test("a task snapshot without opencodeServer (frozen before 078) or with an inva
   expect(bound.agentProfile!.opencodeServer).toBe("standalone");
 });
 
-test("pipeline-run snapshot profiles read a missing opencodeServer as shared, strict and lenient entries alike", () => {
+test("pipeline-run snapshot profiles keep a missing opencodeServer absent (means shared) and normalize an invalid one, strict and lenient entries alike", () => {
   const raw = JSON.stringify({
     pipelineId: "pl", pipelineName: "P", status: "running", active: [], blocked: [], history: [],
     stepCount: 1, startedAt: 1, endedAt: null,
@@ -223,14 +223,16 @@ test("pipeline-run snapshot profiles read a missing opencodeServer as shared, st
         p2: snapshotJson({ id: "p2", opencodeServer: "standalone" }),
         // No `model` — the strict sanitizer refuses it; the lenient fallback keeps it.
         p3: { id: "p3", name: "Odd" },
+        p4: { id: "p4", name: "Odd", opencodeServer: "nope" },
       },
       maxSteps: 25, capturedAt: 1,
     },
   });
   const profiles = parsePipelineRunState(raw)!.snapshot!.profiles;
-  expect(profiles.p1!.opencodeServer).toBe("shared");
+  expect(profiles.p1!.opencodeServer).toBeUndefined();
   expect(profiles.p2!.opencodeServer).toBe("standalone");
-  expect(profiles.p3!.opencodeServer).toBe("shared");
+  expect(profiles.p3!.opencodeServer).toBeUndefined();
+  expect(profiles.p4!.opencodeServer).toBe("shared");
 });
 
 // ---------------------------------------------------------------------------

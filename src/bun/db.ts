@@ -416,9 +416,9 @@ const sanitizeSkillsList = (raw: unknown): string[] => {
  * legacy pre-072 `fast` boolean, else `"off"`) and emitted alongside its
  * derived `fast`, `maxMode` coerced to a boolean, `instructions` a string
  * (default `""`), `skills` sanitized via {@link sanitizeSkillsList}, and
- * `capturedAt` a number (default `0`), and `opencodeServer` a valid
- * `OpencodeServerMode` (absent — every snapshot frozen before migration 078
- * — or invalid reads as `"shared"`).
+ * `capturedAt` a number (default `0`), and `opencodeServer`, when present, a
+ * valid `OpencodeServerMode` (invalid reads as `"shared"`; absent — every
+ * snapshot frozen before migration 078 — stays absent and means `"shared"`).
  */
 const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | null => {
   if (!raw) return null;
@@ -485,9 +485,10 @@ const sanitizeAgentProfileSnapshot = (parsed: unknown): AgentProfileSnapshot | n
     speed,
     fast: speed !== "off",
     maxMode: rec.maxMode === true,
-    // Absent (every snapshot frozen before migration 078) or invalid ⇒
-    // "shared", the column default.
-    opencodeServer: readOpencodeServer(rec.opencodeServer),
+    // Absent (every snapshot frozen before migration 078) stays absent —
+    // readers treat that as "shared" — so a stored snapshot round-trips
+    // unchanged; an invalid value reads as "shared".
+    ...(rec.opencodeServer !== undefined ? { opencodeServer: readOpencodeServer(rec.opencodeServer) } : {}),
     instructions: typeof instructions === "string" ? instructions : "",
     skills: sanitizeSkillsList(rec.skills),
     capturedAt: typeof capturedAt === "number" ? capturedAt : 0,
@@ -727,7 +728,7 @@ const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
       if (!isPlainObject(value)) continue;
       const speed = readSnapshotSpeed(value);
       profiles[id] = sanitizeAgentProfileSnapshot(value)
-        ?? ({ ...value, speed, fast: speed !== "off", opencodeServer: readOpencodeServer(value.opencodeServer) } as unknown as AgentProfileSnapshot);
+        ?? ({ ...value, speed, fast: speed !== "off", ...(value.opencodeServer !== undefined ? { opencodeServer: readOpencodeServer(value.opencodeServer) } : {}) } as unknown as AgentProfileSnapshot);
     }
   }
 
