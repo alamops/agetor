@@ -1,0 +1,2 @@
+Exporting session: ses_doesnotexist000000000000
+[91m[1mError: [0mSession not found: ses_doesnotexist000000000000

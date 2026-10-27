@@ -1,0 +1,171 @@
+{
+  "info": {
+    "id": "ses_e82612922ffe6VVY5SiPNRsanX",
+    "parentID": "ses_e8261398affehUf22D8iOXNtgS",
+    "projectID": "global",
+    "agent": "explore",
+    "model": {
+      "id": "glm-5.3-flash-free",
+      "providerID": "opencode",
+      "variant": "default"
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 2287,
+      "output": 134,
+      "reasoning": 40,
+      "cache": {
+        "read": 1664,
+        "write": 0
+      }
+    },
+    "outcome": "succeeded",
+    "time": {
+      "created": 1793108924192,
+      "updated": 1793108925946,
+      "idle": 1793108925949
+    },
+    "title": "List files in current directory",
+    "location": {
+      "directory": "/Users/test/project"
+    }
+  },
+  "messages": [
+    {
+      "id": "msg_17d9ed7210027s6DYllGqQDZoq",
+      "time": {
+        "created": 1793108924201
+      },
+      "text": "You are a subagent spawned by another session.\nList the files in the current directory and reply with their names.",
+      "type": "user"
+    },
+    {
+      "id": "msg_17d9ed72b001SI4oiUSW42BHpq",
+      "time": {
+        "created": 1793108924209,
+        "streamed": 1793108925271,
+        "completed": 1793108925305
+      },
+      "type": "assistant",
+      "agent": "explore",
+      "model": {
+        "id": "glm-5.3-flash-free",
+        "providerID": "opencode",
+        "variant": "default"
+      },
+      "content": [
+        {
+          "type": "reasoning",
+          "text": "The user wants me to list the files in the current working directory. I'll read the directory to see what's in it.",
+          "native": {
+            "reasoningField": "reasoning_content"
+          },
+          "time": {
+            "created": 1793108924919,
+            "completed": 1793108925267
+          }
+        },
+        {
+          "type": "tool",
+          "id": "20a87c29-c799-4ab1-9e82-adbba04dc0e1",
+          "name": "read",
+          "executed": false,
+          "state": {
+            "status": "completed",
+            "input": {
+              "path": "/Users/test/project"
+            },
+            "content": [
+              {
+                "type": "text",
+                "text": "Read directory /Users/test/project, entries 1-3\n.git/\na.txt\nb.txt"
+              }
+            ],
+            "metadata": {
+              "truncated": false
+            }
+          },
+          "time": {
+            "created": 1793108925241,
+            "ran": 1793108925270,
+            "completed": 1793108925275
+          }
+        }
+      ],
+      "snapshot": {
+        "start": "18eb80fbbbf9160491c007668d5298f1e86cd40a",
+        "end": "18eb80fbbbf9160491c007668d5298f1e86cd40a",
+        "files": []
+      },
+      "finish": "tool-calls",
+      "rawFinish": "tool_calls",
+      "cost": 0,
+      "tokens": {
+        "input": 1869,
+        "output": 84,
+        "reasoning": 30,
+        "cache": {
+          "read": 0,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_17d9edb7f001NwI4JEqpWBiUMl",
+      "time": {
+        "created": 1793108925317,
+        "streamed": 1793108925912,
+        "completed": 1793108925946
+      },
+      "type": "assistant",
+      "agent": "explore",
+      "model": {
+        "id": "glm-5.3-flash-free",
+        "providerID": "opencode",
+        "variant": "default"
+      },
+      "content": [
+        {
+          "type": "reasoning",
+          "text": "Simple directory listing. Report the entries.",
+          "native": {
+            "reasoningField": "reasoning_content"
+          },
+          "time": {
+            "created": 1793108925663,
+            "completed": 1793108925909
+          }
+        },
+        {
+          "type": "text",
+          "text": "The current directory contains:\n\n- `.git/` (directory)\n- `a.txt`\n- `b.txt`\n\nSo there are 2 files: **a.txt** and **b.txt** (plus the `.git/` repository metadata directory)."
+        }
+      ],
+      "snapshot": {
+        "start": "18eb80fbbbf9160491c007668d5298f1e86cd40a",
+        "end": "18eb80fbbbf9160491c007668d5298f1e86cd40a",
+        "files": []
+      },
+      "finish": "stop",
+      "rawFinish": "stop",
+      "cost": 0,
+      "tokens": {
+        "input": 418,
+        "output": 50,
+        "reasoning": 10,
+        "cache": {
+          "read": 1664,
+          "write": 0
+        }
+      }
+    },
+    {
+      "id": "msg_17d9eddfd001brOTJLsNqMNFuE",
+      "time": {
+        "created": 1793108925949
+      },
+      "type": "idle",
+      "outcome": "succeeded"
+    }
+  ]
+}
