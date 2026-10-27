@@ -223,6 +223,36 @@ describe("mapOpencodeEvent — v1 fixtures", () => {
     expect(mapOpencodeEvent(notFound, ctx3, 0).resumeNotFound).toBeUndefined();
   });
 
+  test("v1 `Error: Unexpected error` takes its cause from the next non-blank line (live W4 smoke)", () => {
+    // Captured from v1.19.4 run in a HOME whose opencode.db v2 had created.
+    const log = "\x1b[91m\x1b[1mError: \x1b[0mUnexpected error\n\nDatabase is not empty and has no session table\n";
+    const { chunks, proc } = (() => {
+      const out: { stream: string; data: string }[] = [];
+      const p = createOpencodeLineProcessor({ onChunk: (stream, data) => out.push({ stream, data }), major: 1 });
+      for (const line of log.split("\n")) p.feed(line);
+      return { chunks: out, proc: p };
+    })();
+    expect(chunks).toEqual([
+      { stream: "status", data: "opencode: Unexpected error" },
+      { stream: "status", data: "opencode: Database is not empty and has no session table" },
+    ]);
+    expect(proc.result()).toMatchObject({
+      failed: true,
+      lastError: "Unexpected error: Database is not empty and has no session table",
+      resumeNotFound: false,
+    });
+    // Only the line right after the generic error is taken; later chatter and a
+    // JSON line in between end the wait.
+    const ctx = createOpencodeMapCtx(1);
+    mapOpencodeEvent("Error: Unexpected error", ctx, 0);
+    mapOpencodeEvent(JSON.stringify({ type: "step_start", sessionID: "ses_x" }), ctx, 1);
+    expect(mapOpencodeEvent("some chatter", ctx, 2).chunks).toEqual([]);
+    const ctx2 = createOpencodeMapCtx(1);
+    mapOpencodeEvent("Error: File not found: /x", ctx2, 0);
+    expect(mapOpencodeEvent("some chatter", ctx2, 1).chunks).toEqual([]);
+    expect(ctx2.lastError).toBe("File not found: /x");
+  });
+
   test("unknown types skipped; the attempt marker resets the failure state", () => {
     const ctx = createOpencodeMapCtx(2);
     expect(mapOpencodeEvent(JSON.stringify({ type: "something_new", sessionID: "ses_x" }), ctx, 0).chunks).toEqual([]);

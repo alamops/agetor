@@ -1248,6 +1248,24 @@ test("discoverOpencode v2: a failed variant probe → ids only, with no efforts 
   expect(getDiscoveredEfforts("opencode", "opencode/big-pickle", "opencode-noapi")).toBeNull();
 });
 
+test("discoverOpencode v2: a probe that loses the cold-home db race is retried once and its variants kept", async () => {
+  __testing.resetForTests();
+  // The first `api` call fails like a real v2 in a fresh home whose
+  // opencode.db the concurrent `models` call is creating (live W4 smoke).
+  const flagDir = mkdtempSync(path.join(tmpdir(), "agetor-opencode-cold-"));
+  const { bin, log } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": catFixture("v2-models.txt"),
+    "api --standalone model.list":
+      `    if [ ! -f '${flagDir}/api-once' ]; then : > '${flagDir}/api-once'; echo 'Error: Standalone server exited before reporting readiness' >&2; exit 1; fi\n` +
+      catFixture("v2-api-model-list.json"),
+  });
+  const models = await refreshHarnessTarget({ harnessId: "opencode-cold", kind: "opencode", env: {}, bin });
+  expect(models.find((m) => m.id === "opencode/deepseek-v4.1-flash-free")?.efforts).toEqual(["low", "high", "max"]);
+  expect(loggedArgv(log).filter((a) => a === "api --standalone model.list")).toHaveLength(2);
+  expect(loggedArgv(log).filter((a) => a === "models --standalone")).toHaveLength(1);
+});
+
 test("discoverOpencode v2: models --standalone failing falls back to the API's own list", async () => {
   __testing.resetForTests();
   const { bin } = plantFakeOpencode({

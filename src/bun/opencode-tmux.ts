@@ -143,6 +143,9 @@ export interface OpencodeMapCtx {
   failed: boolean;
   lastError: string | null;
   resumeNotFound: boolean;
+  /** Set right after a non-JSON `Error: Unexpected error` line: v1 prints
+   *  the real reason on the next non-blank line (live W4 smoke). */
+  awaitingErrorDetail: boolean;
 }
 
 export function createOpencodeMapCtx(major: 1 | 2): OpencodeMapCtx {
@@ -155,6 +158,7 @@ export function createOpencodeMapCtx(major: 1 | 2): OpencodeMapCtx {
     failed: false,
     lastError: null,
     resumeNotFound: false,
+    awaitingErrorDetail: false,
   };
 }
 
@@ -181,6 +185,11 @@ export function stripAnsi(s: string): string {
 
 /** OpenCode's own failure line once ANSI is stripped (spike §2b). */
 const ERROR_LINE_RE = /^Error:\s*(.+)$/;
+/** v1's generic wrapper for an unhandled failure; the cause follows on the
+ *  next non-blank stderr line, e.g. `Error: Unexpected error` then `Database
+ *  is not empty and has no session table` (a v2-created `opencode.db` in the
+ *  same data dir — live W4 smoke). */
+const GENERIC_ERROR_MSG_RE = /^Unexpected error\.?$/i;
 /** v1 resume of an unknown id (spike §2b, A5). No id in the text. */
 const RESUME_NOT_FOUND_RE = /^Error:\s*Session not found\s*$/;
 /** Same message once it arrived as a JSON `error` event's text. */
@@ -382,10 +391,16 @@ export function mapOpencodeEvent(line: string, ctx: OpencodeMapCtx, lineIndex: n
   if (!isRec(evt)) {
     const stripped = stripAnsi(trimmed).trim();
     const m = ERROR_LINE_RE.exec(stripped);
-    if (!m) return { chunks: [] };
+    if (!m) {
+      if (!ctx.awaitingErrorDetail || !stripped) return { chunks: [] };
+      ctx.awaitingErrorDetail = false;
+      ctx.lastError = `${ctx.lastError ?? "Unexpected error"}: ${stripped}`;
+      return { chunks: [{ stream: "status", data: `opencode: ${stripped}`, lineUuid: `opencode:error:${lineIndex}` }] };
+    }
     const msg = m[1]!.trim();
     ctx.failed = true;
     ctx.lastError = msg;
+    ctx.awaitingErrorDetail = GENERIC_ERROR_MSG_RE.test(msg);
     const res: OpencodeMapResult = {
       chunks: [{ stream: "status", data: `opencode: ${msg}`, lineUuid: `opencode:error:${lineIndex}` }],
       failed: true,
@@ -397,6 +412,7 @@ export function mapOpencodeEvent(line: string, ctx: OpencodeMapCtx, lineIndex: n
     return res;
   }
 
+  ctx.awaitingErrorDetail = false;
   const type = evt.type;
   if (type === OPENCODE_ATTEMPT_MARKER_TYPE) {
     ctx.failed = false;

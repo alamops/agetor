@@ -1039,6 +1039,8 @@ function mergeOpencodeV2(ids: DiscoveredModel[], api: DiscoveredModel[] | null):
  *      (labels + variants), run together. `--standalone` is required on
  *      both: without it v2 starts — and reads — the shared background
  *      service instead of this env's providers (spike Q7).
+ *      A probe that exits non-zero is retried once, sequentially (the
+ *      cold-home `opencode.db` race between the two).
  *      v1: `models --verbose` (ids + variants in one call); when it yields
  *      nothing, plain `models` (ids only).
  * Every result carries the semantics `supportedEfforts` reads (D-6):
@@ -1076,10 +1078,19 @@ async function discoverOpencode(env?: Record<string, string>, bin?: string): Pro
     const major = opencodeMajor(version.stdout.trim());
 
     if (major === 2) {
-      const [ids, api] = await Promise.all([
-        runOpencodeProbe([resolved, "models", "--standalone"], probeEnv, remaining()),
-        runOpencodeProbe([resolved, "api", "--standalone", "model.list"], probeEnv, remaining()),
+      const idsCmd = [resolved, "models", "--standalone"];
+      const apiCmd = [resolved, "api", "--standalone", "model.list"];
+      let [ids, api] = await Promise.all([
+        runOpencodeProbe(idsCmd, probeEnv, remaining()),
+        runOpencodeProbe(apiCmd, probeEnv, remaining()),
       ]);
+      // In a home OpenCode has never run in, two concurrent `--standalone`
+      // calls race to create `opencode.db` and the loser exits 1 with
+      // "Standalone server exited before reporting readiness" (live W4
+      // smoke) — so a fresh install's first sweep lost every variant. One
+      // sequential retry of each failed probe, inside the same budget.
+      if (!ids.ok) ids = await runOpencodeProbe(idsCmd, probeEnv, remaining());
+      if (!api.ok) api = await runOpencodeProbe(apiCmd, probeEnv, remaining());
       const idList = ids.ok ? parseOpencodeModels(ids.stdout) : [];
       const apiList = api.ok ? parseOpencodeApiModelList(api.stdout) : [];
       return mergeOpencodeV2(idList, apiList.length > 0 ? apiList : null);

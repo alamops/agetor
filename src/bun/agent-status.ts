@@ -521,21 +521,32 @@ async function probeOpencodeAuth(
   // Start with the v2 form so it overlaps the version probe: it is the only
   // form that never starts the background service (`--standalone`), and a v1
   // binary rejects `--standalone` outright (exit 1), so it can't misfire.
-  const v2 = await probeOutput(bin, ["auth", "list", "--standalone", "--format", "json"], env);
+  const v2Args = ["auth", "list", "--standalone", "--format", "json"];
+  let v2 = await probeOutput(bin, v2Args, env);
+  const major = opencodeMajor(await version);
+  // A v2 that has never run in this home loses the race to create
+  // `opencode.db` against a concurrent `--standalone` discovery probe and
+  // exits 1 ("Standalone server exited before reporting readiness", live W4
+  // smoke). Retry once — the 60 s cache would otherwise hide the notice.
+  if (major === 2 && (!v2 || v2.code !== 0)) v2 = await probeOutput(bin, v2Args, env);
   if (v2 && v2.code === 0) {
     const parsed = parseOpencodeAuthList(v2.stdout, 2);
     if (parsed !== null) return parsed;
   }
-  if (opencodeMajor(await version) !== 1) return null;
+  if (major !== 1) return null;
   const v1 = await probeOutput(bin, ["auth", "list"], env);
   if (!v1 || v1.code !== 0) return null;
   return parseOpencodeAuthList(`${v1.stdout}\n${v1.stderr}`, 1);
 }
 
 /**
- * Memoized (60 s, `harness.id:path`, like `getCachedStatus`) credential check
- * behind the OpenCode "no credentials" notice. Failures are cached too — a
- * broken `auth list` shouldn't be re-spawned on every poll tick.
+ * Memoized (60 s, `harness.id:path` plus the probe env, like
+ * `getCachedStatus`) credential check behind the OpenCode "no credentials"
+ * notice. Failures are cached too — a broken `auth list` shouldn't be
+ * re-spawned on every poll tick. The env is part of the key because it
+ * carries the harness home (`HOME`/`XDG_*`): editing a harness's home or env
+ * points it at other credentials, and the old answer must not outlive that
+ * (live W4 smoke: a home change kept the old notice for a minute).
  */
 async function getCachedOpencodeAuth(
   harness: Harness,
@@ -543,7 +554,7 @@ async function getCachedOpencodeAuth(
   env: Record<string, string>,
   version: Promise<string | null>,
 ): Promise<AuthProbeResult> {
-  const key = `${harness.id}:${path}`;
+  const key = `${harness.id}:${path}:${JSON.stringify(Object.entries(env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))}`;
   const cached = authCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
   const value = await probeOpencodeAuth(path, env, version);

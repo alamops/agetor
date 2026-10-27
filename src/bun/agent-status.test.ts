@@ -1017,6 +1017,22 @@ describe("opencode status notices", () => {
     expect(callLines(dir)).not.toContain("auth list");
   });
 
+  test("v2 auth probe losing the cold-home db race is retried once (live W4 smoke)", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: fixture("v2-auth-list-empty.json") });
+    // First standalone call fails the way a real v2 does when a concurrent
+    // `--standalone` probe is still creating a fresh home's opencode.db.
+    const flaky = path.join(dir, "opencode-flaky");
+    writeFileSync(
+      flaky,
+      `#!/bin/sh\nif [ "$1" = auth ] && [ ! -f '${dir}/once' ]; then : > '${dir}/once'; echo "$@" >> '${dir}/calls'; echo 'Error: Standalone server exited before reporting readiness' >&2; exit 1; fi\nexec '${bin}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const status = await checkHarness(opencodeHarness(flaky, "oc-cold"));
+    expect(status.notices).toEqual(["No OpenCode credentials found — run `opencode auth login`"]);
+    expect(callLines(dir).filter((l) => l === "auth list --standalone --format json")).toHaveLength(2);
+    expect(callLines(dir)).not.toContain("auth list");
+  });
+
   test("v2 with a credential: no notices at all", async () => {
     const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: fixture("v2-auth-list-env.json") });
     const status = await checkHarness(opencodeHarness(bin));
@@ -1070,6 +1086,18 @@ describe("opencode status notices", () => {
     } finally {
       setSystemTime();
     }
+  });
+
+  test("a harness whose home changed re-probes credentials instead of reusing the cached answer", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: "[]" });
+    const authCalls = () => callLines(dir).filter((l) => l.startsWith("auth")).length;
+    await checkHarness(opencodeHarness(bin));
+    expect(authCalls()).toBe(1);
+    const homed = { ...opencodeHarness(bin), home: path.join(dir, "acct-b") };
+    await checkHarness(homed);
+    expect(authCalls()).toBe(2);
+    await checkHarness(homed);
+    expect(authCalls()).toBe(2);
   });
 
   test("non-opencode kinds never get notices", async () => {
