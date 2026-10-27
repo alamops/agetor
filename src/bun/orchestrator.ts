@@ -6536,20 +6536,15 @@ export async function createTask(
   // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
   // unknown id, so this closes a known inconsistency, on purpose. fx is
-  // different: 23 of its 36 curated models advertise real efforts (16
-  // live-probed 2026-09-14, plus anthropic/claude-opus-5.5, openai/gpt-6-sol
-  // and openai/gpt-6-luna from their Gateway catalog entries on 2026-09-22,
-  // anthropic/claude-sonnet-5.5 from its Gateway entry on 2026-09-28, and
-  // openai/gpt-6.1-sol from its Gateway entry on 2026-09-30, and
-  // anthropic/claude-haiku-5.5 on 2026-10-07 from Gateway reasoning_options
-  // none/low/medium/high/xhigh/max plus a toggle, not an ACP probe, and
-  // google/gemini-4-argon on 2026-10-14 from its Gateway reasoning_options
-  // (low/medium/high), not an ACP probe), so both a
+  // different: 40 of its 42 curated models advertise real efforts
+  // (`MODEL_EFFORT_SUPPORT.fx`, refreshed against fx 0.0.14's
+  // `models[].efforts` on 2026-10-22 and extended 2026-10-26), so both a
   // listed and an unlisted fx model resolve through `supportedEfforts` to
   // `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model — or the
   // `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of those
-  // 23; only the remaining 13 no-effort fx models (e.g. `zai/glm-4.7`)
-  // resolve to `null`. That whole computation is `defaultEffortFor` below.
+  // 40; only the remaining 2 no-effort fx models (`minimax/minimax-m3`,
+  // `anthropic/claude-haiku-4.5`) resolve to `null`. That whole computation
+  // is `defaultEffortFor` below.
   //
   // A bound profile's `effort` is passthrough instead (D3/A5 in the plan) —
   // the Settings form only ever offers `supportedEfforts` rows, so a stored

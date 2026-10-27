@@ -2471,9 +2471,13 @@ export interface AgentOption {
    * unauthenticated vs 158 on a standard plan, measured 2026-08-27 on fx
    * 0.0.6. 2026-09-08: unauth catalog reads 244 on both 0.0.7 and 0.0.8
    * (Gateway-side growth, not a binary property); all curated ids present.
-   * Latest: 2026-09-14, unauth catalog reads 247 on 0.0.8, 0.0.9 and 0.0.10
-   * alike (Gateway-side, not client-version-dependent); all 28 curated ids
-   * still present; signed-in view still unverifiable (token expired).
+   * 2026-09-14: unauth catalog reads 247 on 0.0.8, 0.0.9 and 0.0.10 alike
+   * (Gateway-side, not client-version-dependent); all 28 curated ids still
+   * present; signed-in view still unverifiable (token expired).
+   * Latest: 2026-10-26 (fx 0.0.14, docs/plans/add-gpt-6-1-terra.md §2b):
+   * unauth catalog reads 262 ids, the owner's signed-in standard `fx login`
+   * catalog 139; gating follows signed-in presence — the 26 `catalogOnly`
+   * curated rows (of 42) are the ones absent from that signed-in view.
    */
   catalogOnly?: boolean;
 }
@@ -2629,7 +2633,9 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
  * (the catalog gate is 0.155.0); gpt-6-astra — 0.147.0 ✗ / 0.153.0 ✓
  * (0.148–0.152 unprobed, so the true floor may be lower); Aeon mirrors Astra;
  * gpt-6.1-sol — 0.158.0 ✗ / 0.159.0 ✓ (verified 2026-09-30,
- * docs/plans/add-gpt-6-1-sol.md; no 0.158.x above .0 exists).
+ * docs/plans/add-gpt-6-1-sol.md; no 0.158.x above .0 exists);
+ * gpt-6.1-terra — 0.158.0 ✗ / 0.159.0 ✓ (verified 2026-10-26,
+ * docs/plans/add-gpt-6-1-terra.md).
  * The floors were verified on a ChatGPT-plan account; API-key accounts are
  * assumed to be gated the same way, and `AGETOR_SKIP_CLI_VERSION_FLOOR=1` is
  * the override when one isn't.
@@ -2638,6 +2644,7 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 export const MODEL_MIN_CLI_VERSION: Partial<Record<AgentKind, Record<string, string>>> = {
   codex: {
     "gpt-6.1-sol": "0.159.0",
+    "gpt-6.1-terra": "0.159.0",
     "gpt-6-sol": "0.155.0",
     "gpt-6-luna": "0.155.0",
     "gpt-6-astra": "0.153.0",
@@ -3031,6 +3038,53 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
     hint: "GLM 5.2 via Cursor.",
     effortIds: { max: "glm-5.2-max", high: "glm-5.2-high" },
   },
+  // Ids verified against `cursor-agent --list-models` (2026.10.22-27dcf5f,
+  // 2026-10-26); none has a `-fast` form. No `supportsMaxMode`: the Max Mode
+  // bracket `muse-wonder-1.0[context=1m,effort=high]` was rejected live
+  // ("Cannot use this model"); only `-<effort>` ids run.
+  // docs/plans/add-gpt-6-1-terra.md §2/§3.
+  "muse-wonder-1.0": {
+    label: "Muse Wonder",
+    hint: "Meta Muse Wonder via Cursor.",
+    effortIds: {
+      max: "muse-wonder-1.0-max",
+      xhigh: "muse-wonder-1.0-xhigh",
+      high: "muse-wonder-1.0-high",
+      medium: "muse-wonder-1.0-medium",
+      low: "muse-wonder-1.0-low",
+      minimal: "muse-wonder-1.0-minimal",
+    },
+  },
+  // These rows are labeled "1M" in `--list-models`, and the Max Mode bracket
+  // `muse-spark-1.3[context=1m,effort=high]` was accepted live (rc 0), so
+  // `supportsMaxMode` is on.
+  "muse-spark-1.3": {
+    label: "Muse Spark 1.3",
+    hint: "Meta Muse Spark 1.3 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "muse-spark-1.3-max",
+      xhigh: "muse-spark-1.3-xhigh",
+      high: "muse-spark-1.3-high",
+      medium: "muse-spark-1.3-medium",
+      low: "muse-spark-1.3-low",
+      minimal: "muse-spark-1.3-minimal",
+    },
+  },
+  // No `supportsMaxMode`: the bracket `deepseek-v41-flash-1017[context=1m,
+  // effort=high]` was rejected live. Cursor lists `medium` here although the
+  // Gateway entry for this model does not.
+  "deepseek-v41-flash-1017": {
+    label: "DeepSeek V4.1 Flash 1017",
+    hint: "DeepSeek V4.1 Flash 1017 via Cursor.",
+    effortIds: {
+      max: "deepseek-v41-flash-1017-max",
+      high: "deepseek-v41-flash-1017-high",
+      medium: "deepseek-v41-flash-1017-medium",
+      low: "deepseek-v41-flash-1017-low",
+      none: "deepseek-v41-flash-1017-none",
+    },
+  },
 };
 
 export function cursorModelSupportsFast(model: string | null, effort: string | null): boolean {
@@ -3177,7 +3231,8 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *     GPT-5.6 family → none/low/medium/high/xhigh/max
  *     GPT-6 Sol/Luna → none/low/medium/high/xhigh/max (+ Codex-side ultra on Sol)
  *     GPT-6.1 Sol → low/medium/high/xhigh/max (+ Codex-side ultra), NO none
- *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
+ *     GPT-6.1 Terra → none/low/medium/high/xhigh/max (+ Codex-side ultra)
+ *     gpt-5 / gpt-5-codex → low/medium/high/xhigh
  *
  * An empty list means "this model does not accept the effort flag at all"
  * (e.g. Haiku 4.5) — the UI collapses the dropdown and `buildCommand` emits
@@ -3267,6 +3322,14 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // Codex's offering, as for the other rows.
     // docs/plans/add-gpt-6-1-sol.md §2.
     "gpt-6.1-sol": ["ultra", "max", "xhigh", "high", "medium", "low"],
+    // 2026-10-26 — `codex app-server` catalog first lists gpt-6.1-terra on
+    // 0.159.0 as low/medium/high/xhigh/max + ultra (default low). Live
+    // `codex exec` on 0.162.1 accepts `none`, `low` and `ultra`, and rejects
+    // `minimal` with a 400 ("Supported values are: 'none', 'low', 'medium',
+    // 'high', 'xhigh', and 'max'.") — so unlike 6.1 Sol, Terra accepts `none`
+    // (same rule as the other rows: `ultra` follows Codex's offering, `none`
+    // follows live acceptance). docs/plans/add-gpt-6-1-terra.md §2.
+    "gpt-6.1-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-6-astra": ["ultra", "max", "xhigh", "high", "medium", "low"],
     "gpt-6-astra-aeon": ["ultra", "max", "xhigh", "high", "medium", "low"],
     "gpt-6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
@@ -3275,7 +3338,6 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gpt-5.6-sol": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-terra": ["ultra", "max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
-    "gpt-5.5": ["xhigh", "high", "medium", "low", "none"],
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
@@ -3321,6 +3383,13 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // joined it on 2026-09-30 the same way (see its row); a 35th,
   // anthropic/claude-haiku-5.5, joined it on 2026-10-07 the same way (see
   // its row).
+  // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md §2/§2b): nine more ids
+  // joined the effort group — openai/gpt-6.1-terra,
+  // minimax/minimax-m3.1-flash, meta/muse-spark-open, inception/mercury-3,
+  // moonshotai/kimi-k3.1-pro, deepseek/deepseek-v4.1-flash-1017,
+  // meta/muse-wonder-1.0, mistral/mistral-large-4 and reflection/beam (see
+  // their rows below); the §2b re-measure on fx 0.0.14 found no change to any
+  // existing row's set.
   // 2026-10-22 (fx 0.0.14, docs/plans/fx-0.0.14-and-cursor-updates.md §3.4
   // P10/D6/D10): fx 0.0.14's `models --json` now carries each model's
   // `efforts` (the ACP `effort` option is that list plus `auto`), and 20 of
@@ -3406,6 +3475,19 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     // released 2026-10-13, providers google + vertex) plus fx's always-present
     // auto.
     "google/gemini-4-argon": ["high", "medium", "low", "auto"],
+    // 2026-10-26: from each id's public Gateway `reasoning_options` plus
+    // `auto`, cross-checked against fx 0.0.14's `models[].efforts` (matched
+    // for all nine, docs/plans/add-gpt-6-1-terra.md §2b); Mercury 3's
+    // `instant` is deliberately omitted (D6). Not ACP-probed.
+    "openai/gpt-6.1-terra": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "minimax/minimax-m3.1-flash": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "meta/muse-spark-open": ["xhigh", "high", "medium", "low", "auto"],
+    "inception/mercury-3": ["high", "medium", "low", "auto"],
+    "moonshotai/kimi-k3.1-pro": ["max", "high", "low", "auto"],
+    "deepseek/deepseek-v4.1-flash-1017": ["max", "high", "low", "none", "auto"],
+    "meta/muse-wonder-1.0": ["max", "xhigh", "high", "medium", "low", "minimal", "auto"],
+    "mistral/mistral-large-4": ["high", "none", "auto"],
+    "reflection/beam": ["max", "xhigh", "high", "medium", "low", "auto"],
   },
   // Effort is encoded in the model-id suffix (<model>-<effort>), and `agy
   // --effort` accepts only low/medium/high anyway, so the builder never emits
@@ -3630,13 +3712,13 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "OpenAI's most capable model. Needs codex CLI ≥ 0.153 — older CLIs answer a 400 (\"requires a newer version of Codex\")." },
       { id: "gpt-6-astra-aeon", label: "GPT-6 Astra Aeon", hint: "Long-horizon Astra variant for multi-day tasks. Unverified id — not on OpenAI's model page yet; same codex CLI ≥ 0.153 floor as Astra." },
       { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", hint: "Recommended default — near-Astra performance for complex coding and agentic work at GPT-6 Sol's price; the upgrade from GPT-6 Sol. Needs codex CLI ≥ 0.159 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
+      { id: "gpt-6.1-terra", label: "GPT-6.1 Terra", hint: "Fast, efficient model for visual reasoning, computer use and clear writing; replaces GPT-5.6 Terra at about half its price. Needs codex CLI ≥ 0.159 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
       { id: "gpt-6-sol", label: "GPT-6 Sol", hint: "Previous Sol — still offered; GPT-6.1 Sol is its upgrade. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
       { id: "gpt-6-luna", label: "GPT-6 Luna", hint: "Fastest, lowest-cost GPT-6 for focused, high-volume tasks; replaces GPT-5.6 Luna. Needs codex CLI ≥ 0.155 — older CLIs answer a 400 that misleadingly blames the ChatGPT account." },
       { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Previous-generation flagship — superseded by GPT-6.1 Sol; still works on ChatGPT plans." },
-      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model — superseded by GPT-6.1 Sol." },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model — superseded by GPT-6.1 Terra." },
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model — superseded by GPT-6 Luna." },
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous-generation model — works on ChatGPT plans; codex retires it on 2026-10-14 (switch to GPT-6.1 Sol)." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
@@ -3790,8 +3872,25 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // deepseek/deepseek-v4-flash (first row; see `DEFAULT_MODEL.fx`);
     // zai/glm-5.3-flash stays a standard row (not retired, just absent from
     // that account — the curated ∩ discovered merge hides it there).
+    // 2026-10-26 (fx 0.0.14, docs/plans/add-gpt-6-1-terra.md §2/§2b): the
+    // unauthenticated catalog reads 262 ids and the owner's signed-in
+    // standard `fx login` catalog 139. Nine ids added, all present in the
+    // unauthenticated view; gating follows signed-in presence, so
+    // minimax/minimax-m3.1-flash, meta/muse-spark-open and inception/mercury-3
+    // (signed-in) are standard rows, while openai/gpt-6.1-terra,
+    // moonshotai/kimi-k3.1-pro, deepseek/deepseek-v4.1-flash-1017,
+    // meta/muse-wonder-1.0, mistral/mistral-large-4 and reflection/beam
+    // (absent from the signed-in view) are catalogOnly — 16 standard + 26
+    // catalogOnly rows, 42 curated ids total. deepseek/deepseek-v4.1-flash-1017
+    // sits directly under the default row (a catalogOnly row inside the
+    // standard block; the flag, not the position, decides gating). The five
+    // standard rows absent from signed-in (zai/glm-5.3-flash,
+    // openai/gpt-5.4-mini, spacexai/grok-4.6, minimax/minimax-m3,
+    // alibaba/qwen3.8-flash) are left in place. The -fast / -highspeed /
+    // -free twins stay discovery-only.
     models: [
       { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", hint: "Default — 1M context · 384K output. In a standard signed-in Gateway catalog." },
+      { id: "deepseek/deepseek-v4.1-flash-1017", label: "DeepSeek V4.1 Flash 1017", hint: "1M context · 1M output — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash", hint: "1M context · 131K output. Absent from some signed-in standard catalogs." },
       { id: "zai/glm-5v-turbo", label: "GLM 5V Turbo", hint: "200K context · 128K output, vision-capable turbo tier." },
       { id: "zai/glm-4.7", label: "GLM 4.7", hint: "200K context · 120K output, prior Z.AI flagship." },
@@ -3801,14 +3900,18 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "spacexai/grok-4.6", label: "Grok 4.6", hint: "500K context · 500K output." },
       { id: "spacexai/grok-build-0.1", label: "Grok Build 0.1", hint: "256K context · 256K output, xAI's coding-agent model." },
       { id: "moonshotai/kimi-k2.7-code", label: "Kimi K2.7 Code", hint: "256K context · 32K output, Moonshot's coding-tuned tier." },
-      { id: "minimax/minimax-m3", label: "MiniMax M3", hint: "1M context · 1M output." },
+      { id: "minimax/minimax-m3.1-flash", label: "MiniMax M3.1 Flash", hint: "1M context · 1M output — MiniMax's newest flash tier." },
+      { id: "minimax/minimax-m3", label: "MiniMax M3", hint: "512K context · 512K output." },
       { id: "alibaba/qwen3.8-flash", label: "Qwen 3.8 Flash", hint: "991K context · 128K output." },
       { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "1M context · 65K output." },
+      { id: "meta/muse-spark-open", label: "Muse Spark Open", hint: "1M context · 1M output." },
+      { id: "inception/mercury-3", label: "Mercury 3", hint: "1M context · 131K output. fx's Instant effort isn't offered here." },
       { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "google/gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "moonshotai/kimi-k3.1-pro", label: "Kimi K3.1 Pro", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "anthropic/claude-fable-5.1", label: "Claude Fable 5.1", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "anthropic/claude-haiku-4.5", label: "Claude Haiku 4.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
@@ -3824,18 +3927,22 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "openai/gpt-6.1-sol", label: "GPT-6.1 Sol", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "anthropic/claude-haiku-5.5", label: "Claude Haiku 5.5", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
       { id: "google/gemini-4-argon", label: "Gemini 4 Argon", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "openai/gpt-6.1-terra", label: "GPT-6.1 Terra", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "meta/muse-wonder-1.0", label: "Muse Wonder", hint: "Premium Gateway tier — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "mistral/mistral-large-4", label: "Mistral Large 4", hint: "512K context · 262K output — offered only when this account's catalog includes it.", catalogOnly: true },
+      { id: "reflection/beam", label: "Beam 1.0", hint: "1M context · 131K output, coding model — offered only when this account's catalog includes it.", catalogOnly: true },
     ],
     modes: [
       { id: "yolo", label: "Full access", hint: "Hands-off default — disables fx's permission checks entirely, so no tool call is ever held. What fx 0.0.8 calls --full-access / /permissions full-access (still true on 0.0.10); yolo is fx's surviving alias and stays agetor's stored id." },
       { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; needs a Gateway account with access to fx's reviewer model — otherwise every tool call is held." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
-    // 31 of the 33 curated models accept the effort flag (see
+    // 40 of the 42 curated models accept the effort flag (see
     // MODEL_EFFORT_SUPPORT.fx, refreshed 2026-10-22 against fx 0.0.14's
-    // `models[].efforts`); the other 2 (minimax/minimax-m3,
-    // anthropic/claude-haiku-4.5) report an empty set and the picker
-    // collapses for those, same as any other kind's no-effort models. A
-    // discovered `models[].efforts` set wins over the table. Every
+    // `models[].efforts`; nine rows added 2026-10-26); the other 2
+    // (minimax/minimax-m3, anthropic/claude-haiku-4.5) report an empty set
+    // and the picker collapses for those, same as any other kind's no-effort
+    // models. A discovered `models[].efforts` set wins over the table. Every
     // id-supported model always includes `auto` (fx's own default) last, per
     // EFFORT_OPTIONS.
     efforts: EFFORT_OPTIONS,

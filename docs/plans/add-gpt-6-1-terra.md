@@ -571,3 +571,9 @@ Wave-1 test tasks code against the values pinned in §3/§4, as amended by §2b,
 | Re-checking every *other* standard fx hint's context figures against the Gateway | out of scope | pre-existing copy drift unrelated to these models; P4 fixes only the row adjacent to a new successor |
 | Historical "28 then-curated" measurement prose in `agent-discovery.ts` / `fx-acp.ts` | kept as history | only the "postdate" enumerations are extended (T2) |
 | Owner-deferred items | none | — |
+
+## 10. Verification log
+
+- **Wave 1 barrier (2026-10-26):** `bun run typecheck` green; targeted 15-file run 715 pass / 0 fail; full `bun test` 8566 pass / 2 skip / 0 fail (the three known pre-existing failures did not occur this run).
+- **V1 — migration dry run on a dev-DB copy:** the scratch copy (never `~/.agetor-dev` itself) migrated 051 → 074 (23 migrations), then 075 and 076. Codex `gpt-5.5`/`none` → `gpt-6.1-sol`/`high`; codex `gpt-5.5`/`high` → `gpt-6.1-sol`/`high`; cursor `gpt-5.5`/`none` and fx `openai/gpt-5.5` untouched; cursor `muse-wonder-1.0-low` → `muse-wonder-1.0`/`low`, `speed` `off`; `lastModel:codex` → `gpt-6.1-sol`; `lastModel:cursor` `deepseek-v41-flash-1017-max` → `deepseek-v41-flash-1017`; `updated_at` unchanged; `_migrations` ends 074, 075, 076; a rerun applied nothing and changed nothing.
+- **V2 — live dev-app smokes:** not run yet (plan places it after review, Wave 2).
