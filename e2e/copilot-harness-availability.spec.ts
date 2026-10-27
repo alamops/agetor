@@ -169,10 +169,9 @@ async function expectRunRefused(
   expect(task.runId).toBeNull();
   expect(await listRuns(request, backend, task.id)).toEqual([]);
 
-  // The API refuses the same start directly, with a 4xx and the same copy.
+  // The API refuses the same start directly, with a 400 and the same copy.
   const res = await request.post(`${backend.apiBase}/tasks/${task.id}/start`, { headers: auth(backend) });
-  expect(res.status()).toBeGreaterThanOrEqual(400);
-  expect(res.status()).toBeLessThan(500);
+  expect(res.status()).toBe(400);
   const body = (await res.json()) as { error?: string };
   expect(body.error).toMatch(/^GitHub Copilot is not available — /);
   expect(body.error).toContain(`Install it with: ${CASK_HINT}`);

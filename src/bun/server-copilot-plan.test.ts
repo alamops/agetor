@@ -6,7 +6,7 @@
 // task flips to Auto (reverted when the send fails), a profile-bound task keeps
 // Plan and gets the warning, and a concurrent approve is a 409.
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Harness, Task } from "../shared/types.ts";
@@ -56,6 +56,8 @@ afterAll(() => {
   server?.stop?.();
   rmTestDataDir(DATA_DIR);
   rmTestDataDir(STUB_DIR);
+  // Plain workdirs and harness homes, never a data dir.
+  for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true });
 });
 
 async function settle(ms = 80) {
@@ -137,6 +139,8 @@ async function deleteWhenSettled(id: string): Promise<void> {
   while (Date.now() < deadline && runs.listForTask(id).some((r) => r.status === "running")) {
     await settle(25);
   }
+  // Fail here, at the real cause, rather than as a foreign-key error in the next test.
+  expect(runs.listForTask(id).some((r) => r.status === "running")).toBe(false);
   await settle();
   db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
 }

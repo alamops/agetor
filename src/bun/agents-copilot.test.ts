@@ -237,6 +237,15 @@ describe("harnessEnv / resolveBin / terminal command", () => {
     expect(harnessEnv(copilot({ home: "/a", env: { COPILOT_HOME: "/b" } }))).toEqual({ COPILOT_HOME: "/b" });
   });
 
+  test("copilot: a `~` or padded COPILOT_HOME resolves exactly like the spawn does", () => {
+    const tilde = copilot({ env: { COPILOT_HOME: "~/.copilot-work" } });
+    expect(harnessEnv(tilde)).toEqual({ COPILOT_HOME: path.join(os.homedir(), ".copilot-work") });
+    expect(harnessEnv(tilde).COPILOT_HOME).toBe(buildCommand(tilde, "hi", { ...base }).env!.COPILOT_HOME);
+    expect(harnessEnv(copilot({ home: "  /acct/home  " }))).toEqual({ COPILOT_HOME: "/acct/home" });
+    // A blank env value doesn't pin a default for a home-less harness.
+    expect(harnessEnv(copilot({ env: { COPILOT_HOME: "  " } }))).toEqual({ COPILOT_HOME: "  " });
+  });
+
   test("gemini keeps GEMINI_CLI_HOME", () => {
     expect(harnessEnv({ ...copilot({ home: "/g" }), kind: "gemini" })).toEqual({ GEMINI_CLI_HOME: "/g" });
   });

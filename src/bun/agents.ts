@@ -427,7 +427,18 @@ export function harnessEnv(harness: Harness): Record<string, string> {
   }
   // User-provided env wins over the home-derived defaults.
   for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
+  // Copilot: resolve the home the same way every spawn does (`copilotHome`
+  // expands a leading `~` and trims), so the login terminal and
+  // `agetor harness shell` write the login where runs will read it. Only when
+  // the harness names a home — a home-less harness keeps the user's own default.
+  if (harness.kind === "copilot" && (nonBlankString(harness.home) || nonBlankString(harness.env?.COPILOT_HOME))) {
+    env.COPILOT_HOME = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+  }
   return env;
+}
+
+function nonBlankString(v: string | null | undefined): boolean {
+  return typeof v === "string" && v.trim().length > 0;
 }
 
 /**

@@ -1,7 +1,8 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { Run } from "../shared/types.ts";
 
 // db.ts captures AGETOR_DATA_DIR at first import — mkdtemp BEFORE any import
 // that could pull db.ts in transitively.
@@ -105,6 +106,19 @@ async function waitForRunSettled(taskId: string, runId: string): Promise<void> {
   void taskId;
 }
 
+/** Waits until this task has a run that isn't one of `knownIds`, and until
+ *  that run has settled, then returns it. Never picks "the newest" run by
+ *  index: `runs.listForTask` orders by `started_at` alone, so a run started in
+ *  the same millisecond as an earlier one can sort on either side of it (a
+ *  wait on `listForTask(...)[0]` then reads the earlier, settled run and
+ *  passes before the new turn has even run). */
+async function waitForNewRunSettled(taskId: string, knownIds: string[]): Promise<Run> {
+  const { runs } = await import("./db.ts");
+  const fresh = () => runs.listForTask(taskId).filter((r) => !knownIds.includes(r.id));
+  await waitFor(() => fresh().length === 1 && fresh()[0]!.status !== "running");
+  return fresh()[0]!;
+}
+
 test("startTask (copilot) mints a run row, persists the self-issued session id, and moves the card to review", async () => {
   const { runs, tasks } = await import("./db.ts");
   const { sessionNameFor } = await import("./claude-tmux.ts");
@@ -167,14 +181,14 @@ test("a follow-up after a same-kind harness switch starts a fresh session and sa
   tasks.update(taskId, { agent: "copilot-2" });
   const res = await sendInput(runId, "continue on the other account");
   expect(res.delivered).toBe(true);
-  await waitFor(() => runs.listForTask(taskId).length === 2 && runs.listForTask(taskId)[0]?.status !== "running");
+  const second = await waitForNewRunSettled(taskId, [runId]);
 
   const texts = await statusTexts(taskId);
   expect(texts).toContain(
     `previous GitHub Copilot context is on harness "copilot" — starting a fresh session (context didn't carry over)`,
   );
   expect(texts.some((t) => t.startsWith("resuming GitHub Copilot session "))).toBe(false);
-  expect(runs.listForTask(taskId)[0]?.agent).toBe("copilot-2");
+  expect(second.agent).toBe("copilot-2");
 });
 
 test("a resume whose session dir is missing under this COPILOT_HOME starts fresh; once it exists the next follow-up resumes", async () => {
@@ -190,7 +204,7 @@ test("a resume whose session dir is missing under this COPILOT_HOME starts fresh
     // The fake driver wrote no session-state dir → "not found, starting fresh".
     const res1 = await sendInput(runId, "second turn");
     expect(res1.delivered).toBe(true);
-    await waitFor(() => runs.listForTask(taskId).length === 2 && runs.listForTask(taskId)[0]?.status !== "running");
+    const second = await waitForNewRunSettled(taskId, [runId]);
     expect(await statusTexts(taskId)).toContain(
       `previous Copilot session ${sessionId.slice(0, 8)}… not found for this account — starting fresh`,
     );
@@ -199,9 +213,9 @@ test("a resume whose session dir is missing under this COPILOT_HOME starts fresh
     mkdirSync(path.join(copilotHomeDir, "session-state", sessionId), { recursive: true });
     const res2 = await sendInput(runId, "third turn");
     expect(res2.delivered).toBe(true);
-    await waitFor(() => runs.listForTask(taskId).length === 3 && runs.listForTask(taskId)[0]?.status !== "running");
+    const third = await waitForNewRunSettled(taskId, [runId, second.id]);
     expect(await statusTexts(taskId)).toContain(`resuming GitHub Copilot session ${sessionId.slice(0, 8)}…`);
-    expect(runs.listForTask(taskId)[0]?.copilotSessionId).toBe(sessionId);
+    expect(third.copilotSessionId).toBe(sessionId);
   } finally {
     delete process.env.AGETOR_COPILOT_FAKE_REQUIRE_SESSION_DIR;
   }
@@ -245,7 +259,8 @@ test("a queued follow-up refused by Pre-flight 1b goes to the backlog with a sta
     process.env.FAKE_COPILOT_VERSION = "1.0.104";
     const ok = await sendInput(firstRunId, "after upgrade");
     expect(ok.delivered).toBe(true);
-    await waitFor(() => runs.listForTask(taskId).length === 2 && runs.listForTask(taskId)[0]?.status !== "running");
+    await waitForNewRunSettled(taskId, [firstRunId]);
+    expect(runs.listForTask(taskId).length).toBe(2);
     expect(tasks.get(taskId)?.backlog?.length).toBe(2);
   } finally {
     process.env.FAKE_COPILOT_VERSION = "1.0.104";
@@ -388,12 +403,18 @@ test("a tmux launch failure surfaces as a failed run and the task returns to rea
   const bin = path.join(dir, "tmux");
   writeFileSync(
     bin,
+    // Match whole argument words, never a substring of the joined argv: the
+    // new-session argv carries mkdtemp paths whose random suffix can start
+    // with `V` (`…-home-Vx3k2a`), and a `*-V*` glob on "$*" then answered the
+    // launch as a version probe and let it "succeed".
     `#!/bin/sh\n`
-      + `case "$*" in\n`
-      + `  *-V*) echo "tmux 3.4"; exit 0;;\n`
-      + `  *new-session*) echo "boom: cannot launch" >&2; exit 1;;\n`
-      + `  *) exit 1;;\n`
-      + `esac\n`,
+      + `for a in "$@"; do\n`
+      + `  case "$a" in\n`
+      + `    -V) echo "tmux 3.4"; exit 0;;\n`
+      + `    new-session) echo "boom: cannot launch" >&2; exit 1;;\n`
+      + `  esac\n`
+      + `done\n`
+      + `exit 1\n`,
   );
   chmodSync(bin, 0o755);
   const prevBin = process.env.AGETOR_TMUX_BIN;
@@ -470,14 +491,12 @@ test("a follow-up with no recorded Copilot session on any harness starts fresh, 
 
   const res = await sendInput(priorRunId, "try again");
   expect(res.delivered).toBe(true);
-  await waitFor(() => runs.listForTask(taskId).length === 2 && runs.listForTask(taskId)[0]?.status !== "running");
+  const newest = await waitForNewRunSettled(taskId, [priorRunId]);
 
   const texts = await statusTexts(taskId);
   expect(texts).toContain("no prior GitHub Copilot session — starting fresh");
   expect(texts.some((t) => t.startsWith("resuming GitHub Copilot session "))).toBe(false);
   expect(texts.some((t) => t.startsWith("previous GitHub Copilot context is on harness"))).toBe(false);
-  const newest = runs.listForTask(taskId)[0]!;
-  expect(newest.id).not.toBe(priorRunId);
   // The fresh session id the driver minted lands on the new run (via onSessionId).
   expect(newest.copilotSessionId).toBe(`fake-copilot-session-${taskId}`);
   expect(newest.status).toBe("succeeded");
@@ -511,6 +530,15 @@ test("a not-logged-in turn in Plan mode fails the run, returns the card to ready
   const { runs, tasks } = await import("./db.ts");
   const { COPILOT_LOGIN_STATUS_TEXT } = await import("./copilot-tmux.ts");
   const taskId = await createCopilotTask("__agetor_fake_copilot_auth__ plan without a login", { mode: "plan" });
+  // Plant a fresh plan.md where the driver would look for this session's plan,
+  // so only the driver's `code === 0` gate keeps a failed turn from emitting a
+  // plan chunk (the auth script itself sends no exit_plan_mode).
+  const sessionDir = path.join(copilotHomeDir, "session-state", `fake-copilot-session-${taskId}`);
+  mkdirSync(sessionDir, { recursive: true });
+  const planFile = path.join(sessionDir, "plan.md");
+  writeFileSync(planFile, "# Stale plan\n\n1. must not surface\n");
+  const future = new Date(Date.now() + 60 * 60 * 1000);
+  utimesSync(planFile, future, future);
   const runId = await startAndGetRunId(taskId);
   await waitForRunSettled(taskId, runId);
 
@@ -523,6 +551,7 @@ test("a not-logged-in turn in Plan mode fails the run, returns the card to ready
   const events = runs.eventsForTask(taskId);
   expect(events.some((e) => e.stream === "stderr" && e.data.includes("No authentication information found"))).toBe(true);
   expect(events.some((e) => e.stream === "assistant")).toBe(false);
+  expect(events.some((e) => e.stream === "tool_use" && e.data.includes('"copilot_plan"'))).toBe(false);
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
