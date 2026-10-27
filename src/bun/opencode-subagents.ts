@@ -1,7 +1,12 @@
 import { runs, subagents } from "./db.ts";
-import type { RunEvent, RunEventStream, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
+import type { OpencodeServerMode, RunEvent, RunEventStream, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
 import type { OpencodeSubagentNotice } from "./opencode-tmux.ts";
 import { exportOutcome, exportToEvents, runOpencodeExport, type OpencodeExport } from "./opencode-export.ts";
+import {
+  opencodeChildrenDieWithTurn,
+  opencodeTurnBreadcrumbPrefix,
+  parseOpencodeTurnBreadcrumb,
+} from "../shared/opencode.ts";
 
 /**
  * Subagent tabs for OpenCode tasks (`docs/plans/add-opencode-harness.md`
@@ -24,12 +29,17 @@ import { exportOutcome, exportToEvents, runOpencodeExport, type OpencodeExport }
  *  - unfinished child on a v2 Shared turn → `orphaned`: OpenCode's service
  *    may still be running it, so later turn ends re-check orphaned rows (a
  *    re-check only settles one once its export reports an outcome; it never
- *    relabels it "stopped", whatever server mode the later turn ran in).
+ *    relabels it "stopped", whatever server mode the later turn ran in) —
+ *    until {@link ORPHAN_RECHECK_MAX_AGE_MS} after it was orphaned, when a
+ *    still-unfinished child is given up on (`failed`), so a child whose
+ *    service died can't cost an export at every turn end forever.
  *
  * Two paths skip `beforeSettle` and are covered separately: a session
  * teardown (delete/archive/agent switch → `dropOpencodeSession`) and a boot
  * with no live tail to finish the turn; both call
- * `orphanRunningOpencodeSubagents`. Every settle fires the settle hook (the
+ * `orphanRunningOpencodeSubagents`, which applies the same rule from the
+ * dying turn's own recorded server mode ({@link opencodeTurnOfRun}). Every
+ * settle fires the settle hook (the
  * orchestrator's held-task release), so a refresh that outlives the driver's
  * `beforeSettle` budget still lets a held task go when it finally lands.
  */
@@ -160,6 +170,32 @@ function label(row: Subagent): string {
   return row.description ?? row.agentType ?? "subagent";
 }
 
+/**
+ * The CLI line and effective server mode the turn of `runId` ran with, read
+ * from its D-19 opening status line — the durable record, since
+ * `task.opencodeServer` may have changed since and a boot has no memory of
+ * the launch. Null when the run has no such line (or the read fails).
+ */
+export function opencodeTurnOfRun(runId: string | null): { major: 1 | 2; server: OpencodeServerMode | null } | null {
+  if (!runId) return null;
+  try {
+    // Per-major prefixes: `LIKE` is case-insensitive, and a bare `opencode `
+    // prefix would also match this module's own `OpenCode subagent …` lines.
+    for (const major of [2, 1] as const) {
+      const turn = parseOpencodeTurnBreadcrumb(runs.lastStatusDataWithPrefix(runId, opencodeTurnBreadcrumbPrefix(major)));
+      if (turn) return turn;
+    }
+  } catch (e) {
+    console.error(`[opencode-subagents] failed to read the turn breadcrumb of ${runId}:`, e);
+  }
+  return null;
+}
+
+/** How long an `orphaned` row keeps being re-checked at turn ends. A
+ *  background child that hasn't finished a day after its turn ended is
+ *  dead (its Shared service restarted or was killed). */
+export const ORPHAN_RECHECK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 function settleRow(row: Subagent, status: SubagentStatus): void {
   const endedAt = Date.now();
   subagents.setStatus(row.id, status, endedAt);
@@ -202,7 +238,23 @@ async function refreshRow(
   // service; only an export outcome (above) may settle it. This turn's own
   // server mode says nothing about it — a Standalone turn must not call it
   // "stopped" (or fail it) just because the export still reads unfinished.
-  if (row.status === "orphaned") return;
+  if (row.status === "orphaned") {
+    const orphanedAt = row.endedAt ?? row.startedAt;
+    if (Date.now() - orphanedAt < ORPHAN_RECHECK_MAX_AGE_MS) return;
+    if (runId && exp) appendExportEvents(row, runId, exp);
+    if (runId) {
+      append(
+        row,
+        runId,
+        "status",
+        `OpenCode subagent "${label(row)}" never reported finishing — stopped checking on it`,
+        `opencode:subagent:${row.id}:expired`,
+        null,
+      );
+    }
+    settleRow(row, "failed");
+    return;
+  }
 
   if (a.standalone || a.major === 1) {
     // The child died with the turn's private server (A6a); show what it got done.
@@ -227,14 +279,16 @@ async function refreshRow(
 }
 
 /**
- * Flip every still-`running` OpenCode subagent row of a task to `orphaned`
- * when nothing will run a final refresh for it: the task's OpenCode session
- * was torn down (delete/archive/agent switch — `dropOpencodeSession` resolves
- * the tail without `beforeSettle`) or agetor booted with no live tail. Left
- * `running`, the row would hold the task's next turn (any harness) in
- * `running` forever. `orphaned`, not `failed`: a v2 Shared child may still be
- * running in OpenCode's service, and a later OpenCode turn re-checks it.
- * Fires the settle hook once. Returns how many rows it flipped; never throws.
+ * Settle every still-`running` OpenCode subagent row of a task when nothing
+ * will run a final refresh for it: the task's OpenCode session was torn down
+ * (delete/archive/agent switch — `dropOpencodeSession` resolves the tail
+ * without `beforeSettle`) or agetor booted with no live tail. Left `running`,
+ * the row would hold the task's next turn (any harness) in `running` forever.
+ * The row's own turn decides how (A6a, {@link opencodeTurnOfRun}): a v1 or
+ * Standalone child died with that turn → `failed`; a v2 Shared child may
+ * still be running in OpenCode's service → `orphaned`, which a later OpenCode
+ * turn re-checks — as is a row whose turn mode isn't recorded. Fires the
+ * settle hook once. Returns how many rows it settled; never throws.
  */
 export function orphanRunningOpencodeSubagents(taskId: string, reason: string): number {
   let rows: Subagent[];
@@ -249,13 +303,18 @@ export function orphanRunningOpencodeSubagents(taskId: string, reason: string): 
   let flipped = 0;
   for (const row of rows) {
     try {
-      const endedAt = Date.now();
-      subagents.setStatus(row.id, "orphaned", endedAt);
-      emitLifecycle({ ...row, status: "orphaned", endedAt }, "finished");
-      flipped++;
       const runId = runIdFor(row);
+      const turn = opencodeTurnOfRun(runId);
+      const status: SubagentStatus = turn && opencodeChildrenDieWithTurn(turn) ? "failed" : "orphaned";
+      const endedAt = Date.now();
+      subagents.setStatus(row.id, status, endedAt);
+      emitLifecycle({ ...row, status, endedAt }, "finished");
+      flipped++;
       if (runId) {
-        append(row, runId, "status", `OpenCode subagent "${label(row)}" was left unfinished — ${reason}`, `opencode:subagent:${row.id}:left`, null);
+        const text = status === "failed"
+          ? `OpenCode subagent "${label(row)}" stopped — ${reason}`
+          : `OpenCode subagent "${label(row)}" was left unfinished — ${reason}`;
+        append(row, runId, "status", text, `opencode:subagent:${row.id}:left`, null);
       }
     } catch (e) {
       console.error(`[opencode-subagents] failed to orphan ${row.id}:`, e);

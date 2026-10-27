@@ -5,9 +5,13 @@ import {
   OPENCODE_SESSION_ID_RE,
   OPENCODE_VERSION_RE,
   effectiveOpencodeServer,
+  formatOpencodeTurnBreadcrumb,
+  opencodeChildrenDieWithTurn,
   opencodeMajor,
   opencodeModelArgs,
+  opencodeTurnBreadcrumbPrefix,
   parseOpencodeServerInput,
+  parseOpencodeTurnBreadcrumb,
 } from "./opencode.ts";
 import { importedSessionOf } from "./imported-session.ts";
 import {
@@ -124,6 +128,30 @@ describe("parseOpencodeServerInput", () => {
       expect(parseOpencodeServerInput(v)).toEqual({ error: OPENCODE_SERVER_INPUT_ERROR });
     }
     expect(OPENCODE_SERVER_INPUT_ERROR).toBe("opencodeServer must be one of shared, standalone");
+  });
+});
+
+describe("turn breadcrumb (D-19)", () => {
+  test("format → parse round-trips the CLI line and effective server", () => {
+    for (const [major, server] of [[2, "shared"], [2, "standalone"], [1, null]] as const) {
+      const line = formatOpencodeTurnBreadcrumb({ major, server, modelLabel: "OpenCode default", effort: "auto", mode: "auto" });
+      expect(line.startsWith(opencodeTurnBreadcrumbPrefix(major))).toBe(true);
+      expect(parseOpencodeTurnBreadcrumb(line)).toEqual({ major, server });
+    }
+    expect(formatOpencodeTurnBreadcrumb({ major: 1, server: null, modelLabel: "M", effort: "high", mode: "plan" }))
+      .toBe("opencode 1.x · server=n/a · model=M · effort=high · mode=plan");
+  });
+
+  test("anything else parses as null", () => {
+    for (const t of [null, undefined, "", "OpenCode subagent \"x\" stopped", "opencode 3.x · server=shared", "opencode 2.x · server=sharedish", "opencode 2.x · server=bogus · model=x"]) {
+      expect(parseOpencodeTurnBreadcrumb(t)).toBeNull();
+    }
+  });
+
+  test("only a v2 Shared turn's children can outlive it", () => {
+    expect(opencodeChildrenDieWithTurn({ major: 1, server: null })).toBe(true);
+    expect(opencodeChildrenDieWithTurn({ major: 2, server: "standalone" })).toBe(true);
+    expect(opencodeChildrenDieWithTurn({ major: 2, server: "shared" })).toBe(false);
   });
 });
 

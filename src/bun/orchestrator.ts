@@ -30,7 +30,7 @@ import {
 } from "./agents.ts";
 import { cachedCliVersion, checkHarness, upgradeHintFor } from "./agent-status.ts";
 import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
-import { OPENCODE_DEFAULT_MODEL, opencodeMajor } from "../shared/opencode.ts";
+import { OPENCODE_DEFAULT_MODEL, formatOpencodeTurnBreadcrumb, opencodeMajor } from "../shared/opencode.ts";
 import { importedSessionOf } from "../shared/imported-session.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
@@ -151,6 +151,7 @@ import {
   reattachOpencodeSession,
 } from "./opencode-tmux.ts";
 import {
+  opencodeTurnOfRun,
   orphanRunningOpencodeSubagents,
   setOpencodeSubagentEmitter,
   setOpencodeSubagentSettleHook,
@@ -674,8 +675,13 @@ export function isHeldByBackgroundAgents(taskId: string): boolean {
  * bails, so a held release can't stomp a follow-up turn's `running` state.
  */
 function maybeReleaseHeldTask(taskId: string): void {
+  // A delete or archive tearing the task's session down settles its subagent
+  // rows on the way out; moving the card to `review` then would fire a column
+  // event, a toast, an OS notification and the pipeline runner's column
+  // listener for a task that is going away (or already frozen).
+  if (deletingTaskIds.has(taskId)) return;
   const task = tasks.get(taskId);
-  if (!task || task.column !== "running" || task.runId == null) return;
+  if (!task || task.archivedAt != null || task.column !== "running" || task.runId == null) return;
   if (runs.get(task.runId)?.status !== "succeeded") return;
   if (subagents.hasRunning(taskId)) return;
   updateColumn(taskId, task.runId, "review");
@@ -4834,10 +4840,12 @@ async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
 
 /**
  * Reattach to an OpenCode turn whose tmux session survived an agetor restart
- * (boot reconcile). Wires the same subagent hooks `spawnAgent` does. The
- * server mode the turn launched with isn't recorded, so a v2 child left
- * unfinished at settle is treated as still running in the shared service
- * (`standalone: false` → orphaned, spike A6), never as stopped.
+ * (boot reconcile). Wires the same subagent hooks `spawnAgent` does, with the
+ * CLI line and server mode the turn launched with, read back from its own
+ * D-19 status line (`task.opencodeServer` may have changed since, and the
+ * installed CLI may have been upgraded under the live turn). With no such
+ * line the turn is treated as v2 Shared: a child left unfinished at settle
+ * is then orphaned and re-checked (spike A6), never called stopped.
  */
 async function reattachOpencodeTurn(
   runId: string,
@@ -4849,8 +4857,10 @@ async function reattachOpencodeTurn(
 ): Promise<SpawnedAgent | null> {
   const harness = resolveHarness(harnessId);
   if (!harness) return null;
-  const major = opencodeMajor(await cachedCliVersion(harness));
-  const { onSubagent, beforeSettle } = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone: false });
+  const turn = opencodeTurnOfRun(runId);
+  const major = turn?.major ?? opencodeMajor(await cachedCliVersion(harness));
+  const standalone = turn?.server === "standalone";
+  const { onSubagent, beforeSettle } = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone });
   return reattachOpencodeSession({
     taskId,
     runId,
@@ -4875,19 +4885,20 @@ function opencodeModelLabel(harness: Harness, model: string | null): string {
 }
 
 /**
- * D-19: the opening status line of every OpenCode turn —
- * `opencode <major>.x · server=<shared|standalone|n/a> · model=<label> ·
- * effort=<id> · mode=<id>`. The server is the EFFECTIVE one (a harness with
- * a home always runs Standalone; v1 has none → `n/a`), and the effort is the
- * one actually passed (the sentinel model carries no variant → `auto`).
+ * D-19: the opening status line of every OpenCode turn
+ * (`formatOpencodeTurnBreadcrumb`). The server is the EFFECTIVE one (a
+ * harness with a home always runs Standalone; v1 has none → `n/a`), and the
+ * effort is the one actually passed (the sentinel model carries no variant
+ * → `auto`). The line is also the run's durable record of its server mode,
+ * read back by `opencodeTurnOfRun` (teardown, boot, reattach).
  */
 function opencodeTurnBreadcrumb(harness: Harness, task: Task, cliVersion: string | null): string {
   const major = opencodeMajor(cliVersion);
-  const server = opencodeEffectiveServerFor(harness, task, cliVersion) ?? "n/a";
+  const server = opencodeEffectiveServerFor(harness, task, cliVersion);
   const model = task.model ?? DEFAULT_MODEL.opencode;
   const effort = model === OPENCODE_DEFAULT_MODEL ? "auto" : (task.effort?.trim() || "auto");
   const mode = task.mode ?? defaultModeFor("opencode");
-  return `opencode ${major}.x · server=${server} · model=${opencodeModelLabel(harness, model)} · effort=${effort} · mode=${mode}`;
+  return formatOpencodeTurnBreadcrumb({ major, server, modelLabel: opencodeModelLabel(harness, model), effort, mode });
 }
 
 /**

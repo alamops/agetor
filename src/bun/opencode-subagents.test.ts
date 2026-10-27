@@ -238,6 +238,71 @@ test("orphanRunningOpencodeSubagents flips only running OpenCode rows, posts a s
   }
 });
 
+function seedBreadcrumb(runId: string, major: 1 | 2, server: "shared" | "standalone" | "n/a"): void {
+  db.runs.appendEvent(runId, "status", `opencode ${major}.x · server=${server} · model=OpenCode default · effort=auto · mode=auto`);
+}
+
+test("opencodeTurnOfRun reads the run's D-19 line and ignores this module's own OpenCode status lines", () => {
+  const { runId } = seedTask();
+  expect(mod.opencodeTurnOfRun(runId)).toBeNull();
+  expect(mod.opencodeTurnOfRun(null)).toBeNull();
+  seedBreadcrumb(runId, 2, "standalone");
+  // A later `OpenCode subagent …` line (LIKE is case-insensitive) must not shadow it.
+  db.runs.appendEvent(runId, "status", 'OpenCode subagent "x" is still running — its tab fills when a later turn finishes');
+  expect(mod.opencodeTurnOfRun(runId)).toEqual({ major: 2, server: "standalone" });
+  const v1 = seedTask();
+  seedBreadcrumb(v1.runId, 1, "n/a");
+  expect(mod.opencodeTurnOfRun(v1.runId)).toEqual({ major: 1, server: null });
+});
+
+test("orphanRunningOpencodeSubagents fails rows of a Standalone or v1 turn, orphans those of a Shared one", () => {
+  installEmitter();
+  const cases = [
+    { major: 2, server: "standalone", want: "failed" },
+    { major: 1, server: "n/a", want: "failed" },
+    { major: 2, server: "shared", want: "orphaned" },
+  ] as const;
+  for (const c of cases) {
+    const { taskId, runId } = seedTask();
+    seedBreadcrumb(runId, c.major, c.server);
+    const child = `ses_turn${randomUUID().replace(/-/g, "")}`;
+    mod.registerOpencodeSubagent({ taskId, runId, notice: notice(child, { description: "Job" }) });
+    expect(mod.orphanRunningOpencodeSubagents(taskId, "the task was archived")).toBe(1);
+    expect(row(child).status).toBe(c.want);
+  }
+  expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
+    'OpenCode subagent "Job" stopped — the task was archived',
+    'OpenCode subagent "Job" stopped — the task was archived',
+    'OpenCode subagent "Job" was left unfinished — the task was archived',
+  ]);
+});
+
+test("an orphaned row still unfinished past the re-check window is given up on (failed), once", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const stale = `ses_stale${randomUUID().replace(/-/g, "")}`;
+  const fresh = `ses_fresh${randomUUID().replace(/-/g, "")}`;
+  installExports({ [stale]: "v2-session-export-bg-child-dead.json", [fresh]: "v2-session-export-bg-child-dead.json" });
+  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(stale, { description: "Stale job" }) });
+  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(fresh, { description: "Fresh job" }) });
+  db.subagents.setStatus(mod.opencodeSubagentId(stale), "orphaned", Date.now() - mod.ORPHAN_RECHECK_MAX_AGE_MS - 1000);
+  db.subagents.setStatus(mod.opencodeSubagentId(fresh), "orphaned", Date.now() - 1000);
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId, { standalone: false }));
+  expect(row(stale).status).toBe("failed");
+  expect(row(fresh).status).toBe("orphaned");
+  expect(emitted.filter((e) => e.stream === "status" && e.subagentId === null).map((e) => e.data)).toEqual([
+    'OpenCode subagent "Stale job" never reported finishing — stopped checking on it',
+  ]);
+  // A complete export still wins over the window: the outcome is recorded.
+  const late = `ses_late${randomUUID().replace(/-/g, "")}`;
+  exportMod.__forTest.setExportRunner(async () => exportMod.parseOpencodeExport(
+    readFileSync(path.join(FIXTURES, "v2-session-export-child.json"), "utf8"), 2));
+  mod.registerOpencodeSubagent({ taskId, runId, notice: notice(late) });
+  db.subagents.setStatus(mod.opencodeSubagentId(late), "orphaned", Date.now() - mod.ORPHAN_RECHECK_MAX_AGE_MS - 1000);
+  await mod.refreshOpencodeSubagents(refreshArgs(taskId));
+  expect(row(late).status).toBe("completed");
+});
+
 test("v1: an unfinished child is failed even without --standalone", async () => {
   const { taskId, runId } = seedTask();
   const child = `ses_v1${randomUUID().replace(/-/g, "")}`;

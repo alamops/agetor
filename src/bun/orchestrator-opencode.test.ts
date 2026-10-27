@@ -341,6 +341,77 @@ test("boot reconcile orphans OpenCode rows no live tail will settle — and rele
   expect(db.tasks.get(oc.taskId)?.column).toBe("review");
 });
 
+/** The D-19 opening line a turn of `server` on CLI `major` persists. */
+function seedBreadcrumb(runId: string, major: 1 | 2, server: "shared" | "standalone" | "n/a"): void {
+  db.runs.appendEvent(runId, "status", `opencode ${major}.x · server=${server} · model=OpenCode default · effort=auto · mode=auto`);
+}
+
+test("an agent switch off a Standalone turn fails the rows it left (the children died with it) — no later export", async () => {
+  const { taskId, runId } = insertTaskWithRun({ agent: "opencode", column: "review", runStatus: "succeeded" });
+  seedBreadcrumb(runId, 2, "standalone");
+  const rowId = await seedRunningChild(taskId, runId, "Standalone scan");
+  const before = db.tasks.get(taskId)!;
+  const after = db.tasks.update(taskId, { agent: "claude-code" })!;
+  await orch.reconcileTaskSession(taskId, before, after);
+  expect(db.subagents.get(rowId)?.status).toBe("failed");
+  expect(statusLines(runId)).toContain('OpenCode subagent "Standalone scan" stopped — the task switched harness');
+
+  // A failed row is never re-checked: a later turn end runs no export for it.
+  const exportMod = await import("./opencode-export.ts");
+  const exported: string[] = [];
+  const prev = exportMod.__forTest.setExportRunner(async (a) => {
+    exported.push(a.sessionId);
+    return null;
+  });
+  try {
+    const { refreshOpencodeSubagents } = await import("./opencode-subagents.ts");
+    await refreshOpencodeSubagents({ taskId, bin: "opencode", env: {}, cwd: WORKDIR, major: 2, standalone: false, final: true });
+    expect(exported).toEqual([]);
+  } finally {
+    exportMod.__forTest.setExportRunner(prev);
+  }
+});
+
+test("the turn's recorded mode wins over the task's current opencodeServer", async () => {
+  // The turn ran Shared; the task was switched to Standalone afterwards.
+  const { taskId, runId } = insertTaskWithRun({ agent: "opencode", column: "review", runStatus: "succeeded" });
+  seedBreadcrumb(runId, 2, "shared");
+  db.tasks.update(taskId, { opencodeServer: "standalone" });
+  const rowId = await seedRunningChild(taskId, runId, "Shared scan");
+  const before = db.tasks.get(taskId)!;
+  const after = db.tasks.update(taskId, { agent: "claude-code" })!;
+  await orch.reconcileTaskSession(taskId, before, after);
+  expect(db.subagents.get(rowId)?.status).toBe("orphaned");
+});
+
+test("boot reconcile fails the rows a dead v1 turn left running", async () => {
+  setTmux("absent");
+  const oc = insertTaskWithRun({ agent: "opencode", column: "review", runStatus: "succeeded" });
+  seedBreadcrumb(oc.runId, 1, "n/a");
+  const rowId = await seedRunningChild(oc.taskId, oc.runId, "v1 child");
+  await orch.reconcileOrphans();
+  expect(db.subagents.get(rowId)?.status).toBe("failed");
+  expect(statusLines(oc.runId)).toContain('OpenCode subagent "v1 child" stopped — agetor restarted while it was running');
+});
+
+test("deleting a held task settles its rows without moving the card (no column event)", async () => {
+  // Held: the turn succeeded, a background child keeps the card in `running`.
+  const { taskId, runId } = insertTaskWithRun({ agent: "opencode", column: "running", runStatus: "succeeded" });
+  await seedRunningChild(taskId, runId, "Held child");
+  const columns: string[] = [];
+  const unsubscribe = orch.subscribeGlobal((e) => {
+    if (e.kind === "column" && e.taskId === taskId) columns.push(e.column);
+  });
+  try {
+    await orch.deleteTask(taskId);
+    await settle(100);
+  } finally {
+    unsubscribe();
+  }
+  expect(db.tasks.get(taskId)).toBeNull();
+  expect(columns).toEqual([]);
+});
+
 test("createTask: a valid opencodeServer is stored, anything else reads as shared", async () => {
   expect((await newTask({ opencodeServer: "standalone" })).opencodeServer).toBe("standalone");
   expect((await newTask({ opencodeServer: "shared" })).opencodeServer).toBe("shared");

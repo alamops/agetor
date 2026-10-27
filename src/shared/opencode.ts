@@ -102,3 +102,53 @@ export function parseOpencodeServerInput(v: unknown): OpencodeServerMode | { err
   if (v === "shared" || v === "standalone") return v;
   return { error: OPENCODE_SERVER_INPUT_ERROR };
 }
+
+/**
+ * The fixed head of an OpenCode turn's opening status line (D-19) for a CLI
+ * line: `opencode <major>.x · server=`. Also the persisted record of the
+ * server mode a turn ran in — `task.opencodeServer` may change between turns,
+ * so a later reader (teardown, boot, reattach) reads the run's own line.
+ */
+export function opencodeTurnBreadcrumbPrefix(major: 1 | 2): string {
+  return `opencode ${major}.x · server=`;
+}
+
+/**
+ * D-19: the opening status line of every OpenCode turn —
+ * `opencode <major>.x · server=<shared|standalone|n/a> · model=<label> ·
+ * effort=<id> · mode=<id>`. `server` is the EFFECTIVE mode (`null` → `n/a`,
+ * v1). {@link parseOpencodeTurnBreadcrumb} is its inverse for the head.
+ */
+export function formatOpencodeTurnBreadcrumb(a: {
+  major: 1 | 2;
+  server: OpencodeServerMode | null;
+  modelLabel: string;
+  effort: string;
+  mode: string;
+}): string {
+  return `${opencodeTurnBreadcrumbPrefix(a.major)}${a.server ?? "n/a"} · model=${a.modelLabel} · effort=${a.effort} · mode=${a.mode}`;
+}
+
+const TURN_BREADCRUMB_RE = /^opencode ([12])\.x · server=(shared|standalone|n\/a)(?: · |$)/;
+
+/**
+ * The CLI line and effective server mode a {@link formatOpencodeTurnBreadcrumb}
+ * line records, or null when `text` isn't one. `server` is `null` for `n/a`.
+ */
+export function parseOpencodeTurnBreadcrumb(
+  text: string | null | undefined,
+): { major: 1 | 2; server: OpencodeServerMode | null } | null {
+  if (!text) return null;
+  const m = TURN_BREADCRUMB_RE.exec(text);
+  if (!m) return null;
+  return { major: m[1] === "1" ? 1 : 2, server: m[2] === "n/a" ? null : (m[2] as OpencodeServerMode) };
+}
+
+/**
+ * True when a turn's subagent children cannot outlive it (A6a): every v1
+ * child is foreground, and a Standalone v2 child dies with the turn's
+ * private server. Only a v2 Shared child may keep running in the service.
+ */
+export function opencodeChildrenDieWithTurn(t: { major: 1 | 2; server: OpencodeServerMode | null }): boolean {
+  return t.major === 1 || t.server === "standalone";
+}
