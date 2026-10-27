@@ -475,3 +475,19 @@ export function importedSessionOf(t: Pick<Task, "importedClaude" | "importedOpen
 | Existing task/profile rows (no `opencode_server`) | In this run | 078 `DEFAULT 'shared'` backfills every row |
 | Frozen snapshots / bundle files without the field | In this run | Lenient reads → `"shared"` (W1-B, W2-F) |
 | Orphaned code | None | The change is additive; the reversed `enabled=0` posture is handled at runtime (D-14), with no seed edits to old migrations |
+
+### 9a. Execution addendum (Implementing step, 2026-10-27)
+
+| Item | Disposition | Task ID / reason / who deferred |
+| --- | --- | --- |
+| Spike amendments A1–A15 (wrapper `trap 'true' INT`, `api --standalone model.list` / `models --verbose` instead of `serve`, v1 `opencode export`, v1-only resume-not-found, field paths) | In this run | Applied in W1-C/W1-D/W1-E/W1-F/W2-D briefs |
+| Owner: v2 `todowrite` needs `experimental.todo` (no config injection) | In this run | Documented (README, CLAUDE.md); G10 refined by owner |
+| Owner: busy import refused only when unfinished AND updated < 10 min | In this run | W2-D (G14a refined by owner) |
+| Live-smoke fixes: v1 error cause line, first-run `--standalone` probe race (retry once), auth cache keyed on probe env | In this run | W4-B |
+| OpenCode 1 sharing a home with OpenCode 2 ("Database is not empty…") | In this run | Notice in `agent-status.ts` + docs (final sweep) |
+| Tests ran the real `opencode` and wrote into the owner's `$HOME` | In this run | `src/test-preload.ts` + `agents.test.ts` env restore; polluted dirs removed |
+| Harness rows leaking across test files (process-wide db) | In this run | `src/bun/test-harness-state.ts` |
+| Reconcile drained a queued follow-up onto the new harness during the 5 s graceful drop; archive missed `antigravityTurnQueue` | In this run | W2-A |
+| D-19 breadcrumb naming the real model behind "OpenCode default" (`GET /api/model/default`) | Out of scope | Spike A11 marks it optional; the label "OpenCode default" is accurate |
+| v1 Stop leaves the bash tool's child process running | Out of scope | OpenCode 1 behavior (spike Q14/A1); v1 is the legacy line, documented |
+| RunPanel idle-task placeholder "resumes the conversation in a fresh session" (`RunPanel.tsx`) | Out of scope | Pre-existing copy for every kind, unrelated to OpenCode (found by W3-T2) |
