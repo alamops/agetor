@@ -994,3 +994,35 @@ describe("speed (D15)", () => {
     expect(body.error).toContain("speed must be one of off, fast, ultrafast");
   });
 });
+
+describe("opencodeServer (D-4)", () => {
+  test("an imported Agent with opencodeServer standalone creates a profile that keeps it", async () => {
+    // Point the OpenCode probe at a missing binary so no real CLI is spawned:
+    // a not-installed harness only adds a warning, it never blocks the import.
+    const prevBin = process.env.AGETOR_OPENCODE_BIN;
+    process.env.AGETOR_OPENCODE_BIN = path.join(DATA_DIR, "no-opencode-here");
+    try {
+      const text = JSON.stringify({
+        format: "agetor-bundle",
+        version: 1,
+        agents: [{
+          key: "oc",
+          name: "Solo",
+          harness: { id: "opencode", kind: "opencode", label: "OpenCode" },
+          model: "opencode-default",
+          opencodeServer: "standalone",
+        }],
+      });
+      const res = await call("/bundle/import", { text });
+      expect(res.status).toBe(201);
+      const [agent] = ((await res.json()) as { agents: AgentProfile[] }).agents;
+      expect(agent!.harness).toBe("opencode");
+      expect(agent!.opencodeServer).toBe("standalone");
+      const stored = await get<AgentProfile[]>("/agent-profiles");
+      expect(stored.map((p) => [p.name, p.opencodeServer])).toEqual([["Solo", "standalone"]]);
+    } finally {
+      if (prevBin === undefined) delete process.env.AGETOR_OPENCODE_BIN;
+      else process.env.AGETOR_OPENCODE_BIN = prevBin;
+    }
+  });
+});

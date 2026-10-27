@@ -1287,18 +1287,18 @@ function GeneralSection({
       <section className="space-y-1">
         <div className="flex items-center justify-between gap-4">
           <label htmlFor="claude-sessions-launch-scan" className="text-xs text-muted-foreground">
-            Look for Claude Code sessions on launch
+            Look for Claude Code and OpenCode sessions on launch
           </label>
           <Switch
             id="claude-sessions-launch-scan"
             data-testid="claude-sessions-launch-scan"
             checked={launchScan}
             onCheckedChange={setLaunchScanPref}
-            aria-label="Look for Claude Code sessions on launch"
+            aria-label="Look for Claude Code and OpenCode sessions on launch"
           />
         </div>
         <p className="text-[11px] text-muted-foreground">
-          On startup, notice Claude Code sessions that were started outside Agetor so you can import them.
+          On startup, notice Claude Code and OpenCode sessions that were started outside Agetor so you can import them.
         </p>
       </section>
 
@@ -1533,6 +1533,17 @@ function HarnessesSection({
                       {status.authHelp}
                     </div>
                   )}
+                  {/* Neutral, non-blocking lines (D-16): a missing login or
+                      an available upgrade never stops a run. */}
+                  {status?.notices?.map((notice) => (
+                    <div
+                      key={notice}
+                      data-testid="harness-status-notice"
+                      className="text-[11px] text-muted-foreground"
+                    >
+                      {notice}
+                    </div>
+                  ))}
                 </div>
                 <Switch
                   checked={pendingToggle[h.id] ?? h.enabled}

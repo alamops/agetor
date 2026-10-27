@@ -60,6 +60,21 @@ function FxLoginHint({ className }: { className?: string }) {
   );
 }
 
+/** Neutral, non-blocking status lines (D-16) — e.g. OpenCode's "no
+ *  credentials found" hint. Never gates a run, so no warning tone. */
+function StatusNotices({ notices }: { notices?: string[] }) {
+  if (!notices || notices.length === 0) return null;
+  return (
+    <>
+      {notices.map((notice) => (
+        <p key={notice} data-testid="harness-status-notice" className="ml-5 text-[11px] text-muted-foreground">
+          {notice}
+        </p>
+      ))}
+    </>
+  );
+}
+
 function StepIcon({ done, index }: { done: boolean; index: number }) {
   if (done) {
     return (
@@ -101,15 +116,18 @@ function HarnessStepDetail({
           const disabled = harnessRows !== null && row ? !row.enabled : false;
           if (s.available && disabled) {
             return (
-              <div key={s.harnessId} className="flex items-center gap-2 text-xs">
-                <span className="inline-block size-1.5 shrink-0 rounded-full bg-muted-foreground" />
-                <AgentIcon kind={s.kind} className="size-3.5 shrink-0" />
-                <span className="min-w-0 flex-1 truncate text-muted-foreground">
-                  {label} — installed but disabled
-                </span>
-                <Button variant="outline" size="sm" onClick={onOpenSettingsHarnesses}>
-                  Enable in Settings…
-                </Button>
+              <div key={s.harnessId} className="space-y-1 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block size-1.5 shrink-0 rounded-full bg-muted-foreground" />
+                  <AgentIcon kind={s.kind} className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                    {label} — installed but disabled
+                  </span>
+                  <Button variant="outline" size="sm" onClick={onOpenSettingsHarnesses}>
+                    Enable in Settings…
+                  </Button>
+                </div>
+                <StatusNotices notices={s.notices} />
               </div>
             );
           }
@@ -132,18 +150,22 @@ function HarnessStepDetail({
                 {s.authHelp && (
                   <p className="ml-5 text-[11px] text-muted-foreground">{s.authHelp}</p>
                 )}
+                <StatusNotices notices={s.notices} />
               </div>
             );
           }
           if (s.available) {
             return (
-              <div key={s.harnessId} className="flex items-center gap-2 text-xs">
-                <span className="inline-block size-1.5 shrink-0 rounded-full bg-success-solid" />
-                <AgentIcon kind={s.kind} className="size-3.5 shrink-0" />
-                <span className="min-w-0 flex-1 truncate">
-                  {label}
-                  {s.version && <span className="text-muted-foreground"> · {s.version}</span>}
-                </span>
+              <div key={s.harnessId} className="space-y-1 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block size-1.5 shrink-0 rounded-full bg-success-solid" />
+                  <AgentIcon kind={s.kind} className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate">
+                    {label}
+                    {s.version && <span className="text-muted-foreground"> · {s.version}</span>}
+                  </span>
+                </div>
+                <StatusNotices notices={s.notices} />
               </div>
             );
           }

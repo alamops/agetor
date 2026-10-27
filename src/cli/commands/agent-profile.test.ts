@@ -3,10 +3,12 @@ import {
   canonicalInstructions,
   formatAgentProfileListRow,
   formatAgentProfileShow,
+  opencodeServerText,
   parseAgentProfileFlags,
+  profileHarnessContext,
   taskCountText,
 } from "./agent-profile.ts";
-import type { AgentProfile } from "../../shared/types.ts";
+import type { AgentProfile, Harness } from "../../shared/types.ts";
 
 /**
  * `cmdAgentProfile` itself obtains its client via `getClient(flags)` (like
@@ -382,4 +384,64 @@ test("formatAgentProfileShow: header, fields, used-by and instructions lines", (
   expect(lines).toContain("  skills: /code-review, /security-review");
   expect(lines).toContain("  used by: 2 tasks");
   expect(lines.slice(-3)).toEqual(["  instructions:", "    Line one.", "    Line two."]);
+});
+
+// ── --opencode-server ────────────────────────────────────────────────────
+
+test("parseAgentProfileFlags: --opencode-server takes shared and standalone", () => {
+  expect(parseAgentProfileFlags(["--opencode-server", "shared"]).opencodeServer).toBe("shared");
+  expect(parseAgentProfileFlags(["--opencode-server", "standalone"]).opencodeServer).toBe("standalone");
+  expect(parseAgentProfileFlags(["--name", "x"]).opencodeServer).toBeUndefined();
+});
+
+test("parseAgentProfileFlags: a bad --opencode-server is a usage error naming the modes", () => {
+  expect(() => parseAgentProfileFlags(["--opencode-server", "private"])).toThrow(
+    "'--opencode-server' must be one of shared, standalone (got 'private')",
+  );
+  expect(() => parseAgentProfileFlags(["--opencode-server"])).toThrow("'--opencode-server' needs a value");
+});
+
+function harnessRow(over: Partial<Harness> = {}): Harness {
+  return {
+    id: "opencode",
+    kind: "opencode",
+    label: "OpenCode",
+    isBuiltin: true,
+    home: null,
+    bin: null,
+    env: {},
+    enabled: true,
+    ...over,
+  };
+}
+
+test("formatAgentProfileShow: an OpenCode profile prints its server option; other kinds don't", () => {
+  const oc = fakeProfile({ harness: "opencode", model: "opencode-default", opencodeServer: "standalone" });
+  expect(formatAgentProfileShow(oc, { kind: "opencode" })).toContain("  opencode server: standalone");
+  const shared = formatAgentProfileShow(fakeProfile({ harness: "opencode" }), { kind: "opencode" });
+  expect(shared).toContain("  opencode server: shared");
+  expect(formatAgentProfileShow(fakeProfile(), { kind: "codex" }).join("\n")).not.toContain("opencode server");
+  // No harness context (older call site) prints no line.
+  expect(formatAgentProfileShow(oc).join("\n")).not.toContain("opencode server");
+});
+
+test("opencodeServerText: notes a harness home (forced standalone) and OpenCode 1 (unused)", () => {
+  expect(opencodeServerText("shared", { home: null, version: "opencode v2.1.3" })).toBe("shared");
+  expect(opencodeServerText("standalone", { home: "/h" })).toBe("standalone");
+  expect(opencodeServerText("shared", { home: "/h", version: "2.1.3" })).toBe(
+    "shared (runs standalone: the harness has its own home)",
+  );
+  expect(opencodeServerText("shared", { version: "1.19.4" })).toBe("shared (not used by OpenCode 1)");
+  // An unknown version counts as OpenCode 2.
+  expect(opencodeServerText("standalone", { version: null })).toBe("standalone");
+});
+
+test("profileHarnessContext: the harness row first, else a built-in kind id, else unknown", () => {
+  const info = {
+    harnesses: [harnessRow({ id: "oc-work", isBuiltin: false, home: "/Users/me/oc-work" })],
+    statuses: [{ harnessId: "oc-work", version: "opencode v2.1.3" }] as never,
+  };
+  expect(profileHarnessContext("oc-work", info)).toEqual({ kind: "opencode", home: "/Users/me/oc-work", version: "opencode v2.1.3" });
+  expect(profileHarnessContext("opencode", null)).toEqual({ kind: "opencode" });
+  expect(profileHarnessContext("gone-harness", info)).toEqual({ kind: null });
 });

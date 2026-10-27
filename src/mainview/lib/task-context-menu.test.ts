@@ -582,3 +582,31 @@ test("an imported Claude session does not offer Run", () => {
   expect(actions(entries)).not.toContain("start");
   expect(actions(entries)).toContain("open");
 });
+
+describe("an imported OpenCode session does not offer Run", () => {
+  const imported = (status: "importing" | "ready" | "failed") => makeTask({
+    agent: "opencode",
+    column: "review",
+    importedOpencode: {
+      sessionId: "ses_abc123",
+      harnessId: "opencode",
+      directory: "/tmp",
+      importedAt: 1,
+      status,
+      error: status === "failed" ? "export failed" : null,
+    },
+  });
+
+  for (const status of ["importing", "ready", "failed"] as const) {
+    test(`status ${status}`, () => {
+      const entries = buildTaskContextMenu(imported(status), { isOpen: false });
+      expect(actions(entries)).not.toContain("start");
+      expect(actions(entries)).toContain("open");
+    });
+  }
+
+  test("a plain OpenCode task with no import still offers Run", () => {
+    const entries = buildTaskContextMenu(makeTask({ agent: "opencode", importedOpencode: null }), { isOpen: false });
+    expect(actions(entries)).toContain("start");
+  });
+});

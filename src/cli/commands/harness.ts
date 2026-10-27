@@ -2,9 +2,9 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table, isTTY } from "../output.ts";
 import { flagValue } from "../args.ts";
 import { ApiError, type HarnessPatchInput } from "../api-client.ts";
-import type { AgentKind } from "../../shared/types.ts";
+import type { AgentKind, HarnessStatus } from "../../shared/types.ts";
 import { usageError } from "../usage.ts";
-import { escapeControlChars } from "../../shared/terminal-text.ts";
+import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
 
 /** Printed under an fx harness whose own saved profile starts in Ask mode
  *  (`fx status --json` `permission_mode`, fx ≥0.0.14). Neutral on purpose:
@@ -50,6 +50,7 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
         if (h.kind === "fx" && st?.fxProfilePermissionMode === "ask") {
           out(`  ${c.dim("i")} ${c.bold(h.id)} ${FX_ASK_PROFILE_HINT}`);
         }
+        for (const line of harnessNoticeLines(h.id, st)) out(line);
       }
       return;
     }
@@ -137,15 +138,7 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
       const shell = process.env.SHELL || "/bin/zsh";
       const childEnv: Record<string, string | undefined> = { ...process.env, ...env };
       if (binDir) childEnv.PATH = `${binDir}:${process.env.PATH ?? ""}`;
-      // Only claude's and cursor's login commands are certain (`claude /login`,
-      // `cursor-agent login`); keep the fallback for any future kind generic
-      // rather than assert a command we haven't verified.
-      const loginHint =
-        kind === "claude-code"
-          ? `run ${c.cyan(`${launch} /login`)} to authenticate`
-          : kind === "cursor"
-            ? `run ${c.cyan(`${launch} login`)} to authenticate`
-            : `log in to ${c.cyan(launch)} here`;
+      const loginHint = harnessShellLoginHint(kind, launch);
       out(`${c.green("●")} harness ${c.bold(id)} — env applied. ${loginHint} · Ctrl-D to exit`);
       const proc = Bun.spawn([shell], {
         env: childEnv,
@@ -161,6 +154,26 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
         `unknown harness subcommand: ${sub} (use ls | add | edit | enable | disable | rm | shell)`,
       );
   }
+}
+
+/** The neutral notices a harness status carries (OpenCode's "no credentials"
+ *  and "OpenCode 2 is available" lines, `HarnessStatus.notices`), one dim
+ *  line each under the harness rows of `agetor harness ls`. They come from
+ *  the core, which can quote CLI output, so each is escaped as free text. */
+export function harnessNoticeLines(harnessId: string, status: Pick<HarnessStatus, "notices"> | undefined): string[] {
+  return (status?.notices ?? [])
+    .filter((n) => n.trim() !== "")
+    .map((n) => c.dim(`  i ${escapeControlChars(harnessId)} ${escapeFreeText(n)}`));
+}
+
+/** The `agetor harness shell` banner's login hint. Only the commands we've
+ *  verified are asserted (`claude /login`, `cursor-agent login`, `opencode
+ *  auth login`); any other kind keeps the generic wording. */
+export function harnessShellLoginHint(kind: AgentKind, launch: string): string {
+  if (kind === "claude-code") return `run ${c.cyan(`${launch} /login`)} to authenticate`;
+  if (kind === "cursor") return `run ${c.cyan(`${launch} login`)} to authenticate`;
+  if (kind === "opencode") return `run ${c.cyan(`${launch} auth login`)} to authenticate`;
+  return `log in to ${c.cyan(launch)} here`;
 }
 
 interface HarnessFlags {
