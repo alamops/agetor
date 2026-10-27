@@ -421,6 +421,110 @@ test("a tmux launch failure surfaces as a failed run and the task returns to rea
   }
 });
 
+test("startTask refuses a floored model on an older Copilot CLI before any run row exists; an unparseable version never blocks", async () => {
+  const { runs, tasks } = await import("./db.ts");
+  const { startTask } = await import("./orchestrator.ts");
+  // gpt-6-sol needs Copilot CLI 1.0.89 (MODEL_MIN_CLI_VERSION.copilot).
+  const taskId = await createCopilotTask("needs a newer cli", { model: "gpt-6-sol" });
+  const columnBefore = tasks.get(taskId)!.column;
+  process.env.FAKE_COPILOT_VERSION = "1.0.50";
+  try {
+    const refused = await startTask(taskId);
+    expect("error" in refused).toBe(true);
+    if ("error" in refused) {
+      // The stub lives in a temp dir (not a Homebrew prefix) → `copilot update`.
+      expect(refused.error).toBe(
+        "GitHub Copilot 1.0.50 can't run GPT-6 Sol — it needs copilot CLI ≥ 1.0.89. Upgrade with: copilot update",
+      );
+    }
+    // Pre-flight: nothing minted, nothing moved.
+    expect(runs.listForTask(taskId)).toEqual([]);
+    expect(tasks.get(taskId)!.column).toBe(columnBefore);
+    expect(tasks.get(taskId)!.runId).toBeNull();
+
+    // At the floor exactly → allowed.
+    process.env.FAKE_COPILOT_VERSION = "1.0.89";
+    const atFloor = await startAndGetRunId(taskId);
+    await waitForRunSettled(taskId, atFloor);
+    expect(runs.get(atFloor)?.status).toBe("succeeded");
+
+    // A version string that doesn't parse fails OPEN (never blocks a run).
+    const other = await createCopilotTask("dev build", { model: "gpt-6-sol" });
+    process.env.FAKE_COPILOT_VERSION = "dev-build";
+    const devRun = await startAndGetRunId(other);
+    await waitForRunSettled(other, devRun);
+    expect(runs.get(devRun)?.status).toBe("succeeded");
+  } finally {
+    process.env.FAKE_COPILOT_VERSION = "1.0.104";
+  }
+});
+
+test("a follow-up with no recorded Copilot session on any harness starts fresh, says so, and records the minted id", async () => {
+  const { runs, tasks } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const taskId = await createCopilotTask("hello");
+  // An earlier copilot run that failed before Copilot reported a session id.
+  const priorRunId = await insertRunningCopilotRun(taskId, null);
+  runs.update(priorRunId, { status: "failed", endedAt: Date.now(), exitCode: 1 });
+  tasks.update(taskId, { column: "ready", runId: null });
+
+  const res = await sendInput(priorRunId, "try again");
+  expect(res.delivered).toBe(true);
+  await waitFor(() => runs.listForTask(taskId).length === 2 && runs.listForTask(taskId)[0]?.status !== "running");
+
+  const texts = await statusTexts(taskId);
+  expect(texts).toContain("no prior GitHub Copilot session — starting fresh");
+  expect(texts.some((t) => t.startsWith("resuming GitHub Copilot session "))).toBe(false);
+  expect(texts.some((t) => t.startsWith("previous GitHub Copilot context is on harness"))).toBe(false);
+  const newest = runs.listForTask(taskId)[0]!;
+  expect(newest.id).not.toBe(priorRunId);
+  // The fresh session id the driver minted lands on the new run (via onSessionId).
+  expect(newest.copilotSessionId).toBe(`fake-copilot-session-${taskId}`);
+  expect(newest.status).toBe("succeeded");
+  // The follow-up itself is the new run's user bubble.
+  expect(runs.eventsForTask(taskId).some((e) => e.runId === newest.id && e.stream === "user" && e.data === "try again")).toBe(true);
+});
+
+test("a second Plan-mode plan turn supersedes the earlier pending plan", async () => {
+  const { tasks } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const taskId = await createCopilotTask(`${PLAN} first plan`, { mode: "plan" });
+  const firstRunId = await startAndGetRunId(taskId);
+  await waitForRunSettled(taskId, firstRunId);
+  await waitFor(() => (tasks.get(taskId)?.plans ?? []).length === 1);
+
+  const res = await sendInput(firstRunId, `${PLAN} revise the plan`);
+  expect(res.delivered).toBe(true);
+  await waitFor(() => (tasks.get(taskId)?.plans ?? []).length === 2);
+
+  const plans = tasks.get(taskId)!.plans;
+  const first = plans.find((p) => p.runId === firstRunId)!;
+  const second = plans.find((p) => p.runId !== firstRunId)!;
+  expect(first.status).toBe("superseded");
+  expect(first.toolCallId).toBe(`copilot-plan:${firstRunId}`);
+  expect(second.status).toBe("pending");
+  expect(second.toolCallId).toBe(`copilot-plan:${second.runId}`);
+  expect(second.filePath).toBeNull();
+});
+
+test("a not-logged-in turn in Plan mode fails the run, returns the card to ready and shows the login status once", async () => {
+  const { runs, tasks } = await import("./db.ts");
+  const { COPILOT_LOGIN_STATUS_TEXT } = await import("./copilot-tmux.ts");
+  const taskId = await createCopilotTask("__agetor_fake_copilot_auth__ plan without a login", { mode: "plan" });
+  const runId = await startAndGetRunId(taskId);
+  await waitForRunSettled(taskId, runId);
+
+  expect(runs.get(runId)?.status).toBe("failed");
+  await waitFor(() => tasks.get(taskId)?.column === "ready");
+  await settle();
+  expect(tasks.get(taskId)?.plans ?? []).toEqual([]);
+  expect((await statusTexts(taskId)).filter((t) => t === COPILOT_LOGIN_STATUS_TEXT)).toHaveLength(1);
+  // The unauthenticated stderr is kept as stderr, not shown as assistant text.
+  const events = runs.eventsForTask(taskId);
+  expect(events.some((e) => e.stream === "stderr" && e.data.includes("No authentication information found"))).toBe(true);
+  expect(events.some((e) => e.stream === "assistant")).toBe(false);
+});
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * reconcileOrphans — keep these LAST: it scans every `running` run in the DB.
  * ────────────────────────────────────────────────────────────────────────── */

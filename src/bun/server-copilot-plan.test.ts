@@ -106,12 +106,17 @@ async function newPlannedTask(
   const id = created.task.id;
   const started = await startTask(id);
   if ("error" in started) throw new Error(started.error);
-  await settle();
+  // Wait for the first turn to really finish (a fixed sleep let the approval
+  // queue behind a still-running turn on a loaded machine).
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline && runs.get(started.runId)?.status === "running") await settle(25);
+  expect(runs.get(started.runId)?.status).toBe("succeeded");
   const running = tasks.get(id)!;
+  expect(running.runId).toBe(started.runId);
   tasks.update(id, {
     plans: upsertDetectedPlan(running.plans, {
-      toolCallId: `copilot-plan:${running.runId}`,
-      runId: running.runId!,
+      toolCallId: `copilot-plan:${started.runId}`,
+      runId: started.runId,
       name: null,
       content: PLAN_MARKDOWN,
       now: Date.now(),
@@ -122,6 +127,19 @@ async function newPlannedTask(
 
 const approve = (id: string, planId: string) =>
   call(`/tasks/${id}/plans/${planId}/approve`, { method: "POST" });
+
+/** Deletes a task only once none of its runs is still `running`. A fake turn
+ *  (the approval message's follow-up) that is still writing events after its
+ *  task row is gone trips the run_events foreign key, and that error is
+ *  reported against whichever test runs next. */
+async function deleteWhenSettled(id: string): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline && runs.listForTask(id).some((r) => r.status === "running")) {
+    await settle(25);
+  }
+  await settle();
+  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+}
 
 // --- Harness + model routes ----------------------------------------------
 
@@ -209,8 +227,7 @@ test("approve on an unbound plan-mode copilot task flips to auto, embeds the pla
   expect(existsSync(path.join(workdir, ".cursor"))).toBe(false);
   expect(readdirSync(workdir)).toEqual([]);
 
-  await settle();
-  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  await deleteWhenSettled(id);
 });
 
 test("approve of an edited plan sends the edited text", async () => {
@@ -241,8 +258,7 @@ test("approve of an edited plan sends the edited text", async () => {
   expect(approvalEvent!.data).not.toContain("- step one");
   expect(readdirSync(workdir)).toEqual([]);
 
-  await settle();
-  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  await deleteWhenSettled(id);
 });
 
 test("approve on a profile-bound plan-mode copilot task keeps plan and returns the warning", async () => {
@@ -270,8 +286,76 @@ test("approve on a profile-bound plan-mode copilot task keeps plan and returns t
   // appendix is not added on top of copilot's inline form).
   expect(approvalEvent!.data).not.toContain("--- Approved plan ---");
 
-  await settle();
-  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  await deleteWhenSettled(id);
+});
+
+test("approve on a Read-only (ask) copilot task keeps the mode, embeds the plan exactly once, and adds no flip line or warning", async () => {
+  const { id, workdir, task } = await newPlannedTask({ mode: "ask" });
+  expect(task.mode).toBe("ask");
+  const plan = task.plans[0]!;
+
+  const res = await approve(id, plan.id);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as Task & { warning?: string };
+  expect(body.mode).toBe("ask");
+  expect(body.warning).toBeUndefined();
+  expect(body.plans.find((p) => p.id === plan.id)!.status).toBe("approved");
+  expect(tasks.get(id)!.mode).toBe("ask");
+
+  const events = runs.eventsForTask(id);
+  const approvalEvent = events.find((e) => e.stream === "user" && e.data.includes("The plan is approved"));
+  expect(approvalEvent).toBeDefined();
+  expect(approvalEvent!.data).toContain("Approved plan:");
+  // Cursor appends `--- Approved plan ---` for ask mode; Copilot's message is
+  // already inline, so the plan must appear once, not twice.
+  expect(approvalEvent!.data).not.toContain("--- Approved plan ---");
+  expect(approvalEvent!.data.split("- step one").length - 1).toBe(1);
+  expect(events.some((e) => e.data === FLIP_STATUS)).toBe(false);
+  expect(events.some((e) => e.data === BOUND_WARNING)).toBe(false);
+  expect(readdirSync(workdir)).toEqual([]);
+
+  await deleteWhenSettled(id);
+});
+
+test("an additional-account copilot harness passes the kind guard: approve flips to auto and writes no file", async () => {
+  const extra: Pick<Harness, "id" | "kind" | "label" | "home"> = {
+    id: "copilot-plan-2",
+    kind: "copilot",
+    label: "Copilot (second account)",
+    home: mkdtempSync(path.join(tmpdir(), "agetor-copilot-plan-home-")),
+  };
+  scratchDirs.push(extra.home!);
+  harnesses.insert(extra);
+  harnesses.setEnabled(extra.id, true);
+
+  const { id, workdir, task } = await newPlannedTask({ agent: extra.id, mode: "plan" });
+  expect(task.agent).toBe(extra.id);
+  const plan = task.plans[0]!;
+
+  // PATCH (edit) and approve both resolve the task's harness KIND, not the
+  // literal agent id, so a non-built-in copilot harness is accepted.
+  const patchRes = await call(`/tasks/${id}/plans/${plan.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ editedContent: "# Second account plan" }),
+  });
+  expect(patchRes.status).toBe(200);
+
+  const res = await approve(id, plan.id);
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as Task & { warning?: string };
+  expect(body.mode).toBe("auto");
+  expect(body.warning).toBeUndefined();
+  const approved = body.plans.find((p) => p.id === plan.id)!;
+  expect(approved.status).toBe("approved");
+  expect(approved.filePath).toBeNull();
+  const approvalEvent = runs
+    .eventsForTask(id)
+    .find((e) => e.stream === "user" && e.data.includes("The plan is approved"));
+  expect(approvalEvent!.data).toContain("# Second account plan");
+  expect(runs.eventsForTask(id).some((e) => e.data === FLIP_STATUS)).toBe(true);
+  expect(readdirSync(workdir)).toEqual([]);
+
+  await deleteWhenSettled(id);
 });
 
 test("a plan-mode approve whose message is not delivered reverts the flip and leaves the plan pending", async () => {
@@ -313,8 +397,7 @@ test("a concurrent approve of the same plan is refused and the approval is sent 
   expect(approvalEvents).toHaveLength(1);
   expect(tasks.get(id)!.plans.find((p) => p.id === plan.id)!.status).toBe("approved");
 
-  await settle();
-  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  await deleteWhenSettled(id);
 });
 
 // --- Kind guard ----------------------------------------------------------
@@ -355,6 +438,5 @@ test("PATCH plan edit works on a copilot task", async () => {
   expect(res.status).toBe(200);
   expect(((await res.json()) as Task).plans[0]!.editedContent).toBe("an edited plan");
 
-  await settle();
-  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  await deleteWhenSettled(id);
 });

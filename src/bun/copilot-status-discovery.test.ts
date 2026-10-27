@@ -104,6 +104,41 @@ describe("checkHarness (copilot identity gate)", () => {
     expect(status.path).toBe(process.env.AGETOR_COPILOT_BIN!);
   });
 
+  test("a version probe that yields nothing (no output, or a non-zero exit) never trips the gate", async () => {
+    // The npm loader's first launch can blow the probe budget; the row then
+    // has no version and must stay available rather than read as AWS Copilot.
+    for (const body of ["exit 0", 'echo "unpacking…" >&2; exit 1']) {
+      statusTesting.clearStatusCache();
+      process.env.AGETOR_COPILOT_BIN = stub("copilot", body);
+      const status = await checkHarness(builtin("copilot"));
+      expect(status.version).toBeNull();
+      expect(status.available).toBe(true);
+      expect(status.reason).toBeNull();
+      expect(status.installHint).toBeNull();
+    }
+  });
+
+  test("the identity marker matches case-insensitively", async () => {
+    process.env.AGETOR_COPILOT_BIN = stub("copilot", 'echo "github copilot cli 1.0.120"');
+    const status = await checkHarness(builtin("copilot"));
+    expect(status.available).toBe(true);
+    expect(status.version).toBe("github copilot cli 1.0.120");
+  });
+
+  test("the gate is copilot-only: another kind whose --version lacks the marker stays available", async () => {
+    const prev = process.env.AGETOR_CODEX_BIN;
+    process.env.AGETOR_CODEX_BIN = stub("codex", 'echo "codex-cli 0.159.0"');
+    try {
+      const status = await checkHarness(builtin("codex"));
+      expect(status.available).toBe(true);
+      expect(status.reason).toBeNull();
+      expect(status.version).toBe("codex-cli 0.159.0");
+    } finally {
+      if (prev === undefined) delete process.env.AGETOR_CODEX_BIN;
+      else process.env.AGETOR_CODEX_BIN = prev;
+    }
+  });
+
   test("a missing binary reports the cask install hint", async () => {
     process.env.AGETOR_COPILOT_BIN = path.join(sandbox, "nope");
     const status = await checkHarness(builtin("copilot"));
