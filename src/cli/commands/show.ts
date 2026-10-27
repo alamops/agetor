@@ -22,8 +22,14 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   if (flags.json) return printJson({ task, runs, pending });
 
   // One harness lookup serves the mode default and the OpenCode server line;
-  // a failed lookup falls back to the built-in-id heuristic.
-  const harnessCtx = profileHarnessContext(task.agent, await client.listHarnesses().catch(() => null));
+  // a failed lookup falls back to the built-in-id heuristic. It is skipped
+  // when neither needs it: a stored mode on a built-in harness of another
+  // kind (a built-in harness's id is its kind).
+  const builtinCtx = profileHarnessContext(task.agent, null);
+  const needsLookup = task.mode == null || builtinCtx.kind == null || builtinCtx.kind === "opencode";
+  const harnessCtx = needsLookup
+    ? profileHarnessContext(task.agent, await client.listHarnesses().catch(() => null))
+    : builtinCtx;
   const modeText = resolveModeText(harnessCtx, task.mode);
 
   // A step task's title is `<pipeline> · <step>`, both locally written names.

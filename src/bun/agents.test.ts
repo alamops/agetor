@@ -1,4 +1,4 @@
-import { test, expect, beforeEach, afterEach } from "bun:test";
+import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -56,6 +56,25 @@ const {
 } = await import("./agents.ts");
 const { FX_STEER_DROPPED_STATUS, fxSpeedNotOfferedLine } = await import("./fx-acp.ts");
 const { dataDir, tasks, runs, subagents: subagentsDb } = await import("./db.ts");
+
+// `bun test` runs every file in one process: restore the bin/args/driver
+// vars `beforeEach` overwrites once this file is done, so a later file never
+// inherits `AGETOR_OPENCODE_BIN = "opencode"` and runs the real CLI (which
+// writes OpenCode state into $HOME — src/test-preload.ts points it at a
+// missing binary by default).
+const ENV_KEYS_RESET_PER_TEST = [
+  "AGETOR_CLAUDE_BIN", "AGETOR_CODEX_BIN", "AGETOR_CURSOR_BIN", "AGETOR_GEMINI_BIN",
+  "AGETOR_FX_BIN", "AGETOR_ANTIGRAVITY_BIN", "AGETOR_OPENCODE_BIN",
+  "AGETOR_CLAUDE_ARGS", "AGETOR_CODEX_ARGS", "AGETOR_CURSOR_ARGS", "AGETOR_GEMINI_ARGS",
+  "AGETOR_FX_ARGS", "AGETOR_ANTIGRAVITY_ARGS", "AGETOR_OPENCODE_ARGS", "AGETOR_FX_DRIVER",
+] as const;
+const envBeforeFile = new Map(ENV_KEYS_RESET_PER_TEST.map((k) => [k, process.env[k]] as const));
+afterAll(() => {
+  for (const [k, v] of envBeforeFile) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+});
 
 beforeEach(() => {
   // Force the literal "claude" / "codex" names in argv. Production
