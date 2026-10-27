@@ -508,7 +508,7 @@ Each wave ends in a checkpoint commit. The barrier is `bun run typecheck` green 
 - **Auto trusts the worktree.** Its MCP servers and hooks load, and a hanging MCP server stalls the turn (spike: >60 s). That is the same exposure as the interactive CLI; it shows as "Agent is working…" and Stop works.
 - **Ambient tokens and allow-all.** Guarded in the pane shell (TT1). A `gho_`/`github_pat_` token in the user's env still overrides their keychain login, as Copilot documents (D10 accepts this).
 - **AWS Copilot** on PATH is refused by name. A Homebrew hint without `--cask` would upgrade the AWS formula; fixed via `BREW_PACKAGES`.
-- **First-launch extraction.** The npm loader extracts ~204 MB on first launch; the first `--version` probe may exceed `probeVersion`'s budget and read "not installed" until the next 15 s poll. This is documented in the CLAUDE.md bullet and not otherwise handled.
+- **First-launch extraction.** The npm loader extracts ~204 MB on first launch; the first `--version` probe may exceed `probeVersion`'s budget; the row then shows no version (still available; the identity gate is skipped) until the next 15 s poll. This is documented in the CLAUDE.md bullet and not otherwise handled.
 - **Contract drift.** The CLI ships near-daily and auto-updates. The mapper ignores unknown types; TT8 can be re-run against any new version in minutes.
 - **Copilot model ids collide** with other kinds' literals (`gpt-6.1-sol`, `gemini-4-argon`, …). Any future normalize/retire migration for copilot rows must join `harnesses.kind = 'copilot'` (KB `79ea4a46`). This goes into the CLAUDE.md bullet.
 - **Subagent hold.** A copilot subagent row left `running` would hold the task in `running`. `settleAll` before resolve plus the reconcile path prevent it (TT4).
@@ -574,6 +574,7 @@ The owner approved the plan with these as written (2026-10-27). Each still names
 | Harness-scoped resume for codex/cursor/gemini/antigravity/fx | Out of scope | Owner D14: changes existing kinds' behaviour; separate ticket |
 | Antigravity's missing `HARNESS_TEMPLATES` entry | Out of scope | Owner (grill defaults #13): pre-existing gap in another kind |
 | Gemini/antigravity capability-discovery gaps in `commands.ts` | Out of scope | Pre-existing, documented in code; another kind |
+| `archiveTask` doesn't clear `antigravityTurnQueue` (delete and switch do) | Out of scope | Pre-existing gap in another kind, found by T8 during execution; the copilot queue is cleared on archive |
 | Copilot commit trailer / auto-update flags | None by decision | Owner D19 |
 | `--disable-builtin-mcps` | None by decision | Owner D25 (built-in GitHub MCP stays on) |
 | Renumbering the migration at merge | In this run, at merge time | §3.11 rule; whoever merges second |

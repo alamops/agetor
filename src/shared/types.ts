@@ -3989,7 +3989,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     modes: [
       { id: "auto", label: "Auto", hint: "Hands-off — allows all tools, paths and URLs and trusts the worktree (--allow-all + COPILOT_ALLOW_ALL)." },
       { id: "plan", label: "Plan", hint: "Plan without making changes (--mode plan). Approving the plan switches the task to Auto." },
-      { id: "ask", label: "Read-only", hint: "No allow flags — Copilot denies file edits and shell commands, and the run can still report success. Repo MCP servers and hooks stay off (untrusted folder)." },
+      { id: "ask", label: "Read-only", hint: "No allow flags — Copilot denies file edits and commands that change files (read-only commands still run), and the run can still report success. Repo MCP servers and hooks stay off (untrusted folder)." },
     ],
     // Per-model effort levels live in MODEL_EFFORT_SUPPORT.copilot; the
     // "Model default" (`auto`) row omits --reasoning-effort.
