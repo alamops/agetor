@@ -633,6 +633,7 @@ test("cmdPipeline import: a blocked import prints the plan's blocking issues plu
           mode: null,
           speed: "off",
           maxMode: false,
+          opencodeServer: "shared",
           instructions: "",
           skills: [],
           warnings: [],

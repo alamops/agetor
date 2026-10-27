@@ -80,16 +80,19 @@ function tmuxCalls(): string[] {
 const WORKDIR = mkdtempSync(path.join(tmpdir(), "agetor-opencode-wd-"));
 
 let db: typeof import("./db.ts");
+let restoreHarnesses: (() => void) | undefined;
 let orch: typeof import("./orchestrator.ts");
 
 beforeAll(async () => {
   db = await import("./db.ts");
+  restoreHarnesses = (await import("./test-harness-state.ts")).snapshotHarnessState();
   orch = await import("./orchestrator.ts");
   db.harnesses.setEnabled("opencode", true);
   setTmux("absent");
 });
 
 afterAll(async () => {
+  restoreHarnesses?.();
   const { rmTestDataDir } = await import("./test-data-dir.ts");
   rmTestDataDir(DATA_DIR);
 });

@@ -9,6 +9,7 @@ const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-oc-scan-db-"));
 process.env.AGETOR_DATA_DIR ??= dataDir;
 
 const { harnesses, projects, runs, tasks } = await import("./db.ts");
+const restoreHarnesses = (await import("./test-harness-state.ts")).snapshotHarnessState();
 const { clearOpencodeSessionScanCache, parseOpencodeSessionList, scanOpencodeSessions } = await import("./opencode-session-scan.ts");
 const { createTask } = await import("./orchestrator.ts");
 
@@ -63,6 +64,7 @@ afterAll(() => {
   harnesses.setEnabled(hA.id, false);
   harnesses.setEnabled(hB.id, false);
   rmSync(scratch, { recursive: true, force: true });
+  restoreHarnesses();
   rmTestDataDir(dataDir);
 });
 

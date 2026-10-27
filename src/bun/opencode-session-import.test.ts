@@ -12,6 +12,7 @@ const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-oc-import-db-"));
 process.env.AGETOR_DATA_DIR ??= dataDir;
 
 const { db, harnesses, preferences, projects, runs, tasks } = await import("./db.ts");
+const restoreHarnesses = (await import("./test-harness-state.ts")).snapshotHarnessState();
 const { clearOpencodeSessionScanCache } = await import("./opencode-session-scan.ts");
 const {
   OPENCODE_BUSY_IMPORT_ERROR,
@@ -78,6 +79,7 @@ afterAll(() => {
   harnesses.setEnabled(hA.id, false);
   harnesses.setEnabled(hB.id, false);
   rmSync(scratch, { recursive: true, force: true });
+  restoreHarnesses();
   rmTestDataDir(dataDir);
 });
 

@@ -31,14 +31,17 @@ process.env.AGETOR_TMUX_BIN = stub("tmux", "exit 1");
 process.env.AGETOR_FX_AUTO_RESUME_DELAY_MS = "300";
 
 let db: typeof import("./db.ts");
+let restoreHarnesses: (() => void) | undefined;
 let orch: typeof import("./orchestrator.ts");
 
 beforeAll(async () => {
   db = await import("./db.ts");
+  restoreHarnesses = (await import("./test-harness-state.ts")).snapshotHarnessState();
   orch = await import("./orchestrator.ts");
 });
 
 afterAll(async () => {
+  restoreHarnesses?.();
   const { rmTestDataDir } = await import("./test-data-dir.ts");
   rmTestDataDir(DATA_DIR);
 });

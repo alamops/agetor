@@ -71,6 +71,7 @@ const savedEnv = new Map<string, string | undefined>();
 let token = "";
 let stop: (() => void) | null = null;
 let db: typeof import("./db.ts");
+let restoreHarnesses: (() => void) | undefined;
 let unsubscribe: (() => void) | null = null;
 const appEvents: AppEvent[] = [];
 
@@ -86,6 +87,7 @@ beforeAll(async () => {
   delete process.env.AGETOR_HARNESS_AUTO_ENABLE;
 
   db = await import("./db.ts");
+  restoreHarnesses = (await import("./test-harness-state.ts")).snapshotHarnessState();
   const server = await import("./server.ts");
   const { subscribeAppEvents } = await import("./quit-guard.ts");
   token = server.API_TOKEN;
@@ -96,6 +98,7 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
+  restoreHarnesses?.();
   unsubscribe?.();
   stop?.();
   for (const [k, v] of savedEnv) {

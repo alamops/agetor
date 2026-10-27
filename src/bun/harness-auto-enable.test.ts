@@ -12,6 +12,7 @@ process.env.AGETOR_HARNESS_AUTO_ENABLE = "1";
 const refreshed: string[] = [];
 
 const { db, harnesses, harnessAutoEnabled } = await import("./db.ts");
+const restoreHarnesses = (await import("./test-harness-state.ts")).snapshotHarnessState();
 const {
   applyHarnessAutoEnable,
   flushPendingHarnessAutoEnableNotice,
@@ -26,6 +27,7 @@ __forTest.setRefresh(async (id) => {
 
 afterAll(() => {
   __forTest.setRefresh(null);
+  restoreHarnesses();
 });
 
 type Notice = Extract<AppEvent, { type: "harnesses_auto_enabled" }>;
