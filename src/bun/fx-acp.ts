@@ -517,7 +517,7 @@ import {
  *     meta/muse-spark-open, inception/mercury-3, moonshotai/kimi-k3.1-pro,
  *     deepseek/deepseek-v4.1-flash-1017, meta/muse-wonder-1.0,
  *     mistral/mistral-large-4, reflection/beam) postdate it): 16
- *     advertise efforts, 12 advertise none. Example (the owner's default model): `zai/glm-5.3-
+ *     advertise efforts, 12 advertise none. Example: `zai/glm-5.3-
  *     flash` → `auto, low, high, max`. **`session/set_config_option
  *     {sessionId, configId:"effort", value}` sets it** (`server.zig:2222-
  *     2247`, see `applyFxEffort` below; `ReasoningEffort.parse` in

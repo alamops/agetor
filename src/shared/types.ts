@@ -2466,8 +2466,8 @@ export interface AgentOption {
    * Offered only when the harness's CLI-discovered catalog positively
    * contains this id — never on the discovery-empty fallback (unlike an
    * ordinary curated row, which still shows when discovery has nothing).
-   * Used for fx's premium Gateway tiers, which a standard `fx login` team
-   * account can't run: the Gateway catalog is account-scoped — 230 ids
+   * Used for fx Gateway rows a standard `fx login` account's catalog lacks
+   * (mostly premium tiers): the Gateway catalog is account-scoped — 230 ids
    * unauthenticated vs 158 on a standard plan, measured 2026-08-27 on fx
    * 0.0.6. 2026-09-08: unauth catalog reads 244 on both 0.0.7 and 0.0.8
    * (Gateway-side growth, not a binary property); all curated ids present.
@@ -2476,8 +2476,11 @@ export interface AgentOption {
    * present; signed-in view still unverifiable (token expired).
    * Latest: 2026-10-26 (fx 0.0.14, docs/plans/add-gpt-6-1-terra.md §2b):
    * unauth catalog reads 262 ids, the owner's signed-in standard `fx login`
-   * catalog 139; gating follows signed-in presence — the 26 `catalogOnly`
-   * curated rows (of 42) are the ones absent from that signed-in view.
+   * catalog 139. All 26 `catalogOnly` curated rows (of 42) are absent from
+   * that signed-in view; 5 standard rows are absent too (zai/glm-5.3-flash,
+   * openai/gpt-5.4-mini, spacexai/grok-4.6, minimax/minimax-m3,
+   * alibaba/qwen3.8-flash) but stay standard. New rows are gated by
+   * absence from the signed-in view.
    */
   catalogOnly?: boolean;
 }
@@ -3383,13 +3386,6 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // joined it on 2026-09-30 the same way (see its row); a 35th,
   // anthropic/claude-haiku-5.5, joined it on 2026-10-07 the same way (see
   // its row).
-  // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md §2/§2b): nine more ids
-  // joined the effort group — openai/gpt-6.1-terra,
-  // minimax/minimax-m3.1-flash, meta/muse-spark-open, inception/mercury-3,
-  // moonshotai/kimi-k3.1-pro, deepseek/deepseek-v4.1-flash-1017,
-  // meta/muse-wonder-1.0, mistral/mistral-large-4 and reflection/beam (see
-  // their rows below); the §2b re-measure on fx 0.0.14 found no change to any
-  // existing row's set.
   // 2026-10-22 (fx 0.0.14, docs/plans/fx-0.0.14-and-cursor-updates.md §3.4
   // P10/D6/D10): fx 0.0.14's `models --json` now carries each model's
   // `efforts` (the ACP `effort` option is that list plus `auto`), and 20 of
@@ -3409,6 +3405,13 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // problem, never a failed run (an unoffered value degrades to a status
   // breadcrumb). Ids map to fx's own values verbatim
   // (`minimal|low|medium|high|xhigh|max|none|auto`).
+  // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md §2/§2b): nine more ids
+  // joined the effort group — openai/gpt-6.1-terra,
+  // minimax/minimax-m3.1-flash, meta/muse-spark-open, inception/mercury-3,
+  // moonshotai/kimi-k3.1-pro, deepseek/deepseek-v4.1-flash-1017,
+  // meta/muse-wonder-1.0, mistral/mistral-large-4 and reflection/beam (see
+  // their rows below); the §2b re-measure on fx 0.0.14 found no change to any
+  // existing row's set.
   fx: {
     "zai/glm-5.3-flash": ["max", "high", "low", "auto"],
     "zai/glm-5v-turbo": ["high", "medium", "low", "none", "auto"],

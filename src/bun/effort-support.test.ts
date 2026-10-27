@@ -197,8 +197,9 @@ test("codex model picker lists the full 12-model order (GPT-6.1 Terra right afte
 });
 
 test("codex gpt-5.5 is retired: no codex row, no codex effort key, while the Cursor gpt-5.5 spec stays", () => {
-  // docs/plans/add-gpt-6-1-terra.md D2 (2026-10-26): GPT-5.5 → GPT-5.6 Sol on
-  // codex, retiring 2026-10-14. Cursor still lists its own gpt-5.5 variants.
+  // docs/plans/add-gpt-6-1-terra.md D2 (2026-10-26): codex retired GPT-5.5 on
+  // 2026-10-14 and migration 075 moves its rows to GPT-6.1 Sol. Cursor still
+  // lists its own gpt-5.5 variants.
   expect(AGENT_OPTIONS.codex.models.map((m) => m.id)).not.toContain("gpt-5.5");
   expect(MODEL_EFFORT_SUPPORT.codex?.["gpt-5.5"]).toBeUndefined();
   expect(CURSOR_MODEL_SPECS["gpt-5.5"]).toBeDefined();

@@ -18,6 +18,7 @@ import retireFxModels from "./migrations/074_retire_fx_models.sql" with { type: 
 import retireCodexGpt55 from "./migrations/075_retire_codex_gpt_5_5.sql" with { type: "text" };
 import normalizeCursorNewFamilies from "./migrations/076_normalize_cursor_new_families.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
+import { cursorModelArg } from "../shared/types.ts";
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
 const HARNESSES_DDL = `
@@ -1743,7 +1744,129 @@ test("a fresh DB migrated through 076 applies 075 and 076 cleanly and re-running
   const applied = migrate(db, migrations);
   expect(applied).toContain("075_retire_codex_gpt_5_5");
   expect(applied).toContain("076_normalize_cursor_new_families");
-  expect(applied[applied.length - 1]).toBe("076_normalize_cursor_new_families");
   expect(migrate(db, migrations)).toEqual([]);
+  db.close();
+});
+
+// End to end on the REAL schema (the tests above use a minimal hand-built one):
+// a DB migrated through 074 with real task/profile/preference rows, then the
+// pending 075 + 076 applied by the runner the app itself uses at boot.
+test("075 + 076 on the real schema: codex gpt-5.5 rows move, cursor variants fold to a base id that re-composes the same --model, and updated_at plus frozen snapshots are left alone", () => {
+  const db = new Database(":memory:");
+  const i074 = migrations.findIndex((m) => m.id === "074_retire_fx_models");
+  expect(i074).toBeGreaterThan(0);
+  migrate(db, migrations.slice(0, i074 + 1));
+
+  db.run(
+    `INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('codex-2', 'codex', 'Codex (secondary)', 1, 1)`,
+  );
+  const snapshot = JSON.stringify({ name: "Old", harness: "codex", model: "gpt-5.5", effort: "none" });
+  const pipelineRun = JSON.stringify({ status: "done", snapshot: { profiles: { p: { model: "gpt-5.5" } } } });
+  const insertTask = db.prepare(
+    `INSERT INTO tasks (id, title, prompt, "column", agent, workdir, model, effort, speed, agent_profile, pipeline_run, created_at, updated_at)
+     VALUES (?, 't', 'p', 'backlog', ?, '/tmp', ?, ?, ?, ?, ?, 100, ?)`,
+  );
+  insertTask.run("codex-none", "codex", "gpt-5.5", "none", "off", snapshot, pipelineRun, 111);
+  insertTask.run("codex2-xhigh", "codex-2", "gpt-5.5", "xhigh", "off", null, null, 112);
+  insertTask.run("cursor-gpt55", "cursor", "gpt-5.5", "none", "off", null, null, 113);
+  insertTask.run("fx-gpt55", "fx", "openai/gpt-5.5", "none", "off", null, null, 114);
+  insertTask.run("fx-muse", "fx", "meta/muse-wonder-1.0", "auto", "off", null, null, 115);
+
+  // Every variant id cursor-agent lists for the three new families, on a
+  // cursor task with a stale `fast` speed (the migration resets it).
+  const variantIds = Object.entries({
+    "muse-wonder-1.0": ["max", "xhigh", "high", "medium", "low", "minimal"],
+    "muse-spark-1.3": ["max", "xhigh", "high", "medium", "low", "minimal"],
+    "deepseek-v41-flash-1017": ["max", "high", "medium", "low", "none"],
+  }).flatMap(([base, tiers]) => tiers.map((t) => `${base}-${t}`));
+  expect(variantIds).toHaveLength(17);
+  variantIds.forEach((id, i) => insertTask.run(`cursor-v${i}`, "cursor", id, null, "fast", null, null, 200 + i));
+
+  const insertProfile = db.prepare(
+    `INSERT INTO agent_profiles (id, name, name_key, harness_id, model, effort, speed, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 100, ?)`,
+  );
+  insertProfile.run("p-codex", "Codex", "codex", "codex", "gpt-5.5", "minimal", "off", 311);
+  insertProfile.run("p-cursor", "Cursor", "cursor", "cursor", "deepseek-v41-flash-1017-none", "high", "fast", 312);
+  insertProfile.run("p-cursor-gpt55", "Cursor 5.5", "cursor 5.5", "cursor", "gpt-5.5", "xhigh", "fast", 313);
+
+  db.run(
+    `INSERT INTO preferences (key, value, updated_at) VALUES
+       ('lastModel:codex', 'gpt-5.5', 7),
+       ('lastEffort:codex', 'none', 7),
+       ('lastModel:cursor', 'muse-spark-1.3-minimal', 7),
+       ('lastModel:fx', 'openai/gpt-5.5', 7)`,
+  );
+
+  expect(migrate(db, migrations.slice(0, i074 + 3))).toEqual(["075_retire_codex_gpt_5_5", "076_normalize_cursor_new_families"]);
+
+  type Row = {
+    id: string;
+    model: string | null;
+    effort: string | null;
+    speed: string;
+    agent_profile: string | null;
+    pipeline_run: string | null;
+    updated_at: number;
+  };
+  const task = (id: string) =>
+    db
+      .query<Row, [string]>(
+        `SELECT id, model, effort, speed, agent_profile, pipeline_run, updated_at FROM tasks WHERE id = ?`,
+      )
+      .get(id)!;
+
+  expect(task("codex-none")).toEqual({
+    id: "codex-none",
+    model: "gpt-6.1-sol",
+    effort: "high", // GPT-6.1 Sol rejects none
+    speed: "off",
+    agent_profile: snapshot, // frozen snapshot still names gpt-5.5
+    pipeline_run: pipelineRun,
+    updated_at: 111,
+  });
+  expect(task("codex2-xhigh")).toMatchObject({ model: "gpt-6.1-sol", effort: "xhigh", updated_at: 112 });
+  expect(task("cursor-gpt55")).toMatchObject({ model: "gpt-5.5", effort: "none", updated_at: 113 });
+  expect(task("fx-gpt55")).toMatchObject({ model: "openai/gpt-5.5", effort: "none", updated_at: 114 });
+  expect(task("fx-muse")).toMatchObject({ model: "meta/muse-wonder-1.0", effort: "auto", updated_at: 115 });
+
+  variantIds.forEach((id, i) => {
+    const row = task(`cursor-v${i}`);
+    expect(row.model, id).not.toBe(id);
+    expect(row.speed, id).toBe("off");
+    expect(row.updated_at, id).toBe(200 + i);
+    // The folded row launches exactly the variant it was pinned to.
+    expect(cursorModelArg(row.model!, row.effort, row.speed === "fast"), id).toBe(id);
+  });
+
+  const profile = (id: string) =>
+    db
+      .query<{ model: string; effort: string | null; speed: string; updated_at: number }, [string]>(
+        `SELECT model, effort, speed, updated_at FROM agent_profiles WHERE id = ?`,
+      )
+      .get(id)!;
+  expect(profile("p-codex")).toEqual({ model: "gpt-6.1-sol", effort: "high", speed: "off", updated_at: 311 });
+  expect(profile("p-cursor")).toEqual({ model: "deepseek-v41-flash-1017", effort: "none", speed: "off", updated_at: 312 });
+  expect(profile("p-cursor-gpt55")).toEqual({ model: "gpt-5.5", effort: "xhigh", speed: "fast", updated_at: 313 });
+
+  const prefs = db
+    .query<{ key: string; value: string; updated_at: number }, []>(
+      `SELECT key, value, updated_at FROM preferences WHERE key IN ('lastModel:codex', 'lastEffort:codex', 'lastModel:cursor', 'lastModel:fx') ORDER BY key`,
+    )
+    .all();
+  expect(prefs).toEqual([
+    { key: "lastEffort:codex", value: "none", updated_at: 7 },
+    { key: "lastModel:codex", value: "gpt-6.1-sol", updated_at: 7 },
+    { key: "lastModel:cursor", value: "muse-spark-1.3", updated_at: 7 },
+    { key: "lastModel:fx", value: "openai/gpt-5.5", updated_at: 7 },
+  ]);
+
+  // The runner records both and never re-applies them.
+  const recorded = db
+    .query<{ id: string }, []>(`SELECT id FROM _migrations ORDER BY id DESC LIMIT 2`)
+    .all()
+    .map((r) => r.id);
+  expect(recorded).toEqual(["076_normalize_cursor_new_families", "075_retire_codex_gpt_5_5"]);
+  expect(migrate(db, migrations.slice(0, i074 + 3))).toEqual([]);
   db.close();
 });

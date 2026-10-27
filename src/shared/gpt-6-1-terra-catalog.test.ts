@@ -1,6 +1,16 @@
 import { expect, test } from "bun:test";
 import { mergeModelOptions, type DiscoveredModel } from "./model-options.ts";
-import { AGENT_OPTIONS, CATALOG_SCOPED_KINDS, DEFAULT_MODEL, cursorModelIdCoveredByCatalog } from "./types.ts";
+import { supportedSpeeds } from "./speed.ts";
+import {
+  AGENT_OPTIONS,
+  CATALOG_SCOPED_KINDS,
+  CURSOR_MODEL_SPECS,
+  DEFAULT_EFFORT,
+  DEFAULT_MODEL,
+  cursorModelIdCoveredByCatalog,
+  retainableEfforts,
+  supportedEfforts,
+} from "./types.ts";
 
 /**
  * GPT-6.1 Terra and the eight other models added alongside it
@@ -179,5 +189,74 @@ test("cursor picker offers one bare row per new family and no suffixed variant r
   const rows = mergeModelOptions({ curated: AGENT_OPTIONS.cursor.models, discovered, scoped: false, selected: null });
   for (const base of Object.keys(families)) {
     expect(ids(rows).filter((id) => id.startsWith(base)), base).toEqual([base]);
+  }
+});
+
+// --- efforts and speed tiers as the pickers offer them -------------------------
+
+/** What codex's own `model/list` reports for GPT-6.1 Terra (plan §1.2): low
+ *  through max plus ultra, without `none`, which the API accepts anyway. */
+const CODEX_CATALOG_TERRA_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+/** And for GPT-6.1 Sol, which rejects `none` with a live 400. */
+const CODEX_CATALOG_SOL_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+
+test("codex GPT-6.1 Terra: the live effort picker follows codex's catalog (ultra…low), the discovery-empty fallback adds none", () => {
+  const live = supportedEfforts("codex", TERRA_CODEX, CODEX_CATALOG_TERRA_EFFORTS).map((o) => o.id);
+  expect(live).toEqual(["ultra", "max", "xhigh", "high", "medium", "low"]);
+  const fallback = supportedEfforts("codex", TERRA_CODEX, []).map((o) => o.id);
+  expect(fallback).toEqual(["ultra", "max", "xhigh", "high", "medium", "low", "none"]);
+  // The kind default effort is offered either way, so a new Terra task starts at it.
+  expect(live).toContain(DEFAULT_EFFORT.codex);
+  expect(fallback).toContain(DEFAULT_EFFORT.codex);
+});
+
+test("codex GPT-6.1 Terra: a task already on effort none keeps it when codex's catalog omits none; GPT-6.1 Sol does not", () => {
+  // `retainableEfforts` decides whether a model change cascades the stored
+  // effort: Terra keeps a `none` the curated table offers, Sol (no `none`
+  // anywhere) forces a fallback.
+  expect(retainableEfforts("codex", TERRA_CODEX, CODEX_CATALOG_TERRA_EFFORTS).has("none")).toBe(true);
+  expect(retainableEfforts("codex", SOL_CODEX, CODEX_CATALOG_SOL_EFFORTS).has("none")).toBe(false);
+  expect(retainableEfforts("codex", SOL_CODEX, []).has("none")).toBe(false);
+});
+
+test("codex: the retired gpt-5.5 has no effort set of its own, so it falls back to the default model's set", () => {
+  const retired = supportedEfforts("codex", "gpt-5.5").map((o) => o.id);
+  const fallback = supportedEfforts("codex", DEFAULT_MODEL.codex).map((o) => o.id);
+  expect(retired).toEqual(fallback);
+});
+
+test("fx: every new row's curated effort set offers fx's own default (auto), so a new task starts on it", () => {
+  for (const id of [...NEW_FX_STANDARD, ...NEW_FX_CATALOG_ONLY]) {
+    const offered = supportedEfforts("fx", id).map((o) => o.id);
+    expect(offered, id).toContain(DEFAULT_EFFORT.fx);
+    // At least one real tier beyond auto: each new model advertises reasoning efforts.
+    expect(offered.length, id).toBeGreaterThan(1);
+  }
+});
+
+test("Speed: none of the new codex, fx or cursor models offers a tier beyond Off unless fx discovery flags one", () => {
+  for (const effort of [null, ...supportedEfforts("codex", TERRA_CODEX).map((o) => o.id)]) {
+    expect(supportedSpeeds("codex", TERRA_CODEX, effort)).toEqual(["off"]);
+  }
+  for (const id of [...NEW_FX_STANDARD, ...NEW_FX_CATALOG_ONLY]) {
+    expect(supportedSpeeds("fx", id, "auto"), id).toEqual(["off"]);
+  }
+  for (const base of ["muse-wonder-1.0", "muse-spark-1.3", "deepseek-v41-flash-1017"]) {
+    const spec = CURSOR_MODEL_SPECS[base];
+    expect(spec?.fastEfforts, base).toBeUndefined();
+    for (const effort of [null, ...Object.keys(spec?.effortIds ?? {})]) {
+      expect(supportedSpeeds("cursor", base, effort), `${base}/${effort}`).toEqual(["off"]);
+    }
+  }
+});
+
+test("cursor: each new family's effort picker lists exactly the tiers cursor-agent lists as variant ids", () => {
+  for (const base of ["muse-wonder-1.0", "muse-spark-1.3", "deepseek-v41-flash-1017"]) {
+    const spec = CURSOR_MODEL_SPECS[base];
+    expect(spec, base).toBeDefined();
+    const tiers = Object.keys(spec?.effortIds ?? {});
+    expect(supportedEfforts("cursor", base).map((o) => o.id).sort(), base).toEqual([...tiers].sort());
+    // Every variant id is `<base>-<tier>`, the shape migration 076 folds.
+    for (const tier of tiers) expect(spec?.effortIds?.[tier], `${base}/${tier}`).toBe(`${base}-${tier}`);
   }
 });

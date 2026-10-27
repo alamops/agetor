@@ -175,9 +175,10 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
 
 // The 40 effort-advertising ids. Twenty were refreshed on 2026-10-22 against
 // fx 0.0.14's `models --json` `models[].efforts` (plus fx's always-present
-// `auto`) — the plan §3.4 table, copied verbatim; the other eleven are
-// unchanged from their earlier live-probe (fx 0.0.10, 2026-09-14) or Gateway
-// `reasoning_options` measurement. Every row ends in "auto" (fx's own
+// `auto`) — the plan §3.4 table, copied verbatim; eleven are unchanged from
+// their earlier live-probe (fx 0.0.10, 2026-09-14) or Gateway
+// `reasoning_options` measurement; the last nine were curated on 2026-10-26
+// (docs/plans/add-gpt-6-1-terra.md §2b). Every row ends in "auto" (fx's own
 // default, off-scale) and lists ids in agetor order (max, xhigh, high,
 // medium, low, minimal, none, auto).
 const FX_EFFORT_MODELS: Record<string, string[]> = {

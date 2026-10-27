@@ -58,10 +58,10 @@ const EXPECTED_FX_OPTION_LABELS = ["DeepSeek V4 Flash", "GLM 5.3 Flash", "GPT-5.
 const FX_DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
- *  the 4-id stub catalog: two ordinary curated rows absent from the stub
- *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`, plus the three standard
+ *  the 4-id stub catalog: five ordinary curated rows absent from the stub
+ *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`, and the three standard
  *  rows added 2026-10-26: `minimax/minimax-m3.1-flash`, `meta/muse-spark-open`,
- *  `inception/mercury-3` — five in all) and eighteen of the twenty-six
+ *  `inception/mercury-3`) and eighteen of the twenty-six
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
  *  already excludes them under the scoped merge). `Claude Fable 5.1`
