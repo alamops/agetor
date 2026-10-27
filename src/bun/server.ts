@@ -451,7 +451,15 @@ function unauthorized(req: Request): Response {
 // otherwise become `string | undefined` and force needless guards.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F {
-  return ((req: Request) => (isAuthorized(req) ? fn(req) : unauthorized(req))) as F;
+  // A CORS preflight never carries the token, and Bun hands OPTIONS to a
+  // function-valued route's handler too. The webview sends its token in an
+  // `authorization` header (never `?token=`, D13), which makes every
+  // cross-origin request preflight, so answer it here like the fetch()
+  // fallback does instead of 401-ing it.
+  return ((req: Request) => {
+    if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
+    return isAuthorized(req) ? fn(req) : unauthorized(req);
+  }) as F;
 }
 
 /**

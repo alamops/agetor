@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmTestDataDir } from "./test-data-dir.ts";
 
-// Top-level: db.ts (imported transitively by both tmux-resolution.ts and
-// disclaim.ts) captures AGETOR_DATA_DIR at first import — see the same
-// convention in disclaim.test.ts. A `beforeAll` would race with whichever
+// Top-level: db.ts (imported transitively by tmux-resolution.ts) captures
+// AGETOR_DATA_DIR at first import — the convention every db-importing test
+// follows. A `beforeAll` would race with whichever
 // test file's import wins the module-cache race in `bun test`'s single
 // process, so this must be a genuine dynamic `import()` deferred until
 // after the env var below is set, not a static import.
@@ -18,8 +18,7 @@ let tmuxSocketName: () => string | null;
 let tmuxSocketArgs: () => string[];
 let buildEnsureServerArgv: (tmuxBin: string) => string[];
 let ensureDisclaimedServer: () => Promise<void>;
-let DISCLAIM_PREF_KEY: string;
-let preferences: typeof import("./db.ts").preferences;
+let setDisclaimSwitch: (on: boolean) => void;
 let dataDir: string;
 
 beforeAll(async () => {
@@ -30,8 +29,8 @@ beforeAll(async () => {
     buildEnsureServerArgv,
     ensureDisclaimedServer,
   } = await import("./tmux-resolution.ts"));
-  ({ DISCLAIM_PREF_KEY } = await import("./disclaim.ts"));
-  ({ preferences, dataDir } = await import("./db.ts"));
+  ({ setDisclaimSwitch } = await import("./disclaim.ts"));
+  ({ dataDir } = await import("./db.ts"));
 });
 
 afterAll(() => {
@@ -60,7 +59,7 @@ beforeEach(() => {
 
 afterEach(() => {
   (Object.keys(ORIGINAL) as (keyof typeof ORIGINAL)[]).forEach(restoreEnv);
-  preferences.set(DISCLAIM_PREF_KEY, "true");
+  setDisclaimSwitch(true);
 });
 
 // --- deriveTmuxSocketName --------------------------------------------------
@@ -94,7 +93,7 @@ test.skipIf(process.platform !== "darwin")(
   "buildEnsureServerArgv: prepends AGETOR_DISCLAIM_BIN when enabled",
   () => {
     process.env.AGETOR_DISCLAIM_BIN = "/bin/echo";
-    preferences.set(DISCLAIM_PREF_KEY, "true");
+    setDisclaimSwitch(true);
     const argv = buildEnsureServerArgv("/path/to/tmux");
     expect(argv[0]).toBe("/bin/echo");
     expect(argv).toContain("/path/to/tmux");
@@ -103,10 +102,10 @@ test.skipIf(process.platform !== "darwin")(
 );
 
 test.skipIf(process.platform !== "darwin")(
-  'buildEnsureServerArgv: passthrough when the pref is the literal string "false"',
+  "buildEnsureServerArgv: passthrough when the disclaim switch is off",
   () => {
     process.env.AGETOR_DISCLAIM_BIN = "/bin/echo";
-    preferences.set(DISCLAIM_PREF_KEY, "false");
+    setDisclaimSwitch(false);
     const argv = buildEnsureServerArgv("/path/to/tmux");
     expect(argv[0]).toBe("/path/to/tmux");
     expect(argv).toContain("start-server");

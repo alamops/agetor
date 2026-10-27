@@ -296,7 +296,12 @@ async function batchCatFile(cwd: string, ref: string, paths: string[]): Promise<
   return parseCatFileBatch(buf, paths);
 }
 
-const DEFAULT_PATHSPECS = [
+/**
+ * The project-level capability-discovery pathspecs. Exported (T4) so the
+ * CLI-caller project-tree loader in `caller-fs.ts` reads exactly the same set
+ * through `tar` that `loadRefProjectTree` reads through `git ls-tree`.
+ */
+export const PROJECT_CAPABILITY_PATHSPECS: readonly string[] = [
   ".claude", ".codex", ".mcp.json",
   ".cursor", ".agents", ".grok", ".fx", ".opencode", ".claw", "skills",
 ];
@@ -337,7 +342,7 @@ export async function loadRefProjectTree(
   // so this can only be a hostile or malformed caller, never a legitimate ref.
   if (/[\n\r\0]/.test(ref)) return null;
 
-  const pathspecs = opts?.pathspecs ?? DEFAULT_PATHSPECS;
+  const pathspecs = opts?.pathspecs ?? PROJECT_CAPABILITY_PATHSPECS;
   const shouldRead = opts?.shouldRead ?? (() => true);
 
   const lsTree = (r: string) => git(["ls-tree", "-r", "--name-only", "--full-tree", "-z", r, "--", ...pathspecs], dir);

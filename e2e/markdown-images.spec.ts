@@ -201,11 +201,17 @@ test.describe("markdown image rendering", () => {
     for (let i = 0; i < 2; i++) {
       const img = images.nth(i);
       await expect(img).toHaveAttribute("data-path", shotPath);
+      // Images are fetched with the auth header and shown as `blob:` URLs
+      // (the master token never rides in a URL); the route URL the bytes came
+      // from is carried in `data-src-url`.
       const src = await img.getAttribute("src");
-      expect(src, `image ${i} src should hit the preview route`).toContain("/files/preview?path=");
-      expect(src, `image ${i} src should carry the resolved absolute path`).toContain(
+      expect(src, `image ${i} src should be a blob: object URL`).toMatch(/^blob:/);
+      const srcUrl = await img.getAttribute("data-src-url");
+      expect(srcUrl, `image ${i} should come from the preview route`).toContain("/files/preview?path=");
+      expect(srcUrl, `image ${i} source URL should carry the resolved absolute path`).toContain(
         encodeURIComponent(shotPath),
       );
+      expect(srcUrl, `image ${i} source URL must not carry a token`).not.toContain("token=");
       await expect
         .poll(() => img.evaluate((el) => (el as HTMLImageElement).naturalWidth), {
           timeout: CONVERGE_TIMEOUT,

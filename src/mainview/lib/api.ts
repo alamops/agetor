@@ -105,6 +105,7 @@ import type {
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../../shared/bundle-import.ts";
 import { ApiTransitError, fetchWithRecovery } from "./net-retry.ts";
 import { configureCoreBusy, suspendCoreBusy, trackRequest } from "./core-busy.ts";
+import { openEventStream } from "./sse-fetch.ts";
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -358,6 +359,21 @@ const BASE = `http://127.0.0.1:${API_PORT}`;
 // only ever probes the unauthenticated `/health` route and never aborts or
 // retries a tracked request (docs/plans/non-blocking-session-restore.md).
 configureCoreBusy({ base: BASE });
+
+/** The `Authorization` header every webview request to the core carries. The
+ *  master token never rides in a URL (master-token plan, D13): SSE goes through
+ *  `openEventStream` and images through `useAuthedObjectUrl`, both of which
+ *  send this header. */
+function authHeaders(): Record<string, string> {
+  return { authorization: `Bearer ${API_TOKEN}` };
+}
+
+/** `fetch` with the auth header merged in — the one helper the `blob:` image
+ *  hook (`authed-blob.ts`) uses to read a core byte-serving route. Caller
+ *  headers win on a clash. */
+export function authedFetch(url: string, init?: RequestInit): Promise<Response> {
+  return fetch(url, { ...init, headers: { ...authHeaders(), ...(init?.headers as Record<string, string> | undefined) } });
+}
 
 /** Error thrown for any non-2xx API response. Carries the parsed JSON body
  *  so callers can read structured fields (e.g. the `taskIds` list returned
@@ -1869,29 +1885,28 @@ export const api = {
       method: "POST",
     }),
 
-  /** Absolute URL for an inline `<img>` thumbnail of a referenced image path.
-   *  `<img>` can't set an Authorization header any more than EventSource can,
-   *  so the token rides along as a query param exactly like
-   *  `subscribeRun`/`subscribeTask`'s `?token=`. `GET /files/preview`
-   *  responds 401 with a missing/bad token, 400 for a non-absolute or
-   *  non-image path, 404 when the path doesn't exist (or isn't a regular
-   *  file), and 200 with the raw image bytes otherwise; callers handle the
-   *  error cases via the `<img>` element's own `onError`. */
+  /** Absolute, TOKEN-LESS URL for an inline thumbnail of a referenced image
+   *  path. The route needs the `Authorization` header, which an `<img src>`
+   *  can't send, so image consumers pass this to `useAuthedObjectUrl` /
+   *  `<AuthedImg>` (fetch with the header, show a `blob:` URL). `GET
+   *  /files/preview` answers 401 without the header, 400 for a non-absolute
+   *  or non-image path, 404 when the path doesn't exist (or isn't a regular
+   *  file), and 200 with the raw image bytes otherwise. */
   filePreviewUrl: (path: string): string =>
-    `${BASE}/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(API_TOKEN)}`,
+    `${BASE}/files/preview?path=${encodeURIComponent(path)}`,
 
-  /** Absolute URL for a task's worktree-diff binary blob (old or new side of
-   *  a binary file), for `<img src>` use in `BinaryFilePreview`. Same
-   *  `?token=` pattern as `filePreviewUrl` — `<img>` can't set an
-   *  `Authorization` header. Backed by `GET /tasks/:id/diff/blob`, which
-   *  resolves `side: "old"` via `git show <baseRef>:<path>` and `side:
-   *  "new"` from the on-disk file in the task's cwd (worktree or workdir),
-   *  mirroring what `getTaskDiff`'s underlying `git diff` compared. */
+  /** Absolute, token-less URL for a task's worktree-diff binary blob (old or
+   *  new side of a binary file), for `BinaryFilePreview`. Backed by `GET
+   *  /tasks/:id/diff/blob`, which resolves `side: "old"` via `git show
+   *  <baseRef>:<path>` and `side: "new"` from the on-disk file in the task's
+   *  cwd (worktree or workdir), mirroring what `getTaskDiff`'s underlying
+   *  `git diff` compared. Fetched with the header, never used as a bare
+   *  `<img src>`. */
   taskDiffBlobUrl: (taskId: string, path: string, side: "old" | "new"): string =>
-    `${BASE}/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}&token=${encodeURIComponent(API_TOKEN)}`,
+    `${BASE}/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}`,
 
-  /** Absolute URL for a GitHub PR's binary blob (old or new side), for
-   *  `<img src>` use in `BinaryFilePreview`. Identifying params mirror
+  /** Absolute, token-less URL for a GitHub PR's binary blob (old or new
+   *  side), for `BinaryFilePreview`. Identifying params mirror
    *  `getGitHubPullDiff` (`path`, `number`) exactly, plus the blob-specific
    *  `filePath` (repo-relative file path — carried as a distinct param name
    *  from `path`, which is the local repo dir used to resolve the GitHub
@@ -1904,19 +1919,14 @@ export const api = {
       number: String(opts.number),
       filePath: opts.filePath,
       side: opts.side,
-      token: API_TOKEN,
     });
     return `${BASE}/github/pull-blob?${q.toString()}`;
   },
 
   /** Fetch binary blob bytes via an `Authorization: Bearer` header — used
    *  for PDF panes, which go through `fetch`/pdf.js rather than an `<img>`
-   *  tag. This function always authenticates via the header, same as every
-   *  other `api.*` call; it doesn't rely on (or care about) a `?token=` in
-   *  `url` even though `url` is typically one of `taskDiffBlobUrl`'s /
-   *  `pullBlobUrl`'s outputs, which DO append one — those builders are
-   *  shared with `<img src>` consumers, which can't set headers at all, so
-   *  their URLs carry a token unconditionally. Throws an `Error` whose
+   *  tag. `url` is typically one of `taskDiffBlobUrl`'s / `pullBlobUrl`'s
+   *  token-less outputs; the header is the only credential. Throws an `Error` whose
    *  message distinguishes a missing blob ("missing", 404) from one over
    *  the server's size cap ("too-large", 413) from any other failure, so
    *  callers can render a matching empty state. */
@@ -1931,25 +1941,6 @@ export const api = {
     }
     return res.arrayBuffer();
   },
-  /** Lightweight status probe for a blob URL, used to classify an `<img>`
-   *  `onError` (SF-10) without downloading the — possibly large — body the
-   *  way `fetchBlobBytes` does: the response is read only for its status,
-   *  then its body is cancelled unread. Same three-way classification as
-   *  `fetchBlobBytes`, as a return value instead of a thrown error since
-   *  this is a best-effort classification, not a load path a caller awaits
-   *  before rendering. */
-  probeBlobStatus: async (url: string): Promise<"missing" | "too-large" | "ok" | "error"> => {
-    try {
-      const res = await fetch(url, { headers: { "authorization": `Bearer ${API_TOKEN}` } });
-      void res.body?.cancel();
-      if (res.status === 404) return "missing";
-      if (res.status === 413) return "too-large";
-      return res.ok ? "ok" : "error";
-    } catch {
-      return "error";
-    }
-  },
-
   /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
    *  drag) to disk and get back its absolute path. Bypasses `j()` because the
    *  body is raw bytes, not JSON. */
@@ -2092,19 +2083,24 @@ export const api = {
    *  App.tsx to surface success / error / pending-input across every task
    *  without subscribing per-task. */
   subscribeGlobalEvents(onEvent: (e: GlobalEvent) => void): () => void {
-    const es = new EventSource(`${BASE}/events?token=${encodeURIComponent(API_TOKEN)}`);
-    es.onmessage = (m) => {
-      try {
-        const parsed = JSON.parse(m.data);
-        if (parsed.type === "ping") return;
-        onEvent(parsed as GlobalEvent);
-      } catch { /* ignore */ }
-    };
-    // Logged so a future debug session has a breadcrumb when toasts stop
-    // arriving (typically: stale token, backend restart). EventSource
-    // auto-reconnects, so this is informational — no UI surfacing.
-    es.onerror = (e) => { console.warn("[agetor] global events stream error", e); };
-    return () => es.close();
+    return openEventStream(
+      `${BASE}/events`,
+      {
+        onMessage: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping") return;
+            onEvent(parsed as GlobalEvent);
+          } catch { /* ignore */ }
+        },
+        // Logged so a future debug session has a breadcrumb when toasts stop
+        // arriving (typically: stale token, backend restart). The reader
+        // reconnects on its own except after a 401/403/404, so this is
+        // informational — no UI surfacing.
+        onError: (e) => { console.warn("[agetor] global events stream error", e); },
+      },
+      { headers: authHeaders() },
+    );
   },
 
   /** App-level event stream — carries `quit_request` (the main process
@@ -2118,16 +2114,20 @@ export const api = {
    *  is forwarded to `onEvent` as-is, so a new variant needs no change in
    *  this function. Live-only (no replay). */
   subscribeAppEvents(onEvent: (e: AppEvent) => void): () => void {
-    const es = new EventSource(`${BASE}/app/events?token=${encodeURIComponent(API_TOKEN)}`);
-    es.onmessage = (m) => {
-      try {
-        const parsed = JSON.parse(m.data);
-        if (parsed.type === "ping") return;
-        onEvent(parsed as AppEvent);
-      } catch { /* ignore */ }
-    };
-    es.onerror = (e) => { console.warn("[agetor] app events stream error", e); };
-    return () => es.close();
+    return openEventStream(
+      `${BASE}/app/events`,
+      {
+        onMessage: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping") return;
+            onEvent(parsed as AppEvent);
+          } catch { /* ignore */ }
+        },
+        onError: (e) => { console.warn("[agetor] app events stream error", e); },
+      },
+      { headers: authHeaders() },
+    );
   },
 
   /** Tell the main process to quit despite running tasks. Used by the
@@ -2136,17 +2136,20 @@ export const api = {
   forceQuit: () => j<{ ok: boolean }>("/app/force-quit", { method: "POST" }),
 
   subscribeRun(runId: string, onEvent: (e: RunEvent) => void): () => void {
-    // EventSource can't set headers, so the server also accepts the token via query.
-    const es = new EventSource(`${BASE}/runs/${runId}/events?token=${encodeURIComponent(API_TOKEN)}`);
-    es.onmessage = (m) => {
-      try {
-        const parsed = JSON.parse(m.data);
-        if (parsed.type === "ping") return;
-        onEvent(parsed as RunEvent);
-      } catch { /* ignore */ }
-    };
-    es.onerror = (e) => { console.warn("[agetor] run events stream error", runId, e); };
-    return () => es.close();
+    return openEventStream(
+      `${BASE}/runs/${runId}/events`,
+      {
+        onMessage: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping") return;
+            onEvent(parsed as RunEvent);
+          } catch { /* ignore */ }
+        },
+        onError: (e) => { console.warn("[agetor] run events stream error", runId, e); },
+      },
+      { headers: authHeaders() },
+    );
   },
   /** Unified task-level event stream: every run's events, merged in id
    *  order. Replaces per-run subscriptions for the run panel so the user
@@ -2164,22 +2167,30 @@ export const api = {
     onEvent: (e: RunEvent) => void,
     onReplayMeta?: (meta: TaskEventsReplayMeta) => void,
   ): () => void {
-    const es = new EventSource(`${BASE}/tasks/${taskId}/events?token=${encodeURIComponent(API_TOKEN)}`);
-    if (onReplayMeta) {
-      es.addEventListener(TASK_EVENTS_REPLAY_META_EVENT, (m: MessageEvent) => {
-        try {
-          onReplayMeta(JSON.parse(m.data) as TaskEventsReplayMeta);
-        } catch { /* ignore malformed */ }
-      });
-    }
-    es.onmessage = (m) => {
-      try {
-        const parsed = JSON.parse(m.data);
-        if (parsed.type === "ping") return;
-        onEvent(parsed as RunEvent);
-      } catch { /* ignore */ }
-    };
-    es.onerror = (e) => { console.warn("[agetor] task events stream error", taskId, e); };
-    return () => es.close();
+    return openEventStream(
+      `${BASE}/tasks/${taskId}/events`,
+      {
+        onMessage: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.type === "ping") return;
+            onEvent(parsed as RunEvent);
+          } catch { /* ignore */ }
+        },
+        // Named frame: invisible to `onMessage`, so registering it only when
+        // a caller asks costs nothing for callers that don't care.
+        events: onReplayMeta
+          ? {
+              [TASK_EVENTS_REPLAY_META_EVENT]: (data) => {
+                try {
+                  onReplayMeta(JSON.parse(data) as TaskEventsReplayMeta);
+                } catch { /* ignore malformed */ }
+              },
+            }
+          : undefined,
+        onError: (e) => { console.warn("[agetor] task events stream error", taskId, e); },
+      },
+      { headers: authHeaders() },
+    );
   },
 };

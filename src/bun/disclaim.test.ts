@@ -1,85 +1,81 @@
-import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
-import { existsSync, mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { test, expect, afterEach } from "bun:test";
+import { existsSync } from "node:fs";
 import path from "node:path";
-import { rmTestDataDir } from "./test-data-dir.ts";
+import {
+  DISCLAIM_PREF_KEY,
+  bundledDisclaimPath,
+  resolveDisclaimBin,
+  disclaimAvailable,
+  computeDisclaimEnabled,
+  disclaimEnabled,
+  disclaimArgv,
+  isDisclaimOffValue,
+  getDisclaimSwitch,
+  setDisclaimSwitch,
+} from "./disclaim.ts";
 
-// Top-level: db.ts captures AGETOR_DATA_DIR at first import — see the same
-// convention repeated across every sibling *.test.ts that imports db.ts
-// (task-unread.test.ts, db-sent-files.test.ts, …). A `beforeAll` would race
-// with whichever test file's import wins the module-cache race in
-// `bun test`'s single process — disclaim.ts imports db.ts (for the
-// `preferences` store), so this file needs the same guard.
-const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-disclaim-"));
-process.env.AGETOR_DATA_DIR = dataDir;
-
-let DISCLAIM_PREF_KEY: string;
-let bundledDisclaimPath: () => string;
-let resolveDisclaimBin: () => string;
-let disclaimAvailable: () => boolean;
-let computeDisclaimEnabled: (opts: {
-  platform: NodeJS.Platform;
-  prefDisabled: boolean;
-  available: boolean;
-}) => boolean;
-let disclaimEnabled: () => boolean;
-let disclaimArgv: (argv: string[]) => string[];
-let preferences: typeof import("./db.ts").preferences;
-
-beforeAll(async () => {
-  ({
-    DISCLAIM_PREF_KEY,
-    bundledDisclaimPath,
-    resolveDisclaimBin,
-    disclaimAvailable,
-    computeDisclaimEnabled,
-    disclaimEnabled,
-    disclaimArgv,
-  } = await import("./disclaim.ts"));
-  ({ preferences } = await import("./db.ts"));
-});
-
-afterAll(() => {
-  rmTestDataDir(dataDir);
-});
-
+// disclaim.ts no longer touches db.ts (P4: the switch is in memory), so this
+// file needs no AGETOR_DATA_DIR. Ambient state (the env override + the
+// in-memory switch) must never leak between cases — bun runs every test file
+// in one process — so both are restored after every test.
 const ORIGINAL_DISCLAIM_BIN = process.env.AGETOR_DISCLAIM_BIN;
+const ORIGINAL_SWITCH = getDisclaimSwitch();
 
-// Ambient state (the env override + the preference row) must never leak
-// between cases — restore both after every test.
 afterEach(() => {
   if (ORIGINAL_DISCLAIM_BIN === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
   else process.env.AGETOR_DISCLAIM_BIN = ORIGINAL_DISCLAIM_BIN;
-  // Any value other than the literal "false" reads as "enabled" (the
-  // default) — this resets the pref to that default state rather than
-  // leaving whatever a prior case wrote.
-  preferences.set(DISCLAIM_PREF_KEY, "true");
+  setDisclaimSwitch(ORIGINAL_SWITCH);
+});
+
+test("DISCLAIM_PREF_KEY keeps its stored name", () => {
+  expect(DISCLAIM_PREF_KEY).toBe("disclaimSpawnedAgents");
+});
+
+test('isDisclaimOffValue: only the literal "false" means off', () => {
+  expect(isDisclaimOffValue("false")).toBe(true);
+  for (const v of ["true", "", "False", "0", "off", " false", null, undefined]) {
+    expect(isDisclaimOffValue(v)).toBe(false);
+  }
+});
+
+test("the in-memory switch defaults on and round-trips", () => {
+  // The module-level default (before any test touched it) is ON.
+  expect(ORIGINAL_SWITCH).toBe(true);
+  setDisclaimSwitch(false);
+  expect(getDisclaimSwitch()).toBe(false);
+  setDisclaimSwitch(true);
+  expect(getDisclaimSwitch()).toBe(true);
+});
+
+test("disclaim.ts does not import db.ts (P4)", async () => {
+  const src = await Bun.file(path.join(import.meta.dir, "disclaim.ts")).text();
+  expect(src).not.toMatch(/from\s+["']\.\/db(\.ts)?["']/);
 });
 
 test("computeDisclaimEnabled: darwin + enabled + available -> true", () => {
   expect(
-    computeDisclaimEnabled({ platform: "darwin", prefDisabled: false, available: true }),
+    computeDisclaimEnabled({ platform: "darwin", switchOn: true, available: true }),
   ).toBe(true);
 });
 
 test("computeDisclaimEnabled: non-darwin -> false regardless of other flags", () => {
   expect(
-    computeDisclaimEnabled({ platform: "linux", prefDisabled: false, available: true }),
+    computeDisclaimEnabled({ platform: "linux", switchOn: true, available: true }),
   ).toBe(false);
   expect(
-    computeDisclaimEnabled({ platform: "win32", prefDisabled: false, available: true }),
+    computeDisclaimEnabled({ platform: "win32", switchOn: true, available: true }),
   ).toBe(false);
 });
 
-test("computeDisclaimEnabled: prefDisabled -> false", () => {
+test("computeDisclaimEnabled: switch off -> false", () => {
   expect(
-    computeDisclaimEnabled({ platform: "darwin", prefDisabled: true, available: true }),
+    computeDisclaimEnabled({ platform: "darwin", switchOn: false, available: true }),
   ).toBe(false);
 });
 
 test("computeDisclaimEnabled: unavailable -> false", () => {
   expect(
-    computeDisclaimEnabled({ platform: "darwin", prefDisabled: false, available: false }),
+    computeDisclaimEnabled({ platform: "darwin", switchOn: true, available: false }),
   ).toBe(false);
 });
 
@@ -110,17 +106,17 @@ test.skipIf(process.platform !== "darwin")(
   "disclaimArgv: prepends AGETOR_DISCLAIM_BIN when enabled",
   () => {
     process.env.AGETOR_DISCLAIM_BIN = "/bin/echo";
-    preferences.set(DISCLAIM_PREF_KEY, "true");
+    setDisclaimSwitch(true);
     expect(disclaimEnabled()).toBe(true);
     expect(disclaimArgv(["some-cmd", "--flag"])).toEqual(["/bin/echo", "some-cmd", "--flag"]);
   },
 );
 
 test.skipIf(process.platform !== "darwin")(
-  'disclaimArgv: passthrough (unchanged) when the pref is the literal string "false"',
+  "disclaimArgv: passthrough (unchanged) when the switch is off",
   () => {
     process.env.AGETOR_DISCLAIM_BIN = "/bin/echo";
-    preferences.set(DISCLAIM_PREF_KEY, "false");
+    setDisclaimSwitch(false);
     expect(disclaimEnabled()).toBe(false);
     expect(disclaimArgv(["some-cmd", "--flag"])).toEqual(["some-cmd", "--flag"]);
   },

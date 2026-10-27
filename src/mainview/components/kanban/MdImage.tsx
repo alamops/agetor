@@ -52,6 +52,7 @@ import { cn } from "@/lib/utils";
 import { api, ApiError } from "@/lib/api";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import { classifyMdImageSrc } from "@/lib/md-image";
+import { AuthedImg } from "@/components/ui/authed-img";
 import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
 import type { MdComponents } from "./md-components";
 
@@ -254,15 +255,19 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
         source.candidates[candidateIndex] ?? source.candidates[0] ?? source.path;
       content = (
         <span className="inline-flex max-w-full flex-col items-start gap-0.5 align-middle">
-          <img
+          {/* Fetched with the auth header and shown as a `blob:` URL (D13/P9).
+              `key` remounts the image per candidate so each candidate is
+              fetched at most once; any non-ok status (404, 413, network,
+              decode) moves to the next candidate exactly as `onError` did. */}
+          <AuthedImg
+            key={currentPath}
+            url={api.filePreviewUrl(currentPath)}
             data-testid="md-image"
             data-md-src={src}
             data-path={currentPath}
-            src={api.filePreviewUrl(currentPath)}
             alt={alt ?? ""}
             title={title ?? currentPath}
             aria-label={alt || `Open ${refBasename(currentPath)}`}
-            loading="lazy"
             decoding="async"
             role="button"
             tabIndex={0}
@@ -270,7 +275,8 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
             onKeyDown={(e) => {
               if (isActivationKey(e)) stopAnd(e, () => void openLocalPath(currentPath));
             }}
-            onError={() => {
+            onStatus={(status) => {
+              if (status === "ok") return;
               const next = candidateIndex + 1;
               if (next < source.candidates.length) setCandidateIndex(next);
               else setFailed(true);
