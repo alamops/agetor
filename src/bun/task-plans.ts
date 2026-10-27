@@ -161,12 +161,14 @@ export function setEditedContent(
  * must check this *before* sending the auto-approval message, since the send
  * is non-idempotent. `approvedEdited` is derived from whether a draft edit
  * was present at approval time, not re-derived later, so the record stays
- * accurate even if edits were somehow cleared afterward.
+ * accurate even if edits were somehow cleared afterward. `filePath` is the
+ * repo-relative `.plan.md` cursor writes at approval, or `null` for a plan
+ * with no file on disk (GitHub Copilot embeds the plan in the message).
  */
 export function approvePlan(
   plans: TaskPlan[],
   planId: string,
-  opts: { now: number; filePath: string },
+  opts: { now: number; filePath: string | null },
 ): { plans: TaskPlan[]; approved: TaskPlan } | null {
   const idx = plans.findIndex((p) => p.id === planId);
   if (idx === -1) return null;

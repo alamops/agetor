@@ -1,4 +1,4 @@
-import { test, expect, describe, afterAll } from "bun:test";
+import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import {
   chmodSync,
   mkdirSync,
@@ -729,8 +729,11 @@ describe("copilotHome", () => {
  * Paths
  * ────────────────────────────────────────────────────────────────────────── */
 
-test("per-run paths live under <dataDir>/copilot-logs", () => {
-  const dir = path.join(process.env.AGETOR_DATA_DIR!, "copilot-logs");
+test("per-run paths live under <dataDir>/copilot-logs", async () => {
+  // Under a full `bun test` run db.ts's dataDir may come from whichever test
+  // file imported it first, not this file's AGETOR_DATA_DIR.
+  const { dataDir } = await import("./db.ts");
+  const dir = path.join(dataDir, "copilot-logs");
   expect(copilotLogPath("r1")).toBe(path.join(dir, "r1.jsonl"));
   expect(copilotPromptPath("r1")).toBe(path.join(dir, "r1.prompt.txt"));
   expect(copilotExitPath("r1")).toBe(path.join(dir, "r1.exit"));
@@ -742,7 +745,8 @@ test("per-run paths live under <dataDir>/copilot-logs", () => {
  * the isolated `agetor-test` socket (NODE_ENV=test), hosting a stub `copilot`.
  * ────────────────────────────────────────────────────────────────────────── */
 
-const hasTmux = Bun.which("tmux") !== null;
+const realTmux = Bun.which("tmux");
+const hasTmux = realTmux !== null;
 const lifecycle = hasTmux ? describe : describe.skip;
 
 interface StubSpec {
@@ -814,6 +818,18 @@ function launchOpts(
 
 lifecycle("spawnCopilotViaTmux lifecycle", () => {
   const T = 30_000;
+
+  // Other test files in the same `bun test` process point AGETOR_TMUX_BIN at
+  // /bin/echo (session-reaper, orchestrator); these tests need the real tmux.
+  let prevTmuxBin: string | undefined;
+  beforeAll(() => {
+    prevTmuxBin = process.env.AGETOR_TMUX_BIN;
+    process.env.AGETOR_TMUX_BIN = realTmux!;
+  });
+  afterAll(() => {
+    if (prevTmuxBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevTmuxBin;
+  });
 
   test("success: stdin prompt, mapped chunks, subagent routing, usage sentinel, settleAll(completed)", async () => {
     const ids = newIds();

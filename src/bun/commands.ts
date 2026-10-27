@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { AgentKind } from "../shared/types.ts";
 import { diskProjectTree, emptyProjectTree, loadRefProjectTree, type ProjectTree } from "./ref-tree.ts";
+import { copilotHome } from "./copilot-home.ts";
 import { repoRoot } from "./worktree.ts";
 
 /**
@@ -31,22 +32,22 @@ export interface AvailableCommand {
 
 /**
  * A non-command extension the user can reference from the prompt: an MCP
- * server, a skill, or an installed plugin. Surfaced by the "Extensions" picker
+ * server, a skill, an installed plugin, or a custom agent (GitHub Copilot). Surfaced by the "Extensions" picker
  * that sits above the prompt / message field (distinct from the `/` slash
  * autocomplete, which only covers slash-invokable commands + skills).
  *
  * `insert` is the literal token dropped into the textarea at the caret:
  *  - skills    → `/name`  (slash-invokable, same as the autocomplete)
- *  - mcp / plugin → `@name` (a mention nudging the agent to use it; MCP servers
- *    and plugins aren't slash-invokable, so the mention is the lightest-weight
- *    way to point the agent at them).
+ *  - mcp / plugin / agent → `@name` (a mention nudging the agent to use it;
+ *    MCP servers, plugins and custom agents aren't slash-invokable, so the
+ *    mention is the lightest-weight way to point the agent at them).
  */
 export interface AvailableExtension {
   name: string;
   insert: string;
   description: string;
   source: EntrySource;
-  kind: "mcp" | "skill" | "plugin";
+  kind: "mcp" | "skill" | "plugin" | "agent";
 }
 
 /**
@@ -67,6 +68,16 @@ function readMdSummary(text: string): string {
     return line.slice(0, 200);
   }
   return "";
+}
+
+/** The `name:` field of a markdown file's YAML frontmatter, or null. */
+function readMdFrontmatterName(text: string): string | null {
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+  if (!fm) return null;
+  const m = /^name:\s*(.+)$/m.exec(fm[1]!);
+  if (!m) return null;
+  const name = m[1]!.trim().replace(/^["']|["']$/g, "").trim();
+  return name || null;
 }
 
 function safeReadFile(p: string): string {
@@ -126,6 +137,33 @@ function discoverSkills(tree: ProjectTree, relDir: string, source: EntrySource):
       description: readMdSummary(text),
       source,
       kind: "skill",
+    });
+  }
+  return out;
+}
+
+/**
+ * GitHub Copilot custom agents: flat `*.md` files under `relDir` (user
+ * `$COPILOT_HOME/agents`, project `.github/agents`). The name is the
+ * frontmatter `name:` when present, else the filename minus `.agent.md` /
+ * `.md`. Returned as extension rows (`kind: "agent"`, insert `@<name>`) since
+ * agents aren't slash-invokable.
+ */
+function discoverCopilotAgents(tree: ProjectTree, relDir: string, source: "user" | "project"): AvailableExtension[] {
+  const out: AvailableExtension[] = [];
+  for (const entry of tree.list(relDir)) {
+    if (entry.isDir || !entry.name.endsWith(".md")) continue;
+    const text = tree.read(`${relDir}/${entry.name}`);
+    if (text == null) continue;
+    const fileBase = entry.name.endsWith(".agent.md") ? entry.name.slice(0, -".agent.md".length) : entry.name.slice(0, -".md".length);
+    const name = readMdFrontmatterName(text) ?? fileBase;
+    if (!name) continue;
+    out.push({
+      name,
+      insert: "@" + name,
+      description: readMdSummary(text) || "Custom agent",
+      source,
+      kind: "agent",
     });
   }
   return out;
@@ -213,6 +251,11 @@ const CAPABILITY_READ_PATTERNS: RegExp[] = [
   /^\.claude\/settings\.json$/,
   /^\.claude\/settings\.local\.json$/,
   /^\.mcp\.json$/,
+  // GitHub Copilot: project skills / MCP / custom agents under `.github/`
+  // (`.agents/skills` and `.claude/skills` are matched above).
+  /^\.github\/skills\/[^/]+\/SKILL\.md$/,
+  /^\.github\/mcp\.json$/,
+  /^\.github\/agents\/[^/]+\.md$/,
   /^\.codex\/prompts\/.+\.md$/,
   /^\.codex\/skills\/[^/]+\/SKILL\.md$/,
   /^\.codex\/config\.toml$/,
@@ -230,7 +273,23 @@ const CAPABILITY_READ_PATTERNS: RegExp[] = [
 
 const CURSOR_USER_SKILL_DIRS = [".cursor/skills", ".claude/skills", ".codex/skills", ".grok/skills", ".agents/skills"];
 const FX_USER_SKILL_DIRS = [".fx/skills", ".config/opencode/skills", ".codex/skills", ".claude/skills", ".agents/skills", ".claw/skills"];
+// GitHub Copilot: user skills live in `$COPILOT_HOME/skills` (walked on its own
+// tree) plus HOME-relative `.agents/skills`; project skills in these dirs.
+const COPILOT_USER_HOME_SKILL_DIRS = [".agents/skills"];
+const COPILOT_PROJECT_SKILL_DIRS = [".github/skills", ".agents/skills", ".claude/skills"];
 const FX_PROJECT_SKILL_DIRS = [".fx/skills", "skills", ".opencode/skills", ".codex/skills", ".claude/skills", ".agents/skills", ".claw/skills"];
+
+/** `$COPILOT_HOME` for a copilot harness (harness env map, then harness.home,
+ *  then the process env, then `~/.copilot`). */
+function copilotHomeFor(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
+  return copilotHome({ harnessHome: opts.harnessHome, harnessEnv: opts.harnessEnv });
+}
+
+/** HOME for copilot's HOME-relative `~/.agents/skills`. `harness.home` is the
+ *  COPILOT_HOME (not a HOME), so only an explicit env-map HOME overrides. */
+function copilotUserHome(opts: { harnessEnv?: Record<string, string> | null }): string {
+  return opts.harnessEnv?.HOME || homedir();
+}
 
 /** HOME for cursor/fx. An explicit harness-env HOME wins, matching spawn
  *  (`harnessEnv` writes HOME from `harness.home` and then lets the env map
@@ -377,6 +436,17 @@ export async function listAvailableCommands(
     const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts.branch, root);
     if (projectTree) {
       for (const dir of FX_PROJECT_SKILL_DIRS) all.push(...discoverSkills(projectTree, dir, "project"));
+    }
+  } else if (opts.agent === "copilot") {
+    // Skills only in this walk (agents and MCP surface as extensions in
+    // `discoverMcpAndPluginExtensions`). No builtins.
+    all.push(...discoverSkills(diskProjectTree(copilotHomeFor(opts)), "skills", "user"));
+    const userTree = diskProjectTree(copilotUserHome(opts));
+    for (const dir of COPILOT_USER_HOME_SKILL_DIRS) all.push(...discoverSkills(userTree, dir, "user"));
+    const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
+    const projectTree = ctx?.projectTree !== undefined ? ctx.projectTree : await resolveProjectTree(opts.branch, root);
+    if (projectTree) {
+      for (const dir of COPILOT_PROJECT_SKILL_DIRS) all.push(...discoverSkills(projectTree, dir, "project"));
     }
   }
   // Gemini intentionally falls through with no discovery yet: it stores
@@ -755,6 +825,22 @@ function discoverMcpAndPluginExtensions(
         ),
       );
     }
+  } else if (opts.agent === "copilot") {
+    // User MCP: `$COPILOT_HOME/mcp-config.json`. Project MCP: `.mcp.json`
+    // (`mcpServers`) and `.github/mcp.json` (`mcpServers`, or the VS Code
+    // shape's `servers`). Custom agents: `$COPILOT_HOME/agents/*.md` and
+    // `.github/agents/*.md`. The project files read through the project tree
+    // so a ref sees the committed copy.
+    const home = copilotHomeFor(opts);
+    const userMcp = safeReadJson(path.join(home, "mcp-config.json"));
+    all.push(...mcpServersToExtensions(userMcp?.mcpServers ?? userMcp?.servers, "user"));
+    all.push(...discoverCopilotAgents(diskProjectTree(home), "agents", "user"));
+    if (root) {
+      all.push(...mcpServersToExtensions(safeParseJson(projectTree?.read(".mcp.json") ?? null)?.mcpServers, "project"));
+      const ghMcp = safeParseJson(projectTree?.read(".github/mcp.json") ?? null);
+      all.push(...mcpServersToExtensions(ghMcp?.mcpServers ?? ghMcp?.servers, "project"));
+      if (projectTree) all.push(...discoverCopilotAgents(projectTree, ".github/agents", "project"));
+    }
   }
   // Gemini has its own `gemini mcp add/list/remove` surface, so it almost
   // certainly stores MCP config somewhere under GEMINI_CLI_HOME/`.gemini/` —
@@ -767,7 +853,8 @@ function discoverMcpAndPluginExtensions(
 /**
  * Collapse a raw extension list: project overrides user on a (kind, name)
  * collision (same precedence rule as listAvailableCommands), then a stable
- * grouping — mcp, then skill, then plugin; alphabetical within a group.
+ * grouping — mcp, then skill, then plugin, then agent; alphabetical within a
+ * group.
  */
 function dedupeAndSortExtensions(all: AvailableExtension[]): AvailableExtension[] {
   const byKey = new Map<string, AvailableExtension>();
@@ -778,7 +865,7 @@ function dedupeAndSortExtensions(all: AvailableExtension[]): AvailableExtension[
       byKey.set(k, e);
     }
   }
-  const order = { mcp: 0, skill: 1, plugin: 2 } as const;
+  const order = { mcp: 0, skill: 1, plugin: 2, agent: 3 } as const;
   return [...byKey.values()].sort(
     (a, b) => order[a.kind] - order[b.kind] || a.name.localeCompare(b.name),
   );
