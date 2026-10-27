@@ -360,6 +360,7 @@ import { runs, subagents as subagentsDb, tasks } from "./db.ts";
 import { formatApiErrorDetail, mapJsonlEventToChunks } from "./claude-tmux.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import type { RunEvent, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
+import { READ_NOFOLLOW, readTextNoFollow } from "./no-follow.ts";
 
 /** Off only when explicitly disabled. The watcher is cheap when idle, but the
  *  flag lets us kill it entirely if a future claude layout change breaks the
@@ -687,7 +688,7 @@ interface SubagentMeta {
  *  place the tool_result correlation key exists on disk). */
 function readMeta(subagentsDir: string, id: string): SubagentMeta {
   try {
-    const raw = readFileSync(path.join(subagentsDir, `agent-${id}.meta.json`), "utf8");
+    const raw = readTextNoFollow(path.join(subagentsDir, `agent-${id}.meta.json`));
     const o = JSON.parse(raw) as Record<string, unknown>;
     return {
       agentType: typeof o.agentType === "string" ? o.agentType : null,
@@ -731,7 +732,7 @@ function readAppendedSync(
   if (maxBytes !== undefined && len > maxBytes) len = maxBytes;
   const buf = Buffer.alloc(len);
   let fd;
-  try { fd = openSync(filePath, "r"); } catch { return { text: "", next: offset }; }
+  try { fd = openSync(filePath, READ_NOFOLLOW); } catch { return { text: "", next: offset }; }
   try {
     readSync(fd, buf, 0, len, offset);
   } finally {
@@ -787,7 +788,7 @@ function readAppendedLinesSync(
   // Same non-file guard as `readAppendedSync` (a directory `sourcePath`).
   if (!st.isFile() || st.size <= offset) return none;
   let fd;
-  try { fd = openSync(filePath, "r"); } catch { return none; }
+  try { fd = openSync(filePath, READ_NOFOLLOW); } catch { return none; }
   try {
     let size = st.size;
     let end = offset;

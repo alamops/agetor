@@ -10,7 +10,7 @@
  * cached per file until its size or mtime changes. `git` runs only for rows
  * that stay visible.
  */
-import { closeSync, createReadStream, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -22,6 +22,7 @@ import {
   plainEncodedProjectPath,
   type ClaudeSessionMeta,
 } from "../shared/claude-session-meta.ts";
+import { openReadNoFollow, READ_NOFOLLOW, readTextNoFollow } from "./no-follow.ts";
 
 export interface ClaudeSessionCandidate {
   sessionId: string;
@@ -298,7 +299,7 @@ function parseAgentList(value: unknown): ListedClaudeAgent[] {
 function agentsFromStubFile(file: string, configDir: string): ListedClaudeAgent[] {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(file, "utf8"));
+    parsed = JSON.parse(readTextNoFollow(file));
   } catch {
     return [];
   }
@@ -387,7 +388,7 @@ export function readClaudeRegistry(configDir: string): ClaudeRegistryRecord[] {
     if (!name.endsWith(".json")) continue;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(readFileSync(path.join(dir, name), "utf8"));
+      parsed = JSON.parse(readTextNoFollow(path.join(dir, name)));
     } catch {
       continue;
     }
@@ -461,7 +462,9 @@ export function clearClaudeSessionMetaCache(): void {
  */
 export async function readClaudeSessionMetaFile(file: string): Promise<ClaudeSessionMeta> {
   const reader = createClaudeSessionMetaReader();
-  const input = createReadStream(file);
+  // The fd is opened no-follow (a planted symlink throws ELOOP here); the
+  // stream owns and closes it.
+  const input = createReadStream("", { fd: openReadNoFollow(file) });
   const rl = createInterface({ input, crlfDelay: Infinity });
   let sliceStart = Date.now();
   try {
@@ -484,7 +487,7 @@ export async function readClaudeSessionMetaFile(file: string): Promise<ClaudeSes
 function peekFirstCwd(file: string): string | null {
   let fd: number | null = null;
   try {
-    fd = openSync(file, "r");
+    fd = openSync(file, READ_NOFOLLOW);
     const buf = Buffer.alloc(PEEK_BYTES);
     const n = readSync(fd, buf, 0, PEEK_BYTES, 0);
     const lines = buf.subarray(0, n).toString("utf8").split("\n");
@@ -704,7 +707,9 @@ async function loadMeta(
   opts: ScanClaudeSessionsOptions,
 ): Promise<{ meta: ClaudeSessionMeta; mtime: number } | "hidden" | null> {
   let st: ReturnType<typeof statSync>;
-  try { st = statSync(jsonlPath); } catch { return null; }
+  try { st = lstatSync(jsonlPath); } catch { return null; }
+  // A planted symlink is never read (no-follow.ts); Claude writes regular files.
+  if (!st.isFile()) return null;
   let entry = metaCache.get(jsonlPath);
   if (!entry || entry.size !== st.size || entry.mtimeMs !== st.mtimeMs) {
     entry = { size: st.size, mtimeMs: st.mtimeMs, meta: null };
@@ -765,7 +770,9 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
     for (const dirName of projectDirs) {
       const dirPath = path.join(projects, dirName);
       let st: ReturnType<typeof statSync>;
-      try { st = statSync(dirPath); } catch { continue; }
+      // lstat: a project dir planted as a symlink into a protected folder is
+      // skipped, never listed in-process (no-follow.ts).
+      try { st = lstatSync(dirPath); } catch { continue; }
       if (!st.isDirectory()) continue;
       let files: string[] = [];
       try { files = readdirSync(dirPath); } catch { continue; }

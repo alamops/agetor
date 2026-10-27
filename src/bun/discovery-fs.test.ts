@@ -1,0 +1,297 @@
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { getDisclaimSwitch, setDisclaimSwitch } from "./disclaim.ts";
+import {
+  __clearDisclaimedJsonCacheForTest,
+  discoveryFs,
+  disclaimedDiscoveryFs,
+  inProcessDiscoveryFs,
+  markdownTree,
+  singleFile,
+  skillsDir,
+} from "./discovery-fs.ts";
+
+// commands.ts pulls in worktree.ts -> db.ts, which opens sqlite at module load:
+// point it at a temp dir before the dynamic import (same pattern as commands.test.ts).
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-discovery-fs-db-"));
+const { listAgentCapabilities } = await import("./commands.ts");
+
+const scratch = mkdtempSync(path.join(tmpdir(), "discovery-fs-"));
+const ORIGINAL_DISCLAIM_BIN = process.env.AGETOR_DISCLAIM_BIN;
+const ORIGINAL_SWITCH = getDisclaimSwitch();
+
+afterEach(() => {
+  if (ORIGINAL_DISCLAIM_BIN === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+  else process.env.AGETOR_DISCLAIM_BIN = ORIGINAL_DISCLAIM_BIN;
+  setDisclaimSwitch(ORIGINAL_SWITCH);
+  __clearDisclaimedJsonCacheForTest();
+});
+
+afterAll(() => {
+  try {
+    rmSync(scratch, { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
+});
+
+function w(file: string, body: string) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, body);
+}
+
+let counter = 0;
+/** A passthrough disclaim stub that records the program each child runs. */
+function recordingStub(): { log: string; children: () => string[] } {
+  const name = `stub-${counter++}`;
+  const stub = path.join(scratch, name);
+  const log = path.join(scratch, `${name}.log`);
+  writeFileSync(log, "");
+  writeFileSync(stub, `#!/bin/sh\necho "$1" >> '${log}'\nexec "$@"\n`, { mode: 0o755 });
+  process.env.AGETOR_DISCLAIM_BIN = stub;
+  setDisclaimSwitch(true);
+  return { log, children: () => readFileSync(log, "utf8").split("\n").filter(Boolean) };
+}
+
+describe("discoveryFs() selection", () => {
+  test("in-process while the switch is off, even with a helper present", () => {
+    recordingStub();
+    setDisclaimSwitch(false);
+    expect(discoveryFs()).toBe(inProcessDiscoveryFs);
+  });
+
+  test.skipIf(process.platform !== "darwin")("disclaimed while the switch is on and the helper is present", () => {
+    recordingStub();
+    expect(discoveryFs()).toBe(disclaimedDiscoveryFs);
+  });
+
+  test("in-process under test without a helper", () => {
+    delete process.env.AGETOR_DISCLAIM_BIN;
+    setDisclaimSwitch(true);
+    expect(discoveryFs().disclaimed).toBe(false);
+  });
+});
+
+describe.skipIf(process.platform !== "darwin")("disclaimed load()", () => {
+  const cfg = path.join(scratch, "cfg");
+  const outside = path.join(scratch, "outside-the-config-dir");
+
+  beforeAll(() => {
+    w(path.join(cfg, "commands/a.md"), "# a");
+    w(path.join(cfg, "commands/sub/b.md"), "# b");
+    w(path.join(cfg, "commands/readme.txt"), "not markdown");
+    w(path.join(cfg, "skills/real/SKILL.md"), "real skill");
+    w(path.join(cfg, "skills/real/assets/big.bin"), "x".repeat(1000));
+    w(path.join(cfg, "skills/real/deep/SKILL.md"), "too deep");
+    w(path.join(cfg, "skills/node_modules/pkg/SKILL.md"), "pruned");
+    w(path.join(cfg, "settings.json"), '{"enabledPlugins":{}}');
+    // A planted symlink: a skill folder that points outside the config dir.
+    w(path.join(outside, "SKILL.md"), "from behind a symlink");
+    symlinkSync(outside, path.join(cfg, "skills/linked"));
+    symlinkSync("/nonexistent-target", path.join(cfg, "skills/dangling"));
+  });
+
+  test("reads exactly the selected files, in one child, following symlinks inside it", async () => {
+    const { children } = recordingStub();
+    const reader = await disclaimedDiscoveryFs.load([
+      markdownTree(path.join(cfg, "commands")),
+      skillsDir(path.join(cfg, "skills")),
+      singleFile(path.join(cfg, "settings.json")),
+      singleFile(path.join(scratch, "does-not-exist.json")),
+    ]);
+    expect(children()).toEqual(["/bin/sh"]);
+
+    const tree = reader.tree(cfg);
+    expect(tree.read("commands/a.md")).toBe("# a");
+    expect(tree.read("commands/sub/b.md")).toBe("# b");
+    expect(tree.read("commands/readme.txt")).toBeNull(); // not selected
+    expect(tree.read("skills/real/SKILL.md")).toBe("real skill");
+    expect(tree.read("skills/real/assets/big.bin")).toBeNull(); // never archived
+    expect(tree.read("skills/real/deep/SKILL.md")).toBeNull(); // past maxDepth
+    expect(tree.read("skills/node_modules/pkg/SKILL.md")).toBeNull(); // pruned
+    expect(tree.read("skills/linked/SKILL.md")).toBe("from behind a symlink");
+    expect(tree.list("skills").map((e) => e.name).sort()).toEqual(["linked", "real"]);
+    expect(reader.text(path.join(cfg, "settings.json"))).toBe('{"enabledPlugins":{}}');
+    expect(reader.json(path.join(cfg, "settings.json"))).toEqual({ enabledPlugins: {} });
+    expect(reader.text(path.join(scratch, "does-not-exist.json"))).toBeNull();
+  });
+
+  test("a missing root yields an empty tree; no selectors spawn nothing", async () => {
+    const { children } = recordingStub();
+    const reader = await disclaimedDiscoveryFs.load([skillsDir(path.join(scratch, "no-such-dir"))]);
+    expect(reader.tree(path.join(scratch, "no-such-dir")).list("")).toEqual([]);
+    expect(children()).toEqual(["/bin/sh"]);
+    await disclaimedDiscoveryFs.load([]);
+    expect(children()).toEqual(["/bin/sh"]);
+  });
+
+  test("paths with spaces, a leading dash component and unicode survive", async () => {
+    recordingStub();
+    const odd = path.join(scratch, "-odd dir ✓");
+    w(path.join(odd, "skills/s p/SKILL.md"), "odd");
+    const reader = await disclaimedDiscoveryFs.load([skillsDir(path.join(odd, "skills"))]);
+    expect(reader.tree(odd).read("skills/s p/SKILL.md")).toBe("odd");
+  });
+
+  test("a big unrelated file next to a skill cannot hide it (nothing but selected files is archived)", async () => {
+    recordingStub();
+    const root = path.join(scratch, "bigroot");
+    w(path.join(root, "skills/x/SKILL.md"), "needle");
+    writeFileSync(path.join(root, "skills/x/huge.bin"), Buffer.alloc(9 * 1024 * 1024, 0x61));
+    const reader = await disclaimedDiscoveryFs.load([skillsDir(path.join(root, "skills"))]);
+    expect(reader.tree(root).read("skills/x/SKILL.md")).toBe("needle");
+  });
+
+  test("hitting the read cap logs one warning naming the root", async () => {
+    recordingStub();
+    const root = path.join(scratch, "caproot");
+    for (let i = 0; i < 12; i++) w(path.join(root, `commands/c${i}.md`), "y".repeat(1024 * 1024));
+    const warn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    try {
+      await disclaimedDiscoveryFs.load([markdownTree(path.join(root, "commands"))]);
+    } finally {
+      console.warn = warn;
+    }
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(path.join(root, "commands"));
+  });
+});
+
+describe.skipIf(process.platform !== "darwin")("disclaimed readJsonCached()", () => {
+  test("parses, re-reads only when mtime+size change, and answers null when missing", async () => {
+    recordingStub();
+    const file = path.join(scratch, "claude.json");
+    const T = 1_700_000_000; // whole seconds, so a restored mtime matches exactly
+    w(file, '{"v":1}');
+    utimesSync(file, T, T);
+    expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 1 });
+
+    // Same size, same mtime, different bytes: the cache key still matches, so
+    // the old parse is returned (proves the content was not re-read).
+    writeFileSync(file, '{"v":2}');
+    utimesSync(file, T, T);
+    expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 1 });
+
+    // A size change invalidates it.
+    writeFileSync(file, '{"v":22}');
+    utimesSync(file, T, T);
+    expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 22 });
+
+    // So does a new mtime.
+    writeFileSync(file, '{"v":33}');
+    utimesSync(file, T + 5, T + 5);
+    expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 33 });
+
+    expect(await disclaimedDiscoveryFs.readJsonCached(path.join(scratch, "missing.json"))).toBeNull();
+    writeFileSync(file, "not json");
+    utimesSync(file, T + 9, T + 9);
+    expect(await disclaimedDiscoveryFs.readJsonCached(file)).toBeNull();
+  });
+
+  test("follows a symlink inside the child", async () => {
+    recordingStub();
+    const real = path.join(scratch, "real-claude.json");
+    const link = path.join(scratch, "link-claude.json");
+    w(real, '{"via":"link"}');
+    symlinkSync(real, link);
+    expect(await disclaimedDiscoveryFs.readJsonCached(link)).toEqual({ via: "link" });
+  });
+});
+
+describe.skipIf(process.platform !== "darwin")("listAgentCapabilities through the disclaimed child", () => {
+  const home = path.join(scratch, "claude-home");
+  const proj = path.join(scratch, "proj");
+  const plugin = path.join(scratch, "plugin-install");
+  const outside = path.join(scratch, "planted-target");
+
+  beforeAll(() => {
+    w(path.join(home, "commands/user-cmd.md"), "---\ndescription: user command\n---\n");
+    w(path.join(home, "skills/user-skill/SKILL.md"), "---\ndescription: user skill\n---\n");
+    // Planted symlink: a user skill that is really a folder elsewhere.
+    w(path.join(outside, "SKILL.md"), "---\ndescription: planted\n---\n");
+    symlinkSync(outside, path.join(home, "skills/planted"));
+    w(path.join(home, "settings.json"), JSON.stringify({ enabledPlugins: { "demo@mp": true } }));
+    w(
+      path.join(home, "plugins/installed_plugins.json"),
+      JSON.stringify({ plugins: { "demo@mp": [{ scope: "user", installPath: plugin }] } }),
+    );
+    w(path.join(home, ".claude.json"), JSON.stringify({ mcpServers: { userMcp: { command: "x" } } }));
+    w(path.join(plugin, ".claude-plugin/plugin.json"), JSON.stringify({ description: "Demo plugin" }));
+    w(path.join(plugin, ".mcp.json"), JSON.stringify({ mcpServers: { demo: { url: "https://example.com/mcp" } } }));
+    w(path.join(plugin, "commands/hello.md"), "---\ndescription: hi\n---\n");
+    w(path.join(plugin, "skills/pskill/SKILL.md"), "---\ndescription: plugin skill\n---\n");
+    w(path.join(proj, ".claude/commands/proj-cmd.md"), "---\ndescription: project command\n---\n");
+    w(path.join(proj, ".claude/skills/proj-skill/SKILL.md"), "---\ndescription: project skill\n---\n");
+    w(path.join(proj, ".mcp.json"), JSON.stringify({ mcpServers: { projMcp: { command: "y" } } }));
+    w(path.join(proj, ".claude/junk/blob.bin"), "z".repeat(50_000));
+  });
+
+  const claudeOpts = () => ({ agent: "claude-code" as const, workdir: proj, harnessHome: home });
+
+  test("same answer as the in-process read, in a bounded number of children", async () => {
+    setDisclaimSwitch(false);
+    const inProcess = await listAgentCapabilities(claudeOpts());
+
+    const { children } = recordingStub();
+    const disclaimed = await listAgentCapabilities(claudeOpts());
+    expect(disclaimed).toEqual(inProcess);
+
+    const names = disclaimed.commands.map((c) => c.name);
+    expect(names).toContain("/planted"); // the symlinked skill, read via the child
+    expect(names).toContain("/proj-cmd");
+    expect(names).toContain("/demo:hello");
+    expect(disclaimed.extensions.map((e) => e.name)).toEqual(
+      expect.arrayContaining(["userMcp", "projMcp", "demo", "proj-skill"]),
+    );
+    // user+project files, ~/.claude.json, then the plugin's files.
+    expect(children().filter((c) => c === "/bin/sh")).toHaveLength(3);
+    // Nothing else ran under the helper (no per-root probes, no per-plugin children).
+    expect(children().every((c) => c === "/bin/sh" || c.endsWith("/git"))).toBe(true);
+  });
+
+  test("a project loader is not needed (and not used) while disclaiming", async () => {
+    recordingStub();
+    let called = false;
+    const out = await listAgentCapabilities({
+      ...claudeOpts(),
+      projectTreeLoader: async () => {
+        called = true;
+        throw new Error("must not run");
+      },
+    });
+    expect(called).toBe(false);
+    expect(out.commands.map((c) => c.name)).toContain("/proj-cmd");
+  });
+
+  test("codex and cursor each cost one child", async () => {
+    const codexHome = path.join(scratch, "codex-home");
+    w(path.join(codexHome, ".codex/prompts/p.md"), "---\ndescription: prompt\n---\n");
+    w(path.join(codexHome, ".codex/skills/cs/SKILL.md"), "---\ndescription: codex skill\n---\n");
+    w(path.join(codexHome, ".codex/config.toml"), '[mcp_servers.alpha]\ncommand = "a"\n');
+    const rec = recordingStub();
+    const codex = await listAgentCapabilities({ agent: "codex", workdir: null, harnessHome: codexHome });
+    expect(codex.commands.map((c) => c.name)).toEqual(expect.arrayContaining(["/p", "/cs"]));
+    expect(codex.extensions.map((e) => e.name)).toContain("alpha");
+    expect(rec.children()).toEqual(["/bin/sh"]);
+
+    const cursorHome = path.join(scratch, "cursor-home");
+    w(path.join(cursorHome, ".cursor/skills/cur/SKILL.md"), "---\ndescription: cursor skill\n---\n");
+    w(path.join(cursorHome, ".cursor/mcp.json"), JSON.stringify({ mcpServers: { beta: { command: "b" } } }));
+    const rec2 = recordingStub();
+    const cursor = await listAgentCapabilities({ agent: "cursor", workdir: null, harnessHome: cursorHome });
+    expect(cursor.commands.map((c) => c.name)).toContain("/cur");
+    expect(cursor.extensions.map((e) => e.name)).toContain("beta");
+    expect(rec2.children()).toEqual(["/bin/sh"]);
+  });
+
+  test("gemini reads nothing and spawns nothing", async () => {
+    const rec = recordingStub();
+    const out = await listAgentCapabilities({ agent: "gemini", workdir: null });
+    expect(out).toEqual({ commands: [], extensions: [] });
+    expect(rec.children()).toEqual([]);
+  });
+});

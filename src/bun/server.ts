@@ -8,6 +8,7 @@ import { API_TOKEN, DEFAULT_API_HOST, formatHostForUrl, getApiPort, nonLoopbackB
 import { removeCoreCreds } from "./core-creds.ts";
 import { applyRoutePolicy, callerOf, desktopOnlyResponse, type ApiCaller } from "./route-policy.ts";
 import { callerProjectTree, gateCallerPath, probePaths } from "./caller-fs.ts";
+import { readTextNoFollow } from "./no-follow.ts";
 import { PROJECT_CAPABILITY_PATHSPECS } from "./ref-tree.ts";
 import { taskDirExists, writeTaskDirFileAtomic } from "./task-dir-fs.ts";
 import { DISCLAIM_PREF_KEY, isDisclaimOffValue } from "./disclaim.ts";
@@ -75,6 +76,7 @@ import {
   getTmuxSource,
   resolveTmuxBin,
   setTmuxSource,
+  TMUX_SOURCE_KEY,
   tmuxSocketArgs,
   type TmuxSource,
 } from "./tmux-resolution.ts";
@@ -455,6 +457,10 @@ function corsHeaders(req: Request): Record<string, string> {
     "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
     "access-control-allow-headers": "content-type,authorization",
     "access-control-allow-credentials": "true",
+    // The Authorization header makes every webview request preflight; let the
+    // browser cache each answer (WebKit caps this at 600 s) so a transcript's
+    // images and the 2 s polls don't pay a second round trip each time.
+    "access-control-max-age": "600",
   };
 }
 
@@ -1250,11 +1256,16 @@ function sessionCwdGate(req: Request): { gateCwd?: (cwd: string) => Promise<stri
 async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): Promise<Response | null> {
   if (callerOf(req) !== "cli") return null;
   for (const value of Object.values(env)) {
-    if (!value.startsWith("/")) continue;
-    const refusal = await gateCallerPath(value, "cli", "exists");
-    if (refusal) {
-      const { status, ...body } = refusal;
-      return json(body, { status, headers: corsHeaders(req) });
+    // Gate the trimmed spelling too: a consumer that trims the value would
+    // otherwise act on a protected path the raw string never named.
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("/")) continue;
+    for (const p of trimmed === value ? [value] : [value, trimmed]) {
+      const refusal = await gateCallerPath(p, "cli", "exists");
+      if (refusal) {
+        const { status, ...body } = refusal;
+        return json(body, { status, headers: corsHeaders(req) });
+      }
     }
   }
   return null;
@@ -3795,6 +3806,22 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             // Apply the stored value to the in-memory switch (app: immediately,
             // D5; headless: stays on, logs when the value is off, D6).
             applyDisclaimPreferenceWrite(native ? "app" : "headless", body.value, (m) => console.log(m));
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
+          if (req.params.key === TMUX_SOURCE_KEY) {
+            // Which tmux binary the core runs belongs to the desktop-only
+            // `POST /tmux-source`; this generic key route must not be a way
+            // around that for the CLI token. The app caller goes through the
+            // same validation and `setTmuxSource`, so the in-memory cache
+            // `resolveTmuxBin()` reads never disagrees with the stored value.
+            if (callerOf(req) === "cli") return desktopOnlyResponse(req, corsHeaders);
+            if (body.value !== "system" && body.value !== "bundled") {
+              return json({ error: "source must be 'system' or 'bundled'" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (body.value === "bundled" && !bundledTmuxAvailable()) {
+              return json({ error: "bundled tmux is not available in this build" }, { status: 409, headers: corsHeaders(req) });
+            }
+            setTmuxSource(body.value);
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           }
           preferences.set(req.params.key, body.value);
@@ -7410,7 +7437,18 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               ts: baseTs + i++,
             });
           };
-          rebuildEventsFromJsonl(readFileSync(jsonlPath, "utf8"), onChunk);
+          // No-follow: an agent can replace its own transcript with a symlink
+          // into a protected folder; the core must not read through it.
+          let jsonlText: string;
+          try {
+            jsonlText = readTextNoFollow(jsonlPath);
+          } catch {
+            return json(
+              { events: [], reason: `JSONL at ${jsonlPath} is not a readable regular file`, ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
+          }
+          rebuildEventsFromJsonl(jsonlText, onChunk);
           if (hasLimit) {
             // Two cuts, both from the END (newest events), same as the SSE
             // replay / page routes above: first the event-count cap
@@ -7782,9 +7820,14 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       "/daemon/shutdown": {
         POST: authed((req) => {
           setTimeout(() => {
-            removeCoreCreds(dataDir);
+            // On the app, quitting goes through the before-quit confirm, which
+            // removes the creds file only once the quit is actually allowed —
+            // deleting it here first would strand the CLI if the user cancels.
             if (native) native.quit();
-            else process.exit(0);
+            else {
+              removeCoreCreds(dataDir);
+              process.exit(0);
+            }
           }, 0);
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),

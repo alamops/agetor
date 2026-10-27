@@ -50,6 +50,7 @@ const TREE_TIMEOUT_MS = 15_000;
  *  `stat`/`tar` runs through PATH. */
 const SH = "/bin/sh";
 const STAT = "/usr/bin/stat";
+const FIND = "/usr/bin/find";
 const TAR = "/usr/bin/tar";
 
 /**
@@ -265,8 +266,8 @@ export async function gateCallerPath(
 }
 
 /** Read a child's stdout up to `maxBytes`, then stop. `truncated` is true when
- *  the cap cut the stream. */
-async function readCapped(
+ *  the cap cut the stream. Exported for discovery-fs.ts's disclaimed readers. */
+export async function readCapped(
   stream: ReadableStream<Uint8Array> | number | null | undefined,
   maxBytes: number,
 ): Promise<{ bytes: Uint8Array; truncated: boolean }> {
@@ -305,21 +306,81 @@ async function readCapped(
   return { bytes, truncated };
 }
 
+/** Run a child and read at most `maxBytes` of its stdout; kill it at the timeout
+ *  or when the cap cuts the stream. `stdinData` (if any) is written to its
+ *  stdin. Never throws: a spawn failure yields no bytes. */
+async function runToBytes(
+  argv: string[],
+  opts: { cwd: string; maxBytes: number; timeoutMs: number; stdinData?: Uint8Array },
+): Promise<{ bytes: Uint8Array; truncated: boolean }> {
+  let proc: ReturnType<typeof coreSpawn>;
+  try {
+    proc = coreSpawn(argv, {
+      cwd: opts.cwd,
+      // COPYFILE_DISABLE: without it bsdtar adds an AppleDouble `._name`
+      // sibling for every file that carries an xattr (macOS stamps
+      // `com.apple.provenance` on most downloaded/created files).
+      env: { ...childEnv(), LC_ALL: "C", COPYFILE_DISABLE: "1" },
+      stdin: opts.stdinData ? "pipe" : "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+  } catch {
+    return { bytes: new Uint8Array(0), truncated: false };
+  }
+  const kill = () => {
+    try {
+      proc.kill();
+    } catch {
+      // already gone
+    }
+  };
+  const timer = setTimeout(kill, opts.timeoutMs);
+  let result = { bytes: new Uint8Array(0) as Uint8Array, truncated: false };
+  try {
+    if (opts.stdinData) {
+      // Feed stdin concurrently with the stdout read so neither pipe can fill
+      // and deadlock; a child that exits early just makes the write fail.
+      const sink = proc.stdin as { write(d: Uint8Array): unknown; end(): unknown } | undefined;
+      void (async () => {
+        try {
+          await sink?.write(opts.stdinData!);
+          await sink?.end();
+        } catch {
+          // child gone
+        }
+      })();
+    }
+    result = await readCapped(proc.stdout as ReadableStream<Uint8Array>, opts.maxBytes);
+    if (result.truncated) kill();
+    await proc.exited;
+  } catch {
+    // use whatever was read
+  } finally {
+    clearTimeout(timer);
+  }
+  return result;
+}
+
 /**
  * A `ProjectTree` over `root` for capability discovery.
  *
  *  - `app` caller: the live disk (`diskProjectTree`), read lazily in-process.
- *  - `cli` caller: one disclaimed `/usr/bin/tar` child archives the existing
- *    `relRoots` (symlinks followed, `.git` and `node_modules` excluded), at
- *    most 8 MB of its output is read (then the child is killed and whatever
- *    parsed is used), and the archive becomes an in-memory tree. Every regular
- *    file appears in `list()`; only files passing `shouldRead` keep content
- *    (the rest read as null, like `loadRefProjectTree` does for a git ref).
- *    Empty directories do not appear (an archive of files has no use for them).
+ *  - `cli` caller: two disclaimed children, so only what discovery parses is
+ *    archived (a large unrelated file can never push a real capability file out
+ *    of the size cap):
+ *      1. `find -L <relRoots> -type f -print0` (`.git` and `node_modules`
+ *         pruned) enumerates candidate paths; operands that don't exist are
+ *         skipped by find itself.
+ *      2. `shouldRead` filters that list in the core, and `tar -L --null -T -`
+ *         archives exactly the accepted members (symlinks followed).
+ *    At most 8 MB of each child's output is read; hitting the cap kills the
+ *    child, logs one warning naming the root, and uses whatever parsed. Every
+ *    archived member is a file `shouldRead` accepted, so `list()` shows those
+ *    files (and their parent dirs) with content — which is all the parsers
+ *    use — and nothing else.
  *
- * `relRoots` is `PROJECT_CAPABILITY_PATHSPECS` in production. Roots that don't
- * exist (or are denied) are dropped before the call because tar errors on a
- * missing operand and would otherwise lose the whole archive.
+ * `relRoots` is `PROJECT_CAPABILITY_PATHSPECS` in production.
  */
 export async function callerProjectTree(
   root: string,
@@ -329,60 +390,48 @@ export async function callerProjectTree(
 ): Promise<ProjectTree> {
   if (caller === "app") return diskProjectTree(root);
 
-  const kinds = await probePaths(
-    relRoots.map((r) => path.join(root, r)),
-    "cli",
-  );
-  const existing = relRoots.filter((_, i) => kinds[i] === "dir" || kinds[i] === "file" || kinds[i] === "other");
   const files = new Map<string, string | null>();
-  if (existing.length === 0) return refProjectTree(files);
+  // NUL cannot travel in argv, and `-`-leading operands would read as find
+  // expressions; every operand is a fixed relative root name from our own code.
+  const operands = relRoots.filter((r) => r && !r.includes("\0") && !r.startsWith("-"));
+  if (operands.length === 0) return refProjectTree(files);
 
-  let proc: ReturnType<typeof coreSpawn>;
-  try {
-    proc = coreSpawn(
-      [TAR, "-c", "-f", "-", "--format=pax", "-L", "--exclude", ".git", "--exclude", "node_modules", "-C", root, "--", ...existing],
-      {
-        // COPYFILE_DISABLE: without it bsdtar adds an AppleDouble `._name`
-        // sibling for every file that carries an xattr (macOS stamps
-        // `com.apple.provenance` on most downloaded/created files).
-        env: { ...childEnv(), LC_ALL: "C", COPYFILE_DISABLE: "1" },
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "ignore",
-      },
-    );
-  } catch {
+  const listing = await runToBytes(
+    [FIND, "-L", ...operands, "(", "-name", ".git", "-o", "-name", "node_modules", ")", "-prune", "-o", "-type", "f", "-print0"],
+    { cwd: root, maxBytes: PROJECT_TREE_TAR_MAX_BYTES, timeoutMs: TREE_TIMEOUT_MS },
+  );
+  let truncated = listing.truncated;
+  const wanted: string[] = [];
+  for (const raw of Buffer.from(listing.bytes).toString("utf8").split("\0")) {
+    // A name cut by the cap is not a path; only complete NUL-terminated ones count.
+    if (!raw) continue;
+    const rel = raw.replace(/^\.\//, "");
+    if (shouldRead(rel)) wanted.push(rel);
+  }
+  // Drop a possibly cut final name when the listing was truncated.
+  if (listing.truncated && listing.bytes[listing.bytes.length - 1] !== 0) wanted.pop();
+  if (wanted.length === 0) {
+    if (truncated) warnTruncated(root);
     return refProjectTree(files);
   }
-  const timer = setTimeout(() => {
-    try {
-      proc.kill();
-    } catch {
-      // already gone
-    }
-  }, TREE_TIMEOUT_MS);
-  let bytes: Uint8Array = new Uint8Array(0);
-  let truncated = false;
-  try {
-    ({ bytes, truncated } = await readCapped(proc.stdout as ReadableStream<Uint8Array>, PROJECT_TREE_TAR_MAX_BYTES));
-    if (truncated) {
-      try {
-        proc.kill();
-      } catch {
-        // already gone
-      }
-    }
-    await proc.exited;
-  } catch {
-    // use whatever was read
-  } finally {
-    clearTimeout(timer);
-  }
 
-  for (const entry of parseTar(bytes)) {
-    const rel = entry.path;
+  const archive = await runToBytes([TAR, "-c", "-f", "-", "--format=pax", "-L", "--null", "-T", "-"], {
+    cwd: root,
+    maxBytes: PROJECT_TREE_TAR_MAX_BYTES,
+    timeoutMs: TREE_TIMEOUT_MS,
+    stdinData: Buffer.from(wanted.join("\0") + "\0", "utf8"),
+  });
+  truncated = truncated || archive.truncated;
+  for (const entry of parseTar(archive.bytes)) {
     // `Buffer.toString("utf8")` keeps a leading BOM, like `readFileSync(…, "utf8")`.
-    files.set(rel, shouldRead(rel) ? Buffer.from(entry.data).toString("utf8") : null);
+    files.set(entry.path, Buffer.from(entry.data).toString("utf8"));
   }
+  if (truncated) warnTruncated(root);
   return refProjectTree(files);
+}
+
+function warnTruncated(root: string): void {
+  console.warn(
+    `[agetor] capability discovery for ${root} hit the ${PROJECT_TREE_TAR_MAX_BYTES / (1024 * 1024)} MB read cap; some project skills/commands may be missing`,
+  );
 }

@@ -575,3 +575,85 @@ test("path gate: a readable directory is registered for the CLI token", async ()
     body: JSON.stringify({ path: ok }),
   });
 });
+
+// Handlers trim some path fields (`createTask`'s workdir, `/projects/clone`'s
+// dest), so the gate must refuse a padded spelling of a protected path too —
+// otherwise `" /…/locked"` reads as a missing relative path to the probe while
+// the handler acts on the absolute one. Driven from the table so a new gated
+// route is covered automatically.
+test.skipIf(asRoot)("path gate: a whitespace-padded spelling of an unreadable path is refused on every route that declares pathParams", async () => {
+  const locked = path.join(SCRATCH, "locked-padded");
+  mkdirSync(locked);
+  chmodSync(locked, 0o000);
+  try {
+    type Entry = { callers: string; pathParams?: Array<{ in: "query" | "body"; name: string; mode: string }> };
+    const routes: Array<{ method: string; key: string; policy: Entry }> = [];
+    for (const [key, entry] of Object.entries(mods.policy.ROUTE_POLICY)) {
+      if (typeof (entry as Entry).callers === "string") routes.push({ method: "POST", key, policy: entry as Entry });
+      else for (const [method, policy] of Object.entries(entry)) routes.push({ method, key, policy: policy as Entry });
+    }
+    const gated = routes.filter((r) => r.policy.pathParams?.length);
+    expect(gated.length).toBeGreaterThan(10);
+    const spellings = [` ${locked}`, `${locked} `, `\t${locked}\n`];
+    const problems: string[] = [];
+    for (const { method, key, policy } of gated) {
+      const url = key.replace(":id", taskId);
+      for (const param of policy.pathParams!) {
+        for (const raw of spellings) {
+          // A nearest-ancestor field names a not-yet-existing child, so only
+          // the locked ancestor decides.
+          const value = param.mode === "nearest-ancestor" ? `${raw.trimEnd()}/child${raw.slice(raw.trimEnd().length)}` : raw;
+          const fieldValue = param.name === "paths" ? [value] : value;
+          const target = new URL(`${APP}${url}`);
+          let body: string | undefined;
+          if (param.in === "query") target.searchParams.set(param.name, value);
+          else body = JSON.stringify({ [param.name]: fieldValue });
+          const res = await fetch(target, {
+            method,
+            headers: { ...bearer(cli), ...(body ? { "content-type": "application/json" } : {}) },
+            body,
+          });
+          const code = res.status === 403 ? ((await res.json()) as { code?: string }).code : (await res.text(), undefined);
+          if (res.status !== 403 || code !== "path-not-accessible") {
+            problems.push(`${method} ${key} ${param.in}.${param.name}=${JSON.stringify(value)} → ${res.status} ${code ?? ""}`);
+          }
+        }
+      }
+    }
+    expect(problems).toEqual([]);
+  } finally {
+    chmodSync(locked, 0o700);
+  }
+});
+
+// `tmux_source` belongs to the desktop-only POST /tmux-source; the generic
+// preference route must not let the CLI token set it either.
+test("tmux_source: the CLI token can't set it through PUT /preferences/:key; the master is validated and updates the live source", async () => {
+  const tmux = await import("./tmux-resolution.ts");
+  const before = mods.db.preferences.get(tmux.TMUX_SOURCE_KEY);
+  const put = (token: string, value: string) =>
+    fetch(`${APP}/preferences/${tmux.TMUX_SOURCE_KEY}`, {
+      method: "PUT",
+      headers: { ...bearer(token), "content-type": "application/json" },
+      body: JSON.stringify({ value }),
+    });
+  try {
+    const viaCli = await put(cli, "system");
+    expect(viaCli.status).toBe(403);
+    expect(((await viaCli.json()) as { code: string }).code).toBe("desktop-only");
+    expect(mods.db.preferences.get(tmux.TMUX_SOURCE_KEY)).toBe(before);
+
+    const bad = await put(master, "/tmp/evil-tmux");
+    expect(bad.status).toBe(400);
+    await bad.text();
+    expect(mods.db.preferences.get(tmux.TMUX_SOURCE_KEY)).toBe(before);
+
+    const ok = await put(master, "system");
+    expect(ok.status).toBe(204);
+    expect(mods.db.preferences.get(tmux.TMUX_SOURCE_KEY)).toBe("system");
+    expect(tmux.getTmuxSource()).toBe("system");
+  } finally {
+    // No preference delete exists; an unset key and "system" read the same.
+    tmux.setTmuxSource(before === "bundled" ? "bundled" : "system");
+  }
+});

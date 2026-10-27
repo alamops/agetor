@@ -306,11 +306,49 @@ describe("callerProjectTree", () => {
     }
   });
 
-  test("shouldRead decides content, every file stays listed", async () => {
+  test("only files shouldRead accepts are archived", async () => {
     const cli = await callerProjectTree(root, "cli", parityRoots, (rel) => rel.endsWith("SKILL.md"));
     expect(cli.read(".claude/skills/x/SKILL.md")).toContain("name: x");
     expect(cli.read(".mcp.json")).toBeNull();
-    expect(cli.list(".claude").map((e) => e.name)).toContain("settings.json");
+    expect(cli.list(".claude").map((e) => e.name)).not.toContain("settings.json");
+    expect(cli.list(".claude/skills").map((e) => e.name)).toContain("x");
+  });
+
+  test("a big unrelated file under .claude/ cannot hide a capability file", async () => {
+    const proj = path.join(scratch, "unrelated-big");
+    mkdirSync(path.join(proj, ".claude/skills/x"), { recursive: true });
+    mkdirSync(path.join(proj, ".claude/junk"), { recursive: true });
+    // Sorts and walks BEFORE the skill, and alone exceeds the 8 MB cap.
+    writeFileSync(path.join(proj, ".claude/junk/blob.bin"), Buffer.alloc(PROJECT_TREE_TAR_MAX_BYTES + 4096, 0x63));
+    writeFileSync(path.join(proj, ".claude/skills/x/SKILL.md"), "---\nname: x\n---\n");
+    const warn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    try {
+      const tree = await callerProjectTree(proj, "cli", [".claude"], (rel) => rel.endsWith("SKILL.md"));
+      expect(tree.read(".claude/skills/x/SKILL.md")).toContain("name: x");
+      expect(tree.list(".claude/junk")).toEqual([]);
+    } finally {
+      console.warn = warn;
+    }
+    expect(warnings).toEqual([]);
+  });
+
+  test("hitting the read cap logs one warning naming the root", async () => {
+    const proj = path.join(scratch, "cap-warn");
+    mkdirSync(path.join(proj, ".claude/commands"), { recursive: true });
+    const chunk = Buffer.alloc(1024 * 1024, 0x61);
+    for (let i = 0; i < 12; i++) writeFileSync(path.join(proj, `.claude/commands/c${i}.md`), chunk);
+    const warn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    try {
+      await callerProjectTree(proj, "cli", [".claude"], () => true);
+    } finally {
+      console.warn = warn;
+    }
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(proj);
   });
 
   test("roots that don't exist are skipped instead of failing the archive", async () => {
@@ -342,7 +380,7 @@ describe("callerProjectTree", () => {
     for (let i = 0; i < 24; i++) writeFileSync(path.join(big, `.claude/blob/f${String(i).padStart(2, "0")}.bin`), chunk);
     expect(24 * chunk.length).toBeGreaterThan(PROJECT_TREE_TAR_MAX_BYTES * 2);
     const t0 = Date.now();
-    const tree = await callerProjectTree(big, "cli", [".claude"], () => false);
+    const tree = await callerProjectTree(big, "cli", [".claude"], () => true);
     const listed = tree.list(".claude/blob").length;
     expect(listed).toBeGreaterThan(0);
     expect(listed).toBeLessThanOrEqual(PROJECT_TREE_TAR_MAX_BYTES / chunk.length);
@@ -390,8 +428,8 @@ describe.skipIf(process.platform !== "darwin")("disclaimed children", () => {
     setDisclaimSwitch(true);
     const tree = await callerProjectTree(path.join(scratch, "proj"), "cli", PROJECT_CAPABILITY_PATHSPECS, () => true);
     expect(tree.read(".mcp.json")).toBe('{"mcpServers":{}}');
-    // First the existence probe (sh), then the archive (tar).
-    expect(lines(log)).toEqual(["/bin/sh", "/usr/bin/tar"]);
+    // First the enumeration (find), then the archive of the accepted members (tar).
+    expect(lines(log)).toEqual(["/usr/bin/find", "/usr/bin/tar"]);
   });
 
   test("with the switch off the child runs directly, with no helper", async () => {

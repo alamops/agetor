@@ -540,9 +540,23 @@ function toHandler(value: unknown, where: string): Handler {
   throw new Error(`route policy: ${where} is neither a handler nor a Response`);
 }
 
+/**
+ * Every spelling of one caller-supplied path a handler might act on. Handlers
+ * trim (`createTask`'s workdir, `/projects/clone`'s dest, …) and a trimmed path
+ * names a different file than the raw one: `" /Users/me/Documents"` reads as a
+ * missing relative path to the probe while the handler uses the protected
+ * absolute one. So gate the raw string AND its trimmed form; a refusal of
+ * either refuses the request.
+ */
+function spellings(v: string): string[] {
+  if (v === "") return [];
+  const t = v.trim();
+  return t === v || t === "" ? [v] : [v, t];
+}
+
 function pathValues(raw: unknown): string[] {
-  if (typeof raw === "string") return raw === "" ? [] : [raw];
-  if (Array.isArray(raw)) return raw.filter((v): v is string => typeof v === "string" && v !== "");
+  if (typeof raw === "string") return spellings(raw);
+  if (Array.isArray(raw)) return raw.flatMap((v) => (typeof v === "string" ? spellings(v) : []));
   return [];
 }
 

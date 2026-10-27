@@ -1,5 +1,5 @@
 import { test, expect, afterEach, describe } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -219,6 +219,27 @@ describe.skipIf(!darwin)("coreSpawn disclaim wrapping", () => {
       const plain = errorShape(() => Bun.spawn(argv, opts));
       setDisclaimSwitch(true);
       expect(errorShape(() => coreSpawn(argv, opts))).toEqual(plain);
+    }
+  });
+
+  test("a cwd the core can't stat (EACCES, as under a TCC-protected folder) still goes through the helper and fails like Bun.spawn", () => {
+    if (process.getuid?.() === 0) return;
+    const { bin } = recordingHelper("eacces-cwd-helper");
+    process.env.AGETOR_DISCLAIM_BIN = bin;
+    const parent = path.join(scratch, "eacces-parent");
+    mkdirSync(path.join(parent, "child"), { recursive: true });
+    chmodSync(parent, 0o000);
+    try {
+      const opts = { cwd: path.join(parent, "child") };
+      setDisclaimSwitch(false);
+      const plain = errorShape(() => Bun.spawn(["/bin/echo", "a"], opts));
+      setDisclaimSwitch(true);
+      const wrapped = errorShape(() => coreSpawn(["/bin/echo", "a"], opts));
+      expect(plain.code).toBe("EACCES");
+      expect(wrapped.code).toBe("EACCES");
+      expect(wrapped.errno).toBe(plain.errno);
+    } finally {
+      chmodSync(parent, 0o700);
     }
   });
 

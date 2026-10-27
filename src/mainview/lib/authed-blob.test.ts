@@ -4,6 +4,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   createAuthedBlobCache,
+  createLazyGate,
+  createViewportRegistry,
+  IDLE_RELEASE_MS,
+  LOADING_RELEASE_MS,
   LOADING_STATE,
   REVOKE_GRACE_MS,
   statusForHttp,
@@ -232,5 +236,271 @@ describe("concurrency cap", () => {
     gates.get("a")!();
     await settle();
     expect(t.fetched).toEqual(["a", "c"]);
+  });
+});
+
+describe("queue priority and cancellation", () => {
+  function gated(max: number) {
+    const gates = new Map<string, () => void>();
+    const t = setup((url) => new Promise<Response>((resolve) => {
+      gates.set(url, () => resolve(new Response(new Blob(["x"]))));
+    }), max);
+    return { t, gates };
+  }
+
+  test("queued fetches start newest-first (LIFO)", async () => {
+    const { t, gates } = gated(1);
+    for (const u of ["a", "b", "c", "d"]) t.cache.subscribe(u, () => {});
+    await settle();
+    expect(t.fetched).toEqual(["a"]);
+    gates.get("a")!();
+    await settle();
+    expect(t.fetched).toEqual(["a", "d"]);
+    gates.get("d")!();
+    await settle();
+    expect(t.fetched).toEqual(["a", "d", "c"]);
+  });
+
+  test("a queued entry wanted again jumps to the front", async () => {
+    const { t, gates } = gated(1);
+    t.cache.subscribe("a", () => {});
+    t.cache.subscribe("b", () => {});
+    t.cache.subscribe("c", () => {});
+    t.cache.subscribe("b", () => {}); // second consumer of the queued "b"
+    await settle();
+    gates.get("a")!();
+    await settle();
+    expect(t.fetched).toEqual(["a", "b"]);
+  });
+
+  test("an entry cancelled while queued leaves the queue and is never fetched", async () => {
+    const { t, gates } = gated(1);
+    t.cache.subscribe("a", () => {});
+    const unsubB = t.cache.subscribe("b", () => {});
+    const unsubC = t.cache.subscribe("c", () => {});
+    await settle();
+    unsubB();
+    unsubC();
+    gates.get("a")!();
+    await settle();
+    expect(t.fetched).toEqual(["a"]);
+    expect(t.cache.size()).toBe(1);
+  });
+
+  test("a cancelled in-flight fetch frees its slot for the next queued entry", async () => {
+    const { t, gates } = gated(1);
+    const unsubA = t.cache.subscribe("a", () => {});
+    t.cache.subscribe("b", () => {});
+    await settle();
+    unsubA();
+    gates.get("a")!(); // late answer of the aborted fetch
+    await settle();
+    expect(t.fetched).toEqual(["a", "b"]);
+    expect(t.created).toEqual([]);
+  });
+});
+
+describe("release and revoke interplay", () => {
+  test("releasing one of two consumers keeps the blob; releasing the last revokes after the grace; re-acquire refetches", async () => {
+    const t = setup();
+    const unsubA = t.cache.subscribe("u", () => {});
+    const unsubB = t.cache.subscribe("u", () => {});
+    await settle();
+    unsubA();
+    expect(t.revoked).toEqual([]);
+    unsubB();
+    expect(t.live()).toHaveLength(1);
+    t.live()[0]!.fn();
+    expect(t.revoked).toEqual(["blob:test/1"]);
+    t.cache.subscribe("u", () => {});
+    await settle();
+    expect(t.fetched).toEqual(["u", "u"]);
+  });
+
+  test("a consumer that re-acquires within the grace keeps the blob (no refetch)", async () => {
+    const t = setup();
+    const unsub = t.cache.subscribe("u", () => {});
+    await settle();
+    unsub();
+    const again = t.cache.subscribe("u", () => {});
+    expect(t.live()).toHaveLength(0);
+    expect(t.cache.get("u").src).toBe("blob:test/1");
+    again();
+    expect(t.fetched).toEqual(["u"]);
+  });
+});
+
+describe("viewport registry", () => {
+  function fakeFactory() {
+    const observers: Array<{
+      options: { root: object | null; rootMargin: string };
+      targets: Set<object>;
+      disconnected: boolean;
+      emit: (target: object, isIntersecting: boolean) => void;
+    }> = [];
+    const factory: Parameters<typeof createViewportRegistry>[0] = (cb, options) => {
+      const o = {
+        options,
+        targets: new Set<object>(),
+        disconnected: false,
+        emit: (target: object, isIntersecting: boolean) => cb([{ target, isIntersecting }]),
+      };
+      observers.push(o);
+      return {
+        observe: (x) => { o.targets.add(x); },
+        unobserve: (x) => { o.targets.delete(x); },
+        disconnect: () => { o.disconnected = true; },
+      };
+    };
+    return { observers, factory };
+  }
+
+  test("targets with the same root and margin share one observer", () => {
+    const { observers, factory } = fakeFactory();
+    const reg = createViewportRegistry(factory);
+    const a = {}; const b = {};
+    reg.observe(a, { root: null, rootMargin: "300px" }, () => {});
+    reg.observe(b, { root: null, rootMargin: "300px" }, () => {});
+    expect(observers).toHaveLength(1);
+    expect(reg.observerCount()).toBe(1);
+    expect(observers[0]!.targets.size).toBe(2);
+  });
+
+  test("a different root or margin gets its own observer", () => {
+    const { observers, factory } = fakeFactory();
+    const reg = createViewportRegistry(factory);
+    const root = {};
+    reg.observe({}, { root: null, rootMargin: "300px" }, () => {});
+    reg.observe({}, { root, rootMargin: "300px" }, () => {});
+    reg.observe({}, { root: null, rootMargin: "100px" }, () => {});
+    expect(observers).toHaveLength(3);
+  });
+
+  test("entries are routed to the matching target's listeners only", () => {
+    const { observers, factory } = fakeFactory();
+    const reg = createViewportRegistry(factory);
+    const a = {}; const b = {};
+    const seenA: boolean[] = []; const seenB: boolean[] = [];
+    reg.observe(a, { root: null, rootMargin: "m" }, (n) => seenA.push(n));
+    reg.observe(b, { root: null, rootMargin: "m" }, (n) => seenB.push(n));
+    observers[0]!.emit(a, true);
+    observers[0]!.emit(b, false);
+    observers[0]!.emit(a, false);
+    expect(seenA).toEqual([true, false]);
+    expect(seenB).toEqual([false]);
+  });
+
+  test("the observer disconnects with its last target; unobserve is idempotent", () => {
+    const { observers, factory } = fakeFactory();
+    const reg = createViewportRegistry(factory);
+    const a = {}; const b = {};
+    const offA = reg.observe(a, { root: null, rootMargin: "m" }, () => {});
+    const offB = reg.observe(b, { root: null, rootMargin: "m" }, () => {});
+    offA(); offA();
+    expect(observers[0]!.disconnected).toBe(false);
+    expect(observers[0]!.targets.has(a)).toBe(false);
+    offB();
+    expect(observers[0]!.disconnected).toBe(true);
+    expect(reg.observerCount()).toBe(0);
+    // A later observe builds a fresh observer.
+    reg.observe(a, { root: null, rootMargin: "m" }, () => {});
+    expect(observers).toHaveLength(2);
+  });
+
+  test("two listeners on one element share one observe() and survive one leaving", () => {
+    const { observers, factory } = fakeFactory();
+    const reg = createViewportRegistry(factory);
+    const a = {};
+    const seen: string[] = [];
+    const off1 = reg.observe(a, { root: null, rootMargin: "m" }, (n) => seen.push(`1:${n}`));
+    reg.observe(a, { root: null, rootMargin: "m" }, (n) => seen.push(`2:${n}`));
+    off1();
+    observers[0]!.emit(a, true);
+    expect(seen).toEqual(["2:true"]);
+    expect(observers[0]!.disconnected).toBe(false);
+  });
+});
+
+describe("lazy gate", () => {
+  function gateSetup() {
+    const timers: Array<{ fn: () => void; ms: number; cleared: boolean }> = [];
+    const changes: boolean[] = [];
+    const gate = createLazyGate({
+      setTimeout: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t; },
+      clearTimeout: (h) => { (h as { cleared: boolean }).cleared = true; },
+      onActiveChange: (a) => changes.push(a),
+    });
+    const live = () => timers.filter((t) => !t.cleared);
+    return { gate, changes, timers, live };
+  }
+
+  test("starts inactive and activates the moment it is near", () => {
+    const g = gateSetup();
+    expect(g.gate.active).toBe(false);
+    g.gate.setNear(false);
+    expect(g.changes).toEqual([]);
+    g.gate.setNear(true);
+    expect(g.gate.active).toBe(true);
+    expect(g.changes).toEqual([true]);
+    g.gate.setNear(true);
+    expect(g.changes).toEqual([true]);
+  });
+
+  test("leaving the view releases after the idle delay; a loaded image waits the long delay", () => {
+    const g = gateSetup();
+    g.gate.setNear(true);
+    g.gate.setLoading(false);
+    g.gate.setNear(false);
+    expect(g.live()).toHaveLength(1);
+    expect(g.live()[0]!.ms).toBe(IDLE_RELEASE_MS);
+    expect(g.gate.active).toBe(true);
+    g.live()[0]!.fn();
+    expect(g.gate.active).toBe(false);
+    expect(g.changes).toEqual([true, false]);
+  });
+
+  test("a still-loading image is released after the short delay", () => {
+    const g = gateSetup();
+    g.gate.setNear(true);
+    g.gate.setNear(false);
+    expect(g.live()[0]!.ms).toBe(LOADING_RELEASE_MS);
+  });
+
+  test("coming back before the delay cancels the release", () => {
+    const g = gateSetup();
+    g.gate.setNear(true);
+    g.gate.setNear(false);
+    g.gate.setNear(true);
+    expect(g.live()).toHaveLength(0);
+    expect(g.gate.active).toBe(true);
+    expect(g.changes).toEqual([true]);
+  });
+
+  test("a pending release restarts with the long delay once loading finishes", () => {
+    const g = gateSetup();
+    g.gate.setNear(true);
+    g.gate.setNear(false);
+    g.gate.setLoading(false);
+    expect(g.live()).toHaveLength(1);
+    expect(g.live()[0]!.ms).toBe(IDLE_RELEASE_MS);
+  });
+
+  test("re-activates after a release", () => {
+    const g = gateSetup();
+    g.gate.setNear(true);
+    g.gate.setNear(false);
+    g.live()[0]!.fn();
+    g.gate.setNear(true);
+    expect(g.changes).toEqual([true, false, true]);
+  });
+
+  test("dispose cancels a pending release and ignores later input", () => {
+    const g = gateSetup();
+    g.gate.setNear(true);
+    g.gate.setNear(false);
+    g.gate.dispose();
+    expect(g.live()).toHaveLength(0);
+    g.gate.setNear(true);
+    expect(g.changes).toEqual([true]);
   });
 });

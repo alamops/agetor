@@ -29,6 +29,7 @@ import {
   type ChunkHandler,
   type SpawnedAgent,
 } from "./claude-tmux.ts";
+import { READ_NOFOLLOW } from "./no-follow.ts";
 
 /**
  * Driver that hosts a single `gemini` turn inside a per-task tmux session and
@@ -253,7 +254,7 @@ function flushGeminiLog(state: GeminiSessionState): void {
   try {
     const st = fsStatSync(state.logPath);
     if (st.size <= state.offset) return;
-    fd = fsOpenSync(state.logPath, "r");
+    fd = fsOpenSync(state.logPath, READ_NOFOLLOW);
   } catch {
     return; // file not created yet, or transient stat error
   }

@@ -59,6 +59,7 @@ import {
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
 import { compactionStatusLine, isCompactionNotice } from "../shared/compaction.ts";
+import { READ_NOFOLLOW } from "./no-follow.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -3618,7 +3619,7 @@ function readFileTail(filePath: string, maxBytes: number): string | null {
     const start = Math.max(0, size - maxBytes);
     const len = size - start;
     if (len <= 0) return "";
-    fd = fsOpenSync(filePath, "r");
+    fd = fsOpenSync(filePath, READ_NOFOLLOW);
     const buf = Buffer.alloc(len);
     fsReadSync(fd, buf, 0, len, start);
     const text = buf.toString("utf8");
@@ -4856,7 +4857,7 @@ function flushSync(state: SessionState): void {
   const len = st.size - state.offset;
   const buf = Buffer.alloc(len);
   let fd;
-  try { fd = fsOpenSync(state.jsonlPath, "r"); } catch { return; }
+  try { fd = fsOpenSync(state.jsonlPath, READ_NOFOLLOW); } catch { return; }
   try {
     fsReadSync(fd, buf, 0, len, state.offset);
   } finally {
@@ -4879,7 +4880,7 @@ function flushSync(state: SessionState): void {
 
 /** Read the file from `offset` to EOF, advancing the cursor. */
 async function readAppended(filePath: string, offset: number): Promise<{ text: string; next: number }> {
-  const handle = await open(filePath, "r");
+  const handle = await open(filePath, READ_NOFOLLOW);
   try {
     const st = await handle.stat();
     if (st.size <= offset) return { text: "", next: offset };

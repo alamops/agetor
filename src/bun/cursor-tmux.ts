@@ -30,6 +30,7 @@ import {
   type ChunkHandler,
   type SpawnedAgent,
 } from "./claude-tmux.ts";
+import { READ_NOFOLLOW, readTextNoFollow } from "./no-follow.ts";
 
 /**
  * Driver that hosts a single `cursor-agent -p` turn inside a per-task tmux
@@ -96,7 +97,7 @@ function ensureLogDir(): void {
 export function readCursorExitCode(runId: string): number | null {
   let raw: string;
   try {
-    raw = readFileSync(cursorExitPath(runId), "utf8").trim();
+    raw = readTextNoFollow(cursorExitPath(runId)).trim();
   } catch {
     return null;
   }
@@ -443,7 +444,7 @@ function flushCursorLog(state: CursorSessionState): void {
   try {
     const st = fsStatSync(state.logPath);
     if (st.size <= state.offset) return;
-    fd = fsOpenSync(state.logPath, "r");
+    fd = fsOpenSync(state.logPath, READ_NOFOLLOW);
   } catch {
     return; // file not created yet, or transient stat error
   }

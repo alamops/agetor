@@ -19,7 +19,9 @@
 //   2. When disclaiming, `argv[0]` is resolved BEFORE the helper runs. The
 //      helper does `posix_spawnp` and on failure prints `disclaim: exec … failed`
 //      and exits 127 (native/disclaim/disclaim.c); callers instead rely on
-//      `Bun.spawn` throwing a synchronous ENOENT for "binary not installed".
+//      `Bun.spawn` throwing a synchronous ENOENT for "binary not installed",
+//      so an unresolved target (or missing cwd) throws that same error —
+//      never an undisclaimed fall-through spawn.
 //   3. When disclaim is off, unavailable or non-darwin, it is a plain
 //      `Bun.spawn` / `spawnSync` with the scrubbed env.
 
@@ -89,16 +91,61 @@ function resolveExecutable(
   return found || null;
 }
 
-/** True when `cwd` (if given) is not an existing directory. With a bad cwd the
- *  helper itself would fail to start instead of the target, which would blame
- *  the wrong path in the error. */
-function cwdMissing(cwd: string | undefined): boolean {
-  if (cwd === undefined) return false;
+/**
+ * Why a cwd can't be used, or null when it can (or when its state can't be
+ * told from the core — EPERM/EACCES on a TCC-protected folder: the child is
+ * still disclaimed and the kernel gives the real answer when it chdirs).
+ */
+function cwdProblem(cwd: string | undefined): "ENOENT" | null {
+  if (cwd === undefined) return null;
   try {
-    return !statSync(cwd).isDirectory();
-  } catch {
-    return true;
+    return statSync(cwd).isDirectory() ? null : "ENOENT";
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "ENOENT" : null;
   }
+}
+
+type SpawnErrorCode = "ENOENT" | "EACCES";
+
+/** Why `file` would not exec, mirroring Bun's own answer: a name that isn't
+ *  found → ENOENT; an existing path that isn't an executable file → EACCES. */
+function unresolvedCode(file: string, cwd: string | undefined): SpawnErrorCode {
+  if (!file.includes("/")) return "ENOENT";
+  const abs = path.isAbsolute(file) ? file : path.resolve(cwd ?? process.cwd(), file);
+  try {
+    statSync(abs);
+    return "EACCES";
+  } catch {
+    return "ENOENT";
+  }
+}
+
+const ERRNO: Record<SpawnErrorCode, number> = { ENOENT: -2, EACCES: -13 };
+
+/**
+ * The error a plain `Bun.spawn` / `spawnSync` raises for the same failure, so
+ * "binary not installed" handling keeps working: same `code`, `errno`,
+ * `syscall` and `path`, and the same message shapes Bun uses.
+ */
+function spawnError(
+  file: string,
+  code: SpawnErrorCode,
+  cause: "exec" | "cwd",
+  mode: "async" | "sync",
+): NodeJS.ErrnoException {
+  const pathMiss = cause === "exec" && code === "ENOENT" && !file.includes("/");
+  const message = pathMiss
+    ? `Executable not found in $PATH: "${file}"`
+    : `${code}: ${code === "ENOENT" ? "no such file or directory" : "permission denied"}, posix_spawn '${file}'`;
+  const err = new Error(message) as NodeJS.ErrnoException;
+  err.code = code;
+  err.errno = ERRNO[code];
+  // Bun.spawn's PATH miss carries no `syscall`; spawnSync always names itself.
+  if (mode === "sync") err.syscall = `spawnSync ${file}`;
+  else if (!pathMiss) err.syscall = "posix_spawn";
+  err.path = file;
+  return err;
 }
 
 type SpawnOpts = Parameters<typeof Bun.spawn>[1];
@@ -107,33 +154,33 @@ type SpawnOpts = Parameters<typeof Bun.spawn>[1];
  * Spawn `argv` with the scrubbed live env, through the disclaim helper when
  * that is enabled.
  *
- * ENOENT parity: when the target (or the cwd) does not resolve, this does NOT
- * hand the helper a command it would fail on. It falls through to a plain
- * `Bun.spawn` of the original argv, which fails the same way an undisclaimed
- * spawn always did — the genuine error, with Bun's own message / `code:
- * "ENOENT"` / `errno` / `syscall` / `path` — so existing "binary not
- * installed" handling keeps working. The fall-through can only spawn if the
- * target actually appeared between our check and the call, which is the same
- * race any spawn has.
+ * While disclaiming, nothing is ever spawned undisclaimed: when the target
+ * does not resolve (or the cwd does not exist) this THROWS the error a plain
+ * `Bun.spawn` would have thrown — `code` ENOENT/EACCES, `errno`, `syscall`,
+ * `path` — instead of handing the helper a command it would fail on (exit
+ * 127, blaming the wrong thing) or falling through to an undisclaimed spawn
+ * (a binary planted between the check and the call would then run with
+ * Agetor's identity).
  */
 export function coreSpawn(argv: string[], opts: SpawnOpts = {}): ReturnType<typeof Bun.spawn> {
   const env = childEnv(undefined, opts.env ?? process.env);
   const options = { ...opts, env } as NonNullable<SpawnOpts>;
-  if (disclaimEnabled() && argv.length > 0 && !cwdMissing(opts.cwd)) {
-    const resolved = resolveExecutable(argv[0]!, env, opts.cwd);
-    if (resolved) {
-      return Bun.spawn([resolveDisclaimBin(), resolved, ...argv.slice(1)], options);
-    }
+  if (disclaimEnabled() && argv.length > 0) {
+    const file = argv[0]!;
+    if (cwdProblem(opts.cwd)) throw spawnError(file, "ENOENT", "cwd", "async");
+    const resolved = resolveExecutable(file, env, opts.cwd);
+    if (!resolved) throw spawnError(file, unresolvedCode(file, opts.cwd), "exec", "async");
+    return Bun.spawn([resolveDisclaimBin(), resolved, ...argv.slice(1)], options);
   }
   return Bun.spawn(argv, options);
 }
 
 /**
  * Synchronous variant for the few callers that cannot be async (`login-path.ts`,
- * `git-provider.ts`). Same env and disclaim rules as `coreSpawn`; for an
- * unresolvable binary it returns exactly what `spawnSync` returns for ENOENT
- * (it does not throw: `error` is set, `status` is null) because that result
- * comes from `spawnSync` itself.
+ * `git-provider.ts`). Same env and disclaim rules as `coreSpawn`; for a target
+ * or cwd that does not resolve it returns what `spawnSync` returns for that
+ * failure (it does not throw: `error` is set, `status`/`pid` undefined,
+ * `output` null) without spawning anything.
  */
 export function coreSpawnSync(
   file: string,
@@ -143,11 +190,23 @@ export function coreSpawnSync(
   const env = childEnv(undefined, (opts.env ?? process.env) as Record<string, string | undefined>);
   const options = { ...opts, env } as SpawnSyncOptions;
   const cwd = opts.cwd === undefined ? undefined : String(opts.cwd);
-  if (disclaimEnabled() && !cwdMissing(cwd)) {
+  if (disclaimEnabled()) {
+    const failed = (error: NodeJS.ErrnoException): SpawnSyncReturns<string | Buffer> => {
+      (error as NodeJS.ErrnoException & { spawnargs?: string[] }).spawnargs = args;
+      return {
+        pid: undefined as unknown as number,
+        output: null as unknown as Array<string | Buffer | null>,
+        stdout: null as unknown as string | Buffer,
+        stderr: null as unknown as string | Buffer,
+        status: undefined as unknown as null,
+        signal: null,
+        error,
+      };
+    };
+    if (cwdProblem(cwd)) return failed(spawnError(file, "ENOENT", "cwd", "sync"));
     const resolved = resolveExecutable(file, env, cwd);
-    if (resolved) {
-      return spawnSync(resolveDisclaimBin(), [resolved, ...args], options);
-    }
+    if (!resolved) return failed(spawnError(file, unresolvedCode(file, cwd), "exec", "sync"));
+    return spawnSync(resolveDisclaimBin(), [resolved, ...args], options);
   }
   return spawnSync(file, args, options);
 }

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { plainEncodedProjectPath } from "../shared/claude-session-meta.ts";
@@ -404,4 +404,31 @@ test("the liveness probe runs the owning harness's bin and records when it ran",
   } finally {
     clearClaudeSessionLivenessCache();
   }
+});
+
+// An agent can plant a symlink where Claude writes regular files; the core
+// must never open or list through it (no-follow.ts).
+test("a symlinked transcript or project dir is skipped, never read through", async () => {
+  const root = home();
+  const cwd = path.join(root, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const enc = plainEncodedProjectPath(cwd);
+  const config = plant({ home: root, dirName: enc, sessionId: "real", cwd, lines: [userLine(cwd, "hi")] });
+  // A "protected" target outside the config dir, reached only via symlinks.
+  const outside = path.join(root, "outside");
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(path.join(outside, "planted.jsonl"), JSON.stringify(userLine(cwd, "secret")) + "\n");
+  symlinkSync(path.join(outside, "planted.jsonl"), path.join(config, "projects", enc, "via-file-link.jsonl"));
+  symlinkSync(outside, path.join(config, "projects", `${enc}-dirlink`));
+
+  const read: string[] = [];
+  const rows = await scanClaudeSessions({
+    homeDir: root,
+    harnesses: harnessFor(config),
+    encodePath: plainEncodedProjectPath,
+    listLive: () => [],
+    onJsonlRead: (p) => read.push(p),
+  });
+  expect(rows.map((r) => r.sessionId)).toEqual(["real"]);
+  expect(read.every((p) => !p.includes("via-file-link") && !p.includes("dirlink"))).toBe(true);
 });
