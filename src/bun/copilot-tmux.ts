@@ -132,8 +132,8 @@ export interface CopilotShellCommandInput {
    */
   stripClassicTokens: readonly string[];
   /**
-   * `unset COPILOT_ALLOW_ALL` in the pane before exec. True for Plan and
-   * Read-only turns whose harness env does not set it: without it an ambient
+   * `unset COPILOT_ALLOW_ALL` in the pane before exec. True for every
+   * non-Auto turn whose harness env does not set it: without it an ambient
    * `COPILOT_ALLOW_ALL=true` in the tmux server's env would silently turn
    * Read-only into allow-all. `spawnCopilotViaTmux` computes it with
    * `shouldUnsetAllowAll` (any mode but `auto`, and `COPILOT_ALLOW_ALL` is
@@ -145,10 +145,12 @@ export interface CopilotShellCommandInput {
 /**
  * Whether the pane must `unset COPILOT_ALLOW_ALL` before exec'ing copilot.
  * Fail closed: every mode except `auto` gets the guard — not just
- * `plan`/`ask` — because a task can carry a mode id from another kind (an
- * fx `yolo` survives `agetor edit --agent copilot`, and a PATCH of `agent`
- * alone never resets `mode`), and `buildCommand` grants allow-all only for
- * `auto`. A value the harness env sets explicitly always wins.
+ * `plan`/`ask` — because `buildCommand` grants allow-all only for `auto`.
+ * A cross-kind `PATCH /tasks/:id` resets the mode (`reconcileTaskSession`),
+ * so a foreign mode id (fx's `yolo`) normally never reaches a copilot spawn;
+ * this is defense in depth against a write path that bypasses that PATCH, or
+ * a Start racing its async reset. A value the harness env sets explicitly
+ * always wins.
  */
 export function shouldUnsetAllowAll(mode: string | null | undefined, env: Readonly<Record<string, string>>): boolean {
   return mode !== "auto" && !Object.hasOwn(env, "COPILOT_ALLOW_ALL");

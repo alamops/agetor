@@ -342,7 +342,7 @@ test("archived task: both PATCH edit and approve are rejected", async () => {
 // --- 9. Non-cursor task guard --------------------------------------------------
 
 test("plan routes 400 on a non-cursor (claude-code) task, before any runId/plan check", async () => {
-  // No need to start this task at all: `planCursorKindGuard` runs
+  // No need to start this task at all: `planKindGuard` runs
   // immediately after the task lookup, before either route touches
   // `task.plans` or `task.runId` — so the guard fires even for a
   // never-started task with an empty `plans` array and a bogus plan id.

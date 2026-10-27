@@ -353,6 +353,22 @@ test("switching to another copilot harness clears the queue (the drain's kind ch
   expect(runs.listForTask(taskId).length).toBe(1);
 });
 
+test("switching a copilot task to claude-code orphans a leftover running copilot subagent row so the card is not held", async () => {
+  const { tasks, subagents } = await import("./db.ts");
+  const { reconcileTaskSession } = await import("./orchestrator.ts");
+  const taskId = await createCopilotTask("hello");
+  const runId = await insertRunningCopilotRun(taskId, "stale-session-id");
+  const rowId = await insertCopilotSubagentRow(taskId, runId, "call_switch");
+  expect(subagents.hasRunning(taskId)).toBe(true);
+
+  const before = tasks.get(taskId)!;
+  const after = tasks.update(taskId, { agent: "claude-code" })!;
+  await reconcileTaskSession(taskId, before, after);
+
+  expect(subagents.get(rowId)?.status).toBe("orphaned");
+  expect(subagents.hasRunning(taskId)).toBe(false);
+});
+
 test("deleting a task clears its queue and removes the row; nothing is spawned afterwards", async () => {
   const { runs, tasks } = await import("./db.ts");
   const { sendInput, deleteTask } = await import("./orchestrator.ts");

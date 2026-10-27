@@ -651,8 +651,8 @@ describe("buildCopilotShellCommand", () => {
   test("shouldUnsetAllowAll fails closed: every mode but auto unsets an ambient COPILOT_ALLOW_ALL", () => {
     expect(shouldUnsetAllowAll("auto", { COPILOT_ALLOW_ALL: "true" })).toBe(false);
     expect(shouldUnsetAllowAll("auto", {})).toBe(false);
-    // Plan, Read-only, and a mode id carried over from another kind (fx's
-    // `yolo` survives `agetor edit --agent copilot`), an unknown id, or null.
+    // Plan, Read-only, a foreign mode id (fx's `yolo` — normally reset by a
+    // cross-kind PATCH; guarded here as defense in depth), an unknown id, or null.
     for (const mode of ["plan", "ask", "yolo", "full-access", "bogus", null, undefined]) {
       expect(shouldUnsetAllowAll(mode, {})).toBe(true);
     }

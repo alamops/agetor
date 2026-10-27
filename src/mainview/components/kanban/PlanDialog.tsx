@@ -215,8 +215,8 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
 
   const saveAndClose = async () => {
     // Defensive — `dirty` is now gated on `!claude` so this shouldn't be
-    // reachable for a claude plan, but `api.savePlanEdit` is a cursor-only
-    // route (rejected by `planCursorKindGuard`), so guard the mutation
+    // reachable for a claude plan, but `api.savePlanEdit` is a cursor/copilot-only
+    // route (rejected by `planKindGuard`), so guard the mutation
     // itself too rather than relying solely on the caller's gate.
     if (readOnlyHistory) return;
     if (closeSaving) return;

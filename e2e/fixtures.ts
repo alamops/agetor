@@ -382,6 +382,10 @@ async function provisionBackend(
   // Must happen before the spawn below — see writeFxStubBin's doc comment.
   const fxStubBinPath = writeFxStubBin(dataDir);
   const copilotStubBinPath = writeCopilotStubBin(dataDir);
+  // Never created: an absolute path that can't resolve pins a seeded-enabled
+  // harness to "not installed" independent of the machine's PATH.
+  const missingCopilotBinPath = path.join(dataDir, "not-installed", "copilot");
+  const missingAntigravityBinPath = path.join(dataDir, "not-installed", "agy");
   // Backs the `/refs/pick` test seam (src/bun/server.ts) — a spec plants
   // files here, then clicks the picker's Files/Folder button, and the
   // headless backend returns them instead of opening a native panel that
@@ -459,10 +463,14 @@ async function provisionBackend(
       // is seeded enabled, so unlike fx the BIN is opt-in: it points at the
       // stub script written into this backend's own `dataDir` (see
       // `writeCopilotStubBin`) ONLY when the backend's `backendEnv` carries
-      // `AGETOR_E2E_COPILOT_STUB=1`; otherwise it is left unset and every other
-      // spec keeps seeing Copilot as not installed (as with Antigravity).
+      // `AGETOR_E2E_COPILOT_STUB=1`; otherwise it points at a path inside this
+      // backend's `dataDir` that never exists, so every other spec sees Copilot
+      // as not installed (and runs no model discovery) whether or not a real
+      // GitHub Copilot CLI is on the machine's PATH. Antigravity, also seeded
+      // enabled, gets the same pin.
       AGETOR_COPILOT_DRIVER: "fake",
-      ...(extraEnv.AGETOR_E2E_COPILOT_STUB === "1" ? { AGETOR_COPILOT_BIN: copilotStubBinPath } : {}),
+      AGETOR_COPILOT_BIN: extraEnv.AGETOR_E2E_COPILOT_STUB === "1" ? copilotStubBinPath : missingCopilotBinPath,
+      AGETOR_ANTIGRAVITY_BIN: missingAntigravityBinPath,
       // Test seam for the fx auto-resume engine (`docs/plans/fx-recovery-
       // follow-ups.md` §3, `orchestrator.ts`'s `fxAutoResumePrefs`) — shrinks
       // the auto-resume delay from the 120s default down to 2s so

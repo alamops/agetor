@@ -2987,7 +2987,15 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     else if (beforeKind === "cursor") await dropCursorSession(taskId);
     else if (beforeKind === "gemini") await dropGeminiSession(taskId);
     else if (beforeKind === "antigravity") await dropAntigravitySession(taskId);
-    else if (beforeKind === "copilot") await dropCopilotSession(taskId);
+    else if (beforeKind === "copilot") {
+      await dropCopilotSession(taskId);
+      // Copilot subagent rows are settled only by the copilot driver's own
+      // sink. A row left `running` (e.g. by a run whose in-turn settleAll
+      // never landed) would otherwise hold the card forever under the next
+      // harness: the claude watcher skips `copilot_subagent` rows and
+      // `subagents.hasRunning` is task-wide.
+      orphanRunningSubagents(taskId);
+    }
     else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // Any queued codex/cursor/gemini/fx follow-ups belong to the old agent —
     // drop them so a later drain doesn't spawn them against the new harness.
