@@ -12,6 +12,7 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
+  MODEL_DEFAULT_EFFORT_KINDS,
   MODEL_EFFORT_SUPPORT,
   MODEL_MIN_CLI_VERSION,
   PERMISSION_MODE_STATUS_PREFIX,
@@ -428,9 +429,25 @@ test("AGENT_OPTIONS.fx.models has unique ids, unique labels, and every id matche
   }
 });
 
-test("CATALOG_SCOPED_KINDS contains exactly fx", () => {
-  expect(CATALOG_SCOPED_KINDS.size).toBe(1);
+test("CATALOG_SCOPED_KINDS contains exactly fx and opencode", () => {
+  // opencode joined (docs/plans/add-opencode-harness.md D-5): `opencode
+  // models` lists only the providers the harness has credentials for.
+  expect(CATALOG_SCOPED_KINDS.size).toBe(2);
   expect(CATALOG_SCOPED_KINDS.has("fx")).toBe(true);
+  expect(CATALOG_SCOPED_KINDS.has("opencode")).toBe(true);
+});
+
+test("MODEL_DEFAULT_EFFORT_KINDS (kinds that keep the 'auto' effort) is exactly fx and opencode", () => {
+  expect([...MODEL_DEFAULT_EFFORT_KINDS].sort()).toEqual(["fx", "opencode"]);
+});
+
+test("opencode tables: sentinel default, auto effort, Code/Plan → auto/plan, sentinel takes no effort", () => {
+  expect(DEFAULT_MODEL.opencode).toBe("opencode-default");
+  expect(DEFAULT_EFFORT.opencode).toBe("auto");
+  expect(CODE_PLAN_MODE.opencode).toEqual({ code: "auto", plan: "plan" });
+  expect(MODEL_EFFORT_SUPPORT.opencode).toEqual({ "opencode-default": [] });
+  expect(supportedModes("opencode", null).map((m) => m.id)).toEqual(["auto", "plan"]);
+  expect(supportedModes("opencode", "anthropic/claude-x").map((m) => m.id)).toEqual(["auto", "plan"]);
 });
 
 /* ── gemini 3.8 Flash + retired gemini-3-pro-preview default (docs/plans/add-gemini-3-8-flash.md §5 TEST-2) ── */
@@ -590,6 +607,8 @@ test("defaultModeFor: auto for every AgentKind except fx, which is yolo (Full ac
   expect(defaultModeFor("cursor")).toBe("auto");
   expect(defaultModeFor("gemini")).toBe("auto");
   expect(defaultModeFor("fx")).toBe("yolo");
+  expect(defaultModeFor("antigravity")).toBe("auto");
+  expect(defaultModeFor("opencode")).toBe("auto");
 });
 
 test("defaultModeFor: always equals AGENT_OPTIONS[kind].modes[0].id — the single source of truth it's defined against", () => {

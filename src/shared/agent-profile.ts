@@ -200,6 +200,8 @@ export function asProfileError(message: string): string {
  * harness deletion can't blank the snapshot's display) and a `capturedAt`
  * timestamp. `skills` is copied into a fresh array so later mutation of the
  * live profile's array can never leak into an already-captured snapshot.
+ * `opencodeServer` is always written (default `"shared"`), so a snapshot
+ * captured from now on never relies on the absent-means-shared read.
  */
 export function snapshotFromProfile(
   p: AgentProfile,
@@ -218,6 +220,9 @@ export function snapshotFromProfile(
     speed: p.speed,
     fast: p.speed !== "off",
     maxMode: p.maxMode,
+    // A profile row read from an older DB, bundle or fixture may lack the
+    // field; it means "shared".
+    opencodeServer: p.opencodeServer ?? "shared",
     instructions: p.instructions,
     skills: [...p.skills],
     capturedAt: now,

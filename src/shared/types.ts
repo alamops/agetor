@@ -1,3 +1,5 @@
+import { OPENCODE_DEFAULT_MODEL } from "./opencode.ts";
+
 export type ColumnId = "backlog" | "ready" | "running" | "blocked" | "review" | "done";
 
 /**
@@ -293,7 +295,36 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx" | "antigravity";
+export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx" | "antigravity" | "opencode";
+
+/**
+ * Which OpenCode server an `opencode` task's turns run against
+ * (`docs/plans/add-opencode-harness.md` D-4, G3–G3c). `"shared"` (default)
+ * reuses OpenCode 2's background service, so sessions show up in the user's
+ * own OpenCode apps; `"standalone"` passes `--standalone` for a private,
+ * per-turn server. Stored on `tasks.opencode_server` /
+ * `agent_profiles.opencode_server`; non-OpenCode tasks store and ignore it,
+ * the way `maxMode` works. The value a turn actually uses comes from
+ * `effectiveOpencodeServer` in `./opencode.ts` (null on v1, always
+ * standalone for a harness with a home).
+ */
+export type OpencodeServerMode = "shared" | "standalone";
+export const OPENCODE_SERVER_MODES = ["shared", "standalone"] as const satisfies readonly OpencodeServerMode[];
+
+/**
+ * Built-in harness kinds turned on once, automatically, the first time their
+ * CLI is found installed (`docs/plans/add-opencode-harness.md` D-14, G8). A
+ * manual Off afterwards sticks — `src/bun/harness-auto-enable.ts` records
+ * each row in `harness_auto_enabled` the first time it acts on it.
+ * claude-code and antigravity are absent because they already ship enabled.
+ */
+export const AUTO_ENABLE_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>([
+  "codex",
+  "cursor",
+  "gemini",
+  "fx",
+  "opencode",
+]);
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
@@ -336,6 +367,12 @@ export interface Harness {
    *    0.0.8/0.0.9/0.0.10), and its state lives hardcoded at
    *    `~/.fx/*`, so isolating an additional account's login/config means
    *    re-homing the whole process, same approach as cursor.
+   *  - opencode: emitted as HOME=<home> plus XDG_CONFIG_HOME / XDG_DATA_HOME /
+   *    XDG_STATE_HOME / XDG_CACHE_HOME under it — OpenCode keeps its config,
+   *    sessions and credentials under the XDG dirs. A harness with a home
+   *    always runs `--standalone` on v2 (`effectiveOpencodeServer`): the
+   *    shared background service binds a fixed port that HOME/XDG can't
+   *    isolate.
    *  NULL means "inherit the agetor process env". */
   home: string | null;
   /** Optional binary path override. NULL falls back to the AGETOR_*_BIN
@@ -399,6 +436,10 @@ export interface AgentProfile {
    *  by agetor code. */
   fast?: boolean;
   maxMode: boolean; // cursor only
+  /** opencode only (`agent_profiles.opencode_server`): which OpenCode server
+   *  a task launched from this profile runs against. Stored and ignored for
+   *  other kinds, like `maxMode`. See {@link OpencodeServerMode}. */
+  opencodeServer: OpencodeServerMode;
   instructions: string; // may be ""
   skills: string[]; // bare skill names, no leading "/", deduped, max 50, each ≤ 100 chars
   createdAt: number;
@@ -438,6 +479,9 @@ export interface AgentProfileSnapshot {
    *  read through `speedFromFast` in `src/bun/db.ts`). */
   fast?: boolean;
   maxMode: boolean;
+  /** Absent in snapshots captured before OpenCode support — read as
+   *  `"shared"` (`parseAgentProfileSnapshot` in `src/bun/db.ts`). */
+  opencodeServer?: OpencodeServerMode;
   instructions: string;
   skills: string[];
   capturedAt: number;
@@ -892,6 +936,13 @@ export interface HarnessStatus {
    *  drives the Settings / `agetor harness ls` hint. `null` (or absent) when
    *  the kind isn't fx, the field is absent, or the probe failed. */
   fxProfilePermissionMode?: string | null;
+  /** Neutral, non-blocking lines about this harness, rendered in Settings →
+   *  Harnesses (`harness-status-notice`), the Onboarding checklist and
+   *  `agetor harness ls` — e.g. OpenCode's "No OpenCode credentials found —
+   *  run `opencode auth login`" and its v1 "OpenCode 2 is available" hint
+   *  (`docs/plans/add-opencode-harness.md` D-16). Never gates a run (that is
+   *  `loggedIn`'s job). Absent or empty when there is nothing to say. */
+  notices?: string[];
 }
 
 /**
@@ -1040,6 +1091,17 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     kind: "fx",
     suggestedHarnessId: "fx-2",
     home: "{dataDir}/harnesses/fx-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "opencode-additional",
+    label: "Additional OpenCode",
+    description:
+      "Another OpenCode harness with its own HOME and XDG dirs so login, sessions and config are isolated from the built-in. It always runs OpenCode 2 turns with --standalone, since the shared background service can't be separated per account.",
+    kind: "opencode",
+    suggestedHarnessId: "opencode-2",
+    home: "{dataDir}/harnesses/opencode-2",
     bin: null,
     env: {},
   },
@@ -1575,6 +1637,14 @@ export interface Task {
    */
   maxMode: boolean;
   /**
+   * opencode only (`tasks.opencode_server`, default `"shared"`): which
+   * OpenCode server this task's turns run against — see
+   * {@link OpencodeServerMode}. Patchable; a change between turns applies on
+   * the next turn, and an agent switch resets it to `"shared"`. Other kinds
+   * store and ignore it, like `maxMode`.
+   */
+  opencodeServer: OpencodeServerMode;
+  /**
    * Path-only references the user attached at task creation (files and
    * folders on the user's machine). Empty list when none. Inlined into the
    * launch prompt as text — agetor never copies or uploads these.
@@ -1734,6 +1804,16 @@ export interface Task {
    * it on read, so runtime code can treat a missing key the same as `null`.
    */
   importedClaude?: ImportedClaudeSession | null;
+  /**
+   * Provenance for an OpenCode session imported from outside Agetor
+   * (`tasks.imported_opencode` JSON, `docs/plans/add-opencode-harness.md`
+   * D-13). Server-managed exactly like {@link Task.importedClaude}: written
+   * only by `tasks.setImportedOpencode`, skipped by the generic SET clause,
+   * not patchable; `null` for a task that wasn't imported. Read through
+   * `importedSessionOf` (`./imported-session.ts`), never directly by a gate.
+   * Optional for the same fixture-compatibility reason.
+   */
+  importedOpencode?: ImportedOpencodeSession | null;
   /**
    * Whether this task has assistant messages the user hasn't seen yet —
    * `last_assistant_event_id > last_seen_event_id` (both watermarks live on
@@ -2147,6 +2227,64 @@ export interface ImportedClaudeSession {
 }
 
 /**
+ * Persisted shape of `task.importedOpencode` (`tasks.imported_opencode` JSON
+ * column). One imported OpenCode session bound to an in-place task. Written
+ * only by `tasks.setImportedOpencode`. Unlike Claude's import there is no
+ * byte offset: one `session export` is read whole and written in slices.
+ */
+export interface ImportedOpencodeSession {
+  /** OpenCode's own session id (`ses_…`). */
+  sessionId: string;
+  /** The OpenCode harness the session was listed and imported under. */
+  harnessId: string;
+  /** The session's directory — the task's in-place `workdir`. */
+  directory: string;
+  importedAt: number;
+  status: "importing" | "ready" | "failed";
+  error: string | null;
+}
+
+/**
+ * One row of `GET /opencode-sessions` — an OpenCode session started outside
+ * Agetor, listed per enabled OpenCode harness × registered project. The
+ * OpenCode counterpart of the Claude list row (`ClaudeSessionListItem` in
+ * `src/mainview/lib/api.ts`).
+ */
+export interface OpencodeSessionListItem {
+  /** OpenCode's own session id (`ses_…`). */
+  sessionId: string;
+  /** The OpenCode harness whose `session list` reported the session. */
+  harnessId: string;
+  harnessLabel: string;
+  /** The session's directory (`session list`'s `directory`). */
+  directory: string;
+  /** `null` when OpenCode 2 reports no title (its table says "Untitled
+   *  session"). */
+  title: string | null;
+  /** Epoch ms (`session list`'s `updated`). */
+  updatedAt: number;
+  /** Epoch ms (`session list`'s `created`). */
+  createdAt: number;
+  /** `blockedReason === null`. */
+  importable: boolean;
+  /** `"missing-folder"`: the directory no longer exists. `"busy"`: OpenCode
+   *  reports the session unfinished AND it was updated within the last 10
+   *  minutes (owner decision on G14a / spike A8(c)); an older unfinished
+   *  session imports with a status line instead. */
+  blockedReason: "missing-folder" | "busy" | null;
+  /** True when the busy check couldn't run (the export failed), shown as a
+   *  warning rather than a block. */
+  busyUnknown?: boolean;
+  /** The Agetor task that already imported this session, when one did. */
+  importedTaskId?: string | null;
+}
+
+/** `GET /opencode-sessions` body. */
+export interface OpencodeSessionList {
+  sessions: OpencodeSessionListItem[];
+}
+
+/**
  * Preference key for the post-boot Claude session scan
  * (`docs/plans/import-claude-code-sessions.md` D5). Missing or `"1"` scans;
  * `"0"` turns the scan off. It does not skip resume of an import left
@@ -2476,6 +2614,13 @@ export interface AgentOption {
    * still present; signed-in view still unverifiable (token expired).
    */
   catalogOnly?: boolean;
+  /**
+   * Always offered, first, whatever discovery, catalog scoping or the login
+   * state say (`mergeModelOptions` rule 9). Used for OpenCode's
+   * "OpenCode default" sentinel row (`OPENCODE_DEFAULT_MODEL`), which no
+   * catalog ever lists because it means "no `-m`".
+   */
+  pinned?: boolean;
 }
 
 export interface AgentOptions {
@@ -2502,7 +2647,11 @@ export interface CursorModelSpec {
  * for a new task, the migration backfills onto legacy NULL rows, and the
  * orchestrator falls back to when a `createTask` request omits them. There is
  * no "let the CLI pick" placeholder anymore — every task carries an explicit
- * model.
+ * model. The one exception is OpenCode (`docs/plans/add-opencode-harness.md`
+ * G4): its default is the `OPENCODE_DEFAULT_MODEL` sentinel
+ * (`"opencode-default"`), which means "pass no `-m`, run the model OpenCode's
+ * own config names" — OpenCode's providers and models are whatever the user
+ * configured, so there is no model agetor could pin for everyone.
  *
  * "Best" here means: most capable model + a sane high-effort default. Picked
  * deliberately so a run starts with strong reasoning instead of whatever the
@@ -2567,6 +2716,8 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // spawn with no data migration.
   "fx": "deepseek/deepseek-v4-flash",
   "antigravity": "gemini-3.8-flash-high",
+  // The one sentinel default (see the docblock above): no `-m`.
+  "opencode": OPENCODE_DEFAULT_MODEL,
 };
 
 /**
@@ -2578,9 +2729,12 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
  * member today: the Vercel AI Gateway catalog `fx models --json` returns is
  * scoped to whatever account `fx login` (or `AI_GATEWAY_API_KEY`) is signed
  * into, so a curated row unconditionally offered here could be a model the
- * signed-in account can't actually run.
+ * signed-in account can't actually run. opencode joins it: `opencode models`
+ * lists only the providers the harness has credentials for (plus keyless
+ * Zen), so the only unconditional row is its pinned "OpenCode default"
+ * sentinel (`mergeModelOptions` rule 9).
  */
-export const CATALOG_SCOPED_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx"]);
+export const CATALOG_SCOPED_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx", "opencode"]);
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   // `ultra` (Codex's automatic-sub-agent-delegation tier) is deliberately
@@ -2610,6 +2764,10 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // Unused, kept for symmetry: effort rides in the antigravity model id and
   // every MODEL_EFFORT_SUPPORT.antigravity set is empty.
   "antigravity": "high",
+  // OpenCode's variants are per model and discovered (G5, D-6); "auto"
+  // ("Model default") passes no variant, so a new task runs exactly as
+  // OpenCode itself would.
+  "opencode": "auto",
 };
 
 /**
@@ -3127,6 +3285,8 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   // pre-approved rules run; everything else surfaces as an approval card).
   "fx": { code: "yolo", plan: "ask" },
   "antigravity": { code: "auto", plan: "plan" },
+  // OpenCode: Code = the Build agent with `--auto`; Plan = `--agent plan`.
+  "opencode": { code: "auto", plan: "plan" },
 };
 
 /**
@@ -3144,12 +3304,17 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  *                   max → "ultrathink"
  *   fx          → `session/set_config_option {configId:"effort", value:<id>}`
  *                   over ACP (fx ≥0.0.9); ids map to fx's own values verbatim.
+ *   opencode    → the model's variant: v2 `-m provider/model#<id>`, v1
+ *                   `-m provider/model --variant <id>` (`opencodeModelArgs`).
  *
  * `none` is currently used only by GPT-5.6-family Codex models and by
  * effort-advertising fx models whose Gateway catalog entry lists it.
- * `auto` is used only by fx tables (`MODEL_EFFORT_SUPPORT.fx`) — no other
- * kind's model lists it, and `DEFAULT_EFFORT.fx` is the only default that
- * resolves to it.
+ * `auto` is used only by fx and OpenCode (`MODEL_DEFAULT_EFFORT_KINDS`):
+ * `MODEL_EFFORT_SUPPORT.fx` lists it, `supportedEfforts("opencode", …)` adds
+ * it in front of a model's discovered variants, and `DEFAULT_EFFORT.fx` /
+ * `DEFAULT_EFFORT.opencode` are the only defaults that resolve to it. An
+ * OpenCode variant agetor doesn't know (e.g. `thinking`) is offered as a
+ * synthesized `{id, label: id}` row, not one of these.
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "ultra", label: "Ultra", hint: "Codex's top tier — maximum reasoning plus automatic delegation to internal sub-agents. Several times Max's usage; Codex-only today." },
@@ -3160,7 +3325,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
   { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where the harness exposes it (Cursor, fx)." },
   { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
-  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx only today (fx's `auto`, its 'default' option). fx-only by construction: curated tables and the discovered branch both keep it off every other kind." },
+  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx (its `auto`, the 'default' option) and OpenCode (no variant passed) only. Curated tables and the discovered branch keep it off every other kind." },
 ];
 
 /**
@@ -3432,6 +3597,12 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "claude-sonnet-5-5-low": [],
     "gpt-oss-120b-medium": [],
   },
+  // The sentinel accepts no variant (a variant needs a model). Every other
+  // OpenCode model is discovered, and `supportedEfforts` answers for it
+  // from discovery rather than from this table (D-6).
+  opencode: {
+    [OPENCODE_DEFAULT_MODEL]: [],
+  },
 };
 
 /**
@@ -3463,6 +3634,19 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * curated catalog is what the harness's own UI *offers*, while its API often
  * *accepts* a superset, so this function only ever narrows what the picker
  * shows — it never invents an option the harness didn't report.
+ *
+ * OpenCode is answered by its own branch (`docs/plans/add-opencode-harness.md`
+ * D-6), because its variants are per model, discovered, and not limited to
+ * `EFFORT_OPTIONS` ids:
+ *   - the `OPENCODE_DEFAULT_MODEL` sentinel (or a null model) → `[]`;
+ *   - a discovered model that reported no variants (`discoveredEfforts` is
+ *     an empty array — the only kind for which `[]` differs from `null`) →
+ *     `[]`;
+ *   - a discovered model with variants → `auto` first, then the variants in
+ *     the order OpenCode reported them; an id outside `EFFORT_OPTIONS` (e.g.
+ *     `thinking`) gets a synthesized `{id, label: id}` row, which still only
+ *     ever names what the CLI reported;
+ *   - no discovery entry for the model (`null`/`undefined`) → `[auto]`.
  */
 export function supportedEfforts(
   agent: AgentKind,
@@ -3475,16 +3659,17 @@ export function supportedEfforts(
   // non-empty `discoveredEfforts` for an unknown cursor id would defeat it
   // and offer effort choices that would silently never reach the CLI.
   if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
+  if (agent === "opencode") return opencodeEfforts(model, discoveredEfforts);
   if (discoveredEfforts && discoveredEfforts.length > 0) {
     const discoveredAllowed = new Set(discoveredEfforts);
-    // `auto` is fx-only by construction (see the EFFORT_OPTIONS row comment):
-    // a non-fx harness that happens to discover an "auto" id (e.g. codex's
-    // `model/list supportedReasoningEfforts`) must not surface a "Model
-    // default" row or pass `auto` through to a flag that doesn't understand
-    // it, so it's dropped from the discovered set before filtering for every
-    // kind but fx.
+    // `auto` is kept only for MODEL_DEFAULT_EFFORT_KINDS (see the
+    // EFFORT_OPTIONS row comment): any other harness that happens to
+    // discover an "auto" id (e.g. codex's `model/list
+    // supportedReasoningEfforts`) must not surface a "Model default" row or
+    // pass `auto` through to a flag that doesn't understand it, so it's
+    // dropped from the discovered set before filtering.
     const fromDiscovery = EFFORT_OPTIONS.filter((o) =>
-      discoveredAllowed.has(o.id) && (agent === "fx" || o.id !== "auto"));
+      discoveredAllowed.has(o.id) && (MODEL_DEFAULT_EFFORT_KINDS.has(agent) || o.id !== "auto"));
     if (fromDiscovery.length > 0) return fromDiscovery;
   }
   const key = model ?? DEFAULT_MODEL[agent];
@@ -3494,6 +3679,39 @@ export function supportedEfforts(
     ?? [];
   const allowed = new Set(ids);
   return EFFORT_OPTIONS.filter((o) => allowed.has(o.id));
+}
+
+/**
+ * Kinds that offer the off-scale `auto` ("Model default") effort row — the
+ * harness then picks its own reasoning level. fx lists `auto` in its curated
+ * table and keeps a discovered `auto`; OpenCode puts it in front of every
+ * discovered variant list (D-6). Every other kind drops a discovered `auto`.
+ * Exported so a later kind that keeps `auto` (e.g. GitHub Copilot, spike
+ * A15) joins this set instead of adding another kind check.
+ */
+export const MODEL_DEFAULT_EFFORT_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx", "opencode"]);
+
+const AUTO_EFFORT_OPTION: AgentOption = EFFORT_OPTIONS.find((o) => o.id === "auto") ?? {
+  id: "auto",
+  label: "Model default",
+};
+
+/** The OpenCode branch of {@link supportedEfforts} (D-6) — see that
+ *  function's doc for the four cases. */
+function opencodeEfforts(model: string | null, discoveredEfforts: readonly string[] | null | undefined): AgentOption[] {
+  if (model === null || model === OPENCODE_DEFAULT_MODEL) return [];
+  if (discoveredEfforts === null || discoveredEfforts === undefined) return [AUTO_EFFORT_OPTION];
+  if (discoveredEfforts.length === 0) return [];
+  const known = new Map(EFFORT_OPTIONS.map((o) => [o.id, o] as const));
+  const out: AgentOption[] = [AUTO_EFFORT_OPTION];
+  const seen = new Set<string>(["auto"]);
+  for (const raw of discoveredEfforts) {
+    const id = raw.trim();
+    if (id === "" || seen.has(id)) continue;
+    seen.add(id);
+    out.push(known.get(id) ?? { id, label: id });
+  }
+  return out;
 }
 
 /**
@@ -3512,12 +3730,18 @@ export function supportedEfforts(
  * a fallback. A retained-but-unoffered effort is rendered as an unlisted row
  * in the effort select (same idea as `mergeModelOptions`' rule 6 for models)
  * so the control never renders blank.
+ *
+ * OpenCode is the exception: it has no curated table, so its retainable set
+ * is exactly `supportedEfforts("opencode", model, discoveredEfforts)`.
  */
 export function retainableEfforts(
   agent: AgentKind,
   model: string | null,
   discoveredEfforts?: readonly string[] | null,
 ): ReadonlySet<string> {
+  // OpenCode has no curated table to union with (D-6): what discovery says
+  // for this model is the whole answer.
+  if (agent === "opencode") return new Set(supportedEfforts(agent, model, discoveredEfforts).map((o) => o.id));
   const ids = new Set<string>();
   for (const o of supportedEfforts(agent, model, discoveredEfforts)) ids.add(o.id);
   for (const o of supportedEfforts(agent, model)) ids.add(o.id);
@@ -3558,6 +3782,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   gemini: {},
   fx: {},
   antigravity: {},
+  opencode: {},
 };
 
 export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
@@ -3874,6 +4099,21 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     ],
     efforts: EFFORT_OPTIONS,
   },
+  opencode: {
+    // The pinned sentinel is the only curated row (D-5): every real model is
+    // `provider/model` from the harness's own `opencode models` catalog,
+    // which depends on the providers the user configured (CATALOG_SCOPED_KINDS).
+    models: [
+      { id: OPENCODE_DEFAULT_MODEL, label: "OpenCode default", hint: "Use the model configured in OpenCode (no -m)", pinned: true },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "Build agent; approves every tool call (--auto)" },
+      { id: "plan", label: "Plan", hint: "OpenCode's Plan agent: no file edits, but shell commands still run; permission asks are rejected" },
+    ],
+    // Variants are discovered per model; `supportedEfforts` adds any variant
+    // id outside EFFORT_OPTIONS as a synthesized row (D-6).
+    efforts: EFFORT_OPTIONS.filter((o) => o.id === "auto"),
+  },
 };
 
 export type RunStatus =
@@ -3949,6 +4189,13 @@ export interface Run {
    * for `--conversation` on follow-up turns. NULL for every other agent kind.
    */
   antigravitySessionId?: string | null;
+  /**
+   * OpenCode's own session id (`ses_…`) — DISCOVERED from the first
+   * non-empty `sessionID` in the `run --format json` stream. Captured by the
+   * opencode-tmux driver and replayed as `-s <id>` on follow-up turns.
+   * Optional like `antigravitySessionId`; NULL for every other agent kind.
+   */
+  opencodeSessionId?: string | null;
   /**
    * How this run came to exist. `null`/undefined = user-initiated (Run
    * button, a follow-up message typed into the panel — every run before
@@ -4826,7 +5073,11 @@ export type SubagentStatus =
  * tab); and a Claude Code `Monitor` the main agent armed (`"monitor"` — id =
  * the monitor's `taskId` from its launch stub, no source file of its own, its
  * tab streams each `<event>` the monitor reports; holds the task in `running`
- * until the monitor times out or is stopped).
+ * until the monitor times out or is stopped); and an OpenCode child session
+ * (`"opencode_subagent"` — id = the child's `ses_…` id, sourcePath =
+ * `opencode-session:<child>`, events filled from `session export` when a
+ * turn ends, never left `running` past settle; the Claude watcher skips
+ * these rows).
  */
 export interface Subagent {
   /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
@@ -4834,7 +5085,7 @@ export interface Subagent {
   taskId: string;
   /** Parent run that was in flight when this subagent was spawned. */
   runId: string | null;
-  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor";
+  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor" | "opencode_subagent";
   /** Registered subagent type, e.g. "Explore" / "general-purpose". */
   agentType: string | null;
   /** Short human label from the spawning Agent tool call. */
@@ -5158,6 +5409,25 @@ export type AppEvent =
   | {
       type: "claude_sessions_found";
       count: number;
+      ts: number;
+    }
+  | {
+      /** OpenCode sessions started outside Agetor, found by the launch scan
+       *  (`docs/plans/add-opencode-harness.md` D-13). Same toast rules as
+       *  `claude_sessions_found`; `sessionIds` are the ids this notice is
+       *  about (each one is toasted once). */
+      type: "opencode_sessions_found";
+      count: number;
+      sessionIds: string[];
+      ts: number;
+    }
+  | {
+      /** Built-in harnesses turned on because their CLI was found installed
+       *  (D-14, `AUTO_ENABLE_KINDS`). Sent once per harness, to the next
+       *  `/app/events` client. `labels` is index-aligned with `harnessIds`. */
+      type: "harnesses_auto_enabled";
+      harnessIds: string[];
+      labels: string[];
       ts: number;
     }
   | {
