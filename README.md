@@ -5,7 +5,7 @@
 # Agetor
 
 **The harness orchestrator.**<br />
-A local-first kanban for running Claude Code, Codex, Cursor, Gemini CLI, fx and Antigravity in parallel, with each task in its own git worktree.
+A local-first kanban for running Claude Code, Codex, Cursor, Gemini CLI, fx, Antigravity and OpenCode in parallel, with each task in its own git worktree.
 
 [![Latest release](https://img.shields.io/github/v/release/alamops/agetor?style=flat-square&label=release&color=4c1)](https://github.com/alamops/agetor/releases/latest)
 [![Platform](https://img.shields.io/badge/macOS-Apple%20Silicon-111?style=flat-square&logo=apple&logoColor=white)](#install)
@@ -31,7 +31,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Local-first.** Everything runs on your machine. There's no Agetor account, no cloud relay and no telemetry.
 - **Non-invasive.** Agetor installs no hooks and no MCP server, and it doesn't edit your `CLAUDE.md`. It drives the real CLI the way you would.
-- **Restart-safe.** Claude Code, Codex, Cursor, Gemini CLI and Antigravity run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
+- **Restart-safe.** Claude Code, Codex, Cursor, Gemini CLI, Antigravity and OpenCode run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
 
 ---
 
@@ -41,10 +41,10 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Kanban workflow.** Tasks move through *Backlog → Ready → Running → Blocked → Review → Done* as their runs start, stall, fail or finish. You can drag a card to override the flow at any time.
 - **A git worktree for every task.** Each task runs on its own branch (`agetor/<id>-<slug>`) under `~/.agetor/worktrees/`, so two agents can work on the same repo at once without colliding. The base commit is pinned when the task is created, so the task keeps the same starting point even after the source branch moves on.
-- **Six harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx and Antigravity side by side. To use a second account for any of them, add a harness with its own isolated `$HOME`.
+- **Seven harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx, Antigravity and OpenCode side by side. To use a second account for any of them, add a harness with its own isolated `$HOME`.
 - **Agents (reusable profiles).** Save a harness, model, effort, mode, speed, instructions and skills as a named **Agent**, then launch tasks from it in one click.
 - **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
-- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx and Antigravity, they also include the models your account actually offers, as reported by the CLI. If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
+- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx, Antigravity and OpenCode, they also include the models your account actually offers, as reported by the CLI. For OpenCode that includes each model's variants, which show up as its effort choices. If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
 
 ### Converse
 
@@ -58,6 +58,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Diff review.** Review a branch's changes in the app. Select lines and send them back to the agent as a quoted follow-up.
 - **Git host integration.** Works with GitHub, GitLab and Bitbucket Cloud. You can commit and push, open pull requests, check mergeability, create a conflict-resolution task, browse issues, and start a task from an issue's full comment thread.
+- **Import sessions started elsewhere.** Bring a Claude Code or OpenCode session you started in your own terminal onto the board as a task in **Review**, with its history, then send a message to continue it. See [OpenCode notes](#opencode-notes) for what's specific to OpenCode.
 - **Clone any repository.** Clone from any of those three hosts with live progress and cancel. Optionally, an agent then writes an `ELI5.md` tour of the codebase.
 
 ### Stay in the loop
@@ -80,8 +81,9 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 | **Gemini CLI** <sup>experimental</sup> | `gemini` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Gemini 3.1 Pro (preview) | `npm i -g @google/gemini-cli` |
 | **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | DeepSeek V4 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
 | **Antigravity** <sup>experimental</sup> | `agy` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by conversation id | Gemini 3.8 Flash (High) | `brew install --cask antigravity-cli` |
+| **OpenCode** <sup>experimental</sup> | `opencode` | `opencode run --format json` for each turn inside `tmux`; the conversation resumes by session id | OpenCode's own configured model | `brew install opencode` (the `opencode-ai` npm package, OpenCode 1.x, also works) |
 
-Claude Code and Antigravity are enabled out of the box. The other experimental harnesses are opt-in: turn them on in **Settings → Harnesses**. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
+Claude Code and Antigravity are enabled out of the box. Codex, Cursor, Gemini CLI, fx and OpenCode turn on by themselves, once, the first time Agetor finds their CLI installed, and a toast tells you which ones it turned on. If you turn one off in **Settings → Harnesses**, it stays off, even though the CLI is still installed. Extra-account harnesses you add are never touched. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
 
 Each harness offers the permission modes its CLI actually supports. They range from hands-off modes (*Auto*, *Full access*) to *Ask*, *Plan only* and *Read-only*.
 
@@ -92,6 +94,17 @@ Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast*
 - **Three modes.** *Auto (force)* runs hands-off. *Plan* runs `cursor-agent --mode plan`, which plans without editing; the New Task form's Code/Plan toggle picks it for Plan. *Read-only* runs `--mode ask` for questions and answers, with no edits.
 - **Approving a plan.** When you approve a Plan task's plan card, Agetor switches the task to *Auto (force)* so Cursor can implement it. A task launched from an Agent keeps Plan, because the Agent defines its mode; detach the Agent or change the mode to implement.
 - **Workspace trust.** Plan and Read-only runs pass `--trust`, so `cursor-agent` accepts the task's fresh worktree and applies its `.cursor` rules, hooks and MCP config, as Auto already does.
+
+### OpenCode notes
+
+- **Two CLI lines.** Agetor supports both OpenCode 2 (Homebrew's `opencode`) and OpenCode 1.x (the `opencode-ai` npm package), and picks the right flags from `opencode --version`. Settings → Harnesses and the onboarding checklist note when no OpenCode credentials are found (`opencode auth login`) and, on 1.x, that OpenCode 2 is available.
+- **Default model.** The first model row, **OpenCode default**, passes no `-m` at all, so OpenCode runs whatever model its own config names. Pick a specific model to override it. Pickers list the models your OpenCode install reports, and a model's variants (for example `high` or `max`) appear as its effort choices; a model with no variants has no effort picker.
+- **Modes.** *Auto* runs hands-off. *Plan* runs OpenCode's `plan` agent.
+- **Shared or Standalone server.** On OpenCode 2, each task can use OpenCode's shared background server (the default) or run with its own in-process server (**Standalone**). The picker is in the New Task form, in an Agent and in task details, and doesn't exist on OpenCode 1.x. On the CLI, use `--opencode-server shared|standalone` with `agetor add`, `agetor edit` and `agetor profile add|edit`. On the CLI, use `--opencode-server shared|standalone` with `agetor add`, `agetor edit` and `agetor profile add|edit`. An additional-account harness (one with its own `$HOME`) always runs Standalone, so it never reaches another account's server.
+- **Subagents.** OpenCode's subagents appear as tabs on the task. Their transcripts are filled in when the turn ends, not while it runs.
+- **To-do progress.** The to-do card and the board badge need OpenCode 2's `experimental.todo` setting turned on in your own OpenCode config. Agetor doesn't change your config.
+- **Stopping.** *Stop* interrupts the turn the way `Ctrl+C` does, and Agetor ends the session if OpenCode hasn't exited after about 10 seconds.
+- **Importing sessions.** **Projects → Import sessions…** (or `agetor sessions`) lists OpenCode sessions started outside Agetor, for each enabled OpenCode harness and each project folder you've added. A session OpenCode reports as unfinished is refused only if it was also updated in the last 10 minutes; an older unfinished session imports with a status line saying so. A session whose folder no longer exists is listed but can't be imported. Launch-time discovery shares the Claude Code toggle in Settings → General.
 
 ### fx notes
 
@@ -237,6 +250,7 @@ agetor rm <id> --yes         # delete a task, its worktree and its branch
 agetor clone <url>           # clone a GitHub/GitLab/Bitbucket repo as a new project
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell
+agetor sessions [ls|import] # list or import Claude Code and OpenCode sessions started outside Agetor
 agetor profile <sub>         # ls | show | add | edit | rm | export | import (saved Agents)
 agetor pipeline <sub>        # ls | show | rm | export | import | status | retry | advance | restart
 agetor export --all --out f  # Agents and/or Pipelines to a JSON file (--profile/--pipeline <ref> to pick)
@@ -261,7 +275,7 @@ flowchart LR
     CLI["agetor CLI / TUI"] -- "HTTP + SSE" --> Core
     Core["Bun core<br/>orchestrator · SQLite · git"]
     Core -- "tmux (interactive)" --> Claude["claude"]
-    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini · agy"]
+    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini · agy · opencode"]
     Core -- "ACP over stdio" --> FX["fx"]
     Claude --> WT[("git worktree<br/>per task")]
     OneShot --> WT
@@ -269,7 +283,7 @@ flowchart LR
 ```
 
 - **One local API.** The desktop UI and the CLI both talk to the core over HTTP and Server-Sent Events. The API listens only on `127.0.0.1`, and every route except `/health` requires a random token generated at each launch.
-- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Cursor and Gemini CLI run once per turn inside `tmux` and resume by session id. fx talks the Agent Client Protocol.
+- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Cursor, Gemini CLI, Antigravity and OpenCode run once per turn inside `tmux` and resume by session id. fx talks the Agent Client Protocol.
 - **Restart-safe by design.** On boot, Agetor reattaches to any `tmux`-hosted session that is still alive and replays its transcript without duplicates. Runs whose session is gone move back to **Ready**, so no card is left stuck in Running.
 - **Local persistence.** Tasks, runs, events, projects, harnesses and preferences live in a SQLite database with versioned migrations.
 
@@ -291,7 +305,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 ├── attachments/             # files and images attached to prompts
 ├── issue-threads/           # issue snapshots for tasks started from an issue
 ├── pipeline-runs/           # handoffs recorded by each pipeline run
-├── {codex,cursor,gemini,fx,antigravity}-logs/   # per-run structured agent output
+├── {codex,cursor,gemini,fx,antigravity,opencode}-logs/   # per-run structured agent output
 └── daemon.log               # headless CLI daemon log
 ```
 
@@ -311,6 +325,8 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_GEMINI_BIN` / `AGETOR_GEMINI_ARGS` | Same, for Gemini CLI. | `gemini` on `PATH` |
 | `AGETOR_FX_BIN` / `AGETOR_FX_ARGS` | Same, for fx. | `fx` on `PATH` |
 | `AGETOR_ANTIGRAVITY_BIN` / `AGETOR_ANTIGRAVITY_ARGS` | Same, for Antigravity. | `agy` on `PATH` |
+| `AGETOR_OPENCODE_BIN` / `AGETOR_OPENCODE_ARGS` | Same, for OpenCode. | `opencode` on `PATH` |
+| `AGETOR_HARNESS_AUTO_ENABLE` | Set to `0` to stop Agetor turning installed built-in harnesses on by itself (see [Supported harnesses](#supported-harnesses)). | on |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary. | `tmux` on `PATH` |
 | `AGETOR_SKIP_CLI_VERSION_FLOOR` | Set to `1` to skip the per-model minimum CLI version check. | unset |
 | `AGETOR_DAEMON_IDLE_MS` | Shut the CLI daemon down after this long with no run and no client (`0` disables). | `300000` |
@@ -392,15 +408,16 @@ bun run build:cli                               # standalone CLI binary → arti
 1. Extend the `AgentKind` union and add an entry to `AGENT_OPTIONS` in `src/shared/types.ts`.
 2. Teach `buildCommand` and `spawnAgent` in `src/bun/agents.ts` how to launch it, and add a driver if it needs one (see `codex-tmux.ts` or `fx-acp.ts`).
 3. Add availability and install hints in `src/bun/agent-status.ts`.
+4. Walk the hand-edited kind lists the compiler can't check: the harness validators and model discovery in `src/bun`, the orchestrator's session-id and turn-queue sites, the model maps in the webview, and the e2e fixtures. [`CLAUDE.md`](./CLAUDE.md#agent-command-shape) lists them.
 
-The orchestrator, UI and CLI pick up the new kind automatically.
+The type checker catches most of the tables, and the dispatch functions end in an exhaustive check that fails loudly for an unhandled kind, but the hand-edited lists don't, so a new kind isn't picked up everywhere automatically.
 
 ---
 
 ## Roadmap
 
 - Linux and Windows builds. The targets are configured in `electrobun.config.ts` but not yet built or tested.
-- Graduating Codex, Cursor, Gemini CLI, fx and Antigravity from experimental to stable.
+- Graduating Codex, Cursor, Gemini CLI, fx, Antigravity and OpenCode from experimental to stable.
 - More harnesses as new agent CLIs mature.
 
 Have an idea? [Open an issue](https://github.com/alamops/agetor/issues).
@@ -410,7 +427,7 @@ Have an idea? [Open an issue](https://github.com/alamops/agetor/issues).
 ## Acknowledgements
 
 - [Electrobun](https://github.com/blackboardsh/electrobun) and [Bun](https://bun.sh): the runtime Agetor is built on.
-- [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor CLI](https://cursor.com/cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [fx](https://fx.sh) and [Antigravity CLI](https://antigravity.google): the agents Agetor orchestrates.
+- [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor CLI](https://cursor.com/cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [fx](https://fx.sh), [Antigravity CLI](https://antigravity.google) and [OpenCode](https://opencode.ai): the agents Agetor orchestrates.
 - [tmux](https://github.com/tmux/tmux): what keeps agent sessions alive across restarts.
 - [React](https://react.dev), [React Flow](https://reactflow.dev), [dagre](https://github.com/dagrejs/dagre), [Motion](https://motion.dev), [dnd-kit](https://dndkit.com), [shadcn/ui](https://ui.shadcn.com), [Tailwind CSS](https://tailwindcss.com), [Lucide](https://lucide.dev), [Sonner](https://sonner.emilkowal.ski), [xterm.js](https://xtermjs.org), [Ink](https://github.com/vadimdemedes/ink) and [Clack](https://github.com/bombshell-dev/clack): the UI and TUI stack.
 
