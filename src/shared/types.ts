@@ -702,6 +702,23 @@ export interface PipelineStepRecord {
    *  any — one reminder max per execution (see {@link
    *  PipelineStepReminder}). Optional/additive. */
   reminder?: PipelineStepReminder | null;
+  /** Id of the run whose final response supplied the handoff this execution
+   *  used (`null`: none supplied one, a manual advance, or a record written
+   *  before this field existed). Optional/additive. */
+  handoffRunId?: string | null;
+  /** True when {@link handoffRunId} is not the run whose settle advanced or
+   *  recorded the step — i.e. the handoff was found on a different run of the
+   *  same step task (a reminder or background-task continuation raced the
+   *  original run). Absent/false on a record written before this field
+   *  existed. Optional/additive. */
+  handoffFromOtherRun?: boolean;
+  /** Timestamp of the last successful Retry start of this execution (`null`/
+   *  absent: never retried). The attempt window that bounds the handoff
+   *  look-back is `max(startedAt, attemptStartedAt ?? 0)` — a Retry resets
+   *  it, so a handoff from before the Retry can't satisfy the new attempt,
+   *  while a user's own follow-up message does not touch it. Optional/
+   *  additive. */
+  attemptStartedAt?: number | null;
 }
 
 /**

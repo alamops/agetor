@@ -486,8 +486,12 @@ export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
           ? `  ${c.red("(reminder failed)")}`
           : `  ${c.yellow("(reminder sent)")}`
         : "";
+      const handoffNote =
+        h.handoffFromOtherRun && h.handoffRunId
+          ? `  ${c.dim(`(handoff from run ${h.handoffRunId.slice(0, 8)})`)}`
+          : "";
       lines.push(
-        `    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}${kindNote}${remindedNote}  ${c.dim(h.taskId.slice(0, 8))}`,
+        `    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}${kindNote}${remindedNote}${handoffNote}  ${c.dim(h.taskId.slice(0, 8))}`,
       );
     }
   }

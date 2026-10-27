@@ -27,6 +27,7 @@ import {
   edgeVisualState,
   latestTransition,
   reconcileFlowItems,
+  handoffSourceChip,
   responseKindLabel,
   sameStepAttention,
   satellitesSignature,
@@ -533,7 +534,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       .map((b) => `${b.stepId ?? ""}:${b.taskId ?? ""}:${b.kind}:${JSON.stringify(b.message)}`)
       .join(",");
     const history = run.history
-      .map((h) => `${h.stepId}:${h.taskId}:${h.outcome ?? ""}:${h.reminder ? h.reminder.at : ""}`)
+      .map((h) => `${h.stepId}:${h.taskId}:${h.outcome ?? ""}:${h.reminder ? h.reminder.at : ""}:${h.handoffRunId ?? ""}:${h.handoffFromOtherRun ? 1 : 0}`)
       .join(",");
     const columns = steps.map((t) => `${t.id}:${t.column}:${t.pendingInteractionCount}`).join(",");
     return `${active}|${blocked}|${history}|${columns}`;
@@ -1252,6 +1253,7 @@ function HistoryRow({
   const stepName = graph ? stepNameById(graph, record.stepId) : record.stepId;
   const duration = record.endedAt != null ? formatDuration(record.endedAt - record.startedAt) : "—";
   const kindInfo = responseKindLabel(record.responseKind);
+  const handoffSource = handoffSourceChip(record);
 
   return (
     <li data-testid="pipeline-run-history-row" className="rounded-md border border-border p-2">
@@ -1271,7 +1273,7 @@ function HistoryRow({
           {record.outcome ?? "…"} · {duration}
         </span>
       </button>
-      {(kindInfo || record.reminder) && (
+      {(kindInfo || record.reminder || handoffSource) && (
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
           {kindInfo && (
             <span
@@ -1293,6 +1295,15 @@ function HistoryRow({
             >
               {record.reminder.delivered === false ? "Reminder failed" : "Reminder sent"} ·{" "}
               {formatClockTime(record.reminder.at)}
+            </span>
+          )}
+          {handoffSource && (
+            <span
+              data-testid="pipeline-run-handoff-source"
+              title={handoffSource.title}
+              className="inline-flex items-center rounded-full bg-info/10 px-1.5 py-0.5 text-[10px] font-medium text-info"
+            >
+              {handoffSource.text}
             </span>
           )}
         </div>

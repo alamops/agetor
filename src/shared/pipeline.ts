@@ -1238,6 +1238,58 @@ export function composeHandoffReminder(input: {
   return parts.join("\n\n");
 }
 
+/** Most runs of one step task the handoff look-back considers — the newest
+ *  settled ones inside the attempt window (see {@link handoffLookbackOrder}).
+ *  Bounds the work (and the run-event reads) a settle can trigger. */
+export const HANDOFF_LOOKBACK_MAX_RUNS = 20;
+
+/** Status line appended to the run that SUPPLIED a handoff when the settling
+ *  run was newer than it (the step's newest run ended without a handoff, so
+ *  the runner reached back to an earlier one). */
+export const HANDOFF_FROM_NEWER_RUN_STATUS = "handoff taken from this run — the step's newer run had none";
+
+/** Status line appended to the run that supplied a handoff when the settling
+ *  run was NOT newer than it (a later-settling, older run of the step). */
+export const HANDOFF_FROM_OTHER_RUN_STATUS = "handoff taken from this run — another run of this step ended without one";
+
+/**
+ * Start of an execution's current attempt: `max(startedAt, attemptStartedAt
+ * ?? 0)`. Only runs that began at or after it can supply the attempt's
+ * handoff. A Retry (a successful re-start of the execution) sets
+ * `attemptStartedAt`, so output from before the Retry never satisfies the new
+ * attempt; a user's own follow-up message does not touch it, so a handoff
+ * produced in reply to that message still counts.
+ */
+export function attemptWindowStart(r: { startedAt: number; attemptStartedAt?: number | null }): number {
+  return Math.max(r.startedAt, r.attemptStartedAt ?? 0);
+}
+
+/**
+ * The run ids of one step task whose final response may supply the
+ * execution's handoff, newest settled first. Keeps only runs that
+ * `succeeded`, have an `endedAt`, and started at or after `windowStart`
+ * (inclusive — see {@link attemptWindowStart}); a running, failed, cancelled
+ * or orphaned run never supplies one. Ordered by `endedAt` descending, then
+ * `startedAt` descending, and capped at {@link HANDOFF_LOOKBACK_MAX_RUNS}.
+ */
+export function handoffLookbackOrder(
+  runs: ReadonlyArray<{ id: string; status: string; startedAt: number; endedAt: number | null }>,
+  windowStart: number,
+): string[] {
+  return runs
+    .filter((r) => r.status === "succeeded" && r.endedAt != null && r.startedAt >= windowStart)
+    .sort((a, b) => (b.endedAt as number) - (a.endedAt as number) || b.startedAt - a.startedAt)
+    .slice(0, HANDOFF_LOOKBACK_MAX_RUNS)
+    .map((r) => r.id);
+}
+
+/** The status line to append to the run that supplied a handoff: the "newer
+ *  run" text when the settling run started after the supplier, else the
+ *  "another run" text. */
+export function handoffSourceStatusLine(supplierStartedAt: number, settlingStartedAt: number): string {
+  return settlingStartedAt > supplierStartedAt ? HANDOFF_FROM_NEWER_RUN_STATUS : HANDOFF_FROM_OTHER_RUN_STATUS;
+}
+
 /**
  * Resolve a user-typed `<id|name>` reference (CLI `agetor pipeline show
  * <ref>`, `agetor add --pipeline <ref>`, …) against a list of pipelines. An

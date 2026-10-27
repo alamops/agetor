@@ -4,6 +4,7 @@ import {
   blockedSummary,
   edgeVisualState,
   graphFromFlow,
+  handoffSourceChip,
   latestTransition,
   matchSubagentToProfile,
   pipelineAttentionStepTask,
@@ -472,6 +473,34 @@ describe("responseKindLabel", () => {
     expect(responseKindLabel("user-ask")).toEqual({ text: "Asked you", tone: "warning" });
     expect(responseKindLabel("error")).toEqual({ text: "Error", tone: "danger" });
     expect(responseKindLabel("cancelled")).toEqual({ text: "Cancelled", tone: "muted" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handoffSourceChip
+
+describe("handoffSourceChip", () => {
+  const RUN_ID = "0123456789abcdef-run";
+
+  test("pre-change row (neither field) → null", () => {
+    expect(handoffSourceChip(makeRecord())).toBeNull();
+  });
+
+  test("flag without a run id → null", () => {
+    expect(handoffSourceChip(makeRecord({ handoffFromOtherRun: true }))).toBeNull();
+    expect(handoffSourceChip(makeRecord({ handoffFromOtherRun: true, handoffRunId: null }))).toBeNull();
+  });
+
+  test("run id without the flag → null", () => {
+    expect(handoffSourceChip(makeRecord({ handoffRunId: RUN_ID }))).toBeNull();
+    expect(handoffSourceChip(makeRecord({ handoffRunId: RUN_ID, handoffFromOtherRun: false }))).toBeNull();
+  });
+
+  test("both set → short 8-char id in the text, full id in the title", () => {
+    expect(handoffSourceChip(makeRecord({ handoffRunId: RUN_ID, handoffFromOtherRun: true }))).toEqual({
+      text: "Handoff from run 01234567",
+      title: RUN_ID,
+    });
   });
 });
 

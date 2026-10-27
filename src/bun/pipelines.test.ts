@@ -705,11 +705,13 @@ test("parsePipelineRunState: junk entries are dropped from active/blocked/histor
     seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
     outcome: "succeeded", handoff: { schemaVersion: 1, purpose: "p" }, nextStepIds: ["s2", "s3"],
     responseKind: null, reminder: null,
+    handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null,
   } as unknown as PipelineStepRecord);
   expect(parsed?.history[1]).toEqual({
     seq: 3, stepId: "s3", taskId: "t3", startedAt: 300, endedAt: null,
     outcome: null, handoff: null, nextStepIds: [],
     responseKind: null, reminder: null,
+    handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null,
   });
 
   expect(Object.keys(parsed?.joins ?? {})).toEqual(["s2"]);
@@ -775,6 +777,51 @@ test("parsePipelineRunState: a history entry's `responseKind`/`reminder` round-t
   });
 
   expect(parsed?.history[4]?.reminder).toBeNull();
+});
+
+test("parsePipelineRunState: a history entry's `handoffRunId`/`handoffFromOtherRun`/`attemptStartedAt` round-trip; old rows read null/false/null; junk collapses to the defaults", () => {
+  const raw = {
+    pipelineId: "pipe-1",
+    history: [
+      {
+        // all three valid -> survive verbatim.
+        seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200, outcome: "succeeded",
+        handoffRunId: "run-abc", handoffFromOtherRun: true, attemptStartedAt: 150,
+      },
+      {
+        // a row saved before the fields existed -> null/false/null.
+        seq: 2, stepId: "s2", taskId: "t2", startedAt: 100,
+      },
+      {
+        // junk of the wrong type -> defaults, the entry is NOT dropped.
+        seq: 3, stepId: "s3", taskId: "t3", startedAt: 100,
+        handoffRunId: 42, handoffFromOtherRun: "yes", attemptStartedAt: "soon",
+      },
+      {
+        // non-finite number / explicit nulls / false -> defaults.
+        seq: 4, stepId: "s4", taskId: "t4", startedAt: 100,
+        handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null,
+      },
+    ],
+  };
+
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed).not.toBeNull();
+  expect(parsed?.history).toHaveLength(4);
+
+  expect(parsed?.history[0]?.handoffRunId).toBe("run-abc");
+  expect(parsed?.history[0]?.handoffFromOtherRun).toBe(true);
+  expect(parsed?.history[0]?.attemptStartedAt).toBe(150);
+
+  for (const i of [1, 2, 3]) {
+    expect(parsed?.history[i]?.handoffRunId).toBeNull();
+    expect(parsed?.history[i]?.handoffFromOtherRun).toBe(false);
+    expect(parsed?.history[i]?.attemptStartedAt).toBeNull();
+  }
+
+  // A second pass over the already-sanitized output is a fixed point.
+  const again = parsePipelineRunState(JSON.stringify(parsed));
+  expect(again?.history).toEqual(parsed?.history);
 });
 
 test("parsePipelineRunState: a blocked entry's `pending` and the run's `capExtensions` round-trip, junk is dropped", () => {

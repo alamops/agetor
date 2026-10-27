@@ -2,6 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
   EFFECTIVE_STEP_CAP_MAX,
   HANDOFF_FILE_UNTRUSTED_WARNING,
+  HANDOFF_FROM_NEWER_RUN_STATUS,
+  HANDOFF_FROM_OTHER_RUN_STATUS,
+  HANDOFF_LOOKBACK_MAX_RUNS,
+  attemptWindowStart,
+  handoffLookbackOrder,
+  handoffSourceStatusLine,
   PIPELINE_CONTROL_CHAR_RE,
   stepNameKey,
   HANDOFF_REMINDER_MARKER,
@@ -2526,5 +2532,82 @@ describe("composeHandoffReminder", () => {
     const nextRule = 'This is the last step: set "next" to null.';
     expect(prompt).toContain(nextRule);
     expect(reminder).toContain(nextRule);
+  });
+});
+
+describe("attemptWindowStart", () => {
+  test("without a retry the window starts at the execution's own startedAt", () => {
+    expect(attemptWindowStart({ startedAt: 100 })).toBe(100);
+    expect(attemptWindowStart({ startedAt: 100, attemptStartedAt: null })).toBe(100);
+  });
+
+  test("a Retry moves the window forward to attemptStartedAt", () => {
+    expect(attemptWindowStart({ startedAt: 100, attemptStartedAt: 500 })).toBe(500);
+  });
+
+  test("an attemptStartedAt older than startedAt never widens the window", () => {
+    expect(attemptWindowStart({ startedAt: 100, attemptStartedAt: 40 })).toBe(100);
+  });
+});
+
+describe("handoffLookbackOrder", () => {
+  const run = (id: string, status: string, startedAt: number, endedAt: number | null) => ({ id, status, startedAt, endedAt });
+
+  test("keeps only succeeded runs with an endedAt", () => {
+    const runs = [
+      run("ok", "succeeded", 10, 20),
+      run("running", "running", 10, null),
+      run("failed", "failed", 10, 20),
+      run("cancelled", "cancelled", 10, 20),
+      run("orphaned", "orphaned", 10, 20),
+      run("no-end", "succeeded", 10, null),
+    ];
+    expect(handoffLookbackOrder(runs, 0)).toEqual(["ok"]);
+  });
+
+  test("the window boundary is inclusive on startedAt", () => {
+    const runs = [run("before", "succeeded", 99, 150), run("at", "succeeded", 100, 160), run("after", "succeeded", 101, 170)];
+    expect(handoffLookbackOrder(runs, 100)).toEqual(["after", "at"]);
+  });
+
+  test("orders by endedAt descending, then startedAt descending", () => {
+    const runs = [
+      run("old", "succeeded", 10, 50),
+      run("tie-early", "succeeded", 20, 100),
+      run("newest", "succeeded", 5, 200),
+      run("tie-late", "succeeded", 30, 100),
+    ];
+    expect(handoffLookbackOrder(runs, 0)).toEqual(["newest", "tie-late", "tie-early", "old"]);
+  });
+
+  test("caps at HANDOFF_LOOKBACK_MAX_RUNS, keeping the newest", () => {
+    const runs = Array.from({ length: HANDOFF_LOOKBACK_MAX_RUNS + 5 }, (_, i) => run(`r${i}`, "succeeded", i, i + 1));
+    const order = handoffLookbackOrder(runs, 0);
+    expect(order).toHaveLength(HANDOFF_LOOKBACK_MAX_RUNS);
+    expect(order[0]).toBe(`r${HANDOFF_LOOKBACK_MAX_RUNS + 4}`);
+    expect(order[order.length - 1]).toBe("r5");
+  });
+
+  test("does not mutate its input", () => {
+    const runs = [run("a", "succeeded", 1, 2), run("b", "succeeded", 3, 4)];
+    handoffLookbackOrder(runs, 0);
+    expect(runs.map((r) => r.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("handoffSourceStatusLine", () => {
+  test("the settling run started after the supplier -> the 'newer run had none' text", () => {
+    expect(handoffSourceStatusLine(100, 200)).toBe(HANDOFF_FROM_NEWER_RUN_STATUS);
+  });
+
+  test("the settling run started at or before the supplier -> the 'another run' text", () => {
+    expect(handoffSourceStatusLine(200, 100)).toBe(HANDOFF_FROM_OTHER_RUN_STATUS);
+    expect(handoffSourceStatusLine(200, 200)).toBe(HANDOFF_FROM_OTHER_RUN_STATUS);
+  });
+
+  test("the two texts are distinct and never name the product", () => {
+    expect(HANDOFF_FROM_NEWER_RUN_STATUS).not.toBe(HANDOFF_FROM_OTHER_RUN_STATUS);
+    expect(HANDOFF_FROM_NEWER_RUN_STATUS.toLowerCase()).not.toContain("agetor");
+    expect(HANDOFF_FROM_OTHER_RUN_STATUS.toLowerCase()).not.toContain("agetor");
   });
 });

@@ -636,6 +636,11 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
     nextStepIds,
     responseKind: sanitizeResponseKind(rec.responseKind),
     reminder: sanitizeStepReminder(rec.reminder),
+    // Always emitted (like responseKind/reminder above) so the read shape is
+    // stable: a record saved before these fields existed reads null/false/null.
+    handoffRunId: typeof rec.handoffRunId === "string" ? rec.handoffRunId : null,
+    handoffFromOtherRun: rec.handoffFromOtherRun === true,
+    attemptStartedAt: isFiniteNumber(rec.attemptStartedAt) ? rec.attemptStartedAt : null,
   };
 };
 
