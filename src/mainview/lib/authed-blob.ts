@@ -402,6 +402,32 @@ export function createLazyGate(deps: LazyGateDeps): LazyGate {
   };
 }
 
+/** The size an image last showed at, recorded when the lazy gate releases it. */
+export interface HeldBox {
+  url: string;
+  width: number;
+  height: number;
+}
+
+/**
+ * The box an `AuthedImg` that is not showing its image should keep, or `null`
+ * for its placeholder. The last measured size holds while the image is
+ * deferred (released off-screen) AND while it is re-fetching on return — the
+ * blob is revoked after the grace period, so coming back means a fresh
+ * `loading` — so neither step collapses the box and shifts the transcript. A
+ * settled failure (the file is gone) shows the placeholder, and a box measured
+ * for another `url` (a candidate walk moved on) is never reused.
+ */
+export function heldBoxFor(
+  held: HeldBox | null,
+  url: string,
+  active: boolean,
+  status: AuthedBlobStatus,
+): HeldBox | null {
+  if (!held || held.url !== url) return null;
+  return !active || status === "loading" ? held : null;
+}
+
 /** Nearest ancestor that scrolls vertically, or `null` for the viewport.
  *  IntersectionObserver clips a target by every ancestor scroller, but
  *  `rootMargin` only grows the ROOT, so lookahead inside a scroll container

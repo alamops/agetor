@@ -10,7 +10,7 @@
  * cached per file until its size or mtime changes. `git` runs only for rows
  * that stay visible.
  */
-import { closeSync, createReadStream, existsSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, lstatSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -22,7 +22,7 @@ import {
   plainEncodedProjectPath,
   type ClaudeSessionMeta,
 } from "../shared/claude-session-meta.ts";
-import { openReadNoFollow, READ_NOFOLLOW, readTextNoFollow } from "./no-follow.ts";
+import { isPlainDirBelow, openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 
 export interface ClaudeSessionCandidate {
   sessionId: string;
@@ -377,6 +377,9 @@ function harnessBinFor(
 
 export function readClaudeRegistry(configDir: string): ClaudeRegistryRecord[] {
   const dir = path.join(configDir, "sessions");
+  // The config dir is the user's; `sessions/` inside it is agent-writable and
+  // is never listed in-process through a planted symlink (no-follow.ts).
+  if (!isPlainDirBelow(configDir, dir)) return [];
   let names: string[] = [];
   try {
     names = readdirSync(dir);
@@ -487,7 +490,7 @@ export async function readClaudeSessionMetaFile(file: string): Promise<ClaudeSes
 function peekFirstCwd(file: string): string | null {
   let fd: number | null = null;
   try {
-    fd = openSync(file, READ_NOFOLLOW);
+    fd = openReadNoFollow(file);
     const buf = Buffer.alloc(PEEK_BYTES);
     const n = readSync(fd, buf, 0, PEEK_BYTES, 0);
     const lines = buf.subarray(0, n).toString("utf8").split("\n");
@@ -753,6 +756,8 @@ async function collect(opts: ScanClaudeSessionsOptions): Promise<Collected[]> {
 
   for (const configDir of claudeConfigDirsToScan(opts)) {
     const projects = path.join(configDir, "projects");
+    // Same rule one level up: a `projects/` linked elsewhere is not listed.
+    if (!isPlainDirBelow(configDir, projects)) continue;
     let projectDirs: string[] = [];
     try {
       projectDirs = readdirSync(projects);

@@ -2,7 +2,6 @@ import {
   existsSync,
   watch as fsWatch,
   type FSWatcher,
-  openSync as fsOpenSync,
   readSync as fsReadSync,
   closeSync as fsCloseSync,
   statSync as fsStatSync,
@@ -59,7 +58,7 @@ import {
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
 import { compactionStatusLine, isCompactionNotice } from "../shared/compaction.ts";
-import { READ_NOFOLLOW } from "./no-follow.ts";
+import { openReadNoFollow, READ_NOFOLLOW } from "./no-follow.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -3619,7 +3618,7 @@ function readFileTail(filePath: string, maxBytes: number): string | null {
     const start = Math.max(0, size - maxBytes);
     const len = size - start;
     if (len <= 0) return "";
-    fd = fsOpenSync(filePath, READ_NOFOLLOW);
+    fd = openReadNoFollow(filePath);
     const buf = Buffer.alloc(len);
     fsReadSync(fd, buf, 0, len, start);
     const text = buf.toString("utf8");
@@ -4830,7 +4829,7 @@ function isReplayPromise(
  * a correctness requirement, not an oversight. `flush()`'s own race guard
  * (`if (state.offset !== startOffset) return;`, see its comment) only works
  * because a call to THIS function is atomic with respect to the event loop:
- * it runs `fsStatSync`/`fsOpenSync`/`fsReadSync`/`fsCloseSync` back-to-back
+ * it runs `fsStatSync`/`openReadNoFollow`/`fsReadSync`/`fsCloseSync` back-to-back
  * with no `await` in between, so no other flush of the same `state.offset`
  * can interleave mid-read. Rewriting it on top of `fs/promises` (mirroring
  * `readAppended`) would reopen exactly the double-dispatch race `flush`'s
@@ -4857,7 +4856,7 @@ function flushSync(state: SessionState): void {
   const len = st.size - state.offset;
   const buf = Buffer.alloc(len);
   let fd;
-  try { fd = fsOpenSync(state.jsonlPath, READ_NOFOLLOW); } catch { return; }
+  try { fd = openReadNoFollow(state.jsonlPath); } catch { return; }
   try {
     fsReadSync(fd, buf, 0, len, state.offset);
   } finally {
@@ -4883,7 +4882,8 @@ async function readAppended(filePath: string, offset: number): Promise<{ text: s
   const handle = await open(filePath, READ_NOFOLLOW);
   try {
     const st = await handle.stat();
-    if (st.size <= offset) return { text: "", next: offset };
+    // A FIFO or other special file swapped in for the transcript: nothing to tail.
+    if (!st.isFile() || st.size <= offset) return { text: "", next: offset };
     const len = st.size - offset;
     const buf = Buffer.alloc(len);
     await handle.read(buf, 0, len, offset);

@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import { coreSpawn } from "./core-spawn.ts";
+import { readTextNoFollow } from "./no-follow.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
@@ -841,6 +842,9 @@ export function worktreePath(task: Task): string {
   return path.join(WORKTREES_DIR, task.id);
 }
 
+/** A `.git` pointer file is one `gitdir: <path>` line; anything bigger is not one. */
+const GIT_POINTER_MAX_BYTES = 8 * 1024;
+
 /**
  * Best-effort parse of a linked worktree's `.git` file — for a worktree
  * (unlike an ordinary checkout) `.git` is a *file* containing a single line
@@ -854,8 +858,13 @@ export function worktreePath(task: Task): string {
  */
 export function parseWorktreeGitPointer(worktreeDir: string): string | null {
   try {
+    // Everything under the worktrees dir is agent-writable, and `GET /worktrees`
+    // is open to the CLI token: never follow a planted symlink (the worktree
+    // dir or its `.git`) into a protected folder in-process, never block on a
+    // FIFO, and never slurp more than a pointer file's worth (no-follow.ts).
+    if (!lstatSync(worktreeDir).isDirectory()) return null;
     const gitFile = path.join(worktreeDir, ".git");
-    const contents = readFileSync(gitFile, "utf8").trim();
+    const contents = readTextNoFollow(gitFile, { maxBytes: GIT_POINTER_MAX_BYTES }).trim();
     const match = /^gitdir:\s*(.+)$/.exec(contents);
     if (!match) return null;
     const gitdir = match[1]!;

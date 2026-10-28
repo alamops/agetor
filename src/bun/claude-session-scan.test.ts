@@ -432,3 +432,34 @@ test("a symlinked transcript or project dir is skipped, never read through", asy
   expect(rows.map((r) => r.sessionId)).toEqual(["real"]);
   expect(read.every((p) => !p.includes("via-file-link") && !p.includes("dirlink"))).toBe(true);
 });
+
+// One level up: a whole `projects/` (or `sessions/`) folder linked elsewhere is
+// never listed in-process either — only the config dir itself is trusted.
+test("a symlinked projects/ or sessions/ folder is not listed", async () => {
+  const root = home();
+  const cwd = path.join(root, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const enc = plainEncodedProjectPath(cwd);
+  // The real transcripts live outside the config dir…
+  const outsideConfig = plant({ home: root, configName: "outside-config", dirName: enc, sessionId: "planted", cwd, lines: [userLine(cwd, "secret")] });
+  // …and the scanned config dir reaches them only through symlinked folders.
+  const config = path.join(root, ".claude");
+  mkdirSync(config, { recursive: true });
+  symlinkSync(path.join(outsideConfig, "projects"), path.join(config, "projects"));
+  mkdirSync(path.join(outsideConfig, "sessions"), { recursive: true });
+  writeFileSync(path.join(outsideConfig, "sessions", "1.json"), JSON.stringify({ sessionId: "planted", pid: 1 }));
+  symlinkSync(path.join(outsideConfig, "sessions"), path.join(config, "sessions"));
+
+  const read: string[] = [];
+  const rows = await scanClaudeSessions({
+    homeDir: root,
+    harnesses: harnessFor(config),
+    encodePath: plainEncodedProjectPath,
+    listLive: () => [],
+    onJsonlRead: (p) => read.push(p),
+  });
+  expect(rows).toEqual([]);
+  expect(read).toEqual([]);
+  const { readClaudeRegistry } = await import("./claude-session-scan.ts");
+  expect(readClaudeRegistry(config)).toEqual([]);
+});

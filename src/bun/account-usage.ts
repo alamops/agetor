@@ -1,8 +1,8 @@
-import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { closeSync, readdirSync, readSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { AccountUsageSummary, TokenTotals } from "../shared/types.ts";
 import { db } from "./db.ts";
-import { READ_NOFOLLOW } from "./no-follow.ts";
+import { openReadNoFollow } from "./no-follow.ts";
 
 /**
  * Local, deterministic per-account token-usage rollups (SDD: "plane A").
@@ -160,7 +160,7 @@ function listJsonlFiles(root: string, out: string[] = []): string[] {
 function readSlice(p: string, offset: number, size: number): Buffer | null {
   if (size <= offset) return Buffer.alloc(0);
   let fd: number;
-  try { fd = openSync(p, READ_NOFOLLOW); } catch { return null; }
+  try { fd = openReadNoFollow(p); } catch { return null; }
   try {
     const buf = Buffer.alloc(size - offset);
     const n = readSync(fd, buf, 0, buf.length, offset);

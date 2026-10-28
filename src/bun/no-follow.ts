@@ -15,26 +15,78 @@
 //
 // Scope: the final component only. A symlinked parent directory is still
 // followed (a user's own `~/.claude` → dotfiles link keeps working); the
-// directory walks that list agent-writable dirs (`claude-session-scan.ts`)
-// skip symlinked entries with `lstat` themselves.
+// directory walks that list agent-writable dirs check their own chain with
+// `isPlainDirBelow` (or skip symlinked entries with `lstat`) themselves.
+//
+// Special files. The open is non-blocking and the opened descriptor must be a
+// regular file: a named pipe swapped in for a transcript or log would
+// otherwise block `open(2)`/`read(2)` — and with them the core's main thread —
+// until some writer showed up. (O_NONBLOCK has no effect on a regular file's
+// reads.) Code that opens with `READ_NOFOLLOW` directly gets the non-blocking
+// open; `openReadNoFollow` / `readTextNoFollow` also refuse a non-regular file.
 
-import { closeSync, constants, openSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import path from "node:path";
 
-/** `open(2)` flags for reading a file whose final component must not be a symlink. */
-export const READ_NOFOLLOW = constants.O_RDONLY | constants.O_NOFOLLOW;
+/** `open(2)` flags for reading a file whose final component must not be a
+ *  symlink, without blocking on a FIFO. */
+export const READ_NOFOLLOW = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
-/** `openSync(p, "r")`, refusing a symlink at `p` (ELOOP). */
-export function openReadNoFollow(p: string): number {
-  return openSync(p, READ_NOFOLLOW);
+function errnoError(code: string, message: string, p: string): NodeJS.ErrnoException {
+  const err = new Error(`${code}: ${message}, open '${p}'`) as NodeJS.ErrnoException;
+  err.code = code;
+  err.syscall = "open";
+  err.path = p;
+  return err;
 }
 
-/** `readFileSync(p, "utf8")`, refusing a symlink at `p` (ELOOP). Throws like
+/** `openSync(p, "r")`, refusing a symlink at `p` (ELOOP), a non-regular file
+ *  (EINVAL) and — with `maxBytes` — a file larger than that (EFBIG). */
+export function openReadNoFollow(p: string, opts: { maxBytes?: number } = {}): number {
+  const fd = openSync(p, READ_NOFOLLOW);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw errnoError("EINVAL", "not a regular file", p);
+    if (opts.maxBytes !== undefined && st.size > opts.maxBytes) throw errnoError("EFBIG", "file too large", p);
+  } catch (e) {
+    closeSync(fd);
+    throw e;
+  }
+  return fd;
+}
+
+/** `readFileSync(p, "utf8")`, with `openReadNoFollow`'s refusals. Throws like
  *  `readFileSync` on any other failure. */
-export function readTextNoFollow(p: string): string {
-  const fd = openReadNoFollow(p);
+export function readTextNoFollow(p: string, opts: { maxBytes?: number } = {}): string {
+  const fd = openReadNoFollow(p, opts);
   try {
     return readFileSync(fd, "utf8");
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * True when `dir` is `base` itself or lies lexically below it and every path
+ * component from `base` (exclusive) down to `dir` (inclusive) is a real
+ * directory — not a symlink, not missing. `base` is trusted as-is (it may be a
+ * user's own symlink). Use before listing or watching an agent-writable folder
+ * in-process, so a folder linked into a protected location is never read under
+ * Agetor's identity. A component swapped for a symlink between this check and
+ * the read is an accepted timing-race residual.
+ */
+export function isPlainDirBelow(base: string, dir: string): boolean {
+  const rel = path.relative(path.resolve(base), path.resolve(dir));
+  if (rel === "") return true;
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return false;
+  let cur = path.resolve(base);
+  for (const part of rel.split(path.sep)) {
+    cur = path.join(cur, part);
+    try {
+      if (!lstatSync(cur).isDirectory()) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }

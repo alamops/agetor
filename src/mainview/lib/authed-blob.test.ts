@@ -6,6 +6,7 @@ import {
   createAuthedBlobCache,
   createLazyGate,
   createViewportRegistry,
+  heldBoxFor,
   IDLE_RELEASE_MS,
   LOADING_RELEASE_MS,
   LOADING_STATE,
@@ -502,5 +503,34 @@ describe("lazy gate", () => {
     expect(g.live()).toHaveLength(0);
     g.gate.setNear(true);
     expect(g.changes).toEqual([true]);
+  });
+});
+
+describe("held box (heldBoxFor)", () => {
+  const box = { url: "/files/preview?path=a.png", width: 320, height: 240 };
+
+  test("holds the measured box while the image is released off-screen", () => {
+    expect(heldBoxFor(box, box.url, false, "loading")).toBe(box);
+  });
+
+  test("keeps holding it while the image re-fetches on return (blob revoked after the grace)", () => {
+    // Regression: the box used to collapse to the placeholder here, so a
+    // transcript image shrank and then grew again — the scroll position jumped.
+    expect(heldBoxFor(box, box.url, true, "loading")).toBe(box);
+  });
+
+  test("a settled failure shows the placeholder, not an empty box", () => {
+    expect(heldBoxFor(box, box.url, true, "missing")).toBeNull();
+    expect(heldBoxFor(box, box.url, true, "error")).toBeNull();
+    expect(heldBoxFor(box, box.url, true, "too-large")).toBeNull();
+  });
+
+  test("a box measured for another url is never reused", () => {
+    expect(heldBoxFor(box, "/files/preview?path=b.png", false, "loading")).toBeNull();
+    expect(heldBoxFor(box, "/files/preview?path=b.png", true, "loading")).toBeNull();
+  });
+
+  test("nothing measured yet: the placeholder", () => {
+    expect(heldBoxFor(null, box.url, false, "loading")).toBeNull();
   });
 });

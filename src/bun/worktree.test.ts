@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -1953,5 +1953,42 @@ describe("removeWorktree branches option", () => {
     await removeWorktree({ ...fresh, branch: first.branch, worktreePath: wt });
     expect(await branchExists(repo, first.branch!)).toBe(false);
     expect(await branchExists(repo, "implement/x")).toBe(true);
+  });
+});
+
+// `GET /worktrees` (CLI-reachable) parses every dir's `.git` pointer in the
+// core: it must not follow a planted symlink or read an oversized file.
+describe("parseWorktreeGitPointer", () => {
+  test("reads a real pointer file; refuses a symlinked .git, a symlinked dir, and an oversized file", async () => {
+    const { parseWorktreeGitPointer } = await import("./worktree.ts");
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-wt-pointer-"));
+    try {
+      const pointer = "gitdir: /src/repo/.git/worktrees/abc\n";
+      const real = path.join(root, "real");
+      mkdirSync(real);
+      writeFileSync(path.join(real, ".git"), pointer);
+      expect(parseWorktreeGitPointer(real)).toBe("/src/repo");
+
+      const outside = path.join(root, "outside");
+      mkdirSync(outside);
+      writeFileSync(path.join(outside, "pointer"), pointer);
+      writeFileSync(path.join(outside, ".git"), pointer);
+
+      const fileLink = path.join(root, "file-link");
+      mkdirSync(fileLink);
+      symlinkSync(path.join(outside, "pointer"), path.join(fileLink, ".git"));
+      expect(parseWorktreeGitPointer(fileLink)).toBeNull();
+
+      const dirLink = path.join(root, "dir-link");
+      symlinkSync(outside, dirLink);
+      expect(parseWorktreeGitPointer(dirLink)).toBeNull();
+
+      const big = path.join(root, "big");
+      mkdirSync(big);
+      writeFileSync(path.join(big, ".git"), pointer + " ".repeat(64 * 1024));
+      expect(parseWorktreeGitPointer(big)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -12,8 +12,9 @@
 // `LAZY_ROOT_MARGIN` of its scroll root, an image that stays out of view
 // releases its cache subscription (so the blob is revoked after the grace
 // period and the bytes are re-fetched on return), and the box it occupied is
-// held at its last measured size so releasing never shifts the scroll
-// position. `loading="eager"` — or a runtime without IntersectionObserver —
+// held at its last measured size — while released and while re-fetching on
+// return (`heldBoxFor`) — so neither step shifts the scroll position.
+// `loading="eager"` — or a runtime without IntersectionObserver —
 // fetches immediately and never releases. The pure pieces (observer registry,
 // release timers, fetch queue) live in `lib/authed-blob.ts`.
 import { useEffect, useRef, useState } from "react";
@@ -21,9 +22,11 @@ import {
   createLazyGate,
   findScrollRoot,
   getSharedViewportRegistry,
+  heldBoxFor,
   LAZY_ROOT_MARGIN,
   useAuthedObjectUrl,
   type AuthedBlobStatus,
+  type HeldBox,
   type LazyGate,
 } from "@/lib/authed-blob";
 
@@ -66,10 +69,13 @@ export function AuthedImg({
   const registry = loading === "eager" ? null : getSharedViewportRegistry();
   const lazy = registry !== null;
   const [active, setActive] = useState(!lazy);
-  const [heldSize, setHeldSize] = useState<{ width: number; height: number } | null>(null);
+  const [heldSize, setHeldSize] = useState<HeldBox | null>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const sentinelRef = useRef<HTMLSpanElement>(null);
   const gateRef = useRef<LazyGate | null>(null);
+  // The gate's callback is created once; it reads the current url from here.
+  const urlRef = useRef(url);
+  urlRef.current = url;
 
   const { src, status } = useAuthedObjectUrl(active ? url : null);
   const showingImg = status === "ok" && src !== null;
@@ -88,7 +94,7 @@ export function AuthedImg({
           // Releasing: keep the box the image occupied so the layout holds.
           const rect = imgRef.current?.getBoundingClientRect();
           if (rect && rect.width > 0 && rect.height > 0) {
-            setHeldSize({ width: rect.width, height: rect.height });
+            setHeldSize({ url: urlRef.current, width: rect.width, height: rect.height });
           }
         }
         setActive(next);
@@ -124,7 +130,7 @@ export function AuthedImg({
   }, [url, status]);
 
   if (!showingImg) {
-    const held = !active && heldSize !== null;
+    const held = heldBoxFor(heldSize, url, active, status);
     return (
       <>
         {lazy && (
@@ -138,7 +144,7 @@ export function AuthedImg({
           />
         )}
         {held ? (
-          <span aria-hidden style={{ display: "inline-block", width: heldSize.width, height: heldSize.height }} />
+          <span aria-hidden style={{ display: "inline-block", width: held.width, height: held.height }} />
         ) : (
           placeholder
         )}

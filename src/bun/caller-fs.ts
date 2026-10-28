@@ -266,16 +266,26 @@ export async function gateCallerPath(
 }
 
 /** Read a child's stdout up to `maxBytes`, then stop. `truncated` is true when
- *  the cap cut the stream. Exported for discovery-fs.ts's disclaimed readers. */
+ *  the cap cut the stream, or until `signal` aborts (the read then ends with
+ *  whatever arrived). */
 export async function readCapped(
   stream: ReadableStream<Uint8Array> | number | null | undefined,
   maxBytes: number,
+  signal?: AbortSignal,
 ): Promise<{ bytes: Uint8Array; truncated: boolean }> {
   if (!stream || typeof stream === "number") return { bytes: new Uint8Array(0), truncated: false };
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   let truncated = false;
+  // An abort ends the read with what has arrived: a pending `read()` is
+  // settled by cancelling the reader instead of waiting for an EOF that
+  // may never come (a grandchild still holding the pipe open).
+  const onAbort = () => {
+    reader.cancel().catch(() => {});
+  };
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -290,7 +300,10 @@ export async function readCapped(
       chunks.push(value);
       total += value.length;
     }
+  } catch {
+    // A cancelled or killed child's pipe can error mid-read; keep what arrived.
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     try {
       await reader.cancel();
     } catch {
@@ -306,17 +319,31 @@ export async function readCapped(
   return { bytes, truncated };
 }
 
-/** Run a child and read at most `maxBytes` of its stdout; kill it at the timeout
- *  or when the cap cuts the stream. `stdinData` (if any) is written to its
- *  stdin. Never throws: a spawn failure yields no bytes. */
-async function runToBytes(
+/** After the timeout's SIGTERM, how long a child may take to close its stdout
+ *  and exit before it is SIGKILLed and the read is abandoned. */
+const KILL_GRACE_MS = 1_000;
+
+/**
+ * Run one child and read at most `maxBytes` of its stdout. Shared by the
+ * caller-aware tree read below and discovery-fs.ts. Never throws: a spawn
+ * failure yields no bytes.
+ *
+ * Bounded in time no matter what the child does: at `timeoutMs` it gets
+ * SIGTERM; `KILL_GRACE_MS` later it gets SIGKILL and the read is cancelled, so
+ * the call returns by `timeoutMs + KILL_GRACE_MS` even when something else
+ * still holds the pipe open (a grandchild the child left behind) or the child
+ * ignores SIGTERM. `timedOut` reports that the timeout fired; whatever arrived
+ * before it is still returned. Run tools as DIRECT children (never a shell
+ * pipeline): the kill reaches only the child itself.
+ */
+export async function runChildCapped(
   argv: string[],
-  opts: { cwd: string; maxBytes: number; timeoutMs: number; stdinData?: Uint8Array },
-): Promise<{ bytes: Uint8Array; truncated: boolean }> {
+  opts: { maxBytes: number; timeoutMs: number; cwd?: string; stdinData?: Uint8Array },
+): Promise<{ bytes: Uint8Array; truncated: boolean; timedOut: boolean }> {
   let proc: ReturnType<typeof coreSpawn>;
   try {
     proc = coreSpawn(argv, {
-      cwd: opts.cwd,
+      ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
       // COPYFILE_DISABLE: without it bsdtar adds an AppleDouble `._name`
       // sibling for every file that carries an xattr (macOS stamps
       // `com.apple.provenance` on most downloaded/created files).
@@ -326,17 +353,29 @@ async function runToBytes(
       stderr: "ignore",
     });
   } catch {
-    return { bytes: new Uint8Array(0), truncated: false };
+    return { bytes: new Uint8Array(0), truncated: false, timedOut: false };
   }
-  const kill = () => {
+  const kill = (signal: NodeJS.Signals) => {
     try {
-      proc.kill();
+      proc.kill(signal);
     } catch {
       // already gone
     }
   };
-  const timer = setTimeout(kill, opts.timeoutMs);
-  let result = { bytes: new Uint8Array(0) as Uint8Array, truncated: false };
+  let timedOut = false;
+  // Aborted at the hard deadline: ends the stdout read and the exit wait.
+  const stopped = new AbortController();
+  const termTimer = setTimeout(() => {
+    timedOut = true;
+    kill("SIGTERM");
+  }, opts.timeoutMs);
+  const killTimer = setTimeout(() => {
+    kill("SIGKILL");
+    stopped.abort();
+  }, opts.timeoutMs + KILL_GRACE_MS);
+  const giveUp = new Promise<void>((resolve) => stopped.signal.addEventListener("abort", () => resolve(), { once: true }));
+
+  let result: { bytes: Uint8Array; truncated: boolean } = { bytes: new Uint8Array(0), truncated: false };
   try {
     if (opts.stdinData) {
       // Feed stdin concurrently with the stdout read so neither pipe can fill
@@ -351,15 +390,16 @@ async function runToBytes(
         }
       })();
     }
-    result = await readCapped(proc.stdout as ReadableStream<Uint8Array>, opts.maxBytes);
-    if (result.truncated) kill();
-    await proc.exited;
+    result = await readCapped(proc.stdout as ReadableStream<Uint8Array>, opts.maxBytes, stopped.signal);
+    if (result.truncated) kill("SIGTERM");
+    await Promise.race([proc.exited, giveUp]);
   } catch {
     // use whatever was read
   } finally {
-    clearTimeout(timer);
+    clearTimeout(termTimer);
+    clearTimeout(killTimer);
   }
-  return result;
+  return { ...result, timedOut };
 }
 
 /**
@@ -396,7 +436,7 @@ export async function callerProjectTree(
   const operands = relRoots.filter((r) => r && !r.includes("\0") && !r.startsWith("-"));
   if (operands.length === 0) return refProjectTree(files);
 
-  const listing = await runToBytes(
+  const listing = await runChildCapped(
     [FIND, "-L", ...operands, "(", "-name", ".git", "-o", "-name", "node_modules", ")", "-prune", "-o", "-type", "f", "-print0"],
     { cwd: root, maxBytes: PROJECT_TREE_TAR_MAX_BYTES, timeoutMs: TREE_TIMEOUT_MS },
   );
@@ -415,7 +455,7 @@ export async function callerProjectTree(
     return refProjectTree(files);
   }
 
-  const archive = await runToBytes([TAR, "-c", "-f", "-", "--format=pax", "-L", "--null", "-T", "-"], {
+  const archive = await runChildCapped([TAR, "-c", "-f", "-", "--format=pax", "-L", "--null", "-T", "-"], {
     cwd: root,
     maxBytes: PROJECT_TREE_TAR_MAX_BYTES,
     timeoutMs: TREE_TIMEOUT_MS,

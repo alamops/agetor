@@ -1,6 +1,6 @@
 import { test, expect, beforeAll, afterEach } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { RunEvent, Subagent } from "../shared/types.ts";
@@ -567,4 +567,24 @@ test("subagent JSONL with no marker lines: a user-line permissionMode CHANGE sti
 
   w.detach();
   setSubagentEmitter(null);
+});
+
+// An agent can replace its own `<session>/subagents` folder with a symlink into
+// a protected location; the watcher must never list (or watch) it in-process.
+test("a symlinked subagents folder is never listed", async () => {
+  const { subagents } = await import("./db.ts");
+  const { attachSubagentWatcher } = await import("./claude-subagents.ts");
+  const { taskId, jsonlPath, subagentsDir } = await seed();
+
+  const outside = mkdtempSync(path.join(tmpdir(), "agetor-subagents-outside-"));
+  writeFileSync(path.join(outside, "agent-planted01.meta.json"), JSON.stringify({ agentType: "Explore", description: "planted" }));
+  writeFileSync(path.join(outside, "agent-planted01.jsonl"), sidechainLines());
+  rmSync(subagentsDir, { recursive: true, force: true });
+  symlinkSync(outside, subagentsDir);
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  w.pump(Date.now());
+  expect(subagents.listForTask(taskId)).toEqual([]);
+  w.detach();
+  rmSync(outside, { recursive: true, force: true });
 });

@@ -24,13 +24,23 @@
 // Shape. Discovery needs a bounded, known set of files: the `*.md` under a
 // commands dir, `SKILL.md` one level under a skills dir, and a handful of named
 // json/toml files. A caller describes them as `DiscoverySelector`s (absolute
-// path + max depth + file-name glob); `load()` runs ONE child for all of them —
-// `find -L` per selector piped to one `tar` — and returns a `DiscoveryReader`
-// over the in-memory result. So one discovery stage costs one child no matter
-// how many roots or plugins are involved, and only files discovery parses are
-// ever archived (a skill folder's big assets are never read). Absolute paths go
-// to the child as argv, never into script text; tar's leading-`/` strip is
-// undone when the archive is mapped back to absolute keys.
+// path + max depth + file-name glob); `load()` runs one `find -L` per distinct
+// (depth, name) pair — at most three in practice, each over all of its start
+// points, in parallel — then ONE `tar` over every path they listed, and returns
+// a `DiscoveryReader` over the in-memory result. So a discovery stage costs a
+// handful of children no matter how many roots or plugins are involved, and
+// only files discovery parses are ever archived (a skill folder's big assets
+// are never read). Every tool is a DIRECT child (no shell pipeline), so the
+// timeout's kill reaches the process that is actually blocked — a `find` held
+// by a pending permission prompt or a stalled mount, a `tar -L` opening a file
+// swapped for a named pipe — and `runChildCapped` returns near the deadline
+// even if something still holds the pipe. Absolute paths go to the children
+// as argv (find) or NUL-separated stdin (tar), never into script text; tar's
+// leading-`/` strip is undone when the archive is mapped back to absolute keys.
+//
+// Case. A literal file name (`SKILL.md`) is matched case-insensitively and the
+// hit is keyed under the selector's spelling, like the in-process
+// `readFileSync(<dir>/SKILL.md)` on macOS's default case-insensitive volume.
 //
 // The one file that is large and re-read often, `~/.claude.json`, keeps a
 // stat-keyed cache in both modes: the disclaimed child reports `mtime size`
@@ -40,8 +50,7 @@ import { lstatSync, readFileSync, statSync } from "node:fs";
 import { readTextNoFollow } from "./no-follow.ts";
 import path from "node:path";
 import { disclaimEnabled } from "./disclaim.ts";
-import { readCapped, PROJECT_TREE_TAR_MAX_BYTES } from "./caller-fs.ts";
-import { childEnv, coreSpawn } from "./core-spawn.ts";
+import { PROJECT_TREE_TAR_MAX_BYTES, runChildCapped } from "./caller-fs.ts";
 import { diskProjectTree, refProjectTree, type ProjectTree } from "./ref-tree.ts";
 import { parseTar } from "./tar-read.ts";
 
@@ -194,30 +203,26 @@ const TAR = "/usr/bin/tar";
 const STAT = "/usr/bin/stat";
 const CAT = "/bin/cat";
 
-const LOAD_TIMEOUT_MS = 15_000;
+/** Budget for one whole `load()` (the finds, then the tar) or one JSON read. */
+const DEFAULT_LOAD_TIMEOUT_MS = 15_000;
+let LOAD_TIMEOUT_MS = DEFAULT_LOAD_TIMEOUT_MS;
+/** The tar step always gets at least this much (capped by the budget), even
+ *  when the finds used most of it (they ran in parallel, so that only happens
+ *  when one hung). */
+const TAR_MIN_TIMEOUT_MS = 2_000;
 /** `~/.claude.json` has no tighter bound than "multi-MB"; past this the file is
  *  treated as unreadable (a truncated JSON would not parse anyway). */
 const JSON_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_DEPTH = 32;
 
-/**
- * argv: sh -c SCRIPT sh <path> <maxdepth> <name> [<path> <maxdepth> <name> …].
- * One `find -L` per triple (`.git` / `node_modules` pruned, regular files only —
- * `-type f` follows a symlink to a file), NUL-separated, piped into a single
- * `tar` that follows links and writes a pax archive to stdout. A missing start
- * point just prints nothing. Paths are positional parameters, never script text.
- */
-const LOAD_SCRIPT = `
-while [ "$#" -ge 3 ]; do
-  p=$1; d=$2; n=$3; shift 3
-  ${FIND} -L "$p" -maxdepth "$d" \\( -name .git -o -name node_modules \\) -prune -o -type f -name "$n" -print0 2>/dev/null
-done | ${TAR} -c -f - --format=pax -L --null -T - 2>/dev/null
-`;
+/** `find -name` glob metacharacters; a name without them is a literal. */
+const GLOB_CHARS = /[*?[\\]/;
 
 /**
  * argv: sh -c SCRIPT sh <path> <known-key>. First line: `mtime size` of the
  * file (nothing at all when it can't be stat'ed). The content follows only when
- * that key differs from the caller's cached one.
+ * that key differs from the caller's cached one. `cat` is exec'd, so the child
+ * holding stdout is always the direct child the timeout kills.
  */
 const JSON_SCRIPT = `
 k=$(${STAT} -L -f '%Fm %z' -- "$1" 2>/dev/null) || exit 0
@@ -225,50 +230,6 @@ echo "$k"
 [ "$k" = "$2" ] && exit 0
 exec ${CAT} -- "$1" 2>/dev/null
 `;
-
-const childOptions = () =>
-  ({
-    // COPYFILE_DISABLE: without it bsdtar adds an AppleDouble `._name` sibling
-    // for every file carrying an xattr (macOS stamps `com.apple.provenance`).
-    env: { ...childEnv(), LC_ALL: "C", COPYFILE_DISABLE: "1" },
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "ignore",
-  }) as const;
-
-/** Run a child, read at most `maxBytes` of stdout, kill it at the timeout or the
- *  cap. Never throws: a spawn failure yields no bytes. */
-async function runCapped(
-  argv: string[],
-  maxBytes: number,
-  timeoutMs = LOAD_TIMEOUT_MS,
-): Promise<{ bytes: Uint8Array; truncated: boolean }> {
-  let proc: ReturnType<typeof coreSpawn>;
-  try {
-    proc = coreSpawn(argv, childOptions());
-  } catch {
-    return { bytes: new Uint8Array(0), truncated: false };
-  }
-  const kill = () => {
-    try {
-      proc.kill();
-    } catch {
-      // already gone
-    }
-  };
-  const timer = setTimeout(kill, timeoutMs);
-  let result: { bytes: Uint8Array; truncated: boolean } = { bytes: new Uint8Array(0), truncated: false };
-  try {
-    result = await readCapped(proc.stdout as ReadableStream<Uint8Array>, maxBytes);
-    if (result.truncated) kill();
-    await proc.exited;
-  } catch {
-    // use whatever was read
-  } finally {
-    clearTimeout(timer);
-  }
-  return result;
-}
 
 function normalizeSelectors(selectors: readonly DiscoverySelector[]): Array<Required<DiscoverySelector>> {
   const seen = new Set<string>();
@@ -318,19 +279,82 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
   async load(selectors) {
     const items = normalizeSelectors(selectors);
     if (items.length === 0) return emptyReader;
-    const argv = [SH, "-c", LOAD_SCRIPT, "sh"];
-    for (const it of items) argv.push(it.path, String(it.maxDepth), it.name);
-    const { bytes, truncated } = await runCapped(argv, PROJECT_TREE_TAR_MAX_BYTES);
+    const deadline = Date.now() + LOAD_TIMEOUT_MS;
+
+    // One `find -L` per (depth, name): `-maxdepth` counts from each start
+    // point, so every selector sharing both fits one invocation. `.git` and
+    // `node_modules` are pruned; `-type f` follows a symlink to a file. A
+    // missing start point just prints an error to the ignored stderr.
+    const groups = new Map<string, { maxDepth: number; name: string; paths: string[] }>();
+    for (const it of items) {
+      const key = `${it.maxDepth}\0${it.name}`;
+      let g = groups.get(key);
+      if (!g) {
+        g = { maxDepth: it.maxDepth, name: it.name, paths: [] };
+        groups.set(key, g);
+      }
+      g.paths.push(it.path);
+    }
+    let truncated = false;
+    // tar member path → the absolute key the reader serves it under.
+    const keyFor = new Map<string, string>();
+    const listings = await Promise.all(
+      [...groups.values()].map(async (g) => {
+        const literal = !GLOB_CHARS.test(g.name);
+        const listing = await runChildCapped(
+          [
+            FIND, "-L", ...g.paths,
+            "-maxdepth", String(g.maxDepth),
+            "(", "-name", ".git", "-o", "-name", "node_modules", ")", "-prune",
+            "-o", "-type", "f", literal ? "-iname" : "-name", g.name, "-print0",
+          ],
+          { maxBytes: PROJECT_TREE_TAR_MAX_BYTES, timeoutMs: Math.max(1, deadline - Date.now()) },
+        );
+        return { g, literal, listing };
+      }),
+    );
+    // Exact spellings first, so a case variant never shadows the real name on
+    // a case-sensitive volume where both exist.
+    const variants: Array<[string, string]> = [];
+    for (const { g, literal, listing } of listings) {
+      truncated ||= listing.truncated;
+      const names = Buffer.from(listing.bytes).toString("utf8").split("\0");
+      // Only NUL-terminated names are complete; the last piece never is.
+      names.pop();
+      for (const found of names) {
+        if (!found.startsWith("/")) continue;
+        const abs = path.resolve(found);
+        if (!literal || path.basename(abs) === g.name) keyFor.set(abs, abs);
+        else variants.push([abs, path.join(path.dirname(abs), g.name)]);
+      }
+    }
+    const taken = new Set(keyFor.values());
+    for (const [abs, key] of variants) {
+      if (taken.has(key)) continue;
+      taken.add(key);
+      keyFor.set(abs, key);
+    }
+
+    const files = new Map<string, string>();
+    if (keyFor.size > 0) {
+      const archive = await runChildCapped([TAR, "-c", "-f", "-", "--format=pax", "-L", "--null", "-T", "-"], {
+        maxBytes: PROJECT_TREE_TAR_MAX_BYTES,
+        timeoutMs: Math.max(Math.min(TAR_MIN_TIMEOUT_MS, LOAD_TIMEOUT_MS), deadline - Date.now()),
+        stdinData: Buffer.from([...keyFor.keys()].join("\0") + "\0", "utf8"),
+      });
+      truncated ||= archive.truncated;
+      for (const entry of parseTar(archive.bytes)) {
+        // tar strips the leading `/` from absolute member names; put it back.
+        const key = keyFor.get(path.resolve("/", entry.path));
+        if (key === undefined) continue;
+        // `Buffer.toString("utf8")` keeps a leading BOM, like `readFileSync(…, "utf8")`.
+        files.set(key, Buffer.from(entry.data).toString("utf8"));
+      }
+    }
     if (truncated) {
       console.warn(
         `[agetor] capability discovery hit the ${PROJECT_TREE_TAR_MAX_BYTES / (1024 * 1024)} MB read cap while reading ${items[0]!.path} (+${items.length - 1} more); some skills/commands may be missing`,
       );
-    }
-    const files = new Map<string, string>();
-    for (const entry of parseTar(bytes)) {
-      // tar strips the leading `/` from absolute member names; put it back.
-      // `Buffer.toString("utf8")` keeps a leading BOM, like `readFileSync(…, "utf8")`.
-      files.set(path.resolve("/", entry.path), Buffer.from(entry.data).toString("utf8"));
     }
     return memoryReader(files);
   },
@@ -339,7 +363,10 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
     if (abs.includes("\0")) return null;
     const file = path.resolve(abs);
     const hit = disclaimedJsonCache.get(file);
-    const { bytes } = await runCapped([SH, "-c", JSON_SCRIPT, "sh", file, hit?.key ?? ""], JSON_MAX_BYTES);
+    const { bytes } = await runChildCapped([SH, "-c", JSON_SCRIPT, "sh", file, hit?.key ?? ""], {
+      maxBytes: JSON_MAX_BYTES,
+      timeoutMs: LOAD_TIMEOUT_MS,
+    });
     const nl = bytes.indexOf(0x0a);
     if (nl < 0) {
       // Not stat-able (missing / denied / timed out): same as the in-process
@@ -359,6 +386,11 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
  *  switch is effectively on (darwin && switch && helper present). */
 export function discoveryFs(): DiscoveryFs {
   return disclaimEnabled() ? disclaimedDiscoveryFs : inProcessDiscoveryFs;
+}
+
+/** Test seam: shrink the load/JSON budget (`null` restores the default). */
+export function __setLoadTimeoutMsForTest(ms: number | null): void {
+  LOAD_TIMEOUT_MS = ms ?? DEFAULT_LOAD_TIMEOUT_MS;
 }
 
 /** Test seam: forget the disclaimed `readJsonCached` entries. */

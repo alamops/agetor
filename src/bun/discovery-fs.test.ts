@@ -1,10 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { getDisclaimSwitch, setDisclaimSwitch } from "./disclaim.ts";
 import {
   __clearDisclaimedJsonCacheForTest,
+  __setLoadTimeoutMsForTest,
   discoveryFs,
   disclaimedDiscoveryFs,
   inProcessDiscoveryFs,
@@ -27,6 +28,7 @@ afterEach(() => {
   else process.env.AGETOR_DISCLAIM_BIN = ORIGINAL_DISCLAIM_BIN;
   setDisclaimSwitch(ORIGINAL_SWITCH);
   __clearDisclaimedJsonCacheForTest();
+  __setLoadTimeoutMsForTest(null);
 });
 
 afterAll(() => {
@@ -93,7 +95,7 @@ describe.skipIf(process.platform !== "darwin")("disclaimed load()", () => {
     symlinkSync("/nonexistent-target", path.join(cfg, "skills/dangling"));
   });
 
-  test("reads exactly the selected files, in one child, following symlinks inside it", async () => {
+  test("reads exactly the selected files, one find per (depth, name) and one tar, following symlinks inside them", async () => {
     const { children } = recordingStub();
     const reader = await disclaimedDiscoveryFs.load([
       markdownTree(path.join(cfg, "commands")),
@@ -101,7 +103,8 @@ describe.skipIf(process.platform !== "darwin")("disclaimed load()", () => {
       singleFile(path.join(cfg, "settings.json")),
       singleFile(path.join(scratch, "does-not-exist.json")),
     ]);
-    expect(children()).toEqual(["/bin/sh"]);
+    // Direct children only (no shell pipeline the timeout could not reach into).
+    expect(children().sort()).toEqual(["/usr/bin/find", "/usr/bin/find", "/usr/bin/find", "/usr/bin/tar"]);
 
     const tree = reader.tree(cfg);
     expect(tree.read("commands/a.md")).toBe("# a");
@@ -122,9 +125,10 @@ describe.skipIf(process.platform !== "darwin")("disclaimed load()", () => {
     const { children } = recordingStub();
     const reader = await disclaimedDiscoveryFs.load([skillsDir(path.join(scratch, "no-such-dir"))]);
     expect(reader.tree(path.join(scratch, "no-such-dir")).list("")).toEqual([]);
-    expect(children()).toEqual(["/bin/sh"]);
+    // Nothing listed, so no tar.
+    expect(children()).toEqual(["/usr/bin/find"]);
     await disclaimedDiscoveryFs.load([]);
-    expect(children()).toEqual(["/bin/sh"]);
+    expect(children()).toEqual(["/usr/bin/find"]);
   });
 
   test("paths with spaces, a leading dash component and unicode survive", async () => {
@@ -142,6 +146,48 @@ describe.skipIf(process.platform !== "darwin")("disclaimed load()", () => {
     writeFileSync(path.join(root, "skills/x/huge.bin"), Buffer.alloc(9 * 1024 * 1024, 0x61));
     const reader = await disclaimedDiscoveryFs.load([skillsDir(path.join(root, "skills"))]);
     expect(reader.tree(root).read("skills/x/SKILL.md")).toBe("needle");
+  });
+
+  test("a lower-case skill.md is read like the in-process read on a case-insensitive volume", async () => {
+    recordingStub();
+    const root = path.join(scratch, "caseroot");
+    w(path.join(root, "skills/lower/skill.md"), "lower-case name");
+    w(path.join(root, "skills/upper/SKILL.md"), "exact name");
+    const reader = await disclaimedDiscoveryFs.load([skillsDir(path.join(root, "skills"))]);
+    const tree = reader.tree(root);
+    expect(tree.read("skills/lower/SKILL.md")).toBe("lower-case name");
+    expect(tree.read("skills/upper/SKILL.md")).toBe("exact name");
+    // Same answer as the in-process read wherever the volume folds case (the
+    // default APFS volume does).
+    if (existsSync(path.join(root, "skills/lower/SKILL.md"))) {
+      const inProcess = (await inProcessDiscoveryFs.load([])).tree(root);
+      expect(inProcess.read("skills/lower/SKILL.md")).toBe("lower-case name");
+    }
+  });
+
+  test("a find that never finishes is killed and load() returns near the deadline", async () => {
+    // A helper that turns every `find` into a process that never exits and
+    // leaves a grandchild holding stdout — the worst case for the old shell
+    // pipeline, whose kill reached only `sh`.
+    const name = `hang-stub-${counter++}`;
+    const stub = path.join(scratch, name);
+    writeFileSync(
+      stub,
+      `#!/bin/sh
+if [ "$1" = /usr/bin/find ]; then /bin/sleep 3 & exec /bin/sleep 3; fi
+exec "$@"
+`,
+      { mode: 0o755 },
+    );
+    process.env.AGETOR_DISCLAIM_BIN = stub;
+    setDisclaimSwitch(true);
+    __setLoadTimeoutMsForTest(300);
+    const started = Date.now();
+    const reader = await disclaimedDiscoveryFs.load([skillsDir(path.join(cfg, "skills"))]);
+    const elapsed = Date.now() - started;
+    expect(reader.tree(cfg).list("")).toEqual([]);
+    // timeout (300 ms) + kill grace (1 s) + slack, well short of the 3 s hang.
+    expect(elapsed).toBeLessThan(2_200);
   });
 
   test("hitting the read cap logs one warning naming the root", async () => {
@@ -247,10 +293,15 @@ describe.skipIf(process.platform !== "darwin")("listAgentCapabilities through th
     expect(disclaimed.extensions.map((e) => e.name)).toEqual(
       expect.arrayContaining(["userMcp", "projMcp", "demo", "proj-skill"]),
     );
-    // user+project files, ~/.claude.json, then the plugin's files.
-    expect(children().filter((c) => c === "/bin/sh")).toHaveLength(3);
-    // Nothing else ran under the helper (no per-root probes, no per-plugin children).
-    expect(children().every((c) => c === "/bin/sh" || c.endsWith("/git"))).toBe(true);
+    // Two load stages (user+project files, then the plugin's files), one tar
+    // each, plus the ~/.claude.json read.
+    expect(children().filter((c) => c === "/usr/bin/tar")).toHaveLength(2);
+    expect(children().filter((c) => c === "/bin/sh")).toHaveLength(1);
+    // At most one find per (depth, name) per stage — never one per root or plugin.
+    expect(children().filter((c) => c === "/usr/bin/find").length).toBeLessThanOrEqual(6);
+    expect(
+      children().every((c) => ["/usr/bin/find", "/usr/bin/tar", "/bin/sh"].includes(c) || c.endsWith("/git")),
+    ).toBe(true);
   });
 
   test("a project loader is not needed (and not used) while disclaiming", async () => {
@@ -267,7 +318,7 @@ describe.skipIf(process.platform !== "darwin")("listAgentCapabilities through th
     expect(out.commands.map((c) => c.name)).toContain("/proj-cmd");
   });
 
-  test("codex and cursor each cost one child", async () => {
+  test("codex and cursor each cost one find per selector shape plus one tar", async () => {
     const codexHome = path.join(scratch, "codex-home");
     w(path.join(codexHome, ".codex/prompts/p.md"), "---\ndescription: prompt\n---\n");
     w(path.join(codexHome, ".codex/skills/cs/SKILL.md"), "---\ndescription: codex skill\n---\n");
@@ -276,7 +327,8 @@ describe.skipIf(process.platform !== "darwin")("listAgentCapabilities through th
     const codex = await listAgentCapabilities({ agent: "codex", workdir: null, harnessHome: codexHome });
     expect(codex.commands.map((c) => c.name)).toEqual(expect.arrayContaining(["/p", "/cs"]));
     expect(codex.extensions.map((e) => e.name)).toContain("alpha");
-    expect(rec.children()).toEqual(["/bin/sh"]);
+    // prompts (*.md), skills (SKILL.md), config.toml (single file).
+    expect(rec.children().sort()).toEqual(["/usr/bin/find", "/usr/bin/find", "/usr/bin/find", "/usr/bin/tar"]);
 
     const cursorHome = path.join(scratch, "cursor-home");
     w(path.join(cursorHome, ".cursor/skills/cur/SKILL.md"), "---\ndescription: cursor skill\n---\n");
@@ -285,7 +337,8 @@ describe.skipIf(process.platform !== "darwin")("listAgentCapabilities through th
     const cursor = await listAgentCapabilities({ agent: "cursor", workdir: null, harnessHome: cursorHome });
     expect(cursor.commands.map((c) => c.name)).toContain("/cur");
     expect(cursor.extensions.map((e) => e.name)).toContain("beta");
-    expect(rec2.children()).toEqual(["/bin/sh"]);
+    // skills dirs (SKILL.md), mcp.json (single file).
+    expect(rec2.children().sort()).toEqual(["/usr/bin/find", "/usr/bin/find", "/usr/bin/tar"]);
   });
 
   test("gemini reads nothing and spawns nothing", async () => {

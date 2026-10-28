@@ -3,7 +3,6 @@ import {
   mkdirSync,
   watch as fsWatch,
   type FSWatcher,
-  openSync as fsOpenSync,
   readSync as fsReadSync,
   closeSync as fsCloseSync,
   statSync as fsStatSync,
@@ -30,7 +29,7 @@ import {
   type ChunkHandler,
   type SpawnedAgent,
 } from "./claude-tmux.ts";
-import { READ_NOFOLLOW, readTextNoFollow } from "./no-follow.ts";
+import { openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 
 /**
  * Driver that hosts a single `cursor-agent -p` turn inside a per-task tmux
@@ -444,7 +443,7 @@ function flushCursorLog(state: CursorSessionState): void {
   try {
     const st = fsStatSync(state.logPath);
     if (st.size <= state.offset) return;
-    fd = fsOpenSync(state.logPath, READ_NOFOLLOW);
+    fd = openReadNoFollow(state.logPath);
   } catch {
     return; // file not created yet, or transient stat error
   }

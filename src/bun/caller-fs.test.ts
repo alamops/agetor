@@ -17,6 +17,7 @@ import {
   callerProjectTree,
   gateCallerPath,
   probePaths,
+  runChildCapped,
   type ProbeKind,
 } from "./caller-fs.ts";
 import { getDisclaimSwitch, setDisclaimSwitch } from "./disclaim.ts";
@@ -468,5 +469,49 @@ describe.skipIf(process.platform !== "darwin")("disclaimed children", () => {
     const env = readFileSync(out, "utf8");
     expect(env).not.toContain("secret-master-token");
     expect(env).toContain("LC_ALL=C");
+  });
+});
+
+// ---- runChildCapped -------------------------------------------------------
+
+describe("runChildCapped", () => {
+  test("reads a child's stdout to the end", async () => {
+    const r = await runChildCapped(["/bin/echo", "hello"], { maxBytes: 1024, timeoutMs: 5_000 });
+    expect(Buffer.from(r.bytes).toString("utf8")).toBe("hello\n");
+    expect(r.truncated).toBe(false);
+    expect(r.timedOut).toBe(false);
+  });
+
+  test("stops at the byte cap", async () => {
+    const r = await runChildCapped(["/bin/sh", "-c", "yes"], { maxBytes: 4096, timeoutMs: 5_000 });
+    expect(r.bytes.length).toBe(4096);
+    expect(r.truncated).toBe(true);
+  });
+
+  test("returns near the deadline when a grandchild keeps the pipe open", async () => {
+    // `sh` execs into a sleep the SIGTERM ends, but the background sleep it
+    // started still holds stdout: EOF never comes, so only the hard deadline
+    // (timeout + kill grace) can end the read.
+    const started = Date.now();
+    const r = await runChildCapped(["/bin/sh", "-c", "echo partial; /bin/sleep 3 & exec /bin/sleep 3"], {
+      maxBytes: 1024,
+      timeoutMs: 200,
+    });
+    const elapsed = Date.now() - started;
+    expect(r.timedOut).toBe(true);
+    expect(Buffer.from(r.bytes).toString("utf8")).toBe("partial\n");
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
+  test("returns near the deadline when the child ignores SIGTERM", async () => {
+    const started = Date.now();
+    const r = await runChildCapped(["/bin/sh", "-c", "trap '' TERM; /bin/sleep 3"], { maxBytes: 1024, timeoutMs: 200 });
+    expect(r.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  test("a spawn failure yields no bytes and never throws", async () => {
+    const r = await runChildCapped([path.join(scratch, "no-such-binary")], { maxBytes: 1024, timeoutMs: 1_000 });
+    expect(r.bytes.length).toBe(0);
   });
 });
