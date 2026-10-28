@@ -389,6 +389,8 @@ None of these is a one-way door. Each is a revertible runtime rule with no schem
 | `CLAUDE.md` item 19 + session-lifecycle text | in this run | T10 |
 | Fleet knowledge entries describing old successor semantics | in this run | T11 |
 | `differentCurrentRunId` orphaned by the refactor | in this run | T5 removes it if unused |
+| Column-event and boot-reconcile settles picked `runs.listForTask()[0]` (newest started), which two same-millisecond continuations can tie — found by E1 | in this run | `currentRunRow` (`task.runId`'s row, else the newest) in `handleColumnChange`, `resettleCurrentRun`, `reconcilePipelineRuns`; U7(11), shown failing on `fe9896c` |
+| Wait (D5) after a failed spawn whose `startingTaskIds` claim outlives its `run-status` | in this run | backed-off `scheduleWaitRecheck` probes in the runner |
 | Historical plan docs (`adopt-continuation…`, `fix-stuck-subagent…`, `fix-handoff-parser`, `hold-task-running…`) | out of scope | owner D17: historical records |
 | Data backfill / repair of past history rows | out of scope | owner D16: nothing stuck; old rows read empty |
 | Feature flag | out of scope | owner D16 |

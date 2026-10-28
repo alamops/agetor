@@ -4351,3 +4351,35 @@ test("U7(10d) a failed settle looks back and advances on an earlier run's handof
   }
   await waitUntilIdle(s.parentId);
 });
+
+test("U7(11) a column-event settle uses the step's current run, not the newest-started one — a displaced run that started in the same millisecond is not mistaken for it", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks, db } = await import("./db.ts");
+
+  const s = await startOverlapStep("u7-current-run");
+  try {
+    await tick();
+    const B = await openLiveRun(s.stepTaskId, await handoffReply("finished on B"), "notification");
+    await tick();
+    const C = await openLiveRun(s.stepTaskId, "Picking this back up.", "user");
+    expect(tasks.get(s.stepTaskId)!.runId).toBe(C.runId);
+    await B.finish();
+    await tick();
+    await C.finish();
+    // Make the displaced B sort first by `started_at DESC` — the tie two
+    // overlapping continuations hit when they open in the same millisecond.
+    const cStartedAt = db.query<{ started_at: number }, [string]>(`SELECT started_at FROM runs WHERE id = ?`).get(C.runId)!.started_at;
+    db.query(`UPDATE runs SET started_at = ? WHERE id = ?`).run(cStartedAt + 1, B.runId);
+
+    __forTest.setListenerEnabled(true);
+    await __forTest.handleColumnChange(s.stepTaskId, "review", undefined);
+    const done = await waitForPipelineDone(s.parentId);
+    const record = done.pipelineRun!.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("succeeded");
+    expect(record.handoffRunId).toBe(B.runId);
+    expect(record.handoffFromOtherRun).toBe(true);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});

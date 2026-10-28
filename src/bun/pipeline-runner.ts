@@ -95,6 +95,7 @@ import type {
   PipelineRunStatus,
   PipelineStep,
   PipelineStepRecord,
+  Run,
   Task,
   TaskReference,
 } from "../shared/types.ts";
@@ -2924,13 +2925,13 @@ async function handleColumnChange(
         // — including `maybeReleaseHeldTask`'s release of a step held by
         // background subagents, which is the ONLY settle a held execution
         // ever gets (its `run-status` event arrived while it was still held
-        // and deliberately left it active). The latest run row is the
-        // ground truth; the settle body itself is idempotent against the
-        // same outcome arriving twice.
+        // and deliberately left it active). The step's current run row is
+        // the ground truth ({@link currentRunRow}); the settle body itself is
+        // idempotent against the same outcome arriving twice.
         if (isTaskRunLive(taskId)) return;
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
         if (historyEntry && historyEntry.outcome !== null) return;
-        const latest = runs.listForTask(taskId)[0];
+        const latest = currentRunRow(taskId);
         if (!latest || latest.status === "running") return;
         // The in-flight reminder owns the settle of its own run. A newer
         // run (the continuation) is `latest` once it exists and still has
@@ -3010,8 +3011,7 @@ export async function reconcilePipelineRuns(): Promise<number> {
     for (const a of activeSnapshot) {
       if (isTaskRunLive(a.taskId)) continue;
       try {
-        const stepRuns = runs.listForTask(a.taskId);
-        const latest = stepRuns[0] ?? null;
+        const latest = currentRunRow(a.taskId);
         if (!latest) {
           await runExclusive(parent.id, async () => markStepNeverStarted(parent.id, a.taskId));
           count++;
@@ -3037,14 +3037,21 @@ export async function reconcilePipelineRuns(): Promise<number> {
  * step's newest run stands in.
  */
 async function resettleCurrentRun(taskId: string): Promise<void> {
-  const task = tasks.get(taskId);
-  if (!task) return;
-  const currentId = task.runId ?? runs.listForTask(taskId)[0]?.id;
-  if (!currentId) return;
-  const row = runs.get(currentId);
+  const row = currentRunRow(taskId);
   const status = row ? terminalRunStatus(row.status) : null;
-  if (!status) return;
-  await handleRunStatus(taskId, currentId, status);
+  if (!row || !status) return;
+  await handleRunStatus(taskId, row.id, status);
+}
+
+/** The step task's current run row: `task.runId`'s, else (a failed spawn
+ *  clears `task.runId`) the newest one. Never just "the newest started": a
+ *  continuation and a run that displaces it can start in the same
+ *  millisecond, and settling the displaced one as if it were current would
+ *  misattribute which run supplied the handoff. */
+function currentRunRow(taskId: string): Run | null {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  return (task.runId ? runs.get(task.runId) : null) ?? runs.listForTask(taskId)[0] ?? null;
 }
 
 /** The orchestrator's runner-only report that a run of a step task which is
