@@ -10,7 +10,7 @@ import path from "node:path";
 // pattern as harnesses.test.ts). Without this, this file (or whichever file
 // `bun test` loads first) can silently open the real ~/.agetor-dev database.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-commands-db-"));
-const { listAvailableCommands, listAgentCapabilities } = await import("./commands.ts");
+const { listAvailableCommands, listAgentCapabilities, OPENCODE_USER_SKILL_DIRS, stripJsonc, parseJsonc } = await import("./commands.ts");
 
 /** Discover just the extension list via the production path (the picker uses
  *  `listAgentCapabilities`; this keeps the extension assertions pointed at it). */
@@ -1148,6 +1148,235 @@ describe("cursor / fx skill discovery", () => {
       expect(hit[0]!.source).toBe("project");
       expect(hit[0]!.insert).toBe("@mcp-on-ref");
       expect(exts.filter((e) => e.kind === "mcp" && e.name === "mcp-dirty-zq")).toHaveLength(0);
+    });
+  });
+});
+
+describe("opencode capability discovery", () => {
+  const find = (all: Awaited<ReturnType<typeof listAvailableCommands>>, n: string) =>
+    all.filter((c) => c.name === n);
+  const mcpNamed = (exts: Awaited<ReturnType<typeof listExtensions>>, n: string) =>
+    exts.filter((e) => e.kind === "mcp" && e.name === n);
+
+  test("user skill dirs are pinned", () => {
+    expect([...OPENCODE_USER_SKILL_DIRS]).toEqual([".config/opencode/skills", ".claude/skills", ".agents/skills"]);
+  });
+
+  test("skills: each user root, each project root, project replaces user", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-proj-"));
+    OPENCODE_USER_SKILL_DIRS.forEach((d, i) => writeSkill(home, d, `oc-user-${i}-zq`, `user ${i}`));
+    for (const [i, d] of [".opencode/skills", ".claude/skills", ".agents/skills"].entries()) {
+      writeSkill(project, d, `oc-proj-${i}-zq`, `project ${i}`);
+    }
+    writeSkill(home, ".config/opencode/skills", "oc-shared-zq", "from user");
+    writeSkill(project, ".opencode/skills", "oc-shared-zq", "from project");
+    // Not an opencode root: must stay invisible.
+    writeSkill(home, ".cursor/skills", "oc-cursor-only-zq", "nope");
+
+    const all = await listAvailableCommands({ agent: "opencode", workdir: project, harnessHome: home });
+    for (let i = 0; i < 3; i++) {
+      expect(find(all, `/oc-user-${i}-zq`)[0]?.source).toBe("user");
+      expect(find(all, `/oc-user-${i}-zq`)[0]?.kind).toBe("skill");
+      expect(find(all, `/oc-proj-${i}-zq`)[0]?.source).toBe("project");
+    }
+    const shared = find(all, "/oc-shared-zq");
+    expect(shared).toHaveLength(1);
+    expect(shared[0]!.source).toBe("project");
+    expect(shared[0]!.description).toBe("from project");
+    expect(find(all, "/oc-cursor-only-zq")).toHaveLength(0);
+  });
+
+  test("commands: command/ and commands/ dirs, user and project, project wins", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-cmd-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-cmd-proj-"));
+    writeCmd(path.join(home, ".config/opencode/command"), "u-single-zq.md", "---\ndescription: user single\n---\nx");
+    writeCmd(path.join(home, ".config/opencode/commands"), "u-plural-zq.md", "---\ndescription: user plural\n---\nx");
+    writeCmd(path.join(project, ".opencode/command"), "p-single-zq.md", "---\ndescription: proj single\n---\nx");
+    writeCmd(path.join(project, ".opencode/commands"), "p-plural-zq.md", "---\ndescription: proj plural\n---\nx");
+    writeCmd(path.join(home, ".config/opencode/command"), "oc-both-zq.md", "---\ndescription: from user\n---\nx");
+    writeCmd(path.join(project, ".opencode/commands"), "oc-both-zq.md", "---\ndescription: from project\n---\nx");
+
+    const all = await listAvailableCommands({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(find(all, "/u-single-zq")[0]).toMatchObject({ source: "user", kind: "command", description: "user single" });
+    expect(find(all, "/u-plural-zq")[0]?.source).toBe("user");
+    expect(find(all, "/p-single-zq")[0]?.source).toBe("project");
+    expect(find(all, "/p-plural-zq")[0]?.source).toBe("project");
+    const both = find(all, "/oc-both-zq");
+    expect(both).toHaveLength(1);
+    expect(both[0]!.source).toBe("project");
+    expect(both[0]!.description).toBe("from project");
+  });
+
+  test("harnessEnv.HOME overrides harnessHome for skills and MCP", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-env-a-"));
+    const envHome = mkdtempSync(path.join(tmpRoot, "oc-env-b-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-env-proj-"));
+    writeSkill(home, ".config/opencode/skills", "oc-from-harness-zq", "h");
+    writeSkill(envHome, ".config/opencode/skills", "oc-from-env-zq", "e");
+    writeCmd(path.join(home, ".config/opencode"), "opencode.json", JSON.stringify({ mcp: { "oc-h-mcp-zq": { type: "local", command: ["h"] } } }));
+    writeCmd(path.join(envHome, ".config/opencode"), "opencode.json", JSON.stringify({ mcp: { "oc-e-mcp-zq": { type: "local", command: ["e"] } } }));
+
+    const opts = { agent: "opencode" as const, workdir: project, harnessHome: home, harnessEnv: { HOME: envHome } };
+    const all = await listAvailableCommands(opts);
+    expect(find(all, "/oc-from-env-zq")).toHaveLength(1);
+    expect(find(all, "/oc-from-harness-zq")).toHaveLength(0);
+    const exts = await listExtensions(opts);
+    expect(mcpNamed(exts, "oc-e-mcp-zq")).toHaveLength(1);
+    expect(mcpNamed(exts, "oc-h-mcp-zq")).toHaveLength(0);
+  });
+
+  test("MCP v1 shape: mcp.<name>, local argv command and remote url, secrets stay out", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-v1-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-v1-proj-"));
+    writeCmd(
+      path.join(home, ".config/opencode"),
+      "opencode.json",
+      JSON.stringify({
+        mcp: {
+          "v1-local-zq": { type: "local", command: ["npx", "-y", "tool"], environment: { TOKEN: "secret-env" } },
+          "v1-shared-zq": { type: "local", command: ["from-user"] },
+        },
+      }),
+    );
+    writeCmd(
+      project,
+      "opencode.json",
+      JSON.stringify({
+        mcp: {
+          "v1-remote-zq": { type: "remote", url: "https://example.test/mcp", headers: { Authorization: "secret-token" } },
+          "v1-shared-zq": { type: "local", command: ["from-project"] },
+        },
+      }),
+    );
+
+    const exts = await listExtensions({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(mcpNamed(exts, "v1-local-zq")[0]).toMatchObject({ source: "user", insert: "@v1-local-zq", description: "stdio · npx" });
+    const remote = mcpNamed(exts, "v1-remote-zq");
+    expect(remote[0]).toMatchObject({ source: "project", description: "http · example.test" });
+    expect(JSON.stringify(exts)).not.toContain("secret");
+    const shared = mcpNamed(exts, "v1-shared-zq");
+    expect(shared).toHaveLength(1);
+    expect(shared[0]).toMatchObject({ source: "project", description: "stdio · from-project" });
+  });
+
+  test("MCP v2 shape: mcp.servers.<name>; a config-shaped 'servers' entry stays a v1 server", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-v2-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-v2-proj-"));
+    writeCmd(
+      path.join(home, ".config/opencode"),
+      "opencode.json",
+      JSON.stringify({ mcp: { servers: { "v2-user-zq": { type: "local", command: ["u"] }, "v2-http-zq": { type: "http", url: "https://v2.test/x" } } } }),
+    );
+    writeCmd(project, "opencode.json", JSON.stringify({ mcp: { servers: { type: "local", command: ["named-servers"] } } }));
+
+    const exts = await listExtensions({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(mcpNamed(exts, "v2-user-zq")[0]).toMatchObject({ source: "user", description: "stdio · u" });
+    expect(mcpNamed(exts, "v2-http-zq")[0]?.description).toBe("http · v2.test");
+    // The user's v2 container is not itself a server; the project's v1 entry named "servers" is.
+    const servers = mcpNamed(exts, "servers");
+    expect(servers).toHaveLength(1);
+    expect(servers[0]).toMatchObject({ source: "project", description: "stdio · named-servers" });
+  });
+
+  test("MCP: disabled servers and non-object entries are not offered; project disable shadows user", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-dis-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-dis-proj-"));
+    writeCmd(
+      path.join(home, ".config/opencode"),
+      "opencode.json",
+      JSON.stringify({ mcp: { "dis-user-zq": { type: "local", command: ["a"] }, "dis-both-zq": { type: "local", command: ["b"] }, "dis-junk-zq": true } }),
+    );
+    writeCmd(project, "opencode.json", JSON.stringify({ mcp: { "dis-both-zq": { enabled: false }, "dis-off-zq": { type: "local", command: ["c"], enabled: false } } }));
+
+    const exts = await listExtensions({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(mcpNamed(exts, "dis-user-zq")).toHaveLength(1);
+    for (const n of ["dis-both-zq", "dis-off-zq", "dis-junk-zq"]) expect(mcpNamed(exts, n)).toHaveLength(0);
+  });
+
+  test("MCP: opencode.jsonc with comments and trailing commas parses; unparsable files are ignored", async () => {
+    const home = mkdtempSync(path.join(tmpRoot, "oc-jsonc-home-"));
+    const project = mkdtempSync(path.join(tmpRoot, "oc-jsonc-proj-"));
+    writeCmd(
+      path.join(home, ".config/opencode"),
+      "opencode.jsonc",
+      `// user config\n{\n  /* servers */\n  "mcp": {\n    "jsonc-user-zq": { "type": "remote", "url": "https://x.test/a//b", }, // trailing\n  },\n}\n`,
+    );
+    writeCmd(project, "opencode.jsonc", `{ "mcp": { "jsonc-broken-zq": { `);
+
+    const exts = await listExtensions({ agent: "opencode", workdir: project, harnessHome: home });
+    expect(mcpNamed(exts, "jsonc-user-zq")[0]).toMatchObject({ source: "user", description: "http · x.test" });
+    expect(mcpNamed(exts, "jsonc-broken-zq")).toHaveLength(0);
+  });
+
+  test("stripJsonc/parseJsonc keep comment-like text and commas inside strings", () => {
+    const text = `{"a": "// not a comment, /* nor this */", "b": [1, 2,], "c": "q\\"//x", /* c */ "d": 1,}`;
+    expect(parseJsonc(text)).toEqual({ a: "// not a comment, /* nor this */", b: [1, 2], c: 'q"//x', d: 1 });
+    expect(parseJsonc("﻿{\"x\": 1}")).toEqual({ x: 1 });
+    expect(parseJsonc("")).toBeNull();
+    expect(parseJsonc("{ nope")).toBeNull();
+    expect(stripJsonc("[1, // end\n 2 /* unterminated")).toBe("[1, \n 2 ");
+  });
+
+  describe("branch ref", () => {
+    let repo: string;
+    beforeAll(async () => {
+      repo = mkdtempSync(path.join(tmpRoot, "oc-branch-repo-"));
+      await branchGitOk(["init", "-q", "-b", "main"], repo);
+      await branchGitOk(["config", "user.email", "test@example.com"], repo);
+      await branchGitOk(["config", "user.name", "test"], repo);
+      await branchGitOk(["config", "commit.gpgsign", "false"], repo);
+      writeCmd(repo, "README.md", "hello\n");
+      await branchGitOk(["add", "."], repo);
+      await branchGitOk(["commit", "-q", "-m", "init"], repo);
+      await branchGitOk(["checkout", "-q", "-b", "feature/oc"], repo);
+      writeSkill(repo, ".opencode/skills", "oc-on-ref", "committed skill");
+      writeSkill(repo, ".agents/skills", "oc-agents-on-ref", "committed agents skill");
+      writeCmd(path.join(repo, ".opencode/command"), "oc-cmd-on-ref.md", "---\ndescription: committed command\n---\nx");
+      writeCmd(path.join(repo, ".opencode/commands"), "oc-cmds-on-ref.md", "---\ndescription: committed commands\n---\nx");
+      writeCmd(repo, "opencode.jsonc", `{ // v2\n "mcp": { "servers": { "oc-mcp-on-ref": { "type": "local", "command": ["committed"], }, }, },\n}\n`);
+      await branchGitOk(["add", "."], repo);
+      await branchGitOk(["commit", "-q", "-m", "oc"], repo);
+      await branchGitOk(["checkout", "-q", "main"], repo);
+      writeSkill(repo, ".opencode/skills", "oc-uncommitted-zq", "disk only");
+      writeCmd(path.join(repo, ".opencode/command"), "oc-cmd-dirty-zq.md", "---\ndescription: dirty\n---\nx");
+      writeCmd(repo, "opencode.json", JSON.stringify({ mcp: { "oc-mcp-dirty-zq": { type: "local", command: ["dirty"] } } }));
+    });
+
+    test("ref mode offers committed skills and commands, hides uncommitted ones", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "oc-branch-home-"));
+      const all = await listAvailableCommands({ agent: "opencode", workdir: repo, branch: "feature/oc", harnessHome: home });
+      expect(find(all, "/oc-on-ref")[0]).toMatchObject({ source: "project", kind: "skill" });
+      expect(find(all, "/oc-agents-on-ref")[0]?.source).toBe("project");
+      expect(find(all, "/oc-cmd-on-ref")[0]).toMatchObject({ source: "project", kind: "command", description: "committed command" });
+      expect(find(all, "/oc-cmds-on-ref")[0]?.source).toBe("project");
+      expect(find(all, "/oc-uncommitted-zq")).toHaveLength(0);
+      expect(find(all, "/oc-cmd-dirty-zq")).toHaveLength(0);
+    });
+
+    test("ref mode reads the committed opencode.jsonc, not the dirty opencode.json", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "oc-branch-mcp-home-"));
+      const exts = await listExtensions({ agent: "opencode", workdir: repo, branch: "feature/oc", harnessHome: home });
+      expect(mcpNamed(exts, "oc-mcp-on-ref")[0]).toMatchObject({ source: "project", insert: "@oc-mcp-on-ref", description: "stdio · committed" });
+      expect(mcpNamed(exts, "oc-mcp-dirty-zq")).toHaveLength(0);
+    });
+
+    test("disk mode (no branch) sees the dirty files instead", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "oc-disk-home-"));
+      const all = await listAvailableCommands({ agent: "opencode", workdir: repo, harnessHome: home });
+      expect(find(all, "/oc-uncommitted-zq")).toHaveLength(1);
+      expect(find(all, "/oc-cmd-dirty-zq")).toHaveLength(1);
+      expect(find(all, "/oc-on-ref")).toHaveLength(0);
+      const exts = await listExtensions({ agent: "opencode", workdir: repo, harnessHome: home });
+      expect(mcpNamed(exts, "oc-mcp-dirty-zq")).toHaveLength(1);
+    });
+
+    test("unknown ref: no project rows, user rows still show", async () => {
+      const home = mkdtempSync(path.join(tmpRoot, "oc-unknown-home-"));
+      writeSkill(home, ".config/opencode/skills", "oc-user-still-zq", "u");
+      const all = await listAvailableCommands({ agent: "opencode", workdir: repo, branch: "no/such-ref", harnessHome: home });
+      expect(find(all, "/oc-user-still-zq")).toHaveLength(1);
+      expect(find(all, "/oc-on-ref")).toHaveLength(0);
     });
   });
 });

@@ -93,6 +93,7 @@ function makeTaskRow(taskId: string, archivedAt: number | null): Task {
     effort: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     references: [],
     backlog: [],
     plans: [],

@@ -395,6 +395,57 @@ describe("supportedEfforts with discovered efforts", () => {
   });
 });
 
+// docs/plans/add-opencode-harness.md D-6 — OpenCode's own branch.
+describe("supportedEfforts('opencode', …)", () => {
+  const ids = (os: AgentOption[]) => os.map((o) => o.id);
+
+  test("the sentinel (and a null model) offers no effort, whatever discovery says", () => {
+    expect(supportedEfforts("opencode", "opencode-default")).toEqual([]);
+    expect(supportedEfforts("opencode", "opencode-default", ["high"])).toEqual([]);
+    expect(supportedEfforts("opencode", null)).toEqual([]);
+    expect(supportedEfforts("opencode", null, ["low"])).toEqual([]);
+  });
+
+  test("a model discovered with no variants offers no effort", () => {
+    expect(supportedEfforts("opencode", "opencode/big-pickle", [])).toEqual([]);
+  });
+
+  test("a model with no discovery entry offers only Model default", () => {
+    expect(ids(supportedEfforts("opencode", "opencode/big-pickle"))).toEqual(["auto"]);
+    expect(ids(supportedEfforts("opencode", "opencode/big-pickle", null))).toEqual(["auto"]);
+    expect(ids(supportedEfforts("opencode", "opencode/big-pickle", undefined))).toEqual(["auto"]);
+  });
+
+  test("discovered variants follow Model default, in reported order (not canonical order)", () => {
+    expect(ids(supportedEfforts("opencode", "opencode/deepseek-v4.1-flash-free", ["low", "high", "max"])))
+      .toEqual(["auto", "low", "high", "max"]);
+  });
+
+  test("known variant ids reuse the EFFORT_OPTIONS rows; unknown ones get a synthesized {id, label: id} row", () => {
+    const rows = supportedEfforts("opencode", "anthropic/claude-x", ["high", "thinking"]);
+    expect(rows[0]).toBe(EFFORT_OPTIONS.find((o) => o.id === "auto") as AgentOption);
+    expect(rows[1]).toBe(EFFORT_OPTIONS.find((o) => o.id === "high") as AgentOption);
+    expect(rows[2]).toEqual({ id: "thinking", label: "thinking" });
+  });
+
+  test("a discovered auto, duplicates and blanks are not repeated", () => {
+    expect(ids(supportedEfforts("opencode", "x/y", ["auto", "high", "high", " ", "none"])))
+      .toEqual(["auto", "high", "none"]);
+  });
+
+  test("retainableEfforts equals the discovery answer (no curated table to union with)", () => {
+    expect([...retainableEfforts("opencode", "x/y", ["low", "thinking"])]).toEqual(["auto", "low", "thinking"]);
+    expect([...retainableEfforts("opencode", "x/y", [])]).toEqual([]);
+    expect([...retainableEfforts("opencode", "x/y")]).toEqual(["auto"]);
+    expect([...retainableEfforts("opencode", "opencode-default", ["high"])]).toEqual([]);
+  });
+
+  test("DEFAULT_MODEL.opencode / DEFAULT_EFFORT.opencode are the sentinel and auto", () => {
+    expect(DEFAULT_MODEL.opencode).toBe("opencode-default");
+    expect(DEFAULT_EFFORT.opencode).toBe("auto");
+  });
+});
+
 describe("AgentOption / ModelOption efforts field placement", () => {
   test("AgentOption has no efforts field (moved to ModelOption, see mergeModelOptions rule 8)", () => {
     const opt: AgentOption = { id: "x", label: "X" };

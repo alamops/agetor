@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { AgentIcon } from "./AgentIcon";
 import { speedLabel } from "../../../shared/speed.ts";
+import { opencodeServerLock } from "./OpencodeServerPicker";
 import type { TaskProfileDisplay } from "@/lib/agent-profiles";
 import type { AgentKind, Harness, Task } from "../../../shared/types.ts";
 
@@ -14,7 +15,8 @@ const TITLE_ID = "agent-profile-details-title";
  * Task-details "Agent" row modal — plan D2 (`docs/plans/task-details-agent-row.md`).
  * Shows the task's own frozen record of the agent profile it launched (or
  * will launch) with, never a live-refetched profile: name, harness, model,
- * effort, mode, speed, cursor max-mode, skills, and the full instructions.
+ * effort, mode, speed, cursor max-mode, the OpenCode server option, skills,
+ * and the full instructions.
  *
  * Data source, in order: `task.agentProfile` (the {@link AgentProfileSnapshot}
  * every current write path stamps onto the task alongside `agentProfileId` —
@@ -74,6 +76,13 @@ export function AgentProfileDetailsDialog({
   const mode = snapshot?.mode ?? null;
   const speed = snapshot?.speed ?? "off";
   const maxMode = snapshot?.maxMode ?? false;
+  // A snapshot written before the field existed carries none — absent reads
+  // as "shared", the column default.
+  const opencodeServer = snapshot?.opencodeServer ?? "shared";
+  // A harness with a home always runs Standalone whatever is stored
+  // (`effectiveOpencodeServer`) — say so rather than show a value that
+  // won't apply.
+  const opencodeServerForced = opencodeServerLock(harnessRow) !== undefined && opencodeServer !== "standalone";
   const instructions = (snapshot?.instructions ?? "").trim();
   const skills = snapshot?.skills ?? [];
   // Status copy (finding F1-3): the orchestrator's `effectiveAgentProfile`
@@ -141,6 +150,18 @@ export function AgentProfileDetailsDialog({
               <>
                 <dt className="text-muted-foreground">Speed</dt>
                 <dd className="min-w-0" data-testid="agent-profile-details-speed">{speedLabel(speed)}</dd>
+              </>
+            )}
+
+            {harnessKind === "opencode" && (
+              <>
+                <dt className="text-muted-foreground">OpenCode server</dt>
+                <dd className="min-w-0" data-testid="agent-profile-details-opencode-server">
+                  {opencodeServer === "standalone" ? "Standalone" : "Shared"}
+                  {opencodeServerForced && (
+                    <span className="text-muted-foreground"> (runs Standalone — this harness has its own home)</span>
+                  )}
+                </dd>
               </>
             )}
 

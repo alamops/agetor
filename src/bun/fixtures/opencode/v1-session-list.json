@@ -1,0 +1,18 @@
+[
+  {
+    "id": "ses_e825ec104ffenteQsfLQHUAZwn",
+    "title": "Reading missing file and subagent directory listing",
+    "updated": 1793109092253,
+    "created": 1793109081851,
+    "projectId": "global",
+    "directory": "/Users/test/project"
+  },
+  {
+    "id": "ses_e825f1987ffeyx0pPX6PGXHO6G",
+    "title": "Shell commands and todo list test",
+    "updated": 1793109064592,
+    "created": 1793109059192,
+    "projectId": "global",
+    "directory": "/Users/test/project"
+  }
+]

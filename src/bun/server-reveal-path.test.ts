@@ -115,6 +115,7 @@ test("a relative path resolves against the task's worktreePath/workdir", async (
     effort: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     references: [],
     backlog: [],
     plans: [],

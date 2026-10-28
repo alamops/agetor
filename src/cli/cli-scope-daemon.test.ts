@@ -456,6 +456,28 @@ const ROWS: Record<ClientMethod, Row> = {
     call: () => withFakeHome(() => client.importClaudeSessions([MISSING])),
   },
 
+  // ── OpenCode sessions started outside Agetor ───────────────────────────────
+  listOpencodeSessions: {
+    expect: [200],
+    why: "scan finds no session: no OpenCode harness in the throwaway core is installed",
+    call: () => withFakeHome(() => client.listOpencodeSessions()),
+  },
+  recheckOpencodeSessions: {
+    expect: [200],
+    why: "the same scan with the 10 s cache bypassed",
+    call: () => withFakeHome(() => client.recheckOpencodeSessions()),
+  },
+  importOpencodeSessions: {
+    expect: [200],
+    why: "unknown ids come back as per-id errors in `results`, not an HTTP error",
+    call: () => withFakeHome(() => client.importOpencodeSessions([MISSING])),
+  },
+  retryOpencodeSessionImport: {
+    expect: [404],
+    why: "no task with this id",
+    call: () => client.retryOpencodeSessionImport(MISSING),
+  },
+
   // ── notifications ──────────────────────────────────────────────────────────
   notifyOS: {
     expect: [501],

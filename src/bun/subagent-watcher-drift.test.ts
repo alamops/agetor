@@ -165,7 +165,7 @@ async function buildFixture(): Promise<void> {
       id: TASK_ID, title: "drift", prompt: "p", column: "review", agent: "claude-code",
       workdir: WORKDIR, isolation: "none", taskType: "task", branch: null, branchSource: "created",
       worktreePath: null, baseRef: null, mode: null, model: null, effort: null,
-      speed: "off", maxMode: false, references: [], backlog: [], plans: [], draft: null,
+      speed: "off", maxMode: false, opencodeServer: "shared", references: [], backlog: [], plans: [], draft: null,
       runId: runIds[0]!, prUrl: null,
       hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
       archivedAt: null, createdAt: now, updatedAt: now,

@@ -12,6 +12,7 @@ function makeProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
     effort: null,
     mode: null,
     speed: "off",
+    opencodeServer: "shared",
     maxMode: false,
     instructions: "",
     skills: [],

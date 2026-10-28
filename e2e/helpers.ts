@@ -71,13 +71,21 @@ export async function gotoApp(page: Page, url: string, options: GotoAppOptions =
     }
   }
   await page.goto(url);
-  await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+  await expect(headerSettingsButton(page)).toBeVisible();
+}
+
+/** The app bar's Settings button, by its `title` (exact). A role-name lookup
+ *  ("Settings") is ambiguous — strict-mode violation — whenever a toast with
+ *  its own "Settings" action button (e.g. the harness auto-enable toast) is
+ *  also on screen; only the header button carries this title. */
+export function headerSettingsButton(page: Page): Locator {
+  return page.getByTitle("Settings", { exact: true });
 }
 
 /** Opens Settings → General (the default section on open — no tab click
  *  needed) and waits for the dialog to render. */
 export async function openSettingsGeneral(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await headerSettingsButton(page).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
   return dialog;

@@ -20,7 +20,7 @@
  */
 import { AGENT_PROFILE_LIMITS, normalizeSkillName, SKILL_NAME_LEAD_RE } from "./agent-profile.ts";
 import { LONE_SURROGATE_RE, PIPELINE_CONTROL_CHAR_RE, stepNameKey, validatePipelineGraph } from "./pipeline.ts";
-import { DEFAULT_MODEL, PIPELINE_LIMITS } from "./types.ts";
+import { DEFAULT_MODEL, OPENCODE_SERVER_MODES, PIPELINE_LIMITS } from "./types.ts";
 import {
   cutTo,
   escapeCapped,
@@ -31,7 +31,7 @@ import {
   stripInvisible,
 } from "./terminal-text.ts";
 import { isSpeed, speedFromFast } from "./speed.ts";
-import type { AgentProfile, Harness, Pipeline, PipelineEdge, PipelineGraph, Speed } from "./types.ts";
+import type { AgentProfile, Harness, OpencodeServerMode, Pipeline, PipelineEdge, PipelineGraph, Speed } from "./types.ts";
 
 export const BUNDLE_FORMAT = "agetor-bundle";
 export const BUNDLE_VERSION = 1;
@@ -82,6 +82,12 @@ export interface BundleAgent {
    *  the Agent — Ultrafast as Fast. The parser prefers `speed`. */
   fast: boolean;
   maxMode: boolean;
+  /** OpenCode only: whether the Agent's tasks share the machine's OpenCode
+   *  server or run a standalone one. Written only when it isn't `"shared"`
+   *  (so an export of any other Agent stays byte-identical to before) and an
+   *  absent field reads `"shared"` — bundle version 1 files written before
+   *  OpenCode existed carry none. */
+  opencodeServer?: OpencodeServerMode;
   instructions: string;
   skills: string[];
 }
@@ -787,6 +793,7 @@ export function buildBundle(input: {
       speed: p.speed,
       fast: p.speed !== "off",
       maxMode: p.maxMode,
+      ...(p.opencodeServer && p.opencodeServer !== "shared" ? { opencodeServer: p.opencodeServer } : {}),
       instructions: exportText(p.instructions, { multiline: true }, "instructions", changes),
       // Cleaning can make two skills equal (`A\u200b` and `A`); keep one.
       skills: [
@@ -1162,6 +1169,17 @@ function speedFields(speed: unknown, fast: unknown, label: string): { speed: Spe
   return { speed: tier, fast: tier !== "off" };
 }
 
+/** An Agent's optional `opencodeServer`: a strict enum, absent/null reads
+ *  `"shared"`. Returned as a spreadable fragment that stays empty for
+ *  `"shared"`, so a parsed Agent carries the key only when it matters. */
+function opencodeServerField(value: unknown, label: string): { opencodeServer?: OpencodeServerMode } {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "string" || !(OPENCODE_SERVER_MODES as readonly string[]).includes(value)) {
+    return invalid(`${label} opencodeServer must be one of ${OPENCODE_SERVER_MODES.join(", ")}`);
+  }
+  return value === "shared" ? {} : { opencodeServer: value as OpencodeServerMode };
+}
+
 function skillsField(value: unknown, what: string): string[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) return invalid(`${what} must be an array of strings`);
@@ -1226,6 +1244,7 @@ function parseAgent(raw: unknown, index: number, keys: Set<string>): BundleAgent
     mode: optionalLineField(raw.mode, `${label} mode`, BUNDLE_LIMITS.mode),
     ...speedFields(raw.speed, raw.fast, label),
     maxMode: boolField(raw.maxMode, `${label} maxMode`),
+    ...opencodeServerField(raw.opencodeServer, label),
     instructions: textField(raw.instructions, `${label} instructions`, AGENT_PROFILE_LIMITS.instructions),
     skills: skillsField(raw.skills, `${label} skills`),
   };

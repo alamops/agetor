@@ -77,7 +77,7 @@ function makeTask(workdir: string, extra: Partial<Task> = {}): Task {
     mode: null,
     model: null,
     effort: null,
-    speed: "off", maxMode: false,
+    speed: "off", maxMode: false, opencodeServer: "shared",
     references: [],    backlog: [], plans: [], draft: null,
     runId: null,
     hasOpenableRun: false,

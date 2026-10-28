@@ -56,6 +56,7 @@ function makeTaskRow(overrides: Partial<Task> = {}): Task {
     effort: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     references: [],
     backlog: [],
     plans: [],

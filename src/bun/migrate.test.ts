@@ -18,6 +18,9 @@ import retireFxModels from "./migrations/074_retire_fx_models.sql" with { type: 
 import retireCodexGpt55 from "./migrations/075_retire_codex_gpt_5_5.sql" with { type: "text" };
 import normalizeCursorNewFamilies from "./migrations/076_normalize_cursor_new_families.sql" with { type: "text" };
 import copilotHarness from "./migrations/077_copilot_harness.sql" with { type: "text" };
+import opencodeHarness from "./migrations/078_opencode_harness.sql" with { type: "text" };
+import opencodeTaskFields from "./migrations/079_opencode_task_fields.sql" with { type: "text" };
+import harnessAutoEnabled from "./migrations/080_harness_auto_enabled.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 import { cursorModelArg } from "../shared/types.ts";
 
@@ -1172,9 +1175,9 @@ test("074 (retire fx models) sits right after 073 (harness profile MCP servers),
   expect(migrations[at - 2]?.sql).toBe(taskSpeed);
 });
 
-test("077 (copilot harness) is the last registered migration, right after 076 (normalize cursor new families), right after 075 (retire codex gpt-5.5), right after 074 (retire fx models)", () => {
+test("077 (copilot harness) sits right after 076 (normalize cursor new families), right after 075 (retire codex gpt-5.5), right after 074 (retire fx models)", () => {
   const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("076_normalize_cursor_new_families");
   expect(migrations[at - 2]?.id).toBe("075_retire_codex_gpt_5_5");
   expect(migrations[at - 3]?.id).toBe("074_retire_fx_models");
@@ -1501,85 +1504,6 @@ test("a fresh DB migrated through 074 has speed (no fast) on tasks and agent_pro
     .get()?.sql;
   expect(tasksSql).toContain("'ultrafast'");
   expect(migrate(db, migrations)).toEqual([]);
-  db.close();
-});
-
-test("077_copilot_harness rebuilds harnesses keeping every row and column, seeds copilot enabled, adds runs.copilot_session_id; re-running is a no-op", () => {
-  const db = new Database(":memory:");
-  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
-  expect(at).toBeGreaterThan(0);
-  // A real 076-state database: every migration up to (not including) 077.
-  expect(migrate(db, migrations.slice(0, at)).length).toBe(at);
-  expect(columnNames(db, "runs")).not.toContain("copilot_session_id");
-
-  db.exec(`
-    INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers) VALUES
-      ('claude-work', 'claude-code', 'Claude (work)', 0, '/tmp/agetor-test-home', '/opt/bin/claude', '{"FOO":"bar"}', 11, 12, 1, 1),
-      ('fx-off', 'fx', 'fx off', 0, NULL, NULL, '{}', 21, 22, 0, 0),
-      ('grok-legacy', 'grok', 'Grok', 0, '/tmp/grok-home', NULL, '{"A":"b"}', 31, 32, 1, 1);
-    UPDATE harnesses SET enabled = 0, updated_at = 99 WHERE id = 'codex';
-  `);
-  type Row = Record<string, unknown>;
-  const snapshot = () => db.query<Row, []>(`SELECT * FROM harnesses ORDER BY id`).all();
-  const before = snapshot();
-  const beforeColumns = columnNames(db, "harnesses");
-  expect(beforeColumns).toContain("profile_mcp_servers");
-
-  expect(migrate(db, migrations)).toEqual(["077_copilot_harness"]);
-
-  // Same columns, same order.
-  expect(columnNames(db, "harnesses")).toEqual(beforeColumns);
-  const after = snapshot();
-  // Every pre-existing row survives byte-for-byte (incl. the user's disabled
-  // codex, the alias home/bin/env, profile_mcp_servers=0 and the legacy grok row).
-  for (const row of before) {
-    expect(after.find((r) => r.id === row.id)).toEqual(row);
-  }
-  expect(after.find((r) => r.id === "fx-off")?.profile_mcp_servers).toBe(0);
-  expect(after.find((r) => r.id === "codex")?.enabled).toBe(0);
-  expect(after.find((r) => r.id === "grok-legacy")?.kind).toBe("grok");
-
-  // Exactly one new row: the built-in copilot, enabled, default profile_mcp_servers.
-  expect(after.length).toBe(before.length + 1);
-  const copilot = after.find((r) => r.id === "copilot")!;
-  expect(copilot).toMatchObject({
-    kind: "copilot",
-    label: "GitHub Copilot",
-    is_builtin: 1,
-    home: null,
-    bin: null,
-    env_json: "{}",
-    enabled: 1,
-    profile_mcp_servers: 1,
-  });
-
-  // The widened CHECK admits copilot (and opencode), still refuses garbage.
-  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('copilot-2', 'copilot', 'Copilot 2', 1, 1)`);
-  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('oc', 'opencode', 'OC', 1, 1)`);
-  expect(() =>
-    db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('bad', 'nope', 'Bad', 1, 1)`),
-  ).toThrow();
-
-  expect(columnNames(db, "runs")).toContain("copilot_session_id");
-
-  // Re-running is a no-op.
-  expect(migrate(db, migrations)).toEqual([]);
-  db.close();
-});
-
-test("077_copilot_harness is only backfilled, never re-run, on a DB that already applied it as 075_copilot_harness", () => {
-  const db = new Database(":memory:");
-  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
-  migrate(db, migrations.slice(0, at));
-  // The dev-DB shape: the SQL ran under the branch's original id.
-  migrate(db, [{ id: "075_copilot_harness", sql: copilotHarness }]);
-  db.exec(`UPDATE harnesses SET label = 'My Copilot' WHERE id = 'copilot'`);
-  expect(migrate(db, migrations)).toEqual([]);
-  expect(
-    db.query<{ id: string }, []>(`SELECT id FROM _migrations WHERE id IN ('075_copilot_harness', '077_copilot_harness') ORDER BY id`).all().map((r) => r.id),
-  ).toEqual(["075_copilot_harness", "077_copilot_harness"]);
-  // Not re-seeded over the user's edit.
-  expect(db.query<{ label: string }, []>(`SELECT label FROM harnesses WHERE id = 'copilot'`).get()?.label).toBe("My Copilot");
   db.close();
 });
 
@@ -1987,5 +1911,199 @@ test("075 + 076 on the real schema: codex gpt-5.5 rows move, cursor variants fol
     .map((r) => r.id);
   expect(recorded).toEqual(["076_normalize_cursor_new_families", "075_retire_codex_gpt_5_5"]);
   expect(migrate(db, migrations.slice(0, i074 + 3))).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness rebuilds harnesses keeping every row and column, seeds copilot enabled, adds runs.copilot_session_id; re-running is a no-op", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  expect(at).toBeGreaterThan(0);
+  // A real 076-state database: every migration up to (not including) 077.
+  expect(migrate(db, migrations.slice(0, at)).length).toBe(at);
+  expect(columnNames(db, "runs")).not.toContain("copilot_session_id");
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers) VALUES
+      ('claude-work', 'claude-code', 'Claude (work)', 0, '/tmp/agetor-test-home', '/opt/bin/claude', '{"FOO":"bar"}', 11, 12, 1, 1),
+      ('fx-off', 'fx', 'fx off', 0, NULL, NULL, '{}', 21, 22, 0, 0),
+      ('grok-legacy', 'grok', 'Grok', 0, '/tmp/grok-home', NULL, '{"A":"b"}', 31, 32, 1, 1);
+    UPDATE harnesses SET enabled = 0, updated_at = 99 WHERE id = 'codex';
+  `);
+  type Row = Record<string, unknown>;
+  const snapshot = () => db.query<Row, []>(`SELECT * FROM harnesses ORDER BY id`).all();
+  const before = snapshot();
+  const beforeColumns = columnNames(db, "harnesses");
+  expect(beforeColumns).toContain("profile_mcp_servers");
+
+  // Apply only through 077: the OpenCode migrations that follow it add their own
+  // built-in row and are covered by the 078-080 tests below.
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual(["077_copilot_harness"]);
+
+  // Same columns, same order.
+  expect(columnNames(db, "harnesses")).toEqual(beforeColumns);
+  const after = snapshot();
+  // Every pre-existing row survives byte-for-byte (incl. the user's disabled
+  // codex, the alias home/bin/env, profile_mcp_servers=0 and the legacy grok row).
+  for (const row of before) {
+    expect(after.find((r) => r.id === row.id)).toEqual(row);
+  }
+  expect(after.find((r) => r.id === "fx-off")?.profile_mcp_servers).toBe(0);
+  expect(after.find((r) => r.id === "codex")?.enabled).toBe(0);
+  expect(after.find((r) => r.id === "grok-legacy")?.kind).toBe("grok");
+
+  // Exactly one new row: the built-in copilot, enabled, default profile_mcp_servers.
+  expect(after.length).toBe(before.length + 1);
+  const copilot = after.find((r) => r.id === "copilot")!;
+  expect(copilot).toMatchObject({
+    kind: "copilot",
+    label: "GitHub Copilot",
+    is_builtin: 1,
+    home: null,
+    bin: null,
+    env_json: "{}",
+    enabled: 1,
+    profile_mcp_servers: 1,
+  });
+
+  // The widened CHECK admits copilot (and opencode), still refuses garbage.
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('copilot-2', 'copilot', 'Copilot 2', 1, 1)`);
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('oc', 'opencode', 'OC', 1, 1)`);
+  expect(() =>
+    db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('bad', 'nope', 'Bad', 1, 1)`),
+  ).toThrow();
+
+  expect(columnNames(db, "runs")).toContain("copilot_session_id");
+
+  // Re-running is a no-op.
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness is only backfilled, never re-run, on a DB that already applied it as 075_copilot_harness", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  migrate(db, migrations.slice(0, at));
+  // The dev-DB shape: the SQL ran under the branch's original id.
+  migrate(db, [{ id: "075_copilot_harness", sql: copilotHarness }]);
+  db.exec(`UPDATE harnesses SET label = 'My Copilot' WHERE id = 'copilot'`);
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual([]);
+  expect(
+    db.query<{ id: string }, []>(`SELECT id FROM _migrations WHERE id IN ('075_copilot_harness', '077_copilot_harness') ORDER BY id`).all().map((r) => r.id),
+  ).toEqual(["075_copilot_harness", "077_copilot_harness"]);
+  // Not re-seeded over the user's edit.
+  expect(db.query<{ label: string }, []>(`SELECT label FROM harnesses WHERE id = 'copilot'`).get()?.label).toBe("My Copilot");
+  db.close();
+});
+
+test("080 (harness auto-enabled) is the last registered migration, after 079 (opencode task fields), after 078 (opencode harness), after 077 (copilot harness)", () => {
+  const at = migrations.findIndex((m) => m.id === "080_harness_auto_enabled");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("079_opencode_task_fields");
+  expect(migrations[at - 2]?.id).toBe("078_opencode_harness");
+  expect(migrations[at - 3]?.id).toBe("077_copilot_harness");
+  expect(migrations[at]?.sql).toBe(harnessAutoEnabled);
+  expect(migrations[at - 1]?.sql).toBe(opencodeTaskFields);
+  expect(migrations[at - 2]?.sql).toBe(opencodeHarness);
+});
+
+/** Migrate a fresh DB up to (and including) `lastId`. */
+function migrateThrough(db: Database, lastId: string): void {
+  const at = migrations.findIndex((m) => m.id === lastId);
+  expect(at).toBeGreaterThanOrEqual(0);
+  migrate(db, migrations.slice(0, at + 1));
+}
+
+test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabled opencode built-in, and keep admitting opencode/copilot kinds (N-1 recipe)", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "077_copilot_harness");
+  // A user alias with every column off its default, plus a disabled built-in
+  // flipped on by the user, so the explicit-column copy is load-bearing.
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers)
+    VALUES ('fx-2', 'fx', 'fx second', 0, '/tmp/agetor-home/fx-2', '/opt/fx/bin/fx', '{"FX_REVIEW_MODEL":"x/y"}', 11, 22, 0, 0);
+    UPDATE harnesses SET enabled = 1 WHERE id = 'codex';
+    INSERT INTO runs (id, task_id, agent, status, started_at) VALUES ('r1', 't-missing', 'fx', 'succeeded', 5);
+  `);
+  const before = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses ORDER BY id`).all();
+  // 077 (copilot) already widened the CHECK to admit opencode, but seeds no
+  // opencode built-in: that row arrives with 078.
+  expect(db.query(`SELECT 1 FROM harnesses WHERE id = 'opencode'`).get()).toBeNull();
+
+  expect(migrate(db, migrations)).toEqual(["078_opencode_harness", "079_opencode_task_fields", "080_harness_auto_enabled"]);
+
+  const after = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses WHERE id != 'opencode' ORDER BY id`).all();
+  expect(after).toEqual(before);
+  expect(columnNames(db, "harnesses")).toEqual([
+    "id", "kind", "label", "is_builtin", "home", "bin", "env_json", "created_at", "updated_at", "enabled", "profile_mcp_servers",
+  ]);
+  const oc = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses WHERE id = 'opencode'`).get();
+  expect(oc).toMatchObject({ kind: "opencode", label: "OpenCode", is_builtin: 1, home: null, bin: null, env_json: "{}", enabled: 0, profile_mcp_servers: 1 });
+
+  // The widened CHECK keeps admitting copilot and additional opencode harnesses;
+  // junk is still refused.
+  db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('cp', 'copilot', 'Copilot', 1, 1)`);
+  db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('opencode-2', 'opencode', 'OC 2', 1, 1)`);
+  expect(() =>
+    db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('bad', 'nope', 'x', 1, 1)`),
+  ).toThrow();
+
+  // runs gains opencode_session_id; the pre-existing row reads NULL.
+  expect(columnNames(db, "runs")).toContain("opencode_session_id");
+  expect(db.query<{ v: string | null }, []>(`SELECT opencode_session_id AS v FROM runs WHERE id = 'r1'`).get()?.v).toBeNull();
+  db.close();
+});
+
+test("078 self-heal re-seeds a deleted built-in with its own enabled default", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "077_copilot_harness");
+  db.exec(`DELETE FROM harnesses WHERE id IN ('claude-code', 'cursor', 'antigravity')`);
+  migrate(db, migrations);
+  const enabled = Object.fromEntries(
+    db.query<{ id: string; enabled: number }, []>(`SELECT id, enabled FROM harnesses WHERE is_builtin = 1`).all().map((r) => [r.id, r.enabled]),
+  );
+  expect(enabled).toEqual({
+    "claude-code": 1, codex: 0, cursor: 0, gemini: 0, fx: 0, antigravity: 1, opencode: 0, copilot: 1,
+  });
+  db.close();
+});
+
+test("079 adds opencode_server (default shared, CHECK-guarded) to tasks and agent_profiles, the imported-opencode pair with a unique claim, and the runs session-id index", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "077_copilot_harness");
+  db.exec(`
+    INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'codex', '/w', 1, 1);
+    INSERT INTO agent_profiles (id, name, name_key, harness_id, model, instructions, skills_json, created_at, updated_at)
+      VALUES ('p1', 'P', 'p', 'codex', 'm', '', '[]', 1, 1);
+  `);
+  migrate(db, migrations);
+  expect(db.query<{ v: string }, []>(`SELECT opencode_server AS v FROM tasks WHERE id = 't1'`).get()?.v).toBe("shared");
+  expect(db.query<{ v: string }, []>(`SELECT opencode_server AS v FROM agent_profiles WHERE id = 'p1'`).get()?.v).toBe("shared");
+  db.run(`UPDATE tasks SET opencode_server = 'standalone' WHERE id = 't1'`);
+  expect(() => db.run(`UPDATE tasks SET opencode_server = 'junk' WHERE id = 't1'`)).toThrow();
+  expect(() => db.run(`UPDATE agent_profiles SET opencode_server = 'junk' WHERE id = 'p1'`)).toThrow();
+  expect(columnNames(db, "tasks")).toEqual(expect.arrayContaining(["imported_opencode", "imported_opencode_session_id"]));
+
+  db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t2', 't', 'p', 'backlog', 'codex', '/w', 1, 1)`);
+  db.run(`UPDATE tasks SET imported_opencode_session_id = 'ses_abc' WHERE id = 't1'`);
+  expect(() => db.run(`UPDATE tasks SET imported_opencode_session_id = 'ses_abc' WHERE id = 't2'`)).toThrow();
+  // NULL claims never collide.
+  db.run(`UPDATE tasks SET imported_opencode_session_id = NULL WHERE id = 't2'`);
+
+  const indexes = db.query<{ name: string }, []>(`SELECT name FROM sqlite_master WHERE type = 'index'`).all().map((r) => r.name);
+  expect(indexes).toEqual(expect.arrayContaining(["tasks_imported_opencode_session_uidx", "runs_opencode_session_id_idx"]));
+  db.close();
+});
+
+test("080 creates harness_auto_enabled with no foreign key, surviving a harnesses rebuild", () => {
+  const db = new Database(":memory:");
+  migrate(db, migrations);
+  expect(columnNames(db, "harness_auto_enabled")).toEqual(["harness_id", "enabled_at", "notified"]);
+  expect(db.query<unknown, []>(`PRAGMA foreign_key_list(harness_auto_enabled)`).all()).toEqual([]);
+  db.run(`INSERT INTO harness_auto_enabled (harness_id, enabled_at) VALUES ('codex', 5)`);
+  expect(db.query<{ n: number }, []>(`SELECT notified AS n FROM harness_auto_enabled`).get()?.n).toBe(0);
+  // A later rebuild (the recipe 077 uses) leaves the bookkeeping intact.
+  db.exec(`PRAGMA foreign_keys = ON`);
+  db.exec(`CREATE TABLE h2 AS SELECT * FROM harnesses; DROP TABLE harnesses; ALTER TABLE h2 RENAME TO harnesses;`);
+  expect(db.query<{ id: string }, []>(`SELECT harness_id AS id FROM harness_auto_enabled`).all()).toEqual([{ id: "codex" }]);
   db.close();
 });

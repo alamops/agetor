@@ -308,9 +308,18 @@ function probeKey(h: Harness): string {
 }
 
 /** User-level skills for kinds whose discovery implements them (claude-code,
- *  codex, cursor, fx, and copilot — `commands.ts`); null when it can't tell. */
+ *  codex, cursor, fx, opencode and copilot — `commands.ts`); null when it can't tell. */
 export async function userLevelSkills(h: Harness): Promise<string[] | null> {
-  if (h.kind !== "claude-code" && h.kind !== "codex" && h.kind !== "cursor" && h.kind !== "fx" && h.kind !== "copilot") return null;
+  if (
+    h.kind !== "claude-code" &&
+    h.kind !== "codex" &&
+    h.kind !== "cursor" &&
+    h.kind !== "fx" &&
+    h.kind !== "opencode" &&
+    h.kind !== "copilot"
+  ) {
+    return null;
+  }
   try {
     const caps = await listAgentCapabilities({
       agent: h.kind,
@@ -509,6 +518,7 @@ export async function commitBundleImport(
         mode: a.mode,
         speed: a.speed,
         maxMode: a.maxMode,
+        opencodeServer: a.opencodeServer,
         instructions: a.instructions,
         skills: a.skills,
       });

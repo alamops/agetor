@@ -1,0 +1,12 @@
+[
+  {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "connections": [
+      {
+        "type": "env",
+        "name": "ANTHROPIC_API_KEY"
+      }
+    ]
+  }
+]

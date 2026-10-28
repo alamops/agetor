@@ -130,6 +130,8 @@ const EXEMPT_REFS_RESOLVE =
   "the route's own answer comes from probePaths(paths, callerOf(req)): for the CLI token every stat runs in a disclaimed child";
 const EXEMPT_SESSION_IMPORT =
   "no path in the request: the cwd comes from the transcript and is gated in the handler via the importer's gateCwd option";
+const EXEMPT_OPENCODE_SESSION_IMPORT =
+  "no path in the request: the cwd comes from the listed OpenCode session and is gated in the handler via the importer's gateCwd option";
 
 // ── the table ───────────────────────────────────────────────────────────────
 
@@ -359,6 +361,10 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/claude-sessions/recheck": { POST: CLI },
   "/claude-sessions/import": { POST: cli({ pathParamsExempt: EXEMPT_SESSION_IMPORT }) },
   "/claude-sessions/checkout": { POST: CLI },
+  "/tasks/:id/opencode-session/retry": { POST: CLI },
+  "/opencode-sessions": { GET: CLI },
+  "/opencode-sessions/recheck": { POST: CLI },
+  "/opencode-sessions/import": { POST: cli({ pathParamsExempt: EXEMPT_OPENCODE_SESSION_IMPORT }) },
   "/tasks/:id/archive": { POST: CLI },
   "/tasks/:id/unarchive": { POST: CLI },
   "/tasks/:id/pipeline": { GET: CLI },

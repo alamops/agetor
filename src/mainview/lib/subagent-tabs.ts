@@ -14,8 +14,9 @@ export const MAX_VISIBLE_TABS = 6;
  * event stream of its own — it exists only to hold the task in `running` for
  * the workflow's lifetime — so it never becomes a tab. Every other row
  * (`"subagent"`, `"bg_session"`, `"monitor"` — a Claude Code Monitor whose tab
- * streams its events — and `"workflow_agent"` — one agent inside a workflow, a
- * normal sidechain transcript) is tabbable.
+ * streams its events — `"workflow_agent"` — one agent inside a workflow, a
+ * normal sidechain transcript — and `"opencode_subagent"` — an OpenCode child
+ * session) is tabbable.
  */
 function isTabbable(s: Subagent): boolean {
   return s.parentKind !== "workflow";
@@ -35,6 +36,7 @@ export function anySubagentRunning(subs: Subagent[]): boolean {
  * subagent is running, or the parent turn is still running (so a just-finished
  * subagent stays readable until the turn resolves). Once nothing is running the
  * strip collapses back to a plain single-stream log.
+ * The exception is an OpenCode child session (see the body).
  *
  * The "is there anything to show" gate counts only tabbable rows (a workflow
  * container alone shouldn't pop an empty strip), but the "is something still
@@ -44,7 +46,14 @@ export function anySubagentRunning(subs: Subagent[]): boolean {
  */
 export function shouldShowSubagentTabs(subs: Subagent[], parentRunRunning: boolean): boolean {
   const tabbable = subs.filter(isTabbable);
-  return tabbable.length > 0 && (anySubagentRunning(subs) || parentRunRunning);
+  if (tabbable.length === 0) return false;
+  // An OpenCode child session (`opencode_subagent`) fills its tab only at the
+  // END of the parent turn — the turn-end export (plan D-11) is the only
+  // source of its transcript — so the active-only rule would hide the tab at
+  // the exact moment it gets content. Its tab therefore stays readable after
+  // the turn, whatever its status (completed, orphaned, failed).
+  if (tabbable.some((s) => s.parentKind === "opencode_subagent")) return true;
+  return anySubagentRunning(subs) || parentRunRunning;
 }
 
 /**

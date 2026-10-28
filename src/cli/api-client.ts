@@ -27,6 +27,8 @@ import type {
   DbCompactResult,
   RetentionPassResult,
   Speed,
+  OpencodeServerMode,
+  OpencodeSessionList,
 } from "../shared/types.ts";
 import type { NotificationKind } from "../shared/os-notification.ts";
 import type { BundleExportResponse } from "../shared/bundle.ts";
@@ -76,6 +78,11 @@ const NOTIFY_TIMEOUT_MS = 5_000;
  *  `claude agents --json` once per Claude config dir (up to 8 s each). Both
  *  routes opt out of the server's idle timeout. */
 const CLAUDE_SESSIONS_TIMEOUT_MS = 5 * 60_000;
+/** `GET /opencode-sessions` and its `recheck` run `opencode session list`
+ *  once per OpenCode harness × registered project (plus a busy-check export
+ *  per unfinished session). Both routes opt out of the server's idle
+ *  timeout, same as the Claude pair. */
+const OPENCODE_SESSIONS_TIMEOUT_MS = 5 * 60_000;
 /** `POST /db/compact` runs `VACUUM` + `wal_checkpoint(TRUNCATE)` on the core's
  *  single main thread — it rewrites the whole database file, so on a
  *  multi-GB DB (~7.5 s/GB, `DB_COMPACT_SEC_PER_GB`) the core is unresponsive
@@ -253,6 +260,26 @@ export class AgetorClient {
     // The route opts out of the server idle timeout. The default 15s budget
     // aborts a transcript import that is still running.
     return this.req("POST", "/claude-sessions/import", { ids }, CLONE_TIMEOUT_MS);
+  }
+  listOpencodeSessions(): Promise<OpencodeSessionList> {
+    return this.req("GET", "/opencode-sessions", undefined, OPENCODE_SESSIONS_TIMEOUT_MS);
+  }
+  recheckOpencodeSessions(): Promise<OpencodeSessionList> {
+    return this.req("POST", "/opencode-sessions/recheck", undefined, OPENCODE_SESSIONS_TIMEOUT_MS);
+  }
+  /** `harnessId` names the OpenCode harness to import under (default: the
+   *  one that listed each session). */
+  importOpencodeSessions(
+    ids: string[],
+    harnessId?: string,
+  ): Promise<{ results: { id: string; taskId?: string; error?: string }[] }> {
+    // The route opts out of the server idle timeout; an export of a long
+    // session plus its event replay can outlast the default 15s budget.
+    return this.req("POST", "/opencode-sessions/import", harnessId ? { ids, harnessId } : { ids }, CLONE_TIMEOUT_MS);
+  }
+  /** Re-run a failed OpenCode history backfill; the route waits for it. */
+  retryOpencodeSessionImport(taskId: string): Promise<{ ok: true }> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/opencode-session/retry`, undefined, CLONE_TIMEOUT_MS);
   }
   archiveTask(id: string): Promise<Task> {
     return this.req("POST", `/tasks/${id}/archive`);
@@ -775,6 +802,8 @@ export interface CreateTaskInput {
    *  alias (`resolveSpeedInput` on the server still accepts it). */
   speed?: Speed;
   maxMode?: boolean;
+  /** OpenCode's server option (D-4); the server defaults it to `"shared"`. */
+  opencodeServer?: OpencodeServerMode;
   taskType?: string;
   /** Match the app's "Run task", which creates the task in "ready" before
    *  starting (vs "backlog" when queued). */
@@ -787,8 +816,8 @@ export interface CreateTaskInput {
   issueSnapshot?: string;
   /** Id of an {@link AgentProfile} to launch from (create-only) — the server
    *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`speed`/
-   *  `maxMode` from the profile; 400 on an unknown id. Mutually exclusive
-   *  with setting those six fields yourself — the CLI (`agetor add
+   *  `maxMode`/`opencodeServer` from the profile; 400 on an unknown id.
+   *  Mutually exclusive with setting those seven fields yourself — the CLI (`agetor add
    *  --profile`) enforces that client-side before this ever reaches the
    *  wire. */
   agentProfileId?: string;
@@ -813,6 +842,9 @@ export interface AgentProfileInput {
   mode: string | null;
   speed: Speed;
   maxMode: boolean;
+  /** OpenCode's server option (D-4). Omitted ⇒ `"shared"` on create,
+   *  unchanged on PATCH, copied from the source on duplicate. */
+  opencodeServer?: OpencodeServerMode;
   instructions: string;
   skills: string[];
 }
@@ -840,10 +872,11 @@ export interface PatchTaskInput {
   effort?: string | null;
   speed?: Speed;
   maxMode?: boolean;
+  opencodeServer?: OpencodeServerMode;
   taskType?: string;
 }
 
-/** Body for POST /harnesses (kind: claude-code | codex | cursor | gemini). */
+/** Body for POST /harnesses (kind: any {@link AgentKind}). */
 export interface CreateHarnessInput {
   id: string;
   kind: AgentKind;

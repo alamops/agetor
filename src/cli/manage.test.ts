@@ -385,3 +385,45 @@ test("cmdEdit: --speed / --fast / --no-fast patch the task's speed, the later fl
     rmSync(workdir, { recursive: true, force: true });
   });
 }, 30_000);
+
+// docs/plans/add-opencode-harness.md D-4: `agetor edit --opencode-server`,
+// validated with the routes' own parser and applied by the core on the
+// task's next turn.
+
+test("cmdEdit: an invalid --opencode-server is a usage error before any client is created", async () => {
+  // Same no-core setup as the --speed case above.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-mg-ocserver-bad-"));
+  const f = { dataDir: dir, port: 4544, json: false, plain: true, noDaemon: true };
+  try {
+    await expect(cmdEdit(["abcd1234", "--opencode-server", "private"], f)).rejects.toThrow(
+      "'--opencode-server' must be one of shared, standalone (got 'private')",
+    );
+    await expect(cmdEdit(["abcd1234", "--opencode-server", "Standalone"], f)).rejects.toThrow(
+      "(got 'Standalone')",
+    );
+    await expect(cmdEdit(["abcd1234", "--opencode-server"], f)).rejects.toThrow("'--opencode-server' needs a value");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cmdEdit: --opencode-server patches the task's server option", async () => {
+  await withClient(4543, async (client, dir) => {
+    const workdir = mkdtempSync(path.join(tmpdir(), "agetor-mg-ocserver-"));
+    const t = await client.createTask({ title: "OpenCode", prompt: "p", isolation: "none", workdir, agent: "opencode" });
+    expect(t.opencodeServer).toBe("shared");
+    const f = { dataDir: dir, json: false, plain: true, noDaemon: false };
+
+    await cmdEdit([t.id, "--opencode-server", "standalone"], f);
+    expect((await client.getTask(t.id)).opencodeServer).toBe("standalone");
+
+    // Combined with another field, both apply.
+    await cmdEdit([t.id, "--opencode-server", "shared", "--title", "OpenCode (shared)"], f);
+    const after = await client.getTask(t.id);
+    expect(after.opencodeServer).toBe("shared");
+    expect(after.title).toBe("OpenCode (shared)");
+
+    await client.deleteTask(t.id);
+    rmSync(workdir, { recursive: true, force: true });
+  });
+}, 30_000);

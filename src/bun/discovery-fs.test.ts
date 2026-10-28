@@ -435,6 +435,62 @@ describe.skipIf(process.platform !== "darwin")("listAgentCapabilities through th
     expect(rec.children().filter((c) => c === "/usr/bin/tar")).toHaveLength(1);
   });
 
+  test("opencode reads its home and project through the disclaimed reader, same rows as in-process", async () => {
+    const home = path.join(scratch, "opencode-home");
+    const proj = path.join(scratch, "opencode-proj");
+    const md = (d: string) => `---\ndescription: ${d}\n---\n`;
+    w(path.join(home, ".config/opencode/command/uc.md"), md("user command"));
+    w(path.join(home, ".config/opencode/commands/uc2.md"), md("user command two"));
+    w(path.join(home, ".config/opencode/skills/us/SKILL.md"), md("user skill"));
+    w(path.join(home, ".claude/skills/ucs/SKILL.md"), md("user claude skill"));
+    w(path.join(home, ".agents/skills/uas/SKILL.md"), md("user agents skill"));
+    w(
+      path.join(home, ".config/opencode/opencode.json"),
+      JSON.stringify({ mcp: { userMcp: { type: "local", command: ["u"] } } }),
+    );
+    w(path.join(proj, ".opencode/command/pc.md"), md("project command"));
+    w(path.join(proj, ".opencode/commands/pc2.md"), md("project command two"));
+    w(path.join(proj, ".opencode/skills/ps/SKILL.md"), md("project skill"));
+    w(path.join(proj, ".claude/skills/pcs/SKILL.md"), md("project claude skill"));
+    w(path.join(proj, ".agents/skills/pas/SKILL.md"), md("project agents skill"));
+    w(path.join(proj, "opencode.json"), JSON.stringify({ mcp: { projMcp: { type: "local", command: ["p"] } } }));
+    const opts = { agent: "opencode" as const, workdir: proj, harnessHome: home };
+    const rows = (r: Awaited<ReturnType<typeof listAgentCapabilities>>) =>
+      [
+        ...r.commands.map((c) => `command ${c.name} ${c.source}`),
+        ...r.extensions.map((e) => `${e.kind} ${e.name} ${e.source}`),
+      ].sort();
+
+    setDisclaimSwitch(false);
+    const inProcess = rows(await listAgentCapabilities(opts));
+
+    const rec = recordingStub();
+    const disclaimed = rows(await listAgentCapabilities(opts));
+
+    // Guards against both sides being empty: the fixtures above must show up.
+    expect(disclaimed).toEqual(
+      expect.arrayContaining([
+        "command /uc user",
+        "command /uc2 user",
+        "command /us user",
+        "command /ucs user",
+        "command /uas user",
+        "command /pc project",
+        "command /pc2 project",
+        "command /ps project",
+        "command /pcs project",
+        "command /pas project",
+        "mcp userMcp user",
+        "mcp projMcp project",
+      ]),
+    );
+    expect(disclaimed).toEqual(inProcess);
+    expect(
+      rec.children().every((c) => ["/usr/bin/find", "/usr/bin/tar"].includes(c) || c.endsWith("/git")),
+    ).toBe(true);
+    expect(rec.children().filter((c) => c === "/usr/bin/tar")).toHaveLength(1);
+  });
+
   test("gemini reads nothing and spawns nothing", async () => {
     const rec = recordingStub();
     const out = await listAgentCapabilities({ agent: "gemini", workdir: null });

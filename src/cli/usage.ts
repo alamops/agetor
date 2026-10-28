@@ -1,5 +1,6 @@
-import { COLUMNS, SPEEDS, type Speed } from "../shared/types.ts";
+import { COLUMNS, OPENCODE_SERVER_MODES, SPEEDS, type OpencodeServerMode, type Speed } from "../shared/types.ts";
 import { isSpeed } from "../shared/speed.ts";
+import { parseOpencodeServerInput } from "../shared/opencode.ts";
 import { escapeControlChars } from "../shared/terminal-text.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id).join(", ");
@@ -23,13 +24,18 @@ export const USAGE: Record<string, string> = {
                         Fast variants, fx Gateway lanes); --fast = --speed
                         fast, --no-fast = --speed off — the later flag wins
     --max-mode | --no-max-mode   cursor Max Mode
+    --opencode-server <s>  shared | standalone — OpenCode 2 only: shared runs
+                        through OpenCode's background service, standalone
+                        starts a private server per turn (a harness with its
+                        own home always runs standalone)
     --profile <id|name>  launch from a saved agent profile (agetor profile ls) —
                         cannot combine with --agent/--model/--mode/--effort/
                         --speed/--fast/--max-mode, the profile defines them
+                        (and --opencode-server)
     --pipeline <id|name> launch a pipeline (agetor pipeline ls) instead of a
                         single agent — cannot combine with --profile or any
                         of --agent/--model/--mode/--effort/--speed/--fast/
-                        --max-mode
+                        --max-mode/--opencode-server
     --type <t>         task | subtask | epic | feature | bug | spike
     --ref <path>       attach a file/folder reference (repeatable)
     --issue <url>      seed title/prompt from a GitHub/GitLab issue + its thread
@@ -113,8 +119,9 @@ export const USAGE: Record<string, string> = {
 
   attach: `usage: agetor attach <task-id>
 
-  Attach your terminal to the task's live tmux session (all agent kinds;
-  for codex/gemini this only exists while a turn is in flight).
+  Attach your terminal to the task's live tmux session (every tmux-hosted
+  agent kind; fx has none). For the one-shot kinds — codex, cursor, gemini,
+  antigravity and opencode — it exists only while a turn is in flight.
   Detach with Ctrl-b d.`,
 
   shell: `usage: agetor shell <task-id> [--print]
@@ -126,13 +133,16 @@ export const USAGE: Record<string, string> = {
   edit: `usage: agetor edit <task-id> [flags]   (at least one flag)
 
   Patch a task. Changing model / mode / effort applies to a live session mid-run.
-  A task bound to an agent profile refuses agent/mode/model/effort/speed/max-mode
-  edits (409) — pass --detach-profile first (or alongside) to unlock them.
+  A task bound to an agent profile refuses agent/mode/model/effort/speed/max-mode/
+  opencode-server edits (409) — pass --detach-profile first (or alongside) to
+  unlock them.
     --title <s>   --prompt <s> | --prompt-file <p>   --agent <id>   --workdir <p>
     --model <id>   --mode <id>   --effort <id>   --type <t>   --column <c>
     --speed <s>   off | fast | ultrafast; --fast = --speed fast, --no-fast =
                   --speed off — the later flag wins
     --max-mode | --no-max-mode   cursor Max Mode
+    --opencode-server <s>   shared | standalone (OpenCode 2; applies on the
+                  next turn)
     --detach-profile   unbind from the task's agent profile (keeps its values)`,
 
   move: `usage: agetor move <task-id> <column>   (columns: ${COLUMN_IDS})
@@ -255,17 +265,19 @@ export const USAGE: Record<string, string> = {
   "harness shell": `usage: agetor harness shell <id>
 
   Open your shell with the harness's env applied (CLAUDE_CONFIG_DIR / HOME, custom
-  env, bin on PATH). Run 'claude /login' (or 'codex login') here to authenticate a
-  parallel account against its own config. Ctrl-D to exit.`,
+  env, bin on PATH). Run 'claude /login' (or 'codex login', 'opencode auth login')
+  here to authenticate a parallel account against its own config. Ctrl-D to exit.`,
 
-  "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
+  "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--opencode-server shared|standalone] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
 
   Create a reusable agent profile. --harness and --model are required.
+  --opencode-server (OpenCode 2 harnesses) picks the shared background
+  service or a private server per turn; default shared.
   --instructions-file - reads instructions from stdin. --skill is repeatable.
   --fast is the same as --speed fast and --no-fast as --speed off; when
   several speed flags are given, the later one wins.`,
 
-  "profile edit": `usage: agetor profile edit <ref> [--name <new>] [--harness <id>] [--model <id>] [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …] [--clear-skills]   (at least one flag)
+  "profile edit": `usage: agetor profile edit <ref> [--name <new>] [--harness <id>] [--model <id>] [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--opencode-server shared|standalone] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …] [--clear-skills]   (at least one flag)
 
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced). --fast is the
@@ -359,13 +371,18 @@ export const USAGE: Record<string, string> = {
   by a background pass ('agetor compact' then returns the freed space to disk).
   0, false, no, none and disabled also mean off; any other value is refused.`,
 
-  sessions: `usage: agetor sessions [ls | import [id…]] [--dry-run] [--yes]
+  sessions: `usage: agetor sessions [ls | import [id…]] [--kind claude|opencode] [--harness <id>] [--dry-run] [--yes]
 
-  List Claude Code sessions started outside Agetor, or import them as tasks.
-  With no subcommand, lists. import asks in a terminal; --yes skips the
-  question and is required when not in a terminal. --dry-run prints the
-  rows and imports nothing. A folder whose path is too long to import
-  prints "${"Folder path is too long to import yet"}" and is not imported.`,
+  List Claude Code and OpenCode sessions started outside Agetor, or import
+  them as tasks. With no subcommand, lists. --kind limits both to one kind.
+  import routes each id by its shape: an OpenCode id (ses_…) goes to the
+  OpenCode import, any other id to the Claude import; with no ids it imports
+  every importable session (of --kind, when given). --harness <id> imports
+  OpenCode sessions under that OpenCode harness instead of the one that
+  listed them. import asks in a terminal; --yes skips the question and is
+  required when not in a terminal. --dry-run prints the rows and imports
+  nothing. A folder whose path is too long to import prints
+  "${"Folder path is too long to import yet"}" and is not imported.`,
 
   compact: `usage: agetor compact [--yes|-y] [--json]
 
@@ -413,6 +430,17 @@ export function usageError(cmd: string): Error {
 export function parseSpeedFlag(value: string): Speed {
   if (isSpeed(value)) return value;
   throw new Error(`'--speed' must be one of ${SPEEDS.join(", ")} (got '${escapeControlChars(value)}')`);
+}
+
+/** Parse an `--opencode-server` value (`shared | standalone`) with the same
+ *  validator the routes use (`parseOpencodeServerInput`). Anything else is a
+ *  usage error naming the two modes. */
+export function parseOpencodeServerFlag(value: string): OpencodeServerMode {
+  const parsed = parseOpencodeServerInput(value);
+  if (parsed === "shared" || parsed === "standalone") return parsed;
+  throw new Error(
+    `'--opencode-server' must be one of ${OPENCODE_SERVER_MODES.join(", ")} (got '${escapeControlChars(value)}')`,
+  );
 }
 
 /** Resolve the help block for `agetor <cmd> [sub] --help` / `agetor help <cmd>

@@ -290,15 +290,33 @@ const CAPABILITY_READ_PATTERNS: RegExp[] = [
   /^\.opencode\/skills\/[^/]+\/SKILL\.md$/,
   /^\.claw\/skills\/[^/]+\/SKILL\.md$/,
   /^skills\/[^/]+\/SKILL\.md$/,
+  // opencode: markdown commands under `.opencode/command(s)/` (nested folders
+  // allowed, as for claude) and the project `opencode.json[c]` MCP config.
+  // Its project skills live under `.opencode`/`.claude`/`.agents` `skills/`,
+  // which are already matched above.
+  /^\.opencode\/commands?\/.+\.md$/,
+  /^opencode\.jsonc?$/,
 ];
 
 const CURSOR_USER_SKILL_DIRS = [".cursor/skills", ".claude/skills", ".codex/skills", ".grok/skills", ".agents/skills"];
 const FX_USER_SKILL_DIRS = [".fx/skills", ".config/opencode/skills", ".codex/skills", ".claude/skills", ".agents/skills", ".claw/skills"];
+/**
+ * OpenCode's user-level skill dirs, relative to the harness HOME (or the
+ * process home). Earlier entries win a same-name clash, matching the other
+ * multi-root kinds. Exported for `bundle.ts`' user-level skill gate.
+ */
+export const OPENCODE_USER_SKILL_DIRS: readonly string[] = [".config/opencode/skills", ".claude/skills", ".agents/skills"];
+const OPENCODE_PROJECT_SKILL_DIRS = [".opencode/skills", ".claude/skills", ".agents/skills"];
+/** Markdown command dirs; OpenCode reads both the singular and plural spelling. */
+const OPENCODE_USER_COMMAND_DIRS = [".config/opencode/command", ".config/opencode/commands"];
+const OPENCODE_PROJECT_COMMAND_DIRS = [".opencode/command", ".opencode/commands"];
+const OPENCODE_CONFIG_FILES = ["opencode.json", "opencode.jsonc"];
+const FX_PROJECT_SKILL_DIRS = [".fx/skills", "skills", ".opencode/skills", ".codex/skills", ".claude/skills", ".agents/skills", ".claw/skills"];
+
 // GitHub Copilot: user skills live in `$COPILOT_HOME/skills` (walked on its own
 // tree) plus HOME-relative `.agents/skills`; project skills in these dirs.
 const COPILOT_USER_HOME_SKILL_DIRS = [".agents/skills"];
 const COPILOT_PROJECT_SKILL_DIRS = [".github/skills", ".agents/skills", ".claude/skills"];
-const FX_PROJECT_SKILL_DIRS = [".fx/skills", "skills", ".opencode/skills", ".codex/skills", ".claude/skills", ".agents/skills", ".claw/skills"];
 
 /** `$COPILOT_HOME` for a copilot harness (harness env map, then harness.home,
  *  then the process env, then `~/.copilot`). */
@@ -312,7 +330,7 @@ function copilotUserHome(opts: { harnessEnv?: Record<string, string> | null }): 
   return opts.harnessEnv?.HOME || homedir();
 }
 
-/** HOME for cursor/fx. An explicit harness-env HOME wins, matching spawn
+/** HOME for cursor/fx/opencode. An explicit harness-env HOME wins, matching spawn
  *  (`harnessEnv` writes HOME from `harness.home` and then lets the env map
  *  overwrite it). Else the harness home, else the process home. */
 function homeForHomeKinds(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
@@ -439,6 +457,16 @@ function userSelectors(opts: DiscoveryOpts): DiscoverySelector[] {
       const home = homeForHomeKinds(opts);
       return FX_USER_SKILL_DIRS.map((d) => skillsDir(path.join(home, d)));
     }
+    case "opencode": {
+      // Markdown commands, one-level skills and `opencode.json[c]`, all
+      // HOME-relative (`.config/opencode/...`).
+      const home = homeForHomeKinds(opts);
+      return [
+        ...OPENCODE_USER_COMMAND_DIRS.map((d) => markdownTree(path.join(home, d))),
+        ...OPENCODE_USER_SKILL_DIRS.map((d) => skillsDir(path.join(home, d))),
+        ...OPENCODE_CONFIG_FILES.map((f) => singleFile(path.join(home, ".config", "opencode", f))),
+      ];
+    }
     case "copilot": {
       // `$COPILOT_HOME` (skills, custom agents, user MCP) plus HOME-relative
       // `.agents/skills`.
@@ -479,6 +507,12 @@ function projectSelectors(agent: AgentKind, root: string): DiscoverySelector[] {
       return [...CURSOR_USER_SKILL_DIRS.map((d) => skillsDir(at(d))), singleFile(at(".cursor/mcp.json"))];
     case "fx":
       return FX_PROJECT_SKILL_DIRS.map((d) => skillsDir(at(d)));
+    case "opencode":
+      return [
+        ...OPENCODE_PROJECT_COMMAND_DIRS.map((d) => markdownTree(at(d))),
+        ...OPENCODE_PROJECT_SKILL_DIRS.map((d) => skillsDir(at(d))),
+        ...OPENCODE_CONFIG_FILES.map((f) => singleFile(at(f))),
+      ];
     case "copilot":
       return [
         ...COPILOT_PROJECT_SKILL_DIRS.map((d) => skillsDir(at(d))),
@@ -546,6 +580,9 @@ async function prepareDiscovery(opts: DiscoveryOpts, want: { claudeJson: boolean
  *    that HOME (`.cursor/skills`, `.fx/skills`, …),
  *    project skills under the same relative dirs (fx also a bare `skills/`),
  *    and cursor's `~/.cursor/skills-cursor` built-ins are read from disk last.
+ *  - opencode: same HOME rule as cursor/fx; user skills/commands live under
+ *    `<home>/.config/opencode` (plus `.claude/skills` and `.agents/skills`),
+ *    project ones under `.opencode/`, `.claude/skills` and `.agents/skills`.
  *  - NULL: fall back to the agetor process homedir + the default `.claude/`
  *    or `.codex/` layout.
  *
@@ -628,6 +665,18 @@ export async function listAvailableCommands(
     if (projectTree) {
       for (const dir of FX_PROJECT_SKILL_DIRS) all.push(...discoverSkills(projectTree, dir, "project"));
     }
+  } else if (opts.agent === "opencode") {
+    // Markdown commands plus one-level `SKILL.md` skills. User roots are
+    // HOME-relative (read through the discovery reader); project roots read through the project
+    // tree, so a ref shows only what that ref committed. MCP config is parsed
+    // in `discoverMcpAndPluginExtensions`. No builtin list.
+    const userTree = reader.tree(homeForHomeKinds(opts));
+    for (const dir of OPENCODE_USER_COMMAND_DIRS) all.push(...discoverCommands(userTree, dir, "user"));
+    for (const dir of OPENCODE_USER_SKILL_DIRS) all.push(...discoverSkills(userTree, dir, "user"));
+    if (projectTree) {
+      for (const dir of OPENCODE_PROJECT_COMMAND_DIRS) all.push(...discoverCommands(projectTree, dir, "project"));
+      for (const dir of OPENCODE_PROJECT_SKILL_DIRS) all.push(...discoverSkills(projectTree, dir, "project"));
+    }
   } else if (opts.agent === "copilot") {
     // Skills only in this walk (agents and MCP surface as extensions in
     // `discoverMcpAndPluginExtensions`). No builtins.
@@ -689,6 +738,121 @@ function mcpServersToExtensions(
     source,
     kind: "mcp" as const,
   }));
+}
+
+/**
+ * Strip line and block comments and trailing commas from JSONC text, leaving
+ * string contents untouched. Tolerant by design: it never throws and does not
+ * validate — `parseJsonc` hands the result to `JSON.parse`. A leading BOM is
+ * dropped. An unterminated block comment swallows the rest of the text.
+ */
+export function stripJsonc(text: string): string {
+  let src = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  // Pass 1: comments. Newlines inside a comment are kept so line numbers in
+  // any later JSON.parse error still line up.
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i]!;
+    if (c === '"') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== '"') j += src[j] === "\\" ? 2 : 1;
+      out += src.slice(i, j + 1);
+      i = j + 1;
+    } else if (c === "/" && src[i + 1] === "/") {
+      while (i < src.length && src[i] !== "\n") i++;
+    } else if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? src.length : end + 2;
+      for (let k = i; k < stop; k++) if (src[k] === "\n") out += "\n";
+      i = stop;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  // Pass 2: a comma whose next significant character closes the container.
+  src = out;
+  out = "";
+  i = 0;
+  while (i < src.length) {
+    const c = src[i]!;
+    if (c === '"') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== '"') j += src[j] === "\\" ? 2 : 1;
+      out += src.slice(i, j + 1);
+      i = j + 1;
+    } else if (c === ",") {
+      let k = i + 1;
+      while (k < src.length && /\s/.test(src[k]!)) k++;
+      if (src[k] !== "}" && src[k] !== "]") out += c;
+      i++;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
+/** `JSON.parse` over `stripJsonc`; `null` for empty or unparsable text. */
+export function parseJsonc(text: string | null): any {
+  if (!text) return null;
+  try { return JSON.parse(stripJsonc(text)); } catch { return null; }
+}
+
+/** One-line summary of an OpenCode MCP server entry, never leaking auth or env.
+ *  v1 `local` servers carry `command` as an argv array; v2 may use a string. */
+function describeOpencodeMcpServer(value: Record<string, unknown>): string {
+  if (typeof value.url === "string") {
+    let host = value.url;
+    try { host = new URL(value.url).host || value.url; } catch { /* keep raw */ }
+    const type = typeof value.type === "string" && value.type !== "remote" ? value.type : "http";
+    return `${type} · ${host}`;
+  }
+  const cmd = Array.isArray(value.command) ? value.command[0] : value.command;
+  if (typeof cmd === "string" && cmd) return `stdio · ${cmd}`;
+  return "MCP server";
+}
+
+const OPENCODE_SERVER_KEYS = ["type", "command", "url"] as const;
+
+/**
+ * Server entries of one parsed `opencode.json[c]`. v2 nests them under
+ * `mcp.servers`; v1 keeps them directly under `mcp`. A v1 server may itself be
+ * named "servers", so `mcp.servers` only counts as the v2 container when it
+ * doesn't look like a server config. Entries that aren't objects are skipped.
+ */
+function opencodeMcpEntries(config: unknown): Map<string, { description: string; disabled: boolean }> {
+  const out = new Map<string, { description: string; disabled: boolean }>();
+  const mcp = (config as { mcp?: unknown } | null)?.mcp;
+  if (!mcp || typeof mcp !== "object" || Array.isArray(mcp)) return out;
+  const asRecord = (v: unknown): Record<string, unknown> | null =>
+    v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  let servers = mcp as Record<string, unknown>;
+  const nested = asRecord(servers.servers);
+  if (nested && !OPENCODE_SERVER_KEYS.some((k) => k in nested)) servers = nested;
+  for (const [name, raw] of Object.entries(servers)) {
+    const cfg = asRecord(raw);
+    if (!cfg) continue;
+    out.set(name, { description: describeOpencodeMcpServer(cfg), disabled: cfg.enabled === false });
+  }
+  return out;
+}
+
+/** MCP rows from `opencode.json[c]` layers, lowest precedence first (user
+ *  files, then project files; `.jsonc` after `.json` within a layer). A later
+ *  entry replaces an earlier one of the same name wholesale, so a project
+ *  `enabled: false` also hides the user's server; disabled servers are not
+ *  loaded by OpenCode, so they are omitted. */
+function opencodeMcpExtensions(layers: Array<{ text: string | null; source: "user" | "project" }>): AvailableExtension[] {
+  const merged = new Map<string, { description: string; disabled: boolean; source: "user" | "project" }>();
+  for (const { text, source } of layers) {
+    for (const [name, entry] of opencodeMcpEntries(parseJsonc(text))) merged.set(name, { ...entry, source });
+  }
+  return [...merged]
+    .filter(([, e]) => !e.disabled)
+    .map(([name, e]) => ({ name, insert: "@" + name, description: e.description, source: e.source, kind: "mcp" as const }));
 }
 
 /**
@@ -980,6 +1144,18 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, data: DiscoveryData
         ),
       );
     }
+  } else if (opts.agent === "opencode") {
+    // `opencode.json[c]` at `<home>/.config/opencode/` (user, always disk) and
+    // at the project root (project tree, so a ref reads the committed copy).
+    // v1 `mcp` and v2 `mcp.servers` both parse; a project server replaces a
+    // user server of the same name, disabled ones included.
+    const userDir = path.join(homeForHomeKinds(opts), ".config", "opencode");
+    all.push(
+      ...opencodeMcpExtensions([
+        ...OPENCODE_CONFIG_FILES.map((f) => ({ text: reader.text(path.join(userDir, f)) || null, source: "user" as const })),
+        ...(root ? OPENCODE_CONFIG_FILES.map((f) => ({ text: projectTree?.read(f) ?? null, source: "project" as const })) : []),
+      ]),
+    );
   } else if (opts.agent === "copilot") {
     // User MCP: `$COPILOT_HOME/mcp-config.json`. Project MCP: `.mcp.json`
     // (`mcpServers`) and `.github/mcp.json` (`mcpServers`, or the VS Code

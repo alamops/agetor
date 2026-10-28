@@ -22,6 +22,9 @@ import { daemonLog } from "./daemon-log.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resumeIncompleteImports } from "./claude-session-import.ts";
+import { resumeIncompleteOpencodeImports } from "./opencode-session-import.ts";
+import { checkAllHarnesses } from "./agent-status.ts";
+import { applyHarnessAutoEnable } from "./harness-auto-enable.ts";
 
 /**
  * Headless Agetor core — the same Bun server + orchestrator the desktop app
@@ -282,6 +285,25 @@ export async function runDaemon(): Promise<void> {
     });
   }, 0);
   importResumeTimer.unref();
+
+  // Same for an OpenCode import left `importing` by a crash.
+  const opencodeImportResumeTimer = setTimeout(() => {
+    resumeIncompleteOpencodeImports().catch((err) => {
+      daemonLog(`opencode session import resume failed: ${(err as Error)?.message ?? String(err)}`);
+    });
+  }, 0);
+  opencodeImportResumeTimer.unref();
+
+  // D-14: turn on built-in harnesses whose CLI is installed. Once, after the
+  // API binds; `GET /harnesses` repeats it as CLIs appear later. Never blocks
+  // boot, and a failed probe only skips this pass.
+  setTimeout(() => {
+    checkAllHarnesses()
+      .then((statuses) => applyHarnessAutoEnable(statuses))
+      .catch((err) => {
+        daemonLog(`harness auto-enable failed: ${(err as Error)?.message ?? String(err)}`);
+      });
+  }, 0).unref();
 
   // Archived-history retention: first pass ~90 s after boot (after the API is
   // up and restore/seed work has settled), then every 24 h; each fire reads the

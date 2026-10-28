@@ -37,6 +37,7 @@ import {
   type AgentStatus,
   type Harness,
   type Isolation,
+  type OpencodeServerMode,
   type Pipeline,
   type Speed,
   type TaskReference,
@@ -47,6 +48,7 @@ import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
 import { PipelinePicker } from "@/components/pipelines";
+import { OpencodeServerPicker, opencodeServerLock, showOpencodeServerPicker } from "./OpencodeServerPicker";
 import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import { TaskTypePicker } from "./TaskTypePicker";
@@ -79,6 +81,10 @@ interface Props {
       effort: string | null;
       speed: Speed;
       maxMode: boolean;
+      /** OpenCode's server option (D-4) — always sent, `"shared"` for any
+       *  other kind (stored and ignored, like `maxMode`). A selected
+       *  profile's own value is sent while one is picked. */
+      opencodeServer: OpencodeServerMode;
       references: TaskReference[];
       taskType: TaskType;
       /** Id of the {@link AgentProfile} this task launches from, or null —
@@ -249,6 +255,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   const [effort, setEffort] = useState<string | null>(DEFAULT_EFFORT["claude-code"]);
   const [speed, setSpeed] = useState<Speed>("off");
   const [maxMode, setMaxMode] = useState(false);
+  const [opencodeServer, setOpencodeServer] = useState<OpencodeServerMode>("shared");
   // Spins the Model label's ↻ button while a manual `onRefreshModels` probe
   // is in flight for the currently-selected harness.
   const [refreshingModels, setRefreshingModels] = useState(false);
@@ -304,14 +311,15 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // picks (mode/model/effort are kind-specific, not alias-specific).
   // Reads/writes happen synchronously inside `switchAgent` — no effects, so
   // no transient wrong-slot writes on render commit.
-  const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null; speed: Speed; maxMode: boolean }>>({
-    "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"], speed: "off", maxMode: false },
-    "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], speed: "off", maxMode: false },
-    "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], speed: "off", maxMode: false },
-    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], speed: "off", maxMode: false },
-    "antigravity": { mode: initialMode("antigravity"), model: DEFAULT_MODEL["antigravity"], effort: DEFAULT_EFFORT["antigravity"], speed: "off", maxMode: false },
-    "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], speed: "off", maxMode: false },
-    "copilot": { mode: initialMode("copilot"), model: DEFAULT_MODEL["copilot"], effort: DEFAULT_EFFORT["copilot"], speed: "off", maxMode: false },
+  const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null; speed: Speed; maxMode: boolean; opencodeServer: OpencodeServerMode }>>({
+    "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"], speed: "off", maxMode: false, opencodeServer: "shared" },
+    "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], speed: "off", maxMode: false, opencodeServer: "shared" },
+    "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], speed: "off", maxMode: false, opencodeServer: "shared" },
+    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], speed: "off", maxMode: false, opencodeServer: "shared" },
+    "antigravity": { mode: initialMode("antigravity"), model: DEFAULT_MODEL["antigravity"], effort: DEFAULT_EFFORT["antigravity"], speed: "off", maxMode: false, opencodeServer: "shared" },
+    "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], speed: "off", maxMode: false, opencodeServer: "shared" },
+    "opencode": { mode: initialMode("opencode"), model: DEFAULT_MODEL["opencode"], effort: DEFAULT_EFFORT["opencode"], speed: "off", maxMode: false, opencodeServer: "shared" },
+    "copilot": { mode: initialMode("copilot"), model: DEFAULT_MODEL["copilot"], effort: DEFAULT_EFFORT["copilot"], speed: "off", maxMode: false, opencodeServer: "shared" },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -336,6 +344,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         const e = prefs[`lastEffort:${a}`];
         const sp = prefs[`lastSpeed:${a}`];
         const mm = prefs[`lastMaxMode:${a}`];
+        // Only OpenCode stores a server pick (`lastOpencodeServer:opencode`);
+        // every other kind keeps "shared".
+        const os = a === "opencode" ? prefs[`lastOpencodeServer:${a}`] : undefined;
         if (md && AGENT_OPTIONS[a].modes.some((x) => x.id === md)) {
           agentCache.current[a].mode = md;
         }
@@ -364,6 +375,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         if (mm === "true" || mm === "false") {
           agentCache.current[a].maxMode = mm === "true";
         }
+        if (os === "shared" || os === "standalone") {
+          agentCache.current[a].opencodeServer = os;
+        }
       };
       seed("claude-code");
       seed("codex");
@@ -371,6 +385,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       seed("gemini");
       seed("antigravity");
       seed("fx");
+      seed("opencode");
       seed("copilot");
       const active = agentCache.current[kindRef.current];
       setMode(active.mode);
@@ -378,6 +393,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       setEffort(active.effort);
       setSpeed(active.speed);
       setMaxMode(active.maxMode);
+      setOpencodeServer(active.opencodeServer);
     }).catch(() => { /* preferences failure is non-fatal — defaults stay */ });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -390,7 +406,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     // Stash the current picks under the current kind, then restore the
     // next kind's picks. Aliases of the same kind share the cache slot, so
     // a swap claude-work ↔ claude-personal keeps the user's last pick.
-    agentCache.current[kind] = { mode, model, effort, speed, maxMode };
+    agentCache.current[kind] = { mode, model, effort, speed, maxMode, opencodeServer };
     const saved = agentCache.current[nextKind];
     setAgent(nextId);
     setMode(saved.mode);
@@ -398,6 +414,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     setEffort(saved.effort);
     setSpeed(saved.speed);
     setMaxMode(saved.maxMode);
+    setOpencodeServer(saved.opencodeServer);
   };
 
   const selectedStatus = agents.find((a) => a.harnessId === agent);
@@ -633,6 +650,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
         effort: selectedProfile ? selectedProfile.effort : effort,
         speed: selectedProfile ? selectedProfile.speed : (kind === "cursor" || kind === "fx" ? speed : "off"),
         maxMode: selectedProfile ? selectedProfile.maxMode : (kind === "cursor" ? maxMode : false),
+        opencodeServer: selectedProfile ? selectedProfile.opencodeServer : (kind === "opencode" ? opencodeServer : "shared"),
         references,
         taskType,
         // Omit entirely when no profile/pipeline is selected — an explicit
@@ -655,12 +673,13 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     // picks, and there's no "last used profile"/"last used pipeline"
     // preference (plan D12).
     if (!selectedProfile && !selectedPipeline) {
-      agentCache.current[kind] = { mode, model, effort, speed, maxMode };
+      agentCache.current[kind] = { mode, model, effort, speed, maxMode, opencodeServer };
       void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
       void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
       if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
       void api.setPreference(`lastSpeed:${kind}`, kind === "cursor" || kind === "fx" ? speed : "off").catch(() => {});
       void api.setPreference(`lastMaxMode:${kind}`, String(kind === "cursor" && maxMode)).catch(() => {});
+      if (kind === "opencode") void api.setPreference(`lastOpencodeServer:${kind}`, opencodeServer).catch(() => {});
     }
     setTitle("");
     setPrompt("");
@@ -996,6 +1015,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
                         : kind === "antigravity"
                         ? "Routed to agy's --mode plan — a real read-only planning mode."
+                        : kind === "opencode"
+                        ? "Routed to OpenCode's Plan agent — no file edits, but shell commands still run."
                         : kind === "fx"
                         ? "fx has no native plan mode — routed to 'ask': only pre-approved rules run; anything else surfaces as an approval card in the run panel."
                         : "Plan only — agent describes what it would do without making changes."
@@ -1109,6 +1130,18 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                     options={speedOptions}
                     value={speed}
                     onChange={setSpeed}
+                  />
+                </div>
+              )}
+
+              {showOpencodeServerPicker(kind, selectedStatus?.version) && (
+                <div className="space-y-1">
+                  <label className="text-muted-foreground">OpenCode server</label>
+                  <OpencodeServerPicker
+                    testId="new-task-opencode-server"
+                    value={opencodeServer}
+                    onChange={setOpencodeServer}
+                    locked={opencodeServerLock(selectedHarness)}
                   />
                 </div>
               )}

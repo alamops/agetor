@@ -115,6 +115,7 @@ function plannedAgent(over: Partial<PlannedAgent> = {}): PlannedAgent {
     mode: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     instructions: "",
     skills: [],
     warnings: [],

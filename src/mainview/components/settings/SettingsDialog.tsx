@@ -142,7 +142,7 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
  *  badge everywhere a harness/template kind is shown. Extend this list (not
  *  the individual call sites) as a kind graduates out of experimental. */
 function isExperimentalKind(kind: AgentKind): boolean {
-  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx" || kind === "copilot";
+  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx" || kind === "opencode" || kind === "copilot";
 }
 
 function stringifyEnv(env: Record<string, string>): string {
@@ -209,6 +209,11 @@ const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: 
     label: "HOME override (absolute path; optional)",
     slug: "fx-2",
     help: "HOME override — fx has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, so fx's state (~/.fx) lands under this path, giving this harness its own account.",
+  },
+  opencode: {
+    label: "HOME override (absolute path; optional)",
+    slug: "opencode-2",
+    help: "HOME override — OpenCode has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, with XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME and XDG_CACHE_HOME pointed at directories under it, so OpenCode's config, auth and sessions land under this path, giving this harness its own account.",
   },
   copilot: {
     label: "COPILOT_HOME override (absolute path; optional)",
@@ -1291,18 +1296,18 @@ function GeneralSection({
       <section className="space-y-1">
         <div className="flex items-center justify-between gap-4">
           <label htmlFor="claude-sessions-launch-scan" className="text-xs text-muted-foreground">
-            Look for Claude Code sessions on launch
+            Look for Claude Code and OpenCode sessions on launch
           </label>
           <Switch
             id="claude-sessions-launch-scan"
             data-testid="claude-sessions-launch-scan"
             checked={launchScan}
             onCheckedChange={setLaunchScanPref}
-            aria-label="Look for Claude Code sessions on launch"
+            aria-label="Look for Claude Code and OpenCode sessions on launch"
           />
         </div>
         <p className="text-[11px] text-muted-foreground">
-          On startup, notice Claude Code sessions that were started outside Agetor so you can import them.
+          On startup, notice Claude Code and OpenCode sessions that were started outside Agetor so you can import them.
         </p>
       </section>
 
@@ -1537,6 +1542,17 @@ function HarnessesSection({
                       {status.authHelp}
                     </div>
                   )}
+                  {/* Neutral, non-blocking lines (D-16): a missing login or
+                      an available upgrade never stops a run. */}
+                  {status?.notices?.map((notice) => (
+                    <div
+                      key={notice}
+                      data-testid="harness-status-notice"
+                      className="text-[11px] text-muted-foreground"
+                    >
+                      {notice}
+                    </div>
+                  ))}
                 </div>
                 <Switch
                   checked={pendingToggle[h.id] ?? h.enabled}
@@ -1913,8 +1929,8 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-3 gap-1 sm:grid-cols-7">
-          {(["claude-code", "codex", "cursor", "gemini", "antigravity", "fx", "copilot"] as AgentKind[]).map((k) => {
+        <div className="grid grid-cols-3 gap-1 sm:grid-cols-8">
+          {(["claude-code", "codex", "cursor", "gemini", "antigravity", "fx", "opencode", "copilot"] as AgentKind[]).map((k) => {
             const experimental = isExperimentalKind(k);
             return (
               <Button

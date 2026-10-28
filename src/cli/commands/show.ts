@@ -3,10 +3,11 @@ import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { ApiError, type AgetorClient } from "../api-client.ts";
-import { AGENT_OPTIONS, defaultModeFor, type AgentKind, type Run, type Task } from "../../shared/types.ts";
+import { defaultModeFor, type Run, type Task } from "../../shared/types.ts";
 import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import { colorRunStatus } from "./pipeline.ts";
+import { opencodeServerText, profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -20,7 +21,16 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
 
   if (flags.json) return printJson({ task, runs, pending });
 
-  const modeText = await resolveModeText(client, task.agent, task.mode);
+  // One harness lookup serves the mode default and the OpenCode server line;
+  // a failed lookup falls back to the built-in-id heuristic. It is skipped
+  // when neither needs it: a stored mode on a built-in harness of another
+  // kind (a built-in harness's id is its kind).
+  const builtinCtx = profileHarnessContext(task.agent, null);
+  const needsLookup = task.mode == null || builtinCtx.kind == null || builtinCtx.kind === "opencode";
+  const harnessCtx = needsLookup
+    ? profileHarnessContext(task.agent, await client.listHarnesses().catch(() => null))
+    : builtinCtx;
+  const modeText = resolveModeText(harnessCtx, task.mode);
 
   // A step task's title is `<pipeline> · <step>`, both locally written names.
   out(`${c.bold(escapeFreeText(task.title))}  ${c.dim(task.id)}`);
@@ -32,6 +42,10 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${task.agent}${agentNote}` +
       `   ${label("model")} ${escapeControlChars(task.model ?? "-")}   ${label("mode")} ${escapeControlChars(modeText)}`,
   );
+  // The parent of a pipeline never runs an agent, so its server option means nothing.
+  if (harnessCtx.kind === "opencode" && !task.pipelineId) {
+    out(`  ${label("opencode server")} ${opencodeServerText(task.opencodeServer ?? "shared", harnessCtx)}`);
+  }
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
   if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);
   // Last-seen worktree checkout (recorded at run start/settle, terminal open,
@@ -54,6 +68,13 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
       `  ${label("imported")} ${escapeControlChars(task.importedClaude.sessionId)} ` +
         `(on ${escapeControlChars(branch)}, ${task.importedClaude.status})`,
     );
+  } else if (task.importedOpencode) {
+    const imported = task.importedOpencode;
+    out(
+      `  ${label("imported")} ${escapeControlChars(imported.sessionId)} ` +
+        `(OpenCode via ${escapeControlChars(imported.harnessId)}, ${imported.status})`,
+    );
+    if (imported.status === "failed" && imported.error) out(c.yellow(`    ⚠ ${escapeFreeText(imported.error)}`));
   }
   if (task.pipelineId && task.pipelineRun) {
     const progress = pipelineStepProgress(task.pipelineRun);
@@ -102,34 +123,17 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
  * §3.6/`defaultModeFor`): a stored `null` mode no longer prints the literal
  * string `"auto"` — for fx specifically that was a lie, since a null fx mode
  * actually spawns as `yolo` ("Full access") via `defaultModeFor`, not
- * `auto`. Resolves the task's harness kind (`client.listHarnesses()` first —
- * covers a custom-account harness whose id differs from its `AgentKind` —
- * falling back to treating `agent` itself as a built-in kind id, which is
- * how every built-in harness is seeded, mirroring `defaultNonInteractiveMode`
- * in `add.ts`) and prints `defaultModeFor(kind) + " (default)"`; when the
- * kind can't be resolved at all (harness deleted, listHarnesses failed)
- * prints `"-"` rather than guessing.
+ * `auto`. The harness kind comes from `profileHarnessContext` (the
+ * `listHarnesses()` row first — covers a custom-account harness whose id
+ * differs from its `AgentKind` — falling back to treating `agent` itself as a
+ * built-in kind id, which is how every built-in harness is seeded, mirroring
+ * `defaultNonInteractiveMode` in `add.ts`) and the text is
+ * `defaultModeFor(kind) + " (default)"`; when the kind can't be resolved at
+ * all (harness deleted, listHarnesses failed) it is `"-"` rather than a guess.
  */
-async function resolveModeText(
-  client: AgetorClient,
-  agent: string,
-  mode: string | null,
-): Promise<string> {
+function resolveModeText(harness: ProfileHarnessContext, mode: string | null): string {
   if (mode) return mode;
-  const kind = await resolveAgentKind(client, agent);
-  return kind ? `${defaultModeFor(kind)} (default)` : "-";
-}
-
-async function resolveAgentKind(client: AgetorClient, agentId: string): Promise<AgentKind | null> {
-  try {
-    const { harnesses } = await client.listHarnesses();
-    const found = harnesses.find((h) => h.id === agentId);
-    if (found) return found.kind;
-  } catch {
-    // listHarnesses failed — fall through to the built-in-id heuristic below
-    // rather than failing the whole `show` command over a display nicety.
-  }
-  return agentId in AGENT_OPTIONS ? (agentId as AgentKind) : null;
+  return harness.kind ? `${defaultModeFor(harness.kind)} (default)` : "-";
 }
 
 /** ` (deleted)` when the task's bound profile no longer exists — checked

@@ -309,12 +309,13 @@ async function batchCatFile(cwd: string, ref: string, paths: string[]): Promise<
 export const PROJECT_CAPABILITY_PATHSPECS: readonly string[] = [
   ".claude", ".codex", ".mcp.json",
   ".cursor", ".agents", ".grok", ".fx", ".opencode", ".claw", "skills", ".github",
+  "opencode.json", "opencode.jsonc",
 ];
 
 /**
  * Load a `ProjectTree` view of `ref`'s committed tree in the repo at `dir`,
  * scoped to `pathspecs` (default: the capability-discovery trees — `.claude`,
- * `.codex`, `.mcp.json`, and the cursor/fx skill dirs). Two git spawns total
+ * `.codex`, `.mcp.json`, `opencode.json[c]`, `.github` for copilot, and the cursor/fx/opencode skill dirs). Two git spawns total
  * regardless of entry count: one
  * `ls-tree` to enumerate, one `cat-file --batch` to fetch the content of
  * whichever listed paths `shouldRead` accepts (default: all of them).

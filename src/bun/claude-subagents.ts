@@ -79,6 +79,10 @@
  * design — `checkStale`'s self-correction (a falsely-stale row resuming)
  * depends on that looseness.
  *
+ * (`parentKind: "opencode_subagent"` rows belong to OpenCode tasks, not this
+ * watcher: their `sourcePath` is a pseudo `opencode-session:<child>` id that
+ * `opencode-subagents.ts` fills from `session export` — never tailed here.)
+ *
  * ── Workflows (`/workflow`) ────────────────────────────────────────────────
  *
  * A Workflow is claude's multi-agent orchestration tool. It is ALWAYS launched
@@ -1636,7 +1640,7 @@ export function subagentActivityWithin(taskId: string, withinMs: number): boolea
   }
   const now = Date.now();
   for (const row of rows) {
-    if (row.status !== "running" || !row.sourcePath) continue;
+    if (row.status !== "running" || !row.sourcePath || row.parentKind === "opencode_subagent" || row.sourcePath.startsWith("opencode-session:")) continue;
     try {
       if (now - statSync(row.sourcePath).mtimeMs < withinMs) return true;
     } catch { /* vanished / unreadable — not fresh */ }
@@ -1959,6 +1963,9 @@ export function attachSubagentWatcher(opts: {
    *  the old synchronous `for (const row of listForTask(taskId))` loop, moved
    *  verbatim — each `return` below is the old `continue`. */
   function seedRow(row: Subagent): void {
+    // OpenCode child sessions: `sourcePath` is not a file, and
+    // opencode-subagents.ts owns their status — never rehydrate them here.
+    if (row.parentKind === "opencode_subagent" || row.sourcePath.startsWith("opencode-session:")) return;
     // A GitHub Copilot subagent row belongs to the copilot driver: its events
     // were persisted from the copilot run's own JSONL by the orchestrator's
     // copilot sink, and it has no Claude transcript to tail. Seeding it as a

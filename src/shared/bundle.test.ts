@@ -38,6 +38,7 @@ function profile(id: string, name: string, overrides: Partial<AgentProfile> = {}
     mode: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     instructions: "",
     skills: [],
     createdAt: 1,
@@ -1941,5 +1942,50 @@ describe("speed (D15)", () => {
     expectError(onlyAgent({ speed: 1 }), "invalid", "speed must be one of off, fast, ultrafast");
     // A conflicting fast is still type-checked: the file is malformed.
     expectError(onlyAgent({ speed: "fast", fast: "yes" }), "invalid", "fast must be true or false");
+  });
+});
+
+describe("opencodeServer", () => {
+  const OC_HARNESSES = [...HARNESSES, { id: "opencode", kind: "opencode" as const, label: "OpenCode" }];
+  const ocProfile = (id: string, name: string, overrides: Partial<AgentProfile> = {}) =>
+    profile(id, name, { harness: "opencode", model: "anthropic/claude-sonnet-5.5", effort: null, ...overrides });
+  const onlyAgent = (a: Record<string, unknown>) => bundleJson({ agents: [agentJson(a)], pipelines: [] });
+
+  test("an export writes it only when it isn't shared, so other exports stay byte-identical", () => {
+    const r = mustBuild(
+      { all: true },
+      [ocProfile("p1", "Shared"), ocProfile("p2", "Alone", { opencodeServer: "standalone" }), profile("p3", "Claude")],
+      [],
+      OC_HARNESSES,
+    );
+    const byName = new Map(r.bundle.agents.map((a) => [a.name, a]));
+    expect(byName.get("Alone")!.opencodeServer).toBe("standalone");
+    expect(Object.hasOwn(byName.get("Shared")!, "opencodeServer")).toBe(false);
+    expect(Object.hasOwn(byName.get("Claude")!, "opencodeServer")).toBe(false);
+    expect(r.text.match(/"opencodeServer"/g)).toHaveLength(1);
+    expect(r.text).toContain('"opencodeServer": "standalone"');
+  });
+
+  test("it round-trips through serialize and parse", () => {
+    const built = mustBuild({ agentIds: ["p1"] }, [ocProfile("p1", "Alone", { opencodeServer: "standalone" })], [], OC_HARNESSES);
+    const parsed = parseBundleText(built.text);
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.bundle.agents[0]).toMatchObject({ opencodeServer: "standalone" });
+    expect(parsed.bundle.agents[0]).toEqual(built.bundle.agents[0]!);
+  });
+
+  test("an older file (no field) and an explicit shared both read as shared", () => {
+    for (const raw of [agentJson(), agentJson({ opencodeServer: "shared" }), agentJson({ opencodeServer: null })]) {
+      const r = parseObj(bundleJson({ agents: [raw], pipelines: [] }));
+      if (!r.ok) throw new Error(r.error);
+      expect(r.bundle.agents[0]!.opencodeServer ?? "shared").toBe("shared");
+    }
+  });
+
+  test("a junk value is refused with a field error naming the modes", () => {
+    expectError(onlyAgent({ opencodeServer: "Shared" }), "invalid", 'Agent "worker" opencodeServer must be one of shared, standalone');
+    expectError(onlyAgent({ opencodeServer: "" }), "invalid", "opencodeServer must be one of shared, standalone");
+    expectError(onlyAgent({ opencodeServer: 1 }), "invalid", "opencodeServer must be one of shared, standalone");
+    expectError(onlyAgent({ opencodeServer: true }), "invalid", "opencodeServer must be one of shared, standalone");
   });
 });

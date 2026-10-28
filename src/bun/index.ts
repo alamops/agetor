@@ -7,6 +7,9 @@ import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
+import { resumeIncompleteOpencodeImports } from "./opencode-session-import.ts";
+import { checkAllHarnesses } from "./agent-status.ts";
+import { applyHarnessAutoEnable } from "./harness-auto-enable.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { beginLagLabel, startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
@@ -461,6 +464,24 @@ setTimeout(() => {
   startClaudeSessionLaunchScan().catch((err) => {
     console.error("[agetor] claude session launch scan failed:", err);
   });
+}, 0);
+
+// An OpenCode import left `importing` by a crash resumes the same way.
+setTimeout(() => {
+  resumeIncompleteOpencodeImports().catch((err) => {
+    console.error("[agetor] opencode session import resume failed:", err);
+  });
+}, 0);
+
+// D-14: turn on built-in harnesses whose CLI is installed. Once, after the API
+// binds (`GET /harnesses` repeats it as CLIs appear later). Fire-and-forget:
+// a failed probe only skips this pass and never delays the window.
+setTimeout(() => {
+  checkAllHarnesses()
+    .then((statuses) => applyHarnessAutoEnable(statuses))
+    .catch((err) => {
+      console.error("[agetor] harness auto-enable failed:", err);
+    });
 }, 0);
 
 // Warn the user before quitting when runs are still active. Electrobun's

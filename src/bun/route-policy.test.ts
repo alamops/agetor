@@ -615,6 +615,7 @@ describe("path-valued fields (D24)", () => {
       "DELETE /projects",
       "GET /projects/settings",
       "POST /claude-sessions/import",
+      "POST /opencode-sessions/import",
       "POST /refs/resolve",
       "PUT /projects/settings",
     ]);

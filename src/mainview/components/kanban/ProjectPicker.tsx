@@ -3,7 +3,7 @@ import { Folder, GitBranch, Import, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { SearchSelect } from "@/components/ui/search-select";
 import { CloneProjectDialog } from "@/components/kanban/CloneProjectDialog";
-import { ImportClaudeSessionsDialog } from "@/components/kanban/ImportClaudeSessionsDialog";
+import { ImportSessionsDialog } from "@/components/kanban/ImportSessionsDialog";
 import type { Project } from "../../../shared/types.ts";
 
 interface Props {
@@ -142,7 +142,7 @@ export function ProjectPicker({
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-accent/60"
             >
               <Import className="size-3.5" aria-hidden />
-              Import Claude Code sessions…
+              Import sessions…
             </button>
           </>
         }
@@ -155,7 +155,7 @@ export function ProjectPicker({
         onClose={() => setCloneOpen(false)}
         onCloned={() => { void refresh(); }}
       />
-      <ImportClaudeSessionsDialog
+      <ImportSessionsDialog
         open={importOpen}
         onClose={() => setImportOpen(false)}
         onImported={() => { void refresh(); }}
