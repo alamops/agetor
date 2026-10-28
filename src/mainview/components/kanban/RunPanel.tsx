@@ -1011,7 +1011,7 @@ function RunPanelBody({
   // Declared BEFORE listPendingInteractions/listRuns/listSubagents (below)
   // and every other one-shot fetch in this component — deliberately.
   // Passive effects commit in declaration order, so on a task switch this
-  // effect's `api.subscribeTask` call (which opens the EventSource) fires
+  // effect's `api.subscribeTask` call (which opens the event-stream fetch) fires
   // before any of those `fetch()` calls are issued. The webview has a
   // small, shared per-host connection budget (WKWebView observed at 6 at
   // rest), and a switch used to fire ~8 one-shot requests ahead of the new
@@ -1250,7 +1250,7 @@ function RunPanelBody({
         // PR-mergeability now instead of waiting out the fallback timer.
         markStreamReady();
         // The server sends `replay_meta` as the FIRST frame of every (re)connect
-        // — including an EventSource-internal reconnect after a network blip,
+        // — including a reconnect `openEventStream` makes on its own after a network blip,
         // which reuses this same subscription/effect instance rather than
         // re-running it. Re-arming the settle window here (not just at effect
         // setup) is what makes the kick-storm suppression above cover BOTH the
@@ -2805,7 +2805,7 @@ function RunPanelBody({
   // switch, from which the real fetch's result then supersedes it), and a
   // `pipeline` global event for the parent — delivered through the
   // `subscribePipelineGlobalEvents` store App.tsx feeds from its single
-  // `/events` subscription, never a second EventSource — evicts that
+  // `/events` subscription, never a second event stream — evicts that
   // parent's entry outright (see the subscription right below), since a
   // Restart re-captures the frozen graph and the cached one would then be
   // wrong on the next switch. `"missing"` is the parent 404-ing (deleted out

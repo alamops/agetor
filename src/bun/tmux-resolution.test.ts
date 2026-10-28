@@ -1,12 +1,12 @@
 import { test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmTestDataDir } from "./test-data-dir.ts";
 
-// Top-level: db.ts (imported transitively by both tmux-resolution.ts and
-// disclaim.ts) captures AGETOR_DATA_DIR at first import — see the same
-// convention in disclaim.test.ts. A `beforeAll` would race with whichever
+// Top-level: db.ts (imported transitively by tmux-resolution.ts) captures
+// AGETOR_DATA_DIR at first import — the convention every db-importing test
+// follows. A `beforeAll` would race with whichever
 // test file's import wins the module-cache race in `bun test`'s single
 // process, so this must be a genuine dynamic `import()` deferred until
 // after the env var below is set, not a static import.
@@ -18,8 +18,8 @@ let tmuxSocketName: () => string | null;
 let tmuxSocketArgs: () => string[];
 let buildEnsureServerArgv: (tmuxBin: string) => string[];
 let ensureDisclaimedServer: () => Promise<void>;
-let DISCLAIM_PREF_KEY: string;
-let preferences: typeof import("./db.ts").preferences;
+let resetTmuxServerEnvCleared: () => void;
+let setDisclaimSwitch: (on: boolean) => void;
 let dataDir: string;
 
 beforeAll(async () => {
@@ -29,9 +29,10 @@ beforeAll(async () => {
     tmuxSocketArgs,
     buildEnsureServerArgv,
     ensureDisclaimedServer,
+    __resetTmuxServerEnvClearedForTest: resetTmuxServerEnvCleared,
   } = await import("./tmux-resolution.ts"));
-  ({ DISCLAIM_PREF_KEY } = await import("./disclaim.ts"));
-  ({ preferences, dataDir } = await import("./db.ts"));
+  ({ setDisclaimSwitch } = await import("./disclaim.ts"));
+  ({ dataDir } = await import("./db.ts"));
 });
 
 afterAll(() => {
@@ -60,7 +61,7 @@ beforeEach(() => {
 
 afterEach(() => {
   (Object.keys(ORIGINAL) as (keyof typeof ORIGINAL)[]).forEach(restoreEnv);
-  preferences.set(DISCLAIM_PREF_KEY, "true");
+  setDisclaimSwitch(true);
 });
 
 // --- deriveTmuxSocketName --------------------------------------------------
@@ -90,28 +91,17 @@ test('deriveTmuxSocketName: empty-basename edge falls back to "agetor"', () => {
 
 // --- buildEnsureServerArgv --------------------------------------------------
 
-test.skipIf(process.platform !== "darwin")(
-  "buildEnsureServerArgv: prepends AGETOR_DISCLAIM_BIN when enabled",
-  () => {
-    process.env.AGETOR_DISCLAIM_BIN = "/bin/echo";
-    preferences.set(DISCLAIM_PREF_KEY, "true");
-    const argv = buildEnsureServerArgv("/path/to/tmux");
-    expect(argv[0]).toBe("/bin/echo");
-    expect(argv).toContain("/path/to/tmux");
-    expect(argv).toContain("start-server");
-  },
-);
-
-test.skipIf(process.platform !== "darwin")(
-  'buildEnsureServerArgv: passthrough when the pref is the literal string "false"',
-  () => {
-    process.env.AGETOR_DISCLAIM_BIN = "/bin/echo";
-    preferences.set(DISCLAIM_PREF_KEY, "false");
-    const argv = buildEnsureServerArgv("/path/to/tmux");
-    expect(argv[0]).toBe("/path/to/tmux");
-    expect(argv).toContain("start-server");
-  },
-);
+// The disclaim wrapping moved into coreSpawn (core-spawn.ts, the only caller of
+// disclaimArgv): the argv built here must stay the plain tmux command, or the
+// helper would be exec'd twice (P3).
+test("buildEnsureServerArgv: the plain tmux command, never pre-wrapped with the disclaim helper", () => {
+  process.env.AGETOR_DISCLAIM_BIN = "/bin/echo";
+  setDisclaimSwitch(true);
+  process.env.AGETOR_TMUX_SOCKET = "foo";
+  expect(buildEnsureServerArgv("/path/to/tmux")).toEqual(["/path/to/tmux", "-L", "foo", "start-server"]);
+  setDisclaimSwitch(false);
+  expect(buildEnsureServerArgv("/path/to/tmux")).toEqual(["/path/to/tmux", "-L", "foo", "start-server"]);
+});
 
 // --- ensureDisclaimedServer --------------------------------------------------
 
@@ -120,6 +110,51 @@ test("ensureDisclaimedServer: resolves without throwing", async () => {
   process.env.AGETOR_DISCLAIM_BIN = "/bin/echo";
   await expect(ensureDisclaimedServer()).resolves.toBeUndefined();
 });
+
+test("ensureDisclaimedServer: never throws when tmux is not installed", async () => {
+  process.env.AGETOR_TMUX_BIN = "definitely-not-tmux-xyz123";
+  await expect(ensureDisclaimedServer()).resolves.toBeUndefined();
+});
+
+test.skipIf(process.platform !== "darwin")(
+  "ensureDisclaimedServer: start-server goes through the helper, then clears a stale AGETOR_API_TOKEN from the server env exactly once per process",
+  async () => {
+    const scratch = mkdtempSync(path.join(tmpdir(), "agetor-tmux-resolution-stub-"));
+    const log = path.join(scratch, "calls.log");
+    const disclaimStub = path.join(scratch, "disclaim");
+    const tmuxStub = path.join(scratch, "tmux");
+    // The disclaim stub records what it is asked to run, then execs it (like the
+    // real helper). The tmux stub records its own env view of the token.
+    writeFileSync(disclaimStub, `#!/bin/sh\nprintf 'disclaim %s\\n' "$*" >> '${log}'\nexec "$@"\n`);
+    writeFileSync(tmuxStub, `#!/bin/sh\nprintf 'tmux token=%s %s\\n' "\${AGETOR_API_TOKEN-unset}" "$*" >> '${log}'\nexit 0\n`);
+    chmodSync(disclaimStub, 0o755);
+    chmodSync(tmuxStub, 0o755);
+    process.env.AGETOR_DISCLAIM_BIN = disclaimStub;
+    process.env.AGETOR_TMUX_BIN = tmuxStub;
+    process.env.AGETOR_TMUX_SOCKET = "agetor-tmux-res-test";
+    const savedToken = process.env.AGETOR_API_TOKEN;
+    process.env.AGETOR_API_TOKEN = "master-token-for-test";
+    setDisclaimSwitch(true);
+    resetTmuxServerEnvCleared();
+    try {
+      await ensureDisclaimedServer();
+      await ensureDisclaimedServer();
+      const lines = readFileSync(log, "utf8").split("\n").filter(Boolean);
+      const starts = lines.filter((l) => l.startsWith("disclaim ") && l.includes("start-server"));
+      const clears = lines.filter((l) => l.startsWith("disclaim ") && l.includes("set-environment -g -u AGETOR_API_TOKEN"));
+      expect(starts).toHaveLength(2); // start-server is idempotent, repeated each call
+      expect(starts[0]).toBe(`disclaim ${tmuxStub} -L agetor-tmux-res-test start-server`);
+      expect(clears).toHaveLength(1); // the stale-env cleanup is once per process
+      expect(lines.some((l) => l.startsWith("tmux ") && l.includes("set-environment -g -u AGETOR_API_TOKEN"))).toBe(true);
+      // No tmux client saw the master token.
+      expect(lines.filter((l) => l.startsWith("tmux ")).every((l) => l.startsWith("tmux token=unset "))).toBe(true);
+    } finally {
+      if (savedToken === undefined) delete process.env.AGETOR_API_TOKEN;
+      else process.env.AGETOR_API_TOKEN = savedToken;
+      resetTmuxServerEnvCleared();
+    }
+  },
+);
 
 // --- tmuxSocketName ----------------------------------------------------------
 

@@ -18,7 +18,8 @@
  * an `agetor.sqlite` behind).
  */
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -76,6 +77,8 @@ type Daemon = {
   proc: ReturnType<typeof Bun.spawn>;
 };
 
+const MASTER_TOKEN = randomBytes(32).toString("hex");
+
 async function bootDaemon(dir: string, port: number, env: Record<string, string | undefined>): Promise<Daemon> {
   const proc = Bun.spawn(["bun", "src/bun/headless.ts"], {
     cwd: process.cwd(),
@@ -85,6 +88,10 @@ async function bootDaemon(dir: string, port: number, env: Record<string, string 
       AGETOR_API_PORT: String(port),
       AGETOR_DAEMON_IDLE_MS: "0",
       AGETOR_TEST_BLOCK_ROUTE: "1",
+      // `/test/block-event-loop` is desktop-only (an app-token route), and
+      // `agetor-core.json` only ever holds the CLI-scoped token, so the test
+      // drives the child with a master token it chose itself.
+      AGETOR_API_TOKEN: MASTER_TOKEN,
       ...env,
     },
     stdout: "pipe",
@@ -117,8 +124,7 @@ async function bootDaemon(dir: string, port: number, env: Record<string, string 
     proc.kill();
     throw new Error(`daemon never came up: ${stderrText}`);
   }
-  const creds = JSON.parse(readFileSync(path.join(dir, "agetor-core.json"), "utf8"));
-  return { base, bearer: { authorization: `Bearer ${creds.token}` }, stderr: () => stderrText, proc };
+  return { base, bearer: { authorization: `Bearer ${MASTER_TOKEN}` }, stderr: () => stderrText, proc };
 }
 
 async function waitFor<T>(what: string, fn: () => Promise<T | null>, timeoutMs: number): Promise<T> {

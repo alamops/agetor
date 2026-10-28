@@ -1,7 +1,7 @@
 // In-memory manager for per-task interactive terminal tabs.
 //
 // Each tab is a real PTY spawned via Bun's native terminal support
-// (`Bun.spawn(argv, { terminal })`, shipped in Bun 1.3.5) — NOT node-pty,
+// (`Bun.spawn` with a `terminal` option, shipped in Bun 1.3.5) — NOT node-pty,
 // which loads under Bun but whose libuv-based read loop never delivers data
 // here (verified by spike). Bun.Terminal uses openpty(3) directly, so output,
 // resize, and raw-mode all work without a native module or a tmux shim.
@@ -21,6 +21,7 @@ import { existsSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import type { Task, TerminalTab } from "../shared/types.ts";
 import { tasks } from "./db.ts";
+import { childEnv } from "./core-spawn.ts";
 // NOTE: worktree.ts is imported *dynamically* inside createTerminal, not at
 // the top level. worktree.ts reads db.ts's `dataDir` at module init; importing
 // it statically here would pull that read into db.ts's own init chain (db.ts →
@@ -262,10 +263,12 @@ export async function createTerminal(
       exitCode: null,
     };
 
+    // spawn-exempt(terminal-tab): the user's own interactive shell stays on Agetor's TCC identity (owner decision D8); it still gets a scrubbed env.
     const proc = Bun.spawn([shell, "-l"], {
       cwd: prepared.cwd,
-      // Inherit the user's env; force a sane TERM so colors/cursor work in xterm.
-      env: { ...process.env, TERM: "xterm-256color" },
+      // Inherit the user's env (minus the master API token); force a sane TERM
+      // so colors/cursor work in xterm.
+      env: childEnv({ TERM: "xterm-256color" }),
       terminal: {
         cols: DEFAULT_COLS,
         rows: DEFAULT_ROWS,

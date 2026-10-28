@@ -43,7 +43,8 @@ beforeAll(async () => {
   EVENTS_REPLAY_MAX_BYTES = shared.EVENTS_REPLAY_MAX_BYTES;
   EVENTS_PAGE_MAX_BYTES = shared.EVENTS_PAGE_MAX_BYTES;
   TASK_EVENTS_REPLAY_META_EVENT = shared.TASK_EVENTS_REPLAY_META_EVENT;
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void; port: number };
   token = API_TOKEN;
   // Deferred until after db.ts/server.ts are loaded (and AGETOR_DATA_DIR is
@@ -121,7 +122,7 @@ async function readSseFrames(
   timeoutMs: number,
 ): Promise<Array<{ event: string; data: any }>> {
   const ctrl = new AbortController();
-  const res = await fetch(url, { signal: ctrl.signal });
+  const res = await fetch(url, { signal: ctrl.signal, headers: { authorization: `Bearer ${token}` } });
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   const frames: Array<{ event: string; data: any }> = [];
@@ -203,7 +204,7 @@ test("SSE replay of a task whose newest window exceeds EVENTS_REPLAY_MAX_BYTES i
   const { taskId, ids } = seedUniformByteTask(SSE_EVENT_COUNT, SSE_EVENT_SIZE);
   const expectedWindow = ids.slice(-SSE_EXPECTED_WINDOW);
 
-  const url = `${BASE()}/tasks/${taskId}/events?token=${encodeURIComponent(token)}`;
+  const url = `${BASE()}/tasks/${taskId}/events`;
   const frames = await readSseFrames(url, expectedWindow.length + 1, 15_000);
 
   expect(frames.length).toBe(expectedWindow.length + 1);

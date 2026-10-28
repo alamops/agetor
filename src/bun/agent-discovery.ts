@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import type { Subprocess } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import type { AgentKind } from "../shared/types.ts";
+import { coreSpawn } from "./core-spawn.ts";
 import { opencodeMajor } from "../shared/opencode.ts";
 
 /**
@@ -66,12 +67,14 @@ async function runProbe(
   timeoutMs = 3_000,
 ): Promise<{ ok: boolean; stdout: string }> {
   try {
-    const proc = Bun.spawn(cmd, {
+    // coreSpawn: the probed CLI (or anything earlier on PATH) is
+    // agent-plantable, so it must not inherit Agetor's macOS identity (P2/P3).
+    const proc = coreSpawn(cmd, {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
       ...(env ? { env: { ...process.env, ...env } } : {}),
-    });
+    }) as Subprocess<"ignore", "pipe", "ignore">;
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* already exited */ } }, timeoutMs);
     const stdout = await new Response(proc.stdout).text();
     await proc.exited;
@@ -292,12 +295,12 @@ async function discoverCodex(env?: Record<string, string>, bin?: string): Promis
 
   let proc: Subprocess<"pipe", "pipe", "ignore">;
   try {
-    proc = Bun.spawn([resolvedBin, "app-server"], {
+    proc = coreSpawn([resolvedBin, "app-server"], {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",
       ...(env ? { env: { ...process.env, ...env } } : {}),
-    });
+    }) as Subprocess<"pipe", "pipe", "ignore">;
   } catch {
     return [];
   }
@@ -849,12 +852,14 @@ async function runOpencodeProbe(
   if (timeoutMs <= 0) return { ok: false, stdout: "" };
   let proc: Subprocess<"ignore", "pipe", "ignore">;
   try {
-    proc = Bun.spawn(cmd, {
+    // coreSpawn: the opencode binary (or anything earlier on PATH) is
+    // agent-plantable, so it must not inherit Agetor's macOS identity.
+    proc = coreSpawn(cmd, {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
       env: { ...process.env, ...env },
-    });
+    }) as Subprocess<"ignore", "pipe", "ignore">;
   } catch {
     return { ok: false, stdout: "" };
   }

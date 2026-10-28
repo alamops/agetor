@@ -1310,7 +1310,7 @@ function AppInner() {
       }
       if (ev.type === "clone_progress") {
         // Forwarded to the module store CloneProjectDialog subscribes to —
-        // never opens its own EventSource (see clone-progress.ts for why).
+        // never opens its own event stream (see clone-progress.ts for why).
         publishCloneProgress(ev);
         return;
       }
@@ -1442,8 +1442,8 @@ function AppInner() {
       // Fan the pipeline-relevant kinds out to the module store FIRST —
       // before any of the gating below — so the pipeline run view and the
       // RunPanel's pipeline strip get every event without opening a second
-      // permanent `EventSource` (WKWebView's ~6-per-host connection cap; see
-      // `lib/pipeline-events.ts`). `interaction` lets the run view repaint a
+      // permanent event stream (one `openEventStream` fetch each; WKWebView's
+      // ~6-per-host connection cap; see `lib/pipeline-events.ts`). `interaction` lets the run view repaint a
       // step's amber "waiting on you" highlight the moment it asks.
       if (ev.kind === "pipeline" || ev.kind === "column" || ev.kind === "run-status" || ev.kind === "interaction") {
         publishPipelineGlobalEvent(ev);

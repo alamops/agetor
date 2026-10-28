@@ -7,6 +7,7 @@ import { accountUsageSummary } from "./account-usage.ts";
 import { harnesses } from "./db.ts";
 import { effectiveClaudeConfigDir, readClaudeAccount } from "./harness-discovery.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
+import { coreSpawn } from "./core-spawn.ts";
 
 const VERSION_PROBE_TIMEOUT_MS = 2000;
 
@@ -102,7 +103,10 @@ export function upgradeHintFor(kind: AgentKind, binPath: string | null): string 
 }
 
 async function probeVersion(bin: string, env: Record<string, string>): Promise<string | null> {
-  const proc = Bun.spawn([bin, "--version"], {
+  // coreSpawn (here and in the other probes): the harness binary, or anything
+  // earlier on PATH, is agent-plantable, so it must not inherit Agetor's macOS
+  // identity (P2/P3).
+  const proc = coreSpawn([bin, "--version"], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -110,7 +114,7 @@ async function probeVersion(bin: string, env: Record<string, string>): Promise<s
     // a custom HOME still finds its node binary on PATH. We don't override
     // PATH here — bin resolution already happened via resolveBinPath().
     env: { ...process.env, ...env },
-  });
+  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
 
   const timer = setTimeout(() => {
     try { proc.kill(); } catch { /* already gone */ }
@@ -145,12 +149,12 @@ async function probeVersion(bin: string, env: Record<string, string>): Promise<s
  * non-zero for --help.
  */
 async function probeHelp(bin: string, env: Record<string, string>): Promise<string | null> {
-  const proc = Bun.spawn([bin, "--help"], {
+  const proc = coreSpawn([bin, "--help"], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, ...env },
-  });
+  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
 
   const timer = setTimeout(() => {
     try { proc.kill(); } catch { /* already gone */ }
@@ -189,12 +193,12 @@ async function probeJson(
 ): Promise<string | null> {
   const merged: Record<string, string | undefined> = { ...process.env, ...env };
   for (const key of omitEnv) delete merged[key];
-  const proc = Bun.spawn([bin, ...args], {
+  const proc = coreSpawn([bin, ...args], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
     env: merged,
-  });
+  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
 
   const timer = setTimeout(() => {
     try { proc.kill(); } catch { /* already gone */ }
@@ -481,7 +485,7 @@ type CommandOutput = { code: number; stdout: string; stderr: string };
 async function probeOutput(bin: string, args: string[], env: Record<string, string>): Promise<CommandOutput | null> {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn([bin, ...args], {
+    proc = coreSpawn([bin, ...args], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",

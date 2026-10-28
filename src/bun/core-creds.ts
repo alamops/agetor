@@ -11,9 +11,17 @@ import {
 /**
  * The "core credentials" file is how an out-of-process client (the `agetor`
  * CLI, or a second app launch) discovers and authenticates to the running
- * Agetor core. The API token is generated fresh per launch and lives only in
+ * Agetor core. The credentials are generated fresh per launch and live in
  * memory (see `api-config.ts`), so without this file a separate process has no
  * way to authorize a single request against the localhost API.
+ *
+ * What this file carries is the CLI-scoped token (`CLI_TOKEN`), never the master
+ * (`API_TOKEN`): the file is readable by anything running as the user, an agent
+ * included, so it holds only the credential the CLI routes need
+ * (docs/plans/master-token-agent-read.md D3/D23). The master stays in the core's
+ * memory and reaches only the app's own webview. An agent that reads this file
+ * can therefore do what the CLI can do, and no more: desktop-only routes answer
+ * it 403.
  *
  * Exactly one process owns the port at a time and writes this file right after
  * the server binds: the Electrobun app (`kind: "app"`) or the headless CLI
@@ -25,7 +33,10 @@ import {
 export interface CoreCreds {
   /** Port the core's HTTP API is bound to on 127.0.0.1. */
   port: number;
-  /** Per-launch bearer token (also accepted as `?token=` on SSE URLs). */
+  /** Per-launch CLI-scoped bearer token (agent-readable by design; not the
+   *  master). Sent as an `Authorization` header; the core accepts it as
+   *  `?token=` only on the three legacy SSE GETs (`/events`, `/tasks/:id/events`,
+   *  `/app/events`) that older CLIs still use (P6). */
   token: string;
   /** PID of the owning process, for a `kill(pid, 0)` liveness check. */
   pid: number;

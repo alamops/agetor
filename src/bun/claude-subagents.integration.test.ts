@@ -40,7 +40,8 @@ let token: string;
 
 beforeAll(async () => {
   await import("./db.ts");
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void; port: number };
   token = API_TOKEN;
 });
@@ -53,7 +54,7 @@ const authed = (p: string) => fetch(url(p), { headers: { authorization: `Bearer 
 /** Read an SSE endpoint for `ms`, returning the parsed `data:` frames. */
 async function readSse(p: string, ms: number): Promise<any[]> {
   const ctrl = new AbortController();
-  const res = await fetch(url(`${p}?token=${encodeURIComponent(token)}`), { signal: ctrl.signal });
+  const res = await fetch(url(p), { signal: ctrl.signal, headers: { authorization: `Bearer ${token}` } });
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   const out: any[] = [];

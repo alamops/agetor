@@ -3,7 +3,6 @@ import {
   mkdirSync,
   watch as fsWatch,
   type FSWatcher,
-  openSync as fsOpenSync,
   readSync as fsReadSync,
   closeSync as fsCloseSync,
   statSync as fsStatSync,
@@ -30,6 +29,7 @@ import {
   type ChunkHandler,
   type SpawnedAgent,
 } from "./claude-tmux.ts";
+import { openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 
 /**
  * Driver that hosts a single `agy -p` turn inside a per-task tmux
@@ -59,7 +59,7 @@ function ensureLogDir(): void {
 export function readAntigravityExitCode(runId: string): number | null {
   let raw: string;
   try {
-    raw = readFileSync(antigravityExitPath(runId), "utf8").trim();
+    raw = readTextNoFollow(antigravityExitPath(runId)).trim();
   } catch {
     return null;
   }
@@ -265,7 +265,7 @@ function flushAntigravityLog(state: AntigravitySessionState): void {
   try {
     const st = fsStatSync(state.logPath);
     if (st.size <= state.offset) return;
-    fd = fsOpenSync(state.logPath, "r");
+    fd = openReadNoFollow(state.logPath);
   } catch {
     return;
   }

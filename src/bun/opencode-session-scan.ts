@@ -24,6 +24,7 @@
  * that can't run contributes no rows.
  */
 import { statSync } from "node:fs";
+import { coreSpawn } from "./core-spawn.ts";
 import type { Harness, OpencodeSessionListItem } from "../shared/types.ts";
 import { OPENCODE_SESSION_ID_RE, opencodeMajor } from "../shared/opencode.ts";
 import { harnesses, hiddenOpencodeSessionIds, projects } from "./db.ts";
@@ -144,7 +145,8 @@ async function runBounded(
   merged.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(argv, { cwd, env: merged, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    // coreSpawn: see opencode-export.ts — `opencode` runs disclaimed.
+    proc = coreSpawn(argv, { cwd, env: merged, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   } catch {
     return null;
   }

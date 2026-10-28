@@ -232,7 +232,8 @@ import {
 } from "../shared/sent-files.ts";
 import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
-import { expandAtReferencesDetailed } from "./project-files.ts";
+import { expandAtReferencesDetailedAsync } from "./project-files.ts";
+import { resolveAtPathsInTaskDir } from "./task-dir-fs.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 import { isSpeed } from "../shared/speed.ts";
 
@@ -1780,7 +1781,18 @@ async function startTaskInner(
   // is left untouched in the DB, so editing the task or re-running it later
   // keeps the `@tokens` and re-resolves them against whatever cwd that next
   // run gets (a fresh worktree, a moved workdir, etc).
-  const { text: expandedPrompt, unresolved: unresolvedRefs } = expandAtReferencesDetailed(task.prompt, prepared.cwd);
+  //
+  // The stat/realpath work behind each token runs in a disclaimed child when
+  // the disclaim switch is on (`resolveAtPathsInTaskDir`, D25): the core never
+  // touches the task directory itself, so an agent that planted a symlink in
+  // its own cwd can't use `@x` to make the core probe a protected path under
+  // the core's TCC identity. Injected as a parameter (rather than imported by
+  // project-files.ts) to avoid an import cycle.
+  const { text: expandedPrompt, unresolved: unresolvedRefs } = await expandAtReferencesDetailedAsync(
+    task.prompt,
+    prepared.cwd,
+    resolveAtPathsInTaskDir,
+  );
   // Budget-check the fully expanded + reffed prompt against what the RAW
   // (pre-expansion) prompt would already have needed. Expansion can turn a
   // handful of short `@tokens` into long absolute paths and push a prompt
@@ -4015,7 +4027,12 @@ async function sendInputInner(
   // match, producing a duplicate backlog entry every time the same message is
   // retried (R2, code review).
   const rawLine = line;
-  const expanded = expandAtReferencesDetailed(line, cwdTask.worktreePath ?? cwdTask.workdir);
+  // Resolved through the disclaimed task-dir helper (D25), same as `startTask`.
+  const expanded = await expandAtReferencesDetailedAsync(
+    line,
+    cwdTask.worktreePath ?? cwdTask.workdir,
+    resolveAtPathsInTaskDir,
+  );
   line = expanded.text;
   const unresolvedRefs = expanded.unresolved;
 

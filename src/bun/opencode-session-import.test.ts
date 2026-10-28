@@ -255,6 +255,42 @@ test("refusals: unknown id, missing folder at commit, a failed export, an unknow
   expect(r.error).toBe('unknown OpenCode harness "no-such-harness"');
 });
 
+test("opts.gateCwd runs first: a refusal is the session's result and imports nothing; null allows", async () => {
+  const { id } = plant();
+  const seen: string[] = [];
+  const refused = await importOne(id, {
+    gateCwd: async (cwd) => {
+      seen.push(cwd);
+      return "folder not reachable for this caller";
+    },
+  });
+  expect(refused.error).toBe("folder not reachable for this caller");
+  expect(refused.taskId).toBeUndefined();
+  expect(seen).toHaveLength(1);
+  expect(tasks.findTaskByImportedOpencodeSession(id)).toBeNull();
+
+  // The gate runs BEFORE the commit's own folder check: this gate removes the
+  // folder, and the check that follows must see it gone. Were the check first,
+  // it would pass (the folder existed) and the import would succeed.
+  const orderDir = path.join(scratch, "gate-order");
+  mkdirSync(orderDir);
+  const ordered = sid();
+  writeExport(ordered, v2Export(ordered, { updated: Date.now() - 60 * 60_000 }));
+  writeList("a", [{ id: ordered, updated: Date.now() - 60 * 60_000, directory: orderDir }]);
+  const afterGate = await importOne(ordered, {
+    gateCwd: async (cwd) => {
+      rmSync(cwd, { recursive: true });
+      return null;
+    },
+  });
+  expect(afterGate.error).toBe(MISSING_FOLDER_IMPORT_ERROR);
+
+  const { id: allowedId } = plant();
+  const allowed = await importOne(allowedId, { gateCwd: async () => null });
+  expect(allowed.error).toBeUndefined();
+  expect(allowed.taskId).toBeTruthy();
+});
+
 test("opts.harnessId runs the task under another OpenCode harness", async () => {
   const { id } = plant();
   const task = tasks.get((await importOne(id, { harnessId: hB.id })).taskId!)!;

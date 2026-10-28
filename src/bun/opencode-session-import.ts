@@ -70,6 +70,14 @@ export interface ImportOpencodeSessionsOptions {
    *  reads another OpenCode data dir: its `-s <id>` follow-ups couldn't see
    *  the session (v2 would silently start an empty one, spike Q4). */
   harnessId?: string;
+  /**
+   * Caller gate for the session's folder (D24): the server passes it for a
+   * CLI-token caller, and it probes the folder in a disclaimed child, resolving
+   * to a refusal message or `null` to allow. It runs BEFORE this module's first
+   * in-process touch of the folder (the `isDirectory` check), once per session,
+   * and a refusal is reported in that session's result. Omitted = no gate.
+   */
+  gateCwd?: (cwd: string) => Promise<string | null>;
   /** Test seam: the backfill waits here before writing events. */
   backfillGate?: Promise<void>;
   /** Slice length for the cooperative writes. Tests use `0` to yield per event. */
@@ -469,6 +477,12 @@ async function commitOne(
 
   return withCommitLock(id, async () => {
     if (sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
+    // The caller gate comes first: nothing in this process may stat a folder
+    // the caller is not allowed to reach (D24).
+    if (opts?.gateCwd) {
+      const refusal = await opts.gateCwd(found.directory);
+      if (refusal !== null) return { id, error: refusal };
+    }
     // The folder can go away between the scan and this commit.
     if (!isDirectory(found.directory)) return { id, error: MISSING_FOLDER_IMPORT_ERROR };
     const listedUnder = harnesses.get(found.harnessId);

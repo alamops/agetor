@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { coreSpawn } from "./core-spawn.ts";
 import type { RunEventStream } from "../shared/types.ts";
 import {
   addOpencodeTokens,
@@ -121,7 +122,9 @@ async function defaultExportRunner(a: RunOpencodeExportArgs): Promise<OpencodeEx
   env.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(argv, {
+    // coreSpawn: `opencode` is agent-plantable and its cwd may sit in a
+    // macOS-protected folder, so it runs disclaimed, never as Agetor.
+    proc = coreSpawn(argv, {
       cwd: a.cwd && existsSync(a.cwd) ? a.cwd : undefined,
       env,
       stdin: "ignore",

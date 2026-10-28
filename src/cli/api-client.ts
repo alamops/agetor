@@ -108,6 +108,22 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+
+  /**
+   * The response body's machine-readable `code`, when the core sent one
+   * (`desktop-only`, `path-not-accessible`, …). Derived from `body` so every
+   * `new ApiError(status, body, msg)` site keeps working unchanged; the
+   * human sentence stays in `message`, which `req` already takes from the
+   * body's `error`, so the CLI's central printer shows a refusal plainly.
+   */
+  get code(): string | undefined {
+    const b = this.body;
+    if (typeof b === "object" && b !== null && "code" in b) {
+      const code = (b as { code: unknown }).code;
+      if (typeof code === "string") return code;
+    }
+    return undefined;
+  }
 }
 
 export interface ClaudeSessionSummary {

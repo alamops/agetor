@@ -67,6 +67,7 @@ import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
 import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
+import { coreSpawn } from "./core-spawn.ts";
 
 /** GitHub REST/GraphQL API origin. `AGETOR_GITHUB_API_BASE` is a dev/test-only
  *  override (the Playwright e2e harness points it at a local stub server); unset in
@@ -543,7 +544,8 @@ const ISSUE_LOCK_REASONS = new Set(["off-topic", "too heated", "resolved", "spam
 export async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Promise<CommandResult> {
   let proc: PipedProcess;
   try {
-    proc = Bun.spawn(cmd, {
+    // coreSpawn: git/gh/glab read agent-plantable config (P2/P3).
+    proc = coreSpawn(cmd, {
       cwd,
       stdin: "ignore",
       stdout: "pipe",

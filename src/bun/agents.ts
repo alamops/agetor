@@ -3113,12 +3113,16 @@ function makeFakeAgent(
     // in flight for that long (default 20ms — the historical timing every
     // other consumer relies on), so a test can deterministically queue
     // follow-ups behind it and mutate the task (model, CLI version) before
-    // `drainCodexQueue` runs. Read at call time; codex only, so claude/fx
-    // fake turns keep their own timing.
+    // `drainCodexQueue` runs. Read at call time. `AGETOR_FAKE_CLAUDE_TURN_MS`
+    // is the claude counterpart for this generic turn: a test that folds a
+    // follow-up into the still-running turn holds it open instead of racing
+    // the 20ms timer (which a loaded machine loses). fx keeps its own timing.
     const resolveAfterMs =
       fakeOpts.kind === "codex"
         ? (Number(process.env.AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS ?? 20) || 20)
-        : 20;
+        : fakeOpts.kind === "claude-code"
+          ? (Number(process.env.AGETOR_FAKE_CLAUDE_TURN_MS ?? 20) || 20)
+          : 20;
     after(resolveAfterMs, () => {
       if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
       onChunk("status", "turn complete");
@@ -3670,7 +3674,12 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       if (Number.isFinite(spawnDelayMs) && spawnDelayMs > 0) {
         await Bun.sleep(spawnDelayMs);
       }
-      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        cwd,
+        kind: "claude-code",
+      });
     }
     // Pre-generate a session uuid when we're not resuming. The driver will
     // expect claude to write its JSONL at the deterministic path derived

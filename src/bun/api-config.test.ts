@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import path from "node:path";
 import {
+  API_TOKEN,
+  CLI_TOKEN,
   DEFAULT_API_HOST,
   formatHostForUrl,
   getApiPort,
@@ -115,5 +118,59 @@ describe("nonLoopbackBindWarning", () => {
     expect(w!).toContain("cleartext");
     expect(w!).toContain("-p 127.0.0.1:4317:4317");
     expect(nonLoopbackBindWarning("::", 4317)!).toContain("[::]:4317");
+  });
+});
+
+// The tokens are read once, when the module is first evaluated, so the
+// env-handling cases run in a fresh `bun` child per scenario.
+function probeTokens(env: Record<string, string | undefined>): {
+  api: string;
+  cli: string;
+  envAfter: string | null;
+} {
+  const base: Record<string, string | undefined> = { ...process.env };
+  delete base.AGETOR_API_TOKEN;
+  const mod = path.join(import.meta.dir, "api-config.ts");
+  const code =
+    `const m = await import(${JSON.stringify(mod)});` +
+    `console.log(JSON.stringify({ api: m.API_TOKEN, cli: m.CLI_TOKEN, envAfter: process.env.AGETOR_API_TOKEN ?? null }));`;
+  const r = Bun.spawnSync([process.execPath, "-e", code], { env: { ...base, ...env }, stdout: "pipe", stderr: "pipe" });
+  if (r.exitCode !== 0) throw new Error(`probe failed: ${r.stderr.toString()}`);
+  return JSON.parse(r.stdout.toString());
+}
+
+describe("API_TOKEN / CLI_TOKEN", () => {
+  it("are 32-byte hex strings that differ", () => {
+    expect(CLI_TOKEN).toMatch(/^[0-9a-f]{64}$/);
+    expect(API_TOKEN.length).toBeGreaterThan(0);
+    expect(CLI_TOKEN).not.toBe(API_TOKEN);
+  });
+
+  it("AGETOR_API_TOKEN is deleted from process.env once read", () => {
+    expect(process.env.AGETOR_API_TOKEN).toBeUndefined();
+  });
+
+  it("the env override sets the master only, and is removed from the environment", () => {
+    const r = probeTokens({ AGETOR_API_TOKEN: "e2e-master-token" });
+    expect(r.api).toBe("e2e-master-token");
+    expect(r.envAfter).toBeNull();
+    expect(r.cli).toMatch(/^[0-9a-f]{64}$/);
+    expect(r.cli).not.toBe("e2e-master-token");
+  });
+
+  it("without an override both are random per launch (and a blank override counts as unset)", () => {
+    const a = probeTokens({});
+    const b = probeTokens({ AGETOR_API_TOKEN: "   " });
+    expect(a.api).toMatch(/^[0-9a-f]{64}$/);
+    expect(b.api).toMatch(/^[0-9a-f]{64}$/);
+    expect(a.api).not.toBe(b.api);
+    expect(a.cli).not.toBe(b.cli);
+    expect(a.cli).not.toBe(a.api);
+    expect(b.envAfter).toBeNull();
+  });
+
+  it("the CLI token has no env override", () => {
+    const r = probeTokens({ AGETOR_CLI_TOKEN: "pinned", AGETOR_API_TOKEN: "m" });
+    expect(r.cli).not.toBe("pinned");
   });
 });

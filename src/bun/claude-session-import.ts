@@ -20,6 +20,7 @@ import {
 } from "./db.ts";
 import { createTask, emitRunEvent } from "./orchestrator.ts";
 import { claudeModelIdFromArg } from "./agents.ts";
+import { coreSpawn } from "./core-spawn.ts";
 import { replayJsonlLines, type JsonlReplayLine } from "./claude-tmux.ts";
 import { broadcastAppEvent } from "./quit-guard.ts";
 import {
@@ -73,6 +74,17 @@ export interface ImportClaudeSessionsOptions {
   ) => Promise<{ bytesRead: number }>;
   /** Test seam: forwarded to the scanner so a batch can prove it parsed each file once. */
   onJsonlRead?: (jsonlPath: string) => void;
+  /**
+   * Caller gate for a session's folder (D24, docs/plans/master-token-agent-read.md).
+   * The cwd comes from the transcript, not the request, so the route cannot
+   * check it up front. The server passes this for a CLI-token caller: it probes
+   * the folder in a disclaimed child and resolves to a refusal message, or
+   * `null` to allow. It runs BEFORE this module's first in-process touch of the
+   * folder (the `isDirectory` check), once per session, and a refusal is
+   * reported in that session's result (import) or as the error (checkout).
+   * Omitted = no gate.
+   */
+  gateCwd?: (cwd: string) => Promise<string | null>;
 }
 
 export interface ImportClaudeSessionResult {
@@ -598,6 +610,12 @@ async function commitOne(
 
   return withCommitLock(id, async () => {
     if (sessionAlreadyBound(id)) return { id, error: ALREADY_IMPORTED };
+    // The caller gate comes first: nothing in this process may stat a folder
+    // the caller is not allowed to reach (D24).
+    if (opts?.gateCwd) {
+      const refusal = await opts.gateCwd(found.cwd);
+      if (refusal !== null) return { id, error: refusal };
+    }
     // The folder can go away between the scan and this commit.
     if (!isDirectory(found.cwd)) return { id, error: MISSING_FOLDER_IMPORT_ERROR };
     return bindImportedSession(id, found, opts);
@@ -703,6 +721,11 @@ export async function checkoutSessionBranch(
   // only to copy `gitBranch` holds the main thread on a large JSONL.
   const branch = requested ?? record.gitBranch;
   if (!branch) return { error: "this session has no branch to switch to" };
+  // Caller gate before the first in-process touch of the folder (D24).
+  if (opts?.gateCwd) {
+    const refusal = await opts.gateCwd(record.cwd);
+    if (refusal !== null) return { error: refusal };
+  }
   if (!isDirectory(record.cwd)) return { error: MISSING_FOLDER_IMPORT_ERROR };
   const inside = await git(record.cwd, ["rev-parse", "--is-inside-work-tree"]);
   if (inside.code !== 0 || inside.stdout.trim() !== "true") {
@@ -719,7 +742,13 @@ export async function checkoutSessionBranch(
 }
 
 async function git(cwd: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+  // coreSpawn: `cwd` comes from a transcript and its git config is
+  // agent-plantable (P2/P3).
+  const proc = coreSpawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" }) as Bun.Subprocess<
+    "ignore",
+    "pipe",
+    "pipe"
+  >;
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
   const code = await proc.exited;

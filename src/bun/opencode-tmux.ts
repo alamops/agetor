@@ -3,19 +3,19 @@ import {
   mkdirSync,
   watch as fsWatch,
   type FSWatcher,
-  openSync as fsOpenSync,
   readSync as fsReadSync,
   closeSync as fsCloseSync,
   statSync as fsStatSync,
   writeFileSync,
   appendFileSync,
   unlinkSync,
-  readFileSync,
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import { resolveTmuxBin, tmuxSocketArgs, tmuxClientEnv, spawnTmuxNewSession } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
+import { childEnv, coreSpawn } from "./core-spawn.ts";
+import { openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import {
   FX_USAGE_STATUS_PREFIX,
@@ -82,7 +82,7 @@ function ensureLogDir(): void {
 export function readOpencodeExitCode(runId: string): number | null {
   let raw: string;
   try {
-    raw = readFileSync(opencodeExitPath(runId), "utf8").trim();
+    raw = readTextNoFollow(opencodeExitPath(runId)).trim();
   } catch {
     return null;
   }
@@ -594,12 +594,15 @@ const RECONCILE_EXPORT_TIMEOUT_MS = 10_000;
 /** One-shot tmux command on agetor's socket. Never throws. */
 async function tmuxRun(args: string[]): Promise<boolean> {
   try {
-    const proc = Bun.spawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
+    // coreSpawn like every tmux client call (D22): the client binary comes
+    // from a PATH an agent can influence, and `childEnv()` keeps the master
+    // token out of its env.
+    const proc = coreSpawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: tmuxClientEnv(),
-    });
+      env: childEnv(),
+    }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
     await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     return (await proc.exited) === 0;
   } catch {
@@ -636,7 +639,7 @@ function flushOpencodeLog(state: OpencodeSessionState, final = false): void {
   let fd: number | null = null;
   try {
     const st = fsStatSync(state.logPath);
-    if (st.size > state.offset) fd = fsOpenSync(state.logPath, "r");
+    if (st.size > state.offset) fd = openReadNoFollow(state.logPath);
   } catch {
     fd = null;
   }

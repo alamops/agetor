@@ -5,6 +5,7 @@ import { AlertTriangle, ChevronLeft, ChevronRight, FileWarning, ImageOff } from 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { useAuthedObjectUrl } from "@/lib/authed-blob";
 import { loadPdfDocument, isRenderCancelledError, type PdfDoc } from "@/lib/pdf";
 import { MAX_BLOB_PREVIEW_BYTES } from "../../../shared/attachments.ts";
 import type { DiffFile } from "../../../shared/types.ts";
@@ -118,28 +119,26 @@ const IMAGE_ERROR_COPY: Record<ImageErrorKind, string> = {
 
 function ImagePane({ side, status, url, fileName }: { side: Side; status: BinaryPreviewFileStatus; url: string | null; fileName?: string }) {
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
-  const [errorKind, setErrorKind] = useState<ImageErrorKind | null>(null);
+  // The bytes are fetched with the auth header and shown as a `blob:` URL
+  // (D13/P9), so the hook already knows the status that the old `<img
+  // onError>` + `api.probeBlobStatus` re-probe had to reconstruct: 413 reads
+  // "too large to preview", 404 "not present on this side", anything else (or
+  // a decode failure below) a generic failure.
+  const blob = useAuthedObjectUrl(url);
+  const [decodeFailed, setDecodeFailed] = useState(false);
 
   useEffect(() => {
     setDims(null);
-    setErrorKind(null);
-  }, [url]);
-
-  // SF-10: a bare 404/413 both surface through `onError` as the same
-  // generic broken-image icon — the browser gives no status code to an
-  // `<img>` load failure. Re-probe the URL (status only, body cancelled
-  // unread — see `api.probeBlobStatus`) so the pane can distinguish "too
-  // large to preview" and "not present on this side" from a genuine
-  // decode/network failure. Only runs on error, so no steady-state cost.
-  const handleError = useCallback(() => {
-    setErrorKind("generic");
-    if (!url) return;
-    void api.probeBlobStatus(url).then((kind) => {
-      setErrorKind(kind === "too-large" ? "too-large" : kind === "missing" ? "missing" : "generic");
-    });
+    setDecodeFailed(false);
   }, [url]);
 
   if (!url) return <EmptyPane side={side} status={status} />;
+
+  const errorKind: ImageErrorKind | null =
+    blob.status === "too-large" ? "too-large"
+    : blob.status === "missing" ? "missing"
+    : blob.status === "error" || decodeFailed ? "generic"
+    : null;
 
   if (errorKind) {
     return (
@@ -157,18 +156,20 @@ function ImagePane({ side, status, url, fileName }: { side: Side; status: Binary
         className="flex h-56 items-center justify-center overflow-hidden rounded-md border border-border/60 p-2"
         style={CHECKERBOARD_STYLE}
       >
-        <img
-          src={url}
-          alt={`${label} version of ${fileName ?? "file"}`}
-          loading="lazy"
-          decoding="async"
-          className="max-h-full max-w-full object-contain"
-          onLoad={(e) => setDims({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
-          onError={handleError}
-        />
+        {blob.src !== null && (
+          <img
+            src={blob.src}
+            data-src-url={url}
+            alt={`${label} version of ${fileName ?? "file"}`}
+            decoding="async"
+            className="max-h-full max-w-full object-contain"
+            onLoad={(e) => setDims({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+            onError={() => setDecodeFailed(true)}
+          />
+        )}
       </div>
       <span className="text-center font-mono text-[11px] tabular-nums text-muted-foreground">
-        {dims ? `${dims.w} × ${dims.h} px` : " "}
+        {dims ? `${dims.w} × ${dims.h} px` : " "}
       </span>
     </div>
   );

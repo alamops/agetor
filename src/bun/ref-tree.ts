@@ -4,8 +4,10 @@
 // that need "what will actually be in the worktree" pass a ref; callers that
 // read machine-local, untracked state (user config, plugin installs) keep
 // using `diskProjectTree` directly, bypassing refs entirely.
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { coreSpawn } from "./core-spawn.ts";
+import { readTextNonBlocking } from "./no-follow.ts";
 
 export interface ProjectTreeEntry {
   name: string;
@@ -58,7 +60,9 @@ export function diskProjectTree(root: string): ProjectTree {
     },
     read(relFile: string): string | null {
       try {
-        return readFileSync(path.join(root, normalizeRel(relFile)), "utf8");
+        // Non-blocking, regular files only: a FIFO an agent planted under a
+        // discovered name must not block the core's main thread.
+        return readTextNonBlocking(path.join(root, normalizeRel(relFile)));
       } catch {
         return null;
       }
@@ -159,12 +163,13 @@ const GIT_TIMEOUT_MS = 8_000;
 async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
   let proc: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
   try {
-    proc = Bun.spawn(["git", ...args], {
+    // coreSpawn: the repo's own git config is agent-plantable (P2/P3).
+    proc = coreSpawn(["git", ...args], {
       cwd,
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-    });
+    }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
     const timer = setTimeout(() => proc!.kill(), timeoutMs);
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
@@ -205,12 +210,12 @@ function splitNulTerminated(out: string): string[] {
 async function runCatFileBatch(cwd: string, requestText: string, timeoutMs = GIT_TIMEOUT_MS): Promise<Buffer | null> {
   let proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
   try {
-    proc = Bun.spawn(["git", "cat-file", "--batch"], {
+    proc = coreSpawn(["git", "cat-file", "--batch"], {
       cwd,
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
-    });
+    }) as Bun.Subprocess<"pipe", "pipe", "pipe">;
     const timer = setTimeout(() => proc!.kill(), timeoutMs);
     try {
       // `.write()`/`.end()` on a Bun `FileSink` can return promises (e.g.
@@ -296,7 +301,12 @@ async function batchCatFile(cwd: string, ref: string, paths: string[]): Promise<
   return parseCatFileBatch(buf, paths);
 }
 
-const DEFAULT_PATHSPECS = [
+/**
+ * The project-level capability-discovery pathspecs. Exported (T4) so the
+ * CLI-caller project-tree loader in `caller-fs.ts` reads exactly the same set
+ * through `tar` that `loadRefProjectTree` reads through `git ls-tree`.
+ */
+export const PROJECT_CAPABILITY_PATHSPECS: readonly string[] = [
   ".claude", ".codex", ".mcp.json",
   ".cursor", ".agents", ".grok", ".fx", ".opencode", ".claw", "skills", ".github",
   "opencode.json", "opencode.jsonc",
@@ -338,7 +348,7 @@ export async function loadRefProjectTree(
   // so this can only be a hostile or malformed caller, never a legitimate ref.
   if (/[\n\r\0]/.test(ref)) return null;
 
-  const pathspecs = opts?.pathspecs ?? DEFAULT_PATHSPECS;
+  const pathspecs = opts?.pathspecs ?? PROJECT_CAPABILITY_PATHSPECS;
   const shouldRead = opts?.shouldRead ?? (() => true);
 
   const lsTree = (r: string) => git(["ls-tree", "-r", "--name-only", "--full-tree", "-z", r, "--", ...pathspecs], dir);

@@ -969,9 +969,9 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
     expect(result.delivered).toBe(true);
     if (result.delivered) newRunId = result.runId;
 
-    await new Promise((r) => setTimeout(r, 300));
-
-    const entries = readLog(logPath);
+    // The spawn is fire-and-forget past `sendInput`'s budget; poll for the
+    // `new-session` call instead of guessing how long it takes.
+    const entries = await waitForLog(logPath, "new-session");
     const newSessionEntries = entries.filter((e) => e.argv.includes("new-session"));
     expect(newSessionEntries.length).toBeGreaterThan(0);
     // Guards against accidentally deferring everything: a short prompt must

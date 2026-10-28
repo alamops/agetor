@@ -40,6 +40,7 @@
  * spawn.
  */
 
+import { childEnv } from "./core-spawn.ts";
 import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
 import {
   buildNotifierListArgs,
@@ -98,8 +99,12 @@ interface TaskQueue {
   pending: Op[];
 }
 
+// The helper lives inside the signed app bundle and posts under Agetor's own
+// notification identity, so it must NOT be disclaimed (P2); it still gets a
+// scrubbed env so it can never see the master API token.
 const defaultSpawn: SpawnFn = (argv, opts) =>
-  Bun.spawn(argv, { stdout: opts.stdout, stderr: "ignore", stdin: "ignore" });
+  // spawn-exempt(notifier): the notifier helper is inside the signed app bundle and needs Agetor's notification identity.
+  Bun.spawn(argv, { stdout: opts.stdout, stderr: "ignore", stdin: "ignore", env: childEnv() });
 
 const defaultLog = (msg: string, err?: unknown) => {
   if (err === undefined) console.error(`[agetor] ${msg}`);

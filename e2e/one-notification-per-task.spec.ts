@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, injectSseFrame, installSseInjector } from "./helpers";
 
 /**
  * E2E coverage for "one notification per task" (docs/plans/duplicated-macos-
@@ -195,37 +195,17 @@ async function createOnBoardThenStart(
   return task;
 }
 
-/** Records the page's global-events `EventSource` (`GET /events`) so a test can
- *  deliver synthetic `GlobalEvent` frames through the same `onmessage` path a
- *  real SSE frame takes. Needed for facts the fake driver can't produce — its
+/** Installs the `/events` stream injector (see `installSseInjector`) so a test
+ *  can deliver synthetic `GlobalEvent` frames through the same `onMessage` path
+ *  a real SSE frame takes. Needed for facts the fake driver can't produce — its
  *  sent-files scenario always reports `status: "normal"`, never a proactive
  *  send. Must run BEFORE `gotoApp`. */
 async function installGlobalEventSink(page: Page): Promise<void> {
-  await page.addInitScript(() => {
-    const w = window as unknown as { __globalEventSources: EventSource[] };
-    w.__globalEventSources = [];
-    const Native = window.EventSource;
-    class Recording extends Native {
-      constructor(url: string | URL, init?: EventSourceInit) {
-        super(url, init);
-        if (new URL(String(url), location.href).pathname === "/events") w.__globalEventSources.push(this);
-      }
-    }
-    window.EventSource = Recording as unknown as typeof EventSource;
-  });
+  await installSseInjector(page, "/events");
 }
 
 async function deliverGlobalEvent(page: Page, event: Record<string, unknown>): Promise<void> {
-  await page.evaluate((ev) => {
-    // Only sources still open: React's dev double-mount leaves a closed one
-    // whose handler would otherwise get the frame a second time.
-    const sources = (window as unknown as { __globalEventSources: EventSource[] }).__globalEventSources.filter(
-      (es) => es.readyState !== EventSource.CLOSED,
-    );
-    if (sources.length === 0) throw new Error("no open /events EventSource recorded");
-    const data = JSON.stringify(ev);
-    for (const es of sources) es.dispatchEvent(new MessageEvent("message", { data }));
-  }, event);
+  await injectSseFrame(page, "/events", event);
 }
 
 async function waitForColumn(request: APIRequestContext, backend: E2EBackend, id: string, column: string) {

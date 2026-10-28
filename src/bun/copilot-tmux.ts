@@ -3,19 +3,18 @@ import {
   mkdirSync,
   watch as fsWatch,
   type FSWatcher,
-  openSync as fsOpenSync,
   readSync as fsReadSync,
   closeSync as fsCloseSync,
   statSync as fsStatSync,
   writeFileSync,
   unlinkSync,
-  readFileSync,
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
+import { isPlainDirBelow, openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 import {
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
@@ -98,7 +97,7 @@ function ensureLogDir(): void {
 export function readCopilotExitCode(runId: string): number | null {
   let raw: string;
   try {
-    raw = readFileSync(copilotExitPath(runId), "utf8").trim();
+    raw = readTextNoFollow(copilotExitPath(runId)).trim();
   } catch {
     return null;
   }
@@ -255,7 +254,7 @@ export function copilotUsageSentinel(payload: FxUsagePayload): string {
 export function readCopilotUsagePayload(runId: string): FxUsagePayload | null {
   let text: string;
   try {
-    text = readFileSync(copilotUsagePath(runId), "utf8");
+    text = readTextNoFollow(copilotUsagePath(runId));
   } catch {
     return null;
   }
@@ -278,9 +277,14 @@ export function readCopilotPlanFile(
   }
   const file = path.join(copilotHome, "session-state", sessionId, "plan.md");
   try {
+    // The session folder and `plan.md` are the agent's to rewrite: refuse a
+    // folder chain below the Copilot home that holds a symlink, and open the
+    // file itself no-follow, so a link into a protected folder is never read
+    // under Agetor's identity (D26).
+    if (!isPlainDirBelow(copilotHome, path.dirname(file))) return null;
     const st = fsStatSync(file);
     if (!st.isFile() || st.mtimeMs < sinceMs) return null;
-    const content = readFileSync(file, "utf8");
+    const content = readTextNoFollow(file);
     return content.trim().length > 0 ? content : null;
   } catch {
     return null;
@@ -795,7 +799,7 @@ function flushCopilotLog(state: CopilotSessionState): void {
   try {
     const st = fsStatSync(state.logPath);
     if (st.size <= state.offset) return;
-    fd = fsOpenSync(state.logPath, "r");
+    fd = openReadNoFollow(state.logPath);
   } catch {
     return;
   }
@@ -862,7 +866,7 @@ async function finishCopilotTurn(state: CopilotSessionState, opts: { waitForExit
     if (exit !== null && exit !== 0 && code === 0) code = 1;
 
     let usageText: string | null = null;
-    try { usageText = readFileSync(copilotUsagePath(state.runId), "utf8"); } catch { /* none */ }
+    try { usageText = readTextNoFollow(copilotUsagePath(state.runId)); } catch { /* none */ }
     finalizeCopilotTurn({
       runId: state.runId,
       code,

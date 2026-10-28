@@ -688,8 +688,8 @@ async function fetchJson(
  *     failure's short text — not the sign-in sentence — even when a stale
  *     access-token cookie was already derived. That cookie is not sent.
  *     That `error` still means the database read was already allowed (the
- *     refresh token came from it); do not fold it back to `unavailable` or
- *     the poller will treat a later sign-in as unconsented.
+ *     refresh token came from it), so it is reported as `error`, not folded
+ *     back into `unavailable`.
  *  2. With a cookie, fetch `usage-summary` and `auth/me` in parallel (each
  *     under a ~5s timeout) and parse via `parseCursorUsage`. Empty meters
  *     still resolves `status:"unavailable"` (we got a response but
@@ -706,8 +706,8 @@ async function fetchJson(
  * today's behavior for any direct caller and the explicit-refresh path)
  * gates the cross-app read of the Cursor IDE's `state.vscdb` inside
  * `discoverCursorCookie` — see that function's doc and
- * `src/bun/usage/poller.ts`'s `refreshOne` for why a background sweep with
- * no prior snapshot passes `false`.
+ * `src/bun/usage/poller.ts`'s `refreshOne` for why a background sweep passes
+ * `false` until the user refreshes this harness's usage in this process.
  */
 export async function fetchCursorQuota(
   harness: Harness,
@@ -797,14 +797,14 @@ export async function fetchCursorQuota(
       // Actionable guidance — rendered verbatim in the topbar popover, so
       // tell the user exactly how to make usage appear rather than just
       // stating that it can't. When the IDE read itself was skipped (no
-      // prior consent/snapshot yet), say so explicitly rather than implying
+      // user refresh in this process yet), say so explicitly rather than implying
       // a login problem — the fix here is clicking Refresh, not signing in.
       reason:
         allowIdeRead || opts?.session
           ? "No Cursor session found. Open the Cursor desktop app and sign in, " +
             "then Refresh here \u2014 Agetor reads Cursor's local login to fetch plan usage."
-          : "Cursor usage isn't read in the background. Click Refresh to read " +
-            "Cursor's local login and show plan usage.",
+          : "Cursor usage isn't read in the background until you refresh it once " +
+            "after launch. Click Refresh to read Cursor's local login and show plan usage.",
     };
   }
 

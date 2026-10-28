@@ -294,8 +294,8 @@ describe("allowIdeRead gating (macOS TCC cross-app-read guard)", () => {
     expect(quota.meters).toEqual([]);
     expect(quota.planType).toBeNull();
     expect(quota.reason).toBe(
-      "Cursor usage isn't read in the background. Click Refresh to read " +
-        "Cursor's local login and show plan usage.",
+      "Cursor usage isn't read in the background until you refresh it once " +
+        "after launch. Click Refresh to read Cursor's local login and show plan usage.",
     );
   });
 

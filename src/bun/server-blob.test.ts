@@ -82,7 +82,8 @@ let task: Task;
 
 beforeAll(async () => {
   const { tasks } = await import("./db.ts");
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void };
   token = API_TOKEN;
 
@@ -123,9 +124,9 @@ test("/tasks/:id/diff/blob requires a token", async () => {
   expect(res.status).toBe(401);
 });
 
-test("/tasks/:id/diff/blob accepts a ?token= query param", async () => {
+test("/tasks/:id/diff/blob refuses a ?token= query param (D13: webview fetches with a header)", async () => {
   const res = await withQueryToken(blobUrl(task.id, "logo.png", "new"));
-  expect(res.status).toBe(200);
+  expect(res.status).toBe(401);
 });
 
 test("/tasks/:id/diff/blob 404s for an unknown task", async () => {

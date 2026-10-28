@@ -342,7 +342,7 @@ test.describe("sent files to user", () => {
     // Playwright never observes a "response") until the first real event or
     // the 15s keepalive ping, whichever comes first. Waiting on the request
     // event avoids riding that latency while still proving the effect that
-    // opens the EventSource has fired — see the product-bug note in this
+    // opens the event stream has fired — see the product-bug note in this
     // spec's header comment for the underlying latency issue itself.
     await installToastLog(page);
     const globalEventsRequested = page.waitForRequest(

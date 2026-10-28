@@ -26,10 +26,11 @@
  * harness or one flaky endpoint.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Harness, HarnessQuota, QuotaMeter } from "../../shared/types.ts";
+import { isPlainDirBelow, openReadNoFollow, readAccountFileText } from "../no-follow.ts";
 
 /** Fetch timeout for the live `wham/usage` call. */
 const FETCH_TIMEOUT_MS = 5000;
@@ -39,6 +40,15 @@ const ROLLOUT_FILE_RE = /^rollout-.*\.jsonl$/;
 
 /** Bound on how deep we'll recurse under `sessions/`/`archived_sessions/`. */
 const MAX_WALK_DEPTH = 6;
+
+/** Upper bound on an `auth.json` we parse — a token blob is a few KB. */
+const AUTH_JSON_MAX_BYTES = 1024 * 1024;
+
+/** How much of the newest rollout's end we scan for its last `rate_limits`.
+ *  codex writes a `token_count` event after every model turn, so the latest
+ *  one sits near the end; reading only the tail keeps a long session's
+ *  hundreds of MB off the main thread. */
+const ROLLOUT_TAIL_BYTES = 8 * 1024 * 1024;
 
 /**
  * `<home>/.codex` for an aliased harness, else `~/.codex` for the main
@@ -63,7 +73,9 @@ export function readCodexToken(harness: Harness): {
   try {
     const authPath = path.join(codexHome(harness), "auth.json");
     if (!existsSync(authPath)) return { accessToken: null, accountId: null };
-    const raw = readFileSync(authPath, "utf8");
+    // CODEX_HOME is agent-writable: read no-follow while disclaiming, never
+    // blocking on a FIFO (no-follow.ts).
+    const raw = readAccountFileText(authPath, AUTH_JSON_MAX_BYTES);
     const parsed = JSON.parse(raw) as unknown;
     if (
       parsed &&
@@ -241,7 +253,9 @@ interface RolloutCandidate {
   mtimeMs: number;
 }
 
-/** Recursively collect `rollout-*.jsonl` files under `dir`, bounded by depth. */
+/** Recursively collect `rollout-*.jsonl` files under `dir`, bounded by depth.
+ *  Dirents carry the entry's own type, so a symlinked folder or file is never
+ *  followed. */
 function collectRolloutFiles(dir: string, depth: number, out: RolloutCandidate[]): void {
   if (depth > MAX_WALK_DEPTH) return;
   let entries: import("node:fs").Dirent[];
@@ -293,20 +307,54 @@ function newestRolloutDir(root: string): string | null {
 }
 
 /**
+ * The trailing `ROLLOUT_TAIL_BYTES` of a rollout file as text, starting at a
+ * line boundary. Opened no-follow and regular-file-only: codex writes these
+ * files itself, so a symlink or FIFO in their place is an agent's plant
+ * (no-follow.ts). Throws on an unreadable file.
+ */
+function readRolloutTail(filePath: string): string {
+  const fd = openReadNoFollow(filePath);
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - ROLLOUT_TAIL_BYTES);
+    const buf = Buffer.alloc(size - start);
+    let read = 0;
+    while (read < buf.length) {
+      const n = readSync(fd, buf, read, buf.length - read, start + read);
+      if (n === 0) break;
+      read += n;
+    }
+    let text = buf.subarray(0, read).toString("utf8");
+    // Drop the partial first line of a cut tail.
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      text = nl === -1 ? "" : text.slice(nl + 1);
+    }
+    return text;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
  * Find the newest `rollout-*.jsonl` under `<codexHome>/sessions/` (falling
  * back to `<codexHome>/archived_sessions/` when `sessions/` has nothing),
- * and pull the last `token_count` event's `rate_limits` blob out of it.
- * Never throws — returns `null` on any I/O or parse failure, or when no
- * rollout file carries a `rate_limits` blob at all.
+ * and pull the last `token_count` event's `rate_limits` blob out of its
+ * tail. Both folders are agent-writable, so each is listed only while it is
+ * a real directory below CODEX_HOME (`isPlainDirBelow` — a `sessions` linked
+ * into a protected folder is skipped). Never throws — returns `null` on any
+ * I/O or parse failure, or when no rollout file carries a `rate_limits` blob
+ * at all.
  */
 export function readNewestCodexRateLimits(harness: Harness): { rateLimits: unknown; mtimeMs: number } | null {
   try {
     const home = codexHome(harness);
     const candidates: RolloutCandidate[] = [];
     // Fast path: only scan the newest day directory (cheap — one day's files).
-    for (const sub of ["sessions", "archived_sessions"]) {
-      const root = path.join(home, sub);
-      if (!existsSync(root)) continue;
+    const roots = ["sessions", "archived_sessions"]
+      .map((sub) => path.join(home, sub))
+      .filter((root) => isPlainDirBelow(home, root));
+    for (const root of roots) {
       const dayDir = newestRolloutDir(root);
       if (dayDir) collectRolloutFiles(dayDir, MAX_WALK_DEPTH, candidates);
       if (candidates.length > 0) break;
@@ -315,17 +363,14 @@ export function readNewestCodexRateLimits(harness: Harness): { rateLimits: unkno
     // unexpected layout), fall back to the bounded full walk so real data
     // in an oddly-structured tree isn't missed.
     if (candidates.length === 0) {
-      for (const sub of ["sessions", "archived_sessions"]) {
-        const dir = path.join(home, sub);
-        if (existsSync(dir)) collectRolloutFiles(dir, 0, candidates);
-      }
+      for (const root of roots) collectRolloutFiles(root, 0, candidates);
     }
     if (candidates.length === 0) return null;
 
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
     const newest = candidates[0];
     if (!newest) return null;
-    const text = readFileSync(newest.filePath, "utf8");
+    const text = readRolloutTail(newest.filePath);
     const lines = text.split("\n");
 
     for (let i = lines.length - 1; i >= 0; i--) {

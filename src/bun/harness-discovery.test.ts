@@ -1,4 +1,4 @@
-import { beforeAll, expect, test } from "bun:test";
+import { afterEach, beforeAll, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -72,6 +72,51 @@ test("readClaudeAccount returns null for missing, malformed, or logged-out blobs
   expect(mod.readClaudeAccount(path.join(home, ".claude-bad"), opts)).toBeNull();
   expect(mod.readClaudeAccount(path.join(home, ".claude-loggedout"), opts)).toBeNull();
   expect(mod.readClaudeAccount(path.join(home, ".claude-nonexistent"), opts)).toBeNull();
+});
+
+// While disclaiming, the blob is an agent-writable account file: never opened
+// through a symlink (it could point into a protected folder) and never allowed
+// to block on a FIFO. With the switch off a user's own symlinked blob reads.
+const savedDisclaimBin = process.env.AGETOR_DISCLAIM_BIN;
+let savedDisclaimSwitch: boolean | null = null;
+afterEach(async () => {
+  if (savedDisclaimSwitch === null) return;
+  const { setDisclaimSwitch } = await import("./disclaim.ts");
+  setDisclaimSwitch(savedDisclaimSwitch);
+  savedDisclaimSwitch = null;
+  if (savedDisclaimBin === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+  else process.env.AGETOR_DISCLAIM_BIN = savedDisclaimBin;
+});
+async function useDisclaim(on: boolean, home: string): Promise<void> {
+  const { getDisclaimSwitch, setDisclaimSwitch } = await import("./disclaim.ts");
+  savedDisclaimSwitch ??= getDisclaimSwitch();
+  const stub = path.join(home, "disclaim-stub");
+  writeFileSync(stub, '#!/bin/sh\nexec "$@"\n', { mode: 0o755 });
+  process.env.AGETOR_DISCLAIM_BIN = stub;
+  setDisclaimSwitch(on);
+}
+
+test.skipIf(process.platform !== "darwin")("readClaudeAccount refuses a symlinked blob only while disclaiming", async () => {
+  const home = makeHome();
+  const opts = { homeDir: home, env: {} };
+  mkdirSync(path.join(home, ".claude-link"));
+  symlinkSync(path.join(home, ".claude-adevinta", ".claude.json"), path.join(home, ".claude-link", ".claude.json"));
+  await useDisclaim(true, home);
+  expect(mod.readClaudeAccount(path.join(home, ".claude-link"), opts)).toBeNull();
+  await useDisclaim(false, home);
+  expect(mod.readClaudeAccount(path.join(home, ".claude-link"), opts)?.email).toBe("work@adevinta.com");
+});
+
+test.skipIf(process.platform === "win32")("readClaudeAccount answers null for a FIFO blob without blocking, switch on or off", async () => {
+  const home = makeHome();
+  const opts = { homeDir: home, env: {} };
+  mkdirSync(path.join(home, ".claude-fifo"));
+  expect(Bun.spawnSync(["/usr/bin/mkfifo", path.join(home, ".claude-fifo", ".claude.json")]).exitCode).toBe(0);
+  for (const on of [false, true]) {
+    await useDisclaim(on, home);
+    // A blocking open/read would hang the test (and the core) here.
+    expect(mod.readClaudeAccount(path.join(home, ".claude-fifo"), opts)).toBeNull();
+  }
 });
 
 // --- suggestHarnessId ---------------------------------------------------------

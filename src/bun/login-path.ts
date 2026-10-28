@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { coreSpawnSync } from "./core-spawn.ts";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
@@ -77,7 +77,9 @@ function readLoginShellPath(): LoginShellProbe {
 
   let result;
   try {
-    result = spawnSync(shell, ["-ilc", script], {
+    // coreSpawnSync: the login shell sources rc files an agent can plant, so it
+    // runs through the disclaim wrapper like every other core spawn (P2/P3).
+    result = coreSpawnSync(shell, ["-ilc", script], {
       env: { ...process.env, AGETOR_PATH_PROBE: "1" },
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf8",
@@ -125,7 +127,7 @@ function probeCommandDir(cmd: ProbeableCommand): { dir: string | null; aliased: 
   const safe = JSON.stringify(cmd);
   let result;
   try {
-    result = spawnSync(
+    result = coreSpawnSync(
       shell,
       ["-ilc", `type -p ${safe} 2>/dev/null; echo "---"; type ${safe} 2>/dev/null || true`],
       {
@@ -139,7 +141,7 @@ function probeCommandDir(cmd: ProbeableCommand): { dir: string | null; aliased: 
     return { dir: null, aliased: false };
   }
 
-  const stdout = (result?.stdout ?? "").trim();
+  const stdout = String(result?.stdout ?? "").trim();
   const [pathSection, typeSection = ""] = stdout.split("---").map((s) => s.trim());
   // `type -p` prints the absolute path on success; nothing on alias/function/miss.
   const filePath = pathSection?.split("\n").pop()?.trim() ?? "";

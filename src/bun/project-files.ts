@@ -4,8 +4,9 @@
 // repo-relative path back to an absolute path under a task's cwd.
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
+import { coreSpawn } from "./core-spawn.ts";
 import { isSafeRelPath } from "./worktree.ts";
-import { expandAtTokens, MAX_PROJECT_FILES } from "../shared/at-refs.ts";
+import { expandAtTokens, findAtTokens, MAX_PROJECT_FILES } from "../shared/at-refs.ts";
 import { buildFileEntries, filterFileEntries, type FileEntry } from "../shared/at-file-filter.ts";
 
 // The cap lives in the shared module so the webview's truncation footer and
@@ -81,12 +82,22 @@ const GIT_TIMEOUT_MS = 30_000;
  * instead of growing a shared "git utils" module every file depends on.
  */
 async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
-  const proc = Bun.spawn(["git", ...args], {
-    cwd,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  // coreSpawn: the repo's own git config is agent-plantable (P2/P3).
+  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+  try {
+    proc = coreSpawn(["git", ...args], {
+      cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
+  } catch (err) {
+    // The spawn itself throws synchronously when `cwd` can't be entered
+    // (e.g. a mode-000 directory → EACCES) or git is missing — keep the
+    // "never throws" contract so the route answers its normal error instead
+    // of an unhandled rejection.
+    return { ok: false, stdout: "", stderr: err instanceof Error ? err.message : String(err), exitCode: -1 };
+  }
   const timer = setTimeout(() => proc.kill(), timeoutMs);
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
@@ -499,6 +510,62 @@ export function expandAtReferencesDetailed(text: string, cwd: string): { text: s
     text,
     (p, isDir) => {
       const resolved = resolveAtPath(cwd, p, isDir);
+      if (resolved === null) return null;
+      return /\s/.test(resolved) ? `"${resolved}"` : resolved;
+    },
+    (token) => {
+      if (seen.has(token.raw)) return;
+      seen.add(token.raw);
+      unresolved.push(token.raw);
+    },
+  );
+  return { text: expanded, unresolved };
+}
+
+/**
+ * Async twin of {@link expandAtReferencesDetailed} with the resolver injected
+ * (D25, docs/plans/master-token-agent-read.md). The orchestrator passes
+ * `resolveAtPathsInTaskDir`, which answers a whole batch from ONE disclaimed
+ * child instead of stat-ing the task's directory in the core process; it is
+ * injected rather than imported because `task-dir-fs.ts` imports
+ * `resolveAtPath` from this file.
+ *
+ * Output is identical to the sync form: all tokens are collected first, the
+ * resolver is called ONCE with the distinct `(path, isDirectory)` pairs (and
+ * not at all when the text holds no token), then the results are spliced with
+ * the very same `expandAtTokens` pass — a resolved path containing whitespace
+ * is double-quoted, an unresolved token stays verbatim, and `unresolved`
+ * lists each raw token once, in document order. `resolve` must return one
+ * entry per item, in order, with `resolveAtPath`'s semantics (absolute path,
+ * trailing `/` for a directory, `null` when unresolvable).
+ */
+export async function expandAtReferencesDetailedAsync(
+  text: string,
+  cwd: string,
+  resolve: (cwd: string, items: readonly { rel: string; isDir: boolean }[]) => Promise<(string | null)[]>,
+): Promise<{ text: string; unresolved: string[] }> {
+  if (!text.includes("@")) return { text, unresolved: [] };
+  const tokens = findAtTokens(text);
+  if (tokens.length === 0) return { text, unresolved: [] };
+
+  const keyOf = (rel: string, isDir: boolean): string => `${isDir ? "d" : "f"}:${rel}`;
+  const items: { rel: string; isDir: boolean }[] = [];
+  const indexByKey = new Map<string, number>();
+  for (const token of tokens) {
+    const key = keyOf(token.path, token.isDirectory);
+    if (indexByKey.has(key)) continue;
+    indexByKey.set(key, items.length);
+    items.push({ rel: token.path, isDir: token.isDirectory });
+  }
+
+  const results = await resolve(cwd, items);
+
+  const unresolved: string[] = [];
+  const seen = new Set<string>();
+  const expanded = expandAtTokens(
+    text,
+    (p, isDir) => {
+      const resolved = results[indexByKey.get(keyOf(p, isDir)) ?? -1] ?? null;
       if (resolved === null) return null;
       return /\s/.test(resolved) ? `"${resolved}"` : resolved;
     },

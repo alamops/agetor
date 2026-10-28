@@ -351,11 +351,9 @@
 import {
   existsSync,
   statSync,
-  openSync,
   readSync,
   closeSync,
   readdirSync,
-  readFileSync,
   watch as fsWatch,
   type FSWatcher,
 } from "node:fs";
@@ -364,6 +362,7 @@ import { runs, subagents as subagentsDb, tasks } from "./db.ts";
 import { formatApiErrorDetail, mapJsonlEventToChunks } from "./claude-tmux.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import type { RunEvent, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
+import { isPlainDirBelow, openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 
 /** Off only when explicitly disabled. The watcher is cheap when idle, but the
  *  flag lets us kill it entirely if a future claude layout change breaks the
@@ -691,7 +690,7 @@ interface SubagentMeta {
  *  place the tool_result correlation key exists on disk). */
 function readMeta(subagentsDir: string, id: string): SubagentMeta {
   try {
-    const raw = readFileSync(path.join(subagentsDir, `agent-${id}.meta.json`), "utf8");
+    const raw = readTextNoFollow(path.join(subagentsDir, `agent-${id}.meta.json`));
     const o = JSON.parse(raw) as Record<string, unknown>;
     return {
       agentType: typeof o.agentType === "string" ? o.agentType : null,
@@ -735,7 +734,7 @@ function readAppendedSync(
   if (maxBytes !== undefined && len > maxBytes) len = maxBytes;
   const buf = Buffer.alloc(len);
   let fd;
-  try { fd = openSync(filePath, "r"); } catch { return { text: "", next: offset }; }
+  try { fd = openReadNoFollow(filePath); } catch { return { text: "", next: offset }; }
   try {
     readSync(fd, buf, 0, len, offset);
   } finally {
@@ -791,7 +790,7 @@ function readAppendedLinesSync(
   // Same non-file guard as `readAppendedSync` (a directory `sourcePath`).
   if (!st.isFile() || st.size <= offset) return none;
   let fd;
-  try { fd = openSync(filePath, "r"); } catch { return none; }
+  try { fd = openReadNoFollow(filePath); } catch { return none; }
   try {
     let size = st.size;
     let end = offset;
@@ -1850,7 +1849,12 @@ export function attachSubagentWatcher(opts: {
   }
 
   const sessionId = path.basename(opts.jsonlPath, ".jsonl");
-  const subagentsDir = path.join(path.dirname(opts.jsonlPath), sessionId, "subagents");
+  // Everything below the project dir is agent-writable. The folders listed or
+  // watched in-process (`<session>/subagents`, its `workflows/` tree) must be
+  // real directories all the way down from it, so a folder linked into a
+  // protected location is never read under Agetor's identity (no-follow.ts).
+  const projectDir = path.dirname(opts.jsonlPath);
+  const subagentsDir = path.join(projectDir, sessionId, "subagents");
   const workflowsDir = path.join(subagentsDir, WORKFLOWS_SUBDIR);
   const files = new Map<string, FileState>();
   // Workflow CONTAINER rows this watcher knows about, keyed by container id
@@ -2267,6 +2271,7 @@ export function attachSubagentWatcher(opts: {
   /** Pick up newly-created `agent-*.jsonl` files. */
   function discover(): void {
     let entries: string[];
+    if (!isPlainDirBelow(projectDir, subagentsDir)) return;
     try { entries = readdirSync(subagentsDir); } catch { return; }
     for (const name of entries) {
       const m = /^agent-(.+)\.jsonl$/.exec(name);
@@ -2469,12 +2474,14 @@ export function attachSubagentWatcher(opts: {
   function discoverWorkflowAgents(): void {
     if (!WORKFLOWS_ENABLED) return;
     let dirs: string[];
+    if (!isPlainDirBelow(projectDir, workflowsDir)) return;
     try { dirs = readdirSync(workflowsDir); } catch { return; }
     for (const dirName of dirs) {
       const dir = path.join(workflowsDir, dirName);
       let names: string[];
-      // Also the is-it-a-directory probe: a stray file in `workflows/` throws
-      // ENOTDIR here and is skipped, no `statSync` round-trip needed.
+      // One `lstat` (the chain above it was just checked) — also skips a stray
+      // file in `workflows/`.
+      if (!isPlainDirBelow(workflowsDir, dir)) continue;
       try { names = readdirSync(dir); } catch { continue; }
       if (!wfJournals.has(dir)) {
         wfJournals.set(dir, 0);
@@ -4023,7 +4030,7 @@ export function attachSubagentWatcher(opts: {
   }
 
   function armDirWatcher(): void {
-    if (dirWatcher || !existsSync(subagentsDir)) return;
+    if (dirWatcher || !isPlainDirBelow(projectDir, subagentsDir)) return;
     try {
       dirWatcher = fsWatch(subagentsDir, { persistent: false }, () => {
         if (detached) return;

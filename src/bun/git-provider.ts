@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { coreSpawnSync } from "./core-spawn.ts";
 import { existsSync } from "node:fs";
 import type { GitProvider, ProviderRepoInfo } from "../shared/types.ts";
 import { canonicalGitHost, parseGitRemote, run } from "./github.ts";
@@ -179,7 +179,9 @@ export function apiHostForRemote(remoteHost: string): string {
     // No shell involved (argv array, not a command string) and `--` marks
     // the end of options, so `normalized` can't be reinterpreted as an ssh
     // flag even if the leading-dash guard above were somehow bypassed.
-    const res = spawnSync(sshBin, ["-G", "--", normalized], {
+    // coreSpawnSync: `ssh -G` evaluates `Match exec` clauses from the user's
+    // ssh config, which an agent can plant (P2/P3).
+    const res = coreSpawnSync(sshBin, ["-G", "--", normalized], {
       encoding: "utf8",
       timeout: SSH_RESOLVE_TIMEOUT_MS,
     });
