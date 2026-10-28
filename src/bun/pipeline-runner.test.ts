@@ -2104,18 +2104,11 @@ test("a running successor suppresses the handoff reminder; its own handoff advan
     });
 
     // The background-task continuation is already the step's current run
-    // and still writing when the previous run (no `<handoff>`) settles.
-    const continuationId = randomUUID();
-    runs.insert({
-      ...settled,
-      id: continuationId,
-      status: "running",
-      startedAt: Date.now(),
-      endedAt: null,
-      exitCode: null,
-      origin: "continuation",
-    });
-    tasks.update(stepA.id, { runId: continuationId });
+    // and still writing when the previous run (no `<handoff>`) settles. It
+    // is a REAL live run (an `active` handle), since the runner waits on
+    // what the orchestrator reports live, not on a bare `running` row.
+    const continuation = await openLiveRun(stepA.id, null, "notification");
+    const continuationId = continuation.runId;
 
     await __forTest.handleRunStatus(stepA.id, settled.id, "succeeded");
 
@@ -2142,11 +2135,8 @@ test("a running successor suppresses the handoff reminder; its own handoff advan
       openQuestions: [] as string[],
       status: "done" as const,
     };
-    runs.appendEvent(
-      continuationId,
-      "assistant",
-      `Skill scan.\n<${HANDOFF_TAG}>\n${JSON.stringify(doneHandoff)}\n</${HANDOFF_TAG}>`,
-    );
+    continuation.say(`Skill scan.\n<${HANDOFF_TAG}>\n${JSON.stringify(doneHandoff)}\n</${HANDOFF_TAG}>`);
+    await continuation.finish();
     await __forTest.handleRunStatus(stepA.id, continuationId, "succeeded");
   } finally {
     __forTest.setListenerEnabled(true);
@@ -2495,14 +2485,16 @@ test("a running successor that appears before the reminder is stamped is not rec
       "assistant",
       `Skill scan.\n<${HANDOFF_TAG}>\n${JSON.stringify(doneHandoff)}\n</${HANDOFF_TAG}>`,
     );
-    await __forTest.handleRunStatus(stepA.id, continuationId, "succeeded");
     // `sendInput` returns before the fake driver's resolve timer writes its
-    // chunks. Drain that turn while the listener is still off and the run
-    // row still exists, so the timer cannot append after `deleteTask`.
+    // chunks. Drain that reminder turn while the listener is still off and
+    // the run row still exists, so the timer cannot append after
+    // `deleteTask` — and because the step never advances while a run of it
+    // is still live (D5), the continuation's settle has to come after it.
     await waitFor(() => {
       const pending = runs.listForTask(stepA!.id).some((r) => r.id !== continuationId && r.status === "running");
       return pending ? undefined : true;
     });
+    await __forTest.handleRunStatus(stepA.id, continuationId, "succeeded");
   } finally {
     __forTest.setBeforeReminderStamp(null);
     __forTest.setListenerEnabled(true);
@@ -2556,7 +2548,10 @@ test("a failed run records step-failed with no reminder and responseKind \"error
 
     // Simulate the run actually failing — e.g. an api-error/session-died
     // settle — regardless of the (irrelevant) assistant text the fake
-    // driver already emitted for its `:done` handoff.
+    // driver already emitted for its `:done` handoff. The run row has to say
+    // `failed` too: a SUCCEEDED run of the attempt holding a valid handoff
+    // would otherwise be the look-back's supplier (see U7(10d)).
+    runs.update(runRow.id, { status: "failed", exitCode: 1 });
     await __forTest.handleRunStatus(stepA.id, runRow.id, "failed");
   } finally {
     __forTest.setListenerEnabled(true);
@@ -3601,4 +3596,758 @@ test("M-R7: a delete cascade that throws un-tombstones the parent, which stays r
   expect(tasks.get(parentId)).toBeNull();
   expect(tombstonedPipelineParents.has(parentId)).toBe(true);
   expect(tasks.list().some((t) => t.pipelineParentId === parentId)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// Handoff look-back across overlapping runs of one step task
+// (docs/plans/handoff-identification-fix.md, U7)
+// ---------------------------------------------------------------------------
+
+/** A short pause so consecutive runs get distinct `startedAt`/`endedAt`
+ *  milliseconds — the look-back orders by them. */
+function tick(ms = 6): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** An assistant reply ending in a valid `<handoff>` block. */
+async function handoffReply(reason: string, extra: Record<string, unknown> = {}): Promise<string> {
+  const { HANDOFF_TAG } = await import("../shared/pipeline.ts");
+  const body = {
+    schemaVersion: 1,
+    purpose: "p",
+    summary: "s",
+    reason,
+    next: null,
+    artifacts: [] as string[],
+    openQuestions: [] as string[],
+    status: "done",
+    ...extra,
+  };
+  return `Work.\n<${HANDOFF_TAG}>\n${JSON.stringify(body)}\n</${HANDOFF_TAG}>`;
+}
+
+interface OverlapStep {
+  parentId: string;
+  stepTaskId: string;
+  /** The step's first run (the fake driver's own turn) — already settled,
+   *  carrying whatever `suffix` made it write. */
+  firstRunId: string;
+}
+
+/** A one-step pipeline started with the runner's listener OFF: its first run
+ *  settles unobserved, so the test decides exactly when (and for which run)
+ *  each settle reaches the runner. The caller re-enables the listener. */
+async function startOverlapStep(label: string, suffix = "missing"): Promise<OverlapStep> {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile(label);
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${suffix}` });
+  const pipeline = pipelines.insert({
+    name: uniqueName(`${label}-pipeline`),
+    graph: { steps: [A], edges: [], startStepId: A.id },
+    maxSteps: 25,
+  });
+  const created = await createTask({ title: `${label} run`, prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  __forTest.setListenerEnabled(false);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  const stepTask = await waitFor(() => tasks.stepsForParent(parentId)[0]);
+  const first = await waitFor(() => {
+    const r = runs.listForTask(stepTask.id)[0];
+    return r && r.status !== "running" ? r : undefined;
+  });
+  return { parentId, stepTaskId: stepTask.id, firstRunId: first.id };
+}
+
+interface LiveRun {
+  runId: string;
+  /** Write a further assistant chunk into the still-open run. */
+  say(text: string): void;
+  /** End the run (exit code 0 unless given) and wait for its row to settle. */
+  finish(code?: number): Promise<void>;
+}
+
+/** Open a REAL live run on a claude step task the way a background-task
+ *  continuation (`trigger: "notification"`) or a message typed in the
+ *  terminal (`"user"`) does — it becomes `task.runId` and registers an
+ *  `active` handle — and hold it open until the test calls `finish()`, so the
+ *  order in which overlapping runs end is exactly the test's. */
+async function openLiveRun(taskId: string, reply: string | null, trigger: "notification" | "user" = "notification"): Promise<LiveRun> {
+  const { openContinuationRun } = await import("./claude-tmux.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const hooks = openContinuationRun(taskId, trigger);
+  if (!hooks) throw new Error("no continuation run factory is installed");
+  let resolveDone!: (code: number) => void;
+  const done = new Promise<number>((res) => { resolveDone = res; });
+  hooks.onAdopted({ kill: () => resolveDone(0), writeInput: () => true, done });
+  const runId = tasks.get(taskId)!.runId!;
+  if (reply) hooks.onChunk("assistant", reply);
+  return {
+    runId,
+    say: (text) => hooks.onChunk("assistant", text),
+    async finish(code = 0) {
+      hooks.onChunk("status", "turn complete");
+      resolveDone(code);
+      await waitFor(() => {
+        const r = runs.get(runId);
+        return r && r.status !== "running" ? r : undefined;
+      });
+    },
+  };
+}
+
+/** Every handoff-reminder `user` event across all runs of a step task. */
+async function reminderEventsOf(stepTaskId: string): Promise<string[]> {
+  const { runs } = await import("./db.ts");
+  const { HANDOFF_REMINDER_MARKER } = await import("../shared/pipeline.ts");
+  return runs.listForTask(stepTaskId)
+    .flatMap((r) => runs.events(r.id))
+    .filter((e) => e.stream === "user" && e.data.includes(HANDOFF_REMINDER_MARKER))
+    .map((e) => e.data);
+}
+
+async function statusLinesOf(runId: string): Promise<string[]> {
+  const { runs } = await import("./db.ts");
+  return runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+}
+
+/** The step execution is still waiting: active, unblocked, un-reminded,
+ *  un-resolved, with the run not finished. */
+async function expectStepWaiting(s: OverlapStep): Promise<void> {
+  const { tasks } = await import("./db.ts");
+  const run = tasks.get(s.parentId)!.pipelineRun!;
+  expect(run.status).toBe("running");
+  expect(run.active.some((a) => a.taskId === s.stepTaskId)).toBe(true);
+  expect(run.blocked.filter((b) => b.taskId === s.stepTaskId)).toEqual([]);
+  const record = run.history.find((h) => h.taskId === s.stepTaskId)!;
+  expect(record.outcome).toBeNull();
+  expect(record.reminder ?? null).toBeNull();
+  expect(record.responseKind ?? null).toBeNull();
+  expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+}
+
+async function waitForPipelineDone(parentId: string) {
+  const { tasks } = await import("./db.ts");
+  return waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  }, 8000);
+}
+
+/** Wait until no run of the step task is `running` (a reminder turn the fake
+ *  driver is still writing would otherwise append after `deleteTask`). */
+async function waitForStepRunsIdle(stepTaskId: string): Promise<void> {
+  const { runs } = await import("./db.ts");
+  await waitFor(() => (runs.listForTask(stepTaskId).some((r) => r.status === "running") ? undefined : true), 8000);
+}
+
+test("U7(1) incident shape: A has no handoff, B (displaced) has one, C (current) has none — the step advances on B once both end, with no reminder", async () => {
+  const { HANDOFF_FROM_NEWER_RUN_STATUS } = await import("../shared/pipeline.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const s = await startOverlapStep("u7-incident");
+  try {
+    await tick();
+    const B = await openLiveRun(s.stepTaskId, await handoffReply("finished on B"), "notification");
+    await tick();
+    const C = await openLiveRun(s.stepTaskId, "Picking this back up.", "user");
+    expect(tasks.get(s.stepTaskId)!.runId).toBe(C.runId);
+
+    // A's settle reaches the runner while B and C are both writing: the step
+    // waits instead of reminding about a handoff B has already written.
+    __forTest.setListenerEnabled(true);
+    await __forTest.handleRunStatus(s.stepTaskId, s.firstRunId, "succeeded");
+    await expectStepWaiting(s);
+
+    // B ends first. It is no longer `task.runId`, so only the orchestrator's
+    // displaced-run report reaches the runner — and C is still live.
+    await B.finish();
+    await tick(80);
+    await expectStepWaiting(s);
+
+    await tick();
+    await C.finish();
+    const done = await waitForPipelineDone(s.parentId);
+
+    const record = done.pipelineRun!.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("succeeded");
+    expect(record.responseKind).toBe("handoff");
+    expect(record.handoffRunId).toBe(B.runId);
+    expect(record.handoffFromOtherRun).toBe(true);
+    expect(record.handoff?.reason).toBe("finished on B");
+    expect(record.reminder ?? null).toBeNull();
+    expect(done.pipelineRun!.blocked).toEqual([]);
+
+    // The supplying run explains itself; the others stay quiet.
+    expect(await statusLinesOf(B.runId)).toContain(HANDOFF_FROM_NEWER_RUN_STATUS);
+    expect(await statusLinesOf(C.runId)).not.toContain(HANDOFF_FROM_NEWER_RUN_STATUS);
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+    expect(runs.listForTask(s.stepTaskId).length).toBe(3);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});
+
+test("U7(2) the current run C ends first while the displaced B is still live — nothing is reminded or blocked until B's displaced settle advances the step", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+
+  const s = await startOverlapStep("u7-c-first");
+  try {
+    await tick();
+    const B = await openLiveRun(s.stepTaskId, await handoffReply("finished on B"), "notification");
+    await tick();
+    const C = await openLiveRun(s.stepTaskId, "Picking this back up.", "user");
+
+    __forTest.setListenerEnabled(true);
+    await __forTest.handleRunStatus(s.stepTaskId, s.firstRunId, "succeeded");
+
+    // C (the current run) ends with no handoff while B is still writing.
+    await C.finish();
+    await tick(80);
+    await expectStepWaiting(s);
+
+    // B's settle is the displaced-run report; it re-settles C and the
+    // look-back finds B's handoff.
+    await tick();
+    await B.finish();
+    const done = await waitForPipelineDone(s.parentId);
+    const record = done.pipelineRun!.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("succeeded");
+    expect(record.handoffRunId).toBe(B.runId);
+    expect(record.handoffFromOtherRun).toBe(true);
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});
+
+/** B (done) then C (blocked) both end with the runner deaf, then B's late
+ *  settle arrives: the newest settled handoff — C's `status:"blocked"` — wins. */
+async function setupNewerBlockedHandoff(label: string) {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const s = await startOverlapStep(label);
+  await tick();
+  const B = await openLiveRun(s.stepTaskId, await handoffReply("older, done"), "notification");
+  await B.finish();
+  await tick();
+  const C = await openLiveRun(s.stepTaskId, await handoffReply("newer, needs a decision", { status: "blocked" }), "user");
+  await C.finish();
+  await __forTest.handleRunStatus(s.stepTaskId, B.runId, "succeeded");
+  return { s, B, C };
+}
+
+test("U7(3) D10: an older done handoff and a newer blocked one — the newest settled wins, so the step blocks with the newer handoff", async () => {
+  const { HANDOFF_FROM_OTHER_RUN_STATUS } = await import("../shared/pipeline.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const { s, B, C } = await setupNewerBlockedHandoff("u7-newest-wins");
+  try {
+    const run = tasks.get(s.parentId)!.pipelineRun!;
+    expect(run.status).toBe("blocked");
+    expect(run.active.some((a) => a.taskId === s.stepTaskId)).toBe(true);
+    const block = run.blocked.find((b) => b.taskId === s.stepTaskId);
+    expect(block?.kind).toBe("step-blocked");
+    expect(block?.message).toContain("newer, needs a decision");
+    const record = run.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBeNull();
+    expect(record.responseKind).toBe("handoff-blocked");
+    expect(record.handoffRunId).toBe(C.runId);
+    expect(record.handoffFromOtherRun).toBe(true);
+    expect(record.handoff?.reason).toBe("newer, needs a decision");
+    // B (the settling run) started BEFORE the supplier, so the supplier's
+    // line says "another run", not "newer run".
+    expect(await statusLinesOf(C.runId)).toContain(HANDOFF_FROM_OTHER_RUN_STATUS);
+    expect(await statusLinesOf(B.runId)).not.toContain(HANDOFF_FROM_OTHER_RUN_STATUS);
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId).catch(() => {});
+});
+
+test("U7(3b) a manual Advance clears the supplying-run fields", async () => {
+  const { __forTest, advancePipeline } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const { s } = await setupNewerBlockedHandoff("u7-advance-clears");
+  try {
+    const advanced = await advancePipeline(s.parentId, { nextStepIds: null, fromTaskId: s.stepTaskId });
+    if ("error" in advanced) throw new Error(advanced.error);
+    const record = tasks.get(s.parentId)!.pipelineRun!.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("advanced-manually");
+    expect(record.handoffRunId).toBeNull();
+    expect(record.handoffFromOtherRun).toBe(false);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});
+
+test("U7(3c) m11: the step genuinely running again resets the supplying-run fields", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const { s } = await setupNewerBlockedHandoff("u7-m11-resets");
+  try {
+    expect(tasks.get(s.parentId)!.pipelineRun!.history[0]!.handoffRunId).not.toBeNull();
+    await __forTest.handleColumnChange(s.stepTaskId, "running", undefined);
+    const record = tasks.get(s.parentId)!.pipelineRun!.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.responseKind ?? null).toBeNull();
+    expect(record.handoffRunId).toBeNull();
+    expect(record.handoffFromOtherRun).toBe(false);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  // The execution reads `running` again with nothing left to drive it, so
+  // `waitUntilIdle` would never return; no run is live, which is what matters.
+  await waitForStepRunsIdle(s.stepTaskId);
+});
+
+test("U7(4a) D11: a handoff from before the last Retry cannot satisfy the new attempt — the new run's settle reminds instead", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const s = await startOverlapStep("u7-retry-window");
+  try {
+    await tick();
+    const B = await openLiveRun(s.stepTaskId, await handoffReply("from the previous attempt"), "notification");
+    await B.finish();
+
+    // The Retry: the execution's attempt window now starts after B ended.
+    await tick();
+    const parent = tasks.get(s.parentId)!;
+    const run = parent.pipelineRun!;
+    run.history.find((h) => h.taskId === s.stepTaskId)!.attemptStartedAt = Date.now();
+    tasks.setPipelineRun(s.parentId, run);
+    await tick();
+
+    const C = await openLiveRun(s.stepTaskId, "retried, forgot the handoff", "user");
+    await C.finish();
+    await __forTest.handleRunStatus(s.stepTaskId, C.runId, "succeeded");
+
+    // B's handoff is out of the window: no advance, and the one reminder goes out.
+    const after = tasks.get(s.parentId)!.pipelineRun!;
+    expect(after.status).not.toBe("done");
+    expect(after.active.some((a) => a.taskId === s.stepTaskId)).toBe(true);
+    const record = after.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBeNull();
+    expect(record.handoffRunId ?? null).toBeNull();
+    expect(record.reminder?.reason).toBe("handoff-missing");
+    expect((await reminderEventsOf(s.stepTaskId)).length).toBe(1);
+    await waitForStepRunsIdle(s.stepTaskId);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+});
+
+test("U7(4b) D11: a user's own follow-up run does not move the window — the handoff written before it still advances the step", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const s = await startOverlapStep("u7-user-window");
+  try {
+    await tick();
+    const B = await openLiveRun(s.stepTaskId, await handoffReply("written before the follow-up"), "notification");
+    await B.finish();
+    await tick();
+    // A message typed into the step ("thanks") that gets a handoff-less reply.
+    const U = await openLiveRun(s.stepTaskId, "You're welcome.", "user");
+    await U.finish();
+    await __forTest.handleRunStatus(s.stepTaskId, U.runId, "succeeded");
+
+    const done = tasks.get(s.parentId)!.pipelineRun!;
+    expect(done.status).toBe("done");
+    const record = done.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("succeeded");
+    expect(record.handoffRunId).toBe(B.runId);
+    expect(record.handoffFromOtherRun).toBe(true);
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});
+
+test("U7(4c) a successful Retry stamps attemptStartedAt on the execution", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { retryPipelineStep } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("u7-retry-stamp");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+  const pipeline = pipelines.insert({ name: uniqueName("u7-retry-stamp-pipeline"), graph: { steps: [A], edges: [], startStepId: A.id }, maxSteps: 25 });
+  const created = await createTask({ title: "retry stamp", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  // :missing → one reminder → blocked "still no valid handoff after one reminder".
+  const blocked = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" ? t : undefined;
+  }, 8000);
+  const before = blocked.pipelineRun!.history[0]!;
+  expect(before.attemptStartedAt ?? null).toBeNull();
+
+  const retried = await retryPipelineStep(parentId);
+  if ("error" in retried) throw new Error(retried.error);
+  const after = tasks.get(parentId)!.pipelineRun!.history[0]!;
+  expect(after.attemptStartedAt).not.toBeNull();
+  expect(after.attemptStartedAt!).toBeGreaterThanOrEqual(before.startedAt);
+
+  await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" && t.pipelineRun.blocked.length > 0 ? t : undefined;
+  }, 8000);
+  await waitForStepRunsIdle(tasks.stepsForParent(parentId)[0]!.id);
+});
+
+test("U7(5) D14: an already-reminded, blocked execution advances once a displaced run carrying a handoff settles", async () => {
+  const { tasks } = await import("./db.ts");
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+
+  const profile = await makeProfile("u7-reminded");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing` });
+  const pipeline = pipelines.insert({ name: uniqueName("u7-reminded-pipeline"), graph: { steps: [A], edges: [], startStepId: A.id }, maxSteps: 25 });
+  const created = await createTask({ title: "reminded then handoff elsewhere", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  // The original turn and the one reminder both omit the handoff: blocked.
+  const blocked = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" ? t : undefined;
+  }, 8000);
+  const stepTaskId = tasks.stepsForParent(parentId)[0]!.id;
+  expect(blocked.pipelineRun!.history[0]!.reminder).not.toBeNull();
+  expect(blocked.pipelineRun!.blocked[0]?.message).toContain("still no valid handoff after one reminder");
+  await waitForStepRunsIdle(stepTaskId);
+
+  // Claude then answers on two overlapping runs: X (displaced) carries the
+  // handoff, Y (current) does not.
+  await tick();
+  const X = await openLiveRun(stepTaskId, await handoffReply("finished on X"), "notification");
+  await tick();
+  const Y = await openLiveRun(stepTaskId, "Picking this back up.", "user");
+  await Y.finish();
+  await tick(80);
+  const waiting = tasks.get(parentId)!.pipelineRun!;
+  expect(waiting.status).not.toBe("done");
+  expect(waiting.active.some((a) => a.taskId === stepTaskId)).toBe(true);
+
+  await tick();
+  await X.finish();
+  const done = await waitForPipelineDone(parentId);
+  const record = done.pipelineRun!.history.find((h) => h.taskId === stepTaskId)!;
+  expect(record.outcome).toBe("succeeded");
+  expect(record.reminder).not.toBeNull(); // the stamped reminder no longer blocks
+  expect(record.handoffRunId).toBe(X.runId);
+  expect(record.handoffFromOtherRun).toBe(true);
+  expect(done.pipelineRun!.blocked).toEqual([]);
+  await waitUntilIdle(parentId);
+});
+
+test("U7(6) D15: with the runner deaf to every settle, reconcilePipelineRuns advances on the look-back", async () => {
+  const { __forTest, reconcilePipelineRuns } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const s = await startOverlapStep("u7-reconcile");
+  try {
+    await tick();
+    const B = await openLiveRun(s.stepTaskId, await handoffReply("finished on B"), "notification");
+    await B.finish();
+    await tick();
+    const C = await openLiveRun(s.stepTaskId, "Picking this back up.", "user");
+    await C.finish();
+    expect(tasks.get(s.parentId)!.pipelineRun!.status).toBe("running");
+
+    const count = await reconcilePipelineRuns();
+    expect(count).toBeGreaterThanOrEqual(1);
+
+    const done = tasks.get(s.parentId)!.pipelineRun!;
+    expect(done.status).toBe("done");
+    const record = done.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("succeeded");
+    expect(record.handoffRunId).toBe(B.runId);
+    expect(record.handoffFromOtherRun).toBe(true);
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});
+
+/** A subagent of `runId` that ended after the run did — the DB trace of a
+ *  held step that was released. */
+async function insertReleasedSubagent(s: OverlapStep): Promise<void> {
+  const { subagents } = await import("./db.ts");
+  subagents.insertIfAbsent({
+    id: randomUUID(),
+    taskId: s.stepTaskId,
+    runId: s.firstRunId,
+    parentKind: "subagent",
+    agentType: "general-purpose",
+    description: "background work",
+    spawnDepth: 1,
+    sourcePath: "/tmp/u7-subagent.jsonl",
+    status: "completed",
+    startedAt: Date.now() - 500,
+    endedAt: Date.now(),
+  });
+}
+
+test("U7(7a) grace: a released held run with no handoff and no continuation waits out the grace, then gets the one reminder", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const s = await startOverlapStep("u7-grace-expires");
+  const previous = __forTest.setReleaseGraceMs(200);
+  try {
+    await tick();
+    await insertReleasedSubagent(s);
+    await __forTest.handleRunStatus(s.stepTaskId, s.firstRunId, "succeeded");
+
+    // Inside the grace: nothing sent, nothing blocked, no outcome stamped.
+    await expectStepWaiting(s);
+    await tick(80);
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+
+    // The grace timer re-settles the run; with no continuation it reminds.
+    const reminders = await waitFor(() => {
+      const found = tasks.get(s.parentId)!.pipelineRun!.history[0]!.reminder;
+      return found ?? undefined;
+    }, 4000);
+    expect(reminders.reason).toBe("handoff-missing");
+    expect((await reminderEventsOf(s.stepTaskId)).length).toBe(1);
+    await waitForStepRunsIdle(s.stepTaskId);
+  } finally {
+    __forTest.setReleaseGraceMs(previous);
+    __forTest.setListenerEnabled(true);
+  }
+});
+
+test("U7(7b) grace: a continuation adopted inside the grace is advanced on — no reminder, now or when the grace ends", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+
+  const s = await startOverlapStep("u7-grace-cont");
+  const previous = __forTest.setReleaseGraceMs(300);
+  try {
+    await tick();
+    await insertReleasedSubagent(s);
+    __forTest.setListenerEnabled(true);
+    await __forTest.handleRunStatus(s.stepTaskId, s.firstRunId, "succeeded");
+    await expectStepWaiting(s);
+
+    const B = await openLiveRun(s.stepTaskId, await handoffReply("continued after the helper finished"), "notification");
+    await B.finish();
+    const done = await waitForPipelineDone(s.parentId);
+    const record = done.pipelineRun!.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.handoffRunId).toBe(B.runId);
+    expect(record.handoffFromOtherRun).toBe(false);
+
+    // Past the original deadline the (cleared) timer must not remind anyone.
+    await tick(400);
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+  } finally {
+    __forTest.setReleaseGraceMs(previous);
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});
+
+test("U7(8) D6: a run turns live between the reminder decision and the send — the idle-only send is refused, nothing is recorded or blocked, and the run's own handoff advances the step", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const s = await startOverlapStep("u7-idle-only");
+  let B: LiveRun | null = null;
+  try {
+    __forTest.setListenerEnabled(true);
+    __forTest.setBeforeReminderDispatch(async () => {
+      // The pre-send recheck saw an idle step; a continuation starts now.
+      B = await openLiveRun(s.stepTaskId, await handoffReply("continuation won the race"), "notification");
+    });
+    await __forTest.handleRunStatus(s.stepTaskId, s.firstRunId, "succeeded");
+
+    expect(B).not.toBeNull();
+    const run = tasks.get(s.parentId)!.pipelineRun!;
+    expect(run.active.some((a) => a.taskId === s.stepTaskId)).toBe(true);
+    expect(run.blocked.filter((b) => b.taskId === s.stepTaskId)).toEqual([]);
+    const record = run.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.reminder ?? null).toBeNull();
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+
+    await B!.finish();
+    const done = await waitForPipelineDone(s.parentId);
+    const advanced = done.pipelineRun!.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(advanced.outcome).toBe("succeeded");
+    expect(advanced.responseKind).toBe("handoff");
+    expect(advanced.handoffRunId).toBe(B!.runId);
+    expect(advanced.reminder ?? null).toBeNull();
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+  } finally {
+    __forTest.setBeforeReminderDispatch(null);
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});
+
+test("U7(9) a pending question on the settling run wins over an older run's handoff", async () => {
+  const { registerTmuxPrompt, cancelPendingForTask } = await import("./interactions.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const s = await startOverlapStep("u7-user-ask");
+  try {
+    await tick();
+    const B = await openLiveRun(s.stepTaskId, await handoffReply("older, done"), "notification");
+    await B.finish();
+    await tick();
+    const C = await openLiveRun(s.stepTaskId, "Which database should I use?", "user");
+    await C.finish();
+    registerTmuxPrompt({
+      taskId: s.stepTaskId,
+      runId: C.runId,
+      paneText: "pane",
+      choices: [{ key: "1", label: "Postgres" }],
+      fingerprint: `fp-u7-user-ask-${s.stepTaskId}`,
+    });
+
+    await __forTest.handleRunStatus(s.stepTaskId, C.runId, "succeeded");
+
+    const run = tasks.get(s.parentId)!.pipelineRun!;
+    expect(run.status).toBe("blocked");
+    expect(run.blocked.find((b) => b.taskId === s.stepTaskId)?.message).toContain("is waiting for you");
+    const record = run.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.responseKind).toBe("user-ask");
+    expect(record.outcome).toBeNull();
+    expect(record.handoffRunId ?? null).toBeNull();
+    expect(await reminderEventsOf(s.stepTaskId)).toEqual([]);
+    cancelPendingForTask(s.stepTaskId, "test cleanup");
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId).catch(() => {});
+});
+
+/** B (handoff) and C (none) have both ended with the runner deaf. */
+async function setupHandoffThenSilentRun(label: string) {
+  const s = await startOverlapStep(label);
+  await tick();
+  const B = await openLiveRun(s.stepTaskId, await handoffReply("finished on B"), "notification");
+  await B.finish();
+  await tick();
+  const C = await openLiveRun(s.stepTaskId, "Picking this back up.", "user");
+  await C.finish();
+  return { s, B, C };
+}
+
+test("U7(10a) an orphaned settle looks back and advances on an earlier run's handoff", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const { s, B, C } = await setupHandoffThenSilentRun("u7-orph-look");
+  try {
+    runs.update(C.runId, { status: "orphaned" });
+    await __forTest.handleRunStatus(s.stepTaskId, C.runId, "orphaned");
+
+    const done = tasks.get(s.parentId)!.pipelineRun!;
+    expect(done.status).toBe("done");
+    const record = done.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("succeeded");
+    expect(record.handoffRunId).toBe(B.runId);
+    expect(record.handoffFromOtherRun).toBe(true);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
+});
+
+test("U7(10b) an orphaned settle during a whole-run stop does NOT look back", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const { s, C } = await setupHandoffThenSilentRun("u7-orphaned-stop");
+  try {
+    const parent = tasks.get(s.parentId)!;
+    const run = parent.pipelineRun!;
+    run.status = "cancelled";
+    __forTest.persist(s.parentId, run, { preserveStatus: true });
+
+    runs.update(C.runId, { status: "orphaned" });
+    await __forTest.handleRunStatus(s.stepTaskId, C.runId, "orphaned");
+
+    const after = tasks.get(s.parentId)!.pipelineRun!;
+    expect(after.status).toBe("cancelled");
+    expect(after.active.some((a) => a.taskId === s.stepTaskId)).toBe(true);
+    const record = after.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("cancelled");
+    expect(record.handoffRunId ?? null).toBeNull();
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+});
+
+test("U7(10c) a cancelled settle (a deliberate Stop) never looks back", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const { s, C } = await setupHandoffThenSilentRun("u7-cancelled");
+  try {
+    runs.update(C.runId, { status: "cancelled" });
+    await __forTest.handleRunStatus(s.stepTaskId, C.runId, "cancelled");
+
+    const after = tasks.get(s.parentId)!.pipelineRun!;
+    expect(after.status).toBe("cancelled");
+    expect(after.active.some((a) => a.taskId === s.stepTaskId)).toBe(true);
+    const record = after.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("cancelled");
+    expect(record.handoffRunId ?? null).toBeNull();
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+});
+
+test("U7(10d) a failed settle looks back and advances on an earlier run's handoff", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const { s, B, C } = await setupHandoffThenSilentRun("u7-fail-look");
+  try {
+    runs.update(C.runId, { status: "failed", exitCode: 1 });
+    await __forTest.handleRunStatus(s.stepTaskId, C.runId, "failed");
+
+    const done = tasks.get(s.parentId)!.pipelineRun!;
+    expect(done.status).toBe("done");
+    const record = done.history.find((h) => h.taskId === s.stepTaskId)!;
+    expect(record.outcome).toBe("succeeded");
+    expect(record.handoffRunId).toBe(B.runId);
+    expect(record.handoffFromOtherRun).toBe(true);
+    expect(done.blocked).toEqual([]);
+  } finally {
+    __forTest.setListenerEnabled(true);
+  }
+  await waitUntilIdle(s.parentId);
 });

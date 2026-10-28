@@ -80,6 +80,8 @@ import {
   mirrorModelViaPicker,
   getSessionLaunchEffort,
   hasSessionState,
+  drainSessionJsonl,
+  sessionHasTurn,
   sessionExists,
   sessionExistsByName,
   sessionIdleInfo,
@@ -457,6 +459,49 @@ export function subscribeGlobal(fn: GlobalListener): () => void {
   return () => globalListeners.delete(fn);
 }
 
+/**
+ * Pipeline-runner-only report of a settle the global bus deliberately never
+ * carries: a STEP task's run that finished after it was displaced as the
+ * task's current run (`task.runId !== runId` — e.g. a continuation a
+ * reminder run overwrote). `attachDoneHandler` suppresses the column move and
+ * the `run-status` event for such a run, so the runner would otherwise never
+ * learn that a handoff may have landed on it (docs/plans/handoff-
+ * identification-fix.md RC3). This is a module-level setter, NOT a
+ * `GlobalEvent`: no SSE client, toast, OS notification, TUI or `logs --notify`
+ * consumer can see it (O6). Same setter pattern as the claude-tmux seams;
+ * it also avoids an orchestrator ↔ pipeline-runner import cycle.
+ */
+export type DisplacedStepRunSettledHandler = (
+  taskId: string,
+  runId: string,
+  status: "succeeded" | "failed" | "cancelled",
+) => void;
+let displacedStepRunSettledHandler: DisplacedStepRunSettledHandler | null = null;
+export function setDisplacedStepRunSettledHandler(
+  fn: DisplacedStepRunSettledHandler | null,
+): DisplacedStepRunSettledHandler | null {
+  const prev = displacedStepRunSettledHandler;
+  displacedStepRunSettledHandler = fn;
+  return prev;
+}
+
+/** Report a displaced step run's settle to the pipeline runner (if one is
+ *  installed). Never throws — a runner bug must not break run settlement. */
+function reportDisplacedStepRunSettled(
+  task: Task | null | undefined,
+  taskId: string,
+  runId: string,
+  status: RunStatus,
+): void {
+  if (!task?.pipelineParentId) return;
+  if (status !== "succeeded" && status !== "failed" && status !== "cancelled") return;
+  try {
+    displacedStepRunSettledHandler?.(taskId, runId, status);
+  } catch (err) {
+    console.warn(`[agetor] displaced step run settle report failed for task ${taskId}:`, err);
+  }
+}
+
 /** `GlobalEvent` kinds that carry a per-task `taskId` and get stamped with
  *  the task's `pipelineParentId` (when it's a hidden pipeline step row) so
  *  consumers — the webview's toast/notification gates, the CLI's `--notify`,
@@ -623,8 +668,25 @@ export function isHeldByBackgroundAgents(taskId: string): boolean {
  * the user hasn't moved the card, the terminal run still succeeded, and no
  * subagent is left running. A newer in-flight run (status !== succeeded) also
  * bails, so a held release can't stomp a follow-up turn's `running` state.
+ *
+ * Drains the session's JSONL FIRST (docs/plans/handoff-identification-fix.md,
+ * RC1). The subagent watcher scans the same JSONL independently of the
+ * session tailer, so it can settle the last subagent — and reach this hook —
+ * a few hundred ms before the tailer has dispatched the very
+ * `<task-notification>` line that starts Claude's auto-continuation. Without
+ * the drain the release would flip the card to `review` (and a pipeline step
+ * would settle the pre-continuation run) a beat before the continuation is
+ * adopted. With it, a line that is already on disk is dispatched now:
+ * `maybeAdoptContinuation` points `task.runId` at a `running` continuation run
+ * and the fresh read below bails on the `!== "succeeded"` check. The drain is
+ * a no-op when this hook is reached from inside the tailer's own dispatch
+ * (re-entry guard) — there the tailer already adopted ahead of the settle —
+ * and it never fires a staged end_turn. A release whose notification line is
+ * not on disk yet (the `checkDone`/`checkStale` paths) still releases; the
+ * pipeline runner's release grace covers that case.
  */
 function maybeReleaseHeldTask(taskId: string): void {
+  drainSessionJsonl(taskId);
   const task = tasks.get(taskId);
   if (!task || task.column !== "running" || task.runId == null) return;
   if (runs.get(task.runId)?.status !== "succeeded") return;
@@ -1396,6 +1458,26 @@ export function isTaskRunLive(taskId: string): boolean {
   // `maybeReleaseHeldTask` lets it go. Same DB-derived predicate the done
   // handler and `cancelRun` already agree on.
   return isTaskHeldByBackgroundAgents(task);
+}
+
+/**
+ * Whether ANY run of `taskId` is live in this process: everything
+ * {@link isTaskRunLive} counts (current run active, a spawn claim, a held
+ * task) plus every other run registered in `active` for the task — a run
+ * that was displaced as `task.runId` (a continuation a reminder run
+ * overwrote, a stranded slot) is still running and still writing to the
+ * shared worktree. In-memory and authoritative: a stale `running` DB row
+ * with no `active` handle (what boot reconcile would orphan) does not count,
+ * so it can never freeze a pipeline step forever. Backs the runner's "never
+ * advance a step while any of its runs is live" rule and the idle-only send
+ * gate (docs/plans/handoff-identification-fix.md D5/D6).
+ */
+export function isAnyRunOfTaskLive(taskId: string): boolean {
+  if (isTaskRunLive(taskId)) return true;
+  for (const handle of active.values()) {
+    if (handle.taskId === taskId) return true;
+  }
+  return false;
 }
 
 /**
@@ -2667,6 +2749,8 @@ function attachDoneHandler(
       });
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
+      } else {
+        reportDisplacedStepRunSettled(task, taskId, runId, newStatus);
       }
       // fx-only: record/schedule an auto-resume for a fresh resumable pause,
       // or clear a stale row — must run BEFORE drainFxQueue (plan §3 T2 item
@@ -2713,6 +2797,8 @@ function attachDoneHandler(
       });
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
+      } else {
+        reportDisplacedStepRunSettled(task, taskId, runId, newStatus);
       }
       // fx-only settlement hook — see the matching call/comment in the
       // `.then` branch above.
@@ -3389,7 +3475,32 @@ export async function cancelRun(runId: string): Promise<boolean> {
  */
 export type SendInputResult =
   | { delivered: true; runId: string; unresolvedRefs?: string[]; pending?: true }
-  | { delivered: false; reason: string; withheld?: true; savedToBacklog?: boolean };
+  | { delivered: false; reason: string; withheld?: true; savedToBacklog?: boolean; busy?: true };
+
+/**
+ * `SendInputResult.busy` — set ONLY by an idle-only send (`opts.onlyIfIdle`
+ * on {@link sendInput}) that was refused because the task still had a live
+ * run (or, for claude, a turn in flight / queued / awaiting a continuation's
+ * content). A busy refusal has no side effects: no run row, no `user` event,
+ * no queue entry, no steer, no backlog stash, no un-archive. It is the
+ * pipeline runner's handoff reminder that asks for this (a reminder pasted
+ * into a working session is folded into a turn that would have produced the
+ * handoff anyway, or splits it); every other caller omits the option and
+ * keeps its fold/queue/steer behavior.
+ */
+const IDLE_ONLY_BUSY_REASON = "the agent is busy with a turn — not sent";
+function idleOnlyBusyResult(): SendInputResult {
+  return { delivered: false, busy: true, reason: IDLE_ONLY_BUSY_REASON };
+}
+
+/** What a per-kind `send*Turn` helper returns for an idle-only send it
+ *  refused (see {@link SendInputResult}'s `busy`). */
+interface IdleOnlyBusy {
+  busy: true;
+}
+function isIdleOnlyBusy(value: unknown): value is IdleOnlyBusy {
+  return typeof value === "object" && value !== null && (value as { busy?: unknown }).busy === true;
+}
 
 /**
  * Forward a line of user-supplied input to the agent. Behavior depends on
@@ -3464,11 +3575,22 @@ export type SendInputResult =
  * BEFORE the archived-task auto-unarchive (both inside `sendInputInner`, in
  * that order), so a send the CLI floor refuses — even a late-refused one —
  * never un-archives the task or re-creates its worktree.
+ *
+ * Idle-only (opt-in, `opts.onlyIfIdle`): refuse with `{ delivered: false,
+ * busy: true }` instead of folding/queueing/steering when the task still has
+ * a live run — see {@link SendInputResult}. Only the pipeline runner's
+ * handoff reminder passes it (docs/plans/handoff-identification-fix.md RC4/
+ * D6); the HTTP route, cursor plan approval and the ask-card fallback do not.
+ * Checked twice: a cheap early pre-check at the top of `sendInputInner`
+ * (before the un-archive, teardown wait and worktree restore, so a refusal
+ * never causes those side effects), and the authoritative one inside each
+ * kind's `send*Turn` helper, in the same synchronous section as its busy/idle
+ * decision.
  */
 export async function sendInput(
   runId: string,
   line: string,
-  opts: { bounded?: boolean } = {},
+  opts: { bounded?: boolean; onlyIfIdle?: boolean } = {},
 ): Promise<SendInputResult> {
   const row = db.query<{ task_id: string; agent: string }, [string]>(
     `SELECT task_id, agent FROM runs WHERE id = ?`,
@@ -3494,7 +3616,7 @@ export async function sendInput(
   // tray item was saved with, which is what the re-stash dedupes against.
   const rawLine = line;
   const sendStartedAt = Date.now();
-  const inner = sendInputInner(row, task, line).catch(
+  const inner = sendInputInner(row, task, line, opts.onlyIfIdle === true).catch(
     (err): SendInputResult => ({
       delivered: false,
       reason: err instanceof Error ? err.message : String(err),
@@ -3564,6 +3686,7 @@ async function sendInputInner(
   row: { task_id: string; agent: string },
   task: Task,
   line: string,
+  onlyIfIdle: boolean,
 ): Promise<SendInputResult> {
   // The claim column, not the JSON blob. Migration 070 leaves a duplicate's
   // losing row with `importedClaude` set and `imported_claude_session_id`
@@ -3580,6 +3703,13 @@ async function sendInputInner(
   if (task.importedClaude?.status === "failed") {
     return { delivered: false, reason: task.importedClaude.error ?? "import failed" };
   }
+
+  // Idle-only early pre-check, BEFORE every side effect below (the archivedAt
+  // clear, the teardown wait, the worktree restore). It is a cheap fast path,
+  // not the decision: each kind's `send*Turn` re-checks in the same
+  // synchronous section as its busy/idle decision, because a continuation can
+  // still be adopted (or a turn started) during the awaits in between.
+  if (onlyIfIdle && isAnyRunOfTaskLive(row.task_id)) return idleOnlyBusyResult();
 
   // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
   // below — the archivedAt clear and the worktree restore both mutate state,
@@ -3683,9 +3813,10 @@ async function sendInputInner(
   }
 
   if (kind === "claude-code") {
-    const result = await sendClaudeTurn(row.task_id, line, rawLine);
+    const result = await sendClaudeTurn(row.task_id, line, rawLine, onlyIfIdle);
     if (!result) return { delivered: false, reason: "internal: task lookup failed" };
     if (!result.delivered) {
+      if ("busy" in result) return idleOnlyBusyResult();
       if (result.withheld) {
         return {
           delivered: false,
@@ -3715,7 +3846,8 @@ async function sendInputInner(
   // it — matching the wording claude's own idle-mint guard already uses —
   // while still being accurate ("try again") for the rare lookup race too.
   if (kind === "codex") {
-    const result = await sendCodexTurn(row.task_id, line, rawLine);
+    const result = await sendCodexTurn(row.task_id, line, rawLine, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
     // Pre-flight 1b refused the turn before any run row was minted (see
     // `minCliVersionError`) — surface its message as the decline reason.
     if (result !== null && typeof result === "object") return { delivered: false, reason: result.declined };
@@ -3727,7 +3859,8 @@ async function sendInputInner(
         };
   }
   if (kind === "cursor") {
-    const result = await sendCursorTurn(row.task_id, line);
+    const result = await sendCursorTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3736,7 +3869,8 @@ async function sendInputInner(
         };
   }
   if (kind === "gemini") {
-    const result = await sendGeminiTurn(row.task_id, line);
+    const result = await sendGeminiTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3745,7 +3879,8 @@ async function sendInputInner(
         };
   }
   if (kind === "antigravity") {
-    const result = await sendAntigravityTurn(row.task_id, line);
+    const result = await sendAntigravityTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3754,7 +3889,8 @@ async function sendInputInner(
         };
   }
   if (kind === "fx") {
-    const result = await sendFxTurn(row.task_id, line);
+    const result = await sendFxTurn(row.task_id, line, onlyIfIdle);
+    if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3811,9 +3947,17 @@ interface CodexTurnDecline {
  * Returns a `CodexTurnDecline` when Pre-flight 1b refused the turn (no run
  * row, no user event — the caller's draft is untouched).
  */
-async function sendCodexTurn(taskId: string, line: string, rawLine: string = line): Promise<string | CodexTurnDecline | null> {
+async function sendCodexTurn(
+  taskId: string,
+  line: string,
+  rawLine: string = line,
+  onlyIfIdle = false,
+): Promise<string | CodexTurnDecline | IdleOnlyBusy | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
+  // Idle-only send (`sendInput`'s `onlyIfIdle`): refuse BEFORE the queue push,
+  // the user event or a spawn — same synchronous section as the busy check.
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = codexTurnQueue.get(taskId) ?? [];
     q.push({ raw: rawLine, expanded: line });
@@ -4104,9 +4248,16 @@ const cursorTurnQueue = new Map<string, string[]>();
  * because `startingTaskIds` was already claimed for this task (see that
  * set's doc, near `startTask`).
  */
-async function sendCursorTurn(taskId: string, line: string): Promise<string | null> {
+async function sendCursorTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
+  // Idle-only send: refuse before the queue push / user event / spawn (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = cursorTurnQueue.get(taskId) ?? [];
     q.push(line);
@@ -4283,9 +4434,16 @@ const geminiTurnQueue = new Map<string, string[]>();
  * because `startingTaskIds` was already claimed for this task (see that
  * set's doc, near `startTask`).
  */
-async function sendGeminiTurn(taskId: string, line: string): Promise<string | null> {
+async function sendGeminiTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
+  // Idle-only send: refuse before the queue push / user event / spawn (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = geminiTurnQueue.get(taskId) ?? [];
     q.push(line);
@@ -4461,9 +4619,16 @@ const antigravityTurnQueue = new Map<string, string[]>();
  * lookup failure — or when `spawnAntigravityTurnNow` declined to mint a run
  * because `startingTaskIds` was already claimed for this task.
  */
-async function sendAntigravityTurn(taskId: string, line: string): Promise<string | null> {
+async function sendAntigravityTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
+  // Idle-only send: refuse before the queue push / user event / spawn (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
   if (task.runId && active.has(task.runId)) {
     const q = antigravityTurnQueue.get(taskId) ?? [];
     q.push(line);
@@ -4793,9 +4958,17 @@ function appendFxStatusLine(taskId: string, runId: string, data: string): void {
  * `startingTaskIds` was already claimed for this task (see that set's doc,
  * near `startTask`).
  */
-async function sendFxTurn(taskId: string, line: string): Promise<string | null> {
+async function sendFxTurn(
+  taskId: string,
+  line: string,
+  onlyIfIdle = false,
+): Promise<string | IdleOnlyBusy | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
+  // Idle-only send: refuse before ANY side effect — including the auto-resume
+  // timer cancel below, the steer attempt and the queue push (see
+  // `sendCodexTurn`).
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
   // A follow-up message is an implicit cancel of any pending auto-resume
   // schedule (plan §3.4 / T2 item 8) — whichever branch below runs, the
   // pause chain is over. The full row clear happens once the turn actually
@@ -5534,6 +5707,7 @@ export async function resumeFxRecovery(
  */
 type ClaudeTurnResult =
   | { runId: string; delivered: true; pending?: true }
+  | { runId: string; delivered: false; busy: true }
   | { runId: string; delivered: false; withheld: true; savedToBacklog: boolean }
   | { runId: string; delivered: false; withheld: false; reason: string };
 
@@ -5656,9 +5830,13 @@ async function resolveClaudeTurnOutcome(
  * paste path (`pasteFollowUp`, above) never does this — a live-session paste
  * is fast and has no comparable spawn to bound.
  */
-async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): Promise<ClaudeTurnResult | null> {
-  const task = tasks.get(taskId);
-  if (!task) return null;
+async function sendClaudeTurn(
+  taskId: string,
+  line: string,
+  rawLine?: string,
+  onlyIfIdle = false,
+): Promise<ClaudeTurnResult | null> {
+  if (!tasks.get(taskId)) return null;
 
   // Route to the live-session paste path unless we're SURE the session is
   // dead. `sessionLiveness` (not the raw `sessionExists` boolean it replaces
@@ -5675,13 +5853,27 @@ async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): P
   // pre-kill (`spawnClaudeViaTmux`) tearing down a live, possibly mid-turn
   // session over a transient probe failure. Only an unambiguous `gone` (or no
   // in-memory state at all) reaches the destructive respawn path.
+  //
+  // No task snapshot crosses that await (docs/plans/handoff-identification-
+  // fix.md RC2): `sendTurnInExistingSession` drains the JSONL and re-reads the
+  // task itself, in the same synchronous section as its fold/mint decision,
+  // so a continuation adopted DURING the `has-session` fork is seen.
   if (hasSessionState(taskId) && (await sessionLiveness(sessionNameFor(taskId))) !== "gone") {
-    return sendTurnInExistingSession(task, taskId, line, rawLine);
+    return sendTurnInExistingSession(taskId, line, rawLine, { onlyIfIdle });
   }
-  // Dead/no session: about to mint a brand-new run. Claim the unified
+  // Dead/no session: about to mint a brand-new run. Re-read the task (the
+  // liveness await above may have let it change) and claim the unified
   // per-task "starting" slot first — see `startingTaskIds`'s doc (near
   // `startTask`) for why this is needed now that `sessionLiveness` above is
   // a genuine await.
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  // Idle-only send: a fake-driver or no-state task can still have an active
+  // run here (`hasSessionState` is false for it), and minting would create a
+  // second concurrent run. Refuse before the claim and any run-row insert.
+  if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) {
+    return { runId: task.runId ?? "", delivered: false, busy: true };
+  }
   if (startingTaskIds.has(taskId)) {
     return {
       runId: task.runId ?? "",
@@ -5711,11 +5903,28 @@ async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): P
  * for why a withheld paste must re-stash that raw form, not the expanded one.
  */
 async function sendTurnInExistingSession(
-  task: Task,
   taskId: string,
   line: string,
   rawLine?: string,
+  opts: { onlyIfIdle?: boolean } = {},
 ): Promise<ClaudeTurnResult> {
+  // The fold-vs-mint decision below is ONE synchronous section (no `await`
+  // until `pasteFollowUp` / the claim + run insert): drain whatever the
+  // session's JSONL has gained that the tailer hasn't dispatched yet, THEN
+  // read the task fresh. Draining first matters because a
+  // `<task-notification>` line that is already on disk but untailed would
+  // otherwise be adopted as a continuation only after this send had decided
+  // "idle" and minted a second concurrent run (RC2); reading fresh matters
+  // because `sendClaudeTurn` awaits a `has-session` fork before getting here
+  // and a continuation adopted during it (`startContinuationRun` sets
+  // `task.runId` and registers `active` synchronously) is invisible to any
+  // snapshot taken before the await. `drainSessionJsonl` is a no-op without a
+  // live session and never fires a staged end_turn.
+  drainSessionJsonl(taskId);
+  const task = tasks.get(taskId);
+  if (!task) {
+    return { runId: "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
+  }
   // Fold-while-busy: if a turn is already in flight, paste the message into
   // the live session and record it on the ACTIVE run — no new run row, no new
   // turn slot. Claude's TUI queues the keystrokes and replays them as part of
@@ -5726,7 +5935,16 @@ async function sendTurnInExistingSession(
   // forever. `active.has(task.runId)` is true iff the latest run hasn't
   // resolved yet (registerActiveRun adds; attachDoneHandler deletes on done) —
   // a more reliable "in flight" signal than the polled `task.column`.
-  if (task.runId && active.has(task.runId)) {
+  const busy = !!task.runId && active.has(task.runId);
+  // Idle-only send (the pipeline handoff reminder): never fold into, queue
+  // behind or interleave with a working session. Any live run of the task
+  // (including one displaced as `task.runId`), or turn activity the session
+  // itself still tracks (in flight, a queued slot, a continuation awaiting
+  // content), refuses with no side effects — nothing below has run yet.
+  if (opts.onlyIfIdle && (isAnyRunOfTaskLive(taskId) || sessionHasTurn(taskId))) {
+    return { runId: task.runId ?? "", delivered: false, busy: true };
+  }
+  if (busy && task.runId) {
     const activeRunId = task.runId;
     // What `handlePasteWithheld` reported, for `savedToBacklog`.
     let stashed: boolean | null = null;
@@ -6039,6 +6257,16 @@ function startContinuationRun(
   trigger: ContinuationTrigger = "notification",
 ): ContinuationHooks | null {
   if (taskId === "__rebuild__") return null;
+  // D12 (docs/plans/handoff-identification-fix.md): an agetor-initiated turn
+  // that is being minted right now (`startingTaskIds` is held across
+  // `sendTurnInExistingSession`'s `sendTurn`, whose `flushSync` can dispatch
+  // a notification line, and across fresh/`--resume` spawns) OWNS the content
+  // that arrives in that window. Adopting a continuation here would overwrite
+  // the `task.runId` the mint just pointed at its own run and leave two
+  // in-flight runs for one Claude turn. Decline: the line falls to the
+  // tailer's `lastChunk` routing, then `sendTurn` pushes its slot and the
+  // rest of the (folded) turn lands on the minted run.
+  if (startingTaskIds.has(taskId)) return null;
   const task = tasks.get(taskId);
   if (!task || task.archivedAt != null) return null;
   if (resolveHarness(task.agent)?.kind !== "claude-code") return null;

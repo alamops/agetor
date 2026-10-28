@@ -1,6 +1,6 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -1080,5 +1080,246 @@ test("spawnClaudeViaTmux with no CLAUDE_CODE_EFFORT_LEVEL in the launch env leav
     expect(__forTest.getSessionLaunchEffort(taskId)).toBeNull();
     rmSync(path.dirname(jsonlPath), { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ─── RC2 + D12: the fold-vs-mint decision is one synchronous section ────────
+//
+// docs/plans/handoff-identification-fix.md §3.2. A claude follow-up used to
+// decide fold-vs-new-turn from a task snapshot taken BEFORE `sendClaudeTurn`'s
+// `has-session` await, and without first reading JSONL lines that were already
+// on disk — so a background-task continuation adopted (or about to be adopted)
+// around the send was invisible to it, and the idle branch minted a second
+// concurrent run for what Claude treats as ONE turn. These drive the real
+// orchestrator + the real claude-tmux tailer over a synthetic session; only
+// tmux itself is a recording stub.
+
+/**
+ * A fake tmux that reports the session ALIVE. `has-session` sleeps
+ * `hasSessionDelayMs` first (synchronously, in the stub process) so a test can
+ * land a tailer tick inside `sendClaudeTurn`'s liveness await. Every call is
+ * logged like `fakeRoutingTmuxBin`.
+ */
+function fakeAliveTmuxBin(hasSessionDelayMs: number): { bin: string; logPath: string } {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-alive-tmux-"));
+  const bin = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  writeFileSync(
+    bin,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync } from "node:fs";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv }) + "\\n");\n` +
+      `if (argv.includes("has-session") && ${hasSessionDelayMs} > 0) {\n` +
+      `  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${hasSessionDelayMs});\n` +
+      `}\n` +
+      `process.exit(0);\n`,
+  );
+  chmodSync(bin, 0o755);
+  return { bin, logPath };
+}
+
+/** The `<task-notification>` user line claude writes when a background agent
+ *  finishes — the line that starts its auto-continuation. */
+function notificationLine(tag: string): string {
+  return JSON.stringify({
+    type: "user",
+    uuid: `uuid-${tag}`,
+    origin: { kind: "task-notification" },
+    message: { content: `<task-notification><task-id>${tag}</task-id></task-notification>` },
+  }) + "\n";
+}
+
+/** An idle-looking claude task: its last run succeeded, the card sits in
+ *  `review`, and a live synthetic session tails an empty JSONL. */
+async function seedIdleClaudeTask(prefix: string) {
+  const { tasks, runs } = await import("./db.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = `task-${prefix}-${randomUUID()}`;
+  const priorRunId = `run-${prefix}-${randomUUID()}`;
+  const now = Date.now();
+  const jsonlDir = mkdtempSync(path.join(tmpdir(), "agetor-rc2-jsonl-"));
+  const jsonlPath = path.join(jsonlDir, `${randomUUID()}.jsonl`);
+  writeFileSync(jsonlPath, "");
+  const state = __forTest.installSession(taskId, jsonlPath);
+  tasks.insert({
+    id: taskId,
+    title: prefix,
+    prompt: "p",
+    column: "review",
+    agent: "claude-code",
+    workdir: "/tmp",
+    isolation: "none",
+    taskType: "task",
+    branch: null,
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    prUrl: null,
+    mode: null,
+    model: "claude-opus-4-7",
+    effort: "medium",
+    speed: "off",
+    maxMode: false,
+    references: [], backlog: [], plans: [], draft: null,
+    runId: priorRunId,
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+  runs.insert({
+    id: priorRunId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: now - 1000,
+    endedAt: now,
+    exitCode: 0,
+    tmuxSession: state.sessionName,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+  return { taskId, priorRunId, jsonlPath, state };
+}
+
+/** Disarm the continuation watchdog an adopted notification turn armed, stop
+ *  whatever run is still current, and drop the synthetic session + task. */
+async function cleanupRc2(f: Awaited<ReturnType<typeof seedIdleClaudeTask>>): Promise<void> {
+  const { db, tasks } = await import("./db.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { cancelRun } = await import("./orchestrator.ts");
+  const wd = __forTest.getContinuationWatchdog(f.state);
+  if (wd) clearTimeout(wd.timer);
+  const current = tasks.get(f.taskId)?.runId;
+  if (current && current !== f.priorRunId) await cancelRun(current);
+  __forTest.uninstallSession(f.taskId);
+  db.run(`DELETE FROM tasks WHERE id = ?`, [f.taskId]);
+}
+
+test("RC2(a): a task-notification already on disk but untailed is adopted by sendInput's drain — the message folds into the continuation, no second run", async () => {
+  const { bin } = fakeAliveTmuxBin(0);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { runs, tasks } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+  const f = await seedIdleClaudeTask("rc2a");
+  try {
+    appendFileSync(f.jsonlPath, notificationLine("rc2a"));
+    expect(f.state.offset).toBe(0); // on disk, not tailed
+
+    const result = await sendInput(f.priorRunId, "do you have the findings yet?");
+    expect(result.delivered).toBe(true);
+
+    const rows = runs.listForTask(f.taskId);
+    const running = rows.filter((r) => r.status === "running");
+    // Prior run + the adopted continuation; the message minted no run of its own.
+    expect(rows.length).toBe(2);
+    expect(running.length).toBe(1);
+    expect(running[0]!.origin).toBe("continuation");
+    expect(tasks.get(f.taskId)?.runId).toBe(running[0]!.id);
+    if (result.delivered) expect(result.runId).toBe(running[0]!.id);
+
+    // The user event landed on the continuation (the fold target).
+    expect(
+      runs.events(running[0]!.id).some(
+        (e) => e.stream === "user" && e.data.includes("do you have the findings yet?"),
+      ),
+    ).toBe(true);
+  } finally {
+    await cleanupRc2(f);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+  }
+});
+
+test("RC2(b): a continuation adopted DURING sendClaudeTurn's has-session await is seen — the send re-reads the task and folds instead of minting", async () => {
+  // has-session takes ~600 ms, so the tailer tick below lands inside the await.
+  const { bin, logPath } = fakeAliveTmuxBin(600);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { runs, tasks } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+  const f = await seedIdleClaudeTask("rc2b");
+  try {
+    const sending = sendInput(f.priorRunId, "any news from the review?");
+    // The liveness probe is in flight (the stub logs on entry, then sleeps).
+    await waitForLog(logPath, "has-session");
+    // The tailer picks the notification up in the gap: continuation adopted.
+    appendFileSync(f.jsonlPath, notificationLine("rc2b"));
+    __forTest.flushSync(f.state);
+    const adopted = tasks.get(f.taskId)!.runId!;
+    expect(adopted).not.toBe(f.priorRunId);
+    expect(runs.get(adopted)?.origin).toBe("continuation");
+
+    const result = await sending;
+    expect(result.delivered).toBe(true);
+
+    const rows = runs.listForTask(f.taskId);
+    expect(rows.length).toBe(2);
+    expect(rows.filter((r) => r.status === "running").map((r) => r.id)).toEqual([adopted]);
+    expect(tasks.get(f.taskId)?.runId).toBe(adopted);
+    if (result.delivered) expect(result.runId).toBe(adopted);
+    expect(
+      runs.events(adopted).some(
+        (e) => e.stream === "user" && e.data.includes("any news from the review?"),
+      ),
+    ).toBe(true);
+  } finally {
+    await cleanupRc2(f);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+  }
+});
+
+test("D12: a notification landing in the mint window (sendTurn's flushSync) does not displace the freshly minted run — it stays task.runId, one in-flight run, no continuation row", async () => {
+  const { bin } = fakeAliveTmuxBin(0);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { runs, tasks } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+  const f = await seedIdleClaudeTask("d12");
+  // Nothing is on disk when the send decides "idle" (so the drain finds
+  // nothing); the line lands only inside the mint window, right before
+  // sendTurn's flushSync dispatches it.
+  const prevHook = __forTest.setBeforeSendTurnFlush(() => {
+    appendFileSync(f.jsonlPath, notificationLine("d12"));
+  });
+  try {
+    const result = await sendInput(f.priorRunId, "checking back in");
+    expect(result.delivered).toBe(true);
+
+    const rows = runs.listForTask(f.taskId);
+    const minted = rows.filter((r) => r.id !== f.priorRunId);
+    // Exactly one new run — the send's own — and no continuation row.
+    expect(minted.length).toBe(1);
+    expect(minted[0]!.origin).not.toBe("continuation");
+    expect(rows.some((r) => r.origin === "continuation")).toBe(false);
+    expect(rows.filter((r) => r.status === "running").length).toBe(1);
+    expect(tasks.get(f.taskId)?.runId).toBe(minted[0]!.id);
+    if (result.delivered) expect(result.runId).toBe(minted[0]!.id);
+  } finally {
+    __forTest.setBeforeSendTurnFlush(prevHook);
+    await cleanupRc2(f);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
   }
 });
