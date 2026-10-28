@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Blocks, BookText, ChevronDown, Plug, Puzzle, Sparkles } from "lucide-react";
+import { Blocks, BookText, Bot, ChevronDown, Plug, Puzzle, Sparkles } from "lucide-react";
 import type { AvailableExtension } from "@/lib/api";
 import type { SavedPrompt } from "../../../shared/types.ts";
 import { filterPromptsForPicker } from "@/lib/prompt-picker";
@@ -7,7 +7,7 @@ import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { cn } from "@/lib/utils";
 
 interface Props {
-  /** Available MCP / skill / plugin entries. Empty disables selection but the
+  /** Available MCP / skill / plugin / agent entries. Empty disables selection but the
    *  trigger still renders (with an empty-state hint inside the popover). */
   extensions: AvailableExtension[];
   /** User-global reusable prompt snippets, rendered as a fourth "Saved
@@ -39,9 +39,10 @@ const KINDS = [
   { kind: "mcp", label: "MCP Servers", Icon: Plug },
   { kind: "skill", label: "Skills", Icon: Sparkles },
   { kind: "plugin", label: "Plugins", Icon: Puzzle },
+  { kind: "agent", label: "Agents", Icon: Bot },
 ] as const;
 
-/** A group row is either an MCP/skill/plugin entry or a saved prompt — the
+/** A group row is either an MCP/skill/plugin/agent entry or a saved prompt — the
  *  tag lets the flattened keyboard-nav list and the row renderer dispatch
  *  without conflating the two shapes. */
 type Row = { tag: "ext"; ext: AvailableExtension } | { tag: "prompt"; prompt: SavedPrompt };
@@ -49,9 +50,9 @@ type Row = { tag: "ext"; ext: AvailableExtension } | { tag: "prompt"; prompt: Sa
 /**
  * "Extensions" picker that sits above the prompt / message textarea. A single
  * button opens a searchable, grouped popover of the MCP servers, skills,
- * plugins, and saved prompts reachable for the current agent + workdir.
- * Selecting an MCP/skill/plugin inserts its `insert` token (`/skill` or
- * `@mcp` / `@plugin`); selecting a saved prompt inserts its content.
+ * plugins, agents, and saved prompts reachable for the current agent + workdir.
+ * Selecting an MCP/skill/plugin/agent inserts its `insert` token (`/skill` or
+ * `@mcp` / `@plugin` / `@agent`); selecting a saved prompt inserts its content.
  *
  * Complements — doesn't replace — the `/` SlashAutocomplete: that one is a
  * typeahead for slash-invokable commands; this is an always-available browse
@@ -123,7 +124,7 @@ export function ExtensionPicker({
       rows: extensions.filter((e) => e.kind === kind && match(e)).map((ext): Row => ({ tag: "ext", ext })),
     }));
     const promptRows = filterPromptsForPicker(savedPrompts ?? [], query).map((prompt): Row => ({ tag: "prompt", prompt }));
-    // Saved Prompts always renders last, after mcp/skill/plugin.
+    // Saved Prompts always renders last, after mcp/skill/plugin/agent.
     return [...extGroups, { key: "prompt", label: "Saved Prompts", Icon: BookText, rows: promptRows }]
       .filter((g) => g.rows.length > 0);
   }, [extensions, savedPrompts, query]);
@@ -179,7 +180,7 @@ export function ExtensionPicker({
         data-testid="extension-picker-trigger"
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
-        title="Insert an MCP server, skill, plugin reference, or saved prompt"
+        title="Insert an MCP server, skill, plugin, or agent reference, or a saved prompt"
         className={cn(
           "inline-flex items-center gap-1 rounded-md border border-border/60 bg-card/40 px-2 py-1 text-[11px] text-muted-foreground",
           "hover:bg-accent/40 hover:text-foreground disabled:opacity-50 disabled:hover:bg-card/40 disabled:hover:text-muted-foreground",
@@ -187,7 +188,7 @@ export function ExtensionPicker({
         )}
       >
         <Blocks className="size-3" />
-        <span>MCP · Skills · Plugins · Prompts</span>
+        <span>MCP · Skills · Plugins · Agents · Prompts</span>
         <ChevronDown className={cn("size-3 transition-transform", open && "rotate-180")} />
       </button>
 
@@ -235,7 +236,7 @@ export function ExtensionPicker({
             {grouped.length === 0 ? (
               <p className="px-3 py-2 text-[11px] text-muted-foreground">
                 {extensions.length === 0 && (savedPrompts?.length ?? 0) === 0
-                  ? "No MCP servers, skills, or plugins found for this project, and no saved prompts."
+                  ? "No MCP servers, skills, plugins, or agents found for this project, and no saved prompts."
                   : "No matches."}
               </p>
             ) : (

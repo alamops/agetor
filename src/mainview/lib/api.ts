@@ -197,7 +197,7 @@ export interface AvailableExtension {
   insert: string;
   description: string;
   source: EntrySource;
-  kind: "mcp" | "skill" | "plugin";
+  kind: "mcp" | "skill" | "plugin" | "agent";
 }
 
 /** Per-kind model id list from the CLI's own catalog discovery — kept fresh
@@ -213,6 +213,7 @@ export interface AgentModelMap {
   "gemini": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
   "antigravity": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
   "fx": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
+  "copilot": { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[];
 }
 
 /** Per-harness model id list from `GET /agent-models/harnesses` — one entry

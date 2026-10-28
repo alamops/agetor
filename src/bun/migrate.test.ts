@@ -17,6 +17,7 @@ import harnessProfileMcpServers from "./migrations/073_harness_profile_mcp_serve
 import retireFxModels from "./migrations/074_retire_fx_models.sql" with { type: "text" };
 import retireCodexGpt55 from "./migrations/075_retire_codex_gpt_5_5.sql" with { type: "text" };
 import normalizeCursorNewFamilies from "./migrations/076_normalize_cursor_new_families.sql" with { type: "text" };
+import copilotHarness from "./migrations/077_copilot_harness.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 import { cursorModelArg } from "../shared/types.ts";
 
@@ -1171,6 +1172,20 @@ test("074 (retire fx models) sits right after 073 (harness profile MCP servers),
   expect(migrations[at - 2]?.sql).toBe(taskSpeed);
 });
 
+test("077 (copilot harness) is the last registered migration, right after 076 (normalize cursor new families), right after 075 (retire codex gpt-5.5), right after 074 (retire fx models)", () => {
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("076_normalize_cursor_new_families");
+  expect(migrations[at - 2]?.id).toBe("075_retire_codex_gpt_5_5");
+  expect(migrations[at - 3]?.id).toBe("074_retire_fx_models");
+  expect(migrations[at]?.sql).toBe(copilotHarness);
+  expect(migrations[at - 1]?.sql).toBe(normalizeCursorNewFamilies);
+  expect(migrations[at - 2]?.sql).toBe(retireCodexGpt55);
+  expect(migrations[at - 3]?.sql).toBe(retireFxModels);
+  // Authored as 075 before main claimed 075/076; the old id stays an alias.
+  expect(migrations[at]?.aliases).toEqual(["075_copilot_harness"]);
+});
+
 test("071 moves the seen-id preference into claude_session_seen in order and drops the preference", () => {
   const db = new Database(":memory:");
   db.exec(`
@@ -1489,9 +1504,88 @@ test("a fresh DB migrated through 074 has speed (no fast) on tasks and agent_pro
   db.close();
 });
 
-test("076 (normalize cursor new families) is the last registered migration, right after 075 (retire codex gpt-5.5), right after 074 (retire fx models)", () => {
+test("077_copilot_harness rebuilds harnesses keeping every row and column, seeds copilot enabled, adds runs.copilot_session_id; re-running is a no-op", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  expect(at).toBeGreaterThan(0);
+  // A real 076-state database: every migration up to (not including) 077.
+  expect(migrate(db, migrations.slice(0, at)).length).toBe(at);
+  expect(columnNames(db, "runs")).not.toContain("copilot_session_id");
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers) VALUES
+      ('claude-work', 'claude-code', 'Claude (work)', 0, '/tmp/agetor-test-home', '/opt/bin/claude', '{"FOO":"bar"}', 11, 12, 1, 1),
+      ('fx-off', 'fx', 'fx off', 0, NULL, NULL, '{}', 21, 22, 0, 0),
+      ('grok-legacy', 'grok', 'Grok', 0, '/tmp/grok-home', NULL, '{"A":"b"}', 31, 32, 1, 1);
+    UPDATE harnesses SET enabled = 0, updated_at = 99 WHERE id = 'codex';
+  `);
+  type Row = Record<string, unknown>;
+  const snapshot = () => db.query<Row, []>(`SELECT * FROM harnesses ORDER BY id`).all();
+  const before = snapshot();
+  const beforeColumns = columnNames(db, "harnesses");
+  expect(beforeColumns).toContain("profile_mcp_servers");
+
+  expect(migrate(db, migrations)).toEqual(["077_copilot_harness"]);
+
+  // Same columns, same order.
+  expect(columnNames(db, "harnesses")).toEqual(beforeColumns);
+  const after = snapshot();
+  // Every pre-existing row survives byte-for-byte (incl. the user's disabled
+  // codex, the alias home/bin/env, profile_mcp_servers=0 and the legacy grok row).
+  for (const row of before) {
+    expect(after.find((r) => r.id === row.id)).toEqual(row);
+  }
+  expect(after.find((r) => r.id === "fx-off")?.profile_mcp_servers).toBe(0);
+  expect(after.find((r) => r.id === "codex")?.enabled).toBe(0);
+  expect(after.find((r) => r.id === "grok-legacy")?.kind).toBe("grok");
+
+  // Exactly one new row: the built-in copilot, enabled, default profile_mcp_servers.
+  expect(after.length).toBe(before.length + 1);
+  const copilot = after.find((r) => r.id === "copilot")!;
+  expect(copilot).toMatchObject({
+    kind: "copilot",
+    label: "GitHub Copilot",
+    is_builtin: 1,
+    home: null,
+    bin: null,
+    env_json: "{}",
+    enabled: 1,
+    profile_mcp_servers: 1,
+  });
+
+  // The widened CHECK admits copilot (and opencode), still refuses garbage.
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('copilot-2', 'copilot', 'Copilot 2', 1, 1)`);
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('oc', 'opencode', 'OC', 1, 1)`);
+  expect(() =>
+    db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('bad', 'nope', 'Bad', 1, 1)`),
+  ).toThrow();
+
+  expect(columnNames(db, "runs")).toContain("copilot_session_id");
+
+  // Re-running is a no-op.
+  expect(migrate(db, migrations)).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness is only backfilled, never re-run, on a DB that already applied it as 075_copilot_harness", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  migrate(db, migrations.slice(0, at));
+  // The dev-DB shape: the SQL ran under the branch's original id.
+  migrate(db, [{ id: "075_copilot_harness", sql: copilotHarness }]);
+  db.exec(`UPDATE harnesses SET label = 'My Copilot' WHERE id = 'copilot'`);
+  expect(migrate(db, migrations)).toEqual([]);
+  expect(
+    db.query<{ id: string }, []>(`SELECT id FROM _migrations WHERE id IN ('075_copilot_harness', '077_copilot_harness') ORDER BY id`).all().map((r) => r.id),
+  ).toEqual(["075_copilot_harness", "077_copilot_harness"]);
+  // Not re-seeded over the user's edit.
+  expect(db.query<{ label: string }, []>(`SELECT label FROM harnesses WHERE id = 'copilot'`).get()?.label).toBe("My Copilot");
+  db.close();
+});
+
+test("076 (normalize cursor new families) sits right after 075 (retire codex gpt-5.5), right after 074 (retire fx models)", () => {
   const at = migrations.findIndex((m) => m.id === "076_normalize_cursor_new_families");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("075_retire_codex_gpt_5_5");
   expect(migrations[at - 2]?.id).toBe("074_retire_fx_models");
   expect(migrations[at]?.sql).toBe(normalizeCursorNewFamilies);
@@ -1739,12 +1833,37 @@ test("076 moves lastModel:cursor off every one of the 17 variant ids and leaves 
   }
 });
 
-test("a fresh DB migrated through 076 applies 075 and 076 cleanly and re-running is a no-op", () => {
+test("a fresh DB applies 075, 076 and 077 cleanly and re-running is a no-op", () => {
   const db = new Database(":memory:");
   const applied = migrate(db, migrations);
   expect(applied).toContain("075_retire_codex_gpt_5_5");
   expect(applied).toContain("076_normalize_cursor_new_families");
+  expect(applied).toContain("077_copilot_harness");
   expect(migrate(db, migrations)).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness self-heals wiped built-ins with their original enabled defaults and never overwrites an existing row", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  migrate(db, migrations.slice(0, at));
+  db.exec(`DELETE FROM harnesses WHERE id IN ('codex', 'fx', 'antigravity')`);
+  db.exec(`UPDATE harnesses SET enabled = 0, label = 'My Claude' WHERE id = 'claude-code'`);
+  migrate(db, migrations);
+  const byId = Object.fromEntries(
+    db
+      .query<{ id: string; label: string; enabled: number }, []>(`SELECT id, label, enabled FROM harnesses WHERE is_builtin = 1`)
+      .all()
+      .map((r) => [r.id, r]),
+  );
+  expect(byId["codex"]?.enabled).toBe(0);
+  expect(byId["fx"]?.enabled).toBe(0);
+  expect(byId["antigravity"]?.enabled).toBe(1);
+  expect(byId["copilot"]?.enabled).toBe(1);
+  expect(byId["cursor"]?.enabled).toBe(0);
+  expect(byId["gemini"]?.enabled).toBe(0);
+  // An existing row the user customised is left alone.
+  expect(byId["claude-code"]).toMatchObject({ label: "My Claude", enabled: 0 });
   db.close();
 });
 

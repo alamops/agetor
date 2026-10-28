@@ -1808,7 +1808,8 @@ export const harnesses = {
     if (direct) return direct;
     if (
       id === "claude-code" || id === "codex" || id === "cursor" ||
-      id === "gemini" || id === "fx" || id === "antigravity"
+      id === "gemini" || id === "fx" || id === "antigravity" ||
+      id === "copilot"
     ) {
       const label =
         id === "claude-code" ? "Claude Code"
@@ -1816,6 +1817,7 @@ export const harnesses = {
         : id === "cursor" ? "Cursor"
         : id === "gemini" ? "Gemini CLI"
         : id === "fx" ? "fx.sh"
+        : id === "copilot" ? "GitHub Copilot"
         : "Antigravity";
       return {
         id,
@@ -1840,7 +1842,8 @@ export const harnesses = {
     if (
       input.kind !== "claude-code" && input.kind !== "codex" &&
       input.kind !== "cursor" && input.kind !== "gemini" &&
-      input.kind !== "antigravity" && input.kind !== "fx"
+      input.kind !== "antigravity" && input.kind !== "fx" &&
+      input.kind !== "copilot"
     ) {
       throw new Error(`unknown harness kind: ${input.kind}`);
     }
@@ -2569,6 +2572,7 @@ type RunRow = {
   gemini_session_id: string | null;
   fx_session_id: string | null;
   antigravity_session_id: string | null;
+  copilot_session_id: string | null;
   origin: string | null;
 };
 
@@ -2664,6 +2668,7 @@ const toRun = (r: RunRow): Run => ({
   geminiSessionId: r.gemini_session_id,
   fxSessionId: r.fx_session_id,
   antigravitySessionId: r.antigravity_session_id,
+  copilotSessionId: r.copilot_session_id,
   origin: (r.origin as Run["origin"]) ?? null,
 });
 
@@ -2707,9 +2712,9 @@ export const runs = {
    *  bun:sqlite would otherwise bind. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, origin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.antigravitySessionId ?? null, r.origin ?? null],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, copilot_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.antigravitySessionId ?? null, r.copilotSessionId ?? null, r.origin ?? null],
     );
     return { ...r, origin: r.origin ?? null };
   },
@@ -2719,8 +2724,8 @@ export const runs = {
     const current = toRun(row);
     const next: Run = { ...current, ...patch, id };
     db.run(
-      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=?, fx_session_id=?, antigravity_session_id=? WHERE id=?`,
-      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, next.fxSessionId, next.antigravitySessionId ?? null, id],
+      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=?, fx_session_id=?, antigravity_session_id=?, copilot_session_id=? WHERE id=?`,
+      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, next.fxSessionId, next.antigravitySessionId ?? null, next.copilotSessionId ?? null, id],
     );
     return next;
   },
@@ -3420,7 +3425,14 @@ interface SubagentRow {
  *  still land on a member of the union, so `toSubagent` falls back to
  *  `"subagent"` for anything not listed here. Keep in sync with
  *  `Subagent.parentKind` in shared/types.ts. */
-const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent", "monitor"]);
+const PARENT_KINDS = new Set<string>([
+  "subagent",
+  "bg_session",
+  "workflow",
+  "workflow_agent",
+  "monitor",
+  "copilot_subagent",
+]);
 
 function toSubagent(r: SubagentRow): Subagent {
   return {
@@ -3543,6 +3555,19 @@ export const subagents = {
       [now, taskId],
     );
     return rows.map((r) => toSubagent({ ...r, status: "orphaned", ended_at: now }));
+  },
+  /** Settle every `running` subagent row of ONE run to `status` (ended_at =
+   *  `now`). Run-scoped (unlike `orphanRunning`, which is task-scoped), for
+   *  drivers that own their subagents' lifecycle and close them all when the
+   *  parent run settles. Only `running` rows change, so a row a driver already
+   *  settled keeps its own status and timestamp. Returns the number of rows
+   *  changed. */
+  settleRunningForRun(runId: string, status: SubagentStatus, now: number): number {
+    const result = db.run(
+      `UPDATE subagents SET status = ?, ended_at = ? WHERE run_id = ? AND status = 'running'`,
+      [status, now, runId],
+    );
+    return result.changes;
   },
   /** taskId -> count of `running` rows. One grouped query, for the board poll. */
   runningCountsByTask(): Map<string, number> {

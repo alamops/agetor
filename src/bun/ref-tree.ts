@@ -298,7 +298,7 @@ async function batchCatFile(cwd: string, ref: string, paths: string[]): Promise<
 
 const DEFAULT_PATHSPECS = [
   ".claude", ".codex", ".mcp.json",
-  ".cursor", ".agents", ".grok", ".fx", ".opencode", ".claw", "skills",
+  ".cursor", ".agents", ".grok", ".fx", ".opencode", ".claw", "skills", ".github",
 ];
 
 /**

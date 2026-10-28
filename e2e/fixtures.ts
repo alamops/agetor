@@ -168,6 +168,87 @@ function writeFxStubBin(dataDir: string): string {
   return binPath;
 }
 
+/**
+ * GitHub Copilot CLI stub (docs/plans/github-copilot-harness.md T13). Copilot
+ * is seeded ENABLED, so every fresh backend lists a "GitHub Copilot" harness;
+ * its availability probe (`checkHarness`, agent-status.ts) only passes when
+ * `<bin> --version` prints "GitHub Copilot CLI" (the AWS Copilot wrong-binary
+ * guard), which `/bin/echo` can never satisfy — and model discovery
+ * (`discoverCopilot`) reads the `model` block of `<bin> help config`. This
+ * stub answers both: `--version` with the real 1.0.104 banner, and
+ * `help config` with a reproduction of the real output's SHAPE (a few other
+ * keys' value lists around the `model` block, whose items are the curated ids
+ * plus `gpt-5.4-mini`, a discovered-only id with no curated row). Anything
+ * else exits 0 silently.
+ *
+ * It is opt-in: `provisionBackend` points `AGETOR_COPILOT_BIN` at it ONLY when
+ * the backend's `backendEnv` carries `AGETOR_E2E_COPILOT_STUB=1` (see
+ * `e2e/copilot-harness.spec.ts`), so every other spec keeps seeing Copilot as
+ * not installed, exactly as it sees Antigravity. Written into the backend's own
+ * `dataDir` (cleaned up with it), before the backend spawns.
+ */
+function writeCopilotStubBin(dataDir: string): string {
+  const binDir = path.join(dataDir, "copilot-stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, "copilot");
+  const modelIds = [
+    "claude-sonnet-5.5",
+    "claude-sonnet-5",
+    "claude-fable-5.1",
+    "claude-opus-5.5",
+    "claude-opus-5",
+    "claude-haiku-5.5",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-6-astra",
+    "gpt-5.4-mini",
+    "mai-code-1.1-flash",
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "grok-4.7",
+    "kimi-k3",
+  ];
+  const helpConfig = [
+    "Configuration Settings:",
+    "",
+    "  Change these settings with `copilot config`, using dot notation for nested keys:",
+    "    $ copilot config footer.showQuota off",
+    "",
+    '  `banner`: frequency of showing animated banner; defaults to "once".',
+    '    - "always" displays it every time',
+    '    - "never" disables it',
+    '    - "once" displays it the first time',
+    "",
+    "  `model`: AI model to use for Copilot CLI; can be changed with /model command or --model flag option.",
+    ...modelIds.map((id) => `    - "${id}"`),
+    "",
+    '  `contextTier`: context window tier for tiered-pricing models (e.g., "default" or "long_context").',
+    '    - "default"',
+    "",
+  ];
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "GitHub Copilot CLI 1.0.104."',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "help" ] && [ "$2" = "config" ]; then',
+      "  cat <<'AGETOR_E2E_COPILOT_HELP_CONFIG'",
+      ...helpConfig,
+      "AGETOR_E2E_COPILOT_HELP_CONFIG",
+      "  exit 0",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
+
 async function tailFile(filePath: string, maxBytes = 4_000): Promise<string> {
   if (!existsSync(filePath)) return `<${filePath} not found>`;
   try {
@@ -300,6 +381,11 @@ async function provisionBackend(
   const daemonLogFile = path.join(dataDir, "daemon.log");
   // Must happen before the spawn below — see writeFxStubBin's doc comment.
   const fxStubBinPath = writeFxStubBin(dataDir);
+  const copilotStubBinPath = writeCopilotStubBin(dataDir);
+  // Never created: an absolute path that can't resolve pins a seeded-enabled
+  // harness to "not installed" independent of the machine's PATH.
+  const missingCopilotBinPath = path.join(dataDir, "not-installed", "copilot");
+  const missingAntigravityBinPath = path.join(dataDir, "not-installed", "agy");
   // Backs the `/refs/pick` test seam (src/bun/server.ts) — a spec plants
   // files here, then clicks the picker's Files/Folder button, and the
   // headless backend returns them instead of opening a native panel that
@@ -372,6 +458,19 @@ async function provisionBackend(
       AGETOR_CURSOR_DRIVER: "fake",
       AGETOR_CURSOR_BIN: "/bin/echo",
       AGETOR_CURSOR_ARGS: "",
+      // GitHub Copilot routes through its in-process fake driver for every
+      // worker (`src/bun/copilot-fake.ts`, e2e/copilot-harness.spec.ts). Copilot
+      // is seeded enabled, so unlike fx the BIN is opt-in: it points at the
+      // stub script written into this backend's own `dataDir` (see
+      // `writeCopilotStubBin`) ONLY when the backend's `backendEnv` carries
+      // `AGETOR_E2E_COPILOT_STUB=1`; otherwise it points at a path inside this
+      // backend's `dataDir` that never exists, so every other spec sees Copilot
+      // as not installed (and runs no model discovery) whether or not a real
+      // GitHub Copilot CLI is on the machine's PATH. Antigravity, also seeded
+      // enabled, gets the same pin.
+      AGETOR_COPILOT_DRIVER: "fake",
+      AGETOR_COPILOT_BIN: extraEnv.AGETOR_E2E_COPILOT_STUB === "1" ? copilotStubBinPath : missingCopilotBinPath,
+      AGETOR_ANTIGRAVITY_BIN: missingAntigravityBinPath,
       // Test seam for the fx auto-resume engine (`docs/plans/fx-recovery-
       // follow-ups.md` §3, `orchestrator.ts`'s `fxAutoResumePrefs`) — shrinks
       // the auto-resume delay from the 120s default down to 2s so

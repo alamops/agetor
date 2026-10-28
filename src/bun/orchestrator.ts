@@ -117,6 +117,13 @@ import {
   dropAntigravitySession,
   reattachAntigravitySession,
 } from "./antigravity-tmux.ts";
+import {
+  COPILOT_PLAN_TOOL_NAME,
+  dropCopilotSession,
+  reattachCopilotSession,
+  type CopilotSubagentSink,
+} from "./copilot-tmux.ts";
+import { copilotHome } from "./copilot-home.ts";
 import {  dropFxSession,
 } from "./fx-acp.ts";
 import { beginLagLabel, setLagStallSink } from "./event-loop-lag.ts";
@@ -159,9 +166,12 @@ import type {
   FxRecoveryPayload,
   GlobalEvent,
   Pipeline,
+  Run,
   RunEvent,
   RunStatus,
   SentFileEntry,
+  Subagent,
+  SubagentEvent,
   Task,
   TaskFxRecovery,
   WorktreeGitStatus,
@@ -794,26 +804,28 @@ export async function reconcileOrphans(): Promise<number> {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; agent: string }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; copilot_session_id: string | null; agent: string }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, copilot_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
   const reattachedTaskIds = new Set<string>();
-  const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null }[] = [];
+  const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null; kind: AgentKind | null }[] = [];
 
   for (const row of stale) {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // claude-code, codex, cursor, gemini, and antigravity runs can all be reattached
-    // when their detached tmux session is still alive. The reattach key differs
-    // by kind: claude needs its JSONL session uuid (`claude_session_id`),
-    // codex needs its thread id (`codex_session_id`), cursor needs its
-    // `session_id` (`cursor_session_id`), gemini needs its self-issued uuid
-    // (`gemini_session_id`), antigravity needs its conversation id
-    // (`antigravity_session_id`) — the per-run log path is derived from the run
-    // id in every case. Note codex's, cursor's, gemini's, antigravity's, and fx's
-    // sessions only live WHILE their turn is in flight (one process per turn), so a
+    // claude-code, codex, cursor, gemini, antigravity, and copilot runs can all
+    // be reattached when their detached tmux session is still alive. The
+    // reattach key differs by kind: claude needs its JSONL session uuid
+    // (`claude_session_id`), codex needs its thread id (`codex_session_id`),
+    // cursor needs its `session_id` (`cursor_session_id`), gemini needs its
+    // self-issued uuid (`gemini_session_id`), antigravity needs its
+    // conversation id (`antigravity_session_id`), copilot needs its self-issued
+    // uuid (`copilot_session_id`) — the per-run log path is derived from the
+    // run id in every case. Note codex's, cursor's, gemini's, antigravity's,
+    // copilot's, and fx's sessions only live WHILE their turn is in flight
+    // (one process per turn; fx is never reattached at all), so a
     // reattachable one of those is by definition one that was still running
     // when agetor restarted. Also: if we already reattached a newer sibling
     // for this task, orphan the older one — only one SessionState can drive
@@ -824,6 +836,7 @@ export async function reconcileOrphans(): Promise<number> {
       : kind === "cursor" ? row.cursor_session_id
       : kind === "gemini" ? row.gemini_session_id
       : kind === "antigravity" ? row.antigravity_session_id
+      : kind === "copilot" ? row.copilot_session_id
       : null;
     // fx is driven over ACP/stdio, not tmux — nothing to reattach to, so a
     // `running` fx row at boot always takes the orphaned→ready path.
@@ -837,7 +850,7 @@ export async function reconcileOrphans(): Promise<number> {
     // `string` for everything below.
     let canTryReattach = false;
     if (
-      (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity")
+      (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "copilot")
       && task !== null
       && row.tmux_session !== null
       && reattachKey !== null
@@ -889,12 +902,25 @@ export async function reconcileOrphans(): Promise<number> {
               onChunk,
               seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
             })
-          : await reattachAntigravitySession({
+          : kind === "antigravity"
+          ? await reattachAntigravitySession({
               taskId: row.task_id,
               runId: row.id,
               sessionName: row.tmux_session as string,
               onChunk,
               seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            })
+          : await reattachCopilotSession({
+              taskId: row.task_id,
+              runId: row.id,
+              sessionName: row.tmux_session as string,
+              onChunk,
+              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+              sessionId: row.copilot_session_id as string,
+              copilotHome: copilotHome({ harnessHome: harness?.home ?? null, harnessEnv: harness?.env ?? null }),
+              mode: task.mode ?? defaultModeFor("copilot"),
+              model: task.model ?? DEFAULT_MODEL.copilot,
+              onSubagent: makeCopilotSubagentSink(row.id, row.task_id),
             });
         if (spawned) {
           registerActiveRun(row.id, row.task_id, task, spawned);
@@ -929,7 +955,7 @@ export async function reconcileOrphans(): Promise<number> {
         endLag();
       }
     }
-    orphaned.push({ id: row.id, task_id: row.task_id, prevColumn });
+    orphaned.push({ id: row.id, task_id: row.task_id, prevColumn, kind });
   }
 
   const now = Date.now();
@@ -948,6 +974,11 @@ export async function reconcileOrphans(): Promise<number> {
           `UPDATE tasks SET "column" = 'ready', run_id = NULL WHERE id = ? AND "column" = 'running'`,
           [row.task_id],
         );
+        // Copilot owns its subagent rows (the claude watcher is the only other
+        // writer, and its rows are retired by the held-task pass below). A
+        // dead copilot run can never settle its tabs, and a row left `running`
+        // would read as a live background agent forever.
+        if (row.kind === "copilot") subagents.settleRunningForRun(row.id, "orphaned", now);
       }
     });
     reconcile();
@@ -996,10 +1027,34 @@ export async function reconcileOrphans(): Promise<number> {
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
-    // Only claude-code writes subagent rows; a codex or cursor task can never
-    // be held, so it never reaches here. Guard the session probe on kind for
-    // clarity.
-    if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
+    const heldKind = resolveHarness(task.agent)?.kind ?? null;
+    if (heldKind !== "claude-code") {
+      // Copilot is the other subagent-row writer, but only through its
+      // per-turn sink: no watcher ever re-arms for a copilot row, so a row
+      // still `running` outside a live turn (its run's in-turn `settleAll`
+      // write failed, or the task's harness changed) can never settle. A
+      // reattached copilot turn owns its OWN run's rows — leave those to its
+      // sink — and every other run's rows are retired through that run's
+      // sink, so the lifecycle events and the held-task release fire exactly
+      // as on a normal settle. Any other kind (claude rows left behind by a
+      // harness switch) has nothing that could ever settle them either.
+      const liveRunId = heldKind === "copilot" && reattachedTaskIds.has(heldId) ? task.runId : null;
+      if (liveRunId) {
+        const staleRunIds = new Set(
+          subagents
+            .listForTask(heldId)
+            .flatMap((r) => (r.status === "running" && r.runId && r.runId !== liveRunId ? [r.runId] : [])),
+        );
+        for (const staleRunId of staleRunIds) {
+          makeCopilotSubagentSink(staleRunId, heldId).settleAll("orphaned");
+          released++;
+        }
+      } else {
+        orphanRunningSubagents(heldId);
+        released++;
+      }
+      continue;
+    }
 
     if (task.column === "running") {
       // Classic held-task path, unchanged: only proceed when the terminal run
@@ -1755,6 +1810,7 @@ async function startTaskInner(
       geminiSessionId: null,
       fxSessionId: null,
       antigravitySessionId: null,
+      copilotSessionId: null,
     });
   });
   persist();
@@ -1788,18 +1844,11 @@ async function startTaskInner(
     cwd: prepared.cwd,
     onChunk,
     onSessionId: (sessionId) => {
-      runs.update(runId, harness.kind === "claude-code"
-        ? { claudeSessionId: sessionId }
-        : harness.kind === "codex"
-        ? { codexSessionId: sessionId }
-        : harness.kind === "cursor"
-        ? { cursorSessionId: sessionId }
-        : harness.kind === "gemini"
-        ? { geminiSessionId: sessionId }
-        : harness.kind === "antigravity"
-        ? { antigravitySessionId: sessionId }
-        : { fxSessionId: sessionId });
+      runs.update(runId, sessionIdPatchFor(harness.kind, sessionId));
     },
+    // copilot: the driver reports subagents inline in its JSON stream; the
+    // sink turns each into a `subagents` row (a tab) + tagged events.
+    ...(harness.kind === "copilot" ? { copilotSubagents: makeCopilotSubagentSink(runId, taskId) } : {}),
     // fx: a mid-turn steer fx didn't take comes back here as the next turn.
     ...(harness.kind === "fx" ? { onSteerDropped: fxSteerDroppedHandler(taskId, runId, harness.id) } : {}),
     opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, speed: task.speed, maxMode: task.maxMode },
@@ -2458,6 +2507,174 @@ function registerActiveRun(
 }
 
 /**
+ * The run-row patch that records an agent's session id, per harness kind. An
+ * exhaustive switch (docs/plans/github-copilot-harness.md §3.8): the old
+ * ternary chain fell through to `fxSessionId` for any kind it didn't name, so
+ * a new kind silently wrote its id into fx's column. Adding a kind to
+ * `AgentKind` now fails the `never` assignment at compile time; a retired kind
+ * that reaches here at runtime (a `grok`/`kimi` harness row) throws, and the
+ * launch path's `spawnAgentOrFail` turns that into a failed run.
+ */
+function sessionIdPatchFor(kind: AgentKind, sessionId: string): Partial<Run> {
+  switch (kind) {
+    case "claude-code": return { claudeSessionId: sessionId };
+    case "codex": return { codexSessionId: sessionId };
+    case "cursor": return { cursorSessionId: sessionId };
+    case "gemini": return { geminiSessionId: sessionId };
+    case "antigravity": return { antigravitySessionId: sessionId };
+    case "copilot": return { copilotSessionId: sessionId };
+    case "fx": return { fxSessionId: sessionId };
+    default: {
+      const unreachable: never = kind;
+      throw new Error(`unknown harness kind: ${String(unreachable)}`);
+    }
+  }
+}
+
+/**
+ * Copilot-only: the sink `spawnCopilotViaTmux` (and the fake driver, and the
+ * reattach path) feed with the subagents Copilot reports inline in its JSON
+ * stream. Mirrors what the claude subagent watcher does for its own rows —
+ * a `subagents` row (one tab), `runs.appendEvent` tagged with the row's id,
+ * the same `emit` fan-out, a `stream: "subagent"` lifecycle event — with a
+ * globally unique row id (`cp-<runId>-<toolCallId>`; tool call ids are only
+ * unique within a session). Every method is idempotent: a reattach replays
+ * the log from offset 0 and the driver may call any of them twice.
+ *
+ * `settled`/`settleAll` fire `maybeReleaseHeldTask`, the same release edge the
+ * claude watcher drives through `setSubagentSettleHook`, so a card held in
+ * `running` for a still-open subagent advances the moment the last one closes.
+ */
+function makeCopilotSubagentSink(runId: string, taskId: string): CopilotSubagentSink {
+  const subagentIdFor = (toolCallId: string): string => `cp-${runId}-${toolCallId}`;
+  const emitLifecycle = (sub: Subagent, phase: SubagentEvent["phase"]): void => {
+    const payload: SubagentEvent = { phase, subagent: sub };
+    emit({
+      runId,
+      taskId,
+      stream: "subagent",
+      data: JSON.stringify(payload),
+      ts: Date.now(),
+      subagentId: sub.id,
+    });
+  };
+  const release = (): void => {
+    try {
+      maybeReleaseHeldTask(taskId);
+    } catch (e) {
+      console.error(`[agetor] copilot subagent settle hook threw for task ${taskId}:`, e);
+    }
+  };
+  return {
+    started(info) {
+      const id = subagentIdFor(info.toolCallId);
+      // A replayed `started` (reattach) finds the row already there — keep its
+      // status/timing and don't announce it a second time.
+      if (subagents.get(id)) return;
+      const sub: Subagent = {
+        id,
+        taskId,
+        runId,
+        // A dedicated kind (never "subagent") so the Claude watcher's seed
+        // skips the row — see `seedRow` in claude-subagents.ts. No source file
+        // of its own: its events live inline in the copilot run's log and are
+        // persisted by this sink, so `sourcePath` stays empty (which also keeps
+        // `subagentActivityWithin` from stat'ing the main log for it).
+        parentKind: "copilot_subagent",
+        agentType: info.agentType ?? info.name ?? null,
+        description: info.description || info.name || null,
+        spawnDepth: 1,
+        sourcePath: "",
+        toolUseId: info.toolCallId,
+        status: "running",
+        startedAt: Date.now(),
+        endedAt: null,
+      };
+      subagents.insertIfAbsent(sub);
+      emitLifecycle(sub, "started");
+    },
+    event(parentToolCallId, stream, data, lineUuid) {
+      const id = subagentIdFor(parentToolCallId);
+      let inserted: number | null;
+      try {
+        inserted = runs.appendEvent(runId, stream, data, lineUuid, id);
+      } catch (e) {
+        // The run row cascade-deleted under a live tail: cost one event, not
+        // the rest of the batch.
+        console.error(`[agetor] failed to persist copilot subagent event for ${id}:`, e);
+        return;
+      }
+      if (inserted === null) return; // replayed line
+      emit({ runId, taskId, stream, data, ts: Date.now(), subagentId: id });
+    },
+    settled(toolCallId, status) {
+      const id = subagentIdFor(toolCallId);
+      const row = subagents.get(id);
+      if (!row || row.status !== "running") return;
+      const endedAt = Date.now();
+      subagents.setStatus(id, status, endedAt);
+      emitLifecycle({ ...row, status, endedAt }, "finished");
+      release();
+    },
+    settleAll(status) {
+      const open = subagents
+        .listForTask(taskId)
+        .filter((r) => r.runId === runId && r.status === "running");
+      if (open.length === 0) return;
+      const endedAt = Date.now();
+      subagents.settleRunningForRun(runId, status, endedAt);
+      for (const row of open) emitLifecycle({ ...row, status, endedAt }, "finished");
+      release();
+    },
+  };
+}
+
+/**
+ * Copilot-only: when a run resolves `succeeded`, check whether its LAST
+ * `tool_use` event is the synthetic `copilot_plan` the driver emits at the end
+ * of a successful Plan-mode turn (docs/plans/github-copilot-harness.md §3.3)
+ * and, if so, persist a `pending` `TaskPlan`. The plan's `toolCallId` is the
+ * synthetic tool_use's own id (`copilot-plan:<runId>`), which is the key
+ * RunPanel's `PlanCard` substitution matches on. Same contract as
+ * `detectCursorPlan`: re-reads the task fresh, idempotent by `toolCallId`,
+ * never throws.
+ */
+function detectCopilotPlan(task: Task, runId: string): void {
+  if (resolveHarness(task.agent)?.kind !== "copilot") return;
+
+  const lastToolUse = runs.lastToolUseData(runId);
+  if (lastToolUse === null) return;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(lastToolUse);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const chunk = parsed as Record<string, unknown>;
+  if (chunk.name !== COPILOT_PLAN_TOOL_NAME) return;
+
+  const callId = chunk.id;
+  if (typeof callId !== "string" || callId.length === 0) return;
+  const input = chunk.input;
+  if (!input || typeof input !== "object") return;
+  const plan = (input as Record<string, unknown>).plan;
+  if (typeof plan !== "string" || plan.trim() === "") return;
+
+  const fresh = tasks.get(task.id);
+  if (!fresh) return;
+  const nextPlans = upsertDetectedPlan(fresh.plans, {
+    toolCallId: callId,
+    runId,
+    name: null,
+    content: plan,
+    now: Date.now(),
+  });
+  if (nextPlans !== fresh.plans) tasks.update(task.id, { plans: nextPlans });
+}
+
+/**
  * Cursor-only: when a run resolves `succeeded`, check whether its LAST
  * `tool_use` event is `createPlanToolCall` — cursor's "finished after
  * planning" signature (plan §2, confirmed 5/5 on real runs) — and if so,
@@ -2602,6 +2819,7 @@ function attachDoneHandler(
       if (newStatus === "succeeded" && task) {
         try {
           detectCursorPlan(task, runId);
+          detectCopilotPlan(task, runId);
         } catch {
           // Never let plan detection break run settlement.
         }
@@ -2680,6 +2898,7 @@ function attachDoneHandler(
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
       await drainAntigravityQueue(taskId);
+      await drainCopilotQueue(taskId);
       // Every steer this run accepted has now been reported (dropped ones
       // before `done` resolved) or absorbed — forget the bookkeeping.
       fxPendingSteers.delete(runId);
@@ -2723,6 +2942,7 @@ function attachDoneHandler(
       await drainCursorQueue(taskId);
       await drainGeminiQueue(taskId);
       await drainAntigravityQueue(taskId);
+      await drainCopilotQueue(taskId);
       // Every steer this run accepted has now been reported (dropped ones
       // before `done` resolved) or absorbed — forget the bookkeeping.
       fxPendingSteers.delete(runId);
@@ -2767,6 +2987,15 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     else if (beforeKind === "cursor") await dropCursorSession(taskId);
     else if (beforeKind === "gemini") await dropGeminiSession(taskId);
     else if (beforeKind === "antigravity") await dropAntigravitySession(taskId);
+    else if (beforeKind === "copilot") {
+      await dropCopilotSession(taskId);
+      // Copilot subagent rows are settled only by the copilot driver's own
+      // sink. A row left `running` (e.g. by a run whose in-turn settleAll
+      // never landed) would otherwise hold the card forever under the next
+      // harness: the claude watcher skips `copilot_subagent` rows and
+      // `subagents.hasRunning` is task-wide.
+      orphanRunningSubagents(taskId);
+    }
     else if (beforeKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // Any queued codex/cursor/gemini/fx follow-ups belong to the old agent —
     // drop them so a later drain doesn't spawn them against the new harness.
@@ -2774,6 +3003,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     cursorTurnQueue.delete(taskId);
     geminiTurnQueue.delete(taskId);
     antigravityTurnQueue.delete(taskId);
+    copilotTurnQueue.delete(taskId);
     fxTurnQueue.delete(taskId);
     // Same reasoning for a pending fx auto-resume schedule: it belongs to
     // the old fx session, and the new agent (fx or otherwise) has nothing to
@@ -3581,7 +3811,7 @@ async function sendInputInner(
     return { delivered: false, reason: task.importedClaude.error ?? "import failed" };
   }
 
-  // Pre-flight 1b for a one-shot kind (today codex) BEFORE any side effect
+  // Pre-flight 1b for a floored one-shot kind (codex, copilot) BEFORE any side effect
   // below — the archivedAt clear and the worktree restore both mutate state,
   // and a follow-up the CLI floor is going to refuse must not un-archive the
   // task or re-create its worktree on the way to that refusal.
@@ -3590,7 +3820,7 @@ async function sendInputInner(
   // gate, not the only one.
   {
     const taskHarness = resolveHarness(task.agent);
-    if (taskHarness?.kind === "codex") {
+    if (taskHarness?.kind === "codex" || taskHarness?.kind === "copilot") {
       const floorError = await minCliVersionError(taskHarness, task.model ?? DEFAULT_MODEL[taskHarness.kind]);
       if (floorError !== null) return { delivered: false, reason: floorError };
     }
@@ -3746,6 +3976,17 @@ async function sendInputInner(
   }
   if (kind === "antigravity") {
     const result = await sendAntigravityTurn(row.task_id, line);
+    return result
+      ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
+      : {
+          delivered: false,
+          reason: "another message is already starting a new turn for this task — try again in a moment",
+        };
+  }
+  if (kind === "copilot") {
+    const result = await sendCopilotTurn(row.task_id, line, rawLine);
+    // Pre-flight 1b refused the turn before any run row was minted.
+    if (result !== null && typeof result === "object") return { delivered: false, reason: result.declined };
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -4596,6 +4837,285 @@ function findLastAntigravitySessionId(taskId: string): string | null {
      LIMIT 1`,
   ).get(taskId);
   return row?.antigravity_session_id ?? null;
+}
+
+/**
+ * One queued copilot follow-up — same raw/expanded split as
+ * `QueuedCodexLine`: `expanded` is what the turn executes, `raw` is the text
+ * the user typed, kept so a floor-refused queued turn restashes under the
+ * exact text a draft/tray item was saved with.
+ */
+interface QueuedCopilotLine {
+  raw: string;
+  expanded: string;
+}
+
+/**
+ * `spawnCopilotTurnNow`'s "refused before minting a run" result — Pre-flight
+ * 1b (`minCliVersionError`): the task's model needs a newer Copilot CLI than
+ * the one installed. Distinct from the `null` "another turn is already
+ * starting" decline so `sendInput` can report the real reason.
+ */
+interface CopilotTurnDecline {
+  declined: string;
+}
+
+/**
+ * Per-task queue of follow-up lines received while a copilot turn is in
+ * flight. `copilot -p` is one-shot per invocation (not a REPL), so — queue
+ * semantics modelled on codex's, incl. the per-model CLI-floor re-check and
+ * `declined` handling — the message is held and a fresh `copilot --session-id
+ * <id>` turn is spawned for it once the active turn resolves
+ * (`drainCopilotQueue`, called from `attachDoneHandler`).
+ */
+const copilotTurnQueue = new Map<string, QueuedCopilotLine[]>();
+
+/**
+ * Send a follow-up to a copilot task. Each follow-up is its own run row + its
+ * own `copilot --session-id <id>` turn (sequential-turn model). When a turn is
+ * already running the message is queued; otherwise it spawns immediately.
+ * Returns the run id the message was attached to, a `CopilotTurnDecline` when
+ * Pre-flight 1b refused the turn (no run row, no user event), or null on a
+ * lookup failure / when `spawnCopilotTurnNow` declined because
+ * `startingTaskIds` was already claimed for this task.
+ */
+async function sendCopilotTurn(taskId: string, line: string, rawLine: string = line): Promise<string | CopilotTurnDecline | null> {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  if (task.runId && active.has(task.runId)) {
+    const q = copilotTurnQueue.get(taskId) ?? [];
+    q.push({ raw: rawLine, expanded: line });
+    copilotTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    runs.appendEvent(runId, "user", data);
+    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    return runId;
+  }
+  return spawnCopilotTurnNow(task, taskId, line);
+}
+
+/** Most-recent copilot session id the task has on THIS harness (a different
+ *  harness has a different `COPILOT_HOME`, which can't see it). */
+function findLastCopilotSessionId(taskId: string, harnessId: string): string | null {
+  const row = db.query<{ copilot_session_id: string }, [string, string]>(
+    `SELECT copilot_session_id FROM runs
+     WHERE task_id = ? AND agent = ? AND copilot_session_id IS NOT NULL
+     ORDER BY started_at DESC, rowid DESC
+     LIMIT 1`,
+  ).get(taskId, harnessId);
+  return row?.copilot_session_id ?? null;
+}
+
+/** Harness id of the task's most recent copilot session recorded on a harness
+ *  OTHER than `harnessId`, or null. Only used to explain why nothing resumes. */
+function findCopilotSessionHarnessElsewhere(taskId: string, harnessId: string): string | null {
+  const row = db.query<{ agent: string }, [string, string]>(
+    `SELECT agent FROM runs
+     WHERE task_id = ? AND agent != ? AND copilot_session_id IS NOT NULL
+     ORDER BY started_at DESC, rowid DESC
+     LIMIT 1`,
+  ).get(taskId, harnessId);
+  return row?.agent ?? null;
+}
+
+/** Test seam: under `AGETOR_COPILOT_DRIVER=fake` nothing writes
+ *  `<COPILOT_HOME>/session-state/<id>/`, so the existence check is skipped
+ *  unless this is `1` (lets a test drive the "session not found" path). */
+const COPILOT_FAKE_REQUIRE_SESSION_DIR_ENV = "AGETOR_COPILOT_FAKE_REQUIRE_SESSION_DIR";
+
+function copilotSessionDirExists(harness: Harness, sessionId: string): boolean {
+  if (
+    process.env.AGETOR_COPILOT_DRIVER === "fake"
+    && process.env[COPILOT_FAKE_REQUIRE_SESSION_DIR_ENV] !== "1"
+  ) {
+    return true;
+  }
+  try {
+    const home = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+    return existsSync(join(home, "session-state", sessionId));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decide which Copilot session (if any) a follow-up turn resumes, plus the
+ * status line explaining it. The id is scoped to the task's CURRENT harness
+ * (`runs.agent`): switching to another Copilot harness — a different
+ * `COPILOT_HOME`, possibly a different account — can't carry the context, so
+ * it starts fresh and says so; likewise when the id's session dir is gone
+ * from this account's `COPILOT_HOME`. Copilot always gets a `--session-id`
+ * (the prior id when resuming, else a fresh uuid minted by `spawnAgent`).
+ */
+function resolveCopilotResume(taskId: string, harness: Harness): { sessionId: string | null; note: string } {
+  const own = findLastCopilotSessionId(taskId, harness.id);
+  if (own) {
+    if (copilotSessionDirExists(harness, own)) {
+      return { sessionId: own, note: `resuming GitHub Copilot session ${own.slice(0, 8)}…` };
+    }
+    return {
+      sessionId: null,
+      note: `previous Copilot session ${own.slice(0, 8)}… not found for this account — starting fresh`,
+    };
+  }
+  const elsewhere = findCopilotSessionHarnessElsewhere(taskId, harness.id);
+  if (elsewhere) {
+    return {
+      sessionId: null,
+      note: `previous GitHub Copilot context is on harness "${elsewhere}" — starting a fresh session (context didn't carry over)`,
+    };
+  }
+  return { sessionId: null, note: "no prior GitHub Copilot session — starting fresh" };
+}
+
+/**
+ * Spawn a fresh copilot turn that resumes the task's prior session via
+ * `--session-id <prior>` (see `resolveCopilotResume`). New run row, new tmux
+ * session (the previous turn's exited). Re-runs Pre-flight 1b before minting
+ * the run row — the model is PATCH-able between turns — and returns a
+ * `CopilotTurnDecline` with nothing written on a refusal.
+ */
+async function spawnCopilotTurnNow(task: Task, taskId: string, line: string): Promise<string | CopilotTurnDecline | null> {
+  // Claim the unified "starting" slot — see `spawnCodexTurnNow`.
+  if (startingTaskIds.has(taskId)) return null;
+  startingTaskIds.add(taskId);
+  try {
+    const cwd = task.worktreePath ?? task.workdir;
+    const harness = resolveHarness(task.agent);
+
+    // Pre-flight 1b — before any state mutation.
+    if (harness) {
+      const floorError = await minCliVersionError(harness, task.model ?? DEFAULT_MODEL[harness.kind]);
+      if (floorError !== null) return { declined: floorError };
+    }
+
+    const resume = harness ? resolveCopilotResume(taskId, harness) : { sessionId: null, note: "no prior GitHub Copilot session — starting fresh" };
+    const priorSessionId = resume.sessionId;
+
+    const newRunId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: newRunId,
+      taskId,
+      agent: task.agent,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      exitCode: null,
+      tmuxSession: sessionNameFor(taskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+      antigravitySessionId: null,
+      // Carry the id forward up front so a reattach mid-turn finds it before
+      // the driver's own `onSessionId` re-stamps it (idempotent). Null when
+      // this turn starts fresh — `onSessionId` fills in the minted uuid.
+      copilotSessionId: priorSessionId,
+    });
+    const prevColumn: ColumnId = task.column;
+    tasks.update(taskId, { column: "running", runId: newRunId });
+    if (prevColumn !== "running") {
+      emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+    }
+
+    const kind: AgentKind = harness?.kind ?? "copilot";
+    const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+    onChunk("user", normalizeUserText(line));
+    onChunk("status", resume.note);
+
+    if (!harness) {
+      onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+      runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      tasks.update(taskId, { column: "ready", runId: null });
+      return newRunId;
+    }
+
+    const { agent } = await spawnAgentOrFail({
+      taskId,
+      runId: newRunId,
+      harness,
+      prompt: line,
+      cwd,
+      onChunk,
+      onSessionId: (sessionId) => {
+        runs.update(newRunId, sessionIdPatchFor(harness.kind, sessionId));
+      },
+      copilotSubagents: makeCopilotSubagentSink(newRunId, taskId),
+      opts: {
+        mode: task.mode,
+        model: task.model ?? DEFAULT_MODEL[harness.kind],
+        effort: task.effort,
+        speed: task.speed,
+        maxMode: task.maxMode,
+        resumeSessionId: priorSessionId,
+      },
+    });
+    if (!agent) {
+      // spawnAgentOrFail already failed this run row and bounced the task to
+      // `ready` (a tmux launch failure surfaces here too). attachDoneHandler —
+      // the only drain caller — never runs, so drop the queue rather than
+      // strand follow-ups that would resurface out of order on a later turn.
+      copilotTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
+      copilotTurnQueue.delete(taskId);
+      return newRunId;
+    }
+    registerActiveRun(newRunId, taskId, task, agent);
+    attachDoneHandler(newRunId, taskId, agent);
+    return newRunId;
+  } finally {
+    startingTaskIds.delete(taskId);
+  }
+}
+
+/**
+ * After a copilot turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op while a run is still active for the task, and the
+ * stale queue is abandoned if the task's agent was switched away from copilot
+ * mid-flight. A queued follow-up Pre-flight 1b refuses moves — with everything
+ * queued behind it — to the backlog tray with a status line, as codex's does.
+ */
+async function drainCopilotQueue(taskId: string): Promise<void> {
+  const q = copilotTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  if (!task || resolveHarness(task.agent)?.kind !== "copilot") {
+    copilotTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) copilotTurnQueue.delete(taskId);
+  if (next === undefined) return;
+  const result = await spawnCopilotTurnNow(task, taskId, next.expanded);
+  if (result === null) {
+    // Another spawn holds the `startingTaskIds` claim; its own done handler
+    // drains the queue, so put the line back at the front instead of losing it.
+    const rest = copilotTurnQueue.get(taskId) ?? [];
+    copilotTurnQueue.set(taskId, [next, ...rest]);
+    return;
+  }
+  if (typeof result !== "object") return;
+  const stranded = [next, ...(copilotTurnQueue.get(taskId) ?? [])];
+  copilotTurnQueue.delete(taskId);
+  // `backlog.add` PREPENDS, so restash in reverse send order: the refused line
+  // lands on top and the tray reads chronologically. RAW text, so the tray's
+  // dedupe matches a draft saved with the same `@token`s.
+  for (const item of [...stranded].reverse()) restashPasteWithheldText(taskId, item.raw);
+  const lastRunId = runs.listForTask(taskId)[0]?.id;
+  if (lastRunId) {
+    const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
+    const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
+    runs.appendEvent(lastRunId, "status", data);
+    emit({ runId: lastRunId, taskId, stream: "status", data, ts: Date.now() });
+  }
 }
 
 /**
@@ -6819,6 +7339,7 @@ function enqueueArchiveTeardown(
     else if (kind === "cursor") await dropCursorSession(cur.id);
     else if (kind === "gemini") await dropGeminiSession(cur.id);
     else if (kind === "antigravity") await dropAntigravitySession(cur.id);
+    else if (kind === "copilot") await dropCopilotSession(cur.id);
     else if (kind === "fx") dropFxSession(cur.id); // fx has no tmux session — stays sync
     // Pipeline step rows share the parent's worktree (D2, docs/plans/pipelines.md)
     // — a step's own archive teardown must never detach it out from under
@@ -6971,6 +7492,7 @@ export async function archiveTask(
   codexTurnQueue.delete(taskId);
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
+  copilotTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
   // Same for a pending fx auto-resume schedule — an archived task has
   // nothing left to resume (plan §3 T2 item 8).
@@ -7166,6 +7688,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
   antigravityTurnQueue.delete(taskId);
+  copilotTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
   // Same for a pending fx auto-resume schedule, before the task row itself
   // goes (plan §3 T2 item 8).
@@ -7191,6 +7714,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
     else if (deleteKind === "antigravity") await dropAntigravitySession(taskId);
+    else if (deleteKind === "copilot") await dropCopilotSession(taskId);
     else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // A step task's worktree is the shared parent's (D2) — never remove it
     // out from under the parent (or any sibling step) just because one step

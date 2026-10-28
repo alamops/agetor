@@ -1955,6 +1955,12 @@ export function attachSubagentWatcher(opts: {
    *  the old synchronous `for (const row of listForTask(taskId))` loop, moved
    *  verbatim — each `return` below is the old `continue`. */
   function seedRow(row: Subagent): void {
+    // A GitHub Copilot subagent row belongs to the copilot driver: its events
+    // were persisted from the copilot run's own JSONL by the orchestrator's
+    // copilot sink, and it has no Claude transcript to tail. Seeding it as a
+    // JSONL subagent would, after a copilot -> claude-code harness switch,
+    // re-read (and re-map with the Claude mapper) whatever `sourcePath` named.
+    if (row.parentKind === "copilot_subagent") return;
     if (row.parentKind === "workflow") {
       // Container rows are directory-backed: they must never enter `files`
       // (nothing to tail) and must never be resurrected here — a row the DB

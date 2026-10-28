@@ -5,7 +5,7 @@
 # Agetor
 
 **The harness orchestrator.**<br />
-A local-first kanban for running Claude Code, Codex, Cursor, Gemini CLI, fx and Antigravity in parallel, with each task in its own git worktree.
+A local-first kanban for running Claude Code, Codex, Cursor, Gemini CLI, fx, Antigravity and GitHub Copilot in parallel, with each task in its own git worktree.
 
 [![Latest release](https://img.shields.io/github/v/release/alamops/agetor?style=flat-square&label=release&color=4c1)](https://github.com/alamops/agetor/releases/latest)
 [![Platform](https://img.shields.io/badge/macOS-Apple%20Silicon-111?style=flat-square&logo=apple&logoColor=white)](#install)
@@ -31,7 +31,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Local-first.** Everything runs on your machine. There's no Agetor account, no cloud relay and no telemetry.
 - **Non-invasive.** Agetor installs no hooks and no MCP server, and it doesn't edit your `CLAUDE.md`. It drives the real CLI the way you would.
-- **Restart-safe.** Claude Code, Codex, Cursor, Gemini CLI and Antigravity run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
+- **Restart-safe.** Claude Code, Codex, Cursor, Gemini CLI, Antigravity and GitHub Copilot run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
 
 ---
 
@@ -41,15 +41,15 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Kanban workflow.** Tasks move through *Backlog → Ready → Running → Blocked → Review → Done* as their runs start, stall, fail or finish. You can drag a card to override the flow at any time.
 - **A git worktree for every task.** Each task runs on its own branch (`agetor/<id>-<slug>`) under `~/.agetor/worktrees/`, so two agents can work on the same repo at once without colliding. The base commit is pinned when the task is created, so the task keeps the same starting point even after the source branch moves on.
-- **Six harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx and Antigravity side by side. To use a second account for any of them, add a harness with its own isolated `$HOME`.
+- **Seven harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx, Antigravity and GitHub Copilot side by side. To use a second account, add a harness with its own home directory (`$HOME`, or the CLI's own config-dir variable). For GitHub Copilot that is a separate `COPILOT_HOME`; whether it also keeps the login separate isn't verified yet, see the [GitHub Copilot notes](#github-copilot-notes).
 - **Agents (reusable profiles).** Save a harness, model, effort, mode, speed, instructions and skills as a named **Agent**, then launch tasks from it in one click.
 - **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
-- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx and Antigravity, they also include the models your account actually offers, as reported by the CLI. If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
+- **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx and Antigravity, they also include the models your account actually offers, as reported by the CLI. For GitHub Copilot, they include the models your installed CLI version knows about (that list doesn't depend on your account). If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
 
 ### Converse
 
 - **A live, structured transcript.** Assistant text, thinking, tool calls, subagents, plans, TODO progress and files the agent sends you each render as their own UI components, not as raw terminal output.
-- **Questions and approvals as cards.** Claude's `AskUserQuestion`, plan approvals and permission prompts show up as cards you answer in the panel. Agetor then types the keystrokes into the real session. fx permission requests and Cursor plans work the same way.
+- **Questions and approvals as cards.** Claude's `AskUserQuestion`, plan approvals and permission prompts show up as cards you answer in the panel. Agetor then types the keystrokes into the real session. fx permission requests and Cursor and GitHub Copilot plans work the same way.
 - **Follow-ups at any time.** You can message a running agent and the message folds into its current turn. Drafts you're not ready to send go to a per-task **Save for later** tray.
 - **An autocompleting composer.** `/` completes slash commands, skills, MCP servers and plugins. `@` completes files and folders, which Agetor resolves to real paths inside the task's worktree. You can also attach files and images and reuse saved prompts.
 - **Built-in terminals.** Every task has terminal tabs rooted in its worktree. `agetor attach <id>` connects your own terminal to the live agent session.
@@ -80,8 +80,9 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 | **Gemini CLI** <sup>experimental</sup> | `gemini` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Gemini 3.1 Pro (preview) | `npm i -g @google/gemini-cli` |
 | **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | DeepSeek V4 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
 | **Antigravity** <sup>experimental</sup> | `agy` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by conversation id | Gemini 3.8 Flash (High) | `brew install --cask antigravity-cli` |
+| **GitHub Copilot** <sup>experimental</sup> | `copilot` | `--output-format json` headless mode for each turn inside `tmux`, prompt on stdin; the conversation resumes by session id | Auto | `brew install --cask copilot-cli` |
 
-Claude Code and Antigravity are enabled out of the box. The other experimental harnesses are opt-in: turn them on in **Settings → Harnesses**. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
+Claude Code, Antigravity and GitHub Copilot are enabled out of the box. The other experimental harnesses are opt-in: turn them on in **Settings → Harnesses**. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
 
 Each harness offers the permission modes its CLI actually supports. They range from hands-off modes (*Auto*, *Full access*) to *Ask*, *Plan only* and *Read-only*.
 
@@ -106,6 +107,19 @@ Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast*
 - **Auto mode's reviewer.** In *Auto*, an fx reviewer model checks each tool call. If your account can't reach fx's default reviewer, fx holds every tool call. Switch the task to *Full access* or *Ask*, or set `FX_REVIEW_MODEL` to a model your account can use, in the environment of an fx harness you add in Settings → Harnesses.
 - **Messages during a turn.** With fx 0.0.13 or later, a message you send while fx is working joins the running turn. If fx doesn't take it before the turn ends, Agetor sends it as the next turn.
 - **Background processes.** Agetor runs one fx process per turn, and since fx 0.0.13 the processes fx's shell tool started stop when that process exits. A dev server an agent starts in one turn isn't running in the next one.
+
+### GitHub Copilot notes
+
+- **Install the right `copilot`.** GitHub's CLI is the Homebrew *cask* `copilot-cli` (`brew install --cask copilot-cli`, or `npm i -g @github/copilot`, which needs Node.js 22 or later). AWS Copilot ships a binary with the same name; Agetor recognizes it from `copilot --version` and reports it as not GitHub Copilot CLI instead of launching it. Sign in with `copilot login`.
+- **First launch is slow.** The npm build unpacks about 200 MB the first time it runs, so the first status check can show no version until the next refresh.
+- **Three modes.** *Auto* runs hands-off (`--allow-all`) and trusts the task's worktree. *Plan* runs `copilot --mode plan`, which plans without editing. *Read-only* passes no allow flags, so Copilot denies file edits and commands that change files (read-only commands still run), and the run can still finish as succeeded. Agetor passes the mode on every turn, so switching a task out of Plan stops planning.
+- **Approving a plan.** The plan card shows the plan Copilot wrote. Approving it sends the plan back to Copilot in the message, writes no file into your repo, and switches the task to *Auto* so Copilot can implement it. A task launched from an Agent keeps Plan, because the Agent defines its mode.
+- **Default model.** New tasks use **Auto**, Copilot's own model router. A status line in the transcript names the model it actually picked. Effort defaults to *Model default*, which leaves `--reasoning-effort` off.
+- **Background agents.** Subagents Copilot starts show up as tabs on the task, like Claude Code's background agents.
+- **Messages during a turn.** A message you send while Copilot is working runs as the next turn, in the same Copilot session. After you switch the task to a different Copilot harness, it starts a fresh session instead and says so, because another account can't see the old one.
+- **Second account.** An additional GitHub Copilot harness gets its own `COPILOT_HOME`, a separate config and session directory. Run `COPILOT_HOME=<path> copilot login` once to sign it in. Whether Copilot keeps that login separate from your main one isn't verified yet; if both harnesses end up on the same account, set `COPILOT_GITHUB_TOKEN` in the second harness's env instead.
+- **Tokens.** A classic `ghp_` token in `GH_TOKEN` or `GITHUB_TOKEN` is dropped before Copilot starts, since Copilot rejects it and it can override a keychain login. To sign in with a token instead of `copilot login`, use `COPILOT_GITHUB_TOKEN`.
+- **Skills, MCP servers and custom agents.** Copilot's skills, MCP servers and custom agents (`~/.copilot`, plus `.github/` and `.agents/` in the project) appear in the `/` menu and the Extensions picker. Custom agents get their own *Agents* group.
 
 ---
 
@@ -265,7 +279,7 @@ flowchart LR
     CLI["agetor CLI / TUI"] -- "HTTP + SSE" --> Core
     Core["Bun core<br/>orchestrator · SQLite · git"]
     Core -- "tmux (interactive)" --> Claude["claude"]
-    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini · agy"]
+    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini · agy · copilot"]
     Core -- "ACP over stdio" --> FX["fx"]
     Claude --> WT[("git worktree<br/>per task")]
     OneShot --> WT
@@ -273,7 +287,7 @@ flowchart LR
 ```
 
 - **One local API.** The desktop UI and the CLI both talk to the core over HTTP and Server-Sent Events. The API listens only on `127.0.0.1`, and every route except `/health` requires a random token generated at each launch.
-- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Cursor and Gemini CLI run once per turn inside `tmux` and resume by session id. fx talks the Agent Client Protocol.
+- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Cursor, Gemini CLI, Antigravity and GitHub Copilot run once per turn inside `tmux` and resume by session id. fx talks the Agent Client Protocol.
 - **Restart-safe by design.** On boot, Agetor reattaches to any `tmux`-hosted session that is still alive and replays its transcript without duplicates. Runs whose session is gone move back to **Ready**, so no card is left stuck in Running.
 - **Local persistence.** Tasks, runs, events, projects, harnesses and preferences live in a SQLite database with versioned migrations.
 
@@ -291,11 +305,11 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 ├── agetor-core.json         # 0600: the running core's port + token (how the CLI connects)
 ├── github-tokens.json       # 0600: git host tokens from Settings → Git Integration
 ├── worktrees/<task-id>/     # per-task git worktrees
-├── harnesses/<id>/          # isolated $HOME for additional-account harnesses
+├── harnesses/<id>/          # separate home dir ($HOME, or COPILOT_HOME) for additional-account harnesses
 ├── attachments/             # files and images attached to prompts
 ├── issue-threads/           # issue snapshots for tasks started from an issue
 ├── pipeline-runs/           # handoffs recorded by each pipeline run
-├── {codex,cursor,gemini,fx,antigravity}-logs/   # per-run structured agent output
+├── {codex,cursor,gemini,fx,antigravity,copilot}-logs/   # per-run structured agent output
 └── daemon.log               # headless CLI daemon log
 ```
 
@@ -315,6 +329,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_GEMINI_BIN` / `AGETOR_GEMINI_ARGS` | Same, for Gemini CLI. | `gemini` on `PATH` |
 | `AGETOR_FX_BIN` / `AGETOR_FX_ARGS` | Same, for fx. | `fx` on `PATH` |
 | `AGETOR_ANTIGRAVITY_BIN` / `AGETOR_ANTIGRAVITY_ARGS` | Same, for Antigravity. | `agy` on `PATH` |
+| `AGETOR_COPILOT_BIN` / `AGETOR_COPILOT_ARGS` | Same, for GitHub Copilot. | `copilot` on `PATH` |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary. | `tmux` on `PATH` |
 | `AGETOR_SKIP_CLI_VERSION_FLOOR` | Set to `1` to skip the per-model minimum CLI version check. | unset |
 | `AGETOR_DAEMON_IDLE_MS` | Shut the CLI daemon down after this long with no run and no client (`0` disables). | `300000` |
@@ -393,18 +408,20 @@ bun run build:cli                               # standalone CLI binary → arti
 
 ### Adding a harness
 
-1. Extend the `AgentKind` union and add an entry to `AGENT_OPTIONS` in `src/shared/types.ts`.
-2. Teach `buildCommand` and `spawnAgent` in `src/bun/agents.ts` how to launch it, and add a driver if it needs one (see `codex-tmux.ts` or `fx-acp.ts`).
-3. Add availability and install hints in `src/bun/agent-status.ts`.
+1. Extend the `AgentKind` union and add an entry to `AGENT_OPTIONS` in `src/shared/types.ts`, along with the other per-kind tables there (default model and effort, effort support, Code/Plan mode).
+2. Add a migration that widens the `harnesses.kind` check, seeds the built-in row and adds a session id column to `runs`.
+3. Teach `resolveBin`, `harnessEnv`, `buildCommand` and `spawnAgent` in `src/bun/agents.ts` how to launch it, and add a driver if it needs one (see `copilot-tmux.ts`, `codex-tmux.ts` or `fx-acp.ts`).
+4. Add availability and install hints in `src/bun/agent-status.ts`, and model discovery in `src/bun/agent-discovery.ts`.
+5. Wire the follow-up queue, restart reattach and session id handling in `src/bun/orchestrator.ts`, then the Settings, onboarding and picker surfaces in the webview.
 
-The orchestrator, UI and CLI pick up the new kind automatically.
+The compiler flags most of these places for you; `CLAUDE.md` has the full checklist.
 
 ---
 
 ## Roadmap
 
 - Linux and Windows builds. The targets are configured in `electrobun.config.ts` but not yet built or tested.
-- Graduating Codex, Cursor, Gemini CLI, fx and Antigravity from experimental to stable.
+- Graduating Codex, Cursor, Gemini CLI, fx, Antigravity and GitHub Copilot from experimental to stable.
 - More harnesses as new agent CLIs mature.
 
 Have an idea? [Open an issue](https://github.com/alamops/agetor/issues).
@@ -414,7 +431,7 @@ Have an idea? [Open an issue](https://github.com/alamops/agetor/issues).
 ## Acknowledgements
 
 - [Electrobun](https://github.com/blackboardsh/electrobun) and [Bun](https://bun.sh): the runtime Agetor is built on.
-- [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor CLI](https://cursor.com/cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [fx](https://fx.sh) and [Antigravity CLI](https://antigravity.google): the agents Agetor orchestrates.
+- [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), [Cursor CLI](https://cursor.com/cli), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [fx](https://fx.sh), [Antigravity CLI](https://antigravity.google) and [GitHub Copilot CLI](https://github.com/github/copilot-cli): the agents Agetor orchestrates.
 - [tmux](https://github.com/tmux/tmux): what keeps agent sessions alive across restarts.
 - [React](https://react.dev), [React Flow](https://reactflow.dev), [dagre](https://github.com/dagrejs/dagre), [Motion](https://motion.dev), [dnd-kit](https://dndkit.com), [shadcn/ui](https://ui.shadcn.com), [Tailwind CSS](https://tailwindcss.com), [Lucide](https://lucide.dev), [Sonner](https://sonner.emilkowal.ski), [xterm.js](https://xtermjs.org), [Ink](https://github.com/vadimdemedes/ink) and [Clack](https://github.com/bombshell-dev/clack): the UI and TUI stack.
 
