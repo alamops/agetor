@@ -95,6 +95,12 @@ describe("supportedSpeeds", () => {
     expect(supportedSpeeds("cursor", "claude-sonnet-5-5", "high", { fast: true, ultrafast: true })).toEqual(["off"]);
   });
 
+  test("copilot: off only, whatever the model, effort or discovery flags", () => {
+    expect(supportedSpeeds("copilot", "auto", "auto")).toEqual(["off"]);
+    expect(supportedSpeeds("copilot", "claude-opus-5.5", "high", { fast: true, ultrafast: true })).toEqual(["off"]);
+    expect(supportedSpeeds("copilot", null, null)).toEqual(["off"]);
+  });
+
   test("fx: off only without discovery flags", () => {
     expect(supportedSpeeds("fx", "deepseek/deepseek-v4-flash", "auto")).toEqual(["off"]);
     expect(supportedSpeeds("fx", "deepseek/deepseek-v4-flash", "auto", {})).toEqual(["off"]);

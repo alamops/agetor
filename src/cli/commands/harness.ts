@@ -137,13 +137,14 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
       const shell = process.env.SHELL || "/bin/zsh";
       const childEnv: Record<string, string | undefined> = { ...process.env, ...env };
       if (binDir) childEnv.PATH = `${binDir}:${process.env.PATH ?? ""}`;
-      // Only claude's and cursor's login commands are certain (`claude /login`,
-      // `cursor-agent login`); keep the fallback for any future kind generic
-      // rather than assert a command we haven't verified.
+      // Only claude's, cursor's and GitHub Copilot's login commands are certain
+      // (`claude /login`, `cursor-agent login`, `copilot login`); keep the
+      // fallback for any future kind generic rather than assert a command we
+      // haven't verified.
       const loginHint =
         kind === "claude-code"
           ? `run ${c.cyan(`${launch} /login`)} to authenticate`
-          : kind === "cursor"
+          : kind === "cursor" || kind === "copilot"
             ? `run ${c.cyan(`${launch} login`)} to authenticate`
             : `log in to ${c.cyan(launch)} here`;
       out(`${c.green("●")} harness ${c.bold(id)} — env applied. ${loginHint} · Ctrl-D to exit`);

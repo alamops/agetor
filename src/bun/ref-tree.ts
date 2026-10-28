@@ -308,7 +308,7 @@ async function batchCatFile(cwd: string, ref: string, paths: string[]): Promise<
  */
 export const PROJECT_CAPABILITY_PATHSPECS: readonly string[] = [
   ".claude", ".codex", ".mcp.json",
-  ".cursor", ".agents", ".grok", ".fx", ".opencode", ".claw", "skills",
+  ".cursor", ".agents", ".grok", ".fx", ".opencode", ".claw", "skills", ".github",
 ];
 
 /**

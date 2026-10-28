@@ -104,6 +104,7 @@ import m073 from "./073_harness_profile_mcp_servers.sql" with { type: "text" };
 import m074 from "./074_retire_fx_models.sql" with { type: "text" };
 import m075 from "./075_retire_codex_gpt_5_5.sql" with { type: "text" };
 import m076 from "./076_normalize_cursor_new_families.sql" with { type: "text" };
+import m077 from "./077_copilot_harness.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -189,4 +190,10 @@ export const migrations: Migration[] = [
   { id: "074_retire_fx_models", sql: m074 },
   { id: "075_retire_codex_gpt_5_5", sql: m075 },
   { id: "076_normalize_cursor_new_families", sql: m076 },
+  // The Copilot harness was authored as 075 on its branch while main claimed
+  // 075/076 for the codex gpt-5.5 retirement and the new Cursor families;
+  // renumbered on merge (house rule: whoever merges second renumbers) with the
+  // original id kept as an alias so a dev DB that already applied it is not
+  // re-migrated.
+  { id: "077_copilot_harness", sql: m077, aliases: ["075_copilot_harness"] },
 ];

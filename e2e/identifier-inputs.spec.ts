@@ -206,7 +206,7 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     await expect(projectSearch).toBeHidden();
 
     // 6. Extensions picker search box. Its trigger label is "MCP · Skills ·
-    // Plugins · Prompts" (ExtensionPicker.tsx) — the test id is more
+    // Plugins · Agents · Prompts" (ExtensionPicker.tsx) — the test id is more
     // robust than the label text, and is already used the same way by
     // e2e/issue-task.spec.ts and e2e/resolve-conflicts.spec.ts.
     const extTrigger = newTaskPanel.getByTestId("extension-picker-trigger");

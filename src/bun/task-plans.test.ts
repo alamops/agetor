@@ -297,6 +297,17 @@ test("approvePlan: sets approvedAt/filePath and approvedEdited=false for an uned
   expect(result!.plans[0]).toEqual(approved);
 });
 
+test("approvePlan: accepts a null filePath (plans with no file on disk, e.g. GitHub Copilot)", () => {
+  const plan = makePlan();
+  const result = approvePlan([plan], plan.id, { now: 777, filePath: null });
+  expect(result).not.toBeNull();
+  const approved = result!.approved;
+  expect(approved.status).toBe("approved");
+  expect(approved.approvedAt).toBe(777);
+  expect(approved.filePath).toBeNull();
+  expect(approved.approvedEdited).toBe(false);
+});
+
 test("approvePlan: approvedEdited=true when a draft edit is present at approval time", () => {
   const plan = makePlan({ editedContent: "edited version" });
   const result = approvePlan([plan], plan.id, { now: 1, filePath: "x.plan.md" });

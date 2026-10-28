@@ -22,6 +22,10 @@ export const INSTALL_HINTS: Record<AgentKind, string> = {
   "gemini": "npm i -g @google/gemini-cli",
   "fx": "curl -fsSL https://fx.sh/setup.sh | bash",
   "antigravity": "brew install --cask antigravity-cli",
+  // GitHub's CLI is the Homebrew CASK `copilot-cli`; the same-named
+  // *formula* (aws/tap) is AWS Copilot, a different program that also
+  // installs a binary called `copilot`.
+  "copilot": "brew install --cask copilot-cli",
 };
 
 /**
@@ -35,6 +39,9 @@ const BREW_PACKAGES: Partial<Record<AgentKind, string>> = {
   "claude-code": "claude-code",
   "gemini": "gemini-cli",
   "antigravity": "antigravity-cli",
+  // A cask, not a formula: `brew upgrade copilot-cli` without `--cask` can
+  // resolve to AWS Copilot's formula on a machine with aws/tap tapped.
+  "copilot": "--cask copilot-cli",
 };
 
 /**
@@ -73,6 +80,8 @@ function isHomebrewInstall(binPath: string): boolean {
  *   - claude-code otherwise → `claude update` (its self-updater covers both
  *     the native and the npm install);
  *   - cursor → `cursor-agent update`;
+ *   - a Homebrew-managed copilot → `brew upgrade --cask copilot-cli`
+ *     (otherwise `copilot update`);
  *   - anything else → the kind's `INSTALL_HINTS` entry (the npm / curl
  *     installers upgrade in place).
  */
@@ -84,6 +93,7 @@ export function upgradeHintFor(kind: AgentKind, binPath: string | null): string 
   if (kind === "claude-code") return "claude update";
   if (kind === "cursor") return "cursor-agent update";
   if (kind === "antigravity") return "agy update";
+  if (kind === "copilot") return "copilot update";
   return INSTALL_HINTS[kind];
 }
 
@@ -420,6 +430,19 @@ const FX_WRONG_BINARY_HINT =
   "found a different 'fx' binary (JSON viewer?) — install Vercel fx: curl -fsSL https://fx.sh/setup.sh | bash or set AGETOR_FX_BIN";
 
 /**
+ * AWS Copilot ships a binary of the same name as GitHub Copilot CLI, and
+ * `aws/tap/copilot-cli` is a Homebrew formula that shadows GitHub's cask on
+ * some machines. GitHub's `copilot --version` prints
+ * `GitHub Copilot CLI 1.0.104.` (spike-verified, 1.0.104); AWS Copilot
+ * prints `copilot version: vX.Y.Z`. The marker is matched
+ * case-insensitively against the `--version` output the status probe has
+ * already captured, so no extra spawn is needed.
+ */
+const COPILOT_VERSION_MARKER = "github copilot cli";
+const COPILOT_WRONG_BINARY_REASON =
+  "`copilot` isn't GitHub Copilot CLI (AWS Copilot ships a binary of the same name)";
+
+/**
  * Resolve an executable name to an absolute path. Absolute paths bypass `$PATH`
  * and are checked for existence directly — `Bun.which` only searches `$PATH`
  * and returns null for absolute paths, which would falsely report a hand-
@@ -568,6 +591,27 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
 
     ({ loggedIn, authHelp } = status);
     fxProfilePermissionMode = status.permissionMode;
+  }
+
+  // copilot-only identity gate (the fx wrong-binary pattern, minus the extra
+  // `--help` spawn: `--version` already identifies GitHub's CLI). `loggedIn`
+  // stays null for copilot — there is no cheap passive auth probe, and a
+  // logged-out run fails fast with copilot's own stderr instead.
+  if (harness.kind === "copilot" && version !== null && !version.toLowerCase().includes(COPILOT_VERSION_MARKER)) {
+    return {
+      harnessId: harness.id,
+      kind: harness.kind,
+      bin,
+      available: false,
+      path,
+      version,
+      reason: COPILOT_WRONG_BINARY_REASON,
+      installHint: INSTALL_HINTS.copilot,
+      loggedIn: null,
+      authHelp: null,
+      fxProfilePermissionMode: null,
+      ...accountFields,
+    };
   }
 
   return {

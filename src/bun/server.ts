@@ -622,16 +622,17 @@ function planGuard(req: { params: { id: string } } & Request): Response | null {
   return null;
 }
 
-/** Shared precondition for both cursor-plan-mutation routes: plan
- *  approval/editing only makes sense for a cursor-harness task (the whole
- *  detect/approve flow is keyed on cursor's `createPlanToolCall`). Identical
- *  check, identical 400 shape, in both the PATCH edit route and the approve
- *  route — factored out so they can't drift. */
-function planCursorKindGuard(req: Request, task: Task): Response | null {
+/** Shared precondition for both plan-mutation routes: plan approval/editing
+ *  only makes sense for a cursor task (keyed on cursor's `createPlanToolCall`)
+ *  or a GitHub Copilot task (keyed on the driver's synthetic `copilot_plan`
+ *  tool_use). Identical check, identical 400 shape, in both the PATCH edit
+ *  route and the approve route — factored out so they can't drift. Returns
+ *  the harness kind alongside so the approve route can branch on it. */
+function planKindGuard(req: Request, task: Task): Response | null {
   const kind = harnesses.getByIdOrKind(task.agent)?.kind;
-  if (kind !== "cursor") {
+  if (kind !== "cursor" && kind !== "copilot") {
     return json(
-      { error: "plan approval is only supported for cursor tasks" },
+      { error: "plan approval is only supported for cursor or GitHub Copilot tasks" },
       { status: 400, headers: corsHeaders(req) },
     );
   }
@@ -4092,10 +4093,10 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (
             body.kind !== "claude-code" && body.kind !== "codex" &&
             body.kind !== "cursor" && body.kind !== "gemini" && body.kind !== "fx" &&
-            body.kind !== "antigravity"
+            body.kind !== "antigravity" && body.kind !== "copilot"
           ) {
             return json(
-              { error: "kind must be 'claude-code', 'codex', 'cursor', 'gemini', 'fx', or 'antigravity'" },
+              { error: "kind must be 'claude-code', 'codex', 'cursor', 'gemini', 'fx', 'antigravity', or 'copilot'" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
@@ -5072,6 +5073,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               "gemini": getDiscoveredModels("gemini"),
               "antigravity": getDiscoveredModels("antigravity"),
               "fx": getDiscoveredModels("fx"),
+              "copilot": getDiscoveredModels("copilot"),
             },
             { headers: corsHeaders(req) },
           )),
@@ -5107,6 +5109,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               "gemini": getDiscoveredModels("gemini"),
               "antigravity": getDiscoveredModels("antigravity"),
               "fx": getDiscoveredModels("fx"),
+              "copilot": getDiscoveredModels("copilot"),
             },
             { headers: corsHeaders(req) },
           );
@@ -7056,7 +7059,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           const task = tasks.get(req.params.id);
           if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
-          const kindBlocked = planCursorKindGuard(req, task);
+          const kindBlocked = planKindGuard(req, task);
           if (kindBlocked) return kindBlocked;
           const nextPlans = setEditedContent(task.plans, req.params.planId, body.editedContent ?? null);
           if (!nextPlans) {
@@ -7112,7 +7115,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             const task = tasks.get(req.params.id);
             if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
 
-            const kindBlocked = planCursorKindGuard(req, task);
+            const kindBlocked = planKindGuard(req, task);
             if (kindBlocked) return kindBlocked;
 
             const plan = task.plans.find((p) => p.id === req.params.planId);
@@ -7156,25 +7159,38 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             }
 
             const content = effectiveContent(plan);
-            const cwd = task.worktreePath ?? task.workdir;
-            const relDir = ".cursor/plans";
-            const filename = `${planSlug(plan.name)}_${plan.id}.plan.md`;
-            const relPath = path.join(relDir, filename);
-            try {
-              await writeTaskDirFileAtomic(path.join(cwd, relPath), content, { mkdirParent: true });
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              // Plan stays pending, no message sent — the user can retry.
-              return json(
-                { error: `failed to write plan file: ${msg}` },
-                { status: 500, headers: corsHeaders(req) },
-              );
-            }
-
             const edited = plan.editedContent !== null;
-            let message = edited
-              ? `The plan is approved with edits by the user — the approved version is saved at ${relPath}. Read it and follow that version; it supersedes your original plan. Good to go.`
-              : `The plan is approved — proceed with the implementation. It is also saved at ${relPath} for reference.`;
+            // GitHub Copilot writes NO plan file (no `.copilot/plans` in the
+            // user's repo): the effective plan always rides inline in the
+            // approval message and the plan record keeps `filePath: null`.
+            // Cursor keeps its `.cursor/plans/*.plan.md` file, unchanged.
+            const isCopilot = harnesses.getByIdOrKind(task.agent)?.kind === "copilot";
+            const agentLabel = isCopilot ? "GitHub Copilot" : "cursor";
+            let relPath: string | null = null;
+            let message: string;
+            if (isCopilot) {
+              message = edited
+                ? `The plan is approved with edits by the user — follow this version; it supersedes your original plan. Implement it now. Approved plan:\n\n${content}`
+                : `The plan is approved — implement it now. Approved plan:\n\n${content}`;
+            } else {
+              const cwd = task.worktreePath ?? task.workdir;
+              const relDir = ".cursor/plans";
+              const filename = `${planSlug(plan.name)}_${plan.id}.plan.md`;
+              relPath = path.join(relDir, filename);
+              try {
+                await writeTaskDirFileAtomic(path.join(cwd, relPath), content, { mkdirParent: true });
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                // Plan stays pending, no message sent — the user can retry.
+                return json(
+                  { error: `failed to write plan file: ${msg}` },
+                  { status: 500, headers: corsHeaders(req) },
+                );
+              }
+              message = edited
+                ? `The plan is approved with edits by the user — the approved version is saved at ${relPath}. Read it and follow that version; it supersedes your original plan. Good to go.`
+                : `The plan is approved — proceed with the implementation. It is also saved at ${relPath} for reference.`;
+            }
             // Plan mode (`cursor-agent --mode plan`) is read-only, so an
             // approved plan could never be implemented in it: an unbound task
             // is switched to Auto (force) right before the approval message
@@ -7188,13 +7204,14 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             const flipToAuto = task.mode === "plan" && task.agentProfileId === null;
             const boundPlanWarning =
               task.mode === "plan" && !flipToAuto
-                ? "plan approved, but this task's agent runs cursor in Plan mode — detach the agent or switch the mode to implement"
+                ? `plan approved, but this task's agent runs ${agentLabel} in Plan mode — detach the agent or switch the mode to implement`
                 : null;
             // ask-mode — and plan-mode when it stays plan — is propose-only
             // and may not be able to read the file back off disk headlessly —
             // embed the full effective content inline so the agent has it
             // regardless. `null` mode means auto (buildCommand's convention).
-            if (task.mode === "ask" || boundPlanWarning !== null) {
+            // Copilot's message already embeds the plan, so it is skipped here.
+            if (!isCopilot && (task.mode === "ask" || boundPlanWarning !== null)) {
               message += `\n\n--- Approved plan ---\n\n${content}`;
             }
 
@@ -7217,8 +7234,8 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             }
             if (!sendResult.delivered) {
               revertFlip();
-              // The file is already written but nothing was sent — leave the
-              // plan pending so the user can retry the approve action.
+              // Any plan file is already written but nothing was sent — leave
+              // the plan pending so the user can retry the approve action.
               return json(
                 { error: `approval message not delivered: ${sendResult.reason}` },
                 { status: 409, headers: corsHeaders(req) },
@@ -7232,7 +7249,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               appendRunStatusLine(
                 task.id,
                 task.runId,
-                "plan approved — switched this task to Auto (force) so cursor can implement it",
+                isCopilot
+                  ? "plan approved — switched this task to Auto so GitHub Copilot can implement it"
+                  : "plan approved — switched this task to Auto (force) so cursor can implement it",
               );
             } else if (boundPlanWarning !== null) {
               appendRunStatusLine(task.id, task.runId, boundPlanWarning);
