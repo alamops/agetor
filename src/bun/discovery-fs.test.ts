@@ -348,3 +348,50 @@ describe.skipIf(process.platform !== "darwin")("listAgentCapabilities through th
     expect(rec.children()).toEqual([]);
   });
 });
+
+describe.skipIf(process.platform !== "darwin")("disclaimed discovery timeouts are reported", () => {
+  /** A helper that turns every child whose program is `prog` into a 3 s hang. */
+  function hangStub(prog: string): void {
+    const stub = path.join(scratch, `hang-${counter++}`);
+    writeFileSync(stub, `#!/bin/sh\nif [ "$1" = ${prog} ]; then exec /bin/sleep 3; fi\nexec "$@"\n`, { mode: 0o755 });
+    process.env.AGETOR_DISCLAIM_BIN = stub;
+    setDisclaimSwitch(true);
+    __setLoadTimeoutMsForTest(300);
+  }
+  async function captureWarnings(fn: () => Promise<unknown>): Promise<string[]> {
+    const warn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => void warnings.push(a.join(" "));
+    try {
+      await fn();
+    } finally {
+      console.warn = warn;
+    }
+    return warnings;
+  }
+
+  test("a load() whose find times out logs one warning naming the root", async () => {
+    hangStub("/usr/bin/find");
+    const root = path.join(scratch, "timeout-root", "skills");
+    const warnings = await captureWarnings(() => disclaimedDiscoveryFs.load([skillsDir(root)]));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("timed out");
+    expect(warnings[0]).toContain(root);
+  });
+
+  test("a readJsonCached() that times out answers null, warns, and caches nothing", async () => {
+    const file = path.join(scratch, "slow-claude.json");
+    w(file, '{"v":1}');
+    hangStub("/bin/sh");
+    let value: unknown = "unset";
+    const warnings = await captureWarnings(async () => {
+      value = await disclaimedDiscoveryFs.readJsonCached(file);
+    });
+    expect(value).toBeNull();
+    expect(warnings.some((m) => m.includes("timed out") && m.includes(file))).toBe(true);
+    // The next read, no longer stuck, parses the file instead of answering a
+    // cached null.
+    recordingStub();
+    expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 1 });
+  });
+});

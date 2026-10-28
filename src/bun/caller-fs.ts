@@ -441,17 +441,15 @@ export async function callerProjectTree(
     { cwd: root, maxBytes: PROJECT_TREE_TAR_MAX_BYTES, timeoutMs: TREE_TIMEOUT_MS },
   );
   let truncated = listing.truncated;
+  let timedOut = listing.timedOut;
   const wanted: string[] = [];
-  for (const raw of Buffer.from(listing.bytes).toString("utf8").split("\0")) {
-    // A name cut by the cap is not a path; only complete NUL-terminated ones count.
+  for (const raw of completeNulNames(listing.bytes)) {
     if (!raw) continue;
     const rel = raw.replace(/^\.\//, "");
     if (shouldRead(rel)) wanted.push(rel);
   }
-  // Drop a possibly cut final name when the listing was truncated.
-  if (listing.truncated && listing.bytes[listing.bytes.length - 1] !== 0) wanted.pop();
   if (wanted.length === 0) {
-    if (truncated) warnTruncated(root);
+    warnIncomplete(root, truncated, timedOut);
     return refProjectTree(files);
   }
 
@@ -462,16 +460,33 @@ export async function callerProjectTree(
     stdinData: Buffer.from(wanted.join("\0") + "\0", "utf8"),
   });
   truncated = truncated || archive.truncated;
+  timedOut = timedOut || archive.timedOut;
   for (const entry of parseTar(archive.bytes)) {
     // `Buffer.toString("utf8")` keeps a leading BOM, like `readFileSync(…, "utf8")`.
     files.set(entry.path, Buffer.from(entry.data).toString("utf8"));
   }
-  if (truncated) warnTruncated(root);
+  warnIncomplete(root, truncated, timedOut);
   return refProjectTree(files);
 }
 
-function warnTruncated(root: string): void {
-  console.warn(
-    `[agetor] capability discovery for ${root} hit the ${PROJECT_TREE_TAR_MAX_BYTES / (1024 * 1024)} MB read cap; some project skills/commands may be missing`,
-  );
+/**
+ * The complete names in a `-print0` listing. Only NUL-terminated names count:
+ * the piece after the last NUL is either empty or a name the read cap or the
+ * timeout cut off, and a cut name is not a path.
+ */
+export function completeNulNames(bytes: Uint8Array): string[] {
+  const names = Buffer.from(bytes).toString("utf8").split("\0");
+  names.pop();
+  return names;
+}
+
+function warnIncomplete(root: string, truncated: boolean, timedOut: boolean): void {
+  if (truncated) {
+    console.warn(
+      `[agetor] capability discovery for ${root} hit the ${PROJECT_TREE_TAR_MAX_BYTES / (1024 * 1024)} MB read cap; some project skills/commands may be missing`,
+    );
+  }
+  if (timedOut) {
+    console.warn(`[agetor] capability discovery for ${root} timed out; some project skills/commands may be missing`);
+  }
 }

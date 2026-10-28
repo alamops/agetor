@@ -6,6 +6,7 @@ import {
   createAuthedBlobCache,
   createLazyGate,
   createViewportRegistry,
+  heldBoxAfterStatus,
   heldBoxFor,
   IDLE_RELEASE_MS,
   LOADING_RELEASE_MS,
@@ -503,6 +504,28 @@ describe("lazy gate", () => {
     expect(g.live()).toHaveLength(0);
     g.gate.setNear(true);
     expect(g.changes).toEqual([true]);
+  });
+});
+
+describe("held box after a status change (heldBoxAfterStatus)", () => {
+  const box = { url: "/files/preview?path=a.png", width: 320, height: 240 };
+
+  test("a failed re-fetch forgets the box, so a later release shows the placeholder", () => {
+    // Regression: the stale box was kept, so once the failed image left the
+    // view it flipped from the placeholder back to its old size.
+    for (const status of ["missing", "error", "too-large"] as const) {
+      const after = heldBoxAfterStatus(box, box.url, true, status);
+      expect(after).toBeNull();
+      expect(heldBoxFor(after, box.url, false, "loading")).toBeNull();
+    }
+  });
+
+  test("loading, ok, a released image and another url's box keep it unchanged", () => {
+    expect(heldBoxAfterStatus(box, box.url, true, "loading")).toBe(box);
+    expect(heldBoxAfterStatus(box, box.url, true, "ok")).toBe(box);
+    expect(heldBoxAfterStatus(box, box.url, false, "loading")).toBe(box);
+    expect(heldBoxAfterStatus(box, "/files/preview?path=b.png", true, "missing")).toBe(box);
+    expect(heldBoxAfterStatus(null, box.url, true, "missing")).toBeNull();
   });
 });
 

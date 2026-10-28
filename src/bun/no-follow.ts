@@ -4,7 +4,10 @@
 // The core tails and scans files an agent can rewrite: Claude Code session
 // transcripts and their subagent files under a config dir's `projects/`, the
 // `sessions/` registry, the codex/cursor/gemini/antigravity run logs and exit
-// files under the data dir. Agents run as the same user, so one can replace
+// files under the data dir, and the usage poller's account files (codex
+// rollouts; `.claude.json`, `.credentials.json` and codex `auth.json` through
+// `readAccountFileText`, which follows a user's own symlinked dotfile only
+// while the disclaim switch is off). Agents run as the same user, so one can replace
 // such a file with a symlink into a macOS-protected folder (~/Documents, another
 // app's ~/Library/Application Support). The core would then open it in its own
 // process, under Agetor's TCC identity — exactly what disclaiming every spawn
@@ -27,6 +30,7 @@
 
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { disclaimEnabled } from "./disclaim.ts";
 
 /** `open(2)` flags for reading a file whose final component must not be a
  *  symlink, without blocking on a FIFO. */
@@ -40,10 +44,18 @@ function errnoError(code: string, message: string, p: string): NodeJS.ErrnoExcep
   return err;
 }
 
+/** `open(2)` flags for reading a file through symlinks, without blocking on a
+ *  FIFO. */
+const READ_NONBLOCK = constants.O_RDONLY | constants.O_NONBLOCK;
+
 /** `openSync(p, "r")`, refusing a symlink at `p` (ELOOP), a non-regular file
  *  (EINVAL) and — with `maxBytes` — a file larger than that (EFBIG). */
 export function openReadNoFollow(p: string, opts: { maxBytes?: number } = {}): number {
-  const fd = openSync(p, READ_NOFOLLOW);
+  return openRegular(p, READ_NOFOLLOW, opts);
+}
+
+function openRegular(p: string, flags: number, opts: { maxBytes?: number }): number {
+  const fd = openSync(p, flags);
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw errnoError("EINVAL", "not a regular file", p);
@@ -59,6 +71,25 @@ export function openReadNoFollow(p: string, opts: { maxBytes?: number } = {}): n
  *  `readFileSync` on any other failure. */
 export function readTextNoFollow(p: string, opts: { maxBytes?: number } = {}): string {
   const fd = openReadNoFollow(p, opts);
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Read a user-owned config or credential file that an agent can also rewrite
+ * — a harness home's `.claude.json` or `.credentials.json`, codex's
+ * `auth.json` — as text. While Agetor disclaims its spawns the final component
+ * is opened no-follow, so a file swapped for a symlink into a protected folder
+ * is refused (ELOOP) instead of being read under Agetor's identity; with the
+ * switch off a user's own symlinked dotfile keeps working, the same rule
+ * `readClaudeAccount` applies. Either way the open never blocks on a FIFO and
+ * the file must be a regular one of at most `maxBytes`.
+ */
+export function readAccountFileText(p: string, maxBytes: number): string {
+  const fd = openRegular(p, disclaimEnabled() ? READ_NOFOLLOW : READ_NONBLOCK, { maxBytes });
   try {
     return readFileSync(fd, "utf8");
   } finally {

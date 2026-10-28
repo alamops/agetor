@@ -22,6 +22,7 @@ import {
   createLazyGate,
   findScrollRoot,
   getSharedViewportRegistry,
+  heldBoxAfterStatus,
   heldBoxFor,
   LAZY_ROOT_MARGIN,
   useAuthedObjectUrl,
@@ -109,7 +110,8 @@ export function AuthedImg({
 
   useEffect(() => {
     gateRef.current?.setLoading(status === "loading");
-  }, [status]);
+    setHeldSize((held) => heldBoxAfterStatus(held, url, active, status));
+  }, [active, status, url]);
 
   // Watch the image itself once shown (a tall image can have its top corner
   // off-screen while most of it is visible), the sentinel otherwise.

@@ -428,6 +428,23 @@ export function heldBoxFor(
   return !active || status === "loading" ? held : null;
 }
 
+/**
+ * The box to keep remembering once `url`'s status changes. A settled failure
+ * while active means the image is gone, so the box measured for it no longer
+ * applies: forgetting it keeps a later release off-screen on the placeholder
+ * the failure already shows, instead of flipping back to the old box. Returns
+ * `held` itself (same reference, so React skips the update) otherwise.
+ */
+export function heldBoxAfterStatus(
+  held: HeldBox | null,
+  url: string,
+  active: boolean,
+  status: AuthedBlobStatus,
+): HeldBox | null {
+  if (!held || held.url !== url || !active || status === "loading" || status === "ok") return held;
+  return null;
+}
+
 /** Nearest ancestor that scrolls vertically, or `null` for the viewport.
  *  IntersectionObserver clips a target by every ancestor scroller, but
  *  `rootMargin` only grows the ROOT, so lookahead inside a scroll container

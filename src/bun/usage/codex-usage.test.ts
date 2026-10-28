@@ -1,5 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { parseCodexSessionRateLimits, parseCodexUsage } from "./codex-usage.ts";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import type { Harness } from "../../shared/types.ts";
+import { withDisclaimOn } from "../test-disclaim-on.ts";
+import {
+  parseCodexSessionRateLimits,
+  parseCodexUsage,
+  readCodexToken,
+  readNewestCodexRateLimits,
+} from "./codex-usage.ts";
 
 const FETCHED_AT_MS = 1_700_000_000_000;
 
@@ -267,5 +278,105 @@ describe("parseCodexSessionRateLimits", () => {
     for (const shape of garbageShapes) {
       expect(() => parseCodexSessionRateLimits(shape, FETCHED_AT_MS)).not.toThrow();
     }
+  });
+});
+
+describe("codex account files — agent-writable CODEX_HOME", () => {
+  // `codexHome` is `<home>/.codex` for an aliased harness.
+  const alias = (home: string): Harness => ({
+    id: "codex-alias",
+    kind: "codex",
+    label: "test",
+    isBuiltin: false,
+    home,
+    bin: null,
+    env: {},
+    enabled: true,
+  });
+  const auth = JSON.stringify({ tokens: { access_token: "test-access", account_id: "acct-1" } });
+  const tokenCount = (pct: number) =>
+    JSON.stringify({
+      type: "event_msg",
+      payload: { type: "token_count", rate_limits: { primary: { used_percent: pct, window_minutes: 10080 } } },
+    });
+  function freshHome(): { home: string; codex: string } {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-codex-usage-"));
+    const codex = path.join(home, ".codex");
+    mkdirSync(codex);
+    return { home, codex };
+  }
+  function writeRollout(dayDir: string, body: string): string {
+    mkdirSync(dayDir, { recursive: true });
+    const file = path.join(dayDir, "rollout-2026-10-27T10-00-00-test.jsonl");
+    writeFileSync(file, body);
+    return file;
+  }
+
+  test("auth.json and the newest rollout read normally", () => {
+    const { home, codex } = freshHome();
+    writeFileSync(path.join(codex, "auth.json"), auth);
+    writeRollout(path.join(codex, "sessions", "2026", "10", "27"), `${tokenCount(5)}\n${tokenCount(7)}\n`);
+    expect(readCodexToken(alias(home))).toEqual({ accessToken: "test-access", accountId: "acct-1" });
+    expect(readNewestCodexRateLimits(alias(home))?.rateLimits).toEqual({
+      primary: { used_percent: 7, window_minutes: 10080 },
+    });
+  });
+
+  test.skipIf(process.platform !== "darwin")(
+    "an auth.json swapped for a symlink is not read while disclaiming (but is with the switch off)",
+    async () => {
+      const { home, codex } = freshHome();
+      const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-codex-usage-target-"));
+      writeFileSync(path.join(elsewhere, "auth.json"), auth);
+      symlinkSync(path.join(elsewhere, "auth.json"), path.join(codex, "auth.json"));
+      expect(readCodexToken(alias(home)).accessToken).toBe("test-access");
+      expect(await withDisclaimOn(() => readCodexToken(alias(home)))).toEqual({ accessToken: null, accountId: null });
+    },
+  );
+
+  test("an auth.json that is a named pipe resolves at once to no token", () => {
+    const { home, codex } = freshHome();
+    expect(spawnSync("/usr/bin/mkfifo", [path.join(codex, "auth.json")]).status).toBe(0);
+    const started = Date.now();
+    expect(readCodexToken(alias(home))).toEqual({ accessToken: null, accountId: null });
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test("a sessions folder swapped for a symlink is never listed", () => {
+    const { home, codex } = freshHome();
+    const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-codex-usage-target-"));
+    writeRollout(path.join(elsewhere, "2026", "10", "27"), `${tokenCount(9)}\n`);
+    symlinkSync(elsewhere, path.join(codex, "sessions"));
+    expect(readNewestCodexRateLimits(alias(home))).toBeNull();
+    // A real archived_sessions still answers.
+    writeRollout(path.join(codex, "archived_sessions", "2026", "10", "26"), `${tokenCount(3)}\n`);
+    expect(readNewestCodexRateLimits(alias(home))?.rateLimits).toEqual({
+      primary: { used_percent: 3, window_minutes: 10080 },
+    });
+  });
+
+  test("a rollout swapped for a symlink or a named pipe is not read", () => {
+    const { home, codex } = freshHome();
+    const dayDir = path.join(codex, "sessions", "2026", "10", "27");
+    mkdirSync(dayDir, { recursive: true });
+    const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-codex-usage-target-"));
+    writeFileSync(path.join(elsewhere, "r.jsonl"), `${tokenCount(9)}\n`);
+    symlinkSync(path.join(elsewhere, "r.jsonl"), path.join(dayDir, "rollout-linked.jsonl"));
+    expect(readNewestCodexRateLimits(alias(home))).toBeNull();
+
+    expect(spawnSync("/usr/bin/mkfifo", [path.join(dayDir, "rollout-fifo.jsonl")]).status).toBe(0);
+    const started = Date.now();
+    expect(readNewestCodexRateLimits(alias(home))).toBeNull();
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test("only the rollout's tail is scanned: the last rate_limits past the 8 MB mark is found", () => {
+    const { home, codex } = freshHome();
+    const filler = `${JSON.stringify({ type: "response_item", payload: { text: "x".repeat(1024) } })}\n`;
+    const body = `${tokenCount(1)}\n${filler.repeat(9 * 1024)}${tokenCount(42)}\n`;
+    writeRollout(path.join(codex, "sessions", "2026", "10", "27"), body);
+    expect(readNewestCodexRateLimits(alias(home))?.rateLimits).toEqual({
+      primary: { used_percent: 42, window_minutes: 10080 },
+    });
   });
 });

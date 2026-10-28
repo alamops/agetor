@@ -15,6 +15,7 @@ import {
   PATH_NOT_ACCESSIBLE_MESSAGE,
   PROJECT_TREE_TAR_MAX_BYTES,
   callerProjectTree,
+  completeNulNames,
   gateCallerPath,
   probePaths,
   runChildCapped,
@@ -513,5 +514,15 @@ describe("runChildCapped", () => {
   test("a spawn failure yields no bytes and never throws", async () => {
     const r = await runChildCapped([path.join(scratch, "no-such-binary")], { maxBytes: 1024, timeoutMs: 1_000 });
     expect(r.bytes.length).toBe(0);
+  });
+});
+
+describe("completeNulNames", () => {
+  const bytes = (s: string) => new TextEncoder().encode(s);
+  test("keeps every NUL-terminated name and drops a cut final one", () => {
+    expect(completeNulNames(bytes("a\0b\0"))).toEqual(["a", "b"]);
+    expect(completeNulNames(bytes("a\0b\0.claude/skills/x/SKI"))).toEqual(["a", "b"]);
+    expect(completeNulNames(bytes("cut"))).toEqual([]);
+    expect(completeNulNames(bytes(""))).toEqual([]);
   });
 });

@@ -2,7 +2,7 @@ import { closeSync, readdirSync, readSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { AccountUsageSummary, TokenTotals } from "../shared/types.ts";
 import { db } from "./db.ts";
-import { openReadNoFollow } from "./no-follow.ts";
+import { isPlainDirBelow, openReadNoFollow } from "./no-follow.ts";
 
 /**
  * Local, deterministic per-account token-usage rollups (SDD: "plane A").
@@ -234,7 +234,12 @@ function* splitLines(buf: Buffer): Generator<Buffer> {
 export function scanAccountUsage(configDir: string, budgetBytes = SCAN_BUDGET_BYTES): ScanResult {
   const result: ScanResult = { filesScanned: 0, eventsCounted: 0, parseErrors: 0, budgetExhausted: false };
   let remaining = budgetBytes;
-  for (const f of listJsonlFiles(path.join(configDir, "projects"))) {
+  const projects = path.join(configDir, "projects");
+  // `projects/` is agent-writable: never list it once it has been swapped for
+  // a symlink into a protected folder (no-follow.ts). Dirents below it carry
+  // their own type, so nested symlinks are never followed either.
+  if (!isPlainDirBelow(configDir, projects)) return result;
+  for (const f of listJsonlFiles(projects)) {
     if (remaining <= 0) {
       result.budgetExhausted = true;
       break;

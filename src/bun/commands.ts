@@ -295,9 +295,10 @@ export async function resolveProjectTree(
 // Discovery data: every file one request reads, fetched up front.
 //
 // All filesystem access goes through `DiscoveryFs` (discovery-fs.ts). While the
-// disclaim switch is on, each stage below is ONE disclaimed child (user-level
-// files + the live project tree together; then, once `installed_plugins.json`
-// is known, every active plugin's files together), so a symlink an agent plants
+// disclaim switch is on, each stage below is a handful of disclaimed children
+// — one `find -L` per selector shape, then one `tar` (user-level files + the
+// live project tree together; then, once `installed_plugins.json` is known,
+// every active plugin's files together), so a symlink an agent plants
 // in a skills dir, a plugin `installPath` or the project can never make the core
 // open a protected folder under Agetor's TCC identity. With the switch off the
 // same code reads the disk in-process, as it always did. The parsers below stay

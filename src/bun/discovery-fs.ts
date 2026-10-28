@@ -50,7 +50,7 @@ import { lstatSync, readFileSync, statSync } from "node:fs";
 import { readTextNoFollow } from "./no-follow.ts";
 import path from "node:path";
 import { disclaimEnabled } from "./disclaim.ts";
-import { PROJECT_TREE_TAR_MAX_BYTES, runChildCapped } from "./caller-fs.ts";
+import { completeNulNames, PROJECT_TREE_TAR_MAX_BYTES, runChildCapped } from "./caller-fs.ts";
 import { diskProjectTree, refProjectTree, type ProjectTree } from "./ref-tree.ts";
 import { parseTar } from "./tar-read.ts";
 
@@ -78,8 +78,9 @@ export interface DiscoveryReader {
 export interface DiscoveryFs {
   /** True when reads run in a disclaimed child. */
   readonly disclaimed: boolean;
-  /** Fetch every selected file (one child in disclaimed mode, nothing to do
-   *  in-process). Never rejects: a failed child yields an empty reader. */
+  /** Fetch every selected file (in disclaimed mode one `find -L` per
+   *  (depth, name) shape plus one `tar`; nothing to do in-process). Never
+   *  rejects: a failed child yields an empty reader. */
   load(selectors: readonly DiscoverySelector[]): Promise<DiscoveryReader>;
   /** Parsed JSON of a large, re-read file (`~/.claude.json`), stat-keyed cached. */
   readJsonCached(abs: string): Promise<any>;
@@ -296,6 +297,7 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
       g.paths.push(it.path);
     }
     let truncated = false;
+    let timedOut = false;
     // tar member path → the absolute key the reader serves it under.
     const keyFor = new Map<string, string>();
     const listings = await Promise.all(
@@ -318,10 +320,8 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
     const variants: Array<[string, string]> = [];
     for (const { g, literal, listing } of listings) {
       truncated ||= listing.truncated;
-      const names = Buffer.from(listing.bytes).toString("utf8").split("\0");
-      // Only NUL-terminated names are complete; the last piece never is.
-      names.pop();
-      for (const found of names) {
+      timedOut ||= listing.timedOut;
+      for (const found of completeNulNames(listing.bytes)) {
         if (!found.startsWith("/")) continue;
         const abs = path.resolve(found);
         if (!literal || path.basename(abs) === g.name) keyFor.set(abs, abs);
@@ -343,6 +343,7 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
         stdinData: Buffer.from([...keyFor.keys()].join("\0") + "\0", "utf8"),
       });
       truncated ||= archive.truncated;
+      timedOut ||= archive.timedOut;
       for (const entry of parseTar(archive.bytes)) {
         // tar strips the leading `/` from absolute member names; put it back.
         const key = keyFor.get(path.resolve("/", entry.path));
@@ -356,6 +357,11 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
         `[agetor] capability discovery hit the ${PROJECT_TREE_TAR_MAX_BYTES / (1024 * 1024)} MB read cap while reading ${items[0]!.path} (+${items.length - 1} more); some skills/commands may be missing`,
       );
     }
+    if (timedOut) {
+      console.warn(
+        `[agetor] capability discovery timed out while reading ${items[0]!.path} (+${items.length - 1} more); some skills/commands may be missing`,
+      );
+    }
     return memoryReader(files);
   },
 
@@ -363,10 +369,16 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
     if (abs.includes("\0")) return null;
     const file = path.resolve(abs);
     const hit = disclaimedJsonCache.get(file);
-    const { bytes } = await runChildCapped([SH, "-c", JSON_SCRIPT, "sh", file, hit?.key ?? ""], {
+    const { bytes, timedOut } = await runChildCapped([SH, "-c", JSON_SCRIPT, "sh", file, hit?.key ?? ""], {
       maxBytes: JSON_MAX_BYTES,
       timeoutMs: LOAD_TIMEOUT_MS,
     });
+    if (timedOut) {
+      // A cut-off read (often a pending privacy prompt) proves nothing about
+      // the file: answer null without caching it, so the next request retries.
+      console.warn(`[agetor] capability discovery timed out while reading ${file}`);
+      return null;
+    }
     const nl = bytes.indexOf(0x0a);
     if (nl < 0) {
       // Not stat-able (missing / denied / timed out): same as the in-process

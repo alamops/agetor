@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
 import type { Harness } from "../../shared/types.ts";
+import { withDisclaimOn } from "../test-disclaim-on.ts";
 import {
   claudeCredentialsPath,
   claudeDotJsonPath,
@@ -88,5 +90,32 @@ describe("readClaudeToken — alias/keychain isolation", () => {
     const { token, scopes } = await readClaudeToken(mkHarness(home));
     expect(token).toBeNull();
     expect(scopes).toEqual([]);
+  });
+});
+
+describe("readClaudeToken — agent-writable creds file", () => {
+  const writeCreds = (file: string) =>
+    writeFileSync(file, JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-oat-test-linked", scopes: ["user:profile"] } }));
+
+  test.skipIf(process.platform !== "darwin")(
+    "a .credentials.json swapped for a symlink is not read while disclaiming (but is with the switch off)",
+    async () => {
+      const home = mkdtempSync(path.join(tmpdir(), "agetor-creds-"));
+      const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-creds-target-"));
+      writeCreds(path.join(elsewhere, "creds.json"));
+      symlinkSync(path.join(elsewhere, "creds.json"), path.join(home, ".credentials.json"));
+
+      expect((await readClaudeToken(mkHarness(home))).token).toBe("sk-ant-oat-test-linked");
+      const disclaimed = await withDisclaimOn(() => readClaudeToken(mkHarness(home)));
+      expect(disclaimed).toEqual({ token: null, scopes: [] });
+    },
+  );
+
+  test("a .credentials.json that is a named pipe resolves at once to no token", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-creds-"));
+    expect(spawnSync("/usr/bin/mkfifo", [path.join(home, ".credentials.json")]).status).toBe(0);
+    const started = Date.now();
+    expect(await readClaudeToken(mkHarness(home))).toEqual({ token: null, scopes: [] });
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 });

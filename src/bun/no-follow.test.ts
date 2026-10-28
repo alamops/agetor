@@ -1,9 +1,11 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { closeSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { isPlainDirBelow, openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
+import { disclaimEnabled } from "./disclaim.ts";
+import { isPlainDirBelow, openReadNoFollow, readAccountFileText, readTextNoFollow } from "./no-follow.ts";
+import { withDisclaimOn } from "./test-disclaim-on.ts";
 
 const dir = mkdtempSync(path.join(tmpdir(), "agetor-no-follow-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -73,4 +75,39 @@ test("isPlainDirBelow: real directories pass; a symlinked, missing or file compo
   expect(isPlainDirBelow(base, path.join(base, "..dots"))).toBe(true);
   // The base itself is trusted even when it is a symlink.
   expect(isPlainDirBelow(path.join(base, "linked"), path.join(base, "linked", "b"))).toBe(true);
+});
+
+describe("readAccountFileText", () => {
+  const acct = path.join(dir, "acct");
+  mkdirSync(acct);
+  const real = path.join(acct, "real.json");
+  writeFileSync(real, '{"a":1}');
+  const link = path.join(acct, "link.json");
+  symlinkSync(real, link);
+
+  test("with the switch off a user's own symlinked dotfile still reads", () => {
+    expect(disclaimEnabled()).toBe(false);
+    expect(readAccountFileText(real, 1024)).toBe('{"a":1}');
+    expect(readAccountFileText(link, 1024)).toBe('{"a":1}');
+  });
+
+  test.skipIf(process.platform !== "darwin")("while disclaiming a symlinked file is refused with ELOOP", async () => {
+    await withDisclaimOn(() => {
+      expect(disclaimEnabled()).toBe(true);
+      expect(readAccountFileText(real, 1024)).toBe('{"a":1}');
+      expect(() => readAccountFileText(link, 1024)).toThrow(expect.objectContaining({ code: "ELOOP" }));
+    });
+  });
+
+  test("a named pipe is refused at once in both modes; a file over maxBytes is refused", async () => {
+    const fifo = path.join(acct, "fifo.json");
+    expect(spawnSync("/usr/bin/mkfifo", [fifo]).status).toBe(0);
+    const started = Date.now();
+    expect(() => readAccountFileText(fifo, 1024)).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    await withDisclaimOn(() => {
+      expect(() => readAccountFileText(fifo, 1024)).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(() => readAccountFileText(real, 3)).toThrow(expect.objectContaining({ code: "EFBIG" }));
+  });
 });

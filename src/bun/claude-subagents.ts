@@ -350,7 +350,6 @@ import {
   readSync,
   closeSync,
   readdirSync,
-  readFileSync,
   watch as fsWatch,
   type FSWatcher,
 } from "node:fs";
