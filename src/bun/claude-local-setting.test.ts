@@ -1008,7 +1008,7 @@ test("applyClaudeLocalSetting no-ops for a non-claude-code task and leaves the r
     agent: "codex",
     workdir: process.cwd(),
     isolation: "none",
-    model: "gpt-5.5",
+    model: "gpt-6.1-terra",
     effort: "medium",
   });
   if ("error" in created) throw new Error(created.error);
@@ -1023,7 +1023,7 @@ test("applyClaudeLocalSetting no-ops for a non-claude-code task and leaves the r
 
   expect(changed).toBe(false);
   const after = tasks.get(task.id);
-  expect(after?.model).toBe("gpt-5.5");
+  expect(after?.model).toBe("gpt-6.1-terra");
   expect(after?.effort).toBe("medium");
   expect(after?.updatedAt).toBe(task.updatedAt);
 });
