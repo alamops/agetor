@@ -139,13 +139,13 @@ type TaskRow = {
   // by `tasks.insert` (new rows stay NULL) or the generic `update` SET
   // clause — same rationale as `fx_recovery`/`checkout_branch`.
   imported_claude: string | null;
-  // Which OpenCode server an opencode task's turns use (migration 078,
+  // Which OpenCode server an opencode task's turns use (migration 079,
   // `OpencodeServerMode`). Patchable — the generic `update` SET clause
   // writes it. A CHECK keeps it to `shared | standalone`; `toTask` still
   // validates before trusting it.
   opencode_server: string;
   // Provenance for an OpenCode session imported from outside Agetor
-  // (migration 078, `ImportedOpencodeSession` JSON). Written exclusively by
+  // (migration 079, `ImportedOpencodeSession` JSON). Written exclusively by
   // `tasks.setImportedOpencode`, never by `tasks.insert` or the generic
   // `update` SET clause — same rationale as `imported_claude`. Its claim
   // column `imported_opencode_session_id` is never read into `Task`.
@@ -418,7 +418,7 @@ const sanitizeSkillsList = (raw: unknown): string[] => {
  * (default `""`), `skills` sanitized via {@link sanitizeSkillsList}, and
  * `capturedAt` a number (default `0`), and `opencodeServer`, when present, a
  * valid `OpencodeServerMode` (invalid reads as `"shared"`; absent — every
- * snapshot frozen before migration 078 — stays absent and means `"shared"`).
+ * snapshot frozen before migration 079 — stays absent and means `"shared"`).
  */
 const parseAgentProfileSnapshot = (raw: string | null): AgentProfileSnapshot | null => {
   if (!raw) return null;
@@ -485,7 +485,7 @@ const sanitizeAgentProfileSnapshot = (parsed: unknown): AgentProfileSnapshot | n
     speed,
     fast: speed !== "off",
     maxMode: rec.maxMode === true,
-    // Absent (every snapshot frozen before migration 078) stays absent —
+    // Absent (every snapshot frozen before migration 079) stays absent —
     // readers treat that as "shared" — so a stored snapshot round-trips
     // unchanged; an invalid value reads as "shared".
     ...(rec.opencodeServer !== undefined ? { opencodeServer: readOpencodeServer(rec.opencodeServer) } : {}),
@@ -971,7 +971,7 @@ export const IMPORTED_OPENCODE_HELD_ELSEWHERE =
   "another task already holds this OpenCode session";
 
 /** Another task already holds this OpenCode session id
- *  (`tasks.imported_opencode_session_id`, migration 078) — the OpenCode
+ *  (`tasks.imported_opencode_session_id`, migration 079) — the OpenCode
  *  counterpart of {@link ImportedClaudeSessionTaken}. */
 export class ImportedOpencodeSessionTaken extends Error {
   readonly sessionId: string;
@@ -1187,7 +1187,7 @@ export const tasks = {
     // never clobber an in-flight history backfill or drop the session claim,
     // and that write never bumps `updated_at`. `tasks.insert` leaves both
     // columns NULL.
-    // `imported_opencode`/`imported_opencode_session_id` (migration 078)
+    // `imported_opencode`/`imported_opencode_session_id` (migration 079)
     // join the same skip list on the same rationale: both are written only
     // by `tasks.setImportedOpencode` below. `opencode_server` (also 078) is
     // NOT skipped — it is an ordinary patchable launch field like `speed`.
@@ -1422,7 +1422,7 @@ export const tasks = {
    * Write (or clear) a task's imported-OpenCode provenance in one targeted
    * UPDATE — the OpenCode counterpart of {@link setImportedClaude}, same
    * contract: no `updated_at` bump, the only writer of `imported_opencode`
-   * and `imported_opencode_session_id` (migration 078), a missing task id
+   * and `imported_opencode_session_id` (migration 079), a missing task id
    * matches zero rows.
    *
    * Binding a `sessionId` another task already holds throws
@@ -1855,7 +1855,7 @@ export const claudeSessionSeen = {
 
 /**
  * Bookkeeping for the "turn a built-in harness on once its CLI is installed"
- * hook (migration 079, `src/bun/harness-auto-enable.ts`,
+ * hook (migration 080, `src/bun/harness-auto-enable.ts`,
  * docs/plans/add-opencode-harness.md D-14). A harness id here has been acted
  * on once and is never auto-enabled again — so a user who turns it back Off
  * keeps it off. `notified = 0` rows are the ones whose
@@ -2011,7 +2011,8 @@ export const harnesses = {
     if (direct) return direct;
     if (
       id === "claude-code" || id === "codex" || id === "cursor" ||
-      id === "gemini" || id === "fx" || id === "antigravity" || id === "opencode"
+      id === "gemini" || id === "fx" || id === "antigravity" || id === "opencode" ||
+      id === "copilot"
     ) {
       const label =
         id === "claude-code" ? "Claude Code"
@@ -2020,6 +2021,7 @@ export const harnesses = {
         : id === "gemini" ? "Gemini CLI"
         : id === "fx" ? "fx.sh"
         : id === "antigravity" ? "Antigravity"
+        : id === "copilot" ? "GitHub Copilot"
         : "OpenCode";
       return {
         id,
@@ -2045,7 +2047,7 @@ export const harnesses = {
       input.kind !== "claude-code" && input.kind !== "codex" &&
       input.kind !== "cursor" && input.kind !== "gemini" &&
       input.kind !== "antigravity" && input.kind !== "fx" &&
-      input.kind !== "opencode"
+      input.kind !== "opencode" && input.kind !== "copilot"
     ) {
       throw new Error(`unknown harness kind: ${input.kind}`);
     }
@@ -2314,7 +2316,7 @@ type AgentProfileRow = {
   mode: string | null;
   speed: string;
   max_mode: number;
-  // opencode only (migration 078): `OpencodeServerMode`, CHECK-guarded.
+  // opencode only (migration 079): `OpencodeServerMode`, CHECK-guarded.
   opencode_server: string;
   instructions: string;
   skills_json: string;
@@ -2793,9 +2795,10 @@ type RunRow = {
   gemini_session_id: string | null;
   fx_session_id: string | null;
   antigravity_session_id: string | null;
-  // OpenCode's own session id (`ses_…`, migration 077), discovered from the
+  // OpenCode's own session id (`ses_…`, migration 078), discovered from the
   // first NDJSON line that carries a `sessionID` and replayed via `-s`.
   opencode_session_id: string | null;
+  copilot_session_id: string | null;
   origin: string | null;
 };
 
@@ -2809,6 +2812,7 @@ export const SESSION_ID_COLUMNS = [
   "antigravity_session_id",
   "fx_session_id",
   "opencode_session_id",
+  "copilot_session_id",
 ] as const;
 export type SessionIdColumn = (typeof SESSION_ID_COLUMNS)[number];
 
@@ -2905,6 +2909,7 @@ const toRun = (r: RunRow): Run => ({
   fxSessionId: r.fx_session_id,
   antigravitySessionId: r.antigravity_session_id,
   opencodeSessionId: r.opencode_session_id,
+  copilotSessionId: r.copilot_session_id,
   origin: (r.origin as Run["origin"]) ?? null,
 });
 
@@ -2948,9 +2953,9 @@ export const runs = {
    *  bun:sqlite would otherwise bind. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, origin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.antigravitySessionId ?? null, r.opencodeSessionId ?? null, r.origin ?? null],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, copilot_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.fxSessionId ?? null, r.antigravitySessionId ?? null, r.opencodeSessionId ?? null, r.copilotSessionId ?? null, r.origin ?? null],
     );
     return { ...r, origin: r.origin ?? null };
   },
@@ -2960,8 +2965,8 @@ export const runs = {
     const current = toRun(row);
     const next: Run = { ...current, ...patch, id };
     db.run(
-      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=?, fx_session_id=?, antigravity_session_id=?, opencode_session_id=? WHERE id=?`,
-      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, next.fxSessionId, next.antigravitySessionId ?? null, next.opencodeSessionId ?? null, id],
+      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=?, fx_session_id=?, antigravity_session_id=?, opencode_session_id=?, copilot_session_id=? WHERE id=?`,
+      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, next.fxSessionId, next.antigravitySessionId ?? null, next.opencodeSessionId ?? null, next.copilotSessionId ?? null, id],
     );
     return next;
   },
@@ -3445,7 +3450,7 @@ export const runs = {
   },
   /** Every non-null `runs.opencode_session_id` — the OpenCode ids Agetor
    *  owns as runs. One query, served by `runs_opencode_session_id_idx`
-   *  (migration 078). The scanner hides the union of this set and the import
+   *  (migration 079). The scanner hides the union of this set and the import
    *  claim column — see {@link hiddenOpencodeSessionIds}. */
   opencodeSessionIdsOwned(): Set<string> {
     const rows = db.query<{ opencode_session_id: string }, []>(
@@ -3707,7 +3712,15 @@ interface SubagentRow {
  *  still land on a member of the union, so `toSubagent` falls back to
  *  `"subagent"` for anything not listed here. Keep in sync with
  *  `Subagent.parentKind` in shared/types.ts. */
-const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent", "monitor", "opencode_subagent"]);
+const PARENT_KINDS = new Set<string>([
+  "subagent",
+  "bg_session",
+  "workflow",
+  "workflow_agent",
+  "monitor",
+  "opencode_subagent",
+  "copilot_subagent",
+]);
 
 function toSubagent(r: SubagentRow): Subagent {
   return {
@@ -3830,6 +3843,19 @@ export const subagents = {
       [now, taskId],
     );
     return rows.map((r) => toSubagent({ ...r, status: "orphaned", ended_at: now }));
+  },
+  /** Settle every `running` subagent row of ONE run to `status` (ended_at =
+   *  `now`). Run-scoped (unlike `orphanRunning`, which is task-scoped), for
+   *  drivers that own their subagents' lifecycle and close them all when the
+   *  parent run settles. Only `running` rows change, so a row a driver already
+   *  settled keeps its own status and timestamp. Returns the number of rows
+   *  changed. */
+  settleRunningForRun(runId: string, status: SubagentStatus, now: number): number {
+    const result = db.run(
+      `UPDATE subagents SET status = ?, ended_at = ? WHERE run_id = ? AND status = 'running'`,
+      [status, now, runId],
+    );
+    return result.changes;
   },
   /** taskId -> count of `running` rows. One grouped query, for the board poll. */
   runningCountsByTask(): Map<string, number> {

@@ -140,6 +140,43 @@ test("manual mode: ready is already resolved, the first pump() runs the first cy
   w.detach();
 });
 
+test("a GitHub Copilot subagent row is never seeded or tailed by the Claude watcher (copilot -> claude-code switch)", async () => {
+  const { attachSubagentWatcher } = await import("./claude-subagents.ts");
+  const { subagents } = await import("./db.ts");
+  const { taskId, runId, jsonlPath, now } = await seed();
+  // A file of Claude-shaped lines at the row's `sourcePath`: were the row seeded
+  // as a JSONL subagent, the first cycle would tail and persist all of them.
+  const foreignLog = path.join(FIXTURE_DIR, `copilot-log-${randomUUID()}.jsonl`);
+  writeFileSync(foreignLog, sidechainLines("cp", 4));
+  const copilotId = `cp-${runId}-call_sub`;
+  subagents.insertIfAbsent({
+    id: copilotId, taskId, runId, parentKind: "copilot_subagent", agentType: "explore",
+    description: "copilot helper", spawnDepth: 1, sourcePath: foreignLog, toolUseId: "call_sub",
+    status: "completed", startedAt: now - 5_000, endedAt: now - 1_000,
+  });
+  // Control row on the same file, seeded the ordinary way, so a skip that
+  // stopped working (or a fixture that can't be tailed) fails this test.
+  const controlId = "ctl0aaaaaaaa";
+  subagents.insertIfAbsent({
+    id: controlId, taskId, runId, parentKind: "subagent", agentType: "general-purpose",
+    description: "control", spawnDepth: 1, sourcePath: foreignLog, toolUseId: "toolu_ctl",
+    status: "completed", startedAt: now - 4_000, endedAt: now - 1_000,
+  });
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  w.pump(Date.now());
+  const { db } = await import("./db.ts");
+  const perSubagent = (id: string) =>
+    db.query<{ c: number }, [string]>(`SELECT COUNT(*) c FROM run_events WHERE subagent_id = ?`).get(id)!.c;
+  expect(perSubagent(controlId)).toBe(4);
+  expect(perSubagent(copilotId)).toBe(0);
+  const row = subagents.get(copilotId)!;
+  expect(row.parentKind).toBe("copilot_subagent");
+  expect(row.status).toBe("completed");
+  expect(row.endedAt).toBe(now - 1_000);
+  w.detach();
+});
+
 test("production mode: pump() is a no-op while the seed / first cycle is pending, and works after settled", async () => {
   const { attachSubagentWatcher } = await import("./claude-subagents.ts");
   const { subagents } = await import("./db.ts");

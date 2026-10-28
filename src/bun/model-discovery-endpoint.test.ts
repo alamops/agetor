@@ -237,7 +237,7 @@ test(
 );
 
 test("GET and POST /agent-models carry an opencode key alongside every other kind", async () => {
-  const kinds = ["claude-code", "codex", "cursor", "gemini", "antigravity", "fx", "opencode"];
+  const kinds = ["claude-code", "codex", "cursor", "gemini", "antigravity", "fx", "opencode", "copilot"];
   const getRes = await authedFetch("/agent-models");
   expect(getRes.status).toBe(200);
   const getBody = (await getRes.json()) as Record<string, unknown>;

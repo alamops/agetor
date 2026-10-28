@@ -1,5 +1,7 @@
 # Plan — Add OpenCode harness
 
+> **Renumbered on merge:** this plan names the OpenCode migrations `077`–`079`. Main merged the Copilot harness as `077_copilot_harness` first, so they shipped as `078_opencode_harness`, `079_opencode_task_fields` and `080_harness_auto_enabled` (the old ids stay as aliases in `src/bun/migrations/index.ts`). Read every `077`/`078`/`079` below as `078`/`079`/`080`.
+
 | Field | Value |
 | --- | --- |
 | Date | 2026-10-27 |

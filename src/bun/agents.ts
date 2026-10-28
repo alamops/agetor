@@ -28,6 +28,9 @@ import {
   type OpencodeSubagentNotice,
 } from "./opencode-tmux.ts";
 import { refreshOpencodeSubagents, registerOpencodeSubagent } from "./opencode-subagents.ts";
+import { copilotHome } from "./copilot-home.ts";
+import { fakeCopilotScript, playFakeCopilotTurn } from "./copilot-fake.ts";
+import { copilotUsagePath, spawnCopilotViaTmux, type CopilotSubagentSink } from "./copilot-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
 import { gitWritableRoots } from "./worktree.ts";
 
@@ -57,6 +60,14 @@ export interface AgentCommand {
    * other kind.
    */
   freshArgv?: string[];
+  /**
+   * Set only by the copilot branch of `buildCommand`: the classic-PAT
+   * variables (`GH_TOKEN` / `GITHUB_TOKEN`) the launch shell must drop when
+   * the pane's real env holds a `ghp_` classic token — Copilot CLI rejects
+   * those — minus any the harness env map sets itself. Forwarded to
+   * `spawnCopilotViaTmux` as `stripClassicTokens`.
+   */
+  stripClassicTokens?: string[];
 }
 
 /**
@@ -368,15 +379,27 @@ export function resolveBin(harness: Harness): string {
       fallback = "opencode";
       override = process.env.AGETOR_OPENCODE_BIN;
       break;
-    default: {
-      // Exhaustive: a new AgentKind must name its binary here rather than
-      // silently resolving to an unassigned fallback.
-      const _never: never = harness.kind;
-      throw new Error(`resolveBin: unknown harness kind ${String(_never)}`);
-    }
+    case "copilot":
+      fallback = "copilot";
+      override = process.env.AGETOR_COPILOT_BIN;
+      break;
+    default:
+      // A retired kind (`grok`/`kimi` rows can still sit in a database).
+      // `checkHarness` resolves a bin for every row, so this must not throw;
+      // `buildCommand`/`spawnAgent` are what refuse to launch it.
+      fallback = String(harness.kind satisfies never);
+      break;
   }
   if (override) return override;
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+}
+
+const warnedUnknownKinds = new Set<string>();
+
+function warnUnknownHarnessKind(kind: string): void {
+  if (warnedUnknownKinds.has(kind)) return;
+  warnedUnknownKinds.add(kind);
+  console.warn(`[agetor] harness kind "${kind}" is not supported by this build; no home env var is set for it`);
 }
 
 /**
@@ -437,6 +460,11 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       env.XDG_DATA_HOME = path.join(harness.home, ".local", "share");
       env.XDG_STATE_HOME = path.join(harness.home, ".local", "state");
       env.XDG_CACHE_HOME = path.join(harness.home, ".cache");
+    } else if (harness.kind === "copilot") {
+      // Copilot CLI keeps config, login state, session state and skills under
+      // $COPILOT_HOME (default ~/.copilot), a dedicated home-override env var,
+      // so an additional account needs no HOME override.
+      env.COPILOT_HOME = harness.home;
     } else if (harness.kind === "gemini") {
       // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
       // in the bundled CLI source — `homedir()` returns
@@ -445,15 +473,28 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       // the real HOME.
       env.GEMINI_CLI_HOME = harness.home;
     } else {
-      // Exhaustive: a new AgentKind must say how its home is applied rather
-      // than silently inheriting another kind's config-dir variable.
-      const _never: never = harness.kind;
-      throw new Error(`harnessEnv: unknown harness kind ${String(_never)}`);
+      // Compile-time exhaustiveness: a new AgentKind must get a branch above.
+      // At runtime an unknown kind (a retired `grok`/`kimi` row) contributes
+      // no home var and warns once — it must NOT throw, because
+      // `checkHarness` calls this for every harness row and a throw would
+      // break `GET /harnesses`.
+      warnUnknownHarnessKind(harness.kind satisfies never);
     }
   }
   // User-provided env wins over the home-derived defaults.
   for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
+  // Copilot: resolve the home the same way every spawn does (`copilotHome`
+  // expands a leading `~` and trims), so the login terminal and
+  // `agetor harness shell` write the login where runs will read it. Only when
+  // the harness names a home — a home-less harness keeps the user's own default.
+  if (harness.kind === "copilot" && (nonBlankString(harness.home) || nonBlankString(harness.env?.COPILOT_HOME))) {
+    env.COPILOT_HOME = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+  }
   return env;
+}
+
+function nonBlankString(v: string | null | undefined): boolean {
+  return typeof v === "string" && v.trim().length > 0;
 }
 
 /**
@@ -961,6 +1002,63 @@ export function buildCommand(
     };
   }
 
+  if (harness.kind === "copilot") {
+    // GitHub Copilot CLI — hosted in a per-task tmux session via
+    // copilot-tmux.ts. One-shot per turn like codex (prompt on stdin, so no
+    // argv-size cap), with a self-issued `--session-id` like gemini: the
+    // caller passes the prior id as `resumeSessionId` on a follow-up, else a
+    // fresh uuid as `sessionId`; Copilot resumes by seeing the same id.
+    const extra = (process.env.AGETOR_COPILOT_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    if (!opts.model) {
+      throw new Error("model is required for copilot");
+    }
+    if (!opts.runId) {
+      throw new Error("runId is required for copilot (used to build the --usage-output-file path)");
+    }
+    const sessionId = opts.resumeSessionId ?? opts.sessionId;
+    if (!sessionId) {
+      throw new Error("sessionId or resumeSessionId is required for copilot");
+    }
+
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    const args: string[] = [
+      bin,
+      "--output-format", "json",
+      "--no-color",
+      "--no-ask-user",
+      "--session-id", sessionId,
+      "--model", opts.model,
+    ];
+    // `auto` ("Model default") and null both mean: let Copilot choose.
+    if (opts.effort && opts.effort !== "auto") {
+      args.push("--reasoning-effort", opts.effort);
+    }
+    // `--mode` is always passed (never inherited from the saved session), so
+    // a task switched Plan -> Auto stops planning on the very next turn.
+    args.push("--mode", mode === "plan" ? "plan" : "interactive");
+    if (mode === "auto") {
+      args.push("--allow-all");
+    }
+    args.push("--usage-output-file", copilotUsagePath(opts.runId));
+    args.push(...extra);
+
+    // The long-lived tmux server's env may belong to another process, and the
+    // plan-file reader must look where Copilot writes: always pin the home.
+    env.COPILOT_HOME = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+    // Allow-all rides the env too (Auto only); a value the harness env map
+    // sets wins in every mode. In every other mode the driver additionally
+    // unsets an ambient export (`shouldUnsetAllowAll`), which only holds while
+    // the key is absent here.
+    if (mode === "auto" && !("COPILOT_ALLOW_ALL" in env)) {
+      env.COPILOT_ALLOW_ALL = "true";
+    }
+    const harnessSetsEnv = harness.env ?? {};
+    const stripClassicTokens = ["GH_TOKEN", "GITHUB_TOKEN"].filter((k) => !(k in harnessSetsEnv));
+
+    return { cmd: args, env, stripClassicTokens };
+  }
+
   if (harness.kind === "codex") {
     // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
     // element: it's delivered on stdin (the trailing `-`), so the driver can
@@ -1034,7 +1132,7 @@ export function buildCommand(
   // Exhaustive: a new AgentKind must get its own branch above rather than
   // silently falling through to another kind's argv (KB 785913e5).
   const _never: never = harness.kind;
-  throw new Error(`buildCommand: unknown harness kind ${String(_never)}`);
+  throw new Error(`unknown harness kind: ${String(_never)}`);
 }
 
 /**
@@ -3494,6 +3592,12 @@ export interface SpawnAgentArgs {
    * `FxLaunchOptions.onSteerDropped`; every other kind ignores it.
    */
   onSteerDropped?: (text: string) => boolean;
+  /**
+   * copilot-only: the orchestrator's background-agent sink. Copilot reports
+   * subagents inline in its JSON stream; the driver feeds each one through
+   * this sink so it shows up as a subagent tab. Other kinds ignore it.
+   */
+  copilotSubagents?: CopilotSubagentSink;
   opts?: AgentRunOptions;
 }
 
@@ -3678,6 +3782,49 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     });
   }
 
+  if (harness.kind === "copilot") {
+    // Self-issued session id, like gemini: always passed as `--session-id` —
+    // the prior id when resuming, else a fresh uuid.
+    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();
+    const built = buildCommand(harness, prompt, {
+      ...opts,
+      runId,
+      sessionId: opts.resumeSessionId ? null : sessionId,
+    });
+    const home = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+    if (process.env.AGETOR_COPILOT_DRIVER === "fake") {
+      const fakeSessionId = opts.resumeSessionId ?? `fake-copilot-session-${taskId}`;
+      onSessionId?.(fakeSessionId);
+      const script = fakeCopilotScript(prompt, { runId, sessionId: fakeSessionId, model: opts.model ?? null });
+      return playFakeCopilotTurn({
+        script,
+        runId,
+        sessionId: fakeSessionId,
+        model: opts.model ?? null,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        copilotHome: home,
+        onChunk,
+        sink: args.copilotSubagents,
+      });
+    }
+    return await spawnCopilotViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      sessionId,
+      copilotHome: home,
+      mode: opts.mode ?? defaultModeFor(harness.kind),
+      model: opts.model ?? null,
+      stripClassicTokens: built.stripClassicTokens ?? [],
+      onSubagent: args.copilotSubagents,
+      onSessionId,
+    });
+  }
+
   if (harness.kind === "fx") {
     // fx — driven over ACP/stdio via fx-acp.ts, a plain `Bun.spawn` child
     // process with no tmux involved (see that file's header for why: an ACP
@@ -3781,5 +3928,5 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
   // Exhaustive: a new AgentKind must get its own dispatch branch above
   // rather than silently spawning another kind's driver (KB 785913e5).
   const _never: never = harness.kind;
-  throw new Error(`spawnAgent: unknown harness kind ${String(_never)}`);
+  throw new Error(`unknown harness kind: ${String(_never)}`);
 }

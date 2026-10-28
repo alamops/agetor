@@ -44,6 +44,7 @@ const LOGIN_COMMAND: Partial<Record<AgentKind, string>> = {
   antigravity: "agy login",
   fx: "fx login",
   opencode: "opencode auth login",
+  copilot: "copilot login",
 };
 
 /** fx ≥0.0.5 supports logging into a subscription provider (Codex/Grok

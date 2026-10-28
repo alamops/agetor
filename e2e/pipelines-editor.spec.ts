@@ -811,6 +811,17 @@ test.describe("pipelines editor", () => {
     await editor.getByTestId("pipeline-add-step").click();
     await expect(editor.locator('[data-testid="pipeline-step-node"]')).toHaveCount(3);
 
+    // One-off layout + fit, done ONCE up front (same as the CRUD test above).
+    // Without it the canvas keeps the zoom-2 fit of the lone initial step, so
+    // the later steps sit mostly off-canvas and a click on one only lands
+    // when Playwright's scroll-into-view happens to shift the pane — the
+    // panel then stays on the previous step and the test failed
+    // intermittently (on main too) for a reason unrelated to the bug it pins.
+    await editor.getByTestId("pipeline-auto-arrange").click();
+    await page.waitForTimeout(200);
+    await editor.getByTestId("pipeline-fit-view").click();
+    await page.waitForTimeout(500);
+
     const [id0, id1, id2] = await nodeIds(page);
     const node0 = stepNode(page, id0!);
     const node1 = stepNode(page, id1!);

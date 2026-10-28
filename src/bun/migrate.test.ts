@@ -17,9 +17,10 @@ import harnessProfileMcpServers from "./migrations/073_harness_profile_mcp_serve
 import retireFxModels from "./migrations/074_retire_fx_models.sql" with { type: "text" };
 import retireCodexGpt55 from "./migrations/075_retire_codex_gpt_5_5.sql" with { type: "text" };
 import normalizeCursorNewFamilies from "./migrations/076_normalize_cursor_new_families.sql" with { type: "text" };
-import opencodeHarness from "./migrations/077_opencode_harness.sql" with { type: "text" };
-import opencodeTaskFields from "./migrations/078_opencode_task_fields.sql" with { type: "text" };
-import harnessAutoEnabled from "./migrations/079_harness_auto_enabled.sql" with { type: "text" };
+import copilotHarness from "./migrations/077_copilot_harness.sql" with { type: "text" };
+import opencodeHarness from "./migrations/078_opencode_harness.sql" with { type: "text" };
+import opencodeTaskFields from "./migrations/079_opencode_task_fields.sql" with { type: "text" };
+import harnessAutoEnabled from "./migrations/080_harness_auto_enabled.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 import { cursorModelArg } from "../shared/types.ts";
 
@@ -1174,6 +1175,20 @@ test("074 (retire fx models) sits right after 073 (harness profile MCP servers),
   expect(migrations[at - 2]?.sql).toBe(taskSpeed);
 });
 
+test("077 (copilot harness) sits right after 076 (normalize cursor new families), right after 075 (retire codex gpt-5.5), right after 074 (retire fx models)", () => {
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("076_normalize_cursor_new_families");
+  expect(migrations[at - 2]?.id).toBe("075_retire_codex_gpt_5_5");
+  expect(migrations[at - 3]?.id).toBe("074_retire_fx_models");
+  expect(migrations[at]?.sql).toBe(copilotHarness);
+  expect(migrations[at - 1]?.sql).toBe(normalizeCursorNewFamilies);
+  expect(migrations[at - 2]?.sql).toBe(retireCodexGpt55);
+  expect(migrations[at - 3]?.sql).toBe(retireFxModels);
+  // Authored as 075 before main claimed 075/076; the old id stays an alias.
+  expect(migrations[at]?.aliases).toEqual(["075_copilot_harness"]);
+});
+
 test("071 moves the seen-id preference into claude_session_seen in order and drops the preference", () => {
   const db = new Database(":memory:");
   db.exec(`
@@ -1742,12 +1757,37 @@ test("076 moves lastModel:cursor off every one of the 17 variant ids and leaves 
   }
 });
 
-test("a fresh DB migrated through 076 applies 075 and 076 cleanly and re-running is a no-op", () => {
+test("a fresh DB applies 075, 076 and 077 cleanly and re-running is a no-op", () => {
   const db = new Database(":memory:");
   const applied = migrate(db, migrations);
   expect(applied).toContain("075_retire_codex_gpt_5_5");
   expect(applied).toContain("076_normalize_cursor_new_families");
+  expect(applied).toContain("077_copilot_harness");
   expect(migrate(db, migrations)).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness self-heals wiped built-ins with their original enabled defaults and never overwrites an existing row", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  migrate(db, migrations.slice(0, at));
+  db.exec(`DELETE FROM harnesses WHERE id IN ('codex', 'fx', 'antigravity')`);
+  db.exec(`UPDATE harnesses SET enabled = 0, label = 'My Claude' WHERE id = 'claude-code'`);
+  migrate(db, migrations);
+  const byId = Object.fromEntries(
+    db
+      .query<{ id: string; label: string; enabled: number }, []>(`SELECT id, label, enabled FROM harnesses WHERE is_builtin = 1`)
+      .all()
+      .map((r) => [r.id, r]),
+  );
+  expect(byId["codex"]?.enabled).toBe(0);
+  expect(byId["fx"]?.enabled).toBe(0);
+  expect(byId["antigravity"]?.enabled).toBe(1);
+  expect(byId["copilot"]?.enabled).toBe(1);
+  expect(byId["cursor"]?.enabled).toBe(0);
+  expect(byId["gemini"]?.enabled).toBe(0);
+  // An existing row the user customised is left alone.
+  expect(byId["claude-code"]).toMatchObject({ label: "My Claude", enabled: 0 });
   db.close();
 });
 
@@ -1874,12 +1914,93 @@ test("075 + 076 on the real schema: codex gpt-5.5 rows move, cursor variants fol
   db.close();
 });
 
-test("079 (harness auto-enabled) is the last registered migration, after 078 (opencode task fields), after 077 (opencode harness), after 076", () => {
-  const at = migrations.findIndex((m) => m.id === "079_harness_auto_enabled");
+test("077_copilot_harness rebuilds harnesses keeping every row and column, seeds copilot enabled, adds runs.copilot_session_id; re-running is a no-op", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  expect(at).toBeGreaterThan(0);
+  // A real 076-state database: every migration up to (not including) 077.
+  expect(migrate(db, migrations.slice(0, at)).length).toBe(at);
+  expect(columnNames(db, "runs")).not.toContain("copilot_session_id");
+
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers) VALUES
+      ('claude-work', 'claude-code', 'Claude (work)', 0, '/tmp/agetor-test-home', '/opt/bin/claude', '{"FOO":"bar"}', 11, 12, 1, 1),
+      ('fx-off', 'fx', 'fx off', 0, NULL, NULL, '{}', 21, 22, 0, 0),
+      ('grok-legacy', 'grok', 'Grok', 0, '/tmp/grok-home', NULL, '{"A":"b"}', 31, 32, 1, 1);
+    UPDATE harnesses SET enabled = 0, updated_at = 99 WHERE id = 'codex';
+  `);
+  type Row = Record<string, unknown>;
+  const snapshot = () => db.query<Row, []>(`SELECT * FROM harnesses ORDER BY id`).all();
+  const before = snapshot();
+  const beforeColumns = columnNames(db, "harnesses");
+  expect(beforeColumns).toContain("profile_mcp_servers");
+
+  // Apply only through 077: the OpenCode migrations that follow it add their own
+  // built-in row and are covered by the 078-080 tests below.
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual(["077_copilot_harness"]);
+
+  // Same columns, same order.
+  expect(columnNames(db, "harnesses")).toEqual(beforeColumns);
+  const after = snapshot();
+  // Every pre-existing row survives byte-for-byte (incl. the user's disabled
+  // codex, the alias home/bin/env, profile_mcp_servers=0 and the legacy grok row).
+  for (const row of before) {
+    expect(after.find((r) => r.id === row.id)).toEqual(row);
+  }
+  expect(after.find((r) => r.id === "fx-off")?.profile_mcp_servers).toBe(0);
+  expect(after.find((r) => r.id === "codex")?.enabled).toBe(0);
+  expect(after.find((r) => r.id === "grok-legacy")?.kind).toBe("grok");
+
+  // Exactly one new row: the built-in copilot, enabled, default profile_mcp_servers.
+  expect(after.length).toBe(before.length + 1);
+  const copilot = after.find((r) => r.id === "copilot")!;
+  expect(copilot).toMatchObject({
+    kind: "copilot",
+    label: "GitHub Copilot",
+    is_builtin: 1,
+    home: null,
+    bin: null,
+    env_json: "{}",
+    enabled: 1,
+    profile_mcp_servers: 1,
+  });
+
+  // The widened CHECK admits copilot (and opencode), still refuses garbage.
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('copilot-2', 'copilot', 'Copilot 2', 1, 1)`);
+  db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('oc', 'opencode', 'OC', 1, 1)`);
+  expect(() =>
+    db.exec(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('bad', 'nope', 'Bad', 1, 1)`),
+  ).toThrow();
+
+  expect(columnNames(db, "runs")).toContain("copilot_session_id");
+
+  // Re-running is a no-op.
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual([]);
+  db.close();
+});
+
+test("077_copilot_harness is only backfilled, never re-run, on a DB that already applied it as 075_copilot_harness", () => {
+  const db = new Database(":memory:");
+  const at = migrations.findIndex((m) => m.id === "077_copilot_harness");
+  migrate(db, migrations.slice(0, at));
+  // The dev-DB shape: the SQL ran under the branch's original id.
+  migrate(db, [{ id: "075_copilot_harness", sql: copilotHarness }]);
+  db.exec(`UPDATE harnesses SET label = 'My Copilot' WHERE id = 'copilot'`);
+  expect(migrate(db, migrations.slice(0, at + 1))).toEqual([]);
+  expect(
+    db.query<{ id: string }, []>(`SELECT id FROM _migrations WHERE id IN ('075_copilot_harness', '077_copilot_harness') ORDER BY id`).all().map((r) => r.id),
+  ).toEqual(["075_copilot_harness", "077_copilot_harness"]);
+  // Not re-seeded over the user's edit.
+  expect(db.query<{ label: string }, []>(`SELECT label FROM harnesses WHERE id = 'copilot'`).get()?.label).toBe("My Copilot");
+  db.close();
+});
+
+test("080 (harness auto-enabled) is the last registered migration, after 079 (opencode task fields), after 078 (opencode harness), after 077 (copilot harness)", () => {
+  const at = migrations.findIndex((m) => m.id === "080_harness_auto_enabled");
   expect(at).toBe(migrations.length - 1);
-  expect(migrations[at - 1]?.id).toBe("078_opencode_task_fields");
-  expect(migrations[at - 2]?.id).toBe("077_opencode_harness");
-  expect(migrations[at - 3]?.id).toBe("076_normalize_cursor_new_families");
+  expect(migrations[at - 1]?.id).toBe("079_opencode_task_fields");
+  expect(migrations[at - 2]?.id).toBe("078_opencode_harness");
+  expect(migrations[at - 3]?.id).toBe("077_copilot_harness");
   expect(migrations[at]?.sql).toBe(harnessAutoEnabled);
   expect(migrations[at - 1]?.sql).toBe(opencodeTaskFields);
   expect(migrations[at - 2]?.sql).toBe(opencodeHarness);
@@ -1892,9 +2013,9 @@ function migrateThrough(db: Database, lastId: string): void {
   migrate(db, migrations.slice(0, at + 1));
 }
 
-test("077-079 on a 076-era DB keep every harnesses row and column, seed a disabled opencode built-in, and admit opencode/copilot kinds (N-1 recipe)", () => {
+test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabled opencode built-in, and keep admitting opencode/copilot kinds (N-1 recipe)", () => {
   const db = new Database(":memory:");
-  migrateThrough(db, "076_normalize_cursor_new_families");
+  migrateThrough(db, "077_copilot_harness");
   // A user alias with every column off its default, plus a disabled built-in
   // flipped on by the user, so the explicit-column copy is load-bearing.
   db.exec(`
@@ -1904,12 +2025,11 @@ test("077-079 on a 076-era DB keep every harnesses row and column, seed a disabl
     INSERT INTO runs (id, task_id, agent, status, started_at) VALUES ('r1', 't-missing', 'fx', 'succeeded', 5);
   `);
   const before = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses ORDER BY id`).all();
-  // opencode is not admitted before 077.
-  expect(() =>
-    db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('oc', 'opencode', 'oc', 1, 1)`),
-  ).toThrow();
+  // 077 (copilot) already widened the CHECK to admit opencode, but seeds no
+  // opencode built-in: that row arrives with 078.
+  expect(db.query(`SELECT 1 FROM harnesses WHERE id = 'opencode'`).get()).toBeNull();
 
-  expect(migrate(db, migrations)).toEqual(["077_opencode_harness", "078_opencode_task_fields", "079_harness_auto_enabled"]);
+  expect(migrate(db, migrations)).toEqual(["078_opencode_harness", "079_opencode_task_fields", "080_harness_auto_enabled"]);
 
   const after = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses WHERE id != 'opencode' ORDER BY id`).all();
   expect(after).toEqual(before);
@@ -1919,7 +2039,7 @@ test("077-079 on a 076-era DB keep every harnesses row and column, seed a disabl
   const oc = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses WHERE id = 'opencode'`).get();
   expect(oc).toMatchObject({ kind: "opencode", label: "OpenCode", is_builtin: 1, home: null, bin: null, env_json: "{}", enabled: 0, profile_mcp_servers: 1 });
 
-  // The widened CHECK admits copilot (parallel branch) and opencode aliases;
+  // The widened CHECK keeps admitting copilot and additional opencode harnesses;
   // junk is still refused.
   db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('cp', 'copilot', 'Copilot', 1, 1)`);
   db.run(`INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('opencode-2', 'opencode', 'OC 2', 1, 1)`);
@@ -1933,23 +2053,23 @@ test("077-079 on a 076-era DB keep every harnesses row and column, seed a disabl
   db.close();
 });
 
-test("077 self-heal re-seeds a deleted built-in with its own enabled default", () => {
+test("078 self-heal re-seeds a deleted built-in with its own enabled default", () => {
   const db = new Database(":memory:");
-  migrateThrough(db, "076_normalize_cursor_new_families");
+  migrateThrough(db, "077_copilot_harness");
   db.exec(`DELETE FROM harnesses WHERE id IN ('claude-code', 'cursor', 'antigravity')`);
   migrate(db, migrations);
   const enabled = Object.fromEntries(
     db.query<{ id: string; enabled: number }, []>(`SELECT id, enabled FROM harnesses WHERE is_builtin = 1`).all().map((r) => [r.id, r.enabled]),
   );
   expect(enabled).toEqual({
-    "claude-code": 1, codex: 0, cursor: 0, gemini: 0, fx: 0, antigravity: 1, opencode: 0,
+    "claude-code": 1, codex: 0, cursor: 0, gemini: 0, fx: 0, antigravity: 1, opencode: 0, copilot: 1,
   });
   db.close();
 });
 
-test("078 adds opencode_server (default shared, CHECK-guarded) to tasks and agent_profiles, the imported-opencode pair with a unique claim, and the runs session-id index", () => {
+test("079 adds opencode_server (default shared, CHECK-guarded) to tasks and agent_profiles, the imported-opencode pair with a unique claim, and the runs session-id index", () => {
   const db = new Database(":memory:");
-  migrateThrough(db, "076_normalize_cursor_new_families");
+  migrateThrough(db, "077_copilot_harness");
   db.exec(`
     INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'codex', '/w', 1, 1);
     INSERT INTO agent_profiles (id, name, name_key, harness_id, model, instructions, skills_json, created_at, updated_at)
@@ -1974,7 +2094,7 @@ test("078 adds opencode_server (default shared, CHECK-guarded) to tasks and agen
   db.close();
 });
 
-test("079 creates harness_auto_enabled with no foreign key, surviving a harnesses rebuild", () => {
+test("080 creates harness_auto_enabled with no foreign key, surviving a harnesses rebuild", () => {
   const db = new Database(":memory:");
   migrate(db, migrations);
   expect(columnNames(db, "harness_auto_enabled")).toEqual(["harness_id", "enabled_at", "notified"]);

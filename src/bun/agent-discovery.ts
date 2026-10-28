@@ -63,6 +63,7 @@ export interface DiscoveredModel {
 async function runProbe(
   cmd: string[],
   env?: Record<string, string>,
+  timeoutMs = 3_000,
 ): Promise<{ ok: boolean; stdout: string }> {
   try {
     const proc = Bun.spawn(cmd, {
@@ -71,7 +72,7 @@ async function runProbe(
       stderr: "ignore",
       ...(env ? { env: { ...process.env, ...env } } : {}),
     });
-    const timer = setTimeout(() => { try { proc.kill(); } catch { /* already exited */ } }, 3_000);
+    const timer = setTimeout(() => { try { proc.kill(); } catch { /* already exited */ } }, timeoutMs);
     const stdout = await new Response(proc.stdout).text();
     await proc.exited;
     clearTimeout(timer);
@@ -1286,6 +1287,98 @@ export function getDiscoveredEfforts(
   if (Array.isArray(entry?.efforts)) return entry.efforts;
   return null;
 }
+/**
+ * Parse the `model` block out of `copilot help config` (GitHub Copilot CLI
+ * 1.0.104, offline, no auth). The command prints one block per config key:
+ * an indented header line (`` `model`: <description> `` — the key may or may
+ * not be backtick/quote wrapped), optionally followed by wrapped description
+ * lines, then one `- "<id>"` line per allowed value. Other keys (`theme`,
+ * `effortLevel`, …) have their own `- "x"` value lists, so only the `model`
+ * block counts: it starts at the header whose key is exactly `model` and ends
+ * at the next non-empty line that sits at the header's indent or shallower
+ * and isn't one of its own `- "<id>"` items (the next key's header). Lines
+ * indented deeper than the header that aren't items (wrapped description
+ * text) are skipped, never treated as a boundary. Ids are deduped, ANSI is
+ * stripped and anything that doesn't look like a model id is dropped.
+ * Pure, never throws; unparseable input yields `[]`.
+ *
+ * `auto` is not in the printed list (it is a separate accepted value) and is
+ * therefore never produced here — the curated `AGENT_OPTIONS.copilot` row
+ * covers it. No labels: the picker's merge layer applies the curated label
+ * to a known id and falls back to the bare id otherwise, same as antigravity.
+ */
+function parseCopilotModels(stdout: string): DiscoveredModel[] {
+  const out: DiscoveredModel[] = [];
+  const seen = new Set<string>();
+  const clean = stdout.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "").replace(/\r/g, "");
+  const headerRe = /^[`"']?model[`"']?\s*:/;
+  const itemRe = /^-\s+["'`]?([^"'`\s]+)["'`]?\s*$/;
+  let headerIndent = -1;
+  for (const raw of clean.split("\n")) {
+    if (raw.trim().length === 0) continue;
+    const indent = raw.length - raw.trimStart().length;
+    const line = raw.trim();
+    if (headerIndent < 0) {
+      if (headerRe.test(line)) headerIndent = indent;
+      continue;
+    }
+    const item = itemRe.exec(line);
+    if (item) {
+      const id = item[1]!;
+      if (/^[a-z0-9][a-z0-9._-]*$/i.test(id) && !seen.has(id)) {
+        seen.add(id);
+        out.push({ id });
+      }
+      continue;
+    }
+    if (indent <= headerIndent) break;
+  }
+  return out;
+}
+
+/**
+ * The default copilot binary resolution — `AGETOR_COPILOT_BIN ?? "copilot"`,
+ * rehydrated against `process.env.PATH`. Same shape as `defaultFxBin`.
+ */
+function defaultCopilotBin(): string {
+  const fallback = process.env.AGETOR_COPILOT_BIN ?? "copilot";
+  return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+}
+
+/** Copilot's `help config` is a local print (~100 ms); 4 s is generous for a cold node-loader start. */
+const COPILOT_PROBE_TIMEOUT_MS = 4_000;
+
+/**
+ * `copilot help config` lists the model ids the installed CLI knows about,
+ * offline and without auth (spike-verified, 1.0.104: 31 ids). The list is
+ * static per CLI version — it tracks the binary, NOT the account's
+ * entitlements or org policy — so it is a kind-level catalog and copilot is
+ * deliberately not in `CATALOG_SCOPED_KINDS`: discovered ids are appended
+ * after the curated rows and the curated rows are never hidden.
+ * `COPILOT_OFFLINE=true` keeps the probe from reaching for the network.
+ * The refresh paths call it with no arguments — a per-harness env could not
+ * change a list that depends only on the binary — so `env` (merged under
+ * `COPILOT_OFFLINE`) and `bin` are test seams.
+ * Never throws; an unresolvable binary, non-zero exit or empty output is `[]`.
+ */
+async function discoverCopilot(env?: Record<string, string>, bin?: string): Promise<DiscoveredModel[]> {
+  try {
+    const resolved = bin ?? defaultCopilotBin();
+    const resolvable = isAbsolute(resolved)
+      ? existsSync(resolved)
+      : Bun.which(resolved, { PATH: process.env.PATH }) !== null;
+    if (!resolvable) return [];
+    const probe = await runProbe(
+      [resolved, "help", "config"],
+      { ...(env ?? {}), COPILOT_OFFLINE: "true" },
+      COPILOT_PROBE_TIMEOUT_MS,
+    );
+    if (!probe.ok || !probe.stdout) return [];
+    return parseCopilotModels(probe.stdout);
+  } catch {
+    return [];
+  }
+}
 
 /**
  * False until the first `refreshDiscoveredModels` call has fully settled
@@ -1328,9 +1421,10 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
       discoverFx(),
       discoverAntigravity(),
       discoverOpencode(),
+      discoverCopilot(),
     ]);
     // Index-aligned with the discoverer list above — append to both together.
-    const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx", "antigravity", "opencode"];
+    const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx", "antigravity", "opencode", "copilot"];
     results.forEach((result, i) => {
       cache.set(kinds[i]!, result.status === "fulfilled" ? result.value : []);
     });
@@ -1478,6 +1572,9 @@ async function runRefreshKind(kind: AgentKind): Promise<void> {
       case "opencode":
         models = await discoverOpencode();
         break;
+      case "copilot":
+        models = await discoverCopilot();
+        break;
     }
   } catch {
     models = [];
@@ -1570,6 +1667,8 @@ export const __testing = {
   parseOpencodeApiModelList,
   parseOpencodeVerboseModels,
   discoverOpencode,
+  parseCopilotModels,
+  discoverCopilot,
   resetForTests,
   setCodexProbeTimeoutMs,
   setOpencodeProbeTimeouts,

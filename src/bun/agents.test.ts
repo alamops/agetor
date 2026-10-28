@@ -3079,15 +3079,16 @@ test("opencodeEffectiveServerFor: v1 → null, a home → standalone, else the t
   expect(opencodeEffectiveServerFor(builtin("opencode"), { opencodeServer: null }, null)).toBe("shared");
 });
 
-test("exhaustive never arms: an unknown kind throws instead of falling through to codex/gemini", async () => {
-  expect(() => buildCommand(bogusHarness(), "p", { ...codexDefaults })).toThrow(/unknown harness kind bogus/);
-  expect(() => harnessEnv(bogusHarness("/h"))).toThrow(/unknown harness kind bogus/);
-  expect(() => resolveBin(bogusHarness())).toThrow(/unknown harness kind bogus/);
+test("exhaustive never arms: buildCommand/spawnAgent refuse an unknown kind instead of falling through to codex/gemini; harnessEnv/resolveBin stay total", async () => {
+  expect(() => buildCommand(bogusHarness(), "p", { ...codexDefaults })).toThrow(/unknown harness kind: bogus/);
+  // `checkHarness` calls these for every harness row, so a retired kind must not throw.
+  expect(() => harnessEnv(bogusHarness("/h"))).not.toThrow();
+  expect(() => resolveBin(bogusHarness())).not.toThrow();
   process.env.AGETOR_CODEX_DRIVER = "fake";
   try {
     await expect(
       spawnAgent({ taskId: "t-bogus", runId: "r-bogus", harness: bogusHarness(), prompt: "p", cwd: "/tmp", onChunk: () => {}, opts: { ...codexDefaults } }),
-    ).rejects.toThrow(/unknown harness kind bogus/);
+    ).rejects.toThrow(/unknown harness kind: bogus/);
   } finally {
     delete process.env.AGETOR_CODEX_DRIVER;
   }

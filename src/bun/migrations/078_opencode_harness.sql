@@ -1,8 +1,8 @@
 -- Widen harnesses.kind's CHECK to admit 'opencode' (OpenCode CLI) and seed
--- its built-in row disabled. The CHECK also lists 'copilot' so the parallel
--- Copilot branch's rebuild and this one copy cleanly in either merge order
+-- its built-in row disabled. The CHECK also lists 'copilot' (077) so this
+-- rebuild and Copilot's copy cleanly in either order
 -- (docs/plans/add-opencode-harness.md §2c) — neither branch adds a harnesses
--- column.
+-- column. Authored as 077 and renumbered to 078 when Copilot merged first.
 --
 -- Follows the table-rebuild recipe established by 032/037/046/061:
 --   1. Create harnesses_new with 'opencode' (and 'copilot') in the CHECK.
@@ -10,7 +10,7 @@
 --      (073) included.
 --   3. Drop harnesses and rename harnesses_new to harnesses.
 --   4. Seed the built-in 'opencode' row, disabled (the auto-enable hook,
---      `harness_auto_enabled` / 079, turns it on once the CLI is installed).
+--      `harness_auto_enabled` / 080, turns it on once the CLI is installed).
 --   5. Self-heal re-seed of all built-in harnesses.
 --   6. Add `opencode_session_id` to `runs`.
 --
@@ -77,6 +77,10 @@ VALUES
   ('opencode',    'opencode',    'OpenCode',    1, NULL, NULL, '{}',
    CAST(strftime('%s', 'now') AS INTEGER) * 1000,
    CAST(strftime('%s', 'now') AS INTEGER) * 1000,
-   0);
+   0),
+  ('copilot',     'copilot',     'GitHub Copilot', 1, NULL, NULL, '{}',
+   CAST(strftime('%s', 'now') AS INTEGER) * 1000,
+   CAST(strftime('%s', 'now') AS INTEGER) * 1000,
+   1);
 
 ALTER TABLE runs ADD COLUMN opencode_session_id TEXT;

@@ -196,7 +196,7 @@ export function useTaskLaunch(
   const initial = opts?.initial;
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [], opencode: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [], opencode: [], copilot: [] });
   const [harnessModels, setHarnessModels] = useState<Record<string, DiscoveredModel[]>>({});
   // Seeded from `open` (not a bare `false`) so a hook whose owning component
   // mounts already-open is truthful on its very first render instead of

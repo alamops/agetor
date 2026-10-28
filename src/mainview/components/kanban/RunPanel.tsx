@@ -1806,7 +1806,7 @@ function RunPanelBody({
     const provider = new Map<string, string>();
     const title = new Map<string, string>();
     const recovery = new Map<string, FxRecoveryPayload>();
-    if (kind !== "fx" && kind !== "cursor" && kind !== "opencode") {
+    if (kind !== "fx" && kind !== "cursor" && kind !== "opencode" && kind !== "copilot") {
       return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
     }
     for (const e of events) {
@@ -4175,7 +4175,7 @@ function RunPanelBody({
                 pausedRecovery={pausedRecovery}
                 taskId={task.id}
                 pathRoots={pathRoots}
-                plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
+                plans={kind === "cursor" || kind === "copilot" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
                 agentKind={kind}
                 onAskAnswerWithheld={(reason) => {
@@ -6945,6 +6945,7 @@ function toolIcon(name: string): ComponentType<{ className?: string; "aria-hidde
       return HelpCircle;
     case "ExitPlanMode":
     case "createPlanToolCall":
+    case "copilot_plan":
       return ClipboardList;
     case "WebFetch":
     case "WebSearch":
@@ -6978,7 +6979,7 @@ function formatToolInputSummary(name: string, input: unknown): string {
     const q0 = input.questions[0] as Record<string, unknown>;
     return typeof q0?.question === "string" ? truncateString(q0.question, 80) : `${input.questions.length} question(s)`;
   }
-  if (name === "ExitPlanMode" || name === "createPlanToolCall") return "plan ready for approval";
+  if (name === "ExitPlanMode" || name === "createPlanToolCall" || name === "copilot_plan") return "plan ready for approval";
   if (name === "TodoWrite" && Array.isArray(input.todos)) {
     const todos = input.todos as Array<Record<string, unknown>>;
     const done = todos.filter((t) => t.status === "completed").length;

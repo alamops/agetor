@@ -319,6 +319,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     "antigravity": { mode: initialMode("antigravity"), model: DEFAULT_MODEL["antigravity"], effort: DEFAULT_EFFORT["antigravity"], speed: "off", maxMode: false, opencodeServer: "shared" },
     "fx": { mode: initialMode("fx"), model: DEFAULT_MODEL["fx"], effort: DEFAULT_EFFORT["fx"], speed: "off", maxMode: false, opencodeServer: "shared" },
     "opencode": { mode: initialMode("opencode"), model: DEFAULT_MODEL["opencode"], effort: DEFAULT_EFFORT["opencode"], speed: "off", maxMode: false, opencodeServer: "shared" },
+    "copilot": { mode: initialMode("copilot"), model: DEFAULT_MODEL["copilot"], effort: DEFAULT_EFFORT["copilot"], speed: "off", maxMode: false, opencodeServer: "shared" },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -385,6 +386,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
       seed("antigravity");
       seed("fx");
       seed("opencode");
+      seed("copilot");
       const active = agentCache.current[kindRef.current];
       setMode(active.mode);
       setModel(active.model);
@@ -1007,6 +1009,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                         ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
                         : kind === "cursor"
                         ? "Routed to cursor-agent's --mode plan — a real read-only planning mode. Approving the plan switches the task to Auto (force)."
+                        : kind === "copilot"
+                        ? "Routed to Copilot's --mode plan — approving the plan switches the task to Auto"
                         : kind === "gemini"
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
                         : kind === "antigravity"

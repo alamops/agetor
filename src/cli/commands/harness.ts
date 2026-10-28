@@ -167,11 +167,11 @@ export function harnessNoticeLines(harnessId: string, status: Pick<HarnessStatus
 }
 
 /** The `agetor harness shell` banner's login hint. Only the commands we've
- *  verified are asserted (`claude /login`, `cursor-agent login`, `opencode
- *  auth login`); any other kind keeps the generic wording. */
+ *  verified are asserted (`claude /login`, `cursor-agent login`, `copilot
+ *  login`, `opencode auth login`); any other kind keeps the generic wording. */
 export function harnessShellLoginHint(kind: AgentKind, launch: string): string {
   if (kind === "claude-code") return `run ${c.cyan(`${launch} /login`)} to authenticate`;
-  if (kind === "cursor") return `run ${c.cyan(`${launch} login`)} to authenticate`;
+  if (kind === "cursor" || kind === "copilot") return `run ${c.cyan(`${launch} login`)} to authenticate`;
   if (kind === "opencode") return `run ${c.cyan(`${launch} auth login`)} to authenticate`;
   return `log in to ${c.cyan(launch)} here`;
 }

@@ -1,11 +1,11 @@
 // DB-level tests for the OpenCode harness (docs/plans/add-opencode-harness.md
 // W1-B / W1-T2): `tasks.opencode_server` / `agent_profiles.opencode_server`
-// (migration 078) round-tripping through the `tasks`/`agentProfiles` modules,
+// (migration 079) round-tripping through the `tasks`/`agentProfiles` modules,
 // the lenient read of frozen snapshots without `opencodeServer`, the
 // imported-OpenCode provenance + unique session claim
 // (`tasks.setImportedOpencode` and friends), `runs.opencode_session_id`
-// (migration 077) through `toRun`, `runs.sessionIdsForTask`, and the
-// `harnessAutoEnabled` bookkeeping module (migration 079).
+// (migration 078) through `toRun`, `runs.sessionIdsForTask`, and the
+// `harnessAutoEnabled` bookkeeping module (migration 080).
 // Same setup as db-speed.test.ts: AGETOR_DATA_DIR is set at module scope
 // BEFORE `./db.ts` is dynamically imported (the db opens — and migrates — on
 // module load), and `rmTestDataDir` tears the dir down.

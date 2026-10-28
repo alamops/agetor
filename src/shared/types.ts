@@ -295,7 +295,7 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx" | "antigravity" | "opencode";
+export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx" | "antigravity" | "opencode" | "copilot";
 
 /**
  * Which OpenCode server an `opencode` task's turns run against
@@ -316,7 +316,7 @@ export const OPENCODE_SERVER_MODES = ["shared", "standalone"] as const satisfies
  * CLI is found installed (`docs/plans/add-opencode-harness.md` D-14, G8). A
  * manual Off afterwards sticks — `src/bun/harness-auto-enable.ts` records
  * each row in `harness_auto_enabled` the first time it acts on it.
- * claude-code and antigravity are absent because they already ship enabled.
+ * claude-code, antigravity and copilot are absent because they already ship enabled.
  */
 export const AUTO_ENABLE_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>([
   "codex",
@@ -328,7 +328,7 @@ export const AUTO_ENABLE_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>([
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
- * harnesses (`claude-code`, `codex`, `cursor`, `gemini`) wrap each CLI directly;
+ * harnesses (`claude-code`, `codex`, `cursor`, `gemini`, `fx`, `antigravity`, `copilot`) wrap each CLI directly;
  * user-created harnesses are *aliases* that wrap the same underlying `kind`
  * with extra env, an alternate `bin` path, or a per-account `home` override
  * so the CLI's login/config writes to a separate dir (multi-account support).
@@ -373,6 +373,13 @@ export interface Harness {
    *    always runs `--standalone` on v2 (`effectiveOpencodeServer`): the
    *    shared background service binds a fixed port that HOME/XDG can't
    *    isolate.
+   *  - copilot: emitted as COPILOT_HOME=<home>. GitHub Copilot CLI has a
+   *    dedicated state-dir env var (config, logins, session state and
+   *    `session-state/<id>/plan.md` all live under it), so like gemini there
+   *    is no need to touch the real `HOME`. The driver always pins
+   *    COPILOT_HOME per spawn (harness env, then this home, then the process
+   *    env, then `~/.copilot`) so the tmux server's env can't leak another
+   *    account's dir.
    *  NULL means "inherit the agetor process env". */
   home: string | null;
   /** Optional binary path override. NULL falls back to the AGETOR_*_BIN
@@ -1102,6 +1109,17 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     kind: "opencode",
     suggestedHarnessId: "opencode-2",
     home: "{dataDir}/harnesses/opencode-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "copilot-additional",
+    label: "Additional GitHub Copilot",
+    description:
+      "Another GitHub Copilot harness with its own COPILOT_HOME so login, config and session history are isolated from the built-in. After saving, sign the new account in by running COPILOT_HOME=<path> copilot login in a terminal.",
+    kind: "copilot",
+    suggestedHarnessId: "copilot-2",
+    home: "{dataDir}/harnesses/copilot-2",
     bin: null,
     env: {},
   },
@@ -2725,6 +2743,13 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   "antigravity": "gemini-3.8-flash-high",
   // The one sentinel default (see the docblock above): no `-m`.
   "opencode": OPENCODE_DEFAULT_MODEL,
+  // Owner decision D3 (docs/plans/github-copilot-harness-grill.md): Copilot's
+  // own `auto` router — available on every plan, a 10% credit discount, and it
+  // never picks an org-disabled model. Copilot joins fx as an exemption from
+  // the "always default to the best available model" rule because both bill
+  // per token/credit; the flagships stay one click away in the picker. The
+  // driver reports which model `auto` actually used as a status line (D23).
+  "copilot": "auto",
 };
 
 /**
@@ -2775,6 +2800,11 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // ("Model default") passes no variant, so a new task runs exactly as
   // OpenCode itself would.
   "opencode": "auto",
+  // Like fx: `auto` is "Model default" — the driver omits `--reasoning-effort`
+  // so Copilot runs each model at its own default (owner D7,
+  // docs/plans/github-copilot-harness-grill.md). Explicit levels stay one
+  // click away in the picker.
+  "copilot": "auto",
 };
 
 /**
@@ -2810,6 +2840,21 @@ export const MODEL_MIN_CLI_VERSION: Partial<Record<AgentKind, Record<string, str
     "gpt-6-luna": "0.155.0",
     "gpt-6-astra": "0.153.0",
     "gpt-6-astra-aeon": "0.153.0",
+  },
+  // GitHub Copilot CLI: the first stable release whose bundled changelog
+  // mentions each model (docs/plans/github-copilot-harness.md §2). No match
+  // was found for claude-sonnet-5.5, gemini-3.8-flash, grok-4.7 or
+  // mai-code-1.1-flash, so those carry no floor (fail-open); `auto` never does.
+  copilot: {
+    "kimi-k3": "1.0.79",
+    "claude-fable-5.1": "1.0.83",
+    "gpt-6-astra": "1.0.85",
+    "claude-opus-5.5": "1.0.89",
+    "gpt-6-sol": "1.0.89",
+    "gpt-6-luna": "1.0.89",
+    "gpt-6.1-sol": "1.0.90",
+    "claude-haiku-5.5": "1.0.94",
+    "gemini-4-argon": "1.0.98",
   },
 };
 
@@ -3344,6 +3389,9 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   "antigravity": { code: "auto", plan: "plan" },
   // OpenCode: Code = the Build agent with `--auto`; Plan = `--agent plan`.
   "opencode": { code: "auto", plan: "plan" },
+  // Plan is Copilot's own `--mode plan`; approving the plan switches an
+  // unbound task to Auto (D4, D5).
+  "copilot": { code: "auto", plan: "plan" },
 };
 
 /**
@@ -3366,9 +3414,10 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  *
  * `none` is currently used only by GPT-5.6-family Codex models and by
  * effort-advertising fx models whose Gateway catalog entry lists it.
- * `auto` is used only by fx and OpenCode (`MODEL_DEFAULT_EFFORT_KINDS`):
- * `MODEL_EFFORT_SUPPORT.fx` lists it, `supportedEfforts("opencode", …)` adds
- * it in front of a model's discovered variants, and `DEFAULT_EFFORT.fx` /
+ * `auto` is used only by the `MODEL_DEFAULT_EFFORT_KINDS` (fx, GitHub Copilot
+ * and OpenCode): `MODEL_EFFORT_SUPPORT.fx` and `MODEL_EFFORT_SUPPORT.copilot`
+ * list it, `supportedEfforts("opencode", …)` adds it in front of a model's
+ * discovered variants, and `DEFAULT_EFFORT.fx` / `DEFAULT_EFFORT.copilot` /
  * `DEFAULT_EFFORT.opencode` are the only defaults that resolve to it. An
  * OpenCode variant agetor doesn't know (e.g. `thinking`) is offered as a
  * synthesized `{id, label: id}` row, not one of these.
@@ -3380,9 +3429,9 @@ export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "high", label: "High", hint: "Deep reasoning. The API default on most models (Opus 5.5 defaults to medium)." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
-  { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where the harness exposes it (Cursor, fx)." },
+  { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where the harness exposes it (Cursor, fx, GitHub Copilot)." },
   { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
-  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx (its `auto`, the 'default' option) and OpenCode (no variant passed) only. Curated tables and the discovered branch keep it off every other kind." },
+  { id: "auto", label: "Model default", hint: "Let the model/gateway pick its own reasoning level — fx, GitHub Copilot and OpenCode only (fx's `auto`, its 'default' option; Copilot omits --reasoning-effort; OpenCode passes no variant). Limited by construction to the kinds in `MODEL_DEFAULT_EFFORT_KINDS`: curated tables and the discovered branch both keep it off every other kind." },
 ];
 
 /**
@@ -3688,7 +3737,43 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   opencode: {
     [OPENCODE_DEFAULT_MODEL]: [],
   },
+  // GitHub Copilot's `--reasoning-effort` accepts none|minimal|low|medium|high|
+  // xhigh|max (no `ultra`), and an unsupported level is reported and ignored
+  // rather than failing the run (changelog 1.0.88). Per-model support is
+  // borrowed from agetor's tables for the same model families
+  // (docs/plans/github-copilot-harness.md §3.6, owner D7): claude rows from
+  // claude-code, gpt-6.1-sol / gpt-6-astra from codex minus `ultra`, the
+  // gemini / grok / kimi rows from fx. Copilot-only ids (`auto` itself,
+  // mai-code-1.1-flash) get the full set. Every row ends in `auto` ("Model
+  // default" — the driver omits the flag). A discovered-only id falls back to
+  // the `auto` row's full set.
+  copilot: {
+    "auto": ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+    "claude-opus-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "claude-sonnet-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "claude-fable-5.1": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "gpt-6-astra": ["max", "xhigh", "high", "medium", "low", "auto"],
+    "gpt-6-luna": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "gpt-6-sol": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+    "gemini-4-argon": ["high", "medium", "low", "auto"],
+    "gemini-3.8-flash": ["high", "low", "auto"],
+    "grok-4.7": ["xhigh", "high", "medium", "low", "auto"],
+    "kimi-k3": ["max", "high", "low", "auto"],
+    "mai-code-1.1-flash": ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"],
+  },
 };
+
+/**
+ * Kinds that offer the `auto` ("Model default") effort row: fx (its own
+ * default reasoning option), GitHub Copilot (the driver omits
+ * `--reasoning-effort`) and OpenCode (no variant is passed; `supportedEfforts`
+ * puts `auto` in front of every discovered variant list, D-6). Every other
+ * kind never surfaces `auto`, even when a discovery probe reports it — see
+ * `supportedEfforts`.
+ */
+export const MODEL_DEFAULT_EFFORT_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx", "copilot", "opencode"]);
 
 /**
  * Effort options the picker should show for a given (agent, model). Returns
@@ -3705,10 +3790,11 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * and `discoveredEffortsFor` in `src/shared/model-options.ts`). Precedence:
  * a non-empty `discoveredEfforts` wins outright — the result is
  * `EFFORT_OPTIONS` filtered to it (canonical highest→lowest order), with
- * `auto` additionally dropped from the filter for every kind but fx (`auto`
- * is fx-only by construction — see the `EFFORT_OPTIONS` row comment — so a
- * non-fx harness that discovers an `auto` id, e.g. codex's `model/list
- * supportedReasoningEfforts`, must never surface a "Model default" row) —
+ * `auto` additionally dropped from the filter for every kind outside
+ * `MODEL_DEFAULT_EFFORT_KINDS` (fx, copilot, opencode — see the `EFFORT_OPTIONS` row
+ * comment — so any other harness that discovers an `auto` id, e.g. codex's
+ * `model/list supportedReasoningEfforts`, must never surface a "Model
+ * default" row) —
  * unless that leaves none of its ids known to agetor, in which case we fall
  * through to the curated table below. `undefined`, `null`, or an empty array
  * behave exactly like the two-argument call (today's curated-table-only
@@ -3747,12 +3833,12 @@ export function supportedEfforts(
   if (agent === "opencode") return opencodeEfforts(model, discoveredEfforts);
   if (discoveredEfforts && discoveredEfforts.length > 0) {
     const discoveredAllowed = new Set(discoveredEfforts);
-    // `auto` is kept only for MODEL_DEFAULT_EFFORT_KINDS (see the
-    // EFFORT_OPTIONS row comment): any other harness that happens to
-    // discover an "auto" id (e.g. codex's `model/list
-    // supportedReasoningEfforts`) must not surface a "Model default" row or
-    // pass `auto` through to a flag that doesn't understand it, so it's
-    // dropped from the discovered set before filtering.
+    // `auto` belongs only to `MODEL_DEFAULT_EFFORT_KINDS` (fx, copilot, opencode — see
+    // the EFFORT_OPTIONS row comment): any other harness that happens to
+    // discover an "auto" id (e.g. codex's `model/list supportedReasoningEfforts`)
+    // must not surface a "Model default" row or pass `auto` through to a flag
+    // that doesn't understand it, so it's dropped from the discovered set
+    // before filtering for every other kind.
     const fromDiscovery = EFFORT_OPTIONS.filter((o) =>
       discoveredAllowed.has(o.id) && (MODEL_DEFAULT_EFFORT_KINDS.has(agent) || o.id !== "auto"));
     if (fromDiscovery.length > 0) return fromDiscovery;
@@ -3765,16 +3851,6 @@ export function supportedEfforts(
   const allowed = new Set(ids);
   return EFFORT_OPTIONS.filter((o) => allowed.has(o.id));
 }
-
-/**
- * Kinds that offer the off-scale `auto` ("Model default") effort row — the
- * harness then picks its own reasoning level. fx lists `auto` in its curated
- * table and keeps a discovered `auto`; OpenCode puts it in front of every
- * discovered variant list (D-6). Every other kind drops a discovered `auto`.
- * Exported so a later kind that keeps `auto` (e.g. GitHub Copilot, spike
- * A15) joins this set instead of adding another kind check.
- */
-export const MODEL_DEFAULT_EFFORT_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["fx", "opencode"]);
 
 const AUTO_EFFORT_OPTION: AgentOption = EFFORT_OPTIONS.find((o) => o.id === "auto") ?? {
   id: "auto",
@@ -3880,6 +3956,8 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   fx: {},
   antigravity: {},
   opencode: {},
+  // All three Copilot modes (auto / plan / ask) are universally available.
+  copilot: {},
 };
 
 export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
@@ -4236,6 +4314,32 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // id outside EFFORT_OPTIONS as a synthesized row (D-6).
     efforts: EFFORT_OPTIONS.filter((o) => o.id === "auto"),
   },
+  copilot: {
+    models: [
+      { id: "auto", label: "Auto", hint: "Default — Copilot's own model router. Available on every plan, a 10% credit discount, and it never picks a model your organisation has disabled. A status line names the model Copilot actually used." },
+      { id: "claude-opus-5.5", label: "Claude Opus 5.5", hint: "Anthropic's Opus 5.5 through Copilot. Needs Copilot CLI 1.0.89 or newer." },
+      { id: "claude-sonnet-5.5", label: "Claude Sonnet 5.5", hint: "Faster, lower-cost complement to Opus 5.5." },
+      { id: "claude-haiku-5.5", label: "Claude Haiku 5.5", hint: "Cheapest, fastest Claude. Needs Copilot CLI 1.0.94 or newer." },
+      { id: "claude-fable-5.1", label: "Claude Fable 5.1", hint: "Most capable Claude, above Opus. Needs Copilot CLI 1.0.83 or newer." },
+      { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", hint: "OpenAI's GPT-6.1 Sol through Copilot. Needs Copilot CLI 1.0.90 or newer." },
+      { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "Most capable GPT-6 tier, heavier than Sol. Needs Copilot CLI 1.0.85 or newer." },
+      { id: "gpt-6-luna", label: "GPT-6 Luna", hint: "Efficient GPT-6 model. Needs Copilot CLI 1.0.89 or newer." },
+      { id: "gpt-6-sol", label: "GPT-6 Sol", hint: "GPT-6 Sol, superseded by GPT-6.1 Sol. Needs Copilot CLI 1.0.89 or newer." },
+      { id: "gemini-4-argon", label: "Gemini 4 Argon", hint: "Google's Gemini 4 Argon through Copilot. Needs Copilot CLI 1.0.98 or newer." },
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "Fast Gemini 3.8 Flash for long-horizon coding at Flash cost." },
+      { id: "grok-4.7", label: "Grok 4.7", hint: "xAI's Grok 4.7 through Copilot." },
+      { id: "kimi-k3", label: "Kimi K3", hint: "Moonshot's Kimi K3 through Copilot. Needs Copilot CLI 1.0.79 or newer." },
+      { id: "mai-code-1.1-flash", label: "MAI Code 1.1 Flash", hint: "Microsoft's MAI Code 1.1 Flash — a Copilot-only model." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "Hands-off — allows all tools, paths and URLs and trusts the worktree (--allow-all + COPILOT_ALLOW_ALL)." },
+      { id: "plan", label: "Plan", hint: "Plan without making changes (--mode plan). Approving the plan switches the task to Auto." },
+      { id: "ask", label: "Read-only", hint: "No allow flags — Copilot denies file edits and commands that change files (read-only commands still run), and the run can still report success. Repo MCP servers and hooks stay off (untrusted folder)." },
+    ],
+    // Per-model effort levels live in MODEL_EFFORT_SUPPORT.copilot; the
+    // "Model default" (`auto`) row omits --reasoning-effort.
+    efforts: EFFORT_OPTIONS,
+  },
 };
 
 export type RunStatus =
@@ -4318,6 +4422,15 @@ export interface Run {
    * Optional like `antigravitySessionId`; NULL for every other agent kind.
    */
   opencodeSessionId?: string | null;
+  /**
+   * GitHub Copilot CLI's session id — SELF-ISSUED by agetor (a uuid minted
+   * for the first turn and passed as `--session-id`, which creates or resumes
+   * the session), like gemini's, not discovered from an event. Captured by
+   * the copilot-tmux driver and persisted as `runs.copilot_session_id`; a
+   * follow-up turn resumes it only on the same harness id (a different
+   * `COPILOT_HOME` can't see it). NULL for every other agent kind.
+   */
+  copilotSessionId?: string | null;
   /**
    * How this run came to exist. `null`/undefined = user-initiated (Run
    * button, a follow-up message typed into the panel — every run before
@@ -5195,11 +5308,14 @@ export type SubagentStatus =
  * tab); and a Claude Code `Monitor` the main agent armed (`"monitor"` — id =
  * the monitor's `taskId` from its launch stub, no source file of its own, its
  * tab streams each `<event>` the monitor reports; holds the task in `running`
- * until the monitor times out or is stopped); and an OpenCode child session
+ * until the monitor times out or is stopped); an OpenCode child session
  * (`"opencode_subagent"` — id = the child's `ses_…` id, sourcePath =
  * `opencode-session:<child>`, events filled from `session export` when a
  * turn ends, never left `running` past settle; the Claude watcher skips
- * these rows).
+ * these rows); and a GitHub Copilot CLI subagent (`"copilot_subagent"` —
+ * reported inline in the copilot run's own JSONL log, persisted by the
+ * orchestrator's copilot sink, no source file of its own; never seeded or
+ * tailed by the Claude subagent watcher).
  */
 export interface Subagent {
   /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
@@ -5207,7 +5323,7 @@ export interface Subagent {
   taskId: string;
   /** Parent run that was in flight when this subagent was spawned. */
   runId: string | null;
-  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor" | "opencode_subagent";
+  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor" | "opencode_subagent" | "copilot_subagent";
   /** Registered subagent type, e.g. "Explore" / "general-purpose". */
   agentType: string | null;
   /** Short human label from the spawning Agent tool call. */

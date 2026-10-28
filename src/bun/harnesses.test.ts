@@ -1,14 +1,21 @@
-import { test, expect, beforeEach } from "bun:test";
+import { test, expect, beforeEach, afterAll } from "bun:test";
 import type { SQLQueryBindings } from "bun:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Set AGETOR_DATA_DIR before any import that pulls in db.ts. ES imports
 // hoist before top-level code, so we use dynamic `await import()` below
 // instead of a top-level `import { db } from "./db.ts"`.
-process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-harnesses-"));
-const { db, harnesses, HarnessBuiltinError, HarnessInUseError } = await import("./db.ts");
+const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-harnesses-"));
+process.env.AGETOR_DATA_DIR = DATA_DIR;
+const { db, harnesses, runs, tasks, subagents, HarnessBuiltinError, HarnessInUseError } = await import("./db.ts");
+
+afterAll(() => {
+  // Refuses (returns false) while the live db file is still there.
+  rmTestDataDir(DATA_DIR);
+});
 
 beforeEach(() => {
   // Wipe any user-added aliases between tests; built-ins (is_builtin=1)
@@ -391,16 +398,6 @@ test("getByIdOrKind synthesises a built-in opencode row for legacy id without a 
   }
 });
 
-test("the harnesses.kind CHECK admits copilot (the parallel branch's kind) but the insert validator still refuses it", () => {
-  db.run(
-    `INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('copilot-raw', 'copilot', 'Copilot', 1, 1)`,
-  );
-  expect(db.query<{ kind: string }, [string]>(`SELECT kind FROM harnesses WHERE id = ?`).get("copilot-raw")?.kind).toBe("copilot");
-  expect(() =>
-    harnesses.insert({ id: "copilot-2", kind: "copilot" as never, label: "x", home: null, bin: null, env: {} }),
-  ).toThrow(/unknown harness kind/);
-});
-
 test("profileMcpServers defaults to true on seeded built-ins, a fresh alias and a synthesized row", () => {
   expect(harnesses.get("fx")!.profileMcpServers).toBe(true);
   expect(harnesses.get("claude-code")!.profileMcpServers).toBe(true);
@@ -446,4 +443,106 @@ test("update accepts a profileMcpServers-only patch on a built-in but still refu
 
   expect(() => harnesses.update("fx", { profileMcpServers: true, label: "Renamed" })).toThrow(HarnessBuiltinError);
   expect(harnesses.get("fx")!.profileMcpServers).toBe(false);
+});
+
+test("copilot is a seeded built-in row labelled GitHub Copilot, enabled by default", () => {
+  const h = harnesses.get("copilot")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("copilot");
+  expect(h.label).toBe("GitHub Copilot");
+  expect(h.enabled).toBe(true);
+  expect(() => harnesses.update("copilot", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'copilot' and round-trips a copilot alias", () => {
+  const inserted = harnesses.insert({
+    id: "copilot-2",
+    kind: "copilot",
+    label: "GitHub Copilot (2)",
+    home: "/tmp/agetor-test-copilot-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("copilot");
+  expect(harnesses.get("copilot-2")!.home).toBe("/tmp/agetor-test-copilot-home");
+});
+
+test("getByIdOrKind synthesises a built-in GitHub Copilot row for legacy id without a matching row", () => {
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("copilot");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["copilot"]);
+    const synth = harnesses.getByIdOrKind("copilot");
+    expect(synth?.kind).toBe("copilot");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("GitHub Copilot");
+    expect(synth?.enabled).toBe(true);
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled, s.profile_mcp_servers] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+function seedTaskAndRun(taskId: string, runId: string) {
+  tasks.insert({
+    id: taskId, title: "t", prompt: "p", agent: "copilot", workdir: "/tmp", isolation: "none",
+    taskType: "task", branch: null, branchSource: "created", worktreePath: null, baseRef: null,
+    prUrl: null, mode: null, model: null, effort: null, speed: "off", opencodeServer: "shared", maxMode: false,
+    references: [], backlog: [], plans: [], draft: null, column: "ready", runId: null,
+    createdAt: 1, updatedAt: 1, hasOpenableRun: false, pendingInteractionCount: 0,
+    openTerminalCount: 0, archivedAt: null,
+  });
+  runs.insert({
+    id: runId, taskId, agent: "copilot", status: "running", startedAt: 1, endedAt: null,
+    exitCode: null, tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+    cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+}
+
+test("runs carry copilotSessionId through insert, update and get (omitted on insert reads back null)", () => {
+  seedTaskAndRun("t-cop-sess", "r-cop-sess");
+  expect(runs.get("r-cop-sess")!.copilotSessionId).toBeNull();
+  const updated = runs.update("r-cop-sess", { copilotSessionId: "11111111-2222-3333-4444-555555555555" });
+  expect(updated!.copilotSessionId).toBe("11111111-2222-3333-4444-555555555555");
+  expect(runs.get("r-cop-sess")!.copilotSessionId).toBe("11111111-2222-3333-4444-555555555555");
+  // A patch that doesn't name it keeps it.
+  runs.update("r-cop-sess", { status: "succeeded", endedAt: 5, exitCode: 0 });
+  expect(runs.get("r-cop-sess")!.copilotSessionId).toBe("11111111-2222-3333-4444-555555555555");
+  db.run(`DELETE FROM tasks WHERE id = ?`, ["t-cop-sess"]);
+});
+
+test("subagents.settleRunningForRun settles only that run's running rows and reports the count", () => {
+  seedTaskAndRun("t-settle", "r-settle-a");
+  runs.insert({
+    id: "r-settle-b", taskId: "t-settle", agent: "copilot", status: "running", startedAt: 2, endedAt: null,
+    exitCode: null, tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+    cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+  const mk = (id: string, runId: string, status: "running" | "completed", endedAt: number | null) =>
+    subagents.insertIfAbsent({
+      id, taskId: "t-settle", runId, parentKind: "subagent", agentType: null, description: null,
+      spawnDepth: 1, sourcePath: "", status, startedAt: 10, endedAt,
+    });
+  mk("sa-a1", "r-settle-a", "running", null);
+  mk("sa-a2", "r-settle-a", "running", null);
+  mk("sa-a3", "r-settle-a", "completed", 50);
+  mk("sa-b1", "r-settle-b", "running", null);
+
+  expect(subagents.settleRunningForRun("r-settle-a", "completed", 777)).toBe(2);
+  expect(subagents.get("sa-a1")).toMatchObject({ status: "completed", endedAt: 777 });
+  expect(subagents.get("sa-a2")).toMatchObject({ status: "completed", endedAt: 777 });
+  // Already-settled row keeps its own timestamp; other run untouched.
+  expect(subagents.get("sa-a3")).toMatchObject({ status: "completed", endedAt: 50 });
+  expect(subagents.get("sa-b1")).toMatchObject({ status: "running", endedAt: null });
+  // Idempotent.
+  expect(subagents.settleRunningForRun("r-settle-a", "orphaned", 888)).toBe(0);
+  expect(subagents.settleRunningForRun("r-unknown", "completed", 1)).toBe(0);
+  expect(subagents.settleRunningForRun("r-settle-b", "failed", 999)).toBe(1);
+  expect(subagents.get("sa-b1")).toMatchObject({ status: "failed", endedAt: 999 });
+  db.run(`DELETE FROM tasks WHERE id = ?`, ["t-settle"]);
 });
