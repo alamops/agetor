@@ -89,6 +89,10 @@ Each harness offers the permission modes its CLI actually supports. They range f
 
 Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast* or *Ultrafast*. Cursor's Fast comes from its fast model variants, and fx's Fast and Ultrafast come from the AI Gateway lanes your account's catalog lists for that model. Ultrafast costs more per token than Fast. On the CLI, use `--speed off|fast|ultrafast` (`--fast` and `--no-fast` still work).
 
+### Codex notes
+
+- **GPT-5.5 retired.** Codex no longer serves GPT-5.5 on ChatGPT plans. Tasks and Agents on it move to GPT-6.1 Sol when you upgrade; an effort GPT-6.1 Sol doesn't offer, like *No thinking*, becomes *High*.
+
 ### Cursor notes
 
 - **Three modes.** *Auto (force)* runs hands-off. *Plan* runs `cursor-agent --mode plan`, which plans without editing; the New Task form's Code/Plan toggle picks it for Plan. *Read-only* runs `--mode ask` for questions and answers, with no edits.

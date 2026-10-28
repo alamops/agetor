@@ -707,11 +707,11 @@ test("codex model 'gpt-6-luna' passes through verbatim as --model", () => {
   ]);
 });
 
-test("codex model 'gpt-5.5' passes through verbatim as --model", () => {
-  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5.5", mode: "auto" });
+test("codex model 'gpt-6.1-terra' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-6.1-terra", mode: "auto" });
   expect(cmd).toEqual([
     "codex", "exec",
-    "--model", "gpt-5.5",
+    "--model", "gpt-6.1-terra",
     "-c", "model_reasoning_effort=high",
     "--json", "--color", "never", "--skip-git-repo-check",
     "--sandbox", "workspace-write",
@@ -829,6 +829,17 @@ test("codex effort 'none' passes through verbatim on gpt-5.6-sol (-c model_reaso
   const { cmd } = buildCommand(builtin("codex"), "hi", {
     ...codexDefaults,
     model: "gpt-5.6-sol",
+    effort: "none",
+    mode: "auto",
+  });
+  expect(cmd).toContain("-c");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=none");
+});
+
+test("codex gpt-6.1-terra with effort none emits -c model_reasoning_effort=none", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6.1-terra",
     effort: "none",
     mode: "auto",
   });
@@ -1045,6 +1056,72 @@ test("cursor Gemini 3.8 Flash ignores speed fast and maxMode (no fast variant, n
     maxMode: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
+});
+
+// docs/plans/add-gpt-6-1-terra.md D1 (2026-10-26): the three new Cursor
+// families, from the task row to the argv cursor-agent actually receives.
+test("cursor DeepSeek V4.1 Flash 1017 + low effort launches the deepseek-v41-flash-1017-low variant", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "deepseek-v41-flash-1017",
+    effort: "low",
+    mode: "ask",
+  });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "deepseek-v41-flash-1017-low",
+    "--mode", "ask", "--trust",
+  ]);
+});
+
+test("cursor DeepSeek V4.1 Flash 1017 + none effort launches the -none variant (none exists only on this family)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "deepseek-v41-flash-1017",
+    effort: "none",
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("deepseek-v41-flash-1017-none");
+});
+
+test("cursor Muse Spark 1.3 + Max Mode launches the bracket form with its effort and no fast= (no Fast tier)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "muse-spark-1.3",
+    effort: "minimal",
+    speed: "fast",
+    maxMode: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("muse-spark-1.3[context=1m,effort=minimal]");
+});
+
+test("cursor Muse Spark 1.3 without Max Mode launches the plain effort variant", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "muse-spark-1.3",
+    effort: "xhigh",
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("muse-spark-1.3-xhigh");
+});
+
+test("cursor Muse Wonder 1.0 ignores speed fast and maxMode (no Fast variant, no Max Mode)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "muse-wonder-1.0",
+    effort: "minimal",
+    speed: "fast",
+    maxMode: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("muse-wonder-1.0-minimal");
+});
+
+test("cursor Muse Wonder 1.0 with null effort falls back to the high variant", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "muse-wonder-1.0",
+    effort: null,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("muse-wonder-1.0-high");
 });
 
 test("cursor speed fast selects the Fast model variant when that effort supports it", () => {
@@ -1500,6 +1577,32 @@ test("fx model id passes through verbatim — no translation table, unlike claud
   const i = cmd.indexOf("--model");
   expect(i).toBeGreaterThan(-1);
   expect(cmd[i + 1]).toBe("openai/gpt-5.2");
+});
+
+test.each([
+  "openai/gpt-6.1-terra",
+  "minimax/minimax-m3.1-flash",
+  "meta/muse-spark-open",
+  "inception/mercury-3",
+  "moonshotai/kimi-k3.1-pro",
+  "deepseek/deepseek-v4.1-flash-1017",
+  "meta/muse-wonder-1.0",
+  "mistral/mistral-large-4",
+  "reflection/beam",
+])("fx model '%s' (curated 2026-10-26) passes through verbatim as --model", (model) => {
+  const { cmd } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, model });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe(model);
+});
+
+test("codex gpt-6.1-terra with effort ultra emits -c model_reasoning_effort=ultra", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    model: "gpt-6.1-terra",
+    effort: "ultra",
+    mode: "auto",
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-6.1-terra");
+  expect(cmd[cmd.indexOf("-c") + 1]).toBe("model_reasoning_effort=ultra");
 });
 
 test.each(["auto", "ask", "yolo"])(

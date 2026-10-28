@@ -554,8 +554,12 @@ async function discoverAntigravity(): Promise<DiscoveredModel[]> {
  * anthropic/claude-opus-5.5, openai/gpt-6-sol and openai/gpt-6-luna (all
  * curated since 2026-09-22), anthropic/claude-sonnet-5.5 (curated since
  * 2026-09-28), openai/gpt-6.1-sol (curated since 2026-09-30),
- * anthropic/claude-haiku-5.5 (curated since 2026-10-07) and
- * google/gemini-4-argon (curated since 2026-10-14) postdate
+ * anthropic/claude-haiku-5.5 (curated since 2026-10-07),
+ * google/gemini-4-argon (curated since 2026-10-14) and the nine ids curated
+ * 2026-10-26 (openai/gpt-6.1-terra, minimax/minimax-m3.1-flash,
+ * meta/muse-spark-open, inception/mercury-3, moonshotai/kimi-k3.1-pro,
+ * deepseek/deepseek-v4.1-flash-1017, meta/muse-wonder-1.0,
+ * mistral/mistral-large-4, reflection/beam) postdate
  * this measurement) are present in the unauth catalog; the signed-in
  * reference account still couldn't be re-measured (no valid local login at
  * measurement time).

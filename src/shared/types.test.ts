@@ -174,11 +174,12 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
 
 /* ── fx effort (docs/plans/fx-0.0.14-and-cursor-updates.md §3.4 / T1) ────── */
 
-// The 31 effort-advertising ids. Twenty were refreshed on 2026-10-22 against
+// The 40 effort-advertising ids. Twenty were refreshed on 2026-10-22 against
 // fx 0.0.14's `models --json` `models[].efforts` (plus fx's always-present
-// `auto`) — the plan §3.4 table, copied verbatim; the other eleven are
-// unchanged from their earlier live-probe (fx 0.0.10, 2026-09-14) or Gateway
-// `reasoning_options` measurement. Every row ends in "auto" (fx's own
+// `auto`) — the plan §3.4 table, copied verbatim; eleven are unchanged from
+// their earlier live-probe (fx 0.0.10, 2026-09-14) or Gateway
+// `reasoning_options` measurement; the last nine were curated on 2026-10-26
+// (docs/plans/add-gpt-6-1-terra.md §2b). Every row ends in "auto" (fx's own
 // default, off-scale) and lists ids in agetor order (max, xhigh, high,
 // medium, low, minimal, none, auto).
 const FX_EFFORT_MODELS: Record<string, string[]> = {
@@ -215,6 +216,18 @@ const FX_EFFORT_MODELS: Record<string, string[]> = {
   "openai/gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
   "anthropic/claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
   "google/gemini-4-argon": ["high", "medium", "low", "auto"],
+  // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md): nine new rows. Each set is
+  // the Gateway `reasoning_options` plus `auto`, confirmed identical to fx
+  // 0.0.14's `models[].efforts` (plan §2b; Mercury 3 minus fx's `instant`).
+  "openai/gpt-6.1-terra": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+  "minimax/minimax-m3.1-flash": ["max", "xhigh", "high", "medium", "low", "auto"],
+  "meta/muse-spark-open": ["xhigh", "high", "medium", "low", "auto"],
+  "inception/mercury-3": ["high", "medium", "low", "auto"],
+  "moonshotai/kimi-k3.1-pro": ["max", "high", "low", "auto"],
+  "deepseek/deepseek-v4.1-flash-1017": ["max", "high", "low", "none", "auto"],
+  "meta/muse-wonder-1.0": ["max", "xhigh", "high", "medium", "low", "minimal", "auto"],
+  "mistral/mistral-large-4": ["high", "none", "auto"],
+  "reflection/beam": ["max", "xhigh", "high", "medium", "low", "auto"],
 };
 
 // The 2 no-effort ids left — the picker collapses for them, same treatment
@@ -223,7 +236,7 @@ const FX_NO_EFFORT_MODELS = ["minimax/minimax-m3", "anthropic/claude-haiku-4.5"]
 
 const AGETOR_EFFORT_ORDER = ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"];
 
-test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 31 effort models in agetor order each end in auto, 2 named models are empty", () => {
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 40 effort models in agetor order each end in auto, 2 named models are empty", () => {
   for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
     expect(expected[expected.length - 1]).toBe("auto");
@@ -232,11 +245,11 @@ test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 31 
   for (const id of FX_NO_EFFORT_MODELS) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
   }
-  // The two lists above are exactly the 33 curated fx ids, no more no less.
-  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(31);
+  // The two lists above are exactly the 42 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(40);
   expect(FX_NO_EFFORT_MODELS.length).toBe(2);
-  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(33);
-  expect(AGENT_OPTIONS.fx.models.length).toBe(33);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(42);
+  expect(AGENT_OPTIONS.fx.models.length).toBe(42);
 });
 
 test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
@@ -340,7 +353,7 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the twenty catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the twenty-six catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
@@ -379,12 +392,20 @@ test("exactly the twenty catalog-gated Gateway ids are catalogOnly in AGENT_OPTI
     // 2026-10-14 (docs/plans/add-gemini-4-argon.md) — released 2026-10-13;
     // signed-in presence unverified, same treatment as the rows above.
     "google/gemini-4-argon",
+    // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md) — gated by absence from the
+    // owner's signed-in catalog (fx 0.0.14 re-measure, plan §2b).
+    "openai/gpt-6.1-terra",
+    "moonshotai/kimi-k3.1-pro",
+    "deepseek/deepseek-v4.1-flash-1017",
+    "meta/muse-wonder-1.0",
+    "mistral/mistral-large-4",
+    "reflection/beam",
   ]);
   const actualCatalogOnly = new Set(
     AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
   );
   expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
-  expect(actualCatalogOnly.size).toBe(20);
+  expect(actualCatalogOnly.size).toBe(26);
 
   for (const kind of KINDS) {
     if (kind === "fx") continue;
@@ -394,7 +415,35 @@ test("exactly the twenty catalog-gated Gateway ids are catalogOnly in AGENT_OPTI
   }
 });
 
-test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twenty catalogOnly rows included)", () => {
+test("the three fx rows added 2026-10-26 whose models are in the signed-in catalog are standard (non-catalogOnly)", () => {
+  // docs/plans/add-gpt-6-1-terra.md §2b: gating follows signed-in presence.
+  const byId = new Map(AGENT_OPTIONS.fx.models.map((m) => [m.id, m]));
+  for (const id of ["minimax/minimax-m3.1-flash", "meta/muse-spark-open", "inception/mercury-3"]) {
+    const row = byId.get(id);
+    expect(row, id).toBeDefined();
+    expect(row?.catalogOnly, id).toBeFalsy();
+  }
+});
+
+test("deepseek/deepseek-v4.1-flash-1017 sits directly below the default at index 1 (the default stays first)", () => {
+  const ids = AGENT_OPTIONS.fx.models.map((m) => m.id);
+  expect(ids[0]).toBe(DEFAULT_MODEL.fx);
+  expect(ids[1]).toBe("deepseek/deepseek-v4.1-flash-1017");
+});
+
+test("each fx successor row sits directly above its predecessor (M3.1 Flash above M3, Kimi K3.1 Pro above K3)", () => {
+  const ids = AGENT_OPTIONS.fx.models.map((m) => m.id);
+  const pairs: [string, string][] = [
+    ["minimax/minimax-m3.1-flash", "minimax/minimax-m3"],
+    ["moonshotai/kimi-k3.1-pro", "moonshotai/kimi-k3"],
+  ];
+  for (const [successor, predecessor] of pairs) {
+    expect(ids.indexOf(successor), successor).toBeGreaterThanOrEqual(0);
+    expect(ids.indexOf(successor), successor).toBe(ids.indexOf(predecessor) - 1);
+  }
+});
+
+test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twenty-six catalogOnly rows included)", () => {
   // Narrower restatement of the bidirectional-keys test above, scoped to
   // just the fx picker's own ids — guards specifically against a
   // catalogOnly row landing in AGENT_OPTIONS.fx.models without a paired

@@ -520,6 +520,58 @@ describe("POST /bundle/import/preview", () => {
     expect(plan.canImport).toBe(true);
   });
 
+  // docs/plans/add-gpt-6-1-terra.md §7: codex GPT-5.5 is retired, so a codex
+  // Agent exported before the retirement previews an honest unknown-model
+  // warning (it still imports); GPT-6.1 Terra is a known codex model.
+  test("a codex Agent on retired gpt-5.5 warns unknown-model; one on gpt-6.1-terra doesn't", async () => {
+    const codexAgent = (key: string, name: string, model: string) => ({
+      key,
+      name,
+      harness: { id: "codex", kind: "codex", label: "Codex" },
+      model,
+    });
+    const text = JSON.stringify({
+      format: "agetor-bundle",
+      version: 1,
+      agents: [codexAgent("r", "Retired", "gpt-5.5"), codexAgent("t", "Terra", "gpt-6.1-terra")],
+    });
+    const plan = (await (await call("/bundle/import/preview", { text })).json()) as BundleImportPlan;
+    const byName = (n: string) => plan.agents.find((a) => a.sourceName === n)!.warnings.map((w) => w.code);
+    expect(byName("Retired")).toContain("unknown-model");
+    expect(byName("Terra")).not.toContain("unknown-model");
+    expect(plan.agents.find((a) => a.sourceName === "Retired")!.model).toBe("gpt-5.5");
+    expect(plan.canImport).toBe(true);
+  });
+
+  test("on a logged-out fx harness the new standard rows are known and the new catalog-gated rows warn", async () => {
+    const fxAgent = (key: string, name: string, model: string) => ({
+      key,
+      name,
+      harness: { id: "fx", kind: "fx", label: "fx" },
+      model,
+    });
+    const standard = ["minimax/minimax-m3.1-flash", "meta/muse-spark-open", "inception/mercury-3"];
+    const gated = [
+      "openai/gpt-6.1-terra",
+      "moonshotai/kimi-k3.1-pro",
+      "deepseek/deepseek-v4.1-flash-1017",
+      "meta/muse-wonder-1.0",
+      "mistral/mistral-large-4",
+      "reflection/beam",
+    ];
+    const agents = [...standard, ...gated].map((model, i) => fxAgent(`a${i}`, `Agent ${i}`, model));
+    const text = JSON.stringify({ format: "agetor-bundle", version: 1, agents });
+    const plan = (await (await call("/bundle/import/preview", { text })).json()) as BundleImportPlan;
+    expect(plan.harnesses.find((h) => h.id === "fx")?.warnings.map((w) => w.code)).toContain("harness-logged-out");
+    const codesFor = (model: string) => {
+      const i = [...standard, ...gated].indexOf(model);
+      return plan.agents.find((a) => a.sourceName === `Agent ${i}`)!.warnings.map((w) => w.code);
+    };
+    for (const model of standard) expect(codesFor(model), model).not.toContain("unknown-model");
+    for (const model of gated) expect(codesFor(model), model).toContain("unknown-model");
+    expect(plan.canImport).toBe(true);
+  });
+
   test("unparseable files are 400 with a code", async () => {
     const bad = await call("/bundle/import/preview", { text: "{nope" });
     expect(bad.status).toBe(400);
