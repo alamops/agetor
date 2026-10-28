@@ -641,6 +641,8 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
     handoffRunId: typeof rec.handoffRunId === "string" ? rec.handoffRunId : null,
     handoffFromOtherRun: rec.handoffFromOtherRun === true,
     attemptStartedAt: isFiniteNumber(rec.attemptStartedAt) ? rec.attemptStartedAt : null,
+    stoppedAt: isFiniteNumber(rec.stoppedAt) ? rec.stoppedAt : null,
+    stoppedRunId: typeof rec.stoppedRunId === "string" ? rec.stoppedRunId : null,
   };
 };
 
@@ -790,6 +792,16 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
     capExtensions: Number.isSafeInteger(rec.capExtensions) && (rec.capExtensions as number) >= 0
       ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
       : undefined,
+    // A row written before the marker existed (no key at all): a `cancelled`
+    // run was stopped, so it reads as stopped when it ended. Any other value
+    // (an explicit `null` — every write since stores the key — or junk) is a
+    // cleared marker and stays `null`, so it round-trips and is never
+    // mistaken for a legacy row on the next read.
+    stopRequestedAt: isFiniteNumber(rec.stopRequestedAt)
+      ? rec.stopRequestedAt
+      : !("stopRequestedAt" in rec) && status === "cancelled"
+        ? (endedAt ?? 0)
+        : null,
   };
 };
 

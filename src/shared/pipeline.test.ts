@@ -1325,6 +1325,40 @@ describe("deriveRunStatus", () => {
     const run = makeRun({ status: "running" });
     expect(deriveRunStatus(run)).toBe("done");
   });
+  test("a stopped run stays cancelled while its executions remain active", () => {
+    const run = makeRun({ status: "running", stopRequestedAt: 5, active: [{ stepId: "a", taskId: "t1", seq: 1 }] });
+    expect(deriveRunStatus(run)).toBe("cancelled");
+  });
+
+  test("blocked still wins over the stop marker", () => {
+    const run = makeRun({
+      stopRequestedAt: 5,
+      active: [{ stepId: "a", taskId: "t1", seq: 1 }],
+      blocked: [{ taskId: "t1", stepId: "a", kind: "step-failed", message: "boom" }],
+    });
+    expect(deriveRunStatus(run)).toBe("blocked");
+  });
+
+  test("a cleared marker (null) reads like no marker", () => {
+    const run = makeRun({ stopRequestedAt: null, active: [{ stepId: "a", taskId: "t1", seq: 1 }] });
+    expect(deriveRunStatus(run)).toBe("running");
+  });
+
+  test("every active execution stopped on its own (stoppedAt) reads cancelled; one still going reads running", () => {
+    const record = (taskId: string, seq: number, stoppedAt: number | null) => ({
+      seq, stepId: taskId, taskId, startedAt: 1, endedAt: null, outcome: null, handoff: null, nextStepIds: [], stoppedAt,
+    });
+    const allStopped = makeRun({
+      active: [{ stepId: "t1", taskId: "t1", seq: 1 }, { stepId: "t2", taskId: "t2", seq: 2 }],
+      history: [record("t1", 1, 10), record("t2", 2, 11)],
+    });
+    expect(deriveRunStatus(allStopped)).toBe("cancelled");
+    const oneGoing = makeRun({
+      active: [{ stepId: "t1", taskId: "t1", seq: 1 }, { stepId: "t2", taskId: "t2", seq: 2 }],
+      history: [record("t1", 1, 10), record("t2", 2, null)],
+    });
+    expect(deriveRunStatus(oneGoing)).toBe("running");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2596,13 +2630,12 @@ describe("handoffLookbackOrder", () => {
 });
 
 describe("handoffSourceStatusLine", () => {
-  test("the settling run started after the supplier -> the 'newer run had none' text", () => {
-    expect(handoffSourceStatusLine(100, 200)).toBe(HANDOFF_FROM_NEWER_RUN_STATUS);
+  test("a run opened after the supplier exists -> the 'newer run had none' text", () => {
+    expect(handoffSourceStatusLine(true)).toBe(HANDOFF_FROM_NEWER_RUN_STATUS);
   });
 
-  test("the settling run started at or before the supplier -> the 'another run' text", () => {
-    expect(handoffSourceStatusLine(200, 100)).toBe(HANDOFF_FROM_OTHER_RUN_STATUS);
-    expect(handoffSourceStatusLine(200, 200)).toBe(HANDOFF_FROM_OTHER_RUN_STATUS);
+  test("the supplier is the step's newest run -> the 'another run' text", () => {
+    expect(handoffSourceStatusLine(false)).toBe(HANDOFF_FROM_OTHER_RUN_STATUS);
   });
 
   test("the two texts are distinct and never name the product", () => {

@@ -941,15 +941,25 @@ export function resolveNextSteps(
 
 /**
  * Derive a run's overall status from its live progress: any blocked
- * execution wins outright (`"blocked"`), else any active execution means
- * `"running"`, else the run is either a terminal state it already recorded
- * (`"cancelled"`/`"idle"` are preserved, since nothing here can re-derive
- * them) or `"done"` (nothing active, nothing blocked, and not explicitly
- * idle/cancelled).
+ * execution wins outright (`"blocked"`), else a stopped run
+ * (`stopRequestedAt` set, or every active execution stopped on its own —
+ * `PipelineStepRecord.stoppedAt`) stays `"cancelled"`, else any active
+ * execution means `"running"`, else the run is either a terminal state it
+ * already recorded (`"cancelled"`/`"idle"` are preserved, since nothing here
+ * can re-derive them) or `"done"` (nothing active, nothing blocked, and not
+ * explicitly idle/cancelled).
  */
 export function deriveRunStatus(run: PipelineRunState): PipelineRunStatus {
   if (run.blocked.length > 0) return "blocked";
-  if (run.active.length > 0) return "running";
+  // A stopped run stays stopped: its executions remain in `active` (Retry
+  // re-runs them), but nothing is running on the run's behalf.
+  if (run.stopRequestedAt != null) return "cancelled";
+  if (run.active.length > 0) {
+    const allStopped = run.active.every(
+      (a) => run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq)?.stoppedAt != null,
+    );
+    return allStopped ? "cancelled" : "running";
+  }
   if (run.status === "cancelled" || run.status === "idle") return run.status;
   return "done";
 }
@@ -1243,13 +1253,14 @@ export function composeHandoffReminder(input: {
  *  Bounds the work (and the run-event reads) a settle can trigger. */
 export const HANDOFF_LOOKBACK_MAX_RUNS = 20;
 
-/** Status line appended to the run that SUPPLIED a handoff when the settling
- *  run was newer than it (the step's newest run ended without a handoff, so
+/** Status line appended to the run that SUPPLIED a handoff when a newer run
+ *  of the attempt exists (the step's newest run ended without a handoff, so
  *  the runner reached back to an earlier one). */
 export const HANDOFF_FROM_NEWER_RUN_STATUS = "handoff taken from this run — the step's newer run had none";
 
-/** Status line appended to the run that supplied a handoff when the settling
- *  run was NOT newer than it (a later-settling, older run of the step). */
+/** Status line appended to the run that supplied a handoff when it is the
+ *  step's newest run itself (an older run of the step, which settled later,
+ *  ended without one). */
 export const HANDOFF_FROM_OTHER_RUN_STATUS = "handoff taken from this run — another run of this step ended without one";
 
 /**
@@ -1284,10 +1295,12 @@ export function handoffLookbackOrder(
 }
 
 /** The status line to append to the run that supplied a handoff: the "newer
- *  run" text when the settling run started after the supplier, else the
- *  "another run" text. */
-export function handoffSourceStatusLine(supplierStartedAt: number, settlingStartedAt: number): string {
-  return settlingStartedAt > supplierStartedAt ? HANDOFF_FROM_NEWER_RUN_STATUS : HANDOFF_FROM_OTHER_RUN_STATUS;
+ *  run" text when the step has a run opened after the supplier (its newest
+ *  run, which ended without one), else the "another run" text. The runner
+ *  decides that from the step's runs, never from which run's settle got the
+ *  lock, so the wording doesn't depend on which settle won the race. */
+export function handoffSourceStatusLine(newerRunExists: boolean): string {
+  return newerRunExists ? HANDOFF_FROM_NEWER_RUN_STATUS : HANDOFF_FROM_OTHER_RUN_STATUS;
 }
 
 /**

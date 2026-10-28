@@ -3370,7 +3370,16 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     // Hand the orchestrator a thread id so it persists `codex_session_id` and
     // can route follow-ups through `codex exec resume` — mirrors what a real
     // `thread.started` event would deliver.
-    onSessionId?.(`fake-codex-thread-${taskId}`);    return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });  }
+    onSessionId?.(`fake-codex-thread-${taskId}`);
+    // `kind` is what arms the fake's codex-only resolve delay
+    // (`AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS`).
+    return makeFakeAgent(taskId, prompt, onChunk, {
+      runId,
+      mode: opts.mode ?? defaultModeFor(harness.kind),
+      cwd,
+      kind: harness.kind,
+    });
+  }
   // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
   // worktree) so a codex `auto` run that has to write there escalates its
   // sandbox to full access. Computed here — the single choke point every codex

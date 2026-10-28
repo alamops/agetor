@@ -243,11 +243,15 @@ async function waitForColumn(request: APIRequestContext, backend: E2EBackend, id
 /** Waits until the task's slot holds exactly one live toast and it is the
  *  success one. The files-sent toast (sonner's default 4 s lifetime) would
  *  otherwise outlive the short timeout: only a REPLACEMENT clears it in time.
- *  `toHaveCount` retries, which absorbs the few ms the dismissed toast takes
- *  to flip `data-removed` after its successor mounts. */
+ *  The success toast is awaited FIRST: a count of 1 alone also matches the
+ *  moment before it mounts, when only the files-sent toast is live, and the
+ *  text check then caught both toasts during the few ms the dismissed one
+ *  takes to flip `data-removed`. `toHaveCount` retries through that flip. */
 async function expectSuccessToastReplacedOthers(page: Page, title: string): Promise<void> {
-  await expect(liveToasts(page, title)).toHaveCount(1, { timeout: 2500 });
-  await expect(liveToasts(page, title)).toContainText("Task succeeded");
+  await expect(liveToasts(page, title).filter({ hasText: "Task succeeded" })).toHaveCount(1);
+  // A replacement drops the old toast within a few ms, so 1 s after the
+  // success toast mounts is far inside the files-sent toast's own lifetime.
+  await expect(liveToasts(page, title)).toHaveCount(1, { timeout: 1000 });
 }
 
 /** Live (not being removed) toasts that name the task. */

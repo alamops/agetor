@@ -485,6 +485,38 @@ export function setDisplacedStepRunSettledHandler(
   return prev;
 }
 
+/**
+ * Pipeline-runner-only report that the Stop button was pressed on a HELD step
+ * task (`cancelRun` → `stopHeldTask`). Its turn already succeeded, so no
+ * `cancelled` settle will tell the runner the step was stopped, and the
+ * settle that follows the hold's release would otherwise get the release
+ * grace and paste the handoff reminder into the session the user just
+ * stopped. Same setter pattern as {@link setDisplacedStepRunSettledHandler},
+ * and likewise never a `GlobalEvent`.
+ */
+export type HeldStepStoppedHandler = (taskId: string, runId: string | null) => void;
+let heldStepStoppedHandler: HeldStepStoppedHandler | null = null;
+export function setHeldStepStoppedHandler(fn: HeldStepStoppedHandler | null): HeldStepStoppedHandler | null {
+  const prev = heldStepStoppedHandler;
+  heldStepStoppedHandler = fn;
+  return prev;
+}
+
+/** Report a Stop on a held step task to the pipeline runner (if one is
+ *  installed), with the run current when Stop was pressed — the runner's
+ *  record of the stop runs later, under its per-parent lock, by which time
+ *  Claude may have adopted a continuation that is a NEW turn, not the stopped
+ *  one. Never throws — a runner bug must not break Stop. */
+function reportHeldStepStopped(taskId: string): void {
+  const task = tasks.get(taskId);
+  if (!task?.pipelineParentId) return;
+  try {
+    heldStepStoppedHandler?.(taskId, task.runId ?? null);
+  } catch (err) {
+    console.warn(`[agetor] held step stop report failed for task ${taskId}:`, err);
+  }
+}
+
 /** Report a displaced step run's settle to the pipeline runner (if one is
  *  installed). Never throws — a runner bug must not break run settlement. */
 function reportDisplacedStepRunSettled(
@@ -1313,6 +1345,41 @@ export function activeRunCount(): number {
 const pendingCancelRunIds = new Set<string>();
 
 /**
+ * Tasks the user asked to Stop while a spawn path held their
+ * `startingTaskIds` claim but had not minted its run row yet (codex's
+ * per-model CLI floor probe, `startTask`'s pre-flight): there is no run for
+ * `cancelRun` to record in {@link pendingCancelRunIds}, so
+ * {@link cancelLiveRunOfTask} records the task here. The spawn path converts
+ * it into a run-level pending cancel the moment it mints the run
+ * ({@link adoptPendingTaskCancel}), and `consumePendingCancel` then kills the
+ * turn instead of registering it. Released with the claim
+ * ({@link releaseStartingClaim}), so a claim that ends without a run (a floor
+ * decline, a failed pre-flight) never carries a Stop into a later turn.
+ */
+const pendingCancelTaskIds = new Set<string>();
+
+/**
+ * Hand a Stop recorded against `taskId`'s claim ({@link pendingCancelTaskIds})
+ * to the run the claim just minted. Every spawn path that mints a run under a
+ * `startingTaskIds` claim calls this right after pointing `task.runId` at it,
+ * before it emits the `running` column event, so the pipeline runner already
+ * sees the run as cancelling ({@link isTaskRunCancelling}). Returns whether a
+ * Stop was adopted.
+ */
+function adoptPendingTaskCancel(taskId: string, runId: string): boolean {
+  if (!pendingCancelTaskIds.delete(taskId)) return false;
+  pendingCancelRunIds.add(runId);
+  return true;
+}
+
+/** Release `taskId`'s `startingTaskIds` claim, dropping any Stop recorded
+ *  against the claim that no minted run adopted. */
+function releaseStartingClaim(taskId: string): void {
+  startingTaskIds.delete(taskId);
+  pendingCancelTaskIds.delete(taskId);
+}
+
+/**
  * Consume a Stop recorded in `pendingCancelRunIds` right before a run would
  * register — the one hook every spawn path that inserts a run row BEFORE an
  * `await` must call (`startTaskInner`/`spawnResumedSessionInner` do it
@@ -1491,10 +1558,22 @@ export function isAnyRunOfTaskLive(taskId: string): boolean {
  * cancelled, is not "cancelling" — it's either idle or a genuinely live run.
  */
 export function isTaskRunCancelling(taskId: string): boolean {
-  const task = tasks.get(taskId);
-  if (!task?.runId) return false;
-  const handle = active.get(task.runId);
-  return !!handle?.cancelled;
+  // Every live handle of the task counts, a displaced one included: a task
+  // whose current run is cancelling but whose displaced continuation is still
+  // running genuinely is not stopping.
+  let any = false;
+  for (const handle of active.values()) {
+    if (handle.taskId !== taskId) continue;
+    if (!handle.cancelled) return false;
+    any = true;
+  }
+  if (any) return true;
+  // A Stop that landed before the current run's agent registered
+  // (`pendingCancelRunIds`): its spawn path will kill it instead of
+  // registering it, so the run is going down even though its row still
+  // reads `running` and no handle exists yet.
+  const currentRunId = tasks.get(taskId)?.runId;
+  return currentRunId != null && pendingCancelRunIds.has(currentRunId) && runs.get(currentRunId)?.status === "running";
 }
 
 /**
@@ -1840,6 +1919,7 @@ async function startTaskInner(
     });
   });
   persist();
+  adoptPendingTaskCancel(taskId, runId);
   if (prevColumn !== "running") {
     emitGlobal({ kind: "column", taskId, runId, column: "running", prev: prevColumn, ts: now });
   }
@@ -1970,7 +2050,7 @@ async function startTaskInner(
       console.warn(`[agetor] detached spawn continuation failed for task ${taskId} run ${runId}:`, err);
       return { ok: false as const, message };
     } finally {
-      startingTaskIds.delete(taskId);
+      releaseStartingClaim(taskId);
     }
   })();
 
@@ -1986,7 +2066,7 @@ async function startTaskInner(
   if (!raced.value.ok) return { error: `failed to start agent: ${raced.value.message}` };
   return { runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
   } finally {
-    if (!claimTransferred) startingTaskIds.delete(taskId);
+    if (!claimTransferred) releaseStartingClaim(taskId);
   }
 }
 
@@ -2758,16 +2838,7 @@ function attachDoneHandler(
       // row once it drains, and `recordFxPause` needs to see the queue as it
       // stands right now to decide whether to skip scheduling.
       noteFxRunSettled(task, runId, newStatus);
-      // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
-      // for a task of a different kind).
-      await drainCodexQueue(taskId);
-      await drainCursorQueue(taskId);
-      await drainGeminiQueue(taskId);
-      await drainAntigravityQueue(taskId);
-      // Every steer this run accepted has now been reported (dropped ones
-      // before `done` resolved) or absorbed — forget the bookkeeping.
-      fxPendingSteers.delete(runId);
-      await drainFxQueue(taskId);
+      await drainFollowUpQueues(taskId, runId, wasCancelled);
     })
     .catch(async (err) => {
       const handle = active.get(runId);
@@ -2803,17 +2874,96 @@ function attachDoneHandler(
       // fx-only settlement hook — see the matching call/comment in the
       // `.then` branch above.
       noteFxRunSettled(task, runId, newStatus);
-      // Spawn the next queued codex/cursor/gemini/fx follow-up, if any (no-op
-      // for a task of a different kind).
-      await drainCodexQueue(taskId);
-      await drainCursorQueue(taskId);
-      await drainGeminiQueue(taskId);
-      await drainAntigravityQueue(taskId);
-      // Every steer this run accepted has now been reported (dropped ones
-      // before `done` resolved) or absorbed — forget the bookkeeping.
-      fxPendingSteers.delete(runId);
-      await drainFxQueue(taskId);
+      await drainFollowUpQueues(taskId, runId, wasCancelled);
     });
+}
+
+/**
+ * After a run settles: spawn the next queued codex/cursor/gemini/antigravity/
+ * fx follow-up, if any (each drain is a no-op for a task of a different
+ * kind) — except when the run was stopped on a pipeline step task. Nothing
+ * may run on a stopped step's behalf, and a turn the queue started would read
+ * as the user resuming the step (a run with no `origin`), silently undoing
+ * the Stop the user pressed AFTER typing the message. Those follow-ups go to
+ * the step's backlog tray instead ({@link stashQueuedFollowUpsOfStoppedStep}).
+ * A Stop on an ordinary task keeps draining, as before.
+ */
+async function drainFollowUpQueues(taskId: string, runId: string, wasCancelled: boolean): Promise<void> {
+  if (wasCancelled && isPipelineStepTaskId(taskId)) {
+    // Dropped steers were re-queued in send order before `done` resolved.
+    fxPendingSteers.delete(runId);
+    stashQueuedFollowUpsOfStoppedStep(taskId, runId);
+    return;
+  }
+  await drainCodexQueue(taskId);
+  await drainCursorQueue(taskId);
+  await drainGeminiQueue(taskId);
+  await drainAntigravityQueue(taskId);
+  // Every steer this run accepted has now been reported (dropped ones before
+  // `done` resolved) or absorbed — forget the bookkeeping.
+  fxPendingSteers.delete(runId);
+  await drainFxQueue(taskId);
+}
+
+function isPipelineStepTaskId(taskId: string): boolean {
+  return tasks.get(taskId)?.pipelineParentId != null;
+}
+
+/**
+ * Remove and return every follow-up still queued for `taskId`, oldest first,
+ * as the text to put back in the backlog tray. Only one queue is ever
+ * non-empty for a task (one harness kind). Codex keeps the raw pre-`@`-
+ * expansion text (see `QueuedCodexLine`); the other queues only hold the
+ * text the turn would have executed.
+ */
+function takeQueuedFollowUps(taskId: string): string[] {
+  const lines = [
+    ...(codexTurnQueue.get(taskId) ?? []).map((q) => q.raw),
+    ...(cursorTurnQueue.get(taskId) ?? []),
+    ...(geminiTurnQueue.get(taskId) ?? []),
+    ...(antigravityTurnQueue.get(taskId) ?? []),
+    ...(fxTurnQueue.get(taskId) ?? []).map((q) => q.line),
+  ];
+  codexTurnQueue.delete(taskId);
+  cursorTurnQueue.delete(taskId);
+  geminiTurnQueue.delete(taskId);
+  antigravityTurnQueue.delete(taskId);
+  fxTurnQueue.delete(taskId);
+  return lines;
+}
+
+/**
+ * A pipeline step task's run was stopped: move its queued follow-ups (and the
+ * fx steers the cancelled turn dropped, which `fxSteerDroppedHandler` put back
+ * in the queue in send order) into the step's backlog tray, in send order,
+ * and say so on the stopped run. Their `user` bubbles were written when they
+ * were sent, so nothing is lost; resending one from the tray resumes the
+ * step. A task gone or archived meanwhile keeps nothing
+ * (`restashPasteWithheldText`), and then no line is written.
+ */
+function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void {
+  const lines = takeQueuedFollowUps(taskId);
+  if (lines.length === 0) return;
+  let saved = false;
+  // `backlog.add` PREPENDS, so restash newest first (see `drainCodexQueue`).
+  for (const text of [...lines].reverse()) saved = restashPasteWithheldText(taskId, text) || saved;
+  if (!saved) return;
+  const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
+  const data = `${what} — this pipeline step was stopped; saved to your backlog, resend from the tray to continue it`;
+  runs.appendEvent(runId, "status", data);
+  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/**
+ * The follow-ups queued behind a turn whose Stop landed before its agent
+ * launched (`consumePendingCancel`): `attachDoneHandler` never runs for that
+ * run, so they are dropped — or, on a pipeline step task, kept in its backlog
+ * tray like any other stopped step's queue
+ * ({@link stashQueuedFollowUpsOfStoppedStep}).
+ */
+function dropQueuedFollowUpsAfterPendingCancel(taskId: string, runId: string): void {
+  if (isPipelineStepTaskId(taskId)) stashQueuedFollowUpsOfStoppedStep(taskId, runId);
+  else takeQueuedFollowUps(taskId);
 }
 
 /**
@@ -3400,6 +3550,9 @@ export async function cancelRun(runId: string): Promise<boolean> {
     const taskId = runs.get(runId)?.taskId;
     if (!taskId) return false;
     if (isHeldByBackgroundAgents(taskId)) {
+      // Before the interrupt: the runner queues its record of the stop
+      // ahead of the settle the hold's release triggers.
+      reportHeldStepStopped(taskId);
       await stopHeldTask(taskId, "cancelled by user");
       return true;
     }
@@ -3425,6 +3578,39 @@ export async function cancelRun(runId: string): Promise<boolean> {
   // Stop targets the whole task, not just one run.
   stopActiveHandle(h, "cancelled by user");
   return true;
+}
+
+/**
+ * Stop whatever run of `taskId` is live — the pipeline Stop's counterpart of
+ * {@link isAnyRunOfTaskLive}. Tries the task's current run first (which also
+ * covers a held task and a bounded-spawn pending window, see `cancelRun`);
+ * when that has nothing to stop, the newest run still registered in `active`
+ * (a displaced continuation). Only ONE run is cancelled: `stopActiveHandle`
+ * already flags every handle of the task cancelled, and for claude every run
+ * of a task shares one tmux session, where a second Ctrl+C on an idle prompt
+ * would exit the REPL. When the task only holds a spawn claim (no run minted
+ * yet), the Stop is recorded against the claim instead
+ * ({@link pendingCancelTaskIds}). Returns whether anything was stopped.
+ */
+export async function cancelLiveRunOfTask(taskId: string): Promise<boolean> {
+  const currentRunId = tasks.get(taskId)?.runId;
+  if (currentRunId && (await cancelRun(currentRunId))) return true;
+  let newest: string | null = null;
+  // `active` is a Map: insertion order is registration order, newest last.
+  for (const [runId, handle] of active) {
+    if (handle.taskId === taskId && runId !== currentRunId) newest = runId;
+  }
+  if (newest && (await cancelRun(newest))) return true;
+  // A spawn holds the task's claim but hasn't minted its run yet (codex's
+  // per-model CLI floor probe runs inside the claim, before the insert):
+  // there is no run to cancel, so record the Stop against the claim. The
+  // spawn path hands it to the run it mints (`adoptPendingTaskCancel`).
+  if (startingTaskIds.has(taskId)) {
+    pendingCancelTaskIds.add(taskId);
+    cancelPendingForTask(taskId, "cancelled by user");
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -4056,8 +4242,20 @@ export async function minCliVersionError(
  * live session to reconcile — so a too-old CLI would otherwise hit codex's
  * misleading ChatGPT-account 400 after the run row exists. A refusal returns
  * a `CodexTurnDecline` with nothing written.
+ *
+ * `drained` is the queued follow-up `drainCodexQueue` took off the queue to
+ * spawn this turn. When a pipeline Stop recorded against this call's claim
+ * (during the floor probe) cancels the turn before it launches, the message
+ * never reached the agent, so it goes back to the head of the queue and on
+ * to the step's backlog tray with the rest
+ * ({@link dropQueuedFollowUpsAfterPendingCancel}). A user send passes none.
  */
-async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
+async function spawnCodexTurnNow(
+  task: Task,
+  taskId: string,
+  line: string,
+  drained?: QueuedCodexLine,
+): Promise<string | CodexTurnDecline | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) for the double-mint race this
   // closes: a second overlapping call could otherwise race in behind
@@ -4105,6 +4303,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
+    const stoppedDuringClaim = adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
       emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
@@ -4122,6 +4321,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
       runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
@@ -4153,21 +4353,27 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
       // dropped messages were already recorded as `user` events on their
       // originating run, so dropping the queue here is more honest than
       // re-delivering them later.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       codexTurnQueue.delete(taskId);
       return newRunId;
     }
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
-      // the run is settled `cancelled` and, as in the `!agent` branch above,
-      // attachDoneHandler never runs, so drop the queue the same way.
-      codexTurnQueue.delete(taskId);
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      // A drained follow-up stopped during the claim goes first, in send
+      // order (see this function's doc).
+      if (stoppedDuringClaim && drained && isPipelineStepTaskId(taskId)) {
+        codexTurnQueue.set(taskId, [drained, ...(codexTurnQueue.get(taskId) ?? [])]);
+      }
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    startingTaskIds.delete(taskId);
+    releaseStartingClaim(taskId);
   }
 }
 
@@ -4193,7 +4399,7 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   const next = q.shift();
   if (q.length === 0) codexTurnQueue.delete(taskId);
   if (next === undefined) return;
-  const result = await spawnCodexTurnNow(task, taskId, next.expanded);
+  const result = await spawnCodexTurnNow(task, taskId, next.expanded, next);
   if (result === null || typeof result !== "object") return;
   // Pre-flight 1b refused the queued follow-up (the task's model needs a
   // newer codex CLI — e.g. the model was changed to a GPT-6 row while the
@@ -4313,6 +4519,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
       emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
@@ -4330,6 +4537,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
       runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
@@ -4363,21 +4571,22 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       // failed this run and attachDoneHandler (the only caller of
       // drainCursorQueue) never runs, so drop the queue rather than let queued
       // follow-ups resurface out of order on a later turn.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       cursorTurnQueue.delete(taskId);
       return newRunId;
     }
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
-      // the run is settled `cancelled` and, as in the `!agent` branch above,
-      // attachDoneHandler never runs, so drop the queue the same way.
-      cursorTurnQueue.delete(taskId);
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    startingTaskIds.delete(taskId);
+    releaseStartingClaim(taskId);
   }
 }
 
@@ -4499,6 +4708,7 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
       emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
@@ -4516,6 +4726,7 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
       runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
@@ -4550,21 +4761,22 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
       // drainGeminiQueue) never runs, so drop the queue rather than let queued
       // follow-ups resurface out of order on a later turn. Reachable in
       // practice via GEMINI_PROMPT_ARGV_MAX_BYTES on a long follow-up.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       geminiTurnQueue.delete(taskId);
       return newRunId;
     }
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
-      // the run is settled `cancelled` and, as in the `!agent` branch above,
-      // attachDoneHandler never runs, so drop the queue the same way.
-      geminiTurnQueue.delete(taskId);
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    startingTaskIds.delete(taskId);
+    releaseStartingClaim(taskId);
   }
 }
 
@@ -4677,6 +4889,7 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
       emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
@@ -4694,6 +4907,7 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
     if (!harness) {
       onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
       runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       tasks.update(taskId, { column: "ready", runId: null });
       return newRunId;
     }
@@ -4718,18 +4932,19 @@ async function spawnAntigravityTurnNow(task: Task, taskId: string, line: string)
       },
     });
     if (!agent) {
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       antigravityTurnQueue.delete(taskId);
       return newRunId;
     }
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
-      antigravityTurnQueue.delete(taskId);
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return newRunId;
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
-    startingTaskIds.delete(taskId);
+    releaseStartingClaim(taskId);
   }
 }
 
@@ -4819,9 +5034,12 @@ function insertBySendOrder(q: QueuedFxLine[], item: QueuedFxLine): void {
  * steer dropped). A switch to ANOTHER fx harness counts as a teardown too:
  * the queued turn would resume the old harness's session id under the new
  * harness's account. A Stop is not a teardown: its dropped steers re-queue
- * and drain like any other queued follow-up. Returns whether the text was
- * queued — the driver only tells the user "sending it as the next turn"
- * when it was.
+ * and drain like any other queued follow-up — except on a pipeline step
+ * task, whose queue a Stop moves into the backlog tray
+ * (`drainFollowUpQueues`): the steer is still queued in send order so it
+ * lands there with the rest, but the handler reports `false`. Returns whether
+ * the text will be sent as the next turn — the driver only tells the user
+ * "sending it as the next turn" when it will.
  */
 function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string): (text: string) => boolean {
   return (text) => {
@@ -4840,7 +5058,9 @@ function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string)
     const q = fxTurnQueue.get(taskId) ?? [];
     insertBySendOrder(q, { line: text, seq, echoed: true });
     fxTurnQueue.set(taskId, q);
-    return true;
+    // The driver calls this before `done` resolves, so the handle is still
+    // registered: a stopped step's queue goes to the backlog, not a turn.
+    return !(active.get(runId)?.cancelled === true && task.pipelineParentId != null);
   };
 }
 
@@ -5098,9 +5318,13 @@ async function spawnFxRun(
       geminiSessionId: null,
       fxSessionId: priorSessionId,
       antigravitySessionId: null,
+      // Durable "nobody asked for this turn" marker — the pipeline runner
+      // reads it to tell an automatic resume from a user-started turn.
+      origin: "continueRecovery" in turn && turn.origin === "auto" ? "auto-resume" : null,
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
       emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
@@ -5153,6 +5377,7 @@ async function spawnFxRun(
       const error = `harness "${task.agent}" not found — cannot resume`;
       onChunk("stderr", error);
       runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       tasks.update(taskId, { column: "ready", runId: null });
       return { runId: newRunId, spawned: false, error };
     }
@@ -5183,6 +5408,7 @@ async function spawnFxRun(
       // failed this run and attachDoneHandler (the only caller of
       // drainFxQueue) never runs, so drop the queue rather than let queued
       // follow-ups resurface out of order on a later turn.
+      pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       fxTurnQueue.delete(taskId);
       return {
         runId: newRunId,
@@ -5192,16 +5418,16 @@ async function spawnFxRun(
     }
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
-      // settled `cancelled`; attachDoneHandler never runs, so drop the queue
-      // exactly like the `!agent` branch above.
-      fxTurnQueue.delete(taskId);
+      // the run is settled `cancelled` and attachDoneHandler never runs, so
+      // the queue is dropped here (kept in the backlog on a pipeline step).
+      dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
       return { runId: newRunId, spawned: false, error: "cancelled by user before the agent launched" };
     }
     registerActiveRun(newRunId, taskId, task, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return { runId: newRunId, spawned: true };
   } finally {
-    startingTaskIds.delete(taskId);
+    releaseStartingClaim(taskId);
   }
 }
 
@@ -6022,6 +6248,7 @@ async function sendTurnInExistingSession(
     });
     const prevColumn: ColumnId = task.column;
     tasks.update(taskId, { column: "running", runId: newRunId });
+    adoptPendingTaskCancel(taskId, newRunId);
     if (prevColumn !== "running") {
       emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
     }
@@ -6049,7 +6276,7 @@ async function sendTurnInExistingSession(
     attachDoneHandler(newRunId, taskId, agent);
     return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome, () => stashed);
   } finally {
-    startingTaskIds.delete(taskId);
+    releaseStartingClaim(taskId);
   }
 }
 
@@ -6297,14 +6524,17 @@ function startContinuationRun(
   // decision in the plan: the session genuinely resumed talking, so the
   // card must reflect that live activity).
   tasks.update(taskId, { column: "running", runId: newRunId });
-  if (prevColumn !== "running") {
-    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
-  }
 
   const harness = resolveHarness(task.agent);
   const kind: AgentKind = harness?.kind ?? "claude-code";
   const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+  // The opening status line names the trigger, and the pipeline runner's
+  // `running` column listener reads it to tell a turn typed in the terminal
+  // from an automatic one — so it must exist before that event goes out.
   onChunk("status", CONTINUATION_STATUS_TEXT[trigger] ?? CONTINUATION_STATUS_TEXT.notification);
+  if (prevColumn !== "running") {
+    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+  }
 
   return {
     onChunk,
@@ -6360,7 +6590,7 @@ async function spawnResumedSession(
     // never throws itself, and the continuation catches its own errors), so
     // this catch can't fire for anything the continuation is responsible
     // for — no double-delete risk.
-    startingTaskIds.delete(taskId);
+    releaseStartingClaim(taskId);
     throw err;
   }
 }
@@ -6393,6 +6623,7 @@ async function spawnResumedSessionInner(
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
+  adoptPendingTaskCancel(taskId, newRunId);
   if (prevColumn !== "running") {
     emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
   }
@@ -6411,10 +6642,11 @@ async function spawnResumedSessionInner(
   if (!harness) {
     onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
     runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
     tasks.update(taskId, { column: "ready", runId: null });
     // No continuation was ever created for this run — release the claim
     // `sendClaudeTurn` took before calling in, right here.
-    startingTaskIds.delete(taskId);
+    releaseStartingClaim(taskId);
     return { runId: newRunId };
   }
 
@@ -6483,7 +6715,7 @@ async function spawnResumedSessionInner(
       // e.g. the ownership-guard cleanup above.
       console.warn(`[agetor] detached claude resume spawn failed for task ${taskId} run ${newRunId}:`, err);
     } finally {
-      startingTaskIds.delete(taskId);
+      releaseStartingClaim(taskId);
     }
   })();
 

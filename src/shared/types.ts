@@ -719,6 +719,26 @@ export interface PipelineStepRecord {
    *  while a user's own follow-up message does not touch it. Optional/
    *  additive. */
   attemptStartedAt?: number | null;
+  /** When this one execution was stopped on its own — a Stop pressed on the
+   *  step task's own panel (its run settled `cancelled`, or a held step was
+   *  stopped) rather than the pipeline's Stop (`PipelineRunState.
+   *  stopRequestedAt`). While set, no settle of the execution gets the
+   *  release grace or the automatic handoff reminder, and an automatic
+   *  continuation that starts on it is cancelled. Cleared when a turn the
+   *  user started begins on the step, and on Retry. `null`/absent: not
+   *  stopped. Optional/additive. */
+  stoppedAt?: number | null;
+  /** The step task's run the latest Stop applied to — the run a `cancelled`
+   *  settle recorded, the current run of a held step that was stopped, or the
+   *  current run when the pipeline's own Stop was pressed. Only meaningful
+   *  while the execution or its run is stopped: a `running` column event for
+   *  any OTHER run is a turn that began after the Stop (the runner decides
+   *  whether the user started it); the same run — a parked card pulled back,
+   *  or the stopped run's own row before its kill lands — never resumes the
+   *  step. `null`/absent: unknown (a row written before this field), where
+   *  the runner falls back to "the current run is still running". Cleared
+   *  with `stoppedAt`. Optional/additive. */
+  stoppedRunId?: string | null;
 }
 
 /**
@@ -751,6 +771,15 @@ export interface PipelineRunState {
    *  effectiveStepCap} in `src/shared/pipeline.ts`. Undefined/0 before the
    *  first extension. */
   capExtensions?: number;
+  /** When the user stopped the whole run (`cancelPipelineRun` only — a Stop
+   *  on one step's own panel is {@link PipelineStepRecord.stoppedAt}, and an
+   *  orphaned settle is neither) — the durable "this run is stopped" fact.
+   *  While set, `deriveRunStatus` reads `cancelled` unless something is
+   *  blocked, and no settle may remind, block or launch off it. Cleared by a
+   *  Retry, an Advance, a Restart, and a turn the user starts on one of the
+   *  run's steps. `null` when not stopped; absent only on a row written
+   *  before the marker existed (read as stopped when it is `cancelled`). */
+  stopRequestedAt?: number | null;
 }
 
 /** Field length/count caps enforced by both the server routes and the
@@ -3978,8 +4007,11 @@ export interface Run {
    * `"imported"` = the seed run written when a Claude Code session started
    * outside Agetor was imported (migration 068 does not change the column;
    * the value is a new application of the existing `origin` text).
+   * `"auto-resume"` = an fx continue-recovery run the auto-resume timer
+   * started (`resumeFxRecovery` with `origin: "auto"`) — no user action; a
+   * manual Resume stays `null`. Same column, a new value.
    */
-  origin?: "continuation" | "imported" | null;
+  origin?: "continuation" | "imported" | "auto-resume" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

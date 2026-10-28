@@ -1762,6 +1762,9 @@ test("fx auto-resume: storm → paused (scheduled, attempt 1/3) → timer fires 
       ),
     ).toBe(true);
     expect(secondEvents.some((e) => e.stream === "assistant" && e.data === "recovered answer")).toBe(true);
+    // The timer, not the user, started this run (the pipeline runner relies on it).
+    expect(runs.get(secondRun.id)?.origin).toBe("auto-resume");
+    expect(runs.get(firstRunId)?.origin).toBeNull();
 
     expect(runs.get(secondRun.id)?.status).toBe("succeeded");
     expect(tasks.get(taskId)?.column).toBe("review");
@@ -2012,6 +2015,8 @@ test("fx auto-resume: a manual resumeFxRecovery while a schedule is pending canc
     secondEvents.some((e) => e.stream === "status" && e.data.startsWith("resuming paused fx response in session ")),
   ).toBe(true);
   expect(secondEvents.some((e) => e.stream === "status" && e.data.includes("auto-resuming"))).toBe(false);
+  // A manual Resume is the user's own turn: no automatic origin.
+  expect(runs.get(resumed.runId)?.origin).toBeNull();
 
   await waitForRunSettled(resumed.runId, 3000);
   expect(runs.get(resumed.runId)?.status).toBe("succeeded");

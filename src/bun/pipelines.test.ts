@@ -130,6 +130,7 @@ function makeRunState(pipeline: Pipeline, overrides: Partial<PipelineRunState> =
     stepCount: 1,
     startedAt: Date.now(),
     endedAt: null,
+    stopRequestedAt: null,
     ...overrides,
   };
 }
@@ -644,6 +645,7 @@ test("parsePipelineRunState: minimal valid input fills every default", () => {
     stepCount: 0,
     startedAt: null,
     endedAt: null,
+    stopRequestedAt: null,
   });
 });
 
@@ -656,6 +658,39 @@ test("parsePipelineRunState: an unknown status value falls back to idle", () => 
     const p = parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status }));
     expect(p?.status).toBe(status);
   }
+});
+
+test("parsePipelineRunState: stopRequestedAt round-trips, and a legacy cancelled row reads as stopped when it ended", () => {
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "cancelled", stopRequestedAt: 42 }))?.stopRequestedAt).toBe(42);
+  // Written before the marker existed: a cancelled run was stopped.
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "cancelled", endedAt: 77 }))?.stopRequestedAt).toBe(77);
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "cancelled" }))?.stopRequestedAt).toBe(0);
+  // Not stopped, or a cleared marker: `null` — even on a cancelled row — so
+  // it round-trips and the next read can't mistake it for a legacy row.
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "cancelled", stopRequestedAt: null }))?.stopRequestedAt).toBeNull();
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "running", stopRequestedAt: null }))?.stopRequestedAt).toBeNull();
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "running" }))?.stopRequestedAt).toBeNull();
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "blocked", stopRequestedAt: "junk" }))?.stopRequestedAt).toBeNull();
+});
+
+test("a cleared stopRequestedAt survives a write/read cycle on a cancelled run (never re-read as a legacy stop)", () => {
+  const p = pipelines.insert({ name: "Stop Null", graph: makeGraph() });
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId, { pipelineId: p.id, pipelineRun: makeRunState(p, { status: "cancelled", stopRequestedAt: null }) }));
+  const first = tasks.get(taskId)!.pipelineRun!;
+  expect(first.stopRequestedAt).toBeNull();
+  tasks.setPipelineRun(taskId, first);
+  expect(tasks.get(taskId)!.pipelineRun!.stopRequestedAt).toBeNull();
+});
+
+test("parsePipelineRunState: a history entry's stoppedAt round-trips; junk reads null", () => {
+  const raw = (stoppedAt: unknown) => JSON.stringify({
+    pipelineId: "pipe-1",
+    history: [{ seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: null, stoppedAt }],
+  });
+  expect(parsePipelineRunState(raw(123))?.history[0]?.stoppedAt).toBe(123);
+  expect(parsePipelineRunState(raw(null))?.history[0]?.stoppedAt).toBeNull();
+  expect(parsePipelineRunState(raw("junk"))?.history[0]?.stoppedAt).toBeNull();
 });
 
 test("parsePipelineRunState: junk entries are dropped from active/blocked/history/joins, valid ones kept", () => {
@@ -705,13 +740,13 @@ test("parsePipelineRunState: junk entries are dropped from active/blocked/histor
     seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
     outcome: "succeeded", handoff: { schemaVersion: 1, purpose: "p" }, nextStepIds: ["s2", "s3"],
     responseKind: null, reminder: null,
-    handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null,
+    handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null, stoppedAt: null, stoppedRunId: null,
   } as unknown as PipelineStepRecord);
   expect(parsed?.history[1]).toEqual({
     seq: 3, stepId: "s3", taskId: "t3", startedAt: 300, endedAt: null,
     outcome: null, handoff: null, nextStepIds: [],
     responseKind: null, reminder: null,
-    handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null,
+    handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null, stoppedAt: null, stoppedRunId: null,
   });
 
   expect(Object.keys(parsed?.joins ?? {})).toEqual(["s2"]);
@@ -820,6 +855,29 @@ test("parsePipelineRunState: a history entry's `handoffRunId`/`handoffFromOtherR
   }
 
   // A second pass over the already-sanitized output is a fixed point.
+  const again = parsePipelineRunState(JSON.stringify(parsed));
+  expect(again?.history).toEqual(parsed?.history);
+});
+
+test("parsePipelineRunState: a history entry's `stoppedAt`/`stoppedRunId` round-trip; old rows and junk read null", () => {
+  const raw = {
+    pipelineId: "pipe-1",
+    history: [
+      { seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, stoppedAt: 250, stoppedRunId: "run-stopped" },
+      // saved before the fields existed
+      { seq: 2, stepId: "s2", taskId: "t2", startedAt: 100 },
+      // junk of the wrong type -> null, the entry is NOT dropped
+      { seq: 3, stepId: "s3", taskId: "t3", startedAt: 100, stoppedAt: "later", stoppedRunId: 7 },
+    ],
+  };
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed?.history).toHaveLength(3);
+  expect(parsed?.history[0]?.stoppedAt).toBe(250);
+  expect(parsed?.history[0]?.stoppedRunId).toBe("run-stopped");
+  for (const i of [1, 2]) {
+    expect(parsed?.history[i]?.stoppedAt).toBeNull();
+    expect(parsed?.history[i]?.stoppedRunId).toBeNull();
+  }
   const again = parsePipelineRunState(JSON.stringify(parsed));
   expect(again?.history).toEqual(parsed?.history);
 });
