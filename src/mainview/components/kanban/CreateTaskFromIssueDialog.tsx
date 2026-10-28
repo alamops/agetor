@@ -186,6 +186,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
         effort: launch.effort,
         speed: launch.speed,
         maxMode: launch.maxMode,
+        opencodeServer: launch.opencodeServer,
         // Omit entirely when no profile is selected (finding F2-1) — see
         // NewTaskForm.submit's matching comment.
         ...(launch.agentProfileId ? { agentProfileId: launch.agentProfileId } : {}),

@@ -481,9 +481,15 @@ test("discoveredEffortsFor: returns null when models is null, undefined, or empt
   expect(discoveredEffortsFor([], "openai/gpt-5.2")).toBeNull();
 });
 
-test("discoveredEffortsFor: returns null when the matching entry's efforts is an empty array", () => {
+// Changed for OpenCode (docs/plans/add-opencode-harness.md D-6): an explicit
+// empty array is now returned as-is, since OpenCode's `supportedEfforts`
+// branch reads `[]` ("discovered, no variants") differently from `null` ("no
+// discovery entry"). Merged rows only carry `[]` through rule 8's scoped
+// carve-out, and every other kind's `supportedEfforts` treats `[]` like
+// `null`, so no other picker changes.
+test("discoveredEffortsFor: returns the empty array when the matching entry's efforts is an explicit empty array", () => {
   const models = [{ id: "openai/gpt-5.2", efforts: [] as string[] }];
-  expect(discoveredEffortsFor(models, "openai/gpt-5.2")).toBeNull();
+  expect(discoveredEffortsFor(models, "openai/gpt-5.2")).toEqual([]);
 });
 
 test("discoveredEffortsFor: returns null when the matching entry has no efforts field", () => {
@@ -628,4 +634,97 @@ test("discoveredEffortsFor over the RAW discovered list would wrongly return eff
   // callers must pass `mergeModelOptions`'s own output instead (see the two
   // tests above).
   expect(discoveredEffortsFor(rawDiscovered, "a")).toEqual(["low", "high"]);
+});
+
+// --- rule 8 scoped carve-out: an explicit "no efforts" survives ------------
+
+test("rule 8 (scoped): an entry with efforts: [] attaches efforts: [] to its row", () => {
+  const result = mergeModelOptions({
+    curated: [],
+    discovered: [{ id: "opencode/big-pickle", efforts: [] }, { id: "opencode/other" }],
+    scoped: true,
+    selected: null,
+  });
+  expect(result.find((r) => r.id === "opencode/big-pickle")?.efforts).toEqual([]);
+  // An entry with no efforts field at all still attaches nothing.
+  expect(result.find((r) => r.id === "opencode/other")).not.toHaveProperty("efforts");
+  expect(discoveredEffortsFor(result, "opencode/big-pickle")).toEqual([]);
+  expect(discoveredEffortsFor(result, "opencode/other")).toBeNull();
+});
+
+test("rule 8 (scoped): the rule-6 unlisted row keeps an explicit empty efforts array too", () => {
+  const result = mergeModelOptions({
+    curated: [],
+    discovered: [{ id: "x/y", efforts: [] }],
+    scoped: true,
+    selected: "x/y",
+  });
+  expect(result.filter((r) => r.id === "x/y")).toHaveLength(1);
+  expect(result.find((r) => r.id === "x/y")?.efforts).toEqual([]);
+});
+
+// --- rule 9: pinned rows ----------------------------------------------------
+
+const PINNED: CuratedModel = { id: "opencode-default", label: "OpenCode default", hint: "no -m", pinned: true };
+
+test("rule 9: a pinned row survives a scoped kind whose discovery doesn't list it, and leads", () => {
+  const result = mergeModelOptions({
+    curated: [PINNED],
+    discovered: [{ id: "opencode/big-pickle" }, { id: "anthropic/claude-x", efforts: ["high"] }],
+    scoped: true,
+    selected: null,
+  });
+  expect(result.map((r) => r.id)).toEqual(["opencode-default", "opencode/big-pickle", "anthropic/claude-x"]);
+  expect(result[0]).toEqual({ id: "opencode-default", label: "OpenCode default", hint: "no -m" });
+});
+
+test("rule 9: a pinned row survives empty discovery", () => {
+  for (const scoped of [true, false]) {
+    const result = mergeModelOptions({ curated: [PINNED], discovered: [], scoped, selected: null });
+    expect(result.map((r) => r.id)).toEqual(["opencode-default"]);
+  }
+});
+
+test("rule 9: a pinned row survives a logged-out harness (rule 7 distrust)", () => {
+  const result = mergeModelOptions({
+    curated: [PINNED],
+    discovered: [{ id: "opencode/big-pickle" }],
+    scoped: true,
+    selected: null,
+    loggedIn: false,
+  });
+  expect(result.map((r) => r.id)).toEqual(["opencode-default"]);
+});
+
+test("rule 9: a pinned row is never duplicated when discovery also lists its id, or when it is selected", () => {
+  const result = mergeModelOptions({
+    curated: [PINNED],
+    discovered: [{ id: "opencode/a" }, { id: "opencode-default" }],
+    scoped: true,
+    selected: "opencode-default",
+  });
+  expect(result.filter((r) => r.id === "opencode-default")).toHaveLength(1);
+  expect(result[0]?.id).toBe("opencode-default");
+  expect(result[0]?.label).toBe("OpenCode default");
+  expect(result[0]?.unlisted).toBeUndefined();
+});
+
+test("rule 9: pinned rows lead even when listed after other curated rows, and win over catalogOnly", () => {
+  const curated: CuratedModel[] = [
+    { id: "zai/glm-5.3-flash", label: "GLM 5.3 Flash" },
+    { id: "pinned/gated", label: "Pinned gated", pinned: true, catalogOnly: true },
+  ];
+  const result = mergeModelOptions({ curated, discovered: [], scoped: false, selected: null });
+  expect(result.map((r) => r.id)).toEqual(["pinned/gated", "zai/glm-5.3-flash"]);
+});
+
+test("rule 9: a selected discovered id still renders after the pinned row", () => {
+  const result = mergeModelOptions({
+    curated: [PINNED],
+    discovered: [],
+    scoped: true,
+    selected: "anthropic/claude-x",
+  });
+  expect(result.map((r) => r.id)).toEqual(["opencode-default", "anthropic/claude-x"]);
+  expect(result[1]?.unlisted).toBe(true);
 });

@@ -179,3 +179,65 @@ test("cmdStart: a plain running task keeps the generic cancel/answer/send error"
 
   await expect(cmdStart(["t1"], flags)).rejects.toThrow(/agetor cancel t1.*agetor answer t1.*agetor send t1/);
 });
+
+// ── cmdStart on an imported session (docs/plans/add-opencode-harness.md D-13) ──
+
+const { importedStartRefusal } = await import("./commands/lifecycle.ts");
+
+const importedOpencode = {
+  sessionId: "ses_importedcli0001",
+  harnessId: "opencode",
+  directory: "/tmp/project",
+  importedAt: 1,
+  status: "ready" as const,
+  error: null,
+};
+
+test("importedStartRefusal: names the session's kind, null for a task that wasn't imported", () => {
+  expect(importedStartRefusal(makeTask({ importedOpencode }))).toBe(
+    "imported OpenCode session — send a message to continue",
+  );
+  expect(
+    importedStartRefusal(
+      makeTask({
+        importedClaude: {
+          sessionId: "11111111-2222-3333-4444-555555555555",
+          gitBranch: null,
+          importedAt: 1,
+          configDir: "/tmp/.claude",
+          status: "ready",
+          backfillOffset: 0,
+          error: null,
+        },
+      }),
+    ),
+  ).toBe("imported Claude session — send a message to continue");
+  expect(importedStartRefusal(makeTask({}))).toBeNull();
+  expect(importedStartRefusal(makeTask({ importedClaude: null, importedOpencode: null }))).toBeNull();
+});
+
+test("cmdStart: an imported OpenCode task is refused client-side, whatever its import status — no request sent", async () => {
+  for (const status of ["ready", "importing", "failed"] as const) {
+    const task = makeTask({
+      id: `oc-${status}`,
+      agent: "opencode",
+      column: "review",
+      runId: null,
+      importedOpencode: { ...importedOpencode, status, error: status === "failed" ? "export failed" : null },
+    });
+    const { client, startTaskCalls } = makeClient([task]);
+    currentClient = client;
+    await expect(cmdStart([`oc-${status}`], flags)).rejects.toThrow(
+      "imported OpenCode session — send a message to continue",
+    );
+    expect(startTaskCalls).toEqual([]);
+  }
+});
+
+test("cmdStart: the archived refusal still comes first for an archived imported task", async () => {
+  const task = makeTask({ id: "oc-arch", agent: "opencode", column: "done", archivedAt: 5, importedOpencode });
+  const { client, startTaskCalls } = makeClient([task]);
+  currentClient = client;
+  await expect(cmdStart(["oc-arch"], flags)).rejects.toThrow(/task is archived/);
+  expect(startTaskCalls).toEqual([]);
+});

@@ -168,6 +168,90 @@ function writeFxStubBin(dataDir: string): string {
   return binPath;
 }
 
+/** File a spec writes into a project folder to make the OpenCode stub's
+ *  `session list` answer for that cwd (see `writeOpencodeStubBin`). */
+export const OPENCODE_STUB_SESSIONS_FILE = ".agetor-e2e-opencode-sessions.json";
+
+/** The session ids the OpenCode stub's `session export` answers, each with
+ *  the captured fixture it prints (`src/bun/fixtures/opencode/`). Any other
+ *  id gets OpenCode's own not-found answer (exit 1). */
+export const OPENCODE_STUB_EXPORTS: Readonly<Record<string, string>> = {
+  ses_e8261398affehUf22D8iOXNtgS: "v2-session-export.json",
+  ses_e82612922ffe6VVY5SiPNRsanX: "v2-session-export-child.json",
+};
+
+/**
+ * Stub `opencode` binary for every backend (`AGETOR_OPENCODE_BIN`), the
+ * OpenCode sibling of `writeFxStubBin`. Turns run through the in-process
+ * fake driver (`AGETOR_OPENCODE_DRIVER=fake`), but the start-task pre-flight,
+ * the credential notice, model discovery, the session scan and the session
+ * import still shell out to the binary, so it answers each of them like a
+ * keyless OpenCode 2 install (docs/plans/add-opencode-harness.md §5, item 4):
+ *  - `--version` → `opencode v2.1.4` (so every turn is a 2.x turn);
+ *  - `models [--standalone]` → two Zen ids, one per line;
+ *  - `api --standalone model.list` → the captured `v2-api-model-list.json`;
+ *  - `auth list [--standalone] [--format json]` → `[]` (no credentials, so
+ *    Settings shows the "No OpenCode credentials found" notice);
+ *  - `session list [--standalone] --format json` → the
+ *    {@link OPENCODE_STUB_SESSIONS_FILE} in the cwd when a spec wrote one,
+ *    else `[]` (the scan runs it once per registered project folder);
+ *  - `session export [--standalone] <id>` → the fixture named in
+ *    {@link OPENCODE_STUB_EXPORTS}, else "Session not found" and exit 1;
+ *  - anything else (e.g. `serve`) → exit 0 with no output.
+ * Written into the backend's `dataDir`, like the fx stub, so teardown
+ * removes it.
+ */
+function writeOpencodeStubBin(dataDir: string): string {
+  const binDir = path.join(dataDir, "opencode-stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, "opencode");
+  const fixtures = path.join(REPO_ROOT, "src", "bun", "fixtures", "opencode");
+  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const exportCases = Object.entries(OPENCODE_STUB_EXPORTS).map(
+    ([id, file]) => `      ${id}) cat ${q(path.join(fixtures, file))}; exit 0 ;;`,
+  );
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "opencode v2.1.4"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "models" ]; then',
+      '  echo "opencode/big-pickle"',
+      '  echo "opencode/glm-5.3-flash-free"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "api" ]; then',
+      '  for a in "$@"; do',
+      `    if [ "$a" = "model.list" ]; then cat ${q(path.join(fixtures, "v2-api-model-list.json"))}; exit 0; fi`,
+      "  done",
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "auth" ] && [ "$2" = "list" ]; then',
+      '  echo "[]"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "session" ] && [ "$2" = "list" ]; then',
+      `  if [ -f ./${OPENCODE_STUB_SESSIONS_FILE} ]; then cat ./${OPENCODE_STUB_SESSIONS_FILE}; else echo "[]"; fi`,
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "session" ] && [ "$2" = "export" ]; then',
+      '  for a in "$@"; do id="$a"; done',
+      '  case "$id" in',
+      ...exportCases,
+      '      *) echo "Error: Session not found: $id" >&2; exit 1 ;;',
+      "  esac",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
+
 /**
  * GitHub Copilot CLI stub (docs/plans/github-copilot-harness.md T13). Copilot
  * is seeded ENABLED, so every fresh backend lists a "GitHub Copilot" harness;
@@ -381,6 +465,7 @@ async function provisionBackend(
   const daemonLogFile = path.join(dataDir, "daemon.log");
   // Must happen before the spawn below — see writeFxStubBin's doc comment.
   const fxStubBinPath = writeFxStubBin(dataDir);
+  const opencodeStubBinPath = writeOpencodeStubBin(dataDir);
   const copilotStubBinPath = writeCopilotStubBin(dataDir);
   // Never created: an absolute path that can't resolve pins a seeded-enabled
   // harness to "not installed" independent of the machine's PATH.
@@ -458,6 +543,21 @@ async function provisionBackend(
       AGETOR_CURSOR_DRIVER: "fake",
       AGETOR_CURSOR_BIN: "/bin/echo",
       AGETOR_CURSOR_ARGS: "",
+      // OpenCode turns run through its in-process fake driver (canned v2
+      // NDJSON fed through the real mapper, src/bun/agents.ts D-18); the
+      // stub answers every CLI call the backend still makes itself — see
+      // writeOpencodeStubBin. The built-in row ships disabled; specs that
+      // need it enable it over the API.
+      AGETOR_OPENCODE_DRIVER: "fake",
+      AGETOR_OPENCODE_BIN: opencodeStubBinPath,
+      AGETOR_OPENCODE_ARGS: "",
+      // Auto-enable (src/bun/harness-auto-enable.ts, D-14) would turn on
+      // every built-in harness whose binary answers `--version` — cursor,
+      // fx and opencode through the stubs above, plus a codex or gemini the
+      // machine happens to have installed — the moment a backend boots,
+      // under every spec. Off by default; e2e/harness-auto-enable.spec.ts turns it on
+      // through `backendEnv`.
+      AGETOR_HARNESS_AUTO_ENABLE: "0",
       // GitHub Copilot routes through its in-process fake driver for every
       // worker (`src/bun/copilot-fake.ts`, e2e/copilot-harness.spec.ts). Copilot
       // is seeded enabled, so unlike fx the BIN is opt-in: it points at the

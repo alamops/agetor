@@ -34,6 +34,7 @@ function makeTask(taskId: string, workdir: string): Task {
     effort: "medium",
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     references: [],
     backlog: [],
     plans: [],

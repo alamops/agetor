@@ -225,6 +225,7 @@ export function CloneProjectDialog({ open, onClose, onCloned }: Props) {
                 effort: launch.effort,
                 speed: launch.speed,
                 maxMode: launch.maxMode,
+                opencodeServer: launch.opencodeServer,
               }
           : {}),
       });

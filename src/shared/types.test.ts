@@ -264,7 +264,7 @@ test("EFFORT_OPTIONS: ultra is first, auto ('Model default') is last", () => {
   expect(last?.label).toBe("Model default");
 });
 
-test("no kind outside MODEL_DEFAULT_EFFORT_KINDS (fx, copilot) lists 'auto' in its MODEL_EFFORT_SUPPORT table", () => {
+test("no kind outside MODEL_DEFAULT_EFFORT_KINDS (fx, copilot, opencode) lists 'auto' in its MODEL_EFFORT_SUPPORT table", () => {
   for (const kind of KINDS) {
     if (MODEL_DEFAULT_EFFORT_KINDS.has(kind)) continue;
     for (const ids of Object.values(MODEL_EFFORT_SUPPORT[kind])) {
@@ -307,6 +307,29 @@ test("supportedEfforts('fx', …) lets a discovered models[].efforts set (plus a
 test("retainableEfforts('fx', 'deepseek/deepseek-v4-flash') contains 'auto'", () => {
   const retained = retainableEfforts("fx", "deepseek/deepseek-v4-flash");
   expect(retained.has("auto")).toBe(true);
+});
+
+test("retainableEfforts('opencode', …) keeps the current variant while the model's variants are unknown", () => {
+  // Discovery not loaded / variant probe failed: a stored variant can't be
+  // proven wrong, so the panel's cascade must not PATCH it to `auto`.
+  expect(retainableEfforts("opencode", "p/m", null, "high").has("high")).toBe(true);
+  expect(retainableEfforts("opencode", "p/m", undefined, "thinking").has("thinking")).toBe(true);
+  // `auto` stays retainable too, and nothing is added without a current effort.
+  expect([...retainableEfforts("opencode", "p/m", null)]).toEqual(["auto"]);
+});
+
+test("retainableEfforts('opencode', …) drops a variant once discovery is known, and never keeps one on the sentinel", () => {
+  // Known variants that omit it: the cascade may clear it.
+  expect(retainableEfforts("opencode", "p/m", ["low"], "high").has("high")).toBe(false);
+  // Known-empty variant list: the model takes no variant at all.
+  expect(retainableEfforts("opencode", "p/m", [], "high").size).toBe(0);
+  // The "OpenCode default" sentinel passes no `-m`, so no effort reaches the CLI.
+  expect(retainableEfforts("opencode", "opencode-default", null, "high").size).toBe(0);
+  expect(retainableEfforts("opencode", null, null, "high").size).toBe(0);
+});
+
+test("retainableEfforts ignores `current` for every other kind", () => {
+  expect(retainableEfforts("codex", "gpt-6.1-sol", null, "bogus").has("bogus")).toBe(false);
 });
 
 test("none of the seven previously-curated fx ids survives as an unconditional row — each is either absent or catalogOnly — and the nonexistent google/gemini-3-pro id is gone entirely", () => {
@@ -479,9 +502,25 @@ test("AGENT_OPTIONS.fx.models has unique ids, unique labels, and every id matche
   }
 });
 
-test("CATALOG_SCOPED_KINDS contains exactly fx", () => {
-  expect(CATALOG_SCOPED_KINDS.size).toBe(1);
+test("CATALOG_SCOPED_KINDS contains exactly fx and opencode", () => {
+  // opencode joined (docs/plans/add-opencode-harness.md D-5): `opencode
+  // models` lists only the providers the harness has credentials for.
+  expect(CATALOG_SCOPED_KINDS.size).toBe(2);
   expect(CATALOG_SCOPED_KINDS.has("fx")).toBe(true);
+  expect(CATALOG_SCOPED_KINDS.has("opencode")).toBe(true);
+});
+
+test("MODEL_DEFAULT_EFFORT_KINDS (kinds that keep the 'auto' effort) is exactly fx, copilot and opencode", () => {
+  expect([...MODEL_DEFAULT_EFFORT_KINDS].sort()).toEqual(["copilot", "fx", "opencode"]);
+});
+
+test("opencode tables: sentinel default, auto effort, Code/Plan → auto/plan, sentinel takes no effort", () => {
+  expect(DEFAULT_MODEL.opencode).toBe("opencode-default");
+  expect(DEFAULT_EFFORT.opencode).toBe("auto");
+  expect(CODE_PLAN_MODE.opencode).toEqual({ code: "auto", plan: "plan" });
+  expect(MODEL_EFFORT_SUPPORT.opencode).toEqual({ "opencode-default": [] });
+  expect(supportedModes("opencode", null).map((m) => m.id)).toEqual(["auto", "plan"]);
+  expect(supportedModes("opencode", "anthropic/claude-x").map((m) => m.id)).toEqual(["auto", "plan"]);
 });
 
 /* ── gemini 3.8 Flash + retired gemini-3-pro-preview default (docs/plans/add-gemini-3-8-flash.md §5 TEST-2) ── */
@@ -641,6 +680,8 @@ test("defaultModeFor: auto for every AgentKind except fx, which is yolo (Full ac
   expect(defaultModeFor("cursor")).toBe("auto");
   expect(defaultModeFor("gemini")).toBe("auto");
   expect(defaultModeFor("fx")).toBe("yolo");
+  expect(defaultModeFor("antigravity")).toBe("auto");
+  expect(defaultModeFor("opencode")).toBe("auto");
 });
 
 test("defaultModeFor: always equals AGENT_OPTIONS[kind].modes[0].id — the single source of truth it's defined against", () => {
@@ -781,8 +822,8 @@ test("copilot: MODEL_MIN_CLI_VERSION floors follow the changelog table; models w
   for (const key of Object.keys(MODEL_MIN_CLI_VERSION.copilot ?? {})) expect(ids.has(key)).toBe(true);
 });
 
-test("MODEL_DEFAULT_EFFORT_KINDS is exactly fx + copilot, and copilot (unlike codex) keeps a discovered auto", () => {
-  expect([...MODEL_DEFAULT_EFFORT_KINDS].sort()).toEqual(["copilot", "fx"]);
+test("copilot is in MODEL_DEFAULT_EFFORT_KINDS and (unlike codex) keeps a discovered auto", () => {
+  expect(MODEL_DEFAULT_EFFORT_KINDS.has("copilot")).toBe(true);
   expect(CATALOG_SCOPED_KINDS.has("copilot")).toBe(false);
   expect(supportedEfforts("copilot", "claude-opus-5.5", ["auto", "low"]).map((o) => o.id)).toEqual(["low", "auto"]);
 });

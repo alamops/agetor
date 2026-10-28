@@ -1,0 +1,66 @@
+{
+  "info": {
+    "id": "ses_e8250f036ffepNNRrhaD7yBOwE",
+    "parentID": "ses_e8250f7afffe2QG7oD3Eo1lRTX",
+    "projectID": "global",
+    "agent": "explore",
+    "model": {
+      "id": "deepseek-v4.1-flash-free",
+      "providerID": "opencode",
+      "variant": "default"
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1793109987348,
+      "updated": 1793109988996
+    },
+    "title": "Sleep then list files",
+    "location": {
+      "directory": "/Users/test/project"
+    }
+  },
+  "messages": [
+    {
+      "id": "msg_17daf10160012aN6XM81Njzqxn",
+      "time": {
+        "created": 1793109987358
+      },
+      "text": "You are a subagent spawned by another session.\nRun the shell command sleep 20, then list the files in the current directory.",
+      "type": "user"
+    },
+    {
+      "id": "msg_17daf10200010fCEG3lOnDpEkx",
+      "time": {
+        "created": 1793109987365,
+        "completed": 1793109988996
+      },
+      "type": "assistant",
+      "agent": "explore",
+      "model": {
+        "id": "deepseek-v4.1-flash-free",
+        "providerID": "opencode",
+        "variant": "default"
+      },
+      "content": [],
+      "snapshot": {
+        "start": "18eb80fbbbf9160491c007668d5298f1e86cd40a",
+        "end": "18eb80fbbbf9160491c007668d5298f1e86cd40a",
+        "files": []
+      },
+      "finish": "error",
+      "error": {
+        "type": "aborted",
+        "message": "Step interrupted"
+      }
+    }
+  ]
+}

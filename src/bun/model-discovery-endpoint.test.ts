@@ -235,3 +235,19 @@ test(
     expect(events.filter(isFxChangeEvent).length).toBe(fxEventCountBefore);
   },
 );
+
+test("GET and POST /agent-models carry an opencode key alongside every other kind", async () => {
+  const kinds = ["claude-code", "codex", "cursor", "gemini", "antigravity", "fx", "opencode", "copilot"];
+  const getRes = await authedFetch("/agent-models");
+  expect(getRes.status).toBe(200);
+  const getBody = (await getRes.json()) as Record<string, unknown>;
+  expect(Object.keys(getBody).sort()).toEqual([...kinds].sort());
+  expect(Array.isArray(getBody.opencode)).toBe(true);
+
+  // The single-harness POST form answers with the same kind-keyed map.
+  const postRes = await authedFetch("/agent-models?harness=fx", { method: "POST" });
+  expect(postRes.status).toBe(200);
+  const postBody = (await postRes.json()) as Record<string, unknown>;
+  expect(Object.keys(postBody).sort()).toEqual([...kinds].sort());
+  expect(Array.isArray(postBody.opencode)).toBe(true);
+});

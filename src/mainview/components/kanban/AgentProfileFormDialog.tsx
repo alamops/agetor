@@ -9,7 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { useAgentProfiles } from "@/lib/agent-profiles";
-import { agentProfileTextDirty, duplicateAgentName } from "@/lib/agent-profile-form";
+import { agentProfileTextDirty, duplicateAgentName, trackLaunchInteractions } from "@/lib/agent-profile-form";
 import { cn } from "@/lib/utils";
 import { AGENT_PROFILE_LIMITS } from "../../../shared/agent-profile.ts";
 import type { AgentProfile } from "../../../shared/types.ts";
@@ -47,7 +47,7 @@ export interface AgentProfileFormProps {
   autoFocus?: boolean;
   /** Reports whether the form holds unsaved edits — a text field differing
    *  from what the form opened with, or any harness/mode/model/effort/speed/
-   *  max-mode pick the user made. Fires when the flag flips and reports
+   *  max-mode/OpenCode-server pick the user made. Fires when the flag flips and reports
    *  `false` again when the form unmounts, so a host can keep a plain
    *  "is dirty" ref without tracking mount state itself. */
   onDirtyChange?: (dirty: boolean) => void;
@@ -65,7 +65,7 @@ const PAGE_FOOTER_CLASS = "border-t border-border/60 pt-3";
 
 /**
  * The agent-profile create/edit form — name, harness/mode/model/effort/speed/
- * maxMode (via `<TaskLaunchPickers hideProfilePicker>`), instructions and
+ * maxMode/opencodeServer (via `<TaskLaunchPickers hideProfilePicker>`), instructions and
  * skills. Extracted out of `AgentProfilesSection` (Settings → Agents) so it
  * can be hosted twice without duplicating the save/validation logic: as the
  * Settings modal's agent-editor subpage (`variant="page"`) and inside
@@ -232,6 +232,7 @@ function AgentProfileFormBody({
           effort: editingProfile.effort,
           speed: editingProfile.speed,
           maxMode: editingProfile.maxMode,
+          opencodeServer: editingProfile.opencodeServer,
         }
       : undefined,
   });
@@ -240,36 +241,11 @@ function AgentProfileFormBody({
   // seeds mode/model/effort asynchronously (preferences, harness fetch) and
   // its reset effects call its own internal setters, so a value diff would
   // read an untouched form as dirty. Only a pick made through the setters
-  // `TaskLaunchPickers` calls marks the form touched.
+  // `TaskLaunchPickers` calls marks the form touched
+  // (`trackLaunchInteractions`, which covers the OpenCode server picker too).
   const [launchTouched, setLaunchTouched] = useState(false);
   const trackedLaunch = useMemo<TaskLaunch>(
-    () => ({
-      ...launch,
-      switchAgent: (id) => {
-        if (id !== launch.agent) setLaunchTouched(true);
-        launch.switchAgent(id);
-      },
-      setMode: (mode) => {
-        if (mode !== launch.mode) setLaunchTouched(true);
-        launch.setMode(mode);
-      },
-      setModel: (model) => {
-        if (model !== launch.model) setLaunchTouched(true);
-        launch.setModel(model);
-      },
-      setEffort: (effort) => {
-        if (effort !== launch.effort) setLaunchTouched(true);
-        launch.setEffort(effort);
-      },
-      setSpeed: (speed) => {
-        if (speed !== launch.speed) setLaunchTouched(true);
-        launch.setSpeed(speed);
-      },
-      setMaxMode: (maxMode) => {
-        if (maxMode !== launch.maxMode) setLaunchTouched(true);
-        launch.setMaxMode(maxMode);
-      },
-    }),
+    () => trackLaunchInteractions(launch, () => setLaunchTouched(true)),
     [launch],
   );
 
@@ -311,6 +287,7 @@ function AgentProfileFormBody({
         mode: launch.mode,
         speed: launch.speed,
         maxMode: launch.maxMode,
+        opencodeServer: launch.opencodeServer,
         instructions: form.instructions,
         skills: form.skills,
       };

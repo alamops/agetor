@@ -351,6 +351,53 @@ test("getByIdOrKind synthesises a built-in antigravity row for legacy id without
   }
 });
 
+test("opencode is a built-in row (carve-out setEnabled toggle works like every other built-in; its seeded enabled=0 is pinned in migrate.test.ts)", () => {
+  const h = harnesses.get("opencode")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("opencode");
+  expect(h.label).toBe("OpenCode");
+  expect(h.profileMcpServers).toBe(true);
+  expect(harnesses.setEnabled("opencode", false).enabled).toBe(false);
+  expect(harnesses.get("opencode")!.enabled).toBe(false);
+  expect(() => harnesses.update("opencode", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'opencode' and round-trips an opencode alias", () => {
+  const inserted = harnesses.insert({
+    id: "opencode-2",
+    kind: "opencode",
+    label: "OpenCode (second account)",
+    home: "/tmp/agetor-test-opencode-home",
+    bin: null,
+    env: { OPENCODE_CONFIG: "/tmp/agetor-test-opencode-home/opencode.json" },
+  });
+  expect(inserted.kind).toBe("opencode");
+  const back = harnesses.get("opencode-2")!;
+  expect(back.home).toBe("/tmp/agetor-test-opencode-home");
+  expect(back.env).toEqual({ OPENCODE_CONFIG: "/tmp/agetor-test-opencode-home/opencode.json" });
+  expect(harnesses.list().map((x) => x.id)).toContain("opencode-2");
+});
+
+test("getByIdOrKind synthesises a built-in opencode row for legacy id without a matching row", () => {
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("opencode");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["opencode"]);
+    const synth = harnesses.getByIdOrKind("opencode");
+    expect(synth?.kind).toBe("opencode");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("OpenCode");
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
 test("profileMcpServers defaults to true on seeded built-ins, a fresh alias and a synthesized row", () => {
   expect(harnesses.get("fx")!.profileMcpServers).toBe(true);
   expect(harnesses.get("claude-code")!.profileMcpServers).toBe(true);
@@ -445,7 +492,7 @@ function seedTaskAndRun(taskId: string, runId: string) {
   tasks.insert({
     id: taskId, title: "t", prompt: "p", agent: "copilot", workdir: "/tmp", isolation: "none",
     taskType: "task", branch: null, branchSource: "created", worktreePath: null, baseRef: null,
-    prUrl: null, mode: null, model: null, effort: null, speed: "off", maxMode: false,
+    prUrl: null, mode: null, model: null, effort: null, speed: "off", opencodeServer: "shared", maxMode: false,
     references: [], backlog: [], plans: [], draft: null, column: "ready", runId: null,
     createdAt: 1, updatedAt: 1, hasOpenableRun: false, pendingInteractionCount: 0,
     openTerminalCount: 0, archivedAt: null,

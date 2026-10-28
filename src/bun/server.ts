@@ -33,6 +33,8 @@ import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, typ
 import { notificationTargetTaskId } from "./notification-hooks.ts";
 import { activeRunCount, appendRunStatusLine, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
+import { scanOpencodeSessions } from "./opencode-session-scan.ts";
+import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
 import { claudeConfigDirsToScan, claudeSessionLivenessCheckedAt, refreshClaudeSessionLiveness, scanClaudeSessions } from "./claude-session-scan.ts";
 import { claudeSessionScanOptions, flushPendingClaudeSessionsNotice } from "./claude-session-launch.ts";
 import {
@@ -46,6 +48,11 @@ import {
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import {
+  applyHarnessAutoEnable,
+  flushPendingHarnessAutoEnableNotice,
+  setHarnessAutoEnableBroadcaster,
+} from "./harness-auto-enable.ts";
 import { accountUsageDays } from "./account-usage.ts";
 import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
 import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
@@ -227,6 +234,8 @@ import type {
   PipelineInput,
   PipelineRunState,
   RunEvent,
+  OpencodeServerMode,
+  OpencodeSessionList,
   Speed,
   Task,
   TaskEventsReplayMeta,
@@ -234,7 +243,7 @@ import type {
   TaskTeardownPreview,
   TaskReference,
 } from "../shared/types.ts";
-import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
+import { armForceQuit, broadcastAppEvent, hasAppEventListeners, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -261,6 +270,7 @@ import { pickedPaths, singlePickedPath } from "./native-pick.ts";
 import type { AgentProfilePatch } from "./db.ts";
 import { duplicateAgentName } from "../shared/duplicate-name.ts";
 import { resolveSpeedInput } from "../shared/speed.ts";
+import { parseOpencodeServerInput } from "../shared/opencode.ts";
 import { duplicateAgentProfile } from "./duplicate-agent-profile.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -462,12 +472,17 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
  * from `startTask`'s live-profile refresh and the detach route below),
  * never through this generic PATCH. See the bound-agent 409 guard in
  * `PATCH /tasks/:id` for the other half of that lock: even a listed field
- * here (`agent`/`mode`/`model`/`effort`/`speed`/`maxMode`) is refused once a
+ * here (`agent`/`mode`/`model`/`effort`/`speed`/`maxMode`/`opencodeServer`) is refused once a
  * task is bound to a profile, until it's detached.
  *
  * `fast` is the legacy boolean alias of `speed` (D13): `filterPatch` maps it
  * through `resolveSpeedInput` (`true` → `"fast"`, `false` → `"off"`; an
  * explicit `speed` wins) and never forwards `fast` itself to the db layer.
+ *
+ * `opencodeServer` (OpenCode's per-task server option, D-4) is validated by
+ * `filterPatch` through `parseOpencodeServerInput` — anything but `shared`/
+ * `standalone` is a 400. A non-OpenCode task stores it and ignores it, like
+ * `maxMode`. It is one of the profile-bound fields below.
  *
  * `checkoutBranch` (the last-seen worktree checkout, migration 063) is
  * server-managed the same way: only `tasks.setCheckoutBranch` writes it, at
@@ -476,6 +491,7 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
  */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
   "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "speed", "fast", "maxMode", "taskType",
+  "opencodeServer",
 ]);
 
 /** The 8 reaction contents GitHub's API accepts — validated here before the
@@ -492,6 +508,12 @@ function filterPatch(raw: unknown): { patch: Partial<Task> } | { error: string }
     if (k === "speed" || k === "fast") continue;
     if (k === "maxMode") {
       patch.maxMode = v === true;
+      continue;
+    }
+    if (k === "opencodeServer") {
+      const server = parseOpencodeServerInput(v);
+      if (typeof server === "object") return { error: server.error };
+      if (server !== undefined) patch.opencodeServer = server;
       continue;
     }
     if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;
@@ -1006,12 +1028,12 @@ function parsePipelineMaxSteps(body: Record<string, unknown>): { value: number |
  * (docs/plans/clone-repository-launch-pickers.md D3) BEFORE `cloneRepo` runs,
  * so a bad profile/harness id 400s with nothing cloned to disk instead of
  * cloning and then reporting `eli5Error`. Mirrors `createTask`'s own
- * precedence: a resolvable `agentProfileId` wins and the six manual fields
- * are not forwarded to it.
+ * precedence: a resolvable `agentProfileId` wins and the seven manual fields
+ * (`opencodeServer` included) are not forwarded to it.
  */
 function validateCloneLaunch(
   body: Record<string, unknown>,
-): { agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean } | { error: string } {
+): { agentProfileId?: string; agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean; opencodeServer?: OpencodeServerMode } | { error: string } {
   let agentProfileId: string | undefined;
   if (body.agentProfileId !== undefined && body.agentProfileId !== null) {
     if (typeof body.agentProfileId !== "string") {
@@ -1050,6 +1072,8 @@ function validateCloneLaunch(
   if (body.maxMode !== undefined && typeof body.maxMode !== "boolean") {
     return { error: "maxMode must be a boolean" };
   }
+  const opencodeServer = parseOpencodeServerInput(body.opencodeServer);
+  if (typeof opencodeServer === "object") return { error: opencodeServer.error };
 
   if (agentProfileId) return { agentProfileId };
 
@@ -1057,13 +1081,14 @@ function validateCloneLaunch(
     return { error: `unknown harness "${body.agent}"` };
   }
 
-  const out: { agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean } = {};
+  const out: { agent?: string; mode?: string; model?: string; effort?: string | null; speed?: Speed; maxMode?: boolean; opencodeServer?: OpencodeServerMode } = {};
   if (typeof body.agent === "string") out.agent = body.agent;
   if (typeof body.mode === "string") out.mode = body.mode;
   if (typeof body.model === "string") out.model = body.model;
   if (body.effort !== undefined) out.effort = body.effort as string | null;
   if (speedInput.speed !== undefined) out.speed = speedInput.speed;
   if (typeof body.maxMode === "boolean") out.maxMode = body.maxMode;
+  if (opencodeServer !== undefined) out.opencodeServer = opencodeServer;
   return out;
 }
 
@@ -1171,6 +1196,14 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       console.error("[agetor] removeTaskNotification failed:", err);
     }
   };
+  // Live delivery of the D-14 "harnesses turned on" notice to clients that
+  // are already connected. Reports no delivery when nobody is listening, so
+  // the ids stay pending for the next `/app/events` subscriber.
+  setHarnessAutoEnableBroadcaster((e) => {
+    if (!hasAppEventListeners()) return false;
+    broadcastAppEvent(e);
+    return true;
+  });
   const blockRouteEnabled = process.env.AGETOR_TEST_BLOCK_ROUTE === "1";
   const blockEventLoopRoute = authed(async (req: Request) => {
     const body = (await req.json().catch(() => ({}))) as { ms?: unknown };
@@ -1334,6 +1367,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             speed?: unknown;
             fast?: unknown;
             maxMode?: unknown;
+            opencodeServer?: unknown;
             agentProfileId?: unknown;
             cloneId?: unknown;
           };
@@ -3903,6 +3937,15 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       "/harnesses": {
         GET: authed(async (req) => {
           const statuses = await checkAllHarnesses();
+          // D-14: turn on a disabled built-in harness the first time its CLI
+          // shows up installed, BEFORE the response is built, so the
+          // `harnesses.list()` read below already shows the flipped rows.
+          // Synchronous db writes; off under `bun test` unless the seam is on.
+          try {
+            applyHarnessAutoEnable(statuses);
+          } catch (err) {
+            console.error("[agetor] harness auto-enable failed:", err);
+          }
           // Fire-and-forget: feeds the transition detector (docs/plans/
           // fx-model-catalog-refresh.md §3 D4) so an availability/login
           // flip noticed by this poll (fx login, an install, a version
@@ -3931,10 +3974,13 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (
             body.kind !== "claude-code" && body.kind !== "codex" &&
             body.kind !== "cursor" && body.kind !== "gemini" && body.kind !== "fx" &&
-            body.kind !== "antigravity" && body.kind !== "copilot"
+            body.kind !== "antigravity" && body.kind !== "opencode" && body.kind !== "copilot"
           ) {
             return json(
-              { error: "kind must be 'claude-code', 'codex', 'cursor', 'gemini', 'fx', 'antigravity', or 'copilot'" },
+              {
+                error:
+                  "kind must be 'claude-code', 'codex', 'cursor', 'gemini', 'fx', 'antigravity', 'opencode', or 'copilot'",
+              },
               { status: 400, headers: corsHeaders(req) },
             );
           }
@@ -4262,6 +4308,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if ("error" in speedInput) {
             return json({ error: speedInput.error }, { status: 400, headers: corsHeaders(req) });
           }
+          // OpenCode's server option (D-4); omitted ⇒ "shared" (db default).
+          const opencodeServer = parseOpencodeServerInput(body.opencodeServer);
+          if (typeof opencodeServer === "object") {
+            return json({ error: opencodeServer.error }, { status: 400, headers: corsHeaders(req) });
+          }
 
           try {
             const created = agentProfiles.insert({
@@ -4272,6 +4323,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               mode: agentProfileOptionalField(body.mode),
               speed: speedInput.speed ?? "off",
               maxMode: body.maxMode === true,
+              ...(opencodeServer !== undefined ? { opencodeServer } : {}),
               instructions,
               skills,
             });
@@ -4305,6 +4357,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // neither present keeps the source's tier.
           const speedInput = resolveSpeedInput(body);
           if ("error" in speedInput) return bad(speedInput.error);
+          // Omitted keeps the source's OpenCode server option (D-4).
+          const opencodeServer = parseOpencodeServerInput(body.opencodeServer);
+          if (typeof opencodeServer === "object") return bad(opencodeServer.error);
 
           const name =
             "name" in body
@@ -4365,6 +4420,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
                 mode: "mode" in body ? agentProfileOptionalField(body.mode) : source.mode,
                 speed: speedInput.speed ?? source.speed,
                 maxMode: "maxMode" in body ? body.maxMode === true : source.maxMode,
+                opencodeServer: opencodeServer ?? source.opencodeServer,
                 instructions,
                 skills,
               },
@@ -4443,6 +4499,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           if (speedInput.speed !== undefined) patch.speed = speedInput.speed;
           if ("maxMode" in body) patch.maxMode = body.maxMode === true;
+          const opencodeServer = parseOpencodeServerInput(body.opencodeServer);
+          if (typeof opencodeServer === "object") {
+            return json({ error: opencodeServer.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (opencodeServer !== undefined) patch.opencodeServer = opencodeServer;
           if ("instructions" in body) {
             const instructions = typeof body.instructions === "string" ? body.instructions : "";
             const instructionsError = agentProfileInstructionsError(instructions);
@@ -4905,6 +4966,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               "gemini": getDiscoveredModels("gemini"),
               "antigravity": getDiscoveredModels("antigravity"),
               "fx": getDiscoveredModels("fx"),
+              "opencode": getDiscoveredModels("opencode"),
               "copilot": getDiscoveredModels("copilot"),
             },
             { headers: corsHeaders(req) },
@@ -4941,6 +5003,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               "gemini": getDiscoveredModels("gemini"),
               "antigravity": getDiscoveredModels("antigravity"),
               "fx": getDiscoveredModels("fx"),
+              "opencode": getDiscoveredModels("opencode"),
               "copilot": getDiscoveredModels("copilot"),
             },
             { headers: corsHeaders(req) },
@@ -5063,6 +5126,12 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if ("error" in speedInput) {
             return json({ error: speedInput.error }, { status: 400, headers: corsHeaders(req) });
           }
+          // OpenCode's per-task server option (D-4). A selected profile's own
+          // value wins inside `createTask`, like the other launch fields.
+          const opencodeServer = parseOpencodeServerInput((body as { opencodeServer?: unknown }).opencodeServer);
+          if (typeof opencodeServer === "object") {
+            return json({ error: opencodeServer.error }, { status: 400, headers: corsHeaders(req) });
+          }
           // Additive agent-profile binding (docs/plans/agent-profiles.md):
           // `createTask` resolves it and overrides agent/model/effort/mode/
           // speed/maxMode from the profile — this route only checks the
@@ -5117,10 +5186,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
                   return [{ path: p, isDirectory: Boolean(r.isDirectory) }];
                 })
             : [];
-          const { fast: _legacyFast, speed: _rawSpeed, ...rest } = body;
+          const { fast: _legacyFast, speed: _rawSpeed, opencodeServer: _rawOpencodeServer, ...rest } = body;
           const result = await createTask({
             ...rest,
             ...(speedInput.speed !== undefined ? { speed: speedInput.speed } : {}),
+            ...(opencodeServer !== undefined ? { opencodeServer } : {}),
             title: body.title,
             prompt: body.prompt,
             references,
@@ -5201,11 +5271,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             }
           }
           // A task bound to an agent profile (docs/plans/agent-profiles.md
-          // D5) has its agent/mode/model/effort/speed/maxMode locked — the
-          // profile owns those six fields, and the only sanctioned way to
+          // D5) has its agent/mode/model/effort/speed/maxMode/opencodeServer
+          // locked — the profile owns those seven fields, and the only sanctioned way to
           // change them is to detach first (`DELETE /tasks/:id/agent-profile`)
           // or edit the profile itself. Refuse the whole PATCH with 409 if it
-          // touches any of the six with a value that actually differs from
+          // touches any of the seven with a value that actually differs from
           // what's already on the row — a same-value resend (e.g. a stale
           // form re-submitting unchanged fields) is allowed through rather
           // than punishing a no-op.
@@ -5213,7 +5283,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             // `speed` is already resolved from a `speed` or legacy `fast`
             // body field by `filterPatch`, so a tier change through either
             // spelling is compared against the row here.
-            const boundFields = ["agent", "mode", "model", "effort", "speed", "maxMode"] as const;
+            const boundFields = ["agent", "mode", "model", "effort", "speed", "maxMode", "opencodeServer"] as const;
             const touchesBoundField = boundFields.some(
               (field) => field in patch && patch[field] !== before[field],
             );
@@ -5398,6 +5468,19 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
         }),
       },
 
+      // OpenCode counterpart of the Claude retry route above (D-13): same
+      // wait-for-settle contract and the same status codes.
+      "/tasks/:id/opencode-session/retry": {
+        POST: authed(async (req) => {
+          // An export of a long session can outlast the idle timeout.
+          server.timeout(req, 0);
+          const result = await retryOpencodeImport(req.params.id);
+          return "error" in result
+            ? json(result, { status: tasks.get(req.params.id) ? 400 : 404, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/claude-sessions": {
         GET: authed(async (req) => {
           // A first scan reads every transcript Agetor does not own; it can
@@ -5432,6 +5515,49 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await importClaudeSessions(body.ids, claudeSessionScanOptions());
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // OpenCode sessions started outside Agetor (D-13): `session list` per
+      // enabled OpenCode harness × registered project, cached 10 s by the
+      // scanner; `recheck` bypasses that cache.
+      "/opencode-sessions": {
+        GET: authed(async (req) => {
+          // One CLI call per harness × project (plus a busy-check export per
+          // unfinished session) can outlast the idle timeout.
+          server.timeout(req, 0);
+          const body: OpencodeSessionList = { sessions: await scanOpencodeSessions() };
+          return json(body, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/opencode-sessions/recheck": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const body: OpencodeSessionList = { sessions: await scanOpencodeSessions({ force: true }) };
+          return json(body, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/opencode-sessions/import": {
+        POST: authed(async (req) => {
+          // One export per session plus the event replay can outlast the
+          // idle timeout.
+          server.timeout(req, 0);
+          const body = await req.json().catch(() => null) as { ids?: unknown; harnessId?: unknown } | null;
+          if (!body || !Array.isArray(body.ids) || body.ids.some((id) => typeof id !== "string")) {
+            return json({ error: "ids must be a string array" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // An unknown or non-OpenCode `harnessId` is reported per id by
+          // `importOpencodeSessions` itself; only the wire shape is checked here.
+          if (body.harnessId !== undefined && (typeof body.harnessId !== "string" || !body.harnessId)) {
+            return json({ error: "harnessId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await importOpencodeSessions(
+            body.ids as string[],
+            typeof body.harnessId === "string" ? { harnessId: body.harnessId } : undefined,
+          );
           return json(result, { headers: corsHeaders(req) });
         }),
       },
@@ -7581,6 +7707,14 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             } catch {
               // Never let a db hiccup stop `start` before the abort handler below
               // is registered — see `send` above for why that leaks.
+            }
+            // And the "harnesses turned on" notice (D-14): rows auto-enabled
+            // while no client was connected (boot, or a poll before the
+            // webview attached) are announced to the next one.
+            try {
+              flushPendingHarnessAutoEnableNotice(send);
+            } catch {
+              // Same reason as above.
             }
             req.signal.addEventListener("abort", () => {
               clearInterval(ping);

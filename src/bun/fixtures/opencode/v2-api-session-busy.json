@@ -1,0 +1,4 @@
+{
+  "running": {"id": "ses_e825667ddffewH5PdYtT5d1idb", "outcome": null, "time": {"created": 1793109629026, "updated": 1793109631260}},
+  "afterCtrlC": {"id": "ses_e825667ddffewH5PdYtT5d1idb", "outcome": "interrupted", "time": {"created": 1793109629026, "updated": 1793109645461, "idle": 1793109645464}}
+}

@@ -49,6 +49,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     effort: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     references: [],
     backlog: [],
     plans: [],

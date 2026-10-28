@@ -68,7 +68,7 @@ Commands:
                       previews; --harness-map / --name / --enable-harnesses;
                       asks before importing in a terminal (--yes skips)
   clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)
-  sessions [ls|import]  list or import Claude Code sessions started outside Agetor
+  sessions [ls|import]  list or import Claude Code or OpenCode sessions started outside Agetor
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
   compact [--yes]     VACUUM the database to reclaim disk (blocks the core while it runs)

@@ -1,5 +1,5 @@
-import { test, expect } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { test, expect, beforeAll, afterAll } from "bun:test";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -19,6 +19,21 @@ import {
 } from "./agent-discovery.ts";
 import { plantFakeCodexAppServer } from "./test-codex-app-server.ts";
 import { AGENT_OPTIONS } from "../shared/types.ts";
+
+// Full sweeps (`refreshDiscoveredModels`) also run `discoverOpencode()` for the
+// built-in opencode probe. Point it at a binary that doesn't exist for this
+// file, so a sweep never spawns whatever real `opencode` the machine has —
+// the opencode tests below plant their own stub and override this per test.
+const MISSING_OPENCODE_BIN = "/nonexistent/agetor-test-opencode";
+let prevOpencodeBin: string | undefined;
+beforeAll(() => {
+  prevOpencodeBin = process.env.AGETOR_OPENCODE_BIN;
+  process.env.AGETOR_OPENCODE_BIN = MISSING_OPENCODE_BIN;
+});
+afterAll(() => {
+  if (prevOpencodeBin === undefined) delete process.env.AGETOR_OPENCODE_BIN;
+  else process.env.AGETOR_OPENCODE_BIN = prevOpencodeBin;
+});
 
 /* ── codex: parseCodexModelList (pure) ───────────────────────────────────
  * `discoverCodex` speaks `codex app-server`'s JSON-RPC `model/list` and hands
@@ -1061,4 +1076,368 @@ test("discoverCodex (via refreshKindModels): a grandchild that keeps holding the
   });
   expect(getDiscoveredModels("codex")).toEqual([{ id: "grandchild-model", label: "GC" }]);
   expect(Date.now() - start).toBeLessThan(1_500);
+});
+
+/* ── opencode: parsers (pure, over the captured CLI fixtures) ─────────────
+ * Fixtures: src/bun/fixtures/opencode/ (README.md), captured from live v2.1.3
+ * and v1.19.4 runs. Spike doc §2e / amendment A3: v2 reads variants from
+ * `api --standalone model.list`, v1 from `models --verbose`. */
+
+const OPENCODE_FIXTURES = path.join(import.meta.dir, "fixtures", "opencode");
+const opencodeFixture = (name: string): string => readFileSync(path.join(OPENCODE_FIXTURES, name), "utf8");
+
+test("parseOpencodeModels: one provider/model id per line (v2 and v1 fixtures)", () => {
+  const v2 = __testing.parseOpencodeModels(opencodeFixture("v2-models.txt"));
+  expect(v2.map((m) => m.id)).toEqual([
+    "opencode/beam-free",
+    "opencode/big-pickle",
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/flint-40b-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/mimo-v2.6-flash-free",
+    "opencode/nemotron-3-ultra-free",
+    "opencode/nemotron-3.5-lightning-free",
+    "opencode/nemotron-3.5-super-vl-free",
+  ]);
+  // Ids only — `models` carries no label or variant data.
+  expect(v2[0]).toEqual({ id: "opencode/beam-free" });
+  expect(__testing.parseOpencodeModels(opencodeFixture("v1-models.txt"))).toHaveLength(10);
+});
+
+test("parseOpencodeModels: skips blanks, prose, JSON lines and ANSI noise; dedupes", () => {
+  const out = __testing.parseOpencodeModels(
+    "\n\x1b[33mwarning: something\x1b[0m\n{\n  \"id\": \"x\"\n}\nopencode/a\nopencode/a\n  anthropic/claude-x  \n",
+  );
+  expect(out).toEqual([{ id: "opencode/a" }, { id: "anthropic/claude-x" }]);
+});
+
+test("parseOpencodeApiModelList: v2 model.list → providerID/id, name, variant ids in order; [] for none", () => {
+  const out = __testing.parseOpencodeApiModelList(opencodeFixture("v2-api-model-list.json"));
+  expect(out).toHaveLength(9);
+  const byId = new Map(out.map((m) => [m.id, m]));
+  expect(byId.get("opencode/big-pickle")).toEqual({ id: "opencode/big-pickle", label: "Big Pickle", efforts: [] });
+  expect(byId.get("opencode/deepseek-v4.1-flash-free")).toEqual({
+    id: "opencode/deepseek-v4.1-flash-free",
+    label: "DeepSeek V4.1 Flash Free",
+    efforts: ["low", "high", "max"],
+  });
+  expect(byId.get("opencode/nemotron-3.5-super-vl-free")?.efforts).toEqual([
+    "none", "minimal", "low", "medium", "high", "xhigh",
+  ]);
+});
+
+test("parseOpencodeApiModelList: malformed answers degrade to []; bad entries and enabled:false are skipped", () => {
+  expect(__testing.parseOpencodeApiModelList("not json")).toEqual([]);
+  expect(__testing.parseOpencodeApiModelList("{}")).toEqual([]);
+  expect(__testing.parseOpencodeApiModelList(JSON.stringify({ data: "x" }))).toEqual([]);
+  const out = __testing.parseOpencodeApiModelList(JSON.stringify({
+    data: [
+      null,
+      { providerID: "p", id: "" },
+      { id: "no-provider" },
+      { providerID: "p", id: "off", enabled: false },
+      { providerID: "p", id: "m", variants: [{ id: "high" }, { id: "high" }, { id: 3 }, "low", { id: " " }] },
+      { providerID: "p", id: "m", name: "Dup" },
+      { providerID: "p", id: "nv" },
+    ],
+  }));
+  expect(out).toEqual([
+    { id: "p/m", efforts: ["high"] },
+    { id: "p/nv", efforts: [] },
+  ]);
+});
+
+test("parseOpencodeVerboseModels: v1 models --verbose → id + name + Object.keys(variants); {} → []", () => {
+  expect(__testing.parseOpencodeVerboseModels(opencodeFixture("v1-models-verbose.txt"))).toEqual([
+    { id: "opencode/beam-free", label: "Beam Free", efforts: ["low", "medium", "high", "xhigh", "max"] },
+    { id: "opencode/big-pickle", label: "Big Pickle", efforts: [] },
+  ]);
+});
+
+test("parseOpencodeVerboseModels: an id with no block, or an unparsable block, keeps no efforts key (unknown)", () => {
+  const out = __testing.parseOpencodeVerboseModels(
+    ["p/no-block", "p/bad-block", "{", "  not json", "}", "p/no-variants-key", "{", '  "name": "N"', "}"].join("\n"),
+  );
+  expect(out).toEqual([
+    { id: "p/no-block" },
+    { id: "p/bad-block" },
+    { id: "p/no-variants-key", label: "N", efforts: [] },
+  ]);
+});
+
+/* ── opencode: discoverOpencode end-to-end against planted stub binaries ── */
+
+/**
+ * A stub `opencode` that answers by argv (`$*`): each case key is the exact
+ * argument string, each value a shell body. Unknown argv exits 1 (both real
+ * lines reject an unknown flag). Every invocation's argv is appended to the
+ * returned `log` file, and `env` lines prove what env the probe ran under.
+ */
+function plantFakeOpencode(cases: Record<string, string>): { bin: string; log: string; dir: string } {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-opencode-bin-"));
+  const bin = path.join(dir, "opencode");
+  const log = path.join(dir, "argv.log");
+  const branches = Object.entries(cases)
+    .map(([argv, body]) => `  "${argv}")\n${body}\n    ;;`)
+    .join("\n");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\necho "$*" >> '${log}'\ncase "$*" in\n${branches}\n  *) exit 1 ;;\nesac\n`,
+    { mode: 0o755 },
+  );
+  writeFileSync(log, "");
+  return { bin, log, dir };
+}
+
+const catFixture = (name: string): string => `    cat '${path.join(OPENCODE_FIXTURES, name)}'`;
+const loggedArgv = (log: string): string[] => readFileSync(log, "utf8").split("\n").filter((l) => l !== "");
+
+test("discoverOpencode v2: ids from models --standalone, labels + variants from api --standalone model.list", async () => {
+  __testing.resetForTests();
+  const { bin, log } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": catFixture("v2-models.txt"),
+    "api --standalone model.list": catFixture("v2-api-model-list.json"),
+  });
+  const models = await refreshHarnessTarget({ harnessId: "opencode-v2", kind: "opencode", env: {}, bin });
+  // Order follows `models`; data follows the API.
+  expect(models.map((m) => m.id)).toEqual(__testing.parseOpencodeModels(opencodeFixture("v2-models.txt")).map((m) => m.id));
+  expect(models[0]).toEqual({
+    id: "opencode/beam-free",
+    label: "Beam Free",
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+  });
+  expect(models.find((m) => m.id === "opencode/big-pickle")).toEqual({
+    id: "opencode/big-pickle",
+    label: "Big Pickle",
+    efforts: [],
+  });
+  expect(getHarnessDiscoveredModels("opencode-v2")).toEqual(models);
+  // v2 never ran a probe without --standalone (that would start the shared service).
+  const argv = loggedArgv(log);
+  expect(argv).toContain("--version");
+  expect(argv.filter((a) => a !== "--version").every((a) => a.includes("--standalone"))).toBe(true);
+});
+
+test("discoverOpencode: probes under the target env, with OPENCODE_DISABLE_AUTOUPDATE defaulting to 1", async () => {
+  __testing.resetForTests();
+  const { bin } = plantFakeOpencode({
+    "--version": `    [ "$OPENCODE_DISABLE_AUTOUPDATE" = "1" ] || exit 1\n    [ "$AGETOR_TEST_HOME_MARK" = "acct-b" ] || exit 1\n    echo 'opencode v2.1.3'`,
+    "models --standalone": `    echo 'anthropic/claude-x'`,
+    "api --standalone model.list": `    exit 1`,
+  });
+  const models = await refreshHarnessTarget({
+    harnessId: "opencode-env",
+    kind: "opencode",
+    env: { AGETOR_TEST_HOME_MARK: "acct-b" },
+    bin,
+  });
+  expect(models).toEqual([{ id: "anthropic/claude-x" }]);
+});
+
+test("discoverOpencode v2: a failed variant probe → ids only, with no efforts key (unknown)", async () => {
+  __testing.resetForTests();
+  const { bin } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": catFixture("v2-models.txt"),
+    "api --standalone model.list": `    echo 'not json'`,
+  });
+  const models = await refreshHarnessTarget({ harnessId: "opencode-noapi", kind: "opencode", env: {}, bin });
+  expect(models).toHaveLength(9);
+  for (const m of models) expect(m).toEqual({ id: m.id });
+  expect(getDiscoveredEfforts("opencode", "opencode/big-pickle", "opencode-noapi")).toBeNull();
+});
+
+test("discoverOpencode v2: a probe that loses the cold-home db race is retried once and its variants kept", async () => {
+  __testing.resetForTests();
+  // The first `api` call fails like a real v2 in a fresh home whose
+  // opencode.db the concurrent `models` call is creating (live W4 smoke).
+  const flagDir = mkdtempSync(path.join(tmpdir(), "agetor-opencode-cold-"));
+  const { bin, log } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": catFixture("v2-models.txt"),
+    "api --standalone model.list":
+      `    if [ ! -f '${flagDir}/api-once' ]; then : > '${flagDir}/api-once'; echo 'Error: Standalone server exited before reporting readiness' >&2; exit 1; fi\n` +
+      catFixture("v2-api-model-list.json"),
+  });
+  const models = await refreshHarnessTarget({ harnessId: "opencode-cold", kind: "opencode", env: {}, bin });
+  expect(models.find((m) => m.id === "opencode/deepseek-v4.1-flash-free")?.efforts).toEqual(["low", "high", "max"]);
+  expect(loggedArgv(log).filter((a) => a === "api --standalone model.list")).toHaveLength(2);
+  expect(loggedArgv(log).filter((a) => a === "models --standalone")).toHaveLength(1);
+});
+
+test("discoverOpencode v2: models --standalone failing falls back to the API's own list", async () => {
+  __testing.resetForTests();
+  const { bin } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": `    exit 1`,
+    "api --standalone model.list": catFixture("v2-api-model-list.json"),
+  });
+  const models = await refreshHarnessTarget({ harnessId: "opencode-nomodels", kind: "opencode", env: {}, bin });
+  expect(models).toEqual(__testing.parseOpencodeApiModelList(opencodeFixture("v2-api-model-list.json")));
+});
+
+test("discoverOpencode v1: one models --verbose call; never passes --standalone", async () => {
+  __testing.resetForTests();
+  const { bin, log } = plantFakeOpencode({
+    "--version": catFixture("v1-version.txt"),
+    "models --verbose": catFixture("v1-models-verbose.txt"),
+  });
+  const models = await refreshHarnessTarget({ harnessId: "opencode-v1", kind: "opencode", env: {}, bin });
+  expect(models).toEqual([
+    { id: "opencode/beam-free", label: "Beam Free", efforts: ["low", "medium", "high", "xhigh", "max"] },
+    { id: "opencode/big-pickle", label: "Big Pickle", efforts: [] },
+  ]);
+  expect(loggedArgv(log)).toEqual(["--version", "models --verbose"]);
+});
+
+test("discoverOpencode v1: models --verbose failing falls back to plain models (ids only)", async () => {
+  __testing.resetForTests();
+  const { bin, log } = plantFakeOpencode({
+    "--version": catFixture("v1-version.txt"),
+    "models --verbose": `    exit 1`,
+    models: catFixture("v1-models.txt"),
+  });
+  const models = await refreshHarnessTarget({ harnessId: "opencode-v1-plain", kind: "opencode", env: {}, bin });
+  expect(models).toHaveLength(10);
+  for (const m of models) expect(m).toEqual({ id: m.id });
+  expect(loggedArgv(log)).toEqual(["--version", "models --verbose", "models"]);
+});
+
+test("discoverOpencode: a failing --version probe → [] without running any model probe", async () => {
+  __testing.resetForTests();
+  const { bin, log } = plantFakeOpencode({ "--version": `    exit 1` });
+  expect(await refreshHarnessTarget({ harnessId: "opencode-broken", kind: "opencode", env: {}, bin })).toEqual([]);
+  expect(loggedArgv(log)).toEqual(["--version"]);
+});
+
+test("discoverOpencode: a binary that doesn't exist resolves [] without spawning", async () => {
+  __testing.resetForTests();
+  expect(await __testing.discoverOpencode({}, "/nonexistent/opencode-xyz")).toEqual([]);
+});
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("discoverOpencode: a hung variant probe times out → ids only; the child is killed and a pipe-holding grandchild can't stall it", async () => {
+  __testing.resetForTests();
+  __testing.setOpencodeProbeTimeouts({ budgetMs: 1_200, versionMs: 1_000 });
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-opencode-hang-"));
+  const pidFile = path.join(dir, "api.pid");
+  const grandchildPidFile = path.join(dir, "grandchild.pid");
+  const { bin } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": catFixture("v2-models.txt"),
+    // Prints half an answer, leaves a grandchild holding stdout, then hangs.
+    "api --standalone model.list": [
+      `    echo $$ > '${pidFile}'`,
+      `    printf '{"data":['`,
+      `    sleep 30 &`,
+      `    echo $! > '${grandchildPidFile}'`,
+      `    wait`,
+    ].join("\n"),
+  });
+  const start = Date.now();
+  let grandchild: number | null = null;
+  try {
+    const models = await refreshHarnessTarget({ harnessId: "opencode-hang", kind: "opencode", env: {}, bin });
+    expect(Date.now() - start).toBeLessThan(3_000);
+    expect(models).toHaveLength(9);
+    for (const m of models) expect(m).toEqual({ id: m.id });
+    grandchild = Number(readFileSync(grandchildPidFile, "utf8").trim());
+    const apiPid = Number(readFileSync(pidFile, "utf8").trim());
+    const deadline = Date.now() + 1_000;
+    while (pidAlive(apiPid) && Date.now() < deadline) await Bun.sleep(25);
+    expect(pidAlive(apiPid)).toBe(false);
+  } finally {
+    __testing.setOpencodeProbeTimeouts(null);
+    if (grandchild !== null && pidAlive(grandchild)) process.kill(grandchild);
+  }
+});
+
+test("discoverOpencode: a probe whose grandchild keeps stdout open after a clean exit still succeeds promptly", async () => {
+  __testing.resetForTests();
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-opencode-linger-"));
+  const grandchildPidFile = path.join(dir, "grandchild.pid");
+  const { bin } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": catFixture("v2-models.txt"),
+    "api --standalone model.list": [
+      catFixture("v2-api-model-list.json"),
+      `    sleep 30 &`,
+      `    echo $! > '${grandchildPidFile}'`,
+      `    exit 0`,
+    ].join("\n"),
+  });
+  const start = Date.now();
+  try {
+    const models = await refreshHarnessTarget({ harnessId: "opencode-linger", kind: "opencode", env: {}, bin });
+    expect(Date.now() - start).toBeLessThan(2_000);
+    expect(models.find((m) => m.id === "opencode/big-pickle")?.efforts).toEqual([]);
+  } finally {
+    try {
+      const gc = Number(readFileSync(grandchildPidFile, "utf8").trim());
+      if (pidAlive(gc)) process.kill(gc);
+    } catch { /* never started */ }
+  }
+});
+
+// A full sweep also runs every other kind's real probe (cursor's alone can
+// take its 3 s cap), so give it room on a loaded machine.
+test("refreshKindModels('opencode') and a full sweep fill the opencode kind cache from AGETOR_OPENCODE_BIN (index-aligned kinds)", async () => {
+  __testing.resetForTests();
+  const { bin } = plantFakeOpencode({
+    "--version": catFixture("v1-version.txt"),
+    "models --verbose": catFixture("v1-models-verbose.txt"),
+  });
+  const expected = __testing.parseOpencodeVerboseModels(opencodeFixture("v1-models-verbose.txt"));
+  await withEnvOverride("AGETOR_OPENCODE_BIN", bin, async () => {
+    await refreshKindModels("opencode");
+    expect(getDiscoveredModels("opencode")).toEqual(expected);
+
+    __testing.resetForTests();
+    await refreshDiscoveredModels();
+  });
+  expect(getDiscoveredModels("opencode")).toEqual(expected);
+  // The sweep's results land under their own kinds — opencode's list didn't
+  // shift onto a neighbour.
+  expect(getDiscoveredModels("antigravity")).not.toEqual(expected);
+  expect(getDiscoveredModels("claude-code")).toEqual([]);
+}, 30_000);
+
+// A full sweep also runs every other kind's real probe (cursor's alone can
+// take its 3 s cap), so give it room on a loaded machine.
+test("a full sweep probes an opencode harness target under its own bin, and prunes it when absent", async () => {
+  __testing.resetForTests();
+  const { bin } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": `    echo 'opencode/only-model'`,
+    "api --standalone model.list": `    echo '{"data":[{"providerID":"opencode","id":"only-model","variants":[{"id":"thinking"}]}]}'`,
+  });
+  await refreshDiscoveredModels({ fxHarnesses: [{ harnessId: "opencode-sweep", kind: "opencode", env: {}, bin }] });
+  expect(getHarnessDiscoveredModels("opencode-sweep")).toEqual([{ id: "opencode/only-model", efforts: ["thinking"] }]);
+  expect(getDiscoveredEfforts("opencode", "opencode/only-model", "opencode-sweep")).toEqual(["thinking"]);
+  await refreshDiscoveredModels({ fxHarnesses: [] });
+  expect(getHarnessDiscoveredModels("opencode-sweep")).toEqual([]);
+}, 30_000);
+
+test("getDiscoveredEfforts: passes an explicit [] through (opencode 'no variants'), null when the key is absent", async () => {
+  __testing.resetForTests();
+  const { bin } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": `    printf 'p/none\\np/unknown\\n'`,
+    "api --standalone model.list": `    echo '{"data":[{"providerID":"p","id":"none","variants":[]}]}'`,
+  });
+  await refreshHarnessTarget({ harnessId: "opencode-efforts", kind: "opencode", env: {}, bin });
+  expect(getHarnessDiscoveredModels("opencode-efforts")).toEqual([{ id: "p/none", efforts: [] }, { id: "p/unknown" }]);
+  expect(getDiscoveredEfforts("opencode", "p/none", "opencode-efforts")).toEqual([]);
+  expect(getDiscoveredEfforts("opencode", "p/unknown", "opencode-efforts")).toBeNull();
+  expect(getDiscoveredEfforts("opencode", "p/missing", "opencode-efforts")).toBeNull();
+  expect(getDiscoveredEfforts("opencode", null, "opencode-efforts")).toBeNull();
 });

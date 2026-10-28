@@ -1,0 +1,23 @@
+[
+  {
+    "id": "ses_e8261398affehUf22D8iOXNtgS",
+    "updated": 1793108926663,
+    "created": 1793108920151,
+    "projectId": "global",
+    "directory": "/Users/test/project"
+  },
+  {
+    "id": "ses_e8261a325ffe6fHIVNDgP5Dw0o",
+    "updated": 1793108899388,
+    "created": 1793108893120,
+    "projectId": "global",
+    "directory": "/Users/test/project"
+  },
+  {
+    "id": "ses_e82633d29ffe0DoEvC6EOxs6O7",
+    "updated": 1793108796044,
+    "created": 1793108788365,
+    "projectId": "global",
+    "directory": "/Users/test/project"
+  }
+]

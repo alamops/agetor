@@ -11,7 +11,7 @@ import type { AgentKind, Harness } from "../shared/types.ts";
 // Without this, this file (or whichever file `bun test` loads first) can
 // silently open the real ~/.agetor-dev database.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-db-"));
-const { checkHarness, upgradeHintFor, INSTALL_HINTS, __testing } = await import("./agent-status.ts");
+const { checkHarness, cachedCliVersion, parseOpencodeAuthList, upgradeHintFor, INSTALL_HINTS, __testing } = await import("./agent-status.ts");
 
 function builtin(kind: AgentKind): Harness {
   return { id: kind, kind, label: kind, isBuiltin: true, home: null, bin: null, env: {}, enabled: true };
@@ -918,4 +918,277 @@ test("checkHarness re-probes once the cached entry's TTL has expired (stale-cach
   } finally {
     rmSync(counterDir, { recursive: true, force: true });
   }
+});
+
+// --- opencode: hints, notices, version cache --------------------------------
+
+const OPENCODE_FIXTURES = path.join(import.meta.dir, "fixtures", "opencode");
+const fixture = (name: string) => readFileSync(path.join(OPENCODE_FIXTURES, name), "utf8");
+
+describe("opencode install / upgrade hints", () => {
+  test("install hint is the Homebrew formula", () => {
+    expect(INSTALL_HINTS.opencode).toBe("brew install opencode");
+  });
+  test("a Homebrew install upgrades through brew", () => {
+    expect(upgradeHintFor("opencode", "/opt/homebrew/bin/opencode-x")).toBe("brew upgrade opencode");
+  });
+  test("any other install (or an unknown path) uses opencode's own updater", () => {
+    expect(upgradeHintFor("opencode", "/usr/local/bin/opencode-x")).toBe("opencode upgrade");
+    expect(upgradeHintFor("opencode", null)).toBe("opencode upgrade");
+  });
+});
+
+describe("parseOpencodeAuthList", () => {
+  test("v2 JSON: [] is empty, a connection list is not, garbage is unknown", () => {
+    expect(parseOpencodeAuthList(fixture("v2-auth-list-empty.json"), 2)).toBe(true);
+    expect(parseOpencodeAuthList(fixture("v2-auth-list-env.json"), 2)).toBe(false);
+    expect(parseOpencodeAuthList("No authenticated integrations", 2)).toBeNull();
+    expect(parseOpencodeAuthList('{"a":1}', 2)).toBeNull();
+  });
+  test("v1 text (ANSI): 0 credentials and no env line is empty; an env variable is not", () => {
+    expect(parseOpencodeAuthList(fixture("v1-auth-list-empty.txt"), 1)).toBe(true);
+    expect(parseOpencodeAuthList(fixture("v1-auth-list-env.txt"), 1)).toBe(false);
+    expect(parseOpencodeAuthList("\u001b[0m└  2 credentials", 1)).toBe(false);
+    expect(parseOpencodeAuthList("nothing recognisable", 1)).toBeNull();
+  });
+});
+
+/**
+ * A stub `opencode`: logs every argv line to `<dir>/calls`, answers
+ * `--version` from `<dir>/version`, and `auth list` from `<dir>/auth-v2` (only
+ * with `--standalone`, like a real v2) or `<dir>/auth-v1` (only without it,
+ * like a real v1, which rejects `--standalone`). A missing answer file means
+ * exit 1.
+ */
+function plantFakeOpencode(dir: string, opts: { version: string; authV2?: string; authV1?: string }): string {
+  writeFileSync(path.join(dir, "version"), `${opts.version}\n`);
+  if (opts.authV2 !== undefined) writeFileSync(path.join(dir, "auth-v2"), opts.authV2);
+  if (opts.authV1 !== undefined) writeFileSync(path.join(dir, "auth-v1"), opts.authV1);
+  const bin = path.join(dir, "opencode-stub");
+  writeFileSync(
+    bin,
+    `#!/bin/sh
+D='${dir}'
+echo "$@" >> "$D/calls"
+case "$1" in
+  --version) cat "$D/version" ;;
+  auth)
+    case "$*" in
+      "auth list --standalone --format json") [ -f "$D/auth-v2" ] && cat "$D/auth-v2" || exit 1 ;;
+      "auth list") [ -f "$D/auth-v1" ] && cat "$D/auth-v1" || exit 1 ;;
+      *) echo "unknown option" >&2; exit 1 ;;
+    esac ;;
+  *) exit 1 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+function opencodeHarness(bin: string, id = "opencode"): Harness {
+  return { id, kind: "opencode", label: "OpenCode", isBuiltin: true, home: null, bin, env: {}, enabled: true };
+}
+
+const callLines = (dir: string): string[] => {
+  try {
+    return readFileSync(path.join(dir, "calls"), "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+};
+
+describe("opencode status notices", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-opencode-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("v2 with no credentials: neutral login hint, loggedIn stays null, no upgrade note", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: fixture("v2-auth-list-empty.json") });
+    const status = await checkHarness(opencodeHarness(bin));
+    expect(status.available).toBe(true);
+    expect(status.version).toBe("opencode v2.1.3");
+    expect(status.loggedIn).toBeNull();
+    expect(status.notices).toEqual(["No OpenCode credentials found — run `opencode auth login`"]);
+    // Only the standalone JSON form ran: the v1 text form would start v2's service.
+    expect([...callLines(dir)].sort()).toEqual(["--version", "auth list --standalone --format json"]);
+    expect(callLines(dir)).not.toContain("auth list");
+  });
+
+  test("v2 auth probe losing the cold-home db race is retried once (live W4 smoke)", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: fixture("v2-auth-list-empty.json") });
+    // First standalone call fails the way a real v2 does when a concurrent
+    // `--standalone` probe is still creating a fresh home's opencode.db.
+    const flaky = path.join(dir, "opencode-flaky");
+    writeFileSync(
+      flaky,
+      `#!/bin/sh\nif [ "$1" = auth ] && [ ! -f '${dir}/once' ]; then : > '${dir}/once'; echo "$@" >> '${dir}/calls'; echo 'Error: Standalone server exited before reporting readiness' >&2; exit 1; fi\nexec '${bin}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const status = await checkHarness(opencodeHarness(flaky, "oc-cold"));
+    expect(status.notices).toEqual(["No OpenCode credentials found — run `opencode auth login`"]);
+    expect(callLines(dir).filter((l) => l === "auth list --standalone --format json")).toHaveLength(2);
+    expect(callLines(dir)).not.toContain("auth list");
+  });
+
+  test("v2 with a credential: no notices at all", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: fixture("v2-auth-list-env.json") });
+    const status = await checkHarness(opencodeHarness(bin));
+    expect(status.notices).toBeUndefined();
+    expect(status.loggedIn).toBeNull();
+  });
+
+  test("v1 with 0 credentials: falls back to the text form, adds the login hint and the OpenCode 2 note", async () => {
+    const bin = plantFakeOpencode(dir, { version: "1.19.4", authV1: fixture("v1-auth-list-empty.txt") });
+    const status = await checkHarness(opencodeHarness(bin));
+    expect(status.version).toBe("1.19.4");
+    expect(status.notices).toEqual([
+      "No OpenCode credentials found — run `opencode auth login`",
+      "OpenCode 2 is available: `opencode upgrade --major`",
+    ]);
+    expect(callLines(dir)).toContain("auth list");
+  });
+
+  test("v1 sharing a home with OpenCode 2's opencode.db: the shared-data-dir notice replaces the credentials one (live W4 smoke)", async () => {
+    // ANSI-wrapped, on stderr, exit 1 — the way v1 reports it.
+    const bin = plantFakeOpencode(dir, { version: "1.19.4" });
+    const conflicting = path.join(dir, "opencode-conflict");
+    writeFileSync(
+      conflicting,
+      `#!/bin/sh\nif [ "$1" = auth ] && [ "$2" = list ] && [ "$3" != --standalone ]; then echo "$@" >> '${dir}/calls'; printf '\\033[91m\\033[1mError: \\033[0mUnexpected error\\nDatabase is not empty and has no session table\\n' >&2; exit 1; fi\nexec '${bin}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const status = await checkHarness(opencodeHarness(conflicting, "oc-v1-shared"));
+    expect(status.available).toBe(true);
+    expect(status.loggedIn).toBeNull();
+    expect(status.notices).toEqual([
+      "OpenCode 1 can't read the data OpenCode 2 wrote in this home — give this harness its own Home in Settings → Harnesses",
+      "OpenCode 2 is available: `opencode upgrade --major`",
+    ]);
+  });
+
+  test("v1 with an environment key: only the upgrade note", async () => {
+    const bin = plantFakeOpencode(dir, { version: "1.19.4", authV1: fixture("v1-auth-list-env.txt") });
+    const status = await checkHarness(opencodeHarness(bin));
+    expect(status.notices).toEqual(["OpenCode 2 is available: `opencode upgrade --major`"]);
+  });
+
+  test("a failing auth probe gives no credential notice and never blocks (v2 and v1)", async () => {
+    const v2 = plantFakeOpencode(dir, { version: "opencode v2.1.3" });
+    const s2 = await checkHarness(opencodeHarness(v2, "oc-v2"));
+    expect(s2.available).toBe(true);
+    expect(s2.loggedIn).toBeNull();
+    expect(s2.notices).toBeUndefined();
+
+    const v1 = plantFakeOpencode(dir, { version: "1.19.4" });
+    const s1 = await checkHarness(opencodeHarness(v1, "oc-v1"));
+    expect(s1.loggedIn).toBeNull();
+    expect(s1.notices).toEqual(["OpenCode 2 is available: `opencode upgrade --major`"]);
+  });
+
+  test("the auth probe is cached for 60s per harness+path, then re-run", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: "[]" });
+    const harness = opencodeHarness(bin);
+    const authCalls = () => callLines(dir).filter((l) => l.startsWith("auth")).length;
+
+    await checkHarness(harness);
+    await checkHarness(harness);
+    expect(authCalls()).toBe(1);
+
+    setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      await checkHarness(harness);
+      expect(authCalls()).toBe(2);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("a harness whose home changed re-probes credentials instead of reusing the cached answer", async () => {
+    const bin = plantFakeOpencode(dir, { version: "opencode v2.1.3", authV2: "[]" });
+    const authCalls = () => callLines(dir).filter((l) => l.startsWith("auth")).length;
+    await checkHarness(opencodeHarness(bin));
+    expect(authCalls()).toBe(1);
+    const homed = { ...opencodeHarness(bin), home: path.join(dir, "acct-b") };
+    await checkHarness(homed);
+    expect(authCalls()).toBe(2);
+    await checkHarness(homed);
+    expect(authCalls()).toBe(2);
+  });
+
+  test("non-opencode kinds never get notices", async () => {
+    process.env.AGETOR_GEMINI_BIN = "/bin/echo";
+    expect((await checkAgent("gemini")).notices).toBeUndefined();
+  });
+});
+
+describe("cachedCliVersion", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-opencode-ver-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  const versionCalls = () => callLines(dir).filter((l) => l === "--version").length;
+
+  test("memoizes the version for 60s, then re-probes", async () => {
+    const harness = opencodeHarness(plantFakeOpencode(dir, { version: "opencode v2.1.3" }));
+    expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+    expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+    expect(versionCalls()).toBe(1);
+
+    setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+      expect(versionCalls()).toBe(2);
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("checkHarness primes it: no extra --version spawn afterwards", async () => {
+    const harness = opencodeHarness(plantFakeOpencode(dir, { version: "1.19.4", authV1: fixture("v1-auth-list-empty.txt") }));
+    await checkHarness(harness);
+    expect(versionCalls()).toBe(1);
+    expect(await cachedCliVersion(harness)).toBe("1.19.4");
+    expect(versionCalls()).toBe(1);
+  });
+
+  test("a missing binary or a failed probe is null and not cached", async () => {
+    expect(await cachedCliVersion(opencodeHarness("definitely-not-a-real-binary-xyz123"))).toBeNull();
+    const bin = path.join(dir, "flaky");
+    writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const harness = opencodeHarness(bin, "flaky");
+    expect(await cachedCliVersion(harness)).toBeNull();
+    writeFileSync(bin, "#!/bin/sh\necho 1.2.3\n", { mode: 0o755 });
+    expect(await cachedCliVersion(harness)).toBe("1.2.3");
+  });
+
+  test("a failed re-probe returns the last version the binary reported, not null (null would read as v2)", async () => {
+    const bin = path.join(dir, "flaky-later");
+    writeFileSync(bin, "#!/bin/sh\necho 1.19.4\n", { mode: 0o755 });
+    const harness = opencodeHarness(bin, "flaky-later");
+    expect(await cachedCliVersion(harness)).toBe("1.19.4");
+    writeFileSync(bin, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      expect(await cachedCliVersion(harness)).toBe("1.19.4");
+      // Not re-cached as fresh: once the binary answers again, its new
+      // version wins on the very next call.
+      writeFileSync(bin, "#!/bin/sh\necho opencode v2.1.3\n", { mode: 0o755 });
+      expect(await cachedCliVersion(harness)).toBe("opencode v2.1.3");
+    } finally {
+      setSystemTime();
+    }
+  });
+
+  test("probes OpenCode with OPENCODE_DISABLE_AUTOUPDATE=1 unless the harness env sets it", async () => {
+    const bin = path.join(dir, "env-echo");
+    writeFileSync(bin, `#!/bin/sh\necho "v-$OPENCODE_DISABLE_AUTOUPDATE"\n`, { mode: 0o755 });
+    expect(await cachedCliVersion(opencodeHarness(bin, "env-a"))).toBe("v-1");
+    const own: Harness = { ...opencodeHarness(bin, "env-b"), isBuiltin: false, env: { OPENCODE_DISABLE_AUTOUPDATE: "0" } };
+    expect(await cachedCliVersion(own)).toBe("v-0");
+    expect((await checkHarness(opencodeHarness(bin, "env-c"))).version).toBe("v-1");
+  });
 });

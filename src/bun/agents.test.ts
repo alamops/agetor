@@ -1,4 +1,4 @@
-import { test, expect, beforeEach, afterEach } from "bun:test";
+import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -44,9 +44,37 @@ const {
   FAKE_CURSOR_STREAM_PROMPT_MARKER,
   FAKE_CLAUDE_HANDOFF_PROMPT_MARKER,
   buildFxLaunchOptions,
+  resolveBin,
+  harnessEnv,
+  opencodeEffectiveServerFor,
+  OPENCODE_TITLE_MAX_CHARS,
+  FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER,
+  FAKE_OPENCODE_ERROR_PROMPT_MARKER,
+  FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER,
+  fakeOpencodeChildSessionId,
+  opencodeResumeFailedStatusLine,
 } = await import("./agents.ts");
 const { FX_STEER_DROPPED_STATUS, fxSpeedNotOfferedLine } = await import("./fx-acp.ts");
-const { dataDir, tasks } = await import("./db.ts");
+const { dataDir, tasks, runs, subagents: subagentsDb } = await import("./db.ts");
+
+// `bun test` runs every file in one process: restore the bin/args/driver
+// vars `beforeEach` overwrites once this file is done, so a later file never
+// inherits `AGETOR_OPENCODE_BIN = "opencode"` and runs the real CLI (which
+// writes OpenCode state into $HOME — src/test-preload.ts points it at a
+// missing binary by default).
+const ENV_KEYS_RESET_PER_TEST = [
+  "AGETOR_CLAUDE_BIN", "AGETOR_CODEX_BIN", "AGETOR_CURSOR_BIN", "AGETOR_GEMINI_BIN",
+  "AGETOR_FX_BIN", "AGETOR_ANTIGRAVITY_BIN", "AGETOR_OPENCODE_BIN",
+  "AGETOR_CLAUDE_ARGS", "AGETOR_CODEX_ARGS", "AGETOR_CURSOR_ARGS", "AGETOR_GEMINI_ARGS",
+  "AGETOR_FX_ARGS", "AGETOR_ANTIGRAVITY_ARGS", "AGETOR_OPENCODE_ARGS", "AGETOR_FX_DRIVER",
+] as const;
+const envBeforeFile = new Map(ENV_KEYS_RESET_PER_TEST.map((k) => [k, process.env[k]] as const));
+afterAll(() => {
+  for (const [k, v] of envBeforeFile) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+});
 
 beforeEach(() => {
   // Force the literal "claude" / "codex" names in argv. Production
@@ -60,12 +88,14 @@ beforeEach(() => {
   process.env.AGETOR_GEMINI_BIN = "gemini";
   process.env.AGETOR_FX_BIN = "fx";
   process.env.AGETOR_ANTIGRAVITY_BIN = "agy";
+  process.env.AGETOR_OPENCODE_BIN = "opencode";
   delete process.env.AGETOR_CLAUDE_ARGS;
   delete process.env.AGETOR_CODEX_ARGS;
   delete process.env.AGETOR_CURSOR_ARGS;
   delete process.env.AGETOR_GEMINI_ARGS;
   delete process.env.AGETOR_FX_ARGS;
   delete process.env.AGETOR_ANTIGRAVITY_ARGS;
+  delete process.env.AGETOR_OPENCODE_ARGS;
   delete process.env.AGETOR_FX_DRIVER;
 });
 
@@ -86,6 +116,7 @@ afterEach(() => {
   delete process.env.AGETOR_FAKE_CURSOR_PLAN;
   delete process.env.AGETOR_CURSOR_DRIVER;
   delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_OPENCODE_DRIVER;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -2793,6 +2824,7 @@ function makeHandoffTaskRow(taskId: string, prompt: string): Task {
     effort: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     references: [],
     backlog: [],
     plans: [],
@@ -2908,4 +2940,289 @@ test("claude fake driver: two-turn inheritance combines with a task's stored mar
   // turn 2 for this taskId, resolves to the "then" (done) behavior.
   const turn2 = await runFakeHandoffTurn(taskId, "no <handoff> was found in your last reply — please retry");
   expect((turn2 as { next: string | null }).next).toBeNull();
+});
+
+// ── opencode (docs/plans/add-opencode-harness.md D-3/D-4/D-5/D-6/D-9/D-18, spike A10) ──
+
+const V2 = "opencode v2.1.3";
+const V1 = "1.19.4";
+const opencodeDefaults = { mode: "auto", model: "opencode-default", effort: "auto" } as const;
+const BASE = ["opencode", "run", "--format", "json", "--thinking"];
+
+/** A harness of an unknown kind — the exhaustive `never` arms must throw on
+ *  it rather than falling through to codex/gemini. */
+function bogusHarness(home: string | null = null): Harness {
+  return { ...builtin("codex"), id: "bogus", kind: "bogus" as AgentKind, home };
+}
+
+test("opencode resolveBin: AGETOR_OPENCODE_BIN override, harness.bin wins over it", () => {
+  expect(resolveBin(builtin("opencode"))).toBe("opencode");
+  process.env.AGETOR_OPENCODE_BIN = "/opt/oc/opencode";
+  expect(resolveBin(builtin("opencode"))).toBe("/opt/oc/opencode");
+  expect(resolveBin(alias("opencode", { bin: "/usr/local/bin/opencode" }))).toBe("/usr/local/bin/opencode");
+});
+
+test("opencode harnessEnv: a home pins HOME plus all four XDG dirs under it; the harness env map still wins", () => {
+  expect(harnessEnv(builtin("opencode"))).toEqual({});
+  expect(harnessEnv(alias("opencode", { home: "/h/oc-2", env: { XDG_CACHE_HOME: "/elsewhere" } }))).toEqual({
+    HOME: "/h/oc-2",
+    XDG_CONFIG_HOME: "/h/oc-2/.config",
+    XDG_DATA_HOME: "/h/oc-2/.local/share",
+    XDG_STATE_HOME: "/h/oc-2/.local/state",
+    XDG_CACHE_HOME: "/elsewhere",
+  });
+});
+
+test("gemini harnessEnv stays GEMINI_CLI_HOME after the fall-through became an explicit arm", () => {
+  expect(harnessEnv(alias("gemini", { home: "/h/g" }))).toEqual({ GEMINI_CLI_HOME: "/h/g" });
+});
+
+test("opencode buildHarnessTerminalCommand re-homes inline through HOME + XDG", () => {
+  expect(buildHarnessTerminalCommand(alias("opencode", { home: "/h" }))).toBe(
+    "HOME='/h' XDG_CONFIG_HOME='/h/.config' XDG_DATA_HOME='/h/.local/share' XDG_STATE_HOME='/h/.local/state' XDG_CACHE_HOME='/h/.cache' opencode",
+  );
+});
+
+// Argv matrix: major × mode × server × model × effort × resume/title.
+type OcCase = {
+  name: string;
+  harness?: Harness;
+  opts: Record<string, unknown>;
+  cmd: string[];
+};
+const OC_CASES: OcCase[] = [
+  { name: "v2 shared auto sentinel", opts: { cliVersion: V2 }, cmd: [...BASE, "--auto"] },
+  { name: "v1 shared auto sentinel", opts: { cliVersion: V1 }, cmd: [...BASE, "--auto"] },
+  { name: "v2 standalone", opts: { cliVersion: V2, opencodeServer: "standalone" }, cmd: [...BASE, "--auto", "--standalone"] },
+  { name: "v1 ignores standalone (no flag on v1)", opts: { cliVersion: V1, opencodeServer: "standalone" }, cmd: [...BASE, "--auto"] },
+  { name: "v2 harness with a home forces standalone", harness: alias("opencode", { home: "/h" }), opts: { cliVersion: V2, opencodeServer: "shared" }, cmd: [...BASE, "--auto", "--standalone"] },
+  { name: "v1 harness with a home: still no flag", harness: alias("opencode", { home: "/h" }), opts: { cliVersion: V1 }, cmd: [...BASE, "--auto"] },
+  { name: "unknown/missing version reads as v2", opts: { cliVersion: null, opencodeServer: "standalone" }, cmd: [...BASE, "--auto", "--standalone"] },
+  { name: "v2 plan", opts: { cliVersion: V2, mode: "plan" }, cmd: [...BASE, "--agent", "plan"] },
+  { name: "v1 plan", opts: { cliVersion: V1, mode: "plan" }, cmd: [...BASE, "--agent", "plan"] },
+  { name: "null mode resolves to auto", opts: { cliVersion: V2, mode: null }, cmd: [...BASE, "--auto"] },
+  { name: "unknown mode gets no flag", opts: { cliVersion: V2, mode: "mystery" }, cmd: [...BASE] },
+  { name: "v2 real model, auto effort", opts: { cliVersion: V2, model: "opencode/big-pickle" }, cmd: [...BASE, "-m", "opencode/big-pickle", "--auto"] },
+  { name: "v1 real model, auto effort", opts: { cliVersion: V1, model: "opencode/big-pickle" }, cmd: [...BASE, "-m", "opencode/big-pickle", "--auto"] },
+  { name: "v2 real model, null effort", opts: { cliVersion: V2, model: "anthropic/claude-x", effort: null }, cmd: [...BASE, "-m", "anthropic/claude-x", "--auto"] },
+  { name: "v2 variant rides in the model id", opts: { cliVersion: V2, model: "opencode/deepseek-v4.1-flash-free", effort: "high" }, cmd: [...BASE, "-m", "opencode/deepseek-v4.1-flash-free#high", "--auto"] },
+  { name: "v1 variant is --variant", opts: { cliVersion: V1, model: "opencode/deepseek-v4.1-flash-free", effort: "high" }, cmd: [...BASE, "-m", "opencode/deepseek-v4.1-flash-free", "--variant", "high", "--auto"] },
+  { name: "sentinel drops a stored variant", opts: { cliVersion: V2, effort: "high" }, cmd: [...BASE, "--auto"] },
+  { name: "fresh session carries --title", opts: { cliVersion: V2, title: "Fix the login bug" }, cmd: [...BASE, "--auto", "--title=Fix the login bug"] },
+  // A dash-leading title must stay one `--title=` item: OpenCode v2 parses a
+  // separate `-v2 migration` value as `-v` (prints the version, runs nothing).
+  { name: "dash-leading title stays the --title= value", opts: { cliVersion: V2, title: "-v2 migration" }, cmd: [...BASE, "--auto", "--title=-v2 migration"] },
+  { name: "double-dash title stays the --title= value (v1)", opts: { cliVersion: V1, title: "--version bump" }, cmd: [...BASE, "--auto", "--title=--version bump"] },
+  { name: "blank title is omitted", opts: { cliVersion: V2, title: "   " }, cmd: [...BASE, "--auto"] },
+  { name: "v2 resume: -s, no --title, then --standalone", opts: { cliVersion: V2, title: "T", resumeSessionId: "ses_abc123", opencodeServer: "standalone", mode: "plan", model: "p/m", effort: "low" }, cmd: [...BASE, "-m", "p/m#low", "--agent", "plan", "-s", "ses_abc123", "--standalone"] },
+  { name: "v1 resume", opts: { cliVersion: V1, resumeSessionId: "ses_abc123", model: "p/m", effort: "low" }, cmd: [...BASE, "-m", "p/m", "--variant", "low", "--auto", "-s", "ses_abc123"] },
+];
+test.each(OC_CASES)("opencode argv: $name", ({ harness, opts, cmd }) => {
+  const built = buildCommand(harness ?? builtin("opencode"), "the prompt", { ...opencodeDefaults, ...opts });
+  expect(built.cmd).toEqual(cmd);
+  // The prompt never rides in argv — the driver feeds it on stdin.
+  expect(built.cmd).not.toContain("the prompt");
+  expect(built.deferredPrompt).toBeUndefined();
+});
+
+test("opencode resume returns a freshArgv: the same argv without -s, plus --title", () => {
+  const built = buildCommand(builtin("opencode"), "p", {
+    ...opencodeDefaults,
+    cliVersion: V2,
+    opencodeServer: "standalone",
+    model: "p/m",
+    effort: "high",
+    resumeSessionId: "ses_old1",
+    title: "Task title",
+  });
+  expect(built.cmd).toEqual([...BASE, "-m", "p/m#high", "--auto", "-s", "ses_old1", "--standalone"]);
+  expect(built.freshArgv).toEqual([...BASE, "-m", "p/m#high", "--auto", "--title=Task title", "--standalone"]);
+});
+
+test("opencode fresh session returns no freshArgv", () => {
+  const built = buildCommand(builtin("opencode"), "p", { ...opencodeDefaults, cliVersion: V2, title: "x" });
+  expect(built.freshArgv).toBeUndefined();
+});
+
+test("other kinds never get a freshArgv, even when resuming", () => {
+  expect(buildCommand(builtin("codex"), "p", { ...codexDefaults, resumeSessionId: "t1" }).freshArgv).toBeUndefined();
+  expect(buildCommand(builtin("cursor"), "p", { ...cursorDefaults, resumeSessionId: "c1" }).freshArgv).toBeUndefined();
+});
+
+test("opencode --title is cut to OPENCODE_TITLE_MAX_CHARS code points, never mid-surrogate", () => {
+  const title = "😀".repeat(OPENCODE_TITLE_MAX_CHARS + 50);
+  const { cmd } = buildCommand(builtin("opencode"), "p", { ...opencodeDefaults, cliVersion: V2, title });
+  const value = cmd.find((a) => a.startsWith("--title="))!.slice("--title=".length);
+  expect(Array.from(value)).toHaveLength(OPENCODE_TITLE_MAX_CHARS);
+  expect(value).toBe("😀".repeat(OPENCODE_TITLE_MAX_CHARS));
+});
+
+test("opencode env: OPENCODE_DISABLE_AUTOUPDATE defaults to 1; a harness env value wins", () => {
+  expect(buildCommand(builtin("opencode"), "p", { ...opencodeDefaults, cliVersion: V2 }).env).toEqual({ OPENCODE_DISABLE_AUTOUPDATE: "1" });
+  const env = buildCommand(alias("opencode", { home: "/h", env: { OPENCODE_DISABLE_AUTOUPDATE: "0" } }), "p", { ...opencodeDefaults, cliVersion: V2 }).env;
+  expect(env?.OPENCODE_DISABLE_AUTOUPDATE).toBe("0");
+  expect(env?.XDG_DATA_HOME).toBe("/h/.local/share");
+  expect(env?.HOME).toBe("/h");
+});
+
+test("AGETOR_OPENCODE_ARGS land last, after --standalone", () => {
+  process.env.AGETOR_OPENCODE_ARGS = "--print-logs  --log-level DEBUG";
+  const { cmd } = buildCommand(builtin("opencode"), "p", { ...opencodeDefaults, cliVersion: V2, opencodeServer: "standalone" });
+  expect(cmd).toEqual([...BASE, "--auto", "--standalone", "--print-logs", "--log-level", "DEBUG"]);
+});
+
+test("opencodeEffectiveServerFor: v1 → null, a home → standalone, else the task's value (absent = shared)", () => {
+  expect(opencodeEffectiveServerFor(builtin("opencode"), { opencodeServer: "standalone" }, V1)).toBeNull();
+  expect(opencodeEffectiveServerFor(alias("opencode", { home: "/h" }), { opencodeServer: "shared" }, V2)).toBe("standalone");
+  expect(opencodeEffectiveServerFor(builtin("opencode"), { opencodeServer: "standalone" }, V2)).toBe("standalone");
+  expect(opencodeEffectiveServerFor(builtin("opencode"), {}, V2)).toBe("shared");
+  expect(opencodeEffectiveServerFor(builtin("opencode"), { opencodeServer: null }, null)).toBe("shared");
+});
+
+test("exhaustive never arms: buildCommand/spawnAgent refuse an unknown kind instead of falling through to codex/gemini; harnessEnv/resolveBin stay total", async () => {
+  expect(() => buildCommand(bogusHarness(), "p", { ...codexDefaults })).toThrow(/unknown harness kind: bogus/);
+  // `checkHarness` calls these for every harness row, so a retired kind must not throw.
+  expect(() => harnessEnv(bogusHarness("/h"))).not.toThrow();
+  expect(() => resolveBin(bogusHarness())).not.toThrow();
+  process.env.AGETOR_CODEX_DRIVER = "fake";
+  try {
+    await expect(
+      spawnAgent({ taskId: "t-bogus", runId: "r-bogus", harness: bogusHarness(), prompt: "p", cwd: "/tmp", onChunk: () => {}, opts: { ...codexDefaults } }),
+    ).rejects.toThrow(/unknown harness kind: bogus/);
+  } finally {
+    delete process.env.AGETOR_CODEX_DRIVER;
+  }
+});
+
+// ── fake opencode driver (D-18) ──
+
+type OcChunk = { stream: RunEventStream; data: string; lineUuid?: string };
+async function runFakeOpencode(taskId: string, prompt: string, opts: Record<string, unknown> = {}, runId = `run-${taskId}`) {
+  process.env.AGETOR_OPENCODE_DRIVER = "fake";
+  const chunks: OcChunk[] = [];
+  const sessionIds: string[] = [];
+  const handle = await spawnAgent({
+    taskId,
+    runId,
+    harness: builtin("opencode"),
+    prompt,
+    cwd: "/tmp",
+    onChunk: (stream, data, lineUuid) => { chunks.push({ stream, data, lineUuid }); },
+    onSessionId: (id) => { sessionIds.push(id); },
+    opts: { ...opencodeDefaults, cliVersion: V2, ...opts },
+  });
+  const code = await handle.done;
+  return { chunks, code, sessionIds, handle };
+}
+const toolUses = (chunks: OcChunk[]) => chunks.filter((c) => c.stream === "tool_use").map((c) => JSON.parse(c.data) as { name: string; input: Record<string, unknown> });
+
+test("fake opencode turn: thinking → shell tool → TodoWrite → assistant text, usage sentinels, discovered ses_fake<id8> session, exit 0", async () => {
+  const { chunks, code, sessionIds } = await runFakeOpencode("task-oc-plain-1", "go");
+  expect(code).toBe(0);
+  expect(sessionIds[0]).toBe("ses_faketaskoc");
+  expect(sessionIds[0]).toMatch(/^ses_[A-Za-z0-9]+$/);
+
+  const thinkingIdx = chunks.findIndex((c) => c.stream === "thinking" && c.data === "fake opencode reasoning");
+  const uses = toolUses(chunks);
+  expect(uses.map((u) => u.name)).toEqual(["shell", "TodoWrite"]);
+  expect(chunks.filter((c) => c.stream === "tool_result")).toHaveLength(2);
+  const shellIdx = chunks.findIndex((c) => c.stream === "tool_use");
+  const assistantIdx = chunks.findIndex((c) => c.stream === "assistant");
+  expect(thinkingIdx).toBeGreaterThanOrEqual(0);
+  expect(thinkingIdx).toBeLessThan(shellIdx);
+  expect(shellIdx).toBeLessThan(assistantIdx);
+  expect(chunks[assistantIdx]!.data).toBe("fake response to: go");
+  const todos = uses[1]!.input.todos as { content: string; status: string }[];
+  expect(todos.map((t) => t.content)).toEqual(["inspect the project", "answer the user"]);
+
+  const usage = chunks.filter((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX));
+  expect(usage.length).toBeGreaterThan(0);
+  const last = JSON.parse(usage.at(-1)!.data.slice(FX_USAGE_STATUS_PREFIX.length)) as { cost?: { currency: string }; turn?: Record<string, number> };
+  expect(last.cost?.currency).toBe("USD");
+  expect(last.turn?.inputTokens).toBeGreaterThan(0);
+  // Every persisted chunk carries a line uuid, so a reattach replay dedups.
+  for (const c of chunks) expect(c.lineUuid).toBeTruthy();
+});
+
+test("fake opencode: two turns of one task never share a line uuid", async () => {
+  const a = await runFakeOpencode("task-oc-uuid-1", "one", {}, "run-oc-uuid-a");
+  const b = await runFakeOpencode("task-oc-uuid-1", "two", { resumeSessionId: a.sessionIds[0] }, "run-oc-uuid-b");
+  const ua = new Set(a.chunks.map((c) => c.lineUuid));
+  expect(b.chunks.some((c) => ua.has(c.lineUuid))).toBe(false);
+});
+
+test("fake opencode honors resumeSessionId", async () => {
+  const { sessionIds, code } = await runFakeOpencode("task-oc-resume-1", "again", { resumeSessionId: "ses_prior42" });
+  expect(code).toBe(0);
+  expect(sessionIds[0]).toBe("ses_prior42");
+});
+
+test("fake opencode error marker: an error event surfaces as a status line and the turn exits 1", async () => {
+  const { chunks, code } = await runFakeOpencode("task-oc-error-1", `go ${FAKE_OPENCODE_ERROR_PROMPT_MARKER}`);
+  expect(code).toBe(1);
+  expect(chunks.some((c) => c.stream === "status" && c.data.includes("fake opencode error"))).toBe(true);
+  expect(chunks.some((c) => c.stream === "assistant")).toBe(false);
+});
+
+test("fake opencode resume-fail marker: on a resumed turn, the D-9 line, then a NEW session id", async () => {
+  const { chunks, code, sessionIds } = await runFakeOpencode("task-oc-rf-1", `go ${FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER}`, { resumeSessionId: "ses_gone1234" });
+  expect(code).toBe(0);
+  expect(chunks.some((c) => c.stream === "status" && c.data === opencodeResumeFailedStatusLine("ses_gone1234"))).toBe(true);
+  expect(sessionIds).toHaveLength(1);
+  expect(sessionIds[0]).not.toBe("ses_gone1234");
+  expect(sessionIds[0]).toMatch(/^ses_[A-Za-z0-9]+$/);
+});
+
+test("fake opencode resume-fail marker is ignored on a fresh turn", async () => {
+  const { chunks, sessionIds } = await runFakeOpencode("task-oc-rf-2", `go ${FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER}`);
+  expect(chunks.some((c) => c.data.startsWith("couldn't resume OpenCode session"))).toBe(false);
+  expect(sessionIds[0]).toBe("ses_faketaskoc");
+});
+
+test("fake opencode kill() settles as the SIGINT exit (130) and emits nothing afterwards", async () => {
+  process.env.AGETOR_OPENCODE_DRIVER = "fake";
+  const chunks: OcChunk[] = [];
+  const handle = await spawnAgent({
+    taskId: "task-oc-kill-1",
+    runId: "run-oc-kill-1",
+    harness: builtin("opencode"),
+    prompt: "go",
+    cwd: "/tmp",
+    onChunk: (stream, data, lineUuid) => { chunks.push({ stream, data, lineUuid }); },
+    opts: { ...opencodeDefaults, cliVersion: V2 },
+  });
+  handle.kill();
+  expect(await handle.done).toBe(130);
+  const n = chunks.length;
+  await Bun.sleep(80);
+  expect(chunks.length).toBe(n);
+});
+
+test("fake opencode subagent marker: the subagent tool registers an opencode_subagent row that is not left running after settle", async () => {
+  const taskId = "task-oc-sub-1";
+  const runId = "run-oc-sub-1";
+  tasks.insert({ ...makeHandoffTaskRow(taskId, "go"), agent: "opencode" });
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "opencode",
+    status: "running",
+    startedAt: Date.now(),
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: null,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+  });
+  const { chunks, code } = await runFakeOpencode(taskId, `go ${FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER}`, {}, runId);
+  expect(code).toBe(0);
+  expect(toolUses(chunks).map((u) => u.name)).toContain("subagent");
+  const child = fakeOpencodeChildSessionId(taskId);
+  const rows = subagentsDb.listForTask(taskId).filter((r) => r.parentKind === "opencode_subagent");
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.sourcePath).toBe(`opencode-session:${child}`);
+  expect(rows[0]!.status).not.toBe("running");
 });

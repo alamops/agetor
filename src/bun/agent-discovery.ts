@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import type { Subprocess } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import type { AgentKind } from "../shared/types.ts";
+import { opencodeMajor } from "../shared/opencode.ts";
 
 /**
  * A model id (and optional human label) surfaced by the agent CLI itself.
@@ -14,11 +15,15 @@ import type { AgentKind } from "../shared/types.ts";
  * model — codex, sourced from `codex app-server`'s `model/list` response
  * (`supportedReasoningEfforts[].reasoningEffort`; see `parseCodexModelList`),
  * and fx ≥0.0.14, sourced from `fx models --json`'s `models[].efforts` plus
- * `auto` (see `parseFxModels`). Omitted entirely when the CLI reported no efforts
- * (never an empty array), so a model with no discovered effort data is
- * byte-identical to the pre-`efforts` shape. Consumed via `supportedEfforts`'
- * third argument (`src/shared/types.ts`), where a non-empty discovered set
- * wins over the curated `MODEL_EFFORT_SUPPORT` table.
+ * `auto` (see `parseFxModels`). For those two kinds it is omitted entirely when
+ * the CLI reported no efforts (never an empty array), so a model with no
+ * discovered effort data is byte-identical to the pre-`efforts` shape.
+ * OpenCode is the exception (D-6): its `efforts` are the model's variant ids
+ * (see `discoverOpencode`), and an empty array is meaningful — "reported with
+ * no variants", no effort picker — while an absent key means the variant
+ * probe didn't answer for the model. Consumed via `supportedEfforts`' third
+ * argument (`src/shared/types.ts`), where a non-empty discovered set wins over
+ * the curated `MODEL_EFFORT_SUPPORT` table.
  */
 export interface DiscoveredModel {
   id: string;
@@ -793,6 +798,320 @@ async function discoverFx(env?: Record<string, string>, bin?: string): Promise<D
 }
 
 /**
+ * The default opencode binary resolution — `AGETOR_OPENCODE_BIN ??
+ * "opencode"`, rehydrated against `process.env.PATH` — the opencode sibling
+ * of `defaultFxBin`/`defaultCodexBin`, mirroring `resolveBin`'s opencode
+ * case in `agents.ts` (plan W1-D).
+ */
+function defaultOpencodeBin(): string {
+  const fallback = process.env.AGETOR_OPENCODE_BIN ?? "opencode";
+  return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+}
+
+/** Whole-discovery wall-clock budget for one `discoverOpencode` call (D-7). */
+const DEFAULT_OPENCODE_DISCOVERY_BUDGET_MS = 8_000;
+/** The `--version` probe's own cap inside that budget — the same 2 s
+ *  `checkHarness` gives it (`agent-status.ts`). */
+const DEFAULT_OPENCODE_VERSION_TIMEOUT_MS = 2_000;
+let opencodeDiscoveryBudgetMs = DEFAULT_OPENCODE_DISCOVERY_BUDGET_MS;
+let opencodeVersionTimeoutMs = DEFAULT_OPENCODE_VERSION_TIMEOUT_MS;
+
+// eslint-disable-next-line no-control-regex
+const OPENCODE_ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
+/** One `provider/model` id line, as `opencode models` prints it (spike Q7).
+ *  The first character can't be whitespace or `{`, so a JSON line of the
+ *  `--verbose` block never reads as an id (spike §2e). */
+const OPENCODE_MODEL_ID_LINE_RE = /^[^\s{][^\s]*\/\S+$/;
+
+/** How long a probe's stdout may keep draining after the child exited
+ *  before the reader is cancelled — covers a grandchild still holding the
+ *  pipe (see `runOpencodeProbe`). */
+const OPENCODE_EXIT_DRAIN_MS = 250;
+
+/**
+ * Runs one opencode probe with its own deadline and returns its stdout.
+ * Unlike `runProbe` above, the stdout reader is cancelled in `finally`
+ * (KB `52d77b03`): `opencode api --standalone` starts a private server, and a
+ * grandchild that inherited the pipe would otherwise keep `read()` pending —
+ * and this process's end of the pipe open — after the direct child was
+ * killed or had exited. Once the child exits, its output gets
+ * `OPENCODE_EXIT_DRAIN_MS` to drain, then the reader is cancelled, so a
+ * lingering grandchild can't turn a finished probe into a timeout. A timeout
+ * is a failure (`ok: false`) even if some bytes landed, so a half-written
+ * JSON answer is never parsed. Never throws.
+ */
+async function runOpencodeProbe(
+  cmd: string[],
+  env: Record<string, string>,
+  timeoutMs: number,
+): Promise<{ ok: boolean; stdout: string }> {
+  if (timeoutMs <= 0) return { ok: false, stdout: "" };
+  let proc: Subprocess<"ignore", "pipe", "ignore">;
+  try {
+    proc = Bun.spawn(cmd, {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      env: { ...process.env, ...env },
+    });
+  } catch {
+    return { ok: false, stdout: "" };
+  }
+  let timedOut = false;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  let finished = false;
+  const cancelReader = (): void => {
+    try { void reader?.cancel().catch(() => {}); } catch { /* already released/cancelled */ }
+  };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { proc.kill(); } catch { /* already exited */ }
+    cancelReader();
+  }, timeoutMs);
+  proc.exited
+    .then(() => { if (!finished) drainTimer = setTimeout(cancelReader, OPENCODE_EXIT_DRAIN_MS); })
+    .catch(() => { /* spawn-level failure — the read loop below sees it */ });
+  try {
+    reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let stdout = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done || timedOut) break;
+      stdout += decoder.decode(value, { stream: true });
+    }
+    stdout += decoder.decode();
+    if (timedOut) return { ok: false, stdout: "" };
+    const code = await proc.exited;
+    if (timedOut) return { ok: false, stdout: "" };
+    return { ok: code === 0, stdout };
+  } catch {
+    return { ok: false, stdout: "" };
+  } finally {
+    finished = true;
+    clearTimeout(timer);
+    if (drainTimer) clearTimeout(drainTimer);
+    if (proc.exitCode === null) {
+      try { proc.kill(); } catch { /* already exited */ }
+    }
+    cancelReader();
+  }
+}
+
+/** Order-preserving, deduped, non-empty variant ids. */
+function cleanVariantIds(ids: unknown[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of ids) {
+    if (typeof raw !== "string") continue;
+    const id = raw.trim();
+    if (id === "" || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Parse `opencode models` (v2 `models --standalone`, v1 `models`): one
+ * `provider/model` id per line, sorted (spike Q7). Any other line (a blank, a
+ * warning, a stray ANSI-colored notice) is skipped. Ids are deduped, first
+ * occurrence wins. Pure, never throws.
+ */
+function parseOpencodeModels(stdout: string): DiscoveredModel[] {
+  const out: DiscoveredModel[] = [];
+  const seen = new Set<string>();
+  for (const raw of stdout.replace(OPENCODE_ANSI_RE, "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!OPENCODE_MODEL_ID_LINE_RE.test(line) || seen.has(line)) continue;
+    seen.add(line);
+    out.push({ id: line });
+  }
+  return out;
+}
+
+/**
+ * Parse v2 `opencode api --standalone model.list` (spike Q8/§2e,
+ * `v2-api-model-list.json`): `{location, data:[{providerID, id, name,
+ * variants:[{id, settings}], enabled, …}]}`. The id is `providerID/id`, the
+ * label `name`, and `efforts` the variant ids in reported order — `[]` when
+ * the model has none (an explicit "no variants", which hides the effort
+ * picker, D-6), never omitted here, since the API answered for that model.
+ * An entry with `enabled === false` is skipped. Malformed input → `[]`.
+ */
+function parseOpencodeApiModelList(stdout: string): DiscoveredModel[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object") return [];
+  const data = (parsed as { data?: unknown }).data;
+  if (!Array.isArray(data)) return [];
+  const out: DiscoveredModel[] = [];
+  const seen = new Set<string>();
+  for (const entry of data) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as { providerID?: unknown; id?: unknown; name?: unknown; variants?: unknown; enabled?: unknown };
+    if (typeof e.providerID !== "string" || e.providerID === "") continue;
+    if (typeof e.id !== "string" || e.id === "") continue;
+    if (e.enabled === false) continue;
+    const id = `${e.providerID}/${e.id}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const variants = Array.isArray(e.variants)
+      ? e.variants.map((v) => (v && typeof v === "object" ? (v as { id?: unknown }).id : undefined))
+      : [];
+    const model: DiscoveredModel = { id };
+    if (typeof e.name === "string" && e.name.trim() !== "") model.label = e.name;
+    model.efforts = cleanVariantIds(variants);
+    out.push(model);
+  }
+  return out;
+}
+
+/**
+ * Parse v1 `opencode models --verbose` (spike §2e, `v1-models-verbose.txt`):
+ * each `provider/model` id line is followed by a pretty JSON object running
+ * from a `{` line to the next `}` line at column 0. `efforts` is
+ * `Object.keys(variants)` in order — `[]` for `"variants": {}` or no
+ * `variants` key; `label` is the block's `name`. An id whose block is missing
+ * or doesn't parse keeps no `efforts` key (unknown, `[auto]` in the picker).
+ * Pure, never throws.
+ */
+function parseOpencodeVerboseModels(stdout: string): DiscoveredModel[] {
+  const lines = stdout.replace(OPENCODE_ANSI_RE, "").split(/\r?\n/);
+  const out: DiscoveredModel[] = [];
+  const seen = new Set<string>();
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!.trimEnd();
+    i++;
+    if (!OPENCODE_MODEL_ID_LINE_RE.test(line)) continue;
+    const id = line;
+    const model: DiscoveredModel = { id };
+    if (i < lines.length && lines[i]!.trimEnd() === "{") {
+      const start = i;
+      let end = -1;
+      for (let j = start + 1; j < lines.length; j++) {
+        if (lines[j]!.trimEnd() === "}") { end = j; break; }
+      }
+      if (end >= 0) {
+        i = end + 1;
+        try {
+          const block: unknown = JSON.parse(lines.slice(start, end + 1).join("\n"));
+          if (block && typeof block === "object" && !Array.isArray(block)) {
+            const b = block as { name?: unknown; variants?: unknown };
+            if (typeof b.name === "string" && b.name.trim() !== "") model.label = b.name;
+            model.efforts = b.variants && typeof b.variants === "object" && !Array.isArray(b.variants)
+              ? cleanVariantIds(Object.keys(b.variants))
+              : [];
+          }
+        } catch {
+          /* unparsable block — the id stays, efforts unknown */
+        }
+      }
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(model);
+  }
+  return out;
+}
+
+/**
+ * v2 merge: ids (and their order) come from `models --standalone`; label and
+ * `efforts` from `api --standalone model.list` when it answered. A listed id
+ * the API didn't report keeps no `efforts` (unknown). With no usable
+ * `models` answer the API's own list stands in; with neither, `[]`.
+ */
+function mergeOpencodeV2(ids: DiscoveredModel[], api: DiscoveredModel[] | null): DiscoveredModel[] {
+  if (ids.length === 0) return api ?? [];
+  if (!api) return ids;
+  const byId = new Map(api.map((m) => [m.id, m] as const));
+  return ids.map((m) => byId.get(m.id) ?? m);
+}
+
+/**
+ * Discover an OpenCode harness's model catalog and per-model variants (D-7 as
+ * amended by spike A3 — no `serve`, no port, no password):
+ *   1. `opencode --version` → `opencodeMajor` (v2 prints `opencode v2.1.3`,
+ *      v1 `1.19.4`; unparseable reads as 2). A failed probe means `[]`.
+ *   2. v2: `models --standalone` (ids) and `api --standalone model.list`
+ *      (labels + variants), run together. `--standalone` is required on
+ *      both: without it v2 starts — and reads — the shared background
+ *      service instead of this env's providers (spike Q7).
+ *      A probe that exits non-zero is retried once, sequentially (the
+ *      cold-home `opencode.db` race between the two).
+ *      v1: `models --verbose` (ids + variants in one call); when it yields
+ *      nothing, plain `models` (ids only).
+ * Every result carries the semantics `supportedEfforts` reads (D-6):
+ * `efforts: [...]` — the variants, reported order; `efforts: []` — reported
+ * with no variants; no `efforts` key — variants unknown (the variant probe
+ * failed or didn't mention the model).
+ *
+ * Budget: ≤ `opencodeDiscoveryBudgetMs` (8 s) wall clock for the whole call,
+ * the `--version` probe capped at 2 s inside it, each child killed and its
+ * stdout reader cancelled when its share runs out (`runOpencodeProbe`).
+ * `OPENCODE_DISABLE_AUTOUPDATE` defaults to `1` for these probes, like every
+ * run (D-3), so a background discovery never self-updates the binary.
+ * `env`/`bin` follow `discoverFx`'s convention: plain values the caller built
+ * from `harnessEnv(harness)`/`resolveBin(harness)`, so this stays a leaf.
+ * Never throws.
+ */
+async function discoverOpencode(env?: Record<string, string>, bin?: string): Promise<DiscoveredModel[]> {
+  try {
+    const resolved = bin ?? defaultOpencodeBin();
+    const resolvable = isAbsolute(resolved)
+      ? existsSync(resolved)
+      : Bun.which(resolved, { PATH: process.env.PATH }) !== null;
+    if (!resolvable) return [];
+    const probeEnv: Record<string, string> = { ...(env ?? {}) };
+    probeEnv.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
+    const deadline = Date.now() + opencodeDiscoveryBudgetMs;
+    const remaining = (): number => deadline - Date.now();
+
+    const version = await runOpencodeProbe(
+      [resolved, "--version"],
+      probeEnv,
+      Math.min(opencodeVersionTimeoutMs, remaining()),
+    );
+    if (!version.ok) return [];
+    const major = opencodeMajor(version.stdout.trim());
+
+    if (major === 2) {
+      const idsCmd = [resolved, "models", "--standalone"];
+      const apiCmd = [resolved, "api", "--standalone", "model.list"];
+      let [ids, api] = await Promise.all([
+        runOpencodeProbe(idsCmd, probeEnv, remaining()),
+        runOpencodeProbe(apiCmd, probeEnv, remaining()),
+      ]);
+      // In a home OpenCode has never run in, two concurrent `--standalone`
+      // calls race to create `opencode.db` and the loser exits 1 with
+      // "Standalone server exited before reporting readiness" (live W4
+      // smoke) — so a fresh install's first sweep lost every variant. One
+      // sequential retry of each failed probe, inside the same budget.
+      if (!ids.ok) ids = await runOpencodeProbe(idsCmd, probeEnv, remaining());
+      if (!api.ok) api = await runOpencodeProbe(apiCmd, probeEnv, remaining());
+      const idList = ids.ok ? parseOpencodeModels(ids.stdout) : [];
+      const apiList = api.ok ? parseOpencodeApiModelList(api.stdout) : [];
+      return mergeOpencodeV2(idList, apiList.length > 0 ? apiList : null);
+    }
+
+    const verbose = await runOpencodeProbe([resolved, "models", "--verbose"], probeEnv, remaining());
+    const fromVerbose = verbose.ok ? parseOpencodeVerboseModels(verbose.stdout) : [];
+    if (fromVerbose.length > 0) return fromVerbose;
+    const plain = await runOpencodeProbe([resolved, "models"], probeEnv, remaining());
+    return plain.ok ? parseOpencodeModels(plain.stdout) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * True when `target` is indistinguishable from the kind-level built-in probe
  * (`discoverFx()`/`discoverCodex()` with no args, per `target.kind`) — no env
  * override AND either no `bin` at all or a `bin` that resolves to exactly the
@@ -812,13 +1131,36 @@ async function discoverFx(env?: Record<string, string>, bin?: string): Promise<D
 function isBuiltinLikeTarget(target: HarnessTarget): boolean {
   if (Object.keys(target.env).length !== 0) return false;
   const kind = target.kind ?? "fx";
-  const defaultBin = kind === "codex" ? defaultCodexBin() : defaultFxBin();
+  const defaultBin = kind === "codex" ? defaultCodexBin() : kind === "opencode" ? defaultOpencodeBin() : defaultFxBin();
   return target.bin === undefined || target.bin === defaultBin;
 }
 
 /**
- * One harness to probe for its own account-scoped catalog — fx and codex are
- * the two kinds whose catalog varies per harness (`kind` defaults to `"fx"`
+ * The discoverer for one per-harness target kind, probed under `env`/`bin`
+ * — or with no args at all (the kind-level built-in probe) when both are
+ * omitted. One switch, so `runRefresh`'s target fan-out and
+ * `runRefreshHarnessTarget` can't disagree about which kinds probe how.
+ */
+function discoverHarnessKind(
+  kind: NonNullable<HarnessTarget["kind"]>,
+  env?: Record<string, string>,
+  bin?: string,
+): Promise<DiscoveredModel[]> {
+  switch (kind) {
+    case "codex":
+      return env === undefined && bin === undefined ? discoverCodex() : discoverCodex(env, bin);
+    case "opencode":
+      return env === undefined && bin === undefined ? discoverOpencode() : discoverOpencode(env, bin);
+    case "fx":
+      return env === undefined && bin === undefined ? discoverFx() : discoverFx(env, bin);
+  }
+}
+
+/**
+ * One harness to probe for its own account-scoped catalog — fx, codex and
+ * opencode are the kinds whose catalog varies per harness (an OpenCode
+ * harness's providers are whatever its own `HOME`/XDG config and env keys
+ * credential, spike Q7) (`kind` defaults to `"fx"`
  * when omitted, so every caller/test written before codex joined this path —
  * `{ harnessId, env, bin }` with no `kind` field — keeps compiling and
  * behaving unchanged). `env` is the harness's spawn-env overrides (typically
@@ -835,7 +1177,7 @@ function isBuiltinLikeTarget(target: HarnessTarget): boolean {
 export interface HarnessTarget {
   harnessId: string;
   /** Defaults to `"fx"` when omitted — see the interface doc above. */
-  kind?: "fx" | "codex";
+  kind?: "fx" | "codex" | "opencode";
   env: Record<string, string>;
   bin?: string;
 }
@@ -925,10 +1267,14 @@ export function getAllHarnessDiscoveredModels(): Record<string, DiscoveredModel[
  * codex are the only kinds whose catalog varies per harness — a `harnessId`
  * for any other kind simply won't have an entry there, so this is a
  * harmless miss), then falls back to `cache.get(kind)`. Returns the
- * matching model's `efforts` when that list is non-empty, else `null` (no
- * model arg, no matching
- * entry, or an entry with no discovered efforts all read the same way).
- * Callers pass this straight through as `supportedEfforts`'s third argument.
+ * matching model's `efforts` whenever the entry carries the key — an empty
+ * array included, which is OpenCode's explicit "reported with no variants"
+ * (D-6: no effort picker) — else `null` (no model arg, no matching entry, or
+ * an entry whose efforts are unknown). No other kind ever stores `[]`
+ * (`parseCodexModelList`/`parseFxModels` omit the key instead), and
+ * `supportedEfforts` reads `[]` exactly like `null` for every kind but
+ * opencode, so passing it through changes nothing elsewhere. Callers pass
+ * this straight through as `supportedEfforts`'s third argument.
  */
 export function getDiscoveredEfforts(
   kind: AgentKind,
@@ -938,7 +1284,7 @@ export function getDiscoveredEfforts(
   if (!model) return null;
   const fromHarness = harnessId ? harnessCache.get(harnessId)?.find((m) => m.id === model) : undefined;
   const entry = fromHarness ?? cache.get(kind)?.find((m) => m.id === model);
-  if (entry?.efforts && entry.efforts.length > 0) return entry.efforts;
+  if (Array.isArray(entry?.efforts)) return entry.efforts;
   return null;
 }
 /**
@@ -1074,9 +1420,11 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
       discoverGemini(),
       discoverFx(),
       discoverAntigravity(),
+      discoverOpencode(),
       discoverCopilot(),
     ]);
-    const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx", "antigravity", "copilot"];
+    // Index-aligned with the discoverer list above — append to both together.
+    const kinds: AgentKind[] = ["codex", "claude-code", "cursor", "gemini", "fx", "antigravity", "opencode", "copilot"];
     results.forEach((result, i) => {
       cache.set(kinds[i]!, result.status === "fulfilled" ? result.value : []);
     });
@@ -1098,15 +1446,11 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Prom
       // instead of spawning the CLI a second time for what would be an
       // identical probe. Both fx and codex apply now (code-review finding
       // #4) — dispatched by `target.kind` (defaults to `"fx"`).
-      const builtInFx = cache.get("fx") ?? [];
-      const builtInCodex = cache.get("codex") ?? [];
       const targetResults = await Promise.allSettled(
         targets.map((target) => {
           const kind = target.kind ?? "fx";
-          if (isBuiltinLikeTarget(target)) {
-            return Promise.resolve(kind === "codex" ? builtInCodex : builtInFx);
-          }
-          return kind === "codex" ? discoverCodex(target.env, target.bin) : discoverFx(target.env, target.bin);
+          if (isBuiltinLikeTarget(target)) return Promise.resolve(cache.get(kind) ?? []);
+          return discoverHarnessKind(kind, target.env, target.bin);
         }),
       );
       const seen = new Set<string>();
@@ -1159,11 +1503,7 @@ async function runRefreshHarnessTarget(target: HarnessTarget): Promise<Discovere
   const builtinLike = isBuiltinLikeTarget(target);
   let models: DiscoveredModel[];
   try {
-    if (kind === "codex") {
-      models = builtinLike ? await discoverCodex() : await discoverCodex(target.env, target.bin);
-    } else {
-      models = builtinLike ? await discoverFx() : await discoverFx(target.env, target.bin);
-    }
+    models = builtinLike ? await discoverHarnessKind(kind) : await discoverHarnessKind(kind, target.env, target.bin);
   } catch {
     models = [];
   }
@@ -1229,6 +1569,9 @@ async function runRefreshKind(kind: AgentKind): Promise<void> {
       case "antigravity":
         models = await discoverAntigravity();
         break;
+      case "opencode":
+        models = await discoverOpencode();
+        break;
       case "copilot":
         models = await discoverCopilot();
         break;
@@ -1288,8 +1631,18 @@ function setCodexProbeTimeoutMs(ms: number | null): void {
 }
 
 /**
+ * Test seam for `discoverOpencode`'s budgets — `null` restores the defaults
+ * (8 s whole call, 2 s `--version`). Read fresh at the start of every call,
+ * so a test can drive the timeout path in well under a second.
+ */
+function setOpencodeProbeTimeouts(t: { budgetMs?: number; versionMs?: number } | null): void {
+  opencodeDiscoveryBudgetMs = t?.budgetMs ?? DEFAULT_OPENCODE_DISCOVERY_BUDGET_MS;
+  opencodeVersionTimeoutMs = t?.versionMs ?? DEFAULT_OPENCODE_VERSION_TIMEOUT_MS;
+}
+
+/**
  * Clears both caches, the serialization chain, the `ready` flag, and the
- * codex probe-timeout override. Tests that assert on cache contents or
+ * codex/opencode probe-timeout overrides. Tests that assert on cache contents or
  * `isDiscoveryReady()` call this first so module-level state from an earlier
  * test in the same file can't leak in — including a `setCodexProbeTimeoutMs`
  * override a prior test forgot to restore.
@@ -1300,6 +1653,7 @@ function resetForTests(): void {
   chain = Promise.resolve();
   ready = false;
   codexProbeTimeoutMs = DEFAULT_CODEX_PROBE_TIMEOUT_MS;
+  setOpencodeProbeTimeouts(null);
 }
 
 // Exposed for tests that want to feed in synthetic CLI output, drive the
@@ -1309,8 +1663,13 @@ export const __testing = {
   parseCursorModels,
   parseFxModels,
   parseAntigravityModels,
+  parseOpencodeModels,
+  parseOpencodeApiModelList,
+  parseOpencodeVerboseModels,
+  discoverOpencode,
   parseCopilotModels,
   discoverCopilot,
   resetForTests,
   setCodexProbeTimeoutMs,
+  setOpencodeProbeTimeouts,
 };

@@ -1,6 +1,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { TMUX_MISSING_REASON, type AgentKind, type ClaudeAccount, type Harness, type HarnessStatus } from "../shared/types.ts";
+import { opencodeMajor } from "../shared/opencode.ts";
 import { resolveBin, harnessEnv } from "./agents.ts";
 import { accountUsageSummary } from "./account-usage.ts";
 import { harnesses } from "./db.ts";
@@ -21,6 +22,7 @@ export const INSTALL_HINTS: Record<AgentKind, string> = {
   "gemini": "npm i -g @google/gemini-cli",
   "fx": "curl -fsSL https://fx.sh/setup.sh | bash",
   "antigravity": "brew install --cask antigravity-cli",
+  "opencode": "brew install opencode",
   // GitHub's CLI is the Homebrew CASK `copilot-cli`; the same-named
   // *formula* (aws/tap) is AWS Copilot, a different program that also
   // installs a binary called `copilot`.
@@ -38,6 +40,7 @@ const BREW_PACKAGES: Partial<Record<AgentKind, string>> = {
   "claude-code": "claude-code",
   "gemini": "gemini-cli",
   "antigravity": "antigravity-cli",
+  "opencode": "opencode",
   // A cask, not a formula: `brew upgrade copilot-cli` without `--cask` can
   // resolve to AWS Copilot's formula on a machine with aws/tap tapped.
   "copilot": "--cask copilot-cli",
@@ -79,6 +82,7 @@ function isHomebrewInstall(binPath: string): boolean {
  *   - claude-code otherwise → `claude update` (its self-updater covers both
  *     the native and the npm install);
  *   - cursor → `cursor-agent update`;
+ *   - opencode otherwise → `opencode upgrade` (Homebrew → `brew upgrade opencode`);
  *   - a Homebrew-managed copilot → `brew upgrade --cask copilot-cli`
  *     (otherwise `copilot update`);
  *   - anything else → the kind's `INSTALL_HINTS` entry (the npm / curl
@@ -92,6 +96,7 @@ export function upgradeHintFor(kind: AgentKind, binPath: string | null): string 
   if (kind === "claude-code") return "claude update";
   if (kind === "cursor") return "cursor-agent update";
   if (kind === "antigravity") return "agy update";
+  if (kind === "opencode") return "opencode upgrade";
   if (kind === "copilot") return "copilot update";
   return INSTALL_HINTS[kind];
 }
@@ -421,6 +426,188 @@ async function getCachedStatus(
   return value;
 }
 
+/**
+ * `cachedCliVersion` memo, keyed like `statusCache` (`harness.id:path`).
+ * Every OpenCode invocation — `--version` included — writes XDG dirs and
+ * appends to its log (spike A12), and the version is read by the start
+ * pre-flight, the argv builder and the 15s `/harnesses` poll, so one probe
+ * per minute is shared by all of them. `checkHarness` primes it from its own
+ * `--version` probe, so the poll never costs a second spawn.
+ */
+const versionCache = new Map<string, { value: string; expiresAt: number }>();
+
+/**
+ * The env a status/version probe runs with: the harness's spawn env, plus —
+ * for OpenCode — `OPENCODE_DISABLE_AUTOUPDATE=1` unless the harness's own env
+ * map says otherwise, same as every spawn and discovery probe: a background
+ * poll must never self-update the binary.
+ */
+function probeEnvFor(harness: Harness): Record<string, string> {
+  const env = harnessEnv(harness);
+  if (harness.kind === "opencode") env.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
+  return env;
+}
+
+/**
+ * The harness binary's `--version` first line (e.g. `opencode v2.1.3`,
+ * `1.19.4`), memoized for 60 s per `harness.id:path`. A failed probe (a
+ * timeout under load, a transient spawn error) is never cached — the next
+ * call retries — but it returns the last version this binary reported, if
+ * any, rather than `null`: `null` reads as "unknown → v2" downstream, which
+ * would hand a v1 install v2-only flags (`--standalone`, `-m id#variant`).
+ * `null` only when the binary isn't found or has never answered.
+ */
+export async function cachedCliVersion(harness: Harness): Promise<string | null> {
+  const path = resolveBinPath(resolveBin(harness));
+  if (!path) return null;
+  const key = `${harness.id}:${path}`;
+  const hit = versionCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.value;
+  const value = await probeVersion(path, probeEnvFor(harness));
+  if (value !== null) {
+    versionCache.set(key, { value, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+    return value;
+  }
+  return hit?.value ?? null;
+}
+
+type CommandOutput = { code: number; stdout: string; stderr: string };
+
+/**
+ * Like `probeJson` but keeps stdout AND stderr plus the exit code (a v1
+ * OpenCode clack box may land on either stream) and never rejects. `null` on
+ * a spawn error or the `VERSION_PROBE_TIMEOUT_MS` timeout.
+ */
+async function probeOutput(bin: string, args: string[], env: Record<string, string>): Promise<CommandOutput | null> {
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn([bin, ...args], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, ...env },
+    });
+  } catch {
+    return null;
+  }
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { proc.kill(); } catch { /* already gone */ }
+  }, VERSION_PROBE_TIMEOUT_MS);
+  try {
+    const [code, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout as ReadableStream).text(),
+      new Response(proc.stderr as ReadableStream).text(),
+    ]);
+    return timedOut ? null : { code, stdout, stderr };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
+/**
+ * Whether an `opencode auth list` answer shows no usable credential at all
+ * (`true`), at least one (`false`), or can't be read (`null`). Spike Q9/A9:
+ *  - v2 `auth list --standalone --format json` → a JSON array, `[]` when
+ *    empty; an env key is a connection of `type: "env"` in a non-empty list;
+ *  - v1 has no `--format`: a clack text box ending `N credentials`, plus an
+ *    `Environment` box ending `N environment variable(s)` when env keys are
+ *    set. Empty iff `0 credentials` and no environment-variable line.
+ */
+export function parseOpencodeAuthList(out: string, major: 1 | 2): boolean | null {
+  if (major === 2) {
+    try {
+      const parsed: unknown = JSON.parse(out);
+      return Array.isArray(parsed) ? parsed.length === 0 : null;
+    } catch {
+      return null;
+    }
+  }
+  const text = out.replace(ANSI_RE, "");
+  const creds = /(\d+) credentials?/.exec(text);
+  if (!creds) return null;
+  const env = /(\d+) environment variables?/.exec(text);
+  return Number(creds[1]) === 0 && (!env || Number(env[1]) === 0);
+}
+
+/** What OpenCode 1 prints when OpenCode 2's `opencode.db` is in its data dir. */
+const OPENCODE_V1_DB_CONFLICT_RE = /Database is not empty and has no session table/;
+const OPENCODE_V1_DB_CONFLICT = "v1-db-conflict" as const;
+/**
+ * What a harness's `auth list` probe concluded: `true` = no credentials,
+ * `false` = some, `null` = the probe failed, `"v1-db-conflict"` = an OpenCode 1
+ * binary refused to run because OpenCode 2 already created `opencode.db` in the
+ * same home (the probe never read credentials, so it says nothing about them).
+ */
+type AuthProbeResult = boolean | null | typeof OPENCODE_V1_DB_CONFLICT;
+const authCache = new Map<string, { value: AuthProbeResult; expiresAt: number }>();
+
+async function probeOpencodeAuth(
+  bin: string,
+  env: Record<string, string>,
+  version: Promise<string | null>,
+): Promise<AuthProbeResult> {
+  // Start with the v2 form so it overlaps the version probe: it is the only
+  // form that never starts the background service (`--standalone`), and a v1
+  // binary rejects `--standalone` outright (exit 1), so it can't misfire.
+  const v2Args = ["auth", "list", "--standalone", "--format", "json"];
+  let v2 = await probeOutput(bin, v2Args, env);
+  const major = opencodeMajor(await version);
+  // A v2 that has never run in this home loses the race to create
+  // `opencode.db` against a concurrent `--standalone` discovery probe and
+  // exits 1 ("Standalone server exited before reporting readiness", live W4
+  // smoke). Retry once — the 60 s cache would otherwise hide the notice.
+  if (major === 2 && (!v2 || v2.code !== 0)) v2 = await probeOutput(bin, v2Args, env);
+  if (v2 && v2.code === 0) {
+    const parsed = parseOpencodeAuthList(v2.stdout, 2);
+    if (parsed !== null) return parsed;
+  }
+  if (major !== 1) return null;
+  const v1 = await probeOutput(bin, ["auth", "list"], env);
+  if (!v1) return null;
+  const v1Text = `${v1.stdout}\n${v1.stderr}`;
+  // v1 and v2 can't share one data dir: once v2 has created `opencode.db`,
+  // every v1 command in that home fails with this message (live W4 smoke).
+  if (OPENCODE_V1_DB_CONFLICT_RE.test(v1Text.replace(ANSI_RE, ""))) return OPENCODE_V1_DB_CONFLICT;
+  if (v1.code !== 0) return null;
+  return parseOpencodeAuthList(v1Text, 1);
+}
+
+/**
+ * Memoized (60 s, `harness.id:path` plus the probe env, like
+ * `getCachedStatus`) credential check behind the OpenCode "no credentials"
+ * notice. Failures are cached too — a broken `auth list` shouldn't be
+ * re-spawned on every poll tick. The env is part of the key because it
+ * carries the harness home (`HOME`/`XDG_*`): editing a harness's home or env
+ * points it at other credentials, and the old answer must not outlive that
+ * (live W4 smoke: a home change kept the old notice for a minute).
+ */
+async function getCachedOpencodeAuth(
+  harness: Harness,
+  path: string,
+  env: Record<string, string>,
+  version: Promise<string | null>,
+): Promise<AuthProbeResult> {
+  const key = `${harness.id}:${path}:${JSON.stringify(Object.entries(env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))}`;
+  const cached = authCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const value = await probeOpencodeAuth(path, env, version);
+  authCache.set(key, { value, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+  return value;
+}
+
+const OPENCODE_NO_CREDENTIALS_NOTICE = "No OpenCode credentials found — run `opencode auth login`";
+const OPENCODE_V1_DB_CONFLICT_NOTICE =
+  "OpenCode 1 can't read the data OpenCode 2 wrote in this home — give this harness its own Home in Settings → Harnesses";
+const OPENCODE_V2_AVAILABLE_NOTICE = "OpenCode 2 is available: `opencode upgrade --major`";
+
 const FX_HELP_MARKER = "coding agent";
 const FX_WRONG_BINARY_HINT =
   "found a different 'fx' binary (JSON viewer?) — install Vercel fx: curl -fsSL https://fx.sh/setup.sh | bash or set AGETOR_FX_BIN";
@@ -542,7 +729,12 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
     // the system install and always passes — no per-harness symlink needed.
   }
 
-  const version = await probeVersion(path, harnessEnv(harness));
+  const env = probeEnvFor(harness);
+  // Started now, awaited below: the OpenCode credential probe overlaps it.
+  const versionProbe = probeVersion(path, env);
+  const authProbe = harness.kind === "opencode" ? getCachedOpencodeAuth(harness, path, env, versionProbe) : null;
+  const version = await versionProbe;
+  if (version !== null) versionCache.set(`${harness.id}:${path}`, { value: version, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
 
   // fx-only pre-flight auth state. `available: true` regardless — the binary
   // IS installed and IS Vercel's fx; being logged out is a separate state
@@ -552,8 +744,17 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
   let authHelp: string | null = null;
   let fxProfilePermissionMode: string | null = null;
 
+  // OpenCode informational notices. Neutral on purpose: keyless Zen models
+  // exist, so a missing credential never blocks a run (`loggedIn` stays null).
+  const notices: string[] = [];
+  const noCredentials = authProbe ? await authProbe : null;
+  if (harness.kind === "opencode" && version !== null) {
+    if (noCredentials === OPENCODE_V1_DB_CONFLICT) notices.push(OPENCODE_V1_DB_CONFLICT_NOTICE);
+    else if (noCredentials === true) notices.push(OPENCODE_NO_CREDENTIALS_NOTICE);
+    if (opencodeMajor(version) === 1) notices.push(OPENCODE_V2_AVAILABLE_NOTICE);
+  }
+
   if (harness.kind === "fx" && version !== null) {
-    const env = harnessEnv(harness);
     // Run concurrently, not sequentially: probeStatus doesn't actually depend
     // on probeHelp's outcome to execute (only on whether we end up trusting
     // its result), so serializing them just to preserve read order was
@@ -622,6 +823,7 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
     loggedIn,
     authHelp,
     fxProfilePermissionMode,
+    ...(notices.length > 0 ? { notices } : {}),
     ...accountFields,
   };
 }
@@ -638,4 +840,10 @@ export function checkAllHarnesses(): Promise<HarnessStatus[]> {
 // Exposed for tests: clears the fx auth-status memoization (see
 // `getCachedStatus`/`statusCache` above) so a test isn't left racing a TTL
 // window set by an earlier test's probe against the same harness id + path.
-export const __testing = { clearStatusCache: () => statusCache.clear() };
+export const __testing = {
+  clearStatusCache: () => {
+    statusCache.clear();
+    versionCache.clear();
+    authCache.clear();
+  },
+};

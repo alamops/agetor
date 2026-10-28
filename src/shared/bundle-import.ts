@@ -15,7 +15,7 @@ import type { BundleHarnessRef, ParsedBundle } from "./bundle.ts";
 import { AGENT_PROFILE_LIMITS } from "./agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE } from "./pipeline.ts";
 import { DEFAULT_MODEL, PIPELINE_LIMITS } from "./types.ts";
-import type { AgentKind, AgentProfile, Pipeline, PipelineGraph, Speed } from "./types.ts";
+import type { AgentKind, AgentProfile, OpencodeServerMode, Pipeline, PipelineGraph, Speed } from "./types.ts";
 
 export interface BundleIssue {
   code: string;
@@ -85,6 +85,7 @@ export interface PlannedAgent {
   mode: string | null;
   speed: Speed;
   maxMode: boolean;
+  opencodeServer: OpencodeServerMode;
   instructions: string;
   skills: string[];
   warnings: BundleIssue[];
@@ -340,6 +341,7 @@ export function planBundleImport(
     let mode = a.mode;
     let speed = a.speed;
     let maxMode = a.maxMode;
+    let opencodeServer: OpencodeServerMode = a.opencodeServer ?? "shared";
 
     const override = agentHarness.get(a.key) ?? harnessMap.get(a.harness.id);
     if (override !== undefined) {
@@ -375,6 +377,7 @@ export function planBundleImport(
         mode = null;
         speed = "off";
         maxMode = false;
+        opencodeServer = "shared";
         warnings.push(
           issue(
             "settings-reset",
@@ -458,6 +461,7 @@ export function planBundleImport(
       mode,
       speed,
       maxMode,
+      opencodeServer,
       instructions: a.instructions,
       skills: [...a.skills],
       warnings,
@@ -671,7 +675,7 @@ export function planBundleImport(
  */
 export function planFingerprint(plan: Pick<BundleImportPlan, "agents" | "pipelines" | "harnesses">): string {
   const content = JSON.stringify([
-    plan.agents.map((a) => [a.key, a.name, a.harnessId, a.model, a.effort, a.mode, a.speed, a.maxMode]),
+    plan.agents.map((a) => [a.key, a.name, a.harnessId, a.model, a.effort, a.mode, a.speed, a.maxMode, a.opencodeServer]),
     plan.pipelines.map((p) => [
       p.index,
       p.name,

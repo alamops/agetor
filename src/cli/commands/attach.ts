@@ -24,10 +24,12 @@ function cliTmuxSocketArgs(): string[] {
 
 /**
  * Attach the current terminal to a task's live tmux session — the
- * in-terminal equivalent of the app's "Open in tmux". All three agent kinds
- * (claude-code, codex, gemini) run in a per-task tmux session, though for
- * codex/gemini it exists only while a turn is in flight (each turn is a
- * fresh one-shot session). Agetor creates sessions on tmux's default socket
+ * in-terminal equivalent of the app's "Open in tmux". Every tmux-hosted
+ * agent kind runs in a per-task tmux session (fx alone is a plain child
+ * process with none): claude-code's lives for the whole task, while for the
+ * turn-only kinds — codex, cursor, gemini, antigravity and opencode — it
+ * exists only while a turn is in flight (each turn is a fresh one-shot
+ * session). Agetor creates sessions on tmux's default socket
  * (no -L/-S) in production, named `agetor-<id>`, so a plain `tmux attach`
  * finds them; under an active non-default socket (test isolation)
  * `cliTmuxSocketArgs()` threads the matching `-L <name>` through. Detach
@@ -45,7 +47,7 @@ export async function cmdAttach(args: string[], flags: Flags): Promise<void> {
   if (!session) {
     throw new Error(
       "no tmux session — attach needs a task that has run (try 'agetor start' first); " +
-        "for codex/gemini this only exists while a turn is in flight",
+        "for codex, cursor, gemini, antigravity and opencode it only exists while a turn is in flight",
     );
   }
 

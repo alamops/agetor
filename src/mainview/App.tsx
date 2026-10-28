@@ -57,7 +57,7 @@ import { CoreBusyBanner } from "@/components/CoreBusyBanner";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import { WorktreesDialog } from "@/components/worktrees/WorktreesDialog";
-import { ImportClaudeSessionsDialog } from "@/components/kanban/ImportClaudeSessionsDialog";
+import { ImportSessionsDialog } from "@/components/kanban/ImportSessionsDialog";
 import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
 import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
 import type { UpdateSnapshot } from "@/lib/api";
@@ -75,6 +75,7 @@ import { parsePullNumber } from "@/lib/pr-url";
 import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
 import { cn } from "@/lib/utils";
+import { autoEnabledToastText, opencodeSessionsFoundText } from "@/lib/import-sessions";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
 import type { SettingsSectionId } from "@/lib/settings-dialog-view";
 import { reconcileById } from "@/lib/reconcile";
@@ -243,7 +244,7 @@ function AppInner() {
   // tabs/panels never re-triggers a redundant `GET /agent-profiles` — see
   // `useAgentProfiles`'s own doc comment.
   const { profiles, loaded: profilesLoaded, refresh: refreshProfiles } = useAgentProfiles();
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [], copilot: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [], opencode: [], copilot: [] });
   // Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`.
   // `discoveryReady` mirrors the daemon's boot discovery sweep: false until
   // the first `GET /agent-models/harnesses` reports `ready: true`, which is
@@ -1278,6 +1279,31 @@ function AppInner() {
         });
         return;
       }
+      if (ev.type === "opencode_sessions_found") {
+        toast(opencodeSessionsFoundText(ev.count), {
+          action: { label: "Review", onClick: () => setImportSessionsOpen(true) },
+        });
+        return;
+      }
+      if (ev.type === "harnesses_auto_enabled") {
+        // D-14: built-in harnesses turned on because their CLI is installed.
+        // Reload the header's harness state so the new rows show at once.
+        const text = autoEnabledToastText(ev.harnessIds, ev.labels);
+        void refreshAgents();
+        if (text) {
+          toast(text, {
+            action: {
+              label: "Settings",
+              onClick: () => {
+                setSettingsInitialSection("harnesses");
+                setSettingsInitialAgentId(null);
+                setSettingsOpen(true);
+              },
+            },
+          });
+        }
+        return;
+      }
       if (ev.type === "claude_session_import") {
         void refresh();
         return;
@@ -1363,7 +1389,7 @@ function AppInner() {
       });
     });
     return cancel;
-  }, [confirm, refreshAgentModels, refreshHarnessModels, openTask, openPipelineAttention]);
+  }, [confirm, refreshAgents, refreshAgentModels, refreshHarnessModels, openTask, openPipelineAttention]);
 
   // App-wide lifecycle subscription. Drives toasts + native notifications.
   //
@@ -2468,8 +2494,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             variant="ghost"
             size="icon"
             onClick={() => setImportSessionsOpen(true)}
-            aria-label="Import Claude Code sessions"
-            title="Import Claude Code sessions"
+            aria-label="Import Claude Code sessions and OpenCode sessions"
+            title="Import Claude Code sessions and OpenCode sessions"
             data-testid="import-claude-sessions-open"
           >
             <Import className="size-4" />
@@ -2817,7 +2843,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           setSettingsOpen(true);
         }}
       />
-      <ImportClaudeSessionsDialog
+      <ImportSessionsDialog
         open={importSessionsOpen}
         onClose={() => setImportSessionsOpen(false)}
         onImported={() => { void refresh(); }}

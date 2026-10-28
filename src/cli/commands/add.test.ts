@@ -64,8 +64,15 @@ afterAll(() => {
   mock.module("../output.ts", () => realOutputSnapshot);
 });
 
-const { parseAdd, cmdAdd, chooseAddPath, resolveInitialModel, defaultNonInteractiveMode, wizardSpeedChoices } =
-  await import("./add.ts");
+const {
+  parseAdd,
+  cmdAdd,
+  chooseAddPath,
+  resolveInitialModel,
+  defaultNonInteractiveMode,
+  wizardSpeedChoices,
+  wizardOpencodeServerChoices,
+} = await import("./add.ts");
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -167,6 +174,7 @@ function makeAgentProfile(overrides: Partial<AgentProfile> = {}): AgentProfile {
     mode: "auto",
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     instructions: "Be thorough.",
     skills: ["code-review"],
     createdAt: 1,
@@ -1354,5 +1362,64 @@ describe("--pipeline", () => {
     expect(input.workdir).toBe("/tmp/acme-widgets");
     expect(input.isolation).toBe("none");
     expect(input.taskType).toBe("bug");
+  });
+});
+
+describe("--opencode-server", () => {
+  test("parseAdd: takes shared and standalone, refuses anything else with the mode list", () => {
+    expect(parseAdd(["--opencode-server", "shared"]).opencodeServer).toBe("shared");
+    expect(parseAdd(["--opencode-server", "standalone"]).opencodeServer).toBe("standalone");
+    expect(parseAdd(["--title", "T"]).opencodeServer).toBeUndefined();
+    expect(() => parseAdd(["--opencode-server", "Shared"])).toThrow(
+      "'--opencode-server' must be one of shared, standalone (got 'Shared')",
+    );
+    expect(() => parseAdd(["--opencode-server"])).toThrow("'--opencode-server' needs a value");
+    // A typed value is echoed escaped, never as a raw control character.
+    expect(() => parseAdd(["--opencode-server", "x\u001b[2J"])).toThrow("(got 'x\\u001b[2J')");
+  });
+
+  test("cmdAdd: --opencode-server is sent on the create payload", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode", "--opencode-server", "standalone"], flags());
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode"], flags());
+    expect(createTaskCalls.map((c) => c.opencodeServer)).toEqual(["standalone", undefined]);
+  });
+
+  test("cmdAdd: an invalid --opencode-server fails before any request", async () => {
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await expect(cmdAdd(["--title", "T", "--prompt", "P", "--opencode-server", "both"], flags())).rejects.toThrow(
+      /'--opencode-server' must be one of shared, standalone/,
+    );
+    expect(createTaskCalls).toEqual([]);
+  });
+
+  test("cmdAdd: --profile or --pipeline with --opencode-server is the usage error", async () => {
+    reset();
+    await expect(cmdAdd(["--profile", "Reviewer", "--opencode-server", "shared"], flags())).rejects.toThrow(
+      /--profile cannot be combined with .*--opencode-server/,
+    );
+    await expect(cmdAdd(["--pipeline", "Flow", "--opencode-server", "standalone"], flags())).rejects.toThrow(
+      /--pipeline cannot be combined with .*--opencode-server/,
+    );
+  });
+
+  test("wizardOpencodeServerChoices: opencode 2 or an unknown version offers Shared / Standalone", () => {
+    for (const version of ["opencode v2.1.3", null, "garbage"]) {
+      const rows = wizardOpencodeServerChoices("opencode", { home: null }, version);
+      expect(rows.map((r) => [r.id, r.label])).toEqual([["shared", "Shared"], ["standalone", "Standalone"]]);
+    }
+    expect(wizardOpencodeServerChoices("opencode", undefined, "2.0.0").map((r) => r.id)).toEqual(["shared", "standalone"]);
+  });
+
+  test("wizardOpencodeServerChoices: no step on OpenCode 1, for a harness with a home, or another kind", () => {
+    expect(wizardOpencodeServerChoices("opencode", { home: null }, "1.19.4")).toEqual([]);
+    expect(wizardOpencodeServerChoices("opencode", { home: "/Users/me/.agetor/oc-2" }, "opencode v2.1.3")).toEqual([]);
+    // A blank home is no home.
+    expect(wizardOpencodeServerChoices("opencode", { home: "  " }, null).length).toBe(2);
+    expect(wizardOpencodeServerChoices("codex", { home: null }, null)).toEqual([]);
   });
 });
