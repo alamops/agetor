@@ -22,6 +22,6 @@ test("persistPrefs writes lastModel/lastMode/lastEffort for the kind", async () 
 
 test("persistPrefs skips picks that weren't chosen", async () => {
   const calls: Array<[string, string]> = [];
-  await persistPrefs(recordingClient(calls), "codex", { model: "gpt-5.5" });
-  expect(calls).toEqual([["lastModel:codex", "gpt-5.5"]]);
+  await persistPrefs(recordingClient(calls), "codex", { model: "gpt-6.1-terra" });
+  expect(calls).toEqual([["lastModel:codex", "gpt-6.1-terra"]]);
 });
