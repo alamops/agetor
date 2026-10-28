@@ -214,7 +214,7 @@ All spikes ran in the scratchpad against the real `copilot` 1.0.104 binary. They
 | Is the model list available offline? | **Yes (static per CLI version)** | `COPILOT_OFFLINE=true copilot help config` prints the 31 model ids, no auth needed. | 1.0.104 | `help-config.txt` |
 | Would the typechecker catch a half-wired kind? | **No (21 errors, 9 files)** | Scratch copy, `AgentKind \|= "copilot"`, `tsc --noEmit` → 21 errors: types.ts tables, `INSTALL_HINTS`, `AgentIcon`, `HARNESS_HOME_COPY`, `resolveBin`, `runRefreshKind`, `NewTaskForm`/`TaskLaunchPickers`/`RunPanel` map indexing. **It does not flag** `buildCommand`/`spawnAgent` (fall to codex), `harnessEnv` (falls to `GEMINI_CLI_HOME`), `onSessionId` (falls to `fxSessionId`), reconcile/send/drop dispatch, db/server kind whitelists, the migration CHECK, `commands.ts`, `ref-tree.ts` or the README. | repo @ c5cf1a2 | `spikes/tsc-copilot.txt` |
 
-Spike artifacts live under the scratchpad: `/private/tmp/claude-501/-Users-alamosaravali--agetor-worktrees-df2af652-baba-46c3-a9c8-f716f686f331/ce1875c3-c452-4950-bc24-364cba936c35/scratchpad/spikes/`. That covers `copilot-cli/` (binary, help dumps, scenario outputs), `fake-provider/server.ts`, `scripts/` (scenario runners, ACP probe), and `repo-copy/`. The fake-provider recipe is reusable for a **real-binary integration test with no auth**.
+The spike artifacts were kept in a session scratchpad and are not committed. They covered `copilot-cli/` (binary, help dumps, scenario outputs), `fake-provider/server.ts`, `scripts/` (scenario runners, ACP probe), and `repo-copy/`. The fake-provider recipe is reusable for a **real-binary integration test with no auth**; it now lives in `src/bun/test-support/copilot-fake-provider.ts`.
 
 ## 3. What we're assuming
 

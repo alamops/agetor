@@ -41,7 +41,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Kanban workflow.** Tasks move through *Backlog → Ready → Running → Blocked → Review → Done* as their runs start, stall, fail or finish. You can drag a card to override the flow at any time.
 - **A git worktree for every task.** Each task runs on its own branch (`agetor/<id>-<slug>`) under `~/.agetor/worktrees/`, so two agents can work on the same repo at once without colliding. The base commit is pinned when the task is created, so the task keeps the same starting point even after the source branch moves on.
-- **Seven harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx, Antigravity and GitHub Copilot side by side. To use a second account for any of them, add a harness with its own isolated home (`$HOME`, or `COPILOT_HOME` for GitHub Copilot).
+- **Seven harnesses, many accounts.** Run Claude Code, Codex, Cursor, Gemini CLI, fx, Antigravity and GitHub Copilot side by side. To use a second account, add a harness with its own home directory (`$HOME`, or the CLI's own config-dir variable). For GitHub Copilot that is a separate `COPILOT_HOME`; whether it also keeps the login separate isn't verified yet, see the [GitHub Copilot notes](#github-copilot-notes).
 - **Agents (reusable profiles).** Save a harness, model, effort, mode, speed, instructions and skills as a named **Agent**, then launch tasks from it in one click.
 - **Pipelines.** Chain Agents into a reusable graph on a canvas, such as *Plan → Implement → Review*. Steps hand context to each other, branch, fan out and loop, all from a single board card. See [Pipelines](#pipelines).
 - **Model discovery.** Model and effort pickers start from a curated list. For Codex, Cursor, fx and Antigravity, they also include the models your account actually offers, as reported by the CLI. For GitHub Copilot, they include the models your installed CLI version knows about (that list doesn't depend on your account). If a model needs a newer CLI than you have installed, Agetor refuses the run with an upgrade hint instead of letting the CLI fail with a confusing error.
@@ -106,15 +106,15 @@ Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast*
 
 ### GitHub Copilot notes
 
-- **Install the right `copilot`.** GitHub's CLI is the Homebrew *cask* `copilot-cli` (`brew install --cask copilot-cli`, or `npm i -g @github/copilot`). AWS Copilot ships a binary with the same name; Agetor recognizes it from `copilot --version` and reports it as not GitHub Copilot CLI instead of launching it. Sign in with `copilot login`.
+- **Install the right `copilot`.** GitHub's CLI is the Homebrew *cask* `copilot-cli` (`brew install --cask copilot-cli`, or `npm i -g @github/copilot`, which needs Node.js 22 or later). AWS Copilot ships a binary with the same name; Agetor recognizes it from `copilot --version` and reports it as not GitHub Copilot CLI instead of launching it. Sign in with `copilot login`.
 - **First launch is slow.** The npm build unpacks about 200 MB the first time it runs, so the first status check can show no version until the next refresh.
 - **Three modes.** *Auto* runs hands-off (`--allow-all`) and trusts the task's worktree. *Plan* runs `copilot --mode plan`, which plans without editing. *Read-only* passes no allow flags, so Copilot denies file edits and commands that change files (read-only commands still run), and the run can still finish as succeeded. Agetor passes the mode on every turn, so switching a task out of Plan stops planning.
 - **Approving a plan.** The plan card shows the plan Copilot wrote. Approving it sends the plan back to Copilot in the message, writes no file into your repo, and switches the task to *Auto* so Copilot can implement it. A task launched from an Agent keeps Plan, because the Agent defines its mode.
 - **Default model.** New tasks use **Auto**, Copilot's own model router. A status line in the transcript names the model it actually picked. Effort defaults to *Model default*, which leaves `--reasoning-effort` off.
 - **Background agents.** Subagents Copilot starts show up as tabs on the task, like Claude Code's background agents.
 - **Messages during a turn.** A message you send while Copilot is working runs as the next turn, in the same Copilot session. After you switch the task to a different Copilot harness, it starts a fresh session instead and says so, because another account can't see the old one.
-- **Second account.** An additional GitHub Copilot harness gets its own `COPILOT_HOME`. Run `COPILOT_HOME=<path> copilot login` once to sign it in.
-- **Tokens.** A classic `ghp_` token in `GH_TOKEN` or `GITHUB_TOKEN` is dropped before Copilot starts, since Copilot rejects it and it would override your login. Set it in the harness's env if you do want it passed.
+- **Second account.** An additional GitHub Copilot harness gets its own `COPILOT_HOME`, a separate config and session directory. Run `COPILOT_HOME=<path> copilot login` once to sign it in. Whether Copilot keeps that login separate from your main one isn't verified yet; if both harnesses end up on the same account, set `COPILOT_GITHUB_TOKEN` in the second harness's env instead.
+- **Tokens.** A classic `ghp_` token in `GH_TOKEN` or `GITHUB_TOKEN` is dropped before Copilot starts, since Copilot rejects it and it can override a keychain login. To sign in with a token instead of `copilot login`, use `COPILOT_GITHUB_TOKEN`.
 - **Skills, MCP servers and custom agents.** Copilot's skills, MCP servers and custom agents (`~/.copilot`, plus `.github/` and `.agents/` in the project) appear in the `/` menu and the Extensions picker. Custom agents get their own *Agents* group.
 
 ---
@@ -301,7 +301,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 ├── agetor-core.json         # 0600: the running core's port + token (how the CLI connects)
 ├── github-tokens.json       # 0600: git host tokens from Settings → Git Integration
 ├── worktrees/<task-id>/     # per-task git worktrees
-├── harnesses/<id>/          # isolated home ($HOME, or COPILOT_HOME) for additional-account harnesses
+├── harnesses/<id>/          # separate home dir ($HOME, or COPILOT_HOME) for additional-account harnesses
 ├── attachments/             # files and images attached to prompts
 ├── issue-threads/           # issue snapshots for tasks started from an issue
 ├── pipeline-runs/           # handoffs recorded by each pipeline run

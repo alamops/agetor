@@ -50,9 +50,9 @@ type Row = { tag: "ext"; ext: AvailableExtension } | { tag: "prompt"; prompt: Sa
 /**
  * "Extensions" picker that sits above the prompt / message textarea. A single
  * button opens a searchable, grouped popover of the MCP servers, skills,
- * plugins, and saved prompts reachable for the current agent + workdir.
- * Selecting an MCP/skill/plugin inserts its `insert` token (`/skill` or
- * `@mcp` / `@plugin`); selecting a saved prompt inserts its content.
+ * plugins, agents, and saved prompts reachable for the current agent + workdir.
+ * Selecting an MCP/skill/plugin/agent inserts its `insert` token (`/skill` or
+ * `@mcp` / `@plugin` / `@agent`); selecting a saved prompt inserts its content.
  *
  * Complements — doesn't replace — the `/` SlashAutocomplete: that one is a
  * typeahead for slash-invokable commands; this is an always-available browse
@@ -180,7 +180,7 @@ export function ExtensionPicker({
         data-testid="extension-picker-trigger"
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
-        title="Insert an MCP server, skill, plugin reference, or saved prompt"
+        title="Insert an MCP server, skill, plugin, or agent reference, or a saved prompt"
         className={cn(
           "inline-flex items-center gap-1 rounded-md border border-border/60 bg-card/40 px-2 py-1 text-[11px] text-muted-foreground",
           "hover:bg-accent/40 hover:text-foreground disabled:opacity-50 disabled:hover:bg-card/40 disabled:hover:text-muted-foreground",
@@ -188,7 +188,7 @@ export function ExtensionPicker({
         )}
       >
         <Blocks className="size-3" />
-        <span>MCP · Skills · Plugins · Prompts</span>
+        <span>MCP · Skills · Plugins · Agents · Prompts</span>
         <ChevronDown className={cn("size-3 transition-transform", open && "rotate-180")} />
       </button>
 
@@ -236,7 +236,7 @@ export function ExtensionPicker({
             {grouped.length === 0 ? (
               <p className="px-3 py-2 text-[11px] text-muted-foreground">
                 {extensions.length === 0 && (savedPrompts?.length ?? 0) === 0
-                  ? "No MCP servers, skills, or plugins found for this project, and no saved prompts."
+                  ? "No MCP servers, skills, plugins, or agents found for this project, and no saved prompts."
                   : "No matches."}
               </p>
             ) : (

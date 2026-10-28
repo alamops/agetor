@@ -914,7 +914,7 @@ function startCopilotTailer(state: CopilotSessionState): Promise<number> {
     let misses = 0;
     let tickInFlight = false;
     state.deathTimer = setInterval(() => {
-      if (tickInFlight || state.resolved || state.finishing) return;
+      if (tickInFlight || state.resolved || state.finishing || state.killed) return;
       tickInFlight = true;
       void (async () => {
         try {
@@ -929,7 +929,7 @@ function startCopilotTailer(state: CopilotSessionState): Promise<number> {
           if (outcome === "wait") { misses++; return; }
           if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
           setTimeout(() => {
-            if (state.resolved || state.finishing) return;
+            if (state.resolved || state.finishing || state.killed) return;
             flushCopilotLog(state);
             if (state.lastCode === null && readCopilotExitCode(state.runId) === null) {
               state.onChunk("status", `${SESSION_DIED_STATUS_PREFIX}GitHub Copilot session vanished mid-turn`);
@@ -948,9 +948,16 @@ function startCopilotTailer(state: CopilotSessionState): Promise<number> {
 
 async function killCopilotState(state: CopilotSessionState): Promise<void> {
   state.killed = true;
-  await killSessionByName(state.sessionName);
-  try { state.sink?.settleAll("orphaned"); } catch { /* noop */ }
-  resolveSession(state, 1);
+  // Stop the tailer and death watch first: once the session starts vanishing a
+  // pending tick would otherwise read it as a mid-turn death (a `session ended`
+  // sentinel that blocks the card) or settle the turn with the exit file.
+  disposeCopilotState(state);
+  try {
+    await killSessionByName(state.sessionName);
+  } finally {
+    try { state.sink?.settleAll("orphaned"); } catch { /* noop */ }
+    resolveSession(state, 1);
+  }
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *

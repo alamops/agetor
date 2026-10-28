@@ -1001,7 +1001,7 @@ lifecycle("spawnCopilotViaTmux lifecycle", () => {
       lines: [j("assistant.message", "k1", { messageId: "m", content: "working" })],
       sleepAfter: 30,
     });
-    const { onChunk } = collect();
+    const { chunks, onChunk } = collect();
     const { sink, calls } = recordingSink();
     const agent = await spawnCopilotViaTmux(launchOpts(ids, stub, onChunk, { onSubagent: sink }));
     await Bun.sleep(500);
@@ -1010,6 +1010,10 @@ lifecycle("spawnCopilotViaTmux lifecycle", () => {
     expect(calls).toEqual([{ kind: "settleAll", status: "orphaned" }]);
     expect(copilotSessionActive(ids.taskId)).toBe(false);
     expect(await sessionExistsByName(sessionNameFor(ids.taskId))).toBe(false);
+    // Outlast the death watch's two-miss window plus its grace: a deliberate
+    // kill must never be read as the session dying mid-turn.
+    await Bun.sleep(1500);
+    expect(chunks.some((c) => c.stream === "status" && c.data.startsWith(SESSION_DIED_STATUS_PREFIX))).toBe(false);
   }, T);
 
   test("dropCopilotSession kills a live turn", async () => {
