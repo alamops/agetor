@@ -126,6 +126,16 @@ export function contentTypeForPreviewPath(p: string): string | null {
  *  (`github.ts`'s `getGitHubPullBlob`). */
 export const MAX_BLOB_PREVIEW_BYTES = 20_000_000;
 
+/** Above this many bytes, `/files/preview` refuses an image (413) instead of
+ *  reading it. The image is usually an agent's choice (its markdown, its
+ *  `SendUserFile` call), and while disclaiming the route holds the whole file
+ *  in memory before answering (core-file-read.ts `settleFileBytes`), so the
+ *  cap bounds the core's memory per preview. It applies with the disclaim
+ *  switch off too (where the file streams from disk), on purpose: which
+ *  images render must not change with the switch. Generous: a full Retina
+ *  screenshot is well under it. */
+export const MAX_FILE_PREVIEW_BYTES = 50_000_000;
+
 /** Matches claude's `[Image #<digits>]` placeholder token. `N` is a
  *  session-wide attachment counter, not a per-message index — don't attempt
  *  to correlate the number to anything positional. Module-private — callers

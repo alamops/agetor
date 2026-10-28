@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { closeSync, ftruncateSync, mkdtempSync, openSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
@@ -124,10 +124,10 @@ async function createAndStartUserImageTask(
   backend: E2EBackend,
   title: string,
   imagePath: string,
+  prompt = `![u1](file://${imagePath})\n\n![u2](${imagePath})`,
 ): Promise<TaskRow> {
   const workdir = mkdtempSync(path.join(tmpdir(), "agetor-e2e-md-images-user-"));
   const auth = { authorization: `Bearer ${backend.apiToken}` };
-  const prompt = `![u1](file://${imagePath})\n\n![u2](${imagePath})`;
   const createRes = await request.post(`${backend.apiBase}/tasks`, {
     headers: auth,
     data: { title, prompt, isolation: "none", workdir },
@@ -229,6 +229,7 @@ test.describe("markdown image rendering", () => {
     const fallback = panel.locator('[data-testid="md-image-fallback"]');
     await expect(fallback).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
     await expect(fallback).toContainText(path.basename(missingPath));
+    await expect(fallback).toHaveAttribute("data-reason", "not-found");
 
     // --- a non-image extension -> file chip, decided purely by extension,
     //     independent of whether the file actually exists -------------------
@@ -311,6 +312,34 @@ test.describe("markdown image rendering", () => {
         })
         .toBeGreaterThan(0);
     }
+  });
+
+  test("an image over the preview cap renders a 'too large' chip, not 'not found'", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    const { MAX_FILE_PREVIEW_BYTES } = await import("../src/shared/attachments.ts");
+    const imgDir = mkdtempSync(path.join(tmpdir(), "agetor-e2e-md-images-big-"));
+    const bigPath = path.join(imgDir, "huge.png");
+    // Sparse: the size is over the cap, but nothing is written to disk, and
+    // the route refuses it (413) from the stat alone.
+    const fd = openSync(bigPath, "w");
+    ftruncateSync(fd, MAX_FILE_PREVIEW_BYTES + 1);
+    closeSync(fd);
+
+    const title = `md-images-e2e-big ${randomUUID()}`;
+    await createAndStartUserImageTask(request, backend, title, bigPath, `![big](${bigPath})`);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    const chip = panel.locator('.rounded-br-md .agetor-md [data-testid="md-image-fallback"]');
+    await expect(chip).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+    await expect(chip).toHaveAttribute("data-reason", "too-large");
+    await expect(chip).toHaveAttribute("title", `Image too large to preview: ${bigPath}`);
+    await expect(panel.locator('.rounded-br-md .agetor-md [data-testid="md-image"]')).toHaveCount(0);
   });
 
   test("MdImage renders inline content only — no new .agetor-md wrapper containers", async ({

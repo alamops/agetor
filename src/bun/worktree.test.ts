@@ -883,6 +883,52 @@ test("getTaskDiffBlob: a new-side symlink 404s instead of being followed (both d
   }
 });
 
+// D26(j): same answers through the disclaim helper as in-process — an
+// unreadable working-tree file is a 403 (never a 200 that dies), a FIFO named
+// like an image is a 404 at once (never a hung read), and the size cap is
+// checked before reading on both paths.
+test("getTaskDiffBlob: unreadable 403s, a FIFO 404s, an over-cap file 413s (both disclaim modes)", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef, MAX_BLOB_PREVIEW_BYTES } = await import("./worktree.ts");
+  const { getDisclaimSwitch, setDisclaimSwitch } = await import("./disclaim.ts");
+  const { chmodSync } = await import("node:fs");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+  const locked = path.join(prepared.cwd, "locked.png");
+  writeFileSync(locked, BLOB_V1);
+  chmodSync(locked, 0o000);
+  expect(Bun.spawnSync(["/usr/bin/mkfifo", path.join(prepared.cwd, "fifo.png")]).exitCode).toBe(0);
+  await Bun.write(path.join(prepared.cwd, "huge.png"), new Uint8Array(MAX_BLOB_PREVIEW_BYTES + 1));
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const stubDir = mkdtempSync(path.join(tmpdir(), "agetor-blob-stub-"));
+  const stub = path.join(stubDir, "disclaim-stub.sh");
+  writeFileSync(stub, '#!/bin/sh\nexec "$@"\n', { mode: 0o755 });
+  const savedBin = process.env.AGETOR_DISCLAIM_BIN;
+  const savedSwitch = getDisclaimSwitch();
+  try {
+    for (const on of [false, true]) {
+      if (on) process.env.AGETOR_DISCLAIM_BIN = stub;
+      setDisclaimSwitch(on);
+      if (process.getuid?.() !== 0) {
+        expect(await getTaskDiffBlob(live, "locked.png", "new")).toMatchObject({ ok: false, status: 403 });
+      }
+      const started = Date.now();
+      expect(await getTaskDiffBlob(live, "fifo.png", "new")).toMatchObject({ ok: false, status: 404 });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(await getTaskDiffBlob(live, "huge.png", "new")).toMatchObject({ ok: false, status: 413 });
+    }
+  } finally {
+    if (savedBin === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+    else process.env.AGETOR_DISCLAIM_BIN = savedBin;
+    setDisclaimSwitch(savedSwitch);
+    chmodSync(locked, 0o600);
+    rmSync(stubDir, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test("removeWorktree tears down both the worktree and the branch", async () => {
   const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
   const repo = await makeRepo();

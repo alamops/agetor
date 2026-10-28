@@ -9,7 +9,7 @@ import { removeCoreCreds } from "./core-creds.ts";
 import { applyRoutePolicy, callerOf, desktopOnlyResponse, type ApiCaller } from "./route-policy.ts";
 import { callerProjectTree, gateCallerPath, probePaths } from "./caller-fs.ts";
 import { readTextNoFollow } from "./no-follow.ts";
-import { openFileBytes } from "./core-file-read.ts";
+import { openFileBytes, settleFileBytes } from "./core-file-read.ts";
 import { PROJECT_CAPABILITY_PATHSPECS } from "./ref-tree.ts";
 import { taskDirExists, writeTaskDirFileAtomic } from "./task-dir-fs.ts";
 import { DISCLAIM_PREF_KEY, isDisclaimOffValue } from "./disclaim.ts";
@@ -246,7 +246,12 @@ import type {
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
-import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
+import {
+  binaryPreviewKind,
+  contentTypeForPreviewPath,
+  isImagePath,
+  MAX_FILE_PREVIEW_BYTES,
+} from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { LONE_SURROGATE_RE, PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { BUNDLE_MAX_BYTES, findInvisibleChar } from "../shared/bundle.ts";
@@ -6533,9 +6538,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // while disclaiming the file is opened by a disclaimed child, never
           // in the core's own process under Agetor's TCC identity (D26(j)).
           // Only regular files (a FIFO named `*.png` would hang the stream).
+          // `maxBytes` bounds the memory `settleFileBytes` holds below.
           const opened = await openFileBytes(raw, {
             followSymlinks: true,
             ifNoneMatch: req.headers.get("if-none-match"),
+            maxBytes: MAX_FILE_PREVIEW_BYTES,
           });
           if (opened.kind === "missing") {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
@@ -6543,9 +6550,14 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           if (opened.kind === "denied") {
             return json({ error: `not readable: ${raw}` }, { status: 403, headers: corsHeaders(req) });
           }
-          if (opened.kind === "error" || opened.kind === "too-large") {
-            const message = opened.kind === "error" ? opened.message : "too large";
-            return json({ error: `could not read ${raw}: ${message}` }, { status: 500, headers: corsHeaders(req) });
+          if (opened.kind === "too-large") {
+            return json(
+              { error: `image exceeds ${MAX_FILE_PREVIEW_BYTES} bytes: ${raw}` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (opened.kind === "error") {
+            return json({ error: `could not read ${raw}: ${opened.message}` }, { status: 500, headers: corsHeaders(req) });
           }
           const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
           // Shared canonical map (../shared/attachments.ts) — behavior is
@@ -6562,7 +6574,14 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               headers: { ...corsHeaders(req), etag },
             });
           }
-          return new Response(opened.body, {
+          // A streamed body is read whole before the 200: Bun ends a chunked
+          // response cleanly when its stream errors, so a short read would
+          // otherwise reach the webview as a complete, truncated image.
+          const settled = await settleFileBytes(opened, req.signal);
+          if (settled.kind === "error") {
+            return json({ error: `could not read ${raw}: ${settled.message}` }, { status: 500, headers: corsHeaders(req) });
+          }
+          return new Response(settled.body, {
             headers: {
               ...corsHeaders(req),
               "content-type": contentType,

@@ -137,10 +137,14 @@ afterAll(async () => {
     if (SAVED_ENV[k] === undefined) delete process.env[k];
     else process.env[k] = SAVED_ENV[k];
   }
-  try {
-    chmodSync(path.join(SCRATCH, "locked"), 0o700);
-  } catch {
-    // never created
+  // Restore every mode-000 fixture a test left behind (a test that timed out
+  // never reached its own `finally`), or the rm below fails with EACCES.
+  for (const name of ["locked", "locked-padded"]) {
+    try {
+      chmodSync(path.join(SCRATCH, name), 0o700);
+    } catch {
+      // never created
+    }
   }
   rmSync(SCRATCH, { recursive: true, force: true });
   rmTestDataDir(DATA_DIR);
@@ -624,7 +628,10 @@ test.skipIf(asRoot)("path gate: a whitespace-padded spelling of an unreadable pa
   } finally {
     chmodSync(locked, 0o700);
   }
-});
+  // Every gated route × field × spelling is a sequential request whose path
+  // gate probes the raw AND trimmed value in disclaimed child processes —
+  // ~2–3 s alone, well past the 5 s default under a full-suite load.
+}, 60_000);
 
 // `tmux_source` belongs to the desktop-only POST /tmux-source; the generic
 // preference route must not let the CLI token set it either.

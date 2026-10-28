@@ -422,7 +422,9 @@ describe.skipIf(process.platform !== "darwin")("disclaimed children", () => {
     expect(got[0]).toBe("missing");
     expect(got[1]).toBe("dir");
     expect(lines(log)).toEqual(["/bin/sh", "/bin/sh", "/bin/sh"]); // 256 + 256 + 88
-  });
+    // 600 paths is ~600 `stat` execs across the three probe children: ~2 s
+    // alone, past the 5 s default under a full-suite load.
+  }, 30_000);
 
   test("the tar child runs through the disclaim helper", async () => {
     const { stub, log } = recordingStub("disclaim-tar");

@@ -17,8 +17,10 @@
 // identity anyway (D7), so the read stays in-process.
 //
 // The disclaimed path streams: the child prints one header line (`O <size>
-// <mtime>`) and then `exec`s `cat`, whose stdout becomes the response body —
-// one exec per image, no buffering in the core. The header comes before any
+// <mtime>`) and then `exec`s `cat`, whose stdout becomes the body — one exec
+// per image. An HTTP route settles that stream (`settleFileBytes`) before it
+// answers, so a short read is an error rather than a clean-looking truncated
+// 200; `maxBytes` bounds what that holds in memory. The header comes before any
 // byte of content, the path travels only as an argv element after `--`, and
 // `LC_ALL=C` keeps `stat`'s messages parseable.
 
@@ -37,6 +39,22 @@ const HEADER_CAP_BYTES = 4096;
 const STDERR_CAP_BYTES = 4096;
 /** An `If-None-Match` longer than this can't be one of our ETags. */
 const IF_NONE_MATCH_MAX = 256;
+
+/** Live values of the two budgets above that tests may shrink (`__forTest`). */
+let openTimeoutMs = OPEN_TIMEOUT_MS;
+let bodyTimeoutMs = BODY_TIMEOUT_MS;
+
+/** Test-only seams: shrink the helper's open and body budgets so a stalled
+ *  child is observable without waiting 10 s / 60 s. `null` restores the
+ *  production value. Read at use time. */
+export const __forTest = {
+  setOpenTimeoutMs(ms: number | null): void {
+    openTimeoutMs = ms === null ? OPEN_TIMEOUT_MS : Math.max(1, ms);
+  },
+  setBodyTimeoutMs(ms: number | null): void {
+    bodyTimeoutMs = ms === null ? BODY_TIMEOUT_MS : Math.max(1, ms);
+  },
+};
 
 export type FileBytesOpen =
   | { kind: "ok"; etag: string; size: number; body: ReadableStream<Uint8Array> | Blob | Uint8Array<ArrayBuffer> }
@@ -93,12 +111,55 @@ export async function readFileBytes(
   }
 }
 
+/**
+ * An `ok` result whose body is safe to hand to a `Response` as-is. A streamed
+ * (disclaimed) body is collected first — bounded by the result's `size`, so
+ * pass `maxBytes` when opening — because a stream that errors on a short read
+ * does not reach the client as a failure: Bun 1.3.10 ends the chunked
+ * response cleanly and ignores an explicit `content-length` on a stream body,
+ * so a truncated image would read as whole. Collecting turns that into an
+ * `error` before any 200. A `Blob` (in-process `Bun.file`) streams from disk
+ * and a `Uint8Array` is already whole; both pass through untouched. Never
+ * throws.
+ */
+export async function settleFileBytes(
+  r: Extract<FileBytesOpen, { kind: "ok" }>,
+  signal?: AbortSignal,
+): Promise<Extract<FileBytesOpen, { kind: "ok" }> | { kind: "error"; message: string }> {
+  const body = r.body;
+  if (!(body instanceof ReadableStream)) return r;
+  // A dropped request (the webview aborts an image that scrolled away) must
+  // stop the read: cancelling the stream kills the helper child and frees
+  // what was collected, instead of holding both until EOF or the body budget.
+  const reader = body.getReader();
+  const onAbort = () => {
+    reader.cancel().catch(() => {});
+  };
+  if (signal?.aborted) onAbort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const bytes = await collectReader(reader, r.size);
+    if (signal?.aborted) return { kind: "error", message: "request aborted" };
+    return { ...r, body: bytes };
+  } catch (err) {
+    return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 async function collect(body: ReadableStream<Uint8Array> | Blob | Uint8Array<ArrayBuffer>, size: number): Promise<Uint8Array<ArrayBuffer>> {
   if (body instanceof Uint8Array) return body;
   if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
+  return collectReader(body.getReader(), size);
+}
+
+async function collectReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  size: number,
+): Promise<Uint8Array<ArrayBuffer>> {
   const out = new Uint8Array(size);
   let off = 0;
-  const reader = body.getReader();
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -270,7 +331,7 @@ async function openDisclaimed(p: string, opts: FileBytesOptions): Promise<FileBy
   let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
     timedOut = true;
     kill();
-  }, OPEN_TIMEOUT_MS);
+  }, openTimeoutMs);
   const stopTimer = () => {
     if (timer) clearTimeout(timer);
     timer = undefined;
@@ -296,7 +357,7 @@ async function openDisclaimed(p: string, opts: FileBytesOptions): Promise<FileBy
   };
   const timeoutResult = (): FileBytesOpen => ({
     kind: "error",
-    message: `timed out after ${OPEN_TIMEOUT_MS / 1000} s (a macOS permission prompt may be waiting)`,
+    message: `timed out after ${openTimeoutMs / 1000} s (a macOS permission prompt may be waiting)`,
   });
 
   // Header line.
@@ -357,7 +418,7 @@ async function openDisclaimed(p: string, opts: FileBytesOptions): Promise<FileBy
   // Streaming. Cut at `size` (a file that grew is not read past it) and error
   // on a short read, so a client never mistakes a truncated body for a whole one.
   stopTimer();
-  timer = setTimeout(kill, BODY_TIMEOUT_MS);
+  timer = setTimeout(kill, bodyTimeoutMs);
   let sent = 0;
   let finished = false;
   const finish = () => {

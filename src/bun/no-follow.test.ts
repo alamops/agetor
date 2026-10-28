@@ -4,7 +4,13 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { disclaimEnabled } from "./disclaim.ts";
-import { isPlainDirBelow, openReadNoFollow, readAccountFileText, readTextNoFollow } from "./no-follow.ts";
+import {
+  isPlainDirBelow,
+  openReadNoFollow,
+  readAccountFileText,
+  readTextNoFollow,
+  readTextNonBlocking,
+} from "./no-follow.ts";
 import { withDisclaimOn } from "./test-disclaim-on.ts";
 
 const dir = mkdtempSync(path.join(tmpdir(), "agetor-no-follow-"));
@@ -52,6 +58,48 @@ test("a file over maxBytes is refused with EFBIG; within it reads normally", () 
   writeFileSync(f, "x".repeat(100));
   expect(readTextNoFollow(f, { maxBytes: 100 })).toHaveLength(100);
   expect(() => readTextNoFollow(f, { maxBytes: 99 })).toThrow(expect.objectContaining({ code: "EFBIG" }));
+});
+
+// readTextNonBlocking: the switch-off reader for agent-writable files. Only
+// the hang matters there (Agetor's identity isn't at stake), so a symlink is
+// followed, but a FIFO or a directory is refused at once.
+describe("readTextNonBlocking", () => {
+  test("reads a regular file, and follows a symlink at the final component", () => {
+    const real = path.join(dir, "nb-real.txt");
+    writeFileSync(real, "héllo\n");
+    const link = path.join(dir, "nb-link.txt");
+    symlinkSync(real, link);
+    expect(readTextNonBlocking(real)).toBe("héllo\n");
+    expect(readTextNonBlocking(link)).toBe("héllo\n");
+  });
+
+  test.skipIf(process.platform === "win32")("a named pipe, or a symlink to one, is refused at once", () => {
+    const fifo = path.join(dir, "nb-fifo.json");
+    expect(spawnSync("/usr/bin/mkfifo", [fifo]).status).toBe(0);
+    const link = path.join(dir, "nb-fifo-link.json");
+    symlinkSync(fifo, link);
+    const started = Date.now();
+    // No writer ever opens the pipe: a blocking open would hang this test.
+    expect(() => readTextNonBlocking(fifo)).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    expect(() => readTextNonBlocking(link)).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test("a directory is refused with EINVAL; a missing file throws ENOENT", () => {
+    const sub = path.join(dir, "nb-dir");
+    mkdirSync(sub);
+    expect(() => readTextNonBlocking(sub)).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    expect(() => readTextNonBlocking(path.join(dir, "nb-missing"))).toThrow(
+      expect.objectContaining({ code: "ENOENT" }),
+    );
+  });
+
+  test("maxBytes: at the limit reads, one byte over is EFBIG", () => {
+    const f = path.join(dir, "nb-sized.txt");
+    writeFileSync(f, "y".repeat(64));
+    expect(readTextNonBlocking(f, { maxBytes: 64 })).toHaveLength(64);
+    expect(() => readTextNonBlocking(f, { maxBytes: 63 })).toThrow(expect.objectContaining({ code: "EFBIG" }));
+  });
 });
 
 test("isPlainDirBelow: real directories pass; a symlinked, missing or file component fails", () => {

@@ -108,6 +108,10 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
 
   const [candidateIndex, setCandidateIndex] = useState(0);
   const [failed, setFailed] = useState(false);
+  // The last candidate the preview route refused as too large (413). The file
+  // exists, so the chip must not say "not found", and a smaller file at a
+  // later candidate (an older copy in the workdir) must not stand in for it.
+  const [tooLarge, setTooLarge] = useState(false);
   const [notFoundPath, setNotFoundPath] = useState<string | null>(null);
   const [openError, setOpenError] = useState<{ path: string; message: string } | null>(null);
 
@@ -119,6 +123,7 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
   useEffect(() => {
     setCandidateIndex(0);
     setFailed(false);
+    setTooLarge(false);
   }, [source]);
 
   const openLocalPath = async (path: string) => {
@@ -240,7 +245,8 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
         <button
           type="button"
           data-testid="md-image-fallback"
-          title={`Image not found: ${path}`}
+          data-reason={tooLarge ? "too-large" : "not-found"}
+          title={tooLarge ? `Image too large to preview: ${path}` : `Image not found: ${path}`}
           onClick={(e) =>
             stopAnd(e, () => void openLocalPath(source.candidates[0] ?? path))
           }
@@ -257,8 +263,9 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
         <span className="inline-flex max-w-full flex-col items-start gap-0.5 align-middle">
           {/* Fetched with the auth header and shown as a `blob:` URL (D13/P9).
               `key` remounts the image per candidate so each candidate is
-              fetched at most once; any non-ok status (404, 413, network,
-              decode) moves to the next candidate exactly as `onError` did. */}
+              fetched at most once; any non-ok status (404, network, decode)
+              moves to the next candidate exactly as `onError` did. A 413
+              stops at this candidate: the file exists, it's just too big. */}
           <AuthedImg
             key={currentPath}
             url={api.filePreviewUrl(currentPath)}
@@ -277,6 +284,11 @@ export const MdImage: NonNullable<MdComponents["img"]> = ({ src, alt, title, nod
             }}
             onStatus={(status) => {
               if (status === "ok") return;
+              if (status === "too-large") {
+                setTooLarge(true);
+                setFailed(true);
+                return;
+              }
               const next = candidateIndex + 1;
               if (next < source.candidates.length) setCandidateIndex(next);
               else setFailed(true);

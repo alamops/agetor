@@ -431,8 +431,10 @@ describe.skipIf(process.platform !== "darwin")("disclaimed discovery timeouts ar
     expect(value).toBeNull();
     expect(warnings.some((m) => m.includes("timed out") && m.includes(file))).toBe(true);
     // The next read, no longer stuck, parses the file instead of answering a
-    // cached null.
+    // cached null. It gets the production budget back: 300 ms is for proving
+    // the hang times out, not for a real read on a loaded machine.
     recordingStub();
+    __setLoadTimeoutMsForTest(null);
     expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 1 });
   });
 
@@ -449,8 +451,10 @@ describe.skipIf(process.platform !== "darwin")("disclaimed discovery timeouts ar
     });
     expect(value).toEqual({ v: 1 });
     expect(warnings.some((m) => m.includes("timed out") && m.includes(file))).toBe(true);
-    // The cache was left as it was, so an unstuck read sees the new content.
+    // The cache was left as it was, so an unstuck read sees the new content
+    // (with the production budget back, as above).
     recordingStub();
+    __setLoadTimeoutMsForTest(null);
     expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 22 });
   });
 });
