@@ -47,7 +47,7 @@
 // first and only sends the content when the key differs from the cached one.
 
 import { lstatSync, readFileSync, statSync } from "node:fs";
-import { readTextNoFollow } from "./no-follow.ts";
+import { readAccountFileText } from "./no-follow.ts";
 import path from "node:path";
 import { disclaimEnabled } from "./disclaim.ts";
 import { completeNulNames, PROJECT_TREE_TAR_MAX_BYTES, runChildCapped } from "./caller-fs.ts";
@@ -123,25 +123,30 @@ export function safeReadJson(p: string): any {
  * In-process only (the disclaimed reader has its own string-keyed cache).
  */
 const jsonStatCache = new Map<string, { mtimeMs: number; size: number; value: any }>();
-export function safeReadJsonCached(p: string, opts: { noFollow?: boolean } = {}): any {
+export function safeReadJsonCached(p: string, opts: { accountFile?: boolean } = {}): any {
+  // Account-file mode (a harness home's `.claude.json`, which an agent can
+  // rewrite): read through `readAccountFileText` — no-follow while disclaiming,
+  // so a symlink planted at `p` is never opened in-process (it could point
+  // into a protected folder, read under Agetor's TCC identity), and never
+  // blocking on a FIFO. The stat must agree: lstat while disclaiming, and only
+  // a regular file is read at all.
+  const noFollow = opts.accountFile === true && disclaimEnabled();
+  const key = opts.accountFile ? `${noFollow ? "nofollow" : "account"}\0${p}` : p;
   let mtimeMs: number, size: number;
   try {
-    const st = opts.noFollow ? lstatSync(p) : statSync(p);
-    // No-follow: a symlink planted at `p` is never opened in-process (it could
-    // point into a protected folder, read under Agetor's TCC identity).
-    if (opts.noFollow && !st.isFile()) throw new Error("not a regular file");
+    const st = noFollow ? lstatSync(p) : statSync(p);
+    if (opts.accountFile && !st.isFile()) throw new Error("not a regular file");
     ({ mtimeMs, size } = st);
   } catch {
-    jsonStatCache.delete(p);
+    jsonStatCache.delete(key);
     return null;
   }
-  const key = opts.noFollow ? `nofollow\0${p}` : p;
   const hit = jsonStatCache.get(key);
   if (hit && hit.mtimeMs === mtimeMs && hit.size === size) return hit.value;
   let value: any = null;
-  if (opts.noFollow) {
+  if (opts.accountFile) {
     try {
-      value = safeParseJson(readTextNoFollow(p) || null);
+      value = safeParseJson(readAccountFileText(p, JSON_MAX_BYTES) || null);
     } catch {
       value = null;
     }
@@ -221,11 +226,13 @@ const GLOB_CHARS = /[*?[\\]/;
 
 /**
  * argv: sh -c SCRIPT sh <path> <known-key>. First line: `mtime size` of the
- * file (nothing at all when it can't be stat'ed). The content follows only when
- * that key differs from the caller's cached one. `cat` is exec'd, so the child
- * holding stdout is always the direct child the timeout kills.
+ * file (nothing at all when it isn't a regular file or can't be stat'ed — a
+ * FIFO stats fine but would block `cat` until the timeout). The content follows
+ * only when that key differs from the caller's cached one. `cat` is exec'd, so
+ * the child holding stdout is always the direct child the timeout kills.
  */
 const JSON_SCRIPT = `
+[ -f "$1" ] || exit 0
 k=$(${STAT} -L -f '%Fm %z' -- "$1" 2>/dev/null) || exit 0
 echo "$k"
 [ "$k" = "$2" ] && exit 0
@@ -375,9 +382,10 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
     });
     if (timedOut) {
       // A cut-off read (often a pending privacy prompt) proves nothing about
-      // the file: answer null without caching it, so the next request retries.
+      // the file: keep the cache as it was, so the next request retries, and
+      // answer the last value read (null when there is none).
       console.warn(`[agetor] capability discovery timed out while reading ${file}`);
-      return null;
+      return hit ? hit.value : null;
     }
     const nl = bytes.indexOf(0x0a);
     if (nl < 0) {

@@ -206,6 +206,7 @@ const DESKTOP_ONLY = [
   "POST /bundle/export/save",
   "POST /bundle/pick-file",
   "POST /harnesses/:id/open-terminal",
+  "POST /harnesses/:id/usage/refresh",
   "POST /open-external",
   "POST /open-path",
   "POST /projects/pick",

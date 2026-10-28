@@ -328,7 +328,11 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/bundle/import": { POST: CLI },
   "/harnesses/:id/usage": { GET: CLI },
   "/harnesses/:id/account-usage": { GET: CLI },
-  "/harnesses/:id/usage/refresh": { POST: CLI },
+  // Desktop-only: a forced refresh grants the usage poller's cross-app read
+  // (Cursor's IDE database, opened in-process), which would prompt under
+  // Agetor's name — and the stored ok/error snapshot keeps it on for every
+  // later background sweep. No CLI command calls it.
+  "/harnesses/:id/usage/refresh": { POST: APP },
   "/harnesses/:id/shell-env": { GET: CLI },
   "/harnesses/:id/open-terminal": { POST: APP },
   "/agents": { GET: CLI },

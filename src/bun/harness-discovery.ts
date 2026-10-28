@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import * as path from "node:path";
 import type { ClaudeAccount, DiscoveredAccount } from "../shared/types.ts";
 import { safeReadJsonCached } from "./commands.ts";
-import { disclaimEnabled } from "./disclaim.ts";
 
 /**
  * Discovery of existing Claude config dirs (multi-account support) and the
@@ -54,11 +53,12 @@ export function readClaudeAccount(configDir: string, opts: DiscoveryOptions = {}
     candidates.push(path.join(home, ".claude.json"));
   }
   for (const blobPath of candidates) {
-    // While disclaiming, the blob is read no-follow: a harness home is
-    // agent-writable, and a `.claude.json` symlinked into a protected folder
-    // must not be opened by the core (no-follow.ts). A user's own symlinked
-    // blob still reads with the switch off.
-    const blob = safeReadJsonCached(blobPath, { noFollow: disclaimEnabled() });
+    // Read as an account file (`readAccountFileText`, no-follow.ts): a harness
+    // home is agent-writable, so while disclaiming a `.claude.json` symlinked
+    // into a protected folder is never opened by the core, and a FIFO there
+    // never blocks it. A user's own symlinked blob still reads with the
+    // switch off.
+    const blob = safeReadJsonCached(blobPath, { accountFile: true });
     const oauth = blob?.oauthAccount;
     if (oauth && typeof oauth.emailAddress === "string" && oauth.emailAddress) {
       return {

@@ -246,6 +246,19 @@ describe.skipIf(process.platform !== "darwin")("disclaimed readJsonCached()", ()
     symlinkSync(real, link);
     expect(await disclaimedDiscoveryFs.readJsonCached(link)).toEqual({ via: "link" });
   });
+
+  test("a FIFO answers null at once instead of blocking cat until the timeout", async () => {
+    recordingStub();
+    __setLoadTimeoutMsForTest(5_000);
+    const fifo = path.join(scratch, "fifo-claude.json");
+    expect(Bun.spawnSync(["/usr/bin/mkfifo", fifo]).exitCode).toBe(0);
+    for (let i = 0; i < 2; i++) {
+      const started = performance.now();
+      expect(await disclaimedDiscoveryFs.readJsonCached(fifo)).toBeNull();
+      // Well under the 5 s budget a blocked `cat` would use up, every time.
+      expect(performance.now() - started).toBeLessThan(2_000);
+    }
+  });
 });
 
 describe.skipIf(process.platform !== "darwin")("listAgentCapabilities through the disclaimed child", () => {
@@ -393,5 +406,23 @@ describe.skipIf(process.platform !== "darwin")("disclaimed discovery timeouts ar
     // cached null.
     recordingStub();
     expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 1 });
+  });
+
+  test("a readJsonCached() that times out after a good read answers that read and keeps retrying", async () => {
+    const file = path.join(scratch, "slow-cached-claude.json");
+    w(file, '{"v":1}');
+    recordingStub();
+    expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 1 });
+    writeFileSync(file, '{"v":22}');
+    hangStub("/bin/sh");
+    let value: unknown = "unset";
+    const warnings = await captureWarnings(async () => {
+      value = await disclaimedDiscoveryFs.readJsonCached(file);
+    });
+    expect(value).toEqual({ v: 1 });
+    expect(warnings.some((m) => m.includes("timed out") && m.includes(file))).toBe(true);
+    // The cache was left as it was, so an unstuck read sees the new content.
+    recordingStub();
+    expect(await disclaimedDiscoveryFs.readJsonCached(file)).toEqual({ v: 22 });
   });
 });
