@@ -9,6 +9,7 @@ import { removeCoreCreds } from "./core-creds.ts";
 import { applyRoutePolicy, callerOf, desktopOnlyResponse, type ApiCaller } from "./route-policy.ts";
 import { callerProjectTree, gateCallerPath, probePaths } from "./caller-fs.ts";
 import { readTextNoFollow } from "./no-follow.ts";
+import { openFileBytes } from "./core-file-read.ts";
 import { PROJECT_CAPABILITY_PATHSPECS } from "./ref-tree.ts";
 import { taskDirExists, writeTaskDirFileAtomic } from "./task-dir-fs.ts";
 import { DISCLAIM_PREF_KEY, isDisclaimOffValue } from "./disclaim.ts";
@@ -6506,9 +6507,11 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // token is refused); the master token + the bind address is the actual
       // security boundary; the
       // `isImagePath` extension gate exists only to keep this route from
-      // doubling as a generic "read any file" endpoint.
+      // doubling as a generic "read any file" endpoint. The path itself is
+      // usually an agent's choice, so the read goes through `openFileBytes`
+      // (a disclaimed child while disclaiming — see core-file-read.ts).
       "/files/preview": {
-        GET: authed((req) => {
+        GET: authed(async (req) => {
           const url = new URL(req.url);
           const raw = url.searchParams.get("path") ?? "";
           if (!raw) {
@@ -6526,16 +6529,23 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          let st;
-          try {
-            st = statSync(raw);
-          } catch {
+          // The path is the agent's (its markdown, its SendUserFile call), so
+          // while disclaiming the file is opened by a disclaimed child, never
+          // in the core's own process under Agetor's TCC identity (D26(j)).
+          // Only regular files (a FIFO named `*.png` would hang the stream).
+          const opened = await openFileBytes(raw, {
+            followSymlinks: true,
+            ifNoneMatch: req.headers.get("if-none-match"),
+          });
+          if (opened.kind === "missing") {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
           }
-          // Only regular files: a FIFO, device, or symlink-to-device named
-          // `*.png` would otherwise hang the response stream forever.
-          if (!st.isFile()) {
-            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+          if (opened.kind === "denied") {
+            return json({ error: `not readable: ${raw}` }, { status: 403, headers: corsHeaders(req) });
+          }
+          if (opened.kind === "error" || opened.kind === "too-large") {
+            const message = opened.kind === "error" ? opened.message : "too large";
+            return json({ error: `could not read ${raw}: ${message}` }, { status: 500, headers: corsHeaders(req) });
           }
           const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
           // Shared canonical map (../shared/attachments.ts) — behavior is
@@ -6545,14 +6555,14 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           const contentType = contentTypeForPreviewPath(raw) ?? `image/${ext}`;
           // ETag derived from size+mtime so a re-saved file at the same path
           // (e.g. a screenshot overwritten in place) is detected as changed.
-          const etag = `"${st.size}-${st.mtimeMs}"`;
-          if (req.headers.get("if-none-match") === etag) {
+          const etag = opened.etag;
+          if (opened.kind === "not-modified") {
             return new Response(null, {
               status: 304,
               headers: { ...corsHeaders(req), etag },
             });
           }
-          return new Response(Bun.file(raw), {
+          return new Response(opened.body, {
             headers: {
               ...corsHeaders(req),
               "content-type": contentType,

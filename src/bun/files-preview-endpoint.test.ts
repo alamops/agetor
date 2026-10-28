@@ -133,3 +133,42 @@ test("/files/preview is case-insensitive on the extension (.PNG)", async () => {
   expect(res.status).toBe(200);
   expect(res.headers.get("content-type")).toBe("image/png");
 });
+
+// D26(j): while disclaiming, the bytes come from a disclaimed child (a
+// recording passthrough stub stands in for the helper), never the core's own
+// process — same answers as in-process.
+test("/files/preview reads through the disclaim helper while the switch is on", async () => {
+  const { chmodSync, readFileSync } = await import("node:fs");
+  const { getDisclaimSwitch, setDisclaimSwitch } = await import("./disclaim.ts");
+  const stub = path.join(SCRATCH, "disclaim-stub.sh");
+  const log = path.join(SCRATCH, "disclaim-stub.log");
+  writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$1" >> '${log}'\nexec "$@"\n`, { mode: 0o755 });
+  chmodSync(stub, 0o755);
+  writeFileSync(log, "");
+  const savedBin = process.env.AGETOR_DISCLAIM_BIN;
+  const savedSwitch = getDisclaimSwitch();
+  process.env.AGETOR_DISCLAIM_BIN = stub;
+  setDisclaimSwitch(true);
+  try {
+    const res = await previewWithHeader(PNG_FILE);
+    expect(res.status).toBe(200);
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array(PNG_MAGIC));
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(res.headers.get("content-security-policy")).toBe("sandbox; default-src 'none'");
+    expect(readFileSync(log, "utf8")).toContain("/bin/sh");
+
+    const etag = res.headers.get("etag") as string;
+    expect(etag).toBeTruthy();
+    const again = await fetch(previewUrl(PNG_FILE), {
+      headers: { authorization: `Bearer ${token}`, "if-none-match": etag },
+    });
+    expect(again.status).toBe(304);
+
+    expect((await previewWithHeader(path.join(SCRATCH, "gone.png"))).status).toBe(404);
+    expect((await previewWithHeader(DIR_PNG)).status).toBe(404);
+  } finally {
+    if (savedBin === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+    else process.env.AGETOR_DISCLAIM_BIN = savedBin;
+    setDisclaimSwitch(savedSwitch);
+  }
+});

@@ -5,6 +5,7 @@ import path from "node:path";
 import { dataDir } from "./db.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { readTextNoFollow } from "./no-follow.ts";
+import { readFileBytes } from "./core-file-read.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
@@ -1371,32 +1372,28 @@ export async function getTaskDiffBlob(
     const root = await repoRoot(cwd);
     const rootAbs = root ? path.join(root, relPath) : null;
     const cwdAbs = path.join(cwd, relPath);
-    let abs = rootAbs ?? cwdAbs;
-    let st;
-    try {
-      st = statSync(abs);
-    } catch {
-      if (rootAbs && rootAbs !== cwdAbs) {
-        try {
-          st = statSync(cwdAbs);
-          abs = cwdAbs;
-        } catch {
-          return { ok: false, error: "not found", status: 404 };
-        }
-      } else {
+    // The file is the agent's, so it is read through `readFileBytes`: a
+    // disclaimed child while disclaiming, never the core's own process (D25,
+    // D26(j)); without following a symlink at the final component (git shows
+    // a symlink as its target text, so the diff never asks for one), and only
+    // a regular file (a FIFO/device named `*.png` would hang the read).
+    const read = (abs: string) =>
+      readFileBytes(abs, { followSymlinks: false, maxBytes: MAX_BLOB_PREVIEW_BYTES });
+    let result = await read(rootAbs ?? cwdAbs);
+    if (result.kind === "missing" && rootAbs && rootAbs !== cwdAbs) result = await read(cwdAbs);
+    switch (result.kind) {
+      case "ok":
+        return { ok: true, bytes: result.bytes, etag: result.etag };
+      case "too-large":
+        return { ok: false, error: "too large to preview", status: 413 };
+      case "missing":
+      case "not-modified":
         return { ok: false, error: "not found", status: 404 };
-      }
+      case "denied":
+        return { ok: false, error: "not readable", status: 403 };
+      case "error":
+        return { ok: false, error: result.message, status: 500 };
     }
-    // Only regular files: a FIFO/device named `*.png` would otherwise hang
-    // the read forever (same guard as /files/preview).
-    if (!st.isFile()) {
-      return { ok: false, error: "not found", status: 404 };
-    }
-    if (st.size > MAX_BLOB_PREVIEW_BYTES) {
-      return { ok: false, error: "too large to preview", status: 413 };
-    }
-    const bytes = new Uint8Array(await Bun.file(abs).arrayBuffer());
-    return { ok: true, bytes, etag: `"${st.size}-${st.mtimeMs}"` };
   }
 
   // side === "old"

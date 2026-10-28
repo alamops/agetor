@@ -46,8 +46,8 @@
 // stat-keyed cache in both modes: the disclaimed child reports `mtime size`
 // first and only sends the content when the key differs from the cached one.
 
-import { lstatSync, readFileSync, statSync } from "node:fs";
-import { readAccountFileText } from "./no-follow.ts";
+import { lstatSync, statSync } from "node:fs";
+import { readTextNoFollow, readTextNonBlocking } from "./no-follow.ts";
 import path from "node:path";
 import { disclaimEnabled } from "./disclaim.ts";
 import { completeNulNames, PROJECT_TREE_TAR_MAX_BYTES, runChildCapped } from "./caller-fs.ts";
@@ -91,8 +91,10 @@ export interface DiscoveryFs {
 // ---------------------------------------------------------------------------
 
 function safeReadFile(p: string): string {
+  // Non-blocking and regular files only: a FIFO an agent planted under a
+  // discovered name would otherwise block the core's main thread.
   try {
-    return readFileSync(p, "utf8");
+    return readTextNonBlocking(p, { maxBytes: JSON_MAX_BYTES });
   } catch {
     return "";
   }
@@ -120,22 +122,26 @@ export function safeReadJson(p: string): any {
  * re-parsed while unchanged. The key combines mtime *and* size so a
  * same-millisecond rewrite still invalidates when the byte count differs. A
  * changed key invalidates the entry; an unreadable/missing file caches `null`.
- * In-process only (the disclaimed reader has its own string-keyed cache).
+ * Only a regular file is read, never blocking on a FIFO. In-process only (the
+ * disclaimed reader has its own string-keyed cache).
  */
 const jsonStatCache = new Map<string, { mtimeMs: number; size: number; value: any }>();
 export function safeReadJsonCached(p: string, opts: { accountFile?: boolean } = {}): any {
   // Account-file mode (a harness home's `.claude.json`, which an agent can
-  // rewrite): read through `readAccountFileText` — no-follow while disclaiming,
+  // rewrite): read no-follow while disclaiming,
   // so a symlink planted at `p` is never opened in-process (it could point
   // into a protected folder, read under Agetor's TCC identity), and never
   // blocking on a FIFO. The stat must agree: lstat while disclaiming, and only
   // a regular file is read at all.
   const noFollow = opts.accountFile === true && disclaimEnabled();
-  const key = opts.accountFile ? `${noFollow ? "nofollow" : "account"}\0${p}` : p;
+  // One entry per file: a plain read and an account-mode read with the switch
+  // off are the same read, so they share the plain key; only the no-follow
+  // read (which refuses a symlink the plain one follows) keys separately.
+  const key = noFollow ? `nofollow\0${p}` : p;
   let mtimeMs: number, size: number;
   try {
     const st = noFollow ? lstatSync(p) : statSync(p);
-    if (opts.accountFile && !st.isFile()) throw new Error("not a regular file");
+    if (!st.isFile()) throw new Error("not a regular file");
     ({ mtimeMs, size } = st);
   } catch {
     jsonStatCache.delete(key);
@@ -144,14 +150,13 @@ export function safeReadJsonCached(p: string, opts: { accountFile?: boolean } = 
   const hit = jsonStatCache.get(key);
   if (hit && hit.mtimeMs === mtimeMs && hit.size === size) return hit.value;
   let value: any = null;
-  if (opts.accountFile) {
-    try {
-      value = safeParseJson(readAccountFileText(p, JSON_MAX_BYTES) || null);
-    } catch {
-      value = null;
-    }
-  } else {
-    value = safeReadJson(p);
+  try {
+    const text = noFollow
+      ? readTextNoFollow(p, { maxBytes: JSON_MAX_BYTES })
+      : readTextNonBlocking(p, { maxBytes: JSON_MAX_BYTES });
+    value = safeParseJson(text || null);
+  } catch {
+    value = null;
   }
   jsonStatCache.set(key, { mtimeMs, size, value });
   return value;
@@ -184,7 +189,7 @@ const inProcessReader: DiscoveryReader = {
   tree: (root) => diskProjectTree(root),
   text: (abs) => {
     try {
-      return readFileSync(abs, "utf8");
+      return readTextNonBlocking(abs);
     } catch {
       return null;
     }
@@ -389,8 +394,8 @@ export const disclaimedDiscoveryFs: DiscoveryFs = {
     }
     const nl = bytes.indexOf(0x0a);
     if (nl < 0) {
-      // Not stat-able (missing / denied / timed out): same as the in-process
-      // path, which drops the entry and answers null.
+      // Missing, denied or not a regular file (the script prints nothing):
+      // same as the in-process path, which drops the entry and answers null.
       disclaimedJsonCache.delete(file);
       return null;
     }

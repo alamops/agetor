@@ -842,6 +842,47 @@ test("getTaskDiffBlob: a new-side file over MAX_BLOB_PREVIEW_BYTES 413s instead 
   // `fs.statSync`). Skipped here; the check itself is exercised above.
 }, 20_000);
 
+// D26(j): the new side is an agent-writable working-tree file. A symlink
+// planted there (pointing anywhere — here at another file of the tree) is not
+// followed, in-process or through the disclaim helper.
+test("getTaskDiffBlob: a new-side symlink 404s instead of being followed (both disclaim modes)", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const { getDisclaimSwitch, setDisclaimSwitch } = await import("./disclaim.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+  const outside = mkdtempSync(path.join(tmpdir(), "agetor-blob-outside-"));
+  writeFileSync(path.join(outside, "secret.png"), BLOB_V1);
+  symlinkSync(path.join(outside, "secret.png"), path.join(prepared.cwd, "link.png"));
+  writeFileSync(path.join(prepared.cwd, "real.png"), BLOB_V2);
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const stub = path.join(outside, "disclaim-stub.sh");
+  writeFileSync(stub, "#!/bin/sh\nexec \"$@\"\n", { mode: 0o755 });
+  const savedBin = process.env.AGETOR_DISCLAIM_BIN;
+  const savedSwitch = getDisclaimSwitch();
+  try {
+    for (const on of [false, true]) {
+      if (on) process.env.AGETOR_DISCLAIM_BIN = stub;
+      setDisclaimSwitch(on);
+      expect(await getTaskDiffBlob(live, "link.png", "new")).toMatchObject({ ok: false, status: 404 });
+      const real = await getTaskDiffBlob(live, "real.png", "new");
+      expect(real.ok).toBe(true);
+      if (real.ok) {
+        expect(Buffer.from(real.bytes)).toEqual(BLOB_V2);
+        expect(real.etag).toMatch(NEW_ETAG_RE);
+      }
+    }
+  } finally {
+    if (savedBin === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+    else process.env.AGETOR_DISCLAIM_BIN = savedBin;
+    setDisclaimSwitch(savedSwitch);
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test("removeWorktree tears down both the worktree and the branch", async () => {
   const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
   const repo = await makeRepo();

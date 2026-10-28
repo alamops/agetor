@@ -4,9 +4,10 @@
 // that need "what will actually be in the worktree" pass a ref; callers that
 // read machine-local, untracked state (user config, plugin installs) keep
 // using `diskProjectTree` directly, bypassing refs entirely.
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { coreSpawn } from "./core-spawn.ts";
+import { readTextNonBlocking } from "./no-follow.ts";
 
 export interface ProjectTreeEntry {
   name: string;
@@ -59,7 +60,9 @@ export function diskProjectTree(root: string): ProjectTree {
     },
     read(relFile: string): string | null {
       try {
-        return readFileSync(path.join(root, normalizeRel(relFile)), "utf8");
+        // Non-blocking, regular files only: a FIFO an agent planted under a
+        // discovered name must not block the core's main thread.
+        return readTextNonBlocking(path.join(root, normalizeRel(relFile)));
       } catch {
         return null;
       }

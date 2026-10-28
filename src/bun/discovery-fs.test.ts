@@ -10,6 +10,7 @@ import {
   disclaimedDiscoveryFs,
   inProcessDiscoveryFs,
   markdownTree,
+  safeReadJsonCached,
   singleFile,
   skillsDir,
 } from "./discovery-fs.ts";
@@ -73,6 +74,33 @@ describe("discoveryFs() selection", () => {
     delete process.env.AGETOR_DISCLAIM_BIN;
     setDisclaimSwitch(true);
     expect(discoveryFs().disclaimed).toBe(false);
+  });
+});
+
+describe("in-process reads (switch off)", () => {
+  test("a plain and an account-mode read of one file share one cache entry", () => {
+    setDisclaimSwitch(false);
+    const file = path.join(scratch, "shared-key", ".claude.json");
+    w(file, JSON.stringify({ projects: {} }));
+    const plain = safeReadJsonCached(file);
+    expect(plain).toEqual({ projects: {} });
+    // Same object: parsed once, not once per key.
+    expect(safeReadJsonCached(file, { accountFile: true })).toBe(plain);
+  });
+
+  test.skipIf(process.platform === "win32")("a FIFO under a discovered name is refused without blocking", async () => {
+    setDisclaimSwitch(false);
+    const dir = path.join(scratch, "fifo-project");
+    mkdirSync(path.join(dir, ".claude", "commands"), { recursive: true });
+    for (const rel of [".mcp.json", ".claude/commands/x.md", ".claude.json"]) {
+      expect(Bun.spawnSync(["/usr/bin/mkfifo", path.join(dir, rel)]).exitCode).toBe(0);
+    }
+    expect(safeReadJsonCached(path.join(dir, ".claude.json"))).toBeNull();
+    expect(safeReadJsonCached(path.join(dir, ".claude.json"), { accountFile: true })).toBeNull();
+    const reader = await inProcessDiscoveryFs.load([]);
+    expect(reader.text(path.join(dir, ".mcp.json"))).toBeNull();
+    expect(reader.json(path.join(dir, ".mcp.json"))).toBeNull();
+    expect(reader.tree(dir).read(".claude/commands/x.md")).toBeNull();
   });
 });
 

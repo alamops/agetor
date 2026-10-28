@@ -67,6 +67,19 @@ function openRegular(p: string, flags: number, opts: { maxBytes?: number }): num
   return fd;
 }
 
+/** `readFileSync(p, "utf8")` through symlinks, but never blocking on a FIFO:
+ *  refuses a non-regular file (EINVAL) and — with `maxBytes` — a file larger
+ *  than that (EFBIG). For agent-writable files read while Agetor's identity is
+ *  not at stake (the disclaim switch is off), where only the hang matters. */
+export function readTextNonBlocking(p: string, opts: { maxBytes?: number } = {}): string {
+  const fd = openRegular(p, READ_NONBLOCK, opts);
+  try {
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** `readFileSync(p, "utf8")`, with `openReadNoFollow`'s refusals. Throws like
  *  `readFileSync` on any other failure. */
 export function readTextNoFollow(p: string, opts: { maxBytes?: number } = {}): string {
