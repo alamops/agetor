@@ -210,7 +210,11 @@ do_start() {
       token="$(openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     fi
   fi
-  echo "$token" > "$TOKEN_FILE"
+  # 0600: this token is the master for the dev backend (AGETOR_API_TOKEN below),
+  # so it must not be readable by other local users or sandboxed tools. The
+  # umask covers a fresh file; chmod covers one an older run created 0644.
+  ( umask 077; echo "$token" > "$TOKEN_FILE" )
+  chmod 600 "$TOKEN_FILE"
 
   cd "$REPO_ROOT"
 

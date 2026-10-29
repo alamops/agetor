@@ -1,5 +1,6 @@
 import type { Task } from "../../shared/types.ts";
 import { isTaskFxPaused } from "../../shared/fx-recovery.ts";
+import { importedSessionOf } from "../../shared/imported-session.ts";
 
 /** Every action the task context menu can offer. A subset of App.tsx's
  *  existing card callbacks (`start`/`cancel`/`markDone`/`archive`/
@@ -100,7 +101,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   } else {
     entries.push({ action: "open", label: "Open details", group: "primary" });
   }
-  if (!archived && !awaiting && !active && !openable && !task.importedClaude) {
+  if (!archived && !awaiting && !active && !openable && !importedSessionOf(task)) {
     entries.push({ action: "start", label: "Run", group: "primary" });
   }
   if (stoppable && !archived) {

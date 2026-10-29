@@ -1,8 +1,6 @@
-import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 import { dataDir } from "./db.ts";
+import { readTaskDirFile, taskDirExists, writeTaskDirFileAtomic } from "./task-dir-fs.ts";
 import { isValidPermissionEntry } from "../shared/claude-permissions.ts";
 
 /**
@@ -68,7 +66,7 @@ export async function ensureInstalledIfOwned(cwd: string): Promise<InstalledPath
   if (!path.resolve(cwd).startsWith(owned)) return null;
   // Guard against an exotic case where the dir was deleted between
   // prepareWorkdir and spawn (unlikely, but cheap to check).
-  if (!existsSync(cwd)) return null;
+  if (!(await taskDirExists(cwd))) return null;
   return ensureInstalled(cwd);
 }
 
@@ -121,6 +119,9 @@ export async function ensureInstalledMerged(cwd: string): Promise<InstalledPaths
   });
 }
 
+/** A real settings.local.json is a few KB; past this it is not ours to rewrite. */
+const SETTINGS_MAX_BYTES = 1024 * 1024;
+
 interface ApplyOpts {
   /** When the existing settings.local.json is unparseable, refuse to write
    *  (preserves the user's broken edit so they can fix it). When false,
@@ -147,23 +148,28 @@ async function applyAgetorSettings(
   cwd: string,
   opts: ApplyOpts,
 ): Promise<InstalledPaths | null> {
-  if (!existsSync(cwd)) return null;
+  // Every touch of the task's directory goes through task-dir-fs (D25): a
+  // disclaimed child of Apple tools when the disclaim switch is on, in-process
+  // otherwise. The core never stats, reads or writes inside `cwd` itself.
+  if (!(await taskDirExists(cwd))) return null;
 
   const settingsDir = path.join(cwd, ".claude");
-  await mkdir(settingsDir, { recursive: true });
   const settingsFile = path.join(settingsDir, "settings.local.json");
 
-  // Read & parse existing settings.
+  // Read & parse existing settings. The `.claude` directory is created by the
+  // final write (`mkdirParent`); the only early returns below are for a file
+  // that already exists, so the directory exists after every non-null result.
   let settings: Record<string, unknown> = {};
-  if (existsSync(settingsFile)) {
-    let raw: string;
-    try { raw = await readFile(settingsFile, "utf8"); } catch (e) {
-      console.error(
-        `[agetor:hook-installer] cannot read ${settingsFile}: ${(e as Error).message}. ` +
-        `Skipping settings install.`,
-      );
-      return null;
-    }
+  const read = await readTaskDirFile(settingsFile, SETTINGS_MAX_BYTES);
+  if (read.kind === "error") {
+    console.error(
+      `[agetor:hook-installer] cannot read ${settingsFile}: ${read.message}. ` +
+      `Skipping settings install.`,
+    );
+    return null;
+  }
+  if (read.kind === "ok") {
+    const raw = read.text;
     if (raw.trim()) {
       try {
         const parsed = JSON.parse(raw);
@@ -251,20 +257,13 @@ async function applyAgetorSettings(
     }
   }
 
-  await writeJsonAtomic(settingsFile, settings);
+  // Atomic write (temp file + rename, done inside task-dir-fs): a partial write
+  // can never leave settings.local.json corrupted, which matters because this
+  // merges into the file on every task spawn while preserving any pre-existing
+  // user / legacy entries underneath.
+  await writeTaskDirFileAtomic(settingsFile, JSON.stringify(settings, null, 2), { mkdirParent: true });
 
   return { settingsFile };
-}
-
-/** Atomic JSON write: stringify, write to a sibling tempfile, rename onto
- *  the target. rename is atomic on POSIX, so a partial write can never
- *  leave the destination corrupted. Crucial for settings.local.json which
- *  hook-installer merges into on every task spawn while preserving any
- *  pre-existing user / legacy entries underneath. */
-async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
-  const tmp = `${file}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
-  await writeFile(tmp, JSON.stringify(value, null, 2));
-  await rename(tmp, file);
 }
 
 /**
@@ -281,7 +280,7 @@ export async function ensureInstalledForCwd(
 ): Promise<InstalledPaths | null> {
   const owned = path.resolve(dataDir, "worktrees") + path.sep;
   if (path.resolve(cwd).startsWith(owned)) {
-    if (!existsSync(cwd)) return null;
+    if (!(await taskDirExists(cwd))) return null;
     return ensureInstalled(cwd);
   }
   return ensureInstalledMerged(cwd);

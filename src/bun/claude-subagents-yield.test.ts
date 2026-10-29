@@ -57,7 +57,7 @@ async function seed() {
     id: taskId, title: "t", prompt: "p", column: "review", agent: "claude-code",
     workdir: "/tmp", isolation: "none", taskType: "task", branch: null, branchSource: "created",
     worktreePath: null, baseRef: null, mode: null, model: null, effort: null,
-    speed: "off", maxMode: false, references: [], backlog: [], plans: [], draft: null, runId,
+    speed: "off", maxMode: false, opencodeServer: "shared", references: [], backlog: [], plans: [], draft: null, runId,
     prUrl: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,
@@ -137,6 +137,43 @@ test("manual mode: ready is already resolved, the first pump() runs the first cy
   appendFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), sidechainLines("m1", 2, 3));
   w.pump(Date.now());
   expect(await subagentEventCount(taskId)).toBe(5);
+  w.detach();
+});
+
+test("a GitHub Copilot subagent row is never seeded or tailed by the Claude watcher (copilot -> claude-code switch)", async () => {
+  const { attachSubagentWatcher } = await import("./claude-subagents.ts");
+  const { subagents } = await import("./db.ts");
+  const { taskId, runId, jsonlPath, now } = await seed();
+  // A file of Claude-shaped lines at the row's `sourcePath`: were the row seeded
+  // as a JSONL subagent, the first cycle would tail and persist all of them.
+  const foreignLog = path.join(FIXTURE_DIR, `copilot-log-${randomUUID()}.jsonl`);
+  writeFileSync(foreignLog, sidechainLines("cp", 4));
+  const copilotId = `cp-${runId}-call_sub`;
+  subagents.insertIfAbsent({
+    id: copilotId, taskId, runId, parentKind: "copilot_subagent", agentType: "explore",
+    description: "copilot helper", spawnDepth: 1, sourcePath: foreignLog, toolUseId: "call_sub",
+    status: "completed", startedAt: now - 5_000, endedAt: now - 1_000,
+  });
+  // Control row on the same file, seeded the ordinary way, so a skip that
+  // stopped working (or a fixture that can't be tailed) fails this test.
+  const controlId = "ctl0aaaaaaaa";
+  subagents.insertIfAbsent({
+    id: controlId, taskId, runId, parentKind: "subagent", agentType: "general-purpose",
+    description: "control", spawnDepth: 1, sourcePath: foreignLog, toolUseId: "toolu_ctl",
+    status: "completed", startedAt: now - 4_000, endedAt: now - 1_000,
+  });
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  w.pump(Date.now());
+  const { db } = await import("./db.ts");
+  const perSubagent = (id: string) =>
+    db.query<{ c: number }, [string]>(`SELECT COUNT(*) c FROM run_events WHERE subagent_id = ?`).get(id)!.c;
+  expect(perSubagent(controlId)).toBe(4);
+  expect(perSubagent(copilotId)).toBe(0);
+  const row = subagents.get(copilotId)!;
+  expect(row.parentKind).toBe("copilot_subagent");
+  expect(row.status).toBe("completed");
+  expect(row.endedAt).toBe(now - 1_000);
   w.detach();
 });
 

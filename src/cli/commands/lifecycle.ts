@@ -8,7 +8,19 @@ import { appendReferences } from "../../shared/refs.ts";
 import { discoveredExtensionNames, filterUnresolvedRefs, warnUnresolvedRefs } from "../at-warn.ts";
 import { findAtTokens } from "../../shared/at-refs.ts";
 import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
+import { importedSessionOf } from "../../shared/imported-session.ts";
 import type { Task, TaskTeardownPreview } from "../../shared/types.ts";
+
+/** The `agetor start` refusal for a task imported from a session started
+ *  outside Agetor — the same copy as the core's `imported-session` 409,
+ *  checked client-side so no request is sent. */
+export function importedStartRefusal(task: Pick<Task, "importedClaude" | "importedOpencode">): string | null {
+  const imported = importedSessionOf(task);
+  if (!imported) return null;
+  return imported.kind === "opencode"
+    ? "imported OpenCode session — send a message to continue"
+    : "imported Claude session — send a message to continue";
+}
 
 export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -19,9 +31,8 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   if (task.archivedAt != null) {
     throw new Error("task is archived — unarchive it in the app before running");
   }
-  if (task.importedClaude) {
-    throw new Error("imported Claude session — send a message to continue");
-  }
+  const importedRefusal = importedStartRefusal(task);
+  if (importedRefusal) throw new Error(importedRefusal);
   // Match the dashboard Run button: only a not-yet-run (or failed/cancelled)
   // task is runnable. Active tasks are Stop; finished tasks are continued by
   // sending a message (the app resumes rather than starting a fresh run).

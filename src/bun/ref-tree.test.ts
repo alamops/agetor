@@ -340,6 +340,28 @@ describe("diskProjectTree", () => {
     expect(tree.read("x")).toBeNull();
   });
 
+  // A FIFO an agent planted under a discovered name (`.mcp.json`, a skill's
+  // SKILL.md) must not block the core's main thread: read() answers null at once.
+  test.skipIf(process.platform === "win32")("a FIFO -> read() null at once, not a blocked thread", () => {
+    const root = mkdtempSync(path.join(tmpRoot, "disk-fifo-"));
+    mkdirSync(path.join(root, ".claude", "skills", "x"), { recursive: true });
+    for (const rel of [".mcp.json", ".claude/skills/x/SKILL.md"]) {
+      expect(Bun.spawnSync(["/usr/bin/mkfifo", path.join(root, rel)]).exitCode).toBe(0);
+    }
+    const tree = diskProjectTree(root);
+    const started = Date.now();
+    expect(tree.read(".mcp.json")).toBeNull();
+    expect(tree.read(".claude/skills/x/SKILL.md")).toBeNull();
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test("a symlinked file is still read (only FIFOs and other non-files are refused)", () => {
+    const root = mkdtempSync(path.join(tmpRoot, "disk-linkfile-"));
+    writeFileSync(path.join(root, "real.md"), "linked body");
+    symlinkSync(path.join(root, "real.md"), path.join(root, "link.md"));
+    expect(diskProjectTree(root).read("link.md")).toBe("linked body");
+  });
+
   test("an unreadable file -> read() null, not a throw", () => {
     const root = mkdtempSync(path.join(tmpRoot, "disk-unreadable-"));
     const p = path.join(root, "secret.txt");

@@ -246,3 +246,21 @@ test("resolveActiveStream: accepts a running monitor row's id", () => {
 test("shouldShowSubagentTabs: a completed monitor row with the parent turn idle collapses the strip", () => {
   expect(shouldShowSubagentTabs([sub("m", "completed", 0, "monitor")], false)).toBe(false);
 });
+
+test("opencode_subagent rows are tabbable and sort like subagent rows", () => {
+  const rows = [sub("a", "completed", 1, "opencode_subagent"), sub("b", "running", 2, "opencode_subagent")];
+  expect(sortSubagentTabs(rows).map((s) => s.id)).toEqual(["b", "a"]);
+  expect(resolveActiveStream("a", true, rows)).toBe("a");
+});
+
+test("shouldShowSubagentTabs: an OpenCode child stays visible after the turn, whatever its status", () => {
+  // Its transcript only arrives at turn end (D-11), so the strip must not
+  // collapse when the parent run settles.
+  for (const status of ["completed", "orphaned", "failed", "cancelled"] as const) {
+    expect(shouldShowSubagentTabs([sub("a", status, 0, "opencode_subagent")], false)).toBe(true);
+  }
+  expect(shouldShowSubagentTabs([sub("a", "running", 0, "opencode_subagent")], true)).toBe(true);
+  // A finished Claude subagent alongside still collapses only without one.
+  expect(shouldShowSubagentTabs([sub("c", "completed")], false)).toBe(false);
+  expect(shouldShowSubagentTabs([sub("c", "completed"), sub("o", "completed", 1, "opencode_subagent")], false)).toBe(true);
+});

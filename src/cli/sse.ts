@@ -1,12 +1,19 @@
+import { createSseParser } from "../shared/sse-parse.ts";
 import { discoverCore } from "./api-client.ts";
 
 /**
  * Minimal Server-Sent-Events reader over `fetch`. EventSource can't set the
- * Authorization header, and the API authenticates SSE via `?token=`, so we read
- * the stream by hand: parse `data: …\n\n` frames, JSON-decode each, skip
- * `{type:"ping"}` keepalives, and reconnect with full-jitter backoff —
- * re-discovering the core each attempt so the stream follows an app⇄daemon
- * handoff or a relaunched core whose token rotated.
+ * Authorization header, so we read the stream by hand: feed the decoded body
+ * through the shared frame parser (`createSseParser`, the same one the webview
+ * uses), JSON-decode each unnamed (`message`) frame, skip `{type:"ping"}`
+ * keepalives, and reconnect with full-jitter backoff — re-discovering the core
+ * each attempt so the stream follows an app⇄daemon handoff or a relaunched core
+ * whose token rotated.
+ *
+ * The token travels in an `authorization: Bearer` header, never in the URL
+ * (D13): a query-string token lands in access logs and proxies' request lines.
+ * Named events and `retry:` hints are ignored — every stream this CLI reads is
+ * unnamed JSON `data:` frames, and the CLI keeps its own backoff.
  */
 export interface SseHandle {
   close(): void;
@@ -32,12 +39,14 @@ export function streamSse<T>(
     while (!closed) {
       const core = await discoverCore(opts.dataDir);
       if (core) {
-        const sep = pathname.includes("?") ? "&" : "?";
-        const url = `http://127.0.0.1:${core.port}${pathname}${sep}token=${core.token}`;
+        const url = `http://127.0.0.1:${core.port}${pathname}`;
         try {
           const res = await fetch(url, {
             signal: ac.signal,
-            headers: { accept: "text/event-stream" },
+            headers: {
+              accept: "text/event-stream",
+              authorization: `Bearer ${core.token}`,
+            },
           });
           if (!res.ok || !res.body) throw new Error(`SSE ${pathname} → ${res.status}`);
           opts.onOpen?.();
@@ -71,18 +80,15 @@ async function pump<T>(
 ): Promise<void> {
   const reader = body.getReader();
   const dec = new TextDecoder();
-  let buf = "";
+  const parser = createSseParser();
   for (;;) {
     const { value, done } = await reader.read();
     if (done) return;
-    buf += dec.decode(value, { stream: true });
-    let idx: number;
-    while ((idx = buf.indexOf("\n\n")) !== -1) {
-      const frame = buf.slice(0, idx);
-      buf = buf.slice(idx + 2);
-      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
-      if (!dataLine) continue;
-      const payload = dataLine.slice(5).trim();
+    for (const frame of parser.push(dec.decode(value, { stream: true }))) {
+      // Only unnamed frames carry payloads here; a named event (or the
+      // parser's retry-only control frame, `event: ""`) is not for us.
+      if (frame.event !== "message") continue;
+      const payload = frame.data.trim();
       if (!payload) continue;
       let parsed: unknown;
       try {

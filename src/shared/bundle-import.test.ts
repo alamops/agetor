@@ -777,3 +777,42 @@ describe("planBundleImport — option keys that shadow Object.prototype", () => 
     ]);
   });
 });
+
+describe("planBundleImport — opencodeServer", () => {
+  const ocHarness = { id: "opencode", kind: "opencode" as const, label: "OpenCode" };
+  const ocAgent = (key: string, overrides: Record<string, unknown> = {}) =>
+    agent(key, { harness: ocHarness, model: "anthropic/claude-sonnet-5.5", effort: null, mode: null, ...overrides });
+  const ocLocal = () =>
+    localState({
+      harnesses: [harness("claude-code", "claude-code"), harness("opencode", "opencode")],
+      knownKinds: ["claude-code", "codex", "cursor", "gemini", "fx", "opencode"],
+    });
+
+  test("it carries into the plan; an absent field reads shared", () => {
+    const p = plan(bundle([ocAgent("alone", { opencodeServer: "standalone" }), ocAgent("plain"), agent("claude")]), ocLocal());
+    expect(p.agents.map((a) => [a.key, a.opencodeServer])).toEqual([
+      ["alone", "standalone"],
+      ["plain", "shared"],
+      ["claude", "shared"],
+    ]);
+    expect(p.canImport).toBe(true);
+  });
+
+  test("it is part of the fingerprint", () => {
+    const shared = plan(bundle([ocAgent("a")]), ocLocal());
+    const alone = plan(bundle([ocAgent("a", { opencodeServer: "standalone" })]), ocLocal());
+    expect(alone.fingerprint).not.toBe(shared.fingerprint);
+    expect(plan(bundle([ocAgent("a", { opencodeServer: "standalone" })]), ocLocal()).fingerprint).toBe(alone.fingerprint);
+  });
+
+  test("a rebound Agent of an unknown kind resets it to shared", () => {
+    const parsed = bundle([
+      agent("future", { harness: { id: "grok", kind: "grok", label: "Grok" }, model: "grok-9", opencodeServer: "standalone" }),
+    ]);
+    const p = plan(parsed, ocLocal(), { harnessMap: { grok: "opencode" } });
+    const a = p.agents[0]!;
+    expect(a.resolution).toBe("rebound");
+    expect(a.opencodeServer).toBe("shared");
+    expect(a.warnings.map((w) => w.code)).toEqual(["settings-reset"]);
+  });
+});

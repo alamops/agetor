@@ -1,0 +1,36 @@
+{
+  "default": {
+    "opencode": "big-pickle"
+  },
+  "providers": [
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "source": "custom",
+      "models": {
+        "deepseek-v4.1-flash-free": {
+          "id": "deepseek-v4.1-flash-free",
+          "providerID": "opencode",
+          "name": "DeepSeek V4.1 Flash Free",
+          "variants": {
+            "low": {
+              "reasoningEffort": "low"
+            },
+            "high": {
+              "reasoningEffort": "high"
+            },
+            "max": {
+              "reasoningEffort": "max"
+            }
+          }
+        },
+        "big-pickle": {
+          "id": "big-pickle",
+          "providerID": "opencode",
+          "name": "Big Pickle",
+          "variants": {}
+        }
+      }
+    }
+  ]
+}

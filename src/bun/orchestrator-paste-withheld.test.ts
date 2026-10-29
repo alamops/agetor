@@ -778,9 +778,21 @@ test("non-withheld send: delivered:true resolves promptly, driven by the paste's
   if ("error" in created) throw new Error(created.error);
   const taskId = created.task.id;
 
+  // Hold R1's fake turn open (default 20ms) so the send below folds into it
+  // deterministically instead of racing the timer — a loaded machine lost
+  // that race and minted a fresh run instead.
+  const prevTurnMs = process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+  process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "1500";
+  const restoreTurnMs = () => {
+    if (prevTurnMs === undefined) delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+    else process.env.AGETOR_FAKE_CLAUDE_TURN_MS = prevTurnMs;
+  };
   const res = await startTask(taskId);
   expect("runId" in res).toBe(true);
-  if (!("runId" in res)) return;
+  if (!("runId" in res)) {
+    restoreTurnMs();
+    return;
+  }
   const r1 = res.runId;
 
   // Install a REAL session so this takes the fold-capable path, same as
@@ -791,12 +803,11 @@ test("non-withheld send: delivered:true resolves promptly, driven by the paste's
   const prevCapture = claudeTmux.__forTest.setCapturePastePane(async () => "");
 
   try {
-    // TIMING INVARIANT (mirrors test 1): no await between `startTask` above
-    // and this call — R1 must still be in `active` when `sendInput` reads
-    // it, so this folds instead of spawning a new turn. Holds here because
-    // every tmux call the fold makes (liveness probe + load-buffer/
-    // paste-buffer/send-keys) goes through the already-resident `/bin/echo`,
-    // comfortably faster than the fake driver's 20ms completion timer.
+    // TIMING INVARIANT (mirrors test 1): R1 must still be in `active` when
+    // `sendInput` reads it, so this folds instead of spawning a new turn.
+    // `AGETOR_FAKE_CLAUDE_TURN_MS` above holds the fake turn open for 1.5 s,
+    // far longer than the fold's tmux calls through the already-resident
+    // `/bin/echo` take.
     const start = Date.now();
     const sent = await sendInput(r1, "hello again");
     const elapsed = Date.now() - start;
@@ -815,11 +826,14 @@ test("non-withheld send: delivered:true resolves promptly, driven by the paste's
     // that waits out anywhere near the full 15s race.
     expect(elapsed).toBeLessThan(3000);
   } finally {
+    // Let the held turn settle before tearing the task down under it.
+    await waitFor(() => tasks.get(taskId)?.column !== "running", 5000).catch(() => {});
+    restoreTurnMs();
     claudeTmux.__forTest.setCapturePastePane(prevCapture);
     claudeTmux.__forTest.uninstallSession(taskId);
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
-}, 10_000);
+}, 15_000);
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * 8 — Model mirror success: the full 2.1.246 `/model` picker walk — open the

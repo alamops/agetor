@@ -10,17 +10,44 @@
 // Running a child through `disclaim <cmd> [args...]` marks it responsible
 // for itself instead, so any resulting prompt names the real accessor and
 // its grant persists normally. This module only resolves the helper's path
-// and decides whether to use it — the actual spawn-site wiring (tmux
-// server start, fx's Bun.spawn) is a separate task.
+// and decides whether to use it. Spawn sites do not call `disclaimArgv`
+// themselves: every core spawn goes through `coreSpawn` / `coreSpawnSync`
+// (core-spawn.ts), which is the only caller (docs/plans/master-token-agent-read.md,
+// P2/P3).
+//
+// The on/off switch lives in MEMORY, not in SQLite (P4). It used to be read
+// from the `preferences` table on every spawn, which meant anything able to
+// write that row (an agent through the API, or the sqlite file itself) could
+// turn the protection off between two spawns. Now the launch-time reader
+// (disclaim-switch.ts) decides the value once and calls `setDisclaimSwitch`;
+// this module deliberately does not import db.ts, so core-spawn.ts stays
+// importable without opening the database.
 
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { preferences } from "./db.ts";
 
-/** Preference key gating whether spawned agents get disclaimed. Exported so
- *  the Settings UI (a separate task) references the same string rather than
- *  duplicating the literal. */
+/** Preference key the switch is persisted under (by disclaim-switch.ts and the
+ *  Settings UI). Exported so every writer references the same string rather
+ *  than duplicating the literal. */
 export const DISCLAIM_PREF_KEY = "disclaimSpawnedAgents";
+
+/** True for the one stored value that means "off". Anything else — unset,
+ *  corrupt, "true" — reads as on (fail-open toward protection). */
+export function isDisclaimOffValue(v: string | null | undefined): boolean {
+  return v === "false";
+}
+
+/** In-memory switch, default ON. See the header comment for why it is not read
+ *  from the DB on each call. */
+let disclaimSwitchOn = true;
+
+export function getDisclaimSwitch(): boolean {
+  return disclaimSwitchOn;
+}
+
+export function setDisclaimSwitch(on: boolean): void {
+  disclaimSwitchOn = on;
+}
 
 /**
  * Where the bundled disclaim helper lives at runtime. Two locations:
@@ -70,35 +97,37 @@ export function disclaimAvailable(): boolean {
 
 /**
  * Pure decision function — kept separate from disclaimEnabled() so the truth
- * table is unit-testable without touching process.platform / preferences /
+ * table is unit-testable without touching process.platform / the switch /
  * the filesystem.
  */
 export function computeDisclaimEnabled(opts: {
   platform: NodeJS.Platform;
-  prefDisabled: boolean;
+  switchOn: boolean;
   available: boolean;
 }): boolean {
-  return opts.platform === "darwin" && !opts.prefDisabled && opts.available;
+  return opts.platform === "darwin" && opts.switchOn && opts.available;
 }
 
 /**
- * Whether spawned agents should be run through the disclaim helper right
- * now. Default ON — only the literal preference value "false" disables it
- * (fail-open: an unset/corrupt preference, a non-darwin host, or a missing
- * helper binary all resolve safely without throwing).
+ * Whether core spawns should be run through the disclaim helper right now:
+ * darwin && in-memory switch && helper present. The switch defaults ON, so a
+ * non-darwin host or a missing helper binary resolve safely without throwing.
  */
 export function disclaimEnabled(): boolean {
   return computeDisclaimEnabled({
     platform: process.platform,
-    prefDisabled: preferences.get(DISCLAIM_PREF_KEY) === "false",
+    switchOn: disclaimSwitchOn,
     available: disclaimAvailable(),
   });
 }
 
 /**
  * Wrap a command argv with the disclaim helper when enabled, else return it
- * unchanged. Spread the result directly into Bun.spawn / a tmux command
- * builder in place of the raw argv.
+ * unchanged. Only core-spawn.ts (and tests) call this: it prepends the helper
+ * but does NOT resolve `argv[0]`, and the helper exec-resolves bare names
+ * itself, so a missing binary would exit 127 instead of throwing ENOENT the
+ * way `Bun.spawn` does. `coreSpawn` resolves first; do not call this directly
+ * from a spawn site.
  */
 export function disclaimArgv(argv: string[]): string[] {
   if (!disclaimEnabled()) return argv;

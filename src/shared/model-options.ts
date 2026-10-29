@@ -87,6 +87,23 @@
  *    entry reports them `true` — a `false` or absent flag attaches no key.
  *    Pickers pass a row's flags to `supportedSpeeds` (`./speed.ts`).
  *
+ *    One carve-out for `scoped === true`: an entry whose `efforts` is an
+ *    explicitly EMPTY array attaches `efforts: []` — "the CLI reported this
+ *    model and it has no efforts", which OpenCode's `supportedEfforts`
+ *    branch reads differently from "no discovery entry" (`[]` vs `[auto]`,
+ *    `docs/plans/add-opencode-harness.md` D-6). fx's discovery never emits
+ *    an empty array, and every other kind's `supportedEfforts` treats `[]`
+ *    exactly like `null`, so nothing changes outside OpenCode. With
+ *    `scoped === false` an empty array still attaches no key.
+ *
+ * 9. A curated row marked `pinned` is always included, FIRST (in curated
+ *    order among pinned rows), whatever rules 1–4 and 7 would say:
+ *    discovery empty or non-empty, scoped or not, `loggedIn === false`, and
+ *    even with `catalogOnly` set. It is never duplicated — a discovered
+ *    entry with the same id only contributes rule 8's fields to it. Used for
+ *    OpenCode's "OpenCode default" sentinel (`OPENCODE_DEFAULT_MODEL`, D-5),
+ *    which no catalog lists because it means "pass no `-m`".
+ *
  * Inputs are never mutated; a new array is always returned.
  */
 
@@ -100,6 +117,8 @@ export interface CuratedModel {
   /** True for a row that should only be offered when the harness's
    *  discovered catalog positively contains it (see rule 1). */
   catalogOnly?: boolean;
+  /** True for a row that is always offered, first (see rule 9). */
+  pinned?: boolean;
 }
 
 /** A row from a harness's live CLI-discovered model catalog. */
@@ -170,8 +189,10 @@ export function hasDiscoveredCatalog(discovered: readonly DiscoveredModel[]): bo
 /** Rule 8: a fresh copy of `entry.efforts` when it's a non-empty array,
  *  else `undefined` (so callers can spread it in without ever attaching an
  *  empty/undefined `efforts` key). */
-function effortsFor(entry: DiscoveredModel | undefined): readonly string[] | undefined {
+function effortsFor(entry: DiscoveredModel | undefined, keepEmpty = false): readonly string[] | undefined {
   if (entry?.efforts && entry.efforts.length > 0) return [...entry.efforts];
+  // Rule 8's scoped carve-out: an explicit "no efforts" survives as `[]`.
+  if (keepEmpty && entry?.efforts && entry.efforts.length === 0) return [];
   return undefined;
 }
 
@@ -182,19 +203,23 @@ function copySpeedFlags(opt: ModelOption, entry: DiscoveredModel | undefined): v
   if (entry?.ultrafast === true) opt.ultrafast = true;
 }
 
-function toCuratedOption(m: CuratedModel, discoveredById: Map<string, DiscoveredModel>): ModelOption {
+function toCuratedOption(
+  m: CuratedModel,
+  discoveredById: Map<string, DiscoveredModel>,
+  keepEmptyEfforts: boolean,
+): ModelOption {
   const opt: ModelOption = { id: m.id, label: m.label };
   if (m.hint !== undefined) opt.hint = m.hint;
   const entry = discoveredById.get(m.id);
-  const efforts = effortsFor(entry);
+  const efforts = effortsFor(entry, keepEmptyEfforts);
   if (efforts !== undefined) opt.efforts = efforts;
   copySpeedFlags(opt, entry);
   return opt;
 }
 
-function toDiscoveredOnlyOption(m: DiscoveredModel): ModelOption {
+function toDiscoveredOnlyOption(m: DiscoveredModel, keepEmptyEfforts: boolean): ModelOption {
   const opt: ModelOption = { id: m.id, label: m.label ?? m.id };
-  const efforts = effortsFor(m);
+  const efforts = effortsFor(m, keepEmptyEfforts);
   if (efforts !== undefined) opt.efforts = efforts;
   copySpeedFlags(opt, m);
   return opt;
@@ -223,14 +248,19 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
   const pushCurated = (m: CuratedModel) => {
     if (seen.has(m.id)) return;
     seen.add(m.id);
-    result.push(toCuratedOption(m, discoveredById));
+    result.push(toCuratedOption(m, discoveredById, scoped));
   };
 
   const pushDiscoveredOnly = (m: DiscoveredModel) => {
     if (seen.has(m.id)) return;
     seen.add(m.id);
-    result.push(toDiscoveredOnlyOption(m));
+    result.push(toDiscoveredOnlyOption(m, scoped));
   };
+
+  // Rule 9: pinned rows lead, unconditionally (see the module doc).
+  for (const m of curated) {
+    if (m.pinned) pushCurated(m);
+  }
 
   if (!hasDiscoveredCatalog(discovered)) {
     // Rule 2: discovery-empty fallback — non-catalogOnly curated rows only,
@@ -279,7 +309,7 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
         hint,
         unlisted: true,
       };
-      const efforts = effortsFor(discoveredById.get(selected));
+      const efforts = effortsFor(discoveredById.get(selected), scoped);
       if (efforts !== undefined) unlistedOpt.efforts = efforts;
       copySpeedFlags(unlistedOpt, discoveredById.get(selected));
       result.push(unlistedOpt);
@@ -300,8 +330,11 @@ export function mergeModelOptions(input: MergeModelOptionsInput): ModelOption[] 
  *  the per-model effort set. Passing the raw discovered list instead would
  *  silently bypass rule 7 (this function has no `loggedIn` of its own to
  *  check). Given those merged rows and an id, returns the matching row's
- *  `efforts` when it's a non-empty array, else `null`. Pass the result
- *  straight through as `supportedEfforts`'s third argument (`./types.ts`).
+ *  `efforts` when it's an array — including an explicitly empty one, which
+ *  only rule 8's scoped carve-out produces and which only OpenCode's
+ *  `supportedEfforts` branch reads differently from `null` — else `null`.
+ *  Pass the result straight through as `supportedEfforts`'s third argument
+ *  (`./types.ts`).
  *  Structural over `models`/`id` for the same reason the rest of this module
  *  is structural — see the module doc comment. */
 export function discoveredEffortsFor(
@@ -310,6 +343,6 @@ export function discoveredEffortsFor(
 ): readonly string[] | null {
   if (!models || !id) return null;
   const entry = models.find((m) => m.id === id);
-  if (entry?.efforts && entry.efforts.length > 0) return entry.efforts;
+  if (entry?.efforts) return entry.efforts;
   return null;
 }

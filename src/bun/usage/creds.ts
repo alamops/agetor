@@ -14,6 +14,11 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Harness } from "../../shared/types.ts";
+import { coreSpawn } from "../core-spawn.ts";
+import { readAccountFileText } from "../no-follow.ts";
+
+/** Upper bound on a `.credentials.json` we parse — a token blob is ~1 KB. */
+const CREDENTIALS_MAX_BYTES = 1024 * 1024;
 
 /**
  * Path to the `.claude.json` claude reads/writes for this harness.
@@ -81,10 +86,11 @@ export async function readKeychainClaudeToken(): Promise<string | null> {
     return null;
   }
   try {
-    const proc = Bun.spawn(
+    // coreSpawn: `security` resolves from PATH, which an agent can plant.
+    const proc = coreSpawn(
       ["security", "find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
       { stdout: "pipe", stderr: "pipe" },
-    );
+    ) as Bun.Subprocess<"ignore", "pipe", "pipe">;
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -135,8 +141,9 @@ export async function readClaudeToken(
   try {
     const credsPath = claudeCredentialsPath(harness);
     if (credsPath && existsSync(credsPath)) {
-      const raw = await Bun.file(credsPath).text();
-      const parsed = JSON.parse(raw);
+      // A harness home is agent-writable: read no-follow while disclaiming,
+      // never blocking on a FIFO (no-follow.ts).
+      const parsed = JSON.parse(readAccountFileText(credsPath, CREDENTIALS_MAX_BYTES));
       const token = parsed?.claudeAiOauth?.accessToken;
       const scopes = parsed?.claudeAiOauth?.scopes;
       if (typeof token === "string" && token) {

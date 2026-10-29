@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -89,7 +89,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     mode: null,
     model: null,
     effort: null,
-    speed: "off", maxMode: false,
+    speed: "off", maxMode: false, opencodeServer: "shared",
     references: [],    backlog: [], plans: [], draft: null,
     runId: null,
     hasOpenableRun: false,
@@ -841,6 +841,93 @@ test("getTaskDiffBlob: a new-side file over MAX_BLOB_PREVIEW_BYTES 413s instead 
   // the identical cap, just sourced from `git cat-file -s` instead of
   // `fs.statSync`). Skipped here; the check itself is exercised above.
 }, 20_000);
+
+// D26(j): the new side is an agent-writable working-tree file. A symlink
+// planted there (pointing anywhere — here at another file of the tree) is not
+// followed, in-process or through the disclaim helper.
+test("getTaskDiffBlob: a new-side symlink 404s instead of being followed (both disclaim modes)", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const { getDisclaimSwitch, setDisclaimSwitch } = await import("./disclaim.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+  const outside = mkdtempSync(path.join(tmpdir(), "agetor-blob-outside-"));
+  writeFileSync(path.join(outside, "secret.png"), BLOB_V1);
+  symlinkSync(path.join(outside, "secret.png"), path.join(prepared.cwd, "link.png"));
+  writeFileSync(path.join(prepared.cwd, "real.png"), BLOB_V2);
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const stub = path.join(outside, "disclaim-stub.sh");
+  writeFileSync(stub, "#!/bin/sh\nexec \"$@\"\n", { mode: 0o755 });
+  const savedBin = process.env.AGETOR_DISCLAIM_BIN;
+  const savedSwitch = getDisclaimSwitch();
+  try {
+    for (const on of [false, true]) {
+      if (on) process.env.AGETOR_DISCLAIM_BIN = stub;
+      setDisclaimSwitch(on);
+      expect(await getTaskDiffBlob(live, "link.png", "new")).toMatchObject({ ok: false, status: 404 });
+      const real = await getTaskDiffBlob(live, "real.png", "new");
+      expect(real.ok).toBe(true);
+      if (real.ok) {
+        expect(Buffer.from(real.bytes)).toEqual(BLOB_V2);
+        expect(real.etag).toMatch(NEW_ETAG_RE);
+      }
+    }
+  } finally {
+    if (savedBin === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+    else process.env.AGETOR_DISCLAIM_BIN = savedBin;
+    setDisclaimSwitch(savedSwitch);
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+// D26(j): same answers through the disclaim helper as in-process — an
+// unreadable working-tree file is a 403 (never a 200 that dies), a FIFO named
+// like an image is a 404 at once (never a hung read), and the size cap is
+// checked before reading on both paths.
+test("getTaskDiffBlob: unreadable 403s, a FIFO 404s, an over-cap file 413s (both disclaim modes)", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef, MAX_BLOB_PREVIEW_BYTES } = await import("./worktree.ts");
+  const { getDisclaimSwitch, setDisclaimSwitch } = await import("./disclaim.ts");
+  const { chmodSync } = await import("node:fs");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+  const locked = path.join(prepared.cwd, "locked.png");
+  writeFileSync(locked, BLOB_V1);
+  chmodSync(locked, 0o000);
+  expect(Bun.spawnSync(["/usr/bin/mkfifo", path.join(prepared.cwd, "fifo.png")]).exitCode).toBe(0);
+  await Bun.write(path.join(prepared.cwd, "huge.png"), new Uint8Array(MAX_BLOB_PREVIEW_BYTES + 1));
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const stubDir = mkdtempSync(path.join(tmpdir(), "agetor-blob-stub-"));
+  const stub = path.join(stubDir, "disclaim-stub.sh");
+  writeFileSync(stub, '#!/bin/sh\nexec "$@"\n', { mode: 0o755 });
+  const savedBin = process.env.AGETOR_DISCLAIM_BIN;
+  const savedSwitch = getDisclaimSwitch();
+  try {
+    for (const on of [false, true]) {
+      if (on) process.env.AGETOR_DISCLAIM_BIN = stub;
+      setDisclaimSwitch(on);
+      if (process.getuid?.() !== 0) {
+        expect(await getTaskDiffBlob(live, "locked.png", "new")).toMatchObject({ ok: false, status: 403 });
+      }
+      const started = Date.now();
+      expect(await getTaskDiffBlob(live, "fifo.png", "new")).toMatchObject({ ok: false, status: 404 });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(await getTaskDiffBlob(live, "huge.png", "new")).toMatchObject({ ok: false, status: 413 });
+    }
+  } finally {
+    if (savedBin === undefined) delete process.env.AGETOR_DISCLAIM_BIN;
+    else process.env.AGETOR_DISCLAIM_BIN = savedBin;
+    setDisclaimSwitch(savedSwitch);
+    chmodSync(locked, 0o600);
+    rmSync(stubDir, { recursive: true, force: true });
+  }
+}, 30_000);
 
 test("removeWorktree tears down both the worktree and the branch", async () => {
   const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
@@ -1953,5 +2040,42 @@ describe("removeWorktree branches option", () => {
     await removeWorktree({ ...fresh, branch: first.branch, worktreePath: wt });
     expect(await branchExists(repo, first.branch!)).toBe(false);
     expect(await branchExists(repo, "implement/x")).toBe(true);
+  });
+});
+
+// `GET /worktrees` (CLI-reachable) parses every dir's `.git` pointer in the
+// core: it must not follow a planted symlink or read an oversized file.
+describe("parseWorktreeGitPointer", () => {
+  test("reads a real pointer file; refuses a symlinked .git, a symlinked dir, and an oversized file", async () => {
+    const { parseWorktreeGitPointer } = await import("./worktree.ts");
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-wt-pointer-"));
+    try {
+      const pointer = "gitdir: /src/repo/.git/worktrees/abc\n";
+      const real = path.join(root, "real");
+      mkdirSync(real);
+      writeFileSync(path.join(real, ".git"), pointer);
+      expect(parseWorktreeGitPointer(real)).toBe("/src/repo");
+
+      const outside = path.join(root, "outside");
+      mkdirSync(outside);
+      writeFileSync(path.join(outside, "pointer"), pointer);
+      writeFileSync(path.join(outside, ".git"), pointer);
+
+      const fileLink = path.join(root, "file-link");
+      mkdirSync(fileLink);
+      symlinkSync(path.join(outside, "pointer"), path.join(fileLink, ".git"));
+      expect(parseWorktreeGitPointer(fileLink)).toBeNull();
+
+      const dirLink = path.join(root, "dir-link");
+      symlinkSync(outside, dirLink);
+      expect(parseWorktreeGitPointer(dirLink)).toBeNull();
+
+      const big = path.join(root, "big");
+      mkdirSync(big);
+      writeFileSync(path.join(big, ".git"), pointer + " ".repeat(64 * 1024));
+      expect(parseWorktreeGitPointer(big)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -13,6 +13,7 @@ import { ImageOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import { isImagePath } from "../../../shared/attachments.ts";
+import { AuthedImg } from "@/components/ui/authed-img";
 import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
 
 export function AttachmentChips({
@@ -161,11 +162,12 @@ function ImageChip({
 
   return (
     <button type="button" title={path} onClick={onClick} className="group">
-      <img
-        src={api.filePreviewUrl(path)}
+      <AuthedImg
+        url={api.filePreviewUrl(path)}
         alt={base}
-        onError={onMissing}
-        loading="lazy"
+        onStatus={(status) => {
+          if (status !== "ok") onMissing();
+        }}
         decoding="async"
         className="h-16 max-w-40 rounded-md border border-border/60 object-cover transition group-hover:ring-2 group-hover:ring-primary/40"
       />

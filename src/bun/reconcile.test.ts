@@ -76,7 +76,7 @@ function heldTaskRow(overrides: Partial<Task> & { id: string; runId: string | nu
     mode: null,
     model: null,
     effort: null,
-    speed: "off", maxMode: false,
+    speed: "off", maxMode: false, opencodeServer: "shared",
     references: [], backlog: [], plans: [], draft: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,
@@ -184,7 +184,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     mode: null,
     model: null,
     effort: null,
-    speed: "off", maxMode: false,
+    speed: "off", maxMode: false, opencodeServer: "shared",
     references: [],    backlog: [], plans: [], draft: null,
     runId,
     hasOpenableRun: false,
@@ -252,7 +252,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
     mode: null,
     model: null,
     effort: null,
-    speed: "off", maxMode: false,
+    speed: "off", maxMode: false, opencodeServer: "shared",
     references: [],    backlog: [], plans: [], draft: null,
     runId: targetRunId,
     hasOpenableRun: false,
@@ -525,15 +525,15 @@ test("held-task boot pass: succeeded run with no running subagents is left untou
   expect(sub?.status).toBe("completed");
 });
 
-test("held-task boot pass: a codex task can never be held — the kind !== 'claude-code' guard skips it untouched", async () => {
-  // Codex never actually writes `subagents` rows (the table is claude-only —
-  // grep confirms zero call sites in codex-tmux.ts). This constructs the
-  // closest synthetic analogue (a codex task with a `running` subagent row
-  // it would never really have) purely to exercise the
-  // `resolveHarness(task.agent)?.kind !== "claude-code"` guard in the new
-  // pass. `isHeldByBackgroundAgents` itself doesn't check kind — it would
-  // report this task as held — so this test pins the guard as the thing
-  // actually protecting codex, not an accident of the predicate.
+test("held-task boot pass: a non-claude task's stray running subagent row is orphaned and the card released", async () => {
+  // Only claude's watcher can re-arm and settle a subagents row across a
+  // restart. A row still `running` on a task of any other kind (here a
+  // synthetic codex task — codex never writes these, but a harness switch
+  // away from claude-code or copilot can leave one behind) has nothing that
+  // could ever settle it, so the boot pass's non-claude branch orphans it
+  // through `orphanRunningSubagents`. That fires the settle hook, so a card
+  // held in `running` behind a succeeded run is released to `review`
+  // exactly as on a normal settle, instead of being stranded forever.
   const { tasks, runs, subagents } = await import("./db.ts");
   const { reconcileOrphans } = await import("./orchestrator.ts");
 
@@ -549,11 +549,12 @@ test("held-task boot pass: a codex task can never be held — the kind !== 'clau
   subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
   await reconcileOrphans();
-  const task = tasks.get(taskId);
-  expect(task?.column).toBe("running");
-
   const sub = subagents.get(subId);
-  expect(sub?.status).toBe("running");
+  expect(sub?.status).toBe("orphaned");
+  expect(sub?.endedAt).not.toBeNull();
+
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("review");
 });
 
 test("held-task boot pass: null claudeSessionId with a live tmux session is released, not stranded", async () => {
@@ -593,7 +594,7 @@ test("held-task boot pass: null claudeSessionId with a live tmux session is rele
  * Blind-spot coverage: the widened source set reaches tasks OUTSIDE the
  * `running` column. Each test below mirrors one of the `column = 'running'`
  * cases above (dead session / live+recoverable session / live+no session /
- * codex guard), but parks the task in `review` first — the exact shape that
+ * non-claude orphan), but parks the task in `review` first — the exact shape that
  * was invisible to the pre-widening boot pass. `maybeReleaseHeldTask`'s
  * settle hook fires from every orphan in this branch too, but its own guard
  * (`task.column !== 'running'`) must bail every time, so the column is
@@ -701,17 +702,19 @@ test("boot pass (blind spot): review-column task with a live session but no clau
   }
 });
 
-test("boot pass (blind spot): a codex task's stray running subagent row is skipped even outside the running column", async () => {
-  // Same guard as the running-column codex test above
-  // (`resolveHarness(task.agent)?.kind !== "claude-code"`), but pinned
-  // specifically against the NEW blind-spot branch: without this guard, a
-  // codex task parked in 'review' with a (synthetic — codex never really
-  // writes these) running subagent row would hit the dead-session path
-  // below and get orphaned. The guard fires before either branch runs.
+test("boot pass (blind spot): a non-claude task's stray running subagent row is orphaned outside the running column too, with no tmux kill", async () => {
+  // Same non-claude branch as the running-column case above, pinned against
+  // the blind-spot source set: a codex task parked in `review` with a
+  // (synthetic) running subagent row has its row orphaned, while the settle
+  // hook's own `column !== 'running'` guard leaves the card where it is. The
+  // branch only flips DB rows, so `kill-session` never appears in the tmux
+  // call log.
   const { tasks, runs, subagents } = await import("./db.ts");
   const { reconcileOrphans } = await import("./orchestrator.ts");
 
-  const restoreTmux = fakeTmux(1, "can't find session"); // dead — would orphan if the guard were missing
+  const logDir = mkdtempSync(path.join(tmpdir(), "agetor-reconcile-tmuxlog-"));
+  const logPath = path.join(logDir, "calls.log");
+  const restoreTmux = fakeTmux(1, "can't find session", logPath);
   try {
     const taskId = `task-codex-review-${randomUUID()}`;
     const runId = `run-codex-review-${randomUUID()}`;
@@ -725,14 +728,17 @@ test("boot pass (blind spot): a codex task's stray running subagent row is skipp
     subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
     await reconcileOrphans();
+    const sub = subagents.get(subId);
+    expect(sub?.status).toBe("orphaned");
+    expect(sub?.endedAt).not.toBeNull();
+
     const task = tasks.get(taskId);
     expect(task?.column).toBe("review");
-
-    const sub = subagents.get(subId);
-    expect(sub?.status).toBe("running");
   } finally {
     restoreTmux();
   }
+  const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+  expect(log).not.toContain("kill-session");
 });
 
 test("boot pass: never issues a tmux kill — dead and live review-column cases both leave kill-session absent from the tmux call log", async () => {

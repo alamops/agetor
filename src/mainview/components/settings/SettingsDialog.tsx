@@ -142,7 +142,7 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
  *  badge everywhere a harness/template kind is shown. Extend this list (not
  *  the individual call sites) as a kind graduates out of experimental. */
 function isExperimentalKind(kind: AgentKind): boolean {
-  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx";
+  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx" || kind === "opencode" || kind === "copilot";
 }
 
 function stringifyEnv(env: Record<string, string>): string {
@@ -209,6 +209,16 @@ const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: 
     label: "HOME override (absolute path; optional)",
     slug: "fx-2",
     help: "HOME override — fx has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, so fx's state (~/.fx) lands under this path, giving this harness its own account.",
+  },
+  opencode: {
+    label: "HOME override (absolute path; optional)",
+    slug: "opencode-2",
+    help: "HOME override — OpenCode has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, with XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME and XDG_CACHE_HOME pointed at directories under it, so OpenCode's config, auth and sessions land under this path, giving this harness its own account.",
+  },
+  copilot: {
+    label: "COPILOT_HOME override (absolute path; optional)",
+    slug: "copilot-2",
+    help: "Sets COPILOT_HOME on spawn — GitHub Copilot CLI stores its login, config, and session history under this path (a dedicated override, not the real HOME), so a separate path gives this harness its own account. Authenticate by running: COPILOT_HOME=<path> copilot login.",
   },
 };
 
@@ -287,9 +297,13 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
   const [tmuxSource, setTmuxSource] = useState<"system" | "bundled">("system");
   const [bundledTmuxAvailable, setBundledTmuxAvailable] = useState(false);
-  // Default-on kill switch for spawning agents through the macOS "disclaim"
-  // helper — see src/bun/disclaim.ts. Only the literal stored value "false"
-  // turns it off; unset/anything-else reads as on, matching disclaimEnabled().
+  // The ONE macOS "disclaim" switch (D7) — see src/bun/disclaim.ts. It covers
+  // agents AND the programs the core runs in the background (git, harness
+  // checks). The core reads the stored value once at launch into memory
+  // (`initDisclaimSwitch`, which re-asks before honouring a stored "false"),
+  // and a change made here applies immediately via the preference write.
+  // Only the literal stored value "false" reads as off in this UI; unset or
+  // anything else reads as on.
   const [disclaimSpawnedAgents, setDisclaimSpawnedAgents] = useState(true);
   const [view, setView] = useState<SettingsView>(() => entryView(initialSection, initialAgentProfileId));
   // The view (and a per-open counter) must be correct on the very FIRST commit
@@ -1282,18 +1296,18 @@ function GeneralSection({
       <section className="space-y-1">
         <div className="flex items-center justify-between gap-4">
           <label htmlFor="claude-sessions-launch-scan" className="text-xs text-muted-foreground">
-            Look for Claude Code sessions on launch
+            Look for Claude Code and OpenCode sessions on launch
           </label>
           <Switch
             id="claude-sessions-launch-scan"
             data-testid="claude-sessions-launch-scan"
             checked={launchScan}
             onCheckedChange={setLaunchScanPref}
-            aria-label="Look for Claude Code sessions on launch"
+            aria-label="Look for Claude Code and OpenCode sessions on launch"
           />
         </div>
         <p className="text-[11px] text-muted-foreground">
-          On startup, notice Claude Code sessions that were started outside Agetor so you can import them.
+          On startup, notice Claude Code and OpenCode sessions that were started outside Agetor so you can import them.
         </p>
       </section>
 
@@ -1317,20 +1331,20 @@ function GeneralSection({
       <section className="space-y-1">
         <div className="flex items-center justify-between gap-4">
           <label htmlFor="disclaim-spawned-agents" className="text-xs text-muted-foreground">
-            Isolate agent permissions from Agetor (macOS)
+            Keep Agetor's macOS permissions away from agents (macOS)
           </label>
           <Switch
             id="disclaim-spawned-agents"
             checked={disclaimSpawnedAgents}
             // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
             onCheckedChange={onDisclaimSpawnedAgentsChange}
-            aria-label="Isolate agent permissions from Agetor (macOS)"
+            aria-label="Keep Agetor's macOS permissions away from agents (macOS)"
           />
         </div>
         <p className="text-[11px] text-muted-foreground">
-          Spawned agents ask for macOS permissions under their own name instead of Agetor's, so the "access data
-          from other apps" prompt stops naming Agetor and sticks after you Allow it once. Turn off to revert to the
-          previous behavior.
+          Agents and the programs Agetor runs in the background, such as git and harness checks, ask for macOS
+          permissions under their own name instead of Agetor's, so a grant sticks after you allow it once. Only this
+          switch can turn it off, and Agetor asks again at the next launch.
         </p>
       </section>
 
@@ -1528,6 +1542,17 @@ function HarnessesSection({
                       {status.authHelp}
                     </div>
                   )}
+                  {/* Neutral, non-blocking lines (D-16): a missing login or
+                      an available upgrade never stops a run. */}
+                  {status?.notices?.map((notice) => (
+                    <div
+                      key={notice}
+                      data-testid="harness-status-notice"
+                      className="text-[11px] text-muted-foreground"
+                    >
+                      {notice}
+                    </div>
+                  ))}
                 </div>
                 <Switch
                   checked={pendingToggle[h.id] ?? h.enabled}
@@ -1904,8 +1929,8 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-3 gap-1 sm:grid-cols-6">
-          {(["claude-code", "codex", "cursor", "gemini", "antigravity", "fx"] as AgentKind[]).map((k) => {
+        <div className="grid grid-cols-3 gap-1 sm:grid-cols-8">
+          {(["claude-code", "codex", "cursor", "gemini", "antigravity", "fx", "opencode", "copilot"] as AgentKind[]).map((k) => {
             const experimental = isExperimentalKind(k);
             return (
               <Button

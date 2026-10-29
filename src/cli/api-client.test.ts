@@ -335,3 +335,54 @@ test("bundle calls: an HTTP error answer keeps the core's own message", async ()
     server.stop(true);
   }
 });
+
+// The core's 403 refusals (`desktop-only`, `path-not-accessible`) carry a
+// machine-readable `code` next to the plain sentence. `ApiError` exposes the
+// code and keeps `message` as just the sentence, so the CLI's central printer
+// shows it with no "HTTP 403" noise. A stub server on an ephemeral port keeps
+// this off the fixed-port daemon tests.
+test("ApiError exposes the 403 body's code and a plain message", async () => {
+  const bodies: Record<string, unknown> = {
+    "/a": { error: "only available in the Agetor app", code: "desktop-only" },
+    "/b": { error: "This path isn't accessible to Agetor's CLI token.", code: "path-not-accessible" },
+    "/c": { error: "plain refusal" },
+  };
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch(req) {
+      const b = bodies[new URL(req.url).pathname];
+      return b ? Response.json(b, { status: 403 }) : new Response("nope", { status: 404 });
+    },
+  });
+  try {
+    const client = new AgetorClient({ port: server.port as number, token: "t" });
+    const call = async (path: string) => {
+      try {
+        // Reach the private `req` the same way every public method does.
+        await (client as unknown as { req(m: string, p: string): Promise<unknown> }).req("GET", path);
+      } catch (e) {
+        return e as ApiError;
+      }
+      throw new Error("expected a rejection");
+    };
+
+    const a = await call("/a");
+    expect(a).toBeInstanceOf(ApiError);
+    expect(a.status).toBe(403);
+    expect(a.code).toBe("desktop-only");
+    expect(a.message).toBe("only available in the Agetor app");
+
+    const b = await call("/b");
+    expect(b.code).toBe("path-not-accessible");
+    expect(b.message).toBe("This path isn't accessible to Agetor's CLI token.");
+
+    // No code in the body (or no JSON body at all) → undefined, message unchanged.
+    expect((await call("/c")).code).toBeUndefined();
+    const d = await call("/missing");
+    expect(d.code).toBeUndefined();
+    expect(d.status).toBe(404);
+  } finally {
+    server.stop(true);
+  }
+});

@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type Speed } from "../shared/types.ts";
+import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
+import { effectiveOpencodeServer, opencodeMajor, opencodeModelArgs } from "../shared/opencode.ts";
 import { compactionStatusLine } from "../shared/compaction.ts";
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { HANDOFF_TAG } from "../shared/pipeline.ts";
@@ -20,6 +21,16 @@ import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
 import { FX_STEER_DROPPED_STATUS, fxRefusedStatusLine, fxSpeedNotOfferedLine, mapFxUpdate, spawnFxViaAcp, type FxLaunchOptions, type FxMode, type FxUpdateCtx } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { spawnAntigravityViaTmux } from "./antigravity-tmux.ts";
+import {
+  createOpencodeLineProcessor,
+  spawnOpencodeViaTmux,
+  type OpencodeLaunchOptions,
+  type OpencodeSubagentNotice,
+} from "./opencode-tmux.ts";
+import { refreshOpencodeSubagents, registerOpencodeSubagent } from "./opencode-subagents.ts";
+import { copilotHome } from "./copilot-home.ts";
+import { fakeCopilotScript, playFakeCopilotTurn } from "./copilot-fake.ts";
+import { copilotUsagePath, spawnCopilotViaTmux, type CopilotSubagentSink } from "./copilot-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
 import { gitWritableRoots } from "./worktree.ts";
 
@@ -39,6 +50,24 @@ export interface AgentCommand {
    * it has no size-driven argv problem.
    */
   deferredPrompt?: string;
+  /**
+   * Set only by the opencode branch of `buildCommand`, and only when the turn
+   * resumes a session (`opts.resumeSessionId`): the same argv without
+   * `-s <id>`, plus `--title=<t>` when a title was given. `spawnAgent` forwards
+   * it to `spawnOpencodeViaTmux` as `OpencodeLaunchOptions.freshArgv`, which
+   * relaunches with it once when a v1 resume fails with "Session not found"
+   * before any line carried a session id (D-9, spike A5). Undefined for every
+   * other kind.
+   */
+  freshArgv?: string[];
+  /**
+   * Set only by the copilot branch of `buildCommand`: the classic-PAT
+   * variables (`GH_TOKEN` / `GITHUB_TOKEN`) the launch shell must drop when
+   * the pane's real env holds a `ghp_` classic token — Copilot CLI rejects
+   * those — minus any the harness env map sets itself. Forwarded to
+   * `spawnCopilotViaTmux` as `stripClassicTokens`.
+   */
+  stripClassicTokens?: string[];
 }
 
 /**
@@ -152,6 +181,26 @@ export interface AgentRunOptions {
    * kind ignores this field entirely.
    */
   continueRecovery?: boolean;
+  /**
+   * opencode-only: the harness CLI's probed `--version` output (D-2). Picks
+   * the OpenCode line via `opencodeMajor` — v1 takes `--variant` and has no
+   * `--standalone`, v2 carries the variant in `-m provider/model#v`. A
+   * missing or unparseable version reads as v2. Every other kind ignores it.
+   */
+  cliVersion?: string | null;
+  /**
+   * opencode-only: the task's stored server mode (`task.opencodeServer`,
+   * D-4). Resolved through `effectiveOpencodeServer` — a harness with a
+   * home always runs Standalone, v1 has no server flag at all. `null`/absent
+   * reads as `"shared"`. Every other kind ignores it.
+   */
+  opencodeServer?: OpencodeServerMode | null;
+  /**
+   * opencode-only: the task title, passed as `--title` (cut to 100 code
+   * points) on a fresh session only — OpenCode ignores `--title` when `-s`
+   * resumes an existing session (spike A10/Q15). Every other kind ignores it.
+   */
+  title?: string | null;
 }
 
 // Map friendly model ids to the exact strings the claude-code CLI expects.
@@ -326,9 +375,31 @@ export function resolveBin(harness: Harness): string {
       fallback = "agy";
       override = process.env.AGETOR_ANTIGRAVITY_BIN;
       break;
+    case "opencode":
+      fallback = "opencode";
+      override = process.env.AGETOR_OPENCODE_BIN;
+      break;
+    case "copilot":
+      fallback = "copilot";
+      override = process.env.AGETOR_COPILOT_BIN;
+      break;
+    default:
+      // A retired kind (`grok`/`kimi` rows can still sit in a database).
+      // `checkHarness` resolves a bin for every row, so this must not throw;
+      // `buildCommand`/`spawnAgent` are what refuse to launch it.
+      fallback = String(harness.kind satisfies never);
+      break;
   }
   if (override) return override;
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+}
+
+const warnedUnknownKinds = new Set<string>();
+
+function warnUnknownHarnessKind(kind: string): void {
+  if (warnedUnknownKinds.has(kind)) return;
+  warnedUnknownKinds.add(kind);
+  console.warn(`[agetor] harness kind "${kind}" is not supported by this build; no home env var is set for it`);
 }
 
 /**
@@ -375,18 +446,55 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       env.HOME = harness.home;
     } else if (harness.kind === "antigravity") {
       env.HOME = harness.home;
-    } else {
+    } else if (harness.kind === "opencode") {
+      // OpenCode follows the XDG base-dir spec for its config, data (auth +
+      // `opencode.db`), state (the Shared service's `service.json`) and
+      // cache, falling back to `$HOME/.config` etc. only when the XDG var is
+      // unset — so an inherited XDG_* from agetor's own env would otherwise
+      // leak the first account's state into an additional one (GD10). Pin
+      // all four under the home, plus HOME itself for anything that reads
+      // it directly. Spike A12: any invocation, `--version` included,
+      // creates dirs under these.
+      env.HOME = harness.home;
+      env.XDG_CONFIG_HOME = path.join(harness.home, ".config");
+      env.XDG_DATA_HOME = path.join(harness.home, ".local", "share");
+      env.XDG_STATE_HOME = path.join(harness.home, ".local", "state");
+      env.XDG_CACHE_HOME = path.join(harness.home, ".cache");
+    } else if (harness.kind === "copilot") {
+      // Copilot CLI keeps config, login state, session state and skills under
+      // $COPILOT_HOME (default ~/.copilot), a dedicated home-override env var,
+      // so an additional account needs no HOME override.
+      env.COPILOT_HOME = harness.home;
+    } else if (harness.kind === "gemini") {
       // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
       // in the bundled CLI source — `homedir()` returns
       // `process.env.GEMINI_CLI_HOME || os.homedir()`, and every gemini state
       // dir hangs off that), so unlike codex there's no need to also touch
       // the real HOME.
       env.GEMINI_CLI_HOME = harness.home;
+    } else {
+      // Compile-time exhaustiveness: a new AgentKind must get a branch above.
+      // At runtime an unknown kind (a retired `grok`/`kimi` row) contributes
+      // no home var and warns once — it must NOT throw, because
+      // `checkHarness` calls this for every harness row and a throw would
+      // break `GET /harnesses`.
+      warnUnknownHarnessKind(harness.kind satisfies never);
     }
   }
   // User-provided env wins over the home-derived defaults.
   for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
+  // Copilot: resolve the home the same way every spawn does (`copilotHome`
+  // expands a leading `~` and trims), so the login terminal and
+  // `agetor harness shell` write the login where runs will read it. Only when
+  // the harness names a home — a home-less harness keeps the user's own default.
+  if (harness.kind === "copilot" && (nonBlankString(harness.home) || nonBlankString(harness.env?.COPILOT_HOME))) {
+    env.COPILOT_HOME = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+  }
   return env;
+}
+
+function nonBlankString(v: string | null | undefined): boolean {
+  return typeof v === "string" && v.trim().length > 0;
 }
 
 /**
@@ -460,6 +568,17 @@ export function toTerminalAppleScript(shellCmd: string): string {
     `tell application "Terminal" to do script "${asEscape(shellCmd)}"\n` +
     `activate application "Terminal"`
   );
+}
+
+/** `--title` budget for an OpenCode session name (D-3): the task title, cut
+ *  on a code-point boundary so a surrogate pair is never split. */
+export const OPENCODE_TITLE_MAX_CHARS = 100;
+
+/** The `--title` value for a task title, or `null` when there is none. */
+function opencodeTitleArg(title: string | null | undefined): string | null {
+  const trimmed = title?.trim() ?? "";
+  if (trimmed === "") return null;
+  return Array.from(trimmed).slice(0, OPENCODE_TITLE_MAX_CHARS).join("").trimEnd();
 }
 
 /**
@@ -821,73 +940,199 @@ export function buildCommand(
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
 
-  // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
-  // element: it's delivered on stdin (the trailing `-`), so the driver can
-  // pipe a prompt file in and no user text touches the shell wrapper.
-  const extra = (process.env.AGETOR_CODEX_ARGS ?? "").split(/\s+/).filter(Boolean);
+  if (harness.kind === "opencode") {
+    // opencode — hosted in tmux via opencode-tmux.ts, one-shot `opencode run`
+    // per turn (D-1/D-3, spike A10). The prompt is NOT an argv element: a
+    // positional prompt gets wrapped in literal quotes by OpenCode, so the
+    // driver feeds the prompt file on stdin (`"$@" < '<prompt>'`) and no user
+    // text touches argv or the shell wrapper — which also means there is no
+    // argv-size cap to enforce here.
+    const major = opencodeMajor(opts.cliVersion);
+    const server = effectiveOpencodeServer({
+      mode: opts.opencodeServer ?? "shared",
+      harnessHome: harness.home,
+      major,
+    });
+    env.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
+    const extra = (process.env.AGETOR_OPENCODE_ARGS ?? "").split(/\s+/).filter(Boolean);
+    const title = opencodeTitleArg(opts.title);
 
-  const args: string[] = [bin, "exec"];
+    const assemble = (resumeId: string | null): string[] => {
+      const args: string[] = [bin, "run", "--format", "json", "--thinking"];
+      // `-m` (and the variant: v2 `-m id#v`, v1 `-m id --variant v`) is
+      // omitted entirely for the "OpenCode default" sentinel, and the effort
+      // is dropped for `auto` — `opencodeModelArgs` owns both rules, since
+      // every spawn passes the stored `task.effort` straight through (D-6).
+      args.push(...opencodeModelArgs({ model: opts.model ?? null, effort: opts.effort ?? null, major }));
+      // `auto` (and the null default) runs OpenCode's Build agent with every
+      // permission ask approved; `plan` selects OpenCode's own Plan agent
+      // (no file edits; shell commands still run, permission asks are
+      // rejected). An unknown mode id gets no flag (house passthrough).
+      const mode = opts.mode ?? defaultModeFor(harness.kind);
+      if (mode === "auto") {
+        args.push("--auto");
+      } else if (mode === "plan") {
+        args.push("--agent", "plan");
+      }
+      if (resumeId) {
+        args.push("-s", resumeId);
+      } else if (title) {
+        // Only on a fresh session: OpenCode keeps the original title when
+        // `-s` resumes one (spike Q15). One `--title=<t>` argv item, never
+        // `--title <t>`: v2's parser reads a dash-leading VALUE as a flag
+        // (`-v2 migration` printed the version and the turn did nothing), and
+        // both majors parse the `=` form (v1 is yargs).
+        args.push(`--title=${title}`);
+      }
+      // v2 only (v1 rejects unknown flags): run without the shared background
+      // service. A harness with a home always lands here (spike A14 — the
+      // service's fixed port isn't isolated by HOME/XDG).
+      if (major === 2 && server === "standalone") {
+        args.push("--standalone");
+      }
+      args.push(...extra);
+      return args;
+    };
 
-  if (!opts.model) {
-    throw new Error("model is required for codex");
+    const resumeId = opts.resumeSessionId ?? null;
+    return {
+      cmd: assemble(resumeId),
+      env,
+      ...(resumeId ? { freshArgv: assemble(null) } : {}),
+    };
   }
-  args.push("--model", opts.model);
 
-  if (opts.effort) {
-    args.push("-c", `model_reasoning_effort=${opts.effort}`);
-  } else if (!modelDeclinesEffort("codex", opts.model)) {
-    throw new Error(`effort is required for codex model ${opts.model}`);
+  if (harness.kind === "copilot") {
+    // GitHub Copilot CLI — hosted in a per-task tmux session via
+    // copilot-tmux.ts. One-shot per turn like codex (prompt on stdin, so no
+    // argv-size cap), with a self-issued `--session-id` like gemini: the
+    // caller passes the prior id as `resumeSessionId` on a follow-up, else a
+    // fresh uuid as `sessionId`; Copilot resumes by seeing the same id.
+    const extra = (process.env.AGETOR_COPILOT_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    if (!opts.model) {
+      throw new Error("model is required for copilot");
+    }
+    if (!opts.runId) {
+      throw new Error("runId is required for copilot (used to build the --usage-output-file path)");
+    }
+    const sessionId = opts.resumeSessionId ?? opts.sessionId;
+    if (!sessionId) {
+      throw new Error("sessionId or resumeSessionId is required for copilot");
+    }
+
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    const args: string[] = [
+      bin,
+      "--output-format", "json",
+      "--no-color",
+      "--no-ask-user",
+      "--session-id", sessionId,
+      "--model", opts.model,
+    ];
+    // `auto` ("Model default") and null both mean: let Copilot choose.
+    if (opts.effort && opts.effort !== "auto") {
+      args.push("--reasoning-effort", opts.effort);
+    }
+    // `--mode` is always passed (never inherited from the saved session), so
+    // a task switched Plan -> Auto stops planning on the very next turn.
+    args.push("--mode", mode === "plan" ? "plan" : "interactive");
+    if (mode === "auto") {
+      args.push("--allow-all");
+    }
+    args.push("--usage-output-file", copilotUsagePath(opts.runId));
+    args.push(...extra);
+
+    // The long-lived tmux server's env may belong to another process, and the
+    // plan-file reader must look where Copilot writes: always pin the home.
+    env.COPILOT_HOME = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+    // Allow-all rides the env too (Auto only); a value the harness env map
+    // sets wins in every mode. In every other mode the driver additionally
+    // unsets an ambient export (`shouldUnsetAllowAll`), which only holds while
+    // the key is absent here.
+    if (mode === "auto" && !("COPILOT_ALLOW_ALL" in env)) {
+      env.COPILOT_ALLOW_ALL = "true";
+    }
+    const harnessSetsEnv = harness.env ?? {};
+    const stripClassicTokens = ["GH_TOKEN", "GITHUB_TOKEN"].filter((k) => !(k in harnessSetsEnv));
+
+    return { cmd: args, env, stripClassicTokens };
   }
 
-  // Structured streaming + deterministic capture: `--json` emits NDJSON events
-  // on stdout (tailed by the driver); `--color never` guarantees clean JSON
-  // even though codex runs under a tmux pty; `--skip-git-repo-check` lets a
-  // task run in a non-git workdir (agetor has no sandbox philosophy).
-  args.push("--json", "--color", "never", "--skip-git-repo-check");
+  if (harness.kind === "codex") {
+    // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
+    // element: it's delivered on stdin (the trailing `-`), so the driver can
+    // pipe a prompt file in and no user text touches the shell wrapper.
+    const extra = (process.env.AGETOR_CODEX_ARGS ?? "").split(/\s+/).filter(Boolean);
 
-  // Sandbox policy from the agetor mode. `auto` (hands-off) →
-  // `workspace-write` so codex can edit files in the working dir without
-  // approval prompts (codex exec is non-interactive — it can't prompt anyway).
-  // `ask` → `read-only` (the most it can do without changing anything). We use
-  // `--sandbox` rather than the deprecated `--full-auto`, which prints a
-  // warning to stderr on every turn in codex 0.140+.
-  const mode = opts.mode ?? defaultModeFor(harness.kind);
-  // Sandbox policy. `ask` → `read-only` (can't change anything). `auto` →
-  // `workspace-write` (edit the cwd without approval prompts) for the common
-  // case, BUT escalated to `danger-full-access` when the task's git writes have
-  // to land OUTSIDE the cwd: a linked worktree's `.git` is a file pointing at
-  // the source repo's shared `.git`, where a commit's objects/refs go, and
-  // `workspace-write` only makes the cwd writable — so `git commit` is blocked.
-  // Granting the external dir via `sandbox_workspace_write.writable_roots` is
-  // unreliable (codex keeps `.git` read-only under some workspace policies), so
-  // for those runs we drop the sandbox entirely. That's consistent with
-  // agetor's no-sandbox philosophy (CLAUDE.md: "Agents run with the user's full
-  // shell privileges … There is no sandbox") and with claude-code's `auto` mode
-  // (`--dangerously-skip-permissions`). `approval_policy=never` pairs with full
-  // access so a headless `codex exec` never stalls on an approval it can't show
-  // — the empirically-validated combo for full filesystem access. Parent flags
-  // must precede the `resume` subcommand, so emit here.
-  const needsExternalGitWrites = (opts.codexExternalGitDirs?.length ?? 0) > 0;
-  if (mode !== "auto") {
-    args.push("--sandbox", "read-only");
-  } else if (needsExternalGitWrites) {
-    args.push("--sandbox", "danger-full-access", "-c", "approval_policy=never");
-  } else {
-    args.push("--sandbox", "workspace-write");
+    const args: string[] = [bin, "exec"];
+
+    if (!opts.model) {
+      throw new Error("model is required for codex");
+    }
+    args.push("--model", opts.model);
+
+    if (opts.effort) {
+      args.push("-c", `model_reasoning_effort=${opts.effort}`);
+    } else if (!modelDeclinesEffort("codex", opts.model)) {
+      throw new Error(`effort is required for codex model ${opts.model}`);
+    }
+
+    // Structured streaming + deterministic capture: `--json` emits NDJSON events
+    // on stdout (tailed by the driver); `--color never` guarantees clean JSON
+    // even though codex runs under a tmux pty; `--skip-git-repo-check` lets a
+    // task run in a non-git workdir (agetor has no sandbox philosophy).
+    args.push("--json", "--color", "never", "--skip-git-repo-check");
+
+    // Sandbox policy from the agetor mode. `auto` (hands-off) →
+    // `workspace-write` so codex can edit files in the working dir without
+    // approval prompts (codex exec is non-interactive — it can't prompt anyway).
+    // `ask` → `read-only` (the most it can do without changing anything). We use
+    // `--sandbox` rather than the deprecated `--full-auto`, which prints a
+    // warning to stderr on every turn in codex 0.140+.
+    const mode = opts.mode ?? defaultModeFor(harness.kind);
+    // Sandbox policy. `ask` → `read-only` (can't change anything). `auto` →
+    // `workspace-write` (edit the cwd without approval prompts) for the common
+    // case, BUT escalated to `danger-full-access` when the task's git writes have
+    // to land OUTSIDE the cwd: a linked worktree's `.git` is a file pointing at
+    // the source repo's shared `.git`, where a commit's objects/refs go, and
+    // `workspace-write` only makes the cwd writable — so `git commit` is blocked.
+    // Granting the external dir via `sandbox_workspace_write.writable_roots` is
+    // unreliable (codex keeps `.git` read-only under some workspace policies), so
+    // for those runs we drop the sandbox entirely. That's consistent with
+    // agetor's no-sandbox philosophy (CLAUDE.md: "Agents run with the user's full
+    // shell privileges … There is no sandbox") and with claude-code's `auto` mode
+    // (`--dangerously-skip-permissions`). `approval_policy=never` pairs with full
+    // access so a headless `codex exec` never stalls on an approval it can't show
+    // — the empirically-validated combo for full filesystem access. Parent flags
+    // must precede the `resume` subcommand, so emit here.
+    const needsExternalGitWrites = (opts.codexExternalGitDirs?.length ?? 0) > 0;
+    if (mode !== "auto") {
+      args.push("--sandbox", "read-only");
+    } else if (needsExternalGitWrites) {
+      args.push("--sandbox", "danger-full-access", "-c", "approval_policy=never");
+    } else {
+      args.push("--sandbox", "workspace-write");
+    }
+
+    args.push(...extra);
+
+    // Multi-turn: parent flags MUST precede the `resume` subcommand (codex
+    // rejects `--json`/`--color` placed after it). codex loads the prior
+    // conversation from its own rollout via `thread_id`, so the new prompt is
+    // just the user's next line.
+    if (opts.resumeSessionId) {
+      args.push("resume", opts.resumeSessionId);
+    }
+    // Read the prompt from stdin — `-` is codex's stdin sentinel.
+    args.push("-");
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
 
-  args.push(...extra);
-
-  // Multi-turn: parent flags MUST precede the `resume` subcommand (codex
-  // rejects `--json`/`--color` placed after it). codex loads the prior
-  // conversation from its own rollout via `thread_id`, so the new prompt is
-  // just the user's next line.
-  if (opts.resumeSessionId) {
-    args.push("resume", opts.resumeSessionId);
-  }
-  // Read the prompt from stdin — `-` is codex's stdin sentinel.
-  args.push("-");
-  return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  // Exhaustive: a new AgentKind must get its own branch above rather than
+  // silently falling through to another kind's argv (KB 785913e5).
+  const _never: never = harness.kind;
+  throw new Error(`unknown harness kind: ${String(_never)}`);
 }
 
 /**
@@ -914,6 +1159,67 @@ export async function buildCodexCommand(
     ...opts,
     codexExternalGitDirs: await gitWritableRoots(cwd),
   });
+}
+
+/**
+ * The server mode an OpenCode turn runs in for this harness + task + CLI
+ * version (D-4): a thin wrapper over `effectiveOpencodeServer` +
+ * `opencodeMajor`, so the orchestrator (breadcrumb, reattach) and
+ * `spawnAgent` resolve it identically. `null` on v1 (no server flag).
+ */
+export function opencodeEffectiveServerFor(
+  harness: Harness,
+  task: { opencodeServer?: OpencodeServerMode | null },
+  cliVersion: string | null,
+): OpencodeServerMode | null {
+  return effectiveOpencodeServer({
+    mode: task.opencodeServer ?? "shared",
+    harnessHome: harness.home,
+    major: opencodeMajor(cliVersion),
+  });
+}
+
+/**
+ * The subagent hooks an OpenCode turn's driver runs (D-11), exported so the
+ * orchestrator's reattach path wires exactly what `spawnAgent` wires:
+ *  - `onSubagent` registers a `subagents` row (`parentKind:
+ *    "opencode_subagent"`, status `running`) when a `subagent` (v2) / `task`
+ *    (v1) tool result names a child session;
+ *  - `beforeSettle` — awaited by the driver before `done` resolves — exports
+ *    every running/orphaned child of the task and fills or orphans its tab,
+ *    so no row stays `running` past settle (which would park the task in the
+ *    background-agent hold). Best effort: a failed refresh is logged and
+ *    never blocks the turn from settling.
+ * The export runs with the same env a turn gets (`harnessEnv` plus
+ * `OPENCODE_DISABLE_AUTOUPDATE`) and the turn's server mode.
+ */
+export function opencodeDriverHooks(a: {
+  taskId: string;
+  runId: string;
+  harness: Harness;
+  cwd: string;
+  major: 1 | 2;
+  standalone: boolean;
+}): { onSubagent: (n: OpencodeSubagentNotice) => void; beforeSettle: OpencodeLaunchOptions["beforeSettle"] } {
+  const { taskId, runId, harness, cwd, major, standalone } = a;
+  return {
+    onSubagent: (notice) => {
+      try {
+        registerOpencodeSubagent({ taskId, runId, notice });
+      } catch (err) {
+        console.warn(`[agetor] opencode: couldn't register subagent ${notice.childSessionId} for task ${taskId}:`, err);
+      }
+    },
+    beforeSettle: async () => {
+      const env = harnessEnv(harness);
+      env.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
+      try {
+        await refreshOpencodeSubagents({ taskId, bin: resolveBin(harness), env, cwd, major, standalone, final: true });
+      } catch (err) {
+        console.warn(`[agetor] opencode: subagent refresh failed for task ${taskId}:`, err);
+      }
+    },
+  };
 }
 
 /**
@@ -2884,12 +3190,16 @@ function makeFakeAgent(
     // in flight for that long (default 20ms — the historical timing every
     // other consumer relies on), so a test can deterministically queue
     // follow-ups behind it and mutate the task (model, CLI version) before
-    // `drainCodexQueue` runs. Read at call time; codex only, so claude/fx
-    // fake turns keep their own timing.
+    // `drainCodexQueue` runs. Read at call time. `AGETOR_FAKE_CLAUDE_TURN_MS`
+    // is the claude counterpart for this generic turn: a test that folds a
+    // follow-up into the still-running turn holds it open instead of racing
+    // the 20ms timer (which a loaded machine loses). fx keeps its own timing.
     const resolveAfterMs =
       fakeOpts.kind === "codex"
         ? (Number(process.env.AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS ?? 20) || 20)
-        : 20;
+        : fakeOpts.kind === "claude-code"
+          ? (Number(process.env.AGETOR_FAKE_CLAUDE_TURN_MS ?? 20) || 20)
+          : 20;
     after(resolveAfterMs, () => {
       if (fakeOpts.kind === "fx") emitFakeFxUsageAndTitle(onChunk);
       onChunk("status", "turn complete");
@@ -3117,6 +3427,222 @@ function makeFakeCursorStreamAgent(taskId: string, prompt: string, onChunk: Chun
   return inst;
 }
 
+/**
+ * Prompt-marker triggers for the fake opencode driver
+ * (`AGETOR_OPENCODE_DRIVER=fake`, D-18) — same rationale as
+ * {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}: the e2e backend's env is fixed per
+ * worker, the prompt is not.
+ *  - {@link FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER}: the turn also runs a v2
+ *    `subagent` tool whose result names the child session
+ *    `ses_fakechild<taskId8>`, so `onSubagent` registers its tab and the
+ *    turn-end refresh exports it through `opencode-export.ts`'s fake seam.
+ *  - {@link FAKE_OPENCODE_ERROR_PROMPT_MARKER}: the turn ends with an `error`
+ *    event and exit 1.
+ *  - {@link FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER}: on a resumed turn, the
+ *    resume "fails" — the D-9 status line is posted and the turn continues in
+ *    a NEW session (reported through `onSessionId`), like the real driver's
+ *    one-shot `freshArgv` relaunch. Ignored on a fresh turn.
+ */
+export const FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER = "__agetor_fake_opencode_subagent__";
+export const FAKE_OPENCODE_ERROR_PROMPT_MARKER = "__agetor_fake_opencode_error__";
+export const FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER = "__agetor_fake_opencode_resume_fail__";
+
+/** The first 8 chars of a task id, alphanumerics only, so a fake session id
+ *  built from it still matches `OPENCODE_SESSION_ID_RE`. */
+function fakeOpencodeIdPart(taskId: string): string {
+  return taskId.slice(0, 8).replace(/[^A-Za-z0-9]/g, "");
+}
+
+/** The fake child session id the subagent marker names. */
+export function fakeOpencodeChildSessionId(taskId: string): string {
+  return `ses_fakechild${fakeOpencodeIdPart(taskId)}`;
+}
+
+/** The D-9 status line a failed resume posts before the fresh session. */
+export function opencodeResumeFailedStatusLine(sessionId: string): string {
+  return `couldn't resume OpenCode session ${sessionId.slice(0, 8)}… — starting a fresh session`;
+}
+
+/** Makes every fake turn's part ids unique, so two turns of one task never
+ *  share a `line_uuid`. */
+let fakeOpencodeTurnCounter = 0;
+
+/**
+ * Synthetic v2 (2.1.3) `opencode run --format json` turn for the fake driver,
+ * shaped like the captured fixtures (`src/bun/fixtures/opencode/v2-*`):
+ * reasoning, a `shell` tool, a `todowrite`, the assistant text, and a
+ * `step_finish` (tokens + numeric USD cost) per step. The subagent marker
+ * adds a `subagent` step; the error marker ends on an `error` event instead
+ * of the text.
+ */
+function fakeOpencodeEvents(sessionId: string, taskId: string, prompt: string): Record<string, unknown>[] {
+  const turn = ++fakeOpencodeTurnCounter;
+  const tag = `${fakeOpencodeIdPart(taskId)}${turn}`;
+  let clock = 1_793_108_789_000 + turn * 10_000;
+  let seq = 0;
+  const partId = () => `prt_fake${tag}p${++seq}`;
+  const messageId = (n: number) => `msg_fake${tag}m${n}`;
+  const envelope = (type: string, body: Record<string, unknown>) => ({ type, timestamp: (clock += 5), sessionID: sessionId, ...body });
+  const stepStart = (msg: string) =>
+    envelope("step_start", { part: { id: partId(), sessionID: sessionId, messageID: msg, type: "step-start", snapshot: "fakesnapshot" } });
+  const stepFinish = (msg: string, reason: "tool-calls" | "stop", tokens: { input: number; output: number; reasoning: number; read: number }) =>
+    envelope("step_finish", {
+      part: {
+        id: partId(),
+        sessionID: sessionId,
+        messageID: msg,
+        type: "step-finish",
+        reason,
+        snapshot: "fakesnapshot",
+        cost: 0.0012,
+        tokens: { input: tokens.input, output: tokens.output, reasoning: tokens.reasoning, cache: { read: tokens.read, write: 0 } },
+      },
+    });
+  const tool = (msg: string, callId: string, name: string, input: Record<string, unknown>, output: string, metadata: Record<string, unknown>) =>
+    envelope("tool_use", {
+      part: {
+        partID: partId(),
+        sessionID: sessionId,
+        messageID: msg,
+        type: "tool",
+        id: callId,
+        tool: name,
+        state: {
+          status: "completed",
+          input,
+          output,
+          title: name,
+          metadata: { metadata, content: [{ type: "text", text: output }] },
+          time: { start: clock, end: clock + 3 },
+        },
+      },
+    });
+
+  const m1 = messageId(1);
+  const m2 = messageId(2);
+  const m3 = messageId(3);
+  const todos = [
+    { content: "inspect the project", status: "completed" },
+    { content: "answer the user", status: "pending" },
+  ];
+  const events: Record<string, unknown>[] = [
+    stepStart(m1),
+    envelope("reasoning", { part: { id: partId(), sessionID: sessionId, messageID: m1, type: "reasoning", text: "fake opencode reasoning" } }),
+    tool(m1, `call-fake-${tag}-shell`, "shell", { command: "ls" }, "a.txt\nb.txt\n", { status: "completed", truncated: false, exit: 0 }),
+    stepFinish(m1, "tool-calls", { input: 1200, output: 40, reasoning: 12, read: 0 }),
+    stepStart(m2),
+    tool(m2, `call-fake-${tag}-todo`, "todowrite", { todos }, "Todos updated: 1/2 completed, 1 pending", { todos, truncated: false }),
+    stepFinish(m2, "tool-calls", { input: 300, output: 20, reasoning: 0, read: 1100 }),
+  ];
+  if (prompt.includes(FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER)) {
+    const child = fakeOpencodeChildSessionId(taskId);
+    const ms = messageId(4);
+    events.push(
+      stepStart(ms),
+      tool(
+        ms,
+        `call-fake-${tag}-subagent`,
+        "subagent",
+        { prompt: "List the files in the current directory.", description: "Fake child task", agent: "explore" },
+        `<subagent sessionID="${child}" state="completed">\nfake child reply\n</subagent>`,
+        { sessionID: child, status: "completed", truncated: false },
+      ),
+      stepFinish(ms, "tool-calls", { input: 200, output: 15, reasoning: 0, read: 1300 }),
+    );
+  }
+  events.push(stepStart(m3));
+  if (prompt.includes(FAKE_OPENCODE_ERROR_PROMPT_MARKER)) {
+    events.push(envelope("error", { error: { type: "unknown", message: "fake opencode error" } }));
+  } else {
+    events.push(
+      envelope("text", {
+        part: { id: partId(), sessionID: sessionId, messageID: m3, type: "text", text: `fake response to: ${prompt}`, time: { start: clock, end: clock + 2 } },
+      }),
+      stepFinish(m3, "stop", { input: 150, output: 10, reasoning: 0, read: 1400 }),
+    );
+  }
+  return events;
+}
+
+/**
+ * The fake opencode agent (`AGETOR_OPENCODE_DRIVER=fake`, D-18): replays
+ * {@link fakeOpencodeEvents} one NDJSON line per 3 ms through the REAL
+ * `createOpencodeLineProcessor` (the cursor-stream precedent), so the chunks,
+ * line uuids, session-id discovery and subagent notices are exactly what a
+ * real turn produces. Settles with the processor's verdict (exit 1 after an
+ * `error` event, else 0) after awaiting `beforeSettle`, like the real driver;
+ * `kill()` settles as the SIGINT exit (130), the orchestrator's own
+ * `cancelled` flag deciding the run status.
+ */
+function makeFakeOpencodeAgent(
+  taskId: string,
+  prompt: string,
+  onChunk: ChunkHandler,
+  fakeOpts: {
+    major: 1 | 2;
+    resumeSessionId?: string | null;
+    onSessionId?: (id: string) => void;
+    onSubagent?: (n: OpencodeSubagentNotice) => void;
+    beforeSettle?: OpencodeLaunchOptions["beforeSettle"];
+  },
+): SpawnedAgent {
+  const record: string[] = [`spawn:${prompt}`];
+  let resolveDone!: (code: number) => void;
+  const done = new Promise<number>((res) => { resolveDone = res; });
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+
+  const resumeId = fakeOpts.resumeSessionId ?? null;
+  const resumeFails = resumeId !== null && prompt.includes(FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER);
+  const sessionId = resumeFails
+    ? `ses_fakefresh${fakeOpencodeIdPart(taskId)}${fakeOpencodeTurnCounter + 1}`
+    : resumeId ?? `ses_fake${fakeOpencodeIdPart(taskId)}`;
+  const processor = createOpencodeLineProcessor({
+    onChunk,
+    onSessionId: fakeOpts.onSessionId,
+    onSubagent: fakeOpts.onSubagent,
+    major: fakeOpts.major,
+  });
+
+  let settled = false;
+  const settle = async (code: number) => {
+    if (settled) return;
+    settled = true;
+    for (const t of timers) clearTimeout(t);
+    try {
+      await fakeOpts.beforeSettle?.({ code, sessionId: processor.result().sessionId });
+    } catch (err) {
+      console.warn(`[agetor] fake opencode: beforeSettle failed for task ${taskId}:`, err);
+    }
+    resolveDone(code);
+  };
+
+  if (resumeFails) {
+    // Same text and line uuid the real driver's fresh retry posts
+    // (opencode-tmux.ts `settle`).
+    after(2, () => onChunk("status", opencodeResumeFailedStatusLine(resumeId), "opencode:fresh-retry"));
+  }
+  const events = fakeOpencodeEvents(sessionId, taskId, prompt);
+  events.forEach((evt, lineIndex) => {
+    after(5 + lineIndex * 3, () => {
+      processor.feed(JSON.stringify(evt));
+      if (lineIndex === events.length - 1) void settle(processor.result().failed ? 1 : 0);
+    });
+  });
+
+  const inst: FakeDriverInstance = {
+    _record: record,
+    kill: () => {
+      record.push("kill");
+      void settle(130);
+    },
+    writeInput: (line) => { record.push(`write:${line}`); return true; },
+    done,
+  };
+  fakeDrivers.set(taskId, inst);
+  return inst;
+}
+
 export interface SpawnAgentArgs {
   taskId: string;
   /** The run row this spawn belongs to. Used by the codex driver to key its
@@ -3147,6 +3673,12 @@ export interface SpawnAgentArgs {
    * `FxLaunchOptions.onSteerDropped`; every other kind ignores it.
    */
   onSteerDropped?: (text: string) => boolean;
+  /**
+   * copilot-only: the orchestrator's background-agent sink. Copilot reports
+   * subagents inline in its JSON stream; the driver feeds each one through
+   * this sink so it shows up as a subagent tab. Other kinds ignore it.
+   */
+  copilotSubagents?: CopilotSubagentSink;
   opts?: AgentRunOptions;
 }
 
@@ -3219,7 +3751,12 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       if (Number.isFinite(spawnDelayMs) && spawnDelayMs > 0) {
         await Bun.sleep(spawnDelayMs);
       }
-      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        cwd,
+        kind: "claude-code",
+      });
     }
     // Pre-generate a session uuid when we're not resuming. The driver will
     // expect claude to write its JSONL at the deterministic path derived
@@ -3331,6 +3868,49 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     });
   }
 
+  if (harness.kind === "copilot") {
+    // Self-issued session id, like gemini: always passed as `--session-id` —
+    // the prior id when resuming, else a fresh uuid.
+    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();
+    const built = buildCommand(harness, prompt, {
+      ...opts,
+      runId,
+      sessionId: opts.resumeSessionId ? null : sessionId,
+    });
+    const home = copilotHome({ harnessHome: harness.home, harnessEnv: harness.env });
+    if (process.env.AGETOR_COPILOT_DRIVER === "fake") {
+      const fakeSessionId = opts.resumeSessionId ?? `fake-copilot-session-${taskId}`;
+      onSessionId?.(fakeSessionId);
+      const script = fakeCopilotScript(prompt, { runId, sessionId: fakeSessionId, model: opts.model ?? null });
+      return playFakeCopilotTurn({
+        script,
+        runId,
+        sessionId: fakeSessionId,
+        model: opts.model ?? null,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        copilotHome: home,
+        onChunk,
+        sink: args.copilotSubagents,
+      });
+    }
+    return await spawnCopilotViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      sessionId,
+      copilotHome: home,
+      mode: opts.mode ?? defaultModeFor(harness.kind),
+      model: opts.model ?? null,
+      stripClassicTokens: built.stripClassicTokens ?? [],
+      onSubagent: args.copilotSubagents,
+      onSessionId,
+    });
+  }
+
   if (harness.kind === "fx") {
     // fx — driven over ACP/stdio via fx-acp.ts, a plain `Bun.spawn` child
     // process with no tmux involved (see that file's header for why: an ACP
@@ -3362,40 +3942,84 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     return spawnFxViaAcp(buildFxLaunchOptions(args, built));
   }
 
-  // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn
-  // run survives an agetor restart and is reattachable), streaming structured
-  // events by tailing codex's `--json` log.
-  if (process.env.AGETOR_CODEX_DRIVER === "fake") {
-    buildCommand(harness, prompt, opts);
-    // Hand the orchestrator a thread id so it persists `codex_session_id` and
-    // can route follow-ups through `codex exec resume` — mirrors what a real
-    // `thread.started` event would deliver.
-    onSessionId?.(`fake-codex-thread-${taskId}`);
-    // `kind` is what arms the fake's codex-only resolve delay
-    // (`AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS`).
-    return makeFakeAgent(taskId, prompt, onChunk, {
+  if (harness.kind === "opencode") {
+    // opencode — hosted in a per-task tmux session via opencode-tmux.ts (so a
+    // mid-turn run survives an agetor restart and is reattachable), one-shot
+    // `opencode run --format json` per turn with the prompt on stdin,
+    // streaming structured events by tailing its NDJSON log. The session id
+    // is DISCOVERED from the stream (first non-empty `sessionID`), like codex.
+    const major = opencodeMajor(opts.cliVersion);
+    const server = opencodeEffectiveServerFor(harness, { opencodeServer: opts.opencodeServer }, opts.cliVersion ?? null);
+    const hooks = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone: server === "standalone" });
+    if (process.env.AGETOR_OPENCODE_DRIVER === "fake") {
+      // Build the command anyway so the fake exercises the same argv
+      // assembly the real path does; the fake's behaviour doesn't depend on
+      // the argv shape.
+      buildCommand(harness, prompt, opts);
+      return makeFakeOpencodeAgent(taskId, prompt, onChunk, {
+        major,
+        resumeSessionId: opts.resumeSessionId ?? null,
+        onSessionId,
+        ...hooks,
+      });
+    }
+    const built = buildCommand(harness, prompt, opts);
+    return await spawnOpencodeViaTmux({
+      taskId,
       runId,
-      mode: opts.mode ?? defaultModeFor(harness.kind),
+      argv: built.cmd,
+      freshArgv: built.freshArgv ?? null,
+      env: built.env ?? {},
       cwd,
-      kind: harness.kind,
+      promptText: prompt,
+      major,
+      onChunk,
+      onSessionId,
+      ...hooks,
     });
   }
-  // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
-  // worktree) so a codex `auto` run that has to write there escalates its
-  // sandbox to full access. Computed here — the single choke point every codex
-  // spawn path funnels through — rather than at each orchestrator call site.
-  // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
-  // there. `buildCodexCommand` is the testable seam for this wiring (async —
-  // it awaits `gitWritableRoots`, which now shells out via `Bun.spawn`).
-  const built = await buildCodexCommand(harness, prompt, opts, cwd);
-  return await spawnCodexViaTmux({
-    taskId,
-    runId,
-    argv: built.cmd,
-    env: built.env ?? {},
-    cwd,
-    promptText: prompt,
-    onChunk,
-    onSessionId,
-  });
+
+  if (harness.kind === "codex") {
+    // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn
+    // run survives an agetor restart and is reattachable), streaming structured
+    // events by tailing codex's `--json` log.
+    if (process.env.AGETOR_CODEX_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      // Hand the orchestrator a thread id so it persists `codex_session_id` and
+      // can route follow-ups through `codex exec resume` — mirrors what a real
+      // `thread.started` event would deliver.
+      onSessionId?.(`fake-codex-thread-${taskId}`);
+      // `kind` is what arms the fake's codex-only resolve delay
+      // (`AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS`).
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        cwd,
+        kind: harness.kind,
+      });
+    }
+    // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
+    // worktree) so a codex `auto` run that has to write there escalates its
+    // sandbox to full access. Computed here — the single choke point every codex
+    // spawn path funnels through — rather than at each orchestrator call site.
+    // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
+    // there. `buildCodexCommand` is the testable seam for this wiring (async —
+    // it awaits `gitWritableRoots`, which now shells out via `Bun.spawn`).
+    const built = await buildCodexCommand(harness, prompt, opts, cwd);
+    return await spawnCodexViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      onSessionId,
+    });
+  }
+
+  // Exhaustive: a new AgentKind must get its own dispatch branch above
+  // rather than silently spawning another kind's driver (KB 785913e5).
+  const _never: never = harness.kind;
+  throw new Error(`unknown harness kind: ${String(_never)}`);
 }

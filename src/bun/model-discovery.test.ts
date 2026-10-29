@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterEach } from "bun:test";
+import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,7 +19,19 @@ let subscribeAppEvents: typeof import("./quit-guard.ts").subscribeAppEvents;
 let discovery: typeof import("./agent-discovery.ts");
 let scheduler: typeof import("./model-discovery.ts");
 
+// Every full sweep also runs the kind-level `discoverOpencode()`; point it at
+// a binary that doesn't exist so a sweep here never spawns a real `opencode`.
+// The opencode tests below give each harness row its own stub `bin`.
+let prevOpencodeBin: string | undefined;
+
+afterAll(() => {
+  if (prevOpencodeBin === undefined) delete process.env.AGETOR_OPENCODE_BIN;
+  else process.env.AGETOR_OPENCODE_BIN = prevOpencodeBin;
+});
+
 beforeAll(async () => {
+  prevOpencodeBin = process.env.AGETOR_OPENCODE_BIN;
+  process.env.AGETOR_OPENCODE_BIN = "/nonexistent/agetor-test-opencode";
   ({ harnesses } = await import("./db.ts"));
   ({ subscribeAppEvents } = await import("./quit-guard.ts"));
   discovery = await import("./agent-discovery.ts");
@@ -715,3 +727,95 @@ test("noteHarnessStatuses: the scheduled debounce timer is unref'd (never itself
   expect(timer).toBeDefined();
   expect((timer as unknown as { hasRef: () => boolean }).hasRef()).toBe(false);
 });
+
+/* ── opencode: per-harness discovery gates ──────────────────────────────────
+ * OpenCode lists only the providers its own config/env credential (spike
+ * Q7), so each opencode harness is probed under its own env + bin, like fx
+ * and codex. */
+
+/** A v2-shaped stub `opencode`: `--version`, `models --standalone` and
+ *  `api --standalone model.list`, the last answering `apiBody` (or failing
+ *  when it's `null`). */
+function plantFakeOpencodeBin(ids: string[], apiBody: string | null): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-model-discovery-opencode-"));
+  const bin = path.join(dir, "opencode");
+  writeFileSync(
+    bin,
+    [
+      "#!/bin/sh",
+      'case "$*" in',
+      '  "--version") echo "opencode v2.1.3" ;;',
+      `  "models --standalone") printf '${ids.map((id) => `${id}\\n`).join("")}' ;;`,
+      apiBody === null ? '  "api --standalone model.list") exit 1 ;;' : `  "api --standalone model.list") echo '${apiBody}' ;;`,
+      "  *) exit 1 ;;",
+      "esac",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+function insertOpencodeHarness(overrides: { id: string; bin: string }): ReturnType<typeof import("./db.ts").harnesses.insert> {
+  const created = harnesses.insert({
+    id: overrides.id,
+    kind: "opencode",
+    label: overrides.id,
+    home: null,
+    bin: overrides.bin,
+    env: {},
+  });
+  createdHarnessIds.push(created.id);
+  return created;
+}
+
+test("refreshAllModels: an enabled opencode harness is a per-harness target, probed under its own bin, and keyed by its own catalog", async () => {
+  resetAll();
+  const bin = plantFakeOpencodeBin(
+    ["opencode/a", "opencode/b"],
+    '{"data":[{"providerID":"opencode","id":"a","name":"A","variants":[{"id":"low"},{"id":"high"}]},{"providerID":"opencode","id":"b","variants":[]}]}',
+  );
+  const created = insertOpencodeHarness({ id: "opencode-scheduler", bin });
+  await scheduler.refreshAllModels();
+  const expected = [
+    { id: "opencode/a", label: "A", efforts: ["low", "high"] },
+    { id: "opencode/b", efforts: [] },
+  ];
+  expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual(expected);
+  expect(scheduler.getHarnessModelMap().byHarness[created.id]).toEqual(expected);
+  // The kind-level list (the missing built-in binary) is untouched by it.
+  expect(discovery.getDiscoveredModels("opencode")).toEqual([]);
+}, 30_000);
+
+test("refreshHarnessModels: an opencode harness refresh probes that harness (not the kind cache), and a variants-known → unknown flip publishes", async () => {
+  resetAll();
+  const events: AppEvent[] = [];
+  const unsubscribe = subscribeAppEvents((e) => events.push(e));
+  try {
+    const known = plantFakeOpencodeBin(["opencode/b"], '{"data":[{"providerID":"opencode","id":"b","variants":[]}]}');
+    const created = insertOpencodeHarness({ id: "opencode-refresh", bin: known });
+    await scheduler.refreshHarnessModels(created.id);
+    expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([{ id: "opencode/b", efforts: [] }]);
+    expect(discovery.getDiscoveredModels("opencode")).toEqual([]);
+    events.length = 0;
+
+    // Same ids, but the variant probe now fails: `efforts: []` ("no
+    // variants") becomes an absent key ("unknown") — a real picker change.
+    harnesses.update(created.id, { bin: plantFakeOpencodeBin(["opencode/b"], null) });
+    await scheduler.refreshHarnessModels(created.id);
+    expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([{ id: "opencode/b" }]);
+    const changeEvents = events.filter((e): e is Extract<AppEvent, { type: "agent_models_changed" }> => e.type === "agent_models_changed");
+    expect(changeEvents.some((e) => e.harnessIds.includes(created.id))).toBe(true);
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("refreshAllModels: a disabled opencode harness is not probed", async () => {
+  resetAll();
+  const created = insertOpencodeHarness({ id: "opencode-disabled", bin: plantFakeOpencodeBin(["opencode/a"], null) });
+  harnesses.setEnabled(created.id, false);
+  await scheduler.refreshAllModels();
+  expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([]);
+  expect(scheduler.getHarnessModelMap().byHarness[created.id]).toBeUndefined();
+}, 30_000);

@@ -40,7 +40,8 @@ beforeAll(async () => {
   ({ db, tasks, runs, harnesses } = await import("./db.ts"));
   const shared = await import("../shared/types.ts");
   TASK_EVENTS_REPLAY_META_EVENT = shared.TASK_EVENTS_REPLAY_META_EVENT;
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void; port: number };
   token = API_TOKEN;
   // Deferred until after db.ts/server.ts are loaded (and AGETOR_DATA_DIR is
@@ -90,7 +91,7 @@ function makeTaskRow(taskId: string, agent: string, workdir: string): Task {
     mode: null,
     model: null,
     effort: null,
-    speed: "off", maxMode: false,
+    speed: "off", maxMode: false, opencodeServer: "shared",
     references: [],
     backlog: [], plans: [],
     draft: null,
@@ -117,7 +118,7 @@ async function readSseFrames(
   timeoutMs: number,
 ): Promise<Array<{ event: string; data: any }>> {
   const ctrl = new AbortController();
-  const res = await fetch(url, { signal: ctrl.signal });
+  const res = await fetch(url, { signal: ctrl.signal, headers: { authorization: `Bearer ${token}` } });
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   const frames: Array<{ event: string; data: any }> = [];
@@ -194,7 +195,7 @@ test("SSE replay anchors to the last user message: 1 user + 900 assistant -> ear
   const { taskId, ids } = seedEventsTask(spec);
   const userId = ids[0]!;
 
-  const url = `${BASE()}/tasks/${taskId}/events?token=${encodeURIComponent(token)}`;
+  const url = `${BASE()}/tasks/${taskId}/events`;
   const frames = await readSseFrames(url, 902, 20_000);
 
   expect(frames.length).toBe(902);
@@ -220,7 +221,7 @@ test("SSE replay with ?anchor=0 skips the last-user-message extension: 1 user + 
   const { taskId, ids } = seedEventsTask(spec);
   const userId = ids[0]!;
 
-  const url = `${BASE()}/tasks/${taskId}/events?anchor=0&token=${encodeURIComponent(token)}`;
+  const url = `${BASE()}/tasks/${taskId}/events?anchor=0`;
   const frames = await readSseFrames(url, 801, 20_000);
 
   expect(frames.length).toBe(801);
@@ -245,7 +246,7 @@ test("SSE replay ceiling fallback: 1 user + 3100 assistant (span over EVENTS_REP
   const { taskId, ids } = seedEventsTask(spec);
   const expectedWindow = ids.slice(-800);
 
-  const url = `${BASE()}/tasks/${taskId}/events?token=${encodeURIComponent(token)}`;
+  const url = `${BASE()}/tasks/${taskId}/events`;
   const frames = await readSseFrames(url, 801, 30_000);
 
   expect(frames.length).toBe(801);
@@ -270,7 +271,7 @@ test("SSE replay with status breadcrumbs older than the anchor: earliestId is st
   const { taskId, ids } = seedEventsTask(spec);
   const userId = ids[2]!;
 
-  const url = `${BASE()}/tasks/${taskId}/events?token=${encodeURIComponent(token)}`;
+  const url = `${BASE()}/tasks/${taskId}/events`;
   const frames = await readSseFrames(url, 902, 20_000);
 
   expect(frames.length).toBe(902);

@@ -11,6 +11,7 @@ import {
 } from "../shared/clone-input.ts";
 import { apiHostForRemote, bitbucketCreds, gitlabToken } from "./git-provider.ts";
 import { githubToken, run } from "./github.ts";
+import { coreSpawn } from "./core-spawn.ts";
 import { bitbucketServerError } from "./bitbucket.ts";
 
 /**
@@ -1351,12 +1352,14 @@ async function runGitClone(
     }
   }
 
-  const proc = Bun.spawn(["git", "clone", "--progress", "--", source, dest], {
+  // coreSpawn: the clone runs git hooks/filters/config from the cloned
+  // content's ecosystem; it must not inherit Agetor's macOS identity (P2/P3).
+  const proc = coreSpawn(["git", "clone", "--progress", "--", source, dest], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
     env,
-  });
+  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
   let timedOut = false;
   let cancelled = false;
   const timer = setTimeout(() => {

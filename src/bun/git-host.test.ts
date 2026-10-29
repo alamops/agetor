@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -409,6 +409,21 @@ function githubIssueJson(overrides: Record<string, unknown> = {}): Record<string
   };
 }
 
+/**
+ * A PATH that holds only `git`, so `Bun.which("gh"/"glab")` misses while the
+ * repo's own `git` calls still run. Spawns go through `coreSpawn`, which hands
+ * each child the LIVE (scrubbed) `process.env` rather than Bun's startup
+ * snapshot, so blanking PATH entirely would hide `git` too.
+ */
+function gitOnlyPath(): string {
+  const git = Bun.which("git");
+  if (!git) throw new Error("git is required for these tests");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-git-only-path-"));
+  createdDirs.push(dir);
+  symlinkSync(git, path.join(dir, "git"));
+  return dir;
+}
+
 test("issueThread dispatches a github repo directly (sourcePath already stamped) with refetchCommand null when gh isn't on PATH", async () => {
   const dir = await makeGitHubRepo("acme", "app");
   createdDirs.push(dir);
@@ -417,7 +432,7 @@ test("issueThread dispatches a github repo directly (sourcePath already stamped)
     { match: "/repos/acme/app/issues/7/comments", json: [] },
   ]);
   const originalPath = process.env.PATH;
-  process.env.PATH = "/nonexistent-agetor-test-path"; // deny the gh/glab shellouts
+  process.env.PATH = gitOnlyPath(); // deny the gh/glab shellouts
   try {
     const res = await issueThread({ dir, number: 7 });
     expect(res.ok).toBe(true);
@@ -469,7 +484,7 @@ test("issueThread dispatches a gitlab repo and stitches sourcePath onto the item
     { match: "/issues/5/notes", json: [] },
   ]);
   const originalPath = process.env.PATH;
-  process.env.PATH = "/nonexistent-agetor-test-path"; // deny the glab shellout
+  process.env.PATH = gitOnlyPath(); // deny the glab shellout
   try {
     const res = await issueThread({ dir, number: 5 });
     expect(res.ok).toBe(true);

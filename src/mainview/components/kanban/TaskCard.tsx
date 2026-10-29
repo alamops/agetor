@@ -14,6 +14,7 @@ import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-au
 import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
+import { importedSessionOf } from "../../../shared/imported-session.ts";
 import { AgentIcon } from "./AgentIcon";
 import { PipelineBadge } from "@/components/pipelines";
 
@@ -335,7 +336,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
             <Button size="sm" variant="destructive" onClick={() => onCancel(task)}>
               <Square className="size-3" /> Stop
             </Button>
-          ) : openable || task.importedClaude ? (
+          ) : openable || importedSessionOf(task) ? (
             <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
               <FolderOpen className="size-3" /> Open
             </Button>

@@ -12,7 +12,7 @@ import {
 } from "../shared/types.ts";
 import { fxRecoverySummaryLine, isFxRecoveryResumable, parseFxRecoveryMeta } from "../shared/fx-recovery.ts";
 import { isImagePath } from "../shared/attachments.ts";
-import { disclaimArgv } from "./disclaim.ts";
+import { childEnv, coreSpawn } from "./core-spawn.ts";
 import { SENT_FILES_TOOL_NAME } from "../shared/sent-files.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
 import {
@@ -511,9 +511,13 @@ import {
  *     28 then-curated fx models (spike `fx-0010-efforts`; spacexai/grok-4.7,
  *     anthropic/claude-opus-5.5, openai/gpt-6-sol, openai/gpt-6-luna,
  *     anthropic/claude-sonnet-5.5, openai/gpt-6.1-sol,
- *     anthropic/claude-haiku-5.5 (curated since 2026-10-07) and
- *     google/gemini-4-argon (curated since 2026-10-14) postdate it): 16
- *     advertise efforts, 12 advertise none. Example (the owner's default model): `zai/glm-5.3-
+ *     anthropic/claude-haiku-5.5 (curated since 2026-10-07),
+ *     google/gemini-4-argon (curated since 2026-10-14) and the nine ids
+ *     curated 2026-10-26 (openai/gpt-6.1-terra, minimax/minimax-m3.1-flash,
+ *     meta/muse-spark-open, inception/mercury-3, moonshotai/kimi-k3.1-pro,
+ *     deepseek/deepseek-v4.1-flash-1017, meta/muse-wonder-1.0,
+ *     mistral/mistral-large-4, reflection/beam) postdate it): 16
+ *     advertise efforts, 12 advertise none. Example: `zai/glm-5.3-
  *     flash` → `auto, low, high, max`. **`session/set_config_option
  *     {sessionId, configId:"effort", value}` sets it** (`server.zig:2222-
  *     2247`, see `applyFxEffort` below; `ReasoningEffort.parse` in
@@ -3365,7 +3369,7 @@ export interface FxLaunchOptions {
  */
 export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
   ensureLogDirForArgv(opts.argv);
-  const env = { ...process.env, ...opts.env };
+  const env = childEnv(opts.env);
   const [bin, ...rest] = opts.argv;
   if (!bin) {
     const done = Promise.resolve(1);
@@ -3377,22 +3381,23 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
   // `FxLaunchOptions.model`'s doc) — fall back to the argv's own `--model`
   // value so `applyFxEffort`'s breadcrumb names a real model in the
   // meantime, and forever after for any caller that omits it. Note this
-  // reads `opts.argv`, the ORIGINAL fx argv — the disclaim wrap below only
-  // changes what is handed to `Bun.spawn`, so model recovery is unaffected.
+  // reads `opts.argv`, the ORIGINAL fx argv — the disclaim wrap `coreSpawn`
+  // applies below only changes what is handed to `Bun.spawn`, so model
+  // recovery is unaffected.
   const model = opts.model ?? argvValueAfter(opts.argv, "--model");
 
   // fx has no tmux server to disclaim (see the file header — plain
-  // Bun.spawn over piped stdio), so the child itself is wrapped directly.
-  // `disclaimArgv` exec-replaces via POSIX_SPAWN_SETEXEC, preserving Bun's
-  // own pid and the piped stdio fds into fx; it returns the argv unchanged
-  // when disclaim is disabled/unavailable/non-darwin.
-  const proc = Bun.spawn(disclaimArgv([bin, ...rest]), {
+  // Bun.spawn over piped stdio), so the child itself goes through
+  // `coreSpawn`, the one place that disclaims (via POSIX_SPAWN_SETEXEC, which
+  // preserves Bun's own pid and the piped stdio fds into fx) and the one that
+  // scrubs the master API token from `env` (already built with `childEnv`).
+  const proc = coreSpawn([bin, ...rest], {
     cwd: opts.cwd,
     env,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
-  });
+  }) as Subprocess<"pipe", "pipe", "pipe">;
   liveFxProcs.add(proc);
 
   // Built before `state` so both `resolveDone` and `done` can be assigned

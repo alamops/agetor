@@ -269,6 +269,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       effort: "medium",
       speed: "off",
       maxMode: false,
+      opencodeServer: "shared",
       references: [], backlog: [], plans: [], draft: null,
       runId: null, // idle — no in-flight run to fold this follow-up into
       hasOpenableRun: false,
@@ -378,6 +379,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       effort: "medium",
       speed: "off",
       maxMode: false,
+      opencodeServer: "shared",
       references: [], backlog: [], plans: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -499,6 +501,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
       effort: "medium",
       speed: "off",
       maxMode: false,
+      opencodeServer: "shared",
       references: [], backlog: [], plans: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -656,6 +659,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
       effort: "medium",
       speed: "off",
       maxMode: false,
+      opencodeServer: "shared",
       references: [], backlog: [], plans: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -826,6 +830,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
       effort: "medium",
       speed: "off",
       maxMode: false,
+      opencodeServer: "shared",
       references: [], backlog: [], plans: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -936,6 +941,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
       effort: "medium",
       speed: "off",
       maxMode: false,
+      opencodeServer: "shared",
       references: [], backlog: [], plans: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -963,9 +969,9 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
     expect(result.delivered).toBe(true);
     if (result.delivered) newRunId = result.runId;
 
-    await new Promise((r) => setTimeout(r, 300));
-
-    const entries = readLog(logPath);
+    // The spawn is fire-and-forget past `sendInput`'s budget; poll for the
+    // `new-session` call instead of guessing how long it takes.
+    const entries = await waitForLog(logPath, "new-session");
     const newSessionEntries = entries.filter((e) => e.argv.includes("new-session"));
     expect(newSessionEntries.length).toBeGreaterThan(0);
     // Guards against accidentally deferring everything: a short prompt must
@@ -1161,6 +1167,7 @@ async function seedIdleClaudeTask(prefix: string) {
     effort: "medium",
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     references: [], backlog: [], plans: [], draft: null,
     runId: priorRunId,
     hasOpenableRun: false,

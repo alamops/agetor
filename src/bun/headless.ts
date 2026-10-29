@@ -1,11 +1,13 @@
 import pkg from "../../package.json" with { type: "json" };
-import { API_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
-import { db, dataDir, subagents } from "./db.ts";
+import { CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
+import { db, dataDir, subagents, preferences } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
+import { DISCLAIM_PREF_KEY } from "./disclaim.ts";
+import { initDisclaimSwitch } from "./disclaim-switch.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
@@ -20,6 +22,9 @@ import { daemonLog } from "./daemon-log.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resumeIncompleteImports } from "./claude-session-import.ts";
+import { resumeIncompleteOpencodeImports } from "./opencode-session-import.ts";
+import { checkAllHarnesses } from "./agent-status.ts";
+import { applyHarnessAutoEnable } from "./harness-auto-enable.ts";
 
 /**
  * Headless Agetor core — the same Bun server + orchestrator the desktop app
@@ -168,6 +173,16 @@ export async function runDaemon(): Promise<void> {
   // touch a socket auto-starts its server — un-disclaimed, if this didn't
   // run first — leaving every session that server ever hosts un-disclaimed
   // too.
+  //
+  // The disclaim switch is decided first (docs/plans/master-token-agent-read.md
+  // P4/P5, D6): headless has no dialog, so the switch is always on and a stored
+  // "off" (which an agent could have written to the SQLite file) is ignored
+  // with one log line. It has to be settled before any agent host starts.
+  await initDisclaimSwitch("headless", {
+    readPref: () => preferences.get(DISCLAIM_PREF_KEY),
+    writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
+    log: daemonLog,
+  });
   await ensureDisclaimedServer();
   // Same ordering as index.ts's desktop boot path: wire the pipeline runner
   // to the global lifecycle stream before reconcileOrphans() so a step
@@ -271,6 +286,25 @@ export async function runDaemon(): Promise<void> {
   }, 0);
   importResumeTimer.unref();
 
+  // Same for an OpenCode import left `importing` by a crash.
+  const opencodeImportResumeTimer = setTimeout(() => {
+    resumeIncompleteOpencodeImports().catch((err) => {
+      daemonLog(`opencode session import resume failed: ${(err as Error)?.message ?? String(err)}`);
+    });
+  }, 0);
+  opencodeImportResumeTimer.unref();
+
+  // D-14: turn on built-in harnesses whose CLI is installed. Once, after the
+  // API binds; `GET /harnesses` repeats it as CLIs appear later. Never blocks
+  // boot, and a failed probe only skips this pass.
+  setTimeout(() => {
+    checkAllHarnesses()
+      .then((statuses) => applyHarnessAutoEnable(statuses))
+      .catch((err) => {
+        daemonLog(`harness auto-enable failed: ${(err as Error)?.message ?? String(err)}`);
+      });
+  }, 0).unref();
+
   // Archived-history retention: first pass ~90 s after boot (after the API is
   // up and restore/seed work has settled), then every 24 h; each fire reads the
   // preference fresh. Also re-armed on demand by `PUT /preferences/...`.
@@ -281,7 +315,11 @@ export async function runDaemon(): Promise<void> {
       // `server.port` is typed `number | undefined`, but a bound server always
       // has a numeric port.
       port: server.port!,
-      token: API_TOKEN,
+      // The CLI-scoped token, never the master (D3): this file is readable by
+      // anything running as the user, an agent included, so it carries only the
+      // credential the CLI routes need. The master stays in memory (the app's
+      // webview gets it by other means; a headless core has none).
+      token: CLI_TOKEN,
       pid: process.pid,
       kind: "cli-daemon",
       version: pkg.version,

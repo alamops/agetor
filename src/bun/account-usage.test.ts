@@ -1,5 +1,5 @@
 import { beforeAll, expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -197,4 +197,14 @@ test("the byte budget truncates a pass and the next pass resumes from the cursor
   expect(second.budgetExhausted).toBe(false);
   expect(mod.scanAccountUsage(configDir).eventsCounted).toBe(0);
   expect(mod.accountUsageSummary(configDir).today.messageCount).toBe(2);
+});
+
+test("a projects/ folder swapped for a symlink is never listed", () => {
+  const configDir = mkdtempSync(path.join(tmpdir(), "agetor-usage-acct-"));
+  const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-usage-target-"));
+  const proj = path.join(elsewhere, "-home-u-repo");
+  mkdirSync(proj, { recursive: true });
+  writeFileSync(path.join(proj, "session-1.jsonl"), assistantLine({ id: "linked-m1" }));
+  symlinkSync(elsewhere, path.join(configDir, "projects"));
+  expect(mod.scanAccountUsage(configDir)).toMatchObject({ filesScanned: 0, eventsCounted: 0 });
 });

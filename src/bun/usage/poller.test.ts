@@ -13,7 +13,8 @@ import type { UsageProviderOpts } from "./poller.ts";
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-poller-"));
 const { db, harnesses, harnessUsage } = await import("../db.ts");
 const { subscribeAppEvents } = await import("../quit-guard.ts");
-const { pollAllUsage, refreshOne, __setUsageProviderForTest } = await import("./poller.ts");
+const { pollAllUsage, refreshOne, __setUsageProviderForTest, __resetIdeReadConsentForTest } =
+  await import("./poller.ts");
 
 function fakeQuota(overrides: Partial<HarnessQuota> = {}): HarnessQuota {
   return {
@@ -47,6 +48,11 @@ beforeEach(() => {
   db.run(`UPDATE harnesses SET enabled = 0 WHERE id IN ('codex', 'cursor', 'gemini')`);
   db.run(`DELETE FROM harnesses WHERE is_builtin = 0`);
   db.run(`DELETE FROM harness_usage`);
+  __resetIdeReadConsentForTest();
+  // claude-code is enabled for every test, so a `pollAllUsage` sweep would
+  // otherwise run the REAL provider (keychain read + a network call with the
+  // developer's own token). Tests that care install their own fake over this.
+  __setUsageProviderForTest("claude-code", async () => fakeQuota());
 });
 
 afterEach(() => {
@@ -168,7 +174,10 @@ test("refreshOne passes allowIdeRead:false when there's no prior snapshot and no
   expect(capturedOpts?.allowIdeRead).toBe(false);
 });
 
-test("refreshOne passes allowIdeRead:true when a prior *successful* (ok) snapshot exists", async () => {
+// D26(i): consent is in memory only. A stored `ok` or `error` row — which
+// an agent can write straight into agetor.sqlite — must not open the
+// cross-app read; only a forced refresh in this process does.
+test("refreshOne keeps allowIdeRead:false for a stored ok snapshot (agent-seeded or from a previous launch)", async () => {
   harnesses.setEnabled("cursor", true);
   harnessUsage.upsert(
     fakeQuota({
@@ -186,8 +195,18 @@ test("refreshOne passes allowIdeRead:true when a prior *successful* (ok) snapsho
   });
 
   await refreshOne("cursor");
+  expect(capturedOpts?.allowIdeRead).toBe(false);
 
-  expect(capturedOpts?.allowIdeRead).toBe(true);
+  // The same holds through the background sweep.
+  harnessUsage.upsert({ ...harnessUsage.get("cursor")!, fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+  let sweptOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    sweptOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+  await pollAllUsage();
+  expect(sweptOpts).toBeDefined();
+  expect(sweptOpts?.allowIdeRead).toBe(false);
 });
 
 // Cold-start guarantee: the `unavailable` snapshot that the SKIP path itself
@@ -233,7 +252,7 @@ test("refreshOne passes allowIdeRead:true when force:true, even with no prior sn
   expect(capturedOpts?.allowIdeRead).toBe(true);
 });
 
-test("refreshOne passes allowIdeRead:true when the prior snapshot is an error (a previous allowed read)", async () => {
+test("refreshOne keeps allowIdeRead:false for a stored error snapshot", async () => {
   harnesses.setEnabled("cursor", true);
   harnessUsage.upsert(
     fakeQuota({
@@ -254,6 +273,115 @@ test("refreshOne passes allowIdeRead:true when the prior snapshot is an error (a
 
   await refreshOne("cursor");
 
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("a forced refresh grants the IDE read to later background sweeps of that harness only, in this process", async () => {
+  harnesses.setEnabled("cursor", true);
+  const seen: Array<{ id: string; allow: boolean | undefined }> = [];
+  __setUsageProviderForTest("cursor", async (h: Harness, opts?: UsageProviderOpts) => {
+    seen.push({ id: h.id, allow: opts?.allowIdeRead });
+    return fakeQuota({ harnessId: h.id, kind: "cursor", fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+  });
+
+  await refreshOne("cursor", { force: true });
+  await refreshOne("cursor");
+  expect(seen.map((s) => s.allow)).toEqual([true, true]);
+
+  // A relaunch forgets it, whatever the database says.
+  __resetIdeReadConsentForTest();
+  await refreshOne("cursor");
+  expect(seen.at(-1)?.allow).toBe(false);
+});
+
+// D26(i): the consent is keyed on the harness id the user refreshed. A
+// second cursor harness (another account, another HOME) has its own Cursor
+// database, and the user's click on the first one says nothing about it.
+test("a forced refresh grants the IDE read to that harness id only, not a second harness of the same kind", async () => {
+  harnesses.setEnabled("cursor", true);
+  harnesses.insert({ id: "secondary-cursor", kind: "cursor", label: "Cursor (secondary)" });
+  harnesses.setEnabled("secondary-cursor", true);
+  const seen: Array<{ id: string; allow: boolean | undefined }> = [];
+  __setUsageProviderForTest("cursor", async (h: Harness, opts?: UsageProviderOpts) => {
+    seen.push({ id: h.id, allow: opts?.allowIdeRead });
+    // Already stale, so the next call refetches instead of serving the cache.
+    return fakeQuota({ harnessId: h.id, kind: "cursor", fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+  });
+
+  await refreshOne("cursor", { force: true });
+  await refreshOne("secondary-cursor");
+  expect(seen).toEqual([
+    { id: "cursor", allow: true },
+    { id: "secondary-cursor", allow: false },
+  ]);
+
+  // The background sweep: the refreshed harness reads, the other doesn't.
+  seen.length = 0;
+  await pollAllUsage();
+  expect(seen.sort((a, b) => a.id.localeCompare(b.id))).toEqual([
+    { id: "cursor", allow: true },
+    { id: "secondary-cursor", allow: false },
+  ]);
+
+  // Refreshing the second one grants it too, independently.
+  seen.length = 0;
+  await refreshOne("secondary-cursor", { force: true });
+  await refreshOne("secondary-cursor");
+  expect(seen.map((s) => s.allow)).toEqual([true, true]);
+});
+
+test("a forced refresh of a disabled harness grants nothing (it never reaches the provider)", async () => {
+  // cursor stays disabled from beforeEach.
+  let calls = 0;
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    calls++;
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+
+  expect(await refreshOne("cursor", { force: true })).toBeNull();
+  expect(calls).toBe(0);
+
+  // Enabling it later doesn't inherit a consent from the refused click.
+  harnesses.setEnabled("cursor", true);
+  await refreshOne("cursor");
+  expect(calls).toBe(1);
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("a forced refresh of an unknown harness id grants nothing to a harness created later with that id", async () => {
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "late-cursor", kind: "cursor" });
+  });
+
+  expect(await refreshOne("late-cursor", { force: true })).toBeNull();
+  harnesses.insert({ id: "late-cursor", kind: "cursor", label: "Cursor (late)" });
+  harnesses.setEnabled("late-cursor", true);
+  await refreshOne("late-cursor");
+  expect(capturedOpts?.allowIdeRead).toBe(false);
+});
+
+test("a provider throw on a forced refresh is stored as error (the read was allowed), and consent still holds", async () => {
+  harnesses.setEnabled("cursor", true);
+  __setUsageProviderForTest("cursor", async () => {
+    throw new Error("provider regressed");
+  });
+
+  const quota = await refreshOne("cursor", { force: true });
+  expect(quota?.status).toBe("error");
+  expect(quota?.reason).toBe("provider regressed");
+  expect(harnessUsage.get("cursor")?.status).toBe("error");
+
+  let capturedOpts: UsageProviderOpts | undefined;
+  __setUsageProviderForTest("cursor", async (_h: Harness, opts?: UsageProviderOpts) => {
+    capturedOpts = opts;
+    return fakeQuota({ harnessId: "cursor", kind: "cursor" });
+  });
+  harnessUsage.upsert({ ...harnessUsage.get("cursor")!, fetchedAtMs: Date.now() - USAGE_MIN_REFRESH_MS - 1000 });
+  await refreshOne("cursor");
   expect(capturedOpts?.allowIdeRead).toBe(true);
 });
 

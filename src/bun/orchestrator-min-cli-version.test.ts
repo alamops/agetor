@@ -245,6 +245,41 @@ test("codex 0.159.0 + gpt-6.1-sol is allowed to start", async () => {
   expect(runs.listForTask(taskId).length).toBe(1);
 });
 
+// docs/plans/add-gpt-6-1-terra.md (2026-10-26): GPT-6.1 Terra's floor is 0.159.0.
+test("codex 0.158.0 + gpt-6.1-terra is refused before any run row is created", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.158.0";
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await createCodexTask("gpt-6.1-terra");
+  const beforeColumn = tasks.get(taskId)!.column;
+
+  const started = await startTask(taskId);
+  expect("error" in started).toBe(true);
+  if ("error" in started) {
+    expect(started.error).toContain("0.158.0");
+    expect(started.error).toContain("0.159.0");
+  }
+
+  const after = tasks.get(taskId);
+  expect(after!.column).toBe(beforeColumn);
+  expect(after!.runId).toBeNull();
+  expect(runs.listForTask(taskId).length).toBe(0);
+});
+
+test("codex 0.159.0 + gpt-6.1-terra is allowed to start", async () => {
+  process.env.FAKE_CODEX_VERSION = "codex-cli 0.159.0";
+  const { startTask } = await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+
+  const taskId = await createCodexTask("gpt-6.1-terra");
+  const started = await startTask(taskId);
+  expect("error" in started).toBe(false);
+
+  await settle();
+  expect(runs.listForTask(taskId).length).toBe(1);
+});
+
 test("boundary: codex exactly at the 0.155.0 floor + gpt-6-luna is allowed to start", async () => {
   process.env.FAKE_CODEX_VERSION = "codex-cli 0.155.0";
   const { startTask } = await import("./orchestrator.ts");

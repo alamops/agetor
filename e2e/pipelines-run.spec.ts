@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { test, expect, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, injectSseFrame, installSseInjector } from "./helpers";
 
 /**
  * E2e coverage for actually RUNNING a pipeline (docs/plans/pipelines.md
@@ -1251,7 +1251,7 @@ const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
 const ASK_SPAWN_DELAY_MS = "3000";
 
 /** Open the board and wait until the app's single global-events
- *  `EventSource` (`GET /events`) has been requested — toasts are live-only,
+ *  stream (`GET /events`) has been requested — toasts are live-only,
  *  so a task started before the subscription exists never toasts. Waits on
  *  the REQUEST, not a response: see `e2e/sent-files.spec.ts`'s identical
  *  wait for why. */
@@ -1729,36 +1729,17 @@ test.describe("pipelines run: step attention — reading the pipeline", () => {
   // run-level `step-cap` block, so there is nothing to open — `landOnPipeline`
   // must keep the step panel of the SAME pipeline the user is reading. The
   // headless core has no native bridge to emit `open_task`, so the page's
-  // `/app/events` EventSource is recorded by an init script and the frame is
-  // delivered by dispatching a MessageEvent on it (the same `onmessage` path a
-  // real SSE frame takes).
+  // `/app/events` fetch stream is wrapped by an init script (`installSseInjector`)
+  // and the frame is enqueued into its body (the same `onMessage` path a real
+  // SSE frame takes).
   test("an open_task landing that resolves no step keeps a step panel of the same pipeline open", async ({
     page,
     freshBackend,
   }) => {
     const backend = freshBackend;
-    await page.addInitScript(() => {
-      const w = window as unknown as { __appEventSources: EventSource[] };
-      w.__appEventSources = [];
-      const Native = window.EventSource;
-      class Recording extends Native {
-        constructor(url: string | URL, init?: EventSourceInit) {
-          super(url, init);
-          if (String(url).includes("/app/events")) w.__appEventSources.push(this);
-        }
-      }
-      window.EventSource = Recording as unknown as typeof EventSource;
-    });
+    await installSseInjector(page, "/app/events");
     const deliverOpenTask = (taskId: string) =>
-      page.evaluate((id) => {
-        // Only sources still open (a dev double-mount leaves a closed one).
-        const sources = (window as unknown as { __appEventSources: EventSource[] }).__appEventSources.filter(
-          (es) => es.readyState !== EventSource.CLOSED,
-        );
-        if (sources.length === 0) throw new Error("no open /app/events EventSource recorded");
-        const data = JSON.stringify({ type: "open_task", taskId: id, ts: Date.now() });
-        for (const es of sources) es.dispatchEvent(new MessageEvent("message", { data }));
-      }, taskId);
+      injectSseFrame(page, "/app/events", { type: "open_task", taskId, ts: Date.now() });
 
     const profileId = await createProfileRest(backend, "Runner");
     const A = makeStep({ id: randomUUID(), name: "First", agentProfileId: profileId });

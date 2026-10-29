@@ -1,0 +1,1 @@
+[91m[1mError: [0mSession not found

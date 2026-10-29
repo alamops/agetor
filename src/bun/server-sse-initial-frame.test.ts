@@ -15,7 +15,8 @@ let token: string;
 
 beforeAll(async () => {
   await import("./db.ts");
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void; port: number };
   token = API_TOKEN;
 });
@@ -33,7 +34,7 @@ const BASE = () => `http://127.0.0.1:${server.port}`;
 async function readFirstChunk(url: string, timeoutMs: number): Promise<string | null> {
   const ctrl = new AbortController();
   try {
-    const res = await fetch(url, { signal: ctrl.signal });
+    const res = await fetch(url, { signal: ctrl.signal, headers: { authorization: `Bearer ${token}` } });
     const reader = res.body!.getReader();
     try {
       const r = await Promise.race([
@@ -52,13 +53,13 @@ async function readFirstChunk(url: string, timeoutMs: number): Promise<string | 
 }
 
 test("GET /events flushes an initial ': connected' comment frame immediately, before any real event or the 15s ping", async () => {
-  const chunk = await readFirstChunk(`${BASE()}/events?token=${token}`, 2000);
+  const chunk = await readFirstChunk(`${BASE()}/events`, 2000);
   expect(chunk).not.toBeNull();
   expect(chunk).toStartWith(": connected");
 });
 
 test("GET /app/events flushes an initial ': connected' comment frame immediately, before any real event or the 15s ping", async () => {
-  const chunk = await readFirstChunk(`${BASE()}/app/events?token=${token}`, 2000);
+  const chunk = await readFirstChunk(`${BASE()}/app/events`, 2000);
   expect(chunk).not.toBeNull();
   expect(chunk).toStartWith(": connected");
 });

@@ -182,6 +182,7 @@ function makeTask(taskId: string): Task {
     effort: null,
     speed: "off",
     maxMode: false,
+    opencodeServer: "shared",
     references: [],
     backlog: [],
     plans: [],

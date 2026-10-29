@@ -17,6 +17,7 @@ import { api, ApiError } from "@/lib/api";
 import { iconForRef } from "@/lib/file-icons";
 import { cn } from "@/lib/utils";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
+import { AuthedImg } from "@/components/ui/authed-img";
 import { CHECKERBOARD_STYLE } from "./BinaryFilePreview";
 import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
 import {
@@ -104,14 +105,19 @@ function Tile({
     preview = isPreviewFailed ? (
       <ImageOff className="size-8 text-muted-foreground" aria-hidden />
     ) : (
-      <img
-        src={api.filePreviewUrl(tile.path)}
+      // Fetched with the auth header and shown as a `blob:` URL (D13/P9);
+      // any non-ok outcome (404, 413, network, decode) is a failed preview,
+      // same as the old `<img onError>`.
+      <AuthedImg
+        url={api.filePreviewUrl(tile.path)}
         alt={tile.name}
-        loading="lazy"
         decoding="async"
         className="size-full object-contain"
         style={CHECKERBOARD_STYLE}
-        onError={() => onPreviewFail(tile.path)}
+        placeholder={<span aria-hidden className="size-full animate-pulse bg-muted/30" />}
+        onStatus={(status) => {
+          if (status !== "ok") onPreviewFail(tile.path);
+        }}
       />
     );
   } else if (tile.kind === "image") {

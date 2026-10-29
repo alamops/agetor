@@ -58,8 +58,10 @@ const EXPECTED_FX_OPTION_LABELS = ["DeepSeek V4 Flash", "GLM 5.3 Flash", "GPT-5.
 const FX_DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash";
 
 /** Curated ids that must NOT survive the curated ∩ discovered filter against
- *  the 4-id stub catalog: two ordinary curated rows absent from the stub
- *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`) and twelve of the twenty
+ *  the 4-id stub catalog: five ordinary curated rows absent from the stub
+ *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`, and the three standard
+ *  rows added 2026-10-26: `minimax/minimax-m3.1-flash`, `meta/muse-spark-open`,
+ *  `inception/mercury-3`) and eighteen of the twenty-six
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
  *  already excludes them under the scoped merge). `Claude Fable 5.1`
@@ -100,6 +102,20 @@ const EXCLUDED_FX_OPTION_LABELS = [
   // Gemini 4 Argon (docs/plans/add-gemini-4-argon.md) — catalogOnly,
   // unverified signed-in presence.
   "Gemini 4 Argon",
+  // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md) — the nine new fx rows, all
+  // absent from this file's frozen 4-id stub catalog. Three are standard
+  // (MiniMax M3.1 Flash, Muse Spark Open, Mercury 3); six are catalogOnly
+  // (GPT-6.1 Terra, Kimi K3.1 Pro, DeepSeek V4.1 Flash 1017, Muse Wonder,
+  // Mistral Large 4, Beam 1.0).
+  "GPT-6.1 Terra",
+  "MiniMax M3.1 Flash",
+  "Muse Spark Open",
+  "Mercury 3",
+  "Kimi K3.1 Pro",
+  "DeepSeek V4.1 Flash 1017",
+  "Muse Wonder",
+  "Mistral Large 4",
+  "Beam 1.0",
 ];
 
 /** Mirrors `e2e/fx-interactions.spec.ts`'s identical helper. Duplicated

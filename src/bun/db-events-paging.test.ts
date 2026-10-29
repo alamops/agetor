@@ -28,7 +28,8 @@ beforeAll(async () => {
   const shared = await import("../shared/types.ts");
   EVENTS_REPLAY_LIMIT = shared.EVENTS_REPLAY_LIMIT;
   TASK_EVENTS_REPLAY_META_EVENT = shared.TASK_EVENTS_REPLAY_META_EVENT;
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void; port: number };
   token = API_TOKEN;
 });
@@ -71,7 +72,7 @@ function makeTaskRow(taskId: string): Task {
     mode: null,
     model: null,
     effort: null,
-    speed: "off", maxMode: false,
+    speed: "off", maxMode: false, opencodeServer: "shared",
     references: [],
     backlog: [], plans: [],
     draft: null,
@@ -123,7 +124,7 @@ async function readSseFrames(
   timeoutMs: number,
 ): Promise<Array<{ event: string; data: any }>> {
   const ctrl = new AbortController();
-  const res = await fetch(url, { signal: ctrl.signal });
+  const res = await fetch(url, { signal: ctrl.signal, headers: { authorization: `Bearer ${token}` } });
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   const frames: Array<{ event: string; data: any }> = [];
@@ -435,7 +436,7 @@ test("SSE replay caps at EVENTS_REPLAY_LIMIT: a leading named replay_meta frame 
     (_, i) => `e${seedCount - EVENTS_REPLAY_LIMIT + i}`,
   );
 
-  const url = `${BASE()}/tasks/${taskId}/events?token=${encodeURIComponent(token)}`;
+  const url = `${BASE()}/tasks/${taskId}/events`;
   const frames = await readSseFrames(url, EVENTS_REPLAY_LIMIT + 1, 10_000);
 
   expect(frames.length).toBe(EVENTS_REPLAY_LIMIT + 1);

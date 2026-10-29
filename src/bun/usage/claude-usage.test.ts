@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { parseClaudeUsage } from "./claude-usage.ts";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import type { Harness } from "../../shared/types.ts";
+import { withDisclaimOn } from "../test-disclaim-on.ts";
+import { fetchClaudeQuota, parseClaudeUsage } from "./claude-usage.ts";
 
 // `parseClaudeUsage` is pure (no I/O, no network) — these tests are hermetic
 // and use only inline, synthetic (redacted) fixtures. The extra positional
@@ -214,5 +220,58 @@ describe("parseClaudeUsage — defensive handling", () => {
     expect(() => parse({ limits: [null, "oops", 42, { percent: 10, resets_at: "2026-08-15T00:00:00Z" }] })).not.toThrow();
     const meters = parse({ limits: [null, "oops", 42, { percent: 10, resets_at: "2026-08-15T00:00:00Z" }] });
     expect(meters).toHaveLength(1);
+  });
+});
+
+describe("fetchClaudeQuota — agent-writable .claude.json", () => {
+  // An alias harness with no `.credentials.json` never reaches the network,
+  // so the quota comes from the `.claude.json` cache alone.
+  const alias = (home: string): Harness => ({
+    id: "claude-alias",
+    kind: "claude-code",
+    label: "test",
+    isBuiltin: false,
+    home,
+    bin: null,
+    env: {},
+    enabled: true,
+  });
+  const blob = JSON.stringify({
+    oauthAccount: { organizationType: "claude_max" },
+    cachedUsageUtilization: {
+      utilization: { five_hour: { utilization: 0.28, resets_at: "2026-08-12T17:00:00Z" } },
+      fetchedAtMs: FETCHED_AT_MS,
+    },
+  });
+
+  test("a regular .claude.json feeds the cache meters and the plan label", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-claude-usage-"));
+    writeFileSync(path.join(home, ".claude.json"), blob);
+    const quota = await fetchClaudeQuota(alias(home));
+    expect(quota).toMatchObject({ status: "ok", source: "cache", planType: "max" });
+    expect(quota.meters.map((m) => m.id)).toEqual(["five_hour"]);
+  });
+
+  test.skipIf(process.platform !== "darwin")(
+    "a .claude.json swapped for a symlink is not read while disclaiming (but is with the switch off)",
+    async () => {
+      const home = mkdtempSync(path.join(tmpdir(), "agetor-claude-usage-"));
+      const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-claude-usage-target-"));
+      writeFileSync(path.join(elsewhere, "blob.json"), blob);
+      symlinkSync(path.join(elsewhere, "blob.json"), path.join(home, ".claude.json"));
+
+      expect((await fetchClaudeQuota(alias(home))).source).toBe("cache");
+      const disclaimed = await withDisclaimOn(() => fetchClaudeQuota(alias(home)));
+      expect(disclaimed.status).toBe("unavailable");
+      expect(disclaimed.meters).toEqual([]);
+    },
+  );
+
+  test("a .claude.json that is a named pipe resolves at once to no data", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-claude-usage-"));
+    expect(spawnSync("/usr/bin/mkfifo", [path.join(home, ".claude.json")]).status).toBe(0);
+    const started = Date.now();
+    expect((await fetchClaudeQuota(alias(home))).status).toBe("unavailable");
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 });

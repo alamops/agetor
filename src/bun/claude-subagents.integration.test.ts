@@ -40,7 +40,8 @@ let token: string;
 
 beforeAll(async () => {
   await import("./db.ts");
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  const { API_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void; port: number };
   token = API_TOKEN;
 });
@@ -53,7 +54,7 @@ const authed = (p: string) => fetch(url(p), { headers: { authorization: `Bearer 
 /** Read an SSE endpoint for `ms`, returning the parsed `data:` frames. */
 async function readSse(p: string, ms: number): Promise<any[]> {
   const ctrl = new AbortController();
-  const res = await fetch(url(`${p}?token=${encodeURIComponent(token)}`), { signal: ctrl.signal });
+  const res = await fetch(url(p), { signal: ctrl.signal, headers: { authorization: `Bearer ${token}` } });
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   const out: any[] = [];
@@ -98,7 +99,7 @@ test.skipIf(!HAVE_REAL)(
       id: taskId, title: "t", prompt: "p", column: "running", agent: "claude-code",
       workdir: "/tmp", isolation: "none", taskType: "task", branch: null, branchSource: "created", worktreePath: null,
       baseRef: null, mode: null, model: null, effort: null,
-      speed: "off", maxMode: false, references: [], backlog: [], plans: [], draft: null, runId,
+      speed: "off", maxMode: false, opencodeServer: "shared", references: [], backlog: [], plans: [], draft: null, runId,
       prUrl: null,
       hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
       archivedAt: null, createdAt: now, updatedAt: now,

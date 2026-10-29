@@ -12,6 +12,8 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
+  HARNESS_TEMPLATES,
+  MODEL_DEFAULT_EFFORT_KINDS,
   MODEL_EFFORT_SUPPORT,
   MODEL_MIN_CLI_VERSION,
   PERMISSION_MODE_STATUS_PREFIX,
@@ -173,11 +175,12 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
 
 /* ── fx effort (docs/plans/fx-0.0.14-and-cursor-updates.md §3.4 / T1) ────── */
 
-// The 31 effort-advertising ids. Twenty were refreshed on 2026-10-22 against
+// The 40 effort-advertising ids. Twenty were refreshed on 2026-10-22 against
 // fx 0.0.14's `models --json` `models[].efforts` (plus fx's always-present
-// `auto`) — the plan §3.4 table, copied verbatim; the other eleven are
-// unchanged from their earlier live-probe (fx 0.0.10, 2026-09-14) or Gateway
-// `reasoning_options` measurement. Every row ends in "auto" (fx's own
+// `auto`) — the plan §3.4 table, copied verbatim; eleven are unchanged from
+// their earlier live-probe (fx 0.0.10, 2026-09-14) or Gateway
+// `reasoning_options` measurement; the last nine were curated on 2026-10-26
+// (docs/plans/add-gpt-6-1-terra.md §2b). Every row ends in "auto" (fx's own
 // default, off-scale) and lists ids in agetor order (max, xhigh, high,
 // medium, low, minimal, none, auto).
 const FX_EFFORT_MODELS: Record<string, string[]> = {
@@ -214,6 +217,18 @@ const FX_EFFORT_MODELS: Record<string, string[]> = {
   "openai/gpt-6.1-sol": ["max", "xhigh", "high", "medium", "low", "auto"],
   "anthropic/claude-haiku-5.5": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
   "google/gemini-4-argon": ["high", "medium", "low", "auto"],
+  // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md): nine new rows. Each set is
+  // the Gateway `reasoning_options` plus `auto`, confirmed identical to fx
+  // 0.0.14's `models[].efforts` (plan §2b; Mercury 3 minus fx's `instant`).
+  "openai/gpt-6.1-terra": ["max", "xhigh", "high", "medium", "low", "none", "auto"],
+  "minimax/minimax-m3.1-flash": ["max", "xhigh", "high", "medium", "low", "auto"],
+  "meta/muse-spark-open": ["xhigh", "high", "medium", "low", "auto"],
+  "inception/mercury-3": ["high", "medium", "low", "auto"],
+  "moonshotai/kimi-k3.1-pro": ["max", "high", "low", "auto"],
+  "deepseek/deepseek-v4.1-flash-1017": ["max", "high", "low", "none", "auto"],
+  "meta/muse-wonder-1.0": ["max", "xhigh", "high", "medium", "low", "minimal", "auto"],
+  "mistral/mistral-large-4": ["high", "none", "auto"],
+  "reflection/beam": ["max", "xhigh", "high", "medium", "low", "auto"],
 };
 
 // The 2 no-effort ids left — the picker collapses for them, same treatment
@@ -222,7 +237,7 @@ const FX_NO_EFFORT_MODELS = ["minimax/minimax-m3", "anthropic/claude-haiku-4.5"]
 
 const AGETOR_EFFORT_ORDER = ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"];
 
-test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 31 effort models in agetor order each end in auto, 2 named models are empty", () => {
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 40 effort models in agetor order each end in auto, 2 named models are empty", () => {
   for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
     expect(expected[expected.length - 1]).toBe("auto");
@@ -231,11 +246,11 @@ test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 31 
   for (const id of FX_NO_EFFORT_MODELS) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
   }
-  // The two lists above are exactly the 33 curated fx ids, no more no less.
-  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(31);
+  // The two lists above are exactly the 42 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(40);
   expect(FX_NO_EFFORT_MODELS.length).toBe(2);
-  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(33);
-  expect(AGENT_OPTIONS.fx.models.length).toBe(33);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(42);
+  expect(AGENT_OPTIONS.fx.models.length).toBe(42);
 });
 
 test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
@@ -249,9 +264,9 @@ test("EFFORT_OPTIONS: ultra is first, auto ('Model default') is last", () => {
   expect(last?.label).toBe("Model default");
 });
 
-test("no non-fx kind's MODEL_EFFORT_SUPPORT table lists 'auto' — it is fx-only", () => {
+test("no kind outside MODEL_DEFAULT_EFFORT_KINDS (fx, copilot, opencode) lists 'auto' in its MODEL_EFFORT_SUPPORT table", () => {
   for (const kind of KINDS) {
-    if (kind === "fx") continue;
+    if (MODEL_DEFAULT_EFFORT_KINDS.has(kind)) continue;
     for (const ids of Object.values(MODEL_EFFORT_SUPPORT[kind])) {
       expect(ids).not.toContain("auto");
     }
@@ -294,6 +309,29 @@ test("retainableEfforts('fx', 'deepseek/deepseek-v4-flash') contains 'auto'", ()
   expect(retained.has("auto")).toBe(true);
 });
 
+test("retainableEfforts('opencode', …) keeps the current variant while the model's variants are unknown", () => {
+  // Discovery not loaded / variant probe failed: a stored variant can't be
+  // proven wrong, so the panel's cascade must not PATCH it to `auto`.
+  expect(retainableEfforts("opencode", "p/m", null, "high").has("high")).toBe(true);
+  expect(retainableEfforts("opencode", "p/m", undefined, "thinking").has("thinking")).toBe(true);
+  // `auto` stays retainable too, and nothing is added without a current effort.
+  expect([...retainableEfforts("opencode", "p/m", null)]).toEqual(["auto"]);
+});
+
+test("retainableEfforts('opencode', …) drops a variant once discovery is known, and never keeps one on the sentinel", () => {
+  // Known variants that omit it: the cascade may clear it.
+  expect(retainableEfforts("opencode", "p/m", ["low"], "high").has("high")).toBe(false);
+  // Known-empty variant list: the model takes no variant at all.
+  expect(retainableEfforts("opencode", "p/m", [], "high").size).toBe(0);
+  // The "OpenCode default" sentinel passes no `-m`, so no effort reaches the CLI.
+  expect(retainableEfforts("opencode", "opencode-default", null, "high").size).toBe(0);
+  expect(retainableEfforts("opencode", null, null, "high").size).toBe(0);
+});
+
+test("retainableEfforts ignores `current` for every other kind", () => {
+  expect(retainableEfforts("codex", "gpt-6.1-sol", null, "bogus").has("bogus")).toBe(false);
+});
+
 test("none of the seven previously-curated fx ids survives as an unconditional row — each is either absent or catalogOnly — and the nonexistent google/gemini-3-pro id is gone entirely", () => {
   const models = AGENT_OPTIONS.fx.models;
   const byId = new Map(models.map((m) => [m.id, m]));
@@ -316,7 +354,7 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the twenty catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the twenty-six catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
@@ -355,12 +393,20 @@ test("exactly the twenty catalog-gated Gateway ids are catalogOnly in AGENT_OPTI
     // 2026-10-14 (docs/plans/add-gemini-4-argon.md) — released 2026-10-13;
     // signed-in presence unverified, same treatment as the rows above.
     "google/gemini-4-argon",
+    // 2026-10-26 (docs/plans/add-gpt-6-1-terra.md) — gated by absence from the
+    // owner's signed-in catalog (fx 0.0.14 re-measure, plan §2b).
+    "openai/gpt-6.1-terra",
+    "moonshotai/kimi-k3.1-pro",
+    "deepseek/deepseek-v4.1-flash-1017",
+    "meta/muse-wonder-1.0",
+    "mistral/mistral-large-4",
+    "reflection/beam",
   ]);
   const actualCatalogOnly = new Set(
     AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
   );
   expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
-  expect(actualCatalogOnly.size).toBe(20);
+  expect(actualCatalogOnly.size).toBe(26);
 
   for (const kind of KINDS) {
     if (kind === "fx") continue;
@@ -370,7 +416,35 @@ test("exactly the twenty catalog-gated Gateway ids are catalogOnly in AGENT_OPTI
   }
 });
 
-test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twenty catalogOnly rows included)", () => {
+test("the three fx rows added 2026-10-26 whose models are in the signed-in catalog are standard (non-catalogOnly)", () => {
+  // docs/plans/add-gpt-6-1-terra.md §2b: gating follows signed-in presence.
+  const byId = new Map(AGENT_OPTIONS.fx.models.map((m) => [m.id, m]));
+  for (const id of ["minimax/minimax-m3.1-flash", "meta/muse-spark-open", "inception/mercury-3"]) {
+    const row = byId.get(id);
+    expect(row, id).toBeDefined();
+    expect(row?.catalogOnly, id).toBeFalsy();
+  }
+});
+
+test("deepseek/deepseek-v4.1-flash-1017 sits directly below the default at index 1 (the default stays first)", () => {
+  const ids = AGENT_OPTIONS.fx.models.map((m) => m.id);
+  expect(ids[0]).toBe(DEFAULT_MODEL.fx);
+  expect(ids[1]).toBe("deepseek/deepseek-v4.1-flash-1017");
+});
+
+test("each fx successor row sits directly above its predecessor (M3.1 Flash above M3, Kimi K3.1 Pro above K3)", () => {
+  const ids = AGENT_OPTIONS.fx.models.map((m) => m.id);
+  const pairs: [string, string][] = [
+    ["minimax/minimax-m3.1-flash", "minimax/minimax-m3"],
+    ["moonshotai/kimi-k3.1-pro", "moonshotai/kimi-k3"],
+  ];
+  for (const [successor, predecessor] of pairs) {
+    expect(ids.indexOf(successor), successor).toBeGreaterThanOrEqual(0);
+    expect(ids.indexOf(successor), successor).toBe(ids.indexOf(predecessor) - 1);
+  }
+});
+
+test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twenty-six catalogOnly rows included)", () => {
   // Narrower restatement of the bidirectional-keys test above, scoped to
   // just the fx picker's own ids — guards specifically against a
   // catalogOnly row landing in AGENT_OPTIONS.fx.models without a paired
@@ -428,9 +502,25 @@ test("AGENT_OPTIONS.fx.models has unique ids, unique labels, and every id matche
   }
 });
 
-test("CATALOG_SCOPED_KINDS contains exactly fx", () => {
-  expect(CATALOG_SCOPED_KINDS.size).toBe(1);
+test("CATALOG_SCOPED_KINDS contains exactly fx and opencode", () => {
+  // opencode joined (docs/plans/add-opencode-harness.md D-5): `opencode
+  // models` lists only the providers the harness has credentials for.
+  expect(CATALOG_SCOPED_KINDS.size).toBe(2);
   expect(CATALOG_SCOPED_KINDS.has("fx")).toBe(true);
+  expect(CATALOG_SCOPED_KINDS.has("opencode")).toBe(true);
+});
+
+test("MODEL_DEFAULT_EFFORT_KINDS (kinds that keep the 'auto' effort) is exactly fx, copilot and opencode", () => {
+  expect([...MODEL_DEFAULT_EFFORT_KINDS].sort()).toEqual(["copilot", "fx", "opencode"]);
+});
+
+test("opencode tables: sentinel default, auto effort, Code/Plan → auto/plan, sentinel takes no effort", () => {
+  expect(DEFAULT_MODEL.opencode).toBe("opencode-default");
+  expect(DEFAULT_EFFORT.opencode).toBe("auto");
+  expect(CODE_PLAN_MODE.opencode).toEqual({ code: "auto", plan: "plan" });
+  expect(MODEL_EFFORT_SUPPORT.opencode).toEqual({ "opencode-default": [] });
+  expect(supportedModes("opencode", null).map((m) => m.id)).toEqual(["auto", "plan"]);
+  expect(supportedModes("opencode", "anthropic/claude-x").map((m) => m.id)).toEqual(["auto", "plan"]);
 });
 
 /* ── gemini 3.8 Flash + retired gemini-3-pro-preview default (docs/plans/add-gemini-3-8-flash.md §5 TEST-2) ── */
@@ -590,6 +680,8 @@ test("defaultModeFor: auto for every AgentKind except fx, which is yolo (Full ac
   expect(defaultModeFor("cursor")).toBe("auto");
   expect(defaultModeFor("gemini")).toBe("auto");
   expect(defaultModeFor("fx")).toBe("yolo");
+  expect(defaultModeFor("antigravity")).toBe("auto");
+  expect(defaultModeFor("opencode")).toBe("auto");
 });
 
 test("defaultModeFor: always equals AGENT_OPTIONS[kind].modes[0].id — the single source of truth it's defined against", () => {
@@ -661,4 +753,86 @@ test("GlobalEvent: the \"fx-auto-resume\" kind type-checks in a discriminated sw
     .toBe("run-status:succeeded");
   expect(describeGlobalEvent({ kind: "files-sent", taskId: "t1", runId: "r1", count: 2, caption: null, proactive: false, ts: 0 }))
     .toBe("files-sent:2");
+});
+
+/* ── GitHub Copilot (docs/plans/github-copilot-harness.md §3.6 / T1) ─────── */
+
+const COPILOT_MODEL_IDS = [
+  "auto",
+  "claude-opus-5.5",
+  "claude-sonnet-5.5",
+  "claude-haiku-5.5",
+  "claude-fable-5.1",
+  "gpt-6.1-sol",
+  "gpt-6-astra",
+  "gpt-6-luna",
+  "gpt-6-sol",
+  "gemini-4-argon",
+  "gemini-3.8-flash",
+  "grok-4.7",
+  "kimi-k3",
+  "mai-code-1.1-flash",
+];
+
+test("copilot: 14 curated models in D9 order with auto first, default model/effort auto", () => {
+  expect(AGENT_OPTIONS.copilot.models.map((m) => m.id)).toEqual(COPILOT_MODEL_IDS);
+  expect(DEFAULT_MODEL.copilot).toBe("auto");
+  expect(DEFAULT_EFFORT.copilot).toBe("auto");
+});
+
+test("copilot: modes are auto / plan / ask (Auto, Plan, Read-only) and Code/Plan maps to auto/plan", () => {
+  expect(AGENT_OPTIONS.copilot.modes.map((m) => [m.id, m.label])).toEqual([
+    ["auto", "Auto"],
+    ["plan", "Plan"],
+    ["ask", "Read-only"],
+  ]);
+  expect(CODE_PLAN_MODE.copilot).toEqual({ code: "auto", plan: "plan" });
+  expect(defaultModeFor("copilot")).toBe("auto");
+  expect(AGENT_OPTIONS.copilot.modes[2]?.hint).toContain("denies file edits");
+  expect(AGENT_OPTIONS.copilot.modes[2]?.hint).toContain("can still report success");
+});
+
+test("copilot: MODEL_EFFORT_SUPPORT keys exactly match the curated models, none offers ultra, every row ends in auto", () => {
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.copilot)).toEqual(COPILOT_MODEL_IDS);
+  for (const [id, ids] of Object.entries(MODEL_EFFORT_SUPPORT.copilot)) {
+    expect(ids).not.toContain("ultra");
+    expect(ids[ids.length - 1]).toBe("auto");
+    expect(ids).toEqual(AGETOR_EFFORT_ORDER.filter((e) => ids.includes(e)));
+    expect(id.length).toBeGreaterThan(0);
+  }
+  expect(MODEL_EFFORT_SUPPORT.copilot.auto).toEqual(AGETOR_EFFORT_ORDER);
+  expect(MODEL_EFFORT_SUPPORT.copilot["mai-code-1.1-flash"]).toEqual(AGETOR_EFFORT_ORDER);
+  expect(MODEL_EFFORT_SUPPORT.copilot["gpt-6-sol"]).toEqual(["max", "xhigh", "high", "medium", "low", "none", "auto"]);
+  expect(MODEL_EFFORT_SUPPORT.copilot["gemini-3.8-flash"]).toEqual(["high", "low", "auto"]);
+});
+
+test("copilot: MODEL_MIN_CLI_VERSION floors follow the changelog table; models without a floor are absent", () => {
+  expect(MODEL_MIN_CLI_VERSION.copilot).toEqual({
+    "kimi-k3": "1.0.79",
+    "claude-fable-5.1": "1.0.83",
+    "gpt-6-astra": "1.0.85",
+    "claude-opus-5.5": "1.0.89",
+    "gpt-6-sol": "1.0.89",
+    "gpt-6-luna": "1.0.89",
+    "gpt-6.1-sol": "1.0.90",
+    "claude-haiku-5.5": "1.0.94",
+    "gemini-4-argon": "1.0.98",
+  });
+  const ids = new Set(COPILOT_MODEL_IDS);
+  for (const key of Object.keys(MODEL_MIN_CLI_VERSION.copilot ?? {})) expect(ids.has(key)).toBe(true);
+});
+
+test("copilot is in MODEL_DEFAULT_EFFORT_KINDS and (unlike codex) keeps a discovered auto", () => {
+  expect(MODEL_DEFAULT_EFFORT_KINDS.has("copilot")).toBe(true);
+  expect(CATALOG_SCOPED_KINDS.has("copilot")).toBe(false);
+  expect(supportedEfforts("copilot", "claude-opus-5.5", ["auto", "low"]).map((o) => o.id)).toEqual(["low", "auto"]);
+});
+
+test("HARNESS_TEMPLATES has a copilot-additional entry isolating via COPILOT_HOME", () => {
+  const t = HARNESS_TEMPLATES.find((x) => x.id === "copilot-additional");
+  expect(t?.kind).toBe("copilot");
+  expect(t?.suggestedHarnessId).toBe("copilot-2");
+  expect(t?.home).toBe("{dataDir}/harnesses/copilot-2");
+  expect(t?.description).toContain("COPILOT_HOME");
+  expect(t?.description).toContain("copilot login");
 });

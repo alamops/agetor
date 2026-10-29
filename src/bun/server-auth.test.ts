@@ -10,12 +10,17 @@ process.env.AGETOR_API_PORT = "4399";
 
 let server: { stop: () => void; port: number };
 let token: string;
+let cliToken: string;
 
 beforeAll(async () => {
   await import("./db.ts");
-  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { startApiServer } = await import("./server.ts");
+  // The tokens come from api-config (api-config deletes AGETOR_API_TOKEN from
+  // process.env after reading it, so the env var can't be re-read here).
+  const { API_TOKEN, CLI_TOKEN } = await import("./api-config.ts");
   server = startApiServer() as unknown as { stop: () => void; port: number };
   token = API_TOKEN;
+  cliToken = CLI_TOKEN;
 });
 
 afterAll(() => {
@@ -66,8 +71,34 @@ test("the token with extra characters, or without the exact Bearer scheme, is re
   expect(prefixOnly.status).toBe(401);
 });
 
-test("a request with the token in the query string succeeds (SSE fallback)", async () => {
+test("the master token is never accepted in a query string (D13)", async () => {
   const res = await fetch(url(`/tasks?token=${encodeURIComponent(token)}`));
+  expect(res.status).toBe(401);
+  // Not even on the SSE GETs that accept the CLI token that way.
+  for (const p of ["/events", "/app/events", "/tasks/any/events"]) {
+    const sse = await fetch(url(`${p}?token=${encodeURIComponent(token)}`));
+    expect(sse.status).toBe(401);
+  }
+});
+
+test("the CLI token is accepted as ?token= on the three legacy SSE GETs only (P6)", async () => {
+  for (const p of ["/events", "/app/events", "/tasks/any/events"]) {
+    const ctrl = new AbortController();
+    const res = await fetch(url(`${p}?token=${encodeURIComponent(cliToken)}`), { signal: ctrl.signal });
+    // /tasks/any/events 404s for an unknown task: what matters is it got past auth.
+    expect(res.status).not.toBe(401);
+    expect(res.status).not.toBe(403);
+    ctrl.abort();
+  }
+});
+
+test("the CLI token is refused as ?token= on a non-legacy route", async () => {
+  const res = await fetch(url(`/tasks?token=${encodeURIComponent(cliToken)}`));
+  expect(res.status).toBe(401);
+});
+
+test("the CLI token works as a bearer header on an app+cli route", async () => {
+  const res = await fetch(url("/tasks"), { headers: { authorization: `Bearer ${cliToken}` } });
   expect(res.status).toBe(200);
 });
 

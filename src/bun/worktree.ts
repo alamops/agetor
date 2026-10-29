@@ -1,8 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
+import { coreSpawn } from "./core-spawn.ts";
+import { readTextNoFollow } from "./no-follow.ts";
+import { readFileBytes } from "./core-file-read.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
@@ -24,22 +27,25 @@ const GIT_TIMEOUT_MS = 30_000;
 /**
  * Run `git` against a working directory. Resolves with `ok` reflecting exit
  * status for a normal invocation — but CAN throw synchronously, since it's a
- * thin wrapper over `Bun.spawn`, which throws when the `git` binary isn't on
- * `PATH` or `cwd` doesn't exist. Callers that need a true non-throwing
+ * thin wrapper over `coreSpawn` (`Bun.spawn` semantics), which throws when the `git`
+ * binary isn't on `PATH` or `cwd` doesn't exist. Callers that need a true non-throwing
  * contract (e.g. `gitWritableRoots`) must wrap their own call in try/catch.
- * Using Bun.spawn directly (not Bun.$) so we don't pay shell-parsing cost or
+ * Spawning directly (not Bun.$) so we don't pay shell-parsing cost or
  * worry about argument quoting on user-supplied paths/branch names.
  *
  * A hard kill fires after `timeoutMs` (default 30 s) so a hung credential
  * prompt or a stalled pack-objects can't block agetor indefinitely.
  */
 async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<GitResult> {
-  const proc = Bun.spawn(["git", ...args], {
+  // Through the disclaim wrapper: a repo's own config (`core.fsmonitor`, hooks,
+  // filters) is agent-plantable and must not run with Agetor's macOS identity
+  // (docs/plans/master-token-agent-read.md, P2/P3).
+  const proc = coreSpawn(["git", ...args], {
     cwd,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-  });
+  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
   const timer = setTimeout(() => proc.kill(), timeoutMs);
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
@@ -66,12 +72,15 @@ async function gitRaw(
   cwd: string,
   timeoutMs = GIT_TIMEOUT_MS,
 ): Promise<{ ok: boolean; exitCode: number; bytes: Uint8Array<ArrayBuffer>; stderr: string }> {
-  const proc = Bun.spawn(["git", ...args], {
+  // Through the disclaim wrapper: a repo's own config (`core.fsmonitor`, hooks,
+  // filters) is agent-plantable and must not run with Agetor's macOS identity
+  // (docs/plans/master-token-agent-read.md, P2/P3).
+  const proc = coreSpawn(["git", ...args], {
     cwd,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-  });
+  }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
   const timer = setTimeout(() => proc.kill(), timeoutMs);
   try {
     const [buf, stderr, exitCode] = await Promise.all([
@@ -834,6 +843,9 @@ export function worktreePath(task: Task): string {
   return path.join(WORKTREES_DIR, task.id);
 }
 
+/** A `.git` pointer file is one `gitdir: <path>` line; anything bigger is not one. */
+const GIT_POINTER_MAX_BYTES = 8 * 1024;
+
 /**
  * Best-effort parse of a linked worktree's `.git` file — for a worktree
  * (unlike an ordinary checkout) `.git` is a *file* containing a single line
@@ -847,8 +859,13 @@ export function worktreePath(task: Task): string {
  */
 export function parseWorktreeGitPointer(worktreeDir: string): string | null {
   try {
+    // Everything under the worktrees dir is agent-writable, and `GET /worktrees`
+    // is open to the CLI token: never follow a planted symlink (the worktree
+    // dir or its `.git`) into a protected folder in-process, never block on a
+    // FIFO, and never slurp more than a pointer file's worth (no-follow.ts).
+    if (!lstatSync(worktreeDir).isDirectory()) return null;
     const gitFile = path.join(worktreeDir, ".git");
-    const contents = readFileSync(gitFile, "utf8").trim();
+    const contents = readTextNoFollow(gitFile, { maxBytes: GIT_POINTER_MAX_BYTES }).trim();
     const match = /^gitdir:\s*(.+)$/.exec(contents);
     if (!match) return null;
     const gitdir = match[1]!;
@@ -1355,32 +1372,28 @@ export async function getTaskDiffBlob(
     const root = await repoRoot(cwd);
     const rootAbs = root ? path.join(root, relPath) : null;
     const cwdAbs = path.join(cwd, relPath);
-    let abs = rootAbs ?? cwdAbs;
-    let st;
-    try {
-      st = statSync(abs);
-    } catch {
-      if (rootAbs && rootAbs !== cwdAbs) {
-        try {
-          st = statSync(cwdAbs);
-          abs = cwdAbs;
-        } catch {
-          return { ok: false, error: "not found", status: 404 };
-        }
-      } else {
+    // The file is the agent's, so it is read through `readFileBytes`: a
+    // disclaimed child while disclaiming, never the core's own process (D25,
+    // D26(j)); without following a symlink at the final component (git shows
+    // a symlink as its target text, so the diff never asks for one), and only
+    // a regular file (a FIFO/device named `*.png` would hang the read).
+    const read = (abs: string) =>
+      readFileBytes(abs, { followSymlinks: false, maxBytes: MAX_BLOB_PREVIEW_BYTES });
+    let result = await read(rootAbs ?? cwdAbs);
+    if (result.kind === "missing" && rootAbs && rootAbs !== cwdAbs) result = await read(cwdAbs);
+    switch (result.kind) {
+      case "ok":
+        return { ok: true, bytes: result.bytes, etag: result.etag };
+      case "too-large":
+        return { ok: false, error: "too large to preview", status: 413 };
+      case "missing":
+      case "not-modified":
         return { ok: false, error: "not found", status: 404 };
-      }
+      case "denied":
+        return { ok: false, error: "not readable", status: 403 };
+      case "error":
+        return { ok: false, error: result.message, status: 500 };
     }
-    // Only regular files: a FIFO/device named `*.png` would otherwise hang
-    // the read forever (same guard as /files/preview).
-    if (!st.isFile()) {
-      return { ok: false, error: "not found", status: 404 };
-    }
-    if (st.size > MAX_BLOB_PREVIEW_BYTES) {
-      return { ok: false, error: "too large to preview", status: 413 };
-    }
-    const bytes = new Uint8Array(await Bun.file(abs).arrayBuffer());
-    return { ok: true, bytes, etag: `"${st.size}-${st.mtimeMs}"` };
   }
 
   // side === "old"

@@ -296,12 +296,17 @@ test.describe("binary diff previews", () => {
     const modifiedBlock = fileBlock(dialog, "image.png");
     await expect(modifiedBlock).toBeVisible();
 
-    const oldImg = modifiedBlock.locator('img[src*="side=old"]');
-    const newImg = modifiedBlock.locator('img[src*="side=new"]');
+    const oldImg = modifiedBlock.locator('img[data-src-url*="side=old"]');
+    const newImg = modifiedBlock.locator('img[data-src-url*="side=new"]');
     await expect(oldImg).toHaveCount(1);
     await expect(newImg).toHaveCount(1);
-    await expect(oldImg).toHaveAttribute("src", /\/tasks\/.*\/diff\/blob\?/);
-    await expect(newImg).toHaveAttribute("src", /\/tasks\/.*\/diff\/blob\?/);
+    // The bytes are fetched with the auth header and shown as `blob:` URLs;
+    // the route they came from rides in `data-src-url` (never with a token).
+    await expect(oldImg).toHaveAttribute("src", /^blob:/);
+    await expect(newImg).toHaveAttribute("src", /^blob:/);
+    await expect(oldImg).toHaveAttribute("data-src-url", /\/tasks\/.*\/diff\/blob\?/);
+    await expect(newImg).toHaveAttribute("data-src-url", /\/tasks\/.*\/diff\/blob\?/);
+    await expect(oldImg).not.toHaveAttribute("data-src-url", /token=/);
 
     await expect
       .poll(() => oldImg.evaluate((el) => (el as HTMLImageElement).naturalWidth))
@@ -319,9 +324,9 @@ test.describe("binary diff previews", () => {
     const untrackedBlock = fileBlock(dialog, "new-image.png");
     await expect(untrackedBlock).toBeVisible();
     await expect(untrackedBlock.getByText("Added — no previous version")).toBeVisible();
-    await expect(untrackedBlock.locator('img[src*="side=old"]')).toHaveCount(0);
+    await expect(untrackedBlock.locator('img[data-src-url*="side=old"]')).toHaveCount(0);
 
-    const untrackedNewImg = untrackedBlock.locator('img[src*="side=new"]');
+    const untrackedNewImg = untrackedBlock.locator('img[data-src-url*="side=new"]');
     await expect(untrackedNewImg).toHaveCount(1);
     await expect
       .poll(() => untrackedNewImg.evaluate((el) => (el as HTMLImageElement).naturalWidth))
@@ -358,8 +363,8 @@ test.describe("binary diff previews", () => {
     const block = fileBlock(dialog, "doc.pdf");
     await expect(block).toBeVisible();
 
-    const oldImg = block.locator('img[src*="side=old"]');
-    const newImg = block.locator('img[src*="side=new"]');
+    const oldImg = block.locator('img[data-src-url*="side=old"]');
+    const newImg = block.locator('img[data-src-url*="side=new"]');
     // PDFs render via <canvas>, never <img> — confirms the pdf branch, not
     // a mis-detected image preview.
     await expect(oldImg).toHaveCount(0);

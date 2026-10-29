@@ -128,6 +128,8 @@ import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANS
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent, HandoffReminderBadge } from "./MessageSegments";
 import { CompactionSummaryBlock } from "./CompactionSummaryBlock";
 import { SpeedPicker } from "./SpeedPicker";
+import { OpencodeServerPicker, opencodeServerLock, showOpencodeServerPicker } from "./OpencodeServerPicker";
+import { importedSessionOf } from "../../../shared/imported-session.ts";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -1009,7 +1011,7 @@ function RunPanelBody({
   // Declared BEFORE listPendingInteractions/listRuns/listSubagents (below)
   // and every other one-shot fetch in this component — deliberately.
   // Passive effects commit in declaration order, so on a task switch this
-  // effect's `api.subscribeTask` call (which opens the EventSource) fires
+  // effect's `api.subscribeTask` call (which opens the event-stream fetch) fires
   // before any of those `fetch()` calls are issued. The webview has a
   // small, shared per-host connection budget (WKWebView observed at 6 at
   // rest), and a switch used to fire ~8 one-shot requests ahead of the new
@@ -1248,7 +1250,7 @@ function RunPanelBody({
         // PR-mergeability now instead of waiting out the fallback timer.
         markStreamReady();
         // The server sends `replay_meta` as the FIRST frame of every (re)connect
-        // — including an EventSource-internal reconnect after a network blip,
+        // — including a reconnect `openEventStream` makes on its own after a network blip,
         // which reuses this same subscription/effect instance rather than
         // re-running it. Re-arming the settle window here (not just at effect
         // setup) is what makes the kick-storm suppression above cover BOTH the
@@ -1804,7 +1806,7 @@ function RunPanelBody({
     const provider = new Map<string, string>();
     const title = new Map<string, string>();
     const recovery = new Map<string, FxRecoveryPayload>();
-    if (kind !== "fx" && kind !== "cursor") {
+    if (kind !== "fx" && kind !== "cursor" && kind !== "opencode" && kind !== "copilot") {
       return { usageByRunId: usage, providerByRunId: provider, titleByRunId: title, recoveryByRunId: recovery };
     }
     for (const e of events) {
@@ -2113,6 +2115,8 @@ function RunPanelBody({
       if (s.parentKind === "monitor") monitors++;
       else if (s.parentKind === "bg_session") shells++;
       else if (s.parentKind === "workflow") workflows++;
+      // Task-tool subagents, workflow agents and OpenCode child sessions
+      // (`opencode_subagent`) all read as agents.
       else agents++;
     }
     const parts: string[] = [];
@@ -2219,7 +2223,11 @@ function RunPanelBody({
   // current response. The message folds into the active run (recorded in the
   // conversation stream, no new run row), so the task stays a single in-flight
   // run rather than stacking queued rows that could strand "running".
-  const canSend = !!resumableRunId && (!task.importedClaude || task.importedClaude.status === "ready");
+  // An imported session (Claude Code or OpenCode, `importedSessionOf`) can't
+  // take a message until its history has finished importing — the server
+  // refuses the send (`OpenCode history is still importing` for OpenCode).
+  const importedSession = importedSessionOf(task);
+  const canSend = !!resumableRunId && (!importedSession || importedSession.status === "ready");
   // While a native modal (question / plan / permission prompt) is pending,
   // the agent is blocked on it — a typed message would go astray instead of
   // reaching the agent (and the run would hang "working"). This gate is
@@ -2690,7 +2698,7 @@ function RunPanelBody({
     // The next status is the source of truth, so the stale error does not
     // stay on a transcript that finished.
     setImportRetryError(null);
-  }, [task.importedClaude?.status]);
+  }, [importedSession?.status]);
   const [sendDragging, setSendDragging] = useState(false);
   // `/`-command, skill autocomplete, and saved-prompts loading for the send
   // field render through `PromptComposer`'s own `useAgentCapabilities`/
@@ -2797,7 +2805,7 @@ function RunPanelBody({
   // switch, from which the real fetch's result then supersedes it), and a
   // `pipeline` global event for the parent — delivered through the
   // `subscribePipelineGlobalEvents` store App.tsx feeds from its single
-  // `/events` subscription, never a second EventSource — evicts that
+  // `/events` subscription, never a second event stream — evicts that
   // parent's entry outright (see the subscription right below), since a
   // Restart re-captures the frozen graph and the cached one would then be
   // wrong on the next switch. `"missing"` is the parent 404-ing (deleted out
@@ -3363,7 +3371,9 @@ function RunPanelBody({
   // Live checkout vs the branch agetor created (5 s git-status poll). Drift is
   // tolerated, never corrected — the header and details say where it is.
   const branchDrift = driftOf(task.branch ?? null, gitStatus?.branch);
-  const importedGitBranch = task.importedClaude?.gitBranch ?? null;
+  // Claude-only: an OpenCode import carries no transcript branch, so the
+  // "Switch to <branch>" banner never shows for one.
+  const importedGitBranch = importedSession?.kind === "claude-code" ? (task.importedClaude?.gitBranch ?? null) : null;
   const folderBranch = gitStatus && !gitStatus.ignored ? gitStatus.branch : null;
   // The import-time branch is only a hint until the session continues here.
   // After an Agetor turn the folder's branch is whatever that turn left, so
@@ -3379,7 +3389,7 @@ function RunPanelBody({
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
   }, []);
   const switchImportedBranch = async () => {
-    const sessionId = task.importedClaude?.sessionId;
+    const sessionId = importedSession?.kind === "claude-code" ? importedSession.sessionId : undefined;
     // Check out the branch this banner names, not the transcript's latest.
     const branch = importedGitBranch;
     if (!sessionId || !branch || importedBranchBusy) return;
@@ -3414,7 +3424,8 @@ function RunPanelBody({
     setImportRetryBusy(true);
     setImportRetryError(null);
     try {
-      await api.retryClaudeSessionImport(taskId);
+      if (importedSession?.kind === "opencode") await api.retryOpencodeSessionImport(taskId);
+      else await api.retryClaudeSessionImport(taskId);
       if (currentTaskIdRef.current === taskId) setImportRetryOk(true);
     } catch (err) {
       if (currentTaskIdRef.current !== taskId) return;
@@ -3751,9 +3762,12 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
-        {task.importedClaude && (
-          <div className="mt-1 space-y-1 text-xs" data-testid="imported-claude-status">
-            {importedBranchMismatch && (
+        {importedSession && (
+          <div
+            className="mt-1 space-y-1 text-xs"
+            data-testid={importedSession.kind === "opencode" ? "imported-opencode-status" : "imported-claude-status"}
+          >
+            {importedSession.kind === "claude-code" && importedBranchMismatch && (
               <p className="text-warning" data-testid="imported-claude-branch">
                 This session was on <span className="font-mono">{importedGitBranch}</span>, folder is on{" "}
                 <span className="font-mono">{folderBranch}</span>.
@@ -3771,18 +3785,20 @@ function RunPanelBody({
             {importedBranchError && (
               <p className="text-destructive" data-testid="imported-claude-switch-error">{importedBranchError}</p>
             )}
-            {task.importedClaude.status === "importing" && (
-              <p className="text-muted-foreground">Importing history…</p>
+            {importedSession.status === "importing" && (
+              <p className="text-muted-foreground">
+                {importedSession.kind === "opencode" ? "OpenCode history is still importing…" : "Importing history…"}
+              </p>
             )}
-            {task.importedClaude.status === "failed" && !importRetryOk && (
+            {importedSession.status === "failed" && !importRetryOk && (
               <p className="text-destructive">
                 {importRetryBusy
                   ? "Retrying…"
-                  : (importRetryError ?? task.importedClaude.error ?? "Import failed")}
+                  : (importRetryError ?? importedSession.error ?? "Import failed")}
                 <button
                   type="button"
                   className="ml-2 underline disabled:opacity-50"
-                  data-testid="imported-claude-retry"
+                  data-testid={importedSession.kind === "opencode" ? "imported-opencode-retry" : "imported-claude-retry"}
                   disabled={importRetryBusy}
                   onClick={() => { void retryImportedHistory(); }}
                 >
@@ -3790,8 +3806,13 @@ function RunPanelBody({
                 </button>
               </p>
             )}
-            {importRetryError && task.importedClaude.status !== "failed" && (
-              <p className="text-destructive" data-testid="imported-claude-retry-error">{importRetryError}</p>
+            {importRetryError && importedSession.status !== "failed" && (
+              <p
+                className="text-destructive"
+                data-testid={importedSession.kind === "opencode" ? "imported-opencode-retry-error" : "imported-claude-retry-error"}
+              >
+                {importRetryError}
+              </p>
             )}
           </div>
         )}
@@ -4154,7 +4175,7 @@ function RunPanelBody({
                 pausedRecovery={pausedRecovery}
                 taskId={task.id}
                 pathRoots={pathRoots}
-                plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
+                plans={kind === "cursor" || kind === "copilot" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
                 agentKind={kind}
                 onAskAnswerWithheld={(reason) => {
@@ -4465,6 +4486,10 @@ function RunPanelBody({
             placeholder={
               modalPending
                 ? "Answer the prompt above — or type a message and Save it for later."
+                : importedSession?.kind === "opencode" && importedSession.status === "importing"
+                ? "OpenCode history is still importing — type a message and Save it for later."
+                : importedSession?.kind === "opencode" && importedSession.status === "failed"
+                ? "OpenCode history didn't import — retry it above, or type a message and Save it for later."
                 : canSend
                 ? task.column === "running"
                   ? "Agent is working — your message will be added to the current turn. Type / for commands, @ for files."
@@ -6920,6 +6945,7 @@ function toolIcon(name: string): ComponentType<{ className?: string; "aria-hidde
       return HelpCircle;
     case "ExitPlanMode":
     case "createPlanToolCall":
+    case "copilot_plan":
       return ClipboardList;
     case "WebFetch":
     case "WebSearch":
@@ -6953,7 +6979,7 @@ function formatToolInputSummary(name: string, input: unknown): string {
     const q0 = input.questions[0] as Record<string, unknown>;
     return typeof q0?.question === "string" ? truncateString(q0.question, 80) : `${input.questions.length} question(s)`;
   }
-  if (name === "ExitPlanMode" || name === "createPlanToolCall") return "plan ready for approval";
+  if (name === "ExitPlanMode" || name === "createPlanToolCall" || name === "copilot_plan") return "plan ready for approval";
   if (name === "TodoWrite" && Array.isArray(input.todos)) {
     const todos = input.todos as Array<Record<string, unknown>>;
     const done = todos.filter((t) => t.status === "completed").length;
@@ -7135,9 +7161,11 @@ function TaskDetails({
     () => new Set(supportedEffortsForModel.map((o) => o.id)),
     [supportedEffortsForModel],
   );
+  // `task.effort` rides along so OpenCode keeps a stored variant while its
+  // model's variants are still unknown (see `retainableEfforts`).
   const retainable = useMemo(
-    () => retainableEfforts(kind, task.model, discoveredEffortsForTask),
-    [kind, task.model, discoveredEffortsForTask],
+    () => retainableEfforts(kind, task.model, discoveredEffortsForTask, task.effort),
+    [kind, task.model, discoveredEffortsForTask, task.effort],
   );
   // Mirrors `mergeModelOptions` rule 6: a task's current effort can be
   // retained (kept valid by the cascade above) without being one the picker
@@ -7177,6 +7205,7 @@ function TaskDetails({
     return options;
   }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
+  const opencodeLock = opencodeServerLock(harnesses.find((h) => h.id === task.agent));
   // Speed tiers for the task's model: cursor's come from the curated
   // fast-variant table, fx's only from discovery (the merged row's
   // `fast`/`ultrafast` flags, rule 8), every other kind offers `off` only.
@@ -7503,6 +7532,28 @@ function TaskDetails({
                     onChange={(speed) => void save({ speed })}
                     disabled={!editable}
                   />
+                </dd>
+              </>
+            )}
+
+            {/* OpenCode server mode (D-4): shown on v2 or an unknown version
+                only (v1 has no shared service). Locked like the effort
+                select — by a running turn or a bound profile — and, for a
+                harness with its own home, forced to Standalone with the
+                picker's own note. The server reads it per turn, so a change
+                lands on the next one. */}
+            {showOpencodeServerPicker(kind, selectedStatus?.version) && (
+              <>
+                <dt className="text-muted-foreground">Server</dt>
+                <dd className="min-w-0">
+                  <OpencodeServerPicker
+                    testId="task-opencode-server"
+                    value={opencodeLock ? "standalone" : task.opencodeServer}
+                    onChange={(opencodeServer) => void save({ opencodeServer })}
+                    locked={opencodeLock}
+                    disabled={!editable}
+                  />
+                  <p className="mt-0.5 text-[10px] text-muted-foreground">Applies on the next turn.</p>
                 </dd>
               </>
             )}

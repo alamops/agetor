@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { agentProfileTextDirty, duplicateAgentName, type AgentProfileTextDraft } from "./agent-profile-form.ts";
+import {
+  agentProfileTextDirty,
+  duplicateAgentName,
+  LAUNCH_INTERACTION_SETTERS,
+  trackLaunchInteractions,
+  type AgentProfileTextDraft,
+} from "./agent-profile-form.ts";
 
 function draft(overrides: Partial<AgentProfileTextDraft> = {}): AgentProfileTextDraft {
   return { name: "Bug fixer", instructions: "Be terse.", skills: ["review", "test"], ...overrides };
@@ -82,5 +88,90 @@ describe("duplicateAgentName", () => {
     for (let n = 2; n <= 1000; n++) taken.push(`Bug fixer (copy ${n})`);
     const result = duplicateAgentName("Bug fixer", taken);
     expect(taken.map((n) => n.trim().toLowerCase())).not.toContain(result.trim().toLowerCase());
+  });
+});
+
+describe("trackLaunchInteractions", () => {
+  // A stand-in for `TaskLaunch`: current values plus recording setters, and
+  // one unrelated field the tracker must pass through.
+  function fakeLaunch() {
+    const calls: [string, unknown][] = [];
+    const launch = {
+      agent: "opencode",
+      mode: "auto",
+      model: "opencode-default",
+      effort: null as string | null,
+      speed: "off" as "off" | "fast" | "ultrafast",
+      maxMode: false,
+      opencodeServer: "shared" as "shared" | "standalone",
+      kind: "opencode",
+      switchAgent: (v: string) => void calls.push(["switchAgent", v]),
+      setMode: (v: string) => void calls.push(["setMode", v]),
+      setModel: (v: string) => void calls.push(["setModel", v]),
+      setEffort: (v: string | null) => void calls.push(["setEffort", v]),
+      setSpeed: (v: "off" | "fast" | "ultrafast") => void calls.push(["setSpeed", v]),
+      setMaxMode: (v: boolean) => void calls.push(["setMaxMode", v]),
+      setOpencodeServer: (v: "shared" | "standalone") => void calls.push(["setOpencodeServer", v]),
+    };
+    return { launch, calls };
+  }
+
+  test("an OpenCode server pick that changes the value is an interaction", () => {
+    const { launch, calls } = fakeLaunch();
+    let touched = 0;
+    trackLaunchInteractions(launch, () => touched++).setOpencodeServer("standalone");
+    expect(touched).toBe(1);
+    expect(calls).toEqual([["setOpencodeServer", "standalone"]]);
+  });
+
+  test("re-picking the current OpenCode server is not an interaction, but still forwards", () => {
+    const { launch, calls } = fakeLaunch();
+    let touched = 0;
+    trackLaunchInteractions(launch, () => touched++).setOpencodeServer("shared");
+    expect(touched).toBe(0);
+    expect(calls).toEqual([["setOpencodeServer", "shared"]]);
+  });
+
+  test("every launch setter counts a changed value and ignores an unchanged one", () => {
+    const changed: Record<keyof typeof LAUNCH_INTERACTION_SETTERS, unknown> = {
+      switchAgent: "claude-code",
+      setMode: "plan",
+      setModel: "anthropic/claude-x",
+      setEffort: "auto",
+      setSpeed: "fast",
+      setMaxMode: true,
+      setOpencodeServer: "standalone",
+    };
+    for (const setter of Object.keys(LAUNCH_INTERACTION_SETTERS) as (keyof typeof LAUNCH_INTERACTION_SETTERS)[]) {
+      const { launch } = fakeLaunch();
+      let touched = 0;
+      const tracked = trackLaunchInteractions(launch, () => touched++) as unknown as Record<string, (v: unknown) => void>;
+      tracked[setter]!(launch[LAUNCH_INTERACTION_SETTERS[setter]]);
+      expect(touched).toBe(0);
+      tracked[setter]!(changed[setter]);
+      expect(touched).toBe(1);
+    }
+  });
+
+  test("a null effort re-set is unchanged; null → a value is a change", () => {
+    const { launch } = fakeLaunch();
+    let touched = 0;
+    const tracked = trackLaunchInteractions(launch, () => touched++);
+    tracked.setEffort(null);
+    expect(touched).toBe(0);
+    tracked.setEffort("high");
+    expect(touched).toBe(1);
+  });
+
+  test("wrapping never calls onTouch and leaves the original and other fields alone", () => {
+    const { launch, calls } = fakeLaunch();
+    const original = launch.setOpencodeServer;
+    let touched = 0;
+    const tracked = trackLaunchInteractions(launch, () => touched++);
+    expect(touched).toBe(0);
+    expect(calls).toEqual([]);
+    expect(launch.setOpencodeServer).toBe(original);
+    expect(tracked.kind).toBe("opencode");
+    expect(tracked.opencodeServer).toBe("shared");
   });
 });

@@ -71,13 +71,21 @@ export async function gotoApp(page: Page, url: string, options: GotoAppOptions =
     }
   }
   await page.goto(url);
-  await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+  await expect(headerSettingsButton(page)).toBeVisible();
+}
+
+/** The app bar's Settings button, by its `title` (exact). A role-name lookup
+ *  ("Settings") is ambiguous — strict-mode violation — whenever a toast with
+ *  its own "Settings" action button (e.g. the harness auto-enable toast) is
+ *  also on screen; only the header button carries this title. */
+export function headerSettingsButton(page: Page): Locator {
+  return page.getByTitle("Settings", { exact: true });
 }
 
 /** Opens Settings → General (the default section on open — no tab click
  *  needed) and waits for the dialog to render. */
 export async function openSettingsGeneral(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await headerSettingsButton(page).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
   return dialog;
@@ -237,4 +245,78 @@ export async function waitForTerminalReady(scope: Locator, timeoutMs = 20_000): 
   const pane = scope.locator('[data-testid="terminal-pane"][data-ready="true"]').first();
   await expect(pane).toBeAttached({ timeout: timeoutMs });
   return pane;
+}
+
+/**
+ * Synthetic SSE frames for the webview's fetch-based event streams.
+ *
+ * The webview no longer creates `EventSource` objects (master-token plan,
+ * D13/P8): every stream is a `fetch` whose body `openEventStream` reads, so a
+ * spec can't dispatch a `MessageEvent` on a recorded source any more. This
+ * pair of helpers is the replacement seam. `installSseInjector` wraps
+ * `window.fetch` so a response for `pathname` (`/events`, `/app/events`) is
+ * re-served through a `ReadableStream` the page keeps a handle on; the real
+ * body is piped through unchanged, and `injectSseFrame` enqueues an extra
+ * unnamed `data:` frame into every still-open stream — the same bytes, hence
+ * the same `onMessage` path, a real SSE frame takes. A stream the reader
+ * aborted (React's dev double-mount leaves one) is dropped from the registry,
+ * so a frame is never delivered twice. Must run BEFORE `gotoApp`.
+ */
+export async function installSseInjector(page: Page, pathname: string): Promise<void> {
+  await page.addInitScript((target) => {
+    const w = window as unknown as {
+      __sseInjectors?: Record<string, Set<ReadableStreamDefaultController<Uint8Array>>>;
+    };
+    w.__sseInjectors ??= {};
+    const open = (w.__sseInjectors[target] ??= new Set());
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const res = await nativeFetch(input, init);
+      const raw = input instanceof Request ? input.url : String(input);
+      if (new URL(raw, location.href).pathname !== target || !res.body) return res;
+      const reader = res.body.getReader();
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          controller = c;
+          open.add(c);
+        },
+        async pull(c) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              open.delete(c);
+              c.close();
+            } else if (value) c.enqueue(value);
+          } catch (e) {
+            open.delete(c);
+            try {
+              c.error(e);
+            } catch { /* already closed */ }
+          }
+        },
+        cancel(reason) {
+          open.delete(controller);
+          return reader.cancel(reason);
+        },
+      });
+      return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+    }) as typeof fetch;
+  }, pathname);
+}
+
+/** Delivers `event` (JSON-encoded) as one unnamed SSE frame to every open
+ *  stream `installSseInjector` recorded for `pathname`. */
+export async function injectSseFrame(page: Page, pathname: string, event: Record<string, unknown>): Promise<void> {
+  await page.evaluate(
+    ({ target, data }) => {
+      const open = (window as unknown as {
+        __sseInjectors?: Record<string, Set<ReadableStreamDefaultController<Uint8Array>>>;
+      }).__sseInjectors?.[target];
+      if (!open || open.size === 0) throw new Error(`no open ${target} event stream recorded`);
+      const bytes = new TextEncoder().encode(`data: ${data}\n\n`);
+      for (const c of open) c.enqueue(bytes);
+    },
+    { target: pathname, data: JSON.stringify(event) },
+  );
 }

@@ -102,6 +102,12 @@ import m071 from "./071_claude_session_seen.sql" with { type: "text" };
 import m072 from "./072_task_speed.sql" with { type: "text" };
 import m073 from "./073_harness_profile_mcp_servers.sql" with { type: "text" };
 import m074 from "./074_retire_fx_models.sql" with { type: "text" };
+import m075 from "./075_retire_codex_gpt_5_5.sql" with { type: "text" };
+import m076 from "./076_normalize_cursor_new_families.sql" with { type: "text" };
+import m077 from "./077_copilot_harness.sql" with { type: "text" };
+import m078 from "./078_opencode_harness.sql" with { type: "text" };
+import m079 from "./079_opencode_task_fields.sql" with { type: "text" };
+import m080 from "./080_harness_auto_enabled.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -185,4 +191,19 @@ export const migrations: Migration[] = [
   { id: "072_task_speed", sql: m072 },
   { id: "073_harness_profile_mcp_servers", sql: m073 },
   { id: "074_retire_fx_models", sql: m074 },
+  { id: "075_retire_codex_gpt_5_5", sql: m075 },
+  { id: "076_normalize_cursor_new_families", sql: m076 },
+  // The Copilot harness was authored as 075 on its branch while main claimed
+  // 075/076 for the codex gpt-5.5 retirement and the new Cursor families;
+  // renumbered on merge (house rule: whoever merges second renumbers) with the
+  // original id kept as an alias so a dev DB that already applied it is not
+  // re-migrated.
+  { id: "077_copilot_harness", sql: m077, aliases: ["075_copilot_harness"] },
+  // The OpenCode migrations were authored as 077-079 while Copilot's branch
+  // was still planning 075/076; main then merged Copilot as 077, so they were
+  // renumbered to 078-080 on merge. The original ids stay as aliases so a dev
+  // DB that already applied them is not re-migrated.
+  { id: "078_opencode_harness", sql: m078, aliases: ["077_opencode_harness"] },
+  { id: "079_opencode_task_fields", sql: m079, aliases: ["078_opencode_task_fields"] },
+  { id: "080_harness_auto_enabled", sql: m080, aliases: ["079_harness_auto_enabled"] },
 ];

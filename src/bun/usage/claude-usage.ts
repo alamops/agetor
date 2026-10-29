@@ -6,9 +6,13 @@
  * `fetchClaudeQuota` always resolves — it never throws into the poller.
  */
 
-import { existsSync } from "node:fs";
 import type { AgentKind, Harness, HarnessQuota, QuotaMeter, QuotaSource } from "../../shared/types.ts";
+import { readAccountFileText } from "../no-follow.ts";
 import { claudeDotJsonPath, readClaudeToken } from "./creds.ts";
+
+/** Upper bound on the `.claude.json` blob we parse — the CLI's own per-project
+ *  history keeps it at a few MB; anything far larger is not that file. */
+const DOT_JSON_MAX_BYTES = 64 * 1024 * 1024;
 
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const FETCH_TIMEOUT_MS = 5000;
@@ -240,7 +244,7 @@ async function tryFetchApiQuota(harness: Harness): Promise<HarnessQuota | null> 
     // 2026-08); enrich from the account's own `.claude.json` profile.
     const planType =
       (isObject(body) && typeof body.plan_type === "string" ? body.plan_type : null) ??
-      (await readPlanTypeFromDotJson(harness));
+      planTypeFromDotJson(readDotJson(harness));
     return {
       harnessId: harness.id,
       kind: harness.kind,
@@ -257,37 +261,41 @@ async function tryFetchApiQuota(harness: Harness): Promise<HarnessQuota | null> 
 }
 
 /**
- * Pull a human plan label out of the account's `.claude.json` profile
- * (`oauthAccount.organizationType`, e.g. "claude_max" → "max"). The usage
- * endpoint itself sends no plan field, so this is the only per-account plan
- * signal we have. Never throws; `null` when unavailable.
+ * The account's parsed `.claude.json`, or `null` when it is missing, not JSON,
+ * or refused. A harness home is agent-writable, so the blob is read through
+ * `readAccountFileText`: while disclaiming, a `.claude.json` swapped for a
+ * symlink into a protected folder (or for a FIFO) is never opened by the core.
+ * Never throws.
  */
-async function readPlanTypeFromDotJson(harness: Harness): Promise<string | null> {
+function readDotJson(harness: Harness): unknown {
   try {
-    const filePath = claudeDotJsonPath(harness);
-    if (!existsSync(filePath)) return null;
-    const parsed: unknown = JSON.parse(await Bun.file(filePath).text());
-    if (!isObject(parsed) || !isObject(parsed.oauthAccount)) return null;
-    const account = parsed.oauthAccount as Record<string, unknown>;
-    const orgType = account.organizationType;
-    if (typeof orgType === "string" && orgType) {
-      return orgType.startsWith("claude_") ? orgType.slice("claude_".length) : orgType;
-    }
-    return null;
+    return JSON.parse(readAccountFileText(claudeDotJsonPath(harness), DOT_JSON_MAX_BYTES));
   } catch {
     return null;
   }
+}
+
+/**
+ * Pull a human plan label out of the account's `.claude.json` profile
+ * (`oauthAccount.organizationType`, e.g. "claude_max" → "max"). The usage
+ * endpoint itself sends no plan field, so this is the only per-account plan
+ * signal we have. `null` when unavailable.
+ */
+function planTypeFromDotJson(parsed: unknown): string | null {
+  if (!isObject(parsed) || !isObject(parsed.oauthAccount)) return null;
+  const orgType = (parsed.oauthAccount as Record<string, unknown>).organizationType;
+  if (typeof orgType === "string" && orgType) {
+    return orgType.startsWith("claude_") ? orgType.slice("claude_".length) : orgType;
+  }
+  return null;
 }
 
 /** Read the `.claude.json` cache the claude CLI itself maintains
  *  (`cachedUsageUtilization.{utilization,fetchedAtMs}`). Returns `null` if
  *  the file is missing, unparseable, or has no usable utilization block. */
 async function tryReadCacheQuota(harness: Harness): Promise<HarnessQuota | null> {
-  const filePath = claudeDotJsonPath(harness);
-  if (!existsSync(filePath)) return null;
   try {
-    const raw = await Bun.file(filePath).text();
-    const parsed: unknown = JSON.parse(raw);
+    const parsed = readDotJson(harness);
     if (!isObject(parsed)) return null;
     const cached = parsed.cachedUsageUtilization;
     if (!isObject(cached)) return null;
@@ -305,7 +313,7 @@ async function tryReadCacheQuota(harness: Harness): Promise<HarnessQuota | null>
     return {
       harnessId: harness.id,
       kind: harness.kind,
-      planType: await readPlanTypeFromDotJson(harness),
+      planType: planTypeFromDotJson(parsed),
       status: meters.length > 0 ? "ok" : "unavailable",
       source: "cache",
       fetchedAtMs: cachedFetchedAtMs,
