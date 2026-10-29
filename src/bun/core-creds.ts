@@ -46,6 +46,11 @@ export interface CoreCreds {
   version: string;
   /** Unix ms the core started. */
   startedAt: number;
+  /** Set to `"login-item"` when the core was booted by the background
+   *  login-item supervisor (docs/plans/always-on-host.md C15). `kind` stays
+   *  `"cli-daemon"` for it, so an older CLI or app — which ignores unknown
+   *  fields — still treats it as a daemon it can hand off from. */
+  launchedBy?: "login-item";
 }
 
 export const CORE_CREDS_FILENAME = "agetor-core.json";
@@ -100,7 +105,14 @@ export function readCoreCreds(dataDir?: string): CoreCreds | null {
       typeof v.version === "string" &&
       typeof v.startedAt === "number"
     ) {
-      return v as CoreCreds;
+      // `launchedBy` is optional and newer than the file format: an invalid
+      // value is dropped, never a reason to reject the whole file.
+      const creds = v as CoreCreds;
+      if (creds.launchedBy !== undefined && creds.launchedBy !== "login-item") {
+        const { launchedBy: _drop, ...rest } = creds;
+        return rest;
+      }
+      return creds;
     }
   } catch {
     /* corrupt JSON → treat as no core */

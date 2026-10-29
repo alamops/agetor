@@ -5639,12 +5639,89 @@ export type CloneProgressPhase =
   | "cancelled";
 
 /**
+ * "Keep Agetor running in the background" (docs/plans/always-on-host.md).
+ *
+ * `BackgroundRegistration` is macOS's own `SMAppService.Status` for the
+ * login-item LaunchAgent, as the bundled `agetor-login-item` helper reports
+ * it. macOS is the source of truth: Agetor stores no copy of it.
+ */
+export type BackgroundRegistration =
+  | "enabled"
+  | "requiresApproval"
+  | "notRegistered"
+  | "notFound";
+
+/** Why the background switch can't be used on this install. */
+export type BackgroundUnavailableReason =
+  | "not-macos"
+  | "dev-build"
+  | "unsigned"
+  | "not-in-applications"
+  | "helper-missing"
+  | "other-install"
+  | "helper-failed";
+
+/**
+ * The derived state the Settings section shows (plan §3.4):
+ *
+ *   running        — registration enabled and the login-item core is serving.
+ *   parked         — registration enabled; the supervisor runs no core because
+ *                    another core (normally the app) owns the port.
+ *   starting       — the supervisor is waiting out a grace window before it
+ *                    boots a core (after a handoff or an update).
+ *   stopped        — registration enabled but no supervisor is alive (it was
+ *                    stopped until the next login, or crashed out).
+ *   needs-approval — the user turned Agetor off in System Settings › Login Items.
+ *   off            — not registered.
+ *   unavailable    — the switch can't be used here; see `unavailableReason`.
+ */
+export type BackgroundState =
+  | "running"
+  | "parked"
+  | "starting"
+  | "stopped"
+  | "needs-approval"
+  | "off"
+  | "unavailable";
+
+export interface BackgroundStatus {
+  state: BackgroundState;
+  /** macOS's registration status; `null` when the state is `unavailable`. */
+  registration: BackgroundRegistration | null;
+  unavailableReason?: BackgroundUnavailableReason;
+  /** The last helper error, or a human detail for the state line. */
+  detail?: string;
+  /** launchd label of this channel's job; `null` when unavailable. */
+  label: string | null;
+  supervisorPid: number | null;
+  corePid: number | null;
+  /** Whether remote access (preview) is on. */
+  remoteAccess: boolean;
+}
+
+/** `GET /remote-access`. Remote access is a preview: nothing pairs yet. */
+export interface RemoteAccessStatus {
+  enabled: boolean;
+  preview: true;
+}
+
+/** `preferences` key holding the remote-access switch; stored "on" | "off".
+ *  Only the native Remote Access… box may turn it on (plan §3.5). */
+export const REMOTE_ACCESS_PREF_KEY = "remoteAccess";
+
+/**
  * App-level events the webview subscribes to over `GET /app/events`. Used
  * for cross-cutting flows that aren't tied to a single task — currently:
  *
  *   quit_request — main process intercepted Cmd+Q / window close with N
  *                  runs still active. Webview shows a confirm modal; the
  *                  user picks Quit-anyway (POST /app/force-quit) or stays.
+ *                  `backgroundArmed` says a parked login-item supervisor
+ *                  will boot a background core once the app quits (so the
+ *                  running tasks keep going), and `completely` says this
+ *                  quit came from "Quit Agetor Completely", which stops
+ *                  that background core too (docs/plans/always-on-host.md
+ *                  §3.6).
  *   open_task    — a native notification deep-link (`agetor://task/<id>`)
  *                  was clicked. Webview opens that task's RunPanel.
  *   harness_usage — the background usage poller (or a force-refresh) produced
@@ -5662,12 +5739,23 @@ export type CloneProgressPhase =
  *                  already sanitized/length-capped and never carries a
  *                  credential (docs/plans/clone-repository-all-providers.md
  *                  Addendum A).
+ *   background_changed — the "Keep Agetor running in the background" state
+ *                  or the remote-access preview switch changed (a Settings
+ *                  toggle, the native Remote Access… box, a CLI call). The
+ *                  Settings section re-renders from `status`.
  */
 export type AppEvent =
   | {
       type: "quit_request";
       runningRunCount: number;
       runningTaskTitles: string[];
+      backgroundArmed: boolean;
+      completely: boolean;
+      ts: number;
+    }
+  | {
+      type: "background_changed";
+      status: BackgroundStatus;
       ts: number;
     }
   | {

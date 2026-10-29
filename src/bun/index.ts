@@ -527,6 +527,8 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     type: "quit_request",
     runningRunCount: runningCount,
     runningTaskTitles,
+    backgroundArmed: false,
+    completely: false,
     ts: Date.now(),
   });
   event.response = { allow: false };
