@@ -358,7 +358,7 @@ import {
   type FSWatcher,
 } from "node:fs";
 import path from "node:path";
-import { runs, subagents as subagentsDb, tasks } from "./db.ts";
+import { runs, subagents as subagentsDb, tasks, type AppendedEvent } from "./db.ts";
 import { formatApiErrorDetail, mapJsonlEventToChunks } from "./claude-tmux.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
 import type { RunEvent, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
@@ -1443,7 +1443,7 @@ function extractLineTimestampMs(line: string): number | null {
  *  `applyMonitorNotificationForRow` (the DB-only fallback), so the exact
  *  same dedup/format rule applies regardless of which path a given
  *  notification is handled by. `runs.appendEvent`'s `INSERT OR IGNORE`
- *  return value gates the `emitFn` call: a `null` return means this exact
+ *  result gates the `emitFn` call: a `null` result means this exact
  *  content (by key, not just by hash — see below) was already persisted —
  *  the duplicate enqueue/user line pair, a reattach replay, or the live path
  *  and this module's own `scanMainSignals` both reaching the same line — and
@@ -1498,10 +1498,11 @@ function persistMonitorEvent(
   lineTimestampMs?: number | null,
 ): boolean {
   const hasLineTs = typeof lineTimestampMs === "number" && Number.isFinite(lineTimestampMs);
-  // Stamp the tab line (and the emitted event) with when claude WROTE the
-  // notification, not when this scan happened to read it — a restart replay
-  // or lookback catch-up would otherwise date every backlogged event to the
-  // restart.
+  // Stamp the tab line, the stored row and the emitted frame with when claude
+  // WROTE the notification, not when this scan happened to read it — a restart
+  // replay or lookback catch-up would otherwise date every backlogged event to
+  // the restart. The row stores `at` (not "now"), so the live frame and its
+  // replayed/paged copy agree on `ts`.
   const at = hasLineTs ? lineTimestampMs! : Date.now();
   const text = `[${new Date(at).toISOString()}] ${eventText}\n`;
   const hash = fnv1aHex(block);
@@ -1511,9 +1512,9 @@ function persistMonitorEvent(
     : bucket !== null
       ? `monitor:${id}:${hash}:${bucket}`
       : `monitor:${id}:${hash}`;
-  let inserted: number | null;
+  let inserted: AppendedEvent | null;
   try {
-    inserted = runs.appendEvent(runId, "stdout", text, lineUuid, id);
+    inserted = runs.appendEvent(runId, "stdout", text, lineUuid, id, at);
   } catch (e) {
     // A throw here (the run row cascade-deleted out from under a live scan —
     // INSERT OR IGNORE does not cover a foreign-key failure) must cost one
@@ -1524,7 +1525,7 @@ function persistMonitorEvent(
     return false;
   }
   if (inserted === null) return false;
-  emitFn?.({ runId, taskId, stream: "stdout", data: text, ts: at, subagentId: id });
+  emitFn?.({ id: inserted.id, runId, taskId, stream: "stdout", data: text, ts: inserted.ts, subagentId: id });
   return true;
 }
 
@@ -2633,7 +2634,8 @@ export function attachSubagentWatcher(opts: {
    * whatever new bytes exist and they're persisted/emitted verbatim as ONE
    * `stdout` event per batch — mirrors `tailFile`'s persist/emit idiom
    * exactly (`runs.appendEvent` + the matching `emitFn` call, both taskId-
-   * tagged).
+   * tagged; the frame carries the stored row's `id`/`ts` and is sent only
+   * when the row was actually inserted).
    *
    * `line_uuid = "bgshell:<id>:<batchStartOffset>"` — the batch's starting
    * offset is a stable, monotonically-increasing key per shell, so a
@@ -2665,8 +2667,8 @@ export function attachSubagentWatcher(opts: {
       if (!text) continue;
       b.offset = next;
       b.lastAppendAt = Date.now();
-      runs.appendEvent(b.runId, "stdout", text, `bgshell:${b.id}:${batchStart}`, b.id);
-      emitFn?.({ runId: b.runId, taskId, stream: "stdout", data: text, ts: Date.now(), subagentId: b.id });
+      const row = runs.appendEvent(b.runId, "stdout", text, `bgshell:${b.id}:${batchStart}`, b.id);
+      if (row) emitFn?.({ id: row.id, runId: b.runId, taskId, stream: "stdout", data: text, ts: row.ts, subagentId: b.id });
     }
   }
 
@@ -2894,8 +2896,8 @@ export function attachSubagentWatcher(opts: {
       const { endOfTurn } = mapJsonlEventToChunks(
         line,
         (stream, data, lineUuid) => {
-          runs.appendEvent(fs.runId, stream, data, lineUuid ?? null, fs.subagentId);
-          emitFn?.({ runId: fs.runId, taskId, stream, data, ts: Date.now(), subagentId: fs.subagentId });
+          const row = runs.appendEvent(fs.runId, stream, data, lineUuid ?? null, fs.subagentId);
+          if (row) emitFn?.({ id: row.id, runId: fs.runId, taskId, stream, data, ts: row.ts, subagentId: fs.subagentId });
         },
         // Ask the mapper to carry this line's uuid on its own api-error
         // `status` chunk too (unlike the MAIN stream's `dispatchLine`,

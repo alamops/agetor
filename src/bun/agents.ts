@@ -2256,6 +2256,23 @@ const FAKE_CLAUDE_LONG_REPLY_DEFAULT_COUNT = 900;
 const FAKE_CLAUDE_LONG_REPLY_MAX_COUNT = 5000;
 
 /**
+ * Prompt-marker trigger for the "driver rejects `done`" scenario
+ * (docs/plans/event-stream-forward-resume.md, D4): the fake claude agent
+ * rejects its `done` promise with `new Error("fake done rejection")` shortly
+ * after the prompt echo, so `attachDoneHandler`'s `.catch` branch — the
+ * spawn-rejection settle path that persists a `stderr` line
+ * (`Error: fake done rejection`) — can be exercised end to end without a real
+ * driver crash. Like the sibling `FAKE_CLAUDE_*` markers it rides in
+ * `task.prompt` because the e2e suite's worker-shared backend can't set a
+ * per-test env var; specs can't `import` from `src/bun/*` and must keep a
+ * literal copy of this exact string.
+ *
+ * Only turn 1 (a fresh spawn) runs this scenario — same convention as every
+ * other canned scenario in this driver.
+ */
+export const FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER = "__agetor_fake_claude_done_reject__";
+
+/**
  * A real, valid 1×1 transparent PNG (not just arbitrary bytes with a `.png`
  * extension) — small, but enough for `/files/preview` and an `<img>` tile to
  * actually decode and render it. Module-scope so both the sent-files and the
@@ -2282,7 +2299,8 @@ function makeFakeAgent(
   } = {},
 ): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
-  const done = new Promise<number>((res) => { resolveDone = res; });
+  let rejectDone!: (err: Error) => void;
+  const done = new Promise<number>((res, rej) => { resolveDone = res; rejectDone = rej; });
   // Every setTimeout this fake schedules is tracked here so `kill()` can
   // clear them all — otherwise a chunk fires after the run/task row it
   // targets has been deleted (e.g. a test that deletes a task immediately
@@ -2995,6 +3013,11 @@ function makeFakeAgent(
       onChunk("status", "turn complete");
       resolveDone(0);
     });
+  } else if (prompt.includes(FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER)) {
+    // Test hook: reject `done` (see FAKE_CLAUDE_DONE_REJECT_PROMPT_MARKER's
+    // doc comment). The orchestrator has already echoed the prompt by now;
+    // `kill()` clears this timer like every other scenario's.
+    after(5, () => { rejectDone(new Error("fake done rejection")); });
   } else if (prompt.includes(FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER)) {
     // Test hook: emit a reply long enough (in event count) to overflow
     // EVENTS_REPLAY_LIMIT (800) in one turn — see

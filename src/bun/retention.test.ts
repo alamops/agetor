@@ -170,8 +170,9 @@ function seedTask(archivedAt: number | null, spec: SeedSpec): Seeded {
   let rr = 0;
   const add = (kind: Kind, stream: "tool_result" | "assistant" | "tool_use", data: string, subagent: string | null) => {
     const runId = runIds[rr++ % runIds.length]!;
-    const id = dbm.runs.appendEvent(runId, stream, data, `ln-${randomUUID()}`, subagent);
-    if (id === null) throw new Error("seed row was deduped");
+    const row = dbm.runs.appendEvent(runId, stream, data, `ln-${randomUUID()}`, subagent);
+    if (row === null) throw new Error("seed row was deduped");
+    const id = row.id;
     ids[kind].push(id);
     all.push(id);
   };
@@ -672,7 +673,7 @@ describe("retention_swept_tasks record under concurrent task changes", () => {
     const pass = ret.runArchivedHistoryRetentionPass({ now, days: 30, sliceMs: 0 });
     await until(() => trimmedCount([old.runIds[1]!]) > 0, "the sweep to reach the second run");
     // A JSONL rebuild landing behind the sweep's keyset cursor.
-    const late = dbm.runs.appendEvent(old.runIds[0]!, "tool_result", bigToolResult("late"), `ln-${randomUUID()}`, null);
+    const late = dbm.runs.appendEvent(old.runIds[0]!, "tool_result", bigToolResult("late"), `ln-${randomUUID()}`, null)?.id ?? null;
     expect(late).not.toBeNull();
     const first = await pass;
     expect(first.aborted).toBe(false);

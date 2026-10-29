@@ -197,17 +197,17 @@ function seed(): Seed {
   db.transaction(() => {
     // The user message comes FIRST so an anchored window (limit < events) has
     // to look past its default floor and exercise the "below" read.
-    ids.push(runs.appendEvent(runId, "user", "plan-guard first user message", "u-0")!);
+    ids.push(runs.appendEvent(runId, "user", "plan-guard first user message", "u-0")!.id);
     for (let i = 0; i < TAIL_EVENTS; i++) {
-      ids.push(runs.appendEvent(runId, "assistant", `assistant ${i}`, `a-${i}`)!);
+      ids.push(runs.appendEvent(runId, "assistant", `assistant ${i}`, `a-${i}`)!.id);
       if (i % 5 === 0) {
-        ids.push(runs.appendEvent(runId, "tool_use", JSON.stringify({ id: `toolu_${i}`, name: "TaskCreate", input: {} }), `tu-${i}`)!);
-        ids.push(runs.appendEvent(runId, "tool_result", JSON.stringify({ toolUseId: `toolu_${i}`, content: `Task #${i} created successfully` }), `tr-${i}`)!);
+        ids.push(runs.appendEvent(runId, "tool_use", JSON.stringify({ id: `toolu_${i}`, name: "TaskCreate", input: {} }), `tu-${i}`)!.id);
+        ids.push(runs.appendEvent(runId, "tool_result", JSON.stringify({ toolUseId: `toolu_${i}`, content: `Task #${i} created successfully` }), `tr-${i}`)!.id);
       }
     }
-    ids.push(runs.appendEvent(runId, "status", `${API_ERROR_PREFIX}overloaded`)!);
-    ids.push(runs.appendEvent(runId, "assistant", "subagent line", `sa-0`, subagentId)!);
-    ids.push(runs.appendEvent(runId, "status", "monitor:x:terminal:done", "monitor:x:terminal:0", subagentId)!);
+    ids.push(runs.appendEvent(runId, "status", `${API_ERROR_PREFIX}overloaded`)!.id);
+    ids.push(runs.appendEvent(runId, "assistant", "subagent line", `sa-0`, subagentId)!.id);
+    ids.push(runs.appendEvent(runId, "status", "monitor:x:terminal:done", "monitor:x:terminal:0", subagentId)!.id);
   })();
   return {
     taskId,
@@ -260,6 +260,21 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
           }),
       },
     ],
+    "runs.eventsForTaskAfter": [
+      {
+        label: "eventsForTaskAfter — resume",
+        run: () => runs.eventsForTaskAfter(s.taskId, s.firstEventId, { maxEvents: 800, maxBytes: 4 * 1024 * 1024 }),
+      },
+      {
+        label: "eventsForTaskAfter — snapshot by count",
+        run: () => runs.eventsForTaskAfter(s.taskId, 0, { maxEvents: 3, maxBytes: 4 * 1024 * 1024 }),
+      },
+      {
+        label: "eventsForTaskAfter — cursor-ahead",
+        run: () =>
+          runs.eventsForTaskAfter(s.taskId, Number.MAX_SAFE_INTEGER, { maxEvents: 800, maxBytes: 4 * 1024 * 1024 }),
+      },
+    ],
     "runs.userMessageHistory": [{ label: "userMessageHistory(limit)", run: () => runs.userMessageHistory(20) }],
     "runs.todoRelevantEventsForTask": [
       { label: "todoRelevantEventsForTask(taskId)", run: () => runs.todoRelevantEventsForTask(s.taskId) },
@@ -279,6 +294,10 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
       {
         label: "appendEvent with a dedup key + subagent",
         run: () => runs.appendEvent(s.runId, "assistant", "plan-guard append", `pg-${randomUUID()}`, s.subagentId),
+      },
+      {
+        label: "appendEvent with an explicit ts",
+        run: () => runs.appendEvent(s.runId, "status", "plan-guard append ts", null, null, 1_700_000_000_000),
       },
     ],
     "runs.seenLineUuidsForTask": [

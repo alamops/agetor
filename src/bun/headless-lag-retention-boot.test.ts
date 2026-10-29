@@ -49,7 +49,7 @@ async function seedDataDir(dir: string): Promise<{ taskId: string; bigEventId: n
     });
     const big = JSON.stringify({ toolUseId: "toolu_big", content: "x ".repeat(32 * 1024), isError: false });
     const small = JSON.stringify({ toolUseId: "toolu_small", content: "ok", isError: false });
-    const bigEventId = runs.appendEvent(runId, "tool_result", big, "ln-big", null);
+    const bigEventId = runs.appendEvent(runId, "tool_result", big, "ln-big", null)!.id;
     runs.appendEvent(runId, "tool_result", small, "ln-small", null);
     console.log(JSON.stringify({ taskId, bigEventId }));
   `;

@@ -17,6 +17,7 @@ import {
   IMPORTED_CLAUDE_HELD_ELSEWHERE,
   IMPORTED_OPENCODE_HELD_ELSEWHERE,
   type SessionIdColumn,
+  type AppendedEvent,
 } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import {
@@ -400,8 +401,70 @@ export function subscribe(fn: Listener): () => void {
   return () => listeners.delete(fn);
 }
 
+/**
+ * Fan an event out to the `/tasks/:id/events` subscribers.
+ *
+ * Ordering invariant (the SSE resume cursor relies on it): a SAVED row is
+ * sent synchronously, right after its insert, with its stored `{id, ts}` —
+ * so the order frames leave here is the order of their `run_events.id`s. Go
+ * through {@link saveAndEmit} for that; never batch, defer or queue the send
+ * of a saved row, or a client could see id N+1 before id N and a resume from
+ * N+1 would skip it. Unsaved (live-only) events carry no `id`.
+ */
 function emit(e: RunEvent) {
   for (const fn of listeners) fn(e);
+}
+
+/**
+ * Persist an event and send it to live subscribers with the row's stored
+ * `id` and `ts` (so a live frame and its replayed copy are identical).
+ * Sends nothing on a `(run_id, line_uuid)` dedup hit — that row was already
+ * delivered when it was first saved. Throws like `runs.appendEvent` (e.g. a
+ * cascade-deleted run); use {@link saveStatusLineQuietly} on settle paths.
+ */
+function saveAndEmit(args: {
+  runId: string;
+  taskId: string;
+  stream: RunEvent["stream"];
+  data: string;
+  lineUuid?: string | null;
+  subagentId?: string | null;
+}): AppendedEvent | null {
+  const { runId, taskId, stream, data, lineUuid, subagentId } = args;
+  const row = runs.appendEvent(runId, stream, data, lineUuid, subagentId);
+  if (!row) return null;
+  emit({
+    runId,
+    taskId,
+    stream,
+    data,
+    ts: row.ts,
+    id: row.id,
+    ...(subagentId ? { subagentId } : {}),
+  });
+  return row;
+}
+
+/**
+ * {@link saveAndEmit} for status/stderr lines written on settle paths
+ * (`started —`, the hold line, `exit:N`, a rejected spawn). Never throws: a
+ * run deleted under a settling turn drops the line silently (there is
+ * nothing left to record it on), anything else is logged — losing a
+ * breadcrumb must not stop `attachDoneHandler` from draining queues and
+ * moving the card.
+ */
+function saveStatusLineQuietly(
+  runId: string,
+  taskId: string,
+  data: string,
+  stream: "status" | "stderr" = "status",
+): AppendedEvent | null {
+  try {
+    return saveAndEmit({ runId, taskId, stream, data });
+  } catch (err) {
+    if (runs.get(runId)) console.warn(`[agetor] failed to persist ${stream} line for run ${runId}:`, err);
+    return null;
+  }
 }
 
 /** Fan a persisted event out to `/tasks/:id/events` subscribers. History
@@ -819,9 +882,7 @@ function pullBackParkedTask(taskId: string): void {
   const runId = task.runId;
   updateColumn(taskId, runId, "running");
   const data = "background agent active — task pulled back to running";
-  const ts = Date.now();
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts });
+  saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /** Test hook: drive the event bus directly to verify SSE routing without
@@ -852,8 +913,9 @@ export function __dispatchChunkForTest(
   kind: AgentKind,
   stream: RunEvent["stream"],
   data: string,
+  lineUuid?: string,
 ): void {
-  makeChunkHandler(runId, taskId, kind, null)(stream, data);
+  makeChunkHandler(runId, taskId, kind, null)(stream, data, lineUuid);
 }
 
 /**
@@ -2183,21 +2245,19 @@ async function startTaskInner(
       }
 
       registerActiveRun(runId, taskId, fresh, agent);
-      emit({
+      // A stored `null` mode doesn't spawn as a literal "auto" for every
+      // kind (Phase 8 review #3) — `buildCommand` resolves it via
+      // `defaultModeFor`, which is `yolo` for fx since
+      // `AGENT_OPTIONS.fx.modes[0]` is "Full access", not "auto". Mirror
+      // that same resolution here so the opening breadcrumb reports what
+      // actually launched. Persisted (and sent with its row id) so a stream
+      // resumed after a reconnect sees it exactly once, like the drift lines
+      // below.
+      saveStatusLineQuietly(
         runId,
         taskId,
-        stream: "status",
-        // A stored `null` mode doesn't spawn as a literal "auto" for every
-        // kind (Phase 8 review #3) — `buildCommand` resolves it via
-        // `defaultModeFor`, which is `yolo` for fx since
-        // `AGENT_OPTIONS.fx.modes[0]` is "Full access", not "auto". Mirror
-        // that same resolution here so the opening breadcrumb reports what
-        // actually launched.
-        data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
-        ts: now,
-      });
-      // Persisted (unlike the broadcast-only `started —` breadcrumb) so the
-      // drift notice stays in the run log, `agetor logs` and history.
+        `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
+      );
       for (const line of worktreeDriftStatusLines(task, prepared)) {
         appendRunStatusLine(taskId, runId, line);
       }
@@ -2633,7 +2693,9 @@ function makeChunkHandler(
   return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
     let eventId: number | null;
     try {
-      eventId = runs.appendEvent(runId, stream, data, lineUuid);
+      // A dedup hit (`null`) sends nothing: the row was delivered when it
+      // was first saved (e.g. a reattach replay re-delivering a line).
+      eventId = saveAndEmit({ runId, taskId, stream, data, lineUuid })?.id ?? null;
     } catch (err) {
       // A chunk can still arrive after deleteTask cascade-deleted this run
       // (e.g. claude's boot-timeout stderr lines, 30 s after the spawn), and
@@ -2642,7 +2704,6 @@ function makeChunkHandler(
       if (!runs.get(runId)) return;
       throw err;
     }
-    emit({ runId, taskId, stream, data, ts: Date.now() });
     // Todo/task-tools board summary: re-derive + persist on any
     // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap
     // substring pre-filter keeps the common case (unrelated chunks) a no-op.
@@ -2881,17 +2942,15 @@ function makeCopilotSubagentSink(runId: string, taskId: string): CopilotSubagent
     },
     event(parentToolCallId, stream, data, lineUuid) {
       const id = subagentIdFor(parentToolCallId);
-      let inserted: number | null;
       try {
-        inserted = runs.appendEvent(runId, stream, data, lineUuid, id);
+        // Sends nothing for a replayed line (dedup hit).
+        saveAndEmit({ runId, taskId, stream, data, lineUuid, subagentId: id });
       } catch (e) {
         // The run row cascade-deleted under a live tail: cost one event, not
         // the rest of the batch.
         console.error(`[agetor] failed to persist copilot subagent event for ${id}:`, e);
         return;
       }
-      if (inserted === null) return; // replayed line
-      emit({ runId, taskId, stream, data, ts: Date.now(), subagentId: id });
     },
     settled(toolCallId, status) {
       const id = subagentIdFor(toolCallId);
@@ -3144,13 +3203,11 @@ function attachDoneHandler(
           && subagents.hasRunning(taskId);
         if (holdForSubagents) {
           const runningCount = subagents.runningCountForTask(taskId);
-          emit({
+          saveStatusLineQuietly(
             runId,
             taskId,
-            stream: "status",
-            data: `background agents still running (${runningCount}) — holding in running`,
-            ts: Date.now(),
-          });
+            `background agents still running (${runningCount}) — holding in running`,
+          );
         } else {
           // Cancellation wins over api-error here, matching the newStatus
           // resolution above — a user-cancelled run shouldn't land in
@@ -3162,13 +3219,7 @@ function attachDoneHandler(
           updateColumn(taskId, runId, nextColumn);
         }
       }
-      emit({
-        runId,
-        taskId,
-        stream: "status",
-        data: wasCancelled ? `cancelled (exit:${code})` : `exit:${code}`,
-        ts: Date.now(),
-      });
+      saveStatusLineQuietly(runId, taskId, wasCancelled ? `cancelled (exit:${code})` : `exit:${code}`);
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       } else {
@@ -3201,13 +3252,12 @@ function attachDoneHandler(
         // rejects instead).
         updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
       }
-      emit({
+      saveStatusLineQuietly(
         runId,
         taskId,
-        stream: wasCancelled ? "status" : "stderr",
-        data: wasCancelled ? "cancelled" : String(err),
-        ts: Date.now(),
-      });
+        wasCancelled ? "cancelled" : String(err),
+        wasCancelled ? "status" : "stderr",
+      );
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       } else {
@@ -3298,8 +3348,7 @@ function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void 
   if (!saved) return;
   const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
   const data = `${what} — this pipeline step was stopped; saved to your backlog, resend from the tray to continue it`;
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /**
@@ -3501,8 +3550,7 @@ function emitModelMirrorUnsupportedStatus(taskId: string, modelId: string): void
   const recent = runs.listForTask(taskId)[0];
   if (!recent) return;
   const data = `model ${modelId} applies on the next run — claude's picker can't select it for this session`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -3539,8 +3587,7 @@ function emitModelMirrorNextRunStatus(taskId: string, modelId: string, reason: s
   if (!recent) return;
   const detail = reason === "turn in flight" ? "claude is mid-turn" : reason;
   const data = `model ${modelId} applies on the next run — ${detail}`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -3558,8 +3605,7 @@ function emitModelMirrorFailureStatus(taskId: string, modelId: string, reason: s
   const recent = runs.listForTask(taskId)[0];
   if (!recent) return;
   const data = `⚠️ model change not applied — ${reason}; the task's model is ${modelId} but the session kept its previous one`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -3577,8 +3623,7 @@ function emitEffortPinnedStatus(taskId: string, effortId: string, beforeEffort: 
   if (!recent) return;
   const pinned = getSessionLaunchEffort(taskId) ?? beforeEffort ?? "its launch effort";
   const data = `effort ${effortId} applies on the next run — this session is pinned to ${pinned} by CLAUDE_CODE_EFFORT_LEVEL`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -3684,8 +3729,7 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
   const recent = runs.listForTask(taskId)[0];
   const announce = (data: string) => {
     if (!recent) return;
-    runs.appendEvent(recent.id, "status", data);
-    emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+    saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
   };
 
   if (outcome.kind === "unrepresentable") {
@@ -3807,15 +3851,13 @@ function emitModeChangeStatus(
   const recent = runs.listForTask(taskId)[0];
   if (!recent) return;
   const runId = recent.id;
-  const ts = Date.now();
   const data = result.ok
     ? (result.via === "noop"
       ? null
       : `mode → ${agetorMode} (${result.via === "slash-plan" ? "via /plan" : `via Shift+Tab ×${result.presses}`})`)
     : formatModeChangeFailure(agetorMode, result);
   if (!data) return;
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts });
+  saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /**
@@ -3833,8 +3875,7 @@ function emitMatcherRefreshFailure(taskId: string, cwd: string): void {
   const recent = runs.listForTask(taskId)[0];
   if (!recent) return;
   const data = `⚠️ mode took effect but the hook matcher couldn't be refreshed — check ${cwd}/.claude/settings.local.json for malformed JSON. The matcher will sync on the next session start.`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -4562,8 +4603,7 @@ async function sendCodexTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCodexTurnNow(task, taskId, line);
@@ -4829,8 +4869,7 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   if (lastRunId) {
     const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
     const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
-    runs.appendEvent(lastRunId, "status", data);
-    emit({ runId: lastRunId, taskId, stream: "status", data, ts: Date.now() });
+    saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
   }
 }
 
@@ -4872,8 +4911,7 @@ async function sendCursorTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCursorTurnNow(task, taskId, line);
@@ -5051,8 +5089,7 @@ async function sendGeminiTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnGeminiTurnNow(task, taskId, line);
@@ -5229,8 +5266,7 @@ async function sendAntigravityTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnAntigravityTurnNow(task, taskId, line);
@@ -5380,8 +5416,7 @@ async function sendOpencodeTurn(
     opencodeTurnQueue.set(taskId, q);
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnOpencodeTurnNow(task, taskId, line);
@@ -5681,8 +5716,7 @@ async function sendCopilotTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCopilotTurnNow(task, taskId, line);
@@ -5904,8 +5938,7 @@ async function drainCopilotQueue(taskId: string): Promise<void> {
   if (lastRunId) {
     const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
     const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
-    runs.appendEvent(lastRunId, "status", data);
-    emit({ runId: lastRunId, taskId, stream: "status", data, ts: Date.now() });
+    saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
   }
 }
 
@@ -6088,8 +6121,7 @@ function clearFxRecovery(taskId: string): void {
  *  land on a step task's run from outside any spawn — `runs.appendEvent`
  *  alone would persist the line but never reach a live SSE subscriber. */
 export function appendRunStatusLine(taskId: string, runId: string, data: string): void {
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /** @deprecated thin fx-named alias of {@link appendRunStatusLine} — kept so
@@ -6153,8 +6185,7 @@ async function sendFxTurn(
     // away; a queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   // `spawnFxRun` now returns `{ runId, spawned, error? }` (Phase 8 review
@@ -7190,8 +7221,7 @@ async function sendTurnInExistingSession(
       // queued message (see `cancelRun`) and this bubble has no reply. That's the
       // same optimism `sendTurn` already runs with; the bubble correctly reflects
       // that the user did send the message.
-      runs.appendEvent(activeRunId, "user", data);
-      emit({ runId: activeRunId, taskId, stream: "user", data, ts: Date.now() });
+      saveAndEmit({ runId: activeRunId, taskId, stream: "user", data });
       return resolveClaudeTurnOutcome(activeRunId, pasted.pasteOutcome, () => stashed);
     }
   }
@@ -7387,8 +7417,7 @@ function handlePasteWithheld(
   // The re-stash is skipped for a task archived (or deleted) underneath the
   // send — never claim a save that didn't happen.
   if (!saved) data = "message not delivered — the task was archived before it could be saved to your backlog";
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId, taskId, stream: "status", data });
   return saved;
 }
 
@@ -8920,8 +8949,7 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
         // since an emit without persistence would still paint a new chip
         // client-side on every sweep.
         if (runs.lastEventData(recent.id) !== data) {
-          runs.appendEvent(recent.id, "status", data);
-          emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+          saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
         }
       }
     }
