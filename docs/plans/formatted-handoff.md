@@ -349,6 +349,7 @@ No barrier is knowingly red. `e2e/pipelines-run.spec.ts:365` breaks only when th
 | New e2e spec | In this run | E1 |
 | README + CLAUDE.md item 19 | In this run | T10 (D23) |
 | Orphaned code: run-view `<pre>`; old `findLastHandoffBlock` | In this run (removed) | T8, T1 |
+| E2e port collisions with another checkout (Vite :5173, backends 4600–4999, CORS allow-list hard-coding :5173) | In this run (added during execution) | `AGETOR_E2E_VITE_PORT` (playwright.config.ts), `AGETOR_E2E_PORT_OFFSET` + `AGETOR_DEV_ORIGIN_PORT` (e2e/fixtures.ts, src/bun/server.ts); default ports unchanged |
 | Existing data backfill | None needed | Render-only; persisted `responseKind` stays as recorded (D16) |
 | Antigravity delta-streamed handoffs stay raw | Owner-deferred | Owner, grill D11 |
 | Gemini delta-streamed handoffs stay raw | Owner-deferred | Owner, at plan approval on 2026-10-29 (A1); same mechanism as D11 |
