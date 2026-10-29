@@ -8,6 +8,7 @@
  * See `docs/plans/pipelines.md` (§3, D3/D4/D10) for the full design.
  */
 import type {
+  AgentKind,
   AgentProfileSnapshot,
   Handoff,
   Pipeline,
@@ -16,16 +17,17 @@ import type {
   PipelineRunState,
   PipelineRunStatus,
   PipelineStep,
+  PipelineStepRecord,
   StepResponseKind,
 } from "./types.ts";
 import { PIPELINE_LIMITS } from "./types.ts";
+import { HANDOFF_TAG, findHandoffBlocks } from "./handoff-locator.ts";
 
-/** The XML-ish tag a step's agent is asked to wrap its final handoff JSON
- *  in — `<handoff>{...}</handoff>`. Single source of truth for both the
- *  prompt text ({@link composeStepPrompt}) and the parser ({@link
- *  parseHandoff})'s tag matching; renamed from `agetor_handoff` per the
- *  owner's D3 pick. */
-export const HANDOFF_TAG = "handoff";
+/** Re-exported so every existing importer keeps working: the tag name lives
+ *  with the shared locator (`./handoff-locator.ts`), the single source of
+ *  truth for both the prompt text ({@link composeStepPrompt}) and tag
+ *  matching ({@link parseHandoff}). */
+export { HANDOFF_TAG };
 
 /** Leading line of {@link composeHandoffReminder}'s message — the single
  *  automatic follow-up the runner sends when a step's final response didn't
@@ -144,103 +146,84 @@ function escapeHandoffMarkerPhrases(text: string): string {
     .replaceAll("END untrusted handoff", "END-untrusted-handoff");
 }
 
-const HANDOFF_OPEN_PREFIX = `<${HANDOFF_TAG}`;
+/** One piece of a step prompt split by {@link splitHandoffPromptSpans}. */
+export type HandoffPromptPart =
+  | { kind: "text"; text: string }
+  | { kind: "handoff"; fromStep: string; nonce: string; handoff: Handoff }
+  | { kind: "handoff-file"; fromStep: string; nonce: string; filePath: string | null; tooLarge: boolean };
 
-/** ASCII/Unicode whitespace as JS's `\s` regex class sees it — the linear
- *  handoff scanner below must agree with the old regex's `\s` for the
- *  "whitespace around the close tag" tolerance. */
-function isWs(ch: string | undefined): boolean {
-  return ch !== undefined && /\s/.test(ch);
-}
+/** A {@link handoffUntrustedBeginMarker} line, parsed — the nonce is the 8-hex
+ *  token {@link randomHandoffNonce} generates. */
+const HANDOFF_BEGIN_LINE_RE = /^--- BEGIN untrusted handoff ([0-9a-f]{8}) from "(.*)" ---$/gm;
+const HANDOFF_TOO_LARGE_FILE_RE = /^\(handoff too large to inline — saved to ([^\n]+)\)$/;
+const HANDOFF_TOO_LARGE_NO_FILE = "(handoff too large to inline; no file available)";
+const HANDOFF_SAVED_FILE_RE = /^\(handoff saved to ([^\n]+)\)$/;
+const HANDOFF_JSON_FENCE_RE = /^```json\n[\s\S]*\n```$/;
 
-/** Match `</\s*handoff\s*>` at `p` (which must point at a `</`) in the
- *  lower-cased text — returns the index just past the `>` or `-1`. Cost is
- *  the two whitespace runs plus the tag name, never more. */
-function matchCloseTagAt(lower: string, p: number): number {
-  let i = p + 2;
-  while (isWs(lower[i])) i++;
-  if (!lower.startsWith(HANDOFF_TAG, i)) return -1;
-  i += HANDOFF_TAG.length;
-  while (isWs(lower[i])) i++;
-  return lower[i] === ">" ? i + 1 : -1;
-}
-
-/** First `</\s*handoff\s*>` at or after `from` — `{start, end}` or `null`.
- *  Linear: every `</` candidate is checked once and the search resumes past
- *  it, so a run of `</` + whitespace is walked exactly once. */
-function findCloseTag(lower: string, from: number): { start: number; end: number } | null {
-  let p = from;
-  for (;;) {
-    const at = lower.indexOf("</", p);
-    if (at === -1) return null;
-    const end = matchCloseTagAt(lower, at);
-    if (end !== -1) return { start: at, end };
-    p = at + 2;
+/** Interpret the body between one BEGIN/END marker pair as {@link
+ *  composeStepPrompt} wrote it: an inlined ```json block that parses as a
+ *  handoff, or one of the three placeholders. `null` for anything else (the
+ *  span then stays plain text). */
+function interpretHandoffSpanBody(
+  body: string,
+  fromStep: string,
+  nonce: string,
+): Exclude<HandoffPromptPart, { kind: "text" }> | null {
+  const trimmed = body.trim();
+  const tooLargeFile = HANDOFF_TOO_LARGE_FILE_RE.exec(trimmed);
+  if (tooLargeFile !== null) {
+    return { kind: "handoff-file", fromStep, nonce, filePath: tooLargeFile[1]!, tooLarge: true };
   }
+  if (trimmed === HANDOFF_TOO_LARGE_NO_FILE) {
+    return { kind: "handoff-file", fromStep, nonce, filePath: null, tooLarge: true };
+  }
+  const saved = HANDOFF_SAVED_FILE_RE.exec(trimmed);
+  if (saved !== null) {
+    return { kind: "handoff-file", fromStep, nonce, filePath: saved[1]!, tooLarge: false };
+  }
+  if (HANDOFF_JSON_FENCE_RE.test(trimmed)) {
+    const parsed = parseHandoffInner(trimmed);
+    if (parsed.ok) return { kind: "handoff", fromStep, nonce, handoff: parsed.handoff };
+  }
+  return null;
 }
 
 /**
- * Locate the LAST complete `<handoff …>…</handoff>` block in `text` and
- * return its inner text — the linear replacement for the old global regex
- * `<handoff(?:\s[^>]*)?>([\s\S]*?)<\/\s*handoff\s*>` (H2): that
- * pattern's lazy body made a transcript with N unclosed open tags cost
- * O(N × text) — 50k `<handoff>` opens in ~500 KB took seconds — because
- * every open re-scanned to the end looking for a close that wasn't there.
- *
- * Semantics preserved exactly: the same non-overlapping forward tokenization
- * the regex's `exec` loop did — an open tag (attributes allowed up to the
- * next `>`, `<handoffx>` is not an open tag) pairs with the FIRST close tag
- * after it, the scan resumes after that close, and the last such pair wins
- * (so an earlier complete block followed by an unclosed draft yields the
- * earlier block, and a nested `<handoff><handoff>{…}</handoff></handoff>`
- * pairs the outer open with the inner close, leaving `{…}` to the
- * brace-balanced fallback). Two things bound the work: only the trailing
- * `PIPELINE_LIMITS.handoffScanTailBytes` code units of `text` are scanned
- * at all (the contract says the block ENDS the final message, so anything
- * further back is prose — a block whose open tag sits beyond that tail is
- * not found), and the "first `>` after an open" lookup is memoized so a run
- * of `<handoff ` false-opens with no `>` is walked once, not once per
- * candidate.
+ * Split a step's prompt text into plain text and the previous steps'
+ * untrusted-handoff spans — the inverse of what {@link composeStepPrompt}
+ * emits between `--- BEGIN untrusted handoff <nonce> from "<step>" ---` and
+ * `--- END untrusted handoff <nonce> ---`. A span becomes a `handoff` part
+ * (its fenced JSON parsed and normalized) or a `handoff-file` part (one of the
+ * three placeholders: too large with a file, too large with none, saved to a
+ * file). The END marker must carry the SAME nonce as its BEGIN, a span whose
+ * body is neither a parseable ```json block nor a placeholder stays text, and
+ * a BEGIN with no matching END stays text — so a lookalike marker inside
+ * untrusted content can never forge or truncate a span. The text parts hold
+ * the surrounding prompt exactly (empty ones are dropped; the result is never
+ * empty — a prompt without spans is a single text part).
  */
-function findLastHandoffBlock(text: string): string | null {
-  const tail = text.length > PIPELINE_LIMITS.handoffScanTailBytes
-    ? text.slice(text.length - PIPELINE_LIMITS.handoffScanTailBytes)
-    : text;
-  const lower = tail.toLowerCase();
-  let cursor = 0;
-  let last: string | null = null;
-  // Memoized "first `>` at or after i" — valid for any i in [gtFrom, gt]
-  // (or any i >= gtFrom when gt === -1: no `>` remains at all).
-  let gtFrom = -1;
-  let gt = -1;
-  const firstGtAfter = (i: number): number => {
-    if (gtFrom !== -1 && i >= gtFrom && (gt === -1 || i <= gt)) return gt;
-    gtFrom = i;
-    gt = lower.indexOf(">", i);
-    return gt;
-  };
-  for (;;) {
-    const open = lower.indexOf(HANDOFF_OPEN_PREFIX, cursor);
-    if (open === -1) break;
-    const afterName = open + HANDOFF_OPEN_PREFIX.length;
-    const next = lower[afterName];
-    let openEnd: number;
-    if (next === ">") {
-      openEnd = afterName + 1;
-    } else if (isWs(next)) {
-      const g = firstGtAfter(afterName);
-      if (g === -1) break; // an open tag whose attributes never close — nothing after it can match either
-      openEnd = g + 1;
-    } else {
-      cursor = open + 1; // `<handoffx…` — not an open tag
-      continue;
-    }
-    const close = findCloseTag(lower, openEnd);
-    if (close === null) break; // no close after this open → no later open can have one either
-    last = tail.slice(openEnd, close.start);
-    cursor = close.end;
+export function splitHandoffPromptSpans(text: string): HandoffPromptPart[] {
+  const parts: HandoffPromptPart[] = [];
+  let textFrom = 0;
+  const re = new RegExp(HANDOFF_BEGIN_LINE_RE.source, "gm");
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    const nonce = m[1]!;
+    const fromStep = m[2]!;
+    const beginEnd = m.index + m[0].length;
+    const endMarker = `\n${handoffUntrustedEndMarker(nonce)}`;
+    const endAt = text.indexOf(endMarker, beginEnd);
+    if (endAt === -1) continue;
+    const afterEnd = endAt + endMarker.length;
+    if (afterEnd < text.length && text[afterEnd] !== "\n" && text[afterEnd] !== "\r") continue;
+    const part = interpretHandoffSpanBody(text.slice(beginEnd, endAt), fromStep, nonce);
+    if (part === null) continue;
+    if (m.index > textFrom) parts.push({ kind: "text", text: text.slice(textFrom, m.index) });
+    parts.push(part);
+    textFrom = afterEnd;
+    re.lastIndex = afterEnd;
   }
-  return last;
+  if (textFrom < text.length || parts.length === 0) parts.push({ kind: "text", text: text.slice(textFrom) });
+  return parts;
 }
 
 function isFiniteNumber(x: unknown): x is number {
@@ -761,50 +744,88 @@ export function normalizeHandoff(input: unknown): Handoff {
   return handoff;
 }
 
+/** What {@link parseHandoff} / {@link parseHandoffInner} return: the
+ *  normalized handoff, or why there isn't one (`raw` is the inner text of the
+ *  tag that failed to parse, `null` when no tag was found at all). */
+export type HandoffParseResult =
+  | { ok: true; handoff: Handoff }
+  | { ok: false; error: string; raw: string | null };
+
 /**
- * Parse a step's raw output text for its trailing `<handoff>…</handoff>`
- * block (see {@link HANDOFF_TAG}). Finds the LAST such block (tolerating
- * attributes on the open tag, whitespace around the close tag, and trailing
- * prose after it — an earlier "draft" block is ignored once a final one
- * exists). The inner text is stripped of an optional ```json/``` fence, then
- * `JSON.parse`d; on failure, a brace-balanced `{…}` slice starting at the
- * first `{` is tried as a fallback (recovers from stray prose around an
+ * Parse the inner text of one `<handoff>…</handoff>` block: strip an optional
+ * ```json/``` fence, `JSON.parse` it, and on failure try a brace-balanced
+ * `{…}` slice starting at the first `{` (recovers from stray prose around an
  * otherwise-valid object). The result goes through {@link normalizeHandoff}
  * (per-field, per-element, per-array and whole-object caps; defaults).
- * Only the trailing `PIPELINE_LIMITS.handoffScanTailBytes` code units of
- * `text` are scanned — see `findLastHandoffBlock`.
- *
- * Returns `{ok:false, error, raw:null}` when no `<handoff>` tag is found at
- * all, or `{ok:false, error, raw:<inner text>}` when a tag was found but its
- * contents couldn't be parsed as an object.
+ * Returns `{ok:false, error, raw:<inner text>}` when the contents couldn't be
+ * parsed as an object — `raw` is the fence-stripped text.
  */
-export function parseHandoff(text: string): { ok: true; handoff: Handoff } | { ok: false; error: string; raw: string | null } {
-  const block = findLastHandoffBlock(text);
-  if (block === null) return { ok: false, error: "no <handoff> block found", raw: null };
-
-  const inner = stripCodeFence(block);
+export function parseHandoffInner(inner: string): HandoffParseResult {
+  const stripped = stripCodeFence(inner);
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(inner);
+    parsed = JSON.parse(stripped);
   } catch {
-    const balanced = extractBalancedObject(inner);
+    const balanced = extractBalancedObject(stripped);
     if (balanced === null) {
-      return { ok: false, error: "handoff JSON could not be parsed: no valid JSON object found", raw: inner };
+      return { ok: false, error: "handoff JSON could not be parsed: no valid JSON object found", raw: stripped };
     }
     try {
       parsed = JSON.parse(balanced);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: `handoff JSON could not be parsed: ${reason}`, raw: inner };
+      return { ok: false, error: `handoff JSON could not be parsed: ${reason}`, raw: stripped };
     }
   }
 
   if (!isPlainObject(parsed)) {
-    return { ok: false, error: "handoff JSON could not be parsed: expected an object", raw: inner };
+    return { ok: false, error: "handoff JSON could not be parsed: expected an object", raw: stripped };
   }
 
   return { ok: true, handoff: normalizeHandoff(parsed) };
+}
+
+/** Join transcript segments (one per event) with `"\n"` — the same text the
+ *  runner always scanned — and report where each segment starts in it. */
+function joinHandoffSegments(text: string | readonly string[]): { joined: string; starts: number[] | undefined } {
+  if (typeof text === "string") return { joined: text, starts: undefined };
+  const starts: number[] = [];
+  let offset = 0;
+  for (let i = 0; i < text.length; i++) {
+    starts.push(offset);
+    offset += text[i]!.length + 1;
+  }
+  return { joined: text.join("\n"), starts };
+}
+
+/**
+ * Parse a step's raw output text for its trailing `<handoff>…</handoff>`
+ * block (see {@link HANDOFF_TAG}). Finds the LAST real such block via the
+ * shared locator (`./handoff-locator.ts`) — tolerating attributes on the open
+ * tag, whitespace around the close tag, and trailing prose after it (an
+ * earlier "draft" block is ignored once a final one exists); a tag inside an
+ * inline code span or a fenced code block is not a block. The inner text is
+ * parsed by {@link parseHandoffInner}. Only the trailing
+ * `PIPELINE_LIMITS.handoffScanTailBytes` code units of the text are scanned.
+ *
+ * `text` is one string, or an array of segments (one per transcript event):
+ * the array is joined with `"\n"` — the same text a single string would be —
+ * and each element's offset becomes a segment start, where the locator resets
+ * its Markdown state (a block may still pair across segments). Pass
+ * `{ codeAware: false }` for the legacy Markdown-blind scan, which the
+ * delta-streaming harnesses need ({@link HANDOFF_DELTA_STREAM_KINDS}).
+ *
+ * Returns `{ok:false, error, raw:null}` when no `<handoff>` tag is found at
+ * all, or `{ok:false, error, raw:<inner text>}` when a tag was found but its
+ * contents couldn't be parsed as an object.
+ */
+export function parseHandoff(text: string | readonly string[], opts?: { codeAware?: boolean }): HandoffParseResult {
+  const { joined, starts } = joinHandoffSegments(text);
+  const blocks = findHandoffBlocks(joined, { segmentStarts: starts, codeAware: opts?.codeAware });
+  const last = blocks[blocks.length - 1];
+  if (last === undefined) return { ok: false, error: "no <handoff> block found", raw: null };
+  return parseHandoffInner(joined.slice(last.openEnd, last.closeStart));
 }
 
 /**
@@ -830,8 +851,12 @@ export function parseHandoff(text: string): { ok: true; handoff: Handoff } | { o
  */
 export function classifyStepResponse(input: {
   runStatus: "succeeded" | "failed" | "cancelled" | "orphaned";
-  assistantText: string;
+  /** The step's assistant text — one string, or one segment per event (see
+   *  {@link parseHandoff}). */
+  assistantText: string | readonly string[];
   pendingInteractions: number;
+  /** `false` selects the legacy Markdown-blind scan (default `true`). */
+  codeAware?: boolean;
 }): { kind: StepResponseKind; handoff: Handoff | null; error: string | null } {
   if (input.runStatus === "cancelled" || input.runStatus === "orphaned") {
     return { kind: "cancelled", handoff: null, error: null };
@@ -840,7 +865,7 @@ export function classifyStepResponse(input: {
     return { kind: "error", handoff: null, error: null };
   }
 
-  const parsed = parseHandoff(input.assistantText);
+  const parsed = parseHandoff(input.assistantText, { codeAware: input.codeAware });
   if (parsed.ok) {
     if (parsed.handoff.status === "blocked") {
       return { kind: "handoff-blocked", handoff: parsed.handoff, error: null };
@@ -854,6 +879,92 @@ export function classifyStepResponse(input: {
 
   const kind: StepResponseKind = parsed.raw === null ? "handoff-missing" : "handoff-invalid";
   return { kind, handoff: null, error: parsed.error };
+}
+
+/** The harness kinds whose drivers emit ONE `assistant` event per streamed
+ *  delta (gemini `delta:true` messages, antigravity `text_delta`s), so a
+ *  handoff block spans many events there. A code-aware scan resets Markdown
+ *  state at every event, which would break a fence a delta splits — so the
+ *  runner parses these kinds with the legacy Markdown-blind scan (today's
+ *  behaviour, unchanged) and the webview renders no handoff cards for them.
+ *  Every other kind writes message-level events. See
+ *  `docs/plans/formatted-handoff.md` (K2). */
+export const HANDOFF_DELTA_STREAM_KINDS: ReadonlySet<AgentKind> = new Set<AgentKind>(["gemini", "antigravity"]);
+
+/** Whether handoff scanning for a harness of `kind` should be code-aware —
+ *  `false` for {@link HANDOFF_DELTA_STREAM_KINDS}; an unknown kind (`null`/
+ *  `undefined`) is code-aware, the default. */
+export function handoffScanIsCodeAware(kind: AgentKind | null | undefined): boolean {
+  return kind == null || !HANDOFF_DELTA_STREAM_KINDS.has(kind);
+}
+
+/** What {@link splitHandoffMessage} returns: the prose before and after the
+ *  message's last real handoff block, and the block itself (`inner` is the raw
+ *  text between the tags; `result` is `inner` run through {@link
+ *  parseHandoffInner}). `block` is `null` when the message has no real block
+ *  (then `before` is the whole text). */
+export interface HandoffMessageSplit {
+  before: string;
+  after: string;
+  block: { inner: string; result: HandoffParseResult } | null;
+}
+
+/**
+ * Split ONE message's text around its last real `<handoff>` block — the
+ * code-aware, single-segment view every display surface (the transcript card,
+ * search, the `agetor logs` digest, the TUI) shares, so none of them can
+ * disagree with the runner about which block counts. Earlier blocks stay in
+ * `before` as plain text; a tag inside inline code or a fence is not a block.
+ */
+export function splitHandoffMessage(text: string): HandoffMessageSplit {
+  const blocks = findHandoffBlocks(text);
+  const last = blocks[blocks.length - 1];
+  if (last === undefined) return { before: text, after: "", block: null };
+  const inner = text.slice(last.openEnd, last.closeStart);
+  return {
+    before: text.slice(0, last.start),
+    after: text.slice(last.end),
+    block: { inner, result: parseHandoffInner(inner) },
+  };
+}
+
+/** The file name the runner gives a handoff handed to the next step:
+ *  `handoff-<generation>-<seq>-from-<fromSeq>.json`, where `generation` is the
+ *  run's `startedAt` in base 36 (so a Restart's reset `seq` can't overwrite the
+ *  replaced run's files). Written under `dataDir/pipeline-runs/<parentId>/`. */
+export function handoffFileName(generation: string, seq: number, fromSeq: number): string {
+  return `handoff-${generation}-${seq}-from-${fromSeq}.json`;
+}
+
+const HANDOFF_FILE_NAME_RE = /^handoff-([0-9a-z]+)-(\d+)-from-(\d+)\.json$/;
+
+/** Parse a {@link handoffFileName} path back into its parts — only when the
+ *  file sits in `…/pipeline-runs/<parentId>/` (its directory is `parentId` and
+ *  that directory's parent is `pipeline-runs`); anything else is `null`. */
+export function parseHandoffFilePath(
+  path: string,
+  parentId: string,
+): { generation: string; seq: number; fromSeq: number } | null {
+  const segments = path.split("/");
+  if (segments.length < 3) return null;
+  const name = segments[segments.length - 1]!;
+  if (segments[segments.length - 2] !== parentId || segments[segments.length - 3] !== "pipeline-runs") return null;
+  const m = HANDOFF_FILE_NAME_RE.exec(name);
+  if (m === null) return null;
+  return { generation: m[1]!, seq: Number(m[2]), fromSeq: Number(m[3]) };
+}
+
+/** The history record whose handoff a {@link parseHandoffFilePath} result
+ *  points at: same run generation (`(run.startedAt ?? 0).toString(36)`) and
+ *  `record.seq === file.fromSeq`, with a recorded handoff; else `null`. */
+export function findHandoffRecordForFile(
+  run: PipelineRunState | null | undefined,
+  file: { generation: string; fromSeq: number },
+): PipelineStepRecord | null {
+  if (run == null) return null;
+  if ((run.startedAt ?? 0).toString(36) !== file.generation) return null;
+  const record = run.history.find((h) => h.seq === file.fromSeq);
+  return record !== undefined && record.handoff !== null ? record : null;
 }
 
 /**

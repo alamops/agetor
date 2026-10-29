@@ -1273,6 +1273,17 @@ export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
  * suffixes below for what happens when the CURRENT turn's prompt carries no
  * marker at all.
  *
+ * Formatted-handoff suffixes (docs/plans/formatted-handoff.md T3): `rich` /
+ * `rich-blocked` write `agetor-handoff/notes.md` and `report.txt` into the
+ * turn's cwd and emit the canonical rich handoff (all eight artifact shapes,
+ * two open questions, `status` `done` / `blocked`); `mention` quotes
+ * `<handoff>` and a `{schemaVersion, …}` shape in inline code in prose ahead
+ * of a valid terminal block (the legacy parser misreads it, the code-aware
+ * one does not); `fenced` wraps a valid block entirely in a code fence (not a
+ * real handoff to a code-aware reader). `fenced-then-<token>` is the
+ * two-turn form. A bare `rich`/`mention`/`fenced` is therefore no longer
+ * usable as a literal `next` — name such a step differently.
+ *
  * Two-turn suffixes: `missing-then-done` and `invalid-then-done` behave like
  * `missing`/`invalid` on the task's FIRST fake-driver turn and like `done`
  * (a valid terminal handoff) on every turn after that; more generally
@@ -1568,12 +1579,12 @@ function bumpFakeHandoffTurn(taskId: string): number {
 }
 
 /**
- * Two-turn suffix regex: `(missing|invalid)-then-<token>` where `<token>` is
+ * Two-turn suffix regex: `(missing|invalid|fenced)-then-<token>` where `<token>` is
  * itself a valid ordinary suffix (letters/digits/-/_). Matches
  * `missing-then-done`, `invalid-then-done`, and `missing-then-<StepName>`
  * alike — `<token>` is used verbatim, same as a plain suffix would be.
  */
-const FAKE_HANDOFF_TWO_TURN_RE = /^(missing|invalid)-then-(.+)$/;
+const FAKE_HANDOFF_TWO_TURN_RE = /^(missing|invalid|fenced)-then-(.+)$/;
 /**
  * Resolve the raw suffix (from `lastFakeHandoffSuffix`) plus the current
  * turn number into the EFFECTIVE suffix `makeFakeAgent`'s handoff branch
@@ -1589,6 +1600,48 @@ function resolveFakeHandoffTurnSuffix(rawSuffix: string | null, turn: number): s
   const firstTurnBehavior: string = match[1] ?? rawSuffix;
   const laterToken: string = match[2] ?? rawSuffix;
   return turn <= 1 ? firstTurnBehavior : laterToken;
+}
+
+/** The canonical rich handoff's `artifacts` list (docs/plans/formatted-handoff.md
+ *  §4, "Canonical rich handoff"): eight entries covering every artifact shape
+ *  the card and modal render — a relative path, an absolute path, a URL, a path
+ *  with a note, a path with a line number, a path that is never written, a
+ *  knowledge-entry reference and free text. Entry 2 is absolute under `cwd`;
+ *  `rich` writes entries 1 and 2 to disk (entry 6 is deliberately never
+ *  written). Exported for `agents-fake-handoff.test.ts` and kept in step with
+ *  `e2e/formatted-handoff.spec.ts`, which copies it literally. */
+export function fakeRichHandoffArtifacts(cwd: string): string[] {
+  return [
+    "agetor-handoff/notes.md",
+    path.join(cwd, "agetor-handoff", "report.txt"),
+    "https://example.invalid/pr/1",
+    "agetor-handoff/notes.md (the plan)",
+    "agetor-handoff/notes.md:12",
+    "agetor-handoff/missing.md",
+    "jubarteai:00000000-0000-4000-8000-000000000000 (note)",
+    "commit 1234abc on feature/example",
+  ];
+}
+
+/** `rich` / `rich-blocked`: write the two files entries 1 and 2 of
+ *  {@link fakeRichHandoffArtifacts} point at, and return the turn's assistant
+ *  text — prose, then the canonical rich handoff block. */
+function fakeRichHandoffText(cwd: string, status: "done" | "blocked"): string {
+  const dir = path.join(cwd, "agetor-handoff");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "notes.md"), "# Handoff notes\n\nSynthetic notes for the rich handoff fixture.\n");
+  writeFileSync(path.join(dir, "report.txt"), "Synthetic report for the rich handoff fixture.\n");
+  const handoff = {
+    schemaVersion: 1,
+    purpose: "e2e rich purpose",
+    summary: "**Rich** handoff with `code` and a list:\n- one\n- two\n- three\n- four\n- five",
+    reason: "e2e rich reason uniquetoken-reason",
+    next: null as string | null,
+    artifacts: fakeRichHandoffArtifacts(cwd),
+    openQuestions: ["First e2e question?", "Second e2e question?"],
+    status,
+  };
+  return `Here is the rich handoff.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`;
 }
 
 /** Terminal handoff the `continue-then-done` continuation writes. `next`
@@ -2509,6 +2562,20 @@ function makeFakeAgent(
         onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n{not json\n</${HANDOFF_TAG}>`);
       } else if (suffix === "continue-then-done" || suffix === "continue-overlap") {
         onChunk("assistant", fakeTerminalHandoffText(`fake summary for ${suffix}`));
+      } else if (suffix === "rich" || suffix === "rich-blocked") {
+        onChunk("assistant", fakeRichHandoffText(fakeOpts.cwd ?? process.cwd(), suffix === "rich" ? "done" : "blocked"));
+      } else if (suffix === "mention") {
+        // The `{schemaVersion, …}` in the prose is load-bearing: the legacy
+        // balanced-object fallback would otherwise rescue the JSON from the
+        // quoted tag's span and the bug would not reproduce.
+        onChunk(
+          "assistant",
+          `I checked the \`<${HANDOFF_TAG}>\` contract and its \`{schemaVersion, …}\` shape before finishing.\n${fakeTerminalHandoffText("fake summary for mention").replace(/^Done\.\n/, "")}`,
+        );
+      } else if (suffix === "fenced") {
+        // A well-formed block wrapped entirely in a code fence: a code-aware
+        // reader treats it as quoted text, not a handoff.
+        onChunk("assistant", `Done.\n\`\`\`\n${fakeTerminalHandoffText("fake summary for fenced").replace(/^Done\.\n/, "")}\n\`\`\``);
       } else {
         const next = suffix && suffix !== "done" ? suffix : null;
         const handoff = {
