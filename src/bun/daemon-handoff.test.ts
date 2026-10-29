@@ -80,12 +80,10 @@ test("cli-daemon releases its port on /daemon/shutdown so a new owner can bind",
 // instead of reading a stop; a CLI core exits 0 as before. Ports 4479 / 4480.
 //
 // The winner is a stand-in "app" (a plain node:http listener plus a `kind:"app"`
-// creds file naming this test's pid), not a second headless core: Bun.serve's
-// default listen on macOS sets SO_REUSEPORT, so two Bun servers can BOTH bind
-// one port and there would be no loser to observe. A node:net listener does not
-// set it, so the core's bind genuinely fails with EADDRINUSE, which is the path
-// under test (probeLiveCore then finds the stand-in live: pid alive, /health
-// says agetor, /info accepts the token).
+// creds file naming this test's pid), not a second headless core: it binds in
+// milliseconds and is live before the loser reaches its bind, so the core's bind
+// fails with EADDRINUSE, which is the path under test (probeLiveCore then finds
+// the stand-in live: pid alive, /health says agetor, /info accepts the token).
 async function loserExitCode(port: number, loserLaunchedBy?: "login-item"): Promise<{
   code: number;
   winnerStillOwnsPort: boolean;
