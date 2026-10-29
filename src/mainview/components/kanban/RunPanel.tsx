@@ -106,6 +106,12 @@ import { createEventDeduper } from "@/lib/event-dedup";
 import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { isHiddenToolEvent } from "../../../shared/tool-visibility.ts";
 import { createEventBuffer } from "@/lib/event-buffer";
+import { createInteractionRefetchTracker, mergeRefetchedInteractions } from "@/lib/interaction-refetch";
+import {
+  TASK_STREAM_GAP_NOTICE,
+  classifyReplayMeta,
+  createIdHighWater,
+} from "../../../shared/task-stream-resume.ts";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
@@ -163,24 +169,24 @@ const CLAUDE_PLAN_PROMPT_RE = /written up a plan|Would you like to proceed/i;
  * client-assigned monotonic id. `id` here is always assigned by
  * `nextEventIdRef`/`prevEventIdRef` the moment an event is accepted into the
  * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
- * event apart from one the server re-delivers on SSE reconnect (full-history
- * replay) when deciding whether the JSONL rebuild snapshot has gone stale —
+ * event apart from one observed before the JSONL snapshot was captured when
+ * deciding whether the JSONL rebuild snapshot has gone stale —
  * it is NEVER the server's own event id, even when one is available (see
  * `dbId` below), since `rebuilt-mask.ts`'s ordering depends on this id space
  * being contiguous and monotonic per-connection.
  *
- * `dbId`, when present, is the REAL `run_events.id` row id. Historically this
- * was only known for events fetched via `GET /tasks/:id/events/page` ("Load
- * earlier"), but SSE replayed frames (the burst sent on connect/reconnect,
- * before `replay_meta`'s window) now carry it too — only a genuinely NEW
- * live event delivered after the connection has settled lacks one. It's what
- * lets the live-window trim (`EVENTS_WINDOW_MAX`) figure out a fresh
- * `beforeId` cursor after eating into previously-loaded earlier history: if
- * the new front-of-window event carries a `dbId`, that becomes the new
- * `earliestId`; if it doesn't (the rare case of a brand-new live event
- * pushing the window over the cap before any replay/page fetch has run),
- * "Load earlier" has nothing reliable to page from and hides until the next
- * SSE (re)connect re-seeds `earliestId` from `replay_meta`.
+ * `dbId`, when present, is the REAL `run_events.id` row id. Every saved row
+ * carries it — replayed frames, "Load earlier" pages and live frames alike
+ * (the server stamps the stored id on each live send). Only an event the
+ * server never saved lacks one (the live-only `interaction`/`subagent`
+ * frames are consumed before they reach the window). It's what lets the
+ * live-window trim (`EVENTS_WINDOW_MAX`) figure out a fresh `beforeId`
+ * cursor after eating into previously-loaded earlier history: if the new
+ * front-of-window event
+ * carries a `dbId`, that becomes the new `earliestId`; if it doesn't (a
+ * never-saved event at the front of the window), "Load earlier" has nothing
+ * reliable to page from and hides until the next snapshot or fresh connect
+ * re-seeds `earliestId` from `replay_meta`.
  */
 type StreamEvent = RunEvent & { id: number; dbId?: number };
 
@@ -719,6 +725,18 @@ function RunPanelBody({
   >(null);
   const [rebuildBusy, setRebuildBusy] = useState(false);
   const [rebuildNote, setRebuildNote] = useState<string | null>(null);
+  /** Bumped when a snapshot reset replaces the whole stream window (see the
+   *  `replay_meta` handler in the subscription effect). It is the auto-rebuild
+   *  effect's one extra dependency: the reset drops `rebuilt`, and the JSONL
+   *  splice for the current latest run has to be recomputed against the fresh
+   *  window exactly as on first open. Never needs resetting on task switch —
+   *  only changes ever trigger the effect, and a task switch re-runs it anyway
+   *  via `latestRun`. */
+  const [rebuildEpoch, setRebuildEpoch] = useState(0);
+  /** True after a reconnect had to fall back to a fresh window because the
+   *  gap was too large to replay (a snapshot `replay_meta`); renders the
+   *  muted `TASK_STREAM_GAP_NOTICE` line under "Load earlier messages". */
+  const [streamGapNotice, setStreamGapNotice] = useState(false);
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
   /** Background/sub agents this task's main agent has spawned. Seeded from the
    *  snapshot endpoint on open + kept live by `stream: "subagent"` SSE deltas
@@ -897,6 +915,7 @@ function RunPanelBody({
     setLoadingEarlier(false);
     setRebuilt(null);
     setRebuildNote(null);
+    setStreamGapNotice(false);
     setInteractions([]);
     setSubagentList([]);
     setActiveStream("main");
@@ -1031,13 +1050,26 @@ function RunPanelBody({
     // let the deferred fetches go anyway rather than waiting on a stream
     // that may never connect (task deleted mid-switch, backend down).
     const readyTimer = setTimeout(markStreamReady, STREAM_READY_FALLBACK_MS);
-    // Collapse the dual-emit + replay duplicates the server stream carries
-    // (live echo + JSONL twin per user message; full-history replay on every
-    // reconnect). The deduper keeps `user` keys in a never-trimmed set so a
-    // follow-up folded into a long in-flight turn — whose live echo and JSONL
-    // twin are separated by thousands of intervening events — still collapses
-    // to a single bubble. See `event-dedup.ts`.
-    const dedupe = createEventDeduper();
+    // Collapse the dual-emit duplicates the server stream carries (live echo +
+    // JSONL twin per user message). The deduper keeps `user` keys in a
+    // never-trimmed set so a follow-up folded into a long in-flight turn —
+    // whose live echo and JSONL twin are separated by thousands of intervening
+    // events — still collapses to a single bubble. See `event-dedup.ts`.
+    // Reassignable: a snapshot reset (below) replaces the whole window, so the
+    // old keys must not suppress the fresh rows.
+    let dedupe = createEventDeduper();
+    // Highest server row id accepted on this subscription. A reconnect resumes
+    // after the transport's last SSE id, but a row can still arrive twice (the
+    // replay racing a live send), so the consumer keeps its own mark and drops
+    // anything at or below it before dedupe. Id-less frames always pass.
+    const highWater = createIdHighWater();
+    // `replay_meta` frames seen on this subscription. The first is covered by
+    // the `[task.id]` bootstrap fetch; every later one is a reconnect, which
+    // refetches what the stream does not persist (see the handler below).
+    let metaCount = 0;
+    // Bookkeeping for that reconnect refetch: cards that land or resolve over
+    // SSE while the request is in flight are merged into its response.
+    const interactionRefetch = createInteractionRefetchTracker<PendingInteraction>();
     // Coalesce the open-time replay burst into one state update per batch. On
     // connect the server streams the whole history as one SSE frame per event;
     // each `onmessage` is its own event-loop task, so React can't auto-batch
@@ -1096,7 +1128,8 @@ function RunPanelBody({
       (batch) => {
         // Trim from the front once the live window exceeds EVENTS_WINDOW_MAX
         // (see StreamEvent's `dbId` doc comment for how the new earliestId is
-        // derived — or why it sometimes can't be). `eventsRef` mirrors
+        // derived — saved rows always carry one, so it only fails to be when
+        // the new front event was never saved). `eventsRef` mirrors
         // `events` synchronously so this math doesn't need React's
         // functional-setState form (which would run twice under StrictMode's
         // dev double-invoke and could double-decrement counters/side effects
@@ -1171,10 +1204,12 @@ function RunPanelBody({
     const unsub = api.subscribeTask(
       task.id,
       (e) => {
+        if (!highWater.accept(e.id)) return;
         if (!dedupe.accept(e)) return;
         if (e.stream === "interaction") {
           try {
             const req = JSON.parse(e.data) as PendingInteraction;
+            interactionRefetch.noteArrived(req);
             setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
           } catch { /* ignore malformed */ }
           return;
@@ -1204,6 +1239,7 @@ function RunPanelBody({
           // idempotent under `id`-based filtering.
           try {
             const { id } = JSON.parse(e.data) as { id: string };
+            interactionRefetch.noteResolved(id);
             setInteractions((cur) => cur.filter((x) => x.id !== id));
           } catch { /* ignore malformed */ }
           return;
@@ -1233,13 +1269,12 @@ function RunPanelBody({
         }
         // Tag with the next client-assigned id (see `StreamEvent`) — this
         // client id space is distinct from the server's own `RunEvent.id`
-        // (only present on replayed/paged frames, see its doc comment), and
-        // the invalidation check above needs a monotonic ordering to
-        // distinguish a genuinely new event from one the replay burst
-        // re-delivers on reconnect. Capture the server id as `dbId` when
-        // present so the window-cap trim above can derive an exact
-        // `earliestId` cursor from replay alone, without waiting on a
-        // "Load earlier" page fetch.
+        // (present on every saved row, see its doc comment), and the
+        // invalidation check above needs a monotonic ordering to tell a
+        // genuinely new event from the ones already observed. Capture the
+        // server id as `dbId` when present so the window-cap trim above can
+        // derive an exact `earliestId` cursor without waiting on a "Load
+        // earlier" page fetch.
         const dbId = e.id;
         if (typeof dbId === "number") loadedDbIdsRef.current.add(dbId);
         buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
@@ -1258,24 +1293,74 @@ function RunPanelBody({
         // setup) is what makes the kick-storm suppression above cover BOTH the
         // initial open and every later reconnect's replay burst.
         connectedAtRef.current = Date.now();
-        // Never move the cursor FORWARD on a reconnect: a fresh `replay_meta`
-        // reflects only the just-replayed window, which is capped at
-        // EVENTS_REPLAY_LIMIT and so always starts later than whatever
-        // earlier history "Load earlier" may have already paged in before
-        // the reconnect. Losing that progress would silently re-show a
-        // narrower "Load earlier" cursor (or hide it) after every SSE drop —
-        // taking the min (treating null as "no bound yet") keeps whichever
-        // cursor reaches furthest back. `hasMore` only ever grows for the
-        // same reason: once we know older history exists, a later replay
-        // that (re)confirms a narrower window can't un-know that.
-        setEarliestId((prev) =>
-          prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
-        );
-        setHasMoreEarlier((prev) => prev || meta.hasMore);
+        const kind = classifyReplayMeta(meta);
+        if (kind === "snapshot") {
+          // The server could not resume from our cursor (gap too large or the
+          // cursor is ahead of it) and is sending today's fresh window. Throw
+          // away everything built from the old window BEFORE those rows are
+          // pushed — they follow this frame immediately. `nextEventIdRef` is
+          // deliberately NOT reset: client ids stay monotonic for the life of
+          // the subscription so `rebuilt-mask.ts` stays sound.
+          buffer.discard();
+          highWater.reset();
+          dedupe = createEventDeduper();
+          eventsRef.current = [];
+          setEvents([]);
+          loadedDbIdsRef.current = new Set();
+          prevEventIdRef.current = -1;
+          // Replace, don't merge: the fresh window is the only history we hold.
+          setEarliestId(meta.earliestId);
+          setHasMoreEarlier(meta.hasMore);
+          // The JSONL splice masked the old window; drop it and let the
+          // auto-rebuild effect recompute it for the current latest run.
+          setRebuilt(null);
+          setRebuildNote(null);
+          setRebuildEpoch((n) => n + 1);
+          setActiveMatchId(null);
+          nearBottomRef.current = true;
+          setStreamGapNotice(true);
+        } else if (kind === "fresh") {
+          // Never move the cursor FORWARD on a reconnect: a fresh
+          // `replay_meta` reflects only the just-replayed window, which is
+          // capped at EVENTS_REPLAY_LIMIT and so always starts later than
+          // whatever earlier history "Load earlier" may have already paged in
+          // before the reconnect. Losing that progress would silently re-show
+          // a narrower "Load earlier" cursor (or hide it) after every SSE
+          // drop — taking the min (treating null as "no bound yet") keeps
+          // whichever cursor reaches furthest back. `hasMore` only ever grows
+          // for the same reason: once we know older history exists, a later
+          // replay that (re)confirms a narrower window can't un-know that.
+          // (A `resumed` meta carries neither field and changes nothing: the
+          // rows that follow are just the gap after our cursor.)
+          setEarliestId((prev) =>
+            prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
+          );
+          setHasMoreEarlier((prev) => prev || meta.hasMore);
+        }
+        // Every meta after the first is a reconnect. Pending interactions,
+        // subagent lifecycle deltas and run status are live-only or polled, so
+        // whatever the dropped connection missed is recovered here instead of
+        // waiting for the next poll tick.
+        if (metaCount++ > 0) {
+          const token = interactionRefetch.begin();
+          void api.listPendingInteractions(task.id).then((list) => {
+            // Null: superseded by a newer refetch, or the task switched /
+            // the effect cleaned up (cancel) — never apply a stale response.
+            const settled = interactionRefetch.finish(token);
+            if (!settled) return;
+            setInteractions(mergeRefetchedInteractions(list, settled.arrived, settled.resolvedIds));
+          }).catch(() => {
+            // Keep the cards we have; the next reconnect tries again.
+            interactionRefetch.finish(token);
+          });
+          runsPollKickRef.current();
+          subagentsPollKickRef.current();
+        }
       },
     );
     return () => {
       clearTimeout(readyTimer);
+      interactionRefetch.cancel();
       buffer.dispose();
       if (kickTimer) clearTimeout(kickTimer);
       document.removeEventListener("visibilitychange", onVisible);
@@ -1677,17 +1762,21 @@ function RunPanelBody({
   // a run is in flight (live tailing is still appending) and codex
   // (no JSONL transcript).
   //
-  // This effect's deps are ONLY `latestRun` id/status/claudeSessionId, which
-  // is deliberate and load-bearing: when the SSE batch-flush callback above
-  // detects a newer live event for a masked run and calls
-  // `setRebuilt(null)`/`setRebuildNote(null)`, none of those three fields
+  // This effect's deps are ONLY `latestRun` id/status/claudeSessionId plus
+  // `rebuildEpoch`, which is deliberate and load-bearing: when the SSE
+  // batch-flush callback above detects a newer live event for a masked run
+  // and calls `setRebuilt(null)`/`setRebuildNote(null)`, none of those three fields
   // change (the run itself hasn't — its status is still whatever it was),
   // so this effect does NOT re-run and immediately re-mask the stream it
   // was just un-frozen from. It only fires again — legitimately re-snapshot-
   // ting — when the newest run's own id/status/sessionId next changes, i.e.
   // when a later run resolves. This is what makes clearing the snapshot on a
   // background-agent continuation's post-`end_turn` activity actually stick
-  // instead of flapping.
+  // instead of flapping. `rebuildEpoch` is bumped ONLY by a snapshot reset
+  // (the reconnect fell back to a fresh window and dropped `rebuilt`), so it
+  // re-runs the JSONL splice for the current latest run against the new window
+  // exactly like first open — and, bumping on that one event only, it keeps
+  // the no-re-mask-after-invalidation property above.
   useEffect(() => {
     if (!latestRun) return;
     if (latestRun.status === "running") {
@@ -1738,7 +1827,7 @@ function RunPanelBody({
       }
     }).catch(() => { /* network blip — stay on streamed events silently */ });
     return () => { cancelled = true; };
-  }, [latestRun?.id, latestRun?.status, latestRun?.claudeSessionId]);
+  }, [latestRun?.id, latestRun?.status, latestRun?.claudeSessionId, rebuildEpoch]);
 
   /** All run ids that share `rebuilt.sessionId`. A single claude session
    *  spans every turn within one tmux session, and each turn is its own
@@ -4139,6 +4228,17 @@ function RunPanelBody({
               >
                 {loadingEarlier ? "Loading…" : "Load earlier messages"}
               </Button>
+            </div>
+          )}
+          {/* Set by a snapshot reset: the reconnect could not replay the gap
+              and swapped in the latest window. Persists until the next task
+              switch (reset effect above). */}
+          {streamGapNotice && (
+            <div
+              className="mb-2 text-center text-[11px] text-muted-foreground"
+              data-testid="transcript-gap-notice"
+            >
+              {TASK_STREAM_GAP_NOTICE}
             </div>
           )}
           {!runsLoaded && displayedEvents.length === 0 ? (

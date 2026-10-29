@@ -6,6 +6,12 @@ import { usageError } from "../usage.ts";
 import { notifyFor, osNotify } from "../notify.ts";
 import type { AgetorClient } from "../api-client.ts";
 import { escapeFreeText } from "../../shared/terminal-text.ts";
+import {
+  LOGS_STREAM_GAP_NOTICE,
+  classifyReplayMeta,
+  createIdHighWater,
+  parseReplayMeta,
+} from "../../shared/task-stream-resume.ts";
 import type { RunEvent, GlobalEvent, Task } from "../../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel, retentionTrimNote } from "../../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
@@ -101,7 +107,12 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
       if (quiet) clearTimeout(quiet);
       resolve();
     };
+    // Never reset: a reconnect re-delivers the tail of the window (or a whole
+    // fresh snapshot), and nothing older than a row already printed may print
+    // again — in human and `--json` output alike (P7).
+    const printed = createIdHighWater();
     const onEvent = (e: RunEvent) => {
+      if (!printed.accept(e.id)) return;
       const line = renderLine(e);
       if (line !== null) out(line);
       if (noFollow) {
@@ -114,6 +125,14 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
       dataDir: flags.dataDir,
       onReconnect: () => {
         if (!flags.json && !noFollow) errln(c.dim("…reconnecting"));
+      },
+      // A snapshot meta means the server couldn't replay the gap; the rows that
+      // follow are the latest window, of which the high-water mark drops what
+      // was already printed. Stderr, so `--json` stdout stays clean.
+      onNamedEvent: (event, data) => {
+        if (event !== "replay_meta") return;
+        const meta = parseReplayMeta(data);
+        if (meta && classifyReplayMeta(meta) === "snapshot") errln(c.dim(LOGS_STREAM_GAP_NOTICE));
       },
     });
     // --notify (only while following): a desktop notification + bell when this

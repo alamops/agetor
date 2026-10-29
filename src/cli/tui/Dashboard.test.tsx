@@ -3,6 +3,7 @@ import { render } from "ink-testing-library";
 import { Dashboard, buildSentFilesLines, buildFxRecoveryLines, dashboardRows } from "./Dashboard.tsx";
 import type { PipelineRunState } from "../../shared/types.ts";
 import { eventKey } from "./useCoalescedStream.ts";
+import { TASK_STREAM_GAP_NOTICE } from "../../shared/task-stream-resume.ts";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
 import {
@@ -25,12 +26,20 @@ const realSseSnapshot = { ...realSse };
 // a live daemon. The `/events` global-toast subscription (useGlobalEvents) is
 // acknowledged with a no-op handle and never driven — no test here needs it.
 let onTaskEvents: ((e: RunEvent) => void) | null = null;
+// The same subscription's named-frame hook (`replay_meta`), for the forward-
+// resume tests below.
+let onTaskNamed: ((event: string, data: string) => void) | undefined;
 
 mock.module("../sse.ts", () => ({
   ...realSseSnapshot,
-  streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
+  streamSse: (
+    pathname: string,
+    onEvent: (e: unknown) => void,
+    opts?: { onNamedEvent?: (event: string, data: string) => void },
+  ) => {
     if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {
       onTaskEvents = onEvent as (e: RunEvent) => void;
+      onTaskNamed = opts?.onNamedEvent;
     }
     return { close: () => {} };
   },
@@ -199,6 +208,84 @@ test("event stream: an fx_permission interaction renders generically, sentinel s
   expect(frame).not.toContain(PERMISSION_MODE_STATUS_PREFIX);
   // A plain status line still renders.
   expect(frame).toContain("plain status text");
+  unmount();
+});
+
+test("event stream: a snapshot replay_meta replaces the visible lines with the dim notice plus the fresh rows", async () => {
+  onTaskEvents = null;
+  onTaskNamed = undefined;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+  expect(onTaskNamed).toBeDefined();
+
+  const row = (id: number, data: string): RunEvent => ({
+    runId: "runA",
+    taskId: "taskA",
+    stream: "status",
+    data,
+    ts: id,
+    id,
+  });
+  onTaskEvents!(row(1, "old line one"));
+  onTaskEvents!(row(2, "old line two"));
+  await wait(80);
+  expect(lastFrame() ?? "").toContain("old line one");
+
+  onTaskNamed!("replay_meta", JSON.stringify({ earliestId: 5, hasMore: true, snapshotRequired: true }));
+  onTaskEvents!(row(5, "fresh row five"));
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain(TASK_STREAM_GAP_NOTICE);
+  expect(frame).toContain("fresh row five");
+  expect(frame).not.toContain("old line one");
+  expect(frame).not.toContain("old line two");
+  unmount();
+});
+
+test("event stream: a resumed replay_meta keeps the lines and adds only rows newer than the last accepted id", async () => {
+  onTaskEvents = null;
+  onTaskNamed = undefined;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const row = (id: number, data: string, ts = id): RunEvent => ({
+    runId: "runA",
+    taskId: "taskA",
+    stream: "status",
+    data,
+    ts,
+    id,
+  });
+  onTaskEvents!(row(1, "kept line one"));
+  onTaskEvents!(row(2, "kept line two"));
+  await wait(80);
+
+  onTaskNamed!("replay_meta", JSON.stringify({ earliestId: 1, hasMore: false, resumedAfter: 2 }));
+  // A stale re-delivery (id 2 again, with a different key so only the id mark
+  // can reject it) and one genuinely new row.
+  onTaskEvents!(row(2, "stale redelivery", 99));
+  onTaskEvents!(row(3, "new line three"));
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).toContain("kept line one");
+  expect(frame).toContain("kept line two");
+  expect(frame).toContain("new line three");
+  expect(frame).not.toContain("stale redelivery");
+  expect(frame).not.toContain(TASK_STREAM_GAP_NOTICE);
   unmount();
 });
 

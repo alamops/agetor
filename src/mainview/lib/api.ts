@@ -97,6 +97,7 @@ import type {
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
+import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
 import type { NotificationKind } from "../../shared/os-notification.ts";
 import type {
   BundleExportResponse,
@@ -2202,7 +2203,14 @@ export const api = {
    *  (drives the run panel's "Load earlier" button). It's a *named* SSE
    *  event (`event: replay_meta`), invisible to `onmessage`, so registering
    *  the listener only when a caller asks for it costs nothing for callers
-   *  that don't care. */
+   *  that don't care.
+   *
+   *  The meta also tells how the server answered a reconnect: `resumedAfter`
+   *  is the event id the replay continued after (only newer rows follow), and
+   *  `snapshotRequired` means the server could not resume (a gap, or too much
+   *  to send) and sent a fresh bounded window the caller must reset to.
+   *  `openEventStream` remembers the last SSE id and sends it as
+   *  `Last-Event-ID` on every reconnect, so resumption needs no caller code. */
   subscribeTask(
     taskId: string,
     onEvent: (e: RunEvent) => void,
@@ -2223,9 +2231,9 @@ export const api = {
         events: onReplayMeta
           ? {
               [TASK_EVENTS_REPLAY_META_EVENT]: (data) => {
-                try {
-                  onReplayMeta(JSON.parse(data) as TaskEventsReplayMeta);
-                } catch { /* ignore malformed */ }
+                // Tolerant shape check: a malformed meta is dropped, never cast.
+                const meta = parseReplayMeta(data);
+                if (meta) onReplayMeta(meta);
               },
             }
           : undefined,
