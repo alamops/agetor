@@ -235,7 +235,7 @@ On your own machine, a step points at the Agent itself, not at its name, so rena
 
 ## Command-line interface
 
-The `agetor` CLI drives the same board from your shell. If the desktop app is running, the CLI talks to it. If it isn't, the CLI starts a **headless background daemon** that shares the same `~/.agetor` state. A task you add in the terminal shows up in the app, and the reverse is also true. When you open the app later, the daemon hands over to it.
+The `agetor` CLI drives the same board from your shell. If the desktop app is running, the CLI talks to it. If it isn't, the CLI starts a **headless daemon** that shares the same `~/.agetor` state. A task you add in the terminal shows up in the app, and the reverse is also true. When you open the app later, the daemon hands over to it. A CLI-started daemon shuts itself down after 5 idle minutes. To keep a core running all the time, even with the app closed, see [Keep Agetor running in the background](#keep-agetor-running-in-the-background).
 
 ```bash
 agetor                       # full-screen live dashboard: board, streaming detail, inline compose/answer
@@ -276,13 +276,33 @@ agetor profile <sub>         # ls | show | add | edit | rm | export | import (sa
 agetor pipeline <sub>        # ls | show | rm | export | import | status | retry | advance | restart
 agetor export --all --out f  # Agents and/or Pipelines to a JSON file (--profile/--pipeline <ref> to pick)
 agetor import <file>         # preview + confirm, then import (--dry-run, --yes, --harness-map <from>=<to>, --enable-harnesses)
-agetor daemon status|start|stop
+agetor daemon status|start|stop            # the headless core (status also shows the background state)
+agetor daemon background [status|off]     # "Keep Agetor running in the background" (on is app-only)
+agetor remote [status|off]   # remote access (preview): read it or turn it off (on is app-only)
 agetor config [key] [value]  # view or set preferences
 ```
 
 Every command accepts `--json` for scripting. Short id prefixes (the 8 characters `agetor ls` shows) work anywhere an `<id>` is expected. In the CLI, `--agent` always means the **harness**, and a saved Agent is called a **profile**.
 
 **Dashboard keys:** `↑/↓` or `j/k` select · `s` run · `x` stop · `m` message · `c` commit and push · `g` answer · `r` resume · `p` show a pipeline's steps · `q` quit.
+
+---
+
+## Keep Agetor running in the background
+
+By default a core only runs while the app is open (or a CLI daemon is up for five idle minutes). Turn on **Settings → General → Keep Agetor running in the background** and Agetor registers a macOS login item. From then on a background core starts at every login and keeps running with the app closed, so tasks and pipelines carry on, and the [Companion app](docs/plans/companion-pairing-requirements.md) can reach this Mac once it ships.
+
+- **It's a switch, off by default.** Only the desktop app can turn it on. You can turn it off from Settings or with `agetor daemon background off`. The first time, macOS shows a "Background Items Added" notice. If you later switch Agetor off in **System Settings › Login Items**, Settings says "Needs approval" and offers **Open Login Items**.
+- **The background core never idle-exits.** It's the same headless core the CLI starts, but without the 5-minute idle shutdown. Set `AGETOR_DAEMON_IDLE_MS` to override that.
+- **The app and the background core take turns.** While the app is open, the login item stays alive but *parked*: it holds no port, no database and no `tmux`. When you quit the app (⌘Q), the background core takes over within a second or two and your running tasks keep going. Opening the app again hands the core back. The quit dialog says so when tasks are running: "They'll keep running in the background".
+- **Stopping it.** **Agetor › Quit Agetor Completely** (⌥⌘Q), `agetor daemon stop` and the "Quit completely" button in the quit dialog stop the background core until your next login. Settings then shows "stopped, starts again at next login" with a **Start now** button (`agetor daemon start` does the same). Agents running in `tmux` survive every one of these, including turning the switch off, and the next core reattaches them.
+- **Updates.** After an in-app update the parked login item restarts from the new bundle and waits up to 30 seconds for the new app before it boots a core.
+- **Notifications with the app closed.** A background core (and a CLI-started daemon) posts the same one-per-task notifications as the app. Clicking one opens the app on that task. This needs the app installed in `/Applications` or `~/Applications`, because the notifications are posted by its bundled notification helper.
+- **When the switch is unavailable.** It's disabled, with the reason beside it, on non-macOS systems, development builds, unsigned builds, and when Agetor isn't installed in `/Applications` or `~/Applications` (a copy run from a DMG or a download folder counts: move it first). If you move Agetor after turning the switch on, turn it off and on again so the login item points at the new location.
+- **Canary and dev builds** run against `~/.agetor-dev` and port `4318` (not `~/.agetor` and `4317`) and register their own login item, `sh.alamops.agetor.canary.daemon`, so trying one never touches your real data. A canary and the release share one row in Login Items.
+- **Logs.** The background core writes to `daemon.log` in the data directory, and the login item's own state to `login-daemon.json` (informational only). `agetor daemon status` prints the core, the background state and the last log lines.
+
+**Remote access (preview).** **Agetor › Remote Access…** opens a native confirmation box, the only way to turn remote access on, and turning it on also turns on the background switch. Nothing can pair yet, so for now it only records the intent. You can read or turn it off from Settings, `agetor remote status|off` and `GET`/`DELETE /remote-access`. No HTTP route, `agetor` command or preference write can turn it on, so an agent can't open your Mac to a remote client.
 
 ---
 
@@ -327,7 +347,8 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 ├── issue-threads/           # issue snapshots for tasks started from an issue
 ├── pipeline-runs/           # handoffs recorded by each pipeline run
 ├── {codex,cursor,gemini,fx,antigravity,copilot,opencode}-logs/   # per-run structured agent output
-└── daemon.log               # headless CLI daemon log
+├── daemon.log               # headless core log (CLI daemon and background core)
+└── login-daemon.json        # the background login item's state (when it is turned on)
 ```
 
 <details>
@@ -351,7 +372,14 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_HARNESS_AUTO_ENABLE` | Set to `0` to stop Agetor turning installed built-in harnesses on by itself (see [Supported harnesses](#supported-harnesses)). | on |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary. | `tmux` on `PATH` |
 | `AGETOR_SKIP_CLI_VERSION_FLOOR` | Set to `1` to skip the per-model minimum CLI version check. | unset |
-| `AGETOR_DAEMON_IDLE_MS` | Shut the CLI daemon down after this long with no run and no client (`0` disables). | `300000` |
+| `AGETOR_DAEMON_IDLE_MS` | Shut a headless core down after this long with no run and no client (`0` disables). Applies to the CLI-spawned daemon; the background core never idle-exits unless you set this. | `300000` (CLI daemon) |
+| `AGETOR_HEADLESS_NOTIFICATIONS` | Set to `0` to stop a headless core posting OS notifications; `1` forces them on. | on (macOS) |
+| `AGETOR_LOGIN_ITEM_HELPER` | Path to the `agetor-login-item` helper the CLI and the core use to read or change the login item. | the installed app's helper |
+| `AGETOR_LAUNCHED_BY` | Set to `login-item` by the login item for the core it starts (no idle exit, parks on handoff). Don't set it yourself. | unset |
+| `AGETOR_LOGIN_ITEM_BUNDLE` / `AGETOR_LOGIN_ITEM_LABEL` | The app bundle and launchd label the login item runs under. Set by its helper; test seams for the supervisor. | set by the helper |
+| `AGETOR_LOGIN_DAEMON_CORE` | Test seam: the core entry the login item's supervisor runs instead of the bundled one. | unset |
+| `AGETOR_LOGIN_DAEMON_TICK_MS` / `AGETOR_LOGIN_DAEMON_HANDOFF_GRACE_MS` / `AGETOR_LOGIN_DAEMON_UPDATE_GRACE_MS` | Test seams: the supervisor's tick (default 1 s), its wait after the app hands the core back (15 s) and after an update (30 s). | `1000` / `15000` / `30000` |
+| `AGETOR_FAKE_LOGIN_ITEM` / `AGETOR_FAKE_REMOTE_ACCESS` | Test seams (set `AGETOR_FAKE_LOGIN_ITEM=1`): replace the macOS login item with a file-backed fake, and start with remote access `on`. | unset |
 
 The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md).
 

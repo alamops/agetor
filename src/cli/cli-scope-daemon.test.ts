@@ -255,6 +255,8 @@ const ROWS: Record<ClientMethod, Row> = {
     why: "the handoff request reaches the injected shutdown handler, which records it",
     call: async () => {
       const res = await client.shutdownCore("handoff");
+      // The route answers first and runs the handler on the next tick.
+      for (let i = 0; i < 50 && shutdownRequests.length === 0; i++) await Bun.sleep(10);
       expect(shutdownRequests).toEqual(["handoff"]);
       return res;
     },

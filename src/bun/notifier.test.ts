@@ -192,13 +192,31 @@ describe("resolveInstalledAppNotifier", () => {
     expect(resolveInstalledAppNotifier()).toBe("/custom/notifier");
   });
 
-  test("without an override, resolves to the installed app's helper or null", () => {
+  const SUFFIX = "Contents/Resources/app/bin/AgetorNotifier.app/Contents/MacOS/notifier";
+
+  test("prefers /Applications over ~/Applications", () => {
     delete process.env[ENV_VAR];
-    const r = resolveInstalledAppNotifier();
-    expect(
-      r === null ||
-        r === "/Applications/Agetor.app/Contents/Resources/app/bin/AgetorNotifier.app/Contents/MacOS/notifier",
-    ).toBe(true);
+    const seen: string[] = [];
+    const r = resolveInstalledAppNotifier({ home: "/Users/someone", exists: (p) => { seen.push(p); return true; } });
+    expect(r).toBe(`/Applications/Agetor.app/${SUFFIX}`);
+    expect(seen).toEqual([`/Applications/Agetor.app/${SUFFIX}`]);
+  });
+
+  test("falls back to ~/Applications/Agetor.app", () => {
+    delete process.env[ENV_VAR];
+    const home = "/Users/someone";
+    const r = resolveInstalledAppNotifier({ home, exists: (p) => p.startsWith(`${home}/Applications/`) });
+    expect(r).toBe(`${home}/Applications/Agetor.app/${SUFFIX}`);
+  });
+
+  test("null when neither location holds the helper", () => {
+    delete process.env[ENV_VAR];
+    expect(resolveInstalledAppNotifier({ home: "/Users/someone", exists: () => false })).toBeNull();
+  });
+
+  test("the override wins over the seams too", () => {
+    process.env[ENV_VAR] = "/custom/notifier";
+    expect(resolveInstalledAppNotifier({ home: "/h", exists: () => true })).toBe("/custom/notifier");
   });
 });
 

@@ -373,7 +373,8 @@ export class AgetorClient {
    *  state. `fresh` bypasses the core's 2 s status cache. A 404 `ApiError`
    *  means the running core predates the route. */
   getBackground(opts: { fresh?: boolean } = {}): Promise<BackgroundStatus> {
-    return this.req("GET", opts.fresh ? "/background?fresh=1" : "/background");
+    const qs = opts.fresh ? "?fresh=1" : "";
+    return this.req("GET", `/background${qs}`);
   }
   /** `DELETE /background` — unregister the login item (also turns remote
    *  access off). Allowed for the CLI token; turning it ON is desktop-only. */
