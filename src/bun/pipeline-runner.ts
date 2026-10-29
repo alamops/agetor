@@ -3361,8 +3361,12 @@ async function handleColumnChange(
           // (`consumePendingCancel` killed it before it registered), or the
           // user stopping the turn they had just sent. Nothing ran on the
           // step's behalf: the stop stands, and that run's own `cancelled`
-          // settle follows this event.
+          // settle follows this event. A failed run counts only while it is
+          // still the task's current run: `currentRunRow` falls back to the
+          // newest listed run when the task points at none, and a failed run
+          // the task has moved off is not a turn the user is running.
           if (latest.status === "cancelled") return;
+          if (latest.status === "failed" && tasks.get(taskId)?.runId !== latest.id) return;
           if (!turnStartedByUser(taskId, latest, historyEntry)) {
             // Decided by run identity, so the turn may already have ended
             // while this event waited for the lock: only a live one has

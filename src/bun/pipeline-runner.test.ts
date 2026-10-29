@@ -5663,6 +5663,67 @@ test("R4-2: an fx auto-resume run starting on a stopped run is not a user turn â
   if (s) await waitUntilIdle(s.parentId);
 });
 
+/** Inserts a `failed` user-style run on the stopped step and delivers the
+ *  `running` column event for it, `current` deciding whether the task still
+ *  points at that run. */
+async function runningEventForFailedRun(s: OverlapStep, current: boolean): Promise<string> {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const failedRunId = randomUUID();
+  runs.insert({
+    id: failedRunId, taskId: s.stepTaskId, agent: tasks.get(s.stepTaskId)!.agent, status: "failed",
+    startedAt: Date.now() + 1, endedAt: Date.now() + 2, exitCode: 1, tmuxSession: null, claudeSessionId: null,
+    codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    antigravitySessionId: null,
+  });
+  tasks.update(s.stepTaskId, { column: "running", runId: current ? failedRunId : null });
+  await __forTest.handleColumnChange(s.stepTaskId, "running", undefined);
+  return failedRunId;
+}
+
+test("R4-2c: a failed run the stopped step's task no longer points at does not resume the stop", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const previous = __forTest.setReleaseGraceMs(5_000);
+  let s: OverlapStep | null = null;
+  try {
+    s = await stopDuringReleaseGrace("r4-failed-stale");
+    await runningEventForFailedRun(s, false);
+
+    const run = tasks.get(s.parentId)!.pipelineRun!;
+    expect(run.stopRequestedAt).toBeNumber();
+    expect(run.status).toBe("cancelled");
+    expect(run.history[0]!.outcome).toBe("cancelled");
+    tasks.update(s.stepTaskId, { column: "ready" });
+  } finally {
+    __forTest.setReleaseGraceMs(previous);
+    __forTest.setListenerEnabled(true);
+  }
+  if (s) await waitUntilIdle(s.parentId);
+});
+
+test("R4-2d: a failed run that is still the stopped step's current run resumes the stop", async () => {
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+
+  const previous = __forTest.setReleaseGraceMs(5_000);
+  let s: OverlapStep | null = null;
+  try {
+    s = await stopDuringReleaseGrace("r4-failed-live");
+    await runningEventForFailedRun(s, true);
+
+    const run = tasks.get(s.parentId)!.pipelineRun!;
+    expect(run.stopRequestedAt).toBeNull();
+    expect(run.status).toBe("running");
+  } finally {
+    __forTest.setReleaseGraceMs(previous);
+    __forTest.setListenerEnabled(true);
+  }
+  // The resumed step stays `running` on purpose, so there is no idle state to
+  // wait for; the afterEach sweep deletes the pipeline.
+});
+
 test("R4-2b: the pipeline's Stop cancels a pending fx auto-resume on any of its steps", async () => {
   const { __forTest, cancelPipelineRun } = await import("./pipeline-runner.ts");
   const { tasks } = await import("./db.ts");
