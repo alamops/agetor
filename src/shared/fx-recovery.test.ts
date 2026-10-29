@@ -6,6 +6,7 @@ import {
   fxAutoResumeCountdownText,
   fxRecoveryNoticeText,
   fxRecoverySummaryLine,
+  fxSupportsContinueRecovery,
   isFxRecoveryResumable,
   isTaskFxPaused,
   latestFxRecoveryByRun,
@@ -833,5 +834,22 @@ describe("isTaskFxPaused", () => {
     for (const column of ["backlog", "ready", "review", "blocked", "done"]) {
       expect(isTaskFxPaused({ fxRecovery: pausedRecovery, column })).toBe(true);
     }
+  });
+});
+
+describe("fxSupportsContinueRecovery", () => {
+  test.each([
+    ["0.0.14", true],
+    ["0.0.4-fake", true],
+    ["0.0.15", false],
+    ["0.1.0", false],
+    // Fail-open: unknown, unparseable, or a pre-release at the floor.
+    [null, true],
+    [undefined, true],
+    ["", true],
+    ["fx", true],
+    ["0.0.15-rc1", true],
+  ])("%p -> %p", (version, expected) => {
+    expect(fxSupportsContinueRecovery(version)).toBe(expected);
   });
 });

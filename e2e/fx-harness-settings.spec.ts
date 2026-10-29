@@ -124,7 +124,8 @@ test.describe("fx harness settings (fx 0.0.14)", () => {
     const askFile = writeStatusFile(backend, "ask", { auth: "AI_GATEWAY_API_KEY", permission_mode: "ask" });
     const autoFile = writeStatusFile(backend, "auto", { auth: "AI_GATEWAY_API_KEY", permission_mode: "auto" });
     await createFxHarness(backend, ASK_HARNESS, { AGETOR_E2E_FX_STATUS_JSON: askFile });
-    await createFxHarness(backend, AUTO_HARNESS, { AGETOR_E2E_FX_STATUS_JSON: autoFile });
+    // The auto harness also stands in for an upgraded fx (the upgrade-notice test).
+    await createFxHarness(backend, AUTO_HARNESS, { AGETOR_E2E_FX_STATUS_JSON: autoFile, AGETOR_E2E_FX_VERSION: "0.0.15" });
   });
 
   test.afterAll(async ({ backend }) => {
@@ -169,6 +170,18 @@ test.describe("fx harness settings (fx 0.0.14)", () => {
     // Exactly one hint in the whole list: the built-in fx row (no status
     // answer) shows none either.
     await expect(dialog.getByTestId("harness-fx-ask-hint")).toHaveCount(1);
+  });
+
+  test("upgrade notice: shown for fx 0.0.14 and older, absent on 0.0.15", async ({ page, backend }) => {
+    await gotoApp(page, backend.bootBase);
+    const dialog = await openSettingsHarnesses(page);
+
+    const oldRow = harnessRow(profileMcpSwitch(dialog, ASK_HARNESS.label));
+    const newRow = harnessRow(profileMcpSwitch(dialog, AUTO_HARNESS.label));
+    const notice = oldRow.getByTestId("harness-status-notice").filter({ hasText: "fx upgrade" });
+    await expect(notice).toBeVisible({ timeout: 15_000 });
+    await expect(notice).toContainText("fx 0.0.14 and older can fail shell commands");
+    await expect(newRow.getByTestId("harness-status-notice")).toHaveCount(0);
   });
 
   test("profile-MCP toggle: defaults on, persists off across a reload, and back on", async ({

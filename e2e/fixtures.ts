@@ -145,7 +145,8 @@ function writeFxStubBin(dataDir: string): string {
       "  exit 0",
       "fi",
       'if [ "$1" = "--version" ]; then',
-      '  echo "0.0.4-fake"',
+      // A harness env map can set AGETOR_E2E_FX_VERSION to look like a newer fx.
+      '  echo "${AGETOR_E2E_FX_VERSION:-0.0.4-fake}"',
       "  exit 0",
       "fi",
       'if [ "$1" = "status" ] && [ "$2" = "--json" ] && [ -n "$AGETOR_E2E_FX_STATUS_JSON" ]; then',

@@ -15,6 +15,7 @@ import {
   dropFxSession,
   FX_STEER_DROPPED_STATUS,
   fxSessionActive,
+  fxSessionNotFoundStatus,
   fxSpeedNotOfferedLine,
   parseFxEffortOption,
   reapLiveFxProcs,
@@ -288,6 +289,11 @@ const FAKE_ACP_SERVER_SRC = [
   '    fail(id, -32602, "Invalid params (fake, forcing fallback)");',
   "    return;",
   "  }",
+  "  // fx 0.0.15: a session whose first turn never began was never saved.",
+  '  if (scenario === "session-not-found") {',
+  '    fail(id, -32602, "Session not found");',
+  "    return;",
+  "  }",
   '  if (scenario === "resume-auth-error" || scenario === "resume-auth-error-load-ok") {',
   '    fail(id, -32600, "Fx needs a Codex subscription login to continue. Run fx login codex.");',
   "    return;",
@@ -354,6 +360,10 @@ const FAKE_ACP_SERVER_SRC = [
   "",
   "function handleSessionLoad(id, params) {",
   '  capture("session/load", params);',
+  '  if (scenario === "session-not-found") {',
+  '    fail(id, -32602, "Session not found");',
+  "    return;",
+  "  }",
   '  if (scenario === "resume-fallback") {',
   '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "REPLAYED must be discarded" } } });',
   "    setTimeout(function () { ok(id, withSpeed({})); }, 15);",
@@ -1054,6 +1064,46 @@ describe("resume fallback (session/load)", () => {
       expect((loadReq!.msg as { sessionId?: string }).sessionId).toBe(resumeId);
 
       expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("resume of a session fx never saved (fx 0.0.15)", () => {
+  test(
+    "resume and load both answer Session not found → a fresh session/new, a status line, the new id recorded, and the prompt runs there",
+    async () => {
+      const resumeId = "never-saved-id";
+      const { agent, chunks, captureFile, sessionIds } = spawnFake("session-not-found", { resumeSessionId: resumeId });
+
+      expect(await agent.done).toBe(0);
+
+      const labels = readCaptured(captureFile).map((e) => e.label);
+      expect(labels.indexOf("session/resume")).toBeLessThan(labels.indexOf("session/load"));
+      expect(labels.indexOf("session/load")).toBeLessThan(labels.indexOf("session/new"));
+      const prompt = readCaptured(captureFile).find((e) => e.label === "session/prompt");
+      expect((prompt!.msg as { sessionId?: string }).sessionId).toBe("sess-session-not-found-1");
+      expect(sessionIds).toEqual(["sess-session-not-found-1"]);
+
+      expect(chunks).toContainEqual(expect.objectContaining({ stream: "status", data: fxSessionNotFoundStatus(resumeId) }));
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello world")).toBe(true);
+    },
+    10_000,
+  );
+
+  test(
+    "a continue-recovery turn does not start over — it fails with the resume error",
+    async () => {
+      const { agent, chunks, captureFile } = spawnFake("session-not-found", {
+        resumeSessionId: "never-saved-id",
+        continueRecovery: true,
+      });
+
+      expect(await agent.done).not.toBe(0);
+      const labels = readCaptured(captureFile).map((e) => e.label);
+      expect(labels).not.toContain("session/new");
+      expect(labels).not.toContain("session/prompt");
+      expect(chunks.some((c) => c.data.includes("failed to resume session never-saved-id") && c.data.includes("Session not found"))).toBe(true);
     },
     10_000,
   );

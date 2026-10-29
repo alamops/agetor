@@ -83,7 +83,8 @@ import {
  * writes the sole reply instead.
  *
  * ── Protocol index (verified against fx v0.0.4, v0.0.6, v0.0.7, v0.0.8,
- *    v0.0.9, v0.0.10 and v0.0.14 — 0.0.14 facts dated 2026-10-22: release
+ *    v0.0.9, v0.0.10, v0.0.14 and v0.0.15 — 0.0.15 facts dated 2026-10-28,
+ *    see the 0.0.15 facts block at the end of this header; 0.0.14 facts dated 2026-10-22: release
  *    notes, a source diff v0.0.10…v0.0.14 of `src/acp/*`, and ACP probes of
  *    the 0.0.14 release binary in an isolated HOME (see the 0.0.11–0.0.14
  *    facts block at the end of this header); 0.0.9/0.0.10 facts dated
@@ -694,6 +695,39 @@ import {
  *     in one turn dies when that turn ends. 0.0.14 release binaries need
  *     macOS 15 or later. `fx --help` still contains "coding agent", so the
  *     `FX_HELP_MARKER` probe is unchanged.
+ *
+ * ── Facts new in fx 0.0.15 (release notes + a source diff v0.0.14…v0.0.15
+ *    + isolated-HOME ACP probes of the 0.0.15 release binary + an offline
+ *    replay through a fake `openai-chat-completions` provider, dated
+ *    2026-10-28; docs/plans/fx-0.0.15-upgrade-investigation.md) ──
+ *
+ *   - **Shell takes top-level arguments.** 0.0.14 advertised `shell`,
+ *     `subagent` and `read_tool_result` as one required `request` object,
+ *     and a model that sent it as a JSON string got `invalid_shell_request`
+ *     on every call, before any permission check. Nothing here changes for
+ *     it; `checkHarness` nudges older installs to `fx upgrade`.
+ *   - **A session is saved once its first turn starts.** Resume and load of
+ *     an id whose first prompt never began answer `-32602 "Session not
+ *     found"`; `runFxTurn` then starts a fresh session (`isFxSessionNotFound`,
+ *     `fxSessionNotFoundStatus`), except on a `continueRecovery` turn.
+ *   - **`continueRecovery` needs a libfx journal**, which agetor never
+ *     opens: `-32602 "This session does not support durable recovery"`. The
+ *     orchestrator gates Resume on the installed version
+ *     (`fxSupportsContinueRecovery`), so this driver never sends it to 0.0.15
+ *     in practice; the -32602 branch in `runFxTurn` still surfaces the text.
+ *   - **Resume replays nothing before its response** except, while
+ *     converting a 0.0.14 (v1) session, `agent_message_chunk` notices that
+ *     the `replaying` window already drops. `session/load` still replays.
+ *   - **Tool results:** a shell `tool_call_update` carries the plain output
+ *     (200 bytes + `... output truncated ...`), the exit code moved to
+ *     `command_result.exit_code`, and a non-zero exit is `failed`; held and
+ *     denied calls still carry the JSON error `fxToolReviewError` reads; a
+ *     call left pending is closed `failed` when its turn ends.
+ *   - **Smaller deltas:** recovery meta lost `durable` and gained the
+ *     `delivering_response` action (libfx replay); `session.notices` must be
+ *     an object (agetor sends `{}`); `mcpCapabilities.sse`/`acp` are false;
+ *     every JSON-RPC frame is one line; profile MCP servers run on a new
+ *     engine (no SSE, a local server gets only basic shell variables).
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -1115,6 +1149,17 @@ class RpcError extends Error {
     this.code = code;
     this.rawMessage = rawMessage ?? message;
   }
+}
+
+/** fx's answer to `session/resume`/`session/load` for an id it doesn't have:
+ *  `-32602 "Session not found"` (`src/acp/sessions.zig:635, 1384`). */
+function isFxSessionNotFound(err: unknown): boolean {
+  return err instanceof RpcError && err.code === -32602 && /session not found/i.test(err.rawMessage);
+}
+
+/** The status line a follow-up posts when it starts over in a new session. */
+export function fxSessionNotFoundStatus(sessionId: string): string {
+  return `previous fx session ${sessionId} not found — starting a fresh session (earlier context didn't carry over)`;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -2932,6 +2977,42 @@ async function runFxTurn(
   state.steeringSupported = fxSteeringCapable(initResult);
 
   // 2. session/new | session/resume (+ session/load fallback)
+  // `session/new`, used for a fresh turn and as the fallback when fx no
+  // longer has the session a follow-up names. `false` once the turn settled.
+  const startNewSession = async (): Promise<boolean> => {
+    let sessionResult: { sessionId?: string; configOptions?: unknown } | undefined;
+    try {
+      sessionResult = (await withTimeout(
+        sendRpc(state, "session/new", { cwd: opts.cwd, mcpServers: [], ...profileMcpMeta }),
+        RPC_HANDSHAKE_TIMEOUT_MS,
+        "session/new",
+      )) as typeof sessionResult;
+    } catch (err) {
+      failTurn(state, describeHandshakeFailure(err, "session/new", RPC_HANDSHAKE_TIMEOUT_MS));
+      return false;
+    }
+    if (state.resolved) return false;
+
+    const sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
+    if (!sessionId) {
+      failTurn(state, "fx acp: session/new response had no sessionId");
+      return false;
+    }
+    state.sessionId = sessionId;
+    state.onSessionId?.(sessionId);
+    maybeEmitProvider(sessionResult);
+
+    // Apply the task's stored effort, then its speed lane — best-effort,
+    // never throw, never fail the turn (see applyFxEffort/applyFxSpeed).
+    // No `session/set_mode` follows: on fx 0.0.14 it would write the user's
+    // own `~/.fx/settings.json` profile, so `FX_PERMISSION_MODE` is the only
+    // mode channel (see the file header's 0.0.11–0.0.14 facts).
+    await applyFxEffort(state, sessionResult, opts);
+    if (state.resolved) return false;
+    await applyFxSpeed(state, sessionResult, opts);
+    return !state.resolved;
+  };
+
   if (opts.resumeSessionId) {
     state.sessionId = opts.resumeSessionId;
     let resumed = false;
@@ -3018,6 +3099,7 @@ async function runFxTurn(
       // run's own persisted events already cover that history, so it's
       // still discarded wholesale here rather than double-emitted.
       state.suppressUpdates = true;
+      let startedFresh = false;
       try {
         const loadResult = await withTimeout(
           sendRpc(state, "session/load", {
@@ -3049,45 +3131,25 @@ async function runFxTurn(
           // Request" for which `session/load` was precisely the graceful
           // path to try. Surface fx's text verbatim, no wrapper.
           failTurn(state, err.rawMessage);
+        } else if (!opts.continueRecovery && isFxSessionNotFound(err)) {
+          // fx 0.0.15 saves a session only once its first turn starts, so an
+          // id whose first prompt never began (an expired login, a Stop
+          // during the handshake) is gone. Start over rather than fail every
+          // follow-up on the same id; the new id replaces it for the next
+          // turn. A continue-recovery turn has nothing to continue.
+          emit(state, "status", fxSessionNotFoundStatus(opts.resumeSessionId));
+          if (!(await startNewSession())) return;
+          startedFresh = true;
         } else {
           failTurn(state, `fx acp: failed to resume session ${opts.resumeSessionId}: ${errMessage(err)}`);
         }
-        return;
+        // Only the fresh-session fallback goes on to the prompt.
+        if (!startedFresh) return;
       }
     }
     if (state.resolved) return;
-  } else {
-    let sessionResult: { sessionId?: string; configOptions?: unknown } | undefined;
-    try {
-      sessionResult = (await withTimeout(
-        sendRpc(state, "session/new", { cwd: opts.cwd, mcpServers: [], ...profileMcpMeta }),
-        RPC_HANDSHAKE_TIMEOUT_MS,
-        "session/new",
-      )) as typeof sessionResult;
-    } catch (err) {
-      failTurn(state, describeHandshakeFailure(err, "session/new", RPC_HANDSHAKE_TIMEOUT_MS));
-      return;
-    }
-    if (state.resolved) return;
-
-    const sessionId = typeof sessionResult?.sessionId === "string" ? sessionResult.sessionId : null;
-    if (!sessionId) {
-      failTurn(state, "fx acp: session/new response had no sessionId");
-      return;
-    }
-    state.sessionId = sessionId;
-    state.onSessionId?.(sessionId);
-    maybeEmitProvider(sessionResult);
-
-    // Apply the task's stored effort, then its speed lane — best-effort,
-    // never throw, never fail the turn (see applyFxEffort/applyFxSpeed).
-    // No `session/set_mode` follows: on fx 0.0.14 it would write the user's
-    // own `~/.fx/settings.json` profile, so `FX_PERMISSION_MODE` is the only
-    // mode channel (see the file header's 0.0.11–0.0.14 facts).
-    await applyFxEffort(state, sessionResult, opts);
-    if (state.resolved) return;
-    await applyFxSpeed(state, sessionResult, opts);
-    if (state.resolved) return;
+  } else if (!(await startNewSession())) {
+    return;
   }
 
   // 3. session/prompt — the ONLY turn-completion signal; no timeout. A

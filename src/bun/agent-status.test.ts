@@ -11,7 +11,7 @@ import type { AgentKind, Harness } from "../shared/types.ts";
 // Without this, this file (or whichever file `bun test` loads first) can
 // silently open the real ~/.agetor-dev database.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-db-"));
-const { checkHarness, cachedCliVersion, parseOpencodeAuthList, upgradeHintFor, INSTALL_HINTS, __testing } = await import("./agent-status.ts");
+const { checkHarness, cachedCliVersion, parseOpencodeAuthList, upgradeHintFor, FX_UPGRADE_NOTICE, INSTALL_HINTS, __testing } = await import("./agent-status.ts");
 
 function builtin(kind: AgentKind): Harness {
   return { id: kind, kind, label: kind, isBuiltin: true, home: null, bin: null, env: {}, enabled: true };
@@ -499,6 +499,23 @@ test("fx status --json realistic 0.0.8 payload (AI_GATEWAY_API_KEY, no top-level
   expect(status.authHelp).toBeNull();
 });
 
+describe("fx upgrade notice (fx < 0.0.15)", () => {
+  test.each([
+    ["0.0.14", true],
+    ["0.0.8", true],
+    ["0.0.15", false],
+    ["0.0.16", false],
+    ["0.0.15-rc1", false],
+    ["fx dev build", false],
+  ])("fx --version %p -> notice %p", async (version, expected) => {
+    process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned(version, `echo '${fx008StatusPayload("fx login")}'\n  exit 0`);
+    const status = await checkAgent("fx");
+    expect(status.available).toBe(true);
+    if (expected) expect(status.notices).toEqual([FX_UPGRADE_NOTICE]);
+    else expect(status.notices).toBeUndefined();
+  });
+});
+
 test('fx status --json auth:"host managed" (FX_AUTH_MODE=host-managed, an embedding-host feature agetor never sets) -> fail-open fallthrough, loggedIn:true, authHelp:null', async () => {
   const payload = fx008StatusPayload("host managed");
   process.env.AGETOR_FX_BIN = plantFakeFxStatusBinVersioned("0.0.8", `echo '${payload}'\n  exit 0`);
@@ -880,12 +897,12 @@ describe("upgradeHintFor", () => {
     expect(upgradeHintFor("cursor", null)).toBe("cursor-agent update");
   });
 
-  test("fx under any path -> the fx.sh install/self-update command", () => {
-    expect(upgradeHintFor("fx", "/opt/homebrew/bin/fx-x")).toContain("fx.sh");
+  test("fx under any path -> fx's own `fx upgrade`", () => {
+    expect(upgradeHintFor("fx", "/opt/homebrew/bin/fx-x")).toBe("fx upgrade");
   });
 
-  test("fx with a null path -> the fx.sh install/self-update command", () => {
-    expect(upgradeHintFor("fx", null)).toContain("fx.sh");
+  test("fx with a null path -> fx upgrade", () => {
+    expect(upgradeHintFor("fx", null)).toBe("fx upgrade");
   });
 
   test("INSTALL_HINTS.codex is the npm install command (the fallback upgradeHintFor uses for a non-brew codex)", () => {

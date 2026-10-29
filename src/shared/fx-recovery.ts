@@ -10,6 +10,7 @@
 // and formatting `task.fxRecovery` (`TaskFxRecovery`, the persisted pause +
 // auto-resume-schedule state) and the `fxAutoResume*` preference pair — see
 // `docs/plans/fx-recovery-follow-ups.md` §3 for the full design.
+import { cliVersionSatisfies } from "./cli-version.ts";
 import {
   FX_AUTO_RESUME_DEFAULT_DELAY_SEC,
   FX_AUTO_RESUME_DELAY_PREF,
@@ -248,6 +249,29 @@ export function fxRecoverySummaryLine(p: FxRecoveryPayload): string | null {
  */
 export function isFxRecoveryResumable(p: FxRecoveryPayload | undefined | null): boolean {
   return p != null && p.state === "paused" && (p.requiredAction ?? "continue_later") === "continue_later";
+}
+
+/**
+ * First fx release that can't continue a paused response on an ordinary ACP
+ * session: fx 0.0.15 keeps `_meta.fx.continueRecovery` only for libfx hosts
+ * that open a journal and answers everyone else with `-32602 "This session
+ * does not support durable recovery"` (`src/acp/prompt.zig:1023`). See
+ * `docs/plans/fx-0.0.15-upgrade-investigation.md` §1b.2.
+ */
+export const FX_NO_CONTINUE_RECOVERY_VERSION = "0.0.15";
+
+/** What agetor says instead of offering Resume on fx 0.0.15 and later. */
+export const FX_RESUME_UNSUPPORTED_TEXT =
+  "fx 0.0.15 and later can't resume a paused response — send a new message to continue.";
+
+/**
+ * Whether the installed fx (its `--version` line) can still continue a
+ * paused response. Fail-open like every other version gate
+ * (`cliVersionSatisfies`): an unknown or unparseable version keeps Resume
+ * and auto-resume, so a stub binary or a failed probe never hides them.
+ */
+export function fxSupportsContinueRecovery(version: string | null | undefined): boolean {
+  return cliVersionSatisfies(version, FX_NO_CONTINUE_RECOVERY_VERSION) !== true;
 }
 
 /**

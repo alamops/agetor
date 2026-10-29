@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterEach, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterEach, afterAll } from "bun:test";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -2417,3 +2417,114 @@ test("fireFxAutoResume: when resumeFxRecovery itself rejects the auto-resume att
     events.some((e) => e.stream === "status" && e.data.startsWith("auto-resume could not start: ")),
   ).toBe(true);
 }, 8000);
+
+/* ── fx 0.0.15+ can't continue a paused response (docs/plans/
+ * fx-0.0.15-upgrade-investigation.md §1b.2): Resume is refused before a run
+ * row exists, the boot sweep drops persisted pauses, and a pause that
+ * settles on 0.0.15 is never recorded. Each test pauses a task on the
+ * file's 0.0.4-fake stub, then points AGETOR_FX_BIN at a 0.0.15 stub — a
+ * different path, so the 60 s version cache keyed on it starts empty. ── */
+
+function plantFx015Bin(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-fx-015-bin-"));
+  const bin = path.join(dir, "fx");
+  writeFileSync(
+    bin,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--help" ]; then echo "Fast, native coding agent for the terminal"; exit 0; fi',
+      'if [ "$1" = "--version" ]; then echo "0.0.15"; exit 0; fi',
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+async function pauseFxTask(title: string): Promise<{ taskId: string; runId: string }> {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { harnesses } = await import("./db.ts");
+  const { FAKE_FX_RECOVERY_PROMPT_MARKER } = await import("./agents.ts");
+  harnesses.setEnabled("fx", true);
+  const created = await createTask({
+    title,
+    prompt: `hit the gateway limit ${FAKE_FX_RECOVERY_PROMPT_MARKER}`,
+    agent: "fx",
+    mode: "yolo",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  const runId = "runId" in started ? started.runId : "";
+  await waitForRunSettled(runId, 5000);
+  return { taskId: created.task.id, runId };
+}
+
+describe("fx 0.0.15+: no Resume, no auto-resume", () => {
+  test("a manual Resume is refused with the upgrade text, mints no run, and drops the pause and its timer", async () => {
+    const { resumeFxRecovery, __testing } = await import("./orchestrator.ts");
+    const { tasks, runs } = await import("./db.ts");
+    const { FX_RESUME_UNSUPPORTED_TEXT } = await import("../shared/fx-recovery.ts");
+    const { taskId, runId } = await pauseFxTask("fx 0.0.15 manual resume");
+    expect(tasks.get(taskId)?.fxRecovery?.state).toBe("paused");
+    expect(__testing.pendingFxAutoResume(taskId)).toBe(true);
+
+    const prevBin = process.env.AGETOR_FX_BIN;
+    process.env.AGETOR_FX_BIN = plantFx015Bin();
+    try {
+      const result = await resumeFxRecovery(taskId);
+      expect(result).toEqual({ ok: false, status: 400, error: FX_RESUME_UNSUPPORTED_TEXT });
+    } finally {
+      process.env.AGETOR_FX_BIN = prevBin;
+    }
+    expect(tasks.get(taskId)?.fxRecovery).toBeNull();
+    expect(__testing.pendingFxAutoResume(taskId)).toBe(false);
+    expect(tasks.get(taskId)?.runId).toBe(runId);
+    expect(runs.countForTask(taskId)).toBe(1);
+  }, 10_000);
+
+  test("the boot sweep clears a scheduled pause and says why on the paused run", async () => {
+    const { rearmFxAutoResumes, stopFxAutoResumeTimers } = await import("./orchestrator.ts");
+    const { tasks, runs } = await import("./db.ts");
+    const { FX_RESUME_UNSUPPORTED_TEXT } = await import("../shared/fx-recovery.ts");
+    const { taskId, runId } = await pauseFxTask("fx 0.0.15 boot sweep");
+    expect(tasks.get(taskId)?.fxRecovery?.autoResume).toBeTruthy();
+    stopFxAutoResumeTimers(); // what a restart does to the in-memory timer
+
+    const prevBin = process.env.AGETOR_FX_BIN;
+    process.env.AGETOR_FX_BIN = plantFx015Bin();
+    try {
+      await rearmFxAutoResumes();
+    } finally {
+      process.env.AGETOR_FX_BIN = prevBin;
+    }
+    expect(tasks.get(taskId)?.fxRecovery).toBeNull();
+    const events = runs.eventsForTask(taskId).filter((e) => e.runId === runId);
+    expect(events.some((e) => e.stream === "status" && e.data === `auto-resume cancelled — ${FX_RESUME_UNSUPPORTED_TEXT}`)).toBe(true);
+  }, 10_000);
+
+  test("a pause that settles on 0.0.15 records nothing and posts the upgrade text instead of a schedule", async () => {
+    const { __testing } = await import("./orchestrator.ts");
+    const { tasks, runs } = await import("./db.ts");
+    const { FX_RESUME_UNSUPPORTED_TEXT } = await import("../shared/fx-recovery.ts");
+    const prevBin = process.env.AGETOR_FX_BIN;
+    process.env.AGETOR_FX_BIN = plantFx015Bin();
+    let paused: { taskId: string; runId: string };
+    try {
+      paused = await pauseFxTask("fx 0.0.15 settle");
+    } finally {
+      process.env.AGETOR_FX_BIN = prevBin;
+    }
+    const { taskId, runId } = paused;
+    expect(runs.get(runId)?.status).toBe("failed");
+    expect(tasks.get(taskId)?.fxRecovery).toBeNull();
+    expect(__testing.pendingFxAutoResume(taskId)).toBe(false);
+    const events = runs.eventsForTask(taskId).filter((e) => e.runId === runId);
+    expect(events.some((e) => e.stream === "status" && e.data === FX_RESUME_UNSUPPORTED_TEXT)).toBe(true);
+    expect(events.some((e) => e.stream === "status" && e.data.startsWith("auto-resume scheduled"))).toBe(false);
+  }, 10_000);
+});

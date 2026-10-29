@@ -2,6 +2,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { TMUX_MISSING_REASON, type AgentKind, type ClaudeAccount, type Harness, type HarnessStatus } from "../shared/types.ts";
 import { opencodeMajor } from "../shared/opencode.ts";
+import { cliVersionSatisfies } from "../shared/cli-version.ts";
 import { resolveBin, harnessEnv } from "./agents.ts";
 import { accountUsageSummary } from "./account-usage.ts";
 import { harnesses } from "./db.ts";
@@ -99,6 +100,8 @@ export function upgradeHintFor(kind: AgentKind, binPath: string | null): string 
   if (kind === "antigravity") return "agy update";
   if (kind === "opencode") return "opencode upgrade";
   if (kind === "copilot") return "copilot update";
+  // `fx upgrade` ships in every fx agetor's notice targets (0.0.14 has it).
+  if (kind === "fx") return "fx upgrade";
   return INSTALL_HINTS[kind];
 }
 
@@ -461,6 +464,19 @@ function probeEnvFor(harness: Harness): Record<string, string> {
  * would hand a v1 install v2-only flags (`--standalone`, `-m id#variant`).
  * `null` only when the binary isn't found or has never answered.
  */
+/**
+ * The last `--version` line this harness's binary reported, fresh or stale,
+ * without probing; `null` when it has never been probed (or isn't found).
+ * For synchronous callers (fx run settlement) that can't await a probe and
+ * treat `null` as unknown. `checkHarness`, which every start pre-flight and
+ * the `/harnesses` poll run, keeps it primed.
+ */
+export function peekCachedCliVersion(harness: Harness): string | null {
+  const path = resolveBinPath(resolveBin(harness));
+  if (!path) return null;
+  return versionCache.get(`${harness.id}:${path}`)?.value ?? null;
+}
+
 export async function cachedCliVersion(harness: Harness): Promise<string | null> {
   const path = resolveBinPath(resolveBin(harness));
   if (!path) return null;
@@ -611,6 +627,15 @@ const OPENCODE_NO_CREDENTIALS_NOTICE = "No OpenCode credentials found — run `o
 const OPENCODE_V1_DB_CONFLICT_NOTICE =
   "OpenCode 1 can't read the data OpenCode 2 wrote in this home — give this harness its own Home in Settings → Harnesses";
 const OPENCODE_V2_AVAILABLE_NOTICE = "OpenCode 2 is available: `opencode upgrade --major`";
+
+/** fx below this version gets an upgrade notice. fx 0.0.14 and older wrap the
+ *  shell tool's arguments in one `request` object, and some Gateway models
+ *  (zai/glm-5v-turbo, seen live) send it as a JSON string, so fx rejects every
+ *  shell call; 0.0.15 takes the arguments flat. See
+ *  `docs/plans/fx-0.0.15-upgrade-investigation.md` §1a. */
+export const FX_RECOMMENDED_VERSION = "0.0.15";
+export const FX_UPGRADE_NOTICE =
+  "fx 0.0.14 and older can fail shell commands on some models — upgrade to fx 0.0.15: `fx upgrade`";
 
 const FX_HELP_MARKER = "coding agent";
 const FX_WRONG_BINARY_HINT =
@@ -792,6 +817,9 @@ export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolea
 
     ({ loggedIn, authHelp } = status);
     fxProfilePermissionMode = status.permissionMode;
+    // `false` only for a version that parses and is known too old; an
+    // unparseable one (`null`) gets no notice.
+    if (cliVersionSatisfies(version, FX_RECOMMENDED_VERSION) === false) notices.push(FX_UPGRADE_NOTICE);
   }
 
   // copilot-only identity gate (the fx wrong-binary pattern, minus the extra

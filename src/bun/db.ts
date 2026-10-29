@@ -1568,13 +1568,21 @@ export const tasks = {
    * stale by construction.
    */
   listFxAutoResumePending(): Array<{ id: string; fxRecovery: TaskFxRecovery }> {
+    return this.listFxRecovery().filter((row) => row.fxRecovery.autoResume);
+  },
+  /**
+   * Every non-archived task carrying a persisted fx pause, with or without a
+   * pending `autoResume` — the boot sweep's input (`rearmFxAutoResumes`
+   * clears every row once the installed fx can no longer resume a pause).
+   */
+  listFxRecovery(): Array<{ id: string; fxRecovery: TaskFxRecovery }> {
     const rows = db.query<{ id: string; fx_recovery: string | null }, []>(
       `SELECT id, fx_recovery FROM tasks WHERE fx_recovery IS NOT NULL AND archived_at IS NULL`,
     ).all();
     const out: Array<{ id: string; fxRecovery: TaskFxRecovery }> = [];
     for (const row of rows) {
       const fxRecovery = parseTaskFxRecovery(row.fx_recovery);
-      if (fxRecovery && fxRecovery.autoResume) out.push({ id: row.id, fxRecovery });
+      if (fxRecovery) out.push({ id: row.id, fxRecovery });
     }
     return out;
   },

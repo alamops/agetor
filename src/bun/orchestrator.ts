@@ -28,7 +28,7 @@ import {
   type SpawnAgentArgs,
   type SpawnedAgent,
 } from "./agents.ts";
-import { cachedCliVersion, checkHarness, upgradeHintFor } from "./agent-status.ts";
+import { cachedCliVersion, checkHarness, peekCachedCliVersion, upgradeHintFor } from "./agent-status.ts";
 import { getDiscoveredEfforts, getDiscoveredModels, getHarnessDiscoveredModels } from "./agent-discovery.ts";
 import { OPENCODE_DEFAULT_MODEL, formatOpencodeTurnBreadcrumb, opencodeMajor } from "../shared/opencode.ts";
 import { importedSessionOf } from "../shared/imported-session.ts";
@@ -65,7 +65,13 @@ import {
   type TaskType,
 } from "../shared/types.ts";
 import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
-import { isFxRecoveryResumable, parseFxAutoResumePrefs, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
+import {
+  FX_RESUME_UNSUPPORTED_TEXT,
+  fxSupportsContinueRecovery,
+  isFxRecoveryResumable,
+  parseFxAutoResumePrefs,
+  parseFxRecoveryPayload,
+} from "../shared/fx-recovery.ts";
 import { resolveStartStep } from "../shared/pipeline.ts";
 import {
   cascadePipelineArchive,
@@ -5985,6 +5991,19 @@ function latestResumableFxPause(taskId: string): { runId: string; payload: FxRec
   return { runId: latestRun.id, payload };
 }
 
+/** The task's fx `--version` line through the 60 s probe cache, or `null`
+ *  (also for a task whose harness isn't fx: no other CLI's version counts). */
+async function fxCliVersion(task: Task): Promise<string | null> {
+  const harness = resolveHarness(task.agent);
+  return harness?.kind === "fx" ? cachedCliVersion(harness) : null;
+}
+
+/** Same, without probing: the last version `checkHarness` saw, or `null`. */
+function peekFxCliVersion(task: Task): string | null {
+  const harness = resolveHarness(task.agent);
+  return harness?.kind === "fx" ? peekCachedCliVersion(harness) : null;
+}
+
 /**
  * fx-only settlement hook (plan §3 T2 item 4) — called from BOTH
  * `attachDoneHandler` branches (`.then` and `.catch`) right after the run's
@@ -6020,6 +6039,15 @@ function noteFxRunSettled(task: Task | null, runId: string, newStatus: RunStatus
   const taskId = task.id;
   const pause = newStatus === "failed" ? latestResumableFxPause(taskId) : null;
   if (pause && pause.runId === runId) {
+    // fx 0.0.15+ can't continue the pause, so record nothing: no badge, no
+    // auto-resume, and RunPanel drops its Resume button on the same version.
+    // Synchronous, so it reads the last probed version (the start pre-flight
+    // primed it); unknown keeps today's behaviour.
+    if (!fxSupportsContinueRecovery(peekFxCliVersion(task))) {
+      appendFxStatusLine(taskId, runId, FX_RESUME_UNSUPPORTED_TEXT);
+      if (tasks.get(taskId)?.fxRecovery != null) clearFxRecovery(taskId);
+      return;
+    }
     recordFxPause(taskId, runId, pause.payload);
     return;
   }
@@ -6151,11 +6179,22 @@ function recordFxPause(taskId: string, runId: string, payload: FxRecoveryPayload
  * the notice/badge can tell the two apart.
  */
 async function fireFxAutoResume(taskId: string, at: number): Promise<void> {
+  const before = tasks.get(taskId);
+  if (!before) return;
+  // Probed before the re-validation below, so nothing can change between
+  // those checks and acting on them.
+  const supported = fxSupportsContinueRecovery(await fxCliVersion(before));
   const task = tasks.get(taskId);
   const rec = task?.fxRecovery ?? null;
   if (!task || !rec?.autoResume || rec.autoResume.at !== at) return;
   if (task.archivedAt != null) return;
   if (task.runId && active.has(task.runId)) return;
+  if (!supported) {
+    // fx was upgraded to 0.0.15+ after this pause was scheduled.
+    clearFxRecovery(taskId);
+    appendFxStatusLine(taskId, rec.runId, `auto-resume skipped — ${FX_RESUME_UNSUPPORTED_TEXT}`);
+    return;
+  }
 
   const { max } = rec.autoResume;
   const attempt = rec.autoResumeCount + 1;
@@ -6226,20 +6265,33 @@ export function cancelFxAutoResume(taskId: string, reason: "cancelled" | "stoppe
  * overdue entry, persisted back onto the row so its countdown reads
  * correctly — rather than firing every overdue task in the same tick.
  * Returns the count actually armed (clears don't count).
+ *
+ * Every persisted pause — scheduled or not — is cleared once the task's fx is
+ * 0.0.15 or later, which can't continue it (`fxSupportsContinueRecovery`), so
+ * an upgrade doesn't leave a paused badge and a Resume that can only fail.
  */
 export async function rearmFxAutoResumes(): Promise<number> {
-  const pending = tasks.listFxAutoResumePending();
+  const rows = tasks.listFxRecovery();
   const now = Date.now();
   let armed = 0;
   let staggerIndex = 0;
-  for (const { id: taskId, fxRecovery: rec } of pending) {
+  for (const { id: taskId, fxRecovery: rec } of rows) {
+    const task = tasks.get(taskId);
+    if (task && !fxSupportsContinueRecovery(await fxCliVersion(task))) {
+      clearFxRecovery(taskId);
+      if (rec.autoResume) {
+        appendFxStatusLine(taskId, rec.runId, `auto-resume cancelled — ${FX_RESUME_UNSUPPORTED_TEXT}`);
+      }
+      continue;
+    }
+    if (!rec.autoResume) continue;
     const pause = latestResumableFxPause(taskId);
     if (!pause || pause.runId !== rec.runId) {
       tasks.setFxRecovery(taskId, null);
       continue;
     }
     const schedule = rec.autoResume;
-    if (!schedule) continue; // listFxAutoResumePending already filters this — defensive only.
+    if (!schedule) continue; // checked above — narrows the type only.
     let at = schedule.at;
     if (at <= now) {
       at = now + 5000 + staggerIndex * 2000;
@@ -6337,6 +6389,17 @@ export async function resumeFxRecovery(
     if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
     if (resolveHarness(task.agent)?.kind !== "fx") {
       return { ok: false, status: 400, error: "only fx tasks can resume a paused response" };
+    }
+    // fx 0.0.15+ answers `continueRecovery` with -32602 on every ACP session
+    // agetor opens, so refuse before minting a run row, and drop the pause so
+    // the badge and menu entry go too. Re-read after the probe's await.
+    const supported = fxSupportsContinueRecovery(await fxCliVersion(task));
+    task = tasks.get(taskId);
+    if (!task) return { ok: false, status: 404, error: "not found" };
+    if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
+    if (!supported) {
+      if (task.fxRecovery != null) clearFxRecovery(taskId);
+      return { ok: false, status: 400, error: FX_RESUME_UNSUPPORTED_TEXT };
     }
     if ((task.runId && active.has(task.runId)) || startingTaskIds.has(taskId)) {
       return { ok: false, status: 409, error: "a turn is already in flight for this task" };
