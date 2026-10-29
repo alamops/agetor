@@ -129,6 +129,7 @@ import {
   setActiveRunProbe,
   setBackgroundTaskSettledHandler,
   setLocalSettingChangedHandler,
+  claudeBootsInFlight,
   type LocalSettingInfo,
 } from "./claude-tmux.ts";
 import {
@@ -1476,6 +1477,35 @@ const startingTaskIds = new Set<string>();
  */
 export function activeRunCount(): number {
   return active.size + startingTaskIds.size;
+}
+
+/**
+ * How many launches this process is still in the middle of: spawns that hold
+ * a task's start claim (`startingTaskIds`, which covers the codex/cursor/…
+ * one-shot launches and claude's own pre-JSONL spawn) plus claude sessions
+ * that haven't written their JSONL yet (`claudeBootsInFlight` — the deferred
+ * > 4 KB first-prompt paste and the startup-dialog confirm both run in this
+ * process). A launch interrupted by the process exiting leaves a session the
+ * next owner can't reattach, so a core handing the port off waits for these.
+ */
+export function launchesInFlight(): number {
+  return startingTaskIds.size + claudeBootsInFlight();
+}
+
+/** Poll cadence of `waitForLaunchesToSettle`. */
+const LAUNCH_SETTLE_POLL_MS = 100;
+
+/**
+ * Resolves `true` once `launchesInFlight()` is zero, or `false` after
+ * `timeoutMs` with launches still pending. Never rejects.
+ */
+export async function waitForLaunchesToSettle(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (launchesInFlight() === 0) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(Math.min(LAUNCH_SETTLE_POLL_MS, Math.max(0, deadline - Date.now())));
+  }
 }
 /**
  * Runs the user asked to Stop while their spawn was still in flight (the

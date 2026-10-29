@@ -258,9 +258,49 @@ const DAEMON_LOG_ROTATE_CHECK_MS = 60_000;
 
 /** How long a confirmed verdict is reused before probing again. */
 export const LIVE_CORE_PROBE_TTL_MS = 5_000;
-/** Probe failures in a row before a core previously seen live is declared gone
+/** Failed checks in a row before a core previously seen live is declared gone
  *  (one slow answer on a loaded machine must not make us boot a second core). */
 export const LIVE_CORE_FAILURES_TO_DROP = 2;
+/** Bound on the loopback TCP connect `portAcceptsConnections` makes. */
+export const LIVE_CORE_CONNECT_TIMEOUT_MS = 1_000;
+
+/**
+ * Does anything accept TCP connections on 127.0.0.1:`port`? The kernel
+ * completes the handshake for a listening socket on its own, so this answers
+ * `true` for a core whose JS thread is blocked (a native Open panel, a message
+ * box, a VACUUM) — exactly when its HTTP probe can't answer. `false` only on a
+ * failed connect (refused: nothing listens). A connect that neither succeeds
+ * nor fails within `timeoutMs` (a full listen backlog drops SYNs) reads as
+ * `true`: something is listening, it is just not accepting yet.
+ */
+export async function portAcceptsConnections(
+  port: number,
+  timeoutMs = LIVE_CORE_CONNECT_TIMEOUT_MS,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(true), timeoutMs);
+  });
+  const attempt = Bun.connect({
+    hostname: "127.0.0.1",
+    port,
+    socket: {
+      open(socket) {
+        socket.end();
+      },
+      data() {},
+      error() {},
+    },
+  }).then(
+    () => true,
+    () => false,
+  );
+  try {
+    return await Promise.race([attempt, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface LiveCoreCheckDeps {
   readCreds(): CoreCreds | null;
@@ -268,24 +308,41 @@ export interface LiveCoreCheckDeps {
   now?: () => number;
   isPidAlive?: (pid: number) => boolean;
   probe?: (creds: CoreCreds) => Promise<boolean>;
+  /** Loopback connect check (`portAcceptsConnections`). */
+  portListening?: (port: number) => Promise<boolean>;
   ttlMs?: number;
 }
 
 /**
- * "Does a live core own the port?", robust to a recycled pid. The creds file
- * names a pid, but after a crash that pid can belong to an unrelated process,
- * and trusting it would park the supervisor behind nothing forever. So a pid
- * that is alive is confirmed with `probeLiveCore` (/health identifies agetor,
- * authenticated /info accepts the token). The probe runs at most once per
- * `ttlMs` per (pid, startedAt) — the dead-pid and no-creds cases cost nothing —
- * and a core previously seen live survives a single failed probe.
+ * "Does a live core own the port?", robust to a recycled pid AND to a core
+ * that is alive but momentarily unresponsive.
+ *
+ * The creds file names a pid, but after a crash that pid can belong to an
+ * unrelated process, and trusting it would park the supervisor behind nothing
+ * forever. So a pid that has never answered is confirmed with `probeLiveCore`
+ * (/health identifies agetor, authenticated /info accepts the token) — no
+ * answer, no park.
+ *
+ * Once a creds key (pid + startedAt + port) has answered, a failed probe no
+ * longer counts against it while its pid is alive and its port still accepts
+ * connections: the app's Bun thread routinely blocks for seconds to minutes
+ * while it keeps the port (native Open panels, `showMessageBox`, Compact's
+ * VACUUM), and dropping it then would make the supervisor boot a core every
+ * backoff step that only loses the bind. A recycled pid can't hide behind this:
+ * a crashed core's port stops accepting, and a different key starts over at
+ * "never answered". A failed probe whose port refuses counts towards
+ * `LIVE_CORE_FAILURES_TO_DROP`.
+ *
+ * The probe runs at most once per `ttlMs` per key — the dead-pid and no-creds
+ * cases cost nothing.
  */
 export function createLiveCoreCheck(deps: LiveCoreCheckDeps): (exceptPid: number | null) => Promise<boolean> {
   const now = deps.now ?? Date.now;
   const alive = deps.isPidAlive ?? isPidAlive;
   const probe = deps.probe ?? ((c: CoreCreds) => probeLiveCore(c, 2_000));
+  const portListening = deps.portListening ?? ((port: number) => portAcceptsConnections(port));
   const ttl = deps.ttlMs ?? LIVE_CORE_PROBE_TTL_MS;
-  let cache: { key: string; at: number; live: boolean; failures: number } | null = null;
+  let cache: { key: string; at: number; live: boolean; confirmed: boolean; failures: number } | null = null;
 
   return async (exceptPid) => {
     const creds = deps.readCreds();
@@ -295,14 +352,16 @@ export function createLiveCoreCheck(deps: LiveCoreCheckDeps): (exceptPid: number
     const key = `${creds.pid}:${creds.startedAt}:${creds.port}`;
     const t = now();
     if (cache && cache.key === key && t - cache.at < ttl) return cache.live;
-    const ok = await probe(creds);
     const prev = cache && cache.key === key ? cache : null;
-    if (ok) {
-      cache = { key, at: t, live: true, failures: 0 };
+    if (await probe(creds)) {
+      cache = { key, at: t, live: true, confirmed: true, failures: 0 };
+    } else if (prev?.confirmed && (await portListening(creds.port))) {
+      // Answered before, pid alive, port held: busy, not gone.
+      cache = { key, at: t, live: true, confirmed: true, failures: 0 };
     } else {
       const failures = (prev?.failures ?? 0) + 1;
       const live = prev?.live === true && failures < LIVE_CORE_FAILURES_TO_DROP;
-      cache = { key, at: t, live, failures };
+      cache = { key, at: t, live, confirmed: prev?.confirmed ?? false, failures };
     }
     return cache.live;
   };

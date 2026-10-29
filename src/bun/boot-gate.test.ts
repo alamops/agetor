@@ -2,7 +2,7 @@ import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { bootReadySignal, gateRoutesUntilReady } from "./boot-gate.ts";
+import { BOOT_GATE_CLIENT_GONE_STATUS, bootReadySignal, gateRoutesUntilReady } from "./boot-gate.ts";
 
 // The boot gate (boot-gate.ts): a core binds the API port BEFORE its boot
 // restore, and every route but the ownership probes waits until the restore is
@@ -63,6 +63,38 @@ describe("gateRoutesUntilReady", () => {
 
     // Once ready, a wrapped handler calls straight through (no promise).
     expect((routes["/fn"] as (r: never, s: never) => unknown)(undefined as never, undefined as never)).toBe("fn-ok");
+  });
+
+  test("a held request whose client aborted is answered 499 without running its handler", async () => {
+    const calls: string[] = [];
+    const { ready, markReady } = bootReadySignal();
+    const routes = gateRoutesUntilReady(
+      {
+        "/tasks": {
+          POST: () => {
+            calls.push("post");
+            return new Response("created");
+          },
+        },
+      },
+      ready,
+      [],
+    ) as unknown as { "/tasks": { POST: (r: Request, s: never) => unknown } };
+    const post = routes["/tasks"].POST;
+    const gone = new AbortController();
+    const abandoned = post(
+      new Request("http://127.0.0.1/tasks", { method: "POST", signal: gone.signal }),
+      undefined as never,
+    ) as Promise<Response>;
+    const waiting = post(
+      new Request("http://127.0.0.1/tasks", { method: "POST" }),
+      undefined as never,
+    ) as Promise<Response>;
+    gone.abort(); // the CLI gave up while the restore ran
+    markReady();
+    expect((await abandoned).status).toBe(BOOT_GATE_CLIENT_GONE_STATUS);
+    expect(await (await waiting).text()).toBe("created");
+    expect(calls).toEqual(["post"]);
   });
 
   test("no ready promise returns the routes untouched", () => {

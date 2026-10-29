@@ -1,7 +1,14 @@
 import pkg from "../../package.json" with { type: "json" };
 import { CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
 import { db, dataDir, subagents, preferences } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import {
+  launchesInFlight,
+  reconcileOrphans,
+  rearmFxAutoResumes,
+  reapIdleSessions,
+  stopFxAutoResumeTimers,
+  waitForLaunchesToSettle,
+} from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
@@ -20,7 +27,7 @@ import {
 } from "./core-creds.ts";
 import { daemonLog } from "./daemon-log.ts";
 import { bootReadySignal } from "./boot-gate.ts";
-import { CORE_EXIT_PARK, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
+import { CORE_EXIT_PARK, HANDOFF_LAUNCH_SETTLE_MS, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
 import {
   installHeadlessNotifications,
   isHeadlessNotificationsEnabled,
@@ -104,6 +111,32 @@ export function hasRunningWork(): boolean {
 }
 
 let shuttingDown = false;
+let handingOff = false;
+
+/**
+ * The app asked for the port (`/daemon/shutdown {mode:"handoff"}`). Exiting
+ * right away would strand any agent launch this process is still in the middle
+ * of — a claude session waiting for its > 4 KB first prompt to be pasted, or
+ * for its startup dialog to be confirmed, never writes its JSONL, and the app's
+ * restore orphans it after the grace. So wait (bounded) for in-flight launches
+ * to settle, then shut down. The core keeps serving meanwhile; a stop request
+ * or a signal still exits at once.
+ */
+async function handOffPort(reason: string, code: number): Promise<void> {
+  if (handingOff || shuttingDown) return;
+  handingOff = true;
+  const pending = launchesInFlight();
+  if (pending > 0) {
+    daemonLog(`handoff requested — waiting for ${pending} agent launch(es) to settle`);
+    const settled = await waitForLaunchesToSettle(HANDOFF_LAUNCH_SETTLE_MS);
+    if (!settled) {
+      daemonLog(
+        `handoff: ${launchesInFlight()} launch(es) still pending after ${HANDOFF_LAUNCH_SETTLE_MS / 1000}s — handing off anyway`,
+      );
+    }
+  }
+  shutdown(reason, code);
+}
 /** True once THIS process wrote the creds file. A core that never bound (it
  *  lost the port to a live core, or got a signal mid-boot) must not delete the
  *  winner's creds on its way out. */
@@ -230,11 +263,11 @@ export async function runDaemon(): Promise<void> {
       // can take the port from a core that is still booting) waits for the
       // boot restore below.
       ready: bootReady,
-      onShutdownRequest: (request) =>
-        shutdown(
-          `shutdown request (${request})`,
-          request === "handoff" && isLoginItem ? CORE_EXIT_PARK : 0,
-        ),
+      onShutdownRequest: (request) => {
+        const reason = `shutdown request (${request})`;
+        if (request !== "handoff") return shutdown(reason, 0);
+        void handOffPort(reason, isLoginItem ? CORE_EXIT_PARK : 0);
+      },
     });
   } catch (e) {
     // Port busy. If a live core already owns it (the app launched, or another

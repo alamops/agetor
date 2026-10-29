@@ -3197,6 +3197,23 @@ interface TurnSlot {
 
 const sessions = new Map<string, SessionState>(); // taskId → state
 
+/** One entry per `spawnClaudeViaTmux` boot that hasn't attached its JSONL tail
+ *  (or given up) yet — see `claudeBootsInFlight`. */
+const bootsInFlight = new Set<object>();
+
+/**
+ * How many claude sessions this process launched that haven't written their
+ * JSONL yet. While one is pending, this process may still owe the pane its
+ * first prompt (a > 4 KB prompt is pasted once claude is ready; a startup
+ * consent dialog is confirmed by the boot poller), and a process that exits
+ * then leaves a session that never starts its turn — the next owner's restore
+ * orphans it after the JSONL grace. A core handing the port off waits for this
+ * to reach zero (bounded) before it exits.
+ */
+export function claudeBootsInFlight(): number {
+  return bootsInFlight.size;
+}
+
 /**
  * Per-task FIFO of tmux operations (paste-prompt + modal-dismissal).
  *
@@ -8549,7 +8566,13 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // skill scan can take 15s+; the fs.watch trigger means we attach as
   // soon as it appears regardless.
   const BOOT_TIMEOUT_MS = 30_000;
-  (async () => {
+  // Counted until the JSONL is attached or the boot gives up: until then the
+  // first prompt may still be owed to the pane by THIS process (a deferred
+  // paste, a startup dialog's confirm), so a handoff waits for it
+  // (`claudeBootsInFlight`).
+  const bootToken = {};
+  bootsInFlight.add(bootToken);
+  void (async () => {
     // Concurrently watch the boot pane for a dialog blocking claude from ever
     // writing its JSONL. Two classes are handled:
     //
@@ -8765,7 +8788,9 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     if (sessions.get(opts.taskId) !== state) return;
     reportSlowLaunch(watcherMs);
     opts.onChunk("status", `claude session ${sessionName} ready (jsonl: ${jsonlPath})`);
-  })();
+  })().finally(() => {
+    bootsInFlight.delete(bootToken);
+  });
 
   return makeAgent(opts.taskId, done);
 }

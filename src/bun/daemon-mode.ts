@@ -51,6 +51,12 @@ export function resolveIdleTimeoutMs(
  *  for one (the app handed the port over, or the user stopped the host). */
 export const CORE_EXIT_PARK = 76;
 
+/** How long a core asked to hand the port off (`POST /daemon/shutdown
+ *  {mode:"handoff"}`) waits for its in-flight agent launches to finish before
+ *  it exits anyway (`waitForLaunchesToSettle`). The app's wait for the port
+ *  (`TAKEOVER_PORT_FREE_TIMEOUT_MS`) is sized on top of it. */
+export const HANDOFF_LAUNCH_SETTLE_MS = 8_000;
+
 /** Supervisor exit code for "the app bundle I was launched from changed
  *  (update / move)": non-zero so launchd's KeepAlive relaunches it from the
  *  new bundle. */

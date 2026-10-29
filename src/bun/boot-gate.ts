@@ -33,7 +33,9 @@ export const BOOT_GATE_EXEMPT_HEADLESS: readonly string[] = ["/daemon/shutdown"]
  * Wraps every handler of a Bun `routes` object (function-valued or per-method)
  * so it runs only once `ready` has resolved. Static `Response` values and the
  * exempt paths are left untouched. Once `ready` has resolved a wrapped handler
- * calls straight through, so a booted server pays no extra microtask.
+ * calls straight through, so a booted server pays no extra microtask. A request
+ * held by the gate whose client aborted before `ready` resolved is answered
+ * `BOOT_GATE_CLIENT_GONE_STATUS` without running its handler.
  *
  * `ready` must resolve, not reject: a failed restore ends the process (both
  * entry points exit on it), so a rejection would only strand requests.
@@ -51,7 +53,15 @@ export function gateRoutesUntilReady<T>(
   const exemptSet = new Set(exempt);
   const gate = (handler: Handler): Handler =>
     ((req: never, server: never) =>
-      isReady ? handler(req, server) : ready.then(() => handler(req, server))) as Handler;
+      isReady
+        ? handler(req, server)
+        : ready.then(() =>
+            // A client that gave up while the restore ran (the CLI's 15 s
+            // timeout, a closed webview) must not have its request run after
+            // all — `agetor add` would create a task it already reported as
+            // failed. Nobody reads this answer.
+            requestAborted(req) ? abortedResponse() : handler(req, server),
+          )) as Handler;
 
   const out: Record<string, unknown> = {};
   for (const [path, value] of Object.entries(routes as Record<string, unknown>)) {
@@ -70,6 +80,17 @@ export function gateRoutesUntilReady<T>(
     }
   }
   return out as T;
+}
+
+/** Status for a held request whose client disconnected (nginx's convention). */
+export const BOOT_GATE_CLIENT_GONE_STATUS = 499;
+
+function requestAborted(req: unknown): boolean {
+  return req instanceof Request && req.signal.aborted;
+}
+
+function abortedResponse(): Response {
+  return new Response(null, { status: BOOT_GATE_CLIENT_GONE_STATUS });
 }
 
 /** A promise plus its resolver, for the entry points' "restore done" signal. */

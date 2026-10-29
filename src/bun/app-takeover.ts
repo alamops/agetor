@@ -1,4 +1,5 @@
 import type { CoreCreds } from "./core-creds.ts";
+import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
 
 /**
  * Binding the API port when the desktop app boots (docs/plans/always-on-host.md
@@ -40,8 +41,10 @@ export interface AcquireApiPortDeps<S> {
 export const TAKEOVER_RETRY_WINDOW_MS = 5_000;
 /** Retry cadence inside that window. */
 export const TAKEOVER_RETRY_INTERVAL_MS = 250;
-/** How long to wait for a handed-off core to release the port. */
-export const TAKEOVER_PORT_FREE_TIMEOUT_MS = 10_000;
+/** How long to wait for a handed-off core to release the port: the core first
+ *  waits up to `HANDOFF_LAUNCH_SETTLE_MS` for its in-flight agent launches,
+ *  then needs a few seconds to tear down. */
+export const TAKEOVER_PORT_FREE_TIMEOUT_MS = HANDOFF_LAUNCH_SETTLE_MS + 10_000;
 /** Bound on the handoff request itself; the daemon drops the connection as it
  *  parks or exits, so a normal answer never takes this long. */
 const HANDOFF_REQUEST_TIMEOUT_MS = 5_000;

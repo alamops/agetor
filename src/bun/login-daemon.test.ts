@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { createLiveCoreCheck, createSupervisor, type CoreChild } from "./login-daemon.ts";
+import { createLiveCoreCheck, createSupervisor, portAcceptsConnections, type CoreChild } from "./login-daemon.ts";
 import { DEFAULT_CONFIG } from "./login-daemon-machine.ts";
 import {
   existsSync,
@@ -456,7 +456,7 @@ test("liveCore: a dead pid, our own pid, our own child and a missing file never 
   expect(probes).toBe(0);
 });
 
-test("liveCore: one failed probe of a core seen live is tolerated, the second drops it", async () => {
+test("liveCore: one failed probe of a core seen live is tolerated, the second drops it once its port refuses", async () => {
   let t = 0;
   let answer = true;
   const check = createLiveCoreCheck({
@@ -466,6 +466,7 @@ test("liveCore: one failed probe of a core seen live is tolerated, the second dr
     ttlMs: 1000,
     isPidAlive: () => true,
     probe: async () => answer,
+    portListening: async () => false, // the crashed core's port no longer accepts
   });
   expect(await check(null)).toBe(true);
   answer = false;
@@ -532,4 +533,75 @@ test("supervisor: a core that crashes is retried after a backoff, not by exiting
   });
   expect(await sup.run()).toBe(0); // only the stop request ended it
   expect(spawns).toBe(3);
+});
+
+test("liveCore: a confirmed core whose thread is blocked (probe fails, port still accepts) stays live", async () => {
+  let t = 0;
+  let answer = true;
+  let connects = 0;
+  const check = createLiveCoreCheck({
+    readCreds: () => credsOf(),
+    selfPid: 1,
+    now: () => t,
+    ttlMs: 1000,
+    isPidAlive: () => true,
+    probe: async () => answer,
+    portListening: async () => {
+      connects++;
+      return true;
+    },
+  });
+  expect(await check(null)).toBe(true);
+  expect(connects).toBe(0); // a probe that answers never needs the connect check
+  answer = false; // a native Open panel, a message box, a VACUUM…
+  for (t = 2000; t <= 120_000; t += 2000) expect(await check(null)).toBe(true);
+  expect(connects).toBeGreaterThan(2);
+});
+
+test("liveCore: a pid that never answered is not trusted even when its port accepts", async () => {
+  let connects = 0;
+  const check = createLiveCoreCheck({
+    readCreds: () => credsOf(),
+    selfPid: 1,
+    isPidAlive: () => true,
+    probe: async () => false,
+    portListening: async () => {
+      connects++;
+      return true;
+    },
+  });
+  expect(await check(null)).toBe(false);
+  expect(connects).toBe(0);
+});
+
+test("liveCore: a new creds key starts over at 'never answered'", async () => {
+  let t = 0;
+  let creds = credsOf({ startedAt: 1 });
+  let answer = true;
+  const check = createLiveCoreCheck({
+    readCreds: () => creds,
+    selfPid: 1,
+    now: () => t,
+    ttlMs: 1000,
+    isPidAlive: () => true,
+    probe: async () => answer,
+    portListening: async () => true,
+  });
+  expect(await check(null)).toBe(true);
+  answer = false;
+  creds = credsOf({ startedAt: 2 }); // a different core wrote the file
+  t = 2000;
+  expect(await check(null)).toBe(false);
+});
+
+test("portAcceptsConnections: true while something listens, false once it is gone", async () => {
+  const listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: { data() {}, open() {}, close() {} },
+  });
+  const port = listener.port;
+  expect(await portAcceptsConnections(port)).toBe(true);
+  listener.stop(true);
+  expect(await portAcceptsConnections(port)).toBe(false);
 });
