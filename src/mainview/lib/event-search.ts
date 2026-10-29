@@ -14,6 +14,8 @@ import { isInternalStatusSentinel, type RunEventStream } from "../../shared/type
 import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
 import { normalizeDeliveredUserText } from "../../shared/user-message.ts";
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
+import { splitHandoffPromptSpans } from "../../shared/pipeline.ts";
+import { searchableHandoffText, splitHandoffMessageCached } from "./handoff-view.ts";
 
 /** Best-effort JSON.parse that never throws — malformed/partial JSON (e.g. a
  *  tool input truncated by an older agetor mapper) falls back to `null`
@@ -63,8 +65,20 @@ function textOf(value: unknown): string {
  * A `tool_use`/`tool_result` the driver stamped `internal: true`
  * (`isHiddenToolEvent`, shared/tool-visibility.ts — fx's own plumbing
  * calls) is never rendered either, so it returns `null` too.
+ *
+ * `opts.handoffCards` (only passed for a pipeline step task's main stream
+ * whose harness whole-message events — `handoffCardsEnabled`) indexes what the
+ * formatted handoff card shows instead of the raw JSON: an assistant event's
+ * last real `<handoff>` block contributes its field VALUES (never keys, so
+ * `schemaVersion` doesn't match) between the surrounding prose, an invalid
+ * block its raw inner text; a user prompt's untrusted handoff spans do the
+ * same (D10, A4). Without the flag the output is exactly the raw text.
  */
-export function searchableEventText(stream: RunEventStream, data: string): string | null {
+export function searchableEventText(
+  stream: RunEventStream,
+  data: string,
+  opts?: { handoffCards?: boolean },
+): string | null {
   if (isHiddenToolEvent(stream, data)) return null;
   switch (stream) {
     case "interaction":
@@ -104,18 +118,44 @@ export function searchableEventText(stream: RunEventStream, data: string): strin
       // so a raw match on `pasted_content` or the lead-in phrase would jump to
       // a bubble containing neither. Same CR→LF-then-normalize order the
       // bubble uses; same string back when there is nothing to strip.
-      return normalizeDeliveredUserText(data.replace(/\r\n?/g, "\n"));
+      {
+        const normalized = normalizeDeliveredUserText(data.replace(/\r\n?/g, "\n"));
+        return opts?.handoffCards ? withHandoffSpanValues(normalized) : normalized;
+      }
     // Claude's compaction summary renders (when expanded) as its own block —
     // the stored text is Claude's verbatim, so match it as-is.
     case "compaction_summary":
       return data;
-    case "assistant":
+    case "assistant": {
+      if (!opts?.handoffCards || !data.includes("<handoff")) return data;
+      const split = splitHandoffMessageCached(data);
+      if (split.block === null) return data;
+      const body = split.block.result.ok ? searchableHandoffText(split.block.result.handoff) : split.block.inner;
+      return [split.before, body, split.after].filter((p) => p.trim() !== "").join("\n");
+    }
     case "thinking":
     case "stderr":
     case "stdout":
     default:
       return data;
   }
+}
+
+/** A step prompt's text with each untrusted handoff span replaced by what its
+ *  card shows: the previous step's name plus the handoff's field values (a
+ *  placeholder span: the step name and file path). The same string back when
+ *  the prompt carries no span. */
+function withHandoffSpanValues(text: string): string {
+  if (!text.includes("untrusted handoff")) return text;
+  const parts = splitHandoffPromptSpans(text);
+  if (parts.length === 1 && parts[0]!.kind === "text") return text;
+  return parts
+    .map((part) => {
+      if (part.kind === "text") return part.text;
+      if (part.kind === "handoff") return `${part.fromStep}\n${searchableHandoffText(part.handoff)}`;
+      return part.filePath === null ? part.fromStep : `${part.fromStep}\n${part.filePath}`;
+    })
+    .join("\n");
 }
 
 /** Frozen empty-matches sentinel, returned (rather than a fresh `[]`)
@@ -151,6 +191,7 @@ export const NO_MATCHES: readonly number[] = Object.freeze([]);
 export function findMatchingEventIds(
   events: ReadonlyArray<{ stream: RunEventStream; data: string }>,
   query: string,
+  opts?: { handoffCards?: boolean },
 ): readonly number[] {
   const trimmed = query.trim();
   if (!trimmed || events.length === 0) return NO_MATCHES;
@@ -165,7 +206,7 @@ export function findMatchingEventIds(
   const hiddenToolUseIds = new Set<string>();
   for (let i = 0; i < events.length; i++) {
     const e = events[i]!;
-    ownText[i] = searchableEventText(e.stream, e.data);
+    ownText[i] = searchableEventText(e.stream, e.data, opts);
     if (e.stream === "tool_use") {
       const parsed = tryParseJson(e.data) as { id?: unknown } | null;
       const id = parsed && typeof parsed === "object" ? parsed.id : undefined;

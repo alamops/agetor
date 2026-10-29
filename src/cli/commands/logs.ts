@@ -11,6 +11,8 @@ import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel, retentionTrimNote 
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
+import { splitHandoffMessage } from "../../shared/pipeline.ts";
+import { collapseHandoffPromptSpans, handoffDigestLines } from "../../shared/handoff-digest.ts";
 import { COMPACTION_SUMMARY_LABEL, compactionSummaryLine } from "../../shared/compaction.ts";
 import {
   parseSentFilesToolUse,
@@ -53,7 +55,8 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("logs");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
-  const formatEvent = createEventFormatter();
+  const hidden = task.pipelineParentId != null;
+  const formatEvent = createEventFormatter({ handoffDigest: hidden });
   const renderLine = createLineRenderer(formatEvent, flags.json);
 
   // A pipeline (parent) task never runs an agent of its own — only its
@@ -71,8 +74,6 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
     else out(hint);
     if (!notify || noFollow) return;
   }
-
-  const hidden = task.pipelineParentId != null;
 
   // --rebuild: reconstruct the latest run's events from the on-disk claude
   // JSONL (recovery when the live stream truncated) — a one-shot snapshot.
@@ -199,6 +200,10 @@ function createLineRenderer(
   };
 }
 
+/** Cheap prefilter before the real locator — the tag name is matched
+ *  case-insensitively there, so it is here too. */
+const HANDOFF_OPEN_RE = /<handoff/i;
+
 /**
  * Builds a `formatEvent` renderer with its own private `toolUseId → request`
  * map for pairing a `SendUserFile` tool_use with its later tool_result — see
@@ -208,7 +213,14 @@ function createLineRenderer(
  * one map safely covers whichever branch runs, and a fresh map per call
  * means no state leaks between unrelated invocations (or test cases).
  */
-function createEventFormatter(): (e: RunEvent) => string {
+function createEventFormatter(opts: { handoffDigest?: boolean } = {}): (e: RunEvent) => string {
+  // `handoffDigest` is on for hidden pipeline STEP tasks only
+  // (`task.pipelineParentId != null`, formatted-handoff K10/D19): their
+  // assistant text ends in a `<handoff>` JSON block, which prints as a
+  // `handoff›` digest instead, and their prompt carries the previous steps'
+  // untrusted-handoff spans, which collapse the same way. Every other task
+  // prints exactly what it always did.
+  const handoffDigest = opts.handoffDigest === true;
   const pendingSentFiles = new Map<string, SentFilesRequest>();
 
   return function formatEvent(e: RunEvent): string {
@@ -222,7 +234,12 @@ function createEventFormatter(): (e: RunEvent) => string {
       // output is unaffected: it emits the raw event, never routing through
       // this formatter.
       case "user":
-        return userMessageLines(e.data).map((line) => `${colorLabel(line)} ${line.text}`).join("\n");
+        return userMessageLines(e.data)
+          .map((line) => {
+            const text = handoffDigest && line.label === "you›" ? collapseHandoffPromptSpans(line.text) : line.text;
+            return `${colorLabel(line)} ${text}`;
+          })
+          .join("\n");
       // Claude's context-compaction summary (~16 KB of its own markdown) —
       // one digest line (first line + size), never the whole body. The
       // digest is model-written text on one terminal line, so it goes
@@ -235,8 +252,20 @@ function createEventFormatter(): (e: RunEvent) => string {
         };
         return `${colorLabel(line)} ${line.text}`;
       }
-      case "assistant":
-        return e.data;
+      case "assistant": {
+        if (!handoffDigest || !HANDOFF_OPEN_RE.test(e.data)) return e.data;
+        const split = splitHandoffMessage(e.data);
+        if (split.block === null) return e.data;
+        // Prose before, the digest, prose after — only the JSON block itself
+        // is replaced.
+        const before = split.before.trimEnd();
+        const after = split.after.trimStart();
+        return [
+          ...(before === "" ? [] : [before]),
+          ...handoffDigestLines(split).map((line) => `${colorLabel(line)} ${line.text}`),
+          ...(after === "" ? [] : [after]),
+        ].join("\n");
+      }
       case "thinking":
         return c.dim(e.data);
       case "status":

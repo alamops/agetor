@@ -1,6 +1,6 @@
 import { test, expect, mock, afterAll } from "bun:test";
 import { render } from "ink-testing-library";
-import { Dashboard, buildSentFilesLines, buildFxRecoveryLines, dashboardRows } from "./Dashboard.tsx";
+import { Dashboard, buildSentFilesLines, buildFxRecoveryLines, buildHandoffLines, dashboardRows } from "./Dashboard.tsx";
 import type { PipelineRunState } from "../../shared/types.ts";
 import { eventKey } from "./useCoalescedStream.ts";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
@@ -1599,5 +1599,105 @@ test("event stream: fx internal tool_use/tool_result rows are skipped; visible a
   expect(frame).toContain("▸ docs-server · search_pages");
   // Only the visible tool_uses render a line — the internal result's "↳ result" row is gone too.
   expect(frame).not.toContain("↳ result");
+  unmount();
+});
+
+// --- formatted handoff digest (docs/plans/formatted-handoff.md, T7 / D19) ---
+
+const HANDOFF_BODY = JSON.stringify({
+  schemaVersion: 1,
+  purpose: "Ship it",
+  summary: "Did the work",
+  reason: "All done",
+  next: "Grilling",
+  artifacts: ["a.md", "b.md"],
+  openQuestions: ["Which db?"],
+});
+const HANDOFF_MESSAGE = `Wrapping up.\n<handoff>\n${HANDOFF_BODY}\n</handoff>`;
+
+test("buildHandoffLines: a real block maps to a primitive one-line digest; everything else is absent; disabled is empty", () => {
+  const withBlock: RunEvent = { runId: "r", taskId: "t", stream: "assistant", data: HANDOFF_MESSAGE, ts: 1 };
+  const plain: RunEvent = { runId: "r", taskId: "t", stream: "assistant", data: "no block here", ts: 2 };
+  const inCode: RunEvent = { runId: "r", taskId: "t", stream: "assistant", data: "say `<handoff>{}</handoff>`", ts: 3 };
+  const user: RunEvent = { runId: "r", taskId: "t", stream: "user", data: HANDOFF_MESSAGE, ts: 4 };
+
+  const lines = buildHandoffLines([withBlock, plain, inCode, user], true);
+  expect(lines.get(eventKey(withBlock))).toBe("✓ done → Grilling · 2 artifacts · 1 question");
+  expect(typeof lines.get(eventKey(withBlock))).toBe("string");
+  for (const e of [plain, inCode, user]) expect(lines.get(eventKey(e))).toBeUndefined();
+
+  expect(buildHandoffLines([withBlock, plain], false).size).toBe(0);
+  // Two calls give distinct Maps but identical primitives (EventLine's memo).
+  const again = buildHandoffLines([withBlock, plain], true);
+  expect(again).not.toBe(lines);
+  expect(again.get(eventKey(withBlock))).toBe(lines.get(eventKey(withBlock)));
+});
+
+test("event stream: a step task renders prose + handoff› digest line; a non-step task renders the raw text", async () => {
+  onTaskEvents = null;
+  // Step rows are hidden until their parent is expanded with `p`; `j` then
+  // selects the step, which opens its event stream.
+  const client = { listTasks: async () => [parentTask(), stepTask("taskS", { runId: "runS" })] } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("p");
+  await wait(60);
+  stdin.write("j");
+  await wait(80);
+  expect(onTaskEvents).not.toBeNull();
+  onTaskEvents!({ runId: "runS", taskId: "taskS", stream: "assistant", data: HANDOFF_MESSAGE, ts: 1 });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Wrapping up.");
+  expect(frame).toContain("handoff› ✓ done → Grilling · 2 artifacts · 1 question");
+  expect(frame).not.toContain("schemaVersion");
+  unmount();
+});
+
+test("event stream: a non-step task prints a handoff block as raw text, as before", async () => {
+  onTaskEvents = null;
+  const plainTask = task({ id: "taskP", column: "running", runId: "runP", title: "P" });
+  const client = { listTasks: async () => [plainTask] } as unknown as AgetorClient;
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+  onTaskEvents!({ runId: "runP", taskId: "taskP", stream: "assistant", data: "<handoff>raw-marker</handoff>", ts: 1 });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("<handoff>raw-marker</handoff>");
+  expect(frame).not.toContain("handoff›");
+  unmount();
+});
+
+test("event stream: a step task's you› prompt collapses an untrusted-handoff span to one line", async () => {
+  onTaskEvents = null;
+  // Step rows are hidden until their parent is expanded with `p`; `j` then
+  // selects the step, which opens its event stream.
+  const client = { listTasks: async () => [parentTask(), stepTask("taskS", { runId: "runS" })] } as unknown as AgetorClient;
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("p");
+  await wait(60);
+  stdin.write("j");
+  await wait(80);
+  expect(onTaskEvents).not.toBeNull();
+  const prompt = [
+    "intro",
+    '--- BEGIN untrusted handoff abcd1234 from "Investigate" ---',
+    "```json\n" + JSON.stringify({ schemaVersion: 1, purpose: "p", summary: "s", reason: "r", next: "Build", artifacts: [], openQuestions: [] }, null, 2) + "\n```",
+    "--- END untrusted handoff abcd1234 ---",
+    "outro",
+  ].join("\n");
+  onTaskEvents!({ runId: "runS", taskId: "taskS", stream: "user", data: prompt, ts: 1 });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain('[handoff from "Investigate" · untrusted — ✓ done → Build]');
+  expect(frame).not.toContain("--- BEGIN untrusted handoff");
   unmount();
 });

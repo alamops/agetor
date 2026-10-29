@@ -709,3 +709,111 @@ test("logs --rebuild: a 'failed' fx-recovery sentinel prints no yellow progress 
   expect(outputs).toEqual([`• ${summary}`]);
   expect(outputs.join("\n")).not.toContain(FX_RECOVERY_STATUS_PREFIX);
 });
+
+// --- formatted handoff digest (docs/plans/formatted-handoff.md, T7 / D19) ---
+// A hidden pipeline step task (`pipelineParentId` set) prints its `<handoff>`
+// block as a `handoff›` digest and collapses the previous steps' untrusted-
+// handoff spans in its prompt; any other task prints exactly what it did.
+
+const HANDOFF_JSON = JSON.stringify({
+  schemaVersion: 1,
+  purpose: "Ship it",
+  summary: "Did the work",
+  reason: "All done",
+  next: "Grilling",
+  artifacts: ["docs/a.md", "docs/b.md"],
+  openQuestions: ["Which db?"],
+});
+const HANDOFF_MESSAGE = `Wrapping up.\n\n<handoff>\n${HANDOFF_JSON}\n</handoff>\n\nBye.`;
+const SPAN_PROMPT = [
+  "## Context",
+  '--- BEGIN untrusted handoff abcd1234 from "Investigate" ---',
+  "```json\n" + JSON.stringify({ schemaVersion: 1, purpose: "p", summary: "Investigated", reason: "r", next: "Build", artifacts: [], openQuestions: [] }, null, 2) + "\n```",
+  "--- END untrusted handoff abcd1234 ---",
+  "## Your step",
+].join("\n");
+
+function makeTaskClient(task: Record<string, unknown>, events: RunEvent[]): AgetorClient {
+  return {
+    listTasks: async () => [{ id: "t1", title: "T", ...task }],
+    getRuns: async () => [{ id: "run1" }],
+    rebuildEvents: async () => ({ events }),
+  } as unknown as AgetorClient;
+}
+
+const handoffEvents: RunEvent[] = [
+  { runId: "run1", taskId: "t1", stream: "user", data: SPAN_PROMPT, ts: 1 },
+  { runId: "run1", taskId: "t1", stream: "assistant", data: HANDOFF_MESSAGE, ts: 2 },
+];
+
+test("logs --rebuild: a step task prints the handoff digest between the surrounding prose", async () => {
+  outputs.length = 0;
+  currentClient = makeTaskClient({ pipelineParentId: "parent-1" }, handoffEvents);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(2);
+  const assistant = outputs[1]!;
+  expect(assistant).toBe(
+    [
+      "Wrapping up.",
+      "handoff› ✓ done → Grilling",
+      "handoff› purpose: Ship it",
+      "handoff› summary: Did the work",
+      "handoff› reason: All done",
+      "handoff› artifacts:",
+      "handoff›   - docs/a.md",
+      "handoff›   - docs/b.md",
+      "handoff› open questions:",
+      "handoff›   - Which db?",
+      "Bye.",
+    ].join("\n"),
+  );
+  expect(assistant).not.toContain("<handoff>");
+  expect(assistant).not.toContain('"schemaVersion"');
+});
+
+test("logs --rebuild: a step task's you› line collapses the untrusted-handoff span", async () => {
+  outputs.length = 0;
+  currentClient = makeTaskClient({ pipelineParentId: "parent-1" }, handoffEvents);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  const user = outputs[0]!;
+  expect(user.startsWith("you› ")).toBe(true);
+  expect(user).toContain('[handoff from "Investigate" · untrusted]');
+  expect(user).toContain("  summary: Investigated");
+  expect(user).not.toContain("--- BEGIN untrusted handoff");
+  expect(user).not.toContain("```json");
+});
+
+test("logs --rebuild: a non-step task prints the raw text byte-identically", async () => {
+  outputs.length = 0;
+  currentClient = makeTaskClient({}, handoffEvents);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toEqual([`you› ${SPAN_PROMPT}`, HANDOFF_MESSAGE]);
+});
+
+test("logs --rebuild: a step task's assistant text without a real block is unchanged", async () => {
+  outputs.length = 0;
+  const prose = "Use `<handoff>` to finish.\n```\n<handoff>{}</handoff>\n```";
+  currentClient = makeTaskClient({ pipelineParentId: "parent-1" }, [
+    { runId: "run1", taskId: "t1", stream: "assistant", data: prose, ts: 1 },
+  ]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toEqual([prose]);
+});
+
+test("logs --rebuild: a step task's invalid block is an error digest line, escaped", async () => {
+  outputs.length = 0;
+  currentClient = makeTaskClient({ pipelineParentId: "parent-1" }, [
+    { runId: "run1", taskId: "t1", stream: "assistant", data: "<handoff>\nnot json \u001b[31m\n</handoff>", ts: 1 },
+  ]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]!.startsWith("handoff› ✗ invalid handoff — ")).toBe(true);
+  expect(outputs[0]).not.toContain("\u001b");
+});
+
+test("logs --rebuild --json: a step task still emits the raw events", async () => {
+  outputs.length = 0;
+  currentClient = makeTaskClient({ pipelineParentId: "parent-1" }, handoffEvents);
+  await cmdLogs(["t1", "--rebuild"], jsonFlags);
+  expect(outputs).toEqual(handoffEvents.map((e) => JSON.stringify(e)));
+});

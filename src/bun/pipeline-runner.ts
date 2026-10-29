@@ -69,7 +69,9 @@ import {
   composeStepPrompt,
   deriveRunStatus,
   effectiveStepCap,
+  handoffFileName,
   handoffLookbackOrder,
+  handoffScanIsCodeAware,
   handoffSourceStatusLine,
   incomingSteps,
   normalizeHandoff,
@@ -444,14 +446,13 @@ function mainStreamEventsForRun(runId: string): MainStreamEvent[] {
   return runs.events(runId).filter((e) => e.subagentId == null);
 }
 
-/** Concatenate the `assistant` rows of {@link mainStreamEventsForRun}'s
- *  output — the text `parseHandoff` scans for the step's trailing
- *  `<handoff>` block. */
-function assistantTextFrom(events: MainStreamEvent[]): string {
-  return events
-    .filter((e) => e.stream === "assistant")
-    .map((e) => e.data)
-    .join("\n");
+/** The `assistant` rows of {@link mainStreamEventsForRun}'s output, one
+ *  element per event — the segments `parseHandoff` scans for the step's
+ *  trailing `<handoff>` block. Kept per event (not joined) so the shared
+ *  locator can track code state per message and never let one message's
+ *  backtick change how the next one reads. */
+function assistantSegmentsFrom(events: MainStreamEvent[]): string[] {
+  return events.filter((e) => e.stream === "assistant").map((e) => e.data);
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +504,8 @@ function parsedRunResponse(runId: string): ClassifiedResponse {
   }
   const parsed = classifyStepResponse({
     runStatus: "succeeded",
-    assistantText: assistantTextFrom(mainStreamEventsForRun(runId)),
+    assistantText: assistantSegmentsFrom(mainStreamEventsForRun(runId)),
+    codeAware: handoffScanIsCodeAware(row ? harnesses.getByIdOrKind(row.agent)?.kind : undefined),
     pendingInteractions: 0,
   });
   if (finished) {
@@ -1144,7 +1146,7 @@ async function launchStep(
       const stepName = fromStep?.name ?? p.stepId;
       let filePath: string | null = null;
       if (p.handoff) {
-        filePath = join(runDir, `handoff-${generation}-${seq}-from-${p.seq}.json`);
+        filePath = join(runDir, handoffFileName(generation, seq, p.seq));
         writeFileSync(filePath, renderHandoffFile({ fromStepName: stepName, seq: p.seq, handoff: p.handoff }));
         written.push(filePath);
         handoffRefs.push({ path: filePath, isDirectory: false });

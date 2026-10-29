@@ -4,8 +4,11 @@ import {
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   PERMISSION_MODE_STATUS_PREFIX,
+  type Handoff,
+  type PipelineStep,
   type RunEventStream,
 } from "../../shared/types.ts";
+import { composeStepPrompt } from "../../shared/pipeline.ts";
 import {
   findMatchingEventIds,
   NO_MATCHES,
@@ -444,4 +447,128 @@ test("searchableEventText: a compaction_summary event is searchable by its body 
   expect(searchableEventText("compaction_summary", body)).toBe(body);
   const events = [ev("user", "hi"), ev("compaction_summary", body), ev("assistant", "ok")];
   expect(findMatchingEventIds(events, "frobnicator")).toEqual([1]);
+});
+
+// ---------------------------------------------------------------------------
+// handoffCards (formatted handoff card search, D10 / A4)
+// ---------------------------------------------------------------------------
+
+const SAMPLE_HANDOFF: Handoff = {
+  schemaVersion: 1,
+  purpose: "Purpose-words",
+  summary: "Summary-words",
+  reason: "Reason-words",
+  next: "Beta",
+  artifacts: ["docs/artifact-words.md"],
+  openQuestions: ["Question-words?"],
+};
+const SAMPLE_BLOCK = `<handoff>${JSON.stringify(SAMPLE_HANDOFF)}</handoff>`;
+
+test("handoffCards: assistant block is searched by values, not by JSON keys", () => {
+  const data = `Prose-before ${SAMPLE_BLOCK} Prose-after`;
+  const events = [ev("assistant", data)];
+  const opts = { handoffCards: true };
+  expect(findMatchingEventIds(events, "schemaVersion", opts)).toEqual(NO_MATCHES);
+  expect(findMatchingEventIds(events, "openQuestions", opts)).toEqual(NO_MATCHES);
+  expect(findMatchingEventIds(events, "summary-words", opts)).toEqual([0]);
+  expect(findMatchingEventIds(events, "reason-words", opts)).toEqual([0]);
+  expect(findMatchingEventIds(events, "artifact-words", opts)).toEqual([0]);
+  expect(findMatchingEventIds(events, "question-words", opts)).toEqual([0]);
+  expect(findMatchingEventIds(events, "prose-before", opts)).toEqual([0]);
+  expect(findMatchingEventIds(events, "prose-after", opts)).toEqual([0]);
+});
+
+test("handoffCards off: a non-step task still matches the raw text", () => {
+  const events = [ev("assistant", `x ${SAMPLE_BLOCK}`)];
+  expect(findMatchingEventIds(events, "schemaVersion")).toEqual([0]);
+  expect(findMatchingEventIds(events, "schemaVersion", { handoffCards: false })).toEqual([0]);
+  expect(searchableEventText("assistant", `x ${SAMPLE_BLOCK}`)).toBe(`x ${SAMPLE_BLOCK}`);
+});
+
+test("handoffCards: invalid block falls back to its raw inner text; no block is verbatim", () => {
+  const bad = "before <handoff>raw-inner-token not json</handoff> after";
+  const text = searchableEventText("assistant", bad, { handoffCards: true })!;
+  expect(text).toContain("before");
+  expect(text).toContain("raw-inner-token");
+  expect(text).toContain("after");
+  expect(text).not.toContain("<handoff>");
+  expect(searchableEventText("assistant", "no block here", { handoffCards: true })).toBe("no block here");
+});
+
+test("handoffCards: a block quoted in code stays raw text", () => {
+  const quoted = `see \`${SAMPLE_BLOCK}\``;
+  expect(searchableEventText("assistant", quoted, { handoffCards: true })).toBe(quoted);
+});
+
+test("handoffCards: only the last block is formatted; earlier blocks stay raw", () => {
+  const first = `<handoff>${JSON.stringify({ ...SAMPLE_HANDOFF, summary: "first-block-summary" })}</handoff>`;
+  const data = `${first}\n${SAMPLE_BLOCK}`;
+  const text = searchableEventText("assistant", data, { handoffCards: true })!;
+  expect(text).toContain("first-block-summary");
+  expect(text).toContain("Summary-words");
+});
+
+test("handoffCards: non-assistant streams are unchanged", () => {
+  expect(searchableEventText("stdout", SAMPLE_BLOCK, { handoffCards: true })).toBe(SAMPLE_BLOCK);
+  expect(searchableEventText("thinking", SAMPLE_BLOCK, { handoffCards: true })).toBe(SAMPLE_BLOCK);
+});
+
+function stepPrompt(handoff: Handoff | null, filePath: string | null = null, inlineHandoff = true): string {
+  const step: PipelineStep = {
+    id: "s2",
+    name: "Second",
+    instructions: "Instruction-words",
+    agentProfileId: null,
+    position: { x: 0, y: 0 },
+    subagents: { profileIds: [], cap: null },
+    transition: "choose",
+    join: "any",
+  };
+  return composeStepPrompt({
+    pipelineName: "P",
+    step,
+    stepIndex: 2,
+    stepCap: 25,
+    goal: "Goal-words",
+    previous: [{ stepName: "First Step", handoff, filePath }],
+    outgoing: [],
+    transition: "choose",
+    subagentProfiles: [],
+    subagentCap: null,
+    inlineHandoff,
+    parallelSiblings: [],
+    nonce: "a1b2c3d4",
+  });
+}
+
+test("handoffCards: a user prompt's untrusted span matches values, not keys", () => {
+  const prompt = stepPrompt(SAMPLE_HANDOFF);
+  // Raw search sees the key (the prompt's contract text and the JSON both carry it).
+  expect(findMatchingEventIds([ev("user", prompt)], "purpose-words")).toEqual([0]);
+  const opts = { handoffCards: true };
+  const events = [ev("user", prompt)];
+  expect(findMatchingEventIds(events, "summary-words", opts)).toEqual([0]);
+  expect(findMatchingEventIds(events, "first step", opts)).toEqual([0]);
+  expect(findMatchingEventIds(events, "instruction-words", opts)).toEqual([0]);
+  // The span's JSON is gone from the formatted text (the prompt's own contract
+  // text still names the keys, so assert on this handoff's serialized values).
+  expect(prompt).toMatch(/"summary":\s*"Summary-words"/);
+  const formatted = searchableEventText("user", prompt, { handoffCards: true })!;
+  expect(formatted).not.toMatch(/"summary":\s*"Summary-words"/);
+  expect(formatted).toContain("Summary-words");
+  expect(formatted).not.toContain("--- BEGIN untrusted handoff");
+});
+
+test("handoffCards: a prompt placeholder span contributes the step name and file path", () => {
+  const prompt = stepPrompt(SAMPLE_HANDOFF, "/data/pipeline-runs/p1/handoff-abc-1-from-0.json", false);
+  const events = [ev("user", prompt)];
+  expect(findMatchingEventIds(events, "handoff-abc-1-from-0", { handoffCards: true })).toEqual([0]);
+  expect(findMatchingEventIds(events, "first step", { handoffCards: true })).toEqual([0]);
+});
+
+test("handoffCards: a prompt with no span (or the flag off) is byte-identical", () => {
+  const plain = "just a message";
+  expect(searchableEventText("user", plain, { handoffCards: true })).toBe(plain);
+  const prompt = stepPrompt(SAMPLE_HANDOFF);
+  expect(searchableEventText("user", prompt)).toBe(prompt);
 });
