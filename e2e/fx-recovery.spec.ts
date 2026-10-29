@@ -19,6 +19,7 @@ import { gotoApp, getPreferences, openSettingsGeneral } from "./helpers";
 // safe for this Node-run Playwright process, unlike `src/bun/agents.ts`
 // (see the marker-literal comments below for why THOSE stay copied).
 import { FX_AUTO_RESUME_DELAY_PREF, FX_AUTO_RESUME_MAX, FX_AUTO_RESUME_PREF } from "../src/shared/types.ts";
+import { FX_RESUME_UNSUPPORTED_TEXT } from "../src/shared/fx-recovery.ts";
 
 // Wait budget for a fake-driver turn to surface in the panel (the paused
 // notice, the recovered line, a follow-up echo). The fake storm itself is
@@ -1216,3 +1217,62 @@ async function expectRunCountStays(
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
+
+// fx 0.0.15 and later can't continue a paused response
+// (docs/plans/fx-0.0.15-upgrade-investigation.md §1b.2). An extra fx harness
+// whose env makes the stub report 0.0.15 stands in for an upgraded fx: the
+// pause still shows its notice, but with the "send a new message" hint
+// instead of Resume, no auto-resume countdown, and no board badge.
+test.describe("fx recovery on fx 0.0.15", () => {
+  const harness = { id: "fx-e2e-v015", label: "fx 0.0.15 (e2e)" };
+  const taskIds: string[] = [];
+
+  test.beforeAll(async ({ backend }) => {
+    const res = await fetch(`${backend.apiBase}/harnesses`, {
+      method: "POST",
+      headers: { ...authHeaders(backend), "content-type": "application/json" },
+      body: JSON.stringify({ ...harness, kind: "fx", home: null, bin: null, env: { AGETOR_E2E_FX_VERSION: "0.0.15" } }),
+    });
+    if (!res.ok) throw new Error(`POST /harnesses -> ${res.status}: ${await res.text()}`);
+  });
+
+  test.afterAll(async ({ backend }) => {
+    const auth = authHeaders(backend);
+    for (const id of taskIds) {
+      await fetch(`${backend.apiBase}/tasks/${id}`, { method: "DELETE", headers: auth }).catch(() => {});
+    }
+    await fetch(`${backend.apiBase}/harnesses/${harness.id}`, { method: "DELETE", headers: auth }).catch(() => {});
+  });
+
+  test("a pause shows the send-a-new-message hint instead of Resume, with no countdown or board badge", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `fx-recovery-015-e2e ${randomUUID()}`;
+    const createRes = await request.post(`${backend.apiBase}/tasks`, {
+      headers: authHeaders(backend),
+      data: { title, prompt: `${FAKE_FX_RECOVERY_PROMPT_MARKER} ${title}`, agent: harness.id, mode: "yolo", isolation: "none", workdir: tmpdir() },
+    });
+    expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
+    const task = (await createRes.json()) as TaskRow;
+    taskIds.push(task.id);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await startFakeFxRecoveryTask(request, backend, task.id);
+
+    const paused = panel.getByTestId("fx-recovery-paused");
+    await expect(async () => {
+      await kickPolls(page);
+      await expect(paused).toBeVisible({ timeout: 200 });
+    }).toPass({ timeout: PAUSE_TIMEOUT, intervals: [100, 200, 400] });
+    await expect(panel.getByTestId("fx-recovery-unsupported")).toHaveText(FX_RESUME_UNSUPPORTED_TEXT);
+    await expect(panel.getByTestId("fx-recovery-resume")).toHaveCount(0);
+    await expect(panel.getByTestId("fx-recovery-countdown")).toHaveCount(0);
+    await expect(taskCard(page, title).getByTestId("fx-paused-badge")).toHaveCount(0);
+
+    const fresh = await request.get(`${backend.apiBase}/tasks/${task.id}`, { headers: authHeaders(backend) });
+    expect(((await fresh.json()) as { fxRecovery: unknown }).fxRecovery).toBeNull();
+  });
+});

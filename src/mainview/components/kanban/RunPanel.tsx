@@ -1,4 +1,4 @@
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ComponentType } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
@@ -32,8 +32,10 @@ import { useCountdown } from "@/lib/fx-auto-resume";
 import { renderLinkified } from "@/lib/linkify";
 import { subscribePipelineGlobalEvents } from "@/lib/pipeline-events";
 import {
+  FX_RESUME_UNSUPPORTED_TEXT,
   fxRecoveryNoticeText,
   fxRecoverySummaryLine,
+  fxSupportsContinueRecovery,
   isFxRecoveryResumable,
   parseFxRecoveryPayload,
 } from "../../../shared/fx-recovery.ts";
@@ -2625,14 +2627,23 @@ function RunPanelBody({
   // `isFxRecoveryResumable` gate above still decides whether the notice
   // shows at all, `task.fxRecovery` only adds the auto-resume-specific
   // detail on top once it does.
+  //
+  // fx 0.0.15 and later can't continue a pause, so on that version the
+  // notice keeps its text but trades Resume and the auto-resume lines for a
+  // "send a new message" hint. The version is the installed binary's (the
+  // `/harnesses` poll), not the one that paused; unknown keeps Resume.
+  const fxVersion = agents.find((a) => a.harnessId === task.agent)?.version ?? null;
+  const resumeSupported = fxSupportsContinueRecovery(fxVersion);
   const pausedRecovery = useMemo(() => {
     if (kind !== "fx" || activeStream !== "main" || archived) return null;
     if (task.column === "running") return null;
     if (!latestRun || latestRun.status !== "failed") return null;
     const payload = recoveryByRunId.get(latestRun.id);
     if (!payload || !isFxRecoveryResumable(payload)) return null;
+    const text = fxRecoverySummaryLine(payload) ?? fxRecoveryNoticeText(payload);
+    if (!resumeSupported) return { text, busy: false, unsupportedHint: FX_RESUME_UNSUPPORTED_TEXT };
     return {
-      text: fxRecoverySummaryLine(payload) ?? fxRecoveryNoticeText(payload),
+      text,
       busy: resumeBusy,
       onResume: handleResumeFxRecovery,
       autoResume: task.fxRecovery?.autoResume,
@@ -2643,6 +2654,7 @@ function RunPanelBody({
   }, [
     kind, activeStream, archived, task.column, latestRun, recoveryByRunId, resumeBusy,
     handleResumeFxRecovery, task.fxRecovery, handleCancelFxAutoResume, cancelAutoBusy,
+    resumeSupported,
   ]);
   // Messages backlog — saved, not-yet-sent drafts for this task. Seeded from
   // the task prop and kept in sync as the 2s task poll refreshes `task.backlog`;
@@ -5356,7 +5368,7 @@ function RunEventList({
    *  live affordance's label; `busy` disables the button while a resume request is
    *  in flight; `onResume` is the click handler. `null` when there's nothing
    *  to resume. */
-  pausedRecovery?: { text: string; busy: boolean; onResume: () => void } | null;
+  pausedRecovery?: ComponentProps<typeof PausedRecoveryNotice> | null;
   /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
@@ -5844,6 +5856,7 @@ function PausedRecoveryNotice({
   text,
   busy,
   onResume,
+  unsupportedHint,
   autoResume,
   stopped,
   onCancelAuto,
@@ -5851,7 +5864,9 @@ function PausedRecoveryNotice({
 }: {
   text: string;
   busy: boolean;
-  onResume: () => void;
+  /** Absent when the installed fx can't resume; `unsupportedHint` shows instead. */
+  onResume?: () => void;
+  unsupportedHint?: string;
   autoResume?: TaskFxRecovery["autoResume"];
   stopped?: TaskFxRecovery["autoResumeStopped"];
   onCancelAuto?: () => void;
@@ -5865,18 +5880,25 @@ function PausedRecoveryNotice({
     >
       <div className="flex items-start gap-2">
         <span className="min-w-0 flex-1">{renderLinkified(text)}</span>
-        <Button
-          type="button"
-          size="sm"
-          variant="secondary"
-          data-testid="fx-recovery-resume"
-          disabled={busy}
-          onClick={onResume}
-          className="h-6 shrink-0 px-2 text-[11px]"
-        >
-          Resume
-        </Button>
+        {onResume && (
+          <Button
+            type="button"
+            size="sm"
+            variant="secondary"
+            data-testid="fx-recovery-resume"
+            disabled={busy}
+            onClick={onResume}
+            className="h-6 shrink-0 px-2 text-[11px]"
+          >
+            Resume
+          </Button>
+        )}
       </div>
+      {unsupportedHint && (
+        <span data-testid="fx-recovery-unsupported" className="text-danger/80">
+          {unsupportedHint}
+        </span>
+      )}
       {autoResume && (
         <div className="flex items-center gap-2">
           <span data-testid="fx-recovery-countdown" className="min-w-0 flex-1">
