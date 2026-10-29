@@ -31,6 +31,26 @@ import type { BackgroundRegistration } from "../shared/types.ts";
 
 const STATUS_CACHE_MS = 2000;
 
+/**
+ * After a successful register / reregister, launchd needs a moment to start the
+ * supervisor and the supervisor to write `login-daemon.json`. For this long an
+ * enabled item with no live supervisor reads `starting` rather than `stopped`,
+ * so the remote-access reconcile (C3) doesn't undo "Turn On" in the window
+ * before the first state file lands. If no supervisor shows up in time it
+ * reads `stopped` again (and remote access is turned off, as before).
+ */
+const DEFAULT_START_GRACE_MS = 15_000;
+let startGraceUntil = 0;
+
+function startGraceMs(): number {
+  const raw = Number(process.env.AGETOR_BACKGROUND_START_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 && process.env.AGETOR_BACKGROUND_START_GRACE_MS ? raw : DEFAULT_START_GRACE_MS;
+}
+
+function armStartGrace(): void {
+  startGraceUntil = Date.now() + startGraceMs();
+}
+
 /** Thrown by `startBackgroundNow` when its precondition fails; the route maps
  *  it to 409 `{ error, code }`. */
 export class BackgroundStartError extends Error {
@@ -159,6 +179,9 @@ async function probe(): Promise<BackgroundStatus> {
 
   const isLoginItemCore = launchedBy() === "login-item";
   const remoteAccess = remoteIsOn();
+  const supervisor = liveSupervisor(dataDir);
+  // A supervisor that has reported ends the grace; one that never does lets it lapse.
+  if (supervisor) startGraceUntil = 0;
   let status = deriveBackgroundStatus({
     // The fake seam stands in for the macOS helper, so it also stands in for
     // the platform; and it can't know the real data dir of a stable install
@@ -167,7 +190,8 @@ async function probe(): Promise<BackgroundStatus> {
     info,
     helperError,
     registration,
-    supervisor: liveSupervisor(dataDir),
+    supervisor,
+    expectSupervisor: Date.now() < startGraceUntil,
     isLoginItemCore,
     selfPid: isLoginItemCore ? process.pid : null,
     dataDir: fake && info ? expectedDataDirForChannel(info.channel, home) : dataDir,
@@ -237,8 +261,10 @@ export async function turnOnBackground(): Promise<BackgroundStatus> {
   if (before.state === "unavailable") return before;
   const helper = loginItemHelper(dataDir);
   if (!helper) return before;
+  let registeredNow = false;
   if (before.registration !== "enabled") {
     lastActionDetail = null;
+    registeredNow = true;
     try {
       const res = await helper.register();
       if (!res.ok || res.registration !== "enabled") {
@@ -253,7 +279,14 @@ export async function turnOnBackground(): Promise<BackgroundStatus> {
     }
   }
   invalidate();
-  const status = await getBackgroundStatus({ fresh: true });
+  let status = await getBackgroundStatus({ fresh: true });
+  if (registeredNow && status.registration === "enabled") {
+    // The supervisor hasn't had time to write its state file: don't read that
+    // as "stopped" (see DEFAULT_START_GRACE_MS).
+    armStartGrace();
+    invalidate();
+    status = await getBackgroundStatus({ fresh: true });
+  }
   emit(status);
   return status;
 }
@@ -267,6 +300,7 @@ export async function turnOnBackground(): Promise<BackgroundStatus> {
  */
 export async function turnOffBackground(): Promise<BackgroundStatus> {
   writeRemoteOff();
+  startGraceUntil = 0;
   const before = await getBackgroundStatus({ fresh: true });
   if (before.state === "unavailable") {
     emit(before);
@@ -347,6 +381,7 @@ export async function startBackgroundNow(): Promise<BackgroundStatus> {
   } catch (e) {
     failure = errorText(e);
   }
+  if (!failure) armStartGrace(); // launchd is starting the supervisor (DEFAULT_START_GRACE_MS)
   invalidate();
   let status = await getBackgroundStatus({ fresh: true });
   if (failure) status = { ...status, detail: failure };
@@ -360,3 +395,12 @@ export async function openLoginItems(): Promise<void> {
   if (!helper) throw new Error("The login-item helper isn't available on this install.");
   await helper.openSettings();
 }
+
+/** Test hooks; not for production callers. */
+export const __testing = {
+  /** Forget the post-register grace window (and any cached status). */
+  resetStartGrace(): void {
+    startGraceUntil = 0;
+    invalidate();
+  },
+};

@@ -313,6 +313,33 @@ esac`);
     expect(__testing.DEFAULT_TIMEOUT_MS).toBe(15_000);
   });
 
+  test("unregister and reregister time out strictly after the Swift helper's worst case; quick commands keep 15 s", () => {
+    const swiftUnregister = __testing.SWIFT_UNREGISTER_WAIT_MS;
+    expect(__testing.commandTimeoutMs("unregister")).toBeGreaterThan(swiftUnregister);
+    expect(__testing.commandTimeoutMs("reregister")).toBeGreaterThan(
+      swiftUnregister + __testing.SWIFT_REREGISTER_PAUSE_MS,
+    );
+    for (const quick of ["info", "status", "register", "open-settings"]) {
+      expect(__testing.commandTimeoutMs(quick)).toBe(__testing.DEFAULT_TIMEOUT_MS);
+    }
+  });
+
+  test("the test override applies to every command, then restores the per-command defaults", () => {
+    __testing.setTimeoutMs(42);
+    expect(__testing.commandTimeoutMs("reregister")).toBe(42);
+    expect(__testing.commandTimeoutMs("info")).toBe(42);
+    __testing.setTimeoutMs();
+    expect(__testing.commandTimeoutMs("reregister")).toBeGreaterThan(__testing.DEFAULT_TIMEOUT_MS);
+  });
+
+  test("a slow reregister under the default timeout is not killed", async () => {
+    __testing.setTimeoutMs(); // defaults: reregister gets > 20 s, far above this stub's delay
+    const h = helperFor(
+      stub(`sleep 0.4\necho '${JSON.stringify({ ok: true, registration: "enabled" })}'`),
+    );
+    expect(await h.reregister()).toEqual({ ok: true, registration: "enabled" });
+  });
+
   test("a binary that cannot be executed is a HelperError, not a raw spawn error", async () => {
     // Exists (so it resolves) but isn't executable.
     const file = path.join(root, "not-executable");

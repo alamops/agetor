@@ -23,6 +23,7 @@ const ENV_KEYS = [
   "AGETOR_FAKE_REMOTE_ACCESS",
   "AGETOR_LAUNCHED_BY",
   "AGETOR_LOGIN_ITEM_HELPER",
+  "AGETOR_BACKGROUND_START_GRACE_MS",
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -75,6 +76,7 @@ beforeAll(async () => {
   delete process.env.AGETOR_FAKE_REMOTE_ACCESS;
   delete process.env.AGETOR_LAUNCHED_BY;
   delete process.env.AGETOR_LOGIN_ITEM_HELPER;
+  delete process.env.AGETOR_BACKGROUND_START_GRACE_MS;
   db = await import("./db.ts");
   dir = db.dataDir;
   daemonState = await import("./login-daemon-state.ts");
@@ -93,6 +95,8 @@ afterAll(async () => {
 
 beforeEach(async () => {
   delete process.env.AGETOR_LAUNCHED_BY;
+  delete process.env.AGETOR_BACKGROUND_START_GRACE_MS;
+  bg.__testing.resetStartGrace();
   rmSync(daemonFile(), { force: true });
   seedFake();
   db.preferences.set(REMOTE_ACCESS_PREF_KEY, "off");
@@ -301,7 +305,27 @@ describe("turnOnBackground", () => {
     const s = await bg.turnOnBackground();
     expect(callsOf("register")).toBe(1);
     expect(s.registration).toBe("enabled");
-    expect(s.state).toBe("stopped"); // enabled, no supervisor yet
+    // Enabled, and launchd hasn't started the supervisor yet: starting, not stopped.
+    expect(s.state).toBe("starting");
+    expect(s.supervisorPid).toBeNull();
+  });
+
+  test("the starting grace ends when a supervisor reports, and lapses to stopped when none does", async () => {
+    process.env.AGETOR_BACKGROUND_START_GRACE_MS = "120";
+    seedFake({ registration: "notRegistered" });
+    await bg.turnOnBackground();
+    expect((await bg.getBackgroundStatus({ fresh: true })).state).toBe("starting");
+    await tick(180);
+    expect((await bg.getBackgroundStatus({ fresh: true })).state).toBe("stopped");
+
+    // A reporting supervisor takes over the state and clears the grace for good.
+    bg.__testing.resetStartGrace();
+    seedFake({ registration: "notRegistered" });
+    await bg.turnOnBackground();
+    seedSupervisor({ state: "parked", corePid: null });
+    expect((await bg.getBackgroundStatus({ fresh: true })).state).toBe("parked");
+    rmSync(daemonFile(), { force: true });
+    expect((await bg.getBackgroundStatus({ fresh: true })).state).toBe("stopped");
   });
 
   test("an already-enabled item isn't registered again", async () => {
@@ -347,6 +371,68 @@ describe("turnOnBackground", () => {
     const s = await bg.turnOnBackground();
     expect(s.state).toBe("unavailable");
     expect(callsOf("register")).toBe(0);
+  });
+});
+
+describe("regression: remote access turned on right after the host is registered survives the supervisor's first-report lag", () => {
+  test("register → remote on → status read before login-daemon.json exists: remote stays on", async () => {
+    seedFake({ registration: "notRegistered" });
+    const registered = await bg.turnOnBackground();
+    expect(registered.state).toBe("starting");
+    // This is what the native box does once the host is enabled.
+    bg.setRemoteAccessOnFromNativeBox();
+    await tick(40); // let the deferred change notification and any reconcile run
+    const s = await bg.getBackgroundStatus({ fresh: true });
+    expect(s.state).toBe("starting");
+    expect(s.remoteAccess).toBe(true);
+    expect(remotePref()).toBe("on");
+  });
+
+  test("if no supervisor ever reports, the grace lapses and the C3 reconcile turns remote off", async () => {
+    process.env.AGETOR_BACKGROUND_START_GRACE_MS = "100";
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      seedFake({ registration: "notRegistered" });
+      await bg.turnOnBackground();
+      bg.setRemoteAccessOnFromNativeBox();
+      await tick(160);
+      const s = await bg.getBackgroundStatus({ fresh: true });
+      expect(s.state).toBe("stopped");
+      expect(s.remoteAccess).toBe(false);
+      expect(remotePref()).toBe("off");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("an enabled item that is genuinely stopped (no grace) still turns remote off", async () => {
+    seedFake({ registration: "enabled" });
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      bg.setRemoteAccessOnFromNativeBox();
+      const s = await bg.getBackgroundStatus({ fresh: true });
+      expect(s.state).toBe("stopped");
+      expect(s.remoteAccess).toBe(false);
+      expect(remotePref()).toBe("off");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("startBackgroundNow on a stopped host also reads starting until the supervisor reports", async () => {
+    seedFake({ registration: "enabled" });
+    const s = await bg.startBackgroundNow();
+    expect(callsOf("reregister")).toBe(1);
+    expect(s.state).toBe("starting");
+  });
+
+  test("turning the background off clears the grace", async () => {
+    seedFake({ registration: "notRegistered" });
+    await bg.turnOnBackground();
+    seedFake({ registration: "enabled" });
+    await bg.turnOffBackground();
+    seedFake({ registration: "enabled" }); // as if re-enabled elsewhere
+    expect((await bg.getBackgroundStatus({ fresh: true })).state).toBe("stopped");
   });
 });
 

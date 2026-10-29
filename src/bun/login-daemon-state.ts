@@ -49,9 +49,25 @@ export interface LoginDaemonState {
   startedAt: number;
   /** Unix ms of the last state write. */
   updatedAt: number;
+  /** Unix ms of the supervisor's last heartbeat. A live supervisor rewrites its
+   *  state every `SUPERVISOR_HEARTBEAT_MS`, so a pid that is alive but whose
+   *  heartbeat is older than `SUPERVISOR_STALE_MS` is a recycled pid, not the
+   *  supervisor. Absent in files written before the heartbeat existed (and in
+   *  test fixtures): those are trusted on pid liveness alone. */
+  heartbeatAt?: number;
   /** Why the previous core child / supervisor ended, when it did. */
   lastExit?: "stop" | "sigterm" | "bundle-changed" | "crash";
 }
+
+/** How often the supervisor refreshes `heartbeatAt` while idle. */
+export const SUPERVISOR_HEARTBEAT_MS = 30_000;
+/** A heartbeat older than this means the recorded pid is no longer the
+ *  supervisor (ten missed beats: far beyond any event-loop stall). */
+export const SUPERVISOR_STALE_MS = 10 * SUPERVISOR_HEARTBEAT_MS;
+/** A stop request older than this is stale and never honoured. Quit Completely
+ *  writes it while the supervisor is parked/waiting, which reads it within a
+ *  tick, so two minutes is far more than a legitimate request needs. */
+export const SUPERVISOR_STOP_MAX_AGE_MS = 120_000;
 
 const STATE_FILE = "login-daemon.json";
 const CONTROL_FILE = "login-daemon-control.json";
@@ -125,6 +141,7 @@ function parseState(v: unknown): LoginDaemonState | null {
   if (r.lastExit !== undefined && (typeof r.lastExit !== "string" || !LAST_EXITS.has(r.lastExit))) {
     return null;
   }
+  if (r.heartbeatAt !== undefined && !isFiniteNum(r.heartbeatAt)) return null;
   const out: LoginDaemonState = {
     pid: r.pid,
     state: r.state as LoginDaemonState["state"],
@@ -135,6 +152,7 @@ function parseState(v: unknown): LoginDaemonState | null {
     startedAt: r.startedAt,
     updatedAt: r.updatedAt,
   };
+  if (r.heartbeatAt !== undefined) out.heartbeatAt = r.heartbeatAt;
   if (r.lastExit !== undefined) out.lastExit = r.lastExit as LoginDaemonState["lastExit"];
   return out;
 }
@@ -147,29 +165,60 @@ export function writeLoginDaemonState(s: LoginDaemonState, dataDir?: string): vo
   writeJsonAtomic(filePath(STATE_FILE, dataDir), s);
 }
 
-/** The supervisor recorded in the state file, if its process is still alive and
- *  it hasn't recorded a clean stop. A leftover file from a crash or a reused
- *  pid-less stop reads as null. */
-export function liveSupervisor(dataDir?: string): LoginDaemonState | null {
+/** The supervisor recorded in the state file, if its process is still alive,
+ *  it hasn't recorded a clean stop and, when the file carries a heartbeat, the
+ *  heartbeat is fresh. A leftover file from a crash reads as null.
+ *
+ *  Pid reuse: `kill(pid, 0)` alone cannot tell the supervisor from an unrelated
+ *  process that inherited its pid after a crash. The heartbeat closes that
+ *  without spawning `ps` (this runs synchronously inside the app's
+ *  `before-quit`): the supervisor refreshes it every 30 s, so a recycled pid
+ *  goes stale within `SUPERVISOR_STALE_MS`. Residual risk: for up to that long
+ *  after a crash an unrelated process on the same pid still reads as live. */
+export function liveSupervisor(
+  dataDir?: string,
+  now: number = Date.now(),
+): LoginDaemonState | null {
   const s = readLoginDaemonState(dataDir);
   if (!s || s.state === "stopped") return null;
-  return isPidAlive(s.pid) ? s : null;
+  if (!isPidAlive(s.pid)) return null;
+  if (s.heartbeatAt !== undefined && now - s.heartbeatAt > SUPERVISOR_STALE_MS) return null;
+  return s;
 }
 
 /** Ask the supervisor to stop (exit 0 → launchd keeps it down until next
  *  login). A file, not a signal, so it works while the supervisor is parked
- *  and from a process that doesn't know its pid. */
-export function requestSupervisorStop(dataDir?: string): void {
-  writeJsonAtomic(filePath(CONTROL_FILE, dataDir), { action: "stop", at: Date.now() });
+ *  and from a process that doesn't know its pid. The request carries its own
+ *  timestamp: `takeSupervisorStop` only honours a fresh one written after the
+ *  consuming supervisor started, so a request left behind while no supervisor
+ *  was running cannot stop a later one. */
+export function requestSupervisorStop(dataDir?: string, now: number = Date.now()): void {
+  writeJsonAtomic(filePath(CONTROL_FILE, dataDir), { action: "stop", requestedAt: now });
 }
 
-/** Consume a stop request. True only for a well-formed `{action:"stop"}`; the
- *  file is removed whenever it exists, so a malformed one can't linger. */
-export function takeSupervisorStop(dataDir?: string): boolean {
+export interface TakeStopOpts {
+  /** The consuming supervisor's own start time (unix ms). A request written
+   *  before it can't have been meant for this process and is ignored. */
+  supervisorStartedAt?: number;
+  now?: number;
+  maxAgeMs?: number;
+}
+
+/** Consume a stop request. True only for a well-formed, fresh `{action:"stop",
+ *  requestedAt}` that is not older than `maxAgeMs` and was written at or after
+ *  `supervisorStartedAt`. The file is removed whenever it exists, so a stale,
+ *  legacy (no `requestedAt`) or malformed one can't linger. */
+export function takeSupervisorStop(dataDir?: string, opts: TakeStopOpts = {}): boolean {
   const file = filePath(CONTROL_FILE, dataDir);
   const v = readJson(file);
   removeFile(file);
-  return !!v && typeof v === "object" && (v as { action?: unknown }).action === "stop";
+  if (!v || typeof v !== "object") return false;
+  const r = v as { action?: unknown; requestedAt?: unknown };
+  if (r.action !== "stop" || !isFiniteNum(r.requestedAt)) return false;
+  const now = opts.now ?? Date.now();
+  if (now - r.requestedAt > (opts.maxAgeMs ?? SUPERVISOR_STOP_MAX_AGE_MS)) return false;
+  if (opts.supervisorStartedAt !== undefined && r.requestedAt < opts.supervisorStartedAt) return false;
+  return true;
 }
 
 /** Marker the app writes when it quits for an update, so the supervisor takes

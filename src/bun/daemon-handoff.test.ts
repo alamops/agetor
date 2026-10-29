@@ -5,6 +5,7 @@ import path from "node:path";
 import { createServer } from "node:http";
 import { probeLiveCore, waitForPortFree, readCoreCreds, writeCoreCreds } from "./core-creds.ts";
 import { CORE_EXIT_PARK } from "./daemon-mode.ts";
+import { Database } from "bun:sqlite";
 
 function spawnDaemon(dir: string, port: number) {
   return Bun.spawn(["bun", "src/bun/headless.ts"], {
@@ -84,11 +85,52 @@ test("cli-daemon releases its port on /daemon/shutdown so a new owner can bind",
 // milliseconds and is live before the loser reaches its bind, so the core's bind
 // fails with EADDRINUSE, which is the path under test (probeLiveCore then finds
 // the stand-in live: pid alive, /health says agetor, /info accepts the token).
-async function loserExitCode(port: number, loserLaunchedBy?: "login-item"): Promise<{
+/** Seeds `dir`'s database with one task and one `running` fx run, in a
+ *  subprocess so this test process never opens (and pins) a db.ts singleton.
+ *  fx runs are never reattached, so any boot restore that ran would flip it
+ *  to `orphaned`. */
+async function seedRunningRun(dir: string): Promise<void> {
+  const script = `
+    const { tasks, runs } = await import(${JSON.stringify(path.resolve("src/bun/db.ts"))});
+    const now = Date.now();
+    tasks.insert({ id: "t-live", title: "live", prompt: "p", column: "running", agent: "fx", workdir: "/tmp",
+      isolation: "none", taskType: "task", branch: null, branchSource: "created", worktreePath: null, baseRef: null,
+      prUrl: null, mode: null, model: null, effort: null, speed: "off", maxMode: false, opencodeServer: "shared",
+      references: [], backlog: [], plans: [], draft: null, hasOpenableRun: false, pendingInteractionCount: 0,
+      openTerminalCount: 0, archivedAt: null, createdAt: now, updatedAt: now, runId: "r-live" });
+    runs.insert({ id: "r-live", taskId: "t-live", agent: "fx", status: "running", startedAt: now, endedAt: null,
+      exitCode: null, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
+      geminiSessionId: null, fxSessionId: null });
+  `;
+  const seed = Bun.spawn(["bun", "-e", script], {
+    cwd: process.cwd(),
+    env: { ...process.env, NODE_ENV: "test", AGETOR_DATA_DIR: dir } as Record<string, string>,
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  if ((await seed.exited) !== 0) throw new Error(`seed failed: ${await new Response(seed.stderr).text()}`);
+}
+
+function runStatus(dir: string, runId: string): string | null {
+  const db = new Database(path.join(dir, "agetor.sqlite"), { readonly: true });
+  try {
+    return db.query<{ status: string }, [string]>("SELECT status FROM runs WHERE id = ?").get(runId)?.status ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+async function loserExitCode(
+  port: number,
+  loserLaunchedBy?: "login-item",
+  opts: { seedRunningRun?: boolean } = {},
+): Promise<{
   code: number;
   winnerStillOwnsPort: boolean;
+  dir: string;
 }> {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-lost-bind-"));
+  if (opts.seedRunningRun) await seedRunningRun(dir);
   const token = "w".repeat(64);
   const winner = createServer((req, res) => {
     res.setHeader("content-type", "application/json");
@@ -138,7 +180,7 @@ async function loserExitCode(port: number, loserLaunchedBy?: "login-item"): Prom
     // The loser must not have touched the winner's creds or its port.
     const creds = readCoreCreds(dir);
     const winnerStillOwnsPort = creds?.pid === process.pid && creds.kind === "app" && (await probeLiveCore(creds));
-    return { code, winnerStillOwnsPort };
+    return { code, winnerStillOwnsPort, dir };
   } finally {
     loser.kill();
     winner.close();
@@ -156,4 +198,15 @@ test("a CLI core that loses the bind to a live core exits 0", async () => {
   const { code, winnerStillOwnsPort } = await loserExitCode(4480);
   expect(code).toBe(0);
   expect(winnerStillOwnsPort).toBe(true);
+}, 150_000);
+
+// The bind is the ownership claim (boot-gate.ts): a core that loses the port
+// must exit BEFORE its boot restore, or it would act on runs the live owner is
+// driving — this is the app-opens-while-the-background-core-runs race, seen
+// from the loser's side. Port 4615.
+test("a core that loses the bind never runs its boot restore (a live owner's running run stays running)", async () => {
+  const { code, winnerStillOwnsPort, dir } = await loserExitCode(4615, "login-item", { seedRunningRun: true });
+  expect(code).toBe(CORE_EXIT_PARK);
+  expect(winnerStillOwnsPort).toBe(true);
+  expect(runStatus(dir, "r-live")).toBe("running");
 }, 150_000);

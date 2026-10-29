@@ -28,10 +28,12 @@ import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } fr
 import { broadcastAppEvent, consumeForceQuit, consumeQuitCompletely, requestQuitCompletely } from "./quit-guard.ts";
 import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
 import { acquireApiPort } from "./app-takeover.ts";
+import { bootReadySignal } from "./boot-gate.ts";
 import { runRemoteAccessBox } from "./remote-access-box.ts";
 import {
   getBackgroundStatus,
   turnOnBackground,
+  startBackgroundNow,
   openLoginItems,
   getRemoteAccess,
   setRemoteAccessOff,
@@ -154,17 +156,14 @@ async function getMainViewUrl(): Promise<string> {
 // in dev runs — the merge dedupes.
 rehydratePath();
 
-// Mark any runs that were "running" when we last shut down as orphaned, so the
-// kanban doesn't show stuck cards. Awaited (top-level await — this module is
-// ESM) so the rest of boot, in particular `startApiServer()` below, never
-// runs concurrently with reconciliation: the API must not start serving
-// `/tasks`/`/runs` while a `status='running'` row from a previous process is
-// still being reattached or flipped to `orphaned` underneath it — the same
-// "reconcile before the API starts" invariant CLAUDE.md §5 documents, and the
-// same ordering the old synchronous `reconcileOrphans` gave for free by
-// blocking this whole script until it returned. An unhandled rejection here
-// fails boot loudly, matching that old synchronous-throw behavior — no
-// swallow.
+// Boot order (boot-gate.ts): bind the API port first — taking it over from a
+// live background/CLI core — then restore (`reconcileOrphans` and friends),
+// then `markBootReady()`. Only the port owner may restore, and the API must not
+// serve `/tasks`/`/runs` while a `status='running'` row from a previous process
+// is still being reattached or flipped to `orphaned` underneath it (CLAUDE.md
+// §5): routes wait on the ready signal, so a request that arrives mid-restore
+// is answered once the restore is done. A failed restore ends the process
+// loudly (see `failBoot`), never a swallow.
 //
 // Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
 // C): one `.unref()`'d sampler that names whatever held the single main thread
@@ -177,180 +176,6 @@ rehydratePath();
 // attribute are actually sampled. Unref'd, so an early boot failure can never
 // be held open by it; every shutdown path calls `stopLagMonitor()`.
 startLagMonitor({ sampleMs: 100 });
-
-/**
- * Launch-time question for a stored `disclaimSpawnedAgents = "false"`
- * (docs/plans/master-token-agent-read.md P5, D5): the SQLite file is writable
- * by any process running as the user, an agent included, so a stored "off" is
- * only a request. Returns true ONLY for "Keep it off"; the default button, the
- * cancel button and a dialog that can't be shown all mean "turn it back on"
- * (initDisclaimSwitch fails closed on a throw).
- *
- * `showMessageBox` is a synchronous FFI call that blocks the Bun thread until
- * the user answers — like `openFileDialog` — so it is bracketed with a lag
- * label to keep the expected stall from being reported as a core hang. It runs
- * before the first BrowserWindow and before any service starts, so nothing else
- * is waiting on the thread; if it ever fails to render that early, P5's
- * fallback is to ask right after window creation instead.
- */
-async function confirmKeepOff(): Promise<boolean> {
-  const end = beginLagLabel("native message box");
-  try {
-    const { response } = await Utils.showMessageBox({
-      type: "warning",
-      title: "Permission isolation is off",
-      message:
-        "Agents and Agetor's background programs would run with Agetor's macOS permissions.",
-      detail:
-        "It was turned off in Settings, or by something that edited Agetor's database. Keep it off only if you turned it off yourself.",
-      buttons: ["Turn it back on", "Keep it off"],
-      defaultId: 0,
-      cancelId: 0,
-    });
-    return response === 1;
-  } finally {
-    end();
-  }
-}
-
-// Decide the disclaim switch BEFORE any agent host starts (P5): it stays ON
-// while the question is open, and only an explicit "Keep it off" turns it off.
-// Must also run before reconcileOrphans(): reconciliation issues `has-session`
-// probes against agetor's tmux socket, and the first tmux command to touch
-// a socket auto-starts its server — un-disclaimed, if ensureDisclaimedServer()
-// didn't run first — leaving every session that server ever hosts un-disclaimed too.
-await initDisclaimSwitch("app", {
-  readPref: () => preferences.get(DISCLAIM_PREF_KEY),
-  writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
-  confirmKeepOff,
-  log: (m) => console.log(m),
-});
-await ensureDisclaimedServer();
-// Subscribe the pipeline runner to the global lifecycle stream BEFORE
-// reconcileOrphans() runs, so a step task's boot-time orphan→ready
-// transition (an ordinary `run-status` "orphaned" event, fired by
-// reconcileOrphans below) reaches the runner and flips its pipeline parent
-// back to ready/cancelled-with-retry instead of leaving it silently stuck
-// `running` forever (docs/plans/pipelines.md §3, T3).
-initPipelineRunner();
-await reconcileOrphans();
-
-// M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
-// by a prior process crash/restart — placed right after `reconcileOrphans`
-// (per its own doc, and pipeline-runner.ts's module doc) so every step
-// task's own boot-time orphan→ready transition has already fired and been
-// observed by the pipeline runner's global-event subscriber (wired up by
-// `initPipelineRunner()` above) before this does its own pass over parent
-// rows directly.
-const reconciledPipelineRunCount = await reconcilePipelineRuns();
-if (reconciledPipelineRunCount > 0) {
-  console.log(`[agetor] reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
-}
-
-// Re-arm in-memory auto-resume timers for every fx task still carrying a
-// pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — an
-// in-memory `setTimeout` handle never survives a process restart, so without
-// this a pause recorded in a prior process would sit forever with a
-// persisted `autoResume.at` nothing will ever fire. Awaited, and placed right
-// after `reconcileOrphans` so reattach/orphan resolution — which can itself
-// flip a run's status — settles first.
-const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
-if (rearmedFxAutoResumeCount > 0) {
-  console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
-}
-
-// Heal any archive/delete teardown (tmux kill, terminal shells, worktree
-// detach) that was deferred to the in-memory teardown queue but never ran
-// because agetor quit or crashed before the job fired. Fire-and-forget — it
-// only enqueues jobs onto that queue, keyed to this instance's own task ids.
-sweepArchivedTeardowns();
-
-// Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
-// claude REPL tmux sessions that have sat idle (no turn in flight, nothing
-// pending, no activity) for IDLE_SESSION_REAP_MS, reclaiming their ~300–500MB
-// "node" process and per-session timers. A 30s delay before the first sweep
-// lets `reconcileOrphans` above finish reattaching live sessions first, so a
-// task that's mid-reattach isn't mistaken for idle. Errors are swallowed —
-// this is best-effort background hygiene, never something that should crash
-// the app.
-setTimeout(() => {
-  reapIdleSessions().catch((err) => {
-    console.error("[agetor] idle-session reap (post-boot) failed:", err);
-  });
-}, 30_000);
-setInterval(() => {
-  reapIdleSessions().catch((err) => {
-    console.error("[agetor] idle-session reap (interval) failed:", err);
-  });
-}, SESSION_REAP_SWEEP_MS);
-
-// Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): fetches
-// quota/usage snapshots for every enabled harness on a background cadence, so
-// the topbar meters stay fresh without the webview driving the fetches. A
-// 20s post-boot delay (offset from the reaper's 30s so the two sweeps don't
-// both fire in the same tick) lets boot settle first. Errors are swallowed —
-// `pollAllUsage` already never throws, but the `.catch` matches the reaper's
-// belt-and-suspenders shape.
-setTimeout(() => {
-  pollAllUsage().catch((err) => {
-    console.error("[agetor] usage poll (post-boot) failed:", err);
-  });
-}, 20_000);
-setInterval(() => {
-  pollAllUsage().catch((err) => {
-    console.error("[agetor] usage poll sweep failed", err);
-  });
-}, USAGE_POLL_SWEEP_MS);
-
-installNativeMenu();
-
-/** `Utils.showMessageBox` blocks the Bun thread (synchronous FFI) until the user
- *  answers, so every box is bracketed with the lag label — same as
- *  `confirmKeepOff`. */
-async function showLabelledMessageBox(opts: Parameters<typeof Utils.showMessageBox>[0]) {
-  const end = beginLagLabel("native message box");
-  try {
-    return await Utils.showMessageBox(opts);
-  } finally {
-    end();
-  }
-}
-
-Electrobun.events.on("application-menu-clicked", (e: { data?: { action?: string } }) => {
-  const action = e?.data?.action;
-  if (action === "remote-access") {
-    void runRemoteAccessBox({
-      showMessageBox: showLabelledMessageBox,
-      background: {
-        getBackgroundStatus,
-        turnOnBackground,
-        getRemoteAccess,
-        setRemoteAccessOff,
-        setRemoteAccessOnFromNativeBox,
-      },
-      openLoginItems,
-      log: (m) => console.warn(m),
-    });
-  } else if (action === "quit-completely") {
-    // before-quit reads this one-shot; with runs active it still asks first.
-    requestQuitCompletely();
-    Utils.quit();
-  }
-});
-
-// Best-effort: probe the agent CLIs (and every enabled fx harness's own
-// account-scoped catalog) for their model lists so the form can surface
-// anything new the user installed — or logged into — without an app update.
-// Runs in the background — we don't await it so a slow CLI never delays the
-// API/window; the webview polls GET /agent-models/harnesses' `ready` flag
-// until this sweep lands, which is what closes the boot race
-// docs/plans/fx-model-catalog-refresh.md §2 reproduced (fx=0 for the first
-// ~1s after boot). `startPeriodicDiscovery` re-runs the sweep every 15
-// minutes (`.unref()`'d — never itself keeps the app alive) so catalog
-// drift (new models, revoked account access) is eventually noticed even
-// with no triggering event.
-void refreshAllModels();
-startPeriodicDiscovery();
 
 /**
  * Posts and removes task notifications. Each task owns at most one
@@ -445,6 +270,11 @@ if (!requestedApiHost.ok || requestedApiHost.host !== DEFAULT_API_HOST) {
   );
 }
 
+// Bind BEFORE the boot restore (boot-gate.ts): the bind is what makes this
+// process the owner — it hands the port off from a live background/CLI core —
+// and only the owner may reattach sessions, orphan runs or drive pipelines.
+// Until `markBootReady()` every route but the ownership probes waits.
+const { ready: bootReady, markReady: markBootReady } = bootReadySignal();
 let apiServer: ReturnType<typeof startApiServer>;
 try {
   // Port busy? acquireApiPort asks a CLI daemon / login-item core to hand off
@@ -459,6 +289,8 @@ try {
         // Same post/remove pair `native` offers; the server prefers `native`
         // when both are given (headless cores get only this).
         notifications: { post: (n) => taskNotifier.post(n), remove: (r) => taskNotifier.remove(r) },
+        // Requests wait for the boot restore below (markBootReady).
+        ready: bootReady,
       }),
     readCreds: () => readCoreCreds(dataDir),
     probe: probeLiveCore,
@@ -492,6 +324,198 @@ writeCoreCreds(
   },
   dataDir,
 );
+
+
+/**
+ * Launch-time question for a stored `disclaimSpawnedAgents = "false"`
+ * (docs/plans/master-token-agent-read.md P5, D5): the SQLite file is writable
+ * by any process running as the user, an agent included, so a stored "off" is
+ * only a request. Returns true ONLY for "Keep it off"; the default button, the
+ * cancel button and a dialog that can't be shown all mean "turn it back on"
+ * (initDisclaimSwitch fails closed on a throw).
+ *
+ * `showMessageBox` is a synchronous FFI call that blocks the Bun thread until
+ * the user answers — like `openFileDialog` — so it is bracketed with a lag
+ * label to keep the expected stall from being reported as a core hang. It runs
+ * before the first BrowserWindow and before any agent host starts; the API is
+ * already bound but every route waits for the boot restore, so nothing is
+ * served while it is open. If it ever fails to render that early, P5's
+ * fallback is to ask right after window creation instead.
+ */
+async function confirmKeepOff(): Promise<boolean> {
+  const end = beginLagLabel("native message box");
+  try {
+    const { response } = await Utils.showMessageBox({
+      type: "warning",
+      title: "Permission isolation is off",
+      message:
+        "Agents and Agetor's background programs would run with Agetor's macOS permissions.",
+      detail:
+        "It was turned off in Settings, or by something that edited Agetor's database. Keep it off only if you turned it off yourself.",
+      buttons: ["Turn it back on", "Keep it off"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    return response === 1;
+  } finally {
+    end();
+  }
+}
+
+// Decide the disclaim switch BEFORE any agent host starts (P5): it stays ON
+// while the question is open, and only an explicit "Keep it off" turns it off.
+// Must also run before reconcileOrphans(): reconciliation issues `has-session`
+// probes against agetor's tmux socket, and the first tmux command to touch
+// a socket auto-starts its server — un-disclaimed, if ensureDisclaimedServer()
+// didn't run first — leaving every session that server ever hosts un-disclaimed too.
+/** A boot restore that throws must not leave a bound server whose routes wait
+ *  forever on a ready signal that never comes. */
+function failBoot(err: unknown): never {
+  console.error("[agetor] boot restore failed:", err);
+  removeCoreCreds(dataDir);
+  process.exit(1);
+}
+
+try {
+  await initDisclaimSwitch("app", {
+    readPref: () => preferences.get(DISCLAIM_PREF_KEY),
+    writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
+    confirmKeepOff,
+    log: (m) => console.log(m),
+  });
+  await ensureDisclaimedServer();
+  // Subscribe the pipeline runner to the global lifecycle stream BEFORE
+  // reconcileOrphans() runs, so a step task's boot-time orphan→ready
+  // transition (an ordinary `run-status` "orphaned" event, fired by
+  // reconcileOrphans below) reaches the runner and flips its pipeline parent
+  // back to ready/cancelled-with-retry instead of leaving it silently stuck
+  // `running` forever (docs/plans/pipelines.md §3, T3).
+  initPipelineRunner();
+  await reconcileOrphans();
+
+  // M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
+  // by a prior process crash/restart — placed right after `reconcileOrphans`
+  // (per its own doc, and pipeline-runner.ts's module doc) so every step
+  // task's own boot-time orphan→ready transition has already fired and been
+  // observed by the pipeline runner's global-event subscriber (wired up by
+  // `initPipelineRunner()` above) before this does its own pass over parent
+  // rows directly.
+  const reconciledPipelineRunCount = await reconcilePipelineRuns();
+  if (reconciledPipelineRunCount > 0) {
+    console.log(`[agetor] reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
+  }
+
+  // Re-arm in-memory auto-resume timers for every fx task still carrying a
+  // pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — an
+  // in-memory `setTimeout` handle never survives a process restart, so without
+  // this a pause recorded in a prior process would sit forever with a
+  // persisted `autoResume.at` nothing will ever fire. Awaited, and placed right
+  // after `reconcileOrphans` so reattach/orphan resolution — which can itself
+  // flip a run's status — settles first.
+  const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
+  if (rearmedFxAutoResumeCount > 0) {
+    console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
+  }
+} catch (err) {
+  failBoot(err);
+}
+
+// Heal any archive/delete teardown (tmux kill, terminal shells, worktree
+// detach) that was deferred to the in-memory teardown queue but never ran
+// because agetor quit or crashed before the job fired. Fire-and-forget — it
+// only enqueues jobs onto that queue, keyed to this instance's own task ids.
+sweepArchivedTeardowns();
+
+// Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
+// claude REPL tmux sessions that have sat idle (no turn in flight, nothing
+// pending, no activity) for IDLE_SESSION_REAP_MS, reclaiming their ~300–500MB
+// "node" process and per-session timers. A 30s delay before the first sweep
+// lets `reconcileOrphans` above finish reattaching live sessions first, so a
+// task that's mid-reattach isn't mistaken for idle. Errors are swallowed —
+// this is best-effort background hygiene, never something that should crash
+// the app.
+setTimeout(() => {
+  reapIdleSessions().catch((err) => {
+    console.error("[agetor] idle-session reap (post-boot) failed:", err);
+  });
+}, 30_000);
+setInterval(() => {
+  reapIdleSessions().catch((err) => {
+    console.error("[agetor] idle-session reap (interval) failed:", err);
+  });
+}, SESSION_REAP_SWEEP_MS);
+
+// Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): fetches
+// quota/usage snapshots for every enabled harness on a background cadence, so
+// the topbar meters stay fresh without the webview driving the fetches. A
+// 20s post-boot delay (offset from the reaper's 30s so the two sweeps don't
+// both fire in the same tick) lets boot settle first. Errors are swallowed —
+// `pollAllUsage` already never throws, but the `.catch` matches the reaper's
+// belt-and-suspenders shape.
+setTimeout(() => {
+  pollAllUsage().catch((err) => {
+    console.error("[agetor] usage poll (post-boot) failed:", err);
+  });
+}, 20_000);
+setInterval(() => {
+  pollAllUsage().catch((err) => {
+    console.error("[agetor] usage poll sweep failed", err);
+  });
+}, USAGE_POLL_SWEEP_MS);
+
+installNativeMenu();
+
+/** `Utils.showMessageBox` blocks the Bun thread (synchronous FFI) until the user
+ *  answers, so every box is bracketed with the lag label — same as
+ *  `confirmKeepOff`. */
+async function showLabelledMessageBox(opts: Parameters<typeof Utils.showMessageBox>[0]) {
+  const end = beginLagLabel("native message box");
+  try {
+    return await Utils.showMessageBox(opts);
+  } finally {
+    end();
+  }
+}
+
+Electrobun.events.on("application-menu-clicked", (e: { data?: { action?: string } }) => {
+  const action = e?.data?.action;
+  if (action === "remote-access") {
+    void runRemoteAccessBox({
+      showMessageBox: showLabelledMessageBox,
+      background: {
+        getBackgroundStatus,
+        turnOnBackground,
+        startBackgroundNow,
+        getRemoteAccess,
+        setRemoteAccessOff,
+        setRemoteAccessOnFromNativeBox,
+      },
+      openLoginItems,
+      log: (m) => console.warn(m),
+    });
+  } else if (action === "quit-completely") {
+    // before-quit reads this one-shot; with runs active it still asks first.
+    requestQuitCompletely();
+    Utils.quit();
+  }
+});
+
+// Best-effort: probe the agent CLIs (and every enabled fx harness's own
+// account-scoped catalog) for their model lists so the form can surface
+// anything new the user installed — or logged into — without an app update.
+// Runs in the background — we don't await it so a slow CLI never delays the
+// API/window; the webview polls GET /agent-models/harnesses' `ready` flag
+// until this sweep lands, which is what closes the boot race
+// docs/plans/fx-model-catalog-refresh.md §2 reproduced (fx=0 for the first
+// ~1s after boot). `startPeriodicDiscovery` re-runs the sweep every 15
+// minutes (`.unref()`'d — never itself keeps the app alive) so catalog
+// drift (new models, revoked account access) is eventually noticed even
+// with no triggering event.
+void refreshAllModels();
+startPeriodicDiscovery();
+
+// The boot restore above is done: let the routes through (boot-gate.ts).
+markBootReady();
 
 // C3 reconcile: the first fresh status read lets background.ts heal a login item
 // whose registration drifted (e.g. an app moved or replaced). Fire-and-forget; a
@@ -554,16 +578,19 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
   // Background host armed = a live login-item supervisor is parked under this
   // app, or waiting out a grace window to start. Read synchronously from its
   // state file — no helper spawn inside before-quit.
-  const backgroundArmed = ((s) => s !== null && (s.state === "parked" || s.state === "waiting"))(
-    liveSupervisor(dataDir),
-  );
+  const supervisor = liveSupervisor(dataDir);
+  const backgroundArmed = supervisor !== null && (supervisor.state === "parked" || supervisor.state === "waiting");
   // Both consumers are one-shot. A vetoed quit loses nothing: when the user
   // confirms in the webview, `POST /app/force-quit {completely}` carries the
   // intent again.
   const forced = consumeForceQuit();
   const completely = consumeQuitCompletely() || forced?.completely === true;
   const allowQuit = () => {
-    if (completely) {
+    // Only when a supervisor is alive to read it: a request written with none
+    // running would otherwise linger for the next supervisor to start (the
+    // background turned on later, or the next login). takeSupervisorStop also
+    // ignores a stale request, as a second line of defense.
+    if (completely && supervisor !== null) {
       // The supervisor would otherwise take the port back when this process
       // dies; this asks it to stay down until the next login (D6).
       try {

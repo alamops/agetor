@@ -254,7 +254,8 @@ import type {
   TaskReference,
 } from "../shared/types.ts";
 import { REMOTE_ACCESS_PREF_KEY } from "../shared/types.ts";
-import { armForceQuit, broadcastAppEvent, hasAppEventListeners, subscribeAppEvents } from "./quit-guard.ts";
+import { armForceQuit, broadcastAppEvent, hasAppEventListeners, requestQuitCompletely, subscribeAppEvents } from "./quit-guard.ts";
+import { BOOT_GATE_EXEMPT_ALWAYS, BOOT_GATE_EXEMPT_HEADLESS, gateRoutesUntilReady } from "./boot-gate.ts";
 import {
   BackgroundStartError,
   getBackgroundStatus,
@@ -1336,6 +1337,10 @@ export function startApiServer(
      *  parks instead of exiting). Without it the route keeps its original
      *  remove-creds-and-exit behavior. */
     onShutdownRequest?: (mode: "stop" | "handoff") => void;
+    /** Resolves once the caller's boot restore is done (boot-gate.ts). Until
+     *  then every route but the ownership probes waits, so a core can bind —
+     *  claim the port, take it over from a live core — before it restores. */
+    ready?: Promise<void>;
   } = {},
 ) {
   const native = deps.native;
@@ -1352,15 +1357,6 @@ export function startApiServer(
       console.error("[agetor] removeTaskNotification failed:", err);
     }
   };
-  // Background/remote-access changes (turn on/off, start now, remote off, a
-  // supervisor appearing) reach every connected webview as one event, so the
-  // Settings section never needs a poll. Subscribed once per server; the
-  // subscription lives as long as the process (the server is never torn down
-  // short of a process exit, and tests that start several just stack cheap
-  // listeners on a module-level set).
-  subscribeBackgroundChanges((status) => {
-    broadcastAppEvent({ type: "background_changed", status, ts: Date.now() });
-  });
   // Live delivery of the D-14 "harnesses turned on" notice to clients that
   // are already connected. Reports no delivery when nobody is listening, so
   // the ids stay pending for the next `/app/events` subscriber.
@@ -1461,7 +1457,7 @@ export function startApiServer(
     // has no ROUTE_POLICY entry (or an entry has no route). The explicit type
     // keeps the handlers' contextual `req` typing, which a bare generic would
     // lose; the cast hands Bun its own route typing back.
-    routes: applyRoutePolicy<ServerRoutes>({
+    routes: gateRoutesUntilReady(applyRoutePolicy<ServerRoutes>({
       // Unauthenticated liveness probe — never returns data (`callers:
       // "public"` in ROUTE_POLICY). `app: "agetor"` is a self-identifier for
       // its callers (the CLI's creds/daemon probes, the webview's busy-banner
@@ -7938,7 +7934,13 @@ export function startApiServer(
       // the OS notification queue.
       "/notifications": {
         POST: authed(async (req) => {
-          if (!native) return notAvailableHeadless(req);
+          // The native host posts when there is one; a headless core with a
+          // notification sink (headless-notifications.ts) posts through it —
+          // `agetor logs --notify` reaches the background core this way.
+          const post = native
+            ? (n: Parameters<ApiNative["showNotification"]>[0]) => native.showNotification(n)
+            : deps.notifications?.post;
+          if (!post) return notAvailableHeadless(req);
           const body = (await req.json().catch(() => ({}))) as {
             title?: unknown;
             body?: unknown;
@@ -7968,7 +7970,7 @@ export function startApiServer(
             body.taskId.length <= 512
               ? body.taskId
               : undefined;
-          native.showNotification({
+          post({
             title,
             body: trunc(body.body),
             subtitle: trunc(body.subtitle),
@@ -8127,8 +8129,14 @@ export function startApiServer(
             // On the app, quitting goes through the before-quit confirm, which
             // removes the creds file only once the quit is actually allowed —
             // deleting it here first would strand the CLI if the user cancels.
-            if (native) native.quit();
-            else if (deps.onShutdownRequest) deps.onShutdownRequest(mode);
+            if (native) {
+              // `agetor daemon stop` means "stop the core": on the app that is a
+              // complete quit, or a background supervisor parked under it would
+              // just take the port back (a handoff). "handoff" never reaches an
+              // app in practice — only cores hand off to the app.
+              if (mode === "stop") requestQuitCompletely();
+              native.quit();
+            } else if (deps.onShutdownRequest) deps.onShutdownRequest(mode);
             else {
               removeCoreCreds(dataDir);
               process.exit(0);
@@ -8379,7 +8387,7 @@ export function startApiServer(
       cors: corsHeaders,
       gate: gateCallerPath,
       notAvailableHeadless,
-    }) as never,
+    }), deps.ready, native ? BOOT_GATE_EXEMPT_ALWAYS : [...BOOT_GATE_EXEMPT_ALWAYS, ...BOOT_GATE_EXEMPT_HEADLESS]) as never,
     fetch(req, server) {
       if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
       // WebSocket upgrade for a terminal tab's live byte stream. The routes API
@@ -8406,6 +8414,17 @@ export function startApiServer(
       }
       return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
     },
+  });
+
+  // Background/remote-access changes (turn on/off, start now, remote off, a
+  // supervisor appearing) reach every connected webview as one event, so the
+  // Settings section never needs a poll. Subscribed only once the bind has
+  // succeeded — the app retries `startApiServer` while it takes the port over,
+  // and a failed bind must not leave a listener behind. The subscription then
+  // lives as long as the process (the server is never torn down short of a
+  // process exit).
+  subscribeBackgroundChanges((status) => {
+    broadcastAppEvent({ type: "background_changed", status, ts: Date.now() });
   });
 
   console.log(`[agetor] api listening on http://${formatHostForUrl(HOST)}:${server.port}`);

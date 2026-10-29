@@ -281,4 +281,21 @@ describe("deriveBackgroundStatus — enabled × supervisor (step 3)", () => {
       expect(s.registration).toBe("enabled");
     }
   });
+  test("expectSupervisor (just registered): no live supervisor reads starting, not stopped", () => {
+    const s = deriveBackgroundStatus(input({ supervisor: null, expectSupervisor: true }));
+    expect(s).toMatchObject({ state: "starting", registration: "enabled", supervisorPid: null, corePid: null });
+    expect(s.detail).toBeUndefined();
+  });
+
+  test("expectSupervisor only bridges the missing state file: a supervisor that reports, or one that recorded a stop, is read as such", () => {
+    expect(deriveBackgroundStatus(input({ supervisor: sup({ state: "parked", corePid: null }), expectSupervisor: true })).state).toBe("parked");
+    expect(
+      deriveBackgroundStatus(input({ supervisor: sup({ state: "stopped", corePid: null }), expectSupervisor: true })).state,
+    ).toBe("stopped");
+  });
+
+  test("expectSupervisor changes nothing before registration is enabled", () => {
+    expect(deriveBackgroundStatus(input({ registration: "notRegistered", expectSupervisor: true })).state).toBe("off");
+    expect(deriveBackgroundStatus(input({ registration: "requiresApproval", expectSupervisor: true })).state).toBe("needs-approval");
+  });
 });

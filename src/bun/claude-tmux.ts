@@ -8798,7 +8798,14 @@ export interface ReattachOptions {
    *  a task can have `mode: null` (defaults to `auto`/`workspace-write`
    *  elsewhere) or reattach can be invoked without task context in tests. */
   mode?: string | null;
+  /** Epoch ms: while `Date.now()` is before it, a missing JSONL is waited for
+   *  (polled) instead of reported as `null` — a session spawned just before the
+   *  previous process exited has not written it yet. Omitted = no wait. */
+  jsonlWaitUntil?: number;
 }
+
+/** Poll cadence while waiting for a fresh session's JSONL (`jsonlWaitUntil`). */
+const JSONL_APPEAR_POLL_MS = 250;
 
 /**
  * Reattach to a tmux session that survived an agetor restart. Rebuilds the
@@ -8808,7 +8815,8 @@ export interface ReattachOptions {
  * promise resolves on the next end-of-turn (so the orchestrator can route
  * it through the same `attachDoneHandler` as a fresh run).
  *
- * Returns `null` when the JSONL doesn't exist (caller should treat the run
+ * Returns `null` when the JSONL doesn't exist, after waiting until
+ * `opts.jsonlWaitUntil` for it to appear (caller should treat the run
  * as orphaned and kill the tmux session — without the JSONL we'd have no
  * structured visibility into the session anyway).
  */
@@ -8831,7 +8839,13 @@ export async function reattachSession(opts: ReattachOptions): Promise<SpawnedAge
 async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent | null> {
   const sessionName = sessionNameFor(opts.taskId);
   const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
-  if (!existsSync(jsonlPath)) return null;
+  if (!existsSync(jsonlPath)) {
+    const until = opts.jsonlWaitUntil ?? 0;
+    while (Date.now() < until && !existsSync(jsonlPath)) {
+      await Bun.sleep(Math.min(JSONL_APPEAR_POLL_MS, Math.max(1, until - Date.now())));
+    }
+    if (!existsSync(jsonlPath)) return null;
+  }
 
   let resolveDone: ((code: number) => void) | null = null;
   let rejectDone: ((err: Error) => void) | null = null;

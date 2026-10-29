@@ -45,6 +45,13 @@ export const BUNDLE_GIVE_UP_MS = 120_000;
 export const CHILD_KILL_WAIT_MS = 25_000;
 /** A handback marker older than this is ignored at process start. */
 export const HANDBACK_MARKER_MAX_AGE_MS = 120_000;
+/** First retry delay after an early core exit; doubles per consecutive one. */
+export const CRASH_BACKOFF_BASE_MS = 1_000;
+/** Ceiling of that doubling. */
+export const CRASH_BACKOFF_MAX_MS = 60_000;
+/** A core that stayed up this long before exiting was healthy: the failure
+ *  streak (and so the backoff) starts over. */
+export const CRASH_HEALTHY_MS = 120_000;
 /** After SIGKILL, how long to keep waiting for the child to be reaped before
  *  the supervisor exits regardless. */
 const KILL_REAP_MS = 5_000;
@@ -56,6 +63,11 @@ export interface MachineConfig {
   bundleStableMs: number;
   bundleGiveUpMs: number;
   childKillWaitMs: number;
+  /** Backoff after a core exit that is not a clean stop: base, cap, and the
+   *  uptime that resets the streak. */
+  crashBackoffBaseMs: number;
+  crashBackoffMaxMs: number;
+  crashHealthyMs: number;
 }
 
 export const DEFAULT_CONFIG: MachineConfig = {
@@ -64,7 +76,18 @@ export const DEFAULT_CONFIG: MachineConfig = {
   bundleStableMs: BUNDLE_STABLE_MS,
   bundleGiveUpMs: BUNDLE_GIVE_UP_MS,
   childKillWaitMs: CHILD_KILL_WAIT_MS,
+  crashBackoffBaseMs: CRASH_BACKOFF_BASE_MS,
+  crashBackoffMaxMs: CRASH_BACKOFF_MAX_MS,
+  crashHealthyMs: CRASH_HEALTHY_MS,
 };
+
+/** Delay before the `failures`-th consecutive retry (1-based): base, 2x base,
+ *  4x base … capped. Pure; exported for the tests. */
+export function backoffDelay(failures: number, cfg: MachineConfig = DEFAULT_CONFIG): number {
+  const n = Math.max(1, Math.floor(failures));
+  // Clamp the exponent so 2 ** n can't overflow to Infinity on a long streak.
+  return Math.min(cfg.crashBackoffMaxMs, cfg.crashBackoffBaseMs * 2 ** Math.min(n - 1, 30));
+}
 
 export type LastExit = "stop" | "sigterm" | "bundle-changed" | "crash";
 /** The `state` field of `login-daemon.json`. */
@@ -105,6 +128,11 @@ interface Common {
   startSig: string | null | undefined;
   /** Why the previous child / process ended, once something has. */
   lastExit: LastExit | undefined;
+  /** Consecutive core exits (crash, or 76 with no live core taking over) not
+   *  separated by a healthy run or a live core owning the port. */
+  failures?: number;
+  /** When the current core child was booted. */
+  bootedAt?: number;
 }
 
 export interface TickInputs {
@@ -233,14 +261,23 @@ function boot(
   s: MachineState,
   actions: Action[],
   why: string,
+  now: number,
 ): StepResult {
   actions.push({ type: "log", message: `login-daemon: ${why} — booting core` });
   actions.push({ type: "spawnCore" });
   actions.push({ type: "writeState", state: "running", lastExit: s.common.lastExit });
   return {
-    state: { phase: "running", pid: null, common: s.common },
+    state: { phase: "running", pid: null, common: { ...s.common, bootedAt: now } },
     actions,
   };
+}
+
+/** Failure streak after a core that was booted at `common.bootedAt` exited at
+ *  `now`: a healthy run restarts it, so a core that crashes once a day always
+ *  gets the base delay. */
+function nextFailures(common: Common, now: number, cfg: MachineConfig): number {
+  const healthy = common.bootedAt !== undefined && now - common.bootedAt >= cfg.crashHealthyMs;
+  return (healthy ? 0 : (common.failures ?? 0)) + 1;
 }
 
 /** Emit a `writeState` for a phase change that did not already emit one. */
@@ -359,18 +396,43 @@ export function step(
       if (exit.code === 0) {
         return exitNow(state, 0, "stop", actions, "login-daemon: core exited 0 — stopping until next login");
       }
+      const failures = nextFailures(state.common, now, cfg);
       if (exit.code === CORE_EXIT_PARK) {
+        // A genuine handoff to the app is followed by that app owning the port
+        // (we park on the next tick). A 76 that repeats with nobody taking
+        // over (a port held by something that isn't a live core) must not
+        // reboot a core every grace period forever: back off like a crash.
+        const wait = Math.max(cfg.handoffGraceMs, failures > 1 ? backoffDelay(failures, cfg) : 0);
         actions.push({
           type: "log",
-          message: `login-daemon: core exited ${CORE_EXIT_PARK} (handoff) — waiting ${cfg.handoffGraceMs} ms for the app`,
+          message: `login-daemon: core exited ${CORE_EXIT_PARK} (handoff, streak ${failures}) — waiting ${wait} ms for the app`,
         });
         return finish(state, {
-          state: { phase: "waiting", deadline: now + cfg.handoffGraceMs, common: state.common },
+          state: {
+            phase: "waiting",
+            deadline: now + wait,
+            common: { ...state.common, failures },
+          },
           actions,
         });
       }
+      // A crash stays in-process with exponential backoff: the supervisor's own
+      // restarts are paced by launchd's 10 s throttle only, and a streak resets
+      // nothing there, so a core that dies at boot would respawn forever.
       const what = exit.signal ? `signal ${exit.signal}` : `code ${exit.code}`;
-      return exitNow(state, 1, "crash", actions, `login-daemon: core crashed (${what}) — exiting 1 for launchd to restart`);
+      const delay = backoffDelay(failures, cfg);
+      actions.push({
+        type: "log",
+        message: `login-daemon: core crashed (${what}, streak ${failures}) — retrying in ${delay} ms`,
+      });
+      return finish(state, {
+        state: {
+          phase: "waiting",
+          deadline: now + delay,
+          common: { ...state.common, lastExit: "crash", failures },
+        },
+        actions,
+      });
     }
     if (inputs.childPid !== undefined && inputs.childPid !== state.pid) {
       return { state: { ...state, pid: inputs.childPid }, actions };
@@ -382,14 +444,17 @@ export function step(
   if (state.phase === "waiting") {
     if (inputs.liveCore) {
       actions.push({ type: "log", message: "login-daemon: a live core owns the port — parking" });
-      return finish(state, { state: { phase: "parked", common: state.common }, actions });
+      return finish(state, {
+        state: { phase: "parked", common: { ...state.common, failures: 0 } },
+        actions,
+      });
     }
-    if (now >= state.deadline) return boot(state, actions, "grace over, no live core");
+    if (now >= state.deadline) return boot(state, actions, "grace over, no live core", now);
     return { state, actions };
   }
   // parked
   if (inputs.liveCore) return { state, actions };
-  return boot(state, actions, "the live core is gone");
+  return boot(state, actions, "the live core is gone", now);
 }
 
 /** Convenience for the IO layer: the state's last recorded exit. */

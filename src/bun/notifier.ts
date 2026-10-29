@@ -20,6 +20,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { buildTaskDeepLink } from "./deep-link.ts";
+import { launchedBy } from "./daemon-mode.ts";
 import {
   notificationUrgency,
   soundOverUrgencies,
@@ -58,23 +59,43 @@ function devNotifierExe(): string {
  *      as-is, matching AGETOR_TMUX_BIN's contract.
  *   2. The helper bundled inside the packaged app.
  *   3. The locally-built helper under vendor/ (dev runs from source).
- *   4. The installed Agetor.app's helper (`resolveInstalledAppNotifier`), so a
- *      core running from source or a bare binary, with no bundle of its own,
- *      still posts through the signed helper.
+ *   4. The installed Agetor.app's helper (`resolveInstalledAppNotifier`), only
+ *      for a core that is meant to act as the installed app's background host:
+ *      one the login item launched (`AGETOR_LAUNCHED_BY=login-item`), or an
+ *      explicit `AGETOR_NOTIFIER_USE_INSTALLED_APP=1` opt-in. A dev or
+ *      worktree core running from source must NOT post through the release
+ *      app's helper: the notification would carry the release bundle's
+ *      identity and its click would open the release app, not this core.
  *
  * Returns `null` if nothing resolves. The deep-link notification is an
  * enhancement, so callers treat `null` (and a non-zero exit — e.g. the user
  * denied notification permission) as "post a plain Utils.showNotification
  * instead" (see task-notifier.ts).
  */
-export function resolveNotifier(): string | null {
-  const override = process.env.AGETOR_NOTIFIER_BIN;
+export function resolveNotifier(
+  opts: { env?: NodeJS.ProcessEnv; exists?: (p: string) => boolean; installedApp?: () => string | null } = {},
+): string | null {
+  const env = opts.env ?? process.env;
+  const override = env.AGETOR_NOTIFIER_BIN;
   if (override) return override;
 
+  const exists = opts.exists ?? existsSync;
   for (const candidate of [bundledNotifierExe(), devNotifierExe()]) {
-    if (existsSync(candidate)) return candidate;
+    if (exists(candidate)) return candidate;
   }
-  return resolveInstalledAppNotifier();
+  if (!mayUseInstalledAppNotifier(env)) return null;
+  return (opts.installedApp ?? resolveInstalledAppNotifier)();
+}
+
+/**
+ * Whether this process may post through the installed Agetor.app's helper:
+ * the login item's background core (which is the installed app's host), or an
+ * explicit `AGETOR_NOTIFIER_USE_INSTALLED_APP=1`. Everything else — a dev
+ * core, an agetor worktree, a test — resolves only its own bundle/vendor
+ * helper.
+ */
+export function mayUseInstalledAppNotifier(env: NodeJS.ProcessEnv = process.env): boolean {
+  return launchedBy(env) === "login-item" || env.AGETOR_NOTIFIER_USE_INSTALLED_APP === "1";
 }
 
 /**

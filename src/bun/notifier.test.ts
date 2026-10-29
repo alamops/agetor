@@ -1,6 +1,7 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import {
   resolveNotifier,
+  mayUseInstalledAppNotifier,
   buildNotifierArgs,
   buildTaskNotifierPostArgs,
   buildNotifierRemoveArgs,
@@ -253,6 +254,45 @@ describe("resolveNotifier", () => {
     expect(
       r === null || r.endsWith("AgetorNotifier.app/Contents/MacOS/notifier"),
     ).toBe(true);
+  });
+});
+
+describe("resolveNotifier: installed-app fallback gate", () => {
+  const none = () => false;
+  const installed = () => "/Applications/Agetor.app/installed/notifier";
+
+  test("a dev / worktree core (no login-item launch, no opt-in) never falls back to the release app's helper", () => {
+    expect(resolveNotifier({ env: {}, exists: none, installedApp: installed })).toBeNull();
+    expect(resolveNotifier({ env: { AGETOR_LAUNCHED_BY: "cli" }, exists: none, installedApp: installed })).toBeNull();
+    expect(resolveNotifier({ env: { AGETOR_NOTIFIER_USE_INSTALLED_APP: "0" }, exists: none, installedApp: installed })).toBeNull();
+  });
+
+  test("a login-item core falls back to the installed app's helper", () => {
+    expect(resolveNotifier({ env: { AGETOR_LAUNCHED_BY: "login-item" }, exists: none, installedApp: installed })).toBe(
+      "/Applications/Agetor.app/installed/notifier",
+    );
+  });
+
+  test("AGETOR_NOTIFIER_USE_INSTALLED_APP=1 is an explicit opt-in", () => {
+    expect(resolveNotifier({ env: { AGETOR_NOTIFIER_USE_INSTALLED_APP: "1" }, exists: none, installedApp: installed })).toBe(
+      "/Applications/Agetor.app/installed/notifier",
+    );
+  });
+
+  test("the bundled or vendor helper still wins over the installed app, for any core", () => {
+    expect(
+      resolveNotifier({ env: { AGETOR_LAUNCHED_BY: "login-item" }, exists: (p) => p.includes("vendor"), installedApp: installed }),
+    ).toContain("vendor");
+  });
+
+  test("the override wins regardless of the gate", () => {
+    expect(resolveNotifier({ env: { AGETOR_NOTIFIER_BIN: "/o" }, exists: none, installedApp: installed })).toBe("/o");
+  });
+
+  test("mayUseInstalledAppNotifier reads the environment", () => {
+    expect(mayUseInstalledAppNotifier({})).toBe(false);
+    expect(mayUseInstalledAppNotifier({ AGETOR_LAUNCHED_BY: "login-item" })).toBe(true);
+    expect(mayUseInstalledAppNotifier({ AGETOR_NOTIFIER_USE_INSTALLED_APP: "1" })).toBe(true);
   });
 });
 

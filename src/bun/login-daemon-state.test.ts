@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  SUPERVISOR_STALE_MS,
+  SUPERVISOR_STOP_MAX_AGE_MS,
   liveSupervisor,
   readLoginDaemonState,
   requestSupervisorStop,
@@ -200,6 +202,45 @@ describe("stop request (control file)", () => {
     expect(takeSupervisorStop(dir)).toBe(false);
   });
 
+  test("a request is stamped with requestedAt", () => {
+    const dir = freshDir();
+    requestSupervisorStop(dir, 1234);
+    const raw = JSON.parse(readFileSync(path.join(dir, "login-daemon-control.json"), "utf8"));
+    expect(raw).toEqual({ action: "stop", requestedAt: 1234 });
+  });
+
+  test("a stale request (no supervisor was running to read it) is ignored and removed", () => {
+    const dir = freshDir();
+    const now = 10_000_000;
+    requestSupervisorStop(dir, now - SUPERVISOR_STOP_MAX_AGE_MS - 1);
+    expect(takeSupervisorStop(dir, { now })).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+    // Exactly at the limit is still honoured.
+    requestSupervisorStop(dir, now - SUPERVISOR_STOP_MAX_AGE_MS);
+    expect(takeSupervisorStop(dir, { now })).toBe(true);
+  });
+
+  test("a request written before the supervisor started cannot stop it", () => {
+    const dir = freshDir();
+    const now = 10_000_000;
+    requestSupervisorStop(dir, now - 5_000);
+    expect(takeSupervisorStop(dir, { now, supervisorStartedAt: now - 1_000 })).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+    // Written while the supervisor was already running: honoured.
+    requestSupervisorStop(dir, now - 500);
+    expect(takeSupervisorStop(dir, { now, supervisorStartedAt: now - 1_000 })).toBe(true);
+  });
+
+  test("a legacy request without requestedAt is stale and removed", () => {
+    const dir = freshDir();
+    const file = path.join(dir, "login-daemon-control.json");
+    writeFileSync(file, JSON.stringify({ action: "stop", at: Date.now() }));
+    expect(takeSupervisorStop(dir)).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+    writeFileSync(file, JSON.stringify({ action: "stop", requestedAt: "now" }));
+    expect(takeSupervisorStop(dir)).toBe(false);
+  });
+
   test("no request reads false", () => {
     expect(takeSupervisorStop(freshDir())).toBe(false);
   });
@@ -260,5 +301,35 @@ describe("handback marker", () => {
 
   test("missing marker reads null", () => {
     expect(takeHandbackMarker(120_000, freshDir())).toBeNull();
+  });
+});
+
+describe("liveSupervisor pid-reuse guard", () => {
+  test("a fresh heartbeat on a live pid is a live supervisor", () => {
+    const dir = freshDir();
+    const now = 5_000_000;
+    writeLoginDaemonState(sample({ pid: process.pid, heartbeatAt: now - 1_000 }), dir);
+    expect(liveSupervisor(dir, now)?.pid).toBe(process.pid);
+  });
+
+  test("a live pid whose heartbeat went stale is a recycled pid, not the supervisor", () => {
+    const dir = freshDir();
+    const now = 5_000_000;
+    writeLoginDaemonState(sample({ pid: process.pid, heartbeatAt: now - SUPERVISOR_STALE_MS - 1 }), dir);
+    expect(liveSupervisor(dir, now)).toBeNull();
+  });
+
+  test("a state file without a heartbeat is trusted on pid liveness alone", () => {
+    const dir = freshDir();
+    writeLoginDaemonState(sample({ pid: process.pid, updatedAt: 2 }), dir);
+    expect(liveSupervisor(dir)?.pid).toBe(process.pid);
+  });
+
+  test("heartbeatAt round-trips and a non-numeric one reads as a corrupt file", () => {
+    const dir = freshDir();
+    writeLoginDaemonState(sample({ heartbeatAt: 99 }), dir);
+    expect(readLoginDaemonState(dir)?.heartbeatAt).toBe(99);
+    writeFileSync(path.join(dir, "login-daemon.json"), JSON.stringify({ ...sample(), heartbeatAt: "x" }));
+    expect(readLoginDaemonState(dir)).toBeNull();
   });
 });

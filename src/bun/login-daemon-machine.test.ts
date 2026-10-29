@@ -2,8 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { CORE_EXIT_PARK, SUPERVISOR_EXIT_BUNDLE_CHANGED } from "./daemon-mode.ts";
 import {
   BUNDLE_GIVE_UP_MS,
+  backoffDelay,
   BUNDLE_STABLE_MS,
   CHILD_KILL_WAIT_MS,
+  CRASH_BACKOFF_BASE_MS,
+  CRASH_HEALTHY_MS,
   DEFAULT_CONFIG,
   HANDBACK_MARKER_MAX_AGE_MS,
   HANDOFF_GRACE_MS,
@@ -206,18 +209,115 @@ describe("core child exits", () => {
     expect(r.state).toMatchObject({ phase: "waiting", deadline: T0 + 210 });
   });
 
-  test("a crash (non-zero code) → exit 1 for launchd to restart, lastExit crash", () => {
+  test("a crash (non-zero code) → waiting with a 1 s backoff, lastExit crash, supervisor stays up", () => {
     for (const code of [1, 2, 137, 75]) {
       const r = step(runningState(), tick(T0 + 1000, { childExit: { code, signal: null } }));
-      expect(exitCode(r)).toBe(1);
-      expect(written(r)).toMatchObject({ state: "stopped", lastExit: "crash" });
+      expect(find(r, "exit")).toBeUndefined();
+      expect(r.state).toMatchObject({ phase: "waiting", deadline: T0 + 1000 + CRASH_BACKOFF_BASE_MS });
+      expect(written(r)).toMatchObject({ state: "waiting", lastExit: "crash" });
     }
   });
 
   test("death by signal (null code) is a crash too", () => {
     const r = step(runningState(), tick(T0 + 1000, { childExit: { code: null, signal: "SIGSEGV" } }));
-    expect(exitCode(r)).toBe(1);
+    expect(r.state).toMatchObject({ phase: "waiting", deadline: T0 + 1000 + CRASH_BACKOFF_BASE_MS });
     expect(written(r)).toMatchObject({ lastExit: "crash" });
+  });
+
+  test("backoffDelay doubles from the base and is capped", () => {
+    expect([1, 2, 3, 4, 5, 6, 7, 8, 100].map((n) => backoffDelay(n))).toEqual([
+      1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000,
+    ]);
+    expect(backoffDelay(0)).toBe(1000);
+    expect(backoffDelay(3, { ...DEFAULT_CONFIG, crashBackoffBaseMs: 10, crashBackoffMaxMs: 25 })).toBe(25);
+  });
+
+  /** Drive a crash-looping core: boot on the due tick, crash `uptime` later. */
+  function crashLoop(rounds: number, uptime: number, cfg: MachineConfig = DEFAULT_CONFIG) {
+    let state: MachineState = initialState({ now: T0, handbackMarker: false, liveCore: false });
+    let now = T0;
+    const waits: number[] = [];
+    for (let i = 0; i < rounds; i++) {
+      const boot = step(state, tick(now), cfg);
+      expect(types(boot)).toContain("spawnCore");
+      now += uptime;
+      const crash = step(boot.state, tick(now, { childExit: { code: 1, signal: null } }), cfg);
+      expect(crash.state.phase).toBe("waiting");
+      const deadline = (crash.state as { deadline: number }).deadline;
+      // Not due one ms early: no hot loop.
+      expect(types(step(crash.state, tick(deadline - 1), cfg))).not.toContain("spawnCore");
+      waits.push(deadline - now);
+      state = crash.state;
+      now = deadline;
+    }
+    return waits;
+  }
+
+  test("a core that crashes at boot is retried with exponential backoff up to the cap", () => {
+    expect(crashLoop(9, 10)).toEqual([1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000]);
+  });
+
+  test("a core that stayed up past crashHealthyMs starts the streak over", () => {
+    let state: MachineState = initialState({ now: T0, handbackMarker: false, liveCore: false });
+    let now = T0;
+    const crashAfter = (uptime: number): number => {
+      const boot = step(state, tick(now));
+      now += uptime;
+      const crash = step(boot.state, tick(now, { childExit: { code: 1, signal: null } }));
+      const deadline = (crash.state as { deadline: number }).deadline;
+      state = crash.state;
+      const wait = deadline - now;
+      now = deadline;
+      return wait;
+    };
+    expect(crashAfter(10)).toBe(1000);
+    expect(crashAfter(10)).toBe(2000);
+    expect(crashAfter(10)).toBe(4000);
+    expect(crashAfter(CRASH_HEALTHY_MS)).toBe(1000); // healthy run: back to the base delay
+    expect(crashAfter(10)).toBe(2000);
+  });
+
+  test("a live core owning the port during the backoff parks the supervisor and clears the streak", () => {
+    const crash = step(runningState(), tick(T0 + 10, { childExit: { code: 1, signal: null } }));
+    const parked = step(crash.state, tick(T0 + 20, { liveCore: true }));
+    expect(parked.state.phase).toBe("parked");
+    expect(types(parked)).not.toContain("spawnCore");
+    expect((parked.state.common as { failures?: number }).failures).toBe(0);
+  });
+
+  test("repeated exit 76 with no live core backs off beyond the handoff grace instead of looping", () => {
+    let state: MachineState = initialState({ now: T0, handbackMarker: false, liveCore: false });
+    let now = T0;
+    const waits: number[] = [];
+    for (let i = 0; i < 9; i++) {
+      const boot = step(state, tick(now));
+      expect(types(boot)).toContain("spawnCore");
+      now += 100; // the core finds the port held and parks right away
+      const r = step(boot.state, tick(now, { childExit: { code: CORE_EXIT_PARK, signal: null } }));
+      expect(r.state.phase).toBe("waiting");
+      const deadline = (r.state as { deadline: number }).deadline;
+      expect(types(step(r.state, tick(deadline - 1)))).not.toContain("spawnCore");
+      waits.push(deadline - now);
+      state = r.state;
+      now = deadline;
+    }
+    // The 15 s grace is the floor while the doubling is below it, then it grows
+    // to the 60 s cap.
+    expect(waits).toEqual([15_000, 15_000, 15_000, 15_000, 16_000, 32_000, 60_000, 60_000, 60_000]);
+  });
+
+  test("a single exit 76 after a long healthy run is a plain handoff: the 15 s grace, streak reset", () => {
+    const boot = step(initialState({ now: T0, handbackMarker: false, liveCore: false }), tick(T0));
+    const r = step(boot.state, tick(T0 + CRASH_HEALTHY_MS, { childExit: { code: CORE_EXIT_PARK, signal: null } }));
+    expect(r.state).toMatchObject({ phase: "waiting", deadline: T0 + CRASH_HEALTHY_MS + HANDOFF_GRACE_MS });
+    expect((r.state.common as { failures?: number }).failures).toBe(1);
+  });
+
+  test("a stop request or SIGTERM during a crash backoff still exits 0", () => {
+    const crash = step(runningState(), tick(T0 + 10, { childExit: { code: 1, signal: null } }));
+    const r = step(crash.state, tick(T0 + 20, { stopRequested: true }));
+    expect(exitCode(r)).toBe(0);
+    expect(written(r)).toMatchObject({ state: "stopped", lastExit: "stop" });
   });
 
   test("a running child that is simply still up changes nothing, but its pid is tracked", () => {
@@ -542,7 +642,7 @@ describe("purity and bookkeeping", () => {
   test("every terminal path logs and writes state before it exits", () => {
     const paths: StepResult[] = [
       step(runningState(), tick(T0 + 1, { childExit: { code: 0, signal: null } })),
-      step(runningState(), tick(T0 + 1, { childExit: { code: 9, signal: null } })),
+      step(runningState(), tick(T0 + 1, { stopRequested: true })),
       step(initialState({ now: T0, handbackMarker: false, liveCore: true }), tick(T0 + 1, { sigterm: true })),
     ];
     for (const r of paths) {

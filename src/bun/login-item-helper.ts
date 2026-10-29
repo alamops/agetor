@@ -79,7 +79,28 @@ export class HelperError extends Error {
 }
 
 const HELPER_BINARY = "agetor-login-item";
+/** Timeout for the quick commands (`info`, `status`, `register`, `open-settings`). */
 const HELPER_TIMEOUT_MS = 15_000;
+// native/login-item/main.swift's `unregisterAndWait` waits up to 20 s for
+// SMAppService.unregister to call back, and `reregister` runs that, then sleeps
+// 500 ms, then `register()`. Killing the helper mid-way would leave the item
+// unregistered, so the two slow commands get a TS timeout strictly above that
+// Swift worst case (plus slack for the register call and process start), not
+// the 15 s quick-command timeout. Keep these in step with main.swift.
+const SWIFT_UNREGISTER_WAIT_MS = 20_000;
+const SWIFT_REREGISTER_PAUSE_MS = 500;
+const SLOW_COMMAND_SLACK_MS = 5_000;
+const UNREGISTER_TIMEOUT_MS = SWIFT_UNREGISTER_WAIT_MS + SLOW_COMMAND_SLACK_MS;
+const REREGISTER_TIMEOUT_MS =
+  SWIFT_UNREGISTER_WAIT_MS + SWIFT_REREGISTER_PAUSE_MS + 2 * SLOW_COMMAND_SLACK_MS;
+
+/** The timeout for one helper command. */
+function commandTimeoutMs(command: string): number {
+  if (timeoutOverrideMs !== undefined) return timeoutOverrideMs;
+  if (command === "unregister") return UNREGISTER_TIMEOUT_MS;
+  if (command === "reregister") return REREGISTER_TIMEOUT_MS;
+  return HELPER_TIMEOUT_MS;
+}
 const STDERR_CAP = 2000;
 const FAKE_FILENAME = "fake-login-item.json";
 
@@ -97,8 +118,8 @@ const LOCATIONS: readonly HelperInfo["location"][] = [
   "other",
 ];
 
-/** Mutable only through `__testing`, so a unit test can shorten the timeout. */
-let timeoutMs = HELPER_TIMEOUT_MS;
+/** Mutable only through `__testing`, so a unit test can shorten every command's timeout. */
+let timeoutOverrideMs: number | undefined;
 
 /**
  * Where the helper binary is, or `null` when there is none to run.
@@ -206,6 +227,7 @@ async function runHelper(bin: string, command: string): Promise<unknown> {
   // The timeout settles the call itself instead of waiting for the pipes to
   // close: killing the helper does not close them if it left a child holding
   // the write end, and a hung helper must not hang its caller.
+  const timeoutMs = commandTimeoutMs(command);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => {
@@ -397,10 +419,13 @@ function fakeHelper(dataDir?: string): LoginItemHelper {
 
 /** Test hooks; not for production callers. */
 export const __testing = {
-  /** Override the 15 s per-command timeout; `undefined` restores the default. */
+  /** Override every command's timeout; `undefined` restores the per-command defaults. */
   setTimeoutMs(ms?: number): void {
-    timeoutMs = ms ?? HELPER_TIMEOUT_MS;
+    timeoutOverrideMs = ms;
   },
   DEFAULT_TIMEOUT_MS: HELPER_TIMEOUT_MS,
+  commandTimeoutMs,
+  SWIFT_UNREGISTER_WAIT_MS,
+  SWIFT_REREGISTER_PAUSE_MS,
   FAKE_FILENAME,
 };

@@ -37,14 +37,23 @@ function fixture(opts: {
   /** Queued button answers for successive boxes. */
   answers?: number[];
   showThrows?: boolean;
+  /** What `startBackgroundNow()` returns (or throws when given an Error). Absent = not injected. */
+  startNow?: BackgroundStatus | Error;
+  /** Statuses for the 2nd, 3rd… `getBackgroundStatus` call (the last one repeats). */
+  later?: BackgroundStatus[];
 }): Fixture {
   const boxes: MessageBoxOptions[] = [];
   const calls: string[] = [];
   const logs: string[] = [];
   const answers = [...(opts.answers ?? [])];
+  let statusReads = 0;
   const background: RemoteAccessBackground = {
     getBackgroundStatus: async (o) => {
       calls.push(`getBackgroundStatus:${o?.fresh ? "fresh" : "cached"}`);
+      const n = statusReads++;
+      if (n > 0 && opts.later && opts.later.length > 0) {
+        return opts.later[Math.min(n - 1, opts.later.length - 1)]!;
+      }
       return opts.current ?? status();
     },
     turnOnBackground: async () => {
@@ -60,6 +69,13 @@ function fixture(opts: {
       calls.push("setRemoteAccessOnFromNativeBox");
     },
   };
+  if (opts.startNow !== undefined) {
+    background.startBackgroundNow = async () => {
+      calls.push("startBackgroundNow");
+      if (opts.startNow instanceof Error) throw opts.startNow;
+      return opts.startNow as BackgroundStatus;
+    };
+  }
   return {
     boxes,
     calls,
@@ -76,6 +92,11 @@ function fixture(opts: {
           calls.push("openLoginItems");
         },
         log: (m) => logs.push(m),
+        hostWaitMs: 1_000,
+        hostPollMs: 100,
+        sleep: async () => {
+          calls.push("sleep");
+        },
       }),
   };
 }
@@ -243,6 +264,75 @@ describe("runRemoteAccessBox: off", () => {
     });
     await f.run();
     expect(f.boxes[0]!.detail).toContain("Couldn't read the login-item status. exit 3");
+  });
+});
+
+describe("runRemoteAccessBox: the host must actually be coming up", () => {
+  const stopped = status({ state: "stopped", registration: "enabled", detail: "Stopped until the next login." });
+  const starting = status({ state: "starting", registration: "enabled" });
+  const running = status({ state: "running", registration: "enabled" });
+
+  test("regression: a freshly registered item whose supervisor hasn't reported yet is waited for, not abandoned", async () => {
+    // turnOnBackground answers `stopped` (supervisor state file not written yet);
+    // the supervisor shows up on the second poll.
+    const f = fixture({ remoteEnabled: false, answers: [0], turnOn: stopped, later: [stopped, starting] });
+    await f.run();
+    expect(f.calls).toEqual([
+      "getBackgroundStatus:fresh",
+      "turnOnBackground",
+      "sleep",
+      "getBackgroundStatus:fresh",
+      "sleep",
+      "getBackgroundStatus:fresh",
+      "setRemoteAccessOnFromNativeBox",
+    ]);
+    expect(f.boxes).toHaveLength(1);
+  });
+
+  test("a host that is already starting after turn-on needs no wait", async () => {
+    const f = fixture({ remoteEnabled: false, answers: [0], turnOn: starting });
+    await f.run();
+    expect(f.calls).toEqual(["getBackgroundStatus:fresh", "turnOnBackground", "setRemoteAccessOnFromNativeBox"]);
+  });
+
+  test("enabled but stopped: the host is started instead of failing, then remote turns on", async () => {
+    const f = fixture({ remoteEnabled: false, answers: [0], current: stopped, startNow: starting });
+    await f.run();
+    expect(f.calls).toEqual(["getBackgroundStatus:fresh", "startBackgroundNow", "setRemoteAccessOnFromNativeBox"]);
+    expect(f.calls).not.toContain("turnOnBackground");
+  });
+
+  test("enabled but stopped and the host never comes up: remote stays off with an explaining error box", async () => {
+    const f = fixture({ remoteEnabled: false, answers: [0], current: stopped, startNow: stopped });
+    await f.run();
+    expect(f.calls).not.toContain("setRemoteAccessOnFromNativeBox");
+    expect(f.calls.filter((c) => c === "sleep").length).toBeGreaterThan(0);
+    expect(f.boxes).toHaveLength(2);
+    const err = f.boxes[1]!;
+    expect(err.type).toBe("error");
+    expect(err.message).toContain("background host didn't start");
+    expect(err.detail).toContain("did not start");
+  });
+
+  test("startBackgroundNow throwing (raced, already running) falls back to the fresh status", async () => {
+    const f = fixture({
+      remoteEnabled: false,
+      answers: [0],
+      current: stopped,
+      startNow: new Error("already running"),
+      later: [running],
+    });
+    await f.run();
+    expect(f.calls).toContain("setRemoteAccessOnFromNativeBox");
+    expect(f.logs[0]).toContain("already running");
+  });
+
+  test("a host that is running or parked turns remote on without starting anything", async () => {
+    for (const state of ["running", "parked"] as const) {
+      const f = fixture({ remoteEnabled: false, answers: [0], current: status({ state, registration: "enabled" }), startNow: starting });
+      await f.run();
+      expect(f.calls).toEqual(["getBackgroundStatus:fresh", "setRemoteAccessOnFromNativeBox"]);
+    }
   });
 });
 

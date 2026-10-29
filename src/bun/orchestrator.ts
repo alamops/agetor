@@ -951,6 +951,11 @@ wireInteractionBroadcast();
  *
  * Called once at boot from `src/bun/index.ts`.
  */
+/** How long after a claude run started its session JSONL may still be missing
+ *  without that meaning the session is broken: claude writes the file when it
+ *  takes the first prompt, a few seconds after the spawn. */
+export const CLAUDE_JSONL_APPEAR_GRACE_MS = 20_000;
+
 export async function reconcileOrphans(): Promise<number> {
   // Sort newest-first so the at-most-one-reattach-per-task rule below keeps
   // the latest run row. If agetor crashed in the narrow window between
@@ -959,8 +964,8 @@ export async function reconcileOrphans(): Promise<number> {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; opencode_session_id: string | null; copilot_session_id: string | null; agent: string }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, copilot_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; opencode_session_id: string | null; copilot_session_id: string | null; agent: string; started_at: number }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, copilot_session_id, agent, started_at FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
   const reattachedTaskIds = new Set<string>();
@@ -1035,6 +1040,11 @@ export async function reconcileOrphans(): Promise<number> {
               onChunk,
               seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
               mode: task.mode,
+              // A session spawned moments before the previous owner exited (an
+              // app taking the port over from a live background core) may not
+              // have written its JSONL yet: wait for it rather than killing a
+              // healthy session as "JSONL missing".
+              jsonlWaitUntil: row.started_at + CLAUDE_JSONL_APPEAR_GRACE_MS,
             })
           : kind === "codex"
           ? await reattachCodexSession({

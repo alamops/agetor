@@ -1,4 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
+import { createLiveCoreCheck, createSupervisor, type CoreChild } from "./login-daemon.ts";
+import { DEFAULT_CONFIG } from "./login-daemon-machine.ts";
 import {
   existsSync,
   mkdirSync,
@@ -389,3 +391,145 @@ test(
   },
   TEST_MS,
 );
+
+// ---------------------------------------------------------------------------
+// Unit tests (no subprocess): the pid-reuse guard and the idle heartbeat.
+
+const credsOf = (over: Partial<CoreCreds> = {}): CoreCreds => ({
+  port: 4999,
+  token: "t".repeat(64),
+  pid: 424242,
+  kind: "app",
+  version: "test",
+  startedAt: 1,
+  ...over,
+});
+
+test("liveCore: a creds pid recycled by an unrelated process (probe fails) is not a live core", async () => {
+  let probes = 0;
+  const check = createLiveCoreCheck({
+    readCreds: () => credsOf(),
+    selfPid: 1,
+    isPidAlive: () => true, // the recycled pid is alive...
+    probe: async () => {
+      probes++;
+      return false; // ...but nothing agetor answers on the port
+    },
+  });
+  expect(await check(null)).toBe(false);
+  expect(probes).toBe(1);
+});
+
+test("liveCore: a confirmed core is probed once per TTL, not every tick", async () => {
+  let t = 0;
+  let probes = 0;
+  const check = createLiveCoreCheck({
+    readCreds: () => credsOf(),
+    selfPid: 1,
+    now: () => t,
+    ttlMs: 5000,
+    isPidAlive: () => true,
+    probe: async () => {
+      probes++;
+      return true;
+    },
+  });
+  for (t = 0; t < 4000; t += 1000) expect(await check(null)).toBe(true);
+  expect(probes).toBe(1);
+  t = 5000;
+  expect(await check(null)).toBe(true);
+  expect(probes).toBe(2);
+});
+
+test("liveCore: a dead pid, our own pid, our own child and a missing file never probe", async () => {
+  let probes = 0;
+  const probe = async () => {
+    probes++;
+    return true;
+  };
+  const mk = (creds: CoreCreds | null, alive: boolean) =>
+    createLiveCoreCheck({ readCreds: () => creds, selfPid: 7, isPidAlive: () => alive, probe });
+  expect(await mk(null, true)(null)).toBe(false);
+  expect(await mk(credsOf({ pid: 7 }), true)(null)).toBe(false);
+  expect(await mk(credsOf({ pid: 9 }), true)(9)).toBe(false);
+  expect(await mk(credsOf(), false)(null)).toBe(false);
+  expect(probes).toBe(0);
+});
+
+test("liveCore: one failed probe of a core seen live is tolerated, the second drops it", async () => {
+  let t = 0;
+  let answer = true;
+  const check = createLiveCoreCheck({
+    readCreds: () => credsOf(),
+    selfPid: 1,
+    now: () => t,
+    ttlMs: 1000,
+    isPidAlive: () => true,
+    probe: async () => answer,
+  });
+  expect(await check(null)).toBe(true);
+  answer = false;
+  t = 2000;
+  expect(await check(null)).toBe(true); // a slow answer on a loaded machine
+  t = 4000;
+  expect(await check(null)).toBe(false); // still failing: gone
+  answer = true;
+  t = 6000;
+  expect(await check(null)).toBe(true); // recovers
+});
+
+test("supervisor: an idle parked supervisor refreshes its state heartbeat and awaits an async liveCore", async () => {
+  let t = 1_000_000;
+  const writes: { state: string; at: number }[] = [];
+  let ticks = 0;
+  const sup = createSupervisor({
+    now: () => t,
+    tickMs: 1,
+    config: DEFAULT_CONFIG,
+    startup: { lastExit: undefined, handbackMarker: false },
+    liveCore: async () => true,
+    takeStop: () => {
+      ticks++;
+      t += 10_000; // each tick, ten seconds pass
+      return ticks >= 8;
+    },
+    bundleSig: () => undefined,
+    spawnCore: () => {
+      throw new Error("must not spawn while parked");
+    },
+    writeState: (f) => writes.push({ state: f.state, at: t }),
+    log: () => {},
+    heartbeatMs: 25_000,
+  });
+  expect(await sup.run()).toBe(0);
+  const parked = writes.filter((w) => w.state === "parked");
+  // Start write + at least two heartbeats while idle (8 ticks x 10 s, 25 s apart).
+  expect(parked.length).toBeGreaterThanOrEqual(3);
+});
+
+test("supervisor: a core that crashes is retried after a backoff, not by exiting", async () => {
+  let t = 0;
+  let spawns = 0;
+  let stop = false;
+  const sup = createSupervisor({
+    now: () => t,
+    tickMs: 1,
+    config: DEFAULT_CONFIG,
+    startup: { lastExit: undefined, handbackMarker: false },
+    liveCore: () => false,
+    takeStop: () => {
+      t += 500;
+      return stop;
+    },
+    bundleSig: () => undefined,
+    spawnCore: (): CoreChild => {
+      spawns++;
+      if (spawns >= 3) stop = true;
+      return { pid: 100 + spawns, kill() {}, exited: Promise.resolve({ code: 1, signal: null }) };
+    },
+    writeState: () => {},
+    log: () => {},
+  });
+  expect(await sup.run()).toBe(0); // only the stop request ended it
+  expect(spawns).toBe(3);
+});

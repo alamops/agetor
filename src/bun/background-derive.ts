@@ -38,6 +38,17 @@ export interface BackgroundDeriveInput {
   dataDir: string;
   home: string;
   remoteAccess: boolean;
+  /**
+   * The login item was registered (or re-registered) moments ago, so launchd
+   * is still starting the supervisor and it has not written
+   * `login-daemon.json` yet. With no live supervisor an enabled item then
+   * reads `starting`, not `stopped`: `stopped` would be a false "nothing is
+   * running" for a host that is about to be, and the remote-access reconcile
+   * (background.ts, C3) would turn remote access off right after it was turned
+   * on. Only `background.ts` knows the grace window; the CLI's offline
+   * derivation leaves this unset.
+   */
+  expectSupervisor?: boolean;
 }
 
 /** The data dir the installed app of a channel uses: stable builds keep
@@ -146,6 +157,9 @@ export function deriveBackgroundStatus(i: BackgroundDeriveInput): BackgroundStat
       supervisorPid: sup?.pid ?? null,
       corePid: i.selfPid ?? sup?.corePid ?? null,
     };
+  }
+  if (!sup && i.expectSupervisor) {
+    return { ...base, state: "starting", supervisorPid: null, corePid: null };
   }
   if (!sup || sup.state === "stopped") {
     return {

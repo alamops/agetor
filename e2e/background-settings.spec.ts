@@ -96,14 +96,14 @@ async function remoteAccessEnabled(backend: E2EBackend, request: Page["request"]
 test.describe("Settings → Keep Agetor running in the background", () => {
   test.use({ backendEnv: { AGETOR_FAKE_LOGIN_ITEM: "1" } });
 
-  test("off → turning it on registers the item and reads 'On, parked while the app is open'", async ({
+  test("off → turning it on registers the item, reads 'starting' until the supervisor reports, then 'parked'", async ({
     page,
     freshBackend,
   }) => {
     seedFakeHelper(freshBackend, { registration: "notRegistered" });
-    // The supervisor the registration would start; its file exists up front so
-    // the state right after `register` derives to parked.
-    seedSupervisor(freshBackend, "parked");
+    // Deliberately NO supervisor file yet: right after `register` launchd has
+    // not started the supervisor, so the status must read "starting" (the
+    // grace window in background.ts), not "stopped".
 
     const section = await openBackgroundSection(page, freshBackend);
     const state = section.getByTestId("background-state");
@@ -115,9 +115,13 @@ test.describe("Settings → Keep Agetor running in the background", () => {
 
     await toggle.click();
 
-    await expect(state).toHaveText("On, parked while the app is open", { timeout: 15_000 });
+    await expect(state).toHaveText("On — starting…", { timeout: 15_000 });
     await expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(fakeCalls(freshBackend)).toContain("register");
+
+    // The supervisor the registration started now writes its state file.
+    seedSupervisor(freshBackend, "parked");
+    await expect(state).toHaveText("On, parked while the app is open", { timeout: 20_000 });
     await expect(section.getByTestId("background-error")).toHaveCount(0);
   });
 
@@ -208,6 +212,13 @@ test.describe("Settings → Remote access (preview) row", () => {
   // Both keys in ONE call: a nested `test.use({ backendEnv })` replaces the
   // whole object rather than merging into it.
   test.use({ backendEnv: { AGETOR_FAKE_LOGIN_ITEM: "1", AGETOR_FAKE_REMOTE_ACCESS: "on" } });
+
+  // These seed a live supervisor on purpose: the `AGETOR_FAKE_REMOTE_ACCESS`
+  // seed writes the preference directly, and remote access must NOT stay on
+  // over a host that isn't running (C3), so the rows below need a real host
+  // under them. The native Remote Access… box (register → remote on, before
+  // the supervisor's first state file) can't be driven from a browser; that
+  // race is pinned by src/bun/remote-access-box.test.ts and background.test.ts.
 
   test("shows on over a parked host; Turn off switches it off and the host stays on", async ({
     page,

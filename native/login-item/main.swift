@@ -177,7 +177,9 @@ func noLabelResult(_ what: String) -> [String: Any] {
 
 /// SMAppService.unregister(completionHandler:) is callback-based; this build is a
 /// plain command-line tool with no run loop, so wait on a semaphore. 20 s is far
-/// above anything launchd needs and still bounded.
+/// above anything launchd needs and still bounded. src/bun/login-item-helper.ts
+/// gives `unregister` and `reregister` timeouts strictly above this wait (and the
+/// 500 ms pause in `reregister`); change them together.
 func unregisterAndWait(_ service: SMAppService) -> Error? {
   let done = DispatchSemaphore(value: 0)
   var failure: Error?

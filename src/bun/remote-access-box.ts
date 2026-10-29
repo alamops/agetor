@@ -37,6 +37,12 @@ export interface RemoteAccessBackground {
   getRemoteAccess(): RemoteAccessStatus;
   setRemoteAccessOff(): void;
   setRemoteAccessOnFromNativeBox(): void;
+  /**
+   * Boots the supervisor of an enabled-but-`stopped` item (background.ts's
+   * `startBackgroundNow`). Optional: when the caller doesn't inject one, the
+   * real controller is loaded on demand.
+   */
+  startBackgroundNow?(): Promise<BackgroundStatus>;
 }
 
 export interface RemoteAccessBoxDeps {
@@ -44,6 +50,20 @@ export interface RemoteAccessBoxDeps {
   background: RemoteAccessBackground;
   openLoginItems: () => Promise<void>;
   log?: (msg: string) => void;
+  /** How long to wait for the supervisor after turning the host on (default 6 s). */
+  hostWaitMs?: number;
+  /** Poll interval of that wait (default 400 ms). */
+  hostPollMs?: number;
+  /** Test seam for the poll sleep. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const HOST_WAIT_MS = 6_000;
+const HOST_POLL_MS = 400;
+
+/** The host is up or coming up: the C3 reconcile (background.ts) keeps remote access on for these. */
+function hostIsUp(s: BackgroundStatus): boolean {
+  return s.state === "running" || s.state === "parked" || s.state === "starting";
 }
 
 const TITLE_OFF = "Remote access (preview)";
@@ -114,13 +134,23 @@ export async function runRemoteAccessBox(deps: RemoteAccessBoxDeps): Promise<voi
     if (response !== 0) return;
 
     // Remote access needs the background host, so it comes on first. Only a
-    // registration macOS reports as enabled turns remote on (C5): any failure
-    // leaves remote access off.
+    // registration macOS reports as enabled AND a host that is running, parked
+    // or starting turns remote on (C5): any failure leaves remote access off.
+    // The host check matters because background.ts's C3 reconcile turns remote
+    // access straight back off whenever the host is `stopped`, which is what a
+    // just-registered item reads like until its supervisor writes its first
+    // state file (background.ts bridges that with a short `starting` grace),
+    // and what an enabled item with no supervisor reads like for good.
     let result = status;
     if (status.registration !== "enabled") {
       result = await background.turnOnBackground();
+    } else if (status.state === "stopped") {
+      result = await startStoppedHost(deps, status);
     }
-    if (result.registration === "enabled") {
+    if (result.registration === "enabled" && result.state === "stopped") {
+      result = await waitForHost(deps, result);
+    }
+    if (result.registration === "enabled" && hostIsUp(result)) {
       background.setRemoteAccessOnFromNativeBox();
       return;
     }
@@ -140,14 +170,21 @@ export async function runRemoteAccessBox(deps: RemoteAccessBoxDeps): Promise<voi
       return;
     }
 
+    const enabledButNotRunning = result.registration === "enabled";
     const reason =
       result.state === "unavailable"
         ? unavailableText(result)
-        : (result.detail ?? "macOS did not enable the login item.");
+        : enabledButNotRunning
+          ? (result.detail && result.detail !== "Stopped until the next login."
+              ? result.detail
+              : "The login item is on, but the background host did not start. Try again in a moment.")
+          : (result.detail ?? "macOS did not enable the login item.");
     await showMessageBox({
       type: "error",
       title: TITLE_OFF,
-      message: "Remote access stays off: Keep Agetor running in the background couldn't be turned on.",
+      message: enabledButNotRunning
+        ? "Remote access stays off: the background host didn't start."
+        : "Remote access stays off: Keep Agetor running in the background couldn't be turned on.",
       detail: reason,
       buttons: ["OK"],
       defaultId: 0,
@@ -156,4 +193,31 @@ export async function runRemoteAccessBox(deps: RemoteAccessBoxDeps): Promise<voi
   } catch (err) {
     deps.log?.(`[agetor] remote access box failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/** An enabled item with no live supervisor: boot one rather than fail. */
+async function startStoppedHost(deps: RemoteAccessBoxDeps, current: BackgroundStatus): Promise<BackgroundStatus> {
+  try {
+    const start =
+      deps.background.startBackgroundNow ?? (await import("./background.ts")).startBackgroundNow;
+    return await start();
+  } catch (err) {
+    deps.log?.(`[agetor] remote access: starting the background host failed: ${err instanceof Error ? err.message : String(err)}`);
+    // Whatever it was (already running, raced), the fresh status below decides.
+    return deps.background.getBackgroundStatus({ fresh: true }).catch(() => current);
+  }
+}
+
+/** Bounded wait for a registered item's supervisor to come up; returns the last status seen. */
+async function waitForHost(deps: RemoteAccessBoxDeps, first: BackgroundStatus): Promise<BackgroundStatus> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const pollMs = deps.hostPollMs ?? HOST_POLL_MS;
+  const deadline = (deps.hostWaitMs ?? HOST_WAIT_MS) / Math.max(1, pollMs);
+  let last = first;
+  for (let i = 0; i < deadline; i++) {
+    await sleep(pollMs);
+    last = await deps.background.getBackgroundStatus({ fresh: true });
+    if (last.registration !== "enabled" || last.state !== "stopped") break;
+  }
+  return last;
 }

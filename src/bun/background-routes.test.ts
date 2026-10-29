@@ -94,9 +94,12 @@ afterAll(() => {
   rmTestDataDir(DATA_DIR);
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   process.env.AGETOR_FAKE_LOGIN_ITEM = "1";
   delete process.env.AGETOR_FAKE_REMOTE_ACCESS;
+  // background.ts keeps a short "just registered → starting" grace in memory;
+  // a registration from an earlier test must not leak into this one.
+  (await import("./background.ts")).__testing.resetStartGrace();
   rmSync(FAKE_FILE, { force: true });
   rmSync(SUPERVISOR_FILE, { force: true });
   preferences.set(REMOTE_ACCESS_PREF_KEY, "off");
@@ -242,7 +245,8 @@ describe("POST /background", () => {
     expect(res.status).toBe(200);
     const status = (await res.json()) as BackgroundStatus;
     expect(status.registration).toBe("enabled");
-    expect(status.state).toBe("stopped");
+    // Registered a moment ago: the supervisor hasn't reported yet, so starting (not stopped).
+    expect(status.state).toBe("starting");
     expect(actionCalls()).toEqual(["register"]);
     expect(fakeState().registration).toBe("enabled");
   });
@@ -610,6 +614,21 @@ describe("POST /daemon/shutdown mode", () => {
     await waitFor(() => nativeQuits > 0);
     expect(nativeQuits).toBe(1);
     expect(shutdownRequests).toEqual([]);
+  });
+
+  test('on the app, {mode:"stop"} (agetor daemon stop) quits completely so a parked supervisor stays down', async () => {
+    const { consumeQuitCompletely } = await import("./quit-guard.ts");
+    consumeQuitCompletely(); // start from a clean one-shot
+    const before = nativeQuits;
+    const res = await req(NATIVE, "POST", "/daemon/shutdown", { body: { mode: "stop" } });
+    expect(res.status).toBe(200);
+    await waitFor(() => nativeQuits > before);
+    expect(consumeQuitCompletely()).toBe(true);
+    // A handoff (never sent to an app in practice) stays a plain quit.
+    const res2 = await req(NATIVE, "POST", "/daemon/shutdown", { body: { mode: "handoff" } });
+    expect(res2.status).toBe(200);
+    await waitFor(() => nativeQuits > before + 1);
+    expect(consumeQuitCompletely()).toBe(false);
   });
 
   test("requires a token", async () => {

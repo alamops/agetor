@@ -379,13 +379,16 @@ export class AgetorClient {
   /** `DELETE /background` — unregister the login item (also turns remote
    *  access off). Allowed for the CLI token; turning it ON is desktop-only. */
   turnOffBackground(): Promise<BackgroundStatus> {
-    return this.req("DELETE", "/background");
+    // The helper's unregister may take up to ~25 s (login-item-helper.ts), so
+    // the default 15 s would abandon a call that is still succeeding.
+    return this.req("DELETE", "/background", undefined, START_TIMEOUT_MS);
   }
   /** `POST /background/start` — start the background core now. 409 `ApiError`
    *  (body `{ error, code }`) unless the login item is enabled and no
    *  supervisor is alive. */
   startBackground(): Promise<BackgroundStatus> {
-    return this.req("POST", "/background/start");
+    // reregister may take up to ~31 s (login-item-helper.ts).
+    return this.req("POST", "/background/start", undefined, START_TIMEOUT_MS);
   }
   /** `GET /remote-access` — remote access (preview) on/off. */
   getRemoteAccess(): Promise<RemoteAccessStatus> {

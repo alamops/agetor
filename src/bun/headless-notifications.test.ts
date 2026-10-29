@@ -15,13 +15,16 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { GlobalEvent, PipelineRunStatus } from "../shared/types.ts";
+import type { GlobalEvent, PipelineBlock, PipelineBlockKind, PipelineRunStatus } from "../shared/types.ts";
 import { rmTestDataDir } from "./test-data-dir.ts";
 
 let dataDir = "";
 let prevDataDir: string | undefined;
 let headlessNotificationFor: typeof import("./headless-notifications.ts").headlessNotificationFor;
 let isHeadlessNotificationsEnabled: typeof import("./headless-notifications.ts").isHeadlessNotificationsEnabled;
+
+let createHeadlessNotificationHandler: typeof import("./headless-notifications.ts").createHeadlessNotificationHandler;
+let decideOwedPipelineAlert: typeof import("./headless-notifications.ts").decideOwedPipelineAlert;
 
 beforeAll(async () => {
   prevDataDir = process.env.AGETOR_DATA_DIR;
@@ -30,6 +33,8 @@ beforeAll(async () => {
   const mod = await import("./headless-notifications.ts");
   headlessNotificationFor = mod.headlessNotificationFor;
   isHeadlessNotificationsEnabled = mod.isHeadlessNotificationsEnabled;
+  createHeadlessNotificationHandler = mod.createHeadlessNotificationHandler;
+  decideOwedPipelineAlert = mod.decideOwedPipelineAlert;
 });
 
 afterAll(() => {
@@ -159,8 +164,20 @@ describe("column", () => {
     expect(col(undefined)).toMatchObject({ title: "Waiting on you", kind: "blocked" });
   });
 
-  test("a pipeline parent's reason:\"pipeline\" block is silent (its step's question already notified)", () => {
-    expect(col("pipeline")).toBeNull();
+  test("a pipeline parent's reason:\"pipeline\" block with no question behind it posts \"Pipeline needs you\"", () => {
+    expect(col("pipeline", { taskId: "p1" })).toEqual({
+      title: "Waiting on you", body: "Ship it · Pipeline needs you", taskId: "p1", kind: "blocked",
+    });
+  });
+
+  test("...and stays silent while a step's question already holds the parent's notification", () => {
+    expect(
+      headlessNotificationFor(
+        { kind: "column", taskId: "p1", runId: null, column: "blocked", prev: "running", ts: 1, reason: "pipeline" } as GlobalEvent,
+        lookup,
+        { hasPendingQuestion: true },
+      ),
+    ).toBeNull();
   });
 
   test("a hidden step's own blocked transition is silent", () => {
@@ -256,5 +273,107 @@ describe("isHeadlessNotificationsEnabled", () => {
   test("unset otherwise is on (macOS only)", () => {
     expect(isHeadlessNotificationsEnabled({})).toBe(darwin);
     expect(isHeadlessNotificationsEnabled({ NODE_ENV: "production" })).toBe(darwin);
+  });
+});
+
+describe("stateful handler: \"Pipeline needs you\" for a block with no step question", () => {
+  type Row = {
+    column?: string;
+    archivedAt?: number | null;
+    pipelineRun?: { status: PipelineRunStatus; blocked: PipelineBlock[] } | null;
+  };
+  function harness(rows: Record<string, Row> = {}) {
+    const posted: Array<{ title: string; body: string; taskId: string; kind?: string }> = [];
+    const handle = createHeadlessNotificationHandler({
+      lookup,
+      readTask: (id) => (rows[id] ?? null) as ReturnType<Parameters<typeof createHeadlessNotificationHandler>[0]["readTask"]>,
+      post: (n) => { posted.push(n as (typeof posted)[number]); },
+    });
+    return { posted, handle, rows };
+  }
+  const blockedCol = (taskId = "p1"): GlobalEvent =>
+    ({ kind: "column", taskId, runId: null, column: "blocked", prev: "running", ts: 1, reason: "pipeline" }) as GlobalEvent;
+  const ask = (state: "pending" | "resolved", id: string, step = "s1"): GlobalEvent =>
+    ({ kind: "interaction", taskId: step, runId: "r", state, interactionId: id, ts: 1, pipelineParentId: "p1" }) as GlobalEvent;
+
+  test("a pipeline-reason block with nothing pending posts once; the pipeline event that follows does not re-post", () => {
+    const { posted, handle } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: "s1", stepId: "a", kind: "step-failed", message: "x" }] } } });
+    handle(blockedCol());
+    handle({ kind: "pipeline", taskId: "p1", status: "blocked", activeStepIds: [], stepCount: 1, ts: 2 } as GlobalEvent);
+    expect(posted).toEqual([
+      { title: "Waiting on you", body: "Ship it · Pipeline needs you", taskId: "p1", kind: "blocked" },
+    ]);
+  });
+
+  test("a block raised while a step's question is pending is owed: silent now, raised once the question is answered and the run is still blocked", () => {
+    const { posted, handle, rows } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: null, stepId: "a", kind: "step-cap", message: "cap" }] } } });
+    handle(ask("pending", "i1"));
+    expect(posted.map((p) => p.body)).toEqual(["Ship it · Review"]); // the retargeted question
+    handle(blockedCol());
+    expect(posted).toHaveLength(1); // silent: the question holds the slot
+    handle(ask("resolved", "i1"));
+    expect(posted.map((p) => p.body)).toEqual(["Ship it · Review", "Ship it · Pipeline needs you"]);
+    // not raised twice
+    handle({ kind: "pipeline", taskId: "p1", status: "blocked", activeStepIds: [], stepCount: 1, ts: 3 } as GlobalEvent);
+    expect(posted).toHaveLength(2);
+    expect(rows.p1).toBeDefined();
+  });
+
+  test("the owed alert is dropped when the run left blocked by the time the question is answered", () => {
+    const { posted, handle, rows } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: "s1", stepId: "a", kind: "step-blocked", message: "waiting" }] } } });
+    handle(ask("pending", "i1"));
+    handle(blockedCol());
+    rows.p1 = { column: "running", pipelineRun: { status: "running", blocked: [] } };
+    handle(ask("resolved", "i1"));
+    expect(posted).toHaveLength(1);
+  });
+
+  test("an answered question's own step-blocked block does not trigger the alert (it lasts until the step runs again)", () => {
+    const { posted, handle } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: "s1", stepId: "a", kind: "step-blocked", message: "waiting" }] } } });
+    handle(ask("pending", "i1"));
+    handle(blockedCol());
+    handle(ask("resolved", "i1"));
+    expect(posted).toHaveLength(1);
+  });
+
+  test("a step question arriving on an already-blocked run owes the alert it displaces", () => {
+    const { posted, handle } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: null, stepId: "a", kind: "join-incomplete", message: "j" }] } } });
+    handle(ask("pending", "i1"));
+    handle(ask("resolved", "i1"));
+    expect(posted.map((p) => p.body)).toEqual(["Ship it · Review", "Ship it · Pipeline needs you"]);
+  });
+
+  test("a step running again ends the answered-question exemption for its block", () => {
+    const { posted, handle } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: "s1", stepId: "a", kind: "step-blocked", message: "waiting" }] } } });
+    handle(ask("pending", "i1"));
+    handle(blockedCol());
+    handle(ask("resolved", "i1"));
+    expect(posted).toHaveLength(1);
+    handle({ kind: "column", taskId: "s1", runId: null, column: "running", prev: "blocked", ts: 4, pipelineParentId: "p1" } as GlobalEvent);
+    handle({ kind: "pipeline", taskId: "p1", status: "blocked", activeStepIds: [], stepCount: 1, ts: 5 } as GlobalEvent);
+    // The exemption ended, and s1's row is not running: its (still recorded) block now counts.
+    expect(posted.map((p) => p.body)).toEqual(["Ship it · Review", "Ship it · Pipeline needs you"]);
+  });
+});
+
+describe("decideOwedPipelineAlert", () => {
+  const blocked = (b: Array<{ taskId: string | null; kind: PipelineBlockKind }>) => ({
+    pipelineRun: { status: "blocked" as PipelineRunStatus, blocked: b.map((x) => ({ ...x, stepId: null, message: "" })) },
+  });
+  const never = () => false;
+
+  test("drop for a missing, archived or no-longer-blocked parent", () => {
+    expect(decideOwedPipelineAlert(new Set(), null, never)).toBe("drop");
+    expect(decideOwedPipelineAlert(new Set(), { archivedAt: 1, ...blocked([{ taskId: null, kind: "step-cap" }]) }, never)).toBe("drop");
+    expect(decideOwedPipelineAlert(new Set(), { pipelineRun: { status: "running", blocked: [] } }, never)).toBe("drop");
+  });
+
+  test("raise for a run-level block or an unanswered task block; wait when only answered/running steps block", () => {
+    expect(decideOwedPipelineAlert(new Set(), blocked([{ taskId: null, kind: "step-cap" }]), never)).toBe("raise");
+    expect(decideOwedPipelineAlert(new Set(), blocked([{ taskId: "s1", kind: "handoff-missing" }]), never)).toBe("raise");
+    expect(decideOwedPipelineAlert(new Set(["s1"]), blocked([{ taskId: "s1", kind: "step-blocked" }]), never)).toBe("wait");
+    expect(decideOwedPipelineAlert(new Set(), blocked([{ taskId: "s1", kind: "step-failed" }]), (id) => id === "s1")).toBe("wait");
+    // an answered question only exempts a step-blocked block, not a real failure
+    expect(decideOwedPipelineAlert(new Set(["s1"]), blocked([{ taskId: "s1", kind: "step-failed" }]), never)).toBe("raise");
   });
 });

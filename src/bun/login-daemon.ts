@@ -2,8 +2,14 @@ import { closeSync, openSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import { childEnv, coreSpawn } from "./core-spawn.ts";
-import { isPidAlive, readCoreCreds, resolveDataDir } from "./core-creds.ts";
-import { daemonLog, daemonLogPath } from "./daemon-log.ts";
+import {
+  isPidAlive,
+  probeLiveCore,
+  readCoreCreds,
+  resolveDataDir,
+  type CoreCreds,
+} from "./core-creds.ts";
+import { daemonLog, daemonLogPath, rotateDaemonLogIfNeeded } from "./daemon-log.ts";
 import {
   DEFAULT_CONFIG,
   HANDBACK_MARKER_MAX_AGE_MS,
@@ -18,6 +24,7 @@ import {
   type TickInputs,
 } from "./login-daemon-machine.ts";
 import {
+  SUPERVISOR_HEARTBEAT_MS,
   readLoginDaemonState,
   takeHandbackMarker,
   takeSupervisorStop,
@@ -64,8 +71,9 @@ export interface SupervisorDeps {
   config: MachineConfig;
   /** Previous run's `lastExit` and whether a fresh handback marker existed. */
   startup: { lastExit: LoginDaemonState["lastExit"]; handbackMarker: boolean };
-  /** A creds file whose pid is alive, other than `exceptPid` (our own child). */
-  liveCore(exceptPid: number | null): boolean;
+  /** A live core (other than `exceptPid`, our own child) owns the port. May be
+   *  async: the real one confirms over HTTP, not just by pid. */
+  liveCore(exceptPid: number | null): boolean | Promise<boolean>;
   /** Consume the stop control file. */
   takeStop(): boolean;
   /** `ino:mtimeMs` of Info.plist, null when missing, undefined = no bundle. */
@@ -77,6 +85,9 @@ export interface SupervisorDeps {
     lastExit: LoginDaemonState["lastExit"];
   }): void;
   log(message: string): void;
+  /** How often an otherwise idle supervisor refreshes its state file's
+   *  heartbeat (default `SUPERVISOR_HEARTBEAT_MS`). */
+  heartbeatMs?: number;
 }
 
 export interface Supervisor {
@@ -91,6 +102,8 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   let child: CoreChild | null = null;
   let childExit: { code: number | null; signal: string | null } | null = null;
   let wake: (() => void) | null = null;
+  let lastStateWriteAt = 0;
+  const heartbeatMs = deps.heartbeatMs ?? SUPERVISOR_HEARTBEAT_MS;
 
   // A wake that lands while a tick is still executing must not be lost.
   let pendingWake = false;
@@ -134,8 +147,8 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
               poke();
             });
           } catch (e) {
-            // A core that cannot even start is a crash: let launchd's throttle
-            // pace the retries rather than spinning here.
+            // A core that cannot even start is a crash: the machine's crash
+            // backoff paces the retries.
             deps.log(`login-daemon: failed to spawn core: ${(e as Error).message}`);
             childExit = { code: 1, signal: null };
           }
@@ -149,6 +162,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
           }
           break;
         case "writeState":
+          lastStateWriteAt = deps.now();
           try {
             deps.writeState({
               state: a.state,
@@ -173,7 +187,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       now: deps.now(),
       lastExit: deps.startup.lastExit,
       handbackMarker: deps.startup.handbackMarker,
-      liveCore: deps.liveCore(null),
+      liveCore: await deps.liveCore(null),
       bundleSig,
       updateGraceMs: deps.config.updateGraceMs,
     });
@@ -184,6 +198,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
           : ""
       }`,
     );
+    lastStateWriteAt = deps.now();
     try {
       deps.writeState({ state: persistedPhase(state), corePid: null, lastExit: state.common.lastExit });
     } catch (e) {
@@ -194,7 +209,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       const exitSeen = childExit;
       const inputs: TickInputs = {
         now: deps.now(),
-        liveCore: deps.liveCore(child?.pid ?? null),
+        liveCore: await deps.liveCore(child?.pid ?? null),
         stopRequested: deps.takeStop(),
         sigterm,
         bundleSig: deps.bundleSig(),
@@ -211,6 +226,17 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       }
       const code = execute(res.actions);
       if (code !== null) return code;
+      // Idle heartbeat: lets readers tell this supervisor from a process that
+      // recycled its pid (see `liveSupervisor`).
+      if (deps.now() - lastStateWriteAt >= heartbeatMs) {
+        execute([
+          {
+            type: "writeState",
+            state: persistedPhase(state),
+            ...(state.common.lastExit ? { lastExit: state.common.lastExit } : {}),
+          },
+        ]);
+      }
       await sleep(deps.tickMs);
     }
   };
@@ -226,6 +252,61 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
 
 // ---------------------------------------------------------------------------
 // Real dependencies and the process entry point.
+
+/** How often the supervisor checks whether daemon.log needs rotating. */
+const DAEMON_LOG_ROTATE_CHECK_MS = 60_000;
+
+/** How long a confirmed verdict is reused before probing again. */
+export const LIVE_CORE_PROBE_TTL_MS = 5_000;
+/** Probe failures in a row before a core previously seen live is declared gone
+ *  (one slow answer on a loaded machine must not make us boot a second core). */
+export const LIVE_CORE_FAILURES_TO_DROP = 2;
+
+export interface LiveCoreCheckDeps {
+  readCreds(): CoreCreds | null;
+  selfPid: number;
+  now?: () => number;
+  isPidAlive?: (pid: number) => boolean;
+  probe?: (creds: CoreCreds) => Promise<boolean>;
+  ttlMs?: number;
+}
+
+/**
+ * "Does a live core own the port?", robust to a recycled pid. The creds file
+ * names a pid, but after a crash that pid can belong to an unrelated process,
+ * and trusting it would park the supervisor behind nothing forever. So a pid
+ * that is alive is confirmed with `probeLiveCore` (/health identifies agetor,
+ * authenticated /info accepts the token). The probe runs at most once per
+ * `ttlMs` per (pid, startedAt) — the dead-pid and no-creds cases cost nothing —
+ * and a core previously seen live survives a single failed probe.
+ */
+export function createLiveCoreCheck(deps: LiveCoreCheckDeps): (exceptPid: number | null) => Promise<boolean> {
+  const now = deps.now ?? Date.now;
+  const alive = deps.isPidAlive ?? isPidAlive;
+  const probe = deps.probe ?? ((c: CoreCreds) => probeLiveCore(c, 2_000));
+  const ttl = deps.ttlMs ?? LIVE_CORE_PROBE_TTL_MS;
+  let cache: { key: string; at: number; live: boolean; failures: number } | null = null;
+
+  return async (exceptPid) => {
+    const creds = deps.readCreds();
+    if (!creds || creds.pid === deps.selfPid) return false;
+    if (exceptPid !== null && creds.pid === exceptPid) return false;
+    if (!alive(creds.pid)) return false;
+    const key = `${creds.pid}:${creds.startedAt}:${creds.port}`;
+    const t = now();
+    if (cache && cache.key === key && t - cache.at < ttl) return cache.live;
+    const ok = await probe(creds);
+    const prev = cache && cache.key === key ? cache : null;
+    if (ok) {
+      cache = { key, at: t, live: true, failures: 0 };
+    } else {
+      const failures = (prev?.failures ?? 0) + 1;
+      const live = prev?.live === true && failures < LIVE_CORE_FAILURES_TO_DROP;
+      cache = { key, at: t, live, failures };
+    }
+    return cache.live;
+  };
+}
 
 function envMs(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -286,6 +367,19 @@ export async function main(): Promise<number> {
   };
   const tickMs = envMs("AGETOR_LOGIN_DAEMON_TICK_MS", TICK_MS) || TICK_MS;
 
+  // The core child writes daemon.log through an inherited descriptor, never
+  // through daemonLog, so its output alone would never trigger rotation:
+  // check on a slow timer (copy-truncate, so the child's O_APPEND fd keeps
+  // writing into the live file). Unref'd: the supervisor loop keeps us alive.
+  setInterval(() => {
+    rotateDaemonLogIfNeeded();
+  }, DAEMON_LOG_ROTATE_CHECK_MS).unref();
+
+  const liveCoreCheck = createLiveCoreCheck({
+    readCreds: () => readCoreCreds(dataDir),
+    selfPid: process.pid,
+  });
+
   const previous = readLoginDaemonState(dataDir);
   const marker = takeHandbackMarker(HANDBACK_MARKER_MAX_AGE_MS, dataDir);
 
@@ -294,15 +388,8 @@ export async function main(): Promise<number> {
     tickMs,
     config,
     startup: { lastExit: previous?.lastExit, handbackMarker: marker !== null },
-    liveCore(exceptPid) {
-      // Pid liveness only — no HTTP probe every second. An app (`kind:"app"`)
-      // counts, our own child does not.
-      const creds = readCoreCreds(dataDir);
-      if (!creds || creds.pid === process.pid) return false;
-      if (exceptPid !== null && creds.pid === exceptPid) return false;
-      return isPidAlive(creds.pid);
-    },
-    takeStop: () => takeSupervisorStop(dataDir),
+    liveCore: (exceptPid) => liveCoreCheck(exceptPid),
+    takeStop: () => takeSupervisorStop(dataDir, { supervisorStartedAt: startedAt }),
     bundleSig: () => (bundle ? plistSignature(bundle) : undefined),
     spawnCore() {
       // Rotate-then-open: daemonLog truncates an oversized log on its first write.
@@ -341,6 +428,7 @@ export async function main(): Promise<number> {
           label,
           startedAt,
           updatedAt: Date.now(),
+          heartbeatAt: Date.now(),
           ...(fields.lastExit ? { lastExit: fields.lastExit } : {}),
         },
         dataDir,
