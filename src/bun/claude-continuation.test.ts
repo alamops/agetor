@@ -8,8 +8,15 @@ import { randomUUID } from "node:crypto";
 // same convention as claude-tmux-queue.test.ts / claude-tmux-death.test.ts.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-continuation-"));
 
-const { __forTest, setContinuationRunFactory, setBackgroundTaskSettledHandler, setContinuationWatchdogMs } =
-  await import("./claude-tmux.ts");
+const {
+  __forTest,
+  setContinuationRunFactory,
+  setBackgroundTaskSettledHandler,
+  setContinuationWatchdogMs,
+  drainSessionJsonl,
+  sessionHasTurn,
+  sendTurn,
+} = await import("./claude-tmux.ts");
 import type { ContinuationHooks, SpawnedAgent, ChunkHandler } from "./claude-tmux.ts";
 import type { ContinuationTrigger } from "../shared/types.ts";
 
@@ -1221,5 +1228,237 @@ test("a task-notification line adopts a continuation with trigger \"notification
     }
   } finally {
     __forTest.uninstallSession(taskId);
+  }
+});
+
+// ─── RC1/RC2: re-entry-guarded synchronous drain ────────────────────────
+//
+// docs/plans/handoff-identification-fix.md §3.1/§3.2. `drainSessionJsonl`
+// pulls in lines already on disk but not yet tailed (so a held task's release
+// and a follow-up's fold-vs-mint decision see the file's truth), without ever
+// firing a staged end_turn and without re-entering a dispatch loop.
+
+test("drainSessionJsonl: a task-notification line on disk but not yet tailed is adopted by the drain, which returns true", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { calls, factory } = countingFactory(cont);
+    try {
+      await withContinuationFactory(factory, () => {
+        // Nothing appended yet: a drain is a clean no-op.
+        expect(drainSessionJsonl(taskId)).toBe(false);
+        expect(calls).toEqual([]);
+
+        appendFileSync(jsonlPath, taskNotificationLine("agent-drain", "uuid-notif-drain"));
+        const before = state.lastJsonlAppendAt;
+        expect(drainSessionJsonl(taskId)).toBe(true);
+        expect(calls).toEqual([{ taskId, trigger: "notification" }]);
+        expect(state.turnQueue.length).toBe(1); // adopted slot
+        expect(__forTest.getContinuationWatchdog(state)).not.toBeNull();
+        // Mirrors async flush's bookkeeping when it dispatched lines.
+        expect(state.lastJsonlAppendAt).toBeGreaterThanOrEqual(before);
+        expect(state.lastJsonlAppendAt).toBeGreaterThan(0);
+
+        // The cursor moved: a second drain finds nothing and adopts nothing.
+        expect(drainSessionJsonl(taskId)).toBe(false);
+        expect(calls.length).toBe(1);
+      });
+    } finally {
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("drainSessionJsonl: no live session for the task is a no-op returning false", () => {
+  expect(drainSessionJsonl(randomUUID())).toBe(false);
+});
+
+test("drainSessionJsonl never fires a staged pendingEndTurn on an in-flight slot; flushSync still does", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    const rec = recorder();
+    const done = __forTest.pushTurnSlot(state, rec.onChunk);
+    let resolved = false;
+    void done.then(() => { resolved = true; });
+
+    appendFileSync(jsonlPath, endTurnLineId("turn reply", "msg-end", "uuid-end"));
+    expect(drainSessionJsonl(taskId)).toBe(true);
+    // The end_turn line was dispatched and staged, but not fired.
+    expect(rec.out.some((r) => r.data === "turn reply")).toBe(true);
+    expect(state.pendingEndTurn).not.toBeNull();
+    expect(state.turnQueue.length).toBe(1);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(resolved).toBe(false);
+
+    // flushSync (no new data) fires the staged end_turn on the same slot.
+    __forTest.flushSync(state);
+    await expect(done).resolves.toBe(0);
+    expect(state.pendingEndTurn).toBeNull();
+    expect(state.turnQueue.length).toBe(0);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("drainSessionJsonl called from inside dispatch (via the background-task-settled hook) is a no-op: no double dispatch, no out-of-order dispatch", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+    const cont = recorder();
+    const { factory } = countingFactory(cont);
+    const inHook: Array<{ result: boolean; depth: number }> = [];
+    const prevSettle = setBackgroundTaskSettledHandler(() => {
+      // A later line lands on disk while the outer loop is mid-dispatch (the
+      // outer read already advanced the cursor past [A, B]).
+      appendFileSync(jsonlPath, assistantLineId("line-C", "msg-c", "uuid-c"));
+      const depth = state.dispatchDepth;
+      inHook.push({ result: drainSessionJsonl(taskId), depth });
+    });
+    try {
+      await withContinuationFactory(factory, () => {
+        appendFileSync(
+          jsonlPath,
+          taskNotificationLine("agent-reentry", "uuid-notif-reentry")
+            + assistantLineId("line-B", "msg-b", "uuid-b"),
+        );
+        __forTest.flushSync(state);
+
+        // The in-dispatch drain declined: C was NOT dispatched from inside the
+        // outer loop (it would have run before B).
+        expect(inHook).toEqual([{ result: false, depth: 1 }]);
+        const texts = () => cont.out.filter((r) => r.data.startsWith("line-")).map((r) => r.data);
+        expect(texts()).toEqual(["line-B"]);
+        expect(state.dispatchDepth).toBe(0);
+
+        // Once the outer loop is done the same drain picks C up, exactly once,
+        // after B.
+        expect(drainSessionJsonl(taskId)).toBe(true);
+        expect(texts()).toEqual(["line-B", "line-C"]);
+        expect(drainSessionJsonl(taskId)).toBe(false);
+      });
+    } finally {
+      setBackgroundTaskSettledHandler(prevSettle);
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("an async flush awaiting its read drops its batch after an intervening drain: each line is dispatched exactly once", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    const rec = recorder();
+    void __forTest.pushTurnSlot(state, rec.onChunk).catch(() => {});
+    appendFileSync(jsonlPath, assistantLineId("only-once", "msg-once", "uuid-once"));
+
+    // Start the async flush: it captures the start offset and suspends on its
+    // file read. The drain then consumes the same bytes synchronously.
+    const pending = __forTest.flush(state);
+    expect(drainSessionJsonl(taskId)).toBe(true);
+    await pending;
+
+    expect(rec.out.filter((r) => r.data === "only-once").length).toBe(1);
+    expect(state.dispatchDepth).toBe(0);
+    // The cursor sits at EOF (no partial tail), so nothing is re-read.
+    expect(drainSessionJsonl(taskId)).toBe(false);
+    await __forTest.flush(state);
+    expect(rec.out.filter((r) => r.data === "only-once").length).toBe(1);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("sessionHasTurn truth table: false with no session or idle; true for an in-flight slot, a queued slot, a pending reattach listener, or an armed continuation watchdog", async () => {
+  // No session at all.
+  expect(sessionHasTurn(randomUUID())).toBe(false);
+
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    // Installed but idle.
+    expect(sessionHasTurn(taskId)).toBe(false);
+
+    // In-flight slot (live head slot with a resolver).
+    const done = __forTest.pushTurnSlot(state, () => {});
+    expect(sessionHasTurn(taskId)).toBe(true);
+    appendFileSync(jsonlPath, endTurnLineId("done", "msg-1", "uuid-1"));
+    __forTest.flushSync(state);
+    await expect(done).resolves.toBe(0);
+    expect(sessionHasTurn(taskId)).toBe(false);
+
+    // A queued slot with no resolver is still queued turn state.
+    state.turnQueue.push({ onChunk: () => {}, resolve: null, reject: null, slashCommand: null });
+    expect(state.turnQueue[0]!.resolve).toBeNull();
+    expect(sessionHasTurn(taskId)).toBe(true);
+    state.turnQueue.length = 0;
+    expect(sessionHasTurn(taskId)).toBe(false);
+
+    // A pending reattach end-of-turn listener.
+    state.onEndOfTurn = () => {};
+    expect(sessionHasTurn(taskId)).toBe(true);
+    state.onEndOfTurn = null;
+    expect(sessionHasTurn(taskId)).toBe(false);
+
+    // An armed continuation watchdog (adopted turn awaiting content): the
+    // adopted slot is queued with a resolver, and clearing the queue alone
+    // must still leave the watchdog reading as busy.
+    const { factory } = countingFactory(recorder());
+    try {
+      await withContinuationFactory(factory, () => {
+        appendFileSync(jsonlPath, taskNotificationLine("agent-has-turn", "uuid-notif-has-turn"));
+        __forTest.flushSync(state);
+      });
+      expect(__forTest.getContinuationWatchdog(state)).not.toBeNull();
+      state.turnQueue.length = 0;
+      expect(sessionHasTurn(taskId)).toBe(true);
+    } finally {
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("setBeforeSendTurnFlush fires exactly once, with the task id, right before sendTurn's flushSync, and returns the previous hook", async () => {
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  // A tmux that always succeeds: this test is about call order, not pasting.
+  process.env.AGETOR_TMUX_BIN = "/usr/bin/true";
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  const calls: Array<{ taskId: string; offsetAtCall: number }> = [];
+  const prev = __forTest.setBeforeSendTurnFlush((tid) => {
+    calls.push({ taskId: tid, offsetAtCall: state.offset });
+    // Land a line on disk in the window between the hook and the flush.
+    appendFileSync(jsonlPath, assistantLineId("appended in the window", "msg-win", "uuid-win"));
+  });
+  try {
+    expect(prev).toBeNull();
+    const agent = await sendTurn(taskId, "hello", () => {});
+    await agent.pasteOutcome;
+    expect(calls).toEqual([{ taskId, offsetAtCall: 0 }]);
+    // The line the hook appended was consumed by sendTurn's flushSync, which
+    // therefore ran AFTER the hook.
+    expect(state.offset).toBeGreaterThan(0);
+
+    // Restoring the previous hook (null) stops further calls.
+    const mine = __forTest.setBeforeSendTurnFlush(null);
+    expect(typeof mine).toBe("function");
+    state.turnQueue.length = 0;
+    const agent2 = await sendTurn(taskId, "again", () => {});
+    await agent2.pasteOutcome;
+    expect(calls.length).toBe(1);
+  } finally {
+    __forTest.setBeforeSendTurnFlush(null);
+    __forTest.uninstallSession(taskId);
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
   }
 });

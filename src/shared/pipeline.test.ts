@@ -2,6 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
   EFFECTIVE_STEP_CAP_MAX,
   HANDOFF_FILE_UNTRUSTED_WARNING,
+  HANDOFF_FROM_NEWER_RUN_STATUS,
+  HANDOFF_FROM_OTHER_RUN_STATUS,
+  HANDOFF_LOOKBACK_MAX_RUNS,
+  attemptWindowStart,
+  handoffLookbackOrder,
+  handoffSourceStatusLine,
   PIPELINE_CONTROL_CHAR_RE,
   stepNameKey,
   HANDOFF_REMINDER_MARKER,
@@ -1319,6 +1325,40 @@ describe("deriveRunStatus", () => {
     const run = makeRun({ status: "running" });
     expect(deriveRunStatus(run)).toBe("done");
   });
+  test("a stopped run stays cancelled while its executions remain active", () => {
+    const run = makeRun({ status: "running", stopRequestedAt: 5, active: [{ stepId: "a", taskId: "t1", seq: 1 }] });
+    expect(deriveRunStatus(run)).toBe("cancelled");
+  });
+
+  test("blocked still wins over the stop marker", () => {
+    const run = makeRun({
+      stopRequestedAt: 5,
+      active: [{ stepId: "a", taskId: "t1", seq: 1 }],
+      blocked: [{ taskId: "t1", stepId: "a", kind: "step-failed", message: "boom" }],
+    });
+    expect(deriveRunStatus(run)).toBe("blocked");
+  });
+
+  test("a cleared marker (null) reads like no marker", () => {
+    const run = makeRun({ stopRequestedAt: null, active: [{ stepId: "a", taskId: "t1", seq: 1 }] });
+    expect(deriveRunStatus(run)).toBe("running");
+  });
+
+  test("every active execution stopped on its own (stoppedAt) reads cancelled; one still going reads running", () => {
+    const record = (taskId: string, seq: number, stoppedAt: number | null) => ({
+      seq, stepId: taskId, taskId, startedAt: 1, endedAt: null, outcome: null, handoff: null, nextStepIds: [], stoppedAt,
+    });
+    const allStopped = makeRun({
+      active: [{ stepId: "t1", taskId: "t1", seq: 1 }, { stepId: "t2", taskId: "t2", seq: 2 }],
+      history: [record("t1", 1, 10), record("t2", 2, 11)],
+    });
+    expect(deriveRunStatus(allStopped)).toBe("cancelled");
+    const oneGoing = makeRun({
+      active: [{ stepId: "t1", taskId: "t1", seq: 1 }, { stepId: "t2", taskId: "t2", seq: 2 }],
+      history: [record("t1", 1, 10), record("t2", 2, null)],
+    });
+    expect(deriveRunStatus(oneGoing)).toBe("running");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2526,5 +2566,81 @@ describe("composeHandoffReminder", () => {
     const nextRule = 'This is the last step: set "next" to null.';
     expect(prompt).toContain(nextRule);
     expect(reminder).toContain(nextRule);
+  });
+});
+
+describe("attemptWindowStart", () => {
+  test("without a retry the window starts at the execution's own startedAt", () => {
+    expect(attemptWindowStart({ startedAt: 100 })).toBe(100);
+    expect(attemptWindowStart({ startedAt: 100, attemptStartedAt: null })).toBe(100);
+  });
+
+  test("a Retry moves the window forward to attemptStartedAt", () => {
+    expect(attemptWindowStart({ startedAt: 100, attemptStartedAt: 500 })).toBe(500);
+  });
+
+  test("an attemptStartedAt older than startedAt never widens the window", () => {
+    expect(attemptWindowStart({ startedAt: 100, attemptStartedAt: 40 })).toBe(100);
+  });
+});
+
+describe("handoffLookbackOrder", () => {
+  const run = (id: string, status: string, startedAt: number, endedAt: number | null) => ({ id, status, startedAt, endedAt });
+
+  test("keeps only succeeded runs with an endedAt", () => {
+    const runs = [
+      run("ok", "succeeded", 10, 20),
+      run("running", "running", 10, null),
+      run("failed", "failed", 10, 20),
+      run("cancelled", "cancelled", 10, 20),
+      run("orphaned", "orphaned", 10, 20),
+      run("no-end", "succeeded", 10, null),
+    ];
+    expect(handoffLookbackOrder(runs, 0)).toEqual(["ok"]);
+  });
+
+  test("the window boundary is inclusive on startedAt", () => {
+    const runs = [run("before", "succeeded", 99, 150), run("at", "succeeded", 100, 160), run("after", "succeeded", 101, 170)];
+    expect(handoffLookbackOrder(runs, 100)).toEqual(["after", "at"]);
+  });
+
+  test("orders by endedAt descending, then startedAt descending", () => {
+    const runs = [
+      run("old", "succeeded", 10, 50),
+      run("tie-early", "succeeded", 20, 100),
+      run("newest", "succeeded", 5, 200),
+      run("tie-late", "succeeded", 30, 100),
+    ];
+    expect(handoffLookbackOrder(runs, 0)).toEqual(["newest", "tie-late", "tie-early", "old"]);
+  });
+
+  test("caps at HANDOFF_LOOKBACK_MAX_RUNS, keeping the newest", () => {
+    const runs = Array.from({ length: HANDOFF_LOOKBACK_MAX_RUNS + 5 }, (_, i) => run(`r${i}`, "succeeded", i, i + 1));
+    const order = handoffLookbackOrder(runs, 0);
+    expect(order).toHaveLength(HANDOFF_LOOKBACK_MAX_RUNS);
+    expect(order[0]).toBe(`r${HANDOFF_LOOKBACK_MAX_RUNS + 4}`);
+    expect(order[order.length - 1]).toBe("r5");
+  });
+
+  test("does not mutate its input", () => {
+    const runs = [run("a", "succeeded", 1, 2), run("b", "succeeded", 3, 4)];
+    handoffLookbackOrder(runs, 0);
+    expect(runs.map((r) => r.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("handoffSourceStatusLine", () => {
+  test("a run opened after the supplier exists -> the 'newer run had none' text", () => {
+    expect(handoffSourceStatusLine(true)).toBe(HANDOFF_FROM_NEWER_RUN_STATUS);
+  });
+
+  test("the supplier is the step's newest run -> the 'another run' text", () => {
+    expect(handoffSourceStatusLine(false)).toBe(HANDOFF_FROM_OTHER_RUN_STATUS);
+  });
+
+  test("the two texts are distinct and never name the product", () => {
+    expect(HANDOFF_FROM_NEWER_RUN_STATUS).not.toBe(HANDOFF_FROM_OTHER_RUN_STATUS);
+    expect(HANDOFF_FROM_NEWER_RUN_STATUS.toLowerCase()).not.toContain("agetor");
+    expect(HANDOFF_FROM_OTHER_RUN_STATUS.toLowerCase()).not.toContain("agetor");
   });
 });

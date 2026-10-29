@@ -3060,6 +3060,14 @@ interface SessionState {
    * places. Content-triggered adoption arms nothing — real content already
    * arrived, so there's nothing to wait for. Null when not armed. */
   continuationWatchdog: { timer: ReturnType<typeof setTimeout>; slot: TurnSlot } | null;
+  /** Re-entry guard for the tailer's per-line dispatch loops. Incremented
+   *  (try/finally) around the loops of async `flush`, `flushSync` and
+   *  `drainSessionJsonl`, so it is `> 0` exactly while some line of this
+   *  session is mid-`dispatchLine`. `drainSessionJsonl` is a no-op in that
+   *  window: a sync read from inside a dispatch loop would advance
+   *  `offset` past bytes whose earlier lines the outer loop has not
+   *  dispatched yet, and dispatch the later lines first. */
+  dispatchDepth: number;
   /** True while `collectAskQuestionsFromPane` has grown the detached pane and
    *  `window-size` is legitimately `manual` for this session — set right before
    *  the grow, cleared by the SAME `finally` (nested inside it) that restores
@@ -3307,6 +3315,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     lastLocalCommandArgs: null,
     subagentWatcher: null,
     continuationWatchdog: null,
+    dispatchDepth: 0,
     paneGrowInFlight: false,
     composerHoldsText: false,
     drivingPrompt: false,
@@ -4850,13 +4859,32 @@ function isReplayPromise(
  * the file's own `fileWrittenWithin` comment calls out as fine to leave sync.
  */
 function flushSync(state: SessionState): void {
+  const lines = readAppendedLinesSync(state);
+  if (lines) dispatchLinesGuarded(state, lines);
+  // flushSync is called from sendTurn before pushing a new prompt slot.
+  // A new human prompt is definitive proof the previous turn ended — fire any
+  // staged end_turn now so it resolves on the correct (old) slot, not the one
+  // we're about to push.
+  if (state.pendingEndTurn) firePendingEndTurn(state);
+}
+
+/**
+ * The synchronous read half shared by `flushSync` and `drainSessionJsonl`:
+ * stat + read the bytes appended past `state.offset`, advance the cursor to
+ * just before any partial trailing line, and return the complete lines
+ * (possibly empty strings between consecutive newlines). Returns `null` when
+ * there is nothing to read or the file can't be read. Atomic with respect to
+ * the event loop — no `await` between the stat and the cursor advance — which
+ * is what `flush`'s `state.offset !== startOffset` guard relies on.
+ */
+function readAppendedLinesSync(state: SessionState): string[] | null {
   let st;
-  try { st = fsStatSync(state.jsonlPath); } catch { return; }
-  if (st.size <= state.offset) return;
+  try { st = fsStatSync(state.jsonlPath); } catch { return null; }
+  if (st.size <= state.offset) return null;
   const len = st.size - state.offset;
   const buf = Buffer.alloc(len);
   let fd;
-  try { fd = openReadNoFollow(state.jsonlPath); } catch { return; }
+  try { fd = openReadNoFollow(state.jsonlPath); } catch { return null; }
   try {
     fsReadSync(fd, buf, 0, len, state.offset);
   } finally {
@@ -4866,15 +4894,83 @@ function flushSync(state: SessionState): void {
   const lines = text.split("\n");
   const tail = lines.pop() ?? "";
   state.offset = st.size - Buffer.byteLength(tail, "utf8");
-  for (const line of lines) {
-    if (!line) continue;
-    dispatchLine(state, line);
+  return lines;
+}
+
+/** Dispatch `lines` in order under the `dispatchDepth` re-entry guard.
+ *  Returns how many non-empty lines were dispatched. */
+function dispatchLinesGuarded(state: SessionState, lines: string[]): number {
+  let dispatched = 0;
+  state.dispatchDepth++;
+  try {
+    for (const line of lines) {
+      if (!line) continue;
+      dispatched++;
+      dispatchLine(state, line);
+    }
+  } finally {
+    state.dispatchDepth--;
   }
-  // flushSync is called from sendTurn before pushing a new prompt slot.
-  // A new human prompt is definitive proof the previous turn ended — fire any
-  // staged end_turn now so it resolves on the correct (old) slot, not the one
-  // we're about to push.
-  if (state.pendingEndTurn) firePendingEndTurn(state);
+  return dispatched;
+}
+
+/**
+ * Synchronously pull in whatever the session's JSONL has gained since the
+ * tailer's cursor and dispatch it through the normal `dispatchLine` path, so
+ * a task-notification (or any other) line that is already on disk but not yet
+ * tailed is adopted/routed NOW instead of on the next watcher or poll tick.
+ * Returns true iff at least one line was dispatched.
+ *
+ * Why it exists (docs/plans/handoff-identification-fix.md, RC1/RC2): the
+ * subagent watcher scans the same JSONL independently of the tailer, so it can
+ * settle a held task (and release it to `review`) before the tailer has
+ * adopted the continuation that same notification starts; and a follow-up
+ * decides fold-vs-new-turn from tailer state that lags the file. Callers drain
+ * first so that decision sees the file's truth.
+ *
+ * Differences from `flushSync`: it NEVER fires a staged `pendingEndTurn` (that
+ * tail is only correct right before a new human prompt slot is pushed — a
+ * release-path drain must not resolve a turn), and it mirrors async `flush`'s
+ * bookkeeping (`lastJsonlAppendAt`, `bumpActivity`) when it dispatched lines.
+ *
+ * Ordering hazard, and the guard: async `flush` advances `state.offset` BEFORE
+ * its per-line dispatch loop. A drain during `flush`'s `await readAppended`
+ * is safe — `flush` sees `state.offset !== startOffset` and drops its (now
+ * duplicate) batch. A drain from INSIDE a dispatch loop (e.g. `dispatchLine`
+ * → background-task settled hook → release → drain) would read the bytes past
+ * the advanced offset and dispatch those later lines before the outer loop
+ * dispatched its earlier ones. So it is a no-op while `dispatchDepth > 0`;
+ * in that case the tailer has already adopted any continuation ahead of the
+ * settle (`maybeAdoptContinuation` runs before `fireBackgroundTaskSettled`).
+ * Also a no-op, returning false, when the task has no live session.
+ */
+export function drainSessionJsonl(taskId: string): boolean {
+  const state = sessions.get(taskId);
+  if (!state || state.dispatchDepth > 0) return false;
+  const lines = readAppendedLinesSync(state);
+  if (!lines) return false;
+  // Same bookkeeping as async `flush`: stamp it before dispatching so the
+  // scraper's mid-turn-output suppression and the idle clock see the write
+  // even if a dispatched hook reads them.
+  const hasLine = lines.some((l) => l.length > 0);
+  if (hasLine) {
+    state.lastJsonlAppendAt = Date.now();
+    bumpActivity(state);
+  }
+  return dispatchLinesGuarded(state, lines) > 0;
+}
+
+/**
+ * Whether the session has any turn activity an idle-only send must not
+ * interleave with: a turn in flight (live head slot or pending reattach
+ * `onEndOfTurn`), a queued slot, or an armed continuation watchdog (an adopted
+ * turn still awaiting content). False with no live session. Consulted only by
+ * the idle-only send gate (docs/plans/handoff-identification-fix.md §3.2/§3.4).
+ */
+export function sessionHasTurn(taskId: string): boolean {
+  const state = sessions.get(taskId);
+  if (!state) return false;
+  return turnInFlight(state) || state.turnQueue.length > 0 || state.continuationWatchdog != null;
 }
 
 /** Read the file from `offset` to EOF, advancing the cursor. */
@@ -4948,10 +5044,7 @@ async function flush(state: SessionState): Promise<void> {
   // the reaper's idle clock (`sessionIdleInfo`) and the pollTimer's own
   // idle backoff below.
   bumpActivity(state);
-  for (const line of lines) {
-    if (!line) continue;
-    dispatchLine(state, line);
-  }
+  dispatchLinesGuarded(state, lines);
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -8882,6 +8975,7 @@ export async function sendTurn(
   // already in the file would be dispatched against the new slot and
   // pop it immediately. After flushSync, the queue head reflects the
   // truly in-flight turn (or is empty if the previous turn just ended).
+  beforeSendTurnFlushHook?.(taskId);
   flushSync(state);
   // Arm (or disarm) the unknown-command lookout for THIS turn's prompt —
   // must happen after flushSync (which may itself clear a stale token left
@@ -10180,6 +10274,11 @@ function rejectedAgent(_taskId: string, err: Error): SpawnedAgent {
   };
 }
 
+/** Test seam (`__forTest.setBeforeSendTurnFlush`): runs inside `sendTurn`
+ *  right before its `flushSync`, so a test can append a task-notification line
+ *  into the window between the idle mint and the slot push. */
+let beforeSendTurnFlushHook: ((taskId: string) => void) | null = null;
+
 // Test-only helpers — let claude-tmux.test.ts drive the turn-queue
 // dispatch logic against a real temp JSONL file without going through
 // tmux. Not part of the public surface.
@@ -10197,6 +10296,16 @@ export const __forTest = {
     return state;
   },
   uninstallSession(taskId: string) { sessions.delete(taskId); },
+  /** Install a hook `sendTurn` calls (with the task id) right before its
+   *  `flushSync`; `null` clears it. Returns the previous hook so callers can
+   *  restore it. */
+  setBeforeSendTurnFlush(
+    hook: ((taskId: string) => void) | null,
+  ): ((taskId: string) => void) | null {
+    const prev = beforeSendTurnFlushHook;
+    beforeSendTurnFlushHook = hook;
+    return prev;
+  },
   pushTurnSlot(state: SessionState, onChunk: ChunkHandler): Promise<number> {
     return new Promise<number>((resolve, reject) => {
       // slashCommand: null — this generic test helper drives non-slash-turn

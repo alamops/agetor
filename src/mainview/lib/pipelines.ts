@@ -1007,6 +1007,20 @@ export function responseKindLabel(
 }
 
 /**
+ * Run-view chip for a history record whose accepted handoff was written by a
+ * DIFFERENT run than the one the runner settled — e.g. a continuation run
+ * that displaced the settled one and carried the real `<handoff>` block.
+ * Returns `null` (render nothing) unless the runner flagged
+ * `handoffFromOtherRun` AND recorded the supplying `handoffRunId`; rows saved
+ * before the breadcrumb existed carry neither field and therefore read null.
+ * `text` shows the first 8 characters of the run id, `title` the full id.
+ */
+export function handoffSourceChip(r: PipelineStepRecord): { text: string; title: string } | null {
+  if (!r.handoffFromOtherRun || !r.handoffRunId) return null;
+  return { text: `Handoff from run ${r.handoffRunId.slice(0, 8)}`, title: r.handoffRunId };
+}
+
+/**
  * True exactly while the CURRENTLY ACTIVE execution of `stepId` has already
  * received the runner's one automatic "no valid handoff yet" reminder turn
  * (its `run.history` record — pushed at launch, before the execution

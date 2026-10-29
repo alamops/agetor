@@ -41,6 +41,23 @@ async function settle(ms = 100) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+/** Wait until the task has `count` run rows and none of them is still
+ *  running. A fake codex turn usually settles in ~30 ms, but a process's
+ *  first turn and a loaded machine can take several hundred, so a fixed
+ *  sleep races it. */
+async function settledRuns(taskId: string, count: number, timeoutMs = 10_000) {
+  const { runs } = await import("./db.ts");
+  const start = Date.now();
+  for (;;) {
+    const listed = runs.listForTask(taskId);
+    if (listed.length === count && listed.every((r) => r.status !== "running")) return;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`timed out waiting for ${count} settled run(s); have ${listed.map((r) => r.status).join(", ") || "none"}`);
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 async function createCodexTask(model: string | null) {
   const { createTask } = await import("./orchestrator.ts");
   const { harnesses } = await import("./db.ts");
@@ -98,7 +115,7 @@ test("a refused follow-up on an archived codex task leaves it archived (floor ch
   const taskId = await createCodexTask("gpt-5.6-sol");
   const started = await startTask(taskId);
   if ("error" in started) throw new Error(started.error);
-  await settle(150);
+  await settledRuns(taskId, 1);
   expect(runs.listForTask(taskId).length).toBe(1);
 
   const archived = await archiveTask(taskId, { force: true }); // column gate only; the run already settled
@@ -293,7 +310,7 @@ test("follow-up gate: a codex task started on a satisfying version, then switche
   if ("error" in started) throw new Error(started.error);
   const firstRunId = started.runId;
 
-  await settle();
+  await settledRuns(taskId, 1);
   expect(runs.listForTask(taskId).length).toBe(1);
 
   // Now move the task onto a floored model and drop the installed CLI below
@@ -329,7 +346,7 @@ test("follow-up gate: a codex task started on a satisfying version, then switche
   const retried = await sendInput(firstRunId, "follow up");
   expect(retried.delivered).toBe(true);
 
-  await settle();
+  await settledRuns(taskId, 2);
   expect(runs.listForTask(taskId).length).toBe(2);
 });
 

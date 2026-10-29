@@ -1287,7 +1287,18 @@ export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
  * handoff. The continuation is scheduled as a microtask after this turn's
  * `done` resolves, so the first run's settle still runs and sees the newer
  * run already `running`. Later turns ignore the suffix's continuation
- * behavior and emit an ordinary terminal handoff. A per-task turn counter
+ * behavior and emit an ordinary terminal handoff.
+ *
+ * `continue-overlap` is turn 1 only as well, and reproduces two overlapping
+ * continuations: run A writes text with no `<handoff>` and resolves; a
+ * microtask later a notification-continuation B is adopted and writes a
+ * valid terminal handoff but stays open; a user-continuation C is then
+ * opened, displaces B as the task's current run and writes
+ * "Picking this back up." with no handoff. B resolves after
+ * {@link FAKE_OVERLAP_B_MS}, C after {@link FAKE_OVERLAP_C_MS}, so B always
+ * ends first and the step's FINAL run (C) carries no handoff while an
+ * earlier continuation (B) does. Later turns emit an ordinary terminal
+ * handoff, like `continue-then-done`. A per-task turn counter
  * (`fakeHandoffTurnCounts` below) tracks which turn a given taskId is on,
  * and when the CURRENT turn's `prompt` carries no marker at all (true for
  * that reminder, and for any other marker-less follow-up), the driver falls
@@ -1598,6 +1609,22 @@ function fakeTerminalHandoffText(summary: string): string {
 }
 
 /**
+ * `continue-overlap`: how long after both continuations are open the first
+ * one (B, the notification-continuation carrying the handoff) resolves. Kept
+ * well under {@link FAKE_OVERLAP_C_MS} so B always ends before C, and long
+ * enough that C's open (a synchronous run-row insert) lands while B is still
+ * `running`.
+ */
+export const FAKE_OVERLAP_B_MS = 400;
+/**
+ * `continue-overlap`: how long after both continuations are open the second
+ * one (C, the user-continuation that displaces B and carries no handoff)
+ * resolves. It is the step's last run to settle, which is what the pipeline
+ * runner's look-back has to cope with.
+ */
+export const FAKE_OVERLAP_C_MS = 1200;
+
+/**
  * Adopt a continuation run and write a terminal handoff onto it. Called
  * from a microtask queued AFTER the current turn's `done` promise is
  * resolved, so that turn's settle is already queued and still sees this
@@ -1627,6 +1654,51 @@ function adoptFakeHandoffContinuation(taskId: string): void {
     hooks.onChunk("status", "turn complete");
     finish(0);
   });
+}
+
+/**
+ * `continue-overlap` driver: adopt continuation B (trigger `"notification"`)
+ * and write a terminal handoff onto it without resolving, then adopt
+ * continuation C (trigger `"user"`) which displaces B as the task's current
+ * run and writes a handoff-less message. B resolves after
+ * {@link FAKE_OVERLAP_B_MS}, C after {@link FAKE_OVERLAP_C_MS}. Called from a
+ * microtask queued AFTER the first run's `done` is resolved, like
+ * {@link adoptFakeHandoffContinuation}. A null factory (no orchestrator
+ * wired) is a no-op for the continuation it would have opened.
+ */
+function adoptFakeOverlappingContinuations(taskId: string): void {
+  const open = (
+    trigger: "notification" | "user",
+    text: string,
+    resolveAfterMs: number,
+  ): void => {
+    const hooks = openContinuationRun(taskId, trigger);
+    if (!hooks) return;
+    let resolveCont!: (code: number) => void;
+    const contDone = new Promise<number>((res) => { resolveCont = res; });
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let settled = false;
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolveCont(code);
+    };
+    hooks.onAdopted({
+      kill: () => finish(0),
+      writeInput: () => true,
+      done: contDone,
+    });
+    hooks.onChunk("assistant", text);
+    timer = setTimeout(() => {
+      hooks.onChunk("status", "turn complete");
+      finish(0);
+    }, resolveAfterMs);
+  };
+  // B first, C second: C's run-row insert flips `task.runId` to C while B is
+  // still running.
+  open("notification", fakeTerminalHandoffText("continued after background task (overlap)"), FAKE_OVERLAP_B_MS);
+  open("user", "Picking this back up.", FAKE_OVERLAP_C_MS);
 }
 
 /**
@@ -2428,12 +2500,15 @@ function makeFakeAgent(
       });
     }
     after(subagentSpec ? subagentSpec.runMs + 30 : Math.min(20, resolveDelayMs - 10), () => {
-      if (suffix === "missing" || (suffix === "continue-then-done" && turn <= 1)) {
+      if (
+        suffix === "missing"
+        || ((suffix === "continue-then-done" || suffix === "continue-overlap") && turn <= 1)
+      ) {
         onChunk("assistant", "I finished the work but forgot the handoff.");
       } else if (suffix === "invalid") {
         onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n{not json\n</${HANDOFF_TAG}>`);
-      } else if (suffix === "continue-then-done") {
-        onChunk("assistant", fakeTerminalHandoffText("fake summary for continue-then-done"));
+      } else if (suffix === "continue-then-done" || suffix === "continue-overlap") {
+        onChunk("assistant", fakeTerminalHandoffText(`fake summary for ${suffix}`));
       } else {
         const next = suffix && suffix !== "done" ? suffix : null;
         const handoff = {
@@ -2457,6 +2532,8 @@ function makeFakeAgent(
       // current run when the missing handoff is classified.
       if (suffix === "continue-then-done" && turn <= 1) {
         queueMicrotask(() => adoptFakeHandoffContinuation(taskId));
+      } else if (suffix === "continue-overlap" && turn <= 1) {
+        queueMicrotask(() => adoptFakeOverlappingContinuations(taskId));
       }
     });
   } else if (
@@ -3912,7 +3989,14 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       // can route follow-ups through `codex exec resume` — mirrors what a real
       // `thread.started` event would deliver.
       onSessionId?.(`fake-codex-thread-${taskId}`);
-      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+      // `kind` is what arms the fake's codex-only resolve delay
+      // (`AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS`).
+      return makeFakeAgent(taskId, prompt, onChunk, {
+        runId,
+        mode: opts.mode ?? defaultModeFor(harness.kind),
+        cwd,
+        kind: harness.kind,
+      });
     }
     // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
     // worktree) so a codex `auto` run that has to write there escalates its

@@ -774,6 +774,84 @@ test.describe("pipelines run: executing a run", () => {
     await waitForColumn(backend, task.id, "review");
   });
 
+  // The incident shape (docs/plans/handoff-identification-fix.md §3.6):
+  // A's first reply has no `<handoff>`; a background-task continuation (B)
+  // writes the real handoff but is displaced as the step's current run by a
+  // later continuation (C) that ends without one. B settles first, C last.
+  // The runner must wait while any run of the step is live, then take the
+  // handoff from B when C settles — no reminder, no block — and record
+  // where it came from: the history row's handoff-source chip names B, and
+  // B's own transcript carries the "newer run had none" status line.
+  test("overlapping continuations: the handoff on a displaced run advances the step, with a source chip and no reminder", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const profileId = await createProfileRest(backend, "Runner");
+    const A = makeStep({
+      id: randomUUID(),
+      name: "A",
+      agentProfileId: profileId,
+      instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:continue-overlap`,
+    });
+    const B = makeStep({
+      id: randomUUID(),
+      name: "B",
+      agentProfileId: profileId,
+      instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+    });
+    const pipelineId = await createPipelineRest(
+      backend,
+      "Overlapping Continuations Pipeline",
+      [A, B],
+      [{ from: A.id, to: B.id }],
+    );
+    const title = `Overlapping Continuations ${randomUUID()}`;
+    const task = await createPipelineTaskRest(backend, title, pipelineId, "Do the thing.");
+    await openPipelineRunFromBoard(page, backend, title);
+    await startTaskRest(backend, task.id);
+
+    await expect(stepNode(page, A.id)).toHaveAttribute("data-visual", "active", { timeout: CONVERGE_TIMEOUT });
+
+    await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipeline-run-blocked")).toHaveCount(0);
+    await expect(page.getByTestId("pipeline-run-reminder")).toHaveCount(0);
+    await expect(page.locator('[data-testid="pipeline-run-history-row"]')).toHaveCount(2);
+
+    // The supplier is the step task's earliest-started continuation run (B).
+    const parent = await getTask(backend, task.id);
+    const stepTaskId = parent.pipelineRun?.history.find((h) => h.stepId === A.id)?.taskId;
+    expect(stepTaskId).toBeTruthy();
+    const runsRes = await fetch(`${backend.apiBase}/tasks/${stepTaskId}/runs`, { headers: auth(backend) });
+    expect(runsRes.ok).toBe(true);
+    const stepRuns = (await runsRes.json()) as { id: string; origin?: string | null; startedAt: number }[];
+    const continuations = stepRuns
+      .filter((r) => r.origin === "continuation")
+      .sort((a, b) => a.startedAt - b.startedAt);
+    expect(continuations.length).toBe(2);
+    const supplierRunId = continuations[0]!.id;
+
+    const rowA = historyRowFor(page, "A");
+    await expect(rowA).toHaveCount(1);
+    await expect(rowA.locator('[data-testid="pipeline-run-response-kind"][data-kind="handoff"]')).toBeVisible();
+    await expect(rowA.getByTestId("pipeline-run-reminder")).toHaveCount(0);
+    const chip = rowA.getByTestId("pipeline-run-handoff-source");
+    await expect(chip).toBeVisible();
+    await expect(chip).toHaveAttribute("title", supplierRunId);
+    await expect(chip).toHaveText(`Handoff from run ${supplierRunId.slice(0, 8)}`);
+
+    await stepNode(page, A.id).click();
+    const panel = page.locator("aside").last();
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toBeVisible();
+    await expect(panel.getByTestId("handoff-reminder-badge")).toHaveCount(0);
+    await expect(panel.getByTestId("transcript-log")).toContainText(
+      "handoff taken from this run — the step's newer run had none",
+      { timeout: CONVERGE_TIMEOUT },
+    );
+
+    await waitForColumn(backend, task.id, "review");
+  });
+
   // 65f8a75: `:invalid-then-done` is `:invalid`'s two-turn sibling — an
   // unparsable `<handoff>` JSON on the first turn, a valid one on the
   // second. Single-step pipeline (no B) so the final history record is

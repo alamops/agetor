@@ -964,6 +964,36 @@ test("pipelineStatusLines: a reminder recorded with delivered:false prints (remi
   expect(text).not.toContain("(reminder sent)");
 });
 
+test("pipelineStatusLines: prints the dim handoff-source tag only when the handoff came from another run", () => {
+  const base = {
+    seq: 1,
+    stepId: "s1",
+    taskId: "step-task-0",
+    startedAt: 0,
+    endedAt: 1,
+    outcome: "succeeded" as const,
+    handoff: null,
+    nextStepIds: [],
+  };
+  const t = task({
+    pipelineRun: pipelineRun({
+      history: [
+        { ...base, handoffRunId: "0123456789abcdef", handoffFromOtherRun: true },
+        { ...base, seq: 2, handoffRunId: "fedcba9876543210", handoffFromOtherRun: false },
+        { ...base, seq: 3, handoffFromOtherRun: true },
+        { ...base, seq: 4 },
+      ],
+    }),
+  });
+  const lines = pipelineStatusLines(t, []);
+  const row = (n: number) => lines.find((l) => l.includes(`    ${n}. `)) ?? "";
+  expect(row(1)).toContain("(handoff from run 01234567)");
+  expect(row(1)).not.toContain("0123456789abcdef");
+  expect(row(2)).not.toContain("handoff from run");
+  expect(row(3)).not.toContain("handoff from run");
+  expect(row(4)).not.toContain("handoff from run");
+});
+
 test("pipelineStatusLines: a history row with no responseKind/reminder omits both notes", () => {
   const t = task({ pipelineRun: pipelineRun() });
   const lines = pipelineStatusLines(t, []);

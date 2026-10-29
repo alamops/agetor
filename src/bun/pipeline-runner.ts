@@ -14,8 +14,17 @@
  * `reconcilePipelineRuns` is the boot-time (or test-time) self-heal for a
  * step settle the runner's listener missed entirely (M16).
  *
+ * A step task can have several runs in one attempt (the original turn, a
+ * background-task continuation, a user follow-up, a reminder turn), so a
+ * settle is not "the current run ended": `settleStepRun` waits while any run
+ * of the step is live, then advances on the newest settled run of the attempt
+ * window that holds a valid `<handoff>` (see its doc). The orchestrator
+ * reports a displaced run's settle to this module only
+ * (`setDisplacedStepRunSettledHandler`, installed by `initPipelineRunner`),
+ * and a handoff reminder is only ever pasted into an idle session.
+ *
  * This module and `orchestrator.ts` reference each other's exports (the
- * runner needs `subscribeGlobal`/`startTask`/`cancelRun`/`deleteTask`/
+ * runner needs `subscribeGlobal`/`startTask`/`cancelLiveRunOfTask`/`deleteTask`/
  * `archiveTask`/`defaultEffortFor`/`isTaskRunLive`/`pipelineUpdateColumn`;
  * `orchestrator.ts`'s `startTaskInner`/`deleteTask`/`archiveTask`/
  * `createTask` need `startPipelineRun`/`cascadePipelineDelete`/
@@ -30,19 +39,23 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
+import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, subagents, tasks } from "./db.ts";
 import {
   appendRunStatusLine,
   archiveTask,
-  cancelRun,
+  cancelFxAutoResume,
+  cancelLiveRunOfTask,
   defaultEffortFor,
   deleteTask,
+  isAnyRunOfTaskLive,
   isHeldByBackgroundAgents,
   isTaskRunCancelling,
   isTaskRunLive,
   pipelineUpdateColumn,
   publishGlobalEvent,
   sendInput,
+  setDisplacedStepRunSettledHandler,
+  setHeldStepStoppedHandler,
   startTask,
   subscribeGlobal,
 } from "./orchestrator.ts";
@@ -50,11 +63,14 @@ import { cancelPendingForTask, listPendingForTask } from "./interactions.ts";
 import { prepareWorkdir, recordableCheckout } from "./worktree.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
+  attemptWindowStart,
   classifyStepResponse,
   composeHandoffReminder,
   composeStepPrompt,
   deriveRunStatus,
   effectiveStepCap,
+  handoffLookbackOrder,
+  handoffSourceStatusLine,
   incomingSteps,
   normalizeHandoff,
   outgoingSteps,
@@ -81,9 +97,11 @@ import type {
   PipelineRunStatus,
   PipelineStep,
   PipelineStepRecord,
+  Run,
   Task,
   TaskReference,
 } from "../shared/types.ts";
+import { CONTINUATION_STATUS_TEXT } from "../shared/types.ts";
 
 /** `dataDir/pipeline-runs/<parentId>` — where every step's handoff JSON
  *  (see D10) is written, and what `cascadePipelineDelete` removes wholesale. */
@@ -114,6 +132,7 @@ export function initialPipelineRunState(p: Pipeline): PipelineRunState {
     stepCount: 0,
     startedAt: null,
     endedAt: null,
+    stopRequestedAt: null,
   };
 }
 
@@ -244,6 +263,9 @@ function checkJoinIncomplete(run: PipelineRunState): void {
  * choke point every mutator below ends on.
  */
 function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatus?: boolean }): void {
+  // Always store the key: a stored row WITHOUT it is a pre-marker legacy row,
+  // which `parsePipelineRunState` reads as stopped when it is `cancelled`.
+  run.stopRequestedAt ??= null;
   if (!opts?.preserveStatus) run.status = deriveRunStatus(run);
   if (run.status === "done" || run.status === "cancelled") {
     if (run.endedAt === null) run.endedAt = Date.now();
@@ -292,7 +314,11 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
  * "something's blocked" one. Shared by `cancelPipelineRun` and
  * `handleRunStatus`'s cancelled/orphaned-with-nothing-else-live branch —
  * and, transitively, `reconcilePipelineRuns`, which drives missed settles
- * through that same `handleRunStatus` path at boot.
+ * through that same `handleRunStatus` path at boot. It never records
+ * `run.stopRequestedAt`: only the pipeline's own Stop (`cancelPipelineRun`)
+ * is a whole-run stop. A Stop on the last live step's own panel is that
+ * execution's `stoppedAt`, and an orphaned settle (agetor restarted mid-turn)
+ * is not a user stop at all.
  */
 function finalizeCancelled(parentId: string, run: PipelineRunState): void {
   if (run.blocked.length === 0) {
@@ -305,23 +331,50 @@ function finalizeCancelled(parentId: string, run: PipelineRunState): void {
 
 /**
  * Whether `run` is already mid a DELIBERATE whole-run stop as far as
- * `excludeTaskId`'s own execution is concerned — either `run.status` was
- * already forced to `"cancelled"` (`cancelPipelineRun` does this via
- * `finalizeCancelled` BEFORE any live sibling's own settle event reaches
- * this module, per Major 1 round 3's doc on `handleRunStatus`'s
- * cancelled/orphaned branch), or every OTHER still-live sibling is itself
- * mid-cancellation (`isTaskRunCancelling` — e.g. each active execution was
- * cancelled individually rather than through the pipeline-level cancel
- * route, so none of them is a normally-running sibling worth waiting on).
+ * `excludeTaskId`'s own execution is concerned — either the run carries the
+ * durable `stopRequestedAt` marker (set only by `cancelPipelineRun`, BEFORE
+ * it cancels anything, so every settle its cancels set off sees it; a later
+ * persist can't lose it, unlike `run.status`), or every OTHER sibling the
+ * pipeline is still working on is a live run mid-cancellation
+ * (`isTaskRunCancelling` — e.g. each active execution was cancelled
+ * individually rather than through the pipeline-level cancel route, so none
+ * of them is a normally-running sibling worth waiting on; a sibling waiting
+ * on a runner decision — {@link workingSiblings} — is not cancelling).
+ * A bare `run.status === "cancelled"` no longer counts: the last live step's
+ * own Stop and an orphaned settle force that status too, and neither stops
+ * the pipeline for a turn the user starts on the step afterwards.
  * Shared by the cancelled/orphaned settle branch below and the succeeded
  * branch's handoff-reminder gate (round 4, Major 2): a step that finished
  * with a bad/ambiguous handoff while the whole run is being torn down must
  * not have its one automatic reminder revive the run back into `running`.
  */
 function isDeliberateWholeRunStop(run: PipelineRunState, excludeTaskId: string): boolean {
-  if (run.status === "cancelled") return true;
-  const stillLiveSiblings = run.active.filter((a) => a.taskId !== excludeTaskId && isTaskRunLive(a.taskId));
-  return stillLiveSiblings.length > 0 && stillLiveSiblings.every((a) => isTaskRunCancelling(a.taskId));
+  if (run.stopRequestedAt != null) return true;
+  const working = workingSiblings(run, excludeTaskId);
+  return working.length > 0 && working.every((a) => isTaskRunCancelling(a.taskId));
+}
+
+/** The active executions other than `excludeTaskId`'s that the pipeline is
+ *  still working on: a run of them is live, or the runner itself still has a
+ *  decision pending for them ({@link hasPendingStepDecision} — a release
+ *  grace, a wait or busy recheck, a reminder mid-send). A Stop on one step
+ *  must not end the run out from under such a sibling (M5). */
+function workingSiblings(run: PipelineRunState, excludeTaskId: string): PipelineActiveStep[] {
+  return run.active.filter(
+    (a) => a.taskId !== excludeTaskId && (isAnyRunOfTaskLive(a.taskId) || hasPendingStepDecision(a.taskId)),
+  );
+}
+
+/** Whether a settle of this execution must treat it as stopped: the whole
+ *  run was stopped ({@link isDeliberateWholeRunStop}) or this execution was
+ *  stopped on its own (`stoppedAt`). Such a settle gets no release grace,
+ *  no automatic reminder and no block of its own. */
+function isStopApplied(
+  run: PipelineRunState,
+  taskId: string,
+  historyEntry: PipelineStepRecord | undefined,
+): boolean {
+  return historyEntry?.stoppedAt != null || isDeliberateWholeRunStop(run, taskId);
 }
 
 /** Re-read a FRESH copy of the parent's run from the DB and record a
@@ -356,10 +409,8 @@ function persistReconcileFailure(parentId: string, taskId: string, err: unknown)
   }
 }
 
-/** The step's current run when it is a different run from `settledRunId`.
- *  Null when this settle is still the current run. The row may already be
- *  terminal: a continuation can finish in the gap after a reminder was
- *  queued, and that is still the run whose text has to be classified. */
+/** The step's current run (`task.runId`) when it is a different run from
+ *  `settledRunId`; null when this settle is still the current run. */
 function differentCurrentRunId(taskId: string, settledRunId: string): string | null {
   const currentId = tasks.get(taskId)?.runId;
   if (!currentId || currentId === settledRunId) return null;
@@ -367,14 +418,12 @@ function differentCurrentRunId(taskId: string, settledRunId: string): string | n
 }
 
 /** True when {@link differentCurrentRunId} names a run that is still
- *  `running`. The task transcript merges every run, and a background-task
- *  continuation (or a follow-up that already started) often carries the
- *  `<handoff>` the settled run does not have yet. Reminding off the settled
- *  run warns "handoff missing" about a turn that is still writing.
- *  {@link attemptHandoffReminderOrBlock} only skips in this case. A
- *  successor that has already left `running` is not skipped there — its
- *  own settle classifies it, and {@link deliverHandoffReminder} re-enters
- *  that settle when the reminder was already queued.
+ *  `running`. Used by {@link deliverHandoffReminder}'s stamp lock: a user
+ *  message or a continuation can become the step's current run in the gap
+ *  after the reminder landed, and recording the reminder onto an execution
+ *  that run now owns would be wrong. (Before the send, and right after it,
+ *  {@link recheckReminder} handles liveness; this is the last check inside
+ *  the stamp lock itself.)
  *  `ignoreRunId` is the reminder turn `sendInput` just started. That run
  *  is not a continuation; treating it as one skips the stamp and every
  *  later settle of the same execution queues another send. */
@@ -403,6 +452,377 @@ function assistantTextFrom(events: MainStreamEvent[]): string {
     .filter((e) => e.stream === "assistant")
     .map((e) => e.data)
     .join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Handoff look-back (RC3) and the release grace (RC1)
+// ---------------------------------------------------------------------------
+
+type ClassifiedResponse = ReturnType<typeof classifyStepResponse>;
+
+/** A settled run of a step task whose final response holds a valid handoff. */
+interface HandoffSupplier {
+  runId: string;
+  /** `handoff-blocked` is a handoff too (D10) — it just doesn't advance. */
+  kind: "handoff" | "handoff-blocked";
+  handoff: Handoff;
+  startedAt: number;
+}
+
+/** A finished run's parsed response, cached across settles (L4): the
+ *  look-back re-reads up to {@link HANDOFF_LOOKBACK_MAX_RUNS} runs on every
+ *  settle and every reminder recheck, and loading each run's whole event
+ *  list again each time is the expensive part. Only the parse is cached —
+ *  `classifyStepResponse` with no pending interactions — because a pending
+ *  question can be answered between two reads; {@link classifyRunResponse}
+ *  re-applies the live interaction count on a hit. `maxEventId` guards the
+ *  entry: a run whose events grew since (a JSONL rebuild, a late tailer
+ *  line) is parsed again. */
+interface ParsedRunResponse {
+  maxEventId: number;
+  parsed: ClassifiedResponse;
+}
+
+const PARSED_RESPONSE_CACHE_MAX = 256;
+const parsedResponseCache = new Map<string, ParsedRunResponse>();
+
+/** The parse of `runId`'s final response with no pending interactions,
+ *  from the cache when the run has finished and gained no events since. */
+function parsedRunResponse(runId: string): ClassifiedResponse {
+  const row = runs.get(runId);
+  const finished = row != null && row.status !== "running" && row.endedAt != null;
+  const maxEventId = finished ? runs.maxEventIdForRun(runId) : -1;
+  if (finished) {
+    const hit = parsedResponseCache.get(runId);
+    if (hit && hit.maxEventId === maxEventId) {
+      // Refresh recency so the cap evicts the least recently read run.
+      parsedResponseCache.delete(runId);
+      parsedResponseCache.set(runId, hit);
+      return hit.parsed;
+    }
+  }
+  const parsed = classifyStepResponse({
+    runStatus: "succeeded",
+    assistantText: assistantTextFrom(mainStreamEventsForRun(runId)),
+    pendingInteractions: 0,
+  });
+  if (finished) {
+    parsedResponseCache.delete(runId);
+    parsedResponseCache.set(runId, { maxEventId, parsed });
+    while (parsedResponseCache.size > PARSED_RESPONSE_CACHE_MAX) {
+      const oldest = parsedResponseCache.keys().next().value;
+      if (oldest === undefined) break;
+      parsedResponseCache.delete(oldest);
+    }
+  }
+  return parsed;
+}
+
+/** Classify a SUCCEEDED run's final response, at most once per `cache`. A
+ *  parse without a handoff becomes `user-ask` while a question is pending on
+ *  that run — the same precedence as `classifyStepResponse`. */
+function classifyRunResponse(taskId: string, runId: string, cache: Map<string, ClassifiedResponse>): ClassifiedResponse {
+  const hit = cache.get(runId);
+  if (hit) return hit;
+  const parsed = parsedRunResponse(runId);
+  const classified: ClassifiedResponse =
+    parsed.handoff === null && pendingInteractionsForRun(taskId, runId) > 0
+      ? { kind: "user-ask", handoff: null, error: null }
+      : parsed;
+  cache.set(runId, classified);
+  return classified;
+}
+
+/**
+ * The run that supplies `historyEntry`'s handoff, if any: walk the step
+ * task's runs in the execution's attempt window ({@link attemptWindowStart}),
+ * newest settled first ({@link handoffLookbackOrder}), classifying lazily and
+ * stopping at the first `handoff`/`handoff-blocked` (D10 — the newest settled
+ * run wins, and a blocked handoff counts). A run that is still being written
+ * is not a candidate (`handoffLookbackOrder` keeps only `succeeded` runs with
+ * an `endedAt`); callers wait for those (D5) before looking back.
+ * `succeededRunId` is the run whose `succeeded` settle brought us here: the
+ * event is authoritative, so it competes even if its row has not caught up
+ * (status, `endedAt`).
+ *
+ * A `status:"blocked"` handoff is a request for attention, not a result: it
+ * holds only while it is the step's latest word. Once any newer run of the
+ * attempt window has run — a user's reply to it, a continuation, a failed
+ * turn — that blocked handoff is stale and supplies nothing, and the walk
+ * stops there rather than reaching past it to an older `done` handoff the
+ * step since withdrew. The step then settles on what the newer run did (a
+ * reminder for a missing handoff, `step-failed` for a failed turn). A done
+ * handoff is not superseded that way: a later run without one (a
+ * continuation's acknowledgement) doesn't undo the step's result.
+ */
+function findHandoffSupplier(
+  taskId: string,
+  historyEntry: PipelineStepRecord | undefined,
+  cache: Map<string, ClassifiedResponse>,
+  succeededRunId?: string,
+): HandoffSupplier | null {
+  const rows = runs.listForTask(taskId);
+  const windowStart = historyEntry ? attemptWindowStart(historyEntry) : 0;
+  const candidates = rows.map((r) =>
+    r.id === succeededRunId ? { ...r, status: "succeeded" as const, endedAt: r.endedAt ?? Date.now() } : r,
+  );
+  for (const id of handoffLookbackOrder(candidates, windowStart)) {
+    const classified = classifyRunResponse(taskId, id, cache);
+    if ((classified.kind === "handoff" || classified.kind === "handoff-blocked") && classified.handoff) {
+      const supplierRow = candidates.find((r) => r.id === id)!;
+      // Newer = started after the blocked turn ended, i.e. ran after the
+      // step said it was blocked. A run that overlapped it (a continuation
+      // the blocked handoff landed beside) doesn't make it stale.
+      const blockedEndedAt = supplierRow.endedAt as number;
+      if (
+        classified.kind === "handoff-blocked" &&
+        rows.some((r) => r.id !== id && r.startedAt >= windowStart && r.startedAt >= blockedEndedAt)
+      ) {
+        return null;
+      }
+      return { runId: id, kind: classified.kind, handoff: classified.handoff, startedAt: supplierRow.startedAt };
+    }
+  }
+  return null;
+}
+
+/**
+ * Stamp `historyEntry` with the run that supplied the handoff it used (D7/
+ * D8/D13): `responseKind` becomes the supplier's kind, `handoffRunId` its id,
+ * and `handoffFromOtherRun` whether that run differs from the one whose
+ * settle brought us here. When the handoff came from another run, that run
+ * also gets a status line saying so (O2) — once per supplier, so a
+ * re-settle of the same execution doesn't repeat it.
+ */
+function recordHandoffSource(
+  taskId: string,
+  settlingRunId: string,
+  historyEntry: PipelineStepRecord,
+  supplier: HandoffSupplier,
+  newerRun: boolean,
+): void {
+  const fromOtherRun = supplier.runId !== settlingRunId;
+  const alreadyRecorded = historyEntry.handoffFromOtherRun === true && historyEntry.handoffRunId === supplier.runId;
+  historyEntry.responseKind = supplier.kind;
+  historyEntry.handoffRunId = supplier.runId;
+  historyEntry.handoffFromOtherRun = fromOtherRun;
+  if (fromOtherRun && !alreadyRecorded) {
+    try {
+      appendRunStatusLine(taskId, supplier.runId, handoffSourceStatusLine(newerRun));
+    } catch (err) {
+      console.warn(`[agetor] pipeline runner failed writing the handoff-source status line for run ${supplier.runId}:`, err);
+    }
+  }
+}
+
+/** Whether the step has a run in the attempt window opened after the
+ *  supplier — the step's newest run, which by then ended without a handoff.
+ *  Two continuations can open in the same millisecond, so a `startedAt` tie
+ *  goes to the task's current run (the one opened last), as in
+ *  {@link currentRunRow}. */
+function newerRunThanSupplier(
+  taskId: string,
+  historyEntry: PipelineStepRecord | undefined,
+  supplier: HandoffSupplier,
+): boolean {
+  const windowStart = historyEntry ? attemptWindowStart(historyEntry) : 0;
+  const currentRunId = tasks.get(taskId)?.runId ?? null;
+  return runs.listForTask(taskId).some((r) =>
+    r.id !== supplier.runId &&
+    r.startedAt >= windowStart &&
+    (r.startedAt > supplier.startedAt || (r.startedAt === supplier.startedAt && r.id === currentRunId)),
+  );
+}
+
+/** How long after a held step's last background agent ended the runner still
+ *  expects Claude's continuation before it sends the handoff reminder
+ *  (D2b/D3). The watcher can release a hold before the tailer has read the
+ *  task-notification line (`checkDone`/`checkStale` releases), so a
+ *  handoff-less settle right after a release is usually the pre-continuation
+ *  run, not a forgotten handoff. */
+const RELEASE_CONTINUATION_GRACE_MS = 10_000;
+let releaseGraceMs = RELEASE_CONTINUATION_GRACE_MS;
+
+/** Step task id → its single pending grace timer. */
+const releaseGraceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** The moment the release grace for `runId`'s settle ends, or `null` when
+ *  that run was not held. "Held" is DB-derived — some background agent of the
+ *  task was running when the run ended and finished after it — so it
+ *  survives a restart and needs no bookkeeping to clear; the deadline is the
+ *  last such `endedAt` plus the grace.
+ *
+ *  Matched by time overlap across ALL of the task's subagent rows, never by
+ *  `subagent.runId`: that column is whichever run was current when the
+ *  watcher discovered the agent (and may be null), while the hold covers the
+ *  whole task. A hold that spans a later continuation — two background agents,
+ *  the first one's notification starting a continuation while the second
+ *  still runs — holds that continuation on an agent tagged with the earlier
+ *  run. */
+function releaseGraceDeadline(taskId: string, runId: string): number | null {
+  const endedAt = runs.get(runId)?.endedAt;
+  if (endedAt == null) return null;
+  let releasedAt = 0;
+  for (const s of subagents.listForTask(taskId)) {
+    if (s.endedAt == null || s.startedAt > endedAt || s.endedAt <= endedAt) continue;
+    releasedAt = Math.max(releasedAt, s.endedAt);
+  }
+  return releasedAt > 0 ? releasedAt + releaseGraceMs : null;
+}
+
+function clearReleaseGraceTimer(taskId: string): void {
+  const timer = releaseGraceTimers.get(taskId);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  releaseGraceTimers.delete(taskId);
+}
+
+/** (Re-)arm the one grace timer for `taskId`: at `deadline` it re-settles the
+ *  step's current run. An unref'd timer — it must never hold the process
+ *  open. */
+function armReleaseGraceTimer(taskId: string, deadline: number): void {
+  clearReleaseGraceTimer(taskId);
+  const timer = setTimeout(() => {
+    resettleFromTimer(releaseGraceTimers, taskId, timer, "the release grace");
+  }, Math.max(0, deadline - Date.now()));
+  timer.unref?.();
+  releaseGraceTimers.set(taskId, timer);
+}
+
+/**
+ * A fired re-settle timer's callback. The map entry stays until the queued
+ * re-settle holds the per-parent lock and claims it there: until then the
+ * step still has a pending runner decision ({@link hasPendingStepDecision}),
+ * so a Stop queued in that window still finds — and stops — it, and its
+ * `clearStepTimers` then makes the claim fail, so the re-settle does
+ * nothing. An entry the re-settle never claimed (it bailed before taking
+ * the lock) is dropped once it is done.
+ */
+function resettleFromTimer(
+  timers: Map<string, ReturnType<typeof setTimeout>>,
+  taskId: string,
+  timer: ReturnType<typeof setTimeout>,
+  what: string,
+): void {
+  if (timers.get(taskId) !== timer) return;
+  const claim = (): boolean => {
+    if (timers.get(taskId) !== timer) return false;
+    timers.delete(taskId);
+    return true;
+  };
+  void resettleCurrentRun(taskId, claim)
+    .catch((err) => {
+      console.warn(`[agetor] pipeline runner failed re-settling task ${taskId} after ${what}:`, err);
+    })
+    .finally(() => {
+      if (timers.get(taskId) === timer) timers.delete(taskId);
+    });
+}
+
+/** Task id → the pending timer of its {@link scheduleWaitRecheck}. */
+const waitRechecks = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * A settle that waited (D5) because a run of the step is live is normally
+ * re-entered by that run's own settle or the displaced-run report. The one
+ * live state with no settle of its own is the orchestrator's short "starting"
+ * claim: a spawn that fails (`spawnAgentOrFail`) emits its terminal
+ * `run-status` while the claim is still held and releases it a moment later.
+ * These few unref'd, backed-off probes re-settle once that claim is gone;
+ * while a run is genuinely live they do nothing, and that run's settle decides.
+ */
+function scheduleWaitRecheck(taskId: string): void {
+  if (waitRechecks.has(taskId)) return;
+  // Backed off rather than a single probe: the claim is released once the
+  // spawn's own `finally` runs, which under load can trail the failed
+  // `run-status` by more than one short tick. Re-settling is idempotent (a
+  // still-live run just waits again), so a few extra probes cost nothing.
+  const probe = (attempt: number): void => {
+    const timer = setTimeout(() => {
+      if (waitRechecks.get(taskId) !== timer) return;
+      if (isAnyRunOfTaskLive(taskId)) {
+        if (attempt + 1 < WAIT_RECHECK_DELAYS_MS.length) probe(attempt + 1);
+        else waitRechecks.delete(taskId);
+        return;
+      }
+      resettleFromTimer(waitRechecks, taskId, timer, "a wait");
+    }, WAIT_RECHECK_DELAYS_MS[attempt]);
+    timer.unref?.();
+    waitRechecks.set(taskId, timer);
+  };
+  probe(0);
+}
+
+/** Delays between {@link scheduleWaitRecheck}'s probes (~7.5 s in total). */
+const WAIT_RECHECK_DELAYS_MS = [25, 100, 400, 1_500, 5_500];
+
+/** Whether the runner itself still has a pending decision for `taskId` with
+ *  no run of it live: a release-grace timer, a wait or busy recheck, or a
+ *  reminder mid-send. The pipeline is still working on such a step, so Stop
+ *  must be able to stop it. */
+function hasPendingStepDecision(taskId: string): boolean {
+  return (
+    releaseGraceTimers.has(taskId) ||
+    waitRechecks.has(taskId) ||
+    busyRecheckTimers.has(taskId) ||
+    remindersInFlight.has(taskId)
+  );
+}
+
+/** Cancel every timer that would re-settle `taskId` later (release grace,
+ *  wait recheck, busy recheck). A Stop calls it: nothing may decide the step
+ *  again on the run's behalf. A reminder mid-send is not a timer — its
+ *  {@link recheckReminder} sees the stop. */
+function clearStepTimers(taskId: string): void {
+  clearReleaseGraceTimer(taskId);
+  const wait = waitRechecks.get(taskId);
+  if (wait !== undefined) clearTimeout(wait);
+  waitRechecks.delete(taskId);
+  const busy = busyRecheckTimers.get(taskId);
+  if (busy !== undefined) clearTimeout(busy);
+  busyRecheckTimers.delete(taskId);
+  busyRefusals.delete(taskId);
+}
+
+/**
+ * Clear a stopped run's `stopRequestedAt` because the user resumed it (Retry
+ * or Advance). An execution the Stop left behind that the resume does not
+ * re-run — not live, `cancelled`, no block — then gets the same retryable
+ * "was stopped" block a one-step Stop records (M5), so the run reads
+ * `blocked` instead of `running` with nothing behind it. `skipTaskIds` are
+ * the executions this resume handles itself.
+ */
+function resumeFromStop(run: PipelineRunState, skipTaskIds: ReadonlySet<string> = new Set()): void {
+  if (run.stopRequestedAt == null) return;
+  clearStopMarker(run);
+  blockStoppedLeftovers(run, skipTaskIds);
+}
+
+/** Drop the stop marker, and the stored `cancelled` status with it —
+ *  `deriveRunStatus` preserves a stored `cancelled`, so leaving it would
+ *  keep a resumed run reading stopped (`running` lets it derive the real
+ *  status: running, blocked or done). */
+function clearStopMarker(run: PipelineRunState): void {
+  run.stopRequestedAt = null;
+  if (run.status === "cancelled") run.status = "running";
+}
+
+/** The block half of {@link resumeFromStop}. */
+function blockStoppedLeftovers(run: PipelineRunState, skipTaskIds: ReadonlySet<string>): void {
+  const graph = run.snapshot?.graph;
+  for (const a of run.active) {
+    if (skipTaskIds.has(a.taskId) || isAnyRunOfTaskLive(a.taskId)) continue;
+    if (run.blocked.some((b) => b.taskId === a.taskId)) continue;
+    const h = run.history.find((r) => r.taskId === a.taskId && r.seq === a.seq);
+    if (h?.outcome !== "cancelled") continue;
+    const stepName = graph ? stepNameById(graph, a.stepId) : a.stepId;
+    upsertBlocked(run, {
+      taskId: a.taskId,
+      stepId: a.stepId,
+      kind: "step-failed",
+      message: `step "${stepName}" was stopped — retry it or advance past it`,
+    });
+  }
 }
 
 /** Best-effort "why did it fail" tail for a `step-failed` blocked message —
@@ -500,7 +920,7 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   // agent is actively writing to. Only VERIFY the worktree is still on disk
   // in that case; the full (re-)materialization is reserved for a run with
   // nothing live.
-  const anyLive = run.active.some((a) => isTaskRunLive(a.taskId));
+  const anyLive = run.active.some((a) => isAnyRunOfTaskLive(a.taskId));
   if (anyLive) {
     if (parent.isolation === "worktree" && (!parent.worktreePath || !existsSync(parent.worktreePath))) {
       return { error: "the pipeline's worktree is missing while a step is still running — stop the run and retry" };
@@ -937,10 +1357,12 @@ async function retryActiveExecutions(
   const targets = run.active.filter((a) => {
     // M5: never re-`startTask` an execution whose task is genuinely still
     // live (a fan-out with one branch blocked and another still mid-turn,
-    // or a spawn still settling) — `isTaskRunLive` is the authoritative
+    // or a spawn still settling) — `isAnyRunOfTaskLive` is the authoritative
     // "is this actually busy right now" check, not `column === "running"`,
-    // which can lag a beat behind a just-started/just-settled spawn.
-    if (isTaskRunLive(a.taskId)) return false;
+    // which can lag a beat behind a just-started/just-settled spawn. It also
+    // sees a displaced run (an older run of the step task that is no longer
+    // `task.runId` but is still writing into the shared worktree).
+    if (isAnyRunOfTaskLive(a.taskId)) return false;
     if (onlyTaskId) return a.taskId === onlyTaskId;
     // Minor 9: an un-targeted, RUN-LEVEL retry (no `onlyTaskId`) only
     // touches an execution that's actually stuck — one carrying its own
@@ -959,19 +1381,31 @@ async function retryActiveExecutions(
   let first: { runId: string; pending?: true } | null = null;
   for (const t of targets) {
     run.blocked = run.blocked.filter((b) => b.taskId !== t.taskId);
+    // D11: the attempt window starts here. Taken just BEFORE `startTask` (the
+    // new run's `startedAt` is therefore at or after it) and recorded only on
+    // a successful start below, so a live-refusal skip never moves the window
+    // past a run that is still live.
+    const attemptAt = Date.now();
     const started = await startTask(t.taskId);
     if ("error" in started) {
       // L-R2: `startTask`'s own double-start guards ("task is already
       // starting" — a spawn claim still held, e.g. the bounded-pending
       // window; "task already running" — an `active` handle that landed
-      // between our `isTaskRunLive` filter above and this call) mean the
+      // between our `isAnyRunOfTaskLive` filter above and this call) mean the
       // execution IS live, not broken — treat exactly like the live-skip
       // above (no block, left alone) rather than recording a step-failed
       // block against a turn that's actually in flight.
       if (isStartTaskLiveRefusal(started.error)) continue;
       upsertBlocked(run, { taskId: t.taskId, stepId: t.stepId, kind: "step-failed", message: started.error });
-    } else if (!first) {
-      first = { runId: started.runId, ...(started.pending ? { pending: true as const } : {}) };
+    } else {
+      const retried = run.history.find((h) => h.taskId === t.taskId && h.seq === t.seq);
+      if (retried) {
+        retried.attemptStartedAt = attemptAt;
+        // The user re-ran it: no longer stopped.
+        retried.stoppedAt = null;
+        retried.stoppedRunId = null;
+      }
+      if (!first) first = { runId: started.runId, ...(started.pending ? { pending: true as const } : {}) };
     }
   }
   checkJoinIncomplete(run);
@@ -1067,6 +1501,14 @@ async function performPipelineRetry(
   const parentRow = refreshed.parent;
   propagateWorktreeToActiveSteps(parentRow, run);
 
+  // A Retry resumes a stopped run: clear the marker before relaunching so
+  // the relaunched steps' persists and settles see a live run. Restored if
+  // nothing could be retried — the run is still stopped then.
+  const stoppedAt = run.stopRequestedAt ?? null;
+  const statusBefore = run.status;
+  if (stoppedAt !== null) clearStopMarker(run);
+  const retryStartedAt = Date.now();
+
   const activeResult = await retryActiveExecutions(parentRow, run, onlyTaskId);
   let result: { runId: string; pending?: true } | null = "error" in activeResult ? null : activeResult;
 
@@ -1082,7 +1524,22 @@ async function performPipelineRetry(
   }
 
   if (!result) {
+    if (stoppedAt !== null) {
+      run.stopRequestedAt = stoppedAt;
+      run.status = statusBefore;
+      persist(parentRow.id, run);
+    }
     return "error" in activeResult ? { error: activeResult.error } : { error: "nothing to retry" };
+  }
+  if (stoppedAt !== null) {
+    // A one-step Retry leaves the run's other stopped executions behind.
+    // The ones this Retry restarted carry the new attempt stamp.
+    const restarted = new Set(
+      run.history.filter((h) => (h.attemptStartedAt ?? 0) >= retryStartedAt).map((h) => h.taskId),
+    );
+    blockStoppedLeftovers(run, restarted);
+    checkJoinIncomplete(run);
+    persist(parentRow.id, run);
   }
   return result;
 }
@@ -1131,6 +1588,7 @@ export async function startPipelineRun(
       stepCount: 0,
       startedAt: null,
       endedAt: null,
+      stopRequestedAt: null,
     };
 
     if (run.status === "running") return { error: "pipeline is already running" };
@@ -1242,6 +1700,7 @@ export async function startPipelineRun(
       stepCount: 0,
       startedAt: Date.now(),
       endedAt: null,
+      stopRequestedAt: null,
     };
 
     // M-R4: persist the fresh run BEFORE launching anything — `persist`'s
@@ -1280,8 +1739,9 @@ export async function startPipelineRun(
  * a manual advance into a join step runs it with whatever arrived).
  *
  * Refuses (409) an archived parent (M6) and a target execution whose task
- * still has a genuinely live run (M4 — `isTaskRunLive`, not `column`): you
- * can't hand-pick the next step for a turn that hasn't actually finished.
+ * still has a genuinely live run (M4 — `isAnyRunOfTaskLive`, not `column`;
+ * a displaced run counts): you can't hand-pick the next step for a turn
+ * that hasn't actually finished. Advancing a stopped run resumes it.
  */
 export async function advancePipeline(
   parentId: string,
@@ -1338,7 +1798,7 @@ export async function advancePipeline(
           (b.kind === "handoff-missing" ||
             b.kind === "handoff-invalid" ||
             b.kind === "step-blocked" ||
-            (b.kind === "step-failed" && !isTaskRunLive(b.taskId))),
+            (b.kind === "step-failed" && !isAnyRunOfTaskLive(b.taskId))),
       );
       const joinBlocks = run.blocked.filter((b) => b.taskId === null && b.kind === "join-incomplete");
       if (handoffBlocks.length === 1 && joinBlocks.length === 0) {
@@ -1369,6 +1829,8 @@ export async function advancePipeline(
           if (!graph.steps.some((s) => s.id === id)) return { error: `unknown step id "${id}"`, status: 400 as const };
         }
       }
+      // An Advance resumes a stopped run (see `resumeFromStop`).
+      resumeFromStop(run);
       const arrivals = run.joins[joinStepId]?.arrivals ?? [];
       delete run.joins[joinStepId];
       run.blocked = run.blocked.filter((b) => !(b.stepId === joinStepId && b.kind === "join-incomplete"));
@@ -1400,8 +1862,9 @@ export async function advancePipeline(
     if (!activeEntry) return { error: "no active execution for that task", status: 400 as const };
 
     // M4: refuse to hand-pick a next step for a turn that's still actually
-    // in flight — `isTaskRunLive`, not the (laggier) task column.
-    if (isTaskRunLive(targetTaskId)) {
+    // in flight — `isAnyRunOfTaskLive`, not the (laggier) task column; a
+    // displaced run still writing into the shared worktree counts too.
+    if (isAnyRunOfTaskLive(targetTaskId)) {
       return { error: "step is still running — stop it before advancing", status: 409 as const };
     }
 
@@ -1424,6 +1887,9 @@ export async function advancePipeline(
     }
     const handoff = normalizeHandoff(handoffInput);
 
+    // An Advance resumes a stopped run (see `resumeFromStop`); the target
+    // execution itself is resolved right here.
+    resumeFromStop(run, new Set([targetTaskId]));
     const historyEntry = run.history.find((h) => h.taskId === targetTaskId && h.seq === activeEntry.seq);
     run.active = run.active.filter((a) => a.taskId !== targetTaskId);
     removeBlockedFor(run, targetTaskId);
@@ -1432,6 +1898,9 @@ export async function advancePipeline(
       historyEntry.outcome = "advanced-manually";
       historyEntry.handoff = handoff;
       historyEntry.nextStepIds = nextStepIds;
+      // D8: a manual Advance supplies its own handoff — no run did.
+      historyEntry.handoffRunId = null;
+      historyEntry.handoffFromOtherRun = false;
     }
     pipelineUpdateColumn(targetTaskId, tasks.get(targetTaskId)?.runId ?? null, "done");
 
@@ -1503,8 +1972,15 @@ export async function retryPipelineStep(
 /**
  * Stop every currently-running active execution (D9: "Stop on the parent
  * cancels every active execution and returns the parent to ready … active
- * set kept so Run retries them"). 409 when nothing is actually live
- * (M5 — `isTaskRunLive`, not `column`).
+ * set kept so Run retries them"). Also stops an execution the runner itself
+ * is still deciding with no run of it live — a release grace, a wait or busy
+ * recheck, a reminder mid-send ({@link hasPendingStepDecision}): its timers
+ * are cancelled and it is recorded `cancelled`, so Retry re-runs it. 409 when
+ * there is nothing of either kind (M5 — `isAnyRunOfTaskLive`, not `column`).
+ *
+ * Records `run.stopRequestedAt` BEFORE cancelling anything, so every settle
+ * the cancels set off — and every re-settle a timer or a displaced run would
+ * otherwise trigger later — sees the stop.
  */
 export async function cancelPipelineRun(parentId: string): Promise<{ task: Task } | { error: string; status: 404 | 409 }> {
   return runExclusive(parentId, async () => {
@@ -1513,13 +1989,49 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
     if (!parent.pipelineRun) return { error: "pipeline has never run", status: 409 as const };
     const run = parent.pipelineRun;
 
-    const runningTargets = run.active.filter((a) => isTaskRunLive(a.taskId));
-    if (runningTargets.length === 0) return { error: "pipeline is not running", status: 409 as const };
-
-    for (const t of runningTargets) {
-      const runId = tasks.get(t.taskId)?.runId;
-      if (runId) await cancelRun(runId);
+    // Any live run of a step counts, a displaced one included: while the
+    // runner waits on it (D5) the pipeline is running, and Stop must stop it.
+    const runningTargets = run.active.filter((a) => isAnyRunOfTaskLive(a.taskId));
+    const decidingTargets = run.active.filter(
+      (a) => !isAnyRunOfTaskLive(a.taskId) && hasPendingStepDecision(a.taskId),
+    );
+    if (runningTargets.length === 0 && decidingTargets.length === 0) {
+      return { error: "pipeline is not running", status: 409 as const };
     }
+
+    run.stopRequestedAt = Date.now();
+    for (const a of run.active) {
+      // The run this Stop applies to, per execution: a `running` event for
+      // that same run later (its row before the kill lands, a parked card
+      // pulled back) is not a new turn — see `isTurnSinceStop`.
+      const historyEntry = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);
+      if (historyEntry) historyEntry.stoppedRunId = tasks.get(a.taskId)?.runId ?? null;
+    }
+    persist(parentId, run);
+    for (const a of run.active) {
+      clearStepTimers(a.taskId);
+      // A step that is neither live nor deciding can still have work queued
+      // on its behalf: an fx step whose run paused on a provider limit holds
+      // a pending auto-resume timer. Nothing may run on a stopped run's
+      // behalf, so drop it (a no-op for every other step).
+      cancelFxAutoResume(a.taskId, "stopped");
+    }
+    for (const a of decidingTargets) {
+      const historyEntry = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);
+      if (!historyEntry || historyEntry.outcome !== null) continue;
+      // The grace and the busy backstop clear `responseKind` while they
+      // wait; keep what the step's last turn actually answered.
+      if (historyEntry.responseKind == null) {
+        const currentRunId = tasks.get(a.taskId)?.runId;
+        if (currentRunId && runs.get(currentRunId)?.status === "succeeded") {
+          historyEntry.responseKind = classifyRunResponse(a.taskId, currentRunId, new Map()).kind;
+        }
+      }
+      historyEntry.endedAt = Date.now();
+      historyEntry.outcome = "cancelled";
+    }
+
+    for (const t of runningTargets) await cancelLiveRunOfTask(t.taskId);
 
     finalizeCancelled(parentId, run);
     return { task: tasks.get(parentId)! };
@@ -1630,10 +2142,16 @@ function reminderBlockKind(reason: HandoffReminderReason): "handoff-missing" | "
  * the same parent would otherwise queue behind it. The locked body records
  * the intent in-memory (`remindersInFlight`), persists the run with the
  * execution still active and unblocked, and hands this back;
- * {@link deliverHandoffReminder} then sends OUTSIDE the lock and re-acquires
- * it to stamp the outcome — `reminder` on the history entry only when
- * `sendInput` reports `delivered: true` (the "record only delivered"
- * contract is unchanged), an ordinary block otherwise.
+ * {@link deliverHandoffReminder} then sends OUTSIDE the lock — only into an
+ * idle session (`sendInput`'s `onlyIfIdle`), after re-checking under the lock
+ * that no run of the step is live and no run of the attempt window already
+ * holds a handoff ({@link recheckReminder}) — and re-acquires the lock to
+ * stamp the outcome: `reminder` on the history entry only when `sendInput`
+ * reports `delivered: true` (the "record only delivered" contract is
+ * unchanged), an ordinary block for a real send failure. A reminder that is
+ * refused because the session is busy, or abandoned because a live or
+ * handoff-carrying run turned up, records nothing and blocks nothing: that
+ * run's own settle decides the step.
  */
 interface PendingReminder {
   parentId: string;
@@ -1651,17 +2169,27 @@ interface PendingReminder {
  *  A second settle of THAT run arriving in the window — the `review`
  *  column event and the `run-status` event for one turn both reach the
  *  settle body, see `handleColumnChange` — must not classify and send
- *  again. A settle of a *different* run is the continuation and is
- *  classified; it must not queue a second reminder while this one is
- *  still in flight (`attemptHandoffReminderOrBlock`). Cleared by
- *  `deliverHandoffReminder` once it re-acquires the lock, or sooner when
- *  the send is abandoned for a successor. */
+ *  again. A settle of a *different* run is classified; it must not queue a
+ *  second reminder while this one is still in flight
+ *  (`attemptHandoffReminderOrBlock`). Cleared by `deliverHandoffReminder`
+ *  once it re-acquires the lock, or sooner when the send is abandoned
+ *  ({@link releaseReminderOwnership}). */
 const remindersInFlight = new Map<string, string>();
 
 /** Test seam. Invoked once at the start of {@link deliverHandoffReminder}
  *  (then cleared) so a test can settle a successor while the reminder is
  *  queued. Production never sets it. */
 let beforeReminderSend: (() => Promise<void> | void) | null = null;
+
+/** Test seam. Invoked once between the pre-send {@link recheckReminder} and
+ *  `sendInput` (then cleared), so a test can make a run live in exactly the
+ *  window the idle-only send must refuse. Production never sets it. */
+let beforeReminderDispatch: (() => Promise<void> | void) | null = null;
+
+/** Test seam. Replaces `sendInput` for the reminder send, so a test can
+ *  produce an outcome the fake drivers can't (an idle-only refusal while no
+ *  run is live). Production never sets it. */
+let reminderSend: typeof sendInput | null = null;
 
 /** Test seam. Invoked once inside the stamp lock, before the ownership
  *  check (then cleared), so a test can make a successor the current run
@@ -1680,7 +2208,19 @@ let beforeReminderStamp: (() => Promise<void> | void) | null = null;
  * recorded a block instead. Handles its own `checkJoinIncomplete` +
  * `persist` on every path.
  *
+ * Only reached with no supplier: `settleStepRun` already looked back over
+ * every settled run of the attempt window and found no valid handoff, and
+ * already waited for any live run of the step (D5), so a continuation that is
+ * still writing never lands here.
+ *
  * Order of checks (round 4 review fixes):
+ *  - Release grace (D2b/D3), `handoff-missing`/`handoff-invalid` only: the
+ *    settling run was held by background agents that finished moments ago,
+ *    and Claude's continuation has not been adopted yet. The execution stays
+ *    active and unblocked until the grace ends ({@link releaseGraceDeadline});
+ *    a timer then re-settles the step's current run. It comes BEFORE the
+ *    already-reminded check so a released held step never blocks inside its
+ *    grace window.
  *  - Already reminded once for this execution (`historyEntry.reminder` set,
  *    for ANY reason — one reminder max per execution) blocks immediately,
  *    ahead of every other check below: there's nothing left to attempt.
@@ -1691,17 +2231,10 @@ let beforeReminderStamp: (() => Promise<void> | void) | null = null;
  *    BEFORE it ever acquires the lock, per `persist`'s "m8" doc). A
  *    tombstoned/missing/archived parent, or an archived step task, must
  *    never reach `sendInput` — it falls straight to the ordinary block.
- *  - Major 2: `isDeliberateWholeRunStop` — a step that finished with a bad
- *    handoff while the whole run is being torn down (`cancelPipelineRun`,
- *    or every other live sibling already mid-cancellation) must not have
- *    the reminder revive the run back into `running`.
- *  - A newer run of this step is still `running` (`task.runId` moved, and
- *    that run has not settled). The transcript merges every run; the
- *    `<handoff>` usually lands on the continuation, so this settle must
- *    not remind, block, or stamp `handoff-missing`. That run's own settle
- *    classifies the reply. A successor that is already terminal does not
- *    take this branch: its settle already ran, or `deliverHandoffReminder`
- *    re-enters it instead of sending this reminder.
+ *  - A stopped run or execution (Major 2, {@link isStopApplied}) never gets here:
+ *    `settleStepRun` records the execution as stopped instead
+ *    ({@link settleStoppedExecution}), so neither the grace nor the reminder
+ *    can revive it.
  *  - Otherwise: hand the send back to the caller. Medium 3 — the reminder
  *    is recorded onto `historyEntry.reminder` ONLY when `sendInput` reports
  *    `delivered: true` (see `deliverHandoffReminder`); a failed/withheld
@@ -1723,6 +2256,19 @@ function attemptHandoffReminderOrBlock(input: {
 }): PendingReminder | null {
   const { parentId, run, taskId, runId, activeEntry, historyEntry, graph, stepName, reason, detail, baseMessage } = input;
   const blockKind = reminderBlockKind(reason);
+
+  // D2b/D3: a held step released a moment ago may still be about to continue.
+  // `handoff-next-unknown` never waits — a parsed handoff exists, so no
+  // continuation is expected to supply a better one.
+  if (reason !== "handoff-next-unknown") {
+    const deadline = releaseGraceDeadline(taskId, runId);
+    if (deadline !== null && Date.now() < deadline) {
+      if (historyEntry && historyEntry.outcome === null) historyEntry.responseKind = null;
+      armReleaseGraceTimer(taskId, deadline);
+      persist(parentId, run);
+      return null;
+    }
+  }
 
   if (historyEntry?.reminder) {
     // Already reminded once for this execution (retries don't reset it —
@@ -1746,8 +2292,6 @@ function attemptHandoffReminderOrBlock(input: {
   const parentArchived = !parentGone && parentFresh!.archivedAt != null;
   const stepFresh = tasks.get(taskId);
   const stepArchived = stepFresh != null && stepFresh.archivedAt != null;
-  // Major 2: never revive a run that's already being deliberately stopped.
-  const deliberateStop = isDeliberateWholeRunStop(run, taskId);
 
   const skipReason = parentGone
     ? "the pipeline task no longer exists"
@@ -1755,9 +2299,7 @@ function attemptHandoffReminderOrBlock(input: {
       ? "the pipeline task is archived"
       : stepArchived
         ? "the step task is archived"
-        : deliberateStop
-          ? "the pipeline run is stopping"
-          : null;
+        : null;
 
   if (skipReason) {
     upsertBlocked(run, {
@@ -1767,18 +2309,6 @@ function attemptHandoffReminderOrBlock(input: {
       message: `${baseMessage} (automatic reminder skipped — ${skipReason})`,
     });
     checkJoinIncomplete(run);
-    persist(parentId, run);
-    return null;
-  }
-
-  // The step's current run is a newer one that is still in flight. The
-  // handoff (if any) lands on that run; this settle only saw the text that
-  // existed before the continuation started. Leave the execution active and
-  // unblocked, and don't stamp `handoff-missing` — that run's own settle
-  // classifies the reply, or sends the one reminder if it also lacks a
-  // handoff. No `remindersInFlight` entry on this path.
-  if (runningSuccessorSupersedes(taskId, runId)) {
-    if (historyEntry) historyEntry.responseKind = null;
     persist(parentId, run);
     return null;
   }
@@ -1817,15 +2347,14 @@ function attemptHandoffReminderOrBlock(input: {
   };
 }
 
-/** The continuation (or follow-up) became the current run after
- *  {@link attemptHandoffReminderOrBlock} already queued a reminder. Drop
- *  the send, clear the in-flight flag so that run's settle isn't swallowed,
- *  and leave `reminder` unset so a later reply that still lacks a handoff
- *  can still be reminded once. */
 /** Drop this queued reminder under the caller's lock. No-op when a newer
- *  send already owns `remindersInFlight`. A successor settle that already
- *  recorded an outcome owns `responseKind`; clearing it here would wipe a
- *  handoff that was classified while this reminder was queued. */
+ *  send already owns `remindersInFlight`. A settle that already recorded an
+ *  outcome owns `responseKind`; clearing it here would wipe a handoff that
+ *  was classified while this reminder was queued. The execution is left
+ *  active and unblocked, and `reminder` unset, so the run that made this
+ *  reminder moot (a live turn, or one carrying the handoff) decides the
+ *  step, and a later reply that still lacks a handoff can still be
+ *  reminded once. */
 function releaseReminderOwnership(p: PendingReminder): void {
   if (remindersInFlight.get(p.taskId) !== p.runId) return;
   remindersInFlight.delete(p.taskId);
@@ -1848,53 +2377,100 @@ function terminalRunStatus(status: string): "succeeded" | "failed" | "cancelled"
   return null;
 }
 
-/** Stop this reminder when a newer run should own the step's outcome.
- *  Returns true when the caller must not send or stamp.
- *
- *  `sentRunId` is the run `sendInput` just delivered this reminder on.
- *  That run is the reminder turn itself. It is not a continuation, and
- *  treating it as one never stamps `reminder`, so every later settle of
- *  the same execution queues another send.
- *
- *  A still-`running` successor (other than that reminder turn) is left
- *  for its own settle. A terminal successor that already has a handoff
- *  is classified now (`handleRunStatus`) — that recovers a settle which
- *  ran while `remindersInFlight` pointed at the previous run, or which
- *  never ran. A terminal successor with no handoff does not take this
- *  branch: the one reminder still goes out on the run that was queued,
- *  which is the live session. Re-settling that successor would
- *  `sendInput` a finished run that is not a session. */
-async function deferReminderToSuccessor(p: PendingReminder, sentRunId?: string): Promise<boolean> {
-  const successorId = differentCurrentRunId(p.taskId, p.runId);
-  if (!successorId || successorId === sentRunId) return false;
-  const successor = runs.get(successorId);
-  if (!successor) return false;
+/** Whether a run of `taskId` other than `ignoreRunId` is live. Without an
+ *  ignored run this is the in-memory, authoritative {@link isAnyRunOfTaskLive}.
+ *  With one — the reminder turn `sendInput` just started, which is that
+ *  reminder, not a continuation — the question is answered from the run rows
+ *  (`running` and not the ignored one), since the orchestrator's `active`
+ *  map cannot exclude a single run. */
+function otherRunOfTaskLive(taskId: string, ignoreRunId?: string): boolean {
+  if (!ignoreRunId) return isAnyRunOfTaskLive(taskId);
+  return runs.listForTask(taskId).some((r) => r.id !== ignoreRunId && r.status === "running");
+}
 
-  if (successor.status === "running") {
-    await abandonReminderForSuccessor(p);
-    return true;
-  }
+/** True when settling `supplier`'s handoff would resolve or block the step
+ *  rather than ask for a reminder: a `status:"blocked"` handoff, or one whose
+ *  `next` resolves against the frozen graph. */
+function handoffSettlesStep(run: PipelineRunState, stepId: string, supplier: HandoffSupplier): boolean {
+  if (supplier.kind === "handoff-blocked") return true;
+  if (!run.snapshot) return false;
+  const resolved = resolveNextSteps(run.snapshot.graph, stepId, supplier.handoff);
+  return resolved.kind === "terminal" || resolved.kind === "steps";
+}
 
-  const status = terminalRunStatus(successor.status);
-  if (!status) return false;
-  const classified = classifyStepResponse({
-    runStatus: status,
-    assistantText: assistantTextFrom(mainStreamEventsForRun(successorId)),
-    pendingInteractions: pendingInteractionsForRun(p.taskId, successorId),
+/** What {@link recheckReminder} decided. `{ resettle: true }` means the
+ *  caller must re-run the settle of `p.runId` OUTSIDE the lock. `"stopped"`
+ *  means the user stopped the run meanwhile: before the send the caller
+ *  re-settles `p.runId` (which records the stop); after a delivered one it
+ *  cancels the reminder turn. */
+type ReminderRecheck = "send" | "abandon" | "stopped" | { resettle: true };
+
+/**
+ * Re-validate a queued reminder under the per-parent lock, before the send
+ * and again after a delivered one (`ignoreRunId` = the run `sendInput`
+ * started). `deliverHandoffReminder` is not atomic with the settle that
+ * queued the reminder, so by now:
+ *  - the send may have lost ownership (`remindersInFlight`), or (before the
+ *    send) the execution may have been retried/advanced → `"abandon"`;
+ *  - a run of the step may be live (a continuation, a follow-up) → release
+ *    ownership and `"abandon"`: that run's own settle decides, and pasting
+ *    into it would be the false "handoff missing" warning;
+ *  - a settled run of the attempt window may already hold a valid handoff
+ *    (including one that is no longer `task.runId`) → release ownership and
+ *    `{ resettle: true }`, so the caller advances on it through the ordinary
+ *    settle instead of waiting for the next boot reconcile;
+ *  - the user may have stopped the whole run → release ownership and
+ *    `"stopped"`: no reminder may go out (or stay running) after a Stop.
+ * Otherwise `"send"`.
+ */
+async function recheckReminder(p: PendingReminder, ignoreRunId?: string): Promise<ReminderRecheck> {
+  return runExclusive(p.parentId, async (): Promise<ReminderRecheck> => {
+    if (remindersInFlight.get(p.taskId) !== p.runId) return "abandon";
+    const run = tasks.get(p.parentId)?.pipelineRun;
+    const historyEntry = run?.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
+    const stillActive = !!run && run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq);
+    if (!run || !historyEntry) {
+      remindersInFlight.delete(p.taskId);
+      return "abandon";
+    }
+    if (!stillActive) {
+      // Retried/advanced meanwhile. Before the send there is nothing left to
+      // remind; after a delivered one the reminder is still a fact, and the
+      // stamp lock below records it.
+      if (ignoreRunId === undefined) {
+        remindersInFlight.delete(p.taskId);
+        return "abandon";
+      }
+      return "send";
+    }
+    if (isStopApplied(run, p.taskId, historyEntry)) {
+      releaseReminderOwnership(p);
+      return "stopped";
+    }
+    if (otherRunOfTaskLive(p.taskId, ignoreRunId)) {
+      releaseReminderOwnership(p);
+      return "abandon";
+    }
+    // A supplier is only a reason to settle again when that settle would act
+    // on it. A handoff whose `next` doesn't resolve is exactly what this
+    // reminder is FOR (`handoff-next-unknown`): settling it again would just
+    // queue this same reminder, forever.
+    const supplier = findHandoffSupplier(p.taskId, historyEntry, new Map());
+    if (supplier && handoffSettlesStep(run, p.stepId, supplier)) {
+      releaseReminderOwnership(p);
+      return { resettle: true };
+    }
+    return "send";
   });
-  if (classified.kind !== "handoff" && classified.kind !== "handoff-blocked") return false;
-
-  await abandonReminderForSuccessor(p);
-  await handleRunStatus(p.taskId, successorId, status);
-  return true;
 }
 
 /**
  * Second half of the reminder (L-R7): send `p.reminderText` as an ordinary
  * follow-up turn on the step's own run with NO lock held, then re-acquire
- * the per-parent lock to stamp the outcome. `sendInput` folds into the live
- * session (claude) or spawns a fresh turn (codex/cursor/gemini/fx) — either
- * way it settles through the same settle path again, which is what carries
+ * the per-parent lock to stamp the outcome. The send is idle-only, so it
+ * always starts a fresh turn with its own run row (claude pastes into its
+ * idle session; codex/cursor/gemini/fx spawn a one-shot turn) — which
+ * settles through the same settle path again, which is what carries
  * the execution to its next classification once the reminder turn
  * finishes. Nothing here revives an execution that was retried/advanced
  * while the send was in flight: a delivered reminder is still stamped on
@@ -1902,15 +2478,21 @@ async function deferReminderToSuccessor(p: PendingReminder, sentRunId?: string):
  * which case that run is classified and the stamp is skipped. A failed
  * send only records its block if the execution is still the active one.
  *
- * Before sending, and again after `sendInput` returns, defers to a newer
- * current run ({@link deferReminderToSuccessor}). A continuation that
- * starts or finishes in the gap after the settle released the lock must
- * not get this reminder pasted onto the old run, and a handoff it already
- * wrote must be classified instead of waiting for the next boot reconcile.
- * The stamp re-checks under the lock: if this send no longer owns
- * `remindersInFlight`, or a different run is now `running`, the reminder
- * is not recorded. The run `sendInput` just started is excluded from that
- * running check — it is the reminder turn, not a continuation.
+ * The send is idle-only (D6): `sendInput(…, { onlyIfIdle: true })` refuses —
+ * with no run row, user event, queue entry or steer — when any run of the
+ * step is live, for every harness. A refusal (`busy`) records nothing and
+ * blocks nothing: the live turn's own settle classifies the step, and may
+ * still send the one reminder if it also ends without a handoff.
+ *
+ * Before sending, and again after `sendInput` returns, {@link recheckReminder}
+ * re-validates: a continuation that starts or finishes in the gap after the
+ * settle released the lock must not get this reminder pasted onto the old
+ * run, and a handoff it already wrote must be classified instead of waiting
+ * for the next boot reconcile. The stamp re-checks under the lock: if this
+ * send no longer owns `remindersInFlight`, or a different run is now
+ * `running`, the reminder is not recorded. The run `sendInput` just started
+ * is excluded from that running check — it is the reminder turn, not a
+ * continuation.
  */
 async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
   if (beforeReminderSend) {
@@ -1918,23 +2500,59 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
     beforeReminderSend = null;
     await hook();
   }
-  // Re-check outside the lock, before `sendInput`. The continuation often
-  // starts in the gap after the settle released the lock. A successor that
-  // is already terminal had its settle dropped, or never ran; classify it
-  // now. Sending anyway is the false "handoff missing" warning.
-  if (await deferReminderToSuccessor(p)) return;
+  const before = await recheckReminder(p);
+  if (before === "abandon") return;
+  if (before !== "send") {
+    // A handoff to act on, or a Stop to record: the ordinary settle decides.
+    await handleRunStatus(p.taskId, p.runId, "succeeded");
+    return;
+  }
+  if (beforeReminderDispatch) {
+    const hook = beforeReminderDispatch;
+    beforeReminderDispatch = null;
+    await hook();
+  }
   let sent: Awaited<ReturnType<typeof sendInput>>;
   try {
-    sent = await sendInput(p.runId, p.reminderText);
+    sent = await (reminderSend ?? sendInput)(p.runId, p.reminderText, { onlyIfIdle: true });
   } catch (err) {
     sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
   }
+  // D6: refused because a run of the step is live. Nothing was sent, so
+  // nothing is recorded or blocked; that run's settle decides the step.
+  if (!sent.delivered && sent.busy) {
+    await abandonReminderForSuccessor(p);
+    // With no live run there is no settle coming (claude's session can
+    // still track turn activity — a queued slot, a continuation awaiting
+    // content — that never becomes a run): back off and decide again.
+    if (!isAnyRunOfTaskLive(p.taskId)) scheduleBusyRecheck(p);
+    return;
+  }
+  busyRefusals.delete(p.taskId);
   // The continuation can start and finish during `sendInput`. A handoff
   // on that run is classified and this reminder is not stamped over it.
   // No handoff leaves the stamp in place: the paste above is the one
   // reminder, on the run that was queued. The run `sendInput` just
   // started is that reminder, not a continuation.
-  if (await deferReminderToSuccessor(p, sent.delivered ? sent.runId : undefined)) return;
+  const after = await recheckReminder(p, sent.delivered ? sent.runId : undefined);
+  if (after === "abandon") return;
+  if (after === "stopped") {
+    // Stopped while the reminder was being sent. A delivered reminder started
+    // a turn the Stop never saw: cancel it, and its own settle records the
+    // stop. Otherwise re-settle the queued run, which records it.
+    if (sent.delivered && isAnyRunOfTaskLive(p.taskId)) await cancelLiveRunOfTask(p.taskId);
+    else await handleRunStatus(p.taskId, p.runId, "succeeded");
+    return;
+  }
+  if (after !== "send") {
+    await handleRunStatus(p.taskId, p.runId, "succeeded");
+    return;
+  }
+  // L1: the run the reminder started can settle before the stamp below
+  // acquires the lock. That settle saw the reminder still in flight and left
+  // the execution active and unblocked, so once the stamp lands nothing
+  // would decide the step again — re-settle that run afterwards.
+  let resettleReminderRun = false;
   await runExclusive(p.parentId, async () => {
     if (beforeReminderStamp) {
       const hook = beforeReminderStamp;
@@ -1962,12 +2580,11 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
           historyEntry.reminder = {
             at: Date.now(),
             reason: p.reason,
-            // The run this reminder actually landed on — for claude, the
-            // SAME run that just settled (a fold-while-busy paste into the
-            // still-live session); for the one-shot harnesses
-            // (codex/cursor/gemini/fx) a FRESH run row `sendInput` minted,
-            // which may itself already be busy again by the time anything
-            // reads this back (Medium 5).
+            // The run this reminder actually landed on: the FRESH run row
+            // `sendInput` minted for the reminder turn (idle-only, D6 — a
+            // claude reminder never folds into a live turn any more), which
+            // may itself already be busy again by the time anything reads
+            // this back (Medium 5).
             runId: sent.runId,
             detail: p.detail,
             delivered: true,
@@ -1976,6 +2593,8 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
         appendRunStatusLine(p.taskId, p.runId, reminderSentStatusLine(p.reason));
         checkJoinIncomplete(run);
         persist(p.parentId, run);
+        const reminderRun = sent.runId !== p.runId ? runs.get(sent.runId) : null;
+        resettleReminderRun = reminderRun != null && terminalRunStatus(reminderRun.status) !== null;
         return;
       }
 
@@ -2017,6 +2636,81 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
   }).catch((err) => {
     console.warn(`[agetor] pipeline runner failed stamping reminder outcome for task ${p.taskId}:`, err);
   });
+  if (resettleReminderRun && sent.delivered) {
+    const row = runs.get(sent.runId);
+    const status = row ? terminalRunStatus(row.status) : null;
+    if (status) await handleRunStatus(p.taskId, sent.runId, status);
+  }
+}
+
+/** Delays between {@link scheduleBusyRecheck}'s re-settles (~52 s in all). */
+const BUSY_RECHECK_DELAYS_MS = [2_000, 5_000, 15_000, 30_000];
+let busyRecheckDelaysMs: readonly number[] = BUSY_RECHECK_DELAYS_MS;
+
+/** Step task id → how many idle-only refusals with no live run the current
+ *  run's reminder has had in a row ({@link scheduleBusyRecheck}). */
+const busyRefusals = new Map<string, { runId: string; attempts: number }>();
+
+/** Step task id → its pending {@link scheduleBusyRecheck} timer. */
+const busyRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * L3: an idle-only reminder was refused (`busy`) while no run of the step is
+ * live. That happens when claude's session still tracks turn activity that
+ * isn't a run — a queued slot, a continuation awaiting content — and it may
+ * never become one, so no settle would ever decide the step. Re-settle the
+ * step's current run a few times, backed off (each re-settle queues the
+ * reminder again); a run that is live by then decides instead. After the
+ * last attempt the execution blocks with the reason, so it is never left
+ * stuck active and unblocked.
+ */
+function scheduleBusyRecheck(p: PendingReminder): void {
+  const prev = busyRefusals.get(p.taskId);
+  const attempts = prev && prev.runId === p.runId ? prev.attempts : 0;
+  if (attempts >= busyRecheckDelaysMs.length) {
+    busyRefusals.delete(p.taskId);
+    void runExclusive(p.parentId, async () => {
+      const run = tasks.get(p.parentId)?.pipelineRun;
+      if (!run || !run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq)) return;
+      if (isAnyRunOfTaskLive(p.taskId) || remindersInFlight.has(p.taskId)) return;
+      const historyEntry = run.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
+      if (isStopApplied(run, p.taskId, historyEntry)) {
+        settleStoppedExecution(p.parentId, run, p.taskId, historyEntry);
+        return;
+      }
+      // `releaseReminderOwnership` cleared the classification while the
+      // reminder was queued; the block states what the turn answered.
+      if (historyEntry && historyEntry.outcome === null && historyEntry.responseKind == null) {
+        historyEntry.responseKind = p.reason === "handoff-next-unknown" ? "handoff-invalid" : p.reason;
+      }
+      upsertBlocked(run, {
+        taskId: p.taskId,
+        stepId: p.stepId,
+        kind: reminderBlockKind(p.reason),
+        message: `${p.baseMessage} (automatic reminder not sent: the agent session still reports a turn in progress)`,
+      });
+      checkJoinIncomplete(run);
+      persist(p.parentId, run);
+    }).catch((err) => {
+      console.warn(`[agetor] pipeline runner failed blocking task ${p.taskId} after busy refusals:`, err);
+    });
+    return;
+  }
+  busyRefusals.set(p.taskId, { runId: p.runId, attempts: attempts + 1 });
+  const previous = busyRecheckTimers.get(p.taskId);
+  if (previous !== undefined) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    if (busyRecheckTimers.get(p.taskId) !== timer) return;
+    // A run went live meanwhile: its own settle decides the step.
+    if (isAnyRunOfTaskLive(p.taskId)) {
+      busyRecheckTimers.delete(p.taskId);
+      busyRefusals.delete(p.taskId);
+      return;
+    }
+    resettleFromTimer(busyRecheckTimers, p.taskId, timer, "a busy refusal");
+  }, busyRecheckDelaysMs[attempts]);
+  timer.unref?.();
+  busyRecheckTimers.set(p.taskId, timer);
 }
 
 /** Record a retryable run-level hold for `step` instead of launching it —
@@ -2043,18 +2737,255 @@ function holdForStoppedRun(
 }
 
 /**
+ * Advance a step execution on the handoff `handoff` (resolved to `resolved`'s
+ * next steps): remove it from `run.active`, record the history outcome
+ * `"succeeded"` — even when the run whose settle got us here itself failed or
+ * was orphaned, because a different run supplied a valid handoff — move the
+ * step task to `done`, then either hold the successors (the run was
+ * deliberately stopped, or the parent is archived) or launch them. Shared by
+ * every settle that found a handoff; MUST run under `runExclusive(parentId)`
+ * with `activeEntry` still in `run.active`.
+ */
+async function advanceOnHandoff(input: {
+  parentId: string;
+  parent: Task;
+  run: PipelineRunState;
+  graph: PipelineGraph;
+  taskId: string;
+  /** The run whose settle triggered this — only used for the step task's
+   *  `done` column write, like the pre-look-back code. */
+  runId: string;
+  activeEntry: PipelineActiveStep;
+  historyEntry: PipelineStepRecord | undefined;
+  handoff: Handoff;
+  resolved: { kind: "terminal" } | { kind: "steps"; stepIds: string[] };
+}): Promise<void> {
+  const { parentId, parent, run, graph, taskId, runId, activeEntry, historyEntry, handoff, resolved } = input;
+  // M-R2: decided BEFORE this execution is removed from `active` —
+  // `isDeliberateWholeRunStop` counts the OTHER live siblings, so the
+  // answer is the same either way, but the stop marker on entry is the
+  // load-bearing half: `cancelPipelineRun` records it before any sibling's
+  // own settle can land here.
+  const wholeRunStop = isDeliberateWholeRunStop(run, taskId);
+
+  // Resolved (terminal or a real set of next steps) — this execution is
+  // done. Remove it, mark history, move the step task to `done`.
+  run.active.splice(run.active.indexOf(activeEntry), 1);
+  removeBlockedFor(run, taskId);
+  const nextStepIds = resolved.kind === "steps" ? resolved.stepIds : [];
+  if (historyEntry) {
+    historyEntry.endedAt = Date.now();
+    historyEntry.outcome = "succeeded";
+    historyEntry.handoff = handoff;
+    historyEntry.nextStepIds = nextStepIds;
+  }
+  pipelineUpdateColumn(taskId, runId, "done");
+
+  if (wholeRunStop) {
+    // M-R2: a step that finished cleanly AFTER the user stopped the
+    // whole run — its own settle raced the Stop — must never launch its
+    // successors into a run being torn down (which would silently
+    // revive the run back to `running`). Its outcome is recorded above
+    // exactly as a normal success; every resolved next step becomes a
+    // run-level pending hold (a completed join launches as one hold
+    // carrying its full arrival set; an incomplete join just keeps its
+    // arrival in `run.joins` for whatever the retry of its other
+    // sources brings), and the run finalizes as stopped. Retry picks the
+    // holds back up via `retryPendingBlocks`.
+    for (const nid of nextStepIds) {
+      const targetStep = graph.steps.find((s) => s.id === nid);
+      if (!targetStep) continue;
+      if (targetStep.join === "all") {
+        const arrivals = addJoinArrival(run.joins[nid]?.arrivals ?? [], {
+          fromStepId: activeEntry.stepId,
+          seq: activeEntry.seq,
+          handoff,
+        });
+        const incoming = incomingSteps(graph, nid);
+        const arrivedIds = new Set(arrivals.map((a) => a.fromStepId));
+        if (incoming.every((i) => arrivedIds.has(i.step.id))) {
+          delete run.joins[nid];
+          holdForStoppedRun(run, targetStep, arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff })));
+        } else {
+          run.joins[nid] = { arrivals };
+        }
+      } else {
+        holdForStoppedRun(run, targetStep, [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff }]);
+      }
+    }
+    finalizeCancelled(parentId, run);
+    return;
+  }
+
+  // Major 2: re-read the parent fresh — it may have been archived
+  // between this settle firing and this handler acquiring the
+  // per-parent lock (an `archiveTask` cascade races through the same
+  // lock, but sets `archivedAt` on the row BEFORE it ever acquires
+  // it). An archived parent must never have this settle spawn a new
+  // step task or touch its worktree — every resolved next step is
+  // recorded as a retryable pending hold instead of launched.
+  const parentForLaunch = tasks.get(parentId) ?? parent;
+  const parentArchived = parentForLaunch.archivedAt != null;
+  // Minor 5: same tombstone/existence guard as every other locked body
+  // that refreshes the worktree — a delete cascade racing in through
+  // this same per-parent lock must never have this settle's batch
+  // refresh touch the worktree (`launchStep`/`launchTarget` below
+  // still bail on this independently, this just skips the redundant
+  // refresh call).
+  const parentGone = tombstonedPipelineParents.has(parentId) || !tasks.get(parentId);
+  // Minor 15: refresh the shared worktree ONCE for this whole batch (a
+  // fan-out can resolve several next steps from one settle) instead of
+  // once per `launchStep` call — a failed batch refresh here just
+  // falls back to `launchStep`'s own per-call refresh (and its own
+  // per-target error handling) for every target in the loop below.
+  let batchParent = parentForLaunch;
+  let worktreeReady = false;
+  if (!parentArchived && !parentGone && nextStepIds.length > 0) {
+    const refreshedBatch = await refreshParentWorktree(parentForLaunch, run);
+    if (!("error" in refreshedBatch)) {
+      batchParent = refreshedBatch.parent;
+      worktreeReady = true;
+    }
+  }
+
+  for (const nid of nextStepIds) {
+    const targetStep = graph.steps.find((s) => s.id === nid);
+    if (!targetStep) continue;
+    if (targetStep.join === "all") {
+      const arrivals = addJoinArrival(run.joins[nid]?.arrivals ?? [], {
+        fromStepId: activeEntry.stepId,
+        seq: activeEntry.seq,
+        handoff,
+      });
+      const incoming = incomingSteps(graph, nid);
+      const arrivedIds = new Set(arrivals.map((a) => a.fromStepId));
+      const complete = incoming.every((i) => arrivedIds.has(i.step.id));
+      if (complete) {
+        delete run.joins[nid];
+        const previousArr = arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
+        if (parentArchived) {
+          holdForArchivedParent(run, targetStep, previousArr);
+        } else {
+          // Minor 14: a per-target throw is caught and recorded as its
+          // own retryable block instead of aborting the rest of this
+          // fan-out batch.
+          await launchTarget(batchParent, run, targetStep, previousArr, {
+            batchSiblingStepIds: nextStepIds,
+            skipWorktreeRefresh: worktreeReady,
+          });
+        }
+      } else {
+        run.joins[nid] = { arrivals };
+      }
+    } else {
+      const previousArr = [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff }];
+      if (parentArchived) {
+        holdForArchivedParent(run, targetStep, previousArr);
+      } else {
+        await launchTarget(batchParent, run, targetStep, previousArr, {
+          batchSiblingStepIds: nextStepIds,
+          skipWorktreeRefresh: worktreeReady,
+        });
+      }
+    }
+  }
+
+  checkJoinIncomplete(run);
+  persist(parentId, run);
+}
+
+/**
+ * Record a step execution whose run SUCCEEDED, but without a handoff the
+ * runner can act on, after the user stopped it ({@link isStopApplied} — the
+ * whole run, or this one execution): no grace, no reminder — the user asked
+ * to stop. The execution stays in `run.active` with outcome `cancelled`
+ * (Retry re-runs it) and keeps the `responseKind` its turn classified as;
+ * then {@link closeStoppedExecution} decides the run. Idempotent: a later
+ * re-settle of the same run lands here again.
+ */
+function settleStoppedExecution(
+  parentId: string,
+  run: PipelineRunState,
+  taskId: string,
+  historyEntry: PipelineStepRecord | undefined,
+): void {
+  clearStepTimers(taskId);
+  removeBlockedFor(run, taskId);
+  if (historyEntry && historyEntry.outcome === null) {
+    historyEntry.endedAt = Date.now();
+    historyEntry.outcome = "cancelled";
+  }
+  checkJoinIncomplete(run);
+  closeStoppedExecution(parentId, run, taskId);
+}
+
+/**
+ * Decide the run after `taskId`'s execution stopped (or orphaned) and its
+ * outcome was recorded. M5: a Stop pressed on one step's own panel while a
+ * sibling is still being worked on ({@link workingSiblings} — a live run, or
+ * a runner decision such as a release grace) must not end the run out from
+ * under that sibling: the stopped execution gets a retryable "was stopped"
+ * block, so the run reads `blocked` now and still does once the sibling
+ * finishes. Otherwise — nothing else is being worked on, or this is part of
+ * a deliberate whole-run stop — `finalizeCancelled` (idempotent) is the
+ * whole story, and never records a block of its own.
+ */
+function closeStoppedExecution(parentId: string, run: PipelineRunState, taskId: string): void {
+  const activeEntry = run.active.find((a) => a.taskId === taskId);
+  if (activeEntry && workingSiblings(run, taskId).length > 0 && !isDeliberateWholeRunStop(run, taskId)) {
+    const stepName = run.snapshot ? stepNameById(run.snapshot.graph, activeEntry.stepId) : activeEntry.stepId;
+    upsertBlocked(run, {
+      taskId,
+      stepId: activeEntry.stepId,
+      kind: "step-failed",
+      message: `step "${stepName}" was stopped — retry it or advance past it`,
+    });
+    persist(parentId, run);
+    return;
+  }
+  finalizeCancelled(parentId, run);
+}
+
+/**
  * The settle body — ONE implementation for every way a step execution's
  * terminal outcome reaches this module: the orchestrator's `run-status`
  * event (`handleRunStatus`), a step task's own `ready`/`review` column
  * transition re-read against its latest run row (`handleColumnChange`,
- * H1b/M-R3), and the boot-time missed-settle sweep (`reconcilePipelineRuns`,
- * via `handleRunStatus`). MUST be called under `runExclusive(parentId)`.
+ * H1b/M-R3), a displaced run's settle (`resettleCurrentRun`, the
+ * orchestrator's runner-only report), the release-grace timer, and the
+ * boot-time missed-settle sweep (`reconcilePipelineRuns`, via
+ * `handleRunStatus`). MUST be called under `runExclusive(parentId)`.
  * Returns a {@link PendingReminder} the caller delivers once it has released
  * the lock (L-R7), else `null`. Idempotent against the same settle arriving
  * twice (a `review` column event and its `run-status` twin): a succeeded
  * execution that already advanced is no longer `active`; a failed/
  * cancelled one already carries its `outcome`; a reminder mid-send owns its
  * execution (`remindersInFlight`); a held step just stays held.
+ *
+ * A step task can have several runs in one attempt (the original turn, a
+ * background-task continuation, a user follow-up, a reminder turn), and the
+ * `<handoff>` is not always on the one that settled. Decision order:
+ *  1. A succeeded run held by background agents: stamp `responseKind`, stay
+ *     active (M-R3). `maybeReleaseHeldTask`'s release re-enters here.
+ *  2. Any other run of the step still live (`isAnyRunOfTaskLive`, not just
+ *     `task.runId`) and this settle isn't a Stop: WAIT (D5). The next step
+ *     shares the worktree, so the step never advances under a live turn; that
+ *     run's own settle (or the displaced-run report) decides.
+ *  3. `cancelled`: a deliberate Stop never looks back (branch below).
+ *  4. `failed`/`orphaned` whose outcome is already recorded: done.
+ *  5. The settling run's own response is classified; a `user-ask` on it wins
+ *     over any older handoff (a live question isn't orphaned by advancing).
+ *  6. LOOK-BACK ({@link findHandoffSupplier}): the newest settled run of the
+ *     attempt window with a valid handoff — `handoff-blocked` counts — is the
+ *     supplier; the settling run competes if it succeeded. `orphaned`
+ *     settles skip it during a whole-run stop.
+ *  7. Supplier found: record which run supplied it
+ *     ({@link recordHandoffSource}) and run the ordinary blocked/resolve/
+ *     advance code with it — so a stamped reminder no longer blocks (D14),
+ *     and a failed settling run still advances.
+ *  8. No supplier: a succeeded response without a handoff gets the release
+ *     grace and the one reminder (`attemptHandoffReminderOrBlock`); `failed`
+ *     blocks `step-failed`; `orphaned` takes the cancelled/orphaned branch.
  */
 async function settleStepRun(
   parentId: string,
@@ -2080,74 +3011,93 @@ async function settleStepRun(
     // handoff unread until the next boot reconcile.
     if (remindersInFlight.get(taskId) === runId) return null;
 
-    if (status === "succeeded") {
-      // One-shot handoff reminder (owner request, `docs/plans/pipelines.md`):
-      // `classifyStepResponse` is the single decision point for what this
-      // execution's final response actually was. It's called on EVERY
-      // settle (not just this succeeded branch — see the failed/cancelled
-      // branches below) so `historyEntry.responseKind` always reflects the
-      // outcome, even for a settle that never reaches the reminder logic.
-      // L-R6: the run's main-stream rows are loaded ONCE here.
-      const assistantText = assistantTextFrom(mainStreamEventsForRun(runId));
-      const pendingInteractions = pendingInteractionsForRun(taskId, runId);
-      const classified = classifyStepResponse({ runStatus: status, assistantText, pendingInteractions });
-      if (historyEntry) historyEntry.responseKind = classified.kind;
+    // Each run's response is classified at most once per settle (L-R6): the
+    // look-back reuses the settling run's classification.
+    const responses = new Map<string, ClassifiedResponse>();
 
-      // M-R3: the turn succeeded but the step task is HELD — background
-      // subagents it spawned are still running, and the orchestrator has
-      // parked the card in `running` rather than advancing it. That's not a
-      // settled step: record what the response classified as and keep the
-      // execution active, unblocked. `maybeReleaseHeldTask`'s release
-      // (column → `review`) re-enters this body through
-      // `handleColumnChange`'s `review` branch once the last helper
-      // finishes, and THAT settle advances the graph.
-      if (isHeldByBackgroundAgents(taskId)) {
-        persist(parentId, run);
-        return null;
-      }
+    // (1) One-shot handoff reminder (owner request, `docs/plans/pipelines.md`):
+    // `classifyStepResponse` is the single decision point for what a run's
+    // final response actually was. M-R3: the turn succeeded but the step
+    // task is HELD — background subagents it spawned are still running, and
+    // the orchestrator has parked the card in `running` rather than
+    // advancing it. That's not a settled step: record what the response
+    // classified as and keep the execution active, unblocked.
+    // `maybeReleaseHeldTask`'s release (column → `review`) re-enters this
+    // body through `handleColumnChange`'s `review` branch once the last
+    // helper finishes, and THAT settle advances the graph.
+    if (status === "succeeded" && isHeldByBackgroundAgents(taskId)) {
+      if (historyEntry) historyEntry.responseKind = classifyRunResponse(taskId, runId, responses).kind;
+      persist(parentId, run);
+      return null;
+    }
 
-      if (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid") {
-        // Not blocked yet — attempt the ONE automatic reminder as an
-        // ordinary follow-up turn on the step's own run, rather than
-        // blocking the run over a step that may simply have forgotten the
-        // handoff format. See `attemptHandoffReminderOrBlock` for the
-        // round-4 review-fix conditions (archived/tombstoned parent or
-        // step, a run that's being deliberately stopped, already reminded)
-        // that instead fall straight to an ordinary block; the send itself
-        // happens outside the lock (`deliverHandoffReminder`).
-        const reason = classified.kind;
-        const baseMessage = reason === "handoff-missing"
-          ? `step "${stepName}" finished but never emitted a <handoff> block`
-          : `step "${stepName}" emitted a <handoff> block agetor couldn't parse: ${classified.error}`;
-        const detail = classified.error ?? (reason === "handoff-missing"
-          ? "no <handoff> block was found"
-          : "the handoff JSON could not be parsed");
-        return attemptHandoffReminderOrBlock({
-          parentId, run, taskId, runId, activeEntry, historyEntry, graph, stepName, reason, detail, baseMessage,
-        });
-      }
+    // (2) D5: never advance — or remind, or block — while any run of this
+    // step is still live. A continuation or follow-up that is still writing
+    // usually carries the `<handoff>` this settle doesn't have yet; its own
+    // settle (or the displaced-run report, if it is no longer `task.runId`)
+    // re-enters here and decides. A Stop never waits.
+    if (status !== "cancelled" && isAnyRunOfTaskLive(taskId)) {
+      if (historyEntry && historyEntry.outcome === null) historyEntry.responseKind = null;
+      persist(parentId, run);
+      scheduleWaitRecheck(taskId);
+      return null;
+    }
+    // Past the wait: any pending release-grace timer is superseded (the
+    // attempt branch re-arms it when the grace still applies).
+    clearReleaseGraceTimer(taskId);
 
-      if (classified.kind === "user-ask") {
-        // Medium 4: the step's task already reflects a pending interaction
-        // through the ordinary interactions/column machinery — but a
-        // pending card must still surface as a retryable block on the
-        // RUN, not just on the task, so `deriveRunStatus` reads `blocked`
-        // (not a silent `running` with an execution nothing will ever
-        // advance on its own) until the user answers. The "running"-column
-        // handler already clears ANY block naming this task the moment the
-        // step task genuinely runs again (m11) — including this one —
-        // which is what happens once the user answers the card and the
-        // step's own turn resumes.
-        upsertBlocked(run, {
-          taskId,
-          stepId: activeEntry.stepId,
-          kind: "step-blocked",
-          message: `step "${stepName}" is waiting for you`,
-        });
-        checkJoinIncomplete(run);
-        persist(parentId, run);
-        return null;
-      }
+    // (3)/(4) An execution whose history entry already carries an outcome
+    // was settled by an earlier arrival of this same event (the `ready`
+    // column event and the `run-status` event for one turn both land here —
+    // H1b) — nothing left to record. A retry resets `outcome` to `null`
+    // through the `running` column branch before the next settle, so this
+    // never masks a genuinely new outcome. (A succeeded run is exempt: the
+    // execution is still `active`, so it hasn't advanced.)
+    if (status !== "succeeded" && historyEntry && historyEntry.outcome !== null) return null;
+
+    // (5) A pending question on the settling run is the step's state — an
+    // older run's handoff must not override it.
+    const settlingResponse = status === "succeeded" ? classifyRunResponse(taskId, runId, responses) : null;
+    if (settlingResponse?.kind === "user-ask") {
+      // Medium 4: the step's task already reflects a pending interaction
+      // through the ordinary interactions/column machinery — but a
+      // pending card must still surface as a retryable block on the
+      // RUN, not just on the task, so `deriveRunStatus` reads `blocked`
+      // (not a silent `running` with an execution nothing will ever
+      // advance on its own) until the user answers. The "running"-column
+      // handler already clears ANY block naming this task the moment the
+      // step task genuinely runs again (m11) — including this one —
+      // which is what happens once the user answers the card and the
+      // step's own turn resumes.
+      if (historyEntry) historyEntry.responseKind = settlingResponse.kind;
+      upsertBlocked(run, {
+        taskId,
+        stepId: activeEntry.stepId,
+        kind: "step-blocked",
+        message: `step "${stepName}" is waiting for you`,
+      });
+      checkJoinIncomplete(run);
+      persist(parentId, run);
+      return null;
+    }
+
+    // (6) Look-back. A deliberate Stop (`cancelled`, or an `orphaned` settle
+    // during a whole-run stop) never looks back: the user's Stop wins.
+    const mayLookBack =
+      status === "succeeded" ||
+      status === "failed" ||
+      (status === "orphaned" && !isDeliberateWholeRunStop(run, taskId));
+    const supplier = mayLookBack
+      ? findHandoffSupplier(taskId, historyEntry, responses, status === "succeeded" ? runId : undefined)
+      : null;
+
+    // (7) A run of the attempt window holds a valid handoff.
+    if (supplier) {
+      // The supplier's status line is worded against the step's newest run
+      // in the attempt window, not the run whose settle got here: which
+      // settle wins the lock is timing, and a late settle of an older run
+      // must not turn "the step's newer run had none" into "another run".
+      const newerRun = newerRunThanSupplier(taskId, historyEntry, supplier);
 
       // M1: a step can emit a perfectly valid handoff and still report it
       // could not finish (`status:"blocked"`) — record it on the history
@@ -2155,12 +3105,13 @@ async function settleStepRun(
       // are visible), but do NOT resolve/advance: the execution stays in
       // `run.active` exactly like an unresolved handoff, waiting on a
       // Retry (re-run the step) or a manual Advance.
-      if (classified.kind === "handoff-blocked") {
-        const handoff = classified.handoff!;
+      if (supplier.kind === "handoff-blocked") {
+        const handoff = supplier.handoff;
         const oq = handoff.openQuestions.length > 0
           ? ` (open questions: ${handoff.openQuestions.join("; ")})`
           : "";
         const reasonText = handoff.reason.trim().length > 0 ? handoff.reason : "no reason given";
+        if (historyEntry) recordHandoffSource(taskId, runId, historyEntry, supplier, newerRun);
         upsertBlocked(run, {
           taskId,
           stepId: activeEntry.stepId,
@@ -2173,32 +3124,23 @@ async function settleStepRun(
         return null;
       }
 
-      if (classified.kind !== "handoff") {
-        // Defensive: `classifyStepResponse` only returns "error"/
-        // "cancelled" for the failed/cancelled/orphaned run statuses,
-        // never for "succeeded" — this can't actually be reached, but
-        // stay exhaustive rather than fall into `resolveNextSteps` with a
-        // null handoff.
-        upsertBlocked(run, {
-          taskId,
-          stepId: activeEntry.stepId,
-          kind: "step-failed",
-          message: `step "${stepName}" finished with an unexpected response`,
-        });
-        checkJoinIncomplete(run);
-        persist(parentId, run);
-        return null;
-      }
-
-      const parsedHandoff = classified.handoff!;
-      const resolved = resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
+      const resolved = resolveNextSteps(graph, activeEntry.stepId, supplier.handoff);
       if (resolved.kind === "ambiguous" || resolved.kind === "unknown") {
         // Low: a parsed handoff whose `next` didn't resolve to a real
         // outgoing step is a malformed handoff, not a valid one — override
-        // the `"handoff"` stamp `classifyStepResponse` gave this execution
-        // above (it can't have known about the graph). Gets the same one
-        // automatic reminder as handoff-missing/invalid (round 4).
-        if (historyEntry) historyEntry.responseKind = "handoff-invalid";
+        // the `"handoff"` stamp `classifyStepResponse` gave it (it can't
+        // have known about the graph), and record no supplying run: nothing
+        // advanced on it. Gets the same one automatic reminder as
+        // handoff-missing/invalid (round 4).
+        if (historyEntry) {
+          historyEntry.responseKind = "handoff-invalid";
+          historyEntry.handoffRunId = null;
+          historyEntry.handoffFromOtherRun = false;
+        }
+        if (isStopApplied(run, taskId, historyEntry)) {
+          settleStoppedExecution(parentId, run, taskId, historyEntry);
+          return null;
+        }
         const candidates = resolved.candidates.join(", ") || "(no outgoing steps)";
         const baseMessage = resolved.kind === "ambiguous"
           ? `step "${stepName}" finished but didn't say which step comes next — choices: ${candidates}`
@@ -2218,148 +3160,54 @@ async function settleStepRun(
         });
       }
 
-      // M-R2: decided BEFORE this execution is removed from `active` —
-      // `isDeliberateWholeRunStop` counts the OTHER live siblings, so the
-      // answer is the same either way, but `run.status === "cancelled"` on
-      // entry is the load-bearing half: `cancelPipelineRun` forces it via
-      // `finalizeCancelled` before any sibling's own settle can land here.
-      const wholeRunStop = run.status === "cancelled" || isDeliberateWholeRunStop(run, taskId);
+      if (historyEntry) recordHandoffSource(taskId, runId, historyEntry, supplier, newerRun);
+      await advanceOnHandoff({
+        parentId, parent, run, graph, taskId, runId, activeEntry, historyEntry, handoff: supplier.handoff, resolved,
+      });
+      return null;
+    }
 
-      // Resolved (terminal or a real set of next steps) — this execution is
-      // done. Remove it, mark history, move the step task to `done`.
-      run.active.splice(activeIdx, 1);
-      removeBlockedFor(run, taskId);
-      const nextStepIds = resolved.kind === "steps" ? resolved.stepIds : [];
-      if (historyEntry) {
-        historyEntry.endedAt = Date.now();
-        historyEntry.outcome = "succeeded";
-        historyEntry.handoff = parsedHandoff;
-        historyEntry.nextStepIds = nextStepIds;
-      }
-      pipelineUpdateColumn(taskId, runId, "done");
+    // (8) No supplier.
+    if (status === "succeeded") {
+      const classified = settlingResponse!;
+      if (historyEntry) historyEntry.responseKind = classified.kind;
 
-      if (wholeRunStop) {
-        // M-R2: a step that finished cleanly AFTER the user stopped the
-        // whole run — its own settle raced the Stop — must never launch its
-        // successors into a run being torn down (which would silently
-        // revive the run back to `running`). Its outcome is recorded above
-        // exactly as a normal success; every resolved next step becomes a
-        // run-level pending hold (a completed join launches as one hold
-        // carrying its full arrival set; an incomplete join just keeps its
-        // arrival in `run.joins` for whatever the retry of its other
-        // sources brings), and the run finalizes as stopped. Retry picks the
-        // holds back up via `retryPendingBlocks`.
-        for (const nid of nextStepIds) {
-          const targetStep = graph.steps.find((s) => s.id === nid);
-          if (!targetStep) continue;
-          if (targetStep.join === "all") {
-            const arrivals = addJoinArrival(run.joins[nid]?.arrivals ?? [], {
-              fromStepId: activeEntry.stepId,
-              seq: activeEntry.seq,
-              handoff: parsedHandoff,
-            });
-            const incoming = incomingSteps(graph, nid);
-            const arrivedIds = new Set(arrivals.map((a) => a.fromStepId));
-            if (incoming.every((i) => arrivedIds.has(i.step.id))) {
-              delete run.joins[nid];
-              holdForStoppedRun(run, targetStep, arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff })));
-            } else {
-              run.joins[nid] = { arrivals };
-            }
-          } else {
-            holdForStoppedRun(run, targetStep, [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff: parsedHandoff }]);
-          }
+      if (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid") {
+        // The user stopped the run, or this step: no grace, no reminder —
+        // see `settleStoppedExecution`.
+        if (isStopApplied(run, taskId, historyEntry)) {
+          settleStoppedExecution(parentId, run, taskId, historyEntry);
+          return null;
         }
-        finalizeCancelled(parentId, run);
-        return null;
+        // Not blocked yet — attempt the ONE automatic reminder as an
+        // ordinary follow-up turn on the step's own run, rather than
+        // blocking the run over a step that may simply have forgotten the
+        // handoff format. See `attemptHandoffReminderOrBlock` for the
+        // grace and the round-4 review-fix conditions (archived/tombstoned
+        // parent or step, already reminded) that instead fall straight to an
+        // ordinary block; the send itself happens outside the lock
+        // (`deliverHandoffReminder`).
+        const reason = classified.kind;
+        const baseMessage = reason === "handoff-missing"
+          ? `step "${stepName}" finished but never emitted a <handoff> block`
+          : `step "${stepName}" emitted a <handoff> block agetor couldn't parse: ${classified.error}`;
+        const detail = classified.error ?? (reason === "handoff-missing"
+          ? "no <handoff> block was found"
+          : "the handoff JSON could not be parsed");
+        return attemptHandoffReminderOrBlock({
+          parentId, run, taskId, runId, activeEntry, historyEntry, graph, stepName, reason, detail, baseMessage,
+        });
       }
 
-      // Major 2: re-read the parent fresh — it may have been archived
-      // between this settle firing and this handler acquiring the
-      // per-parent lock (an `archiveTask` cascade races through the same
-      // lock, but sets `archivedAt` on the row BEFORE it ever acquires
-      // it). An archived parent must never have this settle spawn a new
-      // step task or touch its worktree — every resolved next step is
-      // recorded as a retryable pending hold instead of launched.
-      const parentForLaunch = tasks.get(parentId) ?? parent;
-      const parentArchived = parentForLaunch.archivedAt != null;
-      // Minor 5: same tombstone/existence guard as every other locked body
-      // that refreshes the worktree — a delete cascade racing in through
-      // this same per-parent lock must never have this settle's batch
-      // refresh touch the worktree (`launchStep`/`launchTarget` below
-      // still bail on this independently, this just skips the redundant
-      // refresh call).
-      const parentGone = tombstonedPipelineParents.has(parentId) || !tasks.get(parentId);
-      // Minor 15: refresh the shared worktree ONCE for this whole batch (a
-      // fan-out can resolve several next steps from one settle) instead of
-      // once per `launchStep` call — a failed batch refresh here just
-      // falls back to `launchStep`'s own per-call refresh (and its own
-      // per-target error handling) for every target in the loop below.
-      let batchParent = parentForLaunch;
-      let worktreeReady = false;
-      if (!parentArchived && !parentGone && nextStepIds.length > 0) {
-        const refreshedBatch = await refreshParentWorktree(parentForLaunch, run);
-        if (!("error" in refreshedBatch)) {
-          batchParent = refreshedBatch.parent;
-          worktreeReady = true;
-        }
-      }
-
-      for (const nid of nextStepIds) {
-        const targetStep = graph.steps.find((s) => s.id === nid);
-        if (!targetStep) continue;
-        if (targetStep.join === "all") {
-          const arrivals = addJoinArrival(run.joins[nid]?.arrivals ?? [], {
-            fromStepId: activeEntry.stepId,
-            seq: activeEntry.seq,
-            handoff: parsedHandoff,
-          });
-          const incoming = incomingSteps(graph, nid);
-          const arrivedIds = new Set(arrivals.map((a) => a.fromStepId));
-          const complete = incoming.every((i) => arrivedIds.has(i.step.id));
-          if (complete) {
-            delete run.joins[nid];
-            const previousArr = arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
-            if (parentArchived) {
-              holdForArchivedParent(run, targetStep, previousArr);
-            } else {
-              // Minor 14: a per-target throw is caught and recorded as its
-              // own retryable block instead of aborting the rest of this
-              // fan-out batch.
-              await launchTarget(batchParent, run, targetStep, previousArr, {
-                batchSiblingStepIds: nextStepIds,
-                skipWorktreeRefresh: worktreeReady,
-              });
-            }
-          } else {
-            run.joins[nid] = { arrivals };
-          }
-        } else {
-          const previousArr = [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff: parsedHandoff }];
-          if (parentArchived) {
-            holdForArchivedParent(run, targetStep, previousArr);
-          } else {
-            await launchTarget(batchParent, run, targetStep, previousArr, {
-              batchSiblingStepIds: nextStepIds,
-              skipWorktreeRefresh: worktreeReady,
-            });
-          }
-        }
-      }
-
-      checkJoinIncomplete(run);
+      // The settling run carries a handoff but fell outside the attempt
+      // window (it started before the last Retry): it can't satisfy this
+      // attempt. Nothing to record; the attempt's own run settles later.
       persist(parentId, run);
       return null;
     }
 
-    // failed / cancelled / orphaned: an execution whose history entry
-    // already carries an outcome was settled by an earlier arrival of this
-    // same event (the `ready` column event and the `run-status` event for
-    // one turn both land here — H1b) — nothing left to record. A retry
-    // resets `outcome` to `null` through the `running` column branch before
-    // the next settle, so this never masks a genuinely new outcome.
-    if (historyEntry && historyEntry.outcome !== null) return null;
-
+    // failed / cancelled / orphaned with no handoff to advance on (the
+    // outcome-already-recorded idempotency check ran above).
     if (status === "failed") {
       if (historyEntry) {
         historyEntry.responseKind = classifyStepResponse({
@@ -2385,14 +3233,14 @@ async function settleStepRun(
 
     // cancelled / orphaned: clean up any blocked entry for this execution,
     // keep it in `active` (retry finds it there), and mark its history
-    // outcome. M5: whether this also forces the WHOLE run to `cancelled`
-    // (and the parent back to `ready`) depends on whether any OTHER
-    // execution is still genuinely live — a Stop pressed from this one
-    // step's own panel (a fan-out sibling keeps running) must not cancel
-    // the run out from under the sibling; only the "nothing else is live"
-    // case (including `cancelPipelineRun`'s own already-set status,
-    // idempotently reaffirmed here) collapses the whole run.
+    // outcome. A `cancelled` settle is a Stop — the pipeline's, or one on
+    // this step's own panel — so the execution is marked stopped
+    // (`stoppedAt`): a later settle of it (a held step's release, a
+    // continuation) must not grace or remind. An `orphaned` settle (agetor
+    // restarted mid-turn) is not a stop. Whether this also ends the WHOLE
+    // run is {@link closeStoppedExecution}'s call (M5, Major 1 round 3).
     removeBlockedFor(run, taskId);
+    clearStepTimers(taskId);
     if (historyEntry) {
       historyEntry.endedAt = Date.now();
       historyEntry.outcome = "cancelled";
@@ -2401,58 +3249,27 @@ async function settleStepRun(
         assistantText: "",
         pendingInteractions: pendingInteractionsForRun(taskId, runId),
       }).kind;
+      if (status === "cancelled") {
+        historyEntry.stoppedAt ??= Date.now();
+        historyEntry.stoppedRunId = runId;
+      }
     }
-    const stillLiveSiblings = run.active.filter((a) => a.taskId !== taskId && isTaskRunLive(a.taskId));
-    // Major 1 (round 3): a WHOLE-pipeline Stop on a fan-out must end
-    // `cancelled`, not `blocked` — `cancelPipelineRun` sends the cancel
-    // signal to every live sibling and forces `run.status = "cancelled"`
-    // (via `finalizeCancelled`) BEFORE any of those siblings' own settle
-    // events actually arrive here, so `run.status === "cancelled"` on
-    // entry is the signal that THIS settle is part of a deliberate
-    // whole-run stop, not an isolated one-step Stop. The same holds when
-    // every other still-live sibling is itself mid-cancellation
-    // (`isTaskRunCancelling`) — e.g. each active execution was cancelled
-    // individually rather than through `cancelPipelineRun` — since none of
-    // them is a normally-running sibling this execution would otherwise
-    // need to wait on. `isDeliberateWholeRunStop` is the shared detector
-    // (round 4, Major 2 also gates the succeeded branch's handoff-reminder
-    // send on it; M-R2 gates its launch on it too).
-    const deliberateWholeRunStop = isDeliberateWholeRunStop(run, taskId);
-    if (stillLiveSiblings.length > 0 && !deliberateWholeRunStop) {
-      // Major 1: this execution stopped (or orphaned) but a SIBLING is
-      // still genuinely running normally — the whole run must not
-      // silently read as `running` with a dead-end execution sitting in
-      // `active` with no block to surface it (`deriveRunStatus` would
-      // otherwise see `blocked.length === 0` and `active.length > 0` and
-      // call it `running`, forever, since nothing is ever going to
-      // advance this execution on its own again). Record a retryable
-      // block for it now, so `deriveRunStatus` reads `blocked`
-      // immediately — and still reads `blocked` once the sibling finishes
-      // too, since this block is still sitting there.
-      upsertBlocked(run, {
-        taskId,
-        stepId: activeEntry.stepId,
-        kind: "step-failed",
-        message: `step "${stepName}" was stopped — retry it or advance past it`,
-      });
-      persist(parentId, run);
-    } else {
-      // Either nothing else is live, or every other live sibling is also
-      // being deliberately stopped as part of the same whole-run Stop —
-      // either way this settle must never add a "was stopped" block of
-      // its own; `finalizeCancelled` (idempotent) is the whole story.
-      finalizeCancelled(parentId, run);
-    }
+    closeStoppedExecution(parentId, run, taskId);
   } catch (err) {
     persistReconcileFailure(parentId, taskId, err);
   }
   return null;
 }
 
+
 async function handleRunStatus(
   taskId: string,
   runId: string,
   status: "succeeded" | "failed" | "cancelled" | "orphaned",
+  /** A timer-driven re-settle's claim ({@link resettleFromTimer}), checked
+   *  once the lock is held: `false` means a Stop (or a newer timer) took the
+   *  decision away meanwhile, and nothing is settled. */
+  claim?: () => boolean,
 ): Promise<void> {
   const task = tasks.get(taskId);
   const parentId = task?.pipelineParentId;
@@ -2461,7 +3278,10 @@ async function handleRunStatus(
   // touch its run (or its worktree) again.
   if (tombstonedPipelineParents.has(parentId)) return;
 
-  const pending = await runExclusive(parentId, () => settleStepRun(parentId, taskId, runId, status)).catch((err) => {
+  const pending = await runExclusive(parentId, async () => {
+    if (claim && !claim()) return null;
+    return settleStepRun(parentId, taskId, runId, status);
+  }).catch((err) => {
     console.warn(`[agetor] pipeline runner failed handling run-status for task ${taskId}:`, err);
     return null;
   });
@@ -2512,6 +3332,59 @@ async function handleColumnChange(
         });
         persist(parentId, run);
       } else if (column === "running") {
+        const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
+        let changed = false;
+        // A turn starting on a stopped step — the whole run stopped, or this
+        // execution stopped on its own. One the user started (a message
+        // from the panel, a turn typed in the terminal) resumes it: the
+        // user is redirecting the step, and its result continues the
+        // pipeline like a one-step Retry would. Anything else (Claude's
+        // automatic continuation after a background task, a reminder that
+        // raced the Stop) is stopped again — nothing runs on a stopped
+        // step's behalf — and the step keeps reading stopped.
+        if (run.stopRequestedAt != null || historyEntry?.stoppedAt != null) {
+          // The Stop is still landing: every live run of the step is already
+          // flagged cancelled, even if a row still reads `running`. Nothing
+          // here resumes anything.
+          if (isTaskRunCancelling(taskId)) return;
+          const latest = currentRunRow(taskId);
+          // No turn started since the Stop: the card moved without a new run
+          // — the orchestrator's `pullBackParkedTask` pulls a `review` card
+          // back to `running`, its current run still `succeeded`, when a
+          // background agent of a (possibly stopped, held) step writes
+          // again — or this is the stopped run's own event. That is nobody
+          // resuming the step: keep the stop, and keep the recorded outcome
+          // (no m11 reset) so the settle after the hold's release still
+          // reads it as stopped.
+          if (!latest || !isTurnSinceStop(latest, historyEntry)) return;
+          // Already cancelled by the time this event got the lock — e.g. a
+          // Stop that landed while the turn's spawn still held its claim
+          // (`consumePendingCancel` killed it before it registered), or the
+          // user stopping the turn they had just sent. Nothing ran on the
+          // step's behalf: the stop stands, and that run's own `cancelled`
+          // settle follows this event. A failed run counts only while it is
+          // still the task's current run: `currentRunRow` falls back to the
+          // newest listed run when the task points at none, and a failed run
+          // the task has moved off is not a turn the user is running.
+          if (latest.status === "cancelled") return;
+          if (latest.status === "failed" && tasks.get(taskId)?.runId !== latest.id) return;
+          if (!turnStartedByUser(taskId, latest, historyEntry)) {
+            // Decided by run identity, so the turn may already have ended
+            // while this event waited for the lock: only a live one has
+            // anything to cancel. Its settle is still recorded as stopped.
+            if (latest.status === "running") await cancelLiveRunOfTask(taskId);
+            return;
+          }
+          // A turn the user started — possibly already finished by now (the
+          // per-parent lock can be held a while); its settle follows this
+          // event and is handled as an ordinary settle of a resumed step.
+          if (run.stopRequestedAt != null) resumeFromStop(run, new Set([taskId]));
+          if (historyEntry) {
+            historyEntry.stoppedAt = null;
+            historyEntry.stoppedRunId = null;
+          }
+          changed = true;
+        }
         // m11: a step task genuinely running again (a manual resend from
         // its own panel, or a retry) clears ANY block that named it —
         // not just a column-reasoned `step-blocked` one, since a
@@ -2520,16 +3393,27 @@ async function handleColumnChange(
         // resets its history record's outcome/endedAt/responseKind (Low,
         // round 4: `responseKind` is stamped fresh by the next settle's own
         // `classifyStepResponse` call — a stale value from the PREVIOUS
-        // attempt must not linger and read as this attempt's outcome) so it
-        // reads as in-flight, not as whatever it last settled as.
+        // attempt must not linger and read as this attempt's outcome; the
+        // same goes for `handoffRunId`/`handoffFromOtherRun`) so it reads as
+        // in-flight, not as whatever it last settled as.
         const beforeLen = run.blocked.length;
         run.blocked = run.blocked.filter((b) => b.taskId !== taskId);
-        let changed = run.blocked.length !== beforeLen;
-        const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
-        if (historyEntry && (historyEntry.outcome !== null || historyEntry.endedAt !== null || (historyEntry.responseKind ?? null) !== null)) {
+        if (run.blocked.length !== beforeLen) changed = true;
+        if (
+          historyEntry &&
+          (historyEntry.outcome !== null ||
+            historyEntry.endedAt !== null ||
+            (historyEntry.responseKind ?? null) !== null ||
+            (historyEntry.handoffRunId ?? null) !== null ||
+            historyEntry.handoffFromOtherRun === true)
+        ) {
           historyEntry.outcome = null;
           historyEntry.endedAt = null;
           historyEntry.responseKind = null;
+          // Like `responseKind`, the supplying-run breadcrumb describes the
+          // latest settle only.
+          historyEntry.handoffRunId = null;
+          historyEntry.handoffFromOtherRun = false;
           changed = true;
         }
         if (changed) persist(parentId, run);
@@ -2544,13 +3428,13 @@ async function handleColumnChange(
         // — including `maybeReleaseHeldTask`'s release of a step held by
         // background subagents, which is the ONLY settle a held execution
         // ever gets (its `run-status` event arrived while it was still held
-        // and deliberately left it active). The latest run row is the
-        // ground truth; the settle body itself is idempotent against the
-        // same outcome arriving twice.
+        // and deliberately left it active). The step's current run row is
+        // the ground truth ({@link currentRunRow}); the settle body itself is
+        // idempotent against the same outcome arriving twice.
         if (isTaskRunLive(taskId)) return;
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
         if (historyEntry && historyEntry.outcome !== null) return;
-        const latest = runs.listForTask(taskId)[0];
+        const latest = currentRunRow(taskId);
         if (!latest || latest.status === "running") return;
         // The in-flight reminder owns the settle of its own run. A newer
         // run (the continuation) is `latest` once it exists and still has
@@ -2607,7 +3491,7 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
  *
  * For every non-archived pipeline parent whose run is `running` (or
  * `blocked` with at least one still-`active` execution), walks every active
- * entry: skips it if `isTaskRunLive` says it's genuinely still busy;
+ * entry: skips it if `isAnyRunOfTaskLive` says it's genuinely still busy;
  * otherwise reads that step task's latest run row and feeds it through the
  * exact same settle path `handleRunStatus` uses for a live event
  * (`succeeded`/`failed`/`cancelled`/`orphaned`), or — no run row at all —
@@ -2628,10 +3512,9 @@ export async function reconcilePipelineRuns(): Promise<number> {
   for (const parent of parents) {
     const activeSnapshot = parent.pipelineRun!.active.slice();
     for (const a of activeSnapshot) {
-      if (isTaskRunLive(a.taskId)) continue;
+      if (isAnyRunOfTaskLive(a.taskId)) continue;
       try {
-        const stepRuns = runs.listForTask(a.taskId);
-        const latest = stepRuns[0] ?? null;
+        const latest = currentRunRow(a.taskId);
         if (!latest) {
           await runExclusive(parent.id, async () => markStepNeverStarted(parent.id, a.taskId));
           count++;
@@ -2645,6 +3528,116 @@ export async function reconcilePipelineRuns(): Promise<number> {
     }
   }
   return count;
+}
+
+/**
+ * Whether `latest` (the step task's current run) began after the latest Stop
+ * of this execution — decided by run identity: any run other than the one the
+ * Stop applied to ({@link PipelineStepRecord.stoppedRunId}) is new, whatever
+ * its status by now. Without a recorded run (a row written before the field,
+ * or a step with no run when the pipeline's Stop was pressed) the current run
+ * still `running` is the best evidence of a new turn.
+ */
+function isTurnSinceStop(latest: Run, historyEntry: PipelineStepRecord | undefined): boolean {
+  const stoppedRunId = historyEntry?.stoppedRunId ?? null;
+  if (stoppedRunId !== null) return latest.id !== stoppedRunId;
+  return latest.status === "running";
+}
+
+/**
+ * Whether `latest`, a run of step task `taskId` that just started, is a turn
+ * the user started: a message sent from the panel (or a Retry) — a run with
+ * no `origin` that is not this execution's automatic handoff reminder — or a
+ * continuation run Claude opened for text typed in the attached terminal
+ * (its opening status line, `CONTINUATION_STATUS_TEXT.user`). A continuation
+ * after a background task, Claude continuing on its own, or an fx
+ * auto-resume (`origin: "auto-resume"`) is not.
+ */
+function turnStartedByUser(taskId: string, latest: Run, historyEntry: PipelineStepRecord | undefined): boolean {
+  if (remindersInFlight.has(taskId) || historyEntry?.reminder?.runId === latest.id) return false;
+  if (latest.origin === "auto-resume") return false;
+  if (latest.origin !== "continuation") return true;
+  // `startContinuationRun` writes the opening status line before it emits
+  // the `running` column event that brings us here.
+  const opening = runs.events(latest.id).find((e) => e.stream === "status" && e.subagentId == null);
+  return opening?.data === CONTINUATION_STATUS_TEXT.user;
+}
+
+/**
+ * The orchestrator's runner-only report that a Stop was pressed on a HELD
+ * step task (`setHeldStepStoppedHandler`): its turn already succeeded, so no
+ * `cancelled` settle will ever say it was stopped. Mark the execution stopped
+ * (`stoppedAt`) and cancel its pending timers, so the settle that follows the
+ * hold's release gets no release grace and no reminder. When the release
+ * already settled it (that settle armed the grace), settle it again now.
+ */
+function handleHeldStepStopped(taskId: string, stoppedRunId: string | null): void {
+  if (!listenerEnabled) return;
+  const parentId = tasks.get(taskId)?.pipelineParentId;
+  if (!parentId || tombstonedPipelineParents.has(parentId)) return;
+  void runExclusive(parentId, async (): Promise<PendingReminder | null> => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    const activeEntry = run?.active.find((a) => a.taskId === taskId);
+    if (!run || !activeEntry) return null;
+    const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
+    if (!historyEntry || historyEntry.outcome !== null) return null;
+    historyEntry.stoppedAt ??= Date.now();
+    // The run current when Stop was pressed (the orchestrator captures it
+    // before the interrupt). Reading `task.runId` here instead would stamp a
+    // continuation Claude adopted while this body waited for the lock, and
+    // that NEW turn's own `running` event would then never be cancelled.
+    historyEntry.stoppedRunId = stoppedRunId;
+    clearStepTimers(taskId);
+    if (!isAnyRunOfTaskLive(taskId) && remindersInFlight.get(taskId) == null) {
+      const row = currentRunRow(taskId);
+      const status = row ? terminalRunStatus(row.status) : null;
+      if (row && status) return settleStepRun(parentId, taskId, row.id, status);
+    }
+    persist(parentId, run);
+    return null;
+  })
+    .then((pending) => (pending ? deliverHandoffReminder(pending) : undefined))
+    .catch((err) => {
+      console.warn(`[agetor] pipeline runner failed recording a stop of held task ${taskId}:`, err);
+    });
+}
+
+/**
+ * Re-run the settle of the step's CURRENT run (`task.runId`), when it has
+ * already ended. Every "something changed, decide again" trigger funnels
+ * through this one body: a displaced run's settle (the older run is done —
+ * the current run's settle may have been waiting on it, D5), and the release
+ * grace's timer. A current run that is still live is left alone: its own
+ * settle is coming. With no current run (a spawn that failed cleared it) the
+ * step's newest run stands in.
+ */
+async function resettleCurrentRun(taskId: string, claim?: () => boolean): Promise<void> {
+  const row = currentRunRow(taskId);
+  const status = row ? terminalRunStatus(row.status) : null;
+  if (!row || !status) return;
+  await handleRunStatus(taskId, row.id, status, claim);
+}
+
+/** The step task's current run row: `task.runId`'s, else (a failed spawn
+ *  clears `task.runId`) the newest one. Never just "the newest started": a
+ *  continuation and a run that displaces it can start in the same
+ *  millisecond, and settling the displaced one as if it were current would
+ *  misattribute which run supplied the handoff. */
+function currentRunRow(taskId: string): Run | null {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  return (task.runId ? runs.get(task.runId) : null) ?? runs.listForTask(taskId)[0] ?? null;
+}
+
+/** The orchestrator's runner-only report that a run of a step task which is
+ *  no longer `task.runId` has settled (`setDisplacedStepRunSettledHandler`).
+ *  Not a `GlobalEvent`: no toast, notification, TUI or CLI consumer ever sees
+ *  it. */
+function handleDisplacedRunSettle(taskId: string, _runId: string, _status: "succeeded" | "failed" | "cancelled"): void {
+  if (!listenerEnabled) return;
+  void resettleCurrentRun(taskId).catch((err) => {
+    console.warn(`[agetor] pipeline runner failed re-settling task ${taskId} after a displaced run settled:`, err);
+  });
 }
 
 let runnerInitialized = false;
@@ -2669,6 +3662,8 @@ let listenerEnabled = true;
 export function initPipelineRunner(): void {
   if (runnerInitialized) return;
   runnerInitialized = true;
+  setDisplacedStepRunSettledHandler(handleDisplacedRunSettle);
+  setHeldStepStoppedHandler(handleHeldStepStopped);
   subscribeGlobal((e: GlobalEvent) => {
     if (!listenerEnabled) return;
     if (e.kind === "run-status") {
@@ -2686,7 +3681,15 @@ export function initPipelineRunner(): void {
  *  not snapped back to Review. `setBeforeReminderSend` lets a test inject a
  *  successor between the reminder being queued and `sendInput`.
  *  `setBeforeReminderStamp` lets a test inject one after `sendInput`
- *  returns and before the reminder is recorded. `refreshParentWorktree` /
+ *  returns and before the reminder is recorded. `setBeforeReminderDispatch`
+ *  lets a test make a run live between the pre-send recheck and `sendInput`.
+ *  `setReleaseGraceMs` shrinks the release grace (returns the previous
+ *  value). `setBusyRecheckDelaysMs` shortens the busy-refusal backstop
+ *  (`null` restores it). `setReminderSend` stubs the reminder's `sendInput`;
+ *  `parsedRunResponse` reads the cached parse of a run's final response.
+ *  `handleDisplacedRunSettle` / `resettleCurrentRun` drive the
+ *  displaced-run report and the "decide again" body directly.
+ *  `refreshParentWorktree` /
  *  `propagateWorktreeToActiveSteps` let a test drive the shared-worktree
  *  upkeep (and its last-seen-checkout mirroring) directly. Never imported
  *  outside this module's own test files. */
@@ -2702,6 +3705,27 @@ export const __forTest = {
   setBeforeReminderStamp(hook: (() => Promise<void> | void) | null): void {
     beforeReminderStamp = hook;
   },
+  setBeforeReminderDispatch(hook: (() => Promise<void> | void) | null): void {
+    beforeReminderDispatch = hook;
+  },
+  setReleaseGraceMs(ms: number): number {
+    const previous = releaseGraceMs;
+    releaseGraceMs = ms;
+    return previous;
+  },
+  setReminderSend(fn: typeof sendInput | null): void {
+    reminderSend = fn;
+  },
+  parsedRunResponse,
+  setBusyRecheckDelaysMs(delays: readonly number[] | null): void {
+    busyRecheckDelaysMs = delays ?? BUSY_RECHECK_DELAYS_MS;
+    busyRefusals.clear();
+    for (const t of busyRecheckTimers.values()) clearTimeout(t);
+    busyRecheckTimers.clear();
+  },
+  handleDisplacedRunSettle,
+  handleHeldStepStopped,
+  resettleCurrentRun,
   persist,
   refreshParentWorktree,
   propagateWorktreeToActiveSteps,

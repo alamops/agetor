@@ -413,3 +413,189 @@ test("codex task → factory returns null (agent-kind guard)", async () => {
   expect(rows.length).toBe(1);
   expect(rows[0]?.id).toBe(priorRunId);
 });
+
+// ── 6. D12: adoption declines while an agetor-initiated turn is being minted ─
+//
+// docs/plans/handoff-identification-fix.md §3.2. `startingTaskIds` is held
+// across a fresh `startTask` spawn, a `--resume` spawn and the idle mint
+// (whose `sendTurn` flushSync can dispatch a notification line). An
+// agetor-initiated turn being minted owns the content that arrives in that
+// window, so the factory declines instead of overwriting `task.runId`.
+
+test("D12: the factory declines while a startTask spawn holds the startingTaskIds claim, and adopts again once it is released", async () => {
+  const taskId = await createTaskWithAgent("continuation-d12", "claude-code");
+  const { startTask, cancelRun, isTaskRunLive } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const prevDelay = process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS;
+  process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS = "400";
+  try {
+    const starting = startTask(taskId);
+    // The claim is taken synchronously-ish inside startTask; the fake spawn
+    // then sits on its 400 ms delay with the claim held.
+    const deadline = Date.now() + 2000;
+    while (!isTaskRunLive(taskId) && Date.now() < deadline) await wait(10);
+    expect(isTaskRunLive(taskId)).toBe(true);
+
+    // Mid-spawn: a continuation must not be adopted over the run being started.
+    const before = tasks.get(taskId)!.runId;
+    expect(realFactory!(taskId, "notification")).toBeNull();
+    expect(tasks.get(taskId)!.runId).toBe(before);
+    expect(runs.listForTask(taskId).some((r) => r.origin === "continuation")).toBe(false);
+
+    const started = await starting;
+    expect("error" in started).toBe(false);
+    // Stop the fake run so the claim-free control below starts from rest.
+    if ("runId" in started) await cancelRun(started.runId);
+    await wait(50);
+
+    // Control: with the claim released the same call adopts, so the decline
+    // above was the claim and nothing else (task is not archived, is claude).
+    const hooks = realFactory!(taskId, "notification");
+    expect(hooks).not.toBeNull();
+    expect(runs.get(tasks.get(taskId)!.runId!)?.origin).toBe("continuation");
+  } finally {
+    if (prevDelay === undefined) delete process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS;
+    else process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS = prevDelay;
+  }
+});
+
+// ── 7. Displaced step-run settle report (runner-only, never the global bus) ──
+//
+// docs/plans/handoff-identification-fix.md §3.3 (RC3, O6). `attachDoneHandler`
+// suppresses the column move and the `run-status` event for a run that is no
+// longer the task's current run; for a STEP task it now reports that settle to
+// the pipeline runner through a dedicated setter hook instead.
+
+/** Open a continuation run on `taskId` and return its id and a resolver for
+ *  its `done`. Opening a second one displaces the first as `task.runId`. */
+async function openContinuation(taskId: string): Promise<{
+  runId: string;
+  finish: (code: number) => void;
+  fail: (err: Error) => void;
+}> {
+  const hooks = realFactory!(taskId)!;
+  expect(hooks).not.toBeNull();
+  const { tasks } = await import("./db.ts");
+  const runId = tasks.get(taskId)!.runId!;
+  let finish!: (code: number) => void;
+  let fail!: (err: Error) => void;
+  const done = new Promise<number>((resolve, reject) => { finish = resolve; fail = reject; });
+  hooks.onAdopted({ kill: () => {}, writeInput: () => true, done });
+  return { runId, finish, fail };
+}
+
+/** Mark `taskId` as a hidden pipeline step row (these columns are server-
+ *  managed, so the test writes them directly). */
+async function makeStepTask(taskId: string): Promise<void> {
+  const { db } = await import("./db.ts");
+  db.run(`UPDATE tasks SET pipeline_parent_id = ?, pipeline_step_id = ? WHERE id = ?`, [
+    `parent-${randomUUID()}`,
+    "step-1",
+    taskId,
+  ]);
+}
+
+test("a displaced STEP run's settle is reported to the runner hook (succeeded and failed), with no run-status on the global bus", async () => {
+  const { setDisplacedStepRunSettledHandler, subscribeGlobal } = await import("./orchestrator.ts");
+  const { runs, tasks } = await import("./db.ts");
+  const taskId = await createTaskWithAgent("displaced-step", "claude-code");
+  await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
+  await makeStepTask(taskId);
+
+  const reported: Array<{ taskId: string; runId: string; status: string }> = [];
+  const prev = setDisplacedStepRunSettledHandler((tid, rid, status) => {
+    reported.push({ taskId: tid, runId: rid, status });
+  });
+  const events: Array<{ kind: string; runId?: string }> = [];
+  const unsubscribe = subscribeGlobal((e) => {
+    if ("taskId" in e && e.taskId === taskId) events.push({ kind: e.kind, runId: "runId" in e ? (e.runId ?? undefined) : undefined });
+  });
+  try {
+    // B then C: C displaces B as the task's current run.
+    const b = await openContinuation(taskId);
+    const c = await openContinuation(taskId);
+    expect(tasks.get(taskId)!.runId).toBe(c.runId);
+
+    b.finish(0);
+    await wait(75);
+    expect(runs.get(b.runId)?.status).toBe("succeeded");
+    expect(reported).toEqual([{ taskId, runId: b.runId, status: "succeeded" }]);
+    // The displaced run moved no column and emitted no run-status.
+    expect(events.filter((e) => e.kind === "run-status")).toEqual([]);
+    expect(tasks.get(taskId)!.runId).toBe(c.runId);
+    expect(tasks.get(taskId)!.column).toBe("running");
+
+    // The current run's own settle is NOT a displaced report; it reaches the
+    // bus as run-status exactly as before.
+    c.finish(0);
+    await wait(75);
+    expect(reported.length).toBe(1);
+    expect(events.filter((e) => e.kind === "run-status" && e.runId === c.runId).length).toBe(1);
+  } finally {
+    unsubscribe();
+    setDisplacedStepRunSettledHandler(prev);
+  }
+});
+
+test("a displaced step run that REJECTS is reported as failed (the .catch branch), and a throwing handler never breaks settlement", async () => {
+  const { setDisplacedStepRunSettledHandler } = await import("./orchestrator.ts");
+  const { runs, tasks } = await import("./db.ts");
+  const taskId = await createTaskWithAgent("displaced-step-catch", "claude-code");
+  await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
+  await makeStepTask(taskId);
+
+  const reported: Array<{ runId: string; status: string }> = [];
+  const prev = setDisplacedStepRunSettledHandler((_tid, rid, status) => {
+    reported.push({ runId: rid, status });
+    throw new Error("runner exploded");
+  });
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const b = await openContinuation(taskId);
+    const c = await openContinuation(taskId);
+
+    b.fail(new Error("tailer died"));
+    await wait(75);
+
+    expect(reported).toEqual([{ runId: b.runId, status: "failed" }]);
+    // Settlement still completed despite the handler throwing.
+    expect(runs.get(b.runId)?.status).toBe("failed");
+    expect(tasks.get(taskId)!.runId).toBe(c.runId);
+  } finally {
+    console.warn = warn;
+    setDisplacedStepRunSettledHandler(prev);
+  }
+});
+
+test("a displaced run of an ORDINARY (non-step) task fires nothing — the hook is step-only", async () => {
+  const { setDisplacedStepRunSettledHandler } = await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+  const taskId = await createTaskWithAgent("displaced-plain", "claude-code");
+  await seedPriorRun(taskId, { claudeSessionId: `sess-${randomUUID()}` });
+
+  const reported: string[] = [];
+  const prev = setDisplacedStepRunSettledHandler((_tid, rid) => { reported.push(rid); });
+  try {
+    const b = await openContinuation(taskId);
+    await openContinuation(taskId);
+    b.finish(0);
+    await wait(75);
+    expect(runs.get(b.runId)?.status).toBe("succeeded");
+    expect(reported).toEqual([]);
+  } finally {
+    setDisplacedStepRunSettledHandler(prev);
+  }
+});
+
+test("setDisplacedStepRunSettledHandler returns the previous handler so callers can restore it", async () => {
+  const { setDisplacedStepRunSettledHandler } = await import("./orchestrator.ts");
+  const a = () => {};
+  const base = setDisplacedStepRunSettledHandler(a);
+  try {
+    expect(setDisplacedStepRunSettledHandler(null)).toBe(a);
+  } finally {
+    setDisplacedStepRunSettledHandler(base);
+  }
+});
