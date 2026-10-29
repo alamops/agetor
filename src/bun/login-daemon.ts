@@ -3,7 +3,9 @@ import path from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import { childEnv, coreSpawn } from "./core-spawn.ts";
 import {
+  LIVE_CORE_CONNECT_TIMEOUT_MS,
   isPidAlive,
+  portAcceptsConnections,
   probeLiveCore,
   readCoreCreds,
   resolveDataDir,
@@ -261,46 +263,7 @@ export const LIVE_CORE_PROBE_TTL_MS = 5_000;
 /** Failed checks in a row before a core previously seen live is declared gone
  *  (one slow answer on a loaded machine must not make us boot a second core). */
 export const LIVE_CORE_FAILURES_TO_DROP = 2;
-/** Bound on the loopback TCP connect `portAcceptsConnections` makes. */
-export const LIVE_CORE_CONNECT_TIMEOUT_MS = 1_000;
-
-/**
- * Does anything accept TCP connections on 127.0.0.1:`port`? The kernel
- * completes the handshake for a listening socket on its own, so this answers
- * `true` for a core whose JS thread is blocked (a native Open panel, a message
- * box, a VACUUM) — exactly when its HTTP probe can't answer. `false` only on a
- * failed connect (refused: nothing listens). A connect that neither succeeds
- * nor fails within `timeoutMs` (a full listen backlog drops SYNs) reads as
- * `true`: something is listening, it is just not accepting yet.
- */
-export async function portAcceptsConnections(
-  port: number,
-  timeoutMs = LIVE_CORE_CONNECT_TIMEOUT_MS,
-): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(true), timeoutMs);
-  });
-  const attempt = Bun.connect({
-    hostname: "127.0.0.1",
-    port,
-    socket: {
-      open(socket) {
-        socket.end();
-      },
-      data() {},
-      error() {},
-    },
-  }).then(
-    () => true,
-    () => false,
-  );
-  try {
-    return await Promise.race([attempt, timedOut]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+export { LIVE_CORE_CONNECT_TIMEOUT_MS, portAcceptsConnections };
 
 export interface LiveCoreCheckDeps {
   readCreds(): CoreCreds | null;

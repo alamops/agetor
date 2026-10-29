@@ -13,6 +13,11 @@ import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
  *  - a daemon that has bound but not yet written its creds file, or a login race
  *    where the daemon is mid-boot: the creds read is racy for a moment, so the
  *    read and the bind are retried every 250 ms for up to 5 s (C16);
+ *  - a live core whose JS thread is blocked (a VACUUM from `agetor compact`, a
+ *    native panel): its pid is alive and the kernel still accepts connections
+ *    on the port, but `/health` can't answer. The retry window then grows to
+ *    `TAKEOVER_BLOCKED_CORE_WAIT_MS` instead of giving up after 5 s and exiting
+ *    with "port held" while the core is merely busy;
  *  - another live app, or a foreign process (a stale agetor, OTLP gRPC which
  *    also defaults to 4317): neither is ours to evict, so this throws the
  *    original bind error and the caller fails loudly, as it always has.
@@ -33,12 +38,21 @@ export interface AcquireApiPortDeps<S> {
   waitForPortFree: (port: number, timeoutMs: number) => Promise<boolean>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /** Is `pid` still running (`isPidAlive`)? Omitted = never extend the wait. */
+  isPidAlive?: (pid: number) => boolean;
+  /** Does anything accept a loopback TCP connect on `port`
+   *  (`portAcceptsConnections`)? Omitted = never extend the wait. */
+  portListening?: (port: number) => Promise<boolean>;
   log?: (msg: string) => void;
 }
 
 /** How long the app keeps retrying when the port is held but no live creds name
  *  the holder (C16). */
 export const TAKEOVER_RETRY_WINDOW_MS = 5_000;
+/** How long the app keeps waiting, in all, while the creds name a core whose
+ *  pid is alive and whose port accepts connections but whose probe fails — a
+ *  blocked core that will answer once its thread is free. */
+export const TAKEOVER_BLOCKED_CORE_WAIT_MS = 60_000;
 /** Retry cadence inside that window. */
 export const TAKEOVER_RETRY_INTERVAL_MS = 250;
 /** How long to wait for a handed-off core to release the port: the core first
@@ -57,9 +71,13 @@ export async function acquireApiPort<S>(deps: AcquireApiPortDeps<S>): Promise<S>
     firstError = e;
   }
 
-  const deadline = deps.now() + TAKEOVER_RETRY_WINDOW_MS;
+  const startedAt = deps.now();
+  const deadline = startedAt + TAKEOVER_RETRY_WINDOW_MS;
+  const blockedDeadline = startedAt + TAKEOVER_BLOCKED_CORE_WAIT_MS;
+  let loggedBlocked = false;
   for (;;) {
     const creds = deps.readCreds();
+    let blocked = false;
     if (creds) {
       let live = false;
       try {
@@ -72,8 +90,16 @@ export async function acquireApiPort<S>(deps: AcquireApiPortDeps<S>): Promise<S>
         if (creds.kind !== "cli-daemon") throw firstError;
         return await handOff(deps, creds, firstError);
       }
+      // Only worth checking once the short window is spent.
+      if (deps.now() >= deadline) blocked = await isBlockedCore(deps, creds);
     }
-    if (deps.now() >= deadline) throw firstError;
+    if (blocked && !loggedBlocked) {
+      loggedBlocked = true;
+      deps.log?.(
+        `[agetor] the core on port ${creds?.port} (pid ${creds?.pid}) is alive but not answering — waiting for it…`,
+      );
+    }
+    if (deps.now() >= (blocked ? blockedDeadline : deadline)) throw firstError;
     await deps.sleep(TAKEOVER_RETRY_INTERVAL_MS);
     // The holder may have been a daemon between its bind and its creds write,
     // or a core that has just exited: bind again before re-reading the creds.
@@ -82,6 +108,18 @@ export async function acquireApiPort<S>(deps: AcquireApiPortDeps<S>): Promise<S>
     } catch {
       /* still held — loop and look at the creds again */
     }
+  }
+}
+
+/** The creds' core is running and its port is listening, so a failed probe
+ *  means it is busy, not gone. */
+async function isBlockedCore<S>(deps: AcquireApiPortDeps<S>, creds: CoreCreds): Promise<boolean> {
+  if (!deps.isPidAlive || !deps.portListening) return false;
+  if (!deps.isPidAlive(creds.pid)) return false;
+  try {
+    return await deps.portListening(creds.port);
+  } catch {
+    return false;
   }
 }
 

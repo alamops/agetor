@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  TAKEOVER_BLOCKED_CORE_WAIT_MS,
   TAKEOVER_PORT_FREE_TIMEOUT_MS,
   TAKEOVER_RETRY_INTERVAL_MS,
   TAKEOVER_RETRY_WINDOW_MS,
@@ -45,6 +46,8 @@ function harness(opts: {
   probe?: (c: CoreCreds) => boolean | Promise<boolean>;
   fetchImpl?: () => Promise<Response>;
   waitForPortFree?: () => boolean;
+  /** Present = wire the blocked-core check (`isPidAlive` + `portListening`). */
+  blocked?: { pidAlive: (pid: number) => boolean; listening: (port: number) => boolean | Promise<boolean> };
 }): Harness {
   const clock = { t: 1_000_000 };
   const calls: Harness["calls"] = {
@@ -85,6 +88,12 @@ function harness(opts: {
       clock.t += ms;
     },
     now: () => clock.t,
+    ...(opts.blocked
+      ? {
+          isPidAlive: opts.blocked.pidAlive,
+          portListening: async (port: number) => opts.blocked!.listening(port),
+        }
+      : {}),
   };
   return { deps, calls, clock };
 }
@@ -221,5 +230,71 @@ describe("acquireApiPort", () => {
     const h = harness({ readCreds: () => creds(), waitForPortFree: () => true });
     await expect(acquireApiPort(h.deps)).rejects.toThrow("EADDRINUSE attempt 1");
     expect(h.calls.starts).toBe(2);
+  });
+
+  test("a blocked live core (pid alive, port listening, probe failing) is waited for past 5 s, then handed off", async () => {
+    // The probe fails for the first 30 s (a VACUUM holds the core's thread),
+    // then answers: the app hands off instead of exiting with "port held".
+    const clockRef: { t?: () => number } = {};
+    const h = harness({
+      startSucceedsOnAttempt: 1_000_000, // set below
+      readCreds: () => creds(),
+      probe: () => (clockRef.t!() - 1_000_000 >= 30_000),
+      blocked: { pidAlive: () => true, listening: () => true },
+    });
+    clockRef.t = h.deps.now;
+    // Only the post-handoff bind succeeds.
+    const start = h.deps.start;
+    h.deps.start = () => {
+      if (h.calls.fetches.length > 0) return "server-after-handoff";
+      return start();
+    };
+    const logs: string[] = [];
+    h.deps.log = (m) => logs.push(m);
+    expect(await acquireApiPort(h.deps)).toBe("server-after-handoff");
+    expect(h.clock.t - 1_000_000).toBeGreaterThanOrEqual(30_000);
+    expect(h.calls.fetches).toHaveLength(1);
+    expect(logs.filter((m) => m.includes("alive but not answering"))).toHaveLength(1);
+  });
+
+  test("a blocked core that never answers is given up on after TAKEOVER_BLOCKED_CORE_WAIT_MS", async () => {
+    const h = harness({
+      readCreds: () => creds(),
+      probe: () => false,
+      blocked: { pidAlive: () => true, listening: () => true },
+    });
+    await expect(acquireApiPort(h.deps)).rejects.toThrow("EADDRINUSE attempt 1");
+    expect(h.clock.t - 1_000_000).toBe(TAKEOVER_BLOCKED_CORE_WAIT_MS);
+    expect(h.calls.fetches).toHaveLength(0);
+  });
+
+  test("a dead pid or a refused port does not extend the 5 s window", async () => {
+    for (const blocked of [
+      { pidAlive: () => false, listening: () => true },
+      { pidAlive: () => true, listening: () => false },
+      {
+        pidAlive: () => true,
+        listening: (): boolean => {
+          throw new Error("connect blew up");
+        },
+      },
+    ]) {
+      const h = harness({ readCreds: () => creds(), probe: () => false, blocked });
+      await expect(acquireApiPort(h.deps)).rejects.toThrow("EADDRINUSE attempt 1");
+      expect(h.clock.t - 1_000_000).toBe(TAKEOVER_RETRY_WINDOW_MS);
+    }
+  });
+
+  test("a blocked live APP is waited for too, then still refused once it answers", async () => {
+    const clockRef: { t?: () => number } = {};
+    const h = harness({
+      readCreds: () => creds({ kind: "app" }),
+      probe: () => (clockRef.t!() - 1_000_000 >= 10_000),
+      blocked: { pidAlive: () => true, listening: () => true },
+    });
+    clockRef.t = h.deps.now;
+    await expect(acquireApiPort(h.deps)).rejects.toThrow("EADDRINUSE attempt 1");
+    expect(h.clock.t - 1_000_000).toBe(10_000);
+    expect(h.calls.fetches).toHaveLength(0);
   });
 });

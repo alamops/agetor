@@ -130,6 +130,8 @@ import {
   setBackgroundTaskSettledHandler,
   setLocalSettingChangedHandler,
   claudeBootsInFlight,
+  claudeTmuxOpsInFlight,
+  CLAUDE_BOOT_TIMEOUT_MS,
   type LocalSettingInfo,
 } from "./claude-tmux.ts";
 import {
@@ -954,8 +956,11 @@ wireInteractionBroadcast();
  */
 /** How long after a claude run started its session JSONL may still be missing
  *  without that meaning the session is broken: claude writes the file when it
- *  takes the first prompt, a few seconds after the spawn. */
-export const CLAUDE_JSONL_APPEAR_GRACE_MS = 20_000;
+ *  takes the first prompt, a few seconds after the spawn — or, on a big
+ *  project, as late as the spawner's own boot timeout. Sized past
+ *  `CLAUDE_BOOT_TIMEOUT_MS` so a slow boot whose previous owner handed off
+ *  mid-launch is never killed as "JSONL missing" while it is still healthy. */
+export const CLAUDE_JSONL_APPEAR_GRACE_MS = CLAUDE_BOOT_TIMEOUT_MS + 5_000;
 
 export async function reconcileOrphans(): Promise<number> {
   // Sort newest-first so the at-most-one-reattach-per-task rule below keeps
@@ -1482,14 +1487,17 @@ export function activeRunCount(): number {
 /**
  * How many launches this process is still in the middle of: spawns that hold
  * a task's start claim (`startingTaskIds`, which covers the codex/cursor/…
- * one-shot launches and claude's own pre-JSONL spawn) plus claude sessions
- * that haven't written their JSONL yet (`claudeBootsInFlight` — the deferred
+ * one-shot launches and claude's own pre-JSONL spawn), claude sessions that
+ * haven't written their JSONL yet (`claudeBootsInFlight` — the deferred
  * > 4 KB first-prompt paste and the startup-dialog confirm both run in this
- * process). A launch interrupted by the process exiting leaves a session the
- * next owner can't reattach, so a core handing the port off waits for these.
+ * process), and claude tmux op chains still running (`claudeTmuxOpsInFlight` —
+ * a follow-up paste between its text and its Enter, an ask-card drive). A
+ * launch interrupted by the process exiting leaves a session the next owner
+ * can't reattach or a composer holding half a message, so a core handing the
+ * port off — and the app before it lets a quit through — waits for these.
  */
 export function launchesInFlight(): number {
-  return startingTaskIds.size + claudeBootsInFlight();
+  return startingTaskIds.size + claudeBootsInFlight() + claudeTmuxOpsInFlight();
 }
 
 /** Poll cadence of `waitForLaunchesToSettle`. */
@@ -1506,6 +1514,61 @@ export async function waitForLaunchesToSettle(timeoutMs: number): Promise<boolea
     if (Date.now() >= deadline) return false;
     await Bun.sleep(Math.min(LAUNCH_SETTLE_POLL_MS, Math.max(0, deadline - Date.now())));
   }
+}
+
+/** Why a launch was refused once this process stopped taking new work. */
+export const LAUNCHES_FROZEN_REASON =
+  "Agetor is handing its work over to another process — try again in a moment";
+
+/** True once `freezeLaunches` ran: this process is about to exit. */
+let launchesFrozenFlag = false;
+
+/**
+ * Stop taking new work because this process is about to exit — a headless core
+ * handing the port to the app (or stopping), or the app letting a quit through.
+ * Called right before the bounded `waitForLaunchesToSettle`, so nothing new
+ * starts that the wait would then cut off at its deadline. Terminal and
+ * idempotent: the process exits once the wait ends.
+ *
+ * - `startTask`, `sendInput` and `resumeFxRecovery` refuse with
+ *   {@link LAUNCHES_FROZEN_REASON} (an idle-only send also reads `busy`, so
+ *   the pipeline runner's reminder is retried by the next owner instead of
+ *   blocking the step);
+ * - fx auto-resume timers stop (the next owner re-arms them from the DB);
+ * - follow-ups queued behind a running one-shot turn — memory-only, so they
+ *   would die with the process — move to their task's backlog tray now, and a
+ *   turn that settles during the wait stashes its queue instead of draining it;
+ * - the pipeline runner leaves step settles to the next owner's
+ *   `reconcilePipelineRuns` (`launchesFrozen()`).
+ *
+ * Runs already in flight keep going: their tmux sessions outlive the process
+ * and the next owner reattaches them.
+ */
+export function freezeLaunches(): void {
+  if (launchesFrozenFlag) return;
+  launchesFrozenFlag = true;
+  try {
+    stopFxAutoResumeTimers();
+  } catch (err) {
+    console.warn("[agetor] stopping fx auto-resume timers failed:", err);
+  }
+  for (const taskId of tasksWithQueuedFollowUps()) {
+    try {
+      stashQueuedFollowUps(taskId, tasks.get(taskId)?.runId ?? null, "Agetor stopped before it could run");
+    } catch (err) {
+      console.warn(`[agetor] stashing queued follow-ups for task ${taskId} failed:`, err);
+    }
+  }
+}
+
+/** True once {@link freezeLaunches} ran. */
+export function launchesFrozen(): boolean {
+  return launchesFrozenFlag;
+}
+
+/** Test-only: undo {@link freezeLaunches} (it is terminal in production). */
+export function __resetLaunchFreezeForTest(): void {
+  launchesFrozenFlag = false;
 }
 /**
  * Runs the user asked to Stop while their spawn was still in flight (the
@@ -1769,6 +1832,7 @@ export async function startTask(
 ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
+  if (launchesFrozenFlag) return { error: LAUNCHES_FROZEN_REASON, code: "launches-frozen" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
   if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
   startingTaskIds.add(taskId);
@@ -3271,6 +3335,13 @@ function attachDoneHandler(
  * A Stop on an ordinary task keeps draining, as before.
  */
 async function drainFollowUpQueues(taskId: string, runId: string, wasCancelled: boolean): Promise<void> {
+  if (launchesFrozenFlag) {
+    // This process is exiting (`freezeLaunches`): a drained turn would be cut
+    // off, and an undrained queue dies with the process — keep the text.
+    fxPendingSteers.delete(runId);
+    stashQueuedFollowUps(taskId, runId, "Agetor stopped before it could run");
+    return;
+  }
   if (wasCancelled && isPipelineStepTaskId(taskId)) {
     // Dropped steers were re-queued in send order before `done` resolved.
     fxPendingSteers.delete(runId);
@@ -3330,16 +3401,44 @@ function takeQueuedFollowUps(taskId: string): string[] {
  * (`restashPasteWithheldText`), and then no line is written.
  */
 function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void {
+  stashQueuedFollowUps(taskId, runId, "this pipeline step was stopped", "to continue it");
+}
+
+/**
+ * Move every follow-up queued for `taskId` into its backlog tray, in send
+ * order, and say why on `runId` (when given): `<n> queued message(s) not sent
+ * — <why>; saved to your backlog, resend from the tray<tail>`. A task gone or
+ * archived keeps nothing (`restashPasteWithheldText`), and then no line is
+ * written.
+ */
+function stashQueuedFollowUps(taskId: string, runId: string | null, why: string, tail = ""): void {
   const lines = takeQueuedFollowUps(taskId);
   if (lines.length === 0) return;
   let saved = false;
   // `backlog.add` PREPENDS, so restash newest first (see `drainCodexQueue`).
   for (const text of [...lines].reverse()) saved = restashPasteWithheldText(taskId, text) || saved;
-  if (!saved) return;
+  if (!saved || runId === null) return;
   const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
-  const data = `${what} — this pipeline step was stopped; saved to your backlog, resend from the tray to continue it`;
+  const data = `${what} — ${why}; saved to your backlog, resend from the tray${tail ? ` ${tail}` : ""}`;
   runs.appendEvent(runId, "status", data);
   emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/** Every task id with at least one queued follow-up, any harness. */
+function tasksWithQueuedFollowUps(): string[] {
+  const ids = new Set<string>();
+  for (const q of [
+    codexTurnQueue,
+    cursorTurnQueue,
+    geminiTurnQueue,
+    antigravityTurnQueue,
+    opencodeTurnQueue,
+    copilotTurnQueue,
+    fxTurnQueue,
+  ] as Map<string, unknown[]>[]) {
+    for (const [taskId, lines] of q) if (lines.length > 0) ids.add(taskId);
+  }
+  return [...ids];
 }
 
 /**
@@ -4197,6 +4296,11 @@ export async function sendInput(
 
   const task = tasks.get(row.task_id);
   if (!task) return { delivered: false, reason: "task not found" };
+  if (launchesFrozenFlag) {
+    return opts.onlyIfIdle === true
+      ? { delivered: false, busy: true, reason: LAUNCHES_FROZEN_REASON }
+      : { delivered: false, reason: LAUNCHES_FROZEN_REASON };
+  }
 
   // Everything past the two cheap lookups above — the codex floor probe, the
   // teardown wait, the worktree restore, `@`-expansion and the per-kind
@@ -6029,6 +6133,9 @@ function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string)
     const q = fxTurnQueue.get(taskId) ?? [];
     insertBySendOrder(q, { line: text, seq, echoed: true });
     fxTurnQueue.set(taskId, q);
+    // Exiting (`freezeLaunches`): the drain stashes it into the backlog
+    // instead of sending it as the next turn, so don't announce that.
+    if (launchesFrozenFlag) return false;
     // The driver calls this before `done` resolves, so the handle is still
     // registered: a stopped step's queue goes to the backlog, not a turn.
     return !(active.get(runId)?.cancelled === true && task.pipelineParentId != null);
@@ -6855,6 +6962,7 @@ export async function resumeFxRecovery(
 ): Promise<
   { ok: true; runId: string } | { ok: false; status: 400 | 404 | 409 | 500; error: string }
 > {
+  if (launchesFrozenFlag) return { ok: false, status: 409, error: LAUNCHES_FROZEN_REASON };
   if (resumingTaskIds.has(taskId)) {
     return { ok: false, status: 409, error: "a resume is already in flight for this task" };
   }

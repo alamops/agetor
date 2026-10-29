@@ -142,6 +142,47 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
+/** Bound on the loopback TCP connect `portAcceptsConnections` makes. */
+export const LIVE_CORE_CONNECT_TIMEOUT_MS = 1_000;
+
+/**
+ * Does anything accept TCP connections on 127.0.0.1:`port`? The kernel
+ * completes the handshake for a listening socket on its own, so this answers
+ * `true` for a core whose JS thread is blocked (a native Open panel, a message
+ * box, a VACUUM) — exactly when its HTTP probe can't answer. `false` only on a
+ * failed connect (refused: nothing listens). A connect that neither succeeds
+ * nor fails within `timeoutMs` (a full listen backlog drops SYNs) reads as
+ * `true`: something is listening, it is just not accepting yet.
+ */
+export async function portAcceptsConnections(
+  port: number,
+  timeoutMs = LIVE_CORE_CONNECT_TIMEOUT_MS,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(true), timeoutMs);
+  });
+  const attempt = Bun.connect({
+    hostname: "127.0.0.1",
+    port,
+    socket: {
+      open(socket) {
+        socket.end();
+      },
+      data() {},
+      error() {},
+    },
+  }).then(
+    () => true,
+    () => false,
+  );
+  try {
+    return await Promise.race([attempt, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Verify a discovered core is actually live and ours: the pid is alive, `/health`
  * self-identifies as agetor (guards against another service grabbing the port,

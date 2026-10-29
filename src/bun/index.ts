@@ -10,7 +10,18 @@ import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import {
+  freezeLaunches,
+  launchesInFlight,
+  reconcileOrphans,
+  rearmFxAutoResumes,
+  sweepArchivedTeardowns,
+  reapIdleSessions,
+  stopFxAutoResumeTimers,
+  waitForLaunchesToSettle,
+} from "./orchestrator.ts";
+import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
+import { createQuitLaunchGate } from "./quit-launch-gate.ts";
 import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
 import { resumeIncompleteOpencodeImports } from "./opencode-session-import.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -25,7 +36,13 @@ import { coreSpawn } from "./core-spawn.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
-import { broadcastAppEvent, consumeForceQuit, consumeQuitCompletely, requestQuitCompletely } from "./quit-guard.ts";
+import {
+  armForceQuit,
+  broadcastAppEvent,
+  consumeForceQuit,
+  consumeQuitCompletely,
+  requestQuitCompletely,
+} from "./quit-guard.ts";
 import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
 import { acquireApiPort } from "./app-takeover.ts";
 import { bootReadySignal } from "./boot-gate.ts";
@@ -45,7 +62,15 @@ import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
 import { repairFrame } from "./screen-frame.ts";
-import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
+import {
+  writeCoreCreds,
+  removeCoreCreds,
+  readCoreCreds,
+  probeLiveCore,
+  waitForPortFree,
+  isPidAlive,
+  portAcceptsConnections,
+} from "./core-creds.ts";
 import { resolveNotifierApp } from "./notifier.ts";
 import { parseTaskDeepLink } from "./deep-link.ts";
 import { createTaskNotifier } from "./task-notifier.ts";
@@ -298,6 +323,8 @@ try {
     waitForPortFree,
     sleep: (ms) => Bun.sleep(ms),
     now: () => Date.now(),
+    isPidAlive,
+    portListening: (port) => portAcceptsConnections(port),
     log: (m) => console.log(m),
   });
 } catch (e) {
@@ -574,6 +601,22 @@ setTimeout(() => {
 // Reattached runs (claude-code sessions kept alive across restart) count
 // as running, so the user is still prompted if they try to quit while one
 // is in flight.
+//
+// A quit about to be allowed still waits (bounded, `HANDOFF_LAUNCH_SETTLE_MS`)
+// for agent launches this process is in the middle of — a claude session that
+// hasn't taken its first prompt yet would otherwise die with the app, which
+// breaks "they'll keep running in the background" (quit-launch-gate.ts).
+const quitLaunchGate = createQuitLaunchGate({
+  launchesInFlight,
+  waitForLaunchesToSettle,
+  freezeLaunches,
+  requeueQuit: ({ completely }) => {
+    armForceQuit({ completely });
+    Utils.quit();
+  },
+  timeoutMs: HANDOFF_LAUNCH_SETTLE_MS,
+  log: (m) => console.log(m),
+});
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
   // Background host armed = a live login-item supervisor is parked under this
   // app, or waiting out a grace window to start. Read synchronously from its
@@ -585,7 +628,18 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
   // intent again.
   const forced = consumeForceQuit();
   const completely = consumeQuitCompletely() || forced?.completely === true;
+  // A quit already held for launches: this one (a second Cmd+Q, the menu's
+  // "Quit Agetor Completely") is absorbed into it — no second confirm dialog.
+  if (quitLaunchGate.isWaiting()) {
+    quitLaunchGate.holdQuit(completely);
+    event.response = { allow: false };
+    return;
+  }
   const allowQuit = () => {
+    if (quitLaunchGate.holdQuit(completely)) {
+      event.response = { allow: false };
+      return;
+    }
     // Only when a supervisor is alive to read it: a request written with none
     // running would otherwise linger for the next supervisor to start (the
     // background turned on later, or the next login). takeSupervisorStop also

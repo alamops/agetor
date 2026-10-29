@@ -5685,7 +5685,15 @@ export function startApiServer(
           }
           server.timeout(req, 0);
           const result = await startTask(req.params.id);
-          const status = "error" in result && result.code === "imported-session" ? 409 : 400;
+          // A core about to exit (`freezeLaunches`) answers 503: retry against
+          // the next owner, not a bad request.
+          const status = !("error" in result)
+            ? 200
+            : result.code === "imported-session"
+            ? 409
+            : result.code === "launches-frozen"
+            ? 503
+            : 400;
           return "error" in result
             ? json(result, { status, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });

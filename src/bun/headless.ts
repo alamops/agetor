@@ -2,6 +2,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
 import { db, dataDir, subagents, preferences } from "./db.ts";
 import {
+  freezeLaunches,
   launchesInFlight,
   reconcileOrphans,
   rearmFxAutoResumes,
@@ -118,13 +119,16 @@ let handingOff = false;
  * right away would strand any agent launch this process is still in the middle
  * of — a claude session waiting for its > 4 KB first prompt to be pasted, or
  * for its startup dialog to be confirmed, never writes its JSONL, and the app's
- * restore orphans it after the grace. So wait (bounded) for in-flight launches
- * to settle, then shut down. The core keeps serving meanwhile; a stop request
- * or a signal still exits at once.
+ * restore orphans it after the grace. So stop taking new work first
+ * (`freezeLaunches`: a launch started during the wait would only be cut off at
+ * its deadline), then wait (bounded) for the in-flight launches to settle, then
+ * shut down. The core keeps serving reads meanwhile; a stop request or a
+ * signal still exits at once.
  */
 async function handOffPort(reason: string, code: number): Promise<void> {
   if (handingOff || shuttingDown) return;
   handingOff = true;
+  freezeLaunches();
   const pending = launchesInFlight();
   if (pending > 0) {
     daemonLog(`handoff requested — waiting for ${pending} agent launch(es) to settle`);
@@ -145,6 +149,14 @@ function shutdown(reason: string, code = 0): void {
   if (shuttingDown) return;
   shuttingDown = true;
   daemonLog(`shutting down (${reason})`);
+  // Take no new work, and keep the follow-ups queued in memory (they would die
+  // with the process) in their tasks' backlog trays. Idempotent: a handoff
+  // already froze before its launch wait.
+  try {
+    freezeLaunches();
+  } catch (err) {
+    daemonLog(`freezing launches failed: ${String(err)}`);
+  }
   // fx-acp.ts's own SIGINT/SIGTERM/SIGHUP handlers always reap `fx acp`
   // children but only call `process.exit` themselves when they're the sole
   // listener for that signal — since this module registers its own

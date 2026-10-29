@@ -3197,6 +3197,13 @@ interface TurnSlot {
 
 const sessions = new Map<string, SessionState>(); // taskId → state
 
+/** How long `spawnClaudeViaTmux` waits for a fresh session's JSONL before it
+ *  reports the boot as stuck (re-armed while a startup question or the deferred
+ *  first-prompt paste is still pending). Exported so the boot restore's
+ *  "JSONL may still appear" grace (`CLAUDE_JSONL_APPEAR_GRACE_MS`) can be sized
+ *  past it. */
+export const CLAUDE_BOOT_TIMEOUT_MS = 30_000;
+
 /** One entry per `spawnClaudeViaTmux` boot that hasn't attached its JSONL tail
  *  (or given up) yet — see `claudeBootsInFlight`. */
 const bootsInFlight = new Set<object>();
@@ -3245,6 +3252,18 @@ export function claudeBootsInFlight(): number {
  * for long-lived sessions.
  */
 const pasteChains = new Map<string, Promise<void>>(); // taskId → in-flight chain tail
+
+/**
+ * How many tasks have a tmux op chain still running (a follow-up paste, an
+ * ask-card or plan drive, a modal dismissal, a `/model` picker mirror). A
+ * process that exits mid-chain can leave pasted text in claude's composer
+ * without its Enter, or a modal half-driven — so a core handing the port off
+ * waits for these too (`launchesInFlight` in orchestrator.ts). Entries
+ * self-evict when their chain drains, so this is 0 on an idle process.
+ */
+export function claudeTmuxOpsInFlight(): number {
+  return pasteChains.size;
+}
 
 /**
  * Build a SessionState. Caller supplies the path-/launch-specific fields and
@@ -8565,7 +8584,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // configured servers). Generous because on big projects the local
   // skill scan can take 15s+; the fs.watch trigger means we attach as
   // soon as it appears regardless.
-  const BOOT_TIMEOUT_MS = 30_000;
+  const BOOT_TIMEOUT_MS = CLAUDE_BOOT_TIMEOUT_MS;
   // Counted until the JSONL is attached or the boot gives up: until then the
   // first prompt may still be owed to the pane by THIS process (a deferred
   // paste, a startup dialog's confirm), so a handoff waits for it
