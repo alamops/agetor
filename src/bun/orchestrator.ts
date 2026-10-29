@@ -5992,10 +5992,18 @@ function latestResumableFxPause(taskId: string): { runId: string; payload: FxRec
 }
 
 /** The task's fx `--version` line through the 60 s probe cache, or `null`
- *  (also for a task whose harness isn't fx: no other CLI's version counts). */
+ *  (also for a task whose harness isn't fx: no other CLI's version counts).
+ *  A probe that throws (the spawn itself failing, e.g. EACCES) reads as
+ *  unknown too, so the boot sweep, a detached auto-resume and a manual
+ *  Resume keep today's behaviour instead of rejecting. */
 async function fxCliVersion(task: Task): Promise<string | null> {
   const harness = resolveHarness(task.agent);
-  return harness?.kind === "fx" ? cachedCliVersion(harness) : null;
+  if (harness?.kind !== "fx") return null;
+  try {
+    return await cachedCliVersion(harness);
+  } catch {
+    return null;
+  }
 }
 
 /** Same, without probing: the last version `checkHarness` saw, or `null`. */

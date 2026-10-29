@@ -2528,3 +2528,26 @@ describe("fx 0.0.15+: no Resume, no auto-resume", () => {
     expect(events.some((e) => e.stream === "status" && e.data.startsWith("auto-resume scheduled"))).toBe(false);
   }, 10_000);
 });
+
+test("fx 0.0.15+ gate: a version probe that throws reads as unknown — the boot sweep keeps the scheduled pause instead of rejecting", async () => {
+  const { rearmFxAutoResumes, stopFxAutoResumeTimers, __testing } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { taskId } = await pauseFxTask("fx version probe throws");
+  expect(tasks.get(taskId)?.fxRecovery?.autoResume).toBeTruthy();
+  stopFxAutoResumeTimers();
+
+  // A non-executable file: `resolveBinPath` accepts it, `Bun.spawn` throws EACCES.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-fx-noexec-bin-"));
+  const bin = path.join(dir, "fx");
+  writeFileSync(bin, "#!/bin/sh\necho 0.0.15\n");
+  chmodSync(bin, 0o644);
+  const prevBin = process.env.AGETOR_FX_BIN;
+  process.env.AGETOR_FX_BIN = bin;
+  try {
+    expect(await rearmFxAutoResumes()).toBeGreaterThanOrEqual(1);
+  } finally {
+    process.env.AGETOR_FX_BIN = prevBin;
+  }
+  expect(tasks.get(taskId)?.fxRecovery?.autoResume).toBeTruthy();
+  expect(__testing.pendingFxAutoResume(taskId)).toBe(true);
+}, 10_000);
