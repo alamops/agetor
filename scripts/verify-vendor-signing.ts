@@ -32,6 +32,10 @@ const OWNERS: Record<string, string> = {
   tmux: "scripts/fetch-tmux.ts",
   notifier: "scripts/build-notifier.ts",
   disclaim: "scripts/build-disclaim.ts",
+  // Shipped in Contents/MacOS (electrobun re-signs it there), but a Developer
+  // ID + runtime + timestamp signature here keeps this gate honest about the
+  // bytes electrobun starts from.
+  "login-item": "scripts/build-login-item.ts",
 };
 
 async function run(cmd: string[]): Promise<{ code: number; out: string }> {

@@ -1,5 +1,7 @@
 import { Updater } from "electrobun/bun";
 import { publishGlobalEvent } from "./orchestrator.ts";
+import { dataDir } from "./db.ts";
+import { writeHandbackMarker } from "./login-daemon-state.ts";
 import type { UpdateStatus } from "../shared/types.ts";
 
 /**
@@ -118,6 +120,14 @@ export async function checkForUpdate(): Promise<void> {
  * back to the client at that point.
  */
 export async function applyUpdate(): Promise<void> {
+  // Tell the background supervisor this quit is an update (D8): it takes the
+  // port back and waits for the relaunch instead of reading the app's
+  // disappearance as a crash. Never blocks the update.
+  try {
+    writeHandbackMarker("update", dataDir);
+  } catch (err) {
+    console.warn("[agetor] failed to write the update handback marker:", err);
+  }
   await Updater.applyUpdate();
 }
 

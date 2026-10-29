@@ -1,3 +1,8 @@
+// MUST stay the first import: it sets the channel's default AGETOR_DATA_DIR /
+// API port as a side effect, and ESM evaluates imports in order — anything below
+// that reaches db.ts (which opens and migrates SQLite on import) would otherwise
+// open the wrong data dir (docs/plans/always-on-host.md §3.6).
+import "./channel-defaults.ts";
 import { writeFileSync, existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
@@ -20,7 +25,18 @@ import { coreSpawn } from "./core-spawn.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
-import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
+import { broadcastAppEvent, consumeForceQuit, consumeQuitCompletely, requestQuitCompletely } from "./quit-guard.ts";
+import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
+import { acquireApiPort } from "./app-takeover.ts";
+import { runRemoteAccessBox } from "./remote-access-box.ts";
+import {
+  getBackgroundStatus,
+  turnOnBackground,
+  openLoginItems,
+  getRemoteAccess,
+  setRemoteAccessOff,
+  setRemoteAccessOnFromNativeBox,
+} from "./background.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
@@ -71,11 +87,16 @@ function installNativeMenu() {
       submenu: [
         { role: "about" },
         { type: "separator" },
+        { label: "Remote Access…", action: "remote-access" },
+        { type: "separator" },
         { role: "hide", accelerator: "Cmd+H" },
         { role: "hideOthers", accelerator: "Cmd+Alt+H" },
         { role: "showAll" },
         { type: "separator" },
         { role: "quit", accelerator: "Cmd+Q" },
+        // Stops the background host too (D6): a plain quit parks the core under
+        // the login item when "run in the background" is on.
+        { label: "Quit Agetor Completely", action: "quit-completely", accelerator: "Cmd+Alt+Q" },
       ],
     },
     {
@@ -283,6 +304,40 @@ setInterval(() => {
 
 installNativeMenu();
 
+/** `Utils.showMessageBox` blocks the Bun thread (synchronous FFI) until the user
+ *  answers, so every box is bracketed with the lag label — same as
+ *  `confirmKeepOff`. */
+async function showLabelledMessageBox(opts: Parameters<typeof Utils.showMessageBox>[0]) {
+  const end = beginLagLabel("native message box");
+  try {
+    return await Utils.showMessageBox(opts);
+  } finally {
+    end();
+  }
+}
+
+Electrobun.events.on("application-menu-clicked", (e: { data?: { action?: string } }) => {
+  const action = e?.data?.action;
+  if (action === "remote-access") {
+    void runRemoteAccessBox({
+      showMessageBox: showLabelledMessageBox,
+      background: {
+        getBackgroundStatus,
+        turnOnBackground,
+        getRemoteAccess,
+        setRemoteAccessOff,
+        setRemoteAccessOnFromNativeBox,
+      },
+      openLoginItems,
+      log: (m) => console.warn(m),
+    });
+  } else if (action === "quit-completely") {
+    // before-quit reads this one-shot; with runs active it still asks first.
+    requestQuitCompletely();
+    Utils.quit();
+  }
+});
+
 // Best-effort: probe the agent CLIs (and every enabled fx harness's own
 // account-scoped catalog) for their model lists so the form can surface
 // anything new the user installed — or logged into — without an app update.
@@ -392,41 +447,32 @@ if (!requestedApiHost.ok || requestedApiHost.host !== DEFAULT_API_HOST) {
 
 let apiServer: ReturnType<typeof startApiServer>;
 try {
-  apiServer = startApiServer({ native });
+  // Port busy? acquireApiPort asks a CLI daemon / login-item core to hand off
+  // (retrying briefly while a daemon's creds file lands, C16); anything else — a
+  // live app, or a foreign process (a stale agetor, or OTLP gRPC which also
+  // defaults to 4317) — falls through to the loud message + exit so the user
+  // sees the real problem rather than a wall of CORS errors in the renderer.
+  apiServer = await acquireApiPort({
+    start: () =>
+      startApiServer({
+        native,
+        // Same post/remove pair `native` offers; the server prefers `native`
+        // when both are given (headless cores get only this).
+        notifications: { post: (n) => taskNotifier.post(n), remove: (r) => taskNotifier.remove(r) },
+      }),
+    readCreds: () => readCoreCreds(dataDir),
+    probe: probeLiveCore,
+    fetch,
+    waitForPortFree,
+    sleep: (ms) => Bun.sleep(ms),
+    now: () => Date.now(),
+    log: (m) => console.log(m),
+  });
 } catch (e) {
-  // Port busy. If our own cli-daemon owns it (the CLI started a background core
-  // while the app was closed), ask it to hand off, wait for the port to free,
-  // then bind and become the owner. Anything else — a foreign process (stale
-  // agetor, or OTLP gRPC which also defaults to 4317) or a wedged daemon that
-  // won't release — falls through to the loud message + exit so the user sees
-  // the real problem rather than a wall of CORS errors in the renderer.
-  const creds = readCoreCreds(dataDir);
-  let recovered: ReturnType<typeof startApiServer> | null = null;
-  if (creds && creds.kind === "cli-daemon" && (await probeLiveCore(creds))) {
-    console.log("[agetor] a CLI daemon owns the API port — requesting handoff…");
-    try {
-      await fetch(`http://127.0.0.1:${creds.port}/daemon/shutdown`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${creds.token}` },
-      });
-    } catch {
-      /* the daemon drops the connection as it exits — expected */
-    }
-    if (await waitForPortFree(creds.port, 10_000)) {
-      try {
-        recovered = startApiServer({ native });
-      } catch {
-        /* fall through to the loud message below */
-      }
-    }
-  }
-  if (!recovered) {
-    const msg = (e as Error)?.message ?? String(e);
-    console.error(`[agetor] failed to bind API on ${DEFAULT_API_HOST}:${API_PORT}: ${msg}`);
-    console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
-    process.exit(1);
-  }
-  apiServer = recovered;
+  const msg = (e as Error)?.message ?? String(e);
+  console.error(`[agetor] failed to bind API on ${DEFAULT_API_HOST}:${API_PORT}: ${msg}`);
+  console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
+  process.exit(1);
 }
 
 // Publish the per-launch API port + token so the CLI (and a second app launch)
@@ -446,6 +492,13 @@ writeCoreCreds(
   },
   dataDir,
 );
+
+// C3 reconcile: the first fresh status read lets background.ts heal a login item
+// whose registration drifted (e.g. an app moved or replaced). Fire-and-forget; a
+// source run has no helper, which reads as `unavailable` and is not an error.
+void getBackgroundStatus({ fresh: true }).catch((err) => {
+  console.warn("[agetor] background status reconcile failed:", err);
+});
 
 // Archived-history retention: first pass ~90 s after boot (after the API is
 // up and restore/seed work has settled), then every 24 h; each fire reads the
@@ -498,9 +551,32 @@ setTimeout(() => {
 // as running, so the user is still prompted if they try to quit while one
 // is in flight.
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
-  if (consumeForceQuit()) {
+  // Background host armed = a live login-item supervisor is parked under this
+  // app, or waiting out a grace window to start. Read synchronously from its
+  // state file — no helper spawn inside before-quit.
+  const backgroundArmed = ((s) => s !== null && (s.state === "parked" || s.state === "waiting"))(
+    liveSupervisor(dataDir),
+  );
+  // Both consumers are one-shot. A vetoed quit loses nothing: when the user
+  // confirms in the webview, `POST /app/force-quit {completely}` carries the
+  // intent again.
+  const forced = consumeForceQuit();
+  const completely = consumeQuitCompletely() || forced?.completely === true;
+  const allowQuit = () => {
+    if (completely) {
+      // The supervisor would otherwise take the port back when this process
+      // dies; this asks it to stay down until the next login (D6).
+      try {
+        requestSupervisorStop(dataDir);
+      } catch (err) {
+        console.warn("[agetor] failed to write the supervisor stop request:", err);
+      }
+    }
     removeCoreCreds(dataDir);
     event.response = { allow: true };
+  };
+  if (forced) {
+    allowQuit();
     return;
   }
   let runningCount = 0;
@@ -519,16 +595,15 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     // of a missed warning is small; the cost of trapping the user is high.
   }
   if (runningCount === 0) {
-    removeCoreCreds(dataDir);
-    event.response = { allow: true };
+    allowQuit();
     return;
   }
   broadcastAppEvent({
     type: "quit_request",
     runningRunCount: runningCount,
     runningTaskTitles,
-    backgroundArmed: false,
-    completely: false,
+    backgroundArmed,
+    completely,
     ts: Date.now(),
   });
   event.response = { allow: false };
