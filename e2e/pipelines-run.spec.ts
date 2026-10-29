@@ -362,7 +362,7 @@ test.describe("pipelines run: executing a run", () => {
     // button itself instead of relying on that coincidence.
     await historyRows.first().getByRole("button").first().click();
     await expect(historyRows.first().getByTestId("pipeline-run-history-handoff")).toBeVisible();
-    await expect(historyRows.first().getByTestId("pipeline-run-history-handoff")).toContainText("schemaVersion");
+    await expect(historyRows.first().getByTestId("pipeline-run-history-handoff")).toContainText("fake summary for");
 
     await waitForColumn(backend, task.id, "review");
 

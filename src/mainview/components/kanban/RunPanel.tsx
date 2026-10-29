@@ -81,6 +81,7 @@ import {
   type FxUsagePayload,
   type GitHubPullMergeability,
   type PipelineGraph,
+  type PipelineRunState,
   type Run,
   type RunEvent,
   type Subagent,
@@ -126,9 +127,12 @@ import { TerminalView } from "./TerminalView";
 import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
 import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
-import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
+import { ASSISTANT_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM, MdImageScopeContext, EMPTY_MD_IMAGE_SCOPE, type MdImageScope } from "./md-components";
 import { MachineLabel, CommandOutputBody, MessageSegments, hasAuthoredContent, HandoffReminderBadge } from "./MessageSegments";
 import { CompactionSummaryBlock } from "./CompactionSummaryBlock";
+import { HandoffViewContext, stepNameFor, useHandoffView, type HandoffViewValue } from "@/components/handoff/handoff-context";
+import { AssistantHandoffMessage, UserHandoffMarkdown } from "@/components/handoff/HandoffMessage";
+import { handoffCardsEnabled, handoffUsage, indexLastHandoffEventByRun } from "@/lib/handoff-view";
 import { SpeedPicker } from "./SpeedPicker";
 import { OpencodeServerPicker, opencodeServerLock, showOpencodeServerPicker } from "./OpencodeServerPicker";
 import { importedSessionOf } from "../../../shared/imported-session.ts";
@@ -728,12 +732,29 @@ function RunPanelBody({
    *  subagent id. Background-agent streams are READ-ONLY — the composer is
    *  hidden while one is active. */
   const [activeStream, setActiveStream] = useState<string>("main");
+  /** Formatted handoff cards render (and search indexes handoff field values
+   *  instead of the raw JSON — `docs/plans/formatted-handoff.md` D10) only on
+   *  a pipeline step task's Main stream, on a harness whose assistant events
+   *  carry whole messages (K2: gemini/antigravity delta streams stay raw).
+   *  Derived from primitives up here so the search memo below can read it;
+   *  the full `handoffView` context value is built further down, next to the
+   *  roots and the parent's run it also needs. */
+  const handoffCardsOn = handoffCardsEnabled({
+    isStepTask: task.pipelineParentId != null,
+    kind,
+    mainStream: activeStream === "main",
+  });
   /** In-panel search over whichever stream is currently displayed (see
    *  lib/event-search.ts). Read-only and deliberately NOT gated on
    *  `activeStream === "main"` or archival state — it works identically on a
    *  subagent tab or an archived task's frozen log. */
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  /** The live query, for the imperative highlight effect's `EXPAND_EVENT`
+   *  detail (the handoff card's "in handoff" hint reads it) — a ref so the
+   *  effect doesn't re-run, and re-scroll, on every keystroke. */
+  const searchQueryRef = useRef(searchQuery);
+  searchQueryRef.current = searchQuery;
   /** The selected match, as an index into `displayedEvents` — NOT a
    *  `StreamEvent.id`. A JSONL-rebuilt event has no client-assigned id at
    *  all (see `StreamEvent`'s doc comment above), so `findMatchingEventIds`
@@ -922,6 +943,10 @@ function RunPanelBody({
     // for whichever task this switch landed on). The cache itself (the ref)
     // deliberately survives this reset — see that effect's doc comment.
     setPipelineStrip(null);
+    // The parent pipeline run the formatted handoff surfaces read (K7) is
+    // per-task too: a switch to another step (or a non-step task) must never
+    // show the previous parent's run until its own fetch lands.
+    setStepPipelineRun(null);
     // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
     // must not survive into the new task: RunPanelBody isn't remounted on
     // task switch, so without this a stale `prStatus` from task A could sit
@@ -1892,9 +1917,11 @@ function RunPanelBody({
   // or memoize here. (It matches a `user` event against its NORMALIZED text —
   // lead-in stripped, `<pasted_content>` unwrapped — i.e. what the bubble
   // actually shows; see `searchableEventText`.)
+  // On a step task's Main stream, a handoff block is indexed by its field
+  // VALUES (what the card and its modal show), not its JSON keys — D10.
   const matches = useMemo(
-    () => findMatchingEventIds(displayedEvents, searchQuery),
-    [displayedEvents, searchQuery],
+    () => findMatchingEventIds(displayedEvents, searchQuery, { handoffCards: handoffCardsOn }),
+    [displayedEvents, searchQuery, handoffCardsOn],
   );
 
   // Derived purely for display — no state, so there's no "0/0" flash before
@@ -1983,7 +2010,12 @@ function RunPanelBody({
     // of force-expanded cards.
     const isExplicitJump = jumpIntentRef.current;
     jumpIntentRef.current = false;
-    if (isExplicitJump) el.dispatchEvent(new CustomEvent(EXPAND_EVENT, { bubbles: true }));
+    // `detail.query` lets a listener that shows only part of its content
+    // inline (the formatted handoff card) tell whether the match is visible
+    // or only inside its modal (`ExpandOnJumpDetail`, D10).
+    if (isExplicitJump) {
+      el.dispatchEvent(new CustomEvent(EXPAND_EVENT, { bubbles: true, detail: { query: searchQueryRef.current } }));
+    }
     el.scrollIntoView({ block: "center" });
     if (isExplicitJump) {
       // The dispatch above can expand a collapsed card AFTER this
@@ -2826,6 +2858,30 @@ function RunPanelBody({
   // (L-A10); `"error"` is any other fetch failure.
   const pipelineStripCacheRef = useRef<Map<string, { pipelineName: string; graph: PipelineGraph | null }>>(new Map());
   const [pipelineStrip, setPipelineStrip] = useState<PipelineStripInfo | "loading" | "error" | "missing" | null>(null);
+  // The parent's FULL run state (`docs/plans/formatted-handoff.md` K7): the
+  // formatted handoff surfaces need its frozen graph (where `next` resolves),
+  // this step's history record (the Used / Not used rule, D21) and the whole
+  // history (the handoff-file chip's record lookup, D18). Filled by the strip
+  // fetch below (which already GETs the untrimmed run) and kept live by the
+  // debounced refetch on the parent's `pipeline` events right after it. Per
+  // task: reset to `null` in the `[task.id]` reset effect above. `forTaskId`
+  // tags which step task the run was fetched for, so a response that lands
+  // after a switch can never be read as the new task's.
+  const [stepPipelineRunState, setStepPipelineRun] = useState<{ forTaskId: string; run: PipelineRunState | null } | null>(null);
+  // Both fetchers (the strip fetch, the debounced refetch) take a ticket from
+  // this counter before their GET and apply a result only if no LATER-issued
+  // request has already been applied — so an older response landing last
+  // can never overwrite a newer run state.
+  const stepRunReqSeqRef = useRef(0);
+  const stepRunAppliedSeqRef = useRef(0);
+  const applyStepPipelineRun = (seq: number, forTaskId: string, run: PipelineRunState | null) => {
+    if (seq <= stepRunAppliedSeqRef.current) return;
+    stepRunAppliedSeqRef.current = seq;
+    setStepPipelineRun({ forTaskId, run });
+  };
+  const stepPipelineRun = stepPipelineRunState !== null && stepPipelineRunState.forTaskId === task.id
+    ? stepPipelineRunState.run
+    : null;
   useEffect(() => subscribePipelineGlobalEvents((ev) => {
     if (ev.kind === "pipeline") pipelineStripCacheRef.current.delete(ev.taskId);
   }), []);
@@ -2854,6 +2910,8 @@ function RunPanelBody({
       setPipelineStrip("loading");
     }
     let cancelled = false;
+    const stripTaskId = task.id;
+    const runSeq = ++stepRunReqSeqRef.current;
     void (async () => {
       try {
         const { task: parentTask } = await api.getPipelineRun(parentId);
@@ -2863,12 +2921,14 @@ function RunPanelBody({
         pipelineStripCacheRef.current.set(parentId, { pipelineName, graph });
         if (cancelled) return;
         setPipelineStrip(buildInfo(pipelineName, graph));
+        applyStepPipelineRun(runSeq, stripTaskId, run);
       } catch (e) {
         if (cancelled) return;
         if (e instanceof ApiError && e.status === 404) {
           // The parent is gone — nothing cached is worth showing either.
           pipelineStripCacheRef.current.delete(parentId);
           setPipelineStrip("missing");
+          applyStepPipelineRun(runSeq, stripTaskId, null);
           return;
         }
         if (!cached) setPipelineStrip("error");
@@ -2876,6 +2936,62 @@ function RunPanelBody({
     })();
     return () => { cancelled = true; };
   }, [task.id, task.pipelineParentId, task.pipelineStepId]);
+
+  // Keep `stepPipelineRun` live while a step task is open (K7): every
+  // `pipeline` global event for this step's parent (the runner persisted —
+  // a settle stamped `handoffRunId`, a step launched, a Restart re-captured
+  // the graph) schedules ONE debounced (500 ms, trailing) GET of the parent's
+  // run. No second event stream — the events come from App's single
+  // `/events` subscription via `subscribePipelineGlobalEvents` (WKWebView's
+  // ~6-connection budget). At most one request is in flight; an event that
+  // lands meanwhile marks it dirty and one more GET follows once it settles,
+  // so the last state is never missed. The timer is cleared and any late
+  // response dropped on a task switch / unmount (the cleanup below), and the
+  // `forTaskId` tag guards the setter too. The strip's own cache eviction
+  // (the subscription above) is untouched.
+  useEffect(() => {
+    const parentId = task.pipelineParentId;
+    if (!parentId) return;
+    const forTaskId = task.id;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight = false;
+    let dirty = false;
+    const refetch = async () => {
+      if (disposed) return;
+      if (inFlight) {
+        dirty = true;
+        return;
+      }
+      inFlight = true;
+      dirty = false;
+      const seq = ++stepRunReqSeqRef.current;
+      try {
+        const { task: parentTask } = await api.getPipelineRun(parentId);
+        if (!disposed) applyStepPipelineRun(seq, forTaskId, parentTask.pipelineRun ?? null);
+      } catch {
+        // A transient failure keeps the last known run; a 404 (the parent
+        // deleted) is the strip's to report — the next event or task switch
+        // re-derives everything.
+      } finally {
+        inFlight = false;
+        if (dirty && !disposed) void refetch();
+      }
+    };
+    const unsubscribe = subscribePipelineGlobalEvents((ev) => {
+      if (ev.kind !== "pipeline" || ev.taskId !== parentId) return;
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        void refetch();
+      }, 500);
+    });
+    return () => {
+      disposed = true;
+      unsubscribe();
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [task.id, task.pipelineParentId]);
 
   // PR mergeability for the composer-row "Resolve Conflicts" button. `parsedPrUrl`
   // is derived once per `task.prUrl` change and reused for both the fetch
@@ -3566,6 +3682,60 @@ function RunPanelBody({
     () => [task.worktreePath, task.workdir],
     [task.worktreePath, task.workdir],
   );
+
+  // Formatted handoff context (`docs/plans/formatted-handoff.md` K6), read by
+  // the transcript's assistant bubbles, the step prompt bubble, its segments
+  // and its attachment chips. Every input is reduced to something whose
+  // identity only changes when its content does — the 2 s `runs` poll and
+  // `reconcileById` hand back fresh arrays, and a fresh value here would
+  // re-render every card in the transcript every poll.
+  //
+  // `settledRunIds` (A8): this task's runs that are no longer `running`,
+  // keyed by a sorted id signature so an unchanged set keeps its identity.
+  const settledRunKey = useMemo(
+    () => runs.filter((r) => r.status !== "running").map((r) => r.id).sort().join("\n"),
+    [runs],
+  );
+  const settledRunIds = useMemo<ReadonlySet<string>>(
+    () => new Set(settledRunKey === "" ? [] : settledRunKey.split("\n")),
+    [settledRunKey],
+  );
+  // The frozen graph: the parent run's snapshot once fetched, else what the
+  // strip cache already holds for this parent (its first paint on a switch).
+  // The ref read is re-evaluated whenever `pipelineStrip` changes — which is
+  // exactly when the cache-hit paint or a fetch result lands.
+  const stepGraph = useMemo<PipelineGraph | null>(() => {
+    if (stepPipelineRun?.snapshot?.graph) return stepPipelineRun.snapshot.graph;
+    const parentId = task.pipelineParentId;
+    return parentId ? (pipelineStripCacheRef.current.get(parentId)?.graph ?? null) : null;
+  }, [stepPipelineRun, task.pipelineParentId, pipelineStrip]);
+  // This step task's history record — the latest execution if a cycle ran
+  // the same step task more than once.
+  const stepRecord = useMemo(() => {
+    const history = stepPipelineRun?.history;
+    if (!history) return null;
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i]!.taskId === task.id) return history[i]!;
+    }
+    return null;
+  }, [stepPipelineRun, task.id]);
+  const handoffStepId = task.pipelineStepId ?? stepRecord?.stepId ?? null;
+  const handoffView = useMemo<HandoffViewValue>(
+    () => ({
+      enabled: handoffCardsOn,
+      taskId: task.id,
+      parentId: task.pipelineParentId ?? null,
+      roots: pathRoots,
+      homeDir: homeDir || null,
+      stepId: handoffStepId,
+      stepName: stepNameFor(stepGraph, handoffStepId),
+      graph: stepGraph,
+      run: stepPipelineRun,
+      record: stepRecord,
+      settledRunIds,
+    }),
+    [handoffCardsOn, task.id, task.pipelineParentId, pathRoots, homeDir, handoffStepId, stepGraph, stepPipelineRun, stepRecord, settledRunIds],
+  );
   const onSendDragOver = (e: React.DragEvent) => {
     if (!e.dataTransfer.types.includes("Files")) return;
     // Always preventDefault on a file dragover so WKWebView doesn't fall back
@@ -4175,39 +4345,41 @@ function RunPanelBody({
                   <span className="text-[10px] text-muted-foreground">{rebuildNote}</span>
                 )}
               </div>
-              <RunEventList
-                events={displayedEvents}
-                stickyUserMessages={stickyUserMessages}
-                interactions={interactions}
-                onInteractionResolved={dismissInteraction}
-                runStatus={activeRunStatus}
-                indicatorMode={indicatorMode}
-                holdSummary={holdSummary}
-                recoveryNotice={liveRecoveryNotice}
-                pausedRecovery={pausedRecovery}
-                taskId={task.id}
-                pathRoots={pathRoots}
-                plans={kind === "cursor" || kind === "copilot" || kind === "claude-code" ? plans : NO_PLANS}
-                onOpenPlan={onOpenPlan}
-                agentKind={kind}
-                onAskAnswerWithheld={(reason) => {
-                  // Same informational framing as `send()`'s withheld branch
-                  // above: claude was showing some OTHER blocking modal when
-                  // the free-text ask-card answer tried to land as a
-                  // follow-up turn, so the server re-stashed it into the
-                  // backlog tray instead of losing it. Refresh the tray right
-                  // away and toast (not toast.error — nothing failed).
-                  toast(reason);
-                  // Captured before the async gap — see `currentTaskIdRef`'s
-                  // doc comment: this panel may have switched to a different
-                  // task by the time `getTask` resolves.
-                  const sentTaskId = task.id;
-                  void api.getTask(sentTaskId).then((fresh) => {
-                    if (currentTaskIdRef.current !== sentTaskId) return;
-                    setBacklogItems(fresh.backlog);
-                  }).catch(() => {});
-                }}
-              />
+              <HandoffViewContext.Provider value={handoffView}>
+                <RunEventList
+                  events={displayedEvents}
+                  stickyUserMessages={stickyUserMessages}
+                  interactions={interactions}
+                  onInteractionResolved={dismissInteraction}
+                  runStatus={activeRunStatus}
+                  indicatorMode={indicatorMode}
+                  holdSummary={holdSummary}
+                  recoveryNotice={liveRecoveryNotice}
+                  pausedRecovery={pausedRecovery}
+                  taskId={task.id}
+                  pathRoots={pathRoots}
+                  plans={kind === "cursor" || kind === "copilot" || kind === "claude-code" ? plans : NO_PLANS}
+                  onOpenPlan={onOpenPlan}
+                  agentKind={kind}
+                  onAskAnswerWithheld={(reason) => {
+                    // Same informational framing as `send()`'s withheld branch
+                    // above: claude was showing some OTHER blocking modal when
+                    // the free-text ask-card answer tried to land as a
+                    // follow-up turn, so the server re-stashed it into the
+                    // backlog tray instead of losing it. Refresh the tray right
+                    // away and toast (not toast.error — nothing failed).
+                    toast(reason);
+                    // Captured before the async gap — see `currentTaskIdRef`'s
+                    // doc comment: this panel may have switched to a different
+                    // task by the time `getTask` resolves.
+                    const sentTaskId = task.id;
+                    void api.getTask(sentTaskId).then((fresh) => {
+                      if (currentTaskIdRef.current !== sentTaskId) return;
+                      setBacklogItems(fresh.backlog);
+                    }).catch(() => {});
+                  }}
+                />
+              </HandoffViewContext.Provider>
             </>
           )}
         </div>
@@ -5412,6 +5584,55 @@ function RunEventList({
   // proper cards.
   const normalised = useMemo(() => events.map(normalizeLegacyEvent), [events]);
 
+  // Formatted handoff usage (`docs/plans/formatted-handoff.md` D21): for an
+  // assistant event holding a real `<handoff>` block, whether the runner
+  // advanced on it ("used"), passed it over ("not-used"), or hasn't decided
+  // yet (`null`). `handoffUsage` depends on the event only through its run
+  // and whether it holds that run's LAST real block, so it reduces to two
+  // values per run — computed here, then folded into a primitive signature
+  // so the `blocks` memo below (and every memoized `AssistantBlock`) only
+  // re-derives when a usage actually changes, not on every run poll or
+  // pipeline refetch that hands the context fresh objects. A run with no
+  // real block in view gets no entry (its events render no card, so usage
+  // is moot). Empty, and free, whenever the handoff view is disabled: a
+  // non-step task, a subagent tab, a delta-streaming harness.
+  const handoffView = useHandoffView();
+  const lastHandoffEventByRun = useMemo(
+    () => (handoffView.enabled ? indexLastHandoffEventByRun(normalised) : null),
+    [handoffView.enabled, normalised],
+  );
+  const handoffUsageKey = useMemo(() => {
+    if (lastHandoffEventByRun === null) return "";
+    const parts: string[] = [];
+    for (const [runId, lastIndex] of lastHandoffEventByRun) {
+      const base = {
+        record: handoffView.record,
+        eventRunId: runId,
+        runSettled: handoffView.settledRunIds.has(runId),
+      };
+      const last = handoffUsage({ ...base, isLastBlockOfRun: true });
+      const other = handoffUsage({ ...base, isLastBlockOfRun: false });
+      if (last === null && other === null) continue;
+      // Run ids are UUIDs — never contain the `|`/`\t` separators.
+      parts.push(`${runId}|${lastIndex}|${last ?? ""}|${other ?? ""}`);
+    }
+    return parts.join("\t");
+  }, [lastHandoffEventByRun, handoffView.record, handoffView.settledRunIds]);
+  const handoffUsageByRun = useMemo(() => {
+    type Usage = "used" | "not-used" | null;
+    const out = new Map<string, { lastIndex: number; last: Usage; other: Usage }>();
+    if (handoffUsageKey === "") return out;
+    for (const entry of handoffUsageKey.split("\t")) {
+      const [runId, lastIndex, last, other] = entry.split("|");
+      out.set(runId!, {
+        lastIndex: Number(lastIndex),
+        last: (last || null) as Usage,
+        other: (other || null) as Usage,
+      });
+    }
+    return out;
+  }, [handoffUsageKey]);
+
   // Full markdown for the plan `TmuxPromptCard`'s plan branch is about to
   // act on — the source of truth is the task's latest PENDING claude plan
   // (mirrors what `resolveClaudePlan` server-side is about to resolve),
@@ -5574,8 +5795,13 @@ function RunEventList({
               stickyUserMessages ? "sticky top-0 z-10" : undefined,
             ),
           ];
-        case "assistant":
-          return [wrap(key, evid, <AssistantBlock text={e.data} />)];
+        case "assistant": {
+          // A primitive (`"used" | "not-used" | null`), so `AssistantBlock`'s
+          // `memo` holds across renders.
+          const runUsage = handoffUsageByRun.get(e.runId);
+          const usage = runUsage ? (evid === runUsage.lastIndex ? runUsage.last : runUsage.other) : null;
+          return [wrap(key, evid, <AssistantBlock text={e.data} usage={usage} />)];
+        }
         case "thinking":
           return [wrap(key, evid, <ThinkingBlock text={e.data} />)];
         case "compaction_summary":
@@ -5724,7 +5950,7 @@ function RunEventList({
     // finished") spill out at the bottom.
     out.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, pathRoots, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId, stickyUserMessages, handoffUsageByRun]);
 
   // Scopes every `MdImage` under this list (assistant/user bubbles, tagged
   // segments, the plan-approval preview) to this task's id + roots without
@@ -6106,6 +6332,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // bubble's height delta so content below the bubble stays at the same
   // visual position after expand/collapse.
   const pendingAdjustRef = useRef<{ scroller: HTMLElement; prevHeight: number } | null>(null);
+  const handoffCards = useHandoffView().enabled;
 
   // Normalize once, up front, and feed every branch below from this single
   // string instead of the raw wire `text`: CR→LF (tmux's paste-buffer
@@ -6246,7 +6473,10 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
     // shortening derives from `pathRoots` too, which changes when a task's
     // worktree materializes — measuring `text` alone left a stale
     // "Show more" on bubbles whose folded content no longer overflows.
-  }, [displayCommandArgs, displayOrdinaryArgs, taggedSegments]);
+    // `handoffCards` too: on a step's prompt bubble the formatted handoff
+    // cards replace the inlined JSON, so the overflow must be re-measured
+    // whenever that rendering switches on or off.
+  }, [displayCommandArgs, displayOrdinaryArgs, taggedSegments, handoffCards]);
 
   // After expand/collapse commits, apply the saved scroll-top compensation.
   useLayoutEffect(() => {
@@ -6316,13 +6546,13 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
               you
             </div>
             <div ref={contentRef} className={collapseClassName}>
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={USER_MD_COMPONENTS}
-                urlTransform={MD_URL_TRANSFORM}
-              >
-                {displayOrdinaryArgs}
-              </ReactMarkdown>
+              {/* The UN-shortened text plus `pathRoots`: on a step's prompt
+                  bubble the untrusted-handoff spans are split out first (a
+                  placeholder's handoff-file path must stay absolute for its
+                  record lookup), then only the text parts are folded with
+                  `shortenTaskPaths`. Otherwise it renders exactly the
+                  `ReactMarkdown` of `displayOrdinaryArgs` it always did. */}
+              <UserHandoffMarkdown text={ordinaryArgsText} pathRoots={pathRoots} />
             </div>
             <AttachmentChips references={ordinary.references} taskId={taskId} />
           </>
@@ -6341,18 +6571,23 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   );
 });
 
-const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
-  return (
-    <div className="agetor-md text-foreground">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={ASSISTANT_MD_COMPONENTS}
-        urlTransform={MD_URL_TRANSFORM}
-      >
-        {text}
-      </ReactMarkdown>
-    </div>
-  );
+/**
+ * One assistant message. Delegates to `AssistantHandoffMessage`, which
+ * renders exactly the `agetor-md` markdown this block always did — unless
+ * the handoff view is enabled (a pipeline step's Main stream on a
+ * message-level harness) and the message carries a real `<handoff>` block,
+ * which then renders as a card between the prose before and after it
+ * (`docs/plans/formatted-handoff.md` D3, D15). `usage` is the block's D21
+ * usage, computed by `RunEventList` as a primitive so this `memo` holds.
+ */
+const AssistantBlock = memo(function AssistantBlock({
+  text,
+  usage = null,
+}: {
+  text: string;
+  usage?: "used" | "not-used" | null;
+}) {
+  return <AssistantHandoffMessage text={text} usage={usage} />;
 });
 
 const RawText = memo(function RawText({ text, muted }: { text: string; muted?: boolean }) {

@@ -1361,6 +1361,16 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
   ALLOWED_ORIGINS.add(`http://localhost:${PORT}`);
   ALLOWED_ORIGINS.add("http://localhost:5173");
   ALLOWED_ORIGINS.add("http://127.0.0.1:5173");
+  // A Vite dev server moved off :5173 (`AGETOR_E2E_VITE_PORT` in
+  // playwright.config.ts, which e2e/fixtures.ts forwards here as
+  // `AGETOR_DEV_ORIGIN_PORT`, so a second checkout can run Playwright beside
+  // one holding :5173). Loopback origins only, and only a valid port —
+  // anything else is ignored; the per-launch token still gates every route.
+  const devOriginPort = Number(process.env.AGETOR_DEV_ORIGIN_PORT ?? "");
+  if (Number.isInteger(devOriginPort) && devOriginPort > 0 && devOriginPort <= 65535 && devOriginPort !== 5173) {
+    ALLOWED_ORIGINS.add(`http://localhost:${devOriginPort}`);
+    ALLOWED_ORIGINS.add(`http://127.0.0.1:${devOriginPort}`);
+  }
   // Electrobun's bundled `views://` scheme sends Origin: views://<viewName>
   // (not the `null` originally documented here). Without this entry, every
   // packaged-build fetch returns 200 from the server but WebKit rejects the

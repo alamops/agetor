@@ -2779,6 +2779,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                   }}
                   onOpenSettingsAgents={openSettingsAgents}
                   onBack={() => setView({ kind: "board" })}
+                  homeDir={homeDir || null}
                 />
               </motion.div>
             )}

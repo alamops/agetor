@@ -29,7 +29,10 @@ import { defineConfig, devices } from "@playwright/test";
  * .sh`-driven backend gated behind `workers: 1`) before that moved to the
  * per-worker fixture.
  */
-export const E2E_VITE_PORT = 5173;
+// `AGETOR_E2E_VITE_PORT` moves the shared Vite server off :5173 for one run —
+// needed when another checkout's dev server already holds :5173, because
+// `reuseExistingServer` would otherwise silently serve THAT checkout's webview.
+export const E2E_VITE_PORT = Number(process.env.AGETOR_E2E_VITE_PORT ?? 5173);
 export const E2E_BASE_URL = `http://localhost:${E2E_VITE_PORT}`;
 
 export default defineConfig({
@@ -50,7 +53,7 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    command: "bun run hmr",
+    command: E2E_VITE_PORT === 5173 ? "bun run hmr" : `bunx vite --port ${E2E_VITE_PORT}`,
     url: E2E_BASE_URL,
     timeout: 60_000,
     reuseExistingServer: !process.env.CI,

@@ -38,6 +38,7 @@ import {
 } from "../../../shared/user-message.ts";
 import { AGENT_INSTRUCTIONS_TAG } from "../../../shared/agent-profile.ts";
 import { USER_MD_COMPONENTS, MD_URL_TRANSFORM } from "./md-components";
+import { UserHandoffMarkdown } from "@/components/handoff/HandoffMessage";
 
 /** The existing 9px "you" / "command output" style label, hoisted here so
  *  every machine-emitted block (and `UserMessageBlock`'s own header) shares
@@ -325,16 +326,12 @@ export function MessageSegments({
     <div data-testid="message-segments" className="agetor-md">
       {visibleSegments.map((seg, i) => {
         if (seg.kind === "text") {
-          return (
-            <ReactMarkdown
-              key={i}
-              remarkPlugins={[remarkGfm]}
-              components={USER_MD_COMPONENTS}
-              urlTransform={MD_URL_TRANSFORM}
-            >
-              {seg.text}
-            </ReactMarkdown>
-          );
+          // Renders exactly the user-markdown body it always did, except
+          // that on a pipeline step's prompt bubble each inlined
+          // untrusted-handoff span becomes a handoff card
+          // (`docs/plans/formatted-handoff.md` D1b). No `pathRoots`: the
+          // caller already folded paths in these segments.
+          return <UserHandoffMarkdown key={i} text={seg.text} />;
         }
 
         if (seg.name === "local-command-stdout") {
