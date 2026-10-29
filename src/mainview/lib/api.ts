@@ -3,6 +3,7 @@ import type {
   AgentProfile,
   AgentStatus,
   AppEvent,
+  BackgroundStatus,
   BranchInfo,
   BranchNamingConfig,
   ColumnId,
@@ -78,6 +79,7 @@ import type {
   Pipeline,
   PipelineInput,
   Project,
+  RemoteAccessStatus,
   Run,
   RunEvent,
   SavedPrompt,
@@ -2173,8 +2175,40 @@ export const api = {
 
   /** Tell the main process to quit despite running tasks. Used by the
    *  QuitConfirmDialog after the user picks "Quit anyway". Fire-and-forget
-   *  — the response races process exit. */
-  forceQuit: () => j<{ ok: boolean }>("/app/force-quit", { method: "POST" }),
+   *  — the response races process exit. `completely` also stops the
+   *  background core ("Quit Agetor Completely", plan §3.6). `retry: false`:
+   *  the process is going away, a replay would only chase a dead socket. */
+  forceQuit: (opts?: { completely?: boolean }) =>
+    j<{ ok: boolean }>(
+      "/app/force-quit",
+      {
+        method: "POST",
+        ...(opts?.completely ? { body: JSON.stringify({ completely: true }) } : {}),
+      },
+      { retry: false },
+    ),
+
+  /** "Keep Agetor running in the background" state (docs/plans/always-on-host.md
+   *  §3.3). `fresh` bypasses the core's short status cache. */
+  getBackground: (opts?: { fresh?: boolean }) =>
+    j<BackgroundStatus>(`/background${opts?.fresh ? "?fresh=1" : ""}`),
+  /** Registers the login item. `retry: false` on the mutations below: a replay
+   *  after a lost answer could flip the switch back. */
+  turnOnBackground: () =>
+    j<BackgroundStatus>("/background", { method: "POST" }, { retry: false }),
+  turnOffBackground: () =>
+    j<BackgroundStatus>("/background", { method: "DELETE" }, { retry: false }),
+  /** Boots the stopped supervisor now; 409 `{code}` when it can't. */
+  startBackground: () =>
+    j<BackgroundStatus>("/background/start", { method: "POST" }, { retry: false }),
+  /** Opens System Settings › Login Items. */
+  openLoginItems: () =>
+    j<{ ok: true }>("/background/open-settings", { method: "POST" }, { retry: false }),
+  getRemoteAccess: () => j<RemoteAccessStatus>("/remote-access"),
+  /** Turning remote access ON is native-only (the Remote Access… box); the
+   *  webview can only turn it off. */
+  turnOffRemoteAccess: () =>
+    j<RemoteAccessStatus>("/remote-access", { method: "DELETE" }, { retry: false }),
 
   subscribeRun(runId: string, onEvent: (e: RunEvent) => void): () => void {
     return openEventStream(

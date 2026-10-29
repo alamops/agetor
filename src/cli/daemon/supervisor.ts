@@ -1,7 +1,7 @@
 import { openSync, closeSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { discoverCore, type CoreInfo } from "../api-client.ts";
+import { AgetorClient, discoverCore, type CoreInfo } from "../api-client.ts";
 import { resolveDataDir } from "../../bun/core-creds.ts";
 
 /**
@@ -76,7 +76,7 @@ function daemonCommand(): string[] {
   return [process.execPath, "__daemon"];
 }
 
-async function waitForCore(
+export async function waitForCore(
   dataDir: string | undefined,
   timeoutMs: number,
 ): Promise<CoreInfo | null> {
@@ -89,17 +89,27 @@ async function waitForCore(
   return null;
 }
 
-/** Ask a running core to shut down. Returns false if nothing was running. */
-export async function stopDaemon(dataDir?: string): Promise<boolean> {
+/**
+ * Ask a running core to shut down (`POST /daemon/shutdown`, no body = "stop")
+ * and report which core it was. `launchedBy` is set when that core is the
+ * login-item (background) one, so the caller can say it starts again at next
+ * login instead of implying it is gone for good. `stopped` is false when
+ * nothing was running.
+ */
+export async function stopCore(
+  dataDir?: string,
+): Promise<{ stopped: boolean; launchedBy?: CoreInfo["launchedBy"] }> {
   const core = await discoverCore(dataDir);
-  if (!core) return false;
+  if (!core) return { stopped: false };
   try {
-    await fetch(`http://127.0.0.1:${core.port}/daemon/shutdown`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${core.token}` },
-    });
+    await new AgetorClient(core).shutdownCore();
   } catch {
     /* the core drops the connection as it exits — expected */
   }
-  return true;
+  return { stopped: true, launchedBy: core.launchedBy };
+}
+
+/** Ask a running core to shut down. Returns false if nothing was running. */
+export async function stopDaemon(dataDir?: string): Promise<boolean> {
+  return (await stopCore(dataDir)).stopped;
 }

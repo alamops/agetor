@@ -203,6 +203,8 @@ const DESKTOP_ONLY = [
   "GET /updates/status",
   "POST /app/force-quit",
   "POST /attachments",
+  "POST /background",
+  "POST /background/open-settings",
   "POST /bundle/export/save",
   "POST /bundle/pick-file",
   "POST /harnesses/:id/open-terminal",
@@ -231,10 +233,16 @@ const DESKTOP_ONLY = [
 // request). NOT in this list, though desktop-only: /bundle/export/save (the
 // downloads target works headless), /window/toggle-zoom (503 "no main window"),
 // and everything that works headless (terminals, previews, screenshots…).
+// POST /background and POST /background/open-settings are in the list: their
+// handlers 501 headless unless the AGETOR_FAKE_LOGIN_ITEM seam is on, and the
+// flag only changes the CLI token's answer, so the seam stays reachable for the
+// master.
 const HEADLESS_501 = [
   "DELETE /notifications/:taskId",
   "GET /updates/status",
   "POST /app/force-quit",
+  "POST /background",
+  "POST /background/open-settings",
   "POST /bundle/pick-file",
   "POST /open-external",
   "POST /open-path",
@@ -296,6 +304,11 @@ describe("desktop-only set", () => {
       ["POST", "/bundle/import/preview"],
       ["POST", "/bundle/import"],
       ["POST", "/daemon/shutdown"],
+      ["GET", "/background"],
+      ["DELETE", "/background"],
+      ["POST", "/background/start"],
+      ["GET", "/remote-access"],
+      ["DELETE", "/remote-access"],
       ["GET", "/info"],
       ["GET", "/github/issue-thread"],
       ["POST", "/refs/resolve"],
@@ -318,14 +331,33 @@ describe("route vocabulary", () => {
   //  - the GitHub repo-permissions lookup (what the signed-in user may do on a repo).
   const PERMISSION_ALLOWLIST = new Set(["/fx-permissions/:id/answer", "/github/repo-permissions"]);
 
-  it("no path segment looks like pairing, devices or remote access", () => {
+  // Remote access (preview, docs/plans/always-on-host.md D11): the one route
+  // family whose name may contain "remote-access", and only to READ or turn it
+  // OFF. Turning it on is the native box's job, so no POST/PUT/PATCH may ever
+  // sit under it (asserted below).
+  const REMOTE_ACCESS_ALLOWLIST: Record<string, string[]> = { "/remote-access": ["GET", "DELETE"] };
+
+  it("no path segment looks like pairing, devices or remote access, except the allowlisted read/off routes", () => {
     const bad: string[] = [];
     for (const key of Object.keys(ROUTE_POLICY)) {
+      if (key in REMOTE_ACCESS_ALLOWLIST) continue;
       for (const segment of key.split("/").filter(Boolean)) {
         if (BANNED_SEGMENT.test(segment)) bad.push(`${key} (${segment})`);
       }
     }
     expect(bad).toEqual([]);
+  });
+
+  it("the remote-access allowlist is exactly GET and DELETE on /remote-access (no way to turn it on over HTTP)", () => {
+    expect(Object.keys(REMOTE_ACCESS_ALLOWLIST)).toEqual(["/remote-access"]);
+    const entry = ROUTE_POLICY["/remote-access"];
+    expect(entry).toBeDefined();
+    expect(Object.keys(entry as Record<string, unknown>).sort()).toEqual(["DELETE", "GET"]);
+    // No other key may carry a remote segment either.
+    const remoteKeys = Object.keys(ROUTE_POLICY).filter((k) =>
+      k.split("/").some((seg) => /^(remote|remote-access)$/i.test(seg)),
+    );
+    expect(remoteKeys).toEqual(["/remote-access"]);
   });
 
   it("no route is named for permissions, except the allowlisted read-only ones", () => {
@@ -392,10 +424,11 @@ function extractCliCalls(): CliCall[] {
     throw new Error("supervisor.ts no longer calls /daemon/shutdown — update this test");
   }
   calls.push({ method: "POST", route: "/daemon/shutdown", where: "supervisor.ts" });
-  if (!read("src/bun/index.ts").includes("/daemon/shutdown")) {
-    throw new Error("index.ts no longer calls /daemon/shutdown — update this test");
+  // The app's handoff lives in app-takeover.ts (`acquireApiPort`, called by index.ts).
+  if (!read("src/bun/app-takeover.ts").includes("/daemon/shutdown")) {
+    throw new Error("app-takeover.ts no longer calls /daemon/shutdown — update this test");
   }
-  calls.push({ method: "POST", route: "/daemon/shutdown", where: "index.ts handoff" });
+  calls.push({ method: "POST", route: "/daemon/shutdown", where: "app-takeover.ts handoff" });
   const creds = read("src/bun/core-creds.ts");
   if (!creds.includes("`${base}/info`")) throw new Error("core-creds.ts no longer probes /info — update this test");
   calls.push({ method: "GET", route: "/info", where: "core-creds.ts probeLiveCore" });
@@ -469,6 +502,13 @@ describe("routes the CLI (and the daemon handoff) call", () => {
       "GET /app/events",
       "POST /daemon/shutdown",
       "GET /info",
+      // These five wait on the parallel CLI api-client methods (getBackground,
+      // turnOffBackground, startBackground, getRemoteAccess, turnOffRemoteAccess).
+      "GET /background",
+      "DELETE /background",
+      "POST /background/start",
+      "GET /remote-access",
+      "DELETE /remote-access",
     ]) {
       expect(seen.has(expected), expected).toBe(true);
     }

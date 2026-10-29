@@ -502,6 +502,9 @@ async function provisionBackend(
       // fails to kill the child (crash, bug), the backend self-reaps
       // instead of squatting on its port forever.
       AGETOR_DAEMON_IDLE_MS: "600000",
+      // The headless core would otherwise post real macOS notifications
+      // through the installed app's helper for every fake-driver event.
+      AGETOR_HEADLESS_NOTIFICATIONS: "0",
       // Same fake-driver combo orchestrator.test.ts uses: with
       // AGETOR_CLAUDE_DRIVER=fake, spawnAgent's claude-code branch
       // returns an in-process fake agent instead of shelling out to

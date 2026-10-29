@@ -438,6 +438,18 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/app/events": SSE_LEGACY,
   "/app/force-quit": { POST: app({ headless501: true }) },
   "/daemon/shutdown": { POST: CLI },
+  // Background (the login item) and remote access — docs/plans/always-on-host.md §3.5.
+  // Status and "off" are CLI-reachable; turning the background ON and opening the
+  // Login Items pane are desktop-only. Both are `headless501`: their handlers
+  // answer 501 without `native` unless the AGETOR_FAKE_LOGIN_ITEM seam is on, and
+  // the flag only changes the CLI token's answer (the master still reaches the
+  // handler, so the fake seam keeps working headless for e2e). Remote access has
+  // no "on" route at all (D10, D11): only the native box turns it on, and
+  // `PUT /preferences/remoteAccess` refuses it.
+  "/background": { GET: CLI, POST: app({ headless501: true }), DELETE: CLI },
+  "/background/start": { POST: CLI },
+  "/background/open-settings": { POST: app({ headless501: true }) },
+  "/remote-access": { GET: CLI, DELETE: CLI },
   "/tasks/:id/terminals": {
     GET: APP,
     POST: APP,

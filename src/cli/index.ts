@@ -5,6 +5,7 @@ import { getClient, ensureOpts, type Flags } from "./context.ts";
 import { ensureCore } from "./daemon/supervisor.ts";
 import { AgetorClient } from "./api-client.ts";
 import { cmdDaemon } from "./commands/daemon.ts";
+import { cmdRemote } from "./commands/remote.ts";
 import { cmdLs } from "./commands/ls.ts";
 import { cmdShow } from "./commands/show.ts";
 import { cmdStart, cmdSend, cmdCancel, cmdRm } from "./commands/lifecycle.ts";
@@ -57,7 +58,9 @@ Commands:
   archive <id>        archive a done task   (unarchive <id> to restore)
   rm <id> [--yes]     delete a task (worktree + branch)
   info                show the connected core's version
-  daemon <sub>        start | stop | status of the background core
+  daemon <sub>        start | stop | status | background of the Agetor core
+                      (background status|off: keep Agetor running in the background)
+  remote <sub>        status | off — remote access (preview; only the app turns it on)
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
   profile <sub>       list | show | add | edit | duplicate | rm | export | import reusable agent profiles
   pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
@@ -152,6 +155,8 @@ async function main(): Promise<void> {
       return cmdLs(args, flags, { onlyRunning: true });
     case "daemon":
       return cmdDaemon(args, flags);
+    case "remote":
+      return cmdRemote(args, flags);
     case "add":
       return cmdAdd(args, flags);
     case "show":

@@ -29,6 +29,8 @@ import type {
   Speed,
   OpencodeServerMode,
   OpencodeSessionList,
+  BackgroundStatus,
+  RemoteAccessStatus,
 } from "../shared/types.ts";
 import type { NotificationKind } from "../shared/os-notification.ts";
 import type { BundleExportResponse } from "../shared/bundle.ts";
@@ -364,6 +366,42 @@ export class AgetorClient {
    *  propagate as a thrown `ApiError` like every other call here. */
   cancelFxAutoResume(taskId: string): Promise<{ ok: true }> {
     return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/fx-auto-resume`);
+  }
+
+  // ── background + remote access (docs/plans/always-on-host.md §3.5) ────────
+  /** `GET /background` — the derived "Keep Agetor running in the background"
+   *  state. `fresh` bypasses the core's 2 s status cache. A 404 `ApiError`
+   *  means the running core predates the route. */
+  getBackground(opts: { fresh?: boolean } = {}): Promise<BackgroundStatus> {
+    return this.req("GET", opts.fresh ? "/background?fresh=1" : "/background");
+  }
+  /** `DELETE /background` — unregister the login item (also turns remote
+   *  access off). Allowed for the CLI token; turning it ON is desktop-only. */
+  turnOffBackground(): Promise<BackgroundStatus> {
+    return this.req("DELETE", "/background");
+  }
+  /** `POST /background/start` — start the background core now. 409 `ApiError`
+   *  (body `{ error, code }`) unless the login item is enabled and no
+   *  supervisor is alive. */
+  startBackground(): Promise<BackgroundStatus> {
+    return this.req("POST", "/background/start");
+  }
+  /** `GET /remote-access` — remote access (preview) on/off. */
+  getRemoteAccess(): Promise<RemoteAccessStatus> {
+    return this.req("GET", "/remote-access");
+  }
+  /** `DELETE /remote-access` — turn remote access off. There is deliberately
+   *  no CLI route that turns it on (only the app's native box can). */
+  turnOffRemoteAccess(): Promise<RemoteAccessStatus> {
+    return this.req("DELETE", "/remote-access");
+  }
+  /** `POST /daemon/shutdown`. No `mode` sends no body, which the core reads as
+   *  `"stop"`; `"handoff"` is what the app sends a background core it is
+   *  taking the port from. The core usually exits before answering, so a
+   *  dropped connection surfaces as an `ApiError` with status 0 — callers that
+   *  mean "stop it and move on" swallow it. */
+  async shutdownCore(mode?: "stop" | "handoff"): Promise<void> {
+    await this.req<unknown>("POST", "/daemon/shutdown", mode ? { mode } : undefined);
   }
 
   // ── database maintenance (docs/plans/non-blocking-session-restore.md §2.4) ─

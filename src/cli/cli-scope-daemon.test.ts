@@ -157,7 +157,11 @@ beforeAll(async () => {
   git(repo, "commit", "-q", "-m", "init");
 
   const { startApiServer } = await import("../bun/server.ts");
-  server = startApiServer() as unknown as { stop: () => void };
+  // `POST /daemon/shutdown` on a headless core exits the process unless a
+  // shutdown handler is wired; record the request instead (the `shutdownCore` row).
+  server = startApiServer({
+    onShutdownRequest: (mode) => shutdownRequests.push(mode),
+  }) as unknown as { stop: () => void };
 
   // The same hand-off the real CLI does: the core's creds file → discovery →
   // client. `headless.ts` writes `CLI_TOKEN` there; so do we.
@@ -205,6 +209,9 @@ afterAll(() => {
   rmTestDataDir(DATA_DIR);
 });
 
+/** `POST /daemon/shutdown` requests the in-process core received. */
+const shutdownRequests: ("stop" | "handoff")[] = [];
+
 /** An id no row will ever find. */
 const MISSING = "00000000-0000-4000-8000-000000000000";
 
@@ -221,6 +228,36 @@ const ROWS: Record<ClientMethod, Row> = {
     expect: [200],
     why: "an ordinary preference key (the disclaim switch has its own rule)",
     call: () => client.setPreference("scopeCheck", "1"),
+  },
+
+  // ── background core and remote access ──────────────────────────────────────
+  // No login-item helper resolves in a test process, so the background state is
+  // `unavailable`; the routes still answer the CLI token.
+  getBackground: { expect: [200], why: "derived background status", call: () => client.getBackground() },
+  turnOffBackground: {
+    expect: [200],
+    why: "turning off is allowed for the CLI (removing authority only)",
+    call: () => client.turnOffBackground(),
+  },
+  startBackground: {
+    expect: [409],
+    why: "Start now needs an enabled registration with no live supervisor → 409 after auth",
+    call: () => client.startBackground(),
+  },
+  getRemoteAccess: { expect: [200], why: "remote-access preview switch", call: () => client.getRemoteAccess() },
+  turnOffRemoteAccess: {
+    expect: [200],
+    why: "DELETE /remote-access is allowlisted for the CLI",
+    call: () => client.turnOffRemoteAccess(),
+  },
+  shutdownCore: {
+    expect: [200],
+    why: "the handoff request reaches the injected shutdown handler, which records it",
+    call: async () => {
+      const res = await client.shutdownCore("handoff");
+      expect(shutdownRequests).toEqual(["handoff"]);
+      return res;
+    },
   },
 
   // ── tasks ──────────────────────────────────────────────────────────────────

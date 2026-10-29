@@ -17,6 +17,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { buildTaskDeepLink } from "./deep-link.ts";
 import {
@@ -57,6 +58,9 @@ function devNotifierExe(): string {
  *      as-is, matching AGETOR_TMUX_BIN's contract.
  *   2. The helper bundled inside the packaged app.
  *   3. The locally-built helper under vendor/ (dev runs from source).
+ *   4. The installed Agetor.app's helper (`resolveInstalledAppNotifier`), so a
+ *      core running from source or a bare binary, with no bundle of its own,
+ *      still posts through the signed helper.
  *
  * Returns `null` if nothing resolves. The deep-link notification is an
  * enhancement, so callers treat `null` (and a non-zero exit — e.g. the user
@@ -70,7 +74,7 @@ export function resolveNotifier(): string | null {
   for (const candidate of [bundledNotifierExe(), devNotifierExe()]) {
     if (existsSync(candidate)) return candidate;
   }
-  return null;
+  return resolveInstalledAppNotifier();
 }
 
 /**
@@ -208,19 +212,30 @@ export function notifierPostAcked(stdout: string, id: string): boolean {
   return stdout.split("\n").some((line) => line.trim() === `posted ${id}`);
 }
 
-/** The helper inside the installed app, for processes that aren't the app (the CLI). */
-const INSTALLED_APP_NOTIFIER =
-  "/Applications/Agetor.app/Contents/Resources/app/bin/AgetorNotifier.app/Contents/MacOS/notifier";
+/** The helper's path under an Agetor.app bundle. */
+const APP_NOTIFIER_SUFFIX = path.join(
+  "Contents", "Resources", "app", "bin", "AgetorNotifier.app", "Contents", "MacOS", "notifier",
+);
 
 /**
- * The installed Agetor.app's helper, for the CLI posting without a desktop
- * core: `AGETOR_NOTIFIER_BIN` wins (returned as-is), else the installed
- * app's helper when it exists, else null. Posting through the same signed
- * helper keeps CLI posts in the app's Notification Center scope, so they
- * share the per-task id with the app's own posts.
+ * The installed Agetor.app's helper, for processes that aren't the app (the
+ * CLI, a background core): `AGETOR_NOTIFIER_BIN` wins (returned as-is), else
+ * the helper in `/Applications/Agetor.app`, else in `~/Applications/Agetor.app`
+ * (the two places the login item may be registered from), else null. Posting
+ * through the same signed helper keeps these posts in the app's Notification
+ * Center scope, so they share the per-task id with the app's own posts.
+ * `home` and `exists` are test seams; the home is read at call time.
  */
-export function resolveInstalledAppNotifier(): string | null {
+export function resolveInstalledAppNotifier(
+  opts: { home?: string; exists?: (p: string) => boolean } = {},
+): string | null {
   const override = process.env.AGETOR_NOTIFIER_BIN;
   if (override) return override;
-  return existsSync(INSTALLED_APP_NOTIFIER) ? INSTALLED_APP_NOTIFIER : null;
+  const exists = opts.exists ?? existsSync;
+  const home = opts.home ?? homedir();
+  for (const root of ["/Applications", path.join(home, "Applications")]) {
+    const candidate = path.join(root, "Agetor.app", APP_NOTIFIER_SUFFIX);
+    if (exists(candidate)) return candidate;
+  }
+  return null;
 }

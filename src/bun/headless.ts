@@ -19,6 +19,12 @@ import {
   probeLiveCore,
 } from "./core-creds.ts";
 import { daemonLog } from "./daemon-log.ts";
+import { CORE_EXIT_PARK, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
+import {
+  installHeadlessNotifications,
+  isHeadlessNotificationsEnabled,
+  type HeadlessNotificationSink,
+} from "./headless-notifications.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resumeIncompleteImports } from "./claude-session-import.ts";
@@ -40,12 +46,11 @@ import { applyHarnessAutoEnable } from "./harness-auto-enable.ts";
  */
 
 const IDLE_CHECK_MS = 30_000;
-/** Default idle-shutdown after 5 min with no run, no running background
- *  agent/workflow, and no attached client.
- *  `AGETOR_DAEMON_IDLE_MS=0` disables idle shutdown (daemon stays up). */
-const IDLE_TIMEOUT_MS = Number(
-  process.env.AGETOR_DAEMON_IDLE_MS ?? 5 * 60 * 1000,
-);
+// The idle-shutdown timeout comes from `resolveIdleTimeoutMs()` (daemon-mode.ts),
+// read when `runDaemon` starts: a CLI-spawned daemon exits after 5 min with no
+// run, no running background agent/workflow and no attached client; the
+// background login-item core never idle-exits; `AGETOR_DAEMON_IDLE_MS`
+// overrides both (`0` = never). See docs/plans/always-on-host.md §1 item 2.
 
 /** Ceiling on how long a `running` subagent row alone can hold the daemon up.
  *  Two row classes can never settle on their own: workflow container rows are
@@ -98,6 +103,10 @@ export function hasRunningWork(): boolean {
 }
 
 let shuttingDown = false;
+/** True once THIS process wrote the creds file. A core that never bound (it
+ *  lost the port to a live core, or got a signal mid-boot) must not delete the
+ *  winner's creds on its way out. */
+let ownsCreds = false;
 function shutdown(reason: string, code = 0): void {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -123,17 +132,31 @@ function shutdown(reason: string, code = 0): void {
   // the lag sampler. Trimmed rows stay trimmed, the next boot resumes.
   stopRetentionTimers();
   stopLagMonitor();
-  try {
-    removeCoreCreds(dataDir);
-  } catch {
-    /* best-effort */
+  // Remove the creds file only when it is still ours: the pid check also
+  // covers a successor (the app taking over) that already rewrote it.
+  if (ownsCreds && readCoreCreds(dataDir)?.pid === process.pid) {
+    try {
+      removeCoreCreds(dataDir);
+    } catch {
+      /* best-effort */
+    }
   }
   process.exit(code);
 }
 
 export async function runDaemon(): Promise<void> {
   process.env.AGETOR_HEADLESS = "1";
-  daemonLog(`cli-daemon starting — pid ${process.pid}, version ${pkg.version}`);
+  const mode = launchedBy();
+  const isLoginItem = mode === "login-item";
+  const idleTimeoutMs = resolveIdleTimeoutMs();
+  daemonLog(
+    `cli-daemon starting — pid ${process.pid}, version ${pkg.version}, launchedBy=${mode}, idle=${idleTimeoutMs > 0 ? idleTimeoutMs : "off"}`,
+  );
+  // Signal handlers go in first, not after the bind: the login-item supervisor
+  // SIGTERMs its core child whenever launchd stops the job, which can land
+  // mid-boot. `shutdown()` only removes creds this process wrote.
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   // Validate AGETOR_API_HOST before any boot work. An unusable value would
   // otherwise only surface at bind time, where Bun reports it as "Is port N in
@@ -253,18 +276,44 @@ export async function runDaemon(): Promise<void> {
   }, USAGE_POLL_SWEEP_MS);
   usageIntervalTimer.unref();
 
+  // Headless OS notifications (docs/plans/always-on-host.md §3.7): the core
+  // posts the same one-per-task notifications the app's webview does, since
+  // no webview is around to decide. Installed only after the bind (a core
+  // that loses the port must not post), so the server gets a forwarding sink
+  // that drops anything sent before then.
+  let notificationSink: HeadlessNotificationSink | null = null;
+  const notifications = {
+    post: (n: Parameters<HeadlessNotificationSink["post"]>[0]) => notificationSink?.post(n),
+    remove: (r: Parameters<HeadlessNotificationSink["remove"]>[0]) => notificationSink?.remove(r),
+  };
+
   let server: ReturnType<typeof startApiServer>;
   try {
     // No native deps → native routes return 501.
-    server = startApiServer({ hostname: apiHost.host });
+    server = startApiServer({
+      hostname: apiHost.host,
+      notifications,
+      // `POST /daemon/shutdown`: "stop" exits 0 (for a login-item core, its
+      // supervisor then stays stopped until the next login); "handoff" is the
+      // app taking the port, which a login-item core answers with
+      // CORE_EXIT_PARK so its supervisor parks and boots it again once the
+      // app quits. A CLI daemon exits 0 either way, as before.
+      onShutdownRequest: (request) =>
+        shutdown(
+          `shutdown request (${request})`,
+          request === "handoff" && isLoginItem ? CORE_EXIT_PARK : 0,
+        ),
+    });
   } catch (e) {
     // Port busy. If a live core already owns it (the app launched, or another
     // daemon won a startup race), exit quietly — the CLI re-discovers the
-    // winner via the creds file. Otherwise it's a real conflict.
+    // winner via the creds file. A login-item core exits CORE_EXIT_PARK
+    // instead, so its supervisor parks rather than reading a stop. Otherwise
+    // it's a real conflict.
     const creds = readCoreCreds(dataDir);
     if (creds && (await probeLiveCore(creds))) {
       daemonLog("port already owned by a live core — exiting quietly");
-      process.exit(0);
+      process.exit(isLoginItem ? CORE_EXIT_PARK : 0);
     }
     daemonLog(
       `failed to bind API on ${formatHostForUrl(apiHost.host)}:${getApiPort()}: ${(e as Error)?.message ?? String(e)}`,
@@ -324,20 +373,29 @@ export async function runDaemon(): Promise<void> {
       kind: "cli-daemon",
       version: pkg.version,
       startedAt: Date.now(),
+      // C15: `kind` stays "cli-daemon" so older CLIs and apps still hand off
+      // from it; the extra field tells newer ones it's the background core.
+      ...(isLoginItem ? { launchedBy: "login-item" as const } : {}),
     },
     dataDir,
   );
+  ownsCreds = true;
   // A non-loopback bind's warning is printed once by startApiServer, to
   // stderr — which `spawnDaemon` points at this same daemon.log.
   daemonLog(`cli-daemon listening on http://${formatHostForUrl(apiHost.host)}:${server.port}`);
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  if (isHeadlessNotificationsEnabled()) {
+    try {
+      notificationSink = installHeadlessNotifications().sink;
+    } catch (err) {
+      daemonLog(`headless notifications unavailable: ${(err as Error)?.message ?? String(err)}`);
+    }
+  }
 
   // Idle-shutdown loop: exit once nothing is running AND no client is attached
   // for longer than the timeout. The interval is unref'd so it never keeps the
   // process alive on its own — the listening server does that.
-  if (IDLE_TIMEOUT_MS > 0) {
+  if (idleTimeoutMs > 0) {
     let idleSince: number | null = null;
     const timer = setInterval(() => {
       if (hasRunningWork() || attachedClientCount() > 0) {
@@ -345,7 +403,7 @@ export async function runDaemon(): Promise<void> {
         return;
       }
       if (idleSince == null) idleSince = Date.now();
-      else if (Date.now() - idleSince >= IDLE_TIMEOUT_MS) shutdown("idle timeout");
+      else if (Date.now() - idleSince >= idleTimeoutMs) shutdown("idle timeout");
     }, IDLE_CHECK_MS);
     timer.unref();
   }

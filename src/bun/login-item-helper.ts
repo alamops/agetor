@@ -128,9 +128,14 @@ export function resolveLoginItemHelperPath(opts: { forCli?: boolean } = {}): str
  * (source runs, non-darwin, an unbundled install). With `AGETOR_FAKE_LOGIN_ITEM=1`
  * it is always the file-backed fake. `dataDir` only matters to the fake.
  */
-export function loginItemHelper(dataDir?: string): LoginItemHelper | null {
+export function loginItemHelper(
+  dataDir?: string,
+  opts: { forCli?: boolean } = {},
+): LoginItemHelper | null {
   if (process.env.AGETOR_FAKE_LOGIN_ITEM === "1") return fakeHelper(dataDir);
-  const bin = resolveLoginItemHelperPath();
+  // `forCli`: the CLI is not inside the app bundle, so it also looks for the
+  // installed app's helper (resolveLoginItemHelperPath).
+  const bin = resolveLoginItemHelperPath({ forCli: opts.forCli });
   return bin ? realHelper(bin) : null;
 }
 
