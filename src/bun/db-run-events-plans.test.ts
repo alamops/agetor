@@ -270,6 +270,10 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
         run: () => runs.eventsForTaskAfter(s.taskId, 0, { maxEvents: 3, maxBytes: 4 * 1024 * 1024 }),
       },
       {
+        label: "eventsForTaskAfter — snapshot by bytes",
+        run: () => runs.eventsForTaskAfter(s.taskId, 0, { maxEvents: 800, maxBytes: 1 }),
+      },
+      {
         label: "eventsForTaskAfter — cursor-ahead",
         run: () =>
           runs.eventsForTaskAfter(s.taskId, Number.MAX_SAFE_INTEGER, { maxEvents: 800, maxBytes: 4 * 1024 * 1024 }),

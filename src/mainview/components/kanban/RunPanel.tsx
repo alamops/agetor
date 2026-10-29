@@ -843,6 +843,17 @@ function RunPanelBody({
    *  earlier" button together with `earliestId !== null`. */
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  /** Generation of the transcript window "Load earlier" pages extend.
+   *  Bumped whenever the window is thrown away and rebuilt — a task switch
+   *  (the reset effect below) and a `snapshotRequired` reconnect (the SSE
+   *  `replay_meta` handler), which keeps the same task id. A page fetched
+   *  under an older generation must never be applied: its rows sit before
+   *  the OLD window's front, so prepending them onto the fresh window (and
+   *  taking its `earliestId`) would leave a hole paging can never fill.
+   *  Every bump also clears `loadingEarlier`, which is what lets the
+   *  `finally` below key the busy-flag reset on the generation without
+   *  ever stranding it. */
+  const historyGenRef = useRef(0);
   /** True once the FIRST `listRuns` response for the CURRENT task has
    *  landed (see the runs-poll effect below, which sets this — guarded by
    *  that effect's own `cancelled` flag, so a late response for a task the
@@ -912,6 +923,7 @@ function RunPanelBody({
     loadedDbIdsRef.current = new Set();
     setEarliestId(null);
     setHasMoreEarlier(false);
+    historyGenRef.current++;
     setLoadingEarlier(false);
     setRebuilt(null);
     setRebuildNote(null);
@@ -1302,6 +1314,10 @@ function RunPanelBody({
           // deliberately NOT reset: client ids stay monotonic for the life of
           // the subscription so `rebuilt-mask.ts` stays sound.
           buffer.discard();
+          // Any "Load earlier" page still in flight belongs to the old
+          // window — invalidate it and free the button for the new one.
+          historyGenRef.current++;
+          setLoadingEarlier(false);
           highWater.reset();
           dedupe = createEventDeduper();
           eventsRef.current = [];
@@ -1603,10 +1619,13 @@ function RunPanelBody({
     // resolving after the user has moved to a different task must not
     // prepend task A's history into task B's transcript state.
     const sentTaskId = task.id;
+    // The task id alone isn't enough: a `snapshotRequired` reconnect
+    // replaces the window under the same task — see `historyGenRef`.
+    const sentGen = historyGenRef.current;
     setLoadingEarlier(true);
     void api.fetchTaskEventsPage(sentTaskId, earliestId)
       .then((page) => {
-        if (currentTaskIdRef.current !== sentTaskId) return;
+        if (currentTaskIdRef.current !== sentTaskId || historyGenRef.current !== sentGen) return;
         // Defensive dedupe: `earliestId` can point past events this panel
         // already holds — e.g. an SSE reconnect moved it backward (see the
         // `replay_meta` handler's "never move forward" comment above), so a
@@ -1639,7 +1658,11 @@ function RunPanelBody({
       })
       .catch(() => { /* transient failure — button stays enabled to retry */ })
       .finally(() => {
-        if (currentTaskIdRef.current === sentTaskId) setLoadingEarlier(false);
+        // Keyed on the generation, not the task id: a reset already cleared
+        // the flag, and a page started after it owns the flag now — an
+        // older request settling late must not re-enable the button under
+        // it (A→B→A task switches included).
+        if (historyGenRef.current === sentGen) setLoadingEarlier(false);
       });
   }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
 

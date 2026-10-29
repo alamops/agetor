@@ -3324,14 +3324,20 @@ export const runs = {
    *
    * Same two-step shape as `eventsForTask`, so a big gap never loads bodies:
    *  1. Read `sqlite_sequence.seq` for `run_events` (the AUTOINCREMENT
-   *     high-water mark; 0 when the row is absent) and probe `{id, len}` of
-   *     the task's rows after the cursor, `LIMIT maxEvents + 1` — the +1 row
-   *     proves "too many" without an unbounded read. `decideForwardResume`
-   *     (pure, shared with the future remote router) makes the call.
-   *  2. On resume, fetch the full rows for `id > afterId AND id <=
-   *     lastProbedId`. Bounding by the last probed id keeps the two steps
-   *     consistent if an event lands in between (it reaches the client
-   *     through the live stream instead).
+   *     high-water mark; 0 when the row is absent) and probe the IDS of the
+   *     task's rows after the cursor, `LIMIT maxEvents + 1` — the +1 row
+   *     proves "too many" without an unbounded read. Ids only: on a
+   *     multi-run task the `ORDER BY` sorts every row after the cursor
+   *     before the `LIMIT` applies, and `(run_id, id)` covers an id-only
+   *     probe, so a stale cursor costs an index walk — never a read of every
+   *     row body since the cursor on the main thread.
+   *  2. Only when the count fits, size the bounded range (`id > afterId AND
+   *     id <= lastProbedId`, at most `maxEvents` rows) with
+   *     `LENGTH(CAST(data AS BLOB))`. `decideForwardResume` (pure, shared
+   *     with the future remote router) makes the call.
+   *  3. On resume, fetch the full rows for that same range. Bounding by the
+   *     last probed id keeps the steps consistent if an event lands in
+   *     between (it reaches the client through the live stream instead).
    *
    *  Plans as `SEARCH runs USING INDEX idx_runs_task` + `SEARCH run_events
    *  USING INDEX idx_run_events_run (run_id=? AND id>?)`; `INDEXED BY` pins
@@ -3346,9 +3352,9 @@ export const runs = {
       .query<{ seq: number }, []>(`SELECT seq FROM sqlite_sequence WHERE name = 'run_events'`)
       .get();
     const highWater = seqRow?.seq ?? 0;
-    const gapRowsAsc = db
-      .query<{ id: number; len: number }, [string, number, number]>(
-        `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+    const gapIdsAsc = db
+      .query<{ id: number }, [string, number, number]>(
+        `SELECT run_events.id as id
          FROM run_events INDEXED BY idx_run_events_run
          JOIN runs ON runs.id = run_events.run_id
          WHERE runs.task_id = ? AND run_events.id > ?
@@ -3356,6 +3362,21 @@ export const runs = {
          LIMIT ?`,
       )
       .all(taskId, afterId, opts.maxEvents + 1);
+    // Over the count budget (or empty) the sizes can't change the answer —
+    // `decideForwardResume` checks the count before the bytes — so skip the
+    // body read and hand it zero lengths.
+    const gapRowsAsc =
+      gapIdsAsc.length === 0 || gapIdsAsc.length > opts.maxEvents
+        ? gapIdsAsc.map((r) => ({ id: r.id, len: 0 }))
+        : db
+            .query<{ id: number; len: number }, [string, number, number]>(
+              `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+               FROM run_events INDEXED BY idx_run_events_run
+               JOIN runs ON runs.id = run_events.run_id
+               WHERE runs.task_id = ? AND run_events.id > ? AND run_events.id <= ?
+               ORDER BY run_events.id ASC`,
+            )
+            .all(taskId, afterId, gapIdsAsc[gapIdsAsc.length - 1]!.id);
     const decision = decideForwardResume({
       afterId,
       highWater,

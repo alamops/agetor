@@ -105,6 +105,35 @@ function isEventsUrl(url: string, taskId: string): boolean {
   return new URL(url).pathname === `/tasks/${taskId}/events`;
 }
 
+/** Poll the task until its run settled into `column`. */
+async function waitForColumn(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  taskId: string,
+  column: string,
+): Promise<{ runId: string | null }> {
+  let last: { column?: string; runId?: string | null } = {};
+  await expect
+    .poll(
+      async () => {
+        const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: authHeaders(backend) });
+        last = (await res.json()) as typeof last;
+        return last.column;
+      },
+      { timeout: 60_000 },
+    )
+    .toBe(column);
+  return { runId: last.runId ?? null };
+}
+
+function isEventsPageUrl(url: string, taskId: string): boolean {
+  return new URL(url).pathname === `/tasks/${taskId}/events/page`;
+}
+
+function pageBeforeId(url: string): number {
+  return Number(new URL(url).searchParams.get("beforeId"));
+}
+
 function runPanel(page: Page): Locator {
   return page.locator("aside").last();
 }
@@ -258,5 +287,86 @@ test.describe("task event stream forward resume (docs/plans/event-stream-forward
     await expect(log.getByText(`snapshot e2e ${marker}`, { exact: false })).toHaveCount(1);
 
     await started;
+  });
+
+  test("a Load earlier page still in flight across a snapshot reset is dropped, not prepended", async ({
+    page,
+    request,
+    freshBackend: backend,
+  }) => {
+    test.setTimeout(180_000);
+
+    const marker = randomUUID();
+    const title = `stream-resume-load-earlier-${marker}`;
+    // 4000 rows after the only user message: past the anchor ceiling (3000),
+    // so the first window is the plain newest 800 and "Load earlier" shows.
+    const task = await createTask(request, backend, {
+      title,
+      prompt: `load-earlier e2e ${marker} ${FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER}:4000`,
+    });
+    const startRes = await startTask(request, backend, task.id);
+    expect(startRes.ok(), `POST /tasks/${task.id}/start -> ${startRes.status()}`).toBeTruthy();
+    const { runId } = await waitForColumn(request, backend, task.id, "review");
+    expect(runId).toBeTruthy();
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTaskWithStream(page, task.id, title);
+    const log = transcript(panel);
+    await expect(log.getByText("long reply chunk 4000/4000", { exact: true })).toHaveCount(1, { timeout: 30_000 });
+    const loadEarlier = panel.getByRole("button", { name: "Load earlier messages" });
+    await expect(loadEarlier).toBeVisible();
+
+    // Hold the FIRST page request until the snapshot has replaced the window;
+    // later ones go straight through.
+    let releaseHeld!: () => void;
+    const held = new Promise<void>((resolve) => { releaseHeld = resolve; });
+    let pageRequests = 0;
+    await page.route(
+      (url) => isEventsPageUrl(url.toString(), task.id),
+      async (route) => {
+        if (pageRequests++ === 0) await held;
+        await route.continue();
+      },
+    );
+
+    const firstPageReq = page.waitForRequest((r) => isEventsPageUrl(r.url(), task.id));
+    await loadEarlier.click();
+    const firstBeforeId = pageBeforeId((await firstPageReq).url());
+    await expect(panel.getByRole("button", { name: "Loading…" })).toBeVisible();
+
+    // A follow-up whose 900-row reply lands while the stream is down: past
+    // EVENTS_REPLAY_LIMIT, so the reconnect gets `snapshotRequired`.
+    const followUp = `follow-up ${marker} ${FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER}:900`;
+    const sent = request.post(`${backend.apiBase}/runs/${runId}/input`, {
+      headers: authHeaders(backend),
+      data: { line: followUp },
+    });
+    await expect(log.getByText(`follow-up ${marker}`, { exact: false })).toHaveCount(1, { timeout: 30_000 });
+    await dropStreams(request, backend, task.id, 5_000);
+
+    await expect(panel.getByTestId("transcript-gap-notice")).toBeVisible({ timeout: 60_000 });
+    await expect(log.getByText("long reply chunk 900/900", { exact: true })).toHaveCount(1, { timeout: 60_000 });
+    // The reset freed the button even though the old page is still pending.
+    await expect(loadEarlier).toBeEnabled();
+
+    // Let the stale page answer; it must change nothing.
+    const staleResponse = page.waitForResponse((r) => isEventsPageUrl(r.url(), task.id));
+    releaseHeld();
+    await staleResponse;
+    await page.waitForTimeout(500);
+    // Those rows sit before the OLD window's front (turn 1's chunks 2401–3200);
+    // prepending them onto the fresh window would leave an unfillable hole.
+    await expect(log.getByText("long reply chunk 3000/4000", { exact: true })).toHaveCount(0);
+    await expect(log.getByText("long reply chunk 4000/4000", { exact: true })).toHaveCount(0);
+    await expect(loadEarlier).toBeEnabled();
+
+    // The cursor is the fresh window's front, not the stale page's: paging
+    // continues from right before the follow-up turn, not from turn 1's middle.
+    const nextPageReq = page.waitForRequest((r) => isEventsPageUrl(r.url(), task.id));
+    await loadEarlier.click();
+    expect(pageBeforeId((await nextPageReq).url())).toBeGreaterThan(firstBeforeId);
+    await expect(log.getByText("long reply chunk 4000/4000", { exact: true })).toHaveCount(1, { timeout: 30_000 });
+
+    expect((await sent).ok()).toBeTruthy();
   });
 });
