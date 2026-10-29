@@ -3326,11 +3326,13 @@ export const runs = {
    *  1. Read `sqlite_sequence.seq` for `run_events` (the AUTOINCREMENT
    *     high-water mark; 0 when the row is absent) and probe the IDS of the
    *     task's rows after the cursor, `LIMIT maxEvents + 1` — the +1 row
-   *     proves "too many" without an unbounded read. Ids only: on a
-   *     multi-run task the `ORDER BY` sorts every row after the cursor
-   *     before the `LIMIT` applies, and `(run_id, id)` covers an id-only
-   *     probe, so a stale cursor costs an index walk — never a read of every
-   *     row body since the cursor on the main thread.
+   *     proves "too many" without an unbounded read. Ids only, so
+   *     `(run_id, id)` covers the probe and no row body is read. The
+   *     temp-B-tree sort is bounded too: each run's index range yields ids
+   *     in order, so SQLite stops a run's walk once the LIMIT sorter is full
+   *     and holds a smaller id — measured ~1 ms at any cursor on a 1M-row
+   *     task over 20 runs (a per-run LIMIT + JS merge was slower: 37 ms at
+   *     300 runs).
    *  2. Only when the count fits, size the bounded range (`id > afterId AND
    *     id <= lastProbedId`, at most `maxEvents` rows) with
    *     `LENGTH(CAST(data AS BLOB))`. `decideForwardResume` (pure, shared

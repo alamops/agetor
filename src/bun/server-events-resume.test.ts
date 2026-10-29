@@ -288,6 +288,48 @@ describe("resume", () => {
     expect(fall.meta().data.resumedAfter).toBe(ids[7]);
   });
 
+  test("a cursor of 0 is a resume of every row (`resumedAfter: 0`), not a fresh connect — header and query alike", async () => {
+    const { taskId, ids } = seed(assistants(3));
+    for (const [p, headers] of [
+      [`/tasks/${taskId}/events?afterId=0`, {}],
+      [`/tasks/${taskId}/events`, { "last-event-id": "0" }],
+    ] as Array<[string, Record<string, string>]>) {
+      const s = await openAndRead(p, 3, headers);
+      expect(s.meta().data).toEqual({ earliestId: null, hasMore: false, resumedAfter: 0 });
+      expect(s.rows().map((f) => f.data.id)).toEqual(ids);
+      s.close();
+    }
+  });
+
+  test("the gap carries the task's subagent rows (with `subagentId`) and none of another task's rows interleaved in id space", async () => {
+    const a = seed(["user"]);
+    const b = seed(["assistant"]);
+    // Ids interleave across tasks: A's gap is [sub, main], B's rows sit between.
+    const sub = runs.appendEvent(a.runId, "stdout", "from a helper", null, "sub-1")!;
+    runs.appendEvent(b.runId, "assistant", "b again");
+    const main = runs.appendEvent(a.runId, "assistant", "main again")!;
+
+    const s = await openAndRead(`/tasks/${a.taskId}/events?afterId=${a.ids[0]}`, 2);
+    // Give a stray third row time to show up before asserting the exact list.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(s.meta().data).toEqual({ earliestId: null, hasMore: false, resumedAfter: a.ids[0] });
+    expect(s.rows().map((f) => f.data.id)).toEqual([sub.id, main.id]);
+    expect(s.rows().every((f) => f.data.taskId === a.taskId)).toBe(true);
+    const [subFrame, mainFrame] = s.rows();
+    expect(subFrame!.data).toMatchObject({ runId: a.runId, stream: "stdout", data: "from a helper", subagentId: "sub-1", ts: sub.ts });
+    expect(subFrame!.id).toBe(String(sub.id));
+    expect(mainFrame!.data.subagentId ?? null).toBeNull();
+  });
+
+  test("a resume ignores ?anchor=0 — the meta and the gap are the same either way", async () => {
+    const { taskId, ids } = seed(["user", ...assistants(4)]);
+    const anchored = await openAndRead(`/tasks/${taskId}/events?afterId=${ids[2]}`, 2);
+    const plain = await openAndRead(`/tasks/${taskId}/events?anchor=0&afterId=${ids[2]}`, 2);
+    expect(plain.meta().data).toEqual(anchored.meta().data);
+    expect(plain.rows().map((f) => f.data.id)).toEqual(anchored.rows().map((f) => f.data.id));
+    expect(plain.rows().map((f) => f.data.id)).toEqual(ids.slice(3));
+  });
+
   test("resuming at the newest row sends only the meta, then live rows carry `id:` and the stored ts", async () => {
     const { taskId, runId, ids } = seed(assistants(3));
     const s = await open(`/tasks/${taskId}/events`, { "last-event-id": String(ids[2]) });
@@ -395,6 +437,27 @@ describe("snapshot", () => {
     const s = await openAndRead(`/tasks/${taskId}/events?afterId=9999999999`, 3);
     expect(s.meta().data).toEqual({ earliestId: ids[0], hasMore: false, snapshotRequired: true });
     expect(s.rows().map((f) => f.data.id)).toEqual(ids);
+  });
+
+  test("a snapshot stream keeps going live with `id:` lines, and its last id resumes cleanly next time", async () => {
+    const { taskId, runId, ids } = seed(assistants(2));
+    const s = await openAndRead(`/tasks/${taskId}/events`, 2, { "last-event-id": "9999999999" });
+    expect(s.meta().data.snapshotRequired).toBe(true);
+
+    orchestrator.appendRunStatusLine(taskId, runId, "after the snapshot");
+    await s.waitFor((x) => x.rows().length === 3);
+    const live = s.rows()[2]!;
+    expect(live.data.data).toBe("after the snapshot");
+    expect(live.id).toBe(String(live.data.id));
+    expect(live.data.id).toBeGreaterThan(ids[1]!);
+    s.close();
+
+    // What a client would send on its next reconnect: the last `id:` it saw.
+    const next = await open(`/tasks/${taskId}/events`, { "last-event-id": live.id! });
+    await next.waitFor((x) => x.meta() !== undefined);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(next.meta().data).toEqual({ earliestId: null, hasMore: false, resumedAfter: live.data.id });
+    expect(next.rows()).toHaveLength(0);
   });
 });
 

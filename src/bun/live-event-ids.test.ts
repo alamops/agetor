@@ -4,7 +4,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmTestDataDir } from "./test-data-dir.ts";
-import type { RunEvent } from "../shared/types.ts";
+import type { GlobalEvent, RunEvent } from "../shared/types.ts";
 
 // Every saved row is sent live with its stored `id` and `ts`, nothing is sent
 // for a dedup hit, send order is id order, and the settle-path lines
@@ -107,6 +107,14 @@ async function waitSettled(taskId: string): Promise<void> {
       await new Promise((r) => setTimeout(r, 60));
       return;
     }
+    await new Promise((r) => setTimeout(r, 15));
+  }
+}
+
+async function waitUntil(cond: () => boolean, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for condition");
     await new Promise((r) => setTimeout(r, 15));
   }
 }
@@ -214,6 +222,39 @@ test("a cancelled run saves cancelled (exit:N)", async () => {
     expect(sent.length).toBe(rows.length);
     sent.forEach((f, i) => expectFrameEqualsRow(f, rows[i]!));
   } finally {
+    if (prev === undefined) delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+    else process.env.AGETOR_FAKE_CLAUDE_TURN_MS = prev;
+  }
+});
+
+test("a settle whose exit line can't be saved (run row gone) still records the outcome, moves the card and emits run-status", async () => {
+  // `saveStatusLineQuietly`: losing a breadcrumb must not derail
+  // `attachDoneHandler`. Were the failed save to throw, the `.catch` branch
+  // would re-settle the run as `failed` and send the card to `ready`.
+  const prev = process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+  process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "800";
+  const globals: GlobalEvent[] = [];
+  const unsubGlobal = orch.subscribeGlobal((g) => globals.push(g));
+  try {
+    const taskId = await createClaudeTask("settles after its run row is gone");
+    const started = await orch.startTask(taskId);
+    if ("error" in started) throw new Error(started.error);
+    const runId = started.runId;
+    await waitUntil(() => storedRows(runId).some((r) => r.data.startsWith("started — ")));
+    // Mid-turn: the run row (and its events, by cascade) disappears; the task
+    // still names it, so the settle is the task's terminal one.
+    dbmod.db.run(`DELETE FROM runs WHERE id = ?`, [runId]);
+
+    const runStatus = () => globals.filter((g) => g.kind === "run-status" && g.runId === runId);
+    await waitUntil(() => runStatus().length > 0);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(runStatus()).toHaveLength(1);
+    expect((runStatus()[0] as Extract<GlobalEvent, { kind: "run-status" }>).status).toBe("succeeded");
+    expect(dbmod.tasks.get(taskId)?.column).toBe("review");
+    // Nothing was saved, so nothing was sent for the exit line.
+    expect(framesOf(runId).some((f) => f.stream === "status" && /^exit:/.test(f.data))).toBe(false);
+  } finally {
+    unsubGlobal();
     if (prev === undefined) delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
     else process.env.AGETOR_FAKE_CLAUDE_TURN_MS = prev;
   }
