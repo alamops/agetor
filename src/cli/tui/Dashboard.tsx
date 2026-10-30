@@ -35,6 +35,7 @@ import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
 import { trimmedResultNote } from "../commands/logs.ts";
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
+import { cursorAskFromToolUse, cursorAskPlainLines } from "../../shared/cursor-ask.ts";
 
 type Mode = "nav" | "compose" | "answer";
 
@@ -966,6 +967,17 @@ const EventLine = memo(function EventLine({
         );
       }
       const t = tryParseJson(e.data) as { name?: string } | null;
+      const ask = cursorAskFromToolUse(t);
+      if (ask) {
+        const lines = cursorAskPlainLines(ask);
+        return (
+          <Box flexDirection="column">
+            {lines.map((line, i) => (
+              <Text key={i} color="magenta" wrap="truncate-end">{line}</Text>
+            ))}
+          </Box>
+        );
+      }
       return (
         <Text color="magenta" wrap="truncate-end">
           ▸ {t?.name ?? "tool"}

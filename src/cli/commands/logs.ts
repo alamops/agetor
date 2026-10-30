@@ -19,6 +19,7 @@ import {
   sentFilesSummaryLine,
   type SentFilesRequest,
 } from "../../shared/sent-files.ts";
+import { cursorAskFromToolUse, cursorAskPlainLines } from "../../shared/cursor-ask.ts";
 
 /** The `trimmed by retention (original …)` note for a `tool_result` payload's
  *  `retention` marker (`trimToolResultData` writes it as the payload's first
@@ -254,6 +255,8 @@ function createEventFormatter(): (e: RunEvent) => string {
             return c.magenta(`📎 ${sentFilesSummaryLine(req, null)}`);
           }
         }
+        const ask = cursorAskFromToolUse(t);
+        if (ask) return cursorAskPlainLines(ask).map((line) => c.magenta(line)).join("\n");
         return c.magenta(`▸ ${t?.name ?? "tool"}`);
       }
       case "tool_result": {

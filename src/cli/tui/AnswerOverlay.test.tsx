@@ -368,3 +368,41 @@ test("fx_permission: zero options (defensive) renders only Dismiss, and arrow ke
   expect(lastFrame() ?? "").toContain("Dismiss (reject)");
   unmount();
 });
+
+test("cursor ask: Skip posts { skip: true } and a claude card has no Skip row", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const cursorReq = {
+    kind: "ask_questions", id: "q-cursor", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "cursor",
+    questions: [{ question: "Which option?", options: [{ label: "Alpha" }, { label: "Beta" }] }],
+  } as unknown as AnyRequest;
+  const cursorUi = render(
+    <AnswerOverlay client={fakeClient(cursorReq, (a) => { captured = a; })} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(cursorUi.lastFrame() ?? "").toContain("Skip");
+  cursorUi.stdin.write(DOWN);
+  await wait();
+  cursorUi.stdin.write(DOWN);
+  await wait();
+  cursorUi.stdin.write(DOWN);
+  await wait();
+  cursorUi.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "q-cursor", answers: { skip: true } });
+  expect(done).toBe("✓ skipped");
+  cursorUi.unmount();
+
+  const claudeReq = {
+    kind: "ask_questions", id: "q-claude", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "scraper",
+    questions: [{ question: "Pick", options: [{ label: "A" }] }],
+  } as unknown as AnyRequest;
+  const claudeUi = render(
+    <AnswerOverlay client={fakeClient(claudeReq, () => {})} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(claudeUi.lastFrame() ?? "").not.toContain("Skip");
+  claudeUi.unmount();
+});

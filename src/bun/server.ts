@@ -102,6 +102,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
+import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels } from "../shared/cursor-ask.ts";
 import {
   getAheadCount,
   getTaskDiff,
@@ -200,6 +201,7 @@ import {
 } from "./model-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
+  answerCursorAsk,
   answerFxPermission,
   answerTmuxPrompt,
   findFxPermissionById,
@@ -6755,17 +6757,79 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // a follow-up message instead. Then drop the card.
       "/ask-questions/:id/answer": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer>;
+          const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer> & { skip?: unknown };
           const answers = Array.isArray(body.answers) ? body.answers : [];
           // Light-weight shape check — sub-arrays normalised, strings trimmed.
           const sanitised = answers.map((a) => ({
             selected: Array.isArray(a?.selected) ? a.selected.filter((s): s is string => typeof s === "string") : [],
             custom: typeof a?.custom === "string" ? a.custom : undefined,
           }));
+          const pending = getAskQuestionsById(req.params.id);
+          if (pending && pending.source === "cursor") {
+            if (askAnswersInFlight.has(req.params.id)) {
+              return json(
+                { error: "this question is already being answered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            askAnswersInFlight.add(req.params.id);
+            try {
+              // Unset in production. The restart follow-up's send is fast under
+              // the fake driver, so the in-flight 409 test holds the claim open.
+              const holdMs = Number(process.env.AGETOR_TEST_HOLD_CURSOR_ASK_MS ?? "");
+              if (Number.isFinite(holdMs) && holdMs > 0) {
+                await new Promise((r) => setTimeout(r, holdMs));
+              }
+              if (body.skip === true) {
+                const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
+                if (ok && pending.delivery === "restart-followup") {
+                  const sent = await sendInput(pending.runId, CURSOR_ASK_SKIP_FOLLOWUP);
+                  return json(
+                    { ok: sent.delivered, delivery: "message" as const, reason: sent.delivered ? undefined : sent.reason },
+                    { headers: corsHeaders(req) },
+                  );
+                }
+                return json({ ok }, { headers: corsHeaders(req) });
+              }
+              if (sanitised.length === 0) {
+                return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const mapped = cursorAskAnswersFromLabels(
+                pending.questions.map((q) => ({
+                  id: q.id ?? "",
+                  multiSelect: q.multiSelect,
+                  options: q.options.map((o) => ({ id: o.id ?? "", label: o.label })),
+                })),
+                sanitised,
+              );
+              if (!mapped.ok) {
+                return json({ error: mapped.error }, { status: 400, headers: corsHeaders(req) });
+              }
+              const empty = mapped.answers.every((a) => a.selectedOptionIds.length === 0 && !a.freeformText);
+              if (empty) {
+                return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const ok = answerCursorAsk(req.params.id, { outcome: "answered", answers: mapped.answers });
+              if (ok && pending.delivery === "restart-followup") {
+                const specs = pending.questions.map((q) => ({
+                  question: q.question,
+                  multiSelect: !!q.multiSelect,
+                  options: q.options.map((o) => o.label),
+                }));
+                const sent = await sendInput(pending.runId, formatAnswersMessage(specs, sanitised));
+                return json(
+                  { ok: sent.delivered, delivery: "message" as const, reason: sent.delivered ? undefined : sent.reason },
+                  { headers: corsHeaders(req) },
+                );
+              }
+              return json({ ok }, { headers: corsHeaders(req) });
+            } finally {
+              askAnswersInFlight.delete(req.params.id);
+            }
+          }
           if (sanitised.length === 0) {
             return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const pending = getAskQuestionsById(req.params.id);
           if (pending && pending.source === "scraper") {
             // Claimed synchronously, before the first answer-delivery await: a
             // second request for the same card must not send keys or a

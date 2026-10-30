@@ -6,6 +6,7 @@ import { buildAskAnswer } from "../answer-logic.ts";
 import { sanitizeDrop } from "./paste.ts";
 
 const OTHER = "✎ Other — type a custom answer";
+const SKIP = "Skip";
 
 /**
  * Answer a task's pending interaction inline — the in-dashboard equivalent of
@@ -131,6 +132,15 @@ export function AnswerOverlay({
       if (req.kind === "ask_questions") {
         const q = req.questions[qIndex]!;
         const otherIndex = q.options.length; // the appended "✎ Other" row
+        const skipIndex = req.source === "cursor" ? otherIndex + 1 : -1;
+        if (skipIndex >= 0 && cursor === skipIndex && (key.return || input === " ")) {
+          setSubmitting(true);
+          client
+            .answerAskQuestions(req.id, { skip: true })
+            .then((r) => onDone(r.ok ? "✓ skipped" : "answer failed"))
+            .catch((e) => onDone(`! ${(e as Error).message}`));
+          return;
+        }
         if (q.multiSelect && input === " ") {
           setHint("");
           return setToggled((s) => {
@@ -143,7 +153,7 @@ export function AnswerOverlay({
         if (key.return) {
           if (q.multiSelect) {
             if (toggled.has(otherIndex)) return setCustom(""); // collect free text, then submit
-            const selected = [...toggled].map((i) => q.options[i]!.label);
+            const selected = [...toggled].filter((i) => i < q.options.length).map((i) => q.options[i]!.label);
             if (!commitAnswer(selected, null)) setHint("pick an option or ✎ Other to answer");
             return;
           }
@@ -242,7 +252,9 @@ export function AnswerOverlay({
 function optionLabels(req: AnyRequest | null, qIndex: number): string[] {
   if (!req) return [];
   if (req.kind === "ask_questions") {
-    return [...(req.questions[qIndex]?.options.map((o) => o.label) ?? []), OTHER];
+    const labels = [...(req.questions[qIndex]?.options.map((o) => o.label) ?? []), OTHER];
+    if (req.source === "cursor") labels.push(SKIP);
+    return labels;
   }
   if (req.kind === "fx_permission") {
     return [...req.options.map((o) => o.name), "Dismiss (reject)"];

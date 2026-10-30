@@ -22,6 +22,7 @@ import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { fileScopeForTask } from "../../../shared/file-scope.ts";
+import { cursorAskFromToolUse } from "../../../shared/cursor-ask.ts";
 import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
@@ -6438,7 +6439,7 @@ const SECONDARY_BADGE_CLASS = badgeVariants({ variant: "secondary" });
  *  agetor's UI doesn't otherwise prompt for. */
 const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: ParsedToolUse; result?: ParsedToolResult }) {
   const summary = formatToolInputSummary(call.name, call.input);
-  const isInteractive = call.name === "AskUserQuestion" || call.name === "ExitPlanMode";
+  const isInteractive = call.name === "AskUserQuestion" || call.name === "askQuestionToolCall" || call.name === "ExitPlanMode";
   const [open, setOpen] = useState(false);
   const [resultOpenSignal, setResultOpenSignal] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -6516,7 +6517,9 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
         <div className="border-t border-primary/40 bg-primary/10 px-2 py-1.5 text-[11px] text-foreground">
           {call.name === "AskUserQuestion"
             ? "Claude is asking — answer it in the card above (it has a custom-answer field for anything not listed)."
-            : "Claude is waiting for plan approval — use the card above. To reject or request changes, press Stop, then send a message."}
+            : call.name === "askQuestionToolCall"
+              ? "Cursor is waiting — answer it in the card above."
+              : "Claude is waiting for plan approval — use the card above. To reject or request changes, press Stop, then send a message."}
         </div>
       )}
     </div>
@@ -6731,6 +6734,28 @@ function ToolInputBody({ name, input }: { name: string; input: unknown }) {
         ))}
       </ul>
     );
+  }
+  if (name === "askQuestionToolCall") {
+    const ask = cursorAskFromToolUse({ name, input });
+    if (ask) {
+      return (
+        <div className="px-2 py-1.5 text-[11px]" data-testid="cursor-ask-tool-body">
+          {ask.title ? <div className="mb-1 font-medium">{ask.title}</div> : null}
+          {ask.questions.map((q, i) => (
+            <div key={q.id || i} className={cn(i > 0 && "mt-2 border-t border-border/30 pt-2")}>
+              <div className="font-medium">{q.text}</div>
+              <ul className="mt-1 space-y-0.5">
+                {q.options.map((o) => (
+                  <li key={o.id} className="text-muted-foreground">
+                    · <span className="font-medium text-foreground">{o.label}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      );
+    }
   }
   if (name === "AskUserQuestion" && isRecord(input) && Array.isArray(input.questions)) {
     return (
@@ -7920,11 +7945,49 @@ function AskQuestionsCard({
         onResolved(req.id);
         return;
       }
+      // Cursor rejects a custom-only answer while that input is unsupported.
+      // The card stays up so an option can still be picked.
+      if (e instanceof ApiError && e.status === 400 && req.source === "cursor") {
+        toast.error(e.message || "Cursor cannot accept a custom answer — pick an option");
+        return;
+      }
       throw e;
     } finally {
       setSubmitting(false);
     }
   };
+
+  const skip = async () => {
+    if (submitting || req.source !== "cursor") return;
+    setSubmitting(true);
+    try {
+      const res = await api.skipAskQuestions(req.id);
+      if (!res.ok) toast.error("Skip didn't reach Cursor");
+      onResolved(req.id);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        toast(e.message || "This question is already being answered");
+        onResolved(req.id);
+        return;
+      }
+      if (e instanceof ApiError && e.status === 400) {
+        toast.error(e.message || "Could not skip");
+        return;
+      }
+      throw e;
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const cursor = req.source === "cursor";
+  const heading = phase === "review"
+    ? "Review your answers"
+    : cursor
+      ? (req.delivery === "restart-followup"
+        ? "Cursor's wait ended when Agetor restarted"
+        : "Cursor is waiting")
+      : "Claude is asking";
 
   /** One-line summary of the user's answer to question `qi` (picked labels +
    *  any custom text), for the review screen. Mirrors the native "→ a, b".
@@ -7939,11 +8002,11 @@ function AskQuestionsCard({
   };
 
   return (
-    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40" data-testid="ask-questions-card">
       <div className="mb-2 flex items-center justify-between">
-        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary" data-testid="ask-questions-title">
           <HelpCircle className="size-3.5" aria-hidden />
-          {phase === "review" ? "Review your answers" : "Claude is asking"}
+          {heading}
         </span>
         <span className="font-mono text-[10px] text-muted-foreground">
           {phase === "review"
@@ -7963,9 +8026,16 @@ function AskQuestionsCard({
             ))}
           </div>
           <div className="mt-3 flex items-center justify-between">
-            <Button variant="ghost" size="sm" onClick={() => setPhase("answer")} disabled={submitting}>
-              ← Back
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" size="sm" onClick={() => setPhase("answer")} disabled={submitting}>
+                ← Back
+              </Button>
+              {cursor && (
+                <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
+                  Skip
+                </Button>
+              )}
+            </div>
             <Button onClick={() => void submit()} disabled={!canSubmit || submitting} size="sm">
               {submitting ? "Submitting…" : "Submit answers"}
             </Button>
@@ -8018,7 +8088,12 @@ function AskQuestionsCard({
               </div>
             ))}
           </div>
-          <div className="mt-3 flex items-center justify-end">
+          <div className="mt-3 flex items-center justify-between">
+            {cursor ? (
+              <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
+                Skip
+              </Button>
+            ) : <span />}
             <Button onClick={() => setPhase("review")} disabled={!canSubmit || submitting} size="sm">
               Review answers →
             </Button>

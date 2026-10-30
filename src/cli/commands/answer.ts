@@ -11,6 +11,8 @@ import type {
 } from "../../bun/interactions.ts";
 import { buildAskAnswer, CUSTOM_OPTION } from "../answer-logic.ts";
 
+const CURSOR_SKIP = "__cursor_skip__";
+
 export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
   if (!ref) throw usageError("answer");
@@ -50,6 +52,7 @@ async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promis
     const options = [
       ...q.options.map((o) => ({ value: o.label, label: o.label, hint: o.description })),
       { value: CUSTOM_OPTION, label: "✎ Other — type a custom answer" },
+      ...(req.source === "cursor" ? [{ value: CURSOR_SKIP, label: "Skip" }] : []),
     ];
     // Re-prompt this question until it has at least one option or custom text.
     let entry: { selected: string[]; custom?: string } | null = null;
@@ -63,6 +66,16 @@ async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promis
         const sel = await p.select({ message: "Select", options });
         if (p.isCancel(sel)) return cancel();
         picks = [sel as string];
+      }
+      if (req.source === "cursor" && picks.includes(CURSOR_SKIP)) {
+        try {
+          const res = await client.answerAskQuestions(req.id, { skip: true });
+          out(res.ok ? c.green("✓ skipped") : c.red("failed to skip"));
+        } catch (e) {
+          if (!(e instanceof ApiError) || e.status !== 409) throw e;
+          out(c.dim("already being answered elsewhere"));
+        }
+        return true;
       }
       let custom: string | null = null;
       if (picks.includes(CUSTOM_OPTION)) {
