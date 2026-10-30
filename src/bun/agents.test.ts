@@ -892,315 +892,292 @@ test("codex throws when effort is missing for a model that supports it", () => {
   ).toThrow(/effort is required/);
 });
 
-// Cursor is hosted in tmux exactly like codex (one-shot turn per invocation),
-// but the prompt is NOT an argv element here — cursor-tmux.ts appends it at
-// spawn time via its own injection-safe quoting. `buildCommand`'s job is just
-// the flags: -p stream-json, --model, the auto/ask force+sandbox posture, and
-// --resume. Cursor effort/Fast/Max Mode are composed into the --model id.
-test("cursor with defaults emits -p --output-format stream-json --model grok-4.7-high --force --sandbox disabled", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "grok-4.7-high",
-    "--force", "--sandbox", "disabled",
-  ]);
+// Cursor launches `cursor-agent acp`. The prompt, composed model, plan/ask
+// mode, and session id are JSON-RPC params, not argv. `--force` is the one
+// flag this CLI build's ACP server reads, and only for auto mode.
+test("cursor with defaults emits acp --force and the composed model off argv", () => {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force"]);
+  expect(cursorModel).toBe("grok-4.7-high");
+  expect(cmd).not.toContain("-p");
+  expect(cmd).not.toContain("--model");
+  expect(cmd).not.toContain("--sandbox");
+  expect(cmd).not.toContain("--trust");
 });
 
-test("cursor 'ask' mode emits --mode ask --trust and no --force / --sandbox (read-only Q&A — cursor can't execute headlessly)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "ask" });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "grok-4.7-high",
-    "--mode", "ask",
-    "--trust",
-  ]);
+test("cursor 'ask' mode puts nothing but acp on argv (mode is session/set_mode)", () => {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "ask" });
+  expect(cmd).toEqual(["cursor-agent", "acp"]);
+  expect(cursorModel).toBe("grok-4.7-high");
   expect(cmd).not.toContain("--force");
+  expect(cmd).not.toContain("--mode");
+  expect(cmd).not.toContain("--trust");
   expect(cmd).not.toContain("--sandbox");
 });
 
-test("cursor 'plan' mode emits --mode plan --trust after --model, and no --force / --sandbox", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "plan" });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "grok-4.7-high",
-    "--mode", "plan",
-    "--trust",
-  ]);
-});
-
-test("cursor 'auto' mode keeps --force --sandbox disabled and never adds --trust or --mode", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "auto" });
-  expect(cmd).not.toContain("--trust");
+test("cursor 'plan' mode puts nothing but acp on argv", () => {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "plan" });
+  expect(cmd).toEqual(["cursor-agent", "acp"]);
+  expect(cursorModel).toBe("grok-4.7-high");
+  expect(cmd).not.toContain("--force");
   expect(cmd).not.toContain("--mode");
 });
 
-test("cursor unknown mode id gets no mode flag, but --trust since nothing passes --force (house passthrough)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "mystery-mode" });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "grok-4.7-high",
-    "--trust",
-  ]);
+test("cursor 'auto' mode is acp --force and never adds --trust, --mode, or --sandbox", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "auto" });
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force"]);
+  expect(cmd).not.toContain("--trust");
+  expect(cmd).not.toContain("--mode");
+  expect(cmd).not.toContain("--sandbox");
 });
 
-test("cursor --trust lands before AGETOR_CURSOR_ARGS extras and before --resume", () => {
+test("cursor unknown mode id gets acp and no --force (only auto sets it)", () => {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "mystery-mode" });
+  expect(cmd).toEqual(["cursor-agent", "acp"]);
+  expect(cursorModel).toBe("grok-4.7-high");
+});
+
+test("cursor AGETOR_CURSOR_ARGS are appended and resume is not an argv flag", () => {
   process.env.AGETOR_CURSOR_ARGS = "--verbose";
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "plan", resumeSessionId: "sess-2" });
-  expect(cmd.slice(-6)).toEqual(["--mode", "plan", "--trust", "--verbose", "--resume", "sess-2"]);
+  expect(cmd).toEqual(["cursor-agent", "acp", "--verbose"]);
+  expect(cmd).not.toContain("--resume");
+  expect(cmd).not.toContain("sess-2");
 });
 
-test("cursor non-auto mode with an AGETOR_CURSOR_ARGS --force gets no --trust (the argv already contains --force)", () => {
+test("cursor ask mode still appends an AGETOR_CURSOR_ARGS --force", () => {
   process.env.AGETOR_CURSOR_ARGS = "--force";
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "ask" });
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force"]);
   expect(cmd).not.toContain("--trust");
-  expect(cmd.filter((a) => a === "--force")).toEqual(["--force"]);
 });
 
-test("cursor null mode defaults to auto (--force --sandbox disabled), house convention", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", { model: "auto", mode: null });
-  expect(cmd).toContain("--force");
-  expect(cmd).toContain("--sandbox");
-  expect(cmd[cmd.indexOf("--sandbox") + 1]).toBe("disabled");
+test("cursor null mode defaults to auto (--force), house convention", () => {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", { model: "auto", mode: null });
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force"]);
+  expect(cursorModel).toBe("auto");
+  expect(cmd).not.toContain("--sandbox");
 });
 
 test("cursor composes a curated model plus effort into Cursor's concrete model id", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "claude-opus-4-8",
     effort: "max",
   });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "claude-opus-4-8-max",
-    "--force", "--sandbox", "disabled",
-  ]);
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force"]);
+  expect(cursorModel).toBe("claude-opus-4-8-max");
 });
 
 test("cursor Gemini 3.8 Flash + medium effort composes gemini-3.8-flash-medium", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-3.8-flash",
     effort: "medium",
   });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "gemini-3.8-flash-medium",
-    "--force", "--sandbox", "disabled",
-  ]);
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force"]);
+  expect(cursorModel).toBe("gemini-3.8-flash-medium");
 });
 
 test("cursor Gemini 3.8 Flash with null effort falls back to the high variant", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-3.8-flash",
     effort: null,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
+  expect(cursorModel).toBe("gemini-3.8-flash-high");
 });
 
 test("cursor Gemini 3.7 Flash + low effort composes gemini-3.7-flash-low", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-3.7-flash",
     effort: "low",
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.7-flash-low");
+  expect(cursorModel).toBe("gemini-3.7-flash-low");
 });
 
 test("cursor Gemini 4 Argon + medium effort composes gemini-4-argon-medium", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-4-argon",
     effort: "medium",
   });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "gemini-4-argon-medium",
-    "--force", "--sandbox", "disabled",
-  ]);
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force"]);
+  expect(cursorModel).toBe("gemini-4-argon-medium");
 });
 
 test("cursor Gemini 4 Argon with null effort falls back to the high variant", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-4-argon",
     effort: null,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-high");
+  expect(cursorModel).toBe("gemini-4-argon-high");
 });
 
 test("cursor Gemini 4 Argon ignores speed fast and maxMode (no fast variant, no Max Mode)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-4-argon",
     effort: "high",
     speed: "fast",
     maxMode: true,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-4-argon-high");
+  expect(cursorModel).toBe("gemini-4-argon-high");
 });
 
 test("cursor Gemini 3.8 Flash ignores speed fast and maxMode (no fast variant, no Max Mode)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gemini-3.8-flash",
     effort: "high",
     speed: "fast",
     maxMode: true,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gemini-3.8-flash-high");
+  expect(cursorModel).toBe("gemini-3.8-flash-high");
 });
 
 // docs/plans/add-gpt-6-1-terra.md D1 (2026-10-26): the three new Cursor
 // families, from the task row to the argv cursor-agent actually receives.
 test("cursor DeepSeek V4.1 Flash 1017 + low effort launches the deepseek-v41-flash-1017-low variant", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "deepseek-v41-flash-1017",
     effort: "low",
     mode: "ask",
   });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "deepseek-v41-flash-1017-low",
-    "--mode", "ask", "--trust",
-  ]);
+  expect(cmd).toEqual(["cursor-agent", "acp"]);
+  expect(cursorModel).toBe("deepseek-v41-flash-1017-low");
 });
 
 test("cursor DeepSeek V4.1 Flash 1017 + none effort launches the -none variant (none exists only on this family)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "deepseek-v41-flash-1017",
     effort: "none",
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("deepseek-v41-flash-1017-none");
+  expect(cursorModel).toBe("deepseek-v41-flash-1017-none");
 });
 
 test("cursor Muse Spark 1.3 + Max Mode launches the bracket form with its effort and no fast= (no Fast tier)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "muse-spark-1.3",
     effort: "minimal",
     speed: "fast",
     maxMode: true,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("muse-spark-1.3[context=1m,effort=minimal]");
+  expect(cursorModel).toBe("muse-spark-1.3[context=1m,effort=minimal]");
 });
 
 test("cursor Muse Spark 1.3 without Max Mode launches the plain effort variant", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "muse-spark-1.3",
     effort: "xhigh",
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("muse-spark-1.3-xhigh");
+  expect(cursorModel).toBe("muse-spark-1.3-xhigh");
 });
 
 test("cursor Muse Wonder 1.0 ignores speed fast and maxMode (no Fast variant, no Max Mode)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "muse-wonder-1.0",
     effort: "minimal",
     speed: "fast",
     maxMode: true,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("muse-wonder-1.0-minimal");
+  expect(cursorModel).toBe("muse-wonder-1.0-minimal");
 });
 
 test("cursor Muse Wonder 1.0 with null effort falls back to the high variant", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "muse-wonder-1.0",
     effort: null,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("muse-wonder-1.0-high");
+  expect(cursorModel).toBe("muse-wonder-1.0-high");
 });
 
 test("cursor speed fast selects the Fast model variant when that effort supports it", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gpt-5.6-sol",
     effort: "max",
     speed: "fast",
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol-max-fast");
+  expect(cursorModel).toBe("gpt-5.6-sol-max-fast");
 });
 
 test("cursor speed off and ultrafast both launch the standard model variant (cursor has no Ultrafast tier)", () => {
   for (const speed of ["off", "ultrafast", null, undefined] as const) {
-    const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
       ...cursorDefaults,
       model: "gpt-5.6-sol",
       effort: "max",
       speed,
     });
-    expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol-max");
+    expect(cursorModel).toBe("gpt-5.6-sol-max");
   }
 });
 
 test("cursor maxMode selects large context without changing reasoning effort", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "gpt-5.6-sol",
     effort: "high",
     speed: "fast",
     maxMode: true,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol[context=1m,effort=high,fast=true]");
+  expect(cursorModel).toBe("gpt-5.6-sol[context=1m,effort=high,fast=true]");
 });
 
 test("cursor maxMode is ignored for models without a large-context override", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "composer-2.5",
     speed: "fast",
     maxMode: true,
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("composer-2.5-fast");
+  expect(cursorModel).toBe("composer-2.5-fast");
 });
 
 test("cursor speed fast is ignored for model/effort pairs without a fast variant", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "claude-sonnet-5",
     effort: "max",
     speed: "fast",
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("claude-sonnet-5-max");
+  expect(cursorModel).toBe("claude-sonnet-5-max");
 });
 
 test("cursor model with no effort levels can still expose a fast variant", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "composer-2.5",
     speed: "fast",
   });
-  expect(cmd[cmd.indexOf("--model") + 1]).toBe("composer-2.5-fast");
+  expect(cursorModel).toBe("composer-2.5-fast");
 });
 
 test("cursor unknown model id passes through verbatim (house convention: unknown ids just work)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     model: "cursor-mystery-9000",
     effort: "max",
     speed: "fast",
   });
-  const i = cmd.indexOf("--model");
-  expect(i).toBeGreaterThan(-1);
-  expect(cmd[i + 1]).toBe("cursor-mystery-9000");
+  expect(cmd).not.toContain("--model");
+  expect(cursorModel).toBe("cursor-mystery-9000");
 });
 
-test("cursor resumeSessionId adds --resume <id> as the final argv elements (--resume is a flag, no subcommand ordering constraint)", () => {
+test("cursor resumeSessionId is not an argv flag (resume is session/load)", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, resumeSessionId: "sess-99" });
-  expect(cmd.slice(-2)).toEqual(["--resume", "sess-99"]);
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force"]);
+  expect(cmd).not.toContain("--resume");
+  expect(cmd).not.toContain("sess-99");
 });
 
 test("cursor throws when model is missing", () => {
@@ -1216,20 +1193,15 @@ test("AGETOR_CURSOR_BIN override is respected for the built-in cursor harness", 
   );
 });
 
-test("AGETOR_CURSOR_ARGS extra args land after the mode flags and before --resume", () => {
+test("AGETOR_CURSOR_ARGS extra args are appended and resume stays off argv", () => {
   process.env.AGETOR_CURSOR_ARGS = "--verbose --foo";
-  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+  const { cmd, cursorModel } = buildCommand(builtin("cursor"), "hi", {
     ...cursorDefaults,
     resumeSessionId: "sess-1",
   });
-  expect(cmd).toEqual([
-    "cursor-agent",
-    "-p", "--output-format", "stream-json",
-    "--model", "grok-4.7-high",
-    "--force", "--sandbox", "disabled",
-    "--verbose", "--foo",
-    "--resume", "sess-1",
-  ]);
+  expect(cmd).toEqual(["cursor-agent", "acp", "--force", "--verbose", "--foo"]);
+  expect(cursorModel).toBe("grok-4.7-high");
+  expect(cmd).not.toContain("--resume");
 });
 
 // ── fake cursor driver (plan §5 "Fake-driver seams") ──

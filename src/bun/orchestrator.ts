@@ -143,8 +143,8 @@ import {
 } from "./codex-tmux.ts";
 import {
   dropCursorSession,
-  reattachCursorSession,
 } from "./cursor-tmux.ts";
+import { rebuildOpenCursorAsks } from "./cursor-acp.ts";
 import {
   dropGeminiSession,
   reattachGeminiSession,
@@ -970,27 +970,38 @@ export async function reconcileOrphans(): Promise<number> {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // claude-code, codex, cursor, gemini, antigravity, opencode and copilot runs
-    // can all be reattached when their detached tmux session is still alive.
-    // The reattach key differs by kind: claude needs its JSONL session uuid
-    // (`claude_session_id`), codex needs its thread id (`codex_session_id`),
-    // cursor needs its `session_id` (`cursor_session_id`), gemini needs its
-    // self-issued uuid (`gemini_session_id`), antigravity needs its
-    // conversation id (`antigravity_session_id`), opencode needs its
-    // discovered `ses_…` id (`opencode_session_id`), copilot needs its
-    // self-issued uuid (`copilot_session_id`) — the per-run log path is derived
-    // from the run id in every case. Note codex's, cursor's, gemini's,
-    // antigravity's, opencode's, copilot's, and fx's sessions only live WHILE
-    // their turn is in flight (one process per turn; fx is never reattached at
-    // all), so a
-    // reattachable one of those is by definition one that was still running
-    // when agetor restarted. Also: if we already reattached a newer sibling
-    // for this task, orphan the older one — only one SessionState can drive
-    // a given tmux session at a time.
+    // claude-code, codex, gemini, antigravity, opencode and copilot runs can
+    // be reattached when their detached tmux session is still alive. Cursor
+    // and fx are ACP over stdio: a `running` row is orphaned (cursor also
+    // kills a leftover tmux name from the old driver, then rebuilds open
+    // questions from `cursor_asks`). The reattach key differs by kind: claude
+    // needs its JSONL session uuid (`claude_session_id`), codex needs its
+    // thread id (`codex_session_id`), gemini needs its self-issued uuid
+    // (`gemini_session_id`), antigravity needs its conversation id
+    // (`antigravity_session_id`), opencode needs its discovered `ses_…` id
+    // (`opencode_session_id`), copilot needs its self-issued uuid
+    // (`copilot_session_id`). Codex, gemini, antigravity, opencode and copilot
+    // sessions only live while their turn is in flight, so a reattachable one
+    // was still running when agetor restarted. If we already reattached a
+    // newer sibling for this task, orphan the older one — only one
+    // SessionState can drive a given tmux session at a time.
+    if (kind === "cursor") {
+      // ACP has no mid-turn reattach. A name left from the old tmux driver
+      // is this task's own session; kill that one, then orphan the row.
+      if (row.tmux_session) {
+        try {
+          await killSessionByName(row.tmux_session);
+        } catch (err) {
+          console.warn(`[agetor] could not kill leftover cursor tmux ${row.tmux_session}:`, err);
+        }
+      }
+      orphaned.push({ id: row.id, task_id: row.task_id, prevColumn, kind });
+      continue;
+    }
+
     const reattachKey =
       kind === "claude-code" ? row.claude_session_id
       : kind === "codex" ? row.codex_session_id
-      : kind === "cursor" ? row.cursor_session_id
       : kind === "gemini" ? row.gemini_session_id
       : kind === "antigravity" ? row.antigravity_session_id
       : kind === "opencode" ? row.opencode_session_id
@@ -1008,7 +1019,7 @@ export async function reconcileOrphans(): Promise<number> {
     // `string` for everything below.
     let canTryReattach = false;
     if (
-      (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "opencode" || kind === "copilot")
+      (kind === "claude-code" || kind === "codex" || kind === "gemini" || kind === "antigravity" || kind === "opencode" || kind === "copilot")
       && task !== null
       && row.tmux_session !== null
       && reattachKey !== null
@@ -1038,14 +1049,6 @@ export async function reconcileOrphans(): Promise<number> {
             })
           : kind === "codex"
           ? await reattachCodexSession({
-              taskId: row.task_id,
-              runId: row.id,
-              sessionName: row.tmux_session as string,
-              onChunk,
-              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
-            })
-          : kind === "cursor"
-          ? await reattachCursorSession({
               taskId: row.task_id,
               runId: row.id,
               sessionName: row.tmux_session as string,
@@ -1166,6 +1169,15 @@ export async function reconcileOrphans(): Promise<number> {
   }
   if (orphaned.length > 0) {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
+  }
+
+  // Open Cursor questions survive the process. Rebuild them from cursor_asks
+  // after the orphan writes, so a card's follow-up
+  // addresses a task that is no longer `running`.
+  try {
+    rebuildOpenCursorAsks();
+  } catch (err) {
+    console.warn("[agetor] could not rebuild open cursor questions:", err);
   }
 
   // Held tasks — and, more generally, ANY task with a stuck `running`

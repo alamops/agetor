@@ -207,3 +207,100 @@ test("deleteTask (cursor) mid-turn does not crash on late chunks", async () => {
 
   expect(tasks.get(taskId)).toBeNull();
 });
+
+test("fake ask marker leaves the run running until the card is answered", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { runs, tasks, harnesses } = await import("./db.ts");
+  const { listPendingForTask, answerCursorAsk } = await import("./interactions.ts");
+  harnesses.setEnabled("cursor", true);
+
+  const created = await createTask({
+    title: "cursor ask",
+    prompt: "__agetor_fake_cursor_ask__",
+    agent: "cursor",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  await settle(40);
+  expect(runs.get(started.runId)?.status).toBe("running");
+  const pending = listPendingForTask(created.task.id);
+  expect(pending).toHaveLength(1);
+  expect(pending[0]?.kind).toBe("ask_questions");
+  answerCursorAsk(pending[0]!.id, { outcome: "skipped" });
+  await settle(80);
+  expect(runs.get(started.runId)?.status).toBe("succeeded");
+  expect(tasks.get(created.task.id)?.column).toBe("review");
+  expect(runs.get(started.runId)?.cursorSessionId).toBe(`fake-cursor-session-${created.task.id}`);
+});
+
+test("fake :2 ask marker registers two cards at once", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { runs, harnesses } = await import("./db.ts");
+  const { listPendingForTask, answerCursorAsk } = await import("./interactions.ts");
+  harnesses.setEnabled("cursor", true);
+
+  const created = await createTask({
+    title: "cursor ask two",
+    prompt: "__agetor_fake_cursor_ask__:2",
+    agent: "cursor",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  await settle(40);
+  const pending = listPendingForTask(created.task.id);
+  expect(pending).toHaveLength(2);
+  expect(runs.get(started.runId)?.status).toBe("running");
+  for (const card of pending) answerCursorAsk(card.id, { outcome: "skipped" });
+  await settle(80);
+  expect(runs.get(started.runId)?.status).toBe("succeeded");
+});
+
+test("a running cursor row at boot is orphaned and its open question is rebuilt", async () => {
+  const { reconcileOrphans } = await import("./orchestrator.ts");
+  const { tasks, runs, insertCursorAsk } = await import("./db.ts");
+  const { listPendingForTask, __testing } = await import("./interactions.ts");
+  __testing.reset();
+  const taskId = `cursor-boot-${Date.now()}`;
+  const runId = `run-${taskId}`;
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: taskId, prompt: "ask", column: "running",
+    agent: "cursor", workdir: process.cwd(), isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null, mode: "auto",
+    model: "grok-4.7", effort: "high", speed: "off", maxMode: false, opencodeServer: "shared",
+    references: [], backlog: [], plans: [], draft: null, runId,
+    createdAt: now, updatedAt: now, hasOpenableRun: true,
+    pendingInteractionCount: 0, openTerminalCount: 0, archivedAt: null,
+  });
+  runs.insert({
+    id: runId, taskId, agent: "cursor", status: "running",
+    startedAt: now, endedAt: null, exitCode: null,
+    tmuxSession: `agetor-leftover-${taskId}`,
+    claudeSessionId: null, codexSessionId: null, cursorSessionId: "sess-old",
+    geminiSessionId: null, fxSessionId: null,
+  });
+  insertCursorAsk({
+    taskId, runId, toolCallId: "call-boot",
+    payload: {
+      title: "Pick one",
+      questions: [{ id: "q1", prompt: "Which?", allowMultiple: false, options: [{ id: "a", label: "Alpha" }] }],
+    },
+  });
+  await reconcileOrphans();
+  expect(runs.get(runId)?.status).toBe("orphaned");
+  expect(tasks.get(taskId)?.column).toBe("ready");
+  expect(tasks.get(taskId)?.runId).toBeNull();
+  const pending = listPendingForTask(taskId);
+  expect(pending).toHaveLength(1);
+  const card = pending[0]!;
+  expect(card.kind).toBe("ask_questions");
+  if (card.kind === "ask_questions") expect(card.delivery).toBe("restart-followup");
+});
