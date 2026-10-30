@@ -4,8 +4,9 @@ import { randomUUID } from "node:crypto";
 // sides touch the other's exports from function bodies (never at module
 // scope). See the matching note at the top of db.ts before adding any
 // top-level use of `tasks` here.
-import { insertCursorAsk, resolveCursorAsk, tasks } from "./db.ts";
+import { insertCursorAsk, resolveCursorAsk, runs, tasks } from "./db.ts";
 import { questionText } from "../shared/cursor-ask.ts";
+import type { RunEvent } from "../shared/types.ts";
 
 /**
  * In-process registry for user interactions an agent needs to drive through
@@ -108,11 +109,14 @@ export interface AskQuestionsRequest {
   /** Raw Cursor tool-call id. Stored for the row key; never a URL segment. */
   toolCallId?: string;
   /**
-   * `"live"` while a child is blocked on the RPC. `"restart-followup"` after
-   * a restart that did not re-issue the request: Submit and Skip send the
-   * next user message.
+   * `"live"` while a child is blocked on the RPC. `"restart-followup"` when
+   * that RPC is gone: Submit and Skip send the next user message.
+   * `followupCause` says why. `"restart"` is a boot rebuild. `"child-exit"`
+   * is the cursor-agent process leaving while Agetor stayed up. Absent on a
+   * follow-up means restart.
    */
   delivery?: "live" | "restart-followup";
+  followupCause?: "restart" | "child-exit";
   /** Pane fingerprint — used by the scraper for two-tick stability, dup
    *  suppression, and auto-cancel when the modal leaves the pane. */
   fingerprint?: string;
@@ -135,10 +139,11 @@ export interface CursorAskQuestionInput {
 
 export interface AskQuestionsAnswer {
   /** One entry per question in `AskQuestionsRequest.questions`, same order.
-   *  Each may contain selected option labels and/or a free-text custom
-   *  answer. At least one of `selected` / `custom` must be non-empty per
-   *  question. */
-  answers: Array<{ selected: string[]; custom?: string }>;
+   *  `selected` is option labels. `selectedOptionIds`, when set, picks those
+   *  ids instead, which is what distinguishes two options that share a label.
+   *  At least one of `selected` / `selectedOptionIds` / `custom` must be
+   *  non-empty per question. */
+  answers: Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }>;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -336,7 +341,14 @@ function cursorAskKey(taskId: string, toolCallId: string): string {
 const tmuxPrompts = new Map<string, TmuxPromptEntry>();
 const fxPermissions = new Map<string, FxPermissionEntry>();
 
-type BroadcastFn = (req: AnyRequest) => void;
+/**
+ * `"register"` is a new card (also raises the app-level pending alert).
+ * `"update"` republishes a card the panel already has — a delivery change
+ * after the child exits. It must not count as a second pending prompt.
+ */
+export type InteractionBroadcastReason = "register" | "update";
+
+type BroadcastFn = (req: AnyRequest, reason?: InteractionBroadcastReason) => void;
 let broadcast: BroadcastFn = () => { /* installed by the orchestrator */ };
 
 /** Carries the bare minimum the UI needs to drop a card whose interaction
@@ -354,6 +366,57 @@ export interface InteractionResolved {
 
 type ResolveBroadcastFn = (res: InteractionResolved) => void;
 let broadcastResolved: ResolveBroadcastFn = () => { /* installed by the orchestrator */ };
+
+type RunEventEmitter = (event: RunEvent) => void;
+let emitRunEvent: RunEventEmitter = () => { /* installed by the orchestrator */ };
+
+/**
+ * Persist the `tool_result` that closes an `askQuestionToolCall` block.
+ * The live child usually sends this as `tool_call_update` `completed`.
+ * Cancel (Stop, archive, delete) and a fake answer have no such update,
+ * so the block would stay forced open. A second write for the same tool
+ * id is a no-op (`INSERT OR IGNORE` on `tool_call:<id>:completed`). A
+ * missing run row is ignored: the card still resolves.
+ */
+export function recordCursorAskToolResult(args: {
+  taskId: string;
+  runId: string;
+  toolCallId: string;
+  content: unknown;
+}): void {
+  if (!args.toolCallId) return;
+  const data = JSON.stringify({
+    toolUseId: args.toolCallId,
+    content: args.content,
+    isError: false,
+  });
+  const lineUuid = `tool_call:${args.toolCallId}:completed`;
+  let inserted: number | null;
+  try {
+    inserted = runs.appendEvent(args.runId, "tool_result", data, lineUuid);
+  } catch {
+    return;
+  }
+  if (inserted == null) return;
+  try {
+    emitRunEvent({
+      runId: args.runId,
+      taskId: args.taskId,
+      stream: "tool_result",
+      data,
+      ts: Date.now(),
+    });
+  } catch {
+    /* the row is already the record */
+  }
+}
+
+/** The orchestrator installs its SSE fan-out. Returns the previous fn. */
+export function setRunEventEmitter(fn: RunEventEmitter): RunEventEmitter {
+  const prev = emitRunEvent;
+  emitRunEvent = fn;
+  return prev;
+}
 
 /**
  * The orchestrator hands us its event emitter so we can fan out new
@@ -507,6 +570,8 @@ export interface RegisterCursorAskArgs {
   title?: string;
   questions: CursorAskQuestionInput[];
   delivery: "live" | "restart-followup";
+  /** Set with `"restart-followup"`. Omitted on a live card. */
+  followupCause?: "restart" | "child-exit";
   /** When false, the row already exists (boot rebuild). Default true. */
   persist?: boolean;
 }
@@ -549,6 +614,7 @@ export function registerCursorAskQuestions(args: RegisterCursorAskArgs): {
     source: "cursor",
     toolCallId: args.toolCallId,
     delivery: args.delivery,
+    ...(args.delivery === "restart-followup" && args.followupCause ? { followupCause: args.followupCause } : {}),
     ...(title !== undefined ? { title } : {}),
   };
   if (args.persist !== false) {
@@ -600,6 +666,42 @@ export function answerCursorAsk(id: string, answer: CursorAskAnswer): boolean {
   entry.resolveCursor(answer);
   fanoutResolved(entry.req);
   return true;
+}
+
+/**
+ * The child blocked on these RPCs has exited. Keep each still-open live
+ * card for this run, switch it to the restart follow-up, and release the
+ * driver's awaiter with `cancelled` without writing an outcome. A later
+ * submit then sends the next user message. The row stays unanswered, so a
+ * restart can rebuild it. The same card id is republished so an open panel
+ * replaces "Cursor is waiting" with the child-exit copy, not the boot
+ * restart sentence. Other runs, follow-ups already retargeted, and scraper
+ * cards are left alone.
+ */
+export function retargetLiveCursorAsksForRun(runId: string): void {
+  for (const entry of askQuestions.values()) {
+    if (entry.req.runId !== runId) continue;
+    if (entry.req.source !== "cursor" || entry.req.delivery !== "live") continue;
+    if (!entry.resolveCursor) continue;
+    const releaseDriver = entry.resolveCursor;
+    let resolveCursor!: (answer: CursorAskAnswer) => void;
+    const cursorAnswer = new Promise<CursorAskAnswer>((resolve) => {
+      resolveCursor = resolve;
+    });
+    entry.resolveCursor = resolveCursor;
+    entry.cursorAnswer = cursorAnswer;
+    entry.req.delivery = "restart-followup";
+    entry.req.followupCause = "child-exit";
+    // Release the dead child's awaiter before publishing. A throwing
+    // listener must not leave this card, or the next one, blocked on a
+    // process that has already exited.
+    releaseDriver({ outcome: "cancelled" });
+    try {
+      broadcast(entry.req, "update");
+    } catch {
+      /* the in-memory card is already the follow-up */
+    }
+  }
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -787,9 +889,12 @@ export function findFxPermissionById(id: string): FxPermissionRequest | null {
 /**
  * Resolve every pending interaction for this task with a synthetic
  * "cancelled" answer so subprocess waiters unblock immediately. Called from
- * cancelRun (Stop button) and deleteTask — if we just kill the tmux session
- * without doing this first, the in-flight curl / MCP children would hang
- * until their HTTP timeout instead of returning cleanly.
+ * cancelRun (Stop button), deleteTask, and archiveTask — including an
+ * archive that has no live run. A Cursor card writes `cancelled` on
+ * `cursor_asks` (never `skipped`) and a `tool_result` for that tool call,
+ * so the ask block can close. If we just kill the tmux session without
+ * doing this first, the in-flight curl / MCP children would hang until
+ * their HTTP timeout instead of returning cleanly.
  */
 export function cancelPendingForTask(taskId: string, reason: string): void {
   for (const [id, entry] of askQuestions) {
@@ -800,6 +905,12 @@ export function cancelPendingForTask(taskId: string, reason: string): void {
       if (toolCallId) {
         cursorAskByTool.delete(cursorAskKey(taskId, toolCallId));
         resolveCursorAsk(taskId, toolCallId, "cancelled");
+        recordCursorAskToolResult({
+          taskId,
+          runId: entry.req.runId,
+          toolCallId,
+          content: "cancelled",
+        });
       }
       entry.resolveCursor({ outcome: "cancelled" });
     } else {

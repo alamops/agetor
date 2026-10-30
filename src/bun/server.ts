@@ -102,7 +102,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
-import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels } from "../shared/cursor-ask.ts";
+import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels, formatCursorAskFollowup } from "../shared/cursor-ask.ts";
 import {
   getAheadCount,
   getTaskDiff,
@@ -203,6 +203,7 @@ import { getMainWindow } from "./window.ts";
 import {
   answerCursorAsk,
   answerFxPermission,
+  recordCursorAskToolResult,
   answerTmuxPrompt,
   findFxPermissionById,
   findTmuxPromptById,
@@ -6762,6 +6763,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // Light-weight shape check — sub-arrays normalised, strings trimmed.
           const sanitised = answers.map((a) => ({
             selected: Array.isArray(a?.selected) ? a.selected.filter((s): s is string => typeof s === "string") : [],
+            selectedOptionIds: Array.isArray(a?.selectedOptionIds)
+              ? a.selectedOptionIds.filter((s): s is string => typeof s === "string")
+              : undefined,
             custom: typeof a?.custom === "string" ? a.custom : undefined,
           }));
           const pending = getAskQuestionsById(req.params.id);
@@ -6780,15 +6784,45 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               if (Number.isFinite(holdMs) && holdMs > 0) {
                 await new Promise((r) => setTimeout(r, holdMs));
               }
-              if (body.skip === true) {
-                const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
-                if (ok && pending.delivery === "restart-followup") {
-                  const sent = await sendInput(pending.runId, CURSOR_ASK_SKIP_FOLLOWUP);
+              // A restart follow-up has no live child. Send first. Writing the
+              // outcome before sendInput consumes the card when the send is
+              // refused, and resolveCursorAsk will not reopen a row that
+              // already has an outcome.
+              const sendRestart = async (text: string): Promise<Response | null> => {
+                if (pending.delivery !== "restart-followup") return null;
+                const sent = await sendInput(pending.runId, text);
+                if (!sent.delivered) {
                   return json(
-                    { ok: sent.delivered, delivery: "message" as const, reason: sent.delivered ? undefined : sent.reason },
-                    { headers: corsHeaders(req) },
+                    { error: sent.reason || "could not send the answer" },
+                    { status: 400, headers: corsHeaders(req) },
                   );
                 }
+                // The dead child never emits tool_call_update completed, so
+                // the tool block would keep "Cursor is waiting" after this
+                // answer. Record the result only once the message is in.
+                if (pending.toolCallId) {
+                  recordCursorAskToolResult({
+                    taskId: pending.taskId,
+                    runId: pending.runId,
+                    toolCallId: pending.toolCallId,
+                    content: text,
+                  });
+                }
+                return null;
+              };
+              if (body.skip === true) {
+                // Read delivery after the hold, and do not await on the live
+                // branch. Awaiting a no-op lets the child exit, flip this
+                // card to the follow-up, and then a skipped write would
+                // report a message that was never sent. A follow-up sends
+                // first. A card that is still live completes the RPC now.
+                if (pending.delivery === "restart-followup") {
+                  const refused = await sendRestart(CURSOR_ASK_SKIP_FOLLOWUP);
+                  if (refused) return refused;
+                  const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
+                  return json({ ok, delivery: "message" as const }, { headers: corsHeaders(req) });
+                }
+                const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
                 return json({ ok }, { headers: corsHeaders(req) });
               }
               if (sanitised.length === 0) {
@@ -6809,18 +6843,26 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               if (empty) {
                 return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
               }
+              const followup = pending.delivery === "restart-followup";
+              if (followup) {
+                // The mapper already dropped leftover custom text. The
+                // follow-up must name those option labels, not the raw
+                // answers (single-select custom would replace the pick).
+                // `followup` is the decision to send, captured before the
+                // await, so a later delivery change cannot report a message
+                // that this request did not send.
+                const refused = await sendRestart(formatCursorAskFollowup(
+                  pending.questions.map((q) => ({
+                    question: q.question,
+                    options: q.options.map((o) => ({ id: o.id, label: o.label })),
+                  })),
+                  mapped.answers,
+                ));
+                if (refused) return refused;
+              }
               const ok = answerCursorAsk(req.params.id, { outcome: "answered", answers: mapped.answers });
-              if (ok && pending.delivery === "restart-followup") {
-                const specs = pending.questions.map((q) => ({
-                  question: q.question,
-                  multiSelect: !!q.multiSelect,
-                  options: q.options.map((o) => o.label),
-                }));
-                const sent = await sendInput(pending.runId, formatAnswersMessage(specs, sanitised));
-                return json(
-                  { ok: sent.delivered, delivery: "message" as const, reason: sent.delivered ? undefined : sent.reason },
-                  { headers: corsHeaders(req) },
-                );
+              if (followup) {
+                return json({ ok, delivery: "message" as const }, { headers: corsHeaders(req) });
               }
               return json({ ok }, { headers: corsHeaders(req) });
             } finally {

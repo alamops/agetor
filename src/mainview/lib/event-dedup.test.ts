@@ -33,6 +33,17 @@ describe("eventDedupKey", () => {
     expect(eventDedupKey(a)).not.toBe(eventDedupKey(b));
   });
 
+  test("same-tick tool_use growth past the first 200 chars is not collapsed", () => {
+    const prefix = "x".repeat(200);
+    const partial = ev({ stream: "tool_use", data: `${prefix}{"command":"l"}`, ts: 5 });
+    const grown = ev({ stream: "tool_use", data: `${prefix}{"command":"ls -la /tmp"}`, ts: 5 });
+    expect(eventDedupKey(partial)).not.toBe(eventDedupKey(grown));
+    const d = createEventDeduper();
+    expect(d.accept(partial)).toBe(true);
+    expect(d.accept(grown)).toBe(true);
+    expect(d.accept(grown)).toBe(false);
+  });
+
   test("same user text on different runs stays distinct", () => {
     const a = ev({ stream: "user", data: "yes", runId: "run-1" });
     const b = ev({ stream: "user", data: "yes", runId: "run-2" });

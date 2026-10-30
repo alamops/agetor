@@ -325,6 +325,12 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
         run: () => runs.replaceEventData(s.midEventId, "plan-guard replace"),
       },
     ],
+    "runs.replaceMainEventDataByLineUuid": [
+      {
+        label: "replaceMainEventDataByLineUuid(runId, lineUuid, data)",
+        run: () => runs.replaceMainEventDataByLineUuid(s.runId, "tu-0", "plan-guard tool rewrite"),
+      },
+    ],
   };
 }
 

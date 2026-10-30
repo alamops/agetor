@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { streamSse, type SseHandle } from "../sse.ts";
+import { foldToolUseRevisions } from "../../shared/tool-use-revisions.ts";
 import type { RunEvent } from "../../shared/types.ts";
 
 const TICK_MS = 33; // ~30fps flush — one state commit per tick, never per event
@@ -9,8 +10,9 @@ const MAX_LINES = 500; // ring-buffer cap on rendered scrollback
  * Stream a task's conversation with the three anti-lag guardrails from the
  * known RunPanel O(N²) bug: (1) BATCH — buffer incoming events and commit once
  * per tick, never setState per frame; (2) VIRTUALIZE — keep only the last
- * MAX_LINES; (3) DEDUPE — collapse the replay/live overlap on the server's
- * documented `ts|stream|data-prefix` key (also used as the React render key).
+ * MAX_LINES; (3) DEDUPE — collapse an exact replay. The key includes the
+ * payload length and its tail, so a same-millisecond Cursor tool revision
+ * is kept, then folded onto one row before the cap.
  */
 export function useCoalescedStream(
   taskId: string | null,
@@ -35,7 +37,7 @@ export function useCoalescedStream(
       if (buffer.current.length === 0) return;
       const batch = buffer.current;
       buffer.current = [];
-      const next = live.current.concat(batch);
+      const next = foldToolUseRevisions(live.current.concat(batch));
       const trimmed =
         next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
       live.current = trimmed;
@@ -71,6 +73,15 @@ export function useCoalescedStream(
   return events;
 }
 
+/** Prefix kept from the old key, plus the length and the tail. Two tool
+ *  payloads that share a timestamp and the first 64 characters still
+ *  differ once `rawInput` grows. An exact replay (same length, prefix,
+ *  and tail) still collapses. */
+function streamDataKey(data: string): string {
+  if (data.length <= 64) return data;
+  return `${data.length}:${data.slice(0, 64)}:${data.slice(-80)}`;
+}
+
 export function eventKey(e: RunEvent): string {
-  return `${e.ts}|${e.stream}|${e.data.slice(0, 64)}`;
+  return `${e.ts}|${e.stream}|${streamDataKey(e.data ?? "")}`;
 }

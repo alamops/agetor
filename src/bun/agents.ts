@@ -3750,12 +3750,19 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
   }
 
   if (harness.kind === "cursor") {
-    // cursor — hosted in a per-task tmux session via cursor-tmux.ts (so a
-    // mid-turn run survives an agetor restart and is reattachable), streaming
-    // structured events by tailing cursor-agent's `--output-format
-    // stream-json` NDJSON log. Same one-shot-turn-in-tmux shape as codex.
+    // cursor — one `cursor-agent acp` child per turn (cursor-acp.ts), NDJSON
+    // JSON-RPC on stdio. A restart leaves that child; an open question is
+    // rebuilt from `cursor_asks` and the next user message carries the answer.
     if (process.env.AGETOR_CURSOR_DRIVER === "fake") {
       buildCommand(harness, prompt, opts);
+      // Test hook: hold the spawn — the promise `spawnAgent` returns — so a
+      // delete or force-archive can land after `spawnCursorTurnNow` has
+      // minted the run and before it registers the child. That is the ACP
+      // handshake window in production. Unset/0/non-finite → no delay.
+      const spawnDelayMs = Number(process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS ?? 0);
+      if (Number.isFinite(spawnDelayMs) && spawnDelayMs > 0) {
+        await Bun.sleep(spawnDelayMs);
+      }
       // Hand the orchestrator a session id so it persists `cursor_session_id`
       // and can route the next turn through `session/load`.
       onSessionId?.(`fake-cursor-session-${taskId}`);

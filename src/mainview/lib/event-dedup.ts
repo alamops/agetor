@@ -62,11 +62,23 @@ const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
  * both sends are still delivered to claude (the tmux paste is independent of UI
  * dedup). Distinct runs get distinct keys via `runId`, so repeated idle
  * follow-ups still each show.
+ *
+ * Non-user keys keep a 200-char prefix so same-tick chunks stay cheap to
+ * compare, and also the length plus the last 80 characters. Cursor rewrites
+ * a `tool_use` in place and rebroadcasts it on `tool_call_update`; when that
+ * lands in the same millisecond and only the suffix grew, a prefix-only key
+ * dropped the update and the open panel kept the partial payload. An exact
+ * replay (same length, same prefix, same tail) still collapses.
  */
+function nonUserDataKey(data: string): string {
+  if (data.length <= 200) return data;
+  return `${data.length}:${data.slice(0, 200)}:${data.slice(-80)}`;
+}
+
 export function eventDedupKey(e: RunEvent): string {
   return e.stream === "user"
     ? `user|${e.runId}|${canonicalizeAttachmentText(canonicalizeUserText(normalizeForKey(e.data ?? ""))).trim().slice(0, 200)}`
-    : `${e.ts}|${e.runId}|${e.stream}|${(e.data ?? "").slice(0, 200)}`;
+    : `${e.ts}|${e.runId}|${e.stream}|${nonUserDataKey(e.data ?? "")}`;
 }
 
 /** Evict oldest keys (Sets iterate in insertion order) once `set` exceeds

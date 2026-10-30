@@ -39,7 +39,10 @@ const createdTaskIds: string[] = [];
 
 afterEach(async () => {
   const { db } = await import("./db.ts");
+  const { cancelPendingForTask } = await import("./interactions.ts");
   for (const id of createdTaskIds.splice(0)) {
+    cancelPendingForTask(id, "test cleanup");
+    db.run(`DELETE FROM cursor_asks WHERE task_id = ?`, [id]);
     db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
   }
 });
@@ -219,4 +222,159 @@ test("(d) archive with force+stopRun on an idle task (no run at all) is a plain 
   expect("task" in result).toBe(true);
   if (!("task" in result)) throw new Error(result.error);
   expect(result.task.archivedAt).not.toBeNull();
+});
+
+test("archive with no active run cancels a restarted Cursor question and writes cancelled", async () => {
+  const { archiveTask } = await import("./orchestrator.ts");
+  const { tasks, db, runs } = await import("./db.ts");
+  const { registerCursorAskQuestions, listPendingForTask } = await import("./interactions.ts");
+
+  const taskId = await createClaudeTask("archive-idle-cursor-ask");
+  const now = Date.now();
+  runs.insert({
+    id: "restarted-run",
+    taskId,
+    agent: "claude-code",
+    status: "orphaned",
+    startedAt: now,
+    endedAt: now,
+    exitCode: null,
+    tmuxSession: null,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+    antigravitySessionId: null,
+    opencodeSessionId: null,
+    copilotSessionId: null,
+  });
+  // Ready column, no live run: the shape left by orphaning a Cursor turn
+  // and rebuilding its question as a restart follow-up. `force` is what the
+  // Worktrees archive uses to get past the Done-only gate.
+  expect(tasks.get(taskId)?.runId).toBeNull();
+  expect(tasks.get(taskId)?.column).not.toBe("done");
+
+  const card = registerCursorAskQuestions({
+    taskId,
+    runId: "restarted-run",
+    toolCallId: "call-archive-idle",
+    delivery: "restart-followup",
+    questions: [{ id: "q", prompt: "Which?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const settled = card.answer;
+
+  const result = await archiveTask(taskId, { force: true });
+  expect("task" in result).toBe(true);
+  if (!("task" in result)) throw new Error(result.error);
+  expect(result.task.archivedAt).not.toBeNull();
+  expect(await settled).toEqual({ outcome: "cancelled" });
+  expect(listPendingForTask(taskId)).toEqual([]);
+  const row = db.query<{ outcome: string }, [string, string]>(
+    `SELECT outcome FROM cursor_asks WHERE task_id = ? AND tool_call_id = ?`,
+  ).get(taskId, "call-archive-idle");
+  expect(row?.outcome).toBe("cancelled");
+  const closed = db.query<{ data: string }, [string, string]>(
+    `SELECT data FROM run_events WHERE run_id = ? AND stream = ?`,
+  ).get("restarted-run", "tool_result");
+  expect(JSON.parse(closed?.data ?? "{}")).toEqual({
+    toolUseId: "call-archive-idle",
+    content: "cancelled",
+    isError: false,
+  });
+
+  // A card rebuilt onto an already-archived task (open row, process
+  // restart) must clear on the repeat-archive path too, or Submit would
+  // un-archive the task and start a turn.
+  const again = registerCursorAskQuestions({
+    taskId,
+    runId: "restarted-run",
+    toolCallId: "call-archive-again",
+    delivery: "restart-followup",
+    questions: [{ id: "q", prompt: "Which?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const settledAgain = again.answer;
+  const repeat = await archiveTask(taskId, { force: true });
+  expect("task" in repeat).toBe(true);
+  expect(await settledAgain).toEqual({ outcome: "cancelled" });
+  expect(listPendingForTask(taskId)).toEqual([]);
+  const againRow = db.query<{ outcome: string }, [string, string]>(
+    `SELECT outcome FROM cursor_asks WHERE task_id = ? AND tool_call_id = ?`,
+  ).get(taskId, "call-archive-again");
+  expect(againRow?.outcome).toBe("cancelled");
+  expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+});
+
+test("sendInput parked on teardown does not spawn when the task is archived before it resumes", async () => {
+  const prevDriver = process.env.AGETOR_CURSOR_DRIVER;
+  const prevBin = process.env.AGETOR_CURSOR_BIN;
+  process.env.AGETOR_CURSOR_DRIVER = "fake";
+  process.env.AGETOR_CURSOR_BIN = "/bin/echo";
+  let release: (() => void) | undefined;
+  const taskIdBox: { id?: string } = {};
+  try {
+    const { createTask, startTask, sendInput, archiveTask, __enqueueTeardownForTest, pendingTeardown } = await import("./orchestrator.ts");
+    const { tasks, runs, harnesses } = await import("./db.ts");
+    harnesses.setEnabled("cursor", true);
+
+    const created = await createTask({
+      title: "archive-during-send",
+      prompt: "hello",
+      agent: "cursor",
+      workdir: process.cwd(),
+      isolation: "none",
+    });
+    if ("error" in created) throw new Error(created.error);
+    const taskId = created.task.id;
+    taskIdBox.id = taskId;
+    createdTaskIds.push(taskId);
+
+    const started = await startTask(taskId);
+    if (!("runId" in started)) throw new Error("expected the run to start");
+    const runId = started.runId;
+    const deadline = Date.now() + 4000;
+    while (runs.get(runId)?.status === "running") {
+      if (Date.now() > deadline) throw new Error("cursor turn did not settle");
+      await wait(20);
+    }
+    expect(runs.get(runId)?.status).toBe("succeeded");
+    expect(runs.listForTask(taskId)).toHaveLength(1);
+
+    // Hold the teardown FIFO so sendInput parks on `pendingTeardown` after
+    // its unarchive check. Archiving in that window used to spawn anyway.
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      resolveGate = resolve;
+    });
+    release = () => resolveGate();
+    void __enqueueTeardownForTest(taskId, process.cwd(), () => gate);
+
+    const sent = sendInput(runId, "Alpha");
+    const archived = await archiveTask(taskId, { force: true });
+    expect("task" in archived).toBe(true);
+    if (!("task" in archived)) throw new Error(archived.error);
+    expect(archived.task.archivedAt).not.toBeNull();
+
+    release();
+    release = undefined;
+    const result = await sent;
+    expect(result).toEqual({
+      delivered: false,
+      reason: "task was archived before the message could be sent",
+    });
+    expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+    expect(runs.listForTask(taskId)).toHaveLength(1);
+    expect(runs.get(runId)?.status).toBe("succeeded");
+    await pendingTeardown(taskId);
+  } finally {
+    release?.();
+    if (prevDriver === undefined) delete process.env.AGETOR_CURSOR_DRIVER;
+    else process.env.AGETOR_CURSOR_DRIVER = prevDriver;
+    if (prevBin === undefined) delete process.env.AGETOR_CURSOR_BIN;
+    else process.env.AGETOR_CURSOR_BIN = prevBin;
+    if (taskIdBox.id) {
+      const { pendingTeardown } = await import("./orchestrator.ts");
+      await pendingTeardown(taskIdBox.id);
+    }
+  }
 });

@@ -253,6 +253,8 @@ export interface PendingAskQuestions {
   title?: string;
   toolCallId?: string;
   delivery?: "live" | "restart-followup";
+  /** Why a follow-up card is no longer live. Absent means a restart. */
+  followupCause?: "restart" | "child-exit";
 }
 
 /** Modal the tmux pane scraper detected — typically a plan-mode safety
@@ -2046,7 +2048,7 @@ export const api = {
    *  another request is still answering is refused 409 (thrown as `ApiError`). */
   skipAskQuestions: (id: string) =>
     j<{ ok: boolean; error?: string }>(`/ask-questions/${id}/answer`, { method: "POST", body: JSON.stringify({ skip: true }) }),
-  answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>
+  answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }> }) =>
     j<{
       ok: boolean;
       withheld?: boolean;

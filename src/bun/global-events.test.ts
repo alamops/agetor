@@ -11,7 +11,7 @@ process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 process.env.AGETOR_CLAUDE_ARGS = "";
 
-import type { GlobalEvent } from "../shared/types.ts";
+import type { GlobalEvent, RunEvent } from "../shared/types.ts";
 
 test("startTask emits column → running and run-status → succeeded", async () => {
   const { createTask, startTask, subscribeGlobal } = await import("./orchestrator.ts");
@@ -109,6 +109,45 @@ test("registering and resolving an interaction emits global interaction events",
   if (resolved?.kind === "interaction") {
     expect(resolved.interactionId).toBe(id);
   }
+});
+
+test("retargeting a live Cursor ask republishes the card without a second pending alert", async () => {
+  const { subscribe, subscribeGlobal } = await import("./orchestrator.ts");
+  const { registerCursorAskQuestions, retargetLiveCursorAsksForRun, answerCursorAsk } = await import("./interactions.ts");
+
+  const taskId = "cursor-retarget-broadcast";
+  const runId = "cursor-retarget-broadcast-run";
+  const globalEvents: GlobalEvent[] = [];
+  const taskEvents: RunEvent[] = [];
+  const unsubGlobal = subscribeGlobal((e) => {
+    if (e.kind === "interaction" && e.taskId === taskId) globalEvents.push(e);
+  });
+  const unsub = subscribe((e) => {
+    if (e.taskId === taskId && e.stream === "interaction") taskEvents.push(e);
+  });
+
+  const card = registerCursorAskQuestions({
+    taskId,
+    runId,
+    toolCallId: "call-retarget-broadcast",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "Which?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  retargetLiveCursorAsksForRun(runId);
+  answerCursorAsk(card.id, { outcome: "cancelled" });
+  unsub();
+  unsubGlobal();
+
+  const pending = globalEvents.filter((e) => e.kind === "interaction" && e.state === "pending");
+  expect(pending).toHaveLength(1);
+  expect(taskEvents).toHaveLength(2);
+  const updated = JSON.parse(taskEvents[1]!.data) as { id: string; delivery?: string; followupCause?: string };
+  expect(updated.id).toBe(card.id);
+  expect(updated.delivery).toBe("restart-followup");
+  expect(updated.followupCause).toBe("child-exit");
+  const first = JSON.parse(taskEvents[0]!.data) as { delivery?: string; followupCause?: string };
+  expect(first.delivery).toBe("live");
+  expect(first.followupCause).toBeUndefined();
 });
 
 test("reconcileOrphans emits run-status → orphaned + column → ready", async () => {

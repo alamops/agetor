@@ -4430,12 +4430,10 @@ export interface Run {
    */
   codexSessionId: string | null;
   /**
-   * Cursor's own conversation/session id (the `session_id` carried on every
-   * event in its `--output-format stream-json` NDJSON stream, first seen on
-   * `system/init`). Captured when the cursor tmux driver tails the run's
-   * NDJSON log. Drives `cursor-agent --resume <session_id>` for follow-up
-   * turns and is the reattach key for a mid-turn cursor run. NULL for
-   * claude-code/codex and legacy rows.
+   * Cursor's ACP session id, discovered from `session/new` or `session/load`.
+   * The next turn resumes with `session/load` of this id. A restart orphans
+   * a mid-turn Cursor child and rebuilds any open question from `cursor_asks`.
+   * NULL for every other agent kind and legacy rows.
    */
   cursorSessionId: string | null;
   /**

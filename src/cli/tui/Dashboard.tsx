@@ -36,6 +36,7 @@ import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
 import { trimmedResultNote } from "../commands/logs.ts";
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
 import { cursorAskFromToolUse, cursorAskPlainLines } from "../../shared/cursor-ask.ts";
+import { supersededToolUseIndexes } from "../../shared/tool-use-revisions.ts";
 
 type Mode = "nav" | "compose" | "answer";
 
@@ -683,6 +684,7 @@ function Detail({
   // notice text (or `null`) already resolved, so `EventLine`'s memo isn't
   // defeated by handing it a Map reference that's fresh every flush.
   const recoveryLines = useMemo(() => buildFxRecoveryLines(events), [events]);
+  const supersededToolUses = useMemo(() => supersededToolUseIndexes(events), [events]);
   // "⚠ paused — press r to resume" header hint (`docs/plans/
   // fx-recovery-follow-ups.md` §2/T6): now driven by the server-managed
   // `task.fxRecovery` field (`isTaskFxPaused`) instead of rescanning this
@@ -731,13 +733,15 @@ function Detail({
         ) : events.length === 0 ? (
           <Text dimColor>no events yet</Text>
         ) : (
-          events.map((e) => (
+          events.map((e, i) => (
+            supersededToolUses.has(i) ? null : (
             <EventLine
               key={eventKey(e)}
               e={e}
               sentLine={sentLines.get(eventKey(e))}
               recoveryLine={recoveryLines.get(eventKey(e))}
             />
+            )
           ))
         )}
       </Box>

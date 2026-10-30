@@ -10,6 +10,8 @@ import type {
   FxPermissionRequest,
 } from "../../bun/interactions.ts";
 import { buildAskAnswer, CUSTOM_OPTION } from "../answer-logic.ts";
+import { CURSOR_ASK_FREEFORM } from "../../shared/cursor-ask-verdict.ts";
+import { cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues } from "../../shared/cursor-ask.ts";
 
 const CURSOR_SKIP = "__cursor_skip__";
 
@@ -46,16 +48,21 @@ export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
 }
 
 async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promise<boolean> {
-  const answers: Array<{ selected: string[]; custom?: string }> = [];
+  const answers: Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }> = [];
+  if (req.title) out(c.bold(req.title));
   for (const q of req.questions) {
     p.note(q.question, q.header ?? "question");
     const options = [
-      ...q.options.map((o) => ({ value: o.label, label: o.label, hint: o.description })),
+      ...q.options.map((o) => ({
+        value: req.source === "cursor" ? cursorAskOptionValue(o) : o.label,
+        label: req.source === "cursor" ? cursorAskOptionChoiceLabel(o, q.options) : o.label,
+        hint: o.description,
+      })),
       { value: CUSTOM_OPTION, label: "✎ Other — type a custom answer" },
       ...(req.source === "cursor" ? [{ value: CURSOR_SKIP, label: "Skip" }] : []),
     ];
     // Re-prompt this question until it has at least one option or custom text.
-    let entry: { selected: string[]; custom?: string } | null = null;
+    let entry: { selected: string[]; selectedOptionIds?: string[]; custom?: string } | null = null;
     while (entry === null) {
       let picks: string[];
       if (q.multiSelect) {
@@ -72,8 +79,17 @@ async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promis
           const res = await client.answerAskQuestions(req.id, { skip: true });
           out(res.ok ? c.green("✓ skipped") : c.red("failed to skip"));
         } catch (e) {
-          if (!(e instanceof ApiError) || e.status !== 409) throw e;
-          out(c.dim("already being answered elsewhere"));
+          if (e instanceof ApiError && e.status === 409) {
+            out(c.dim("already being answered elsewhere"));
+            return true;
+          }
+          // A refused skip (the restart follow-up could not be sent) leaves
+          // the card pending. Match submit: print the error, don't throw.
+          if (e instanceof ApiError && e.status === 400) {
+            out(c.red(e.message || "could not skip"));
+            return false;
+          }
+          throw e;
         }
         return true;
       }
@@ -83,7 +99,24 @@ async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promis
         if (custom === null) return cancel();
       }
       entry = buildAskAnswer(picks, custom);
-      if (entry === null) p.note("Pick an option or add a custom answer.", "required");
+      if (entry && req.source === "cursor") {
+        const mapped = cursorAskPicksFromValues(q.options, entry.selected);
+        entry = entry.custom ? { ...mapped, custom: entry.custom } : mapped;
+      }
+      if (
+        entry
+        && req.source === "cursor"
+        && CURSOR_ASK_FREEFORM === "unsupported"
+        && entry.custom
+      ) {
+        // Multi-select can carry options and typed text together. The typed
+        // text cannot be delivered, so accepting the options alone would
+        // report the question answered without it.
+        p.note("Cursor cannot accept a custom answer — pick an option.", "required");
+        entry = null;
+      } else if (entry === null) {
+        p.note("Pick an option or add a custom answer.", "required");
+      }
     }
     answers.push(entry);
   }
@@ -93,8 +126,17 @@ async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promis
   } catch (e) {
     // 409: another client (the app, the TUI, a second `agetor answer`) is
     // answering this same card right now — nothing was sent on our behalf.
-    if (!(e instanceof ApiError) || e.status !== 409) throw e;
-    out(c.dim("already being answered elsewhere"));
+    if (e instanceof ApiError && e.status === 409) {
+      out(c.dim("already being answered elsewhere"));
+      return true;
+    }
+    // 400: Cursor refused the payload (custom text it cannot deliver). The
+    // card stays pending — don't surface that as an uncaught failure.
+    if (e instanceof ApiError && e.status === 400 && req.source === "cursor") {
+      out(c.red(e.message || "Cursor cannot accept a custom answer — pick an option"));
+      return false;
+    }
+    throw e;
   }
   return true;
 }

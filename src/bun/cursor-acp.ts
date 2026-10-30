@@ -7,16 +7,37 @@
  * The in-process answer is flat (`CursorAskAnswer`). The RPC result is
  * nested (`{ outcome: { outcome, answers? } }`), which is what this CLI
  * build's ask handler reads.
+ *
+ * Plan and ask (no `--force`) ask `session/request_permission` before shell,
+ * read, edit, delete, and MCP. This build treats JSON-RPC `-32601` as a
+ * denial, so those requests are answered `allow-once` — the same unprompted
+ * allow print mode already used. A killed turn answers `cancelled`.
+ *
+ * `tool_call_update` carries the grown `rawInput` and, on `completed` /
+ * `failed`, `rawOutput` / `content`. The started `tool_use` row is rewritten
+ * in place (a second insert would move `detectCursorPlan` off the plan).
+ * Ask and plan calls keep a pinned shape. A later update of the same kind
+ * replaces that pin only when its payload is longer: Cursor streams
+ * `rawInput` through `refreshToolCall` before the body is complete, and the
+ * completed update does not resend it. A shorter or equal replay must not
+ * clobber a fuller payload.
+ *
+ * `session/load` replays the prior transcript as `session/update`s before
+ * its result, and `session/new` can emit updates during the handshake.
+ * Those lines are dropped until that result line is seen. The gate opens
+ * on the result line itself, so a later line in the same stdout chunk is
+ * this turn's own update.
  */
 import type { Subprocess } from "bun";
 import { childEnv, coreSpawn } from "./core-spawn.ts";
 import { CURSOR_ASK_RESUME } from "../shared/cursor-ask-verdict.ts";
 import { FX_USAGE_STATUS_PREFIX } from "../shared/types.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
-import { listOpenCursorAsks } from "./db.ts";
+import { listOpenCursorAsks, runs } from "./db.ts";
 import {
   cancelPendingForTask,
   registerCursorAskQuestions,
+  retargetLiveCursorAsksForRun,
   type CursorAskAnswer,
   type CursorAskQuestionInput,
 } from "./interactions.ts";
@@ -26,6 +47,15 @@ export const FAKE_CURSOR_ASK_PROMPT_MARKER = "__agetor_fake_cursor_ask__";
 
 const RPC_HANDSHAKE_TIMEOUT_MS = 15_000;
 const MAX_STDOUT_BUFFER_BYTES = 8 * 1024 * 1024;
+
+/** Attempts to write a `cursor/ask_question` result after the card was
+ *  registered. Counted before the write so a throw on a dead stdin still
+ *  counts. A settle that only retargets the card must not increase this. */
+let askResultWrites = 0;
+
+export function cursorAskResultWriteCount(): number {
+  return askResultWrites;
+}
 
 export interface CursorAcpLaunch {
   taskId: string;
@@ -65,6 +95,16 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
       },
     );
   });
+}
+
+/**
+ * `session/request_permission` result. `allow-once` is the option id this
+ * CLI's decision provider treats as approved. Anything else, including
+ * `-32601`, is a denial.
+ */
+export function cursorPermissionRpcResult(cancelled: boolean): Record<string, unknown> {
+  if (cancelled) return { outcome: { outcome: "cancelled" } };
+  return { outcome: { outcome: "selected", optionId: "allow-once" } };
 }
 
 /** Nested ACP result. A flat `{ outcome: "answered" }` is treated as cancelled by the CLI. */
@@ -157,6 +197,13 @@ class TurnText {
   }
 }
 
+/**
+ * `session/prompt` on cursor-agent 2026.10.22-27dcf5f returns only
+ * `{ stopReason }`. `presentInteractionUpdate` never forwards `turnEnded`,
+ * which is where print mode's token counts live, and it never emits
+ * `usage`. This still records `result.usage` when a later CLI attaches it.
+ * `usage_update` is a context-window gauge (`size` / `used`), not tokens.
+ */
 function emitUsage(runId: string, result: unknown, emit: ChunkHandler): void {
   if (!isRecord(result) || !isRecord(result.usage)) return;
   const usage = result.usage;
@@ -207,6 +254,7 @@ export function rebuildOpenCursorAsks(): void {
       title: row.payload.title,
       questions,
       delivery,
+      ...(delivery === "restart-followup" ? { followupCause: "restart" as const } : {}),
       persist: false,
     });
   }
@@ -251,7 +299,15 @@ function pinnedAsk(toolCallId: string, title: string, questions: unknown[]): str
   });
 }
 
-/** Blocks until every fake card is answered, skipped, or cancelled. */
+function fakeAskResultContent(answer: CursorAskAnswer): unknown {
+  if (answer.outcome === "answered") return { answered: true, answers: answer.answers };
+  return answer.outcome;
+}
+
+/** Blocks until every fake card is answered, skipped, or cancelled.
+ *  Each settlement writes the `tool_result` a live child would send as
+ *  `tool_call_update` `completed`. `kill` records that result itself
+ *  before the awaiter resolves, so this path does not write a second one. */
 export function spawnFakeCursorAsk(opts: {
   taskId: string;
   runId: string;
@@ -274,7 +330,20 @@ export function spawnFakeCursorAsk(opts: {
       title: card.title,
       questions: card.questions,
       delivery: "live",
-    }).answer;
+    }).answer.then((answer) => {
+      if (!killed) {
+        opts.onChunk(
+          "tool_result",
+          JSON.stringify({
+            toolUseId: card.toolCallId,
+            content: fakeAskResultContent(answer),
+            isError: false,
+          }),
+          `tool_call:${card.toolCallId}:completed`,
+        );
+      }
+      return answer;
+    });
   });
   const done = Promise.all(answers).then((settled) => {
     if (killed || settled.some((a) => a.outcome === "cancelled")) return 1;
@@ -303,7 +372,16 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
   let userCancelled = false;
   let askInFlight = 0;
   let sessionId: string | null = opts.resumeSessionId ?? null;
+  /** False until the `session/new` or `session/load` result line is seen.
+   *  History replayed before that result must not be written into this run. */
+  let acceptSessionUpdates = false;
+  let sessionRpcId: number | undefined;
   const emittedTools = new Set<string>();
+  /** `"ask"` / `"plan"` keep the pinned tool_use and may grow it.
+   *  `"generic"` may be rewritten on every larger or different payload. */
+  const toolKind = new Map<string, "ask" | "plan" | "generic">();
+  const toolPayload = new Map<string, string>();
+  const resultEmitted = new Set<string>();
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   let nextId = 1;
   const text = new TurnText(opts.runId, opts.onChunk);
@@ -330,6 +408,15 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
     if (settled) return;
     settled = true;
     text.flush();
+    // The child can no longer read a live RPC result. Leave the row open
+    // and point this run's card at the follow-up, with cause `child-exit`,
+    // so a later submit is a user message rather than an answer reported
+    // against a dead stdin. The boot rebuild uses cause `restart` instead.
+    try {
+      retargetLiveCursorAsksForRun(opts.runId);
+    } catch {
+      /* the card registry must not keep a dead turn alive */
+    }
     const err = new Error("cursor acp settled");
     for (const waiter of pending.values()) waiter.reject(err);
     pending.clear();
@@ -359,6 +446,7 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
 
   function sendRpc(method: string, params: unknown): Promise<unknown> {
     const id = nextId++;
+    if (method === "session/new" || method === "session/load") sessionRpcId = id;
     return new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
       try {
@@ -370,25 +458,56 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
     });
   }
 
-  function emitAsk(toolCallId: string, title: string, questions: unknown[]): void {
-    if (!toolCallId || emittedTools.has(toolCallId)) return;
+  function emitPinned(toolCallId: string, kind: "ask" | "plan", data: string): void {
+    if (!toolCallId) return;
+    const current = toolKind.get(toolCallId);
+    const other = kind === "ask" ? "plan" : "ask";
+    if (current === other) return;
+    if (current === kind) {
+      const prev = toolPayload.get(toolCallId);
+      if (prev !== undefined && data.length <= prev.length) return;
+    }
+    const uuid = `tool_call:${toolCallId}:started`;
+    // A partial tool_call can arrive before `_toolName` says this is an ask
+    // or a plan, and a later partial of the same kind can carry a longer
+    // body. Replace that row instead of leaving the first payload in place.
+    if (emittedTools.has(toolCallId)) runs.replaceMainEventDataByLineUuid(opts.runId, uuid, data);
     emittedTools.add(toolCallId);
-    opts.onChunk("tool_use", pinnedAsk(toolCallId, title, questions), `tool_call:${toolCallId}:started`);
+    toolKind.set(toolCallId, kind);
+    toolPayload.set(toolCallId, data);
+    opts.onChunk("tool_use", data, uuid);
+  }
+
+  function emitAsk(toolCallId: string, title: string, questions: unknown[]): void {
+    emitPinned(toolCallId, "ask", pinnedAsk(toolCallId, title, questions));
   }
 
   function emitPlan(toolCallId: string, name: string, plan: string): void {
-    if (!toolCallId || emittedTools.has(toolCallId)) return;
-    emittedTools.add(toolCallId);
-    opts.onChunk(
-      "tool_use",
+    emitPinned(
+      toolCallId,
+      "plan",
       JSON.stringify({
         id: toolCallId,
         name: "createPlanToolCall",
         input: { createPlanToolCall: { args: { name, plan } } },
         serverSide: false,
       }),
-      `tool_call:${toolCallId}:started`,
     );
+  }
+
+  function publishGenericTool(toolCallId: string, name: string, input: unknown): void {
+    if (!toolCallId || toolKind.get(toolCallId) === "ask" || toolKind.get(toolCallId) === "plan") return;
+    const data = JSON.stringify({ id: toolCallId, name, input, serverSide: false });
+    const prev = toolPayload.get(toolCallId);
+    if (prev === data) return;
+    const uuid = `tool_call:${toolCallId}:started`;
+    // Rewrite the started row. A second insert would become lastToolUseData
+    // and hide a later createPlanToolCall from detectCursorPlan.
+    if (prev !== undefined) runs.replaceMainEventDataByLineUuid(opts.runId, uuid, data);
+    toolPayload.set(toolCallId, data);
+    toolKind.set(toolCallId, "generic");
+    emittedTools.add(toolCallId);
+    opts.onChunk("tool_use", data, uuid);
   }
 
   function onToolCall(update: Record<string, unknown>): void {
@@ -404,15 +523,49 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
       emitPlan(toolCallId, asString(raw.name) ?? "", asString(raw.plan) ?? "");
       return;
     }
-    if (toolCallId && !emittedTools.has(toolCallId)) {
-      emittedTools.add(toolCallId);
-      const name = toolName ?? asString(update.title) ?? "tool";
-      opts.onChunk(
-        "tool_use",
-        JSON.stringify({ id: toolCallId, name, input: raw, serverSide: false }),
-        `tool_call:${toolCallId}:started`,
-      );
+    if (toolCallId) publishGenericTool(toolCallId, toolName ?? asString(update.title) ?? "tool", raw);
+  }
+
+  function toolResultContent(update: Record<string, unknown>): unknown {
+    if ("rawOutput" in update && update.rawOutput !== undefined) return update.rawOutput;
+    if ("content" in update && update.content !== undefined) return update.content;
+    return "";
+  }
+
+  function onToolCallUpdate(update: Record<string, unknown>): void {
+    text.flush();
+    const toolCallId = asString(update.toolCallId) ?? "";
+    if (!toolCallId) return;
+    // A revision after the result becomes a second live `tool_use` (same
+    // line uuid, so the row is rewritten, but the chunk is still broadcast).
+    // The rendered card is that later row, and a result-only search has no
+    // `data-evid` on it. The completing update still publishes rawInput
+    // first, then the result, in this same call.
+    if (!resultEmitted.has(toolCallId)) {
+      const raw = isRecord(update.rawInput) ? update.rawInput : undefined;
+      const toolName = raw ? asString(raw._toolName) : undefined;
+      if (toolName === "askQuestion" || toolName === "askQuestionToolCall") {
+        emitAsk(toolCallId, asString(raw?.title) ?? "", Array.isArray(raw?.questions) ? raw.questions : []);
+      } else if (toolName === "createPlan" || toolName === "createPlanToolCall") {
+        emitPlan(toolCallId, asString(raw?.name) ?? "", asString(raw?.plan) ?? "");
+      } else if (raw && toolKind.get(toolCallId) !== "ask" && toolKind.get(toolCallId) !== "plan") {
+        publishGenericTool(toolCallId, toolName ?? asString(update.title) ?? "tool", raw);
+      } else if (!emittedTools.has(toolCallId)) {
+        publishGenericTool(toolCallId, asString(update.title) ?? "tool", raw ?? {});
+      }
     }
+    const status = asString(update.status);
+    if ((status !== "completed" && status !== "failed") || resultEmitted.has(toolCallId)) return;
+    resultEmitted.add(toolCallId);
+    opts.onChunk(
+      "tool_result",
+      JSON.stringify({
+        toolUseId: toolCallId,
+        content: toolResultContent(update),
+        isError: status === "failed",
+      }),
+      `tool_call:${toolCallId}:completed`,
+    );
   }
 
   function onUpdate(update: Record<string, unknown>): void {
@@ -429,17 +582,42 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
       onToolCall(update);
       return;
     }
-    // `usage_update` is a context-window gauge, not token counts. `tool_call_update`
-    // repeats a call we already emitted. Flush text so a later chunk starts a new block.
-    if (kind === "usage_update" || kind === "tool_call_update") {
-      text.flush();
+    if (kind === "tool_call_update") {
+      onToolCallUpdate(update);
+      return;
     }
+    // `usage_update` is a context-window gauge, not token counts.
+    if (kind === "usage_update") text.flush();
   }
 
   async function handleRequest(id: unknown, method: string, params: unknown): Promise<void> {
+    if (method === "session/request_permission") {
+      try {
+        writeLine({
+          jsonrpc: "2.0",
+          id,
+          result: cursorPermissionRpcResult(killed || userCancelled || settled),
+        });
+      } catch {
+        /* the child is gone */
+      }
+      return;
+    }
     if (method !== "cursor/ask_question") {
       try {
         writeLine({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+      } catch {
+        /* the child is gone */
+      }
+      return;
+    }
+    // A line already sitting in the stdout buffer is parsed after `kill()`.
+    // `kill` has cancelled every card that existed at that moment; registering
+    // this one would put a question back on a turn that is already stopping.
+    // Answer cancelled and leave the registry alone.
+    if (killed || settled) {
+      try {
+        writeLine({ jsonrpc: "2.0", id, result: cursorAskRpcResult({ outcome: "cancelled" }) });
       } catch {
         /* the child is gone */
       }
@@ -460,8 +638,12 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
     askInFlight++;
     try {
       const answer = await registered.answer;
+      // settle() already retargeted this card and may have killed the child.
+      // A write here would report the answer to a process that has exited.
+      if (settled) return;
       if (answer.outcome === "cancelled") userCancelled = true;
       try {
+        askResultWrites++;
         writeLine({ jsonrpc: "2.0", id, result: cursorAskRpcResult(answer) });
       } catch {
         /* kill already closed stdin */
@@ -496,6 +678,10 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
         const err = isRecord(msg.error) ? asString(msg.error.message) ?? "rpc error" : "rpc error";
         waiter.reject(new Error(err));
       } else {
+        // Open on this line, not when the await resumes. A live update can
+        // share the stdout chunk with the session result and would otherwise
+        // be dropped as replay.
+        if (id === sessionRpcId) acceptSessionUpdates = true;
         waiter.resolve(msg.result);
       }
       return;
@@ -505,6 +691,7 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
       return;
     }
     if (msg.method === "session/update" && isRecord(msg.params)) {
+      if (!acceptSessionUpdates) return;
       const update = isRecord(msg.params.update) ? msg.params.update : msg.params;
       onUpdate(update);
     }

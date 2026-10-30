@@ -72,7 +72,7 @@ test.describe("cursor ask card (worker backend)", () => {
     return task.id;
   }
 
-  test("the card shows Cursor is waiting, the question, and Skip; submitting finishes the run", async ({
+  test("the card shows Cursor is waiting; custom text alone cannot reach Review; submitting finishes the run", async ({
     page,
     request,
     backend,
@@ -94,7 +94,7 @@ test.describe("cursor ask card (worker backend)", () => {
     await expect(card.getByText("Which option?", { exact: true })).toBeVisible();
     await expect(card.getByText("Alpha", { exact: true })).toBeVisible();
     await expect(card.getByText("Beta", { exact: true })).toBeVisible();
-    await expect(card.getByPlaceholder("Custom answer — replaces the selection")).toBeVisible();
+    await expect(card.getByPlaceholder("Custom answer — Cursor can't accept typed text; pick an option")).toBeVisible();
     await expect(card.getByTestId("ask-questions-skip")).toBeVisible();
 
     const tool = panel.getByTestId("cursor-ask-tool-body");
@@ -102,8 +102,13 @@ test.describe("cursor ask card (worker backend)", () => {
     await expect(tool).toContainText("Which option?");
     await expect(tool).toContainText("Alpha");
 
+    const review = card.getByRole("button", { name: "Review answers →" });
+    await expect(review).toBeDisabled();
+    await card.getByPlaceholder("Custom answer — Cursor can't accept typed text; pick an option").fill("typed only");
+    await expect(review).toBeDisabled();
     await card.getByRole("radio", { name: "Alpha" }).check();
-    await card.getByRole("button", { name: "Review answers →" }).click();
+    await expect(review).toBeEnabled();
+    await review.click();
     await card.getByRole("button", { name: "Submit answers" }).click();
     await expect(card).toBeHidden({ timeout: 15_000 });
     await expect.poll(async () => (await getTask(request, backend, taskId)).column, { timeout: 15_000 }).toBe("review");

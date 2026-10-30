@@ -184,7 +184,7 @@ function shouldSkipEvent(e: RunEvent): boolean {
  * the pre-existing `shouldSkipEvent` skip + `formatEvent` render, unchanged.
  */
 function createLineRenderer(
-  formatEvent: (e: RunEvent) => string,
+  formatEvent: (e: RunEvent) => string | null,
   json: boolean,
 ): (e: RunEvent) => string | null {
   return (e: RunEvent): string | null => {
@@ -209,10 +209,14 @@ function createLineRenderer(
  * one map safely covers whichever branch runs, and a fresh map per call
  * means no state leaks between unrelated invocations (or test cases).
  */
-function createEventFormatter(): (e: RunEvent) => string {
+function createEventFormatter(): (e: RunEvent) => string | null {
   const pendingSentFiles = new Map<string, SentFilesRequest>();
+  /** Last line printed for a tool id. A later `tool_use` with the same id
+   *  is a grown payload. Reprint it when the line changed (an ask body
+   *  that arrived after a partial). An identical name line stays quiet. */
+  const printedToolLines = new Map<string, string>();
 
-  return function formatEvent(e: RunEvent): string {
+  return function formatEvent(e: RunEvent): string | null {
     switch (e.stream) {
       // `userMessageLines` (src/shared/user-message.ts) is the single source
       // of truth for rendering a raw user-turn string across all three
@@ -248,16 +252,22 @@ function createEventFormatter(): (e: RunEvent) => string {
         return e.data;
       case "tool_use": {
         const t = tryJson(e.data) as { id?: string; name?: string; input?: unknown } | null;
-        if (t?.id && t.name) {
-          const req = parseSentFilesToolUse(t.name, t.input);
-          if (req) {
-            pendingSentFiles.set(t.id, req);
-            return c.magenta(`📎 ${sentFilesSummaryLine(req, null)}`);
-          }
+        let line: string;
+        const sent = t?.id && t.name ? parseSentFilesToolUse(t.name, t.input) : null;
+        if (sent && t?.id) {
+          pendingSentFiles.set(t.id, sent);
+          line = c.magenta(`📎 ${sentFilesSummaryLine(sent, null)}`);
+        } else {
+          const ask = cursorAskFromToolUse(t);
+          line = ask
+            ? cursorAskPlainLines(ask).map((row) => c.magenta(row)).join("\n")
+            : c.magenta(`▸ ${t?.name ?? "tool"}`);
         }
-        const ask = cursorAskFromToolUse(t);
-        if (ask) return cursorAskPlainLines(ask).map((line) => c.magenta(line)).join("\n");
-        return c.magenta(`▸ ${t?.name ?? "tool"}`);
+        if (typeof t?.id === "string" && t.id.length > 0) {
+          if (printedToolLines.get(t.id) === line) return null;
+          printedToolLines.set(t.id, line);
+        }
+        return line;
       }
       case "tool_result": {
         const t = tryJson(e.data) as

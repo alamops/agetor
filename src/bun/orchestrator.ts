@@ -97,6 +97,7 @@ import {
   countPendingForTask,
   setBroadcaster,
   setResolvedBroadcaster,
+  setRunEventEmitter,
   type AnyRequest,
   type InteractionResolved,
 } from "./interactions.ts";
@@ -873,7 +874,8 @@ export function __dispatchChunkForTest(
  * idempotent so a test can also re-install the real wiring outright.
  */
 export function wireInteractionBroadcast(): void {
-  setBroadcaster((req: AnyRequest) => {
+  setRunEventEmitter(emit);
+  setBroadcaster((req: AnyRequest, reason) => {
     emit({
       runId: req.runId,
       taskId: req.taskId,
@@ -881,6 +883,10 @@ export function wireInteractionBroadcast(): void {
       data: JSON.stringify(req),
       ts: req.createdAt,
     });
+    // A delivery change republishes the same card. The panel needs that
+    // payload; a second app-level "pending" event would alert again and
+    // bump the board's pending count for a prompt that is already showing.
+    if (reason === "update") return;
     // Also ride the app-level bus so the notification hook can alert the user
     // even when no panel for this task is open (or it's open but the window is
     // backgrounded and can't repaint the card). The per-task `interaction`
@@ -2180,6 +2186,13 @@ async function startTaskInner(
           // handler would for a cancelled run (`ready`, this run stays its
           // latest) and say why nothing ran.
           spawnArgs.onChunk("status", "cancelled by user before the agent launched");
+          updateColumn(taskId, runId, "ready");
+        } else if (fresh?.archivedAt != null && fresh.runId === runId) {
+          // Force-archive in this window does not move the column, and this
+          // run never registers, so the done handler will not pull it to
+          // `ready` either. Left on `running`, unarchive shows Stop for a
+          // process that is already gone.
+          spawnArgs.onChunk("status", "task archived before the agent launched");
           updateColumn(taskId, runId, "ready");
         }
         // H1: this run never registers, so no done handler will ever emit
@@ -4072,6 +4085,15 @@ function isIdleOnlyBusy(value: unknown): value is IdleOnlyBusy {
   return typeof value === "object" && value !== null && (value as { busy?: unknown }).busy === true;
 }
 
+/** A cursor follow-up minted a run and then killed it before the child
+ *  was registered. Distinct from a `null` start-claim conflict. */
+type CursorTurnMiss = { declined: string };
+
+function isCursorTurnMiss(value: unknown): value is CursorTurnMiss {
+  return typeof value === "object" && value !== null && typeof (value as { declined?: unknown }).declined === "string"
+    && (value as { busy?: unknown }).busy !== true;
+}
+
 /**
  * Forward a line of user-supplied input to the agent. Behavior depends on
  * agent kind:
@@ -4091,9 +4113,9 @@ function isIdleOnlyBusy(value: unknown): value is IdleOnlyBusy {
  *     to mid-turn. See `sendCodexTurn`/`drainCodexQueue`.
  *
  *   • cursor: same queue-and-resume shape as codex (`sendCursorTurn`/
- *     `drainCursorQueue`), spawning a fresh `cursor-agent --resume
- *     <session-id>` turn for each queued follow-up — cursor's CLI is
- *     one-shot per turn too.
+ *     `drainCursorQueue`). Each queued follow-up is a new `cursor-agent acp`
+ *     child that resumes with `session/load` of the stored session id.
+ *     Cursor is one-shot per turn.
  *
  *   • gemini: same queue-and-resume shape as codex (`sendGeminiTurn`/
  *     `drainGeminiQueue`), spawning `gemini --resume <session-id>` for each
@@ -4398,6 +4420,19 @@ async function sendInputInner(
     }
   }
 
+  // Archive can land while this send is already inside an await —
+  // `pendingTeardown`, the missing-worktree restore, or `@` expansion.
+  // The unarchive above already ran, and `pendingTeardown` only waits on
+  // the promise it captured, so a later archive's stamp is invisible
+  // unless we read the row again in the same turn as the spawn. Spawning
+  // anyway leaves an archived task with a live agent; the restart-followup
+  // answer route then reports a failed delivery with no reason of its own.
+  const readyToSpawn = tasks.get(row.task_id);
+  if (!readyToSpawn) return { delivered: false, reason: "task not found" };
+  if (readyToSpawn.archivedAt != null) {
+    return { delivered: false, reason: "task was archived before the message could be sent" };
+  }
+
   if (kind === "claude-code") {
     const result = await sendClaudeTurn(row.task_id, line, rawLine, onlyIfIdle);
     if (!result) return { delivered: false, reason: "internal: task lookup failed" };
@@ -4447,6 +4482,7 @@ async function sendInputInner(
   if (kind === "cursor") {
     const result = await sendCursorTurn(row.task_id, line, onlyIfIdle);
     if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    if (isCursorTurnMiss(result)) return { delivered: false, reason: result.declined };
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -4849,28 +4885,31 @@ async function drainCodexQueue(taskId: string): Promise<void> {
 
 /**
  * Per-task queue of follow-up lines received while a cursor turn is in
- * flight. `cursor-agent -p` is one-shot per invocation (not a REPL), so we
- * hold the message and spawn a fresh `cursor-agent --resume <session_id>`
- * turn for it once the active turn resolves (`drainCursorQueue`, called from
- * `attachDoneHandler`). Structural clone of `codexTurnQueue` — see that
- * comment for the full rationale.
+ * flight. Each turn is one `cursor-agent acp` child (not a REPL), so we
+ * hold the message and spawn the next turn once the active one resolves
+ * (`drainCursorQueue`, called from `attachDoneHandler`). That turn resumes
+ * with ACP `session/load` of the stored session id. Structural clone of
+ * `codexTurnQueue` — see that comment for the full rationale.
  */
 const cursorTurnQueue = new Map<string, string[]>();
 
 /**
- * Send a follow-up to a cursor task. Each follow-up is its own run row + its
- * own `cursor-agent --resume <session_id>` turn (sequential-turn model). When
- * a turn is already running, the message is queued; otherwise it spawns
- * immediately. Returns the run id the message was attached to, or null on
- * lookup failure — or when `spawnCursorTurnNow` declined to mint a run
+ * Send a follow-up to a cursor task. Each follow-up is its own run row and
+ * its own `cursor-agent acp` turn, resumed with `session/load` of the stored
+ * session id (sequential-turn model). When a turn is already running, the
+ * message is queued; otherwise it spawns immediately. Returns the run id
+ * the message was attached to, or null on lookup failure — or when
+ * `spawnCursorTurnNow` declined to mint a run
  * because `startingTaskIds` was already claimed for this task (see that
- * set's doc, near `startTask`).
+ * set's doc, near `startTask`). A `{ declined }` result means the run was
+ * minted and then killed before the child registered, so the line was
+ * not written as a user message.
  */
 async function sendCursorTurn(
   taskId: string,
   line: string,
   onlyIfIdle = false,
-): Promise<string | IdleOnlyBusy | null> {
+): Promise<string | IdleOnlyBusy | CursorTurnMiss | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   // Idle-only send: refuse before the queue push / user event / spawn (see
@@ -4892,11 +4931,12 @@ async function sendCursorTurn(
 }
 
 /**
- * Spawn a fresh cursor turn that resumes the task's prior conversation via
- * `cursor-agent --resume <session_id>`. New run row, new tmux session (the
- * previous turn's exited), same `session_id` carried forward.
+ * Spawn a fresh cursor turn that resumes the task's prior conversation.
+ * New run row; the previous turn's child has exited. The stored session id
+ * is carried forward as `resumeSessionId`, and the ACP driver resumes with
+ * `session/load`.
  */
-async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Promise<string | CursorTurnMiss | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
   // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
@@ -4938,7 +4978,9 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
 
     const kind: AgentKind = harness?.kind ?? "cursor";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-    onChunk("user", normalizeUserText(line));
+    // The user line is written only after the child is registered. Archive,
+    // delete, and Stop during the handshake must not leave the answer on a
+    // cancelled run that the ask card can no longer retry.
     onChunk(
       "status",
       priorSessionId
@@ -4971,10 +5013,8 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
         speed: task.speed,
         maxMode: task.maxMode,
         // Same generic resume-session field claude-code and codex already
-        // thread through `spawnAgent` → `buildCommand` — cursor's `session_id`
-        // rides the same `AgentRunOptions.resumeSessionId` contract rather than
-        // a cursor-specific field name (see this function's file-level header
-        // note on the resume option-field contract).
+        // thread through `spawnAgent`. Cursor does not put it on argv: the
+        // ACP driver reads `resumeSessionId` and calls `session/load`.
         resumeSessionId: priorSessionId,
       },
     });
@@ -4992,9 +5032,37 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       // the run is settled `cancelled` and attachDoneHandler never runs, so
       // the queue is dropped here (kept in the backlog on a pipeline step).
       dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
-      return newRunId;
+      return { declined: "the turn was cancelled before Cursor started" };
     }
-    registerActiveRun(newRunId, taskId, task, agent);
+    // Ownership guard, the same rule as `startTaskInner`'s continuation.
+    // The ACP handshake is the slow part of this spawn: the run row exists
+    // and the child is already up, but `registerActiveRun` has not run, so
+    // delete and force-archive (whose `active.has(task.runId)` check is
+    // false in this window) do not see a handle to kill. Registering
+    // afterwards would leave that child running on a task that is gone,
+    // archived, or no longer on this run.
+    const fresh = tasks.get(taskId);
+    if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId) {
+      agent.done.catch(() => {});
+      agent.kill();
+      runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+      // This run never registers, so nothing will drain the follow-up queue.
+      // Delete and archive already dropped it; a runId mismatch means a
+      // newer turn owns the task and must keep whatever it queued.
+      if (!fresh || fresh.archivedAt != null) cursorTurnQueue.delete(taskId);
+      if (fresh && fresh.runId === newRunId) {
+        // This run never registers, so `attachDoneHandler` — which is what
+        // moves a cancelled terminal run to `ready` — will not run. Archive
+        // itself does not touch the column. Left on `running`, unarchive
+        // shows Stop for a process that is already gone and has no handle.
+        onChunk("status", "task archived before the agent launched");
+        updateColumn(taskId, newRunId, "ready");
+        emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+      }
+      return { declined: "the turn was cancelled before Cursor started" };
+    }
+    onChunk("user", normalizeUserText(line));
+    registerActiveRun(newRunId, taskId, fresh, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
@@ -7701,6 +7769,11 @@ async function spawnResumedSessionInner(
         if (cancelledWhilePending && fresh && fresh.runId === newRunId) {
           onChunk("status", "cancelled by user before the agent launched");
           updateColumn(taskId, newRunId, "ready");
+        } else if (fresh?.archivedAt != null && fresh.runId === newRunId) {
+          // Same settlement as `startTaskInner`: archive does not move the
+          // column, and this run never registers, so nothing else will.
+          onChunk("status", "task archived before the agent launched");
+          updateColumn(taskId, newRunId, "ready");
         }
         // H1: same terminal emit as `startTaskInner`'s continuation — this
         // run never registers, so nothing else will ever announce it.
@@ -8331,6 +8404,15 @@ function enqueueArchiveTeardown(
  * `cancelRun`) before the normal archive path below proceeds. Without it,
  * the active-run guard stays in place as a backstop.
  *
+ * Every archive that is allowed to proceed also clears pending interactions,
+ * including when no run is active. A Cursor question rebuilt after a restart
+ * has no live child; leaving that card up lets Submit un-archive the task
+ * and start a turn. The card is resolved as cancelled and the stored
+ * `cursor_asks` outcome is `cancelled`. A refused archive (still running,
+ * not in Done, or a pipeline step) leaves the card in place. The clear runs
+ * before the already-archived return and before any later await, so a submit
+ * during cascade or teardown cannot race it.
+ *
  * Pass `{ forceWorktree: true }` to have the detach discard uncommitted
  * changes in the checkout rather than leaving it in place (threaded straight
  * through to `detachWorktree`'s `force` option) — an explicit, user-confirmed
@@ -8380,6 +8462,13 @@ export async function archiveTask(
   } else if (opts?.stopRun && isHeldByBackgroundAgents(taskId)) {
     await stopHeldTask(taskId, "task archived");
   }
+  // Idle archive (a restarted Cursor question, a done-column archive, a
+  // repeat archive) has no live handle, so the branches above never clear
+  // the card. `stopActiveHandle` / `stopHeldTask` already cancelled when
+  // they ran; a second call is a no-op. Must stay synchronous and ahead of
+  // the already-archived return: a surviving restart-followup submit calls
+  // `sendInput`, which un-archives the task and starts a turn.
+  cancelPendingForTask(taskId, "task archived");
   if (task.archivedAt != null) {
     // Already archived is normally a cheap no-op — repeat-archives (e.g. a
     // double click) shouldn't re-enqueue teardown work every time. But when

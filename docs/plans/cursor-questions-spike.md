@@ -31,11 +31,11 @@ The handler then builds the protobuf tool result. Answered copies **only** `ques
 
 `__freeform_other__` is the interactive TUI's synthetic option (`5622.index.js`), not a branch in the ACP handler. Putting that id in `selectedOptionIds` would forward an id the model did not offer, and the typed text would still be dropped.
 
-A custom-only submit therefore cannot reach the model. The answer route returns 400 and leaves the card up. Option picks still map to `selectedOptionIds`.
+A custom-only submit therefore cannot reach the model. The answer route returns 400 and leaves the card up. Option picks still map to `selectedOptionIds`. The web card keeps Review disabled until every question has a selected option, so typed text alone never reaches that screen.
 
 ## Resume — `follow-up`
 
-`session/load` (`loadSession`) replays completed turns as `session/update`s (`replayConversationHistory` → user text, assistant text, thinking, completed tool calls). It does not call `processPrompt` and does not send `cursor/ask_question`.
+`session/load` (`loadSession`) replays completed turns as `session/update`s (`replayConversationHistory` → user text, assistant text, thinking, completed tool calls). It does not call `processPrompt` and does not send `cursor/ask_question`. The driver drops every `session/update` until the `session/new` or `session/load` result line is seen, so that replay is not written into the new run. The gate opens on that result line, before later lines in the same stdout chunk are handled.
 
 `session/resume` dispatches to `unstable_resumeSession`. The Cursor agent class does not implement that method, so the RPC is `methodNotFound`. Resume is `session/load` with the stored session id.
 
@@ -74,7 +74,9 @@ Argv is `cursor-agent acp`, plus `--force` when the task mode is `auto`, plus an
 | `tool_call_update` | `status: "completed"` emits `tool_result` with `line_uuid` `tool_call:<id>:completed`. |
 | `session/prompt` result `usage` | `{ inputTokens, outputTokens, cachedReadTokens?, cachedWriteTokens?, thoughtTokens?, totalTokens? }`. Map `cachedReadTokens` → `cacheReadTokens` and `cachedWriteTokens` → `cacheWriteTokens`. Emit `FX_USAGE_STATUS_PREFIX + { turn }` when any of the four pinned fields is a finite number. |
 
-This build's `handlePrompt` returns only `{ stopReason: "end_turn" \| "cancelled" }`. It does not attach `usage`. The SDK also defines `sessionUpdate: "usage_update"` as `{ size, used, cost? }` (context window), and the Cursor presenter never emits it. Do not treat `usage_update` as token counts.
+This build's `handlePrompt` returns only `{ stopReason: "end_turn" \| "cancelled" }`. It does not attach `usage`. `presentInteractionUpdate` drops `turnEnded`, which is where print mode reads token counts, and the presenter never emits a token `usage` update. The run-row usage chip stays blank on cursor-agent 2026.10.22-27dcf5f. The mapper still emits the sentinel when a later CLI attaches `result.usage`. The SDK also defines `sessionUpdate: "usage_update"` as `{ size, used, cost? }` (context window), and the Cursor presenter never emits it. Do not treat `usage_update` as token counts.
+
+`session/request_permission` (plan and ask, and auto when team policy disables Run Everything) is a real request. This CLI catches `-32601` and records `{ approved: false }`. Answer `{ outcome: { outcome: "selected", optionId: "allow-once" } }`. A killed turn answers `{ outcome: { outcome: "cancelled" } }`. That is the unprompted allow print mode already used, not a new permission card.
 
 `stopReason: "end_turn"` settles the turn as success. `"cancelled"`, a killed child, or an ask that resolved `cancelled` does not.
 

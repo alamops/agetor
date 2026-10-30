@@ -3678,6 +3678,27 @@ export const runs = {
   replaceEventData(id: number, data: string): void {
     db.query(`UPDATE run_events SET data = ? WHERE id = ?`).run(data, id);
   },
+  /**
+   * Replace the `data` of the main-stream event with this `line_uuid`.
+   * No-op when that row is absent. Cursor ACP uses it to fill in a tool
+   * call's `rawInput` as the partial call grows, without inserting a second
+   * `tool_use` — a new row would become `lastToolUseData` and hide a plan.
+   *
+   * The lookup matches `run_events_run_sub_line_uuid`
+   * `(run_id, IFNULL(subagent_id, ''), line_uuid)` exactly, main stream
+   * only (`''`). The write is the same primary-key UPDATE as
+   * `replaceEventData`.
+   */
+  replaceMainEventDataByLineUuid(runId: string, lineUuid: string, data: string): boolean {
+    const row = db.query<{ id: number }, [string, string]>(
+      `SELECT id FROM run_events INDEXED BY run_events_run_sub_line_uuid
+       WHERE run_id = ? AND IFNULL(subagent_id, '') = '' AND line_uuid = ?
+       LIMIT 1`,
+    ).get(runId, lineUuid);
+    if (!row) return false;
+    db.query(`UPDATE run_events SET data = ? WHERE id = ?`).run(data, row.id);
+    return true;
+  },
   /** Newest `run_events.id` of one run, or 0 for a run with no events. The
    *  retention pass folds it into a task's sweep key so a task that gained
    *  events after it was swept (a JSONL rebuild of an archived task) is swept
