@@ -20,16 +20,15 @@ export interface RebuiltSnapshotMeta {
    * the snapshot was captured. Events at or below this id were already
    * accounted for (either folded into the snapshot or superseded by it), so
    * they must never re-trigger invalidation — this is what makes the check
-   * safe against the server's SSE replay-on-(re)connect burst, which
-   * re-delivers the full history (including old ids) on every subscribe.
+   * safe against a replay burst (the first-load window, a snapshot reset, or
+   * an older core re-delivering history), which can carry old ids.
    */
   maxLiveEventIdAtSnapshot: number;
 }
 
-/** The subset of a streamed event this check needs. RunPanel doesn't get a
- *  stable event id from the wire (the server doesn't expose `run_events.id`
- *  over SSE), so it assigns one client-side as events arrive — see
- *  `nextEventIdRef` in RunPanel.tsx. */
+/** The subset of a streamed event this check needs. `id` is the panel's own
+ *  monotonic arrival counter (`nextEventIdRef` in RunPanel.tsx), not the wire's
+ *  `run_events.id`: the snapshot watermark is taken in the same counter. */
 export interface RebuiltMaskEvent {
   id: number;
   runId: string;
@@ -52,7 +51,7 @@ export interface RebuiltMaskEvent {
  *    doesn't affect what the snapshot is displaying;
  *  - the event is strictly newer than everything the snapshot already
  *    accounts for (`id > maxLiveEventIdAtSnapshot`) — guards against the SSE
- *    replay burst (full history re-delivered on every reconnect) re-tripping
+ *    replay burst (re-delivered history after a snapshot reset) re-tripping
  *    the clear on events that predate the snapshot.
  */
 export function invalidatesRebuiltSnapshot(

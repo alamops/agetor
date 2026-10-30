@@ -16,29 +16,34 @@
  *   - `data` lines join with `\n`, `event` sets the type, and an empty line
  *     dispatches the block;
  *   - one leading U+FEFF at the very start of the stream is stripped;
- *   - `id` is accepted and IGNORED: neither reader sends `Last-Event-ID` (the
- *     server replays by its own cursor), so the value would never be read.
+ *   - `id` is surfaced on the frame of its block (forward resume: readers echo
+ *     the last one back as `Last-Event-ID` on reconnect). A value containing
+ *     U+0000 is ignored, per the spec. The parser stays per-block — keeping the
+ *     "last event id" across blocks is the reader's job, since it must outlive
+ *     the connection (and so the parser) anyway. `id:` with an empty value is
+ *     reported as `id: ""`, which consumers read as "reset to none".
  *
  * Input is already text — callers decode with a streaming `TextDecoder`, so a
  * multi-byte character split across network chunks never reaches this module.
  * Chunks may split anywhere, including mid-line and between the two bytes of a
  * CRLF.
  *
- * Retry representation (the one deliberate extension to the spec's dispatch
- * rule): the spec applies `retry:` to the connection the moment the line is
- * read, independent of dispatch, and a server that opens a stream with just
- * `retry: 3000\n\n` has sent a block with no `data`, which the spec never
- * dispatches. To keep that value reachable through a `push(): SseFrame[]`
+ * Retry/id representation (the one deliberate extension to the spec's dispatch
+ * rule): the spec applies `retry:` (and `id:`) to the connection the moment the
+ * line is read, independent of dispatch, and a server that opens a stream with
+ * just `retry: 3000\n\n` has sent a block with no `data`, which the spec never
+ * dispatches. To keep those values reachable through a `push(): SseFrame[]`
  * API:
- *   - a block that dispatches (it has a `data` field) carries its `retry`, if
- *     the block had one, on the frame;
- *   - a block with a valid `retry` but NO `data` field yields a control frame
- *     `{ event: "", data: "", retry }`. `event` is `""` there — a real
- *     dispatched frame never has an empty type (an empty `event:` value
- *     dispatches as `"message"`), so `event === ""` means "retry only, not a
- *     message" and a reader that routes by `event` ignores it naturally.
- * A block with neither `data` nor a valid `retry` (an `event:`-only block, a
- * lone `id:`, stray comments) produces nothing, per the spec.
+ *   - a block that dispatches (it has a `data` field) carries its `retry` and
+ *     `id`, if the block had them, on the frame;
+ *   - a block with a valid `retry` and/or an `id` but NO `data` field yields a
+ *     control frame `{ event: "", data: "", id?, retry? }`. `event` is `""`
+ *     there — a real dispatched frame never has an empty type (an empty
+ *     `event:` value dispatches as `"message"`), so `event === ""` means
+ *     "control only, not a message" and a reader that routes by `event`
+ *     ignores it naturally.
+ * A block with none of `data`, a valid `retry` or an `id` (an `event:`-only
+ * block, stray comments) produces nothing, per the spec.
  */
 export interface SseFrame {
   /** The event type. `"message"` when the block named none; `""` only on a
@@ -48,6 +53,10 @@ export interface SseFrame {
   data: string;
   /** Reconnection delay in ms, when the block carried a valid `retry:`. */
   retry?: number;
+  /** The block's own `id:` value (`""` for a bare/empty `id:`, meaning "reset
+   *  the last event id"). Absent when the block had none or it contained
+   *  U+0000. */
+  id?: string;
 }
 
 export interface SseParser {
@@ -72,21 +81,27 @@ export function createSseParser(): SseParser {
   let data = "";
   let hasData = false;
   let retry: number | undefined;
+  let id: string | undefined;
 
   function processLine(l: string, out: SseFrame[]): void {
     if (l === "") {
       // Blank line: dispatch (or discard) the block, then reset it.
       if (hasData) {
         const frame: SseFrame = { event: event === "" ? "message" : event, data };
+        if (id !== undefined) frame.id = id;
         if (retry !== undefined) frame.retry = retry;
         out.push(frame);
-      } else if (retry !== undefined) {
-        out.push({ event: "", data: "", retry });
+      } else if (retry !== undefined || id !== undefined) {
+        const frame: SseFrame = { event: "", data: "" };
+        if (id !== undefined) frame.id = id;
+        if (retry !== undefined) frame.retry = retry;
+        out.push(frame);
       }
       event = "";
       data = "";
       hasData = false;
       retry = undefined;
+      id = undefined;
       return;
     }
     if (l.charCodeAt(0) === 0x3a /* ":" */) return; // comment / keepalive
@@ -116,8 +131,12 @@ export function createSseParser(): SseParser {
       case "retry":
         if (DIGITS_ONLY.test(value)) retry = Number.parseInt(value, 10);
         break;
+      case "id":
+        // A NUL makes the whole field ignored (WHATWG), not just trimmed.
+        if (!value.includes("\u0000")) id = value;
+        break;
       default:
-        // `id` and any unknown field: ignored (see the module comment).
+        // Unknown fields are ignored.
         break;
     }
   }

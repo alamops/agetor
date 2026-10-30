@@ -140,8 +140,15 @@ test.describe("theme: Settings → General picker", () => {
     await gotoApp(page, backend);
 
     const dialog = await openSettingsGeneral(page);
+    // The picker flips the class optimistically and saves in the background,
+    // so wait for the save itself before reloading — a reload that beats the
+    // PUT boots with the old preference.
+    const saved = page.waitForResponse(
+      (r) => r.request().method() === "PUT" && new URL(r.url()).pathname === "/preferences/theme",
+    );
     await dialog.getByRole("button", { name: "Light", exact: true }).click();
     await expect.poll(() => isDark(page)).toBe(false);
+    expect((await saved).ok()).toBe(true);
 
     await page.reload();
     await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();

@@ -10,6 +10,7 @@ import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
+import { decideForwardResume, type ForwardResumeSnapshotReason } from "./event-resume.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -2841,6 +2842,31 @@ export const SESSION_ID_COLUMNS = [
 ] as const;
 export type SessionIdColumn = (typeof SESSION_ID_COLUMNS)[number];
 
+/** One `run_events` row as the task-level event reads return it
+ *  (`runs.eventsForTask`, `runs.eventsForTaskAfter`). */
+export type TaskEventRow = {
+  id: number;
+  runId: string;
+  stream: string;
+  data: string;
+  ts: number;
+  subagentId: string | null;
+};
+
+/** What `runs.appendEvent` stored: the row id and the timestamp written to
+ *  it — callers broadcast this exact pair so a live frame and its replayed
+ *  twin agree on `id` and `ts`. */
+export interface AppendedEvent {
+  id: number;
+  ts: number;
+}
+
+/** Answer of `runs.eventsForTaskAfter`: the rows after the cursor, or a
+ *  refusal telling the client to take a fresh window. */
+export type ForwardResumeResult =
+  | { kind: "resume"; rows: TaskEventRow[] }
+  | { kind: "snapshot"; reason: ForwardResumeSnapshotReason };
+
 /**
  * Given rows in DESC (newest-first) id order — each carrying its `data`
  * column's `LENGTH()` as `len` — finds the id of the oldest row to keep
@@ -3198,8 +3224,8 @@ export const runs = {
       minEvents?: number;
       anchor?: { maxEvents: number; maxBytes: number };
     },
-  ): Array<{ id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null }> {
-    type Row = { id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null };
+  ): TaskEventRow[] {
+    type Row = TaskEventRow;
     if (opts?.limit) {
       const idConditions = ["runs.task_id = ?"];
       const idParams: Array<string | number> = [taskId];
@@ -3289,6 +3315,90 @@ export const runs = {
        WHERE runs.task_id = ?
        ORDER BY run_events.id ASC`,
     ).all(taskId);
+  },
+  /**
+   * Forward resume for the per-task event stream (docs/plans/
+   * event-stream-forward-resume.md P3): the task's rows with `id > afterId`,
+   * ascending, subagent rows included — or a refusal when the gap is too big
+   * or the cursor is foreign.
+   *
+   * Same two-step shape as `eventsForTask`, so a big gap never loads bodies:
+   *  1. Read `sqlite_sequence.seq` for `run_events` (the AUTOINCREMENT
+   *     high-water mark; 0 when the row is absent) and probe the IDS of the
+   *     task's rows after the cursor, `LIMIT maxEvents + 1` — the +1 row
+   *     proves "too many" without an unbounded read. Ids only, so
+   *     `(run_id, id)` covers the probe and no row body is read. The
+   *     temp-B-tree sort is bounded too: each run's index range yields ids
+   *     in order, so SQLite stops a run's walk once the LIMIT sorter is full
+   *     and holds a smaller id — measured ~1 ms at any cursor on a 1M-row
+   *     task over 20 runs (a per-run LIMIT + JS merge was slower: 37 ms at
+   *     300 runs).
+   *  2. Only when the count fits, size the bounded range (`id > afterId AND
+   *     id <= lastProbedId`, at most `maxEvents` rows) with
+   *     `LENGTH(CAST(data AS BLOB))`. `decideForwardResume` (pure, shared
+   *     with the future remote router) makes the call.
+   *  3. On resume, fetch the full rows for that same range. Bounding by the
+   *     last probed id keeps the steps consistent if an event lands in
+   *     between (it reaches the client through the live stream instead).
+   *
+   *  Plans as `SEARCH runs USING INDEX idx_runs_task` + `SEARCH run_events
+   *  USING INDEX idx_run_events_run (run_id=? AND id>?)`; `INDEXED BY` pins
+   *  the index so SQLite can't pick the `stream`-first user-history one.
+   */
+  eventsForTaskAfter(
+    taskId: string,
+    afterId: number,
+    opts: { maxEvents: number; maxBytes: number },
+  ): ForwardResumeResult {
+    const seqRow = db
+      .query<{ seq: number }, []>(`SELECT seq FROM sqlite_sequence WHERE name = 'run_events'`)
+      .get();
+    const highWater = seqRow?.seq ?? 0;
+    const gapIdsAsc = db
+      .query<{ id: number }, [string, number, number]>(
+        `SELECT run_events.id as id
+         FROM run_events INDEXED BY idx_run_events_run
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE runs.task_id = ? AND run_events.id > ?
+         ORDER BY run_events.id ASC
+         LIMIT ?`,
+      )
+      .all(taskId, afterId, opts.maxEvents + 1);
+    // Over the count budget (or empty) the sizes can't change the answer —
+    // `decideForwardResume` checks the count before the bytes — so skip the
+    // body read and hand it zero lengths.
+    const gapRowsAsc =
+      gapIdsAsc.length === 0 || gapIdsAsc.length > opts.maxEvents
+        ? gapIdsAsc.map((r) => ({ id: r.id, len: 0 }))
+        : db
+            .query<{ id: number; len: number }, [string, number, number]>(
+              `SELECT run_events.id as id, LENGTH(CAST(run_events.data AS BLOB)) as len
+               FROM run_events INDEXED BY idx_run_events_run
+               JOIN runs ON runs.id = run_events.run_id
+               WHERE runs.task_id = ? AND run_events.id > ? AND run_events.id <= ?
+               ORDER BY run_events.id ASC`,
+            )
+            .all(taskId, afterId, gapIdsAsc[gapIdsAsc.length - 1]!.id);
+    const decision = decideForwardResume({
+      afterId,
+      highWater,
+      gapRowsAsc,
+      maxEvents: opts.maxEvents,
+      maxBytes: opts.maxBytes,
+    });
+    if (decision.kind === "snapshot") return decision;
+    if (gapRowsAsc.length === 0) return { kind: "resume", rows: [] };
+    const lastProbedId = gapRowsAsc[gapRowsAsc.length - 1]!.id;
+    const rows = db
+      .query<TaskEventRow, [string, number, number]>(
+        `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
+         FROM run_events INDEXED BY idx_run_events_run
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE runs.task_id = ? AND run_events.id > ? AND run_events.id <= ?
+         ORDER BY run_events.id ASC`,
+      )
+      .all(taskId, afterId, lastProbedId);
+    return { kind: "resume", rows };
   },
   /** Past sent user messages (main-stream only, blank ones excluded) across
    *  every task, regardless of harness — used to build a cross-task "message
@@ -3416,15 +3526,16 @@ export const runs = {
     return row ? row.id : null;
   },
   /**
-   * Returns the inserted row's `id`, or `null` when nothing was actually
+   * Returns the stored `{ id, ts }`, or `null` when nothing was actually
    * inserted — i.e. the `INSERT OR IGNORE` dedup path hit an existing
-   * `(run_id, line_uuid)` row. Callers that only care about "did this event
-   * land, and what's its id" (the unread-watermark detector in
-   * `makeChunkHandler`) can rely on `null` meaning "already persisted
-   * earlier, don't re-derive from it" rather than misreading a stale
+   * `(run_id, line_uuid)` row. `null` means "already persisted earlier,
+   * don't re-derive from it" (the unread-watermark detector in
+   * `makeChunkHandler` relies on it) rather than misreading a stale
    * `lastInsertRowid` left over from some unrelated prior statement on this
-   * connection. Existing call sites all predate this return value and
-   * simply don't use it.
+   * connection. Callers send the returned pair live, so a streamed frame
+   * carries the same `id` and `ts` as its replayed row (forward resume,
+   * docs/plans/event-stream-forward-resume.md D11/P1). `ts` defaults to now;
+   * a caller that already stamped the event passes it so both agree.
    */
   appendEvent(
     runId: string,
@@ -3432,7 +3543,9 @@ export const runs = {
     data: string,
     lineUuid?: string | null,
     subagentId?: string | null,
-  ): number | null {
+    ts?: number,
+  ): AppendedEvent | null {
+    const stamp = ts ?? Date.now();
     // INSERT OR IGNORE only when a dedup key is provided. With NULL keys the
     // partial unique index (`WHERE line_uuid IS NOT NULL`) doesn't apply, so
     // non-JSONL events still insert unconditionally and we don't accidentally
@@ -3441,15 +3554,15 @@ export const runs = {
     if (lineUuid) {
       const result = db.run(
         `INSERT OR IGNORE INTO run_events (run_id, stream, data, ts, line_uuid, subagent_id) VALUES (?, ?, ?, ?, ?, ?)`,
-        [runId, stream, data, Date.now(), lineUuid, subagentId ?? null],
+        [runId, stream, data, stamp, lineUuid, subagentId ?? null],
       );
-      return result.changes > 0 ? Number(result.lastInsertRowid) : null;
+      return result.changes > 0 ? { id: Number(result.lastInsertRowid), ts: stamp } : null;
     }
     const result = db.run(
       `INSERT INTO run_events (run_id, stream, data, ts, subagent_id) VALUES (?, ?, ?, ?, ?)`,
-      [runId, stream, data, Date.now(), subagentId ?? null],
+      [runId, stream, data, stamp, subagentId ?? null],
     );
-    return Number(result.lastInsertRowid);
+    return { id: Number(result.lastInsertRowid), ts: stamp };
   },
   /** Line uuids persisted on one run. Seeds `currentRunLineUuids` on
    *  reattach so a historical `end_turn` that lives on a different run

@@ -336,4 +336,86 @@ describe("openEventStream", () => {
     expect(errors).toHaveLength(1);
     close();
   });
+
+  describe("Last-Event-ID", () => {
+    const lastId = (c: Call) => (c.init.headers as Record<string, string>)["last-event-id"];
+
+    /** Open a stream, push `frames` on the first connection, end it, and fire
+     *  the reconnect so the second call is in `h.calls`. */
+    async function reconnectAfter(frames: string, h: ReturnType<typeof harness>, first: ReturnType<typeof controlledBody>) {
+      const close = openEventStream("http://core/tasks/t/events", { onMessage: () => {} }, h.opts);
+      await settle();
+      first.push(frames);
+      first.end();
+      await settle();
+      h.timers.fire();
+      await settle();
+      return close;
+    }
+
+    test("the first connect sends no last-event-id", async () => {
+      const b = controlledBody();
+      const h = harness([() => streamResponse(b.body)]);
+      const close = openEventStream("http://core/tasks/t/events", {}, h.opts);
+      await settle();
+      expect(lastId(h.calls[0]!)).toBeUndefined();
+      close();
+    });
+
+    test("a reconnect sends the last id seen", async () => {
+      const first = controlledBody();
+      const second = controlledBody();
+      const h = harness([() => streamResponse(first.body), () => streamResponse(second.body)]);
+      const close = await reconnectAfter("id: 4\ndata: a\n\nid: 9\ndata: b\n\n", h, first);
+      expect(h.calls).toHaveLength(2);
+      expect(lastId(h.calls[1]!)).toBe("9");
+      // Still carries the caller's headers alongside it.
+      expect((h.calls[1]!.init.headers as Record<string, string>).authorization).toBe("Bearer T");
+      close();
+    });
+
+    test("an empty id: clears the cursor", async () => {
+      const first = controlledBody();
+      const second = controlledBody();
+      const h = harness([() => streamResponse(first.body), () => streamResponse(second.body)]);
+      const close = await reconnectAfter("id: 4\ndata: a\n\nid:\ndata: b\n\n", h, first);
+      expect(lastId(h.calls[1]!)).toBeUndefined();
+      close();
+    });
+
+    test("an id-only control frame advances the cursor without dispatching", async () => {
+      const first = controlledBody();
+      const second = controlledBody();
+      const h = harness([() => streamResponse(first.body), () => streamResponse(second.body)]);
+      const messages: string[] = [];
+      const close = openEventStream("http://core/tasks/t/events", { onMessage: (d) => messages.push(d) }, h.opts);
+      await settle();
+      first.push("id: 3\ndata: a\n\nid: 7\n\n");
+      first.end();
+      await settle();
+      h.timers.fire();
+      await settle();
+      expect(messages).toEqual(["a"]);
+      expect(lastId(h.calls[1]!)).toBe("7");
+      close();
+    });
+
+    test("the cursor survives a failed attempt and is sent on the next one", async () => {
+      const first = controlledBody();
+      const third = controlledBody();
+      const h = harness([
+        () => streamResponse(first.body),
+        () => new Response("down", { status: 503 }),
+        () => streamResponse(third.body),
+      ]);
+      const close = await reconnectAfter("id: 12\ndata: a\n\n", h, first);
+      expect(h.calls).toHaveLength(2);
+      expect(lastId(h.calls[1]!)).toBe("12");
+      h.timers.fire();
+      await settle();
+      expect(h.calls).toHaveLength(3);
+      expect(lastId(h.calls[2]!)).toBe("12");
+      close();
+    });
+  });
 });

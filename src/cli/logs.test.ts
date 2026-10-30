@@ -3,6 +3,7 @@ import type { AgetorClient } from "./api-client.ts";
 import type { GlobalEvent, RunEvent, Task } from "../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, PERMISSION_MODE_STATUS_PREFIX } from "../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
+import { LOGS_STREAM_GAP_NOTICE } from "../shared/task-stream-resume.ts";
 
 /**
  * `formatEvent`/`shouldSkipEvent`/`createLineRenderer` (in commands/logs.ts)
@@ -34,6 +35,8 @@ const realNotifySnapshot = { ...realNotify };
 
 let currentClient: AgetorClient | null = null;
 const outputs: string[] = [];
+const errLines: string[] = [];
+let onTaskNamed: ((event: string, data: string) => void) | undefined;
 let onTaskEvents: ((e: RunEvent) => void) | null = null;
 let onGlobalEvents: ((e: GlobalEvent) => void) | null = null;
 const osNotifyCalls: Array<{ n: Parameters<typeof realNotify.osNotify>[0]; deps: Parameters<typeof realNotify.osNotify>[1] }> = [];
@@ -62,14 +65,21 @@ mock.module("./output.ts", () => ({
   out: (msg = "") => {
     outputs.push(msg);
   },
-  errln: () => {},
+  errln: (msg = "") => {
+    errLines.push(msg);
+  },
 }));
 
 mock.module("./sse.ts", () => ({
   ...realSseSnapshot,
-  streamSse: (pathname: string, onEvent: (e: unknown) => void) => {
+  streamSse: (
+    pathname: string,
+    onEvent: (e: unknown) => void,
+    opts?: { onNamedEvent?: (event: string, data: string) => void },
+  ) => {
     if (pathname.startsWith("/tasks/") && pathname.includes("/events")) {
       onTaskEvents = onEvent as (e: RunEvent) => void;
+      onTaskNamed = opts?.onNamedEvent;
     }
     if (pathname === "/events") onGlobalEvents = onEvent as (e: GlobalEvent) => void;
     return { close: () => {} };
@@ -423,6 +433,91 @@ test("logs (streaming, --no-follow): a REPLAYED 'active' sentinel prints nothing
   await done;
 
   expect(outputs).toEqual(["live attempt 1/3"]);
+});
+
+// --- forward resume: id high-water mark + snapshot notice -------------------
+
+const idEvent = (id: number, data: string): RunEvent => ({
+  runId: "run1",
+  taskId: "t1",
+  stream: "assistant",
+  data,
+  ts: id,
+  id,
+});
+
+async function openFollowStream(f: Parameters<typeof cmdLogs>[1]): Promise<Promise<void>> {
+  onTaskEvents = null;
+  onTaskNamed = undefined;
+  outputs.length = 0;
+  errLines.length = 0;
+  currentClient = makeClient([]);
+  const done = cmdLogs(["t1", "--no-follow"], f);
+  await new Promise((r) => setTimeout(r, 20));
+  expect(onTaskEvents).not.toBeNull();
+  return done;
+}
+
+test("logs (streaming): a window re-delivered after a reconnect prints nothing twice", async () => {
+  const done = await openFollowStream(flags);
+  for (const e of [idEvent(1, "a"), idEvent(2, "b"), idEvent(3, "c")]) onTaskEvents!(e);
+  // reconnect: the server replays from an earlier point
+  for (const e of [idEvent(2, "b"), idEvent(3, "c"), idEvent(4, "d")]) onTaskEvents!(e);
+  await done;
+  expect(outputs).toEqual(["a", "b", "c", "d"]);
+});
+
+test("logs --json (streaming): the same re-delivered window is filtered", async () => {
+  const done = await openFollowStream(jsonFlags);
+  for (const e of [idEvent(1, "a"), idEvent(2, "b"), idEvent(2, "b"), idEvent(3, "c")]) onTaskEvents!(e);
+  await done;
+  expect(outputs.map((l) => (JSON.parse(l) as RunEvent).id)).toEqual([1, 2, 3]);
+});
+
+test("logs (streaming): id-less live-only rows always print", async () => {
+  const done = await openFollowStream(flags);
+  onTaskEvents!(idEvent(5, "a"));
+  onTaskEvents!({ runId: "run1", taskId: "t1", stream: "assistant", data: "live-only", ts: 1 });
+  onTaskEvents!({ runId: "run1", taskId: "t1", stream: "assistant", data: "live-only", ts: 1 });
+  await done;
+  expect(outputs).toEqual(["a", "live-only", "live-only"]);
+});
+
+test("logs (streaming): a snapshot meta prints the dim notice once on stderr and only newer rows", async () => {
+  const done = await openFollowStream(flags);
+  onTaskEvents!(idEvent(1, "a"));
+  onTaskEvents!(idEvent(2, "b"));
+  expect(onTaskNamed).toBeDefined();
+  onTaskNamed!("replay_meta", JSON.stringify({ earliestId: 1, hasMore: false, snapshotRequired: true }));
+  // The fresh window overlaps what was already printed: the mark is never reset.
+  for (const e of [idEvent(1, "a"), idEvent(2, "b"), idEvent(3, "c")]) onTaskEvents!(e);
+  await done;
+  expect(outputs).toEqual(["a", "b", "c"]);
+  expect(errLines).toEqual([LOGS_STREAM_GAP_NOTICE]);
+});
+
+test("logs (streaming): fresh and resumed metas, junk and other named events print no notice", async () => {
+  const done = await openFollowStream(flags);
+  onTaskEvents!(idEvent(1, "a"));
+  onTaskNamed!("replay_meta", JSON.stringify({ earliestId: 1, hasMore: false }));
+  onTaskNamed!("replay_meta", JSON.stringify({ earliestId: 1, hasMore: false, resumedAfter: 1 }));
+  onTaskNamed!("replay_meta", "not json");
+  onTaskNamed!("other", JSON.stringify({ snapshotRequired: true, earliestId: 1, hasMore: false }));
+  onTaskEvents!(idEvent(2, "b"));
+  await done;
+  expect(outputs).toEqual(["a", "b"]);
+  expect(errLines).toEqual([]);
+});
+
+test("logs --json (streaming): a snapshot meta reports on stderr only, stdout stays pure JSON", async () => {
+  const done = await openFollowStream(jsonFlags);
+  onTaskEvents!(idEvent(1, "a"));
+  onTaskNamed!("replay_meta", JSON.stringify({ earliestId: 1, hasMore: false, snapshotRequired: true }));
+  onTaskEvents!(idEvent(1, "a"));
+  onTaskEvents!(idEvent(2, "b"));
+  await done;
+  expect(outputs.map((l) => (JSON.parse(l) as RunEvent).id)).toEqual([1, 2]);
+  expect(errLines).toEqual([LOGS_STREAM_GAP_NOTICE]);
 });
 
 // --- userMessageLines rendering (src/shared/user-message.ts) --------------

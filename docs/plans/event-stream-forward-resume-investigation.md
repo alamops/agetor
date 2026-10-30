@@ -1,0 +1,138 @@
+# Investigation — event-stream forward resume (`afterId`) + `snapshot_required`
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-10-29 |
+| Change | Add a forward cursor (`afterId`) to the task event stream so a client that reconnects receives only the events it missed, and answer `snapshot_required` when that gap is too large to replay. This brief informs the grill and the plan for item **3.1** of the Agetor Companion Blueprint (§03 "Where Agetor stands today", row *Event streams*; §07 *Protocol*; §12 Track 3). |
+| Base | `main` at `0a2e636e` (release v1.1.0), branch `feature/agetor-event-streams` |
+| Agents | none: the pipeline step said "do not spawn subagents", so all research ran inline. 1 inline spike (query plan + timing). |
+| Flags | none |
+
+**Source of the request.** The blueprint artifact (`https://claude.ai/artifact/25cyTFUnoiRksPpD9CiiPy#readiness`) lists *Event streams* as **Partial**. Today: "SSE replay (800 events / 4 MB, anchored to the last user message) and backward paging by `beforeId`. `run_events.id` is globally monotonic." Needed: "Forward resume (`afterId`) per stream, plus a `snapshot_required` answer when the gap is too large." Track 3 item 3.1 adds: "Add `afterId` next to today's `beforeId` on task events, and answer `snapshot_required` when the gap exceeds the replay window. *Helps desktop now.* Where: events routes in `server.ts`, `runs.eventsForTask` in `db.ts`. Size S." §07 sketches the phone side: `task.subscribe {taskId, after}`, events `{s:"task:<id>", c:<run_events id>, e:{…}}`, and `{s, snapshot_required:true}` ("gap too large: refetch"). A link switch "resumes every stream from its cursor". Related items that the blueprint keeps **separate**: 3.3 (sequence numbers and a ring buffer for the live-only *global* events) and 3.4 (a `maxBytes` replay option of about 256 KB for mobile).
+
+## 1. What we know
+
+### 1.1 The routes today
+
+| Route | Replay | Frame shape | Clients |
+| --- | --- | --- | --- |
+| `GET /tasks/:id/events` (`src/bun/server.ts:8144-8253`) | Subscribe → buffer live events → `runs.eventsForTask(taskId, {limit: 800, maxBytes: 4 MB, minEvents: 20, anchor: {3000, 16 MB}})` (anchor skipped on `?anchor=0`) → named `event: replay_meta` frame `{earliestId, hasMore}` first → window rows (with `id`) → the buffered live events → 15 s `{type:"ping"}`. | `data: <json>` only; **no SSE `id:` lines**. Nothing removes duplicates between the window and the buffer; the client is expected to. | webview `api.subscribeTask` (`src/mainview/lib/api.ts:2206-2238`) → `RunPanel` (`src/mainview/components/kanban/RunPanel.tsx:1171`); `agetor logs` (`src/cli/commands/logs.ts:113`); TUI `useCoalescedStream` with `?anchor=0` (`src/cli/tui/useCoalescedStream.ts:55`) |
+| `GET /tasks/:id/events/page?beforeId=&limit=` (`server.ts:8068-8106`) | Backward page: `beforeId` required (400 otherwise), `limit` ≤ 2000 (default 800), 2 MB budget, `minEvents` 20; never anchored. | JSON `{events (with id), earliestId, hasMore}` | webview `api.fetchTaskEventsPage` (`api.ts:1736`), "Load earlier" (`RunPanel.tsx:1514-1559`); e2e specs read it directly |
+| `GET /runs/:id/events` (`server.ts:7710-7774`) | **Unbounded** replay of every main-stream event of the run (`runs.events(runId)`, `db.ts:3002`). | `data:` only, no `id`, `taskId: ""` | **No caller in the repo.** `api.subscribeRun` (`api.ts:2179`) is defined but never called, and nothing has called this route since the initial commit (`git log -S`). |
+| `GET /events`, `GET /app/events` (`server.ts:7779`, `7895`) | Live-only, no replay. | `GlobalEvent` / `AppEvent` | webview `App.tsx`, CLI/TUI. Out of scope here (blueprint item 3.3). |
+
+- Route policy: `/tasks/:id/events` is `SSE_LEGACY` = `{callers: "app+cli", remote: "none", legacyQueryToken: true}` (`src/bun/route-policy.ts:102`, `:449`). A new query parameter needs no policy change. `/runs/:id/events` is `CLI` (`:431`).
+- Constants live in `src/shared/types.ts:5196-5316`: `EVENTS_REPLAY_LIMIT = 800`, `EVENTS_REPLAY_MAX_BYTES = 4 MB`, `EVENTS_PAGE_MAX_BYTES = 2 MB`, `MIN_REPLAY_EVENTS = 20`, `EVENTS_WINDOW_MAX = 3000`, `EVENTS_REPLAY_ANCHOR_MAX_EVENTS = 3000`, `EVENTS_REPLAY_ANCHOR_MAX_BYTES = 16 MB`, `TASK_EVENTS_REPLAY_META_EVENT = "replay_meta"`, `TaskEventsReplayMeta {earliestId, hasMore}`.
+- `runs.eventsForTask` (`src/bun/db.ts:3192-3290`) is a two-step, ids-first query: step 1 selects ids and `LENGTH(CAST(data AS BLOB))` DESC with `LIMIT`; then `clampWindowByBytes` (`db.ts:2860`) and `resolveAnchoredMinId` (`db.ts:2905`); step 2 fetches `[minId, beforeId)` ASC. The no-`limit` path returns the whole history. There is no forward (`id > x`) variant anywhere. The only `afterId` in `src/` is retention's private keyset cursor (`runs.toolResultRowsForTrim`, `db.ts:3653-3671`; `src/bun/retention.ts:254-292`).
+- `runs.hasEventsBefore` (`db.ts:3370`) backs `hasMore`, and `runs.lastUserEventId` (`db.ts:3401`) backs the anchor.
+
+### 1.2 The cursor's ground truth: `run_events.id`
+
+- `run_events.id INTEGER PRIMARY KEY AUTOINCREMENT` (`src/bun/migrations/001_init.sql:24`). AUTOINCREMENT means an id is never reused, even after a delete. On the owner's database `sqlite_sequence` reads 1,158,404 (measured in this session).
+- Rows are append-only for a live task. Nothing in `src/bun` runs `DELETE FROM run_events` or `DELETE FROM runs`. The only delete is `DELETE FROM tasks` (`db.ts:1239`), which cascades through `runs.task_id … ON DELETE CASCADE` (`001_init.sql:15`) and `run_events.run_id … ON DELETE CASCADE` (`:25`). The only in-place rewrite is retention's `UPDATE run_events SET data = ? WHERE id = ?` (`db.ts:3679`), which trims archived tasks' `tool_result` payloads and leaves `id` unchanged.
+- SQLite has one writer at a time, and every bun:sqlite statement and transaction is synchronous on the main thread. So ids become visible in increasing order. The set `{task rows with id > afterId}` is exactly what a client hasn't seen, **provided the client holds every row up to its cursor with no holes.**
+- Ids interleave across tasks: the owner's largest task has 75,277 events spread over ids 690,543–865,226. A gap must therefore be counted in task rows, never as an id difference.
+
+### 1.3 Live frames carry no id, though one exists at emit time (the main finding)
+
+- `RunEvent.id` is documented as "present on replayed/paged persisted events…; **absent on live-broadcast frames, which have no row yet at broadcast time**" (`src/shared/types.ts:5331-5336`). The rationale doesn't hold for most events. `makeChunkHandler` (`src/bun/orchestrator.ts:2632-2645`) gets `eventId = runs.appendEvent(...)` and then emits `{runId, taskId, stream, data, ts: Date.now()}` without it. Every append-then-emit site follows the same pattern and drops the id:
+  - 25 `runs.appendEvent` sites in `orchestrator.ts`, including `appendRunStatusLine` (`:6090-6093`), the user-bubble sites (`:4566`, `:7194`, …) and the copilot subagent sink (`:2886-2894`);
+  - `claude-subagents.ts:1516/1527` (monitor), `:2668/2669` (background shells), `:2897/2898` (subagent transcripts);
+  - `opencode-subagents.ts:152-158`;
+  - `claude-session-import.ts:337/343` and `opencode-session-import.ts:293/299` (both through `emitRunEvent`).
+- `makeChunkHandler` emits **even when `appendEvent` returned `null`**: the `(run_id, line_uuid)` dedup path fires when a reattach replays a row that is already persisted (`db.ts:3429-3456`). That emit duplicates a row that already exists and has no id to attach.
+- **Live-only events never get a row.** They exist only on the live stream, so no cursor can resume them, and today's replay doesn't include them either:
+
+  | Stream | Event | Where |
+  | --- | --- | --- |
+  | `interaction` | an ask or permission card was opened | `orchestrator.ts:877` |
+  | `interaction_resolved` | a card was answered or cancelled | `orchestrator.ts:907` |
+  | `subagent` | subagent lifecycle | `orchestrator.ts:2838`; `claude-subagents.ts` `emitLifecycle` (`:1615`, `:2247`) |
+  | `status` | the `started — …` breadcrumb ("broadcast-only" per its own comment) | `orchestrator.ts:2186-2199` |
+  | `status` | `exit:N` / `cancelled (exit:N)` | `orchestrator.ts:3165` |
+  | `status` | `background agents still running (N)` | `orchestrator.ts:3147` |
+  | `status` / `stderr` | spawn rejection | `orchestrator.ts:3204` |
+
+  The webview loads pending interactions **only when the task changes** (`RunPanel.tsx` effect after the subscription, `api.listPendingInteractions`), not on reconnect. A card opened or resolved during an SSE drop is already missed or left stale today. Runs and subagents recover through the 2 s polls.
+
+### 1.4 Timestamps diverge, so reconnects already duplicate
+
+- The emitted `ts` comes from a second `Date.now()` call, separate from the one `appendEvent` stores (`orchestrator.ts:2635` vs `:2645`; `db.ts:3449`/`3454`). The claude monitor sink emits `ts: at` (the line's own timestamp) while the row stores `Date.now()` (`claude-subagents.ts:1505-1527`).
+- The webview deduper keys every non-`user` event on `${ts}|${runId}|${stream}|${data[:200]}` (`src/mainview/lib/event-dedup.ts`, `eventDedupKey`), and the TUI on `${ts}|${stream}|${data[:64]}` (`useCoalescedStream.ts` `eventKey`). When a reconnect replays a row whose live twin carried a different `ts`, the panel renders it twice. This is certain for monitor events and possible for any event that straddles a millisecond boundary.
+- `agetor logs` has **no dedupe at all**. `streamSse` reconnects on any drop (`src/cli/sse.ts:28-63`, printing "…reconnecting"), and the server replays the whole window again. So every reconnect reprints up to 800 events (`logs.ts:101-118`). A forward cursor fixes this directly, which is the "helps desktop now" value.
+
+### 1.5 Client mechanics that resume has to fit
+
+- `openEventStream(url, …)` (`src/mainview/lib/sse-fetch.ts:76-191`) reconnects on its own to the **same fixed `url` string**, honouring `retry:`, with backoff from 1 s to 10 s, and stops on 401/403/404. It sends no `Last-Event-ID`. The shared parser deliberately ignores `id:` (`src/shared/sse-parse.ts:19-20`, `:120`). The CLI's `streamSse` (`src/cli/sse.ts`) also uses a fixed pathname but re-discovers the core on every attempt, because port and token can change across a daemon or app handoff.
+- CORS allows only `content-type,authorization` (`server.ts:468-481`). The route-policy walker answers preflight for function-valued routes (`route-policy.ts:635-643`). `Last-Event-ID` is **not** a CORS-safelisted header: the Fetch standard safelists only `accept`, `accept-language`, `content-language`, `content-type` and `range`. So sending that header from the webview would need `last-event-id` added to allow-headers. A `?afterId=` query parameter needs nothing.
+- On every frame, the RunPanel's `replay_meta` handler does `setEarliestId(prev => min(prev, meta.earliestId))` and `setHasMoreEarlier(prev => prev || meta.hasMore)` (`RunPanel.tsx:1254-1275`). On a resumed connection, a meta frame describing "the resumed slice" would report `hasMore: true` (older rows exist) and wrongly re-show "Load earlier" after history was already paged out. The resumed meta needs different semantics, or a flag the handler checks.
+- The RunPanel trims to `EVENTS_WINDOW_MAX` and takes the new `earliestId` from the front event's `dbId` (`RunPanel.tsx:1098-1115`; `StreamEvent` doc at `:160-185`). Because live events carry no `dbId`, "Load earlier" can hide after a trim until the next reconnect. Adding ids to live frames fixes this as a side effect.
+- The RunPanel resets `events`, the deduper and `nextEventIdRef` only when `task.id` changes (`RunPanel.tsx:1026-1040`). Today a reconnect reuses that instance and relies on dedupe. A `snapshot_required` answer would need a "drop local events, re-seed" path that doesn't exist yet.
+- The JSONL rebuild mask (`rebuilt-mask.ts`, `invalidatesRebuiltSnapshot`) works on client-assigned ids (`nextEventIdRef`), not server ids, so a forward resume doesn't change it.
+
+### 1.6 Performance and guards
+
+- The plan guard `src/bun/db-run-events-plans.test.ts` discovers every db method that mentions `run_events` (via `Function.prototype.toString`). It fails if a method isn't invoked there, if any plan `SCAN`s `run_events`, or if a query uses `idx_run_events_user_history` (except `lastUserEventId` and `userMessageHistory`). A new forward-query method must be added to it.
+- Indexes: `idx_run_events_run(run_id, id)` (`001_init.sql:31`), `idx_runs_task(task_id)` (migration 030), `run_events_run_sub_line_uuid` (022), `idx_run_events_user_history` (039). The forward query needs no new index (see §2).
+
+## 2. What we proved
+
+| Question | Verdict | Evidence (command → output) | Versions | Artifact |
+| --- | --- | --- | --- | --- |
+| Does a forward `id > afterId` task query plan without a `SCAN` (plan-guard safe) and without a new index? | **Yes** | `bun run plan.ts <repo>` on a freshly migrated `:memory:` DB (no `sqlite_stat1`, same as the guard) → `SEARCH runs USING INDEX idx_runs_task (task_id=?)` / `SEARCH run_events USING INDEX idx_run_events_run (run_id=? AND id>?)` / `USE TEMP B-TREE FOR ORDER BY`. This is the same shape as today's `eventsForTask` step 1, both for the row fetch and for an `{id, len}` gap probe. | bun 1.3.10, all repo migrations through 080 | `/private/tmp/claude-501/-Users-alamosaravali--agetor-worktrees-26c8846a-f12c-4ee9-9c85-da4f96a1da71/11b0058d-f82e-40eb-bc96-dc1570d7395f/scratchpad/spikes/after-id-plan/plan.ts` |
+| Is a bounded gap probe cheap enough to run synchronously on the main thread, even with a stale cursor on a huge task? | **Yes** | Read-only `sqlite3 -readonly` against `~/.agetor/agetor.sqlite` (4.6 GB, `sqlite_sequence` 1,158,404), largest task 75,277 events: bounded probe `LIMIT 801` with `afterId` near the end → 13 ms; `afterId = 0` (worst case, sorts every task row) → 16 ms; full-row fetch of an 801-row gap (1.65 MB) → 8 ms. Grouping all tasks by count took 1.9 s; that was a one-off to find the largest task, not part of the feature. Times are on a warm cache. | system sqlite3 3.51.0 | inline commands in this session (re-runnable: `sqlite3 -readonly "file:$HOME/.agetor/agetor.sqlite?mode=ro"`) |
+
+Not spiked, and why: the "would the tests notice?" spike needs a scratch copy with `bun install`. It was replaced by a grep: no test pins that live frames *lack* `id`, and no orchestrator test `toEqual`s an emitted event with a `stream` key. That makes adding `id` likely additive, but **unverified until the suite runs** (see §3).
+
+## 3. What we're assuming
+
+1. **Scope is the task stream only** (`/tasks/:id/events` + `runs.*`), per item 3.1. The global `/events` ring buffer (3.3) and the mobile `maxBytes` option (3.4) are separate. *If wrong:* the plan grows a global sequence number and ring buffer, which is a different design.
+2. **Adding `id` to live frames is additive** for the webview, the CLI, the TUI and old installed CLIs: the field is optional and no test pins its absence. *If wrong:* some tests compare emitted events with `toEqual` and need the field added.
+3. **Skipping the emit when `appendEvent` returns `null`** (the row already exists) is safe, because any client either saw it live earlier or gets it from replay. *If wrong:* keep emitting it without an id, and the forward path must tolerate id-less frames.
+4. **"Per stream" means per subscription** (one cursor per `task:<id>` stream), not per `RunEventStream` kind and not per subagent. Subagent rows share the task's id space, so one task cursor covers every tab.
+5. **A cursor greater than `sqlite_sequence.seq` for `run_events` is invalid** (it came from another or a wiped database, for example after `bun run wipe:dev`) and should yield `snapshot_required`. A legitimate cursor can never exceed it under AUTOINCREMENT. *If wrong:* a phone paired to a reset Mac would keep a transcript that no longer exists.
+6. **The phone transport reuses the same handler logic.** The decision ("fits → rows; too big → snapshot") belongs in a pure, DB-free helper plus one db method, like `clampWindowByBytes` and `resolveAnchoredMinId`, so the future `invokeRoute` remote router (item 2.3) can call it without SSE.
+7. **Deletion is task-level only**, so a forward cursor never needs to signal "rows removed below the cursor" except when the whole task is gone, which is the existing 404. Retention trims change `data` in place; a cached copy shows the old, longer payload, which is accepted.
+
+## 4. What we must ask the owner
+
+1. **Where is the `snapshot_required` threshold?** The blueprint says "when the gap exceeds the replay window". Options: (a) the replay window, **800 events / 4 MB**, all-or-nothing like the anchor rule (recommended: matches the blueprint and the existing constants); (b) the anchor ceiling, 3000 / 16 MB, which equals what the panel can hold anyway; (c) a new constant. The spike shows that cost is not the deciding factor, since even the worst case is about 16 ms.
+2. **What does the server send with `snapshot_required` over SSE?** Options: (a) a named `event: snapshot_required` frame, then **continue on the same connection** as a fresh connect (default anchored window + a normal `replay_meta`), so there's no extra round trip (recommended); (b) send the frame and close, so the client reconnects without a cursor (closest to the protocol sketch in §07). Old clients never send `afterId`, so they're unaffected either way.
+3. **How does the cursor travel?** Options: (a) a `?afterId=` query parameter only (as the blueprint says); (b) also standard SSE `id:` lines plus a `Last-Event-ID` request header, which needs `last-event-id` in CORS allow-headers (it isn't safelisted), a parser change (today it ignores `id`), and `openEventStream`/`streamSse` keeping a last id. In both cases `openEventStream` needs a way to change the URL or a header per attempt; today the URL is fixed.
+4. **Does this change also wire the desktop clients** ("helps desktop now"): the webview RunPanel reconnect (no full re-replay, a re-seed path for `snapshot_required`), `agetor logs` (stops reprinting the window on every reconnect), and the TUI? Or is it server, `db`, shared and tests only, leaving the phone to be the first consumer? Recommended: wire all three, since `logs` reprinting is a real bug today.
+5. **What happens to live-only events on resume?** These are `interaction`, `interaction_resolved`, `subagent` lifecycle, and the `started —` / `exit:N` / "background agents still running" status lines. Options: (a) leave them live-only and require a resuming client to refetch side state (pending interactions, subagents, runs); the webview doesn't refetch interactions on reconnect today, so that's a fix too (recommended); (b) persist the status lines so they become resumable rows (a behaviour change for transcripts, history and `agetor logs`); (c) stamp them with the current high-water id as a non-advancing position.
+6. **`GET /runs/:id/events`**: it replays unbounded, carries no ids, and has no caller in the repo. Leave it alone, give it `afterId` too, or deprecate it? Recommended: leave it as is and note it, since the phone and webview use the task stream.
+7. **What does `replay_meta` look like on a resumed connection?** It must not trigger the RunPanel's `hasMore` OR-merge. Proposal: an additive field such as `resumedAfter: number` (plus `snapshot: true` on the snapshot path), with `earliestId`/`hasMore` describing the *whole window the client now holds*, or omitted. Is an additive field on `TaskEventsReplayMeta` acceptable, versus a new named frame?
+8. **Do the live emit sites change their `ts`** to the stored one (return it from `appendEvent` alongside the id), so that replayed and live copies are byte-identical for the existing ts-keyed dedupers? Or does the id-based path make that moot? Recommended: return `{id, ts}` from `appendEvent` and use both. That also fixes today's duplicate-on-reconnect for clients that still dedupe by `ts`.
+
+## 5. Completeness inventory
+
+- **Callers (direct and indirect) of what changes**
+  - Server: `/tasks/:id/events` (`server.ts:8144`), `/tasks/:id/events/page` (`:8068`, unchanged but shares helpers), `/runs/:id/events` (`:7710`, decision Q6), `/runs/:id/rebuild-events` (`:7545`, which shares `clampWindowByBytes`/`resolveAnchoredMinId`; it has no persisted ids, so no forward cursor applies).
+  - `db.ts`: `runs.eventsForTask` (`:3192`), `hasEventsBefore` (`:3370`), `lastUserEventId` (`:3401`), `appendEvent` (`:3429`, if it returns the id and ts), plus a new forward method.
+  - Emit sites that would gain `id`: `orchestrator.ts` `emit()` (`:403`) and `emitRunEvent` (`:410`); `makeChunkHandler` (`:2632`); `appendRunStatusLine` (`:6090`); every `runs.appendEvent` + `emit` pair (25 in `orchestrator.ts`); the subagent emitters through `setSubagentEmitter` (`claude-subagents.ts:597-606`, sites `:1527`, `:2669`, `:2898`), `opencode-subagents.ts:156`, the copilot sink (`orchestrator.ts:2894`); the imports `claude-session-import.ts:343` and `opencode-session-import.ts:299`.
+  - Clients: `src/mainview/lib/sse-fetch.ts` (`openEventStream`), `src/mainview/lib/api.ts:2206` (`subscribeTask`), `RunPanel.tsx:1026-1290` (the subscription effect, `replay_meta` merge, window trim, deduper, interactions bootstrap); `src/cli/sse.ts` (`streamSse`), `src/cli/commands/logs.ts:113`, `src/cli/tui/useCoalescedStream.ts:55`; `src/shared/sse-parse.ts` (only if Q3 picks `id:` lines).
+- **Propagation surface**: `RunEvent.id` doc (`src/shared/types.ts:5331-5336`, now stale); `TaskEventsReplayMeta` (`:5310`); a new named-frame constant if Q2/Q7 add one (next to `TASK_EVENTS_REPLAY_META_EVENT`, `:5282`); possibly a new threshold constant (`:5196-5277`); `StreamEvent.dbId` doc (`RunPanel.tsx:160-185`); CORS allow-headers (`server.ts:474`, only for Q3b); the future `src/shared/remote-protocol.ts` (§07, not in this change).
+- **Tests to extend or that pin current behaviour**: `src/bun/db-events-paging.test.ts` (window and paging oracles, the SSE replay cap test at `:423`); `src/bun/server-events-anchor.test.ts` (anchored replay, `?anchor=0`); `src/bun/db-events-anchor.test.ts`; `src/bun/db-events-byte-budget.test.ts`; `src/bun/task-events.test.ts` (subscribe predicate, cross-run merge); `src/bun/db-run-events-plans.test.ts` (the new method **must** be registered here); `src/mainview/lib/sse-fetch.test.ts`; `src/cli/sse.test.ts`; `src/cli/logs.test.ts`; `src/mainview/lib/event-dedup.test.ts`; e2e `e2e/load-earlier-anchor.spec.ts` (first-load window). A reconnect or resume e2e doesn't exist yet. The fake-driver seam `FAKE_CLAUDE_LONG_REPLY_PROMPT_MARKER` (`__agetor_fake_claude_long_reply__[:<count>]`) can produce a gap larger than the threshold.
+- **Existing data a migration would have to backfill**: none. The cursor is the existing `run_events.id` and the forward query uses existing indexes (§2). No schema change.
+- **Docs, config and examples that describe current behaviour**: `CLAUDE.md` item 16 (the "History payloads are byte-budgeted…" paragraph and the first-load anchor note) and the RunPanel "Things that will trip you up" note; `docs/plans/first-load-reaches-last-user-message.md`; `docs/plans/task-details-blank-while-session-restores.md`; the comment blocks on the routes in `server.ts:8054-8067` and `:8146-8211`; the `sse-parse.ts` module comment (`id` ignored); `event-dedup.ts` header ("the server also replays the full persisted history on every (re)connection"). `README.md` doesn't mention replay.
+- **What the change would orphan**: nothing if the change is additive. `api.subscribeRun` (`api.ts:2179`) and `/runs/:id/events` are already unused; see Q6.
+
+## 6. Runnability
+
+- **Setup**: `export PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH"`, then `bun install`. This worktree has **no `node_modules`** yet.
+- **Start locally**: `bun run dev:hmr` (Vite + Electrobun, `AGETOR_DATA_DIR=~/.agetor-dev`, API port 4318). Never run unmerged builds against `~/.agetor`. Headless core for scripted checks: `src/bun/headless.ts` (used by the e2e harness and the CLI daemon).
+- **Unit and integration tests**: `bun test`. Targeted: `bun test src/bun/db-events-paging.test.ts src/bun/server-events-anchor.test.ts src/bun/db-run-events-plans.test.ts src/bun/task-events.test.ts src/mainview/lib/sse-fetch.test.ts src/cli/sse.test.ts src/cli/logs.test.ts`. Typecheck: `bun run typecheck`. Known flaky tests before this change: the tmux-socket ×2 and reconcile-cancel tests fail on `main`. CLI tests stall under heavy load.
+- **E2E harness**: Playwright (`playwright.config.ts`, `e2e/*.spec.ts`, fixtures in `e2e/fixtures.ts` with a headless backend and fake drivers). Run with `bun node_modules/@playwright/test/cli.js test e2e/<spec>.ts`, not `bunx`, and one Playwright run at a time. An SSE drop can be simulated by aborting the stream fetch, or by calling the route directly with `afterId`, the way `e2e/copilot-harness.spec.ts` reads `/events/page`.
+
+## 7. Risks & blast radius
+
+- **Holes in the client's cursor.** If a client advances its cursor from a replayed row but missed a live id-less event between rows, resume skips nothing (ids are contiguous per task). But if the server ever emits a live frame **with** an id before an earlier-id row has been delivered, the client can jump past it. Today emit order equals id order, because emits happen synchronously right after their insert. Any future batching or queued emit must keep that order or the cursor breaks. The plan should state this as an invariant and test it.
+- **Duplicates across the subscribe → query window.** Rows inserted after `subscribe` but before the forward query appear in both the replay and the buffer. With ids on live frames the server can drop buffered frames with `id ≤ lastSentId`; without them, clients have to keep deduping.
+- **Mixed versions.** An old webview or CLI never sends `afterId`, so behaviour is unchanged for them. An older core ignores an unknown `afterId` and does a full replay, so a new client must not assume the stream was resumed. A `resumedAfter` flag in the meta lets it tell.
+- **Main-thread cost.** The forward probe is bounded (LIMIT threshold + 1) and measured at ≤ 16 ms warm on the largest real task. A cold cache could be slower, comparable to today's `eventsForTask`. The plan guard keeps it on indexes.
+- **WKWebView connection budget** (about 6 per host, 2 permanent SSE): resume reuses the same connection and adds no request. A snapshot that closes the stream and reconnects (Q2b) costs one more connect.
+- **Live-only events.** Resume doesn't recover cards opened or resolved during a drop (true today as well). A phone would show a stale "needs you" unless it refetches pending interactions, which is the inbox's core promise ("never lose a question"). Q5 must be settled or it carries straight into the Companion.
+- **`appendEvent` return-shape change** (if it returns `{id, ts}`): every existing caller that ignores or uses `number | null` (`makeChunkHandler`'s unread watermark via `tasks.noteAssistantEvent`, the imports, the subagent sinks) must be updated together.
+
+Sources: [WHATWG Fetch — CORS-safelisted request-header](https://fetch.spec.whatwg.org/) · [WHATWG HTML — Server-sent events (`id`, `Last-Event-ID`)](https://html.spec.whatwg.org/multipage/server-sent-events.html) · [Electric HTTP API — `must-refetch` control message](https://electric.ax/docs/api/http) (precedent for "drop local state and re-sync") · Matrix `/sync` `timeline.limited` + `prev_batch` (a gappy timeline returns the newest window plus a back-token; spec section not fetched, from Synapse sources found via search).
