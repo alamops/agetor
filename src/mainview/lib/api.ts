@@ -234,20 +234,25 @@ export interface HarnessModelMap {
   byHarness: Record<string, { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[]>;
 }
 
-/** Pending multi-question card from claude's built-in AskUserQuestion tool
- *  (scraper-sourced). */
+/** Pending multi-question card. Claude's scraper cards omit the Cursor
+ *  fields; a Cursor `cursor/ask_question` card sets `source: "cursor"`. */
 export interface PendingAskQuestions {
   kind: "ask_questions";
   id: string;
   taskId: string;
   runId: string;
   questions: Array<{
+    id?: string;
     question: string;
     header?: string;
     multiSelect?: boolean;
-    options: Array<{ label: string; description?: string; preview?: string }>;
+    options: Array<{ id?: string; label: string; description?: string; preview?: string }>;
   }>;
   createdAt: number;
+  source?: "scraper" | "cursor";
+  title?: string;
+  toolCallId?: string;
+  delivery?: "live" | "restart-followup";
 }
 
 /** Modal the tmux pane scraper detected — typically a plan-mode safety
@@ -2039,6 +2044,8 @@ export const api = {
    *  present alongside `ok: false`, and only for that free-text path — see
    *  `/ask-questions/:id/answer` in server.ts. A request for a card that
    *  another request is still answering is refused 409 (thrown as `ApiError`). */
+  skipAskQuestions: (id: string) =>
+    j<{ ok: boolean; error?: string }>(`/ask-questions/${id}/answer`, { method: "POST", body: JSON.stringify({ skip: true }) }),
   answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>
     j<{
       ok: boolean;

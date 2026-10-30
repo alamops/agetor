@@ -820,6 +820,90 @@ test("registerTmuxPrompt rejects a confirmKey that isn't a single printable ASCI
   })).toThrow(/confirmKey/);
 });
 
+test("Cursor ask registers, answers, skips, and returns the same card for a duplicate tool call", async () => {
+  const { registerCursorAskQuestions, answerCursorAsk, listOpenCursorAsks } = await import("./db.ts").then(async (db) => {
+    const interactions = await import("./interactions.ts");
+    return { ...interactions, listOpenCursorAsks: db.listOpenCursorAsks };
+  });
+  const first = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call\n1",
+    title: "Pick",
+    delivery: "live",
+    questions: [{
+      id: "q1",
+      prompt: "",
+      promptMarkdown: "Which?",
+      options: [{ id: "a", label: "Alpha" }, { id: "b", label: "Beta" }],
+    }],
+  });
+  expect(first.req.source).toBe("cursor");
+  expect(first.req.title).toBe("Pick");
+  expect(first.req.questions[0]?.question).toBe("Which?");
+  expect(first.req.questions[0]?.options[0]?.id).toBe("a");
+  const again = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call\n1",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "other", options: [{ id: "z", label: "Zed" }] }],
+  });
+  expect(again.id).toBe(first.id);
+  expect(again.req.questions[0]?.question).toBe("Which?");
+  const pending = answerCursorAsk(first.id, {
+    outcome: "answered",
+    answers: [{ questionId: "q1", selectedOptionIds: ["a"] }],
+  });
+  expect(pending).toBe(true);
+  expect(await first.answer).toEqual({
+    outcome: "answered",
+    answers: [{ questionId: "q1", selectedOptionIds: ["a"] }],
+  });
+  expect(listOpenCursorAsks().some((row) => row.toolCallId === "call\n1")).toBe(false);
+
+  const skip = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call-skip",
+    delivery: "live",
+    questions: [{ id: "q2", prompt: "Skip me?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  expect(answerCursorAsk(skip.id, { outcome: "skipped" })).toBe(true);
+  expect(await skip.answer).toEqual({ outcome: "skipped" });
+});
+
+test("cancelPendingForTask writes cancelled for a Cursor card and does not write skipped", async () => {
+  const { registerCursorAskQuestions, cancelPendingForTask } = await import("./interactions.ts");
+  const { db } = await import("./db.ts");
+  const card = registerCursorAskQuestions({
+    taskId: "tCursorCancel",
+    runId: "rCursorCancel",
+    toolCallId: "call-cancel",
+    delivery: "live",
+    questions: [{ id: "q", prompt: "Stop?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const settled = card.answer;
+  cancelPendingForTask("tCursorCancel", "stop");
+  expect(await settled).toEqual({ outcome: "cancelled" });
+  const row = db.query<{ outcome: string }, [string, string]>(
+    `SELECT outcome FROM cursor_asks WHERE task_id = ? AND tool_call_id = ?`,
+  ).get("tCursorCancel", "call-cancel");
+  expect(row?.outcome).toBe("cancelled");
+});
+
+test("a scraper ask card still has no awaiter", async () => {
+  const { registerScrapedAskQuestions, answerCursorAsk } = await import("./interactions.ts");
+  const req = registerScrapedAskQuestions({
+    taskId: "tScraperStill",
+    runId: "rScraperStill",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp-scraper-still",
+  });
+  expect(req.source).toBe("scraper");
+  expect(answerCursorAsk(req.id, { outcome: "skipped" })).toBe(false);
+});
+
 test("registerTmuxPrompt accepts a single-letter confirmKey regardless of case", async () => {
   const { registerTmuxPrompt } = await import("./interactions.ts");
   expect(() => registerTmuxPrompt({

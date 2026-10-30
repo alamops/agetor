@@ -4,7 +4,8 @@ import { randomUUID } from "node:crypto";
 // sides touch the other's exports from function bodies (never at module
 // scope). See the matching note at the top of db.ts before adding any
 // top-level use of `tasks` here.
-import { tasks } from "./db.ts";
+import { insertCursorAsk, resolveCursorAsk, tasks } from "./db.ts";
+import { questionText } from "../shared/cursor-ask.ts";
 
 /**
  * In-process registry for user interactions an agent needs to drive through
@@ -63,6 +64,8 @@ export type InteractionKind =
 
 /** One question inside an AskUserQuestion tool call (claude code shape). */
 export interface AskQuestion {
+  /** Cursor `questions[].id`. Absent on scraper cards. */
+  id?: string;
   question: string;
   header?: string;
   multiSelect?: boolean;
@@ -71,7 +74,7 @@ export interface AskQuestion {
    *  tool_use (available only after the modal is answered, so in practice not
    *  while the card is live), and the live pane scrape, which grows the pane and walks each option to read its panel
    *  (see `collectAskQuestionsFromPane`). */
-  options: Array<{ label: string; description?: string; preview?: string }>;
+  options: Array<{ id?: string; label: string; description?: string; preview?: string }>;
   /** Live-pane scrapes only: whether the modal has an inline "Type something"
    *  row for a typed custom answer. `false` for the preview layout (bare
    *  `Chat about this`), where typed characters would act as hotkeys; absent
@@ -94,16 +97,40 @@ export interface AskQuestionsRequest {
   questions: AskQuestion[];
   createdAt: number;
   /**
-   * How the answer is delivered back to claude. Only `"scraper"` exists now:
-   * the native modal is detected on the tmux pane and the answer is driven
-   * back as keystrokes (`planAskAnswers` + `driveAskAnswers`), then the card is
-   * removed via `resolveScrapedAskQuestions`. Registered by
-   * `registerScrapedAskQuestions`.
+   * How the answer is delivered. `"scraper"` is Claude's pane modal
+   * (keystrokes via `planAskAnswers` + `driveAskAnswers`). `"cursor"` is an
+   * ACP `cursor/ask_question` awaiter: the answer route resolves the promise
+   * instead of sending keys.
    */
-  source?: "scraper";
+  source?: "scraper" | "cursor";
+  /** Cursor tool title (`args.title`). Omitted when the call set none. */
+  title?: string;
+  /** Raw Cursor tool-call id. Stored for the row key; never a URL segment. */
+  toolCallId?: string;
+  /**
+   * `"live"` while a child is blocked on the RPC. `"restart-followup"` after
+   * a restart that did not re-issue the request: Submit and Skip send the
+   * next user message.
+   */
+  delivery?: "live" | "restart-followup";
   /** Pane fingerprint — used by the scraper for two-tick stability, dup
    *  suppression, and auto-cancel when the modal leaves the pane. */
   fingerprint?: string;
+}
+
+/** What a Cursor ask promise resolves to. The driver turns this into the
+ *  nested ACP result. Labels have already been mapped to option ids. */
+export type CursorAskAnswer =
+  | { outcome: "answered"; answers: Array<{ questionId: string; selectedOptionIds: string[]; freeformText?: string }> }
+  | { outcome: "skipped" }
+  | { outcome: "cancelled" };
+
+export interface CursorAskQuestionInput {
+  id: string;
+  prompt?: string | null;
+  promptMarkdown?: string | null;
+  allowMultiple?: boolean;
+  options: Array<{ id: string; label: string }>;
 }
 
 export interface AskQuestionsAnswer {
@@ -285,7 +312,10 @@ export type AnyRequest =
 
 interface AskQuestionsEntry {
   req: AskQuestionsRequest;
+  /** Scraper cards: no-op. Cursor cards also set `resolveCursor`. */
   resolve: (answer: AskQuestionsAnswer) => void;
+  resolveCursor?: (answer: CursorAskAnswer) => void;
+  cursorAnswer?: Promise<CursorAskAnswer>;
 }
 interface TmuxPromptEntry {
   req: TmuxPromptRequest;
@@ -297,6 +327,12 @@ interface FxPermissionEntry {
 }
 
 const askQuestions = new Map<string, AskQuestionsEntry>();
+/** `taskId + toolCallId` → interaction id. A second register returns the card already here. */
+const cursorAskByTool = new Map<string, string>();
+
+function cursorAskKey(taskId: string, toolCallId: string): string {
+  return `${taskId}\0${toolCallId}`;
+}
 const tmuxPrompts = new Map<string, TmuxPromptEntry>();
 const fxPermissions = new Map<string, FxPermissionEntry>();
 
@@ -460,6 +496,108 @@ export function resolveScrapedAskQuestions(id: string): boolean {
   const entry = askQuestions.get(id);
   if (!entry) return false;
   askQuestions.delete(id);
+  fanoutResolved(entry.req);
+  return true;
+}
+
+export interface RegisterCursorAskArgs {
+  taskId: string;
+  runId: string;
+  toolCallId: string;
+  title?: string;
+  questions: CursorAskQuestionInput[];
+  delivery: "live" | "restart-followup";
+  /** When false, the row already exists (boot rebuild). Default true. */
+  persist?: boolean;
+}
+
+/**
+ * Register a Cursor `cursor/ask_question` card and return the promise the
+ * driver awaits. A second call for the same task and tool-call id returns
+ * the card already registered, including its original promise.
+ */
+export function registerCursorAskQuestions(args: RegisterCursorAskArgs): {
+  id: string;
+  req: AskQuestionsRequest;
+  answer: Promise<CursorAskAnswer>;
+} {
+  const key = cursorAskKey(args.taskId, args.toolCallId);
+  const existingId = cursorAskByTool.get(key);
+  if (existingId) {
+    const existing = askQuestions.get(existingId);
+    if (existing?.cursorAnswer && existing.resolveCursor) {
+      return { id: existingId, req: existing.req, answer: existing.cursorAnswer };
+    }
+  }
+
+  const questions: AskQuestion[] = args.questions.map((q) => ({
+    id: q.id,
+    question: questionText(q.prompt, q.promptMarkdown),
+    multiSelect: q.allowMultiple === true,
+    options: q.options.map((o) => ({ id: o.id, label: o.label })),
+  }));
+  const title = typeof args.title === "string" && args.title.length > 0 ? args.title : undefined;
+  const id = randomUUID();
+  const req: AskQuestionsRequest = {
+    kind: "ask_questions",
+    id,
+    taskId: args.taskId,
+    runId: args.runId,
+    ...pipelineParentFor(args.taskId),
+    questions,
+    createdAt: Date.now(),
+    source: "cursor",
+    toolCallId: args.toolCallId,
+    delivery: args.delivery,
+    ...(title !== undefined ? { title } : {}),
+  };
+  if (args.persist !== false) {
+    insertCursorAsk({
+      taskId: args.taskId,
+      toolCallId: args.toolCallId,
+      runId: args.runId,
+      payload: {
+        ...(title !== undefined ? { title } : {}),
+        questions: args.questions.map((q) => ({
+          id: q.id,
+          prompt: questionText(q.prompt, q.promptMarkdown),
+          allowMultiple: q.allowMultiple === true,
+          options: q.options.map((o) => ({ id: o.id, label: o.label })),
+        })),
+      },
+    });
+  }
+  let resolveCursor!: (answer: CursorAskAnswer) => void;
+  const cursorAnswer = new Promise<CursorAskAnswer>((resolve) => {
+    resolveCursor = resolve;
+  });
+  askQuestions.set(id, { req, resolve: () => { /* cursor: the awaiter is resolveCursor */ }, resolveCursor, cursorAnswer });
+  cursorAskByTool.set(key, id);
+  try {
+    broadcast(req);
+  } catch (err) {
+    askQuestions.delete(id);
+    cursorAskByTool.delete(key);
+    try {
+      fanoutResolved(req);
+    } catch {
+      /* the original broadcast error is authoritative */
+    }
+    throw err;
+  }
+  return { id, req, answer: cursorAnswer };
+}
+
+/** Write the outcome, then resolve the Cursor awaiter. Returns false when
+ *  the id is unknown or is not a Cursor card. */
+export function answerCursorAsk(id: string, answer: CursorAskAnswer): boolean {
+  const entry = askQuestions.get(id);
+  if (!entry?.resolveCursor) return false;
+  const toolCallId = entry.req.toolCallId;
+  if (toolCallId) resolveCursorAsk(entry.req.taskId, toolCallId, answer.outcome);
+  askQuestions.delete(id);
+  cursorAskByTool.delete(cursorAskKey(entry.req.taskId, toolCallId ?? ""));
+  entry.resolveCursor(answer);
   fanoutResolved(entry.req);
   return true;
 }
@@ -657,9 +795,18 @@ export function cancelPendingForTask(taskId: string, reason: string): void {
   for (const [id, entry] of askQuestions) {
     if (entry.req.taskId !== taskId) continue;
     askQuestions.delete(id);
-    entry.resolve({
-      answers: entry.req.questions.map(() => ({ selected: [], custom: reason })),
-    });
+    if (entry.resolveCursor) {
+      const toolCallId = entry.req.toolCallId;
+      if (toolCallId) {
+        cursorAskByTool.delete(cursorAskKey(taskId, toolCallId));
+        resolveCursorAsk(taskId, toolCallId, "cancelled");
+      }
+      entry.resolveCursor({ outcome: "cancelled" });
+    } else {
+      entry.resolve({
+        answers: entry.req.questions.map(() => ({ selected: [], custom: reason })),
+      });
+    }
     fanoutResolved(entry.req);
   }
   for (const [id, entry] of tmuxPrompts) {
@@ -729,6 +876,7 @@ export const __testing = {
    *  broadcaster restores it through the setter's returned previous fn. */
   reset() {
     askQuestions.clear();
+    cursorAskByTool.clear();
     tmuxPrompts.clear();
     fxPermissions.clear();
   },
