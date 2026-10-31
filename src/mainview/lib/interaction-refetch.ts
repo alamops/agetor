@@ -10,21 +10,18 @@
 // switch) get ignored instead of applied.
 
 /** Server list, plus cards that arrived over SSE while the request was in
- *  flight (deduped by id, the server copy wins), minus any id resolved
+ *  flight (deduped by id, the latest SSE copy wins), minus any id resolved
  *  meanwhile. Order: server order, then arrival order. */
 export function mergeRefetchedInteractions<T extends { id: string }>(
   list: T[],
   arrived: readonly T[],
   resolvedIds: ReadonlySet<string>,
 ): T[] {
-  const seen = new Set<string>();
-  const out: T[] = [];
+  const items = new Map<string, T>();
   for (const item of [...list, ...arrived]) {
-    if (resolvedIds.has(item.id) || seen.has(item.id)) continue;
-    seen.add(item.id);
-    out.push(item);
+    if (!resolvedIds.has(item.id)) items.set(item.id, item);
   }
-  return out;
+  return [...items.values()];
 }
 
 export interface InteractionRefetchTracker<T extends { id: string }> {

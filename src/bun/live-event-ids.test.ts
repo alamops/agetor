@@ -126,6 +126,19 @@ async function settledRun(): Promise<{ taskId: string; runId: string }> {
   return { taskId, runId };
 }
 
+test("Cursor ask result broadcasts the persisted event id and timestamp", async () => {
+  const { taskId, runId } = await settledRun();
+  const { recordCursorAskToolResult } = await import("./interactions.ts");
+  const args = { taskId, runId, toolCallId: `ask-${randomUUID()}`, content: "cancelled" };
+  recordCursorAskToolResult(args);
+  recordCursorAskToolResult(args);
+  const matching = storedRows(runId).filter((row) => row.stream === "tool_result" && row.data.includes(args.toolCallId));
+  const sent = framesOf(runId).filter((frame) => frame.stream === "tool_result" && frame.data.includes(args.toolCallId));
+  expect(matching).toHaveLength(1);
+  expect(sent).toHaveLength(1);
+  expectFrameEqualsRow(sent[0]!, matching[0]!);
+});
+
 function expectFrameEqualsRow(frame: RunEvent, row: StoredRow): void {
   expect(frame.id).toBe(row.id);
   expect(frame.ts).toBe(row.ts);

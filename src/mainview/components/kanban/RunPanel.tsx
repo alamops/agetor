@@ -13,6 +13,7 @@ import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitSta
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
+import { mergePendingInteraction, mergePendingInteractionSnapshot } from "@/lib/merge-pending-interaction";
 import { EXPAND_EVENT } from "@/lib/expand-on-jump";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
 import { latestPrProposal } from "@/lib/pr-proposal";
@@ -22,6 +23,9 @@ import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { fileScopeForTask } from "../../../shared/file-scope.ts";
+import { cursorAskCanAdvance, cursorAskCardHeading, cursorAskFromToolUse, cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues, cursorAskToolFooter, cursorAskWireCustom } from "../../../shared/cursor-ask.ts";
+import { CURSOR_ASK_FREEFORM } from "../../../shared/cursor-ask-verdict.ts";
+import { foldToolUseRevisions, supersededToolUseIndexes } from "../../../shared/tool-use-revisions.ts";
 import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
@@ -738,6 +742,9 @@ function RunPanelBody({
    *  muted `TASK_STREAM_GAP_NOTICE` line under "Load earlier messages". */
   const [streamGapNotice, setStreamGapNotice] = useState(false);
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
+  /** Ids the live stream or the card itself already resolved. The bootstrap
+   *  fetch below may have started before that, and must not put them back. */
+  const resolvedInteractionIdsRef = useRef(new Set<string>());
   /** Background/sub agents this task's main agent has spawned. Seeded from the
    *  snapshot endpoint on open + kept live by `stream: "subagent"` SSE deltas
    *  and a 2s poll backstop. Drives the read-only tab strip. */
@@ -929,6 +936,7 @@ function RunPanelBody({
     setRebuildNote(null);
     setStreamGapNotice(false);
     setInteractions([]);
+    resolvedInteractionIdsRef.current = new Set();
     setSubagentList([]);
     setActiveStream("main");
     setSearchOpen(false);
@@ -1160,7 +1168,12 @@ function RunPanelBody({
         // `EVENTS_WINDOW_MAX` so memory still stays bounded for a reader who
         // never returns to the bottom; the jerk can still happen once that
         // cap is hit, which is the accepted trade-off.
-        const merged = [...eventsRef.current, ...batch];
+        // A Cursor tool revision is another `tool_use` with the same id.
+        // Fold it onto the row already in the window before the cap, so
+        // partials do not push real transcript lines out.
+        const merged = batch.some((event) => event.stream === "tool_use")
+          ? foldToolUseRevisions([...eventsRef.current, ...batch])
+          : [...eventsRef.current, ...batch];
         let next = merged;
         const keep = eventWindowKeepCount(merged.length, nearBottomRef.current, EVENTS_WINDOW_MAX);
         if (keep != null) {
@@ -1221,8 +1234,10 @@ function RunPanelBody({
         if (e.stream === "interaction") {
           try {
             const req = JSON.parse(e.data) as PendingInteraction;
+            // Same id is an update, not a duplicate. A Cursor card keeps its
+            // id when the child exits and delivery becomes "restart-followup".
             interactionRefetch.noteArrived(req);
-            setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
+            setInteractions((cur) => mergePendingInteraction(cur, req));
           } catch { /* ignore malformed */ }
           return;
         }
@@ -1251,6 +1266,7 @@ function RunPanelBody({
           // idempotent under `id`-based filtering.
           try {
             const { id } = JSON.parse(e.data) as { id: string };
+            resolvedInteractionIdsRef.current.add(id);
             interactionRefetch.noteResolved(id);
             setInteractions((cur) => cur.filter((x) => x.id !== id));
           } catch { /* ignore malformed */ }
@@ -1387,12 +1403,14 @@ function RunPanelBody({
 
   // Bootstrap any interactions that fired before the panel opened (race
   // between claude tool calls and the panel mount). The SSE subscription
-  // picks up new ones from here on.
+  // picks up new ones from here on. The fetch is in flight while that
+  // stream can update a card or resolve one, so the snapshot is merged
+  // into the live list — replacing it would put the stale card back.
   useEffect(() => {
     let cancelled = false;
     void api.listPendingInteractions(task.id).then((list) => {
       if (cancelled) return;
-      setInteractions(list);
+      setInteractions((cur) => mergePendingInteractionSnapshot(cur, list, resolvedInteractionIdsRef.current));
     }).catch(() => { /* ignore — empty start is fine */ });
     return () => { cancelled = true; };
   }, [task.id]);
@@ -1401,7 +1419,10 @@ function RunPanelBody({
   // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
   // stable setter, so the empty dep list is correct.
   const dismissInteraction = useCallback(
-    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
+    (id: string) => {
+      resolvedInteractionIdsRef.current.add(id);
+      setInteractions((cur) => cur.filter((x) => x.id !== id));
+    },
     [],
   );
 
@@ -5656,6 +5677,19 @@ function RunEventList({
   // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`,
   // `planByToolCallId`, `onOpenPlan`) are tracked explicitly.
   const blocks = useMemo(() => {
+    // A revised Cursor tool_use (same id, grown rawInput) replaces the
+    // partial. Both rows can be in the live list; history keeps one.
+    const supersededToolUses = supersededToolUseIndexes(normalised);
+    // A Cursor ask block stays open only while its card is still pending.
+    // The card also picks the waiting line. A missing card is not a live wait.
+    const cursorAskByToolId = new Map<string, { delivery?: "live" | "restart-followup"; followupCause?: "restart" | "child-exit" }>();
+    for (const bucket of interactionByIndex.values()) {
+      for (const item of bucket) {
+        if (item.kind === "ask_questions" && item.source === "cursor" && item.toolCallId) {
+          cursorAskByToolId.set(item.toolCallId, { delivery: item.delivery, followupCause: item.followupCause });
+        }
+      }
+    }
     // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
     // to and imperatively highlights (`logRef.current?.querySelector('[data-
     // evid="…"]')` in RunPanelBody — see the highlight effect there). `evid`
@@ -5704,6 +5738,7 @@ function RunEventList({
         case "compaction_summary":
           return [wrap(key, evid, <CompactionSummaryBlock text={e.data} />)];
         case "tool_use": {
+          if (supersededToolUses.has(evid)) return [];
           const parsed = safeParse<ParsedToolUse>(e.data);
           if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];
           // A detected Cursor plan replaces the generic tool-call card
@@ -5719,7 +5754,8 @@ function RunEventList({
           if (parseSentFilesToolUse(parsed.name, parsed.input)) {
             return [wrap(key, evid, <SentFilesCard call={parsed} result={result} taskId={taskId} />)];
           }
-          return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} />)];
+          const cursorWait = parsed.name === "askQuestionToolCall" ? cursorAskByToolId.get(parsed.id) : undefined;
+          return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} cursorWait={cursorWait} />)];
         }
         case "tool_result": {
           const parsed = safeParse<ParsedToolResult>(e.data);
@@ -6559,9 +6595,22 @@ const SECONDARY_BADGE_CLASS = badgeVariants({ variant: "secondary" });
  *  AskUserQuestion + ExitPlanMode get prominent styling because the user
  *  *needs to act on them* — claude is blocked waiting for an answer that
  *  agetor's UI doesn't otherwise prompt for. */
-const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: ParsedToolUse; result?: ParsedToolResult }) {
+const ToolUseBlock = memo(function ToolUseBlock({
+  call,
+  result,
+  cursorWait,
+}: {
+  call: ParsedToolUse;
+  result?: ParsedToolResult;
+  /** Pending Cursor ask for this tool id, when the card is still open. */
+  cursorWait?: { delivery?: "live" | "restart-followup"; followupCause?: "restart" | "child-exit" };
+}) {
   const summary = formatToolInputSummary(call.name, call.input);
-  const isInteractive = call.name === "AskUserQuestion" || call.name === "ExitPlanMode";
+  const isInteractive = call.name === "AskUserQuestion" || call.name === "askQuestionToolCall" || call.name === "ExitPlanMode";
+  const cursorAsk = call.name === "askQuestionToolCall";
+  // No card means the question was answered, skipped, or cancelled. Keep
+  // the block collapsible, and do not say Cursor is still waiting.
+  const cursorFooter = cursorAsk && !result ? cursorAskToolFooter(cursorWait) : null;
   const [open, setOpen] = useState(false);
   const [resultOpenSignal, setResultOpenSignal] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -6579,7 +6628,7 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
   useEffect(() => {
     if (!open) setResultOpenSignal(0);
   }, [open]);
-  const forcedOpen = isInteractive && !result;
+  const forcedOpen = cursorAsk ? cursorFooter !== null : isInteractive && !result;
   const expanded = open || forcedOpen;
   // MCP convention: `mcp__<server>__<tool>`. The server name is always the
   // first segment after the `mcp__` prefix; everything after the next `__`
@@ -6635,11 +6684,16 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
           {result && <ToolResultBody result={result} openSignal={resultOpenSignal} />}
         </>
       )}
-      {isInteractive && !result && (
-        <div className="border-t border-primary/40 bg-primary/10 px-2 py-1.5 text-[11px] text-foreground">
+      {forcedOpen && (
+        <div
+          className="border-t border-primary/40 bg-primary/10 px-2 py-1.5 text-[11px] text-foreground"
+          data-testid={cursorAsk ? "cursor-ask-waiting" : undefined}
+        >
           {call.name === "AskUserQuestion"
             ? "Claude is asking — answer it in the card above (it has a custom-answer field for anything not listed)."
-            : "Claude is waiting for plan approval — use the card above. To reject or request changes, press Stop, then send a message."}
+            : cursorAsk
+              ? cursorFooter
+              : "Claude is waiting for plan approval — use the card above. To reject or request changes, press Stop, then send a message."}
         </div>
       )}
     </div>
@@ -6854,6 +6908,28 @@ function ToolInputBody({ name, input }: { name: string; input: unknown }) {
         ))}
       </ul>
     );
+  }
+  if (name === "askQuestionToolCall") {
+    const ask = cursorAskFromToolUse({ name, input });
+    if (ask) {
+      return (
+        <div className="px-2 py-1.5 text-[11px]" data-testid="cursor-ask-tool-body">
+          {ask.title ? <div className="mb-1 font-medium">{ask.title}</div> : null}
+          {ask.questions.map((q, i) => (
+            <div key={q.id || i} className={cn(i > 0 && "mt-2 border-t border-border/30 pt-2")}>
+              <div className="font-medium">{q.text}</div>
+              <ul className="mt-1 space-y-0.5">
+                {q.options.map((o, oi) => (
+                  <li key={`${o.id}:${oi}`} className="text-muted-foreground">
+                    · <span className="font-medium text-foreground">{cursorAskOptionChoiceLabel(o, q.options)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      );
+    }
   }
   if (name === "AskUserQuestion" && isRecord(input) && Array.isArray(input.questions)) {
     return (
@@ -7985,22 +8061,33 @@ function AskQuestionsCard({
   const setCustom = (qi: number, value: string) =>
     setAnswers((cur) => cur.map((a, i) => (i === qi ? { ...a, custom: value } : a)));
 
-  // Every question needs at least one of selected/custom non-empty before
-  // we let the user send. Mirrors the contract claude expects — empty
-  // answers would confuse its next turn.
-  const canSubmit = answers.every(
-    (a) => a.selected.length > 0 || a.custom.trim().length > 0,
-  );
+  const cursor = req.source === "cursor";
+  /** Cursor cannot deliver typed text. A selected option is the answer;
+   *  leftover custom text must not hide that pick, replace it, or count
+   *  as an answer by itself. */
+  const cursorIgnoresCustom = cursor && CURSOR_ASK_FREEFORM === "unsupported";
+
+  // Every question needs a real answer before Review or submit. Claude
+  // accepts the custom field. Cursor with unsupported freeform does not
+  // accept typed text alone, or typed text added to a multi-select.
+  const canSubmit = cursor
+    ? cursorAskCanAdvance(req.questions, answers)
+    : answers.every((a) => a.selected.length > 0 || a.custom.trim().length > 0);
 
   const submit = async () => {
     if (!canSubmit || submitting) return;
     setSubmitting(true);
     try {
       const res = await api.answerAskQuestions(req.id, {
-        answers: answers.map((a) => ({
-          selected: a.selected,
-          custom: a.custom.trim() || undefined,
-        })),
+        answers: answers.map((a, qi) => {
+          const multi = req.questions[qi]?.multiSelect === true;
+          const custom = cursor
+            ? cursorAskWireCustom(multi, a.custom)
+            : (a.custom.trim() || undefined);
+          if (!cursor) return { selected: a.selected, custom };
+          const picks = cursorAskPicksFromValues(req.questions[qi]?.options ?? [], a.selected);
+          return { ...picks, custom };
+        }),
       });
       // The server resolves the card regardless of outcome (see its own
       // doc), so keeping it up wouldn't let the user retry: on the drive
@@ -8024,11 +8111,12 @@ function AskQuestionsCard({
         if (res.delivery === undefined) {
           toast(reason || "This question was already resolved");
         } else {
+          const who = cursor ? "Cursor" : "Claude";
           toast.error(
             reason
               || (res.delivery === "message"
-                ? "Answer didn't reach Claude — answer it in the terminal or resend from the composer"
-                : "Answer didn't reach Claude — a fresh card will appear; answer it there or in the terminal"),
+                ? `Answer didn't reach ${who} — answer it in the terminal or resend from the composer`
+                : `Answer didn't reach ${who} — a fresh card will appear; answer it there or in the terminal`),
           );
         }
       }
@@ -8043,30 +8131,78 @@ function AskQuestionsCard({
         onResolved(req.id);
         return;
       }
+      // Cursor rejects a custom-only answer while that input is unsupported.
+      // The card stays up so an option can still be picked.
+      if (e instanceof ApiError && e.status === 400 && req.source === "cursor") {
+        toast.error(e.message || "Cursor cannot accept a custom answer — pick an option");
+        return;
+      }
       throw e;
     } finally {
       setSubmitting(false);
     }
   };
 
+  const skip = async () => {
+    if (submitting || req.source !== "cursor") return;
+    setSubmitting(true);
+    try {
+      const res = await api.skipAskQuestions(req.id);
+      if (!res.ok) toast.error("Skip didn't reach Cursor");
+      onResolved(req.id);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        toast(e.message || "This question is already being answered");
+        onResolved(req.id);
+        return;
+      }
+      if (e instanceof ApiError && e.status === 400) {
+        toast.error(e.message || "Could not skip");
+        return;
+      }
+      throw e;
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const heading = phase === "review"
+    ? "Review your answers"
+    : cursor
+      ? cursorAskCardHeading(req.delivery, req.followupCause)
+      : "Claude is asking";
+
+  const displayPick = (qi: number, key: string): string => {
+    const options = req.questions[qi]?.options ?? [];
+    const opt = cursor
+      ? options.find((option) => option.id === key)
+      : options.find((option) => option.label === key);
+    if (!opt) return key;
+    return cursor ? cursorAskOptionChoiceLabel(opt, options) : opt.label;
+  };
+
   /** One-line summary of the user's answer to question `qi` (picked labels +
    *  any custom text), for the review screen. Mirrors the native "→ a, b".
    *  A single-select question's custom text REPLACES the pick (the drive and
-   *  the follow-up message both send custom only); multi-select adds it. */
+   *  the follow-up message both send custom only); multi-select adds it.
+   *  Cursor with unsupported freeform is the exception: a selected option
+   *  stays visible, and custom text is shown only when it is the whole answer.
+   *  Cursor picks are option ids; the summary shows the label. */
   const answerSummary = (qi: number): string => {
     const a = answers[qi] ?? { selected: [], custom: "" };
     const custom = a.custom.trim();
-    const pieces = !req.questions[qi]?.multiSelect && custom ? [] : [...a.selected];
-    if (custom) pieces.push(custom);
+    const keys = !req.questions[qi]?.multiSelect && custom && !cursorIgnoresCustom ? [] : [...a.selected];
+    const pieces = keys.map((key) => displayPick(qi, key));
+    if (custom && !(cursorIgnoresCustom && a.selected.length > 0)) pieces.push(custom);
     return pieces.length ? pieces.join(", ") : "(no answer)";
   };
 
   return (
-    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40" data-testid="ask-questions-card">
       <div className="mb-2 flex items-center justify-between">
-        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary" data-testid="ask-questions-title">
           <HelpCircle className="size-3.5" aria-hidden />
-          {phase === "review" ? "Review your answers" : "Claude is asking"}
+          {heading}
         </span>
         <span className="font-mono text-[10px] text-muted-foreground">
           {phase === "review"
@@ -8074,6 +8210,11 @@ function AskQuestionsCard({
             : req.questions.length === 1 ? "1 question" : `${req.questions.length} questions`}
         </span>
       </div>
+      {req.title ? (
+        <div className="mb-2 text-[13px] font-medium" data-testid="ask-questions-args-title">
+          {req.title}
+        </div>
+      ) : null}
 
       {phase === "review" ? (
         <>
@@ -8086,9 +8227,16 @@ function AskQuestionsCard({
             ))}
           </div>
           <div className="mt-3 flex items-center justify-between">
-            <Button variant="ghost" size="sm" onClick={() => setPhase("answer")} disabled={submitting}>
-              ← Back
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" size="sm" onClick={() => setPhase("answer")} disabled={submitting}>
+                ← Back
+              </Button>
+              {cursor && (
+                <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
+                  Skip
+                </Button>
+              )}
+            </div>
             <Button onClick={() => void submit()} disabled={!canSubmit || submitting} size="sm">
               {submitting ? "Submitting…" : "Submit answers"}
             </Button>
@@ -8101,11 +8249,13 @@ function AskQuestionsCard({
               <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
                 <div className="mb-1.5 whitespace-pre-wrap text-[13px] font-medium">{q.question}</div>
                 <div className="space-y-1">
-                  {q.options.map((opt) => {
-                    const picked = answers[qi]?.selected.includes(opt.label) ?? false;
+                  {q.options.map((opt, oi) => {
+                    const value = cursor ? cursorAskOptionValue(opt) : opt.label;
+                    const picked = answers[qi]?.selected.includes(value) ?? false;
+                    const shown = cursor ? cursorAskOptionChoiceLabel(opt, q.options) : opt.label;
                     return (
                       <label
-                        key={opt.label}
+                        key={`${value}:${oi}`}
                         className={cn(
                           "flex cursor-pointer items-start gap-2 rounded border border-transparent px-1.5 py-1 hover:bg-accent/30",
                           picked && "border-primary/40 bg-primary/10",
@@ -8115,11 +8265,11 @@ function AskQuestionsCard({
                           type={q.multiSelect ? "checkbox" : "radio"}
                           name={`q-${req.id}-${qi}`}
                           checked={picked}
-                          onChange={() => togglePick(qi, opt.label, Boolean(q.multiSelect))}
+                          onChange={() => togglePick(qi, value, Boolean(q.multiSelect))}
                           className="mt-0.5"
                         />
                         <span className="text-[12px]">
-                          <span className="font-medium">{opt.label}</span>
+                          <span className="font-medium">{shown}</span>
                           {opt.description && (
                             <span className="block text-[11px] text-muted-foreground">{opt.description}</span>
                           )}
@@ -8134,14 +8284,25 @@ function AskQuestionsCard({
                 <Textarea
                   value={answers[qi]?.custom ?? ""}
                   onChange={(e) => setCustom(qi, e.target.value)}
-                  placeholder={q.multiSelect ? "Custom answer — added to the selection" : "Custom answer — replaces the selection"}
+                  placeholder={
+                    cursorIgnoresCustom
+                      ? "Custom answer — Cursor can't accept typed text; pick an option"
+                      : q.multiSelect
+                        ? "Custom answer — added to the selection"
+                        : "Custom answer — replaces the selection"
+                  }
                   rows={2}
                   className="mt-2 text-[12px]"
                 />
               </div>
             ))}
           </div>
-          <div className="mt-3 flex items-center justify-end">
+          <div className="mt-3 flex items-center justify-between">
+            {cursor ? (
+              <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
+                Skip
+              </Button>
+            ) : <span />}
             <Button onClick={() => setPhase("review")} disabled={!canSubmit || submitting} size="sm">
               Review answers →
             </Button>

@@ -1688,3 +1688,66 @@ test("event stream: fx internal tool_use/tool_result rows are skipped; visible a
   expect(frame).not.toContain("↳ result");
   unmount();
 });
+
+test("event stream: askQuestionToolCall prints the question instead of only the tool name", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  onTaskEvents!({
+    runId: "runA", taskId: "taskA", stream: "tool_use",
+    data: JSON.stringify({
+      id: "call-1",
+      name: "askQuestionToolCall",
+      input: {
+        askQuestionToolCall: {
+          args: {
+            title: "Pick one",
+            questions: [{ id: "q1", prompt: "Which option?", options: [{ id: "a", label: "Alpha" }], allowMultiple: false }],
+          },
+        },
+      },
+    }),
+    ts: 1,
+  });
+  onTaskEvents!({
+    runId: "runA", taskId: "taskA", stream: "tool_use",
+    data: JSON.stringify({ id: "toolu_9", name: "Bash", input: { command: "ls" } }),
+    ts: 2,
+  });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Pick one");
+  expect(frame).toContain("Which option?");
+  expect(frame).toContain("Alpha");
+  expect(frame).not.toContain("▸ askQuestionToolCall");
+  expect(frame).toContain("▸ Bash");
+  unmount();
+});
+
+test("event stream: a same-timestamp askQuestionToolCall revision replaces the partial", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  const head = `{"id":"call-1","name":"askQuestionToolCall","input":{"askQuestionToolCall":{"args":{"title":"${"P".repeat(40)}","questions":[{"id":"q1","prompt":"`;
+  const partial = `${head}Soon"}]}}}}`;
+  const full = `${head}Which option?","options":[{"id":"a","label":"Alpha"}]}]}}}}`;
+  expect(partial.slice(0, 64)).toBe(full.slice(0, 64));
+  expect(eventKey({ runId: "runA", taskId: "taskA", stream: "tool_use", data: partial, ts: 5 })).not.toBe(
+    eventKey({ runId: "runA", taskId: "taskA", stream: "tool_use", data: full, ts: 5 }),
+  );
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "tool_use", data: partial, ts: 5 });
+  onTaskEvents!({ runId: "runA", taskId: "taskA", stream: "tool_use", data: full, ts: 5 });
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Which option?");
+  expect(frame).not.toContain("Soon");
+  unmount();
+});

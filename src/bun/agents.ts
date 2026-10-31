@@ -16,7 +16,8 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
-import { createCursorMapCtx, flushCursorThinking, mapCursorEvent, spawnCursorViaTmux } from "./cursor-tmux.ts";
+import { createCursorMapCtx, flushCursorThinking, mapCursorEvent } from "./cursor-tmux.ts";
+import { FAKE_CURSOR_ASK_PROMPT_MARKER, spawnCursorViaAcp, spawnFakeCursorAsk } from "./cursor-acp.ts";
 import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
 import { FX_STEER_DROPPED_STATUS, fxRefusedStatusLine, fxSpeedNotOfferedLine, mapFxUpdate, spawnFxViaAcp, type FxLaunchOptions, type FxMode, type FxUpdateCtx } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
@@ -60,6 +61,12 @@ export interface AgentCommand {
    * other kind.
    */
   freshArgv?: string[];
+  /**
+   * Set only by the cursor branch. The composed model id (`cursorModelArg`)
+   * sent as `session/set_config_option`, not as an argv `--model` flag.
+   * ACP does not read `--model`.
+   */
+  cursorModel?: string;
   /**
    * Set only by the copilot branch of `buildCommand`: the classic-PAT
    * variables (`GH_TOKEN` / `GITHUB_TOKEN`) the launch shell must drop when
@@ -715,61 +722,22 @@ export function buildCommand(
   }
 
   if (harness.kind === "cursor") {
-    // cursor — hosted in tmux via cursor-tmux.ts, one-shot turn per
-    // invocation exactly like codex. The prompt is NOT an argv element here:
-    // cursor-tmux.ts's spawnCursorViaTmux appends it as the final positional
-    // argv element at spawn time via its own injection-safe quoting pattern
-    // (stdin-prompt support is unverified for cursor-agent, unlike codex).
+    // cursor-agent acp. The prompt, model, plan/ask mode, and session resume
+    // are JSON-RPC params (`session/prompt`, `session/set_config_option`,
+    // `session/set_mode`, `session/load`). Argv is `acp`, plus `--force` when
+    // the mode is auto — that flag is the one ACP launch option this CLI
+    // build reads. `--sandbox`, `--trust`, `--mode`, `--model`, `--resume`,
+    // and `-p` are not.
     const extra = (process.env.AGETOR_CURSOR_ARGS ?? "").split(/\s+/).filter(Boolean);
-
-    const args: string[] = [bin, "-p", "--output-format", "stream-json"];
-
     if (!opts.model) {
       throw new Error("model is required for cursor");
     }
-    // Cursor exposes thinking level and Fast as model variants. Curated base
-    // model ids are composed here; unknown/discovered ids pass through.
-    args.push("--model", cursorModelArg(opts.model, opts.effort ?? null, opts.speed === "fast", opts.maxMode === true));
-
-    // Mode → auto-execute posture. `auto` (also the null default, per house
-    // convention) runs with --force --sandbox disabled so cursor executes
-    // edits/commands without approval prompts — same "no sandbox"
-    // philosophy as claude's --dangerously-skip-permissions and codex's
-    // danger-full-access escalation. `plan` and `ask` map onto cursor-agent's
-    // own read-only modes (`--mode plan`: plan first, implement once the plan
-    // is approved; `--mode ask`: Q&A, no edits) — cursor-agent -p can't
-    // execute unapproved actions headlessly, so neither ever edits. Unknown
-    // mode ids get no mode flag (house passthrough). No gitWritableRoots
-    // escalation is needed here (plan §3.4) — auto never runs sandboxed for
-    // cursor in the first place.
+    const cursorModel = cursorModelArg(opts.model, opts.effort ?? null, opts.speed === "fast", opts.maxMode === true);
+    const args: string[] = [bin, "acp"];
     const mode = opts.mode ?? defaultModeFor(harness.kind);
-    if (mode === "auto") {
-      args.push("--force", "--sandbox", "disabled");
-    } else if (mode === "plan" || mode === "ask") {
-      args.push("--mode", mode);
-    }
-    // Every run without `--force` passes `--trust`: `cursor-agent -p` in a
-    // directory with no trusted ancestor exits 1 with "Workspace Trust
-    // Required" unless it gets `--trust`, `--yolo` or `-f` (`--force` skips
-    // the gate), and an agetor worktree is a fresh path. Trust is recorded
-    // per path under `~/.cursor/projects/` and lets the worktree's project
-    // rules/hooks/MCP config apply, same as auto mode already gets (grill
-    // D22). An `AGETOR_CURSOR_ARGS` `--force` counts too.
-    if (!args.includes("--force") && !extra.includes("--force")) {
-      args.push("--trust");
-    }
-
+    if (mode === "auto") args.push("--force");
     args.push(...extra);
-
-    // Multi-turn continuity: cursor's --resume is a FLAG (unlike codex's
-    // `resume <thread_id>` subcommand), so there's no subcommand-ordering
-    // constraint — it can sit anywhere in the argv. Kept here, after the
-    // mode flags, for visual parity with codex's flags-then-resume shape.
-    if (opts.resumeSessionId) {
-      args.push("--resume", opts.resumeSessionId);
-    }
-
-    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+    return { cmd: args, env: Object.keys(env).length ? env : undefined, cursorModel };
   }
 
   if (harness.kind === "gemini") {
@@ -3743,13 +3711,14 @@ export function buildFxLaunchOptions(args: SpawnAgentArgs, built: AgentCommand):
  * Returns a unified `SpawnedAgent` so the orchestrator's bookkeeping is the
  * same for both agents.
  *
- * Async: `spawnClaudeViaTmux`/`spawnCodexViaTmux`/`spawnCursorViaTmux`/
- * `spawnGeminiViaTmux` are now `Bun.spawn`-backed tmux drivers (wave 1 of
+ * Async: `spawnClaudeViaTmux`/`spawnCodexViaTmux`/`spawnGeminiViaTmux` are
+ * `Bun.spawn`-backed tmux drivers (wave 1 of
  * docs/plans/fix-task-details-load-delay.md — no more `Bun.spawnSync` on the
- * warm-up path), so every dispatch branch below awaits its driver spawn.
- * `spawnFxViaAcp` stays synchronous (fx never used tmux — see fx-acp.ts) and
- * the fake-driver branches stay synchronous too (`makeFakeAgent` /
- * `makeFakeCursorPlanAgent`); both are still valid returns from this `async`
+ * warm-up path), so those dispatch branches await their driver spawn.
+ * `spawnFxViaAcp` and `spawnCursorViaAcp` stay synchronous (neither uses
+ * tmux — see fx-acp.ts and cursor-acp.ts) and the fake-driver branches stay
+ * synchronous too (`makeFakeAgent` / `makeFakeCursorPlanAgent` /
+ * `spawnFakeCursorAsk`); both are still valid returns from this `async`
  * function, just resolved immediately.
  */
 export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
@@ -3804,21 +3773,27 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
   }
 
   if (harness.kind === "cursor") {
-    // cursor — hosted in a per-task tmux session via cursor-tmux.ts (so a
-    // mid-turn run survives an agetor restart and is reattachable), streaming
-    // structured events by tailing cursor-agent's `--output-format
-    // stream-json` NDJSON log. Same one-shot-turn-in-tmux shape as codex.
+    // cursor — one `cursor-agent acp` child per turn (cursor-acp.ts), NDJSON
+    // JSON-RPC on stdio. A restart leaves that child; an open question is
+    // rebuilt from `cursor_asks` and the next user message carries the answer.
     if (process.env.AGETOR_CURSOR_DRIVER === "fake") {
       buildCommand(harness, prompt, opts);
+      // Test hook: hold the spawn — the promise `spawnAgent` returns — so a
+      // delete or force-archive can land after `spawnCursorTurnNow` has
+      // minted the run and before it registers the child. That is the ACP
+      // handshake window in production. Unset/0/non-finite → no delay.
+      const spawnDelayMs = Number(process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS ?? 0);
+      if (Number.isFinite(spawnDelayMs) && spawnDelayMs > 0) {
+        await Bun.sleep(spawnDelayMs);
+      }
       // Hand the orchestrator a session id so it persists `cursor_session_id`
-      // and can route follow-ups through `--resume` — mirrors what a real
-      // `system/init` event would deliver.
+      // and can route the next turn through `session/load`.
       onSessionId?.(`fake-cursor-session-${taskId}`);
-      // Test hooks, additive: without their marker/env these are unreachable
-      // and behavior is unchanged (see `makeFakeCursorPlanAgent`'s and
-      // FAKE_CURSOR_STREAM_PROMPT_MARKER's headers). The per-prompt stream
-      // marker is checked first so an e2e worker running with
-      // AGETOR_FAKE_CURSOR_PLAN=1 can still drive a stream task.
+      // The ask marker is first: an e2e worker with the plan or stream env
+      // still set must be able to drive a question card.
+      if (prompt.includes(FAKE_CURSOR_ASK_PROMPT_MARKER)) {
+        return spawnFakeCursorAsk({ taskId, runId, prompt, onChunk });
+      }
       if (prompt.includes(FAKE_CURSOR_STREAM_PROMPT_MARKER)) {
         return makeFakeCursorStreamAgent(taskId, prompt, onChunk);
       }
@@ -3827,15 +3802,20 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       }
       if (process.env.AGETOR_FAKE_CURSOR_STREAM === "1") {
         return makeFakeCursorStreamAgent(taskId, prompt, onChunk);
-      }      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });    }
+      }
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? defaultModeFor(harness.kind), cwd });
+    }
     const built = buildCommand(harness, prompt, opts);
-    return await spawnCursorViaTmux({
+    return spawnCursorViaAcp({
       taskId,
       runId,
       argv: built.cmd,
       env: built.env ?? {},
       cwd,
       promptText: prompt,
+      mode: opts.mode ?? null,
+      model: built.cursorModel ?? "",
+      resumeSessionId: opts.resumeSessionId ?? undefined,
       onChunk,
       onSessionId,
     });

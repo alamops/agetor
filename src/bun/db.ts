@@ -3791,6 +3791,27 @@ export const runs = {
   replaceEventData(id: number, data: string): void {
     db.query(`UPDATE run_events SET data = ? WHERE id = ?`).run(data, id);
   },
+  /**
+   * Replace the `data` of the main-stream event with this `line_uuid`.
+   * No-op when that row is absent. Cursor ACP uses it to fill in a tool
+   * call's `rawInput` as the partial call grows, without inserting a second
+   * `tool_use` — a new row would become `lastToolUseData` and hide a plan.
+   *
+   * The lookup matches `run_events_run_sub_line_uuid`
+   * `(run_id, IFNULL(subagent_id, ''), line_uuid)` exactly, main stream
+   * only (`''`). The write is the same primary-key UPDATE as
+   * `replaceEventData`.
+   */
+  replaceMainEventDataByLineUuid(runId: string, lineUuid: string, data: string): boolean {
+    const row = db.query<{ id: number }, [string, string]>(
+      `SELECT id FROM run_events INDEXED BY run_events_run_sub_line_uuid
+       WHERE run_id = ? AND IFNULL(subagent_id, '') = '' AND line_uuid = ?
+       LIMIT 1`,
+    ).get(runId, lineUuid);
+    if (!row) return false;
+    db.query(`UPDATE run_events SET data = ? WHERE id = ?`).run(data, row.id);
+    return true;
+  },
   /** Newest `run_events.id` of one run, or 0 for a run with no events. The
    *  retention pass folds it into a task's sweep key so a task that gained
    *  events after it was swept (a JSONL rebuild of an archived task) is swept
@@ -4015,3 +4036,89 @@ export const subagents = {
     return rows.map((r) => r.task_id);
   },
 };
+
+/** Outcome stored on `cursor_asks`. Null in the table means still open. */
+export type CursorAskOutcome = "answered" | "skipped" | "cancelled";
+
+export interface StoredCursorAsk {
+  taskId: string;
+  toolCallId: string;
+  runId: string;
+  payload: { title?: string; questions: unknown[] };
+  outcome: CursorAskOutcome | null;
+  createdAt: number;
+  resolvedAt: number | null;
+}
+
+interface CursorAskSqlRow {
+  task_id: string;
+  tool_call_id: string;
+  run_id: string;
+  payload_json: string;
+  outcome: string | null;
+  created_at: number;
+  resolved_at: number | null;
+}
+
+function toStoredCursorAsk(row: CursorAskSqlRow): StoredCursorAsk {
+  let payload: StoredCursorAsk["payload"] = { questions: [] };
+  try {
+    const parsed = JSON.parse(row.payload_json) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const rec = parsed as Record<string, unknown>;
+      payload = {
+        ...(typeof rec.title === "string" ? { title: rec.title } : {}),
+        questions: Array.isArray(rec.questions) ? rec.questions : [],
+      };
+    }
+  } catch {
+    /* keep the empty payload — a corrupt row must not throw at boot */
+  }
+  const outcome = row.outcome === "answered" || row.outcome === "skipped" || row.outcome === "cancelled"
+    ? row.outcome
+    : null;
+  return {
+    taskId: row.task_id,
+    toolCallId: row.tool_call_id,
+    runId: row.run_id,
+    payload,
+    outcome,
+    createdAt: row.created_at,
+    resolvedAt: row.resolved_at,
+  };
+}
+
+/** Insert a pending Cursor question. A second insert for the same task and
+ *  tool call does not clobber a row that already exists (resolved or not). */
+export function insertCursorAsk(row: {
+  taskId: string;
+  toolCallId: string;
+  runId: string;
+  payload: unknown;
+  createdAt?: number;
+}): void {
+  db.run(
+    `INSERT OR IGNORE INTO cursor_asks (task_id, tool_call_id, run_id, payload_json, outcome, created_at, resolved_at)
+     VALUES (?, ?, ?, ?, NULL, ?, NULL)`,
+    [row.taskId, row.toolCallId, row.runId, JSON.stringify(row.payload), row.createdAt ?? Date.now()],
+  );
+}
+
+/** Mark one question resolved. A row that already has an outcome is left
+ *  alone, so a late cancel cannot overwrite an answer. */
+export function resolveCursorAsk(taskId: string, toolCallId: string, outcome: CursorAskOutcome): void {
+  db.run(
+    `UPDATE cursor_asks SET outcome = ?, resolved_at = ? WHERE task_id = ? AND tool_call_id = ? AND outcome IS NULL`,
+    [outcome, Date.now(), taskId, toolCallId],
+  );
+}
+
+/** Unanswered questions, oldest first. Boot rebuild reads this instead of
+ *  scanning `run_events`. */
+export function listOpenCursorAsks(): StoredCursorAsk[] {
+  const rows = db.query<CursorAskSqlRow, []>(
+    `SELECT task_id, tool_call_id, run_id, payload_json, outcome, created_at, resolved_at
+     FROM cursor_asks WHERE outcome IS NULL ORDER BY created_at ASC, tool_call_id ASC`,
+  ).all();
+  return rows.map(toStoredCursorAsk);
+}

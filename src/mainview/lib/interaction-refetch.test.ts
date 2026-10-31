@@ -13,8 +13,8 @@ describe("mergeRefetchedInteractions", () => {
     expect(mergeRefetchedInteractions([c("a"), c("b")], [c("c")], new Set(["b", "c"]))).toEqual([c("a")]);
   });
 
-  test("dedupes by id and the server copy wins", () => {
-    expect(mergeRefetchedInteractions([c("a", "server")], [c("a", "sse"), c("a", "sse2")], new Set())).toEqual([c("a", "server")]);
+  test("dedupes by id and the latest SSE copy wins", () => {
+    expect(mergeRefetchedInteractions([c("a", "server")], [c("a", "sse"), c("a", "sse2")], new Set())).toEqual([c("a", "sse2")]);
   });
 
   test("empty inputs", () => {

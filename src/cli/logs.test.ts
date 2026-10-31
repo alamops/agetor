@@ -725,6 +725,82 @@ test("logs --rebuild: an ordinary (non-SendUserFile) tool_use/tool_result pair i
   expect(outputs[1]).toBe("  ↳ result");
 });
 
+test("logs --rebuild: askQuestionToolCall prints the question and its options", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    {
+      runId: "run1", taskId: "t1", stream: "tool_use",
+      data: JSON.stringify({
+        id: "call-1",
+        name: "askQuestionToolCall",
+        input: {
+          askQuestionToolCall: {
+            args: {
+              title: "Pick one",
+              questions: [{
+                id: "q1",
+                prompt: "Which option?",
+                options: [{ id: "a", label: "Alpha" }, { id: "b", label: "Beta" }],
+                allowMultiple: false,
+              }],
+            },
+          },
+        },
+      }),
+      ts: 1,
+    },
+    { runId: "run1", taskId: "t1", stream: "tool_use", data: JSON.stringify({ id: "toolu_9", name: "Bash", input: {} }), ts: 2 },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs[0]).toContain("Pick one");
+  expect(outputs[0]).toContain("Which option?");
+  expect(outputs[0]).toContain("Alpha");
+  expect(outputs[0]).not.toContain("▸ askQuestionToolCall");
+  expect(outputs[1]).toBe("▸ Bash");
+});
+
+test("logs --rebuild: a grown askQuestionToolCall prints; an unchanged tool name does not repeat", async () => {
+  outputs.length = 0;
+  const events: RunEvent[] = [
+    {
+      runId: "run1", taskId: "t1", stream: "tool_use",
+      data: JSON.stringify({ id: "call-1", name: "Asking", input: {} }),
+      ts: 1,
+    },
+    {
+      runId: "run1", taskId: "t1", stream: "tool_use",
+      data: JSON.stringify({
+        id: "call-1",
+        name: "askQuestionToolCall",
+        input: {
+          askQuestionToolCall: {
+            args: {
+              title: "Pick one",
+              questions: [{
+                id: "q1",
+                prompt: "Which option?",
+                options: [{ id: "a", label: "Alpha" }, { id: "b", label: "Beta" }],
+                allowMultiple: false,
+              }],
+            },
+          },
+        },
+      }),
+      ts: 2,
+    },
+    { runId: "run1", taskId: "t1", stream: "tool_use", data: JSON.stringify({ id: "toolu_9", name: "Bash", input: { command: "ls" } }), ts: 3 },
+    { runId: "run1", taskId: "t1", stream: "tool_use", data: JSON.stringify({ id: "toolu_9", name: "Bash", input: { command: "ls -la" } }), ts: 4 },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs[0]).toBe("▸ Asking");
+  expect(outputs[1]).toContain("Which option?");
+  expect(outputs[1]).toContain("Alpha");
+  expect(outputs[1]).toContain("Beta");
+  expect(outputs.filter((line) => line === "▸ Bash")).toHaveLength(1);
+});
+
 // --- compaction (docs/plans/claude-code-placeholder.md, T7/TT5) -------------
 
 test("logs --rebuild: a compaction_summary event prints ONE summary› digest line (first line + size), never the body; its status lines print as • …", async () => {

@@ -103,6 +103,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
+import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels, formatCursorAskFollowup } from "../shared/cursor-ask.ts";
 import {
   getAheadCount,
   getTaskDiff,
@@ -201,7 +202,9 @@ import {
 } from "./model-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
+  answerCursorAsk,
   answerFxPermission,
+  recordCursorAskToolResult,
   answerTmuxPrompt,
   findFxPermissionById,
   findTmuxPromptById,
@@ -6804,17 +6807,120 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // a follow-up message instead. Then drop the card.
       "/ask-questions/:id/answer": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer>;
+          const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer> & { skip?: unknown };
           const answers = Array.isArray(body.answers) ? body.answers : [];
           // Light-weight shape check — sub-arrays normalised, strings trimmed.
           const sanitised = answers.map((a) => ({
             selected: Array.isArray(a?.selected) ? a.selected.filter((s): s is string => typeof s === "string") : [],
+            selectedOptionIds: Array.isArray(a?.selectedOptionIds)
+              ? a.selectedOptionIds.filter((s): s is string => typeof s === "string")
+              : undefined,
             custom: typeof a?.custom === "string" ? a.custom : undefined,
           }));
+          const pending = getAskQuestionsById(req.params.id);
+          if (pending && pending.source === "cursor") {
+            if (askAnswersInFlight.has(req.params.id)) {
+              return json(
+                { error: "this question is already being answered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            askAnswersInFlight.add(req.params.id);
+            try {
+              // Unset in production. The restart follow-up's send is fast under
+              // the fake driver, so the in-flight 409 test holds the claim open.
+              const holdMs = Number(process.env.AGETOR_TEST_HOLD_CURSOR_ASK_MS ?? "");
+              if (Number.isFinite(holdMs) && holdMs > 0) {
+                await new Promise((r) => setTimeout(r, holdMs));
+              }
+              // A restart follow-up has no live child. Send first. Writing the
+              // outcome before sendInput consumes the card when the send is
+              // refused, and resolveCursorAsk will not reopen a row that
+              // already has an outcome.
+              const sendRestart = async (text: string): Promise<Response | null> => {
+                if (pending.delivery !== "restart-followup") return null;
+                const sent = await sendInput(pending.runId, text);
+                if (!sent.delivered) {
+                  return json(
+                    { error: sent.reason || "could not send the answer" },
+                    { status: 400, headers: corsHeaders(req) },
+                  );
+                }
+                // The dead child never emits tool_call_update completed, so
+                // the tool block would keep "Cursor is waiting" after this
+                // answer. Record the result only once the message is in.
+                if (pending.toolCallId) {
+                  recordCursorAskToolResult({
+                    taskId: pending.taskId,
+                    runId: pending.runId,
+                    toolCallId: pending.toolCallId,
+                    content: text,
+                  });
+                }
+                return null;
+              };
+              if (body.skip === true) {
+                // Read delivery after the hold, and do not await on the live
+                // branch. Awaiting a no-op lets the child exit, flip this
+                // card to the follow-up, and then a skipped write would
+                // report a message that was never sent. A follow-up sends
+                // first. A card that is still live completes the RPC now.
+                if (pending.delivery === "restart-followup") {
+                  const refused = await sendRestart(CURSOR_ASK_SKIP_FOLLOWUP);
+                  if (refused) return refused;
+                  const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
+                  return json({ ok, delivery: "message" as const }, { headers: corsHeaders(req) });
+                }
+                const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
+                return json({ ok }, { headers: corsHeaders(req) });
+              }
+              if (sanitised.length === 0) {
+                return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const mapped = cursorAskAnswersFromLabels(
+                pending.questions.map((q) => ({
+                  id: q.id ?? "",
+                  multiSelect: q.multiSelect,
+                  options: q.options.map((o) => ({ id: o.id ?? "", label: o.label })),
+                })),
+                sanitised,
+              );
+              if (!mapped.ok) {
+                return json({ error: mapped.error }, { status: 400, headers: corsHeaders(req) });
+              }
+              const empty = mapped.answers.length === 0 || mapped.answers.some((a) => a.selectedOptionIds.length === 0 && !a.freeformText);
+              if (empty) {
+                return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const followup = pending.delivery === "restart-followup";
+              if (followup) {
+                // The mapper already dropped leftover custom text. The
+                // follow-up must name those option labels, not the raw
+                // answers (single-select custom would replace the pick).
+                // `followup` is the decision to send, captured before the
+                // await, so a later delivery change cannot report a message
+                // that this request did not send.
+                const refused = await sendRestart(formatCursorAskFollowup(
+                  pending.questions.map((q) => ({
+                    question: q.question,
+                    options: q.options.map((o) => ({ id: o.id, label: o.label })),
+                  })),
+                  mapped.answers,
+                ));
+                if (refused) return refused;
+              }
+              const ok = answerCursorAsk(req.params.id, { outcome: "answered", answers: mapped.answers });
+              if (followup) {
+                return json({ ok, delivery: "message" as const }, { headers: corsHeaders(req) });
+              }
+              return json({ ok }, { headers: corsHeaders(req) });
+            } finally {
+              askAnswersInFlight.delete(req.params.id);
+            }
+          }
           if (sanitised.length === 0) {
             return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const pending = getAskQuestionsById(req.params.id);
           if (pending && pending.source === "scraper") {
             // Claimed synchronously, before the first answer-delivery await: a
             // second request for the same card must not send keys or a
