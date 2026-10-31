@@ -2219,10 +2219,9 @@ test("startTask (fx): a stored null mode's opening status breadcrumb reports the
   expect(created.task.mode).toBeNull();
   const taskId = created.task.id;
 
-  // The opening "started — …" breadcrumb is a live-only `emit()` (SSE
-  // fan-out), never persisted to `run_events` — subscribe before starting,
-  // not after, since `startTask` fires it synchronously inline with the
-  // spawn, well before this call even returns.
+  // Subscribe before starting, not after: `startTask` saves and sends the
+  // opening "started — …" breadcrumb synchronously inline with the spawn,
+  // well before this call even returns.
   const statuses: string[] = [];
   const unsub = subscribe((e) => {
     if (e.taskId === taskId && e.stream === "status") statuses.push(e.data);

@@ -116,6 +116,14 @@ test("complete child: events appended under subagent_id, row completed, refresh 
   const streamed = emitted.filter((e) => e.subagentId === row(child).id && e.stream !== "subagent");
   expect(streamed.length).toBe(seen.size);
   expect(streamed.some((e) => e.stream === "assistant")).toBe(true);
+  // Each frame is its stored row, in id order (forward resume D11): a resumed
+  // stream replays exactly what was sent live.
+  const stored = db.db
+    .query<{ id: number; ts: number; stream: string; data: string }, [string]>(
+      "SELECT id, ts, stream, data FROM run_events WHERE subagent_id = ? ORDER BY id",
+    )
+    .all(row(child).id);
+  expect<unknown>(streamed.map((e) => ({ id: e.id, ts: e.ts, stream: e.stream, data: e.data }))).toEqual(stored);
   expect(JSON.parse(emitted.filter((e) => e.stream === "subagent").at(-1)!.data)).toMatchObject({ phase: "finished", subagent: { status: "completed" } });
   expect(db.subagents.hasRunning(taskId)).toBe(false);
 

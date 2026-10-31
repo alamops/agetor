@@ -17,6 +17,7 @@ import {
   IMPORTED_CLAUDE_HELD_ELSEWHERE,
   IMPORTED_OPENCODE_HELD_ELSEWHERE,
   type SessionIdColumn,
+  type AppendedEvent,
 } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import {
@@ -97,6 +98,7 @@ import {
   countPendingForTask,
   setBroadcaster,
   setResolvedBroadcaster,
+  setRunEventEmitter,
   type AnyRequest,
   type InteractionResolved,
 } from "./interactions.ts";
@@ -143,8 +145,8 @@ import {
 } from "./codex-tmux.ts";
 import {
   dropCursorSession,
-  reattachCursorSession,
 } from "./cursor-tmux.ts";
+import { rebuildOpenCursorAsks } from "./cursor-acp.ts";
 import {
   dropGeminiSession,
   reattachGeminiSession,
@@ -400,8 +402,70 @@ export function subscribe(fn: Listener): () => void {
   return () => listeners.delete(fn);
 }
 
+/**
+ * Fan an event out to the `/tasks/:id/events` subscribers.
+ *
+ * Ordering invariant (the SSE resume cursor relies on it): a SAVED row is
+ * sent synchronously, right after its insert, with its stored `{id, ts}` —
+ * so the order frames leave here is the order of their `run_events.id`s. Go
+ * through {@link saveAndEmit} for that; never batch, defer or queue the send
+ * of a saved row, or a client could see id N+1 before id N and a resume from
+ * N+1 would skip it. Unsaved (live-only) events carry no `id`.
+ */
 function emit(e: RunEvent) {
   for (const fn of listeners) fn(e);
+}
+
+/**
+ * Persist an event and send it to live subscribers with the row's stored
+ * `id` and `ts` (so a live frame and its replayed copy are identical).
+ * Sends nothing on a `(run_id, line_uuid)` dedup hit — that row was already
+ * delivered when it was first saved. Throws like `runs.appendEvent` (e.g. a
+ * cascade-deleted run); use {@link saveStatusLineQuietly} on settle paths.
+ */
+function saveAndEmit(args: {
+  runId: string;
+  taskId: string;
+  stream: RunEvent["stream"];
+  data: string;
+  lineUuid?: string | null;
+  subagentId?: string | null;
+}): AppendedEvent | null {
+  const { runId, taskId, stream, data, lineUuid, subagentId } = args;
+  const row = runs.appendEvent(runId, stream, data, lineUuid, subagentId);
+  if (!row) return null;
+  emit({
+    runId,
+    taskId,
+    stream,
+    data,
+    ts: row.ts,
+    id: row.id,
+    ...(subagentId ? { subagentId } : {}),
+  });
+  return row;
+}
+
+/**
+ * {@link saveAndEmit} for status/stderr lines written on settle paths
+ * (`started —`, the hold line, `exit:N`, a rejected spawn). Never throws: a
+ * run deleted under a settling turn drops the line silently (there is
+ * nothing left to record it on), anything else is logged — losing a
+ * breadcrumb must not stop `attachDoneHandler` from draining queues and
+ * moving the card.
+ */
+function saveStatusLineQuietly(
+  runId: string,
+  taskId: string,
+  data: string,
+  stream: "status" | "stderr" = "status",
+): AppendedEvent | null {
+  try {
+    return saveAndEmit({ runId, taskId, stream, data });
+  } catch (err) {
+    if (runs.get(runId)) console.warn(`[agetor] failed to persist ${stream} line for run ${runId}:`, err);
+    return null;
+  }
 }
 
 /** Fan a persisted event out to `/tasks/:id/events` subscribers. History
@@ -819,9 +883,7 @@ function pullBackParkedTask(taskId: string): void {
   const runId = task.runId;
   updateColumn(taskId, runId, "running");
   const data = "background agent active — task pulled back to running";
-  const ts = Date.now();
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts });
+  saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /** Test hook: drive the event bus directly to verify SSE routing without
@@ -852,8 +914,9 @@ export function __dispatchChunkForTest(
   kind: AgentKind,
   stream: RunEvent["stream"],
   data: string,
+  lineUuid?: string,
 ): void {
-  makeChunkHandler(runId, taskId, kind, null)(stream, data);
+  makeChunkHandler(runId, taskId, kind, null)(stream, data, lineUuid);
 }
 
 /**
@@ -873,7 +936,8 @@ export function __dispatchChunkForTest(
  * idempotent so a test can also re-install the real wiring outright.
  */
 export function wireInteractionBroadcast(): void {
-  setBroadcaster((req: AnyRequest) => {
+  setRunEventEmitter(emit);
+  setBroadcaster((req: AnyRequest, reason) => {
     emit({
       runId: req.runId,
       taskId: req.taskId,
@@ -881,6 +945,10 @@ export function wireInteractionBroadcast(): void {
       data: JSON.stringify(req),
       ts: req.createdAt,
     });
+    // A delivery change republishes the same card. The panel needs that
+    // payload; a second app-level "pending" event would alert again and
+    // bump the board's pending count for a prompt that is already showing.
+    if (reason === "update") return;
     // Also ride the app-level bus so the notification hook can alert the user
     // even when no panel for this task is open (or it's open but the window is
     // backgrounded and can't repaint the card). The per-task `interaction`
@@ -970,27 +1038,38 @@ export async function reconcileOrphans(): Promise<number> {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // claude-code, codex, cursor, gemini, antigravity, opencode and copilot runs
-    // can all be reattached when their detached tmux session is still alive.
-    // The reattach key differs by kind: claude needs its JSONL session uuid
-    // (`claude_session_id`), codex needs its thread id (`codex_session_id`),
-    // cursor needs its `session_id` (`cursor_session_id`), gemini needs its
-    // self-issued uuid (`gemini_session_id`), antigravity needs its
-    // conversation id (`antigravity_session_id`), opencode needs its
-    // discovered `ses_…` id (`opencode_session_id`), copilot needs its
-    // self-issued uuid (`copilot_session_id`) — the per-run log path is derived
-    // from the run id in every case. Note codex's, cursor's, gemini's,
-    // antigravity's, opencode's, copilot's, and fx's sessions only live WHILE
-    // their turn is in flight (one process per turn; fx is never reattached at
-    // all), so a
-    // reattachable one of those is by definition one that was still running
-    // when agetor restarted. Also: if we already reattached a newer sibling
-    // for this task, orphan the older one — only one SessionState can drive
-    // a given tmux session at a time.
+    // claude-code, codex, gemini, antigravity, opencode and copilot runs can
+    // be reattached when their detached tmux session is still alive. Cursor
+    // and fx are ACP over stdio: a `running` row is orphaned (cursor also
+    // kills a leftover tmux name from the old driver, then rebuilds open
+    // questions from `cursor_asks`). The reattach key differs by kind: claude
+    // needs its JSONL session uuid (`claude_session_id`), codex needs its
+    // thread id (`codex_session_id`), gemini needs its self-issued uuid
+    // (`gemini_session_id`), antigravity needs its conversation id
+    // (`antigravity_session_id`), opencode needs its discovered `ses_…` id
+    // (`opencode_session_id`), copilot needs its self-issued uuid
+    // (`copilot_session_id`). Codex, gemini, antigravity, opencode and copilot
+    // sessions only live while their turn is in flight, so a reattachable one
+    // was still running when agetor restarted. If we already reattached a
+    // newer sibling for this task, orphan the older one — only one
+    // SessionState can drive a given tmux session at a time.
+    if (kind === "cursor") {
+      // ACP has no mid-turn reattach. A name left from the old tmux driver
+      // is this task's own session; kill that one, then orphan the row.
+      if (row.tmux_session) {
+        try {
+          await killSessionByName(row.tmux_session);
+        } catch (err) {
+          console.warn(`[agetor] could not kill leftover cursor tmux ${row.tmux_session}:`, err);
+        }
+      }
+      orphaned.push({ id: row.id, task_id: row.task_id, prevColumn, kind });
+      continue;
+    }
+
     const reattachKey =
       kind === "claude-code" ? row.claude_session_id
       : kind === "codex" ? row.codex_session_id
-      : kind === "cursor" ? row.cursor_session_id
       : kind === "gemini" ? row.gemini_session_id
       : kind === "antigravity" ? row.antigravity_session_id
       : kind === "opencode" ? row.opencode_session_id
@@ -1008,7 +1087,7 @@ export async function reconcileOrphans(): Promise<number> {
     // `string` for everything below.
     let canTryReattach = false;
     if (
-      (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "opencode" || kind === "copilot")
+      (kind === "claude-code" || kind === "codex" || kind === "gemini" || kind === "antigravity" || kind === "opencode" || kind === "copilot")
       && task !== null
       && row.tmux_session !== null
       && reattachKey !== null
@@ -1038,14 +1117,6 @@ export async function reconcileOrphans(): Promise<number> {
             })
           : kind === "codex"
           ? await reattachCodexSession({
-              taskId: row.task_id,
-              runId: row.id,
-              sessionName: row.tmux_session as string,
-              onChunk,
-              seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
-            })
-          : kind === "cursor"
-          ? await reattachCursorSession({
               taskId: row.task_id,
               runId: row.id,
               sessionName: row.tmux_session as string,
@@ -1166,6 +1237,15 @@ export async function reconcileOrphans(): Promise<number> {
   }
   if (orphaned.length > 0) {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
+  }
+
+  // Open Cursor questions survive the process. Rebuild them from cursor_asks
+  // after the orphan writes, so a card's follow-up
+  // addresses a task that is no longer `running`.
+  try {
+    rebuildOpenCursorAsks();
+  } catch (err) {
+    console.warn("[agetor] could not rebuild open cursor questions:", err);
   }
 
   // Held tasks — and, more generally, ANY task with a stuck `running`
@@ -2169,6 +2249,13 @@ async function startTaskInner(
           // latest) and say why nothing ran.
           spawnArgs.onChunk("status", "cancelled by user before the agent launched");
           updateColumn(taskId, runId, "ready");
+        } else if (fresh?.archivedAt != null && fresh.runId === runId) {
+          // Force-archive in this window does not move the column, and this
+          // run never registers, so the done handler will not pull it to
+          // `ready` either. Left on `running`, unarchive shows Stop for a
+          // process that is already gone.
+          spawnArgs.onChunk("status", "task archived before the agent launched");
+          updateColumn(taskId, runId, "ready");
         }
         // H1: this run never registers, so no done handler will ever emit
         // its terminal transition — do it here whenever the run is still the
@@ -2183,21 +2270,19 @@ async function startTaskInner(
       }
 
       registerActiveRun(runId, taskId, fresh, agent);
-      emit({
+      // A stored `null` mode doesn't spawn as a literal "auto" for every
+      // kind (Phase 8 review #3) — `buildCommand` resolves it via
+      // `defaultModeFor`, which is `yolo` for fx since
+      // `AGENT_OPTIONS.fx.modes[0]` is "Full access", not "auto". Mirror
+      // that same resolution here so the opening breadcrumb reports what
+      // actually launched. Persisted (and sent with its row id) so a stream
+      // resumed after a reconnect sees it exactly once, like the drift lines
+      // below.
+      saveStatusLineQuietly(
         runId,
         taskId,
-        stream: "status",
-        // A stored `null` mode doesn't spawn as a literal "auto" for every
-        // kind (Phase 8 review #3) — `buildCommand` resolves it via
-        // `defaultModeFor`, which is `yolo` for fx since
-        // `AGENT_OPTIONS.fx.modes[0]` is "Full access", not "auto". Mirror
-        // that same resolution here so the opening breadcrumb reports what
-        // actually launched.
-        data: `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
-        ts: now,
-      });
-      // Persisted (unlike the broadcast-only `started —` breadcrumb) so the
-      // drift notice stays in the run log, `agetor logs` and history.
+        `started — ${prepared.note} — agent=${task.agent}, model=${task.model ?? "—"}, mode=${task.mode ?? defaultModeFor(harness.kind)}`,
+      );
       for (const line of worktreeDriftStatusLines(task, prepared)) {
         appendRunStatusLine(taskId, runId, line);
       }
@@ -2633,7 +2718,9 @@ function makeChunkHandler(
   return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
     let eventId: number | null;
     try {
-      eventId = runs.appendEvent(runId, stream, data, lineUuid);
+      // A dedup hit (`null`) sends nothing: the row was delivered when it
+      // was first saved (e.g. a reattach replay re-delivering a line).
+      eventId = saveAndEmit({ runId, taskId, stream, data, lineUuid })?.id ?? null;
     } catch (err) {
       // A chunk can still arrive after deleteTask cascade-deleted this run
       // (e.g. claude's boot-timeout stderr lines, 30 s after the spawn), and
@@ -2642,7 +2729,6 @@ function makeChunkHandler(
       if (!runs.get(runId)) return;
       throw err;
     }
-    emit({ runId, taskId, stream, data, ts: Date.now() });
     // Todo/task-tools board summary: re-derive + persist on any
     // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap
     // substring pre-filter keeps the common case (unrelated chunks) a no-op.
@@ -2881,17 +2967,15 @@ function makeCopilotSubagentSink(runId: string, taskId: string): CopilotSubagent
     },
     event(parentToolCallId, stream, data, lineUuid) {
       const id = subagentIdFor(parentToolCallId);
-      let inserted: number | null;
       try {
-        inserted = runs.appendEvent(runId, stream, data, lineUuid, id);
+        // Sends nothing for a replayed line (dedup hit).
+        saveAndEmit({ runId, taskId, stream, data, lineUuid, subagentId: id });
       } catch (e) {
         // The run row cascade-deleted under a live tail: cost one event, not
         // the rest of the batch.
         console.error(`[agetor] failed to persist copilot subagent event for ${id}:`, e);
         return;
       }
-      if (inserted === null) return; // replayed line
-      emit({ runId, taskId, stream, data, ts: Date.now(), subagentId: id });
     },
     settled(toolCallId, status) {
       const id = subagentIdFor(toolCallId);
@@ -3144,13 +3228,11 @@ function attachDoneHandler(
           && subagents.hasRunning(taskId);
         if (holdForSubagents) {
           const runningCount = subagents.runningCountForTask(taskId);
-          emit({
+          saveStatusLineQuietly(
             runId,
             taskId,
-            stream: "status",
-            data: `background agents still running (${runningCount}) — holding in running`,
-            ts: Date.now(),
-          });
+            `background agents still running (${runningCount}) — holding in running`,
+          );
         } else {
           // Cancellation wins over api-error here, matching the newStatus
           // resolution above — a user-cancelled run shouldn't land in
@@ -3162,13 +3244,7 @@ function attachDoneHandler(
           updateColumn(taskId, runId, nextColumn);
         }
       }
-      emit({
-        runId,
-        taskId,
-        stream: "status",
-        data: wasCancelled ? `cancelled (exit:${code})` : `exit:${code}`,
-        ts: Date.now(),
-      });
+      saveStatusLineQuietly(runId, taskId, wasCancelled ? `cancelled (exit:${code})` : `exit:${code}`);
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       } else {
@@ -3201,13 +3277,12 @@ function attachDoneHandler(
         // rejects instead).
         updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
       }
-      emit({
+      saveStatusLineQuietly(
         runId,
         taskId,
-        stream: wasCancelled ? "status" : "stderr",
-        data: wasCancelled ? "cancelled" : String(err),
-        ts: Date.now(),
-      });
+        wasCancelled ? "cancelled" : String(err),
+        wasCancelled ? "status" : "stderr",
+      );
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       } else {
@@ -3298,8 +3373,7 @@ function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void 
   if (!saved) return;
   const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
   const data = `${what} — this pipeline step was stopped; saved to your backlog, resend from the tray to continue it`;
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /**
@@ -3501,8 +3575,7 @@ function emitModelMirrorUnsupportedStatus(taskId: string, modelId: string): void
   const recent = runs.listForTask(taskId)[0];
   if (!recent) return;
   const data = `model ${modelId} applies on the next run — claude's picker can't select it for this session`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -3539,8 +3612,7 @@ function emitModelMirrorNextRunStatus(taskId: string, modelId: string, reason: s
   if (!recent) return;
   const detail = reason === "turn in flight" ? "claude is mid-turn" : reason;
   const data = `model ${modelId} applies on the next run — ${detail}`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -3558,8 +3630,7 @@ function emitModelMirrorFailureStatus(taskId: string, modelId: string, reason: s
   const recent = runs.listForTask(taskId)[0];
   if (!recent) return;
   const data = `⚠️ model change not applied — ${reason}; the task's model is ${modelId} but the session kept its previous one`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -3577,8 +3648,7 @@ function emitEffortPinnedStatus(taskId: string, effortId: string, beforeEffort: 
   if (!recent) return;
   const pinned = getSessionLaunchEffort(taskId) ?? beforeEffort ?? "its launch effort";
   const data = `effort ${effortId} applies on the next run — this session is pinned to ${pinned} by CLAUDE_CODE_EFFORT_LEVEL`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -3684,8 +3754,7 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
   const recent = runs.listForTask(taskId)[0];
   const announce = (data: string) => {
     if (!recent) return;
-    runs.appendEvent(recent.id, "status", data);
-    emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+    saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
   };
 
   if (outcome.kind === "unrepresentable") {
@@ -3807,15 +3876,13 @@ function emitModeChangeStatus(
   const recent = runs.listForTask(taskId)[0];
   if (!recent) return;
   const runId = recent.id;
-  const ts = Date.now();
   const data = result.ok
     ? (result.via === "noop"
       ? null
       : `mode → ${agetorMode} (${result.via === "slash-plan" ? "via /plan" : `via Shift+Tab ×${result.presses}`})`)
     : formatModeChangeFailure(agetorMode, result);
   if (!data) return;
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts });
+  saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /**
@@ -3833,8 +3900,7 @@ function emitMatcherRefreshFailure(taskId: string, cwd: string): void {
   const recent = runs.listForTask(taskId)[0];
   if (!recent) return;
   const data = `⚠️ mode took effect but the hook matcher couldn't be refreshed — check ${cwd}/.claude/settings.local.json for malformed JSON. The matcher will sync on the next session start.`;
-  runs.appendEvent(recent.id, "status", data);
-  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
 }
 
 /**
@@ -4060,6 +4126,15 @@ function isIdleOnlyBusy(value: unknown): value is IdleOnlyBusy {
   return typeof value === "object" && value !== null && (value as { busy?: unknown }).busy === true;
 }
 
+/** A cursor follow-up minted a run and then killed it before the child
+ *  was registered. Distinct from a `null` start-claim conflict. */
+type CursorTurnMiss = { declined: string };
+
+function isCursorTurnMiss(value: unknown): value is CursorTurnMiss {
+  return typeof value === "object" && value !== null && typeof (value as { declined?: unknown }).declined === "string"
+    && (value as { busy?: unknown }).busy !== true;
+}
+
 /**
  * Forward a line of user-supplied input to the agent. Behavior depends on
  * agent kind:
@@ -4079,9 +4154,9 @@ function isIdleOnlyBusy(value: unknown): value is IdleOnlyBusy {
  *     to mid-turn. See `sendCodexTurn`/`drainCodexQueue`.
  *
  *   • cursor: same queue-and-resume shape as codex (`sendCursorTurn`/
- *     `drainCursorQueue`), spawning a fresh `cursor-agent --resume
- *     <session-id>` turn for each queued follow-up — cursor's CLI is
- *     one-shot per turn too.
+ *     `drainCursorQueue`). Each queued follow-up is a new `cursor-agent acp`
+ *     child that resumes with `session/load` of the stored session id.
+ *     Cursor is one-shot per turn.
  *
  *   • gemini: same queue-and-resume shape as codex (`sendGeminiTurn`/
  *     `drainGeminiQueue`), spawning `gemini --resume <session-id>` for each
@@ -4386,6 +4461,19 @@ async function sendInputInner(
     }
   }
 
+  // Archive can land while this send is already inside an await —
+  // `pendingTeardown`, the missing-worktree restore, or `@` expansion.
+  // The unarchive above already ran, and `pendingTeardown` only waits on
+  // the promise it captured, so a later archive's stamp is invisible
+  // unless we read the row again in the same turn as the spawn. Spawning
+  // anyway leaves an archived task with a live agent; the restart-followup
+  // answer route then reports a failed delivery with no reason of its own.
+  const readyToSpawn = tasks.get(row.task_id);
+  if (!readyToSpawn) return { delivered: false, reason: "task not found" };
+  if (readyToSpawn.archivedAt != null) {
+    return { delivered: false, reason: "task was archived before the message could be sent" };
+  }
+
   if (kind === "claude-code") {
     const result = await sendClaudeTurn(row.task_id, line, rawLine, onlyIfIdle);
     if (!result) return { delivered: false, reason: "internal: task lookup failed" };
@@ -4435,6 +4523,7 @@ async function sendInputInner(
   if (kind === "cursor") {
     const result = await sendCursorTurn(row.task_id, line, onlyIfIdle);
     if (isIdleOnlyBusy(result)) return idleOnlyBusyResult();
+    if (isCursorTurnMiss(result)) return { delivered: false, reason: result.declined };
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -4562,8 +4651,7 @@ async function sendCodexTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCodexTurnNow(task, taskId, line);
@@ -4829,36 +4917,38 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   if (lastRunId) {
     const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
     const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
-    runs.appendEvent(lastRunId, "status", data);
-    emit({ runId: lastRunId, taskId, stream: "status", data, ts: Date.now() });
+    saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
   }
 }
 
 
 /**
  * Per-task queue of follow-up lines received while a cursor turn is in
- * flight. `cursor-agent -p` is one-shot per invocation (not a REPL), so we
- * hold the message and spawn a fresh `cursor-agent --resume <session_id>`
- * turn for it once the active turn resolves (`drainCursorQueue`, called from
- * `attachDoneHandler`). Structural clone of `codexTurnQueue` — see that
- * comment for the full rationale.
+ * flight. Each turn is one `cursor-agent acp` child (not a REPL), so we
+ * hold the message and spawn the next turn once the active one resolves
+ * (`drainCursorQueue`, called from `attachDoneHandler`). That turn resumes
+ * with ACP `session/load` of the stored session id. Structural clone of
+ * `codexTurnQueue` — see that comment for the full rationale.
  */
 const cursorTurnQueue = new Map<string, string[]>();
 
 /**
- * Send a follow-up to a cursor task. Each follow-up is its own run row + its
- * own `cursor-agent --resume <session_id>` turn (sequential-turn model). When
- * a turn is already running, the message is queued; otherwise it spawns
- * immediately. Returns the run id the message was attached to, or null on
- * lookup failure — or when `spawnCursorTurnNow` declined to mint a run
+ * Send a follow-up to a cursor task. Each follow-up is its own run row and
+ * its own `cursor-agent acp` turn, resumed with `session/load` of the stored
+ * session id (sequential-turn model). When a turn is already running, the
+ * message is queued; otherwise it spawns immediately. Returns the run id
+ * the message was attached to, or null on lookup failure — or when
+ * `spawnCursorTurnNow` declined to mint a run
  * because `startingTaskIds` was already claimed for this task (see that
- * set's doc, near `startTask`).
+ * set's doc, near `startTask`). A `{ declined }` result means the run was
+ * minted and then killed before the child registered, so the line was
+ * not written as a user message.
  */
 async function sendCursorTurn(
   taskId: string,
   line: string,
   onlyIfIdle = false,
-): Promise<string | IdleOnlyBusy | null> {
+): Promise<string | IdleOnlyBusy | CursorTurnMiss | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   // Idle-only send: refuse before the queue push / user event / spawn (see
@@ -4872,23 +4962,23 @@ async function sendCursorTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCursorTurnNow(task, taskId, line);
 }
 
 /**
- * Spawn a fresh cursor turn that resumes the task's prior conversation via
- * `cursor-agent --resume <session_id>`. New run row, new tmux session (the
- * previous turn's exited), same `session_id` carried forward.
+ * Spawn a fresh cursor turn that resumes the task's prior conversation.
+ * New run row; the previous turn's child has exited. The stored session id
+ * is carried forward as `resumeSessionId`, and the ACP driver resumes with
+ * `session/load`.
  */
-async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Promise<string | CursorTurnMiss | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
   // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
-  // unambiguous: every other return path below yields `newRunId`.
+  // unambiguous: other paths return a run id or a decline reason.
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
@@ -4926,7 +5016,9 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
 
     const kind: AgentKind = harness?.kind ?? "cursor";
     const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-    onChunk("user", normalizeUserText(line));
+    // The user line is written only after the child is registered. Archive,
+    // delete, and Stop during the handshake must not leave the answer on a
+    // cancelled run that the ask card can no longer retry.
     onChunk(
       "status",
       priorSessionId
@@ -4942,7 +5034,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       return newRunId;
     }
 
-    const { agent } = await spawnAgentOrFail({
+    const { agent, message } = await spawnAgentOrFail({
       taskId,
       runId: newRunId,
       harness,
@@ -4959,10 +5051,8 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
         speed: task.speed,
         maxMode: task.maxMode,
         // Same generic resume-session field claude-code and codex already
-        // thread through `spawnAgent` → `buildCommand` — cursor's `session_id`
-        // rides the same `AgentRunOptions.resumeSessionId` contract rather than
-        // a cursor-specific field name (see this function's file-level header
-        // note on the resume option-field contract).
+        // thread through `spawnAgent`. Cursor does not put it on argv: the
+        // ACP driver reads `resumeSessionId` and calls `session/load`.
         resumeSessionId: priorSessionId,
       },
     });
@@ -4973,16 +5063,44 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       // follow-ups resurface out of order on a later turn.
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       cursorTurnQueue.delete(taskId);
-      return newRunId;
+      return { declined: message };
     }
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):
       // the run is settled `cancelled` and attachDoneHandler never runs, so
       // the queue is dropped here (kept in the backlog on a pipeline step).
       dropQueuedFollowUpsAfterPendingCancel(taskId, newRunId);
-      return newRunId;
+      return { declined: "the turn was cancelled before Cursor started" };
     }
-    registerActiveRun(newRunId, taskId, task, agent);
+    // Ownership guard, the same rule as `startTaskInner`'s continuation.
+    // The ACP handshake is the slow part of this spawn: the run row exists
+    // and the child is already up, but `registerActiveRun` has not run, so
+    // delete and force-archive (whose `active.has(task.runId)` check is
+    // false in this window) do not see a handle to kill. Registering
+    // afterwards would leave that child running on a task that is gone,
+    // archived, or no longer on this run.
+    const fresh = tasks.get(taskId);
+    if (!fresh || fresh.archivedAt != null || fresh.runId !== newRunId) {
+      agent.done.catch(() => {});
+      agent.kill();
+      runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
+      // This run never registers, so nothing will drain the follow-up queue.
+      // Delete and archive already dropped it; a runId mismatch means a
+      // newer turn owns the task and must keep whatever it queued.
+      if (!fresh || fresh.archivedAt != null) cursorTurnQueue.delete(taskId);
+      if (fresh && fresh.runId === newRunId) {
+        // This run never registers, so `attachDoneHandler` — which is what
+        // moves a cancelled terminal run to `ready` — will not run. Archive
+        // itself does not touch the column. Left on `running`, unarchive
+        // shows Stop for a process that is already gone and has no handle.
+        onChunk("status", "task archived before the agent launched");
+        updateColumn(taskId, newRunId, "ready");
+        emitGlobal({ kind: "run-status", taskId, runId: newRunId, status: "cancelled", ts: Date.now() });
+      }
+      return { declined: "the turn was cancelled before Cursor started" };
+    }
+    onChunk("user", normalizeUserText(line));
+    registerActiveRun(newRunId, taskId, fresh, agent);
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
@@ -5051,8 +5169,7 @@ async function sendGeminiTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnGeminiTurnNow(task, taskId, line);
@@ -5229,8 +5346,7 @@ async function sendAntigravityTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnAntigravityTurnNow(task, taskId, line);
@@ -5380,8 +5496,7 @@ async function sendOpencodeTurn(
     opencodeTurnQueue.set(taskId, q);
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnOpencodeTurnNow(task, taskId, line);
@@ -5681,8 +5796,7 @@ async function sendCopilotTurn(
     // away; the queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   return spawnCopilotTurnNow(task, taskId, line);
@@ -5904,8 +6018,7 @@ async function drainCopilotQueue(taskId: string): Promise<void> {
   if (lastRunId) {
     const what = stranded.length === 1 ? "queued message not sent" : `${stranded.length} queued messages not sent`;
     const data = `${what} — saved to your backlog; resend from the tray after upgrading. ${result.declined}`;
-    runs.appendEvent(lastRunId, "status", data);
-    emit({ runId: lastRunId, taskId, stream: "status", data, ts: Date.now() });
+    saveAndEmit({ runId: lastRunId, taskId, stream: "status", data });
   }
 }
 
@@ -6088,8 +6201,7 @@ function clearFxRecovery(taskId: string): void {
  *  land on a step task's run from outside any spawn — `runs.appendEvent`
  *  alone would persist the line but never reach a live SSE subscriber. */
 export function appendRunStatusLine(taskId: string, runId: string, data: string): void {
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId, taskId, stream: "status", data });
 }
 
 /** @deprecated thin fx-named alias of {@link appendRunStatusLine} — kept so
@@ -6153,8 +6265,7 @@ async function sendFxTurn(
     // away; a queued turn that answers it lands as a later run row.
     const runId = task.runId;
     const data = normalizeUserText(line);
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    saveAndEmit({ runId, taskId, stream: "user", data });
     return runId;
   }
   // `spawnFxRun` now returns `{ runId, spawned, error? }` (Phase 8 review
@@ -7190,8 +7301,7 @@ async function sendTurnInExistingSession(
       // queued message (see `cancelRun`) and this bubble has no reply. That's the
       // same optimism `sendTurn` already runs with; the bubble correctly reflects
       // that the user did send the message.
-      runs.appendEvent(activeRunId, "user", data);
-      emit({ runId: activeRunId, taskId, stream: "user", data, ts: Date.now() });
+      saveAndEmit({ runId: activeRunId, taskId, stream: "user", data });
       return resolveClaudeTurnOutcome(activeRunId, pasted.pasteOutcome, () => stashed);
     }
   }
@@ -7387,8 +7497,7 @@ function handlePasteWithheld(
   // The re-stash is skipped for a task archived (or deleted) underneath the
   // send — never claim a save that didn't happen.
   if (!saved) data = "message not delivered — the task was archived before it could be saved to your backlog";
-  runs.appendEvent(runId, "status", data);
-  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+  saveAndEmit({ runId, taskId, stream: "status", data });
   return saved;
 }
 
@@ -7688,6 +7797,11 @@ async function spawnResumedSessionInner(
         runs.update(newRunId, { status: "cancelled", endedAt: Date.now(), exitCode: -1 });
         if (cancelledWhilePending && fresh && fresh.runId === newRunId) {
           onChunk("status", "cancelled by user before the agent launched");
+          updateColumn(taskId, newRunId, "ready");
+        } else if (fresh?.archivedAt != null && fresh.runId === newRunId) {
+          // Same settlement as `startTaskInner`: archive does not move the
+          // column, and this run never registers, so nothing else will.
+          onChunk("status", "task archived before the agent launched");
           updateColumn(taskId, newRunId, "ready");
         }
         // H1: same terminal emit as `startTaskInner`'s continuation — this
@@ -8319,6 +8433,15 @@ function enqueueArchiveTeardown(
  * `cancelRun`) before the normal archive path below proceeds. Without it,
  * the active-run guard stays in place as a backstop.
  *
+ * Every archive that is allowed to proceed also clears pending interactions,
+ * including when no run is active. A Cursor question rebuilt after a restart
+ * has no live child; leaving that card up lets Submit un-archive the task
+ * and start a turn. The card is resolved as cancelled and the stored
+ * `cursor_asks` outcome is `cancelled`. A refused archive (still running,
+ * not in Done, or a pipeline step) leaves the card in place. The clear runs
+ * before the already-archived return and before any later await, so a submit
+ * during cascade or teardown cannot race it.
+ *
  * Pass `{ forceWorktree: true }` to have the detach discard uncommitted
  * changes in the checkout rather than leaving it in place (threaded straight
  * through to `detachWorktree`'s `force` option) — an explicit, user-confirmed
@@ -8368,6 +8491,13 @@ export async function archiveTask(
   } else if (opts?.stopRun && isHeldByBackgroundAgents(taskId)) {
     await stopHeldTask(taskId, "task archived");
   }
+  // Idle archive (a restarted Cursor question, a done-column archive, a
+  // repeat archive) has no live handle, so the branches above never clear
+  // the card. `stopActiveHandle` / `stopHeldTask` already cancelled when
+  // they ran; a second call is a no-op. Must stay synchronous and ahead of
+  // the already-archived return: a surviving restart-followup submit calls
+  // `sendInput`, which un-archives the task and starts a turn.
+  cancelPendingForTask(taskId, "task archived");
   if (task.archivedAt != null) {
     // Already archived is normally a cheap no-op — repeat-archives (e.g. a
     // double click) shouldn't re-enqueue teardown work every time. But when
@@ -8920,8 +9050,7 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
         // since an emit without persistence would still paint a new chip
         // client-side on every sweep.
         if (runs.lastEventData(recent.id) !== data) {
-          runs.appendEvent(recent.id, "status", data);
-          emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+          saveAndEmit({ runId: recent.id, taskId, stream: "status", data });
         }
       }
     }

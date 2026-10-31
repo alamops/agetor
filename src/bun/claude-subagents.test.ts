@@ -145,6 +145,55 @@ test("discovers a subagent file, tags its events, and emits lifecycle", async ()
   setSubagentEmitter(null);
 });
 
+test("tailed subagent lines are sent with their stored id and ts; a line already saved under its uuid is sent nothing", async () => {
+  // Forward resume (docs/plans/event-stream-forward-resume.md D11/D12): a live
+  // frame must equal its row, and a dedup hit must send nothing — the row was
+  // delivered when it was first saved.
+  const { db, runs } = await import("./db.ts");
+  const { attachSubagentWatcher, setSubagentEmitter } = await import("./claude-subagents.ts");
+  const { taskId, runId, jsonlPath, subagentsDir } = await seed();
+
+  const captured: RunEvent[] = [];
+  setSubagentEmitter((e) => captured.push(e));
+
+  const agentId = "0a1b2c3d4e5f";
+  const file = path.join(subagentsDir, `agent-${agentId}.jsonl`);
+  writeFileSync(path.join(subagentsDir, `agent-${agentId}.meta.json`),
+    JSON.stringify({ agentType: "Explore", description: "ids", spawnDepth: 1 }));
+  writeFileSync(file, "");
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  const t0 = Date.now();
+  w.pump(t0); // discovers the row with an empty dedup set
+
+  // Another path already saved the user line under its uuid ("u1") after the
+  // row was discovered, so the tail's insert of that line is a dedup hit.
+  const pre = runs.appendEvent(runId, "user", "already saved", "u1", agentId)!;
+  writeFileSync(file, sidechainLines());
+  w.pump(t0 + 1);
+
+  const rows = db.query<{ id: number; ts: number; stream: string; data: string }, [string]>(
+    `SELECT id, ts, stream, data FROM run_events WHERE subagent_id = ? ORDER BY id`,
+  ).all(agentId);
+  expect(rows.map((r) => r.stream)).toEqual(["user", "tool_use"]);
+  expect(rows[0]!.id).toBe(pre.id);
+  expect(rows[0]!.data).toBe("already saved");
+
+  const content = captured.filter((e) => e.subagentId === agentId && e.stream !== "subagent");
+  expect(content).toHaveLength(1);
+  expect(content[0]).toMatchObject({
+    id: rows[1]!.id,
+    ts: rows[1]!.ts,
+    runId,
+    taskId,
+    stream: "tool_use",
+    data: rows[1]!.data,
+    subagentId: agentId,
+  });
+
+  w.detach();
+});
+
 test("marks a subagent completed after end_turn + idle, without double-emitting on reattach", async () => {
   const { subagents, db } = await import("./db.ts");
   const { attachSubagentWatcher, setSubagentEmitter } = await import("./claude-subagents.ts");

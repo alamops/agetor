@@ -38,6 +38,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { beginLagLabel } from "./event-loop-lag.ts";
+import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
 import { activeRunCount, appendRunStatusLine, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
@@ -102,6 +103,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
+import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels, formatCursorAskFollowup } from "../shared/cursor-ask.ts";
 import {
   getAheadCount,
   getTaskDiff,
@@ -200,7 +202,9 @@ import {
 } from "./model-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
+  answerCursorAsk,
   answerFxPermission,
+  recordCursorAskToolResult,
   answerTmuxPrompt,
   findFxPermissionById,
   findTmuxPromptById,
@@ -471,7 +475,10 @@ function corsHeaders(req: Request): Record<string, string> {
   return {
     "access-control-allow-origin": allowed,
     "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    "access-control-allow-headers": "content-type,authorization",
+    // `last-event-id`: the task event stream's reconnects send it (SSE resume
+    // cursor); without it in the allow list the browser fails that
+    // preflight and the stream could never reconnect.
+    "access-control-allow-headers": "content-type,authorization,last-event-id",
     "access-control-allow-credentials": "true",
     // The Authorization header makes every webview request preflight; let the
     // browser cache each answer (WebKit caps this at 600 s) so a transcript's
@@ -1348,6 +1355,48 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
     }
     Bun.sleepSync(ms);
     return json({ ok: true, ms }, { headers: corsHeaders(req) });
+  });
+  // Test-only (e2e/unit): drop the open `/tasks/:id/events` streams of a task
+  // and optionally hold the next ones server-side, so the forward-resume path
+  // gets a deterministic gap (docs/plans/event-stream-forward-resume.md P8).
+  // Registered ONLY when AGETOR_TEST_DROP_STREAMS_ROUTE=1 was set when this
+  // server started (read once per `startApiServer` call, like the block route
+  // above); disabled, the route is absent (the `fetch()` 404 fallback), and
+  // `streamDrop` is null so the stream handler pays nothing — no registry, no
+  // hold map. Classified `app` + `conditional` in ROUTE_POLICY.
+  const streamDrop: {
+    /** taskId -> close function of each open stream. */
+    open: Map<string, Set<() => void>>;
+    /** taskId -> promise that resolves when the hold ends. */
+    holds: Map<string, Promise<void>>;
+  } | null = process.env.AGETOR_TEST_DROP_STREAMS_ROUTE === "1"
+    ? { open: new Map(), holds: new Map() }
+    : null;
+  const dropTaskStreamsRoute = authed(async (req: Request) => {
+    const body = (await req.json().catch(() => ({}))) as { taskId?: unknown; holdMs?: unknown };
+    const { taskId } = body;
+    if (typeof taskId !== "string" || taskId === "") {
+      return json({ error: "taskId (string) required" }, { status: 400, headers: corsHeaders(req) });
+    }
+    const holdMs = body.holdMs === undefined ? 0 : body.holdMs;
+    if (typeof holdMs !== "number" || !Number.isInteger(holdMs) || holdMs < 0 || holdMs > 30_000) {
+      return json({ error: "holdMs (integer 0..30000) must be a number in range" }, { status: 400, headers: corsHeaders(req) });
+    }
+    // Set the hold BEFORE closing, so a reconnect that lands right after the
+    // close already waits.
+    if (holdMs > 0) {
+      const hold = new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          if (streamDrop!.holds.get(taskId) === hold) streamDrop!.holds.delete(taskId);
+          resolve();
+        }, holdMs);
+        timer.unref?.();
+      });
+      streamDrop!.holds.set(taskId, hold);
+    }
+    const closers = [...(streamDrop!.open.get(taskId) ?? [])];
+    for (const close of closers) close();
+    return json({ closed: closers.length }, { headers: corsHeaders(req) });
   });
   // Read the port fresh — supports tests that import server.ts after setting
   // AGETOR_API_PORT and rely on the bind to honour their override even when
@@ -3947,6 +3996,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // Test-only block route: present only under AGETOR_TEST_BLOCK_ROUTE=1
       // (see `blockRouteEnabled` above); absent otherwise → the 404 fallback.
       ...(blockRouteEnabled ? { "/test/block-event-loop": { POST: blockEventLoopRoute } } : {}),
+      // Test-only stream-drop route: present only under
+      // AGETOR_TEST_DROP_STREAMS_ROUTE=1 (see `streamDrop` above).
+      ...(streamDrop ? { "/test/drop-task-streams": { POST: dropTaskStreamsRoute } } : {}),
 
       // App info — currently just the version. Read at module-load time
       // from the bundled package.json so the value tracks releases without
@@ -6765,17 +6817,120 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // a follow-up message instead. Then drop the card.
       "/ask-questions/:id/answer": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer>;
+          const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer> & { skip?: unknown };
           const answers = Array.isArray(body.answers) ? body.answers : [];
           // Light-weight shape check — sub-arrays normalised, strings trimmed.
           const sanitised = answers.map((a) => ({
             selected: Array.isArray(a?.selected) ? a.selected.filter((s): s is string => typeof s === "string") : [],
+            selectedOptionIds: Array.isArray(a?.selectedOptionIds)
+              ? a.selectedOptionIds.filter((s): s is string => typeof s === "string")
+              : undefined,
             custom: typeof a?.custom === "string" ? a.custom : undefined,
           }));
+          const pending = getAskQuestionsById(req.params.id);
+          if (pending && pending.source === "cursor") {
+            if (askAnswersInFlight.has(req.params.id)) {
+              return json(
+                { error: "this question is already being answered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            askAnswersInFlight.add(req.params.id);
+            try {
+              // Unset in production. The restart follow-up's send is fast under
+              // the fake driver, so the in-flight 409 test holds the claim open.
+              const holdMs = Number(process.env.AGETOR_TEST_HOLD_CURSOR_ASK_MS ?? "");
+              if (Number.isFinite(holdMs) && holdMs > 0) {
+                await new Promise((r) => setTimeout(r, holdMs));
+              }
+              // A restart follow-up has no live child. Send first. Writing the
+              // outcome before sendInput consumes the card when the send is
+              // refused, and resolveCursorAsk will not reopen a row that
+              // already has an outcome.
+              const sendRestart = async (text: string): Promise<Response | null> => {
+                if (pending.delivery !== "restart-followup") return null;
+                const sent = await sendInput(pending.runId, text);
+                if (!sent.delivered) {
+                  return json(
+                    { error: sent.reason || "could not send the answer" },
+                    { status: 400, headers: corsHeaders(req) },
+                  );
+                }
+                // The dead child never emits tool_call_update completed, so
+                // the tool block would keep "Cursor is waiting" after this
+                // answer. Record the result only once the message is in.
+                if (pending.toolCallId) {
+                  recordCursorAskToolResult({
+                    taskId: pending.taskId,
+                    runId: pending.runId,
+                    toolCallId: pending.toolCallId,
+                    content: text,
+                  });
+                }
+                return null;
+              };
+              if (body.skip === true) {
+                // Read delivery after the hold, and do not await on the live
+                // branch. Awaiting a no-op lets the child exit, flip this
+                // card to the follow-up, and then a skipped write would
+                // report a message that was never sent. A follow-up sends
+                // first. A card that is still live completes the RPC now.
+                if (pending.delivery === "restart-followup") {
+                  const refused = await sendRestart(CURSOR_ASK_SKIP_FOLLOWUP);
+                  if (refused) return refused;
+                  const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
+                  return json({ ok, delivery: "message" as const }, { headers: corsHeaders(req) });
+                }
+                const ok = answerCursorAsk(req.params.id, { outcome: "skipped" });
+                return json({ ok }, { headers: corsHeaders(req) });
+              }
+              if (sanitised.length === 0) {
+                return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const mapped = cursorAskAnswersFromLabels(
+                pending.questions.map((q) => ({
+                  id: q.id ?? "",
+                  multiSelect: q.multiSelect,
+                  options: q.options.map((o) => ({ id: o.id ?? "", label: o.label })),
+                })),
+                sanitised,
+              );
+              if (!mapped.ok) {
+                return json({ error: mapped.error }, { status: 400, headers: corsHeaders(req) });
+              }
+              const empty = mapped.answers.length === 0 || mapped.answers.some((a) => a.selectedOptionIds.length === 0 && !a.freeformText);
+              if (empty) {
+                return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
+              }
+              const followup = pending.delivery === "restart-followup";
+              if (followup) {
+                // The mapper already dropped leftover custom text. The
+                // follow-up must name those option labels, not the raw
+                // answers (single-select custom would replace the pick).
+                // `followup` is the decision to send, captured before the
+                // await, so a later delivery change cannot report a message
+                // that this request did not send.
+                const refused = await sendRestart(formatCursorAskFollowup(
+                  pending.questions.map((q) => ({
+                    question: q.question,
+                    options: q.options.map((o) => ({ id: o.id, label: o.label })),
+                  })),
+                  mapped.answers,
+                ));
+                if (refused) return refused;
+              }
+              const ok = answerCursorAsk(req.params.id, { outcome: "answered", answers: mapped.answers });
+              if (followup) {
+                return json({ ok, delivery: "message" as const }, { headers: corsHeaders(req) });
+              }
+              return json({ ok }, { headers: corsHeaders(req) });
+            } finally {
+              askAnswersInFlight.delete(req.params.id);
+            }
+          }
           if (sanitised.length === 0) {
             return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const pending = getAskQuestionsById(req.params.id);
           if (pending && pending.source === "scraper") {
             // Claimed synchronously, before the first answer-delivery await: a
             // second request for the same card must not send keys or a
@@ -8151,8 +8306,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
         }),
       },
 
-      "/tasks/:id/events": authed((req) => {
+      "/tasks/:id/events": authed(async (req) => {
         const taskId = req.params.id;
+        const url = new URL(req.url);
         // `?anchor=0` opts the replay window out of the last-user-message
         // extension below. The webview and `agetor logs` want it (they render
         // everything replayed); the TUI dashboard does not — it keeps only its
@@ -8160,14 +8316,46 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
         // anchored window of up to 3000 events / 16 MB would be paid for and
         // immediately discarded there. Anything but the literal `0` keeps the
         // default (anchored) behaviour, so older clients are unaffected.
-        const anchorReplay = new URL(req.url).searchParams.get("anchor") !== "0";
+        const anchorReplay = url.searchParams.get("anchor") !== "0";
+        // Forward resume (docs/plans/event-stream-forward-resume.md §3.1): a
+        // reconnecting client names the last event id it saw, as the standard
+        // `Last-Event-ID` header (what `EventSource` and fetch-based readers
+        // send on reconnect) or `?afterId=`. The first valid of the two wins;
+        // a malformed value is ignored as if absent — never a 400, since a
+        // client retries an error forever. No cursor = today's behaviour.
+        const cursor = resolveResumeCursor(req.headers.get("last-event-id"), url.searchParams.get("afterId"));
+        // Test-only (AGETOR_TEST_DROP_STREAMS_ROUTE): a hold set by
+        // `POST /test/drop-task-streams` parks this request until it ends,
+        // so the events landing meanwhile are the gap the cursor resumes
+        // over. Resolves early when the client gives up so nothing leaks.
+        const hold = streamDrop?.holds.get(taskId);
+        if (hold) {
+          await new Promise<void>((resolve) => {
+            if (req.signal.aborted) return resolve();
+            const done = () => {
+              req.signal.removeEventListener("abort", done);
+              resolve();
+            };
+            req.signal.addEventListener("abort", done, { once: true });
+            void hold.then(done);
+          });
+          if (req.signal.aborted) return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }
         const stream = new ReadableStream({
           start(controller) {
             attachedClients++;
             const enc = new TextEncoder();
+            // A SAVED row carries its `run_events.id` both in the JSON and as
+            // the SSE `id:` line (replayed and live alike), which is what a
+            // reconnect sends back as `Last-Event-ID`. Live-only frames
+            // (`interaction`, `interaction_resolved`, `subagent`, ping) have
+            // no numeric id and get no `id:` line — an empty one would reset
+            // the client's cursor.
             const send = (e: RunEvent | { type: "ping" }) => {
               try {
-                controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+                const id = (e as { id?: unknown }).id;
+                const idLine = typeof id === "number" ? `id: ${id}\n` : "";
+                controller.enqueue(enc.encode(`${idLine}data: ${JSON.stringify(e)}\n\n`));
               } catch {
                 // Client went away mid-send (replay or a live event landing on a
                 // closed controller). Swallow so `start` never throws before the
@@ -8180,7 +8368,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             // Named frame — invisible to a plain `onmessage` listener (only
             // `addEventListener(name, ...)` sees it), so old/unmodified
             // clients keep working unchanged even though a new frame now
-            // precedes the replayed window.
+            // precedes the replayed window. Never carries an `id:` line.
             const sendNamed = (name: string, data: unknown) => {
               try {
                 controller.enqueue(enc.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`));
@@ -8197,6 +8385,33 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               if (buffer) buffer.push(e);
               else send(e);
             });
+            let ping: ReturnType<typeof setInterval> | null = null;
+            // One idempotent teardown for both exits — the client aborting
+            // and the test-only drop route — so neither can double-decrement
+            // `attachedClients` or close an already-closed controller.
+            let cleanedUp = false;
+            const cleanup = () => {
+              if (cleanedUp) return;
+              cleanedUp = true;
+              if (ping) clearInterval(ping);
+              unsubscribe();
+              try {
+                controller.close();
+              } catch {
+                // Already closed/errored by the client going away.
+              }
+              attachedClients--;
+              if (streamDrop) {
+                const set = streamDrop.open.get(taskId);
+                set?.delete(cleanup);
+                if (set?.size === 0) streamDrop.open.delete(taskId);
+              }
+            };
+            if (streamDrop) {
+              let set = streamDrop.open.get(taskId);
+              if (!set) streamDrop.open.set(taskId, (set = new Set()));
+              set.add(cleanup);
+            }
             // Cap replay to the most recent EVENTS_REPLAY_LIMIT events instead
             // of the task's full history — a task with thousands of events
             // used to replay every one of them on every SSE (re)connect.
@@ -8219,18 +8434,49 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             // or nothing: over either ceiling, the plain count/byte window
             // above stands unchanged. Skipped entirely on `?anchor=0` (see
             // `anchorReplay` above).
-            const window = runs.eventsForTask(taskId, {
-              limit: EVENTS_REPLAY_LIMIT,
-              maxBytes: EVENTS_REPLAY_MAX_BYTES,
-              minEvents: MIN_REPLAY_EVENTS,
-              ...(anchorReplay
-                ? { anchor: { maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS, maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES } }
-                : {}),
-            });
-            const earliestId = window.length > 0 ? window[0]!.id : null;
-            const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
-            sendNamed(TASK_EVENTS_REPLAY_META_EVENT, { earliestId, hasMore } satisfies TaskEventsReplayMeta);
-            for (const ev of window) {
+            // Shared by the no-cursor connect and the snapshot answer, so a
+            // snapshot is exactly the window a fresh connect would get.
+            const freshWindow = () => {
+              const window = runs.eventsForTask(taskId, {
+                limit: EVENTS_REPLAY_LIMIT,
+                maxBytes: EVENTS_REPLAY_MAX_BYTES,
+                minEvents: MIN_REPLAY_EVENTS,
+                ...(anchorReplay
+                  ? { anchor: { maxEvents: EVENTS_REPLAY_ANCHOR_MAX_EVENTS, maxBytes: EVENTS_REPLAY_ANCHOR_MAX_BYTES } }
+                  : {}),
+              });
+              const earliestId = window.length > 0 ? window[0]!.id : null;
+              const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+              return { window, earliestId, hasMore };
+            };
+            let meta: TaskEventsReplayMeta;
+            let replay: ReturnType<typeof freshWindow>["window"];
+            if (cursor === null) {
+              const fresh = freshWindow();
+              meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore };
+              replay = fresh.window;
+            } else {
+              // Resume: only the rows after the cursor, subagent rows included.
+              // `earliestId`/`hasMore` describe a window, which a resume
+              // doesn't send, so the client is told to leave its own alone.
+              // Snapshot (gap too big, or a cursor from another database):
+              // the fresh window plus `snapshotRequired`, so the client
+              // replaces what it holds instead of splicing across the gap.
+              const after = runs.eventsForTaskAfter(taskId, cursor, {
+                maxEvents: EVENTS_REPLAY_LIMIT,
+                maxBytes: EVENTS_REPLAY_MAX_BYTES,
+              });
+              if (after.kind === "resume") {
+                meta = { earliestId: null, hasMore: false, resumedAfter: cursor };
+                replay = after.rows;
+              } else {
+                const fresh = freshWindow();
+                meta = { earliestId: fresh.earliestId, hasMore: fresh.hasMore, snapshotRequired: true };
+                replay = fresh.window;
+              }
+            }
+            sendNamed(TASK_EVENTS_REPLAY_META_EVENT, meta);
+            for (const ev of replay) {
               send({
                 id: ev.id,
                 runId: ev.runId,
@@ -8244,13 +8490,9 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             const drained = buffer;
             buffer = null;
             for (const ev of drained) send(ev);
-            const ping = setInterval(() => send({ type: "ping" }), 15_000);
-            req.signal.addEventListener("abort", () => {
-              clearInterval(ping);
-              unsubscribe();
-              controller.close();
-              attachedClients--;
-            });
+            ping = setInterval(() => send({ type: "ping" }), 15_000);
+            if (req.signal.aborted) cleanup();
+            else req.signal.addEventListener("abort", cleanup, { once: true });
           },
         });
         return new Response(stream, {

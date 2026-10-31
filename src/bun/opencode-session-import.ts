@@ -25,6 +25,7 @@ import {
   projects,
   runs,
   tasks,
+  type AppendedEvent,
 } from "./db.ts";
 import { createTask, emitRunEvent } from "./orchestrator.ts";
 import { harnessEnv, resolveBin } from "./agents.ts";
@@ -288,16 +289,16 @@ async function writeEvents(
   };
   let sliceStart = performance.now();
   for (const ev of events) {
-    let eventId: number | null;
+    let row: AppendedEvent | null;
     try {
-      eventId = runs.appendEvent(runId, ev.stream, ev.data, ev.lineUuid, null);
+      row = runs.appendEvent(runId, ev.stream, ev.data, ev.lineUuid, null);
     } catch (err) {
       if (!tasks.exists(taskId)) throw new ImportDeleted();
       throw err;
     }
-    if (eventId != null) {
-      emitRunEvent({ runId, taskId, stream: ev.stream, data: ev.data, ts: Date.now() });
-      if (ev.stream === "assistant") lastAssistant = eventId;
+    if (row != null) {
+      emitRunEvent({ id: row.id, runId, taskId, stream: ev.stream, data: ev.data, ts: row.ts });
+      if (ev.stream === "assistant") lastAssistant = row.id;
     }
     if (performance.now() - sliceStart >= sliceMs) {
       flushAssistant();

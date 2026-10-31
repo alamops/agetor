@@ -22,6 +22,14 @@ async function settle(ms = 80) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+async function waitFor(check: () => boolean, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for cursor turn");
+    await new Promise((r) => setTimeout(r, 15));
+  }
+}
+
 test("createTask (cursor) defaults model to Grok 4.7 at high effort and lands in backlog", async () => {
   const { createTask } = await import("./orchestrator.ts");
 
@@ -151,6 +159,108 @@ test("sendInput (cursor, busy) queues the follow-up; it spawns after the active 
   expect(list.every((r) => r.status !== "running")).toBe(true);
 });
 
+/** First turn settled, so the next `sendInput` takes `spawnCursorTurnNow`. */
+async function startSettledCursorTask(title: string): Promise<{ taskId: string; runId: string }> {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("cursor", true);
+  const created = await createTask({
+    title,
+    prompt: "turn one",
+    agent: "cursor",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  await waitFor(() => tasks.get(created.task.id)?.column === "review");
+  return { taskId: created.task.id, runId: started.runId };
+}
+
+test("a failed Cursor follow-up spawn reports the failure to the sender", async () => {
+  const { sendInput } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const { taskId, runId } = await startSettledCursorTask("cursor follow-up spawn failure");
+  tasks.update(taskId, { model: "" });
+  const result = await sendInput(runId, "retain this message");
+  expect(result).toEqual({ delivered: false, reason: "model is required for cursor" });
+  expect(runs.listForTask(taskId).some((run) => run.status === "failed")).toBe(true);
+});
+
+test("spawnCursorTurnNow does not register a child deleted during the handshake", async () => {
+  const { sendInput, deleteTask, isAnyRunOfTaskLive } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const { taskId, runId } = await startSettledCursorTask("cursor delete during handshake");
+  // Longer than delete on an isolation-none task, so the row is gone before
+  // the spawn returns and the ownership guard runs.
+  process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS = "2000";
+  try {
+    const sent = sendInput(runId, "turn two");
+    let followUpId = "";
+    await waitFor(() => {
+      const next = tasks.get(taskId)?.runId;
+      if (!next || next === runId) return false;
+      followUpId = next;
+      return true;
+    });
+    await deleteTask(taskId);
+    expect(tasks.get(taskId)).toBeNull();
+    await sent;
+    expect(runs.get(followUpId)).toBeNull();
+    expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+    // A registered child would still be in `active` until its turn timer
+    // fired, and that timer would append against the cascade-deleted run.
+    await settle(80);
+    expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+  } finally {
+    delete process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS;
+  }
+});
+
+test("spawnCursorTurnNow does not register a child force-archived during the handshake", async () => {
+  const { sendInput, archiveTask, unarchiveTask, isAnyRunOfTaskLive } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const { taskId, runId } = await startSettledCursorTask("cursor archive during handshake");
+  process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS = "2000";
+  try {
+    const sent = sendInput(runId, "turn two");
+    let followUpId = "";
+    await waitFor(() => {
+      const next = tasks.get(taskId)?.runId;
+      if (!next || next === runId) return false;
+      followUpId = next;
+      return true;
+    });
+    const archived = await archiveTask(taskId, { force: true });
+    expect("error" in archived).toBe(false);
+    const result = await sent;
+    expect(result.delivered).toBe(false);
+    if (result.delivered) return;
+    expect(result.reason).toContain("cancelled before Cursor started");
+    expect(runs.events(followUpId).some((event) => event.stream === "user")).toBe(false);
+    expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+    // The handshake never registers, so the done handler cannot pull the
+    // card off `running`. Settlement has to, or unarchive shows Stop for a
+    // run that is already cancelled.
+    expect(tasks.get(taskId)?.column).toBe("ready");
+    expect(tasks.get(taskId)?.runId).toBe(followUpId);
+    expect(runs.get(followUpId)?.status).toBe("cancelled");
+    expect(
+      runs.events(followUpId).some((event) => event.stream === "status" && event.data === "task archived before the agent launched"),
+    ).toBe(true);
+    expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+    const restored = await unarchiveTask(taskId);
+    expect("error" in restored).toBe(false);
+    expect(tasks.get(taskId)?.archivedAt).toBeNull();
+    expect(tasks.get(taskId)?.column).toBe("ready");
+    expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+  } finally {
+    delete process.env.AGETOR_FAKE_CURSOR_SPAWN_DELAY_MS;
+  }
+});
+
 test("deleteTask (cursor) tears down without throwing and removes the task", async () => {
   const { createTask, startTask, deleteTask } = await import("./orchestrator.ts");
   const { tasks, harnesses } = await import("./db.ts");
@@ -206,4 +316,142 @@ test("deleteTask (cursor) mid-turn does not crash on late chunks", async () => {
   await settle();
 
   expect(tasks.get(taskId)).toBeNull();
+});
+
+test("fake ask marker leaves the run running until the card is answered", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { runs, tasks, harnesses } = await import("./db.ts");
+  const { listPendingForTask, answerCursorAsk } = await import("./interactions.ts");
+  harnesses.setEnabled("cursor", true);
+
+  const created = await createTask({
+    title: "cursor ask",
+    prompt: "__agetor_fake_cursor_ask__",
+    agent: "cursor",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  await settle(40);
+  expect(runs.get(started.runId)?.status).toBe("running");
+  const pending = listPendingForTask(created.task.id);
+  expect(pending).toHaveLength(1);
+  expect(pending[0]?.kind).toBe("ask_questions");
+  answerCursorAsk(pending[0]!.id, { outcome: "skipped" });
+  await settle(80);
+  expect(runs.get(started.runId)?.status).toBe("succeeded");
+  expect(tasks.get(created.task.id)?.column).toBe("review");
+  expect(runs.get(started.runId)?.cursorSessionId).toBe(`fake-cursor-session-${created.task.id}`);
+  const result = runs.events(started.runId).find((event) => event.stream === "tool_result");
+  expect(JSON.parse(result?.data ?? "{}")).toEqual({
+    toolUseId: "fake-ask-1",
+    content: "skipped",
+    isError: false,
+  });
+});
+
+test("fake :2 ask marker registers two cards at once", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { runs, harnesses } = await import("./db.ts");
+  const { listPendingForTask, answerCursorAsk } = await import("./interactions.ts");
+  harnesses.setEnabled("cursor", true);
+
+  const created = await createTask({
+    title: "cursor ask two",
+    prompt: "__agetor_fake_cursor_ask__:2",
+    agent: "cursor",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  await settle(40);
+  const pending = listPendingForTask(created.task.id);
+  expect(pending).toHaveLength(2);
+  expect(runs.get(started.runId)?.status).toBe("running");
+  for (const card of pending) answerCursorAsk(card.id, { outcome: "skipped" });
+  await settle(80);
+  expect(runs.get(started.runId)?.status).toBe("succeeded");
+  const results = runs.events(started.runId).filter((event) => event.stream === "tool_result");
+  expect(results.map((event) => JSON.parse(event.data))).toEqual([
+    { toolUseId: "fake-ask-1", content: "skipped", isError: false },
+    { toolUseId: "fake-ask-2", content: "skipped", isError: false },
+  ]);
+});
+
+test("stopping a fake Cursor ask records a cancelled tool_result", async () => {
+  const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
+  const { runs, harnesses } = await import("./db.ts");
+  const { listPendingForTask } = await import("./interactions.ts");
+  harnesses.setEnabled("cursor", true);
+
+  const created = await createTask({
+    title: "cursor ask stop",
+    prompt: "__agetor_fake_cursor_ask__",
+    agent: "cursor",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  await settle(40);
+  expect(listPendingForTask(created.task.id)).toHaveLength(1);
+  expect(await cancelRun(started.runId)).toBe(true);
+  await settle(80);
+  expect(listPendingForTask(created.task.id)).toEqual([]);
+  const result = runs.events(started.runId).find((event) => event.stream === "tool_result");
+  expect(JSON.parse(result?.data ?? "{}")).toEqual({
+    toolUseId: "fake-ask-1",
+    content: "cancelled",
+    isError: false,
+  });
+});
+
+test("a running cursor row at boot is orphaned and its open question is rebuilt", async () => {
+  const { reconcileOrphans } = await import("./orchestrator.ts");
+  const { tasks, runs, insertCursorAsk } = await import("./db.ts");
+  const { listPendingForTask, __testing } = await import("./interactions.ts");
+  __testing.reset();
+  const taskId = `cursor-boot-${Date.now()}`;
+  const runId = `run-${taskId}`;
+  const now = Date.now();
+  tasks.insert({
+    id: taskId, title: taskId, prompt: "ask", column: "running",
+    agent: "cursor", workdir: process.cwd(), isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null, mode: "auto",
+    model: "grok-4.7", effort: "high", speed: "off", maxMode: false, opencodeServer: "shared",
+    references: [], backlog: [], plans: [], draft: null, runId,
+    createdAt: now, updatedAt: now, hasOpenableRun: true,
+    pendingInteractionCount: 0, openTerminalCount: 0, archivedAt: null,
+  });
+  runs.insert({
+    id: runId, taskId, agent: "cursor", status: "running",
+    startedAt: now, endedAt: null, exitCode: null,
+    tmuxSession: `agetor-leftover-${taskId}`,
+    claudeSessionId: null, codexSessionId: null, cursorSessionId: "sess-old",
+    geminiSessionId: null, fxSessionId: null,
+  });
+  insertCursorAsk({
+    taskId, runId, toolCallId: "call-boot",
+    payload: {
+      title: "Pick one",
+      questions: [{ id: "q1", prompt: "Which?", allowMultiple: false, options: [{ id: "a", label: "Alpha" }] }],
+    },
+  });
+  await reconcileOrphans();
+  expect(runs.get(runId)?.status).toBe("orphaned");
+  expect(tasks.get(taskId)?.column).toBe("ready");
+  expect(tasks.get(taskId)?.runId).toBeNull();
+  const pending = listPendingForTask(taskId);
+  expect(pending).toHaveLength(1);
+  const card = pending[0]!;
+  expect(card.kind).toBe("ask_questions");
+  if (card.kind === "ask_questions") expect(card.delivery).toBe("restart-followup");
 });

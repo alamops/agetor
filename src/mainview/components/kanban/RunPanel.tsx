@@ -13,6 +13,7 @@ import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitSta
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
+import { mergePendingInteraction, mergePendingInteractionSnapshot } from "@/lib/merge-pending-interaction";
 import { EXPAND_EVENT } from "@/lib/expand-on-jump";
 import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
@@ -24,6 +25,9 @@ import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { fileScopeForTask } from "../../../shared/file-scope.ts";
+import { cursorAskCanAdvance, cursorAskCardHeading, cursorAskFromToolUse, cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues, cursorAskToolFooter, cursorAskWireCustom } from "../../../shared/cursor-ask.ts";
+import { CURSOR_ASK_FREEFORM } from "../../../shared/cursor-ask-verdict.ts";
+import { foldToolUseRevisions, supersededToolUseIndexes } from "../../../shared/tool-use-revisions.ts";
 import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
@@ -110,6 +114,12 @@ import { createEventDeduper } from "@/lib/event-dedup";
 import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { isHiddenToolEvent } from "../../../shared/tool-visibility.ts";
 import { createEventBuffer } from "@/lib/event-buffer";
+import { createInteractionRefetchTracker, mergeRefetchedInteractions } from "@/lib/interaction-refetch";
+import {
+  TASK_STREAM_GAP_NOTICE,
+  classifyReplayMeta,
+  createIdHighWater,
+} from "../../../shared/task-stream-resume.ts";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
@@ -170,24 +180,24 @@ const CLAUDE_PLAN_PROMPT_RE = /written up a plan|Would you like to proceed/i;
  * client-assigned monotonic id. `id` here is always assigned by
  * `nextEventIdRef`/`prevEventIdRef` the moment an event is accepted into the
  * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
- * event apart from one the server re-delivers on SSE reconnect (full-history
- * replay) when deciding whether the JSONL rebuild snapshot has gone stale —
+ * event apart from one observed before the JSONL snapshot was captured when
+ * deciding whether the JSONL rebuild snapshot has gone stale —
  * it is NEVER the server's own event id, even when one is available (see
  * `dbId` below), since `rebuilt-mask.ts`'s ordering depends on this id space
  * being contiguous and monotonic per-connection.
  *
- * `dbId`, when present, is the REAL `run_events.id` row id. Historically this
- * was only known for events fetched via `GET /tasks/:id/events/page` ("Load
- * earlier"), but SSE replayed frames (the burst sent on connect/reconnect,
- * before `replay_meta`'s window) now carry it too — only a genuinely NEW
- * live event delivered after the connection has settled lacks one. It's what
- * lets the live-window trim (`EVENTS_WINDOW_MAX`) figure out a fresh
- * `beforeId` cursor after eating into previously-loaded earlier history: if
- * the new front-of-window event carries a `dbId`, that becomes the new
- * `earliestId`; if it doesn't (the rare case of a brand-new live event
- * pushing the window over the cap before any replay/page fetch has run),
- * "Load earlier" has nothing reliable to page from and hides until the next
- * SSE (re)connect re-seeds `earliestId` from `replay_meta`.
+ * `dbId`, when present, is the REAL `run_events.id` row id. Every saved row
+ * carries it — replayed frames, "Load earlier" pages and live frames alike
+ * (the server stamps the stored id on each live send). Only an event the
+ * server never saved lacks one (the live-only `interaction`/`subagent`
+ * frames are consumed before they reach the window). It's what lets the
+ * live-window trim (`EVENTS_WINDOW_MAX`) figure out a fresh `beforeId`
+ * cursor after eating into previously-loaded earlier history: if the new
+ * front-of-window event
+ * carries a `dbId`, that becomes the new `earliestId`; if it doesn't (a
+ * never-saved event at the front of the window), "Load earlier" has nothing
+ * reliable to page from and hides until the next snapshot or fresh connect
+ * re-seeds `earliestId` from `replay_meta`.
  */
 type StreamEvent = RunEvent & { id: number; dbId?: number };
 
@@ -726,7 +736,22 @@ function RunPanelBody({
   >(null);
   const [rebuildBusy, setRebuildBusy] = useState(false);
   const [rebuildNote, setRebuildNote] = useState<string | null>(null);
+  /** Bumped when a snapshot reset replaces the whole stream window (see the
+   *  `replay_meta` handler in the subscription effect). It is the auto-rebuild
+   *  effect's one extra dependency: the reset drops `rebuilt`, and the JSONL
+   *  splice for the current latest run has to be recomputed against the fresh
+   *  window exactly as on first open. Never needs resetting on task switch —
+   *  only changes ever trigger the effect, and a task switch re-runs it anyway
+   *  via `latestRun`. */
+  const [rebuildEpoch, setRebuildEpoch] = useState(0);
+  /** True after a reconnect had to fall back to a fresh window because the
+   *  gap was too large to replay (a snapshot `replay_meta`); renders the
+   *  muted `TASK_STREAM_GAP_NOTICE` line under "Load earlier messages". */
+  const [streamGapNotice, setStreamGapNotice] = useState(false);
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
+  /** Ids the live stream or the card itself already resolved. The bootstrap
+   *  fetch below may have started before that, and must not put them back. */
+  const resolvedInteractionIdsRef = useRef(new Set<string>());
   /** Background/sub agents this task's main agent has spawned. Seeded from the
    *  snapshot endpoint on open + kept live by `stream: "subagent"` SSE deltas
    *  and a 2s poll backstop. Drives the read-only tab strip. */
@@ -849,6 +874,17 @@ function RunPanelBody({
    *  earlier" button together with `earliestId !== null`. */
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  /** Generation of the transcript window "Load earlier" pages extend.
+   *  Bumped whenever the window is thrown away and rebuilt — a task switch
+   *  (the reset effect below) and a `snapshotRequired` reconnect (the SSE
+   *  `replay_meta` handler), which keeps the same task id. A page fetched
+   *  under an older generation must never be applied: its rows sit before
+   *  the OLD window's front, so prepending them onto the fresh window (and
+   *  taking its `earliestId`) would leave a hole paging can never fill.
+   *  Every bump also clears `loadingEarlier`, which is what lets the
+   *  `finally` below key the busy-flag reset on the generation without
+   *  ever stranding it. */
+  const historyGenRef = useRef(0);
   /** True once the FIRST `listRuns` response for the CURRENT task has
    *  landed (see the runs-poll effect below, which sets this — guarded by
    *  that effect's own `cancelled` flag, so a late response for a task the
@@ -918,10 +954,13 @@ function RunPanelBody({
     loadedDbIdsRef.current = new Set();
     setEarliestId(null);
     setHasMoreEarlier(false);
+    historyGenRef.current++;
     setLoadingEarlier(false);
     setRebuilt(null);
     setRebuildNote(null);
+    setStreamGapNotice(false);
     setInteractions([]);
+    resolvedInteractionIdsRef.current = new Set();
     setSubagentList([]);
     setActiveStream("main");
     setSearchOpen(false);
@@ -1059,13 +1098,26 @@ function RunPanelBody({
     // let the deferred fetches go anyway rather than waiting on a stream
     // that may never connect (task deleted mid-switch, backend down).
     const readyTimer = setTimeout(markStreamReady, STREAM_READY_FALLBACK_MS);
-    // Collapse the dual-emit + replay duplicates the server stream carries
-    // (live echo + JSONL twin per user message; full-history replay on every
-    // reconnect). The deduper keeps `user` keys in a never-trimmed set so a
-    // follow-up folded into a long in-flight turn — whose live echo and JSONL
-    // twin are separated by thousands of intervening events — still collapses
-    // to a single bubble. See `event-dedup.ts`.
-    const dedupe = createEventDeduper();
+    // Collapse the dual-emit duplicates the server stream carries (live echo +
+    // JSONL twin per user message). The deduper keeps `user` keys in a
+    // never-trimmed set so a follow-up folded into a long in-flight turn —
+    // whose live echo and JSONL twin are separated by thousands of intervening
+    // events — still collapses to a single bubble. See `event-dedup.ts`.
+    // Reassignable: a snapshot reset (below) replaces the whole window, so the
+    // old keys must not suppress the fresh rows.
+    let dedupe = createEventDeduper();
+    // Highest server row id accepted on this subscription. A reconnect resumes
+    // after the transport's last SSE id, but a row can still arrive twice (the
+    // replay racing a live send), so the consumer keeps its own mark and drops
+    // anything at or below it before dedupe. Id-less frames always pass.
+    const highWater = createIdHighWater();
+    // `replay_meta` frames seen on this subscription. The first is covered by
+    // the `[task.id]` bootstrap fetch; every later one is a reconnect, which
+    // refetches what the stream does not persist (see the handler below).
+    let metaCount = 0;
+    // Bookkeeping for that reconnect refetch: cards that land or resolve over
+    // SSE while the request is in flight are merged into its response.
+    const interactionRefetch = createInteractionRefetchTracker<PendingInteraction>();
     // Coalesce the open-time replay burst into one state update per batch. On
     // connect the server streams the whole history as one SSE frame per event;
     // each `onmessage` is its own event-loop task, so React can't auto-batch
@@ -1124,7 +1176,8 @@ function RunPanelBody({
       (batch) => {
         // Trim from the front once the live window exceeds EVENTS_WINDOW_MAX
         // (see StreamEvent's `dbId` doc comment for how the new earliestId is
-        // derived — or why it sometimes can't be). `eventsRef` mirrors
+        // derived — saved rows always carry one, so it only fails to be when
+        // the new front event was never saved). `eventsRef` mirrors
         // `events` synchronously so this math doesn't need React's
         // functional-setState form (which would run twice under StrictMode's
         // dev double-invoke and could double-decrement counters/side effects
@@ -1143,7 +1196,12 @@ function RunPanelBody({
         // `EVENTS_WINDOW_MAX` so memory still stays bounded for a reader who
         // never returns to the bottom; the jerk can still happen once that
         // cap is hit, which is the accepted trade-off.
-        const merged = [...eventsRef.current, ...batch];
+        // A Cursor tool revision is another `tool_use` with the same id.
+        // Fold it onto the row already in the window before the cap, so
+        // partials do not push real transcript lines out.
+        const merged = batch.some((event) => event.stream === "tool_use")
+          ? foldToolUseRevisions([...eventsRef.current, ...batch])
+          : [...eventsRef.current, ...batch];
         let next = merged;
         const keep = eventWindowKeepCount(merged.length, nearBottomRef.current, EVENTS_WINDOW_MAX);
         if (keep != null) {
@@ -1199,11 +1257,15 @@ function RunPanelBody({
     const unsub = api.subscribeTask(
       task.id,
       (e) => {
+        if (!highWater.accept(e.id)) return;
         if (!dedupe.accept(e)) return;
         if (e.stream === "interaction") {
           try {
             const req = JSON.parse(e.data) as PendingInteraction;
-            setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
+            // Same id is an update, not a duplicate. A Cursor card keeps its
+            // id when the child exits and delivery becomes "restart-followup".
+            interactionRefetch.noteArrived(req);
+            setInteractions((cur) => mergePendingInteraction(cur, req));
           } catch { /* ignore malformed */ }
           return;
         }
@@ -1232,6 +1294,8 @@ function RunPanelBody({
           // idempotent under `id`-based filtering.
           try {
             const { id } = JSON.parse(e.data) as { id: string };
+            resolvedInteractionIdsRef.current.add(id);
+            interactionRefetch.noteResolved(id);
             setInteractions((cur) => cur.filter((x) => x.id !== id));
           } catch { /* ignore malformed */ }
           return;
@@ -1261,13 +1325,12 @@ function RunPanelBody({
         }
         // Tag with the next client-assigned id (see `StreamEvent`) — this
         // client id space is distinct from the server's own `RunEvent.id`
-        // (only present on replayed/paged frames, see its doc comment), and
-        // the invalidation check above needs a monotonic ordering to
-        // distinguish a genuinely new event from one the replay burst
-        // re-delivers on reconnect. Capture the server id as `dbId` when
-        // present so the window-cap trim above can derive an exact
-        // `earliestId` cursor from replay alone, without waiting on a
-        // "Load earlier" page fetch.
+        // (present on every saved row, see its doc comment), and the
+        // invalidation check above needs a monotonic ordering to tell a
+        // genuinely new event from the ones already observed. Capture the
+        // server id as `dbId` when present so the window-cap trim above can
+        // derive an exact `earliestId` cursor without waiting on a "Load
+        // earlier" page fetch.
         const dbId = e.id;
         if (typeof dbId === "number") loadedDbIdsRef.current.add(dbId);
         buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
@@ -1286,24 +1349,78 @@ function RunPanelBody({
         // setup) is what makes the kick-storm suppression above cover BOTH the
         // initial open and every later reconnect's replay burst.
         connectedAtRef.current = Date.now();
-        // Never move the cursor FORWARD on a reconnect: a fresh `replay_meta`
-        // reflects only the just-replayed window, which is capped at
-        // EVENTS_REPLAY_LIMIT and so always starts later than whatever
-        // earlier history "Load earlier" may have already paged in before
-        // the reconnect. Losing that progress would silently re-show a
-        // narrower "Load earlier" cursor (or hide it) after every SSE drop —
-        // taking the min (treating null as "no bound yet") keeps whichever
-        // cursor reaches furthest back. `hasMore` only ever grows for the
-        // same reason: once we know older history exists, a later replay
-        // that (re)confirms a narrower window can't un-know that.
-        setEarliestId((prev) =>
-          prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
-        );
-        setHasMoreEarlier((prev) => prev || meta.hasMore);
+        const kind = classifyReplayMeta(meta);
+        if (kind === "snapshot") {
+          // The server could not resume from our cursor (gap too large or the
+          // cursor is ahead of it) and is sending today's fresh window. Throw
+          // away everything built from the old window BEFORE those rows are
+          // pushed — they follow this frame immediately. `nextEventIdRef` is
+          // deliberately NOT reset: client ids stay monotonic for the life of
+          // the subscription so `rebuilt-mask.ts` stays sound.
+          buffer.discard();
+          // Any "Load earlier" page still in flight belongs to the old
+          // window — invalidate it and free the button for the new one.
+          historyGenRef.current++;
+          setLoadingEarlier(false);
+          highWater.reset();
+          dedupe = createEventDeduper();
+          eventsRef.current = [];
+          setEvents([]);
+          loadedDbIdsRef.current = new Set();
+          prevEventIdRef.current = -1;
+          // Replace, don't merge: the fresh window is the only history we hold.
+          setEarliestId(meta.earliestId);
+          setHasMoreEarlier(meta.hasMore);
+          // The JSONL splice masked the old window; drop it and let the
+          // auto-rebuild effect recompute it for the current latest run.
+          setRebuilt(null);
+          setRebuildNote(null);
+          setRebuildEpoch((n) => n + 1);
+          setActiveMatchId(null);
+          nearBottomRef.current = true;
+          setStreamGapNotice(true);
+        } else if (kind === "fresh") {
+          // Never move the cursor FORWARD on a reconnect: a fresh
+          // `replay_meta` reflects only the just-replayed window, which is
+          // capped at EVENTS_REPLAY_LIMIT and so always starts later than
+          // whatever earlier history "Load earlier" may have already paged in
+          // before the reconnect. Losing that progress would silently re-show
+          // a narrower "Load earlier" cursor (or hide it) after every SSE
+          // drop — taking the min (treating null as "no bound yet") keeps
+          // whichever cursor reaches furthest back. `hasMore` only ever grows
+          // for the same reason: once we know older history exists, a later
+          // replay that (re)confirms a narrower window can't un-know that.
+          // (A `resumed` meta carries neither field and changes nothing: the
+          // rows that follow are just the gap after our cursor.)
+          setEarliestId((prev) =>
+            prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
+          );
+          setHasMoreEarlier((prev) => prev || meta.hasMore);
+        }
+        // Every meta after the first is a reconnect. Pending interactions,
+        // subagent lifecycle deltas and run status are live-only or polled, so
+        // whatever the dropped connection missed is recovered here instead of
+        // waiting for the next poll tick.
+        if (metaCount++ > 0) {
+          const token = interactionRefetch.begin();
+          void api.listPendingInteractions(task.id).then((list) => {
+            // Null: superseded by a newer refetch, or the task switched /
+            // the effect cleaned up (cancel) — never apply a stale response.
+            const settled = interactionRefetch.finish(token);
+            if (!settled) return;
+            setInteractions(mergeRefetchedInteractions(list, settled.arrived, settled.resolvedIds));
+          }).catch(() => {
+            // Keep the cards we have; the next reconnect tries again.
+            interactionRefetch.finish(token);
+          });
+          runsPollKickRef.current();
+          subagentsPollKickRef.current();
+        }
       },
     );
     return () => {
       clearTimeout(readyTimer);
+      interactionRefetch.cancel();
       buffer.dispose();
       if (kickTimer) clearTimeout(kickTimer);
       document.removeEventListener("visibilitychange", onVisible);
@@ -1314,12 +1431,14 @@ function RunPanelBody({
 
   // Bootstrap any interactions that fired before the panel opened (race
   // between claude tool calls and the panel mount). The SSE subscription
-  // picks up new ones from here on.
+  // picks up new ones from here on. The fetch is in flight while that
+  // stream can update a card or resolve one, so the snapshot is merged
+  // into the live list — replacing it would put the stale card back.
   useEffect(() => {
     let cancelled = false;
     void api.listPendingInteractions(task.id).then((list) => {
       if (cancelled) return;
-      setInteractions(list);
+      setInteractions((cur) => mergePendingInteractionSnapshot(cur, list, resolvedInteractionIdsRef.current));
     }).catch(() => { /* ignore — empty start is fine */ });
     return () => { cancelled = true; };
   }, [task.id]);
@@ -1328,7 +1447,10 @@ function RunPanelBody({
   // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
   // stable setter, so the empty dep list is correct.
   const dismissInteraction = useCallback(
-    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
+    (id: string) => {
+      resolvedInteractionIdsRef.current.add(id);
+      setInteractions((cur) => cur.filter((x) => x.id !== id));
+    },
     [],
   );
 
@@ -1546,10 +1668,13 @@ function RunPanelBody({
     // resolving after the user has moved to a different task must not
     // prepend task A's history into task B's transcript state.
     const sentTaskId = task.id;
+    // The task id alone isn't enough: a `snapshotRequired` reconnect
+    // replaces the window under the same task — see `historyGenRef`.
+    const sentGen = historyGenRef.current;
     setLoadingEarlier(true);
     void api.fetchTaskEventsPage(sentTaskId, earliestId)
       .then((page) => {
-        if (currentTaskIdRef.current !== sentTaskId) return;
+        if (currentTaskIdRef.current !== sentTaskId || historyGenRef.current !== sentGen) return;
         // Defensive dedupe: `earliestId` can point past events this panel
         // already holds — e.g. an SSE reconnect moved it backward (see the
         // `replay_meta` handler's "never move forward" comment above), so a
@@ -1582,7 +1707,11 @@ function RunPanelBody({
       })
       .catch(() => { /* transient failure — button stays enabled to retry */ })
       .finally(() => {
-        if (currentTaskIdRef.current === sentTaskId) setLoadingEarlier(false);
+        // Keyed on the generation, not the task id: a reset already cleared
+        // the flag, and a page started after it owns the flag now — an
+        // older request settling late must not re-enable the button under
+        // it (A→B→A task switches included).
+        if (historyGenRef.current === sentGen) setLoadingEarlier(false);
       });
   }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
 
@@ -1705,17 +1834,21 @@ function RunPanelBody({
   // a run is in flight (live tailing is still appending) and codex
   // (no JSONL transcript).
   //
-  // This effect's deps are ONLY `latestRun` id/status/claudeSessionId, which
-  // is deliberate and load-bearing: when the SSE batch-flush callback above
-  // detects a newer live event for a masked run and calls
-  // `setRebuilt(null)`/`setRebuildNote(null)`, none of those three fields
+  // This effect's deps are ONLY `latestRun` id/status/claudeSessionId plus
+  // `rebuildEpoch`, which is deliberate and load-bearing: when the SSE
+  // batch-flush callback above detects a newer live event for a masked run
+  // and calls `setRebuilt(null)`/`setRebuildNote(null)`, none of those three fields
   // change (the run itself hasn't — its status is still whatever it was),
   // so this effect does NOT re-run and immediately re-mask the stream it
   // was just un-frozen from. It only fires again — legitimately re-snapshot-
   // ting — when the newest run's own id/status/sessionId next changes, i.e.
   // when a later run resolves. This is what makes clearing the snapshot on a
   // background-agent continuation's post-`end_turn` activity actually stick
-  // instead of flapping.
+  // instead of flapping. `rebuildEpoch` is bumped ONLY by a snapshot reset
+  // (the reconnect fell back to a fresh window and dropped `rebuilt`), so it
+  // re-runs the JSONL splice for the current latest run against the new window
+  // exactly like first open — and, bumping on that one event only, it keeps
+  // the no-re-mask-after-invalidation property above.
   useEffect(() => {
     if (!latestRun) return;
     if (latestRun.status === "running") {
@@ -1766,7 +1899,7 @@ function RunPanelBody({
       }
     }).catch(() => { /* network blip — stay on streamed events silently */ });
     return () => { cancelled = true; };
-  }, [latestRun?.id, latestRun?.status, latestRun?.claudeSessionId]);
+  }, [latestRun?.id, latestRun?.status, latestRun?.claudeSessionId, rebuildEpoch]);
 
   /** All run ids that share `rebuilt.sessionId`. A single claude session
    *  spans every turn within one tmux session, and each turn is its own
@@ -4343,6 +4476,17 @@ function RunPanelBody({
               </Button>
             </div>
           )}
+          {/* Set by a snapshot reset: the reconnect could not replay the gap
+              and swapped in the latest window. Persists until the next task
+              switch (reset effect above). */}
+          {streamGapNotice && (
+            <div
+              className="mb-2 text-center text-[11px] text-muted-foreground"
+              data-testid="transcript-gap-notice"
+            >
+              {TASK_STREAM_GAP_NOTICE}
+            </div>
+          )}
           {!runsLoaded && displayedEvents.length === 0 ? (
             // Gated on BOTH `runsLoaded` and `displayedEvents.length` — the SSE
             // subscription is now issued before `listRuns` (see the stream-first
@@ -5786,6 +5930,19 @@ function RunEventList({
   // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`,
   // `planByToolCallId`, `onOpenPlan`) are tracked explicitly.
   const blocks = useMemo(() => {
+    // A revised Cursor tool_use (same id, grown rawInput) replaces the
+    // partial. Both rows can be in the live list; history keeps one.
+    const supersededToolUses = supersededToolUseIndexes(normalised);
+    // A Cursor ask block stays open only while its card is still pending.
+    // The card also picks the waiting line. A missing card is not a live wait.
+    const cursorAskByToolId = new Map<string, { delivery?: "live" | "restart-followup"; followupCause?: "restart" | "child-exit" }>();
+    for (const bucket of interactionByIndex.values()) {
+      for (const item of bucket) {
+        if (item.kind === "ask_questions" && item.source === "cursor" && item.toolCallId) {
+          cursorAskByToolId.set(item.toolCallId, { delivery: item.delivery, followupCause: item.followupCause });
+        }
+      }
+    }
     // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
     // to and imperatively highlights (`logRef.current?.querySelector('[data-
     // evid="…"]')` in RunPanelBody — see the highlight effect there). `evid`
@@ -5839,6 +5996,7 @@ function RunEventList({
         case "compaction_summary":
           return [wrap(key, evid, <CompactionSummaryBlock text={e.data} />)];
         case "tool_use": {
+          if (supersededToolUses.has(evid)) return [];
           const parsed = safeParse<ParsedToolUse>(e.data);
           if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];
           // A detected Cursor plan replaces the generic tool-call card
@@ -5854,7 +6012,8 @@ function RunEventList({
           if (parseSentFilesToolUse(parsed.name, parsed.input)) {
             return [wrap(key, evid, <SentFilesCard call={parsed} result={result} taskId={taskId} />)];
           }
-          return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} />)];
+          const cursorWait = parsed.name === "askQuestionToolCall" ? cursorAskByToolId.get(parsed.id) : undefined;
+          return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} cursorWait={cursorWait} />)];
         }
         case "tool_result": {
           const parsed = safeParse<ParsedToolResult>(e.data);
@@ -6711,9 +6870,22 @@ const SECONDARY_BADGE_CLASS = badgeVariants({ variant: "secondary" });
  *  AskUserQuestion + ExitPlanMode get prominent styling because the user
  *  *needs to act on them* — claude is blocked waiting for an answer that
  *  agetor's UI doesn't otherwise prompt for. */
-const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: ParsedToolUse; result?: ParsedToolResult }) {
+const ToolUseBlock = memo(function ToolUseBlock({
+  call,
+  result,
+  cursorWait,
+}: {
+  call: ParsedToolUse;
+  result?: ParsedToolResult;
+  /** Pending Cursor ask for this tool id, when the card is still open. */
+  cursorWait?: { delivery?: "live" | "restart-followup"; followupCause?: "restart" | "child-exit" };
+}) {
   const summary = formatToolInputSummary(call.name, call.input);
-  const isInteractive = call.name === "AskUserQuestion" || call.name === "ExitPlanMode";
+  const isInteractive = call.name === "AskUserQuestion" || call.name === "askQuestionToolCall" || call.name === "ExitPlanMode";
+  const cursorAsk = call.name === "askQuestionToolCall";
+  // No card means the question was answered, skipped, or cancelled. Keep
+  // the block collapsible, and do not say Cursor is still waiting.
+  const cursorFooter = cursorAsk && !result ? cursorAskToolFooter(cursorWait) : null;
   const [open, setOpen] = useState(false);
   const [resultOpenSignal, setResultOpenSignal] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -6731,7 +6903,7 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
   useEffect(() => {
     if (!open) setResultOpenSignal(0);
   }, [open]);
-  const forcedOpen = isInteractive && !result;
+  const forcedOpen = cursorAsk ? cursorFooter !== null : isInteractive && !result;
   const expanded = open || forcedOpen;
   // MCP convention: `mcp__<server>__<tool>`. The server name is always the
   // first segment after the `mcp__` prefix; everything after the next `__`
@@ -6787,11 +6959,16 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
           {result && <ToolResultBody result={result} openSignal={resultOpenSignal} />}
         </>
       )}
-      {isInteractive && !result && (
-        <div className="border-t border-primary/40 bg-primary/10 px-2 py-1.5 text-[11px] text-foreground">
+      {forcedOpen && (
+        <div
+          className="border-t border-primary/40 bg-primary/10 px-2 py-1.5 text-[11px] text-foreground"
+          data-testid={cursorAsk ? "cursor-ask-waiting" : undefined}
+        >
           {call.name === "AskUserQuestion"
             ? "Claude is asking — answer it in the card above (it has a custom-answer field for anything not listed)."
-            : "Claude is waiting for plan approval — use the card above. To reject or request changes, press Stop, then send a message."}
+            : cursorAsk
+              ? cursorFooter
+              : "Claude is waiting for plan approval — use the card above. To reject or request changes, press Stop, then send a message."}
         </div>
       )}
     </div>
@@ -7006,6 +7183,28 @@ function ToolInputBody({ name, input }: { name: string; input: unknown }) {
         ))}
       </ul>
     );
+  }
+  if (name === "askQuestionToolCall") {
+    const ask = cursorAskFromToolUse({ name, input });
+    if (ask) {
+      return (
+        <div className="px-2 py-1.5 text-[11px]" data-testid="cursor-ask-tool-body">
+          {ask.title ? <div className="mb-1 font-medium">{ask.title}</div> : null}
+          {ask.questions.map((q, i) => (
+            <div key={q.id || i} className={cn(i > 0 && "mt-2 border-t border-border/30 pt-2")}>
+              <div className="font-medium">{q.text}</div>
+              <ul className="mt-1 space-y-0.5">
+                {q.options.map((o, oi) => (
+                  <li key={`${o.id}:${oi}`} className="text-muted-foreground">
+                    · <span className="font-medium text-foreground">{cursorAskOptionChoiceLabel(o, q.options)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      );
+    }
   }
   if (name === "AskUserQuestion" && isRecord(input) && Array.isArray(input.questions)) {
     return (
@@ -8145,22 +8344,33 @@ function AskQuestionsCard({
   const setCustom = (qi: number, value: string) =>
     setAnswers((cur) => cur.map((a, i) => (i === qi ? { ...a, custom: value } : a)));
 
-  // Every question needs at least one of selected/custom non-empty before
-  // we let the user send. Mirrors the contract claude expects — empty
-  // answers would confuse its next turn.
-  const canSubmit = answers.every(
-    (a) => a.selected.length > 0 || a.custom.trim().length > 0,
-  );
+  const cursor = req.source === "cursor";
+  /** Cursor cannot deliver typed text. A selected option is the answer;
+   *  leftover custom text must not hide that pick, replace it, or count
+   *  as an answer by itself. */
+  const cursorIgnoresCustom = cursor && CURSOR_ASK_FREEFORM === "unsupported";
+
+  // Every question needs a real answer before Review or submit. Claude
+  // accepts the custom field. Cursor with unsupported freeform does not
+  // accept typed text alone, or typed text added to a multi-select.
+  const canSubmit = cursor
+    ? cursorAskCanAdvance(req.questions, answers)
+    : answers.every((a) => a.selected.length > 0 || a.custom.trim().length > 0);
 
   const submit = async () => {
     if (!canSubmit || submitting) return;
     setSubmitting(true);
     try {
       const res = await api.answerAskQuestions(req.id, {
-        answers: answers.map((a) => ({
-          selected: a.selected,
-          custom: a.custom.trim() || undefined,
-        })),
+        answers: answers.map((a, qi) => {
+          const multi = req.questions[qi]?.multiSelect === true;
+          const custom = cursor
+            ? cursorAskWireCustom(multi, a.custom)
+            : (a.custom.trim() || undefined);
+          if (!cursor) return { selected: a.selected, custom };
+          const picks = cursorAskPicksFromValues(req.questions[qi]?.options ?? [], a.selected);
+          return { ...picks, custom };
+        }),
       });
       // The server resolves the card regardless of outcome (see its own
       // doc), so keeping it up wouldn't let the user retry: on the drive
@@ -8184,11 +8394,12 @@ function AskQuestionsCard({
         if (res.delivery === undefined) {
           toast(reason || "This question was already resolved");
         } else {
+          const who = cursor ? "Cursor" : "Claude";
           toast.error(
             reason
               || (res.delivery === "message"
-                ? "Answer didn't reach Claude — answer it in the terminal or resend from the composer"
-                : "Answer didn't reach Claude — a fresh card will appear; answer it there or in the terminal"),
+                ? `Answer didn't reach ${who} — answer it in the terminal or resend from the composer`
+                : `Answer didn't reach ${who} — a fresh card will appear; answer it there or in the terminal`),
           );
         }
       }
@@ -8203,30 +8414,78 @@ function AskQuestionsCard({
         onResolved(req.id);
         return;
       }
+      // Cursor rejects a custom-only answer while that input is unsupported.
+      // The card stays up so an option can still be picked.
+      if (e instanceof ApiError && e.status === 400 && req.source === "cursor") {
+        toast.error(e.message || "Cursor cannot accept a custom answer — pick an option");
+        return;
+      }
       throw e;
     } finally {
       setSubmitting(false);
     }
   };
 
+  const skip = async () => {
+    if (submitting || req.source !== "cursor") return;
+    setSubmitting(true);
+    try {
+      const res = await api.skipAskQuestions(req.id);
+      if (!res.ok) toast.error("Skip didn't reach Cursor");
+      onResolved(req.id);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        toast(e.message || "This question is already being answered");
+        onResolved(req.id);
+        return;
+      }
+      if (e instanceof ApiError && e.status === 400) {
+        toast.error(e.message || "Could not skip");
+        return;
+      }
+      throw e;
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const heading = phase === "review"
+    ? "Review your answers"
+    : cursor
+      ? cursorAskCardHeading(req.delivery, req.followupCause)
+      : "Claude is asking";
+
+  const displayPick = (qi: number, key: string): string => {
+    const options = req.questions[qi]?.options ?? [];
+    const opt = cursor
+      ? options.find((option) => option.id === key)
+      : options.find((option) => option.label === key);
+    if (!opt) return key;
+    return cursor ? cursorAskOptionChoiceLabel(opt, options) : opt.label;
+  };
+
   /** One-line summary of the user's answer to question `qi` (picked labels +
    *  any custom text), for the review screen. Mirrors the native "→ a, b".
    *  A single-select question's custom text REPLACES the pick (the drive and
-   *  the follow-up message both send custom only); multi-select adds it. */
+   *  the follow-up message both send custom only); multi-select adds it.
+   *  Cursor with unsupported freeform is the exception: a selected option
+   *  stays visible, and custom text is shown only when it is the whole answer.
+   *  Cursor picks are option ids; the summary shows the label. */
   const answerSummary = (qi: number): string => {
     const a = answers[qi] ?? { selected: [], custom: "" };
     const custom = a.custom.trim();
-    const pieces = !req.questions[qi]?.multiSelect && custom ? [] : [...a.selected];
-    if (custom) pieces.push(custom);
+    const keys = !req.questions[qi]?.multiSelect && custom && !cursorIgnoresCustom ? [] : [...a.selected];
+    const pieces = keys.map((key) => displayPick(qi, key));
+    if (custom && !(cursorIgnoresCustom && a.selected.length > 0)) pieces.push(custom);
     return pieces.length ? pieces.join(", ") : "(no answer)";
   };
 
   return (
-    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40" data-testid="ask-questions-card">
       <div className="mb-2 flex items-center justify-between">
-        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary" data-testid="ask-questions-title">
           <HelpCircle className="size-3.5" aria-hidden />
-          {phase === "review" ? "Review your answers" : "Claude is asking"}
+          {heading}
         </span>
         <span className="font-mono text-[10px] text-muted-foreground">
           {phase === "review"
@@ -8234,6 +8493,11 @@ function AskQuestionsCard({
             : req.questions.length === 1 ? "1 question" : `${req.questions.length} questions`}
         </span>
       </div>
+      {req.title ? (
+        <div className="mb-2 text-[13px] font-medium" data-testid="ask-questions-args-title">
+          {req.title}
+        </div>
+      ) : null}
 
       {phase === "review" ? (
         <>
@@ -8246,9 +8510,16 @@ function AskQuestionsCard({
             ))}
           </div>
           <div className="mt-3 flex items-center justify-between">
-            <Button variant="ghost" size="sm" onClick={() => setPhase("answer")} disabled={submitting}>
-              ← Back
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" size="sm" onClick={() => setPhase("answer")} disabled={submitting}>
+                ← Back
+              </Button>
+              {cursor && (
+                <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
+                  Skip
+                </Button>
+              )}
+            </div>
             <Button onClick={() => void submit()} disabled={!canSubmit || submitting} size="sm">
               {submitting ? "Submitting…" : "Submit answers"}
             </Button>
@@ -8261,11 +8532,13 @@ function AskQuestionsCard({
               <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
                 <div className="mb-1.5 whitespace-pre-wrap text-[13px] font-medium">{q.question}</div>
                 <div className="space-y-1">
-                  {q.options.map((opt) => {
-                    const picked = answers[qi]?.selected.includes(opt.label) ?? false;
+                  {q.options.map((opt, oi) => {
+                    const value = cursor ? cursorAskOptionValue(opt) : opt.label;
+                    const picked = answers[qi]?.selected.includes(value) ?? false;
+                    const shown = cursor ? cursorAskOptionChoiceLabel(opt, q.options) : opt.label;
                     return (
                       <label
-                        key={opt.label}
+                        key={`${value}:${oi}`}
                         className={cn(
                           "flex cursor-pointer items-start gap-2 rounded border border-transparent px-1.5 py-1 hover:bg-accent/30",
                           picked && "border-primary/40 bg-primary/10",
@@ -8275,11 +8548,11 @@ function AskQuestionsCard({
                           type={q.multiSelect ? "checkbox" : "radio"}
                           name={`q-${req.id}-${qi}`}
                           checked={picked}
-                          onChange={() => togglePick(qi, opt.label, Boolean(q.multiSelect))}
+                          onChange={() => togglePick(qi, value, Boolean(q.multiSelect))}
                           className="mt-0.5"
                         />
                         <span className="text-[12px]">
-                          <span className="font-medium">{opt.label}</span>
+                          <span className="font-medium">{shown}</span>
                           {opt.description && (
                             <span className="block text-[11px] text-muted-foreground">{opt.description}</span>
                           )}
@@ -8294,14 +8567,25 @@ function AskQuestionsCard({
                 <Textarea
                   value={answers[qi]?.custom ?? ""}
                   onChange={(e) => setCustom(qi, e.target.value)}
-                  placeholder={q.multiSelect ? "Custom answer — added to the selection" : "Custom answer — replaces the selection"}
+                  placeholder={
+                    cursorIgnoresCustom
+                      ? "Custom answer — Cursor can't accept typed text; pick an option"
+                      : q.multiSelect
+                        ? "Custom answer — added to the selection"
+                        : "Custom answer — replaces the selection"
+                  }
                   rows={2}
                   className="mt-2 text-[12px]"
                 />
               </div>
             ))}
           </div>
-          <div className="mt-3 flex items-center justify-end">
+          <div className="mt-3 flex items-center justify-between">
+            {cursor ? (
+              <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
+                Skip
+              </Button>
+            ) : <span />}
             <Button onClick={() => setPhase("review")} disabled={!canSubmit || submitting} size="sm">
               Review answers →
             </Button>

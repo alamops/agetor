@@ -327,8 +327,11 @@ export class AgetorClient {
   }
   answerAskQuestions(
     id: string,
-    answers: AskQuestionsAnswer["answers"],
-  ): Promise<{ ok: boolean }> {
+    answers: AskQuestionsAnswer["answers"] | { skip: true },
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (!Array.isArray(answers)) {
+      return this.req("POST", `/ask-questions/${id}/answer`, { skip: true });
+    }
     return this.req("POST", `/ask-questions/${id}/answer`, { answers });
   }
   answerTmuxPrompt(

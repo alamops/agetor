@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { streamSse, type SseHandle } from "../sse.ts";
+import { foldToolUseRevisions } from "../../shared/tool-use-revisions.ts";
 import type { RunEvent } from "../../shared/types.ts";
+import {
+  TASK_STREAM_GAP_NOTICE,
+  classifyReplayMeta,
+  createIdHighWater,
+  parseReplayMeta,
+} from "../../shared/task-stream-resume.ts";
 
 const TICK_MS = 33; // ~30fps flush — one state commit per tick, never per event
 const MAX_LINES = 500; // ring-buffer cap on rendered scrollback
@@ -9,8 +16,15 @@ const MAX_LINES = 500; // ring-buffer cap on rendered scrollback
  * Stream a task's conversation with the three anti-lag guardrails from the
  * known RunPanel O(N²) bug: (1) BATCH — buffer incoming events and commit once
  * per tick, never setState per frame; (2) VIRTUALIZE — keep only the last
- * MAX_LINES; (3) DEDUPE — collapse the replay/live overlap on the server's
- * documented `ts|stream|data-prefix` key (also used as the React render key).
+ * MAX_LINES; (3) DEDUPE — collapse the replay/live overlap, first on the
+ * server row id (a high-water mark, so a reconnect that re-delivers part of
+ * the window adds nothing) and then on a payload-aware key. Cursor tool
+ * revisions are kept and folded onto one row before the cap.
+ *
+ * Forward resume: `streamSse` echoes the last event id on reconnect, so the
+ * server normally sends just the gap. When it can't (`replay_meta` carries
+ * `snapshotRequired`) it sends a fresh window instead; the visible lines are
+ * then replaced by a dim notice plus that window rather than stacked on top.
  */
 export function useCoalescedStream(
   taskId: string | null,
@@ -29,13 +43,15 @@ export function useCoalescedStream(
     buffer.current = [];
     live.current = [];
     seen.current = new Set();
+    // Highest server row id accepted; reset when a snapshot replaces the window.
+    const highWater = createIdHighWater();
     if (!taskId) return;
 
     const flush = setInterval(() => {
       if (buffer.current.length === 0) return;
       const batch = buffer.current;
       buffer.current = [];
-      const next = live.current.concat(batch);
+      const next = foldToolUseRevisions(live.current.concat(batch));
       const trimmed =
         next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
       live.current = trimmed;
@@ -54,12 +70,35 @@ export function useCoalescedStream(
     const handle: SseHandle = streamSse<RunEvent>(
       `/tasks/${taskId}/events?anchor=0`,
       (e) => {
+        if (!highWater.accept(e.id)) return;
         const key = eventKey(e);
         if (seen.current.has(key)) return;
         seen.current.add(key);
         buffer.current.push(e);
       },
-      { dataDir },
+      {
+        dataDir,
+        onNamedEvent: (event, data) => {
+          if (event !== "replay_meta") return;
+          const meta = parseReplayMeta(data);
+          if (!meta || classifyReplayMeta(meta) !== "snapshot") return;
+          // The window that follows replaces everything shown. The notice is a
+          // synthetic id-less status row, so the mark never sees it; the next
+          // flush commits it ahead of the fresh rows.
+          highWater.reset();
+          seen.current = new Set();
+          live.current = [];
+          buffer.current = [
+            {
+              runId: "",
+              taskId,
+              stream: "status",
+              data: TASK_STREAM_GAP_NOTICE,
+              ts: Date.now(),
+            },
+          ];
+        },
+      },
     );
 
     return () => {
@@ -71,6 +110,15 @@ export function useCoalescedStream(
   return events;
 }
 
+/** Prefix kept from the old key, plus the length and the tail. Two tool
+ *  payloads that share a timestamp and the first 64 characters still
+ *  differ once `rawInput` grows. An exact replay (same length, prefix,
+ *  and tail) still collapses. */
+function streamDataKey(data: string): string {
+  if (data.length <= 64) return data;
+  return `${data.length}:${data.slice(0, 64)}:${data.slice(-80)}`;
+}
+
 export function eventKey(e: RunEvent): string {
-  return `${e.ts}|${e.stream}|${e.data.slice(0, 64)}`;
+  return `${e.ts}|${e.stream}|${streamDataKey(e.data ?? "")}`;
 }

@@ -820,6 +820,181 @@ test("registerTmuxPrompt rejects a confirmKey that isn't a single printable ASCI
   })).toThrow(/confirmKey/);
 });
 
+test("Cursor ask registers, answers, skips, and returns the same card for a duplicate tool call", async () => {
+  const { registerCursorAskQuestions, answerCursorAsk, listOpenCursorAsks } = await import("./db.ts").then(async (db) => {
+    const interactions = await import("./interactions.ts");
+    return { ...interactions, listOpenCursorAsks: db.listOpenCursorAsks };
+  });
+  const first = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call\n1",
+    title: "Pick",
+    delivery: "live",
+    questions: [{
+      id: "q1",
+      prompt: "",
+      promptMarkdown: "Which?",
+      options: [{ id: "a", label: "Alpha" }, { id: "b", label: "Beta" }],
+    }],
+  });
+  expect(first.req.source).toBe("cursor");
+  expect(first.req.title).toBe("Pick");
+  expect(first.req.questions[0]?.question).toBe("Which?");
+  expect(first.req.questions[0]?.options[0]?.id).toBe("a");
+  const again = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call\n1",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "other", options: [{ id: "z", label: "Zed" }] }],
+  });
+  expect(again.id).toBe(first.id);
+  expect(again.req.questions[0]?.question).toBe("Which?");
+  const pending = answerCursorAsk(first.id, {
+    outcome: "answered",
+    answers: [{ questionId: "q1", selectedOptionIds: ["a"] }],
+  });
+  expect(pending).toBe(true);
+  expect(await first.answer).toEqual({
+    outcome: "answered",
+    answers: [{ questionId: "q1", selectedOptionIds: ["a"] }],
+  });
+  expect(listOpenCursorAsks().some((row) => row.toolCallId === "call\n1")).toBe(false);
+
+  const skip = registerCursorAskQuestions({
+    taskId: "tCursor",
+    runId: "rCursor",
+    toolCallId: "call-skip",
+    delivery: "live",
+    questions: [{ id: "q2", prompt: "Skip me?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  expect(answerCursorAsk(skip.id, { outcome: "skipped" })).toBe(true);
+  expect(await skip.answer).toEqual({ outcome: "skipped" });
+});
+
+test("cancelPendingForTask writes cancelled for a Cursor card and does not write skipped", async () => {
+  const { registerCursorAskQuestions, cancelPendingForTask } = await import("./interactions.ts");
+  const { db } = await import("./db.ts");
+  const card = registerCursorAskQuestions({
+    taskId: "tCursorCancel",
+    runId: "rCursorCancel",
+    toolCallId: "call-cancel",
+    delivery: "live",
+    questions: [{ id: "q", prompt: "Stop?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const settled = card.answer;
+  cancelPendingForTask("tCursorCancel", "stop");
+  expect(await settled).toEqual({ outcome: "cancelled" });
+  const row = db.query<{ outcome: string }, [string, string]>(
+    `SELECT outcome FROM cursor_asks WHERE task_id = ? AND tool_call_id = ?`,
+  ).get("tCursorCancel", "call-cancel");
+  expect(row?.outcome).toBe("cancelled");
+});
+
+test("retargetLiveCursorAsksForRun releases only that run's live Cursor card and leaves the row open", async () => {
+  const {
+    registerCursorAskQuestions,
+    registerScrapedAskQuestions,
+    retargetLiveCursorAsksForRun,
+    listPendingForTask,
+    answerCursorAsk,
+    setBroadcaster,
+  } = await import("./interactions.ts");
+  const { db, listOpenCursorAsks } = await import("./db.ts");
+  const published: Array<{ id: string; delivery?: string; followupCause?: string; reason?: string }> = [];
+  setBroadcaster((req, reason) => {
+    if (req.kind === "ask_questions") {
+      published.push({ id: req.id, delivery: req.delivery, followupCause: req.followupCause, reason });
+    }
+  });
+  const live = registerCursorAskQuestions({
+    taskId: "tRetarget",
+    runId: "rRetarget",
+    toolCallId: "call-live",
+    title: "Pick",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "Which?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const olderRun = registerCursorAskQuestions({
+    taskId: "tRetarget",
+    runId: "rOlder",
+    toolCallId: "call-older",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "Older?", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  const already = registerCursorAskQuestions({
+    taskId: "tRetarget",
+    runId: "rRetarget",
+    toolCallId: "call-already",
+    delivery: "restart-followup",
+    questions: [{ id: "q2", prompt: "Later?", options: [{ id: "b", label: "Beta" }] }],
+  });
+  const scraper = registerScrapedAskQuestions({
+    taskId: "tRetarget",
+    runId: "rRetarget",
+    questions: [{ question: "Pane?", options: [{ label: "Yes" }] }],
+    fingerprint: "fp-retarget",
+  });
+  const driver = live.answer;
+  retargetLiveCursorAsksForRun("rRetarget");
+  expect(await driver).toEqual({ outcome: "cancelled" });
+  const pending = listPendingForTask("tRetarget");
+  const retargeted = pending.find((p) => p.kind === "ask_questions" && p.toolCallId === "call-live");
+  if (!retargeted || retargeted.kind !== "ask_questions") throw new Error("expected retargeted ask");
+  expect(retargeted.id).toBe(live.id);
+  expect(retargeted.delivery).toBe("restart-followup");
+  expect(retargeted.followupCause).toBe("child-exit");
+  const updates = published.filter((row) => row.reason === "update");
+  expect(updates).toEqual([{ id: live.id, delivery: "restart-followup", followupCause: "child-exit", reason: "update" }]);
+  const keptFollowup = pending.find((p) => p.kind === "ask_questions" && p.toolCallId === "call-already");
+  if (!keptFollowup || keptFollowup.kind !== "ask_questions") throw new Error("expected follow-up");
+  expect(keptFollowup.id).toBe(already.id);
+  expect(keptFollowup.delivery).toBe("restart-followup");
+  const older = pending.find((p) => p.kind === "ask_questions" && p.toolCallId === "call-older");
+  if (!older || older.kind !== "ask_questions") throw new Error("expected older ask");
+  expect(older.delivery).toBe("live");
+  expect(pending.some((p) => p.kind === "ask_questions" && p.id === scraper.id)).toBe(true);
+  const row = db.query<{ outcome: string | null }, [string, string]>(
+    `SELECT outcome FROM cursor_asks WHERE task_id = ? AND tool_call_id = ?`,
+  ).get("tRetarget", "call-live");
+  expect(row).not.toBeNull();
+  expect(row?.outcome ?? null).toBeNull();
+  expect(listOpenCursorAsks().some((open) => open.taskId === "tRetarget" && open.toolCallId === "call-live")).toBe(true);
+  let resolvedAgain = false;
+  const again = registerCursorAskQuestions({
+    taskId: "tRetarget",
+    runId: "rRetarget",
+    toolCallId: "call-live",
+    delivery: "live",
+    questions: [{ id: "q1", prompt: "nope", options: [{ id: "a", label: "Alpha" }] }],
+  });
+  void again.answer.then(() => { resolvedAgain = true; });
+  retargetLiveCursorAsksForRun("rRetarget");
+  await new Promise((r) => setTimeout(r, 20));
+  expect(resolvedAgain).toBe(false);
+  expect(again.id).toBe(live.id);
+  expect(again.req.delivery).toBe("restart-followup");
+  expect(published.filter((row) => row.reason === "update")).toEqual([
+    { id: live.id, delivery: "restart-followup", followupCause: "child-exit", reason: "update" },
+  ]);
+  answerCursorAsk(again.id, { outcome: "cancelled" });
+  answerCursorAsk(olderRun.id, { outcome: "cancelled" });
+  answerCursorAsk(already.id, { outcome: "cancelled" });
+});
+
+test("a scraper ask card still has no awaiter", async () => {
+  const { registerScrapedAskQuestions, answerCursorAsk } = await import("./interactions.ts");
+  const req = registerScrapedAskQuestions({
+    taskId: "tScraperStill",
+    runId: "rScraperStill",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp-scraper-still",
+  });
+  expect(req.source).toBe("scraper");
+  expect(answerCursorAsk(req.id, { outcome: "skipped" })).toBe(false);
+});
+
 test("registerTmuxPrompt accepts a single-letter confirmKey regardless of case", async () => {
   const { registerTmuxPrompt } = await import("./interactions.ts");
   expect(() => registerTmuxPrompt({

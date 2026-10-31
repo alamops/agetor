@@ -97,6 +97,7 @@ import type {
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
+import { parseReplayMeta } from "../../shared/task-stream-resume.ts";
 import type { NotificationKind } from "../../shared/os-notification.ts";
 import type {
   BundleExportResponse,
@@ -234,20 +235,27 @@ export interface HarnessModelMap {
   byHarness: Record<string, { id: string; label?: string; efforts?: string[]; fast?: boolean; ultrafast?: boolean }[]>;
 }
 
-/** Pending multi-question card from claude's built-in AskUserQuestion tool
- *  (scraper-sourced). */
+/** Pending multi-question card. Claude's scraper cards omit the Cursor
+ *  fields; a Cursor `cursor/ask_question` card sets `source: "cursor"`. */
 export interface PendingAskQuestions {
   kind: "ask_questions";
   id: string;
   taskId: string;
   runId: string;
   questions: Array<{
+    id?: string;
     question: string;
     header?: string;
     multiSelect?: boolean;
-    options: Array<{ label: string; description?: string; preview?: string }>;
+    options: Array<{ id?: string; label: string; description?: string; preview?: string }>;
   }>;
   createdAt: number;
+  source?: "scraper" | "cursor";
+  title?: string;
+  toolCallId?: string;
+  delivery?: "live" | "restart-followup";
+  /** Why a follow-up card is no longer live. Absent means a restart. */
+  followupCause?: "restart" | "child-exit";
 }
 
 /** Modal the tmux pane scraper detected — typically a plan-mode safety
@@ -2039,7 +2047,9 @@ export const api = {
    *  present alongside `ok: false`, and only for that free-text path — see
    *  `/ask-questions/:id/answer` in server.ts. A request for a card that
    *  another request is still answering is refused 409 (thrown as `ApiError`). */
-  answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>
+  skipAskQuestions: (id: string) =>
+    j<{ ok: boolean; error?: string }>(`/ask-questions/${id}/answer`, { method: "POST", body: JSON.stringify({ skip: true }) }),
+  answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }> }) =>
     j<{
       ok: boolean;
       withheld?: boolean;
@@ -2202,7 +2212,14 @@ export const api = {
    *  (drives the run panel's "Load earlier" button). It's a *named* SSE
    *  event (`event: replay_meta`), invisible to `onmessage`, so registering
    *  the listener only when a caller asks for it costs nothing for callers
-   *  that don't care. */
+   *  that don't care.
+   *
+   *  The meta also tells how the server answered a reconnect: `resumedAfter`
+   *  is the event id the replay continued after (only newer rows follow), and
+   *  `snapshotRequired` means the server could not resume (a gap, or too much
+   *  to send) and sent a fresh bounded window the caller must reset to.
+   *  `openEventStream` remembers the last SSE id and sends it as
+   *  `Last-Event-ID` on every reconnect, so resumption needs no caller code. */
   subscribeTask(
     taskId: string,
     onEvent: (e: RunEvent) => void,
@@ -2223,9 +2240,9 @@ export const api = {
         events: onReplayMeta
           ? {
               [TASK_EVENTS_REPLAY_META_EVENT]: (data) => {
-                try {
-                  onReplayMeta(JSON.parse(data) as TaskEventsReplayMeta);
-                } catch { /* ignore malformed */ }
+                // Tolerant shape check: a malformed meta is dropped, never cast.
+                const meta = parseReplayMeta(data);
+                if (meta) onReplayMeta(meta);
               },
             }
           : undefined,

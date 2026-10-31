@@ -359,3 +359,126 @@ test("cancel mid-spawn: Stop during the pending window is honored once the spawn
     delete process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS;
   }
 });
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 9 — Force-archive while the spawn is in flight but not yet registered.
+ *     `archiveTask` only stops a run that is already in `active`, so this
+ *     window used to leave the card on `running` with a cancelled run and
+ *     no handle. Unarchive then showed Stop for a process that was gone.
+ *     Cursor's follow-up handshake is covered in orchestrator-cursor.test.ts.
+ *     These two are the other copies: the first-turn continuation and a
+ *     Claude resume.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("force-archive during the first-turn spawn settles the task to ready", async () => {
+  process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS = String(SLOW_SPAWN_DELAY_MS);
+  try {
+    const { startTask, archiveTask, unarchiveTask, isAnyRunOfTaskLive, subscribeGlobal } = await import("./orchestrator.ts");
+    const { tasks, runs } = await import("./db.ts");
+
+    const taskId = await makeTask("archive-mid-first-spawn");
+    const res = await startTask(taskId);
+    expect("error" in res).toBe(false);
+    if ("error" in res) return;
+    expect(res.pending).toBe(true);
+    const runId = res.runId;
+    expect(runs.get(runId)?.status).toBe("running");
+    expect(tasks.get(taskId)?.column).toBe("running");
+
+    let sawCancelled = false;
+    let sawReady = false;
+    const unsub = subscribeGlobal((event) => {
+      if (!("taskId" in event) || event.taskId !== taskId) return;
+      if (event.kind === "run-status" && event.runId === runId && event.status === "cancelled") sawCancelled = true;
+      if (event.kind === "column" && event.column === "ready") sawReady = true;
+    });
+    try {
+      const archived = await archiveTask(taskId, { force: true });
+      expect("error" in archived).toBe(false);
+      // Archive itself does not move the column, and the child is not
+      // registered, so nothing else will until the continuation settles.
+      expect(tasks.get(taskId)?.column).toBe("running");
+      expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+
+      await waitFor(() => runs.get(runId)?.status === "cancelled", SLOW_SPAWN_DELAY_MS + 3000);
+      expect(tasks.get(taskId)?.column).toBe("ready");
+      expect(tasks.get(taskId)?.runId).toBe(runId);
+      expect(
+        runs.events(runId).some((event) => event.stream === "status" && event.data === "task archived before the agent launched"),
+      ).toBe(true);
+      expect(sawCancelled).toBe(true);
+      expect(sawReady).toBe(true);
+      expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+
+      const restored = await unarchiveTask(taskId);
+      expect("error" in restored).toBe(false);
+      expect(tasks.get(taskId)?.archivedAt).toBeNull();
+      expect(tasks.get(taskId)?.column).toBe("ready");
+      expect(runs.get(runId)?.status).toBe("cancelled");
+      expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+    } finally {
+      unsub();
+    }
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS;
+  }
+});
+
+test("force-archive during a Claude resume spawn settles the task to ready", async () => {
+  delete process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS;
+  const { startTask, sendInput, archiveTask, unarchiveTask, isAnyRunOfTaskLive, subscribeGlobal } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await makeTask("archive-mid-resume-spawn");
+  const started = await startTask(taskId);
+  expect("error" in started).toBe(false);
+  if ("error" in started) return;
+  await waitFor(() => tasks.get(taskId)?.column === "review");
+
+  process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS = String(SLOW_SPAWN_DELAY_MS);
+  try {
+    const sent = await sendInput(started.runId, "resume while the spawn is still in flight");
+    expect(sent.delivered).toBe(true);
+    if (!sent.delivered) return;
+    expect(sent.pending).toBe(true);
+    const runId = sent.runId;
+    expect(runId).not.toBe(started.runId);
+    expect(runs.get(runId)?.status).toBe("running");
+    expect(tasks.get(taskId)?.column).toBe("running");
+
+    let sawCancelled = false;
+    let sawReady = false;
+    const unsub = subscribeGlobal((event) => {
+      if (!("taskId" in event) || event.taskId !== taskId) return;
+      if (event.kind === "run-status" && event.runId === runId && event.status === "cancelled") sawCancelled = true;
+      if (event.kind === "column" && event.column === "ready") sawReady = true;
+    });
+    try {
+      const archived = await archiveTask(taskId, { force: true });
+      expect("error" in archived).toBe(false);
+      expect(tasks.get(taskId)?.column).toBe("running");
+      expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+
+      await waitFor(() => runs.get(runId)?.status === "cancelled", SLOW_SPAWN_DELAY_MS + 3000);
+      expect(tasks.get(taskId)?.column).toBe("ready");
+      expect(tasks.get(taskId)?.runId).toBe(runId);
+      expect(
+        runs.events(runId).some((event) => event.stream === "status" && event.data === "task archived before the agent launched"),
+      ).toBe(true);
+      expect(sawCancelled).toBe(true);
+      expect(sawReady).toBe(true);
+      expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+
+      const restored = await unarchiveTask(taskId);
+      expect("error" in restored).toBe(false);
+      expect(tasks.get(taskId)?.archivedAt).toBeNull();
+      expect(tasks.get(taskId)?.column).toBe("ready");
+      expect(runs.get(runId)?.status).toBe("cancelled");
+      expect(isAnyRunOfTaskLive(taskId)).toBe(false);
+    } finally {
+      unsub();
+    }
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_SPAWN_DELAY_MS;
+  }
+});

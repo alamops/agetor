@@ -1,11 +1,14 @@
 import { useEffect, useState } from "react";
 import { Box, Text, useInput } from "ink";
-import type { AgetorClient } from "../api-client.ts";
+import { ApiError, type AgetorClient } from "../api-client.ts";
 import type { AnyRequest } from "../../bun/interactions.ts";
 import { buildAskAnswer } from "../answer-logic.ts";
+import { CURSOR_ASK_FREEFORM } from "../../shared/cursor-ask-verdict.ts";
+import { cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues } from "../../shared/cursor-ask.ts";
 import { sanitizeDrop } from "./paste.ts";
 
 const OTHER = "✎ Other — type a custom answer";
+const SKIP = "Skip";
 
 /**
  * Answer a task's pending interaction inline — the in-dashboard equivalent of
@@ -35,7 +38,7 @@ export function AnswerOverlay({
   const [qIndex, setQIndex] = useState(0);
   const [cursor, setCursor] = useState(0);
   const [toggled, setToggled] = useState<Set<number>>(new Set());
-  const [answers, setAnswers] = useState<Array<{ selected: string[]; custom?: string }>>([]);
+  const [answers, setAnswers] = useState<Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }>>([]);
   // null = picking options; a string = typing a custom answer for this question.
   const [custom, setCustom] = useState<string | null>(null);
   const [hint, setHint] = useState("");
@@ -70,7 +73,24 @@ export function AnswerOverlay({
     if (!req || req.kind !== "ask_questions") return true;
     const entry = buildAskAnswer(selected, customText);
     if (!entry) return false;
-    const next = [...answers, entry];
+    const question = req.questions[qIndex];
+    let posted: { selected: string[]; selectedOptionIds?: string[]; custom?: string } = entry;
+    if (req.source === "cursor" && question) {
+      const mapped = cursorAskPicksFromValues(question.options, entry.selected);
+      posted = entry.custom ? { ...mapped, custom: entry.custom } : mapped;
+    }
+    if (
+      req.source === "cursor"
+      && CURSOR_ASK_FREEFORM === "unsupported"
+      && entry.custom
+    ) {
+      // Options plus typed text (multi-select Other) must not submit: Cursor
+      // would receive only the options, and the overlay would say answered.
+      setHint("Cursor cannot accept a custom answer — pick an option");
+      setCustom(null);
+      return false;
+    }
+    const next = [...answers, posted];
     if (qIndex + 1 < req.questions.length) {
       setAnswers(next);
       setQIndex((i) => i + 1);
@@ -83,7 +103,17 @@ export function AnswerOverlay({
       client
         .answerAskQuestions(req.id, next)
         .then((r) => onDone(r.ok ? "✓ answered" : "answer failed"))
-        .catch((e) => onDone(`! ${(e as Error).message}`));
+        .catch((e) => {
+          // A 400 leaves the card pending. Closing the overlay here stranded
+          // the question with no way to pick an option except reopening.
+          if (e instanceof ApiError && e.status === 400) {
+            setSubmitting(false);
+            setCustom(null);
+            setHint(e.message || "Cursor cannot accept a custom answer — pick an option");
+            return;
+          }
+          onDone(`! ${(e as Error).message}`);
+        });
     }
     return true;
   };
@@ -103,7 +133,7 @@ export function AnswerOverlay({
           if (!text) return setCustom(null);
           const q = req.kind === "ask_questions" ? req.questions[qIndex] : undefined;
           const selected = q?.multiSelect
-            ? [...toggled].filter((i) => i < q.options.length).map((i) => q.options[i]!.label)
+            ? [...toggled].filter((i) => i < q.options.length).map((i) => optionPickValue(req, q.options[i]!))
             : [];
           commitAnswer(selected, text);
           return;
@@ -131,6 +161,24 @@ export function AnswerOverlay({
       if (req.kind === "ask_questions") {
         const q = req.questions[qIndex]!;
         const otherIndex = q.options.length; // the appended "✎ Other" row
+        const skipIndex = req.source === "cursor" ? otherIndex + 1 : -1;
+        if (skipIndex >= 0 && cursor === skipIndex && (key.return || input === " ")) {
+          setSubmitting(true);
+          client
+            .answerAskQuestions(req.id, { skip: true })
+            .then((r) => onDone(r.ok ? "✓ skipped" : "answer failed"))
+            .catch((e) => {
+              // A 400 leaves the card pending. Closing here stranded Skip
+              // the same way a refused submit used to.
+              if (e instanceof ApiError && e.status === 400) {
+                setSubmitting(false);
+                setHint(e.message || "could not skip");
+                return;
+              }
+              onDone(`! ${(e as Error).message}`);
+            });
+          return;
+        }
         if (q.multiSelect && input === " ") {
           setHint("");
           return setToggled((s) => {
@@ -143,14 +191,14 @@ export function AnswerOverlay({
         if (key.return) {
           if (q.multiSelect) {
             if (toggled.has(otherIndex)) return setCustom(""); // collect free text, then submit
-            const selected = [...toggled].map((i) => q.options[i]!.label);
+            const selected = [...toggled].filter((i) => i < q.options.length).map((i) => optionPickValue(req, q.options[i]!));
             if (!commitAnswer(selected, null)) setHint("pick an option or ✎ Other to answer");
             return;
           }
           if (cursor === otherIndex) return setCustom(""); // single-select "Other"
           const pick = q.options[cursor];
           if (!pick) return;
-          commitAnswer([pick.label], null);
+          commitAnswer([optionPickValue(req, pick)], null);
           return;
         }
         return;
@@ -193,6 +241,9 @@ export function AnswerOverlay({
   const width = (process.stdout.columns || 80) - 6;
   return (
     <Box flexDirection="column">
+      {req.kind === "ask_questions" && req.title ? (
+        <Text bold wrap="truncate-end">{req.title}</Text>
+      ) : null}
       <Text bold color="yellow">
         {req.kind === "ask_questions"
           ? `Question ${qIndex + 1}/${req.questions.length}`
@@ -239,10 +290,20 @@ export function AnswerOverlay({
   );
 }
 
+function optionPickValue(req: AnyRequest, option: { id?: string; label: string }): string {
+  return req.kind === "ask_questions" && req.source === "cursor" ? cursorAskOptionValue(option) : option.label;
+}
+
 function optionLabels(req: AnyRequest | null, qIndex: number): string[] {
   if (!req) return [];
   if (req.kind === "ask_questions") {
-    return [...(req.questions[qIndex]?.options.map((o) => o.label) ?? []), OTHER];
+    const options = req.questions[qIndex]?.options ?? [];
+    const labels = [
+      ...options.map((option) => req.source === "cursor" ? cursorAskOptionChoiceLabel(option, options) : option.label),
+      OTHER,
+    ];
+    if (req.source === "cursor") labels.push(SKIP);
+    return labels;
   }
   if (req.kind === "fx_permission") {
     return [...req.options.map((o) => o.name), "Dismiss (reject)"];

@@ -6,6 +6,12 @@ import { usageError } from "../usage.ts";
 import { notifyFor, osNotify } from "../notify.ts";
 import type { AgetorClient } from "../api-client.ts";
 import { escapeFreeText } from "../../shared/terminal-text.ts";
+import {
+  LOGS_STREAM_GAP_NOTICE,
+  classifyReplayMeta,
+  createIdHighWater,
+  parseReplayMeta,
+} from "../../shared/task-stream-resume.ts";
 import type { RunEvent, GlobalEvent, Task } from "../../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel, retentionTrimNote } from "../../shared/types.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
@@ -22,6 +28,7 @@ import {
   sentFilesSummaryLine,
   type SentFilesRequest,
 } from "../../shared/sent-files.ts";
+import { cursorAskFromToolUse, cursorAskPlainLines } from "../../shared/cursor-ask.ts";
 
 /** The `trimmed by retention (original …)` note for a `tool_result` payload's
  *  `retention` marker (`trimToolResultData` writes it as the payload's first
@@ -103,7 +110,12 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
       if (quiet) clearTimeout(quiet);
       resolve();
     };
+    // Never reset: a reconnect re-delivers the tail of the window (or a whole
+    // fresh snapshot), and nothing older than a row already printed may print
+    // again — in human and `--json` output alike (P7).
+    const printed = createIdHighWater();
     const onEvent = (e: RunEvent) => {
+      if (!printed.accept(e.id)) return;
       const line = renderLine(e);
       if (line !== null) out(line);
       if (noFollow) {
@@ -116,6 +128,14 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
       dataDir: flags.dataDir,
       onReconnect: () => {
         if (!flags.json && !noFollow) errln(c.dim("…reconnecting"));
+      },
+      // A snapshot meta means the server couldn't replay the gap; the rows that
+      // follow are the latest window, of which the high-water mark drops what
+      // was already printed. Stderr, so `--json` stdout stays clean.
+      onNamedEvent: (event, data) => {
+        if (event !== "replay_meta") return;
+        const meta = parseReplayMeta(data);
+        if (meta && classifyReplayMeta(meta) === "snapshot") errln(c.dim(LOGS_STREAM_GAP_NOTICE));
       },
     });
     // --notify (only while following): a desktop notification + bell when this
@@ -185,7 +205,7 @@ function shouldSkipEvent(e: RunEvent): boolean {
  * the pre-existing `shouldSkipEvent` skip + `formatEvent` render, unchanged.
  */
 function createLineRenderer(
-  formatEvent: (e: RunEvent) => string,
+  formatEvent: (e: RunEvent) => string | null,
   json: boolean,
 ): (e: RunEvent) => string | null {
   return (e: RunEvent): string | null => {
@@ -210,7 +230,9 @@ function createLineRenderer(
  * one map safely covers whichever branch runs, and a fresh map per call
  * means no state leaks between unrelated invocations (or test cases).
  */
-function createEventFormatter(opts: { handoffDigest?: boolean } = {}): (e: RunEvent) => string {
+function createEventFormatter(
+  opts: { handoffDigest?: boolean } = {},
+): (e: RunEvent) => string | null {
   // `handoffDigest` is on for hidden pipeline STEP tasks only
   // (`task.pipelineParentId != null`, formatted-handoff K10/D19): their
   // assistant text ends in a `<handoff>` JSON block, which prints as a
@@ -219,8 +241,12 @@ function createEventFormatter(opts: { handoffDigest?: boolean } = {}): (e: RunEv
   // prints exactly what it always did.
   const handoffDigest = opts.handoffDigest === true;
   const pendingSentFiles = new Map<string, SentFilesRequest>();
+  /** Last line printed for a tool id. A later `tool_use` with the same id
+   *  is a grown payload. Reprint it when the line changed (an ask body
+   *  that arrived after a partial). An identical name line stays quiet. */
+  const printedToolLines = new Map<string, string>();
 
-  return function formatEvent(e: RunEvent): string {
+  return function formatEvent(e: RunEvent): string | null {
     switch (e.stream) {
       // `userMessageLines` (src/shared/user-message.ts) is the single source
       // of truth for rendering a raw user-turn string across all three
@@ -273,14 +299,22 @@ function createEventFormatter(opts: { handoffDigest?: boolean } = {}): (e: RunEv
         return e.data;
       case "tool_use": {
         const t = tryJson(e.data) as { id?: string; name?: string; input?: unknown } | null;
-        if (t?.id && t.name) {
-          const req = parseSentFilesToolUse(t.name, t.input);
-          if (req) {
-            pendingSentFiles.set(t.id, req);
-            return c.magenta(`📎 ${sentFilesSummaryLine(req, null)}`);
-          }
+        let line: string;
+        const sent = t?.id && t.name ? parseSentFilesToolUse(t.name, t.input) : null;
+        if (sent && t?.id) {
+          pendingSentFiles.set(t.id, sent);
+          line = c.magenta(`📎 ${sentFilesSummaryLine(sent, null)}`);
+        } else {
+          const ask = cursorAskFromToolUse(t);
+          line = ask
+            ? cursorAskPlainLines(ask).map((row) => c.magenta(row)).join("\n")
+            : c.magenta(`▸ ${t?.name ?? "tool"}`);
         }
-        return c.magenta(`▸ ${t?.name ?? "tool"}`);
+        if (typeof t?.id === "string" && t.id.length > 0) {
+          if (printedToolLines.get(t.id) === line) return null;
+          printedToolLines.set(t.id, line);
+        }
+        return line;
       }
       case "tool_result": {
         const t = tryJson(e.data) as

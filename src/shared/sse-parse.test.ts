@@ -67,9 +67,9 @@ describe("createSseParser", () => {
     ]);
   });
 
-  test("a block without data is not dispatched", () => {
+  test("a block without data, id or retry is not dispatched", () => {
     expect(parse("event: lonely\n\n")).toEqual([]);
-    expect(parse("id: 7\n\n")).toEqual([]);
+    expect(parse("foo: bar\n\n")).toEqual([]);
     expect(parse("\n\n\n")).toEqual([]);
   });
 
@@ -79,10 +79,63 @@ describe("createSseParser", () => {
     ]);
   });
 
-  test("id and unknown fields are ignored", () => {
-    expect(parse("id: 42\nfoo: bar\ndata: x\n\n")).toEqual([
+  test("unknown fields are ignored", () => {
+    expect(parse("foo: bar\ndata: x\n\n")).toEqual([
       { event: "message", data: "x" },
     ]);
+  });
+
+  test("id rides on the frame of its block", () => {
+    expect(parse("id: 42\nfoo: bar\ndata: x\n\n")).toEqual([
+      { event: "message", data: "x", id: "42" },
+    ]);
+    expect(parse("event: task\nid:7\ndata: y\n\n")).toEqual([
+      { event: "task", data: "y", id: "7" },
+    ]);
+  });
+
+  test("an id-only block yields a control frame", () => {
+    expect(parse("id: 7\n\n")).toEqual([{ event: "", data: "", id: "7" }]);
+  });
+
+  test("an id is not carried over to a later block", () => {
+    expect(parse("id: 7\ndata: a\n\ndata: b\n\n")).toEqual([
+      { event: "message", data: "a", id: "7" },
+      { event: "message", data: "b" },
+    ]);
+  });
+
+  test("an id containing NUL is ignored", () => {
+    expect(parse("id: 1\u00002\ndata: x\n\n")).toEqual([
+      { event: "message", data: "x" },
+    ]);
+    expect(parse("id: 1\u00002\n\n")).toEqual([]);
+  });
+
+  test("an empty id value is reported as an empty string", () => {
+    expect(parse("id:\ndata: x\n\n")).toEqual([{ event: "message", data: "x", id: "" }]);
+    expect(parse("id\n\n")).toEqual([{ event: "", data: "", id: "" }]);
+  });
+
+  test("id and retry together", () => {
+    expect(parse("id: 9\nretry: 500\ndata: x\n\n")).toEqual([
+      { event: "message", data: "x", id: "9", retry: 500 },
+    ]);
+    expect(parse("retry: 500\nid: 9\n\n")).toEqual([
+      { event: "", data: "", id: "9", retry: 500 },
+    ]);
+  });
+
+  test("a chunk split inside an id line still parses it", () => {
+    const p = createSseParser();
+    expect(p.push("id: 12")).toEqual([]);
+    expect(p.push("34\ndata: x\n")).toEqual([]);
+    expect(p.push("\n")).toEqual([{ event: "message", data: "x", id: "1234" }]);
+    const text = "id: 5\ndata: z\n\n";
+    const q = createSseParser();
+    const got: SseFrame[] = [];
+    for (const ch of text) got.push(...q.push(ch));
+    expect(got).toEqual([{ event: "message", data: "z", id: "5" }]);
   });
 
   test("retry rides on the frame of its block", () => {

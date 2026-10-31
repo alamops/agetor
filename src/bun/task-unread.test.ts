@@ -132,7 +132,7 @@ test("appendEvent returns the inserted event id, and null when a duplicate (run_
   try {
     const runId = makeRun(taskId);
 
-    const firstId = runs.appendEvent(runId, "assistant", "hello", "line-1");
+    const firstId = runs.appendEvent(runId, "assistant", "hello", "line-1")?.id;
     expect(typeof firstId).toBe("number");
     expect(firstId).not.toBeNull();
 
@@ -142,12 +142,12 @@ test("appendEvent returns the inserted event id, and null when a duplicate (run_
 
     // A distinct line_uuid on the same run still inserts normally, with a
     // strictly greater id.
-    const secondId = runs.appendEvent(runId, "assistant", "again", "line-2");
+    const secondId = runs.appendEvent(runId, "assistant", "again", "line-2")?.id;
     expect(secondId).not.toBeNull();
     expect(secondId as number).toBeGreaterThan(firstId as number);
 
     // No line_uuid at all (e.g. a status/stderr chunk) always inserts.
-    const thirdId = runs.appendEvent(runId, "status", "turn complete");
+    const thirdId = runs.appendEvent(runId, "status", "turn complete")?.id;
     expect(thirdId).not.toBeNull();
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);

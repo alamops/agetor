@@ -83,8 +83,9 @@ export interface RoutePolicy {
   /**
    * The route is registered only under a feature flag, so the "entry without a
    * route" startup check skips it. Today that is the test-only
-   * `/test/block-event-loop` (`AGETOR_TEST_BLOCK_ROUTE=1`). When the route IS
-   * registered it is classified like any other.
+   * `/test/block-event-loop` (`AGETOR_TEST_BLOCK_ROUTE=1`) and
+   * `/test/drop-task-streams` (`AGETOR_TEST_DROP_STREAMS_ROUTE=1`). When the
+   * route IS registered it is classified like any other.
    */
   conditional?: true;
 }
@@ -273,6 +274,7 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/db/compact": { POST: CLI },
   "/db/retention/run": { POST: CLI },
   "/test/block-event-loop": { POST: app({ conditional: true }) },
+  "/test/drop-task-streams": { POST: app({ conditional: true }) },
   "/info": { GET: CLI },
   "/window/toggle-zoom": { POST: APP },
   "/window/focus": { POST: app({ headless501: true }) },

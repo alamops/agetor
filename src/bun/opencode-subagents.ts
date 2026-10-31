@@ -1,4 +1,4 @@
-import { runs, subagents } from "./db.ts";
+import { runs, subagents, type AppendedEvent } from "./db.ts";
 import type { OpencodeServerMode, RunEvent, RunEventStream, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
 import type { OpencodeSubagentNotice } from "./opencode-tmux.ts";
 import { exportOutcome, exportToEvents, runOpencodeExport, type OpencodeExport } from "./opencode-export.ts";
@@ -147,7 +147,7 @@ function runIdFor(row: Subagent): string | null {
 }
 
 function append(row: Subagent, runId: string, stream: RunEventStream, data: string, lineUuid: string, subagentId: string | null): void {
-  let inserted: number | null;
+  let inserted: AppendedEvent | null;
   try {
     inserted = runs.appendEvent(runId, stream, data, lineUuid, subagentId);
   } catch (e) {
@@ -156,7 +156,7 @@ function append(row: Subagent, runId: string, stream: RunEventStream, data: stri
   }
   if (inserted === null) return; // already persisted (re-check of an orphaned row)
   try {
-    emitFn?.({ runId, taskId: row.taskId, stream, data, ts: Date.now(), subagentId });
+    emitFn?.({ id: inserted.id, runId, taskId: row.taskId, stream, data, ts: inserted.ts, subagentId });
   } catch (e) {
     console.error("[opencode-subagents] emit failed:", e);
   }

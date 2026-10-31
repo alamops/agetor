@@ -520,9 +520,7 @@ test("hold: a succeeded run with a running monitor row keeps the task in running
   // Capture live-broadcast status events the same way
   // "createTask + startTask runs to completion and emits stdout" does —
   // the hold breadcrumb (orchestrator.ts, the `holdForSubagents` branch) is
-  // only ever `emit()`-ed for SSE fan-out, never `runs.appendEvent`-persisted,
-  // so it must be caught in flight via `subscribe`, not read back from
-  // `runs.eventsForTask`.
+  // both sent live and persisted on the held run (checked below).
   const statuses: string[] = [];
   const unsub = subscribe((e) => {
     if (e.stream === "status") statuses.push(e.data);
@@ -542,6 +540,8 @@ test("hold: a succeeded run with a running monitor row keeps the task in running
 
   // Pinned UI-facing copy — assert on it verbatim, don't paraphrase it.
   expect(statuses).toContain("background agents still running (1) — holding in running");
+  // ...and saved on the held run, so a resumed stream replays it.
+  expect(runs.events(runId).some((e) => e.stream === "status" && e.data === "background agents still running (1) — holding in running")).toBe(true);
 });
 
 test("release: settleSubagentById(id, \"completed\", \"receipt\") on a monitor row releases the task to review", async () => {

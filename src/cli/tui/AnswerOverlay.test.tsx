@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { render } from "ink-testing-library";
 import { AnswerOverlay } from "./AnswerOverlay.tsx";
-import type { AgetorClient } from "../api-client.ts";
+import { ApiError, type AgetorClient } from "../api-client.ts";
 import type { AnyRequest } from "../../bun/interactions.ts";
 
 const wait = (ms = 40) => new Promise((r) => setTimeout(r, ms));
@@ -52,6 +52,32 @@ test("single-select: down then Enter submits the highlighted option", async () =
   expect(done).toBe("✓ answered");
 });
 
+test("cursor duplicate labels submit the second option's id", async () => {
+  let captured: unknown = null;
+  const req = {
+    kind: "ask_questions", id: "q-dup", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "cursor",
+    questions: [{
+      question: "Which Alpha?",
+      options: [{ id: "a", label: "Alpha" }, { id: "a2", label: "Alpha" }],
+    }],
+  } as unknown as AnyRequest;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(ui.lastFrame() ?? "").toContain("Alpha (a2)");
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({
+    id: "q-dup",
+    answers: [{ selected: ["Alpha"], selectedOptionIds: ["a2"] }],
+  });
+  ui.unmount();
+});
+
 // Cross-agent contract (b): a pipeline parent's pending list aggregates its
 // hidden step tasks' cards — the overlay names the step task the card
 // belongs to when it isn't the task `g` was pressed on.
@@ -65,6 +91,21 @@ test("a card whose taskId differs from the overlay's taskId (a pipeline step's c
   );
   await wait();
   expect(lastFrame()).toContain("↳ on step task step-tas");
+});
+
+test("a cursor card shows args.title above the question", async () => {
+  const req = {
+    kind: "ask_questions", id: "q1", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "cursor", title: "Pick one",
+    questions: [{ question: "Which option?", options: [{ label: "Alpha" }] }],
+  } as unknown as AnyRequest;
+  const { lastFrame } = render(
+    <AnswerOverlay client={fakeClient(req, () => {})} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Pick one");
+  expect(frame.indexOf("Pick one")).toBeLessThan(frame.indexOf("Which option?"));
 });
 
 test("a card on the overlay's own task carries no step-task note", async () => {
@@ -367,4 +408,164 @@ test("fx_permission: zero options (defensive) renders only Dismiss, and arrow ke
   await wait();
   expect(lastFrame() ?? "").toContain("Dismiss (reject)");
   unmount();
+});
+
+test("cursor ask: Skip posts { skip: true } and a claude card has no Skip row", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const cursorReq = {
+    kind: "ask_questions", id: "q-cursor", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "cursor",
+    questions: [{ question: "Which option?", options: [{ label: "Alpha" }, { label: "Beta" }] }],
+  } as unknown as AnyRequest;
+  const cursorUi = render(
+    <AnswerOverlay client={fakeClient(cursorReq, (a) => { captured = a; })} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(cursorUi.lastFrame() ?? "").toContain("Skip");
+  cursorUi.stdin.write(DOWN);
+  await wait();
+  cursorUi.stdin.write(DOWN);
+  await wait();
+  cursorUi.stdin.write(DOWN);
+  await wait();
+  cursorUi.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "q-cursor", answers: { skip: true } });
+  expect(done).toBe("✓ skipped");
+  cursorUi.unmount();
+
+  const claudeReq = {
+    kind: "ask_questions", id: "q-claude", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "scraper",
+    questions: [{ question: "Pick", options: [{ label: "A" }] }],
+  } as unknown as AnyRequest;
+  const claudeUi = render(
+    <AnswerOverlay client={fakeClient(claudeReq, () => {})} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(claudeUi.lastFrame() ?? "").not.toContain("Skip");
+  claudeUi.unmount();
+});
+
+test("cursor multi-select custom text stays on the card", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const req = {
+    kind: "ask_questions", id: "q-multi-custom", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "cursor",
+    questions: [{ question: "Which?", multiSelect: true, options: [{ label: "Alpha" }, { label: "Beta" }] }],
+  } as unknown as AnyRequest;
+  const { stdin, lastFrame } = render(
+    <AnswerOverlay
+      client={fakeClient(req, (a) => { captured = a; })}
+      taskId="t1"
+      onDone={(m) => { done = m; }}
+      onCancel={() => {}}
+    />,
+  );
+  await wait();
+  stdin.write(SPACE); // toggle Alpha
+  await wait();
+  stdin.write(DOWN);
+  await wait();
+  stdin.write(DOWN); // Other
+  await wait();
+  stdin.write(SPACE); // toggle Other
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  stdin.write("typed");
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  expect(captured).toBeNull();
+  expect(done).toBe("");
+  expect(lastFrame() ?? "").toContain("Cursor cannot accept a custom answer");
+  expect(lastFrame() ?? "").toContain("Which?");
+});
+
+test("cursor custom-only stays on the card", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const req = {
+    kind: "ask_questions", id: "q-custom", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "cursor",
+    questions: [{ question: "Which?", options: [{ label: "Alpha" }, { label: "Beta" }] }],
+  } as unknown as AnyRequest;
+  const { stdin, lastFrame } = render(
+    <AnswerOverlay
+      client={fakeClient(req, (a) => { captured = a; })}
+      taskId="t1"
+      onDone={(m) => { done = m; }}
+      onCancel={() => {}}
+    />,
+  );
+  await wait();
+  stdin.write(DOWN);
+  await wait();
+  stdin.write(DOWN); // Other
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  stdin.write("typed");
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  expect(captured).toBeNull();
+  expect(done).toBe("");
+  expect(lastFrame() ?? "").toContain("Cursor cannot accept a custom answer");
+  expect(lastFrame() ?? "").toContain("Which?");
+});
+
+test("cursor skip: a 400 leaves the overlay open", async () => {
+  let done = "";
+  const req = {
+    kind: "ask_questions", id: "q-skip-400", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "cursor",
+    questions: [{ question: "Which?", options: [{ label: "Alpha" }] }],
+  } as unknown as AnyRequest;
+  const client = {
+    pendingInteractions: async () => [req],
+    answerAskQuestions: async () => {
+      throw new ApiError(400, { error: "run not found" }, "run not found");
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame } = render(
+    <AnswerOverlay client={client} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(DOWN); // Other
+  await wait();
+  stdin.write(DOWN); // Skip
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  expect(done).toBe("");
+  expect(lastFrame() ?? "").toContain("run not found");
+  expect(lastFrame() ?? "").toContain("Which?");
+});
+
+test("a cursor 400 leaves the overlay open", async () => {
+  let done = "";
+  const req = {
+    kind: "ask_questions", id: "q-400", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "cursor",
+    questions: [{ question: "Which?", options: [{ label: "Alpha" }] }],
+  } as unknown as AnyRequest;
+  const client = {
+    pendingInteractions: async () => [req],
+    answerAskQuestions: async () => {
+      throw new ApiError(400, { error: "Cursor cannot accept a custom answer — pick an option" }, "Cursor cannot accept a custom answer — pick an option");
+    },
+  } as unknown as AgetorClient;
+  const { stdin, lastFrame } = render(
+    <AnswerOverlay client={client} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(ENTER); // Alpha
+  await wait();
+  expect(done).toBe("");
+  expect(lastFrame() ?? "").toContain("Cursor cannot accept a custom answer");
+  expect(lastFrame() ?? "").toContain("Which?");
 });
