@@ -4940,7 +4940,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
   // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
-  // unambiguous: every other return path below yields `newRunId`.
+  // unambiguous: other paths return a run id or a decline reason.
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
@@ -4996,7 +4996,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       return newRunId;
     }
 
-    const { agent } = await spawnAgentOrFail({
+    const { agent, message } = await spawnAgentOrFail({
       taskId,
       runId: newRunId,
       harness,
@@ -5025,7 +5025,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
       // follow-ups resurface out of order on a later turn.
       pendingCancelRunIds.delete(newRunId); // an adopted Stop has nothing left to cancel
       cursorTurnQueue.delete(taskId);
-      return newRunId;
+      return { declined: message };
     }
     if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) {
       // Stop landed while the spawn was in flight (see `pendingCancelRunIds`):

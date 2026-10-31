@@ -113,6 +113,25 @@ test("cursor submit maps the label to the option id", async () => {
   expect(await pending).toEqual({ outcome: "answered", answers: [{ questionId: "q1", selectedOptionIds: ["b"] }] });
 });
 
+test("cursor rejects a partially answered card and leaves it pending", async () => {
+  const { __testing, registerCursorAskQuestions, listPendingForTask, answerCursorAsk } = await import("./interactions.ts");
+  __testing.reset();
+  const registered = registerCursorAskQuestions({
+    taskId: "t-partial", runId: "run-partial", toolCallId: "call-partial", delivery: "live",
+    questions: [
+      { id: "q1", prompt: "First?", options: [{ id: "a", label: "Alpha" }] },
+      { id: "q2", prompt: "Second?", options: [{ id: "b", label: "Beta" }] },
+    ],
+  });
+  const res = await fetch(url(`/ask-questions/${registered.id}/answer`), {
+    method: "POST", headers: authHeaders(),
+    body: JSON.stringify({ answers: [{ selected: ["Alpha"] }, { selected: [] }] }),
+  });
+  expect(res.status).toBe(400);
+  expect(listPendingForTask("t-partial")).toHaveLength(1);
+  answerCursorAsk(registered.id, { outcome: "cancelled" });
+});
+
 test("cursor skip posts { skip: true }", async () => {
   const { __testing, registerCursorAskQuestions } = await import("./interactions.ts");
   __testing.reset();

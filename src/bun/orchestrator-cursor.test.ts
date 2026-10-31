@@ -179,6 +179,16 @@ async function startSettledCursorTask(title: string): Promise<{ taskId: string; 
   return { taskId: created.task.id, runId: started.runId };
 }
 
+test("a failed Cursor follow-up spawn reports the failure to the sender", async () => {
+  const { sendInput } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+  const { taskId, runId } = await startSettledCursorTask("cursor follow-up spawn failure");
+  tasks.update(taskId, { model: "" });
+  const result = await sendInput(runId, "retain this message");
+  expect(result).toEqual({ delivered: false, reason: "model is required for cursor" });
+  expect(runs.listForTask(taskId).some((run) => run.status === "failed")).toBe(true);
+});
+
 test("spawnCursorTurnNow does not register a child deleted during the handshake", async () => {
   const { sendInput, deleteTask, isAnyRunOfTaskLive } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");

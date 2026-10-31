@@ -6839,7 +6839,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
               if (!mapped.ok) {
                 return json({ error: mapped.error }, { status: 400, headers: corsHeaders(req) });
               }
-              const empty = mapped.answers.every((a) => a.selectedOptionIds.length === 0 && !a.freeformText);
+              const empty = mapped.answers.length === 0 || mapped.answers.some((a) => a.selectedOptionIds.length === 0 && !a.freeformText);
               if (empty) {
                 return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
               }

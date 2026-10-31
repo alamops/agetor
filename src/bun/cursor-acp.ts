@@ -624,6 +624,14 @@ export function spawnCursorViaAcp(opts: CursorAcpLaunch): SpawnedAgent {
       return;
     }
     const toolCallId = isRecord(params) ? asString(params.toolCallId) ?? "" : "";
+    if (!toolCallId) {
+      try {
+        writeLine({ jsonrpc: "2.0", id, result: cursorAskRpcResult({ outcome: "cancelled" }) });
+      } catch {
+        /* the child is gone */
+      }
+      return;
+    }
     const title = isRecord(params) ? asString(params.title) ?? "" : "";
     const questions = questionsFromRpc(params);
     emitAsk(toolCallId, title, questions);

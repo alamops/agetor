@@ -8,13 +8,15 @@ export function supersededToolUseIndexes(
   events: ReadonlyArray<{ stream: string; data: string }>,
 ): Set<number> {
   const last = new Map<string, number>();
+  const ids: Array<string | null> = [];
   for (let i = 0; i < events.length; i++) {
     const id = toolUseId(events[i]!);
+    ids.push(id);
     if (id) last.set(id, i);
   }
   const skip = new Set<number>();
   for (let i = 0; i < events.length; i++) {
-    const id = toolUseId(events[i]!);
+    const id = ids[i];
     if (id && last.get(id) !== i) skip.add(i);
   }
   return skip;

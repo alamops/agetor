@@ -81,6 +81,12 @@ const Q2 = {
 };
 
 async function onPrompt() {
+  if (scenario === "ask-no-id") {
+    const result = await request("cursor/ask_question", { title: "Pick one", questions: [Q1] });
+    capture("ask-result", result);
+    endPrompt({ stopReason: "end_turn" });
+    return;
+  }
   if (scenario === "ask" || scenario === "ask-newline" || scenario === "skip" || scenario === "cancel") {
     const toolCallId = scenario === "ask-newline" ? "call\\n1" : "call-1";
     notify({
@@ -472,6 +478,15 @@ test("ask blocks until the card is answered, then the turn succeeds", async () =
   expect(result.outcome.outcome).toBe("answered");
   expect(result.outcome.answers).toEqual([{ questionId: "q1", selectedOptionIds: ["b"] }]);
   agent.kill();
+});
+
+test("an ask without a tool call id is cancelled without creating a card", async () => {
+  const { agent, taskId, capture, chunks } = launch("ask-no-id");
+  expect(await agent.done).toBe(0);
+  expect(readCapture(capture).find((row) => row.label === "ask-result")?.msg).toEqual({ outcome: { outcome: "cancelled" } });
+  expect(listPendingForTask(taskId)).toHaveLength(0);
+  expect(listOpenCursorAsks().some((row) => row.taskId === taskId)).toBe(false);
+  expect(chunks.some((chunk) => chunk.stream === "tool_use")).toBe(false);
 });
 
 test("a larger ask update replaces the pin and a shorter one does not", async () => {
