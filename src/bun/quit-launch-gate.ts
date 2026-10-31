@@ -89,3 +89,47 @@ export function createQuitLaunchGate(deps: QuitLaunchGateDeps): QuitLaunchGate {
     },
   };
 }
+
+export interface BeforeQuitDeps {
+  /** quit-guard.ts's one-shot force-quit flag (the confirm dialog's POST). */
+  consumeForceQuit(): { completely: boolean } | null;
+  /** quit-guard.ts's one-shot "Quit Agetor Completely" menu flag. */
+  consumeQuitCompletely(): boolean;
+  gate: QuitLaunchGate;
+  /** A live login-item supervisor is around to read a stop request. */
+  hasSupervisor: boolean;
+  /** Tasks with a running run. Read only for an unforced quit; a failure
+   *  should answer `[]` (a missed warning beats trapping the user). */
+  runningTaskIds(): string[];
+}
+
+export type BeforeQuitDecision =
+  /** Vetoed: absorbed into, or held by, the launch gate. */
+  | { kind: "veto" }
+  /** Running tasks and no confirm yet: ask the webview, veto this quit. */
+  | { kind: "confirm"; completely: boolean; runningTaskIds: string[] }
+  /** Let it through. `stopSupervisor` = also keep the background core down. */
+  | { kind: "allow"; completely: boolean; stopSupervisor: boolean };
+
+/**
+ * The app's `before-quit` decision, effect-free apart from the injected
+ * one-shots and gate, so index.ts's handler only applies the result. Both
+ * one-shots are consumed first (an absorbed quit spends them); a waiting gate
+ * absorbs the quit before running tasks are even looked at (no second confirm
+ * dialog); and a quit about to be allowed asks the gate first, so a held quit
+ * keeps the creds file and the supervisor untouched until it really happens.
+ */
+export function decideBeforeQuit(deps: BeforeQuitDeps): BeforeQuitDecision {
+  const forced = deps.consumeForceQuit();
+  const completely = deps.consumeQuitCompletely() || forced?.completely === true;
+  if (deps.gate.isWaiting()) {
+    deps.gate.holdQuit(completely);
+    return { kind: "veto" };
+  }
+  if (!forced) {
+    const running = deps.runningTaskIds();
+    if (running.length > 0) return { kind: "confirm", completely, runningTaskIds: running };
+  }
+  if (deps.gate.holdQuit(completely)) return { kind: "veto" };
+  return { kind: "allow", completely, stopSupervisor: completely && deps.hasSupervisor };
+}

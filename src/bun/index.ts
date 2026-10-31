@@ -21,7 +21,7 @@ import {
   waitForLaunchesToSettle,
 } from "./orchestrator.ts";
 import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
-import { createQuitLaunchGate } from "./quit-launch-gate.ts";
+import { createQuitLaunchGate, decideBeforeQuit } from "./quit-launch-gate.ts";
 import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
 import { resumeIncompleteOpencodeImports } from "./opencode-session-import.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -623,71 +623,61 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
   // state file — no helper spawn inside before-quit.
   const supervisor = liveSupervisor(dataDir);
   const backgroundArmed = supervisor !== null && (supervisor.state === "parked" || supervisor.state === "waiting");
-  // Both consumers are one-shot. A vetoed quit loses nothing: when the user
-  // confirms in the webview, `POST /app/force-quit {completely}` carries the
-  // intent again.
-  const forced = consumeForceQuit();
-  const completely = consumeQuitCompletely() || forced?.completely === true;
-  // A quit already held for launches: this one (a second Cmd+Q, the menu's
-  // "Quit Agetor Completely") is absorbed into it — no second confirm dialog.
-  if (quitLaunchGate.isWaiting()) {
-    quitLaunchGate.holdQuit(completely);
+  // Both one-shots are consumed inside: a vetoed quit loses nothing, since
+  // when the user confirms in the webview `POST /app/force-quit {completely}`
+  // carries the intent again (quit-launch-gate.ts `decideBeforeQuit`).
+  const decision = decideBeforeQuit({
+    consumeForceQuit,
+    consumeQuitCompletely,
+    gate: quitLaunchGate,
+    hasSupervisor: supervisor !== null,
+    runningTaskIds: () => {
+      try {
+        return db
+          .query<{ task_id: string }, []>(`SELECT DISTINCT task_id FROM runs WHERE status = 'running'`)
+          .all()
+          .map((r) => r.task_id);
+      } catch {
+        // If the DB is unavailable for any reason, allow the quit — the cost
+        // of a missed warning is small; the cost of trapping the user is high.
+        return [];
+      }
+    },
+  });
+  if (decision.kind === "veto") {
     event.response = { allow: false };
     return;
   }
-  const allowQuit = () => {
-    if (quitLaunchGate.holdQuit(completely)) {
-      event.response = { allow: false };
-      return;
-    }
-    // Only when a supervisor is alive to read it: a request written with none
-    // running would otherwise linger for the next supervisor to start (the
-    // background turned on later, or the next login). takeSupervisorStop also
-    // ignores a stale request, as a second line of defense.
-    if (completely && supervisor !== null) {
-      // The supervisor would otherwise take the port back when this process
-      // dies; this asks it to stay down until the next login (D6).
-      try {
-        requestSupervisorStop(dataDir);
-      } catch (err) {
-        console.warn("[agetor] failed to write the supervisor stop request:", err);
-      }
-    }
-    removeCoreCreds(dataDir);
-    event.response = { allow: true };
-  };
-  if (forced) {
-    allowQuit();
+  if (decision.kind === "confirm") {
+    broadcastAppEvent({
+      type: "quit_request",
+      runningRunCount: decision.runningTaskIds.length,
+      runningTaskTitles: decision.runningTaskIds
+        .map((id) => tasks.get(id)?.title ?? "")
+        .filter((t) => t.length > 0)
+        .slice(0, 10),
+      backgroundArmed,
+      completely: decision.completely,
+      ts: Date.now(),
+    });
+    event.response = { allow: false };
     return;
   }
-  let runningCount = 0;
-  let runningTaskTitles: string[] = [];
-  try {
-    const rows = db.query<{ task_id: string }, []>(
-      `SELECT DISTINCT task_id FROM runs WHERE status = 'running'`,
-    ).all();
-    runningCount = rows.length;
-    runningTaskTitles = rows
-      .map((r) => tasks.get(r.task_id)?.title ?? "")
-      .filter((t) => t.length > 0)
-      .slice(0, 10);
-  } catch {
-    // If the DB is unavailable for any reason, allow the quit — the cost
-    // of a missed warning is small; the cost of trapping the user is high.
+  // Only when a supervisor is alive to read it (`stopSupervisor`): a request
+  // written with none running would otherwise linger for the next supervisor
+  // to start (the background turned on later, or the next login).
+  // takeSupervisorStop also ignores a stale request, as a second line of
+  // defense. The supervisor would otherwise take the port back when this
+  // process dies; this asks it to stay down until the next login (D6).
+  if (decision.stopSupervisor) {
+    try {
+      requestSupervisorStop(dataDir);
+    } catch (err) {
+      console.warn("[agetor] failed to write the supervisor stop request:", err);
+    }
   }
-  if (runningCount === 0) {
-    allowQuit();
-    return;
-  }
-  broadcastAppEvent({
-    type: "quit_request",
-    runningRunCount: runningCount,
-    runningTaskTitles,
-    backgroundArmed,
-    completely,
-    ts: Date.now(),
-  });
-  event.response = { allow: false };
+  removeCoreCreds(dataDir);
+  event.response = { allow: true };
 });
 
 // Stop the fx auto-resume engine's in-memory timers on the way out (Phase 8
