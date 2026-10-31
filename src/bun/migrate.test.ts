@@ -1995,15 +1995,17 @@ test("077_copilot_harness is only backfilled, never re-run, on a DB that already
   db.close();
 });
 
-test("080 (harness auto-enabled) is the last registered migration, after 079 (opencode task fields), after 078 (opencode harness), after 077 (copilot harness)", () => {
-  const at = migrations.findIndex((m) => m.id === "080_harness_auto_enabled");
+test("081 (cursor asks) is the last registered migration, after 080 (harness auto-enabled), after 079 (opencode task fields), after 078 (opencode harness), after 077 (copilot harness)", () => {
+  const at = migrations.findIndex((m) => m.id === "081_cursor_asks");
   expect(at).toBe(migrations.length - 1);
-  expect(migrations[at - 1]?.id).toBe("079_opencode_task_fields");
-  expect(migrations[at - 2]?.id).toBe("078_opencode_harness");
-  expect(migrations[at - 3]?.id).toBe("077_copilot_harness");
-  expect(migrations[at]?.sql).toBe(harnessAutoEnabled);
-  expect(migrations[at - 1]?.sql).toBe(opencodeTaskFields);
-  expect(migrations[at - 2]?.sql).toBe(opencodeHarness);
+  expect(migrations[at - 1]?.id).toBe("080_harness_auto_enabled");
+  expect(migrations[at - 2]?.id).toBe("079_opencode_task_fields");
+  expect(migrations[at - 3]?.id).toBe("078_opencode_harness");
+  expect(migrations[at - 4]?.id).toBe("077_copilot_harness");
+  expect(migrations[at]?.sql).toContain("CREATE TABLE cursor_asks");
+  expect(migrations[at - 1]?.sql).toBe(harnessAutoEnabled);
+  expect(migrations[at - 2]?.sql).toBe(opencodeTaskFields);
+  expect(migrations[at - 3]?.sql).toBe(opencodeHarness);
 });
 
 /** Migrate a fresh DB up to (and including) `lastId`. */
@@ -2029,7 +2031,13 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
   // opencode built-in: that row arrives with 078.
   expect(db.query(`SELECT 1 FROM harnesses WHERE id = 'opencode'`).get()).toBeNull();
 
-  expect(migrate(db, migrations)).toEqual(["078_opencode_harness", "079_opencode_task_fields", "080_harness_auto_enabled"]);
+  expect(migrate(db, migrations)).toEqual([
+    "078_opencode_harness",
+    "079_opencode_task_fields",
+    "080_harness_auto_enabled",
+    "081_cursor_asks",
+  ]);
+  expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 
   const after = db.query<Record<string, unknown>, []>(`SELECT * FROM harnesses WHERE id != 'opencode' ORDER BY id`).all();
   expect(after).toEqual(before);

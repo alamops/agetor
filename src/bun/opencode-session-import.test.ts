@@ -197,6 +197,32 @@ test("an import creates a Review task bound to the session, with a seed run and 
   expect((await importOne(id)).error).toBe("session is already imported");
 });
 
+test("backfill sends each imported row with its stored id and ts, in id order", async () => {
+  // Forward resume (docs/plans/event-stream-forward-resume.md D11): a panel
+  // opened mid-import resumes by these ids, so a live frame must equal its row.
+  const { subscribe } = await import("./orchestrator.ts");
+  const live: import("../shared/types.ts").RunEvent[] = [];
+  const unsub = subscribe((e) => live.push(e));
+  try {
+    const { id } = plant();
+    const r = await importOne(id);
+    expect(r.error).toBeUndefined();
+    const runId = tasks.get(r.taskId!)!.runId!;
+    const stored = db
+      .query<{ id: number; ts: number; stream: string; data: string }, [string]>(
+        `SELECT id, ts, stream, data FROM run_events WHERE run_id = ? AND line_uuid IS NOT NULL ORDER BY id`,
+      )
+      .all(runId);
+    expect(stored.length).toBeGreaterThan(0);
+    const sent = live
+      .filter((e) => e.runId === runId && stored.some((s) => s.id === e.id))
+      .map((e) => ({ id: e.id, ts: e.ts, stream: e.stream, data: e.data }));
+    expect<unknown>(sent).toEqual(stored);
+  } finally {
+    unsub();
+  }
+});
+
 test("plan agent and a variant map to plan mode and that effort", async () => {
   const { id } = plant({ agent: "plan", variant: "high" });
   const task = tasks.get((await importOne(id)).taskId!)!;

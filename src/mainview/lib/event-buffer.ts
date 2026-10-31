@@ -31,6 +31,11 @@ export interface EventBuffer<T> {
    *  call repeatedly and from event handlers — this is the focus / visibility
    *  recovery path. */
   flushNow(): void;
+  /** Drop buffered items WITHOUT emitting and cancel any pending arm, but stay
+   *  usable: a later `push` arms and flushes normally. For a view that is
+   *  replacing its content (a snapshot reset), where the queued items belong
+   *  to the content being thrown away. */
+  discard(): void;
   /** Cancel any pending arm and discard buffered items without emitting. */
   dispose(): void;
 }
@@ -70,6 +75,13 @@ export function createEventBuffer<T>(
     },
     flushNow() {
       flush();
+    },
+    discard() {
+      if (disarm) {
+        disarm();
+        disarm = null;
+      }
+      pending = [];
     },
     dispose() {
       if (disarm) {

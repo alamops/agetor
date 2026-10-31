@@ -20,6 +20,13 @@
 //     common cause and the old behaviour on a dropped connection was to retry;
 //   - `onError` fires for every failure (network error, bad status), including
 //     the one that stops the stream; a clean end of the stream is not a failure;
+//   - it remembers the last SSE `id:` it saw across the reconnects of ONE
+//     stream and sends it as `Last-Event-ID` on every connect after the first,
+//     as `EventSource` does. Only the task stream (`/tasks/:id/events`) emits
+//     ids today, so a forward-resuming server answers with just the rows past
+//     that id; every other stream never has an id and is unaffected. An `id:`
+//     on an otherwise empty block (a control frame) still advances it, and an
+//     empty `id:` resets it to none (per the SSE spec);
 //   - the returned function aborts the in-flight request and any pending
 //     reconnect, and nothing is delivered or reconnected after it.
 //
@@ -90,6 +97,9 @@ export function openEventStream(
   /** The server's own `retry:` value, once it has sent one (sticks, as in
    *  `EventSource`). */
   let serverRetryMs: number | null = null;
+  /** The last SSE `id:` this stream saw; lives outside the per-connect loop so
+   *  it survives reconnects (a failed attempt keeps it for the next one). */
+  let lastEventId: string | null = null;
 
   const reportError = (e: unknown): void => {
     try {
@@ -99,6 +109,9 @@ export function openEventStream(
 
   const dispatch = (frame: SseFrame): void => {
     if (frame.retry !== undefined) serverRetryMs = frame.retry;
+    // Before the control-frame return below: an id-only block must advance the
+    // cursor too. `""` is the spec's reset-to-none.
+    if (frame.id !== undefined) lastEventId = frame.id === "" ? null : frame.id;
     // `event === ""` is the parser's retry-only control frame, not a message.
     if (frame.event === "") return;
     // The spec never dispatches a block whose data buffer is empty.
@@ -130,7 +143,11 @@ export function openEventStream(
     try {
       const doFetch = opts.fetch ?? fetch;
       const res = await doFetch(url, {
-        headers: { accept: "text/event-stream", ...opts.headers },
+        headers: {
+          accept: "text/event-stream",
+          ...opts.headers,
+          ...(lastEventId !== null ? { "last-event-id": lastEventId } : {}),
+        },
         // No `cache:` option on purpose: "no-store" makes the browser add
         // `Cache-Control`/`Pragma` request headers, which the core's CORS
         // preflight (it allows `authorization` and `content-type` only)

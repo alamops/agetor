@@ -88,7 +88,7 @@ async function taskEvents(
 
 /** Creates a Copilot task (isolation "none", a plain non-git temp dir) and
  *  returns its row WITHOUT starting it, so a spec can open the panel first
- *  and see the live, broadcast-only breadcrumbs. */
+ *  and watch the breadcrumbs arrive live. */
 async function createCopilotTask(
   request: APIRequestContext,
   backend: E2EBackend,
@@ -279,7 +279,7 @@ test.describe("GitHub Copilot harness", () => {
     await gotoApp(page, freshBackend.bootBase);
     const panel = await openTask(page, title);
     await expect(panel.getByTestId("transcript-loading")).toHaveCount(0);
-    // Started with the panel open: the `started — …` breadcrumb is broadcast-only.
+    // Started with the panel open, so the `started — …` breadcrumb arrives live.
     await startTask(request, freshBackend, task.id);
 
     // The opening breadcrumb names the harness, the Auto model and the Auto mode.

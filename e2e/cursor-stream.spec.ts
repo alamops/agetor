@@ -163,9 +163,8 @@ test.describe("cursor stream (worker backend)", () => {
     await form.getByPlaceholder("Short description").fill(title);
     await form.getByTestId("prompt-textarea").fill(`${FAKE_CURSOR_STREAM_PROMPT_MARKER} ${title}`);
     await form.getByTestId("worktree-options").getByTestId("isolate-toggle").uncheck();
-    // To backlog, then start with the panel open: the `started — …`
-    // breadcrumb is broadcast-only (never persisted), so it only reaches a
-    // panel that is already subscribed when the run starts.
+    // To backlog, then start with the panel open, so the `started — …`
+    // breadcrumb arrives live on the panel's subscription.
     await form.getByRole("button", { name: "To backlog", exact: true }).click();
 
     let row: Record<string, any> | null = null;

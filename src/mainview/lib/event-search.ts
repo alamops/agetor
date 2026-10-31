@@ -14,6 +14,7 @@ import { isInternalStatusSentinel, type RunEventStream } from "../../shared/type
 import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
 import { normalizeDeliveredUserText } from "../../shared/user-message.ts";
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
+import { supersededToolUseIndexes } from "../../shared/tool-use-revisions.ts";
 
 /** Best-effort JSON.parse that never throws — malformed/partial JSON (e.g. a
  *  tool input truncated by an older agetor mapper) falls back to `null`
@@ -139,14 +140,23 @@ export const NO_MATCHES: readonly number[] = Object.freeze([]);
  * to land on a DOM block that's actually rendered, so this mirrors that
  * fold: a `tool_result` with an earlier owning `tool_use` is excluded from
  * matching at its own index, and its text is appended to the owner's
- * searchable text instead. An orphan `tool_result` (no owner, or the
- * "owner" only appears later / never arrives) stays independently matchable
+ * searchable text instead. An orphan `tool_result` (no owner, or the only
+ * call appears later / never arrives) stays independently matchable
  * at its own index, same as every other stream.
  *
  * A hidden (`internal: true`) tool event never matches (see
  * `searchableEventText`), and neither does a `tool_result` answering a hidden
  * `tool_use` even when the result itself carries no stamp — RunPanel drops
  * that pair together, so the result never renders as an orphan card either.
+ *
+ * A superseded `tool_use` (an earlier partial of the same id — see
+ * `supersededToolUseIndexes`) is not rendered, so it is not a match target.
+ * The latest revision is the row with the `data-evid` node. Result text
+ * folds into that latest id. When a revision is emitted after its result,
+ * that later index is still the rendered card, so the result folds forward
+ * onto it instead of matching a result row that has no `data-evid`. A
+ * result whose only `tool_use` appears later (no earlier call of that id)
+ * stays independently matchable at its own index.
  */
 export function findMatchingEventIds(
   events: ReadonlyArray<{ stream: RunEventStream; data: string }>,
@@ -155,6 +165,7 @@ export function findMatchingEventIds(
   const trimmed = query.trim();
   if (!trimmed || events.length === 0) return NO_MATCHES;
   const needle = trimmed.toLowerCase();
+  const superseded = supersededToolUseIndexes(events);
 
   // Pass 1: each event's own searchable text, plus a toolUseId → index map
   // for every tool_use that published a non-empty id (legacy normalized
@@ -162,6 +173,7 @@ export function findMatchingEventIds(
   // registered as an owner — an orphan id can't own anything).
   const ownText: (string | null)[] = new Array(events.length);
   const toolUseIndexById = new Map<string, number>();
+  const toolUseFirstIndexById = new Map<string, number>();
   const hiddenToolUseIds = new Set<string>();
   for (let i = 0; i < events.length; i++) {
     const e = events[i]!;
@@ -171,7 +183,10 @@ export function findMatchingEventIds(
       const id = parsed && typeof parsed === "object" ? parsed.id : undefined;
       if (typeof id === "string" && id) {
         if (isHiddenToolEvent(e.stream, e.data)) hiddenToolUseIds.add(id);
-        else toolUseIndexById.set(id, i);
+        else {
+          if (!toolUseFirstIndexById.has(id)) toolUseFirstIndexById.set(id, i);
+          toolUseIndexById.set(id, i);
+        }
       }
     }
   }
@@ -193,10 +208,14 @@ export function findMatchingEventIds(
       continue;
     }
     const ownerIdx = toolUseIndexById.get(toolUseId);
-    // Only an EARLIER tool_use counts as an owner — RunEventList only ever
-    // folds a result into a call it has already rendered, never one that
-    // hasn't arrived yet (or itself, which can't happen, but >= guards it).
-    if (ownerIdx === undefined || ownerIdx >= i) continue;
+    const firstIdx = toolUseFirstIndexById.get(toolUseId);
+    // The rendered card is the latest visible `tool_use`. An earlier owner
+    // is the common case. A later revision of an id that already appeared
+    // is also that card: the result row itself is not rendered, so result
+    // text has to land on the revision. A result whose only call appears
+    // later stays an orphan at its own index.
+    const laterRevision = firstIdx !== undefined && firstIdx < i && ownerIdx !== undefined && ownerIdx > firstIdx;
+    if (ownerIdx === undefined || (ownerIdx >= i && !laterRevision)) continue;
     owned[i] = true;
     const text = ownText[i];
     if (text) {
@@ -210,7 +229,7 @@ export function findMatchingEventIds(
   // its text was folded into the owner above instead.
   const out: number[] = [];
   for (let i = 0; i < events.length; i++) {
-    if (owned[i]) continue;
+    if (owned[i] || superseded.has(i)) continue;
     const extra = foldedText.get(i);
     const text = extra ? `${ownText[i] ?? ""} ${extra.join(" ")}` : ownText[i];
     if (!text) continue;

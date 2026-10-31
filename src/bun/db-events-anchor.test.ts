@@ -158,11 +158,11 @@ test("lastUserEventId returns the NEWEST main-stream user id when several exist"
   const { taskId, runId } = makeTaskAndRun();
   const ids: number[] = [];
   db.transaction(() => {
-    ids.push(runs.appendEvent(runId, "assistant", "a1")!);
-    ids.push(runs.appendEvent(runId, "user", "u1")!);
-    ids.push(runs.appendEvent(runId, "assistant", "a2")!);
-    ids.push(runs.appendEvent(runId, "user", "u2")!);
-    ids.push(runs.appendEvent(runId, "assistant", "a3")!);
+    ids.push(runs.appendEvent(runId, "assistant", "a1")!.id);
+    ids.push(runs.appendEvent(runId, "user", "u1")!.id);
+    ids.push(runs.appendEvent(runId, "assistant", "a2")!.id);
+    ids.push(runs.appendEvent(runId, "user", "u2")!.id);
+    ids.push(runs.appendEvent(runId, "assistant", "a3")!.id);
   })();
   const u2Id = ids[3]!;
   expect(runs.lastUserEventId(taskId)).toBe(u2Id);
@@ -173,7 +173,7 @@ test("lastUserEventId ignores a newer user row that carries a subagentId", () =>
   let mainUserId!: number;
   db.transaction(() => {
     runs.appendEvent(runId, "assistant", "a1");
-    mainUserId = runs.appendEvent(runId, "user", "u-main")!;
+    mainUserId = runs.appendEvent(runId, "user", "u-main")!.id;
     runs.appendEvent(runId, "assistant", "a2");
     // Newer (higher id) but tagged with a subagentId — must NOT be picked.
     runs.appendEvent(runId, "user", "u-subagent", null, "sub-1");
@@ -185,10 +185,10 @@ test("lastUserEventId respects beforeId — returns the newest user id strictly 
   const { taskId, runId } = makeTaskAndRun();
   const ids: number[] = [];
   db.transaction(() => {
-    ids.push(runs.appendEvent(runId, "user", "u1")!);
-    ids.push(runs.appendEvent(runId, "assistant", "a1")!);
-    ids.push(runs.appendEvent(runId, "user", "u2")!);
-    ids.push(runs.appendEvent(runId, "assistant", "a2")!);
+    ids.push(runs.appendEvent(runId, "user", "u1")!.id);
+    ids.push(runs.appendEvent(runId, "assistant", "a1")!.id);
+    ids.push(runs.appendEvent(runId, "user", "u2")!.id);
+    ids.push(runs.appendEvent(runId, "assistant", "a2")!.id);
   })();
   const u1Id = ids[0]!;
   const u2Id = ids[2]!;
@@ -203,7 +203,7 @@ test("lastUserEventId is scoped to the task — a foreign task's newer user row 
   let aUserId!: number;
   db.transaction(() => {
     runs.appendEvent(runA, "assistant", "a1");
-    aUserId = runs.appendEvent(runA, "user", "u-a")!;
+    aUserId = runs.appendEvent(runA, "user", "u-a")!.id;
   })();
 
   // Task B's user event lands with a strictly HIGHER id than task A's own
@@ -366,10 +366,10 @@ test("(f) beforeId + anchor: the anchor is resolved strictly below the cursor an
   const { taskId, runId } = makeTaskAndRun();
   const ids: number[] = [];
   const insertMany = db.transaction(() => {
-    ids.push(runs.appendEvent(runId, "user", "u1")!); // index 0 — the anchor we expect
-    for (let i = 0; i < 900; i++) ids.push(runs.appendEvent(runId, "assistant", "x".repeat(5))!);
-    ids.push(runs.appendEvent(runId, "user", "u2")!); // index 901 — excluded by beforeId
-    for (let i = 0; i < 10; i++) ids.push(runs.appendEvent(runId, "assistant", "x".repeat(5))!);
+    ids.push(runs.appendEvent(runId, "user", "u1")!.id); // index 0 — the anchor we expect
+    for (let i = 0; i < 900; i++) ids.push(runs.appendEvent(runId, "assistant", "x".repeat(5))!.id);
+    ids.push(runs.appendEvent(runId, "user", "u2")!.id); // index 901 — excluded by beforeId
+    for (let i = 0; i < 10; i++) ids.push(runs.appendEvent(runId, "assistant", "x".repeat(5))!.id);
   });
   insertMany();
   const u1Id = ids[0]!;

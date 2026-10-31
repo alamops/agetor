@@ -4430,12 +4430,10 @@ export interface Run {
    */
   codexSessionId: string | null;
   /**
-   * Cursor's own conversation/session id (the `session_id` carried on every
-   * event in its `--output-format stream-json` NDJSON stream, first seen on
-   * `system/init`). Captured when the cursor tmux driver tails the run's
-   * NDJSON log. Drives `cursor-agent --resume <session_id>` for follow-up
-   * turns and is the reattach key for a mid-turn cursor run. NULL for
-   * claude-code/codex and legacy rows.
+   * Cursor's ACP session id, discovered from `session/new` or `session/load`.
+   * The next turn resumes with `session/load` of this id. A restart orphans
+   * a mid-turn Cursor child and rebuilds any open question from `cursor_asks`.
+   * NULL for every other agent kind and legacy rows.
    */
   cursorSessionId: string | null;
   /**
@@ -5313,6 +5311,20 @@ export interface TaskEventsReplayMeta {
   earliestId: number | null;
   /** True when older events exist before `earliestId` (drives "Load earlier"). */
   hasMore: boolean;
+  /**
+   * Present on a forward-resume reconnect (the client sent `Last-Event-ID` /
+   * `?afterId=`): the cursor the server resumed after. The rows that follow are
+   * exactly the events with `id` above it, so a new client keeps its own window
+   * and IGNORES `earliestId` (`null` here) and `hasMore` (`false` here).
+   */
+  resumedAfter?: number;
+  /**
+   * Present (`true`) when the client asked to resume but the gap was too large
+   * (or the cursor was ahead of the server): the server answered with a fresh
+   * window instead. `earliestId` / `hasMore` then describe that fresh window and
+   * REPLACE the client's values; the client drops what it had and shows a notice.
+   */
+  snapshotRequired?: true;
 }
 
 export interface RunEvent {
@@ -5329,9 +5341,11 @@ export interface RunEvent {
    */
   subagentId?: string | null;
   /**
-   * `run_events.id`, present on replayed/paged persisted events (SSE replay
-   * window, `/tasks/:id/events/page`); absent on live-broadcast frames, which
-   * have no row yet at broadcast time.
+   * `run_events.id`. Saved rows carry it both on replay (SSE replay window,
+   * resume gap, `/tasks/:id/events/page`) and on the live broadcast (the
+   * `id:` line of the frame matches it), so a client can resume by it. Live-only
+   * streams — `interaction`, `interaction_resolved`, `subagent` lifecycle and
+   * the ping — have no row and never carry one.
    */
   id?: number;
 }

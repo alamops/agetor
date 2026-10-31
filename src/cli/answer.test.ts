@@ -1,5 +1,5 @@
 import { test, expect, mock, afterAll } from "bun:test";
-import type { AgetorClient } from "./api-client.ts";
+import { ApiError, type AgetorClient } from "./api-client.ts";
 import type { FxPermissionRequest } from "../bun/interactions.ts";
 
 /**
@@ -148,6 +148,30 @@ test("answerFx (via cmdAnswer): isCancel aborts without posting — interaction 
   await cmdAnswer(["t1"], flags);
   expect(calls).toEqual([]); // never posted — the interaction is left pending
   expect(cancelCalls.length).toBeGreaterThan(0);
+});
+
+test("cursor skip: a 400 is printed and does not throw", async () => {
+  outputs.length = 0;
+  const req = {
+    kind: "ask_questions",
+    id: "q1",
+    taskId: "t1",
+    runId: "r1",
+    createdAt: 0,
+    source: "cursor",
+    questions: [{ question: "Which?", options: [{ label: "Alpha" }] }],
+  };
+  currentClient = {
+    listTasks: async () => [{ id: "t1", title: "T" }],
+    pendingInteractions: async () => [req],
+    answerAskQuestions: async () => {
+      throw new ApiError(400, { error: "run not found" }, "run not found");
+    },
+  } as unknown as AgetorClient;
+  selectImpl = async (opts) => opts.options.find((o) => o.label === "Skip")!.value;
+  await cmdAnswer(["t1"], flags);
+  expect(outputs.some((line) => line.includes("run not found"))).toBe(true);
+  expect(outputs.some((line) => line.includes("skipped"))).toBe(false);
 });
 
 test("answerFx (via cmdAnswer): { ok: false } from the server prints 'already resolved'", async () => {

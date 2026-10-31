@@ -256,6 +256,17 @@ test("findMatchingEventIds: orphan tool_result (no owning tool_use) matches at i
   expect(findMatchingEventIds(events, "needle")).toEqual([1]);
 });
 
+test("findMatchingEventIds: a tool_result between revisions folds into the later rendered tool_use", () => {
+  const events = [
+    ev("tool_use", JSON.stringify({ id: "abc", name: "shell", input: "ls" })),
+    ev("tool_result", JSON.stringify({ toolUseId: "abc", content: "needle output" })),
+    ev("tool_use", JSON.stringify({ id: "abc", name: "shell", input: "ls -la" })),
+  ];
+  expect(findMatchingEventIds(events, "needle")).toEqual([2]);
+  expect(findMatchingEventIds(events, "ls -la")).toEqual([2]);
+  expect(findMatchingEventIds(events, "needle")).not.toContain(1);
+});
+
 test("findMatchingEventIds: a forward-referencing tool_result (owner appears later) is not folded and stays independently matchable at its own index", () => {
   // Documented behavior: pass 2 only folds a tool_result into a tool_use whose
   // index is strictly earlier (`ownerIdx >= i` is excluded). A tool_use that
@@ -332,6 +343,18 @@ test("findMatchingEventIds: a stamped result under a visible tool_use adds no te
   ];
   expect(findMatchingEventIds(events, "needle")).toBe(NO_MATCHES);
   expect(findMatchingEventIds(events, "bash")).toEqual([0]);
+});
+
+test("findMatchingEventIds: a superseded tool_use is not a hit; the latest revision is", () => {
+  const prefix = "x".repeat(40);
+  const events = [
+    ev("tool_use", JSON.stringify({ id: "a", name: "shell", input: { command: `${prefix}needle-partial` } })),
+    ev("assistant", "working"),
+    ev("tool_use", JSON.stringify({ id: "a", name: "shell", input: { command: `${prefix}needle-partial and the rest` } })),
+  ];
+  expect(findMatchingEventIds(events, "needle-partial")).toEqual([2]);
+  expect(findMatchingEventIds(events, "the rest")).toEqual([2]);
+  expect(findMatchingEventIds(events, "working")).toEqual([1]);
 });
 
 test("findMatchingEventIds: a visible tool call next to a hidden one still matches at its own index", () => {
