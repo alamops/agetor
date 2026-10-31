@@ -39,6 +39,7 @@ const APP = `http://127.0.0.1:${APP_PORT}`;
 const ENV_KEYS = [
   "AGETOR_API_PORT",
   "AGETOR_TEST_BLOCK_ROUTE",
+  "AGETOR_TEST_DROP_STREAMS_ROUTE",
   "AGETOR_DOWNLOADS_DIR",
   "SHELL",
 ] as const;
@@ -62,10 +63,11 @@ let mods: Mods;
 
 beforeAll(async () => {
   for (const k of ENV_KEYS) SAVED_ENV[k] = process.env[k];
-  // The conditional /test/block-event-loop route must be registered to be
-  // classified; a deterministic shell for the terminal tests; a throwaway
+  // The conditional /test/block-event-loop and /test/drop-task-streams routes
+  // must be registered to be classified; a deterministic shell for the terminal tests; a throwaway
   // Downloads dir so no export can reach the real one.
   process.env.AGETOR_TEST_BLOCK_ROUTE = "1";
+  process.env.AGETOR_TEST_DROP_STREAMS_ROUTE = "1";
   process.env.SHELL = "/bin/sh";
   process.env.AGETOR_DOWNLOADS_DIR = path.join(SCRATCH, "downloads");
 
@@ -202,6 +204,7 @@ test("the desktop-only set is non-trivial (the iteration below can't silently go
   expect(routes.length).toBeGreaterThanOrEqual(25);
   expect(routes.some((r) => r.route === "/terminals/:id/ws-ticket")).toBe(true);
   expect(routes.some((r) => r.route === "/test/block-event-loop")).toBe(true);
+  expect(routes.some((r) => r.route === "/test/drop-task-streams")).toBe(true);
   expect(routes.some((r) => r.headless501)).toBe(true);
 });
 

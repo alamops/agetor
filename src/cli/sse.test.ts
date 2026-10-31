@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { writeCoreCreds } from "../bun/core-creds.ts";
-import { streamSse, type SseHandle } from "./sse.ts";
+import { streamSse, type SseHandle, type SseOptions } from "./sse.ts";
 
 /**
  * `streamSse` against a local stub core: `discoverCore` reads the creds file,
@@ -15,8 +15,16 @@ const TOKEN = "t0k3n-for-sse-test";
 let dir: string;
 let server: ReturnType<typeof Bun.serve>;
 let handle: SseHandle | null = null;
-let seen: { url: string; authorization: string | null; accept: string | null }[];
+let seen: {
+  url: string;
+  authorization: string | null;
+  accept: string | null;
+  lastEventId: string | null;
+}[];
 let body: string[];
+// Per-connection bodies for reconnect tests (the last one repeats); when unset
+// every connection gets `body`.
+let bodies: string[][] | null;
 
 function startStub() {
   server = Bun.serve({
@@ -34,11 +42,13 @@ function startStub() {
         url: req.url,
         authorization: req.headers.get("authorization"),
         accept: req.headers.get("accept"),
+        lastEventId: req.headers.get("last-event-id"),
       });
+      const connBody = bodies ? bodies[Math.min(seen.length - 1, bodies.length - 1)]! : body;
       const enc = new TextEncoder();
       const stream = new ReadableStream({
         start(controller) {
-          for (const c of body) controller.enqueue(enc.encode(c));
+          for (const c of connBody) controller.enqueue(enc.encode(c));
           controller.close();
         },
       });
@@ -64,6 +74,7 @@ beforeEach(() => {
   dir = mkdtempSync(path.join(tmpdir(), "agetor-sse-"));
   seen = [];
   body = [];
+  bodies = null;
 });
 
 afterEach(() => {
@@ -73,7 +84,7 @@ afterEach(() => {
 });
 
 /** Resolve once `n` events arrived (or fail after a bounded wait). */
-function collect<T>(n: number, pathname: string): Promise<T[]> {
+function collect<T>(n: number, pathname: string, extra: Partial<SseOptions> = {}): Promise<T[]> {
   return new Promise((resolve, reject) => {
     const got: T[] = [];
     const timer = setTimeout(
@@ -89,7 +100,7 @@ function collect<T>(n: number, pathname: string): Promise<T[]> {
           resolve(got);
         }
       },
-      { dataDir: dir },
+      { dataDir: dir, ...extra },
     );
   });
 }
@@ -142,4 +153,48 @@ test("joins multi-line data before decoding JSON", async () => {
   startStub();
   const got = await collect<{ a: number }>(1, "/events");
   expect(got).toEqual([{ a: 1 }]);
+});
+
+test("a reconnect carries the last event id; the first connect sends none", async () => {
+  bodies = [['id: 5\ndata: {"n":1}\n\n'], ['id: 6\ndata: {"n":2}\n\n']];
+  startStub();
+  const got = await collect<{ n: number }>(2, "/tasks/abc/events");
+  expect(got).toEqual([{ n: 1 }, { n: 2 }]);
+  expect(seen[0]!.lastEventId).toBeNull();
+  expect(seen[1]!.lastEventId).toBe("5");
+});
+
+test("an empty id: resets the remembered id; a control frame's id counts", async () => {
+  bodies = [
+    ['id: 5\ndata: {"n":1}\n\n', 'id:\ndata: {"n":2}\n\n'],
+    ['id: 9\n\n', 'data: {"n":3}\n\n'],
+    ['data: {"n":4}\n\n'],
+  ];
+  startStub();
+  await collect<{ n: number }>(4, "/tasks/abc/events");
+  expect(seen[1]!.lastEventId).toBeNull(); // reset by the empty id
+  expect(seen[2]!.lastEventId).toBe("9"); // id carried by a data-less frame
+});
+
+test("onNamedEvent receives named frames (replay_meta) and not control frames", async () => {
+  body = [
+    'event: replay_meta\ndata: {"earliestId":1,"hasMore":false}\n\n',
+    "retry: 100\n\n",
+    'data: {"n":1}\n\n',
+  ];
+  startStub();
+  const named: [string, string][] = [];
+  const got = await collect<{ n: number }>(1, "/tasks/abc/events", {
+    onNamedEvent: (event, data) => named.push([event, data]),
+  });
+  expect(got).toEqual([{ n: 1 }]);
+  expect(named).toEqual([["replay_meta", '{"earliestId":1,"hasMore":false}']]);
+});
+
+test("streams without ids (/events style) never send last-event-id", async () => {
+  body = ['data: {"n":1}\n\n'];
+  startStub();
+  await collect(2, "/events"); // two connections: the stub closes after each body
+  expect(seen.length).toBeGreaterThanOrEqual(2);
+  for (const req of seen) expect(req.lastEventId).toBeNull();
 });

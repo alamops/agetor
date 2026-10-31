@@ -3,10 +3,12 @@
 // Every user message is emitted TWICE on the wire: once live (the
 // orchestrator's `onChunk`/`appendEvent` the instant the message is sent,
 // stamped with the wall clock) and once from the JSONL parser when claude
-// transcribes it into its session file (a different `ts`). The server also
-// replays the full persisted history on every (re)connection. So the panel
-// must collapse duplicates client-side — this is that collapse, extracted as a
-// pure helper so it can be unit-tested apart from the React effect.
+// transcribes it into its session file (a different `ts`). A reconnect resumes
+// after the last event id the panel saw, but the deduper still guards the
+// first-load snapshot window, a snapshot reset after a gap, and an older core
+// that replays the full history. So the panel must collapse duplicates
+// client-side — this is that collapse, extracted as a pure helper so it can be
+// unit-tested apart from the React effect.
 import type { RunEvent } from "../../shared/types.ts";
 import { canonicalizeUserText } from "../../shared/user-message.ts";
 import { canonicalizeAttachmentText } from "../../shared/attachments.ts";

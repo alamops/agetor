@@ -416,6 +416,49 @@ test("live output tailing persists batches with offset-derived line_uuids and ne
   w.detach();
 });
 
+test("tailed output batches are sent with their stored id and ts; a batch already saved under its line_uuid is sent nothing", async () => {
+  // Forward resume (docs/plans/event-stream-forward-resume.md D11/D12): the
+  // live frame equals its row, and a dedup hit sends nothing.
+  const { db, runs } = await import("./db.ts");
+  const { attachSubagentWatcher, setSubagentEmitter } = await import("./claude-subagents.ts");
+  const { taskId, runId, jsonlPath } = await seed();
+
+  const captured: RunEvent[] = [];
+  setSubagentEmitter((e) => captured.push(e));
+
+  const toolUseId = "toolu_5ids";
+  const id = "bg5ids";
+  const outputPath = bgOutputPath(id);
+  writeFileSync(outputPath, "");
+  writeFileSync(
+    jsonlPath,
+    launchLine({ toolUseId }) + stubLine({ toolUseId, backgroundTaskId: id, outputPath }),
+  );
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  const t0 = Date.now();
+  w.pump(t0); // discovers the row; nothing to tail yet
+
+  // The first batch (offset 0) is already saved under its key — the tail's
+  // insert of it is a dedup hit.
+  runs.appendEvent(runId, "stdout", "hello ", `bgshell:${id}:0`, id);
+  writeFileSync(outputPath, "hello ");
+  w.pump(t0 + 1);
+  expect(captured.filter((e) => e.stream === "stdout" && e.subagentId === id)).toHaveLength(0);
+
+  appendFileSync(outputPath, "world");
+  w.pump(t0 + 2);
+  const row = db.query<{ id: number; ts: number; data: string }, [string]>(
+    `SELECT id, ts, data FROM run_events WHERE line_uuid = ?`,
+  ).get(`bgshell:${id}:6`)!;
+  expect(row.data).toBe("world");
+  const sent = captured.filter((e) => e.stream === "stdout" && e.subagentId === id);
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({ id: row.id, ts: row.ts, runId, taskId, data: "world", subagentId: id });
+
+  w.detach();
+});
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * 6. Per-batch cap (review fix R4)
  * ────────────────────────────────────────────────────────────────────────── */

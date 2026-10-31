@@ -181,10 +181,10 @@ describe("route coverage (server.ts ↔ ROUTE_POLICY)", () => {
     expect(pub).toEqual(["/health"]);
   });
 
-  it("every entry carries remote: none and conditional is only used on the test-only block route", () => {
+  it("every entry carries remote: none and conditional is only used on the test-only routes", () => {
     for (const { policy } of policyEntries()) expect(policy.remote).toBe("none");
     const conditional = policyEntries().filter((e) => e.policy.conditional).map((e) => `${e.method} ${e.key}`);
-    expect(conditional).toEqual(["POST /test/block-event-loop"]);
+    expect(conditional).toEqual(["POST /test/block-event-loop", "POST /test/drop-task-streams"]);
   });
 });
 
@@ -218,6 +218,7 @@ const DESKTOP_ONLY = [
   "POST /tasks/:id/terminals",
   "POST /terminals/:id/ws-ticket",
   "POST /test/block-event-loop",
+  "POST /test/drop-task-streams",
   "POST /tmux-source",
   "POST /updates/apply",
   "POST /updates/check",

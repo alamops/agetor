@@ -17,6 +17,7 @@ import {
   runs,
   subagents,
   tasks,
+  type AppendedEvent,
 } from "./db.ts";
 import { createTask, emitRunEvent } from "./orchestrator.ts";
 import { claudeModelIdFromArg } from "./agents.ts";
@@ -332,23 +333,24 @@ async function replayFile(
     while (cursor < bound.size) {
       const sliceFrom = cursor;
       await replayJsonlLines(createTranscriptPull(fh, cursor, bound, opts?.readChunk), (stream, data, lineUuid) => {
-        let eventId: number | null;
+        let row: AppendedEvent | null;
         try {
-          eventId = runs.appendEvent(runId, stream, data, lineUuid ?? null, subagentId);
+          row = runs.appendEvent(runId, stream, data, lineUuid ?? null, subagentId);
         } catch (err) {
           if (!tasks.exists(taskId)) throw new ImportDeleted();
           throw err;
         }
-        if (eventId == null) return;
+        if (row == null) return;
         emitRunEvent({
+          id: row.id,
           runId,
           taskId,
           stream,
           data,
-          ts: Date.now(),
+          ts: row.ts,
           ...(subagentId ? { subagentId } : {}),
         });
-        if (trackOffset && stream === "assistant") lastAssistant.id = eventId;
+        if (trackOffset && stream === "assistant") lastAssistant.id = row.id;
       }, {
         sliceMs: opts?.sliceMs,
         onProgress: (consumed) => {

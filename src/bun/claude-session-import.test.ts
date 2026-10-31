@@ -648,6 +648,39 @@ test("a batch parses each transcript once and backfill emits live events", async
   }
 });
 
+test("backfill sends each imported row with its stored id and ts", async () => {
+  // Forward resume (docs/plans/event-stream-forward-resume.md D11): a panel
+  // opened mid-import resumes by these ids, so the live frame must equal its row.
+  const home = scratchDir("cc-import-ids-");
+  const cwd = path.join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const config = plant({ home, sessionId: "ids-a", cwd });
+  const live: import("../shared/types.ts").RunEvent[] = [];
+  const unsub = subscribe((event) => live.push(event));
+  try {
+    const imported = await importClaudeSessions(["ids-a"], baseOpts(home, config));
+    const taskId = imported.results[0]!.taskId!;
+    await pendingImportBackfill(taskId);
+    const rows = runs.eventsForTask(taskId);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const content = live.filter((e) => e.taskId === taskId && (e.stream === "user" || e.stream === "assistant"));
+    expect(content.length).toBeGreaterThan(0);
+    for (const e of content) {
+      expect(typeof e.id).toBe("number");
+      const row = byId.get(e.id!)!;
+      expect(row).toBeDefined();
+      expect({ ts: e.ts, stream: e.stream, data: e.data, runId: e.runId }).toEqual({
+        ts: row.ts, stream: row.stream as typeof e.stream, data: row.data, runId: row.runId,
+      });
+    }
+    // Sent in id order, so a resume cursor taken from any frame skips nothing.
+    const ids = content.map((e) => e.id!);
+    expect(ids).toEqual([...ids].sort((a, b) => a - b));
+  } finally {
+    unsub();
+  }
+});
+
 test("backfill persists its offset and a later resume continues from there", async () => {
   const home = scratchDir("cc-import-offset-");
   const cwd = path.join(home, "repo");

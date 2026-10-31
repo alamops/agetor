@@ -177,7 +177,7 @@ function seedEventsTask(spec: RunEventStream[]): { taskId: string; runId: string
   const insertMany = db.transaction(() => {
     for (const stream of spec) {
       const payload = stream === "user" ? "u".repeat(5) : stream === "status" ? "s".repeat(5) : "a".repeat(5);
-      ids.push(runs.appendEvent(runId, stream, payload)!);
+      ids.push(runs.appendEvent(runId, stream, payload)!.id);
     }
   });
   insertMany();

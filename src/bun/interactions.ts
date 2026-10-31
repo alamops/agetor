@@ -391,7 +391,7 @@ export function recordCursorAskToolResult(args: {
     isError: false,
   });
   const lineUuid = `tool_call:${args.toolCallId}:completed`;
-  let inserted: number | null;
+  let inserted: ReturnType<typeof runs.appendEvent>;
   try {
     inserted = runs.appendEvent(args.runId, "tool_result", data, lineUuid);
   } catch {
@@ -404,7 +404,8 @@ export function recordCursorAskToolResult(args: {
       taskId: args.taskId,
       stream: "tool_result",
       data,
-      ts: Date.now(),
+      ts: inserted.ts,
+      id: inserted.id,
     });
   } catch {
     /* the row is already the record */

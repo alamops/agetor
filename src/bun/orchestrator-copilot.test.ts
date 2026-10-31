@@ -292,35 +292,50 @@ test("a non-Plan-mode run records no plan", async () => {
 
 test("stream marker: a subagent row runs then completes, its events carry the subagent id, and the task is not held", async () => {
   const { runs, tasks, subagents } = await import("./db.ts");
-  const taskId = await createCopilotTask(`${STREAM} stream it`);
-  const runId = await startAndGetRunId(taskId);
+  const { subscribe } = await import("./orchestrator.ts");
+  const live: import("../shared/types.ts").RunEvent[] = [];
+  const unsub = subscribe((e) => live.push(e));
+  try {
+    const taskId = await createCopilotTask(`${STREAM} stream it`);
+    const runId = await startAndGetRunId(taskId);
 
-  // While the 500 ms subagent is open there's a `running` tab for this run.
-  await waitFor(() => subagents.listForTask(taskId).some((s) => s.status === "running"));
-  const open = subagents.listForTask(taskId).find((s) => s.status === "running")!;
-  expect(open.id).toBe(`cp-${runId}-call_sub`);
-  expect(open.runId).toBe(runId);
-  // A dedicated kind (round-trips through db.ts's PARENT_KINDS allow-list) so
-  // the Claude watcher's seed never tails it, and no source file of its own.
-  expect(open.parentKind).toBe("copilot_subagent");
-  expect(open.spawnDepth).toBe(1);
-  expect(open.toolUseId).toBe("call_sub");
-  expect(open.sourcePath).toBe("");
+    // While the 500 ms subagent is open there's a `running` tab for this run.
+    await waitFor(() => subagents.listForTask(taskId).some((s) => s.status === "running"));
+    const open = subagents.listForTask(taskId).find((s) => s.status === "running")!;
+    expect(open.id).toBe(`cp-${runId}-call_sub`);
+    expect(open.runId).toBe(runId);
+    // A dedicated kind (round-trips through db.ts's PARENT_KINDS allow-list) so
+    // the Claude watcher's seed never tails it, and no source file of its own.
+    expect(open.parentKind).toBe("copilot_subagent");
+    expect(open.spawnDepth).toBe(1);
+    expect(open.toolUseId).toBe("call_sub");
+    expect(open.sourcePath).toBe("");
 
-  await waitForRunSettled(taskId, runId);
-  const row = subagents.get(`cp-${runId}-call_sub`)!;
-  expect(row.status).toBe("completed");
-  expect(row.endedAt).not.toBeNull();
-  expect(subagents.hasRunning(taskId)).toBe(false);
-  // Not held in `running` for background agents.
-  await waitFor(() => tasks.get(taskId)?.column === "review");
+    await waitForRunSettled(taskId, runId);
+    const row = subagents.get(`cp-${runId}-call_sub`)!;
+    expect(row.status).toBe("completed");
+    expect(row.endedAt).not.toBeNull();
+    expect(subagents.hasRunning(taskId)).toBe(false);
+    // Not held in `running` for background agents.
+    await waitFor(() => tasks.get(taskId)?.column === "review");
 
-  const events = runs.eventsForTask(taskId);
-  const tagged = events.filter((e) => e.subagentId === row.id);
-  expect(tagged.length).toBeGreaterThan(0);
-  expect(tagged.some((e) => e.stream === "tool_use")).toBe(true);
-  // The main stream still has its own (untagged) assistant text.
-  expect(events.some((e) => !e.subagentId && e.stream === "assistant")).toBe(true);
+    const events = runs.eventsForTask(taskId);
+    const tagged = events.filter((e) => e.subagentId === row.id);
+    expect(tagged.length).toBeGreaterThan(0);
+    expect(tagged.some((e) => e.stream === "tool_use")).toBe(true);
+    // The main stream still has its own (untagged) assistant text.
+    expect(events.some((e) => !e.subagentId && e.stream === "assistant")).toBe(true);
+    // The sink sends each tagged row live with its stored id and ts (forward
+    // resume D11), so a resumed stream replays exactly what was sent.
+    const sentTagged = live
+      .filter((e) => e.taskId === taskId && e.subagentId === row.id && e.stream !== "subagent")
+      .map((e) => ({ id: e.id, ts: e.ts, stream: e.stream, data: e.data, subagentId: e.subagentId }));
+    expect<unknown>(sentTagged).toEqual(
+      tagged.map((e) => ({ id: e.id, ts: e.ts, stream: e.stream, data: e.data, subagentId: e.subagentId })),
+    );
+  } finally {
+    unsub();
+  }
 });
 
 test("Stop mid-turn records the run cancelled, returns the task to ready and settles its open subagents", async () => {

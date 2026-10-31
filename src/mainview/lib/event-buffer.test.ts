@@ -127,4 +127,32 @@ describe("createEventBuffer", () => {
     expect(batches).toEqual([[1], [2]]);
     expect(batches[0]).not.toBe(batches[1]); // distinct arrays, no shared buffer
   });
+
+  test("discard drops pending without emitting and the buffer stays usable", () => {
+    const batches: number[][] = [];
+    const s = makeFakeScheduler();
+    const b = createEventBuffer<number>((batch) => batches.push(batch), s.arm);
+
+    b.push(1);
+    b.push(2);
+    b.discard();
+    expect(s.isArmed()).toBe(false);
+    expect(s.disarmCount()).toBe(1);
+    s.fire(); // the cancelled arm is gone
+    b.flushNow();
+    expect(batches).toEqual([]);
+
+    // Later pushes re-arm and flush normally, without the discarded items.
+    b.push(3);
+    expect(s.isArmed()).toBe(true);
+    s.fire();
+    expect(batches).toEqual([[3]]);
+  });
+
+  test("discard on an empty buffer is a no-op", () => {
+    const s = makeFakeScheduler();
+    const b = createEventBuffer<number>(() => {}, s.arm);
+    b.discard();
+    expect(s.disarmCount()).toBe(0);
+  });
 });
