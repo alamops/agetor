@@ -478,6 +478,13 @@ test("handoffCards: assistant block is searched by values, not by JSON keys", ()
   expect(findMatchingEventIds(events, "prose-after", opts)).toEqual([0]);
 });
 
+test("handoffCards: an upper-case tag is searched by values too", () => {
+  const upper = `<HANDOFF>${JSON.stringify(SAMPLE_HANDOFF)}</Handoff>`;
+  const events = [ev("assistant", `x ${upper}`)];
+  expect(findMatchingEventIds(events, "schemaVersion", { handoffCards: true })).toEqual(NO_MATCHES);
+  expect(findMatchingEventIds(events, "summary-words", { handoffCards: true })).toEqual([0]);
+});
+
 test("handoffCards off: a non-step task still matches the raw text", () => {
   const events = [ev("assistant", `x ${SAMPLE_BLOCK}`)];
   expect(findMatchingEventIds(events, "schemaVersion")).toEqual([0]);

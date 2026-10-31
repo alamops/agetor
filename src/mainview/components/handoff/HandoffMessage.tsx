@@ -16,6 +16,7 @@ import { memo, useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { splitHandoffPromptSpans } from "../../../shared/pipeline.ts";
+import { mayContainHandoffOpenTag } from "../../../shared/handoff-locator.ts";
 import { ASSISTANT_MD_COMPONENTS, MD_URL_TRANSFORM, USER_MD_COMPONENTS } from "@/components/kanban/md-components";
 import { splitHandoffMessageCached } from "@/lib/handoff-view";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
@@ -32,10 +33,6 @@ export const AssistantMarkdown = memo(function AssistantMarkdown({ text }: { tex
   );
 });
 
-/** Cheap pre-check before the (cached) code-aware split: every real block
- *  contains its open tag, matched case-insensitively like the locator. */
-const HANDOFF_OPEN_RE = /<handoff/i;
-
 /**
  * One assistant message, including the `agetor-md text-foreground` wrapper
  * `AssistantBlock` has always rendered. `usage` is the message's D21 usage
@@ -50,7 +47,7 @@ export const AssistantHandoffMessage = memo(function AssistantHandoffMessage({
   usage?: "used" | "not-used" | null;
 }) {
   const { enabled } = useHandoffView();
-  const split = enabled && HANDOFF_OPEN_RE.test(text) ? splitHandoffMessageCached(text) : null;
+  const split = enabled && mayContainHandoffOpenTag(text) ? splitHandoffMessageCached(text) : null;
   const block = split?.block ?? null;
 
   if (split === null || block === null) {
@@ -74,6 +71,17 @@ export const AssistantHandoffMessage = memo(function AssistantHandoffMessage({
   );
 });
 
+/** The plain user-markdown render, memoized on its text so a change of the
+ *  handoff view context (which `UserHandoffMarkdown` subscribes to) doesn't
+ *  re-run ReactMarkdown over a multi-KB prompt that didn't change. */
+const PlainUserMarkdown = memo(function PlainUserMarkdown({ text }: { text: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS} urlTransform={MD_URL_TRANSFORM}>
+      {text}
+    </ReactMarkdown>
+  );
+});
+
 /** Cheap pre-check before splitting a prompt: every span opens with this. */
 const SPAN_BEGIN = "--- BEGIN untrusted handoff ";
 
@@ -87,9 +95,9 @@ const SPAN_BEGIN = "--- BEGIN untrusted handoff ";
  * `pathRoots`, when given, means `text` has NOT been path-shortened yet: the
  * spans are split first, then each text part is folded with
  * `shortenTaskPaths` — so a placeholder's handoff-file path stays absolute
- * and its record lookup keeps working. Without it, `text` renders as passed
- * (the caller already folded it; the inlined JSON sits in a fence, which
- * `shortenTaskPaths` never rewrites).
+ * and its record lookup keeps working. Without it, `text` renders as passed:
+ * a caller that folded paths itself must have kept the spans verbatim
+ * (`mapTextOutsideHandoffSpans`), or a placeholder's path reads as `@rel`.
  */
 export const UserHandoffMarkdown = memo(function UserHandoffMarkdown({
   text,
@@ -106,11 +114,7 @@ export const UserHandoffMarkdown = memo(function UserHandoffMarkdown({
   const fold = (s: string) => (pathRoots?.length ? shortenTaskPaths(s, pathRoots) : s);
 
   if (parts === null || parts.every((p) => p.kind === "text")) {
-    return (
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS} urlTransform={MD_URL_TRANSFORM}>
-        {fold(text)}
-      </ReactMarkdown>
-    );
+    return <PlainUserMarkdown text={fold(text)} />;
   }
 
   return (
@@ -118,16 +122,7 @@ export const UserHandoffMarkdown = memo(function UserHandoffMarkdown({
       {parts.map((part, i) => {
         if (part.kind === "text") {
           if (part.text.trim() === "") return null;
-          return (
-            <ReactMarkdown
-              key={i}
-              remarkPlugins={[remarkGfm]}
-              components={USER_MD_COMPONENTS}
-              urlTransform={MD_URL_TRANSFORM}
-            >
-              {fold(part.text)}
-            </ReactMarkdown>
-          );
+          return <PlainUserMarkdown key={i} text={fold(part.text)} />;
         }
         if (part.kind === "handoff") {
           return (

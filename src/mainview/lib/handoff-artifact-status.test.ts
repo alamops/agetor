@@ -158,6 +158,25 @@ describe("createArtifactStatsCache", () => {
     expect(calls).toBe(2);
   });
 
+  test("invalidate drops one entry so the next load stats again (a contradicting click)", async () => {
+    let exists = false;
+    let calls = 0;
+    const cache = createArtifactStatsCache(async () => {
+      calls++;
+      return exists ? [{ path: "/a", isDirectory: false }] : [];
+    });
+    await cache.load("/a", ["/a"]);
+    await cache.load("/b", ["/b"]);
+    expect(cache.peek("/a")?.get("/a")?.exists).toBe(false);
+    exists = true;
+    cache.invalidate("/a");
+    expect(cache.peek("/a")).toBeUndefined();
+    expect(cache.peek("/b")).toBeDefined();
+    const v = await cache.load("/a", ["/a"]);
+    expect(v.get("/a")?.exists).toBe(true);
+    expect(calls).toBe(3);
+  });
+
   test("keeps at most maxEntries sets, dropping the oldest", async () => {
     const cache = createArtifactStatsCache(async () => [], { maxEntries: 2 });
     await cache.load("/a", ["/a"]);
@@ -166,6 +185,48 @@ describe("createArtifactStatsCache", () => {
     expect(cache.peek("/a")).toBeUndefined();
     expect(cache.peek("/b")).toBeDefined();
     expect(cache.peek("/c")).toBeDefined();
+  });
+
+  test("subscribers of a key hear every landed load, not other keys or failures", async () => {
+    let fail = false;
+    const cache = createArtifactStatsCache(async (paths) => {
+      if (fail) throw new Error("offline");
+      return paths.map((path) => ({ path, isDirectory: false }));
+    });
+    const heardA: number[] = [];
+    let heardB = 0;
+    const offA = cache.subscribe("/a", () => heardA.push(heardA.length));
+    cache.subscribe("/b", () => heardB++);
+    await cache.load("/a", ["/a"]);
+    expect(heardA.length).toBe(1);
+    // A fresh hit lands nothing new, so nobody is told.
+    await cache.load("/a", ["/a"]);
+    expect(heardA.length).toBe(1);
+    // A forced re-check (invalidate + load) by ANOTHER view reaches this one.
+    cache.invalidate("/a");
+    await cache.load("/a", ["/a"]);
+    expect(heardA.length).toBe(2);
+    fail = true;
+    cache.invalidate("/a");
+    await expect(cache.load("/a", ["/a"])).rejects.toThrow("offline");
+    expect(heardA.length).toBe(2);
+    expect(heardB).toBe(0);
+    offA();
+    fail = false;
+    await cache.load("/a", ["/a"]);
+    expect(heardA.length).toBe(2);
+  });
+
+  test("a throwing subscriber doesn't stop the others or fail the load", async () => {
+    const cache = createArtifactStatsCache(async () => []);
+    let heard = 0;
+    cache.subscribe("/a", () => {
+      throw new Error("boom");
+    });
+    cache.subscribe("/a", () => heard++);
+    await cache.load("/a", ["/a"]);
+    expect(heard).toBe(1);
+    expect(cache.peek("/a")).toBeDefined();
   });
 });
 

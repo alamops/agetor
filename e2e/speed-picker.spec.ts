@@ -520,6 +520,61 @@ test.describe("speed picker", () => {
     await expect(picker).toHaveCount(0);
   });
 
+  // Regression: while the harness list doesn't hold the task's harness yet,
+  // RunPanel guessed the kind (claude-code) and its speed cascade PATCHed the
+  // fx task's stored tier to Off the moment Task details opened.
+  test("Task details: the speed/effort cascades never PATCH the task before its harness has loaded", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `speed-details-harness-loading-e2e ${randomUUID()}`;
+    const task = await createTaskRest(
+      request,
+      backend,
+      { title, prompt: title, agent: SPEED_HARNESS.id, model: DEEPSEEK, speed: "fast" },
+      false,
+    );
+    // Hold every GET /harnesses until released, so the panel renders with an
+    // empty harness list — exactly the loading window of a busy machine.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route(
+      (url) => url.pathname === "/harnesses",
+      async (route) => {
+        if (route.request().method() === "GET") await gate;
+        await route.continue();
+      },
+    );
+    const launchPatches: string[] = [];
+    page.on("request", (req) => {
+      if (req.method() !== "PATCH" || !new URL(req.url()).pathname.endsWith(`/tasks/${task.id}`)) return;
+      const body = req.postData() ?? "";
+      if (/"(speed|effort|maxMode|fast)"/.test(body)) launchPatches.push(body);
+    });
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    await panel.getByText("Task details", { exact: true }).click();
+    await expect(detailsModelSelect(panel)).toBeVisible();
+    // The cascades are passive effects of the mounted details: two frames
+    // flush them, and a PATCH they send is recorded the moment it is issued.
+    await page.evaluate(
+      () => new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 50)))),
+    );
+    expect(launchPatches).toEqual([]);
+    expect((await getTask(request, backend, task.id)).speed).toBe("fast");
+
+    release();
+    const picker = panel.getByTestId("task-speed");
+    await expect(picker).toHaveAttribute("data-value", "fast");
+    await expect(picker.getByTestId("task-speed-fast")).toBeVisible();
+    expect((await getTask(request, backend, task.id)).speed).toBe("fast");
+    expect(launchPatches).toEqual([]);
+  });
+
   test("Task details: a profile-bound task's speed picker is locked like the other launch fields", async ({
     page,
     request,

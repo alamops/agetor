@@ -1244,12 +1244,22 @@ function AdvanceForm({
   );
 }
 
+/** `value` as first seen for the current `key` (compared with `Object.is`):
+ *  the 2 s poll hands a row freshly parsed objects with unchanged content,
+ *  and re-keying the card's context on them would re-parse its markdown every
+ *  tick. Pass a key that changes whenever the content does. */
+function useStableByKey<T>(value: T, key: unknown): T {
+  const ref = useRef<{ key: unknown; value: T } | null>(null);
+  if (ref.current === null || !Object.is(ref.current.key, key)) ref.current = { key, value };
+  return ref.current.value;
+}
+
 function HistoryRow({
   taskId,
   expansionKey,
-  record,
-  graph,
-  run,
+  record: polledRecord,
+  graph: polledGraph,
+  run: polledRun,
   parentTask,
   homeDir,
 }: {
@@ -1264,6 +1274,28 @@ function HistoryRow({
   homeDir: string | null;
 }) {
   const [open, setOpen] = useState(() => isHistoryRowExpanded(taskId, expansionKey));
+  // Content-keyed identities (see `useStableByKey`), needed only while the
+  // row is expanded — the handoff card's context is the one consumer that
+  // must not change identity on an unchanged poll. A collapsed row keys on
+  // the polled object itself (no serialization per row per tick). An open
+  // record is small (its handoff is capped at 64 KB), so its JSON is the
+  // exact key; the frozen snapshot graph only changes with the run
+  // (`startedAt`), a template graph keeps its own identity; the run is read
+  // only to map handoff files to records, so its records' seq/end times are
+  // enough.
+  const record = useStableByKey(polledRecord, open ? JSON.stringify(polledRecord) : polledRecord);
+  const graph = useStableByKey(
+    polledGraph,
+    polledRun.snapshot?.graph != null && polledGraph === polledRun.snapshot.graph
+      ? `snapshot:${polledRun.startedAt}`
+      : polledGraph,
+  );
+  const run = useStableByKey(
+    polledRun,
+    open
+      ? `${polledRun.startedAt}|${polledRun.history.map((r) => `${r.seq}:${r.endedAt ?? ""}:${r.taskId}`).join(",")}`
+      : polledRun,
+  );
   const stepName = graph ? stepNameById(graph, record.stepId) : record.stepId;
   const duration = record.endedAt != null ? formatDuration(record.endedAt - record.startedAt) : "—";
   const kindInfo = responseKindLabel(record.responseKind);

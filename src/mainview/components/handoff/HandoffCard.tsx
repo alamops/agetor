@@ -10,7 +10,7 @@
 // untrusted, D17) and `history` (the run view's history row, D1a). Plus two
 // siblings: `InvalidHandoffCard` for a real tag pair whose body doesn't parse,
 // and `HandoffFileCard` for a prompt placeholder that points at a file.
-import { memo, useCallback, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CircleAlert, FileJson, Handshake, Maximize2, Search, ShieldAlert } from "lucide-react";
@@ -20,6 +20,7 @@ import { ASSISTANT_MD_COMPONENTS, MD_URL_TRANSFORM } from "@/components/kanban/m
 import { cardArtifacts, classifyHandoffArtifact } from "@/lib/handoff-artifacts";
 import { handoffMatchLocation, handoffNextLabel, handoffStatusChip, stepIdForName } from "@/lib/handoff-view";
 import type { ExpandOnJumpDetail } from "@/lib/expand-on-jump";
+import { searchHintStillValid, subscribeHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
 import { cn } from "@/lib/utils";
 import { HandoffArtifactChips } from "./HandoffArtifactChips";
@@ -101,7 +102,11 @@ export const HandoffCard = memo(function HandoffCard({
 }: HandoffCardProps) {
   const ctx = useHandoffView();
   const [open, setOpen] = useState(false);
-  const [searchHint, setSearchHint] = useState(false);
+  // The query a search jump matched only inside the modal (null: no hint).
+  // Cleared when the panel's search closes or its query changes — the hint
+  // describes THAT search (`handoff-search-hint.ts`).
+  const [hintQuery, setHintQuery] = useState<string | null>(null);
+  const searchHint = hintQuery !== null;
   const rootRef = useRef<HTMLDivElement>(null);
 
   const sourceStepId =
@@ -128,14 +133,21 @@ export const HandoffCard = memo(function HandoffCard({
   const onJump = useCallback(
     (detail: ExpandOnJumpDetail) => {
       const where = handoffMatchLocation(handoff, detail.query ?? "", { roots: ctx.roots, homeDir: ctx.homeDir });
-      setSearchHint(where === "modal");
+      setHintQuery(where === "modal" ? (detail.query ?? "") : null);
     },
     [handoff, ctx.roots, ctx.homeDir],
   );
   useExpandOnJump(rootRef, onJump);
 
+  useEffect(() => {
+    if (hintQuery === null) return;
+    return subscribeHandoffSearchSession((session) => {
+      if (!searchHintStillValid(hintQuery, session)) setHintQuery(null);
+    });
+  }, [hintQuery]);
+
   const openModal = useCallback(() => {
-    setSearchHint(false);
+    setHintQuery(null);
     setOpen(true);
   }, []);
 

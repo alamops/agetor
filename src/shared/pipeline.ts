@@ -155,6 +155,10 @@ export type HandoffPromptPart =
 /** A {@link handoffUntrustedBeginMarker} line, parsed — the nonce is the 8-hex
  *  token {@link randomHandoffNonce} generates. */
 const HANDOFF_BEGIN_LINE_RE = /^--- BEGIN untrusted handoff ([0-9a-f]{8}) from "(.*)" ---$/gm;
+/** Every BEGIN line starts with this — a cheap pre-check before the regex. */
+const HANDOFF_BEGIN_PREFIX = "--- BEGIN untrusted handoff ";
+/** `\n` + a {@link handoffUntrustedEndMarker} line, whatever follows it. */
+const HANDOFF_END_MARKER_RE = /\n--- END untrusted handoff ([0-9a-f]{8}) ---/g;
 const HANDOFF_TOO_LARGE_FILE_RE = /^\(handoff too large to inline — saved to ([^\n]+)\)$/;
 const HANDOFF_TOO_LARGE_NO_FILE = "(handoff too large to inline; no file available)";
 const HANDOFF_SAVED_FILE_RE = /^\(handoff saved to ([^\n]+)\)$/;
@@ -205,25 +209,78 @@ function interpretHandoffSpanBody(
 export function splitHandoffPromptSpans(text: string): HandoffPromptPart[] {
   const parts: HandoffPromptPart[] = [];
   let textFrom = 0;
+  for (const span of handoffPromptSpans(text)) {
+    if (span.start > textFrom) parts.push({ kind: "text", text: text.slice(textFrom, span.start) });
+    parts.push(span.part);
+    textFrom = span.end;
+  }
+  if (textFrom < text.length || parts.length === 0) parts.push({ kind: "text", text: text.slice(textFrom) });
+  return parts;
+}
+
+/**
+ * `text` with `fn` applied to every stretch OUTSIDE the untrusted-handoff
+ * spans {@link splitHandoffPromptSpans} recognizes, each span kept byte for
+ * byte (`fn` is never called with an empty stretch). For a display-only
+ * rewrite of a step prompt that must leave the spans intact so they still
+ * split into the same cards afterwards — e.g. folding task paths to `@rel`
+ * mentions, which would otherwise rewrite a saved-handoff placeholder's file
+ * path and break its record lookup. Returns `text` itself when there is no
+ * span and `fn` is the identity on it.
+ */
+export function mapTextOutsideHandoffSpans(text: string, fn: (stretch: string) => string): string {
+  let out = "";
+  let textFrom = 0;
+  for (const span of handoffPromptSpans(text)) {
+    if (span.start > textFrom) out += fn(text.slice(textFrom, span.start));
+    out += text.slice(span.start, span.end);
+    textFrom = span.end;
+  }
+  if (textFrom === 0) return text.length > 0 ? fn(text) : text;
+  if (textFrom < text.length) out += fn(text.slice(textFrom));
+  return out;
+}
+
+/** The recognized untrusted-handoff spans of `text`, in order and
+ *  non-overlapping: each one's `[start, end)` range (BEGIN line through the
+ *  END marker, excluding the newline after it) and its interpreted part. The
+ *  shared scanner behind {@link splitHandoffPromptSpans} and
+ *  {@link mapTextOutsideHandoffSpans}. */
+function* handoffPromptSpans(
+  text: string,
+): Generator<{ start: number; end: number; part: Exclude<HandoffPromptPart, { kind: "text" }> }> {
+  if (!text.includes(HANDOFF_BEGIN_PREFIX)) return;
+  // Every END marker's position, per nonce, found in ONE pass — a forged run
+  // of BEGIN lines with no END used to rescan the rest of the text from each
+  // one (`indexOf`), quadratic in the number of BEGIN lines.
+  const endsByNonce = new Map<string, { at: number[]; next: number }>();
+  const endRe = new RegExp(HANDOFF_END_MARKER_RE.source, "g");
+  for (let e = endRe.exec(text); e !== null; e = endRe.exec(text)) {
+    const entry = endsByNonce.get(e[1]!);
+    if (entry) entry.at.push(e.index);
+    else endsByNonce.set(e[1]!, { at: [e.index], next: 0 });
+  }
   const re = new RegExp(HANDOFF_BEGIN_LINE_RE.source, "gm");
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
     const nonce = m[1]!;
     const fromStep = m[2]!;
     const beginEnd = m.index + m[0].length;
     const endMarker = `\n${handoffUntrustedEndMarker(nonce)}`;
-    const endAt = text.indexOf(endMarker, beginEnd);
-    if (endAt === -1) continue;
+    // BEGIN matches arrive in increasing order, so each nonce's cursor only
+    // moves forward: the first END of this nonce at or after `beginEnd`, the
+    // same position `text.indexOf(endMarker, beginEnd)` would return.
+    const ends = endsByNonce.get(nonce);
+    if (ends === undefined) continue;
+    while (ends.next < ends.at.length && ends.at[ends.next]! < beginEnd) ends.next++;
+    if (ends.next >= ends.at.length) continue;
+    const endAt = ends.at[ends.next]!;
     const afterEnd = endAt + endMarker.length;
     if (afterEnd < text.length && text[afterEnd] !== "\n" && text[afterEnd] !== "\r") continue;
     const part = interpretHandoffSpanBody(text.slice(beginEnd, endAt), fromStep, nonce);
     if (part === null) continue;
-    if (m.index > textFrom) parts.push({ kind: "text", text: text.slice(textFrom, m.index) });
-    parts.push(part);
-    textFrom = afterEnd;
+    yield { start: m.index, end: afterEnd, part };
     re.lastIndex = afterEnd;
   }
-  if (textFrom < text.length || parts.length === 0) parts.push({ kind: "text", text: text.slice(textFrom) });
-  return parts;
 }
 
 function isFiniteNumber(x: unknown): x is number {

@@ -101,7 +101,15 @@ export interface ArtifactStatsCache {
    *  starts one. A failure rejects and is NOT cached, so the next call
    *  retries. */
   load(key: string, paths: readonly string[]): Promise<ReadonlyMap<string, ArtifactPathStat>>;
-  /** Drop every cached entry (tests; a forced re-check). */
+  /** Drop the cached entry for `key`, so the next `load` stats again (a click
+   *  whose outcome contradicted the stat). An in-flight load is kept. */
+  invalidate(key: string): void;
+  /** Call `listener` whenever a load for `key` lands a new entry — so every
+   *  mounted view of one path set picks up a re-stat another view (or a
+   *  forced re-check) triggered, instead of keeping the value it last saw.
+   *  Returns the unsubscribe function. */
+  subscribe(key: string, listener: () => void): () => void;
+  /** Drop every cached entry (tests). */
   clear(): void;
 }
 
@@ -120,6 +128,20 @@ export function createArtifactStatsCache(
   const maxEntries = opts?.maxEntries ?? 256;
   const entries = new Map<string, { at: number; value: ReadonlyMap<string, ArtifactPathStat> }>();
   const inflight = new Map<string, Promise<ReadonlyMap<string, ArtifactPathStat>>>();
+  const listeners = new Map<string, Set<() => void>>();
+
+  const notify = (key: string) => {
+    const set = listeners.get(key);
+    if (set === undefined) return;
+    // Copy: a listener may unsubscribe (or subscribe) while we iterate.
+    for (const fn of [...set]) {
+      try {
+        fn();
+      } catch {
+        // One view's failure must not keep the others stale.
+      }
+    }
+  };
 
   const peek = (key: string) => {
     const hit = entries.get(key);
@@ -151,6 +173,7 @@ export function createArtifactStatsCache(
           if (oldest.done) break;
           entries.delete(oldest.value);
         }
+        notify(key);
         return value as ReadonlyMap<string, ArtifactPathStat>;
       })
       .finally(() => {
@@ -163,6 +186,23 @@ export function createArtifactStatsCache(
   return {
     peek,
     load,
+    invalidate: (key: string) => {
+      entries.delete(key);
+    },
+    subscribe: (key: string, listener: () => void) => {
+      let set = listeners.get(key);
+      if (set === undefined) {
+        set = new Set();
+        listeners.set(key, set);
+      }
+      set.add(listener);
+      return () => {
+        const current = listeners.get(key);
+        if (current === undefined) return;
+        current.delete(listener);
+        if (current.size === 0) listeners.delete(key);
+      };
+    },
     clear: () => {
       entries.clear();
       inflight.clear();

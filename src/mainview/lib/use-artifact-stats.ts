@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import { api } from "./api";
 import {
   artifactStatsKey,
@@ -17,6 +17,11 @@ export interface ArtifactStatsResult {
   known: boolean;
   /** One entry per requested absolute path once `known`. */
   stats: ReadonlyMap<string, ArtifactPathStat>;
+  /** Stat the set again: when `force`, always (a click outcome contradicted
+   *  the stat); otherwise only when the cached entry has expired — cheap to
+   *  call on hover/focus, so a mounted card re-checks past the TTL without
+   *  polling. Stable for an unchanged path set. */
+  recheck: (force?: boolean) => void;
 }
 
 const EMPTY_STATS: ReadonlyMap<string, ArtifactPathStat> = new Map();
@@ -35,28 +40,49 @@ export function useArtifactStats(candidatePaths: readonly string[]): ArtifactSta
   // while the card stays mounted must not flip it back to "unknown".
   const lastRef = useRef<{ key: string; value: ReadonlyMap<string, ArtifactPathStat> } | null>(null);
 
+  // Re-render whenever ANY load of this set lands — this view's own, another
+  // card's, or a forced re-check — so two views of one artifact set (the
+  // transcript card and the run-view history card) never disagree.
+  useEffect(() => {
+    if (key === "") return;
+    const unsubscribe = artifactStatsCache.subscribe(key, rerender);
+    // A load that landed between this render and the subscription.
+    const fresh = artifactStatsCache.peek(key);
+    if (fresh !== undefined && (lastRef.current?.key !== key || lastRef.current.value !== fresh)) rerender();
+    return unsubscribe;
+  }, [key]);
+
   useEffect(() => {
     if (key === "" || artifactStatsCache.peek(key) !== undefined) return;
-    let cancelled = false;
-    artifactStatsCache
-      .load(key, key.split("\n"))
-      .then(() => {
-        if (!cancelled) rerender();
-      })
-      .catch(() => {
-        // Network hiccup or a headless quirk — leave the chips unknown.
-      });
-    return () => {
-      cancelled = true;
-    };
+    artifactStatsCache.load(key, key.split("\n")).catch(() => {
+      // Network hiccup or a headless quirk — leave the chips unknown.
+    });
   }, [key]);
+
+  const recheck = useCallback(
+    (force = false) => {
+      if (key === "") return;
+      if (force) artifactStatsCache.invalidate(key);
+      else if (artifactStatsCache.peek(key) !== undefined) {
+        // Fresh in the cache, but possibly newer than what this view shows
+        // (another view re-stat'ed while this one held its last value).
+        if (lastRef.current?.key !== key || lastRef.current.value !== artifactStatsCache.peek(key)) rerender();
+        return;
+      }
+      artifactStatsCache.load(key, key.split("\n")).catch(() => {
+        // Keep the last stats — unknown is never missing.
+      });
+    },
+    [key],
+  );
 
   const fresh = key === "" ? undefined : artifactStatsCache.peek(key);
   if (fresh !== undefined) lastRef.current = { key, value: fresh };
   const value = fresh ?? (lastRef.current?.key === key ? lastRef.current.value : undefined);
 
   return useMemo(
-    () => (value === undefined ? { known: false, stats: EMPTY_STATS } : { known: true, stats: value }),
-    [value],
+    () =>
+      value === undefined ? { known: false, stats: EMPTY_STATS, recheck } : { known: true, stats: value, recheck },
+    [value, recheck],
   );
 }

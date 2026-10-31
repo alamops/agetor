@@ -330,7 +330,8 @@ export function MessageSegments({
           // that on a pipeline step's prompt bubble each inlined
           // untrusted-handoff span becomes a handoff card
           // (`docs/plans/formatted-handoff.md` D1b). No `pathRoots`: the
-          // caller already folded paths in these segments.
+          // caller already folded paths in these segments, leaving the
+          // handoff spans verbatim (`mapTextOutsideHandoffSpans`).
           return <UserHandoffMarkdown key={i} text={seg.text} />;
         }
 

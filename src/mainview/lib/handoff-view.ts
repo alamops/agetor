@@ -12,6 +12,7 @@ import {
   stepNameKey,
   type HandoffMessageSplit,
 } from "../../shared/pipeline.ts";
+import { mayContainHandoffOpenTag } from "../../shared/handoff-locator.ts";
 import {
   cardArtifacts,
   classifyHandoffArtifact,
@@ -187,8 +188,8 @@ export function indexLastHandoffEventByRun(
     const e = events[i]!;
     if (e.stream !== "assistant") continue;
     if (e.subagentId !== null && e.subagentId !== undefined) continue;
-    // Cheap prefilter: every real block contains the open tag text.
-    if (!e.data.includes("<handoff")) continue;
+    // Cheap prefilter shared with every surface (case-insensitive, like the locator).
+    if (!mayContainHandoffOpenTag(e.data)) continue;
     if (splitHandoffMessageCached(e.data).block !== null) out.set(e.runId, i);
   }
   return out;

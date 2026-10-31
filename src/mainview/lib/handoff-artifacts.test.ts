@@ -302,6 +302,22 @@ describe("classifyHandoffArtifact — URLs", () => {
     expect(a.url).toBe("https://example.invalid/wiki/Foo_(bar)");
   });
 
+  test("thousands of trailing ) strip in linear time (agent-controlled input)", () => {
+    // 50 artifacts at the 8,000-char field cap, each `https://x/` + `)`s: the
+    // per-paren recount took ~9 s here.
+    const raw = `https://example.invalid/${")".repeat(7_970)}`;
+    const t0 = performance.now();
+    for (let i = 0; i < 50; i++) {
+      expect(asUrl(classify(raw)).url).toBe("https://example.invalid/");
+    }
+    expect(performance.now() - t0).toBeLessThan(250);
+  });
+
+  test("balanced parens survive a long unbalanced tail", () => {
+    const a = asUrl(classify(`https://example.invalid/wiki/Foo_(bar)${")".repeat(1000)}`));
+    expect(a.url).toBe("https://example.invalid/wiki/Foo_(bar)");
+  });
+
   test("notes after ( , — and -", () => {
     expect(asUrl(classify("https://example.invalid/a (the doc)")).note).toBe("the doc");
     expect(asUrl(classify("https://example.invalid/a — the doc")).note).toBe("the doc");

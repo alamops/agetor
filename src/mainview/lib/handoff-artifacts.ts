@@ -108,18 +108,22 @@ function splitNote(value: string): { head: string; note: string | null } {
 /** Drop closing parens that have no opener inside the URL (`…/y)` from prose
  *  like `(see https://x/y)`), keeping balanced ones (`…/Foo_(bar)`). */
 function stripUnbalancedTrailingParens(url: string): string {
-  let out = url;
-  while (out.endsWith(")")) {
-    let open = 0;
-    let close = 0;
-    for (const ch of out) {
-      if (ch === "(") open++;
-      else if (ch === ")") close++;
-    }
-    if (close <= open) break;
-    out = out.slice(0, -1);
+  // Count once, then trim — one pass. Recounting after every trimmed `)` was
+  // quadratic: a handoff artifact of `https://x/` plus thousands of `)` (agent
+  // text, capped at 8,000 chars × 50 artifacts) froze the webview for seconds.
+  let open = 0;
+  let close = 0;
+  for (let i = 0; i < url.length; i++) {
+    const ch = url.charCodeAt(i);
+    if (ch === 40) open++;
+    else if (ch === 41) close++;
   }
-  return out;
+  let end = url.length;
+  while (end > 0 && url.charCodeAt(end - 1) === 41 && close > open) {
+    end--;
+    close--;
+  }
+  return end === url.length ? url : url.slice(0, end);
 }
 
 /** The note that trails a URL token: ` (note)`, ` — note`, ` - note`, `: note`

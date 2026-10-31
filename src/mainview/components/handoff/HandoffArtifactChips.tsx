@@ -54,8 +54,13 @@ export async function copyText(text: string): Promise<boolean> {
 }
 
 /** Open / reveal / copy for a set of artifacts, plus the two failure dialogs
- *  and the context menu they share. */
-function useArtifactActions(taskId: string | undefined, stats: ArtifactStatsMap) {
+ *  and the context menu they share. `recheck` re-stats the set when a click's
+ *  outcome contradicts what the stat said. */
+function useArtifactActions(
+  taskId: string | undefined,
+  stats: ArtifactStatsMap,
+  recheck: (force?: boolean) => void,
+) {
   // Artifacts (by `raw`) a click proved gone: every candidate answered 404.
   // Cleared when a later open of the same artifact succeeds.
   const [clickedMissing, setClickedMissing] = useState<ReadonlySet<string>>(new Set());
@@ -70,6 +75,7 @@ function useArtifactActions(taskId: string | undefined, stats: ArtifactStatsMap)
 
   const runPath = useCallback(
     async (a: PathArtifact, action: "open" | "reveal") => {
+      const statSaidMissing = pathArtifactStatus(a, stats).missing;
       const order = artifactOpenOrder(a, stats);
       for (const path of order) {
         try {
@@ -83,6 +89,9 @@ function useArtifactActions(taskId: string | undefined, stats: ArtifactStatsMap)
             next.delete(a.raw);
             return next;
           });
+          // The file is there after all (created since the stat) — re-stat so
+          // the chip stops reading as missing.
+          if (statSaidMissing) recheck(true);
           if (!ok) {
             setOpenError({
               path,
@@ -100,8 +109,9 @@ function useArtifactActions(taskId: string | undefined, stats: ArtifactStatsMap)
       }
       setClickedMissing((prev) => (prev.has(a.raw) ? prev : new Set(prev).add(a.raw)));
       setNotFoundPath(artifactPrimaryPath(a, stats));
+      if (!statSaidMissing && stats !== null) recheck(true);
     },
-    [stats, taskId],
+    [stats, taskId, recheck],
   );
 
   const openUrl = useCallback(async (a: UrlArtifact) => {
@@ -119,13 +129,12 @@ function useArtifactActions(taskId: string | undefined, stats: ArtifactStatsMap)
         void openUrl(a);
         return;
       }
-      if (isMissing(a)) {
-        setNotFoundPath(artifactPrimaryPath(a, stats));
-        return;
-      }
+      // Always ask the OS, even for a chip the stat says is missing: the file
+      // may exist by now, and a 404 on every candidate still lands on the
+      // not-found dialog.
       void runPath(a, "open");
     },
-    [isMissing, openUrl, runPath, stats],
+    [openUrl, runPath],
   );
 
   const openMenu = useCallback((artifact: LinkArtifact, x: number, y: number) => setMenu({ artifact, x, y }), []);
@@ -198,16 +207,22 @@ export interface HandoffArtifactChipsProps {
 export function HandoffArtifactChips({ variant, artifacts, hiddenCount = 0, onMore }: HandoffArtifactChipsProps) {
   const { taskId } = useHandoffView();
   const candidatePaths = useMemo(() => artifactCandidatePaths(artifacts), [artifacts]);
-  const { known, stats } = useArtifactStats(candidatePaths);
+  const { known, stats, recheck } = useArtifactStats(candidatePaths);
   const statsMap: ArtifactStatsMap = known ? stats : null;
-  const { isMissing, activate, openMenu, overlays } = useArtifactActions(taskId, statsMap);
+  const { isMissing, activate, openMenu, overlays } = useArtifactActions(taskId, statsMap, recheck);
+  // Re-stat an expired entry when the user reaches for the chips (no polling).
+  const recheckIfStale = useCallback(() => recheck(false), [recheck]);
 
   if (variant === "card") {
     const chips = artifacts.filter((a): a is LinkArtifact => a.kind !== "text");
     if (chips.length === 0 && hiddenCount <= 0) return null;
     return (
       <>
-        <div className="mt-2 flex flex-wrap items-center gap-1">
+        <div
+          className="mt-2 flex flex-wrap items-center gap-1"
+          onPointerEnter={recheckIfStale}
+          onFocus={recheckIfStale}
+        >
           {chips.map((a, i) => {
             const missing = a.kind === "path" && isMissing(a);
             const label = artifactLabel(a);
@@ -261,7 +276,7 @@ export function HandoffArtifactChips({ variant, artifacts, hiddenCount = 0, onMo
   if (artifacts.length === 0) return null;
   return (
     <>
-      <ul className="space-y-1">
+      <ul className="space-y-1" onPointerEnter={recheckIfStale} onFocus={recheckIfStale}>
         {artifacts.map((a, i) => {
           if (a.kind === "text") return <TextArtifactRow key={`${a.raw}-${i}`} text={a.text} />;
           const missing = a.kind === "path" && isMissing(a);

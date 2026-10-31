@@ -12,6 +12,7 @@ import {
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import { COMPACTION_SUMMARY_LABEL, compactionSummaryLine } from "../../shared/compaction.ts";
 import { pipelineStepProgress, splitHandoffMessage } from "../../shared/pipeline.ts";
+import { mayContainHandoffOpenTag } from "../../shared/handoff-locator.ts";
 import { HANDOFF_DIGEST_LABEL, collapseHandoffPromptSpans, handoffDigestLine } from "../../shared/handoff-digest.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import {
@@ -887,10 +888,6 @@ export function buildFxRecoveryLines(events: RunEvent[]): Map<string, string | n
   return lines;
 }
 
-/** Cheap prefilter before the real locator (which matches the tag name
- *  case-insensitively, so this does too). */
-const HANDOFF_OPEN_RE = /<handoff/i;
-
 /**
  * `eventKey(e) → one-line handoff digest` pre-pass for a hidden pipeline step
  * task (`enabled`; formatted-handoff K10/D19): an `assistant` event whose text
@@ -907,7 +904,7 @@ export function buildHandoffLines(events: RunEvent[], enabled: boolean): Map<str
   const lines = new Map<string, string>();
   if (!enabled) return lines;
   for (const e of events) {
-    if (e.stream !== "assistant" || !HANDOFF_OPEN_RE.test(e.data)) continue;
+    if (e.stream !== "assistant" || !mayContainHandoffOpenTag(e.data)) continue;
     const split = splitHandoffMessage(e.data);
     if (split.block !== null) lines.set(eventKey(e), handoffDigestLine(split));
   }

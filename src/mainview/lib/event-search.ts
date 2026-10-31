@@ -15,6 +15,7 @@ import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
 import { normalizeDeliveredUserText } from "../../shared/user-message.ts";
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
 import { splitHandoffPromptSpans } from "../../shared/pipeline.ts";
+import { mayContainHandoffOpenTag } from "../../shared/handoff-locator.ts";
 import { searchableHandoffText, splitHandoffMessageCached } from "./handoff-view.ts";
 
 /** Best-effort JSON.parse that never throws — malformed/partial JSON (e.g. a
@@ -127,7 +128,7 @@ export function searchableEventText(
     case "compaction_summary":
       return data;
     case "assistant": {
-      if (!opts?.handoffCards || !data.includes("<handoff")) return data;
+      if (!opts?.handoffCards || !mayContainHandoffOpenTag(data)) return data;
       const split = splitHandoffMessageCached(data);
       if (split.block === null) return data;
       const body = split.block.result.ok ? searchableHandoffText(split.block.result.handoff) : split.block.inner;

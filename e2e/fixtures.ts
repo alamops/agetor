@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test as base } from "@playwright/test";
-import { E2E_BASE_URL, E2E_VITE_PORT } from "../playwright.config";
+import { E2E_BASE_URL, E2E_VITE_PORT, e2eIntEnv } from "../playwright.config";
 
 export { expect } from "@playwright/test";
 export type { APIRequestContext, Locator, Page } from "@playwright/test";
@@ -64,8 +64,9 @@ const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..
 // `AGETOR_E2E_PORT_OFFSET` shifts every e2e port range below (API, fresh
 // API, both GitHub stubs) by the same amount, so a second checkout can run
 // Playwright while another one holds 4600-4999 (pair it with
-// `AGETOR_E2E_VITE_PORT`, playwright.config.ts). Unset = today's ports.
-const E2E_PORT_OFFSET = Number(process.env.AGETOR_E2E_PORT_OFFSET ?? 0);
+// `AGETOR_E2E_VITE_PORT`, playwright.config.ts). Unset = today's ports; the
+// cap keeps the highest range (4900 + offset + workers) below 65536.
+const E2E_PORT_OFFSET = e2eIntEnv("AGETOR_E2E_PORT_OFFSET", 0, 0, 60_000);
 
 const BASE_API_PORT = 4600 + E2E_PORT_OFFSET;
 

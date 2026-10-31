@@ -154,6 +154,13 @@ function stepPrompt(): string {
   });
 }
 
+test("collapseHandoffPromptSpans: a CRLF-stored prompt collapses like an LF one", () => {
+  const lf = stepPrompt();
+  const crlf = lf.replace(/\n/g, "\r\n");
+  expect(collapseHandoffPromptSpans(crlf)).toBe(collapseHandoffPromptSpans(lf));
+  expect(collapseHandoffPromptSpans(crlf, { oneLine: true })).toBe(collapseHandoffPromptSpans(lf, { oneLine: true }));
+});
+
 test("collapseHandoffPromptSpans: text without spans is returned as the same string", () => {
   const text = "plain prompt\nwith lines";
   expect(collapseHandoffPromptSpans(text)).toBe(text);

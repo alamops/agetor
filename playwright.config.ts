@@ -29,10 +29,23 @@ import { defineConfig, devices } from "@playwright/test";
  * .sh`-driven backend gated behind `workers: 1`) before that moved to the
  * per-worker fixture.
  */
+/** An integer env var in `[min, max]`, `fallback` when unset or blank. Any
+ *  other value throws, so a typo fails the run when the config loads instead
+ *  of turning every derived port into `NaN`. */
+export function e2eIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]?.trim() ?? "";
+  if (raw === "") return fallback;
+  const value = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max} (got "${raw}")`);
+  }
+  return value;
+}
+
 // `AGETOR_E2E_VITE_PORT` moves the shared Vite server off :5173 for one run —
 // needed when another checkout's dev server already holds :5173, because
 // `reuseExistingServer` would otherwise silently serve THAT checkout's webview.
-export const E2E_VITE_PORT = Number(process.env.AGETOR_E2E_VITE_PORT ?? 5173);
+export const E2E_VITE_PORT = e2eIntEnv("AGETOR_E2E_VITE_PORT", 5173, 1, 65535);
 export const E2E_BASE_URL = `http://localhost:${E2E_VITE_PORT}`;
 
 export default defineConfig({

@@ -12,6 +12,7 @@ import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-re
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import { splitHandoffMessage } from "../../shared/pipeline.ts";
+import { mayContainHandoffOpenTag } from "../../shared/handoff-locator.ts";
 import { collapseHandoffPromptSpans, handoffDigestLines } from "../../shared/handoff-digest.ts";
 import { COMPACTION_SUMMARY_LABEL, compactionSummaryLine } from "../../shared/compaction.ts";
 import {
@@ -200,10 +201,6 @@ function createLineRenderer(
   };
 }
 
-/** Cheap prefilter before the real locator — the tag name is matched
- *  case-insensitively there, so it is here too. */
-const HANDOFF_OPEN_RE = /<handoff/i;
-
 /**
  * Builds a `formatEvent` renderer with its own private `toolUseId → request`
  * map for pairing a `SendUserFile` tool_use with its later tool_result — see
@@ -253,7 +250,7 @@ function createEventFormatter(opts: { handoffDigest?: boolean } = {}): (e: RunEv
         return `${colorLabel(line)} ${line.text}`;
       }
       case "assistant": {
-        if (!handoffDigest || !HANDOFF_OPEN_RE.test(e.data)) return e.data;
+        if (!handoffDigest || !mayContainHandoffOpenTag(e.data)) return e.data;
         const split = splitHandoffMessage(e.data);
         if (split.block === null) return e.data;
         // Prose before, the digest, prose after — only the JSON block itself

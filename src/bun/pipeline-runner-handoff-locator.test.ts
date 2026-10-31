@@ -191,3 +191,68 @@ test("handoff files written for the next step have names parseHandoffFilePath ac
 
   await waitUntilIdle(parentId);
 });
+
+test("the scan mode follows the run's harness: a fence split across two delta events hides the block only for a message-level harness", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+  const { __forTest } = await import("./pipeline-runner.ts");
+  const { HANDOFF_TAG } = await import("../shared/pipeline.ts");
+
+  const created = await createTask({
+    title: "scan-mode",
+    prompt: "goal",
+    workdir: mkdtempSync(path.join(tmpdir(), "agetor-handoff-locator-wd-")),
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  // A delta-streaming harness cuts one message at arbitrary points: here the
+  // closing fence of an example lands at the start of the next event, so a
+  // per-event code-aware scan would read it as a NEW fence opener and hide
+  // the real block after it.
+  const handoff = JSON.stringify({
+    schemaVersion: 1,
+    purpose: "p",
+    summary: "s",
+    reason: "r",
+    next: null,
+    artifacts: [],
+    openQuestions: [],
+  });
+  const segments = ["Example:\n```\nnpm test\n", `\`\`\`\nDone.\n<${HANDOFF_TAG}>\n${handoff}\n</${HANDOFF_TAG}>`];
+
+  const kindFor = (agent: string) => {
+    const runId = randomUUID();
+    const now = Date.now();
+    runs.insert({
+      id: runId,
+      taskId,
+      agent,
+      status: "succeeded",
+      startedAt: now,
+      endedAt: now,
+      exitCode: 0,
+      tmuxSession: null,
+      claudeSessionId: null,
+      codexSessionId: null,
+      cursorSessionId: null,
+      geminiSessionId: null,
+      fxSessionId: null,
+    });
+    for (const s of segments) runs.appendEvent(runId, "assistant", s);
+    return __forTest.parsedRunResponse(runId).kind;
+  };
+
+  try {
+    // gemini/antigravity: legacy scan, no Markdown state per event — advances.
+    expect(kindFor("gemini")).toBe("handoff");
+    expect(kindFor("antigravity")).toBe("handoff");
+    // A message-level harness reads each event as Markdown on its own (the
+    // documented trade-off): the second event's leading ``` opens a fence.
+    expect(kindFor("claude-code")).toBe("handoff-missing");
+  } finally {
+    const { deleteTask } = await import("./orchestrator.ts");
+    await deleteTask(taskId).catch(() => {});
+  }
+});

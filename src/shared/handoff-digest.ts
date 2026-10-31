@@ -118,7 +118,10 @@ export function handoffDigestLine(split: HandoffMessageSplit): string {
  */
 export function collapseHandoffPromptSpans(text: string, opts?: { oneLine?: boolean }): string {
   if (!text.includes("untrusted handoff")) return text;
-  const parts = splitHandoffPromptSpans(text);
+  // Same CR normalization the webview applies before splitting (RunPanel's
+  // UserMessageBlock): the span markers and the ```json fence need plain `\n`.
+  const normalized = text.includes("\r") ? text.replace(/\r\n?/g, "\n") : text;
+  const parts = splitHandoffPromptSpans(normalized);
   if (parts.length === 1 && parts[0]!.kind === "text") return text;
   const oneLine = opts?.oneLine === true;
   return parts

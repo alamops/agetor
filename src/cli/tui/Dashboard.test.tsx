@@ -1633,6 +1633,17 @@ test("buildHandoffLines: a real block maps to a primitive one-line digest; every
   expect(again.get(eventKey(withBlock))).toBe(lines.get(eventKey(withBlock)));
 });
 
+test("buildHandoffLines: an upper-case tag counts, like the locator (shared case-insensitive pre-check)", () => {
+  const upper: RunEvent = {
+    runId: "r",
+    taskId: "t",
+    stream: "assistant",
+    data: `Wrapping up.\n<HANDOFF>\n${HANDOFF_BODY}\n</Handoff>`,
+    ts: 1,
+  };
+  expect(buildHandoffLines([upper], true).get(eventKey(upper))).toBe("✓ done → Grilling · 2 artifacts · 1 question");
+});
+
 test("event stream: a step task renders prose + handoff› digest line; a non-step task renders the raw text", async () => {
   onTaskEvents = null;
   // Step rows are hidden until their parent is expanded with `p`; `j` then

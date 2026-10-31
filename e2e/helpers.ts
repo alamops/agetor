@@ -308,6 +308,19 @@ export async function installSseInjector(page: Page, pathname: string): Promise<
 /** Delivers `event` (JSON-encoded) as one unnamed SSE frame to every open
  *  stream `installSseInjector` recorded for `pathname`. */
 export async function injectSseFrame(page: Page, pathname: string, event: Record<string, unknown>): Promise<void> {
+  // Readiness, not a sleep: under a loaded full run the stream may not have
+  // opened yet (or is between a drop and its reconnect) when the spec gets
+  // here, so wait for the injector to hold an open stream first.
+  await page
+    .waitForFunction(
+      (target) =>
+        ((window as unknown as { __sseInjectors?: Record<string, Set<unknown>> }).__sseInjectors?.[target]?.size ?? 0) > 0,
+      pathname,
+      { timeout: 10_000 },
+    )
+    .catch(() => {
+      /* fall through: the evaluate below reports the missing stream */
+    });
   await page.evaluate(
     ({ target, data }) => {
       const open = (window as unknown as {

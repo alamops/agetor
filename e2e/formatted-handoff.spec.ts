@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, expect, type E2EBackend, type Locator, type Page } from "./fixtures";
@@ -589,5 +589,117 @@ test.describe("formatted handoff", () => {
     const wrapper = evidWrapper(card);
     await expectBefore(page, wrapper.getByText("I checked the", { exact: false }), card);
     await expect(panel.getByTestId("handoff-reminder-badge")).toHaveCount(0);
+  });
+
+  test("(11) modal artifact menu: Escape closes only the menu, even when focus left it; the next Escape closes the modal", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const seeded = await runPipeline(backend, ["rich", "done"], "done");
+    const panel = await openStepPanel(page, backend, seeded, "A");
+
+    const card = transcriptCard(panel);
+    await expect(card).toHaveCount(1, { timeout: UI_TIMEOUT });
+    await card.getByTestId("handoff-card-open").click();
+    const dialog = handoffDialog(page);
+    await expect(dialog).toBeVisible();
+    const row = dialog.getByTestId("handoff-dialog-artifact").filter({ hasText: "report.txt" });
+    await expect(row).toHaveCount(1);
+    const menu = page.getByTestId("handoff-artifact-menu");
+
+    // Focus inside the menu: the menu's own handler consumes Escape.
+    await row.click({ button: "right" });
+    await expect(menu).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    await expect(dialog).toBeVisible();
+
+    // Focus outside the menu: the dialog's document listener runs before the menu's own
+    // backstop and must yield to the open menu (it used to close the whole modal).
+    await row.click({ button: "right" });
+    await expect(menu).toBeVisible();
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    await expect(dialog).toBeVisible();
+
+    // With the menu gone, Escape closes the modal and only the modal.
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await expect(panel).toHaveClass(/translate-x-0/);
+    await expect(panel.getByTestId("run-panel-pipeline-strip")).toBeVisible();
+  });
+
+  test("(12) a chip the stat called missing still asks the OS; a click the stat contradicts re-stats the whole set", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const seeded = await runPipeline(backend, ["rich", "done"], "done");
+    const panel = await openStepPanel(page, backend, seeded, "A");
+
+    const card = transcriptCard(panel);
+    await expect(card).toHaveCount(1, { timeout: UI_TIMEOUT });
+    const chips = card.getByTestId("handoff-card-artifact");
+    const missingChip = chips.filter({ hasText: "missing.md" });
+    const existingChip = chips.filter({ hasText: "report.txt" });
+    await expect(missingChip).toHaveAttribute("data-missing", "true", { timeout: UI_TIMEOUT });
+    await expect(existingChip).not.toHaveAttribute("data-missing", "true");
+
+    // The file appears after the stat. The click asks the OS anyway (the chip used to go straight
+    // to the not-found dialog): /open-path finds the file and the headless backend answers 501.
+    // (A 501 is an error answer, which the chip reads as saying nothing about existence, so only
+    // the desktop app's 200 re-stats here — the 404 below shows the forced re-stat instead.)
+    writeFileSync(join(seeded.workdir, "agetor-handoff", "missing.md"), "written after the stat\n");
+    await missingChip.click();
+    const openError = openErrorDialog(page);
+    await expect(openError).toBeVisible({ timeout: UI_TIMEOUT });
+    await expect(openError).toContainText("missing.md");
+    await expect(page.locator("#attachment-not-found-title")).toHaveCount(0);
+    await openError.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(page.locator("#attachment-open-error-title")).toHaveCount(0);
+
+    // The other way round: a file removed after the stat → not-found dialog, and the chip dims.
+    rmSync(join(seeded.workdir, "agetor-handoff", "report.txt"));
+    await existingChip.click();
+    const notFound = notFoundDialog(page);
+    await expect(notFound).toBeVisible({ timeout: UI_TIMEOUT });
+    await expect(notFound).toContainText("report.txt");
+    await notFound.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(existingChip).toHaveAttribute("data-missing", "true", { timeout: UI_TIMEOUT });
+    // That 404 contradicted the stat, which forced a re-stat of the card's whole path set: the
+    // file written above now reads as present, long before the 30 s cache entry would expire.
+    await expect(missingChip).not.toHaveAttribute("data-missing", "true", { timeout: UI_TIMEOUT });
+  });
+
+  test("(13) a mounted card re-stats its chips on hover once the cached stat has expired (no polling)", async ({
+    page,
+    freshBackend,
+  }) => {
+    // Waits out the 30 s artifact-stat TTL (ARTIFACT_STATS_TTL_MS) on top of the pipeline run.
+    test.setTimeout(180_000);
+    const backend = freshBackend;
+    const seeded = await runPipeline(backend, ["rich", "done"], "done");
+    const panel = await openStepPanel(page, backend, seeded, "A");
+
+    const card = transcriptCard(panel);
+    await expect(card).toHaveCount(1, { timeout: UI_TIMEOUT });
+    const missingChip = card.getByTestId("handoff-card-artifact").filter({ hasText: "missing.md" });
+    await expect(missingChip).toHaveAttribute("data-missing", "true", { timeout: UI_TIMEOUT });
+    writeFileSync(join(seeded.workdir, "agetor-handoff", "missing.md"), "written after the stat\n");
+
+    // Nothing polls: each attempt moves the pointer off the chips and back onto them. A hover
+    // inside the TTL reuses the cached stat; the first one past it stats again.
+    await expect
+      .poll(
+        async () => {
+          await page.mouse.move(0, 0);
+          await missingChip.hover();
+          return missingChip.getAttribute("data-missing");
+        },
+        { timeout: 60_000, intervals: [2_000] },
+      )
+      .toBeNull();
   });
 });

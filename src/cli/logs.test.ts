@@ -800,6 +800,17 @@ test("logs --rebuild: a step task's assistant text without a real block is uncha
   expect(outputs).toEqual([prose]);
 });
 
+test("logs --rebuild: an upper-case tag on a step task is digested too (shared case-insensitive pre-check)", async () => {
+  outputs.length = 0;
+  currentClient = makeTaskClient({ pipelineParentId: "parent-1" }, [
+    { runId: "run1", taskId: "t1", stream: "assistant", data: `Wrapping up.\n\n<HANDOFF>\n${HANDOFF_JSON}\n</Handoff>`, ts: 1 },
+  ]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).toContain("handoff› ✓ done → Grilling");
+  expect(outputs[0]).not.toContain("<HANDOFF>");
+});
+
 test("logs --rebuild: a step task's invalid block is an error digest line, escaped", async () => {
   outputs.length = 0;
   currentClient = makeTaskClient({ pipelineParentId: "parent-1" }, [

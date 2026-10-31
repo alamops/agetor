@@ -14,6 +14,8 @@ import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { EXPAND_EVENT } from "@/lib/expand-on-jump";
+import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
+import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
 import { latestPrProposal } from "@/lib/pr-proposal";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
@@ -82,6 +84,7 @@ import {
   type GitHubPullMergeability,
   type PipelineGraph,
   type PipelineRunState,
+  type PipelineStepRecord,
   type Run,
   type RunEvent,
   type Subagent,
@@ -110,7 +113,7 @@ import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
-import { isHandoffReminderMarker } from "../../../shared/pipeline.ts";
+import { isHandoffReminderMarker, mapTextOutsideHandoffSpans } from "../../../shared/pipeline.ts";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
@@ -2027,6 +2030,13 @@ function RunPanelBody({
     }
   }, [activeMatchId, jumpSeq]);
 
+  // Tell the handoff cards which search is on screen, so a card's "Match in
+  // handoff" hint clears when the search closes or its query changes.
+  useEffect(() => {
+    publishHandoffSearchSession({ open: searchOpen, query: searchQuery });
+  }, [searchOpen, searchQuery]);
+  useEffect(() => () => publishHandoffSearchSession({ open: false, query: "" }), []);
+
   const closeSearch = useCallback(() => {
     setSearchOpen(false);
     setSearchQuery("");
@@ -2867,7 +2877,7 @@ function RunPanelBody({
   // task: reset to `null` in the `[task.id]` reset effect above. `forTaskId`
   // tags which step task the run was fetched for, so a response that lands
   // after a switch can never be read as the new task's.
-  const [stepPipelineRunState, setStepPipelineRun] = useState<{ forTaskId: string; run: PipelineRunState | null } | null>(null);
+  const [stepPipelineRunState, setStepPipelineRun] = useState<{ forTaskId: string; run: PipelineRunState | null; sig: string } | null>(null);
   // Both fetchers (the strip fetch, the debounced refetch) take a ticket from
   // this counter before their GET and apply a result only if no LATER-issued
   // request has already been applied — so an older response landing last
@@ -2877,7 +2887,14 @@ function RunPanelBody({
   const applyStepPipelineRun = (seq: number, forTaskId: string, run: PipelineRunState | null) => {
     if (seq <= stepRunAppliedSeqRef.current) return;
     stepRunAppliedSeqRef.current = seq;
-    setStepPipelineRun({ forTaskId, run });
+    // The debounced refetch hands back a freshly parsed run on every
+    // `pipeline` event, mostly with unchanged content: keep the stored
+    // object (and so the identity of everything derived from it — graph,
+    // record, the handoff view context) unless the content differs.
+    const sig = contentSignature(run);
+    setStepPipelineRun((prev) =>
+      prev !== null && prev.forTaskId === forTaskId && prev.sig === sig ? prev : { forTaskId, run, sig },
+    );
   };
   const stepPipelineRun = stepPipelineRunState !== null && stepPipelineRunState.forTaskId === task.id
     ? stepPipelineRunState.run
@@ -3704,20 +3721,35 @@ function RunPanelBody({
   // strip cache already holds for this parent (its first paint on a switch).
   // The ref read is re-evaluated whenever `pipelineStrip` changes — which is
   // exactly when the cache-hit paint or a fetch result lands.
+  // Content-stabilised: the graph is frozen at run start, so a run that
+  // changed only in its history keeps the same graph identity.
+  const stepGraphRef = useRef<Signed<PipelineGraph | null> | null>(null);
   const stepGraph = useMemo<PipelineGraph | null>(() => {
-    if (stepPipelineRun?.snapshot?.graph) return stepPipelineRun.snapshot.graph;
-    const parentId = task.pipelineParentId;
-    return parentId ? (pipelineStripCacheRef.current.get(parentId)?.graph ?? null) : null;
+    let graph: PipelineGraph | null = null;
+    if (stepPipelineRun?.snapshot?.graph) graph = stepPipelineRun.snapshot.graph;
+    else {
+      const parentId = task.pipelineParentId;
+      graph = parentId ? (pipelineStripCacheRef.current.get(parentId)?.graph ?? null) : null;
+    }
+    stepGraphRef.current = reuseIfSameContent(stepGraphRef.current, graph);
+    return stepGraphRef.current.value;
   }, [stepPipelineRun, task.pipelineParentId, pipelineStrip]);
   // This step task's history record — the latest execution if a cycle ran
   // the same step task more than once.
+  const stepRecordRef = useRef<Signed<PipelineStepRecord | null> | null>(null);
   const stepRecord = useMemo(() => {
     const history = stepPipelineRun?.history;
-    if (!history) return null;
-    for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i]!.taskId === task.id) return history[i]!;
+    let found: PipelineStepRecord | null = null;
+    if (history) {
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i]!.taskId === task.id) {
+          found = history[i]!;
+          break;
+        }
+      }
     }
-    return null;
+    stepRecordRef.current = reuseIfSameContent(stepRecordRef.current, found);
+    return stepRecordRef.current.value;
   }, [stepPipelineRun, task.id]);
   const handoffStepId = task.pipelineStepId ?? stepRecord?.stepId ?? null;
   const handoffView = useMemo<HandoffViewValue>(
@@ -6430,9 +6462,17 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   // ONLY; the references arrays keep absolute paths for chips/previews.
   // Shortening runs BEFORE segmentation below: it never touches tag markup
   // (tags aren't paths) and it already skips code spans itself, so the
-  // segment parser sees the folded text and both features compose.
-  const displayCommandArgs = pathRoots?.length ? shortenTaskPaths(commandArgsText, pathRoots) : commandArgsText;
-  const displayOrdinaryArgs = pathRoots?.length ? shortenTaskPaths(ordinaryArgsText, pathRoots) : ordinaryArgsText;
+  // segment parser sees the folded text and both features compose. A step
+  // prompt's untrusted-handoff spans are kept verbatim: a saved-handoff
+  // placeholder carries an absolute file path that the handoff card looks
+  // its record up by, and folding it to `@rel` would break that lookup.
+  const foldPaths = useCallback(
+    (s: string) =>
+      pathRoots?.length ? mapTextOutsideHandoffSpans(s, (t) => shortenTaskPaths(t, pathRoots)) : s,
+    [pathRoots],
+  );
+  const displayCommandArgs = useMemo(() => foldPaths(commandArgsText), [foldPaths, commandArgsText]);
+  const displayOrdinaryArgs = useMemo(() => foldPaths(ordinaryArgsText), [foldPaths, ordinaryArgsText]);
 
   // A slash command's args are an intended user message too — segment them
   // the same general way a `tagged` message's text is segmented below, so a
@@ -6453,8 +6493,8 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   const taggedSegments = useMemo((): MessageSegment[] => {
     if (!parsed || parsed.kind !== "tagged") return [];
     const text = parsed.references.length > 0 ? stripImagePlaceholders(parsed.text) : parsed.text;
-    return parseMessageSegments(pathRoots?.length ? shortenTaskPaths(text, pathRoots) : text);
-  }, [parsed, pathRoots]);
+    return parseMessageSegments(foldPaths(text));
+  }, [parsed, foldPaths]);
 
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
@@ -7356,6 +7396,12 @@ function TaskDetails({
     }
   };
   const kind = harnessKindOf(task.agent, harnesses);
+  // `harnessKindOf` falls back to claude-code while the harness list doesn't
+  // hold the task's harness yet (still loading, or a harness added since the
+  // last poll). The effort/speed/max-mode cascades below must not PATCH the
+  // task under that guessed kind — on a loaded run that cleared an fx task's
+  // stored speed tier the moment the panel opened.
+  const harnessKnown = harnesses.some((h) => h.id === task.agent);
   const selectedStatus = agents.find((a) => a.harnessId === task.agent);
 
   const save = async (patch: Partial<Task>) => {
@@ -7476,6 +7522,7 @@ function TaskDetails({
     // supposed to keep the user's hands off (see the `profileLock`/`editable`
     // rule above).
     if (task.agentProfileId != null) return;
+    if (!harnessKnown) return;
     if (task.effort && retainable.has(task.effort)) return;
     if (supportedEffortsForModel.length === 0) {
       if (task.effort !== null) void save({ effort: null });
@@ -7486,7 +7533,7 @@ function TaskDetails({
       : supportedEffortsForModel[0]!.id;
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId]);
+  }, [allowedEfforts, retainable, task.effort, supportedEffortsForModel, task.agentProfileId, harnessKnown]);
   useEffect(() => {
     // Same profile-lock guard as the effort cascade above — `speed`/`maxMode`
     // are also profile-owned fields once bound.
@@ -7496,15 +7543,16 @@ function TaskDetails({
     // model doesn't list stays and renders as the picker's "(not offered)"
     // segment — the driver posts a breadcrumb and runs without it. Only a
     // user model change resets it (`onModelChange`).
-    if (kind === "fx") return;
+    if (kind === "fx" || !harnessKnown) return;
     if (task.speed !== "off" && !speedOptions.includes(task.speed)) void save({ speed: "off" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, speedOptions, task.speed, task.agentProfileId]);
+  }, [kind, speedOptions, task.speed, task.agentProfileId, harnessKnown]);
   useEffect(() => {
     if (task.agentProfileId != null) return;
+    if (!harnessKnown) return;
     if (task.maxMode && !maxModeAvailable) void save({ maxMode: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [maxModeAvailable, task.maxMode, task.agentProfileId]);
+  }, [maxModeAvailable, task.maxMode, task.agentProfileId, harnessKnown]);
 
   const onAgentChange = (nextId: string) => {
     if (nextId === task.agent) return;

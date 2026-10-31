@@ -289,6 +289,10 @@ describe("indexLastHandoffEventByRun", () => {
     expect(indexLastHandoffEventByRun(events).get("r1")).toBe(5);
     expect(indexLastHandoffEventByRun(events.slice(0, 5)).get("r1")).toBe(0);
   });
+  test("an upper-case tag counts, like the locator (shared case-insensitive pre-check)", () => {
+    const events = [{ runId: "r1", stream: "assistant", data: `<HANDOFF>${JSON.stringify(handoff({}))}</HANDOFF>` }];
+    expect(indexLastHandoffEventByRun(events).get("r1")).toBe(0);
+  });
   test("a run with no real block has no entry", () => {
     expect(indexLastHandoffEventByRun([{ runId: "r1", stream: "assistant", data: "no block" }]).size).toBe(0);
   });
