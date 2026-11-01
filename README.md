@@ -186,6 +186,7 @@ flowchart LR
 
 - **One card, many agents.** Running a pipeline creates a single board card. Each step runs as a hidden task in the card's worktree. Click any step to read its transcript, chat with it or check its diff, just like a normal task.
 - **Structured handoffs.** Each step ends its turn with a small `<handoff>` JSON block: a summary, the files it touched, open questions and which step runs `next`. That block becomes the next step's context.
+- **Readable handoffs.** In a step's transcript the block shows as a card instead of raw JSON: a Done/Blocked chip, where the run goes next, the summary, up to six clickable file and link chips, and the number of open questions. **Open** shows the whole handoff in a window — formatted sections, which step it came from and where `next` leads, whether the pipeline used it, **Copy JSON** and a Raw view. File chips open in your default app (right-click for Reveal in Finder or Copy path) and links open in the browser; a file that doesn't exist is dimmed. The run view's history and the next step's prompt show the same card (marked *untrusted* in the prompt, since another agent wrote it), and `agetor logs` prints a short `handoff›` summary. Message search finds the handoff's text, not its JSON keys.
 - **Branching, fan-out and loops.** When a step has more than one outgoing edge, it chooses where to go by putting the next step's name (or the edge's label) in its handoff. A step can instead run all of its outgoing steps in parallel, and an edge can loop back to an earlier step. A step with several incoming edges either runs each time one of them hands off, or waits until all of them have. A step cap (25 by default) stops runaway loops.
 - **Live run view.** The canvas animates as the pipeline runs: the active step pulses, and a token travels along each edge when a handoff happens.
 - **Blocks instead of guessing.** If a step needs your input, fails, or can't produce a valid handoff even after one automatic reminder, the card moves to **Blocked** with the reason. From there you can retry the step, choose the next step yourself, stop, or restart.
@@ -200,7 +201,7 @@ flowchart LR
 
 <br />
 
-A step ends its turn with a block like this. The last block in the turn wins.
+A step ends its turn with a block like this. The last block in the turn wins. A tag inside inline code (`` `<handoff>` ``) or a fenced code block is just text, not a handoff, so a step can mention the tag in its prose, and a block wrapped entirely in a code fence gets the one automatic reminder.
 
 ```
 <handoff>

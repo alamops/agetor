@@ -29,7 +29,50 @@ import { defineConfig, devices } from "@playwright/test";
  * .sh`-driven backend gated behind `workers: 1`) before that moved to the
  * per-worker fixture.
  */
-export const E2E_VITE_PORT = 5173;
+/** An integer env var in `[min, max]`, `fallback` when unset or blank. Any
+ *  other value throws, so a typo fails the run when the config loads instead
+ *  of turning every derived port into `NaN`. */
+export function e2eIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]?.trim() ?? "";
+  if (raw === "") return fallback;
+  const value = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max} (got "${raw}")`);
+  }
+  return value;
+}
+
+/** Ports Chromium refuses to connect to (`ERR_UNSAFE_PORT`, its
+ *  `kRestrictedPorts` list in net/base/port_util.cc). Every e2e page loads the
+ *  webview from the Vite port and calls its worker's backend on an API port,
+ *  so landing either on one of these fails every request in the browser with
+ *  a network error that never mentions the port. */
+export const CHROMIUM_RESTRICTED_PORTS: ReadonlySet<number> = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102, 103,
+  104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513,
+  514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720,
+  1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
+]);
+
+/** `port` unchanged, or a thrown error when Chromium would refuse to connect
+ *  to it. `name` says which override or range produced it, so the fix (a
+ *  different value) is obvious. Allowed ports pass straight through. */
+export function assertBrowserSafePort(name: string, port: number): number {
+  if (CHROMIUM_RESTRICTED_PORTS.has(port)) {
+    throw new Error(
+      `${name} resolved to port ${port}, which Chromium blocks (ERR_UNSAFE_PORT) — choose a different AGETOR_E2E_VITE_PORT / AGETOR_E2E_PORT_OFFSET`,
+    );
+  }
+  return port;
+}
+
+// `AGETOR_E2E_VITE_PORT` moves the shared Vite server off :5173 for one run —
+// needed when another checkout's dev server already holds :5173, because
+// `reuseExistingServer` would otherwise silently serve THAT checkout's webview.
+export const E2E_VITE_PORT = assertBrowserSafePort(
+  "AGETOR_E2E_VITE_PORT",
+  e2eIntEnv("AGETOR_E2E_VITE_PORT", 5173, 1, 65535),
+);
 export const E2E_BASE_URL = `http://localhost:${E2E_VITE_PORT}`;
 
 export default defineConfig({
@@ -50,7 +93,7 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    command: "bun run hmr",
+    command: E2E_VITE_PORT === 5173 ? "bun run hmr" : `bunx vite --port ${E2E_VITE_PORT}`,
     url: E2E_BASE_URL,
     timeout: 60_000,
     reuseExistingServer: !process.env.CI,

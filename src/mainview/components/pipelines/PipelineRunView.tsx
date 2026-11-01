@@ -64,6 +64,9 @@ import type {
   Subagent,
   Task,
 } from "../../../shared/types.ts";
+import { HandoffCard } from "@/components/handoff/HandoffCard";
+import { HandoffViewContext, stepNameFor, type HandoffViewValue } from "@/components/handoff/handoff-context";
+import { MdImageScopeContext, type MdImageScope } from "@/components/kanban/md-components";
 import { PipelineCanvasContext, type PipelineCanvasContextValue, type StepProfileResolution } from "./pipeline-canvas-context";
 import { StepEdge } from "./StepEdge";
 import { StepNode } from "./StepNode";
@@ -195,6 +198,8 @@ interface PipelineRunViewProps {
    *  `markDone` the board card uses, so the board updates immediately.
    *  Falls back to `api.moveTask` when omitted. */
   onMarkDone?: (task: Task) => Promise<void> | void;
+  /** The user's home directory, for `~/` artifacts in a history handoff card. */
+  homeDir?: string | null;
 }
 
 function formatClockTime(ts: number): string {
@@ -273,7 +278,7 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * re-render (and therefore `<StoreUpdater>`'s own `setEdges`/`setNodes`
  * sync) entirely when a poll turns up nothing new to paint.
  */
-export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone }: PipelineRunViewProps) {
+export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone, homeDir = null }: PipelineRunViewProps) {
   const { resolved } = useTheme();
   const { profiles: liveProfiles, loaded: liveProfilesLoaded } = useAgentProfiles();
   const confirm = useConfirm();
@@ -1163,6 +1168,9 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                       expansionKey={expansionKey}
                       record={record}
                       graph={effectiveGraph}
+                      run={run}
+                      parentTask={task}
+                      homeDir={homeDir}
                     />
                   );
                 })}
@@ -1236,11 +1244,24 @@ function AdvanceForm({
   );
 }
 
+/** `value` as first seen for the current `key` (compared with `Object.is`):
+ *  the 2 s poll hands a row freshly parsed objects with unchanged content,
+ *  and re-keying the card's context on them would re-parse its markdown every
+ *  tick. Pass a key that changes whenever the content does. */
+function useStableByKey<T>(value: T, key: unknown): T {
+  const ref = useRef<{ key: unknown; value: T } | null>(null);
+  if (ref.current === null || !Object.is(ref.current.key, key)) ref.current = { key, value };
+  return ref.current.value;
+}
+
 function HistoryRow({
   taskId,
   expansionKey,
-  record,
-  graph,
+  record: polledRecord,
+  graph: polledGraph,
+  run: polledRun,
+  parentTask,
+  homeDir,
 }: {
   taskId: string;
   /** `historyExpansionKey(run.startedAt, record.seq)` — remembers this row's
@@ -1248,12 +1269,63 @@ function HistoryRow({
   expansionKey: string;
   record: PipelineStepRecord;
   graph: PipelineGraph | null;
+  run: PipelineRunState;
+  parentTask: Task;
+  homeDir: string | null;
 }) {
   const [open, setOpen] = useState(() => isHistoryRowExpanded(taskId, expansionKey));
+  // Content-keyed identities (see `useStableByKey`), needed only while the
+  // row is expanded — the handoff card's context is the one consumer that
+  // must not change identity on an unchanged poll. A collapsed row keys on
+  // the polled object itself (no serialization per row per tick). An open
+  // record is small (its handoff is capped at 64 KB), so its JSON is the
+  // exact key; the frozen snapshot graph only changes with the run
+  // (`startedAt`), a template graph keeps its own identity; the run is read
+  // only to map handoff files to records, so its records' seq/end times are
+  // enough.
+  const record = useStableByKey(polledRecord, open ? JSON.stringify(polledRecord) : polledRecord);
+  const graph = useStableByKey(
+    polledGraph,
+    polledRun.snapshot?.graph != null && polledGraph === polledRun.snapshot.graph
+      ? `snapshot:${polledRun.startedAt}`
+      : polledGraph,
+  );
+  const run = useStableByKey(
+    polledRun,
+    open
+      ? `${polledRun.startedAt}|${polledRun.history.map((r) => `${r.seq}:${r.endedAt ?? ""}:${r.taskId}`).join(",")}`
+      : polledRun,
+  );
   const stepName = graph ? stepNameById(graph, record.stepId) : record.stepId;
   const duration = record.endedAt != null ? formatDuration(record.endedAt - record.startedAt) : "—";
   const kindInfo = responseKindLabel(record.responseKind);
   const handoffSource = handoffSourceChip(record);
+  const worktreePath = parentTask.worktreePath;
+  const workdir = parentTask.workdir;
+  // Per-row context for the formatted handoff card (K6): it resolves
+  // artifacts against the parent's roots and finds the handoff file by the
+  // row's own record. `usage` is deliberately not passed — whether the next
+  // step used this handoff isn't provable here (D21).
+  const handoffView = useMemo<HandoffViewValue>(
+    () => ({
+      enabled: true,
+      taskId: record.taskId,
+      parentId: parentTask.id,
+      roots: [worktreePath, workdir],
+      homeDir,
+      stepId: record.stepId,
+      stepName: stepNameFor(graph, record.stepId),
+      graph,
+      run,
+      record,
+      settledRunIds: new Set<string>(),
+    }),
+    [record, parentTask.id, worktreePath, workdir, homeDir, graph, run],
+  );
+  const mdImageScope = useMemo<MdImageScope>(
+    () => ({ taskId: record.taskId, roots: [worktreePath, workdir], allowLocal: true }),
+    [record.taskId, worktreePath, workdir],
+  );
 
   return (
     <li data-testid="pipeline-run-history-row" className="rounded-md border border-border p-2">
@@ -1309,12 +1381,13 @@ function HistoryRow({
         </div>
       )}
       {open && record.handoff && (
-        <pre
-          data-testid="pipeline-run-history-handoff"
-          className="mt-2 max-h-48 overflow-auto rounded bg-muted p-2 text-[10px]"
-        >
-          {JSON.stringify(record.handoff, null, 2)}
-        </pre>
+        <div data-testid="pipeline-run-history-handoff" className="mt-2">
+          <HandoffViewContext.Provider value={handoffView}>
+            <MdImageScopeContext.Provider value={mdImageScope}>
+              <HandoffCard handoff={record.handoff} variant="history" stepId={record.stepId} />
+            </MdImageScopeContext.Provider>
+          </HandoffViewContext.Provider>
+        </div>
       )}
     </li>
   );

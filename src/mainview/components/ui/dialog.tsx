@@ -123,13 +123,17 @@ export function Dialog({
         // Full carrier list (verify with `grep -rn "data-popover-open"
         // src/mainview`): `SearchSelect` (ui/search-select.tsx),
         // `MultiSearchSelect` (ui/multi-search-select.tsx), `InfoTip`
-        // (ui/info-tip.tsx), `MessageHistoryPicker`, the task context menu
-        // (ui/context-menu.tsx — portals to `document.body`, but it's never
-        // opened from inside a dialog and owns its own Escape listener),
-        // `SlashAutocomplete`, and `ExtensionPicker`. None of these carriers
-        // portal out of their parent (the context menu is the one exception,
-        // and it doesn't apply here for the reason above), which is what
-        // makes panel-scoping safe.
+        // (ui/info-tip.tsx), `MessageHistoryPicker`, `SlashAutocomplete`,
+        // `AtFileAutocomplete`, `ExtensionPicker`, and `ContextMenu`
+        // (ui/context-menu.tsx). None of these carriers portal out of their
+        // parent except `ContextMenu`, which portals to `document.body` and IS
+        // opened from inside a dialog (the handoff dialog's artifact menu) —
+        // so an open `role="menu"` carrier is also honored document-wide
+        // below. It's safe to: the menu closes on any outside mousedown,
+        // scroll, resize or blur, so it is only ever open because the user
+        // just opened it, on top of everything else. Its own panel handler
+        // consumes Escape when it has focus; this covers the case where it
+        // doesn't (its document backstop registers after this listener).
         //
         // Invariant every carrier must uphold: render the marker ONLY while
         // open, and close itself on Escape — otherwise this dialog becomes
@@ -143,6 +147,7 @@ export function Dialog({
         // `:not([data-popover-keys="escape-only"])` so an open `/`
         // autocomplete or Extensions popover doesn't also block Cmd+F.
         if (panelRef.current?.querySelector("[data-popover-open]")) return;
+        if (document.querySelector('[role="menu"][data-popover-open]')) return;
         e.preventDefault();
         onCloseRef.current();
         return;

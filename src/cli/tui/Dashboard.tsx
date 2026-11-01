@@ -11,7 +11,9 @@ import {
 } from "../../shared/fx-recovery.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
 import { COMPACTION_SUMMARY_LABEL, compactionSummaryLine } from "../../shared/compaction.ts";
-import { pipelineStepProgress } from "../../shared/pipeline.ts";
+import { pipelineStepProgress, splitHandoffMessage } from "../../shared/pipeline.ts";
+import { mayContainHandoffOpenTag } from "../../shared/handoff-locator.ts";
+import { HANDOFF_DIGEST_LABEL, collapseHandoffPromptSpans, handoffDigestLine } from "../../shared/handoff-digest.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import {
   parseSentFilesToolUse,
@@ -684,6 +686,13 @@ function Detail({
   // notice text (or `null`) already resolved, so `EventLine`'s memo isn't
   // defeated by handing it a Map reference that's fresh every flush.
   const recoveryLines = useMemo(() => buildFxRecoveryLines(events), [events]);
+  // A hidden pipeline STEP task (`pipelineParentId` set — the same signal the
+  // CLI's `agetor logs` uses, formatted-handoff K10/D19) prints its handoff
+  // as a one-line digest and collapses the untrusted-handoff spans in its
+  // prompt. Primitive per event / one boolean, for the same memo reasons as
+  // `sentLines`.
+  const isStepTask = task.pipelineParentId != null;
+  const handoffLines = useMemo(() => buildHandoffLines(events, isStepTask), [events, isStepTask]);
   const supersededToolUses = useMemo(() => supersededToolUseIndexes(events), [events]);
   // "⚠ paused — press r to resume" header hint (`docs/plans/
   // fx-recovery-follow-ups.md` §2/T6): now driven by the server-managed
@@ -740,6 +749,8 @@ function Detail({
               e={e}
               sentLine={sentLines.get(eventKey(e))}
               recoveryLine={recoveryLines.get(eventKey(e))}
+              handoffLine={handoffLines.get(eventKey(e))}
+              collapseHandoff={isStepTask}
             />
             )
           ))
@@ -882,14 +893,44 @@ export function buildFxRecoveryLines(events: RunEvent[]): Map<string, string | n
   return lines;
 }
 
+/**
+ * `eventKey(e) → one-line handoff digest` pre-pass for a hidden pipeline step
+ * task (`enabled`; formatted-handoff K10/D19): an `assistant` event whose text
+ * holds a real `<handoff>` block (the shared single-segment locator, so the
+ * TUI can't disagree with the runner or `agetor logs`) maps to
+ * `✓ done → Grilling · 7 artifacts · 10 questions`. Same primitive-per-event-key
+ * shape as `buildSentFilesLines`, for the same reason — a value handed to the
+ * memoized `EventLine` must compare by value across flushes. Every other event
+ * (and every event when `enabled` is false) is simply ABSENT, so `.get` yields
+ * the same `undefined` primitive and the line renders exactly as before.
+ * Exported for the primitive-prop assertion in Dashboard.test.tsx.
+ */
+export function buildHandoffLines(events: RunEvent[], enabled: boolean): Map<string, string> {
+  const lines = new Map<string, string>();
+  if (!enabled) return lines;
+  for (const e of events) {
+    if (e.stream !== "assistant" || !mayContainHandoffOpenTag(e.data)) continue;
+    const split = splitHandoffMessage(e.data);
+    if (split.block !== null) lines.set(eventKey(e), handoffDigestLine(split));
+  }
+  return lines;
+}
+
 const EventLine = memo(function EventLine({
   e,
   sentLine,
   recoveryLine,
+  handoffLine,
+  collapseHandoff,
 }: {
   e: RunEvent;
   sentLine: string | null | undefined;
   recoveryLine: string | null | undefined;
+  /** The one-line handoff digest for a step task's assistant event holding a
+   *  real block (`buildHandoffLines`), `undefined` otherwise. */
+  handoffLine?: string | undefined;
+  /** Step task: collapse the prompt's untrusted-handoff spans on `you›` lines. */
+  collapseHandoff?: boolean;
 }) {
   switch (e.stream) {
     // `userMessageLines` (src/shared/user-message.ts) is the single source of
@@ -903,7 +944,14 @@ const EventLine = memo(function EventLine({
       return (
         <Box flexDirection="column">
           {userMessageLines(e.data).map((line, i) => (
-            <UserPlainLine key={i} line={line} />
+            <UserPlainLine
+              key={i}
+              line={
+                collapseHandoff === true && line.label === "you›"
+                  ? { ...line, text: collapseHandoffPromptSpans(line.text, { oneLine: true }) }
+                  : line
+              }
+            />
           ))}
         </Box>
       );
@@ -919,8 +967,29 @@ const EventLine = memo(function EventLine({
           }}
         />
       );
-    case "assistant":
+    case "assistant": {
+      if (typeof handoffLine === "string") {
+        // The prose around the handoff block stays (truncated as always); the
+        // block itself becomes the one-line digest.
+        const split = splitHandoffMessage(e.data);
+        const before = split.before.trimEnd();
+        const after = split.after.trimStart();
+        return (
+          <Box flexDirection="column">
+            {before !== "" ? <Text wrap="truncate-end">{before}</Text> : null}
+            <UserPlainLine
+              line={{
+                label: HANDOFF_DIGEST_LABEL,
+                text: handoffLine,
+                tone: handoffLine.startsWith("✗") ? "error" : "tag",
+              }}
+            />
+            {after !== "" ? <Text wrap="truncate-end">{after}</Text> : null}
+          </Box>
+        );
+      }
       return <Text wrap="truncate-end">{e.data}</Text>;
+    }
     case "thinking":
       return (
         <Text dimColor wrap="truncate-end">

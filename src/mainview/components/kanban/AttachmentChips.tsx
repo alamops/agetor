@@ -13,8 +13,11 @@ import { ImageOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import { isImagePath } from "../../../shared/attachments.ts";
+import { parseHandoffFilePath } from "../../../shared/pipeline.ts";
 import { AuthedImg } from "@/components/ui/authed-img";
 import { AttachmentNotFoundDialog, AttachmentOpenErrorDialog } from "./AttachmentDialogs";
+import { HandoffFileChip } from "@/components/handoff/HandoffFileChip";
+import { useHandoffView } from "@/components/handoff/handoff-context";
 
 export function AttachmentChips({
   references,
@@ -41,6 +44,13 @@ export function AttachmentChips({
   // `{opened:false}`, or a network error) — none of these mean the path is
   // gone, so the thumbnail must survive and stay clickable.
   const [openError, setOpenError] = useState<{ path: string; message: string } | null>(null);
+  // On a pipeline step's prompt bubble, a reference to a runner-written
+  // handoff file (`pipeline-runs/<parentId>/handoff-…json`) opens the
+  // formatted handoff modal instead of OS-opening the JSON
+  // (`docs/plans/formatted-handoff.md` D18). With the handoff view disabled
+  // (any other task, a subagent tab) every chip renders exactly as before.
+  const handoffView = useHandoffView();
+  const handoffParentId = handoffView.enabled ? handoffView.parentId : null;
 
   if (references.length === 0) return null;
 
@@ -81,6 +91,9 @@ export function AttachmentChips({
     <>
       <div className="mt-1 flex flex-wrap gap-1">
         {references.map((path, index) => {
+          if (handoffParentId !== null && parseHandoffFilePath(path, handoffParentId) !== null) {
+            return <HandoffFileChip key={`${path}-${index}`} path={path} taskId={taskId} />;
+          }
           const isDir = path.endsWith("/");
           if (!isDir && isImagePath(path)) {
             return (
