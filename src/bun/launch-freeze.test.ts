@@ -291,3 +291,65 @@ test("an fx steer dropped after the freeze goes to the backlog instead of runnin
     true,
   );
 });
+
+// A freeze is checked on entry, but the calls below await before they claim
+// the task's "starting" slot — the freeze can land during that wait, and a
+// claim taken after it is exactly what the exit would cut off. Each is
+// re-checked in the same synchronous section as the claim.
+
+test("a freeze that lands while a send waits on a teardown refuses it before any claim — no run is minted", async () => {
+  const { createTask, startTask, sendInput, freezeLaunches, __enqueueTeardownForTest, LAUNCHES_FROZEN_REASON } =
+    await import("./orchestrator.ts");
+  const { runs } = await import("./db.ts");
+
+  const created = await createTask({
+    title: "launch freeze send",
+    prompt: "turn one",
+    agent: "claude-code",
+    model: "claude-opus-4-7",
+    workdir: freshWorkdir(),
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  liveTaskIds.push(taskId);
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  await waitFor(() => runs.get(started.runId)?.status !== "running");
+
+  // Hold `sendInputInner` on `pendingTeardown` — one of the awaits between the
+  // entry check and the dispatch — and freeze while it is parked there.
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  void __enqueueTeardownForTest(taskId, `launch-freeze-${taskId}`, () => gate);
+  const sending = sendInput(started.runId, "after the teardown wait");
+  await tick(30);
+  freezeLaunches();
+  release();
+
+  expect(await sending).toEqual({ delivered: false, reason: LAUNCHES_FROZEN_REASON });
+  expect(runs.listForTask(taskId)).toHaveLength(1);
+});
+
+test("a freeze that lands during resumeFxRecovery's version probe refuses it before the claim", async () => {
+  const { createTask, resumeFxRecovery, freezeLaunches, LAUNCHES_FROZEN_REASON } = await import("./orchestrator.ts");
+
+  const created = await createTask({
+    title: "launch freeze fx resume",
+    prompt: "work",
+    agent: "fx",
+    model: "deepseek/deepseek-v4-flash",
+    workdir: freshWorkdir(),
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  liveTaskIds.push(created.task.id);
+
+  // Passes the entry check, then parks on the fx version probe; the freeze
+  // lands there. Un-fixed, it carries on to "no paused fx response to resume".
+  const resuming = resumeFxRecovery(created.task.id);
+  freezeLaunches();
+  expect(await resuming).toEqual({ ok: false, status: 409, error: LAUNCHES_FROZEN_REASON });
+});

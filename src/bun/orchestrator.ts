@@ -4256,6 +4256,21 @@ function idleOnlyBusyResult(): SendInputResult {
   return { delivered: false, busy: true, reason: IDLE_ONLY_BUSY_REASON };
 }
 
+/**
+ * What a send answers once launches are frozen ({@link freezeLaunches}). An
+ * idle-only send also reads `busy`, so the pipeline runner retries its
+ * reminder with the next owner instead of blocking the step. Shared by
+ * `sendInput`'s entry check and the re-checks that follow its awaits.
+ */
+function frozenSendResult(onlyIfIdle: boolean): SendInputResult {
+  return onlyIfIdle
+    ? { delivered: false, busy: true, reason: LAUNCHES_FROZEN_REASON }
+    : { delivered: false, reason: LAUNCHES_FROZEN_REASON };
+}
+
+/** A send's answer when the task was archived while it was still awaiting. */
+const SEND_ARCHIVED_REASON = "task was archived before the message could be sent";
+
 /** What a per-kind `send*Turn` helper returns for an idle-only send it
  *  refused (see {@link SendInputResult}'s `busy`). */
 interface IdleOnlyBusy {
@@ -4371,11 +4386,7 @@ export async function sendInput(
 
   const task = tasks.get(row.task_id);
   if (!task) return { delivered: false, reason: "task not found" };
-  if (launchesFrozenFlag) {
-    return opts.onlyIfIdle === true
-      ? { delivered: false, busy: true, reason: LAUNCHES_FROZEN_REASON }
-      : { delivered: false, reason: LAUNCHES_FROZEN_REASON };
-  }
+  if (launchesFrozenFlag) return frozenSendResult(opts.onlyIfIdle === true);
 
   // Everything past the two cheap lookups above — the codex floor probe, the
   // teardown wait, the worktree restore, `@`-expansion and the per-kind
@@ -4615,8 +4626,16 @@ async function sendInputInner(
   const readyToSpawn = tasks.get(row.task_id);
   if (!readyToSpawn) return { delivered: false, reason: "task not found" };
   if (readyToSpawn.archivedAt != null) {
-    return { delivered: false, reason: "task was archived before the message could be sent" };
+    return { delivered: false, reason: SEND_ARCHIVED_REASON };
   }
+  // `sendInput` checked the freeze on entry, before every await above (the
+  // codex floor probe, the teardown wait, the worktree restore, `@`
+  // expansion). `freezeLaunches` may have landed during any of them, and a
+  // claim taken after it is exactly what the exit would cut off. Checked here
+  // in the same synchronous section as the dispatch — which, for every kind
+  // but claude, goes straight on to its `startingTaskIds` claim; claude
+  // re-checks after its own `has-session` await (`claudeSendRefusal`).
+  if (launchesFrozenFlag) return frozenSendResult(onlyIfIdle);
 
   if (kind === "claude-code") {
     const result = await sendClaudeTurn(row.task_id, line, rawLine, onlyIfIdle);
@@ -7092,6 +7111,11 @@ export async function resumeFxRecovery(
     task = tasks.get(taskId);
     if (!task) return { ok: false, status: 404, error: "not found" };
     if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
+    // The entry check above ran before the probe's await; a freeze can land
+    // during it. Nothing awaits between here and `spawnFxRun`'s claim, so this
+    // is the last point a refusal can still be clean (it also keeps the
+    // manual-resume side effects below from running on a core that is exiting).
+    if (launchesFrozenFlag) return { ok: false, status: 409, error: LAUNCHES_FROZEN_REASON };
     if (!supported) {
       if (task.fxRecovery != null) clearFxRecovery(taskId);
       return { ok: false, status: 400, error: FX_RESUME_UNSUPPORTED_TEXT };
@@ -7186,6 +7210,29 @@ type ClaudeTurnResult =
   | { runId: string; delivered: false; busy: true }
   | { runId: string; delivered: false; withheld: true; savedToBacklog: boolean }
   | { runId: string; delivered: false; withheld: false; reason: string };
+
+/**
+ * Whether a claude send must stop before it pastes into the session or claims
+ * the task's "starting" slot, or `null` to go on. Called with a task row read
+ * in the SAME synchronous section as that paste/claim, after the awaits that
+ * precede it (`sessionLiveness`'s `has-session` fork, `pasteFollowUp`): a
+ * freeze ({@link freezeLaunches}) or an archive can land during either, and
+ * `sendInputInner`'s own checks ran before them. A frozen idle-only send reads
+ * `busy`, like `sendInput`'s entry check; an archived task gets the same
+ * non-delivered answer `sendInputInner` gives, with no paste and no run row.
+ */
+function claudeSendRefusal(task: Task, onlyIfIdle: boolean): ClaudeTurnResult | null {
+  const runId = task.runId ?? "";
+  if (launchesFrozenFlag) {
+    return onlyIfIdle
+      ? { runId, delivered: false, busy: true }
+      : { runId, delivered: false, withheld: false, reason: LAUNCHES_FROZEN_REASON };
+  }
+  if (task.archivedAt != null) {
+    return { runId, delivered: false, withheld: false, reason: SEND_ARCHIVED_REASON };
+  }
+  return null;
+}
 
 /**
  * Bound how long `sendTurnInExistingSession` waits for a paste's real
@@ -7344,6 +7391,9 @@ async function sendClaudeTurn(
   // a genuine await.
   const task = tasks.get(taskId);
   if (!task) return null;
+  // The `has-session` await above is where a freeze or an archive can land.
+  const refusal = claudeSendRefusal(task, onlyIfIdle);
+  if (refusal) return refusal;
   // Idle-only send: a fake-driver or no-state task can still have an active
   // run here (`hasSessionState` is false for it), and minting would create a
   // second concurrent run. Refuse before the claim and any run-row insert.
@@ -7401,6 +7451,9 @@ async function sendTurnInExistingSession(
   if (!task) {
     return { runId: "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
   }
+  // Same section as the paste/claim below, after `sendClaudeTurn`'s await.
+  const refusal = claudeSendRefusal(task, opts.onlyIfIdle === true);
+  if (refusal) return refusal;
   // Fold-while-busy: if a turn is already in flight, paste the message into
   // the live session and record it on the ACTIVE run — no new run row, no new
   // turn slot. Claude's TUI queues the keystrokes and replays them as part of
@@ -7460,6 +7513,17 @@ async function sendTurnInExistingSession(
   // that `sendClaudeTurn`'s `sessionLiveness` read is a genuine await: two
   // overlapping sends can both arrive here having each independently
   // observed "idle" from their own stale snapshot.
+  //
+  // When the busy branch above fell through, `pasteFollowUp` was awaited: a
+  // freeze or an archive may have landed during it, so look again — freshly —
+  // before claiming. (With no await since the check at the top this is the
+  // same answer, read again.)
+  const latest = tasks.get(taskId);
+  if (!latest) {
+    return { runId: task.runId ?? "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
+  }
+  const lateRefusal = claudeSendRefusal(latest, opts.onlyIfIdle === true);
+  if (lateRefusal) return lateRefusal;
   if (startingTaskIds.has(taskId)) {
     return {
       runId: task.runId ?? "",

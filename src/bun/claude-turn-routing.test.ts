@@ -1398,6 +1398,99 @@ test("RC2(b): a continuation adopted DURING sendClaudeTurn's has-session await i
   }
 });
 
+// A claude send awaits a `has-session` fork before it pastes or claims the
+// task's "starting" slot. `sendInput` checked the freeze and the archive before
+// that await; either can land during it, and neither may reach the pane or mint
+// a run afterwards.
+
+test("a freeze that lands during sendClaudeTurn's has-session await refuses the send — nothing is pasted, no run is minted", async () => {
+  const { bin, logPath } = fakeAliveTmuxBin(600);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { runs } = await import("./db.ts");
+  const { sendInput, freezeLaunches, __resetLaunchFreezeForTest, LAUNCHES_FROZEN_REASON } = await import(
+    "./orchestrator.ts"
+  );
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+  const f = await seedIdleClaudeTask("freeze-live");
+  try {
+    const sending = sendInput(f.priorRunId, "typed just before the quit");
+    await waitForLog(logPath, "has-session");
+    freezeLaunches();
+
+    expect(await sending).toEqual({ delivered: false, reason: LAUNCHES_FROZEN_REASON });
+    expect(runs.listForTask(f.taskId)).toHaveLength(1);
+    const entries = readLog(logPath);
+    expect(entries.some((e) => e.argv.includes("load-buffer") || e.argv.includes("paste-buffer"))).toBe(false);
+  } finally {
+    __resetLaunchFreezeForTest();
+    await cleanupRc2(f);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+  }
+});
+
+test("an idle-only claude send frozen during the has-session await reads busy, like sendInput's entry check", async () => {
+  const { bin, logPath } = fakeAliveTmuxBin(600);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { runs } = await import("./db.ts");
+  const { sendInput, freezeLaunches, __resetLaunchFreezeForTest } = await import("./orchestrator.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const f = await seedIdleClaudeTask("freeze-idle");
+  try {
+    const sending = sendInput(f.priorRunId, "reminder", { onlyIfIdle: true });
+    await waitForLog(logPath, "has-session");
+    freezeLaunches();
+
+    const result = await sending;
+    expect(result.delivered).toBe(false);
+    if (!result.delivered) expect(result.busy).toBe(true);
+    expect(runs.listForTask(f.taskId)).toHaveLength(1);
+  } finally {
+    __resetLaunchFreezeForTest();
+    await cleanupRc2(f);
+  }
+});
+
+test("a task archived during sendClaudeTurn's has-session await gets no paste and no new run", async () => {
+  const { bin, logPath } = fakeAliveTmuxBin(600);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { db, runs } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+  const f = await seedIdleClaudeTask("archive-live");
+  try {
+    const sending = sendInput(f.priorRunId, "typed as it was archived");
+    await waitForLog(logPath, "has-session");
+    // The un-archive in `sendInput` already ran; this is a later archive.
+    db.run(`UPDATE tasks SET archived_at = ? WHERE id = ?`, [Date.now(), f.taskId]);
+
+    expect(await sending).toEqual({
+      delivered: false,
+      reason: "task was archived before the message could be sent",
+    });
+    expect(runs.listForTask(f.taskId)).toHaveLength(1);
+    const entries = readLog(logPath);
+    expect(entries.some((e) => e.argv.includes("load-buffer") || e.argv.includes("paste-buffer"))).toBe(false);
+  } finally {
+    await cleanupRc2(f);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+  }
+});
+
 test("D12: a notification landing in the mint window (sendTurn's flushSync) does not displace the freshly minted run — it stays task.runId, one in-flight run, no continuation row", async () => {
   const { bin } = fakeAliveTmuxBin(0);
   process.env.AGETOR_TMUX_BIN = bin;
