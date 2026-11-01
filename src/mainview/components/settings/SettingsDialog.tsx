@@ -13,6 +13,7 @@ import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { AgentProfileForm } from "@/components/kanban/AgentProfileFormDialog";
 import { AgentProfilesSection } from "@/components/settings/AgentProfilesSection";
+import { BackgroundSection } from "@/components/settings/BackgroundSection";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { PipelinesSection } from "@/components/settings/PipelinesSection";
 import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
@@ -1292,6 +1293,8 @@ function GeneralSection({
         </div>
         <p className="text-[11px] text-muted-foreground">{FONT_SIZE_HINT}</p>
       </section>
+
+      <BackgroundSection />
 
       <section className="space-y-1">
         <div className="flex items-center justify-between gap-4">

@@ -69,6 +69,9 @@ import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { OwedPipelineAlerts } from "@/lib/owed-pipeline-alerts";
 import { findTaskById } from "@/lib/notification-open";
 import { publishCloneProgress } from "@/lib/clone-progress";
+import { publishBackgroundStatus } from "@/lib/background";
+import { QuitConfirmDialog } from "@/components/QuitConfirmDialog";
+import type { QuitRequestEvent } from "@/lib/quit-dialog";
 import { publishPipelineGlobalEvent } from "@/lib/pipeline-events";
 import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
@@ -351,6 +354,8 @@ function AppInner() {
   const [githubItemDetailPrefill, setGithubItemDetailPrefill] = useState<GitHubItemDetailPrefill | null>(null);
   const [worktreesOpen, setWorktreesOpen] = useState(false);
   const [importSessionsOpen, setImportSessionsOpen] = useState(false);
+  // Pending `quit_request` (Cmd+Q / window close with runs active); null = closed.
+  const [quitRequest, setQuitRequest] = useState<QuitRequestEvent | null>(null);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -1362,34 +1367,17 @@ function AppInner() {
         })();
         return;
       }
+      if (ev.type === "background_changed") {
+        // Forwarded to the module store the Settings background section
+        // subscribes to — never opens its own event stream.
+        publishBackgroundStatus(ev.status);
+        return;
+      }
       if (ev.type !== "quit_request") return;
-      const n = ev.runningRunCount;
-      const noun = n === 1 ? "task is" : "tasks are";
-      const titlesPreview = ev.runningTaskTitles.length > 0
-        ? ev.runningTaskTitles.slice(0, 3).join(", ")
-          + (ev.runningTaskTitles.length > 3 ? ", …" : "")
-        : null;
-      void confirm({
-        title: "Quit Agetor?",
-        description: (
-          <div className="space-y-2">
-            <div>
-              {n} {noun} still running. They will keep running in the background;
-              you can reconnect to them next time you open Agetor.
-            </div>
-            {titlesPreview && (
-              <div className="font-mono text-foreground/80">{titlesPreview}</div>
-            )}
-          </div>
-        ),
-        confirmLabel: "Quit anyway",
-        cancelLabel: "Stay open",
-      }).then((ok) => {
-        if (ok) void api.forceQuit().catch(() => { /* response races process exit */ });
-      });
+      setQuitRequest(ev);
     });
     return cancel;
-  }, [confirm, refreshAgents, refreshAgentModels, refreshHarnessModels, openTask, openPipelineAttention]);
+  }, [refreshAgents, refreshAgentModels, refreshHarnessModels, openTask, openPipelineAttention]);
 
   // App-wide lifecycle subscription. Drives toasts + native notifications.
   //
@@ -2843,6 +2831,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           setSettingsOpen(true);
         }}
       />
+      <QuitConfirmDialog request={quitRequest} onClose={() => setQuitRequest(null)} />
       <ImportSessionsDialog
         open={importSessionsOpen}
         onClose={() => setImportSessionsOpen(false)}

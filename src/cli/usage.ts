@@ -352,9 +352,22 @@ export const USAGE: Record<string, string> = {
   Print the pipeline task's run status, blocked entries, active step
   executions, and full step history.`,
 
-  daemon: `usage: agetor daemon <status | start | stop>
+  daemon: `usage: agetor daemon <status | start | stop | background [status | off]>
 
-  Control the background headless core (used when the desktop app isn't open).`,
+  Control the headless core (used when the desktop app isn't open).
+
+  status            Print the core that owns the API port, plus the "Keep Agetor
+                    running in the background" state.
+  start             Start a core; brings back a stopped background core.
+  stop              Stop the core. A background core starts again at next login.
+  background status Print the background state (works with no core running).
+  background off    Turn off "Keep Agetor running in the background". Only the
+                    Agetor app can turn it on.`,
+
+  remote: `usage: agetor remote [status | off]
+
+  Remote access (preview). status prints on or off; off turns it off. Only the
+  Agetor app (Agetor › Remote Access…) can turn it on.`,
 
   info: `usage: agetor info
 

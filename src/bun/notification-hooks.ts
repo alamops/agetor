@@ -3,8 +3,8 @@
  * (D6b): a question answered from any client (webview, CLI, terminal, the
  * scraper noticing the modal closed) and a task leaving `blocked`. Both ride
  * the global event bus, so they fire wherever the change came from. The
- * desktop app installs the hook (index.ts); the headless core has no
- * notifications and never does.
+ * desktop app installs the hook (index.ts); a headless core installs it through
+ * `installHeadlessNotifications()` when its own notifications are on.
  *
  * The removals are conditional on the entry's stored kind, so an answer never
  * wipes a newer "Task succeeded" entry, and an answer only removes the entry

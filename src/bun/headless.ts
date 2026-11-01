@@ -1,7 +1,15 @@
 import pkg from "../../package.json" with { type: "json" };
 import { CLI_TOKEN, formatHostForUrl, getApiPort, resolveApiHost } from "./api-config.ts";
 import { db, dataDir, subagents, preferences } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import {
+  freezeLaunches,
+  launchesInFlight,
+  reconcileOrphans,
+  rearmFxAutoResumes,
+  reapIdleSessions,
+  stopFxAutoResumeTimers,
+  waitForLaunchesToSettle,
+} from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
@@ -19,6 +27,13 @@ import {
   probeLiveCore,
 } from "./core-creds.ts";
 import { daemonLog } from "./daemon-log.ts";
+import { bootReadySignal } from "./boot-gate.ts";
+import { CORE_EXIT_PARK, HANDOFF_LAUNCH_SETTLE_MS, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
+import {
+  installHeadlessNotifications,
+  shouldPostHeadlessNotifications,
+  type HeadlessNotificationSink,
+} from "./headless-notifications.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resumeIncompleteImports } from "./claude-session-import.ts";
@@ -40,12 +55,11 @@ import { applyHarnessAutoEnable } from "./harness-auto-enable.ts";
  */
 
 const IDLE_CHECK_MS = 30_000;
-/** Default idle-shutdown after 5 min with no run, no running background
- *  agent/workflow, and no attached client.
- *  `AGETOR_DAEMON_IDLE_MS=0` disables idle shutdown (daemon stays up). */
-const IDLE_TIMEOUT_MS = Number(
-  process.env.AGETOR_DAEMON_IDLE_MS ?? 5 * 60 * 1000,
-);
+// The idle-shutdown timeout comes from `resolveIdleTimeoutMs()` (daemon-mode.ts),
+// read when `runDaemon` starts: a CLI-spawned daemon exits after 5 min with no
+// run, no running background agent/workflow and no attached client; the
+// background login-item core never idle-exits; `AGETOR_DAEMON_IDLE_MS`
+// overrides both (`0` = never). See docs/plans/always-on-host.md §1 item 2.
 
 /** Ceiling on how long a `running` subagent row alone can hold the daemon up.
  *  Two row classes can never settle on their own: workflow container rows are
@@ -98,10 +112,51 @@ export function hasRunningWork(): boolean {
 }
 
 let shuttingDown = false;
+let handingOff = false;
+
+/**
+ * The app asked for the port (`/daemon/shutdown {mode:"handoff"}`). Exiting
+ * right away would strand any agent launch this process is still in the middle
+ * of — a claude session waiting for its > 4 KB first prompt to be pasted, or
+ * for its startup dialog to be confirmed, never writes its JSONL, and the app's
+ * restore orphans it after the grace. So stop taking new work first
+ * (`freezeLaunches`: a launch started during the wait would only be cut off at
+ * its deadline), then wait (bounded) for the in-flight launches to settle, then
+ * shut down. The core keeps serving reads meanwhile; a stop request or a
+ * signal still exits at once.
+ */
+async function handOffPort(reason: string, code: number): Promise<void> {
+  if (handingOff || shuttingDown) return;
+  handingOff = true;
+  freezeLaunches();
+  const pending = launchesInFlight();
+  if (pending > 0) {
+    daemonLog(`handoff requested — waiting for ${pending} agent launch(es) to settle`);
+    const settled = await waitForLaunchesToSettle(HANDOFF_LAUNCH_SETTLE_MS);
+    if (!settled) {
+      daemonLog(
+        `handoff: ${launchesInFlight()} launch(es) still pending after ${HANDOFF_LAUNCH_SETTLE_MS / 1000}s — handing off anyway`,
+      );
+    }
+  }
+  shutdown(reason, code);
+}
+/** True once THIS process wrote the creds file. A core that never bound (it
+ *  lost the port to a live core, or got a signal mid-boot) must not delete the
+ *  winner's creds on its way out. */
+let ownsCreds = false;
 function shutdown(reason: string, code = 0): void {
   if (shuttingDown) return;
   shuttingDown = true;
   daemonLog(`shutting down (${reason})`);
+  // Take no new work, and keep the follow-ups queued in memory (they would die
+  // with the process) in their tasks' backlog trays. Idempotent: a handoff
+  // already froze before its launch wait.
+  try {
+    freezeLaunches();
+  } catch (err) {
+    daemonLog(`freezing launches failed: ${String(err)}`);
+  }
   // fx-acp.ts's own SIGINT/SIGTERM/SIGHUP handlers always reap `fx acp`
   // children but only call `process.exit` themselves when they're the sole
   // listener for that signal — since this module registers its own
@@ -123,17 +178,31 @@ function shutdown(reason: string, code = 0): void {
   // the lag sampler. Trimmed rows stay trimmed, the next boot resumes.
   stopRetentionTimers();
   stopLagMonitor();
-  try {
-    removeCoreCreds(dataDir);
-  } catch {
-    /* best-effort */
+  // Remove the creds file only when it is still ours: the pid check also
+  // covers a successor (the app taking over) that already rewrote it.
+  if (ownsCreds && readCoreCreds(dataDir)?.pid === process.pid) {
+    try {
+      removeCoreCreds(dataDir);
+    } catch {
+      /* best-effort */
+    }
   }
   process.exit(code);
 }
 
 export async function runDaemon(): Promise<void> {
   process.env.AGETOR_HEADLESS = "1";
-  daemonLog(`cli-daemon starting — pid ${process.pid}, version ${pkg.version}`);
+  const mode = launchedBy();
+  const isLoginItem = mode === "login-item";
+  const idleTimeoutMs = resolveIdleTimeoutMs();
+  daemonLog(
+    `cli-daemon starting — pid ${process.pid}, version ${pkg.version}, launchedBy=${mode}, idle=${idleTimeoutMs > 0 ? idleTimeoutMs : "off"}`,
+  );
+  // Signal handlers go in first, not after the bind: the login-item supervisor
+  // SIGTERMs its core child whenever launchd stops the job, which can land
+  // mid-boot. `shutdown()` only removes creds this process wrote.
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   // Validate AGETOR_API_HOST before any boot work. An unusable value would
   // otherwise only surface at bind time, where Bun reports it as "Is port N in
@@ -149,13 +218,12 @@ export async function runDaemon(): Promise<void> {
 
   // Same PATH hydration + orphan reconciliation the app does at boot, so the
   // daemon can find claude/codex/tmux and doesn't leave stale "running" cards.
-  // Awaited so `startApiServer()` below never starts serving `/tasks`/`/runs`
-  // while a `status='running'` row from a previous process is still being
-  // reattached or flipped to `orphaned` underneath it — the "reconcile
-  // before the API starts" invariant (CLAUDE.md §5), mirroring index.ts's
-  // desktop boot path. A reconcile throw propagates out of `runDaemon` and
-  // fails boot loudly, same as the old synchronous `reconcileOrphans` did —
-  // no swallow.
+  // Same order as index.ts's desktop boot path (boot-gate.ts): bind, then
+  // restore, then `markBootReady()`. Routes wait on the ready signal, so the
+  // API never serves `/tasks`/`/runs` while a `status='running'` row from a
+  // previous process is still being reattached or flipped to `orphaned`
+  // underneath it (CLAUDE.md §5). A restore throw is logged and ends the
+  // process with exit 1 — no swallow.
   rehydratePath();
   // Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
   // C): one `.unref()`'d sampler that names whatever held the single main thread
@@ -168,43 +236,138 @@ export async function runDaemon(): Promise<void> {
   // attribute are actually sampled. Unref'd, so an early boot failure can never
   // be held open by it; every shutdown path calls `stopLagMonitor()`.
   startLagMonitor({ sampleMs: 100 });
-  // Must run before reconcileOrphans(): reconciliation issues `has-session`
-  // probes against agetor's tmux socket, and the first tmux command to
-  // touch a socket auto-starts its server — un-disclaimed, if this didn't
-  // run first — leaving every session that server ever hosts un-disclaimed
-  // too.
-  //
-  // The disclaim switch is decided first (docs/plans/master-token-agent-read.md
-  // P4/P5, D6): headless has no dialog, so the switch is always on and a stored
-  // "off" (which an agent could have written to the SQLite file) is ignored
-  // with one log line. It has to be settled before any agent host starts.
-  await initDisclaimSwitch("headless", {
-    readPref: () => preferences.get(DISCLAIM_PREF_KEY),
-    writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
-    log: daemonLog,
-  });
-  await ensureDisclaimedServer();
-  // Same ordering as index.ts's desktop boot path: wire the pipeline runner
-  // to the global lifecycle stream before reconcileOrphans() so a step
-  // task's boot-time orphan→ready transition reaches it too.
-  initPipelineRunner();
-  await reconcileOrphans();
-  // M16: same ordering as index.ts's desktop boot path — reconcile every
-  // pipeline parent left mid-flight by a prior crash/restart right after
-  // reconcileOrphans() resolves every step task's own orphan→ready
-  // transition. `daemonLog`, not `console.log` — see the rearm comment below.
-  const reconciledPipelineRunCount = await reconcilePipelineRuns();
-  if (reconciledPipelineRunCount > 0) {
-    daemonLog(`reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
+
+  // Bind BEFORE the boot restore (boot-gate.ts): the bind is the ownership
+  // claim. A core that loses the port exits before it reattaches a session or
+  // touches a run the owner is driving (at login the app and this core can
+  // race for the port).
+  const { ready: bootReady, markReady: markBootReady } = bootReadySignal();
+
+  // Headless OS notifications (docs/plans/always-on-host.md §3.7): the core
+  // posts the same one-per-task notifications the app's webview does, since
+  // no webview is around to decide. Installed only after the bind (a core
+  // that loses the port must not post), so the server gets a forwarding sink
+  // that drops anything sent before then.
+  // Passed to the server only when headless notifications are on AND a notifier
+  // helper resolves, so a core that never posts keeps answering
+  // `POST /notifications` with 501 — the CLI's `logs --notify` then falls back
+  // to the installed app's helper instead of reading a silent drop as delivered.
+  let notificationSink: HeadlessNotificationSink | null = null;
+  const notifications = shouldPostHeadlessNotifications()
+    ? {
+        post: (n: Parameters<HeadlessNotificationSink["post"]>[0]) => notificationSink?.post(n),
+        remove: (r: Parameters<HeadlessNotificationSink["remove"]>[0]) => notificationSink?.remove(r),
+      }
+    : undefined;
+
+  let server: ReturnType<typeof startApiServer>;
+  try {
+    // No native deps → native routes return 501.
+    server = startApiServer({
+      hostname: apiHost.host,
+      notifications,
+      // `POST /daemon/shutdown`: "stop" exits 0 (for a login-item core, its
+      // supervisor then stays stopped until the next login); "handoff" is the
+      // app taking the port, which a login-item core answers with
+      // CORE_EXIT_PARK so its supervisor parks and boots it again once the
+      // app quits. A CLI daemon exits 0 either way, as before.
+      // Every route but the ownership probes (and /daemon/shutdown, so the app
+      // can take the port from a core that is still booting) waits for the
+      // boot restore below.
+      ready: bootReady,
+      onShutdownRequest: (request) => {
+        const reason = `shutdown request (${request})`;
+        if (request !== "handoff") return shutdown(reason, 0);
+        void handOffPort(reason, isLoginItem ? CORE_EXIT_PARK : 0);
+      },
+    });
+  } catch (e) {
+    // Port busy. If a live core already owns it (the app launched, or another
+    // daemon won a startup race), exit quietly — the CLI re-discovers the
+    // winner via the creds file. Nothing was restored yet, so a losing core
+    // never touched the winner's runs. A login-item core exits CORE_EXIT_PARK
+    // either way: with a live owner its supervisor parks; with no readable
+    // owner (the app between its bind and its creds write, or a foreign
+    // process) the supervisor waits and retries with backoff instead of
+    // counting a crash. Otherwise it's a real conflict.
+    const creds = readCoreCreds(dataDir);
+    if (creds && (await probeLiveCore(creds))) {
+      daemonLog("port already owned by a live core — exiting quietly");
+      process.exit(isLoginItem ? CORE_EXIT_PARK : 0);
+    }
+    daemonLog(
+      `failed to bind API on ${formatHostForUrl(apiHost.host)}:${getApiPort()}: ${(e as Error)?.message ?? String(e)}`,
+    );
+    process.exit(isLoginItem ? CORE_EXIT_PARK : 1);
   }
-  // Re-arm in-memory auto-resume timers for every fx task still carrying a
-  // pending schedule — same rationale as index.ts's desktop boot path (see
-  // its comment): an in-memory `setTimeout` handle never survives a process
-  // restart. `daemonLog`, not `console.log` — this process has no console a
-  // user can see.
-  const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
-  if (rearmedFxAutoResumeCount > 0) {
-    daemonLog(`re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
+
+  writeCoreCreds(
+    {
+      // `server.port` is typed `number | undefined`, but a bound server always
+      // has a numeric port.
+      port: server.port!,
+      // The CLI-scoped token, never the master (D3): this file is readable by
+      // anything running as the user, an agent included, so it carries only the
+      // credential the CLI routes need. The master stays in memory (the app's
+      // webview gets it by other means; a headless core has none).
+      token: CLI_TOKEN,
+      pid: process.pid,
+      kind: "cli-daemon",
+      version: pkg.version,
+      startedAt: Date.now(),
+      // C15: `kind` stays "cli-daemon" so older CLIs and apps still hand off
+      // from it; the extra field tells newer ones it's the background core.
+      ...(isLoginItem ? { launchedBy: "login-item" as const } : {}),
+    },
+    dataDir,
+  );
+  ownsCreds = true;
+
+  // A restore that throws must not leave a bound server whose routes wait on a
+  // ready signal that never comes.
+  try {
+    // Must run before reconcileOrphans(): reconciliation issues `has-session`
+    // probes against agetor's tmux socket, and the first tmux command to
+    // touch a socket auto-starts its server — un-disclaimed, if this didn't
+    // run first — leaving every session that server ever hosts un-disclaimed
+    // too.
+    //
+    // The disclaim switch is decided first (docs/plans/master-token-agent-read.md
+    // P4/P5, D6): headless has no dialog, so the switch is always on and a stored
+    // "off" (which an agent could have written to the SQLite file) is ignored
+    // with one log line. It has to be settled before any agent host starts.
+    await initDisclaimSwitch("headless", {
+      readPref: () => preferences.get(DISCLAIM_PREF_KEY),
+      writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
+      log: daemonLog,
+    });
+    await ensureDisclaimedServer();
+    // Same ordering as index.ts's desktop boot path: wire the pipeline runner
+    // to the global lifecycle stream before reconcileOrphans() so a step
+    // task's boot-time orphan→ready transition reaches it too.
+    initPipelineRunner();
+    await reconcileOrphans();
+    // M16: same ordering as index.ts's desktop boot path — reconcile every
+    // pipeline parent left mid-flight by a prior crash/restart right after
+    // reconcileOrphans() resolves every step task's own orphan→ready
+    // transition. `daemonLog`, not `console.log` — see the rearm comment below.
+    const reconciledPipelineRunCount = await reconcilePipelineRuns();
+    if (reconciledPipelineRunCount > 0) {
+      daemonLog(`reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
+    }
+    // Re-arm in-memory auto-resume timers for every fx task still carrying a
+    // pending schedule — same rationale as index.ts's desktop boot path (see
+    // its comment): an in-memory `setTimeout` handle never survives a process
+    // restart. `daemonLog`, not `console.log` — this process has no console a
+    // user can see.
+    const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
+    if (rearmedFxAutoResumeCount > 0) {
+      daemonLog(`re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
+    }
+  } catch (err) {
+    daemonLog(`boot restore failed: ${(err as Error)?.stack ?? String(err)}`);
+    shutdown("boot restore failed", 1);
+    return;
   }
   // Same boot-sweep + periodic-refresh pair as index.ts's desktop boot path
   // (see its comment for the full rationale) — the daemon needs the same
@@ -253,24 +416,10 @@ export async function runDaemon(): Promise<void> {
   }, USAGE_POLL_SWEEP_MS);
   usageIntervalTimer.unref();
 
-  let server: ReturnType<typeof startApiServer>;
-  try {
-    // No native deps → native routes return 501.
-    server = startApiServer({ hostname: apiHost.host });
-  } catch (e) {
-    // Port busy. If a live core already owns it (the app launched, or another
-    // daemon won a startup race), exit quietly — the CLI re-discovers the
-    // winner via the creds file. Otherwise it's a real conflict.
-    const creds = readCoreCreds(dataDir);
-    if (creds && (await probeLiveCore(creds))) {
-      daemonLog("port already owned by a live core — exiting quietly");
-      process.exit(0);
-    }
-    daemonLog(
-      `failed to bind API on ${formatHostForUrl(apiHost.host)}:${getApiPort()}: ${(e as Error)?.message ?? String(e)}`,
-    );
-    process.exit(1);
-  }
+
+
+  // The boot restore is done: let the routes through.
+  markBootReady();
 
   // The desktop process resumes a crashed Claude import from its launch scan.
   // This process never runs that scan, so resume here too — otherwise a task
@@ -310,34 +459,22 @@ export async function runDaemon(): Promise<void> {
   // preference fresh. Also re-armed on demand by `PUT /preferences/...`.
   scheduleRetention();
 
-  writeCoreCreds(
-    {
-      // `server.port` is typed `number | undefined`, but a bound server always
-      // has a numeric port.
-      port: server.port!,
-      // The CLI-scoped token, never the master (D3): this file is readable by
-      // anything running as the user, an agent included, so it carries only the
-      // credential the CLI routes need. The master stays in memory (the app's
-      // webview gets it by other means; a headless core has none).
-      token: CLI_TOKEN,
-      pid: process.pid,
-      kind: "cli-daemon",
-      version: pkg.version,
-      startedAt: Date.now(),
-    },
-    dataDir,
-  );
   // A non-loopback bind's warning is printed once by startApiServer, to
   // stderr — which `spawnDaemon` points at this same daemon.log.
   daemonLog(`cli-daemon listening on http://${formatHostForUrl(apiHost.host)}:${server.port}`);
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  if (notifications) {
+    try {
+      notificationSink = installHeadlessNotifications().sink;
+    } catch (err) {
+      daemonLog(`headless notifications unavailable: ${(err as Error)?.message ?? String(err)}`);
+    }
+  }
 
   // Idle-shutdown loop: exit once nothing is running AND no client is attached
   // for longer than the timeout. The interval is unref'd so it never keeps the
   // process alive on its own — the listening server does that.
-  if (IDLE_TIMEOUT_MS > 0) {
+  if (idleTimeoutMs > 0) {
     let idleSince: number | null = null;
     const timer = setInterval(() => {
       if (hasRunningWork() || attachedClientCount() > 0) {
@@ -345,7 +482,7 @@ export async function runDaemon(): Promise<void> {
         return;
       }
       if (idleSince == null) idleSince = Date.now();
-      else if (Date.now() - idleSince >= IDLE_TIMEOUT_MS) shutdown("idle timeout");
+      else if (Date.now() - idleSince >= idleTimeoutMs) shutdown("idle timeout");
     }, IDLE_CHECK_MS);
     timer.unref();
   }

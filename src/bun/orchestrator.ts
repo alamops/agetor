@@ -131,6 +131,9 @@ import {
   setActiveRunProbe,
   setBackgroundTaskSettledHandler,
   setLocalSettingChangedHandler,
+  claudeBootsInFlight,
+  claudeTmuxOpsInFlight,
+  CLAUDE_BOOT_TIMEOUT_MS,
   type LocalSettingInfo,
 } from "./claude-tmux.ts";
 import {
@@ -1019,6 +1022,14 @@ wireInteractionBroadcast();
  *
  * Called once at boot from `src/bun/index.ts`.
  */
+/** How long after a claude run started its session JSONL may still be missing
+ *  without that meaning the session is broken: claude writes the file when it
+ *  takes the first prompt, a few seconds after the spawn — or, on a big
+ *  project, as late as the spawner's own boot timeout. Sized past
+ *  `CLAUDE_BOOT_TIMEOUT_MS` so a slow boot whose previous owner handed off
+ *  mid-launch is never killed as "JSONL missing" while it is still healthy. */
+export const CLAUDE_JSONL_APPEAR_GRACE_MS = CLAUDE_BOOT_TIMEOUT_MS + 5_000;
+
 export async function reconcileOrphans(): Promise<number> {
   // Sort newest-first so the at-most-one-reattach-per-task rule below keeps
   // the latest run row. If agetor crashed in the narrow window between
@@ -1027,8 +1038,8 @@ export async function reconcileOrphans(): Promise<number> {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; opencode_session_id: string | null; copilot_session_id: string | null; agent: string }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, copilot_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; gemini_session_id: string | null; fx_session_id: string | null; antigravity_session_id: string | null; opencode_session_id: string | null; copilot_session_id: string | null; agent: string; started_at: number }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, fx_session_id, antigravity_session_id, opencode_session_id, copilot_session_id, agent, started_at FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
   const reattachedTaskIds = new Set<string>();
@@ -1114,6 +1125,11 @@ export async function reconcileOrphans(): Promise<number> {
               onChunk,
               seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
               mode: task.mode,
+              // A session spawned moments before the previous owner exited (an
+              // app taking the port over from a live background core) may not
+              // have written its JSONL yet: wait for it rather than killing a
+              // healthy session as "JSONL missing".
+              jsonlWaitUntil: row.started_at + CLAUDE_JSONL_APPEAR_GRACE_MS,
             })
           : kind === "codex"
           ? await reattachCodexSession({
@@ -1547,6 +1563,93 @@ const startingTaskIds = new Set<string>();
 export function activeRunCount(): number {
   return active.size + startingTaskIds.size;
 }
+
+/**
+ * How many launches this process is still in the middle of: spawns that hold
+ * a task's start claim (`startingTaskIds`, which covers the codex/cursor/…
+ * one-shot launches and claude's own pre-JSONL spawn), claude sessions that
+ * haven't written their JSONL yet (`claudeBootsInFlight` — the deferred
+ * > 4 KB first-prompt paste and the startup-dialog confirm both run in this
+ * process), and claude tmux op chains still running (`claudeTmuxOpsInFlight` —
+ * a follow-up paste between its text and its Enter, an ask-card drive). A
+ * launch interrupted by the process exiting leaves a session the next owner
+ * can't reattach or a composer holding half a message, so a core handing the
+ * port off — and the app before it lets a quit through — waits for these.
+ */
+export function launchesInFlight(): number {
+  return startingTaskIds.size + claudeBootsInFlight() + claudeTmuxOpsInFlight();
+}
+
+/** Poll cadence of `waitForLaunchesToSettle`. */
+const LAUNCH_SETTLE_POLL_MS = 100;
+
+/**
+ * Resolves `true` once `launchesInFlight()` is zero, or `false` after
+ * `timeoutMs` with launches still pending. Never rejects.
+ */
+export async function waitForLaunchesToSettle(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (launchesInFlight() === 0) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(Math.min(LAUNCH_SETTLE_POLL_MS, Math.max(0, deadline - Date.now())));
+  }
+}
+
+/** Why a launch was refused once this process stopped taking new work. */
+export const LAUNCHES_FROZEN_REASON =
+  "Agetor is handing its work over to another process — try again in a moment";
+
+/** True once `freezeLaunches` ran: this process is about to exit. */
+let launchesFrozenFlag = false;
+
+/**
+ * Stop taking new work because this process is about to exit — a headless core
+ * handing the port to the app (or stopping), or the app letting a quit through.
+ * Called right before the bounded `waitForLaunchesToSettle`, so nothing new
+ * starts that the wait would then cut off at its deadline. Terminal and
+ * idempotent: the process exits once the wait ends.
+ *
+ * - `startTask`, `sendInput` and `resumeFxRecovery` refuse with
+ *   {@link LAUNCHES_FROZEN_REASON} (an idle-only send also reads `busy`, so
+ *   the pipeline runner's reminder is retried by the next owner instead of
+ *   blocking the step);
+ * - fx auto-resume timers stop (the next owner re-arms them from the DB);
+ * - follow-ups queued behind a running one-shot turn — memory-only, so they
+ *   would die with the process — move to their task's backlog tray now, and a
+ *   turn that settles during the wait stashes its queue instead of draining it;
+ * - the pipeline runner leaves step settles to the next owner's
+ *   `reconcilePipelineRuns` (`launchesFrozen()`).
+ *
+ * Runs already in flight keep going: their tmux sessions outlive the process
+ * and the next owner reattaches them.
+ */
+export function freezeLaunches(): void {
+  if (launchesFrozenFlag) return;
+  launchesFrozenFlag = true;
+  try {
+    stopFxAutoResumeTimers();
+  } catch (err) {
+    console.warn("[agetor] stopping fx auto-resume timers failed:", err);
+  }
+  for (const taskId of tasksWithQueuedFollowUps()) {
+    try {
+      stashQueuedFollowUps(taskId, tasks.get(taskId)?.runId ?? null, "Agetor stopped before it could run");
+    } catch (err) {
+      console.warn(`[agetor] stashing queued follow-ups for task ${taskId} failed:`, err);
+    }
+  }
+}
+
+/** True once {@link freezeLaunches} ran. */
+export function launchesFrozen(): boolean {
+  return launchesFrozenFlag;
+}
+
+/** Test-only: undo {@link freezeLaunches} (it is terminal in production). */
+export function __resetLaunchFreezeForTest(): void {
+  launchesFrozenFlag = false;
+}
 /**
  * Runs the user asked to Stop while their spawn was still in flight (the
  * bounded-spawn pending window, CLAUDE.md item 16): the run row exists and
@@ -1809,6 +1912,7 @@ export async function startTask(
 ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string; code?: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
+  if (launchesFrozenFlag) return { error: LAUNCHES_FROZEN_REASON, code: "launches-frozen" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
   if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
   startingTaskIds.add(taskId);
@@ -3306,6 +3410,13 @@ function attachDoneHandler(
  * A Stop on an ordinary task keeps draining, as before.
  */
 async function drainFollowUpQueues(taskId: string, runId: string, wasCancelled: boolean): Promise<void> {
+  if (launchesFrozenFlag) {
+    // This process is exiting (`freezeLaunches`): a drained turn would be cut
+    // off, and an undrained queue dies with the process — keep the text.
+    fxPendingSteers.delete(runId);
+    stashQueuedFollowUps(taskId, runId, "Agetor stopped before it could run");
+    return;
+  }
   if (wasCancelled && isPipelineStepTaskId(taskId)) {
     // Dropped steers were re-queued in send order before `done` resolved.
     fxPendingSteers.delete(runId);
@@ -3365,15 +3476,43 @@ function takeQueuedFollowUps(taskId: string): string[] {
  * (`restashPasteWithheldText`), and then no line is written.
  */
 function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void {
+  stashQueuedFollowUps(taskId, runId, "this pipeline step was stopped", "to continue it");
+}
+
+/**
+ * Move every follow-up queued for `taskId` into its backlog tray, in send
+ * order, and say why on `runId` (when given): `<n> queued message(s) not sent
+ * — <why>; saved to your backlog, resend from the tray<tail>`. A task gone or
+ * archived keeps nothing (`restashPasteWithheldText`), and then no line is
+ * written.
+ */
+function stashQueuedFollowUps(taskId: string, runId: string | null, why: string, tail = ""): void {
   const lines = takeQueuedFollowUps(taskId);
   if (lines.length === 0) return;
   let saved = false;
   // `backlog.add` PREPENDS, so restash newest first (see `drainCodexQueue`).
   for (const text of [...lines].reverse()) saved = restashPasteWithheldText(taskId, text) || saved;
-  if (!saved) return;
+  if (!saved || runId === null) return;
   const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
-  const data = `${what} — this pipeline step was stopped; saved to your backlog, resend from the tray to continue it`;
+  const data = `${what} — ${why}; saved to your backlog, resend from the tray${tail ? ` ${tail}` : ""}`;
   saveAndEmit({ runId, taskId, stream: "status", data });
+}
+
+/** Every task id with at least one queued follow-up, any harness. */
+function tasksWithQueuedFollowUps(): string[] {
+  const ids = new Set<string>();
+  for (const q of [
+    codexTurnQueue,
+    cursorTurnQueue,
+    geminiTurnQueue,
+    antigravityTurnQueue,
+    opencodeTurnQueue,
+    copilotTurnQueue,
+    fxTurnQueue,
+  ] as Map<string, unknown[]>[]) {
+    for (const [taskId, lines] of q) if (lines.length > 0) ids.add(taskId);
+  }
+  return [...ids];
 }
 
 /**
@@ -4117,6 +4256,21 @@ function idleOnlyBusyResult(): SendInputResult {
   return { delivered: false, busy: true, reason: IDLE_ONLY_BUSY_REASON };
 }
 
+/**
+ * What a send answers once launches are frozen ({@link freezeLaunches}). An
+ * idle-only send also reads `busy`, so the pipeline runner retries its
+ * reminder with the next owner instead of blocking the step. Shared by
+ * `sendInput`'s entry check and the re-checks that follow its awaits.
+ */
+function frozenSendResult(onlyIfIdle: boolean): SendInputResult {
+  return onlyIfIdle
+    ? { delivered: false, busy: true, reason: LAUNCHES_FROZEN_REASON }
+    : { delivered: false, reason: LAUNCHES_FROZEN_REASON };
+}
+
+/** A send's answer when the task was archived while it was still awaiting. */
+const SEND_ARCHIVED_REASON = "task was archived before the message could be sent";
+
 /** What a per-kind `send*Turn` helper returns for an idle-only send it
  *  refused (see {@link SendInputResult}'s `busy`). */
 interface IdleOnlyBusy {
@@ -4232,6 +4386,7 @@ export async function sendInput(
 
   const task = tasks.get(row.task_id);
   if (!task) return { delivered: false, reason: "task not found" };
+  if (launchesFrozenFlag) return frozenSendResult(opts.onlyIfIdle === true);
 
   // Everything past the two cheap lookups above — the codex floor probe, the
   // teardown wait, the worktree restore, `@`-expansion and the per-kind
@@ -4471,8 +4626,16 @@ async function sendInputInner(
   const readyToSpawn = tasks.get(row.task_id);
   if (!readyToSpawn) return { delivered: false, reason: "task not found" };
   if (readyToSpawn.archivedAt != null) {
-    return { delivered: false, reason: "task was archived before the message could be sent" };
+    return { delivered: false, reason: SEND_ARCHIVED_REASON };
   }
+  // `sendInput` checked the freeze on entry, before every await above (the
+  // codex floor probe, the teardown wait, the worktree restore, `@`
+  // expansion). `freezeLaunches` may have landed during any of them, and a
+  // claim taken after it is exactly what the exit would cut off. Checked here
+  // in the same synchronous section as the dispatch — which, for every kind
+  // but claude, goes straight on to its `startingTaskIds` claim; claude
+  // re-checks after its own `has-session` await (`claudeSendRefusal`).
+  if (launchesFrozenFlag) return frozenSendResult(onlyIfIdle);
 
   if (kind === "claude-code") {
     const result = await sendClaudeTurn(row.task_id, line, rawLine, onlyIfIdle);
@@ -6102,6 +6265,9 @@ function fxSteerDroppedHandler(taskId: string, runId: string, harnessId: string)
     const q = fxTurnQueue.get(taskId) ?? [];
     insertBySendOrder(q, { line: text, seq, echoed: true });
     fxTurnQueue.set(taskId, q);
+    // Exiting (`freezeLaunches`): the drain stashes it into the backlog
+    // instead of sending it as the next turn, so don't announce that.
+    if (launchesFrozenFlag) return false;
     // The driver calls this before `done` resolves, so the handle is still
     // registered: a stopped step's queue goes to the backlog, not a turn.
     return !(active.get(runId)?.cancelled === true && task.pipelineParentId != null);
@@ -6926,6 +7092,7 @@ export async function resumeFxRecovery(
 ): Promise<
   { ok: true; runId: string } | { ok: false; status: 400 | 404 | 409 | 500; error: string }
 > {
+  if (launchesFrozenFlag) return { ok: false, status: 409, error: LAUNCHES_FROZEN_REASON };
   if (resumingTaskIds.has(taskId)) {
     return { ok: false, status: 409, error: "a resume is already in flight for this task" };
   }
@@ -6944,6 +7111,11 @@ export async function resumeFxRecovery(
     task = tasks.get(taskId);
     if (!task) return { ok: false, status: 404, error: "not found" };
     if (task.archivedAt != null) return { ok: false, status: 400, error: "task is archived" };
+    // The entry check above ran before the probe's await; a freeze can land
+    // during it. Nothing awaits between here and `spawnFxRun`'s claim, so this
+    // is the last point a refusal can still be clean (it also keeps the
+    // manual-resume side effects below from running on a core that is exiting).
+    if (launchesFrozenFlag) return { ok: false, status: 409, error: LAUNCHES_FROZEN_REASON };
     if (!supported) {
       if (task.fxRecovery != null) clearFxRecovery(taskId);
       return { ok: false, status: 400, error: FX_RESUME_UNSUPPORTED_TEXT };
@@ -7038,6 +7210,29 @@ type ClaudeTurnResult =
   | { runId: string; delivered: false; busy: true }
   | { runId: string; delivered: false; withheld: true; savedToBacklog: boolean }
   | { runId: string; delivered: false; withheld: false; reason: string };
+
+/**
+ * Whether a claude send must stop before it pastes into the session or claims
+ * the task's "starting" slot, or `null` to go on. Called with a task row read
+ * in the SAME synchronous section as that paste/claim, after the awaits that
+ * precede it (`sessionLiveness`'s `has-session` fork, `pasteFollowUp`): a
+ * freeze ({@link freezeLaunches}) or an archive can land during either, and
+ * `sendInputInner`'s own checks ran before them. A frozen idle-only send reads
+ * `busy`, like `sendInput`'s entry check; an archived task gets the same
+ * non-delivered answer `sendInputInner` gives, with no paste and no run row.
+ */
+function claudeSendRefusal(task: Task, onlyIfIdle: boolean): ClaudeTurnResult | null {
+  const runId = task.runId ?? "";
+  if (launchesFrozenFlag) {
+    return onlyIfIdle
+      ? { runId, delivered: false, busy: true }
+      : { runId, delivered: false, withheld: false, reason: LAUNCHES_FROZEN_REASON };
+  }
+  if (task.archivedAt != null) {
+    return { runId, delivered: false, withheld: false, reason: SEND_ARCHIVED_REASON };
+  }
+  return null;
+}
 
 /**
  * Bound how long `sendTurnInExistingSession` waits for a paste's real
@@ -7196,6 +7391,9 @@ async function sendClaudeTurn(
   // a genuine await.
   const task = tasks.get(taskId);
   if (!task) return null;
+  // The `has-session` await above is where a freeze or an archive can land.
+  const refusal = claudeSendRefusal(task, onlyIfIdle);
+  if (refusal) return refusal;
   // Idle-only send: a fake-driver or no-state task can still have an active
   // run here (`hasSessionState` is false for it), and minting would create a
   // second concurrent run. Refuse before the claim and any run-row insert.
@@ -7253,6 +7451,9 @@ async function sendTurnInExistingSession(
   if (!task) {
     return { runId: "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
   }
+  // Same section as the paste/claim below, after `sendClaudeTurn`'s await.
+  const refusal = claudeSendRefusal(task, opts.onlyIfIdle === true);
+  if (refusal) return refusal;
   // Fold-while-busy: if a turn is already in flight, paste the message into
   // the live session and record it on the ACTIVE run — no new run row, no new
   // turn slot. Claude's TUI queues the keystrokes and replays them as part of
@@ -7312,6 +7513,17 @@ async function sendTurnInExistingSession(
   // that `sendClaudeTurn`'s `sessionLiveness` read is a genuine await: two
   // overlapping sends can both arrive here having each independently
   // observed "idle" from their own stale snapshot.
+  //
+  // When the busy branch above fell through, `pasteFollowUp` was awaited: a
+  // freeze or an archive may have landed during it, so look again — freshly —
+  // before claiming. (With no await since the check at the top this is the
+  // same answer, read again.)
+  const latest = tasks.get(taskId);
+  if (!latest) {
+    return { runId: task.runId ?? "", delivered: false, withheld: false, reason: "internal: task lookup failed" };
+  }
+  const lateRefusal = claudeSendRefusal(latest, opts.onlyIfIdle === true);
+  if (lateRefusal) return lateRefusal;
   if (startingTaskIds.has(taskId)) {
     return {
       runId: task.runId ?? "",

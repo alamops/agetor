@@ -51,6 +51,8 @@ import {
   isHeldByBackgroundAgents,
   isTaskRunCancelling,
   isTaskRunLive,
+  LAUNCHES_FROZEN_REASON,
+  launchesFrozen,
   pipelineUpdateColumn,
   publishGlobalEvent,
   sendInput,
@@ -1565,7 +1567,9 @@ export async function startPipelineRun(
   parent: Task,
   opts?: { restart?: boolean },
 ): Promise<{ runId: string; pending?: true } | { error: string }> {
+  if (launchesFrozen()) return { error: LAUNCHES_FROZEN_REASON };
   return runExclusive(parent.id, async () => {
+    if (launchesFrozen()) return { error: LAUNCHES_FROZEN_REASON };
     // Minor 5: a delete cascade tombstones the parent (and removes its row)
     // before tearing down any step task — a start/restart racing in through
     // this same per-parent lock must bail before touching the worktree.
@@ -1748,6 +1752,7 @@ export async function advancePipeline(
   opts: { nextStepIds: string[] | null; handoff?: Partial<Handoff>; fromTaskId?: string },
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
   return runExclusive(parentId, async () => {
+    if (launchesFrozen()) return { error: LAUNCHES_FROZEN_REASON, status: 409 as const };
     const parent = tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
     // Minor 5: a delete cascade tombstones the parent before tearing down
@@ -1956,6 +1961,7 @@ export async function retryPipelineStep(
   opts?: { taskId?: string },
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
   return runExclusive(parentId, async () => {
+    if (launchesFrozen()) return { error: LAUNCHES_FROZEN_REASON, status: 409 as const };
     const parent = tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
     if (!parent.pipelineRun) return { error: "pipeline has never run", status: 409 as const };
@@ -2993,6 +2999,11 @@ async function settleStepRun(
   runId: string,
   status: "succeeded" | "failed" | "cancelled" | "orphaned",
 ): Promise<PendingReminder | null> {
+  // This process is exiting (`freezeLaunches`): deciding now could launch the
+  // next step only for the exit to cut it off. The step stays in `run.active`
+  // over its settled run row, so the next owner's `reconcilePipelineRuns`
+  // settles it from scratch.
+  if (launchesFrozen()) return null;
   try {
     const parent = tasks.get(parentId);
     if (!parent || !parent.pipelineRun || !parent.pipelineRun.snapshot) return null;

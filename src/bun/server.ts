@@ -257,7 +257,20 @@ import type {
   TaskTeardownPreview,
   TaskReference,
 } from "../shared/types.ts";
-import { armForceQuit, broadcastAppEvent, hasAppEventListeners, subscribeAppEvents } from "./quit-guard.ts";
+import { REMOTE_ACCESS_PREF_KEY } from "../shared/types.ts";
+import { armForceQuit, broadcastAppEvent, hasAppEventListeners, requestQuitCompletely, subscribeAppEvents } from "./quit-guard.ts";
+import { BOOT_GATE_EXEMPT_ALWAYS, BOOT_GATE_EXEMPT_HEADLESS, gateRoutesUntilReady } from "./boot-gate.ts";
+import {
+  BackgroundStartError,
+  getBackgroundStatus,
+  getRemoteAccess,
+  openLoginItems,
+  setRemoteAccessOff,
+  startBackgroundNow,
+  subscribeBackgroundChanges,
+  turnOffBackground,
+  turnOnBackground,
+} from "./background.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
 import {
   binaryPreviewKind,
@@ -1315,13 +1328,38 @@ async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): P
 type RouteHandler = (req: any) => Response | Promise<Response>;
 type ServerRoutes = Record<string, RouteHandler | Record<string, RouteHandler>>;
 
-export function startApiServer(deps: { native?: ApiNative; hostname?: string } = {}) {
+export function startApiServer(
+  deps: {
+    native?: ApiNative;
+    hostname?: string;
+    /** Headless OS notifications (docs/plans/always-on-host.md §3.7): the same
+     *  post/remove pair `native` offers, for a core that has no Electrobun host.
+     *  Removal prefers `native` when both are given. */
+    notifications?: {
+      post(n: Parameters<ApiNative["showNotification"]>[0]): void;
+      remove(r: TaskNotificationRemoval): void;
+    };
+    /** Headless shutdown seam for `POST /daemon/shutdown`: `"stop"` ends the
+     *  core, `"handoff"` is the app taking the port over (a login-item core
+     *  parks instead of exiting). Without it the route keeps its original
+     *  remove-creds-and-exit behavior. */
+    onShutdownRequest?: (mode: "stop" | "handoff") => void;
+    /** Resolves once the caller's boot restore is done (boot-gate.ts). Until
+     *  then every route but the ownership probes waits, so a core can bind —
+     *  claim the port, take it over from a live core — before it restores. */
+    ready?: Promise<void>;
+  } = {},
+) {
   const native = deps.native;
-  /** Best-effort removal of a task's OS notification; never affects a response. */
-  const removeTaskNotification = (taskId: string) => {
-    if (!native) return;
+  /** Best-effort removal of a task's OS notification; never affects a response.
+   *  Goes through the native host when there is one, else the headless sink. */
+  const removeTaskNotification = (taskId: string, ifKinds?: TaskNotificationRemoval["ifKinds"]) => {
+    const remove = native
+      ? (r: TaskNotificationRemoval) => native.removeTaskNotification(r)
+      : deps.notifications?.remove;
+    if (!remove) return;
     try {
-      native.removeTaskNotification({ taskId });
+      remove(ifKinds ? { taskId, ifKinds } : { taskId });
     } catch (err) {
       console.error("[agetor] removeTaskNotification failed:", err);
     }
@@ -1468,7 +1506,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
     // has no ROUTE_POLICY entry (or an entry has no route). The explicit type
     // keeps the handlers' contextual `req` typing, which a bare generic would
     // lose; the cast hands Bun its own route typing back.
-    routes: applyRoutePolicy<ServerRoutes>({
+    routes: gateRoutesUntilReady(applyRoutePolicy<ServerRoutes>({
       // Unauthenticated liveness probe — never returns data (`callers:
       // "public"` in ROUTE_POLICY). `app: "agetor"` is a self-identifier for
       // its callers (the CLI's creds/daemon probes, the webview's busy-banner
@@ -3898,6 +3936,22 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             applyDisclaimPreferenceWrite(native ? "app" : "headless", body.value, (m) => console.log(m));
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           }
+          if (req.params.key === REMOTE_ACCESS_PREF_KEY) {
+            // Remote access ON is a decision only the native confirm box may
+            // make (D10, C6): the preference row is agent-writable SQLite and
+            // this route is `app+cli`, so a stored "on" written here would
+            // otherwise be a way to switch it on without the user. Refused for
+            // EVERY caller, the master token included. "off" is always safe and
+            // behaves exactly like `DELETE /remote-access`.
+            if (body.value !== "off") {
+              return json(
+                { error: "remote access can only be turned on from Agetor › Remote Access…", code: "native-only" },
+                { status: 403, headers: corsHeaders(req) },
+              );
+            }
+            setRemoteAccessOff();
+            return new Response(null, { status: 204, headers: corsHeaders(req) });
+          }
           if (req.params.key === TMUX_SOURCE_KEY) {
             // Which tmux binary the core runs belongs to the desktop-only
             // `POST /tmux-source`; this generic key route must not be a way
@@ -5617,12 +5671,8 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           // A manual move (drag, `agetor move`) emits no global `column` event,
           // so the notification hooks never see a card leave `blocked` this
           // way. Its reason-family OS entry goes with the block.
-          if (native && before.column === "blocked" && updated.column !== "blocked") {
-            try {
-              native.removeTaskNotification({ taskId: req.params.id, ifKinds: UNBLOCKED_REMOVAL_KINDS });
-            } catch (err) {
-              console.error("[agetor] removeTaskNotification failed:", err);
-            }
+          if (before.column === "blocked" && updated.column !== "blocked") {
+            removeTaskNotification(req.params.id, UNBLOCKED_REMOVAL_KINDS);
           }
           // Mirror behavioural changes onto a live claude session via slash
           // commands so the conversation context survives a model/mode/effort
@@ -5687,7 +5737,15 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
           }
           server.timeout(req, 0);
           const result = await startTask(req.params.id);
-          const status = "error" in result && result.code === "imported-session" ? 409 : 400;
+          // A core about to exit (`freezeLaunches`) answers 503: retry against
+          // the next owner, not a bad request.
+          const status = !("error" in result)
+            ? 200
+            : result.code === "imported-session"
+            ? 409
+            : result.code === "launches-frozen"
+            ? 503
+            : 400;
           return "error" in result
             ? json(result, { status, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
@@ -7977,6 +8035,61 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
         });
       }),
 
+      // Background ("keep Agetor running in the background", the login item) and
+      // remote access (preview). Docs: docs/plans/always-on-host.md §3.5. Status
+      // is readable by the CLI too; turning the background ON and opening the
+      // Login Items pane reach the user's screen and system settings, so they
+      // are desktop-only (POST /background answers its own 501 headless,
+      // because the e2e fake-helper seam must keep it reachable there).
+      // Remote access is read/turn-off only over HTTP: turning it on is the
+      // native box's job (D10) and `PUT /preferences/remoteAccess` refuses it.
+      "/background": {
+        GET: authed(async (req) => {
+          const fresh = new URL(req.url).searchParams.get("fresh") === "1";
+          return json(await getBackgroundStatus({ fresh }), { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          if (!native && process.env.AGETOR_FAKE_LOGIN_ITEM !== "1") return notAvailableHeadless(req);
+          return json(await turnOnBackground(), { headers: corsHeaders(req) });
+        }),
+        DELETE: authed(async (req) => {
+          return json(await turnOffBackground(), { headers: corsHeaders(req) });
+        }),
+      },
+      "/background/start": {
+        POST: authed(async (req) => {
+          try {
+            return json(await startBackgroundNow(), { headers: corsHeaders(req) });
+          } catch (err) {
+            if (err instanceof BackgroundStartError) {
+              return json({ error: err.message, code: err.code }, { status: 409, headers: corsHeaders(req) });
+            }
+            throw err;
+          }
+        }),
+      },
+      "/background/open-settings": {
+        POST: authed(async (req) => {
+          if (!native && process.env.AGETOR_FAKE_LOGIN_ITEM !== "1") return notAvailableHeadless(req);
+          try {
+            await openLoginItems();
+            return json({ ok: true }, { headers: corsHeaders(req) });
+          } catch (err) {
+            return json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+        }),
+      },
+      "/remote-access": {
+        GET: authed((req) => json(getRemoteAccess(), { headers: corsHeaders(req) })),
+        DELETE: authed((req) => {
+          setRemoteAccessOff();
+          return json(getRemoteAccess(), { headers: corsHeaders(req) });
+        }),
+      },
+
       // Bridge from webview to native macOS notifications. The webview can't
       // call electrobun's FFI directly — it lives in WKWebView and the
       // notification machinery is in the Bun process. Caps every field at a
@@ -7984,7 +8097,13 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // the OS notification queue.
       "/notifications": {
         POST: authed(async (req) => {
-          if (!native) return notAvailableHeadless(req);
+          // The native host posts when there is one; a headless core with a
+          // notification sink (headless-notifications.ts) posts through it —
+          // `agetor logs --notify` reaches the background core this way.
+          const post = native
+            ? (n: Parameters<ApiNative["showNotification"]>[0]) => native.showNotification(n)
+            : deps.notifications?.post;
+          if (!post) return notAvailableHeadless(req);
           const body = (await req.json().catch(() => ({}))) as {
             title?: unknown;
             body?: unknown;
@@ -8014,7 +8133,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
             body.taskId.length <= 512
               ? body.taskId
               : undefined;
-          native.showNotification({
+          post({
             title,
             body: trunc(body.body),
             subtitle: trunc(body.subtitle),
@@ -8124,14 +8243,17 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // never the CLI token) so neither a foreign page that knows the port nor
       // an agent holding the credentials file can forcibly close the app.
       "/app/force-quit": {
-        POST: authed((req) => {
+        POST: authed(async (req) => {
           if (!native) return notAvailableHeadless(req);
           // Only the first call queues Utils.quit() — subsequent POSTs
           // (rapid double-click on "Quit anyway", a buggy/looping caller,
           // etc.) short-circuit. Electrobun's own `isQuitting` guard is a
           // backstop, but no point spawning extra timers + log-spamming in
           // the meantime.
-          const armed = armForceQuit();
+          // The confirm dialog's "Quit completely" button sends `completely:
+          // true`; absent/invalid bodies mean a plain quit-anyway.
+          const body = (await req.json().catch(() => ({}))) as { completely?: unknown };
+          const armed = armForceQuit({ completely: body?.completely === true });
           if (!armed) {
             return json({ ok: true, alreadyArmed: true }, { headers: corsHeaders(req) });
           }
@@ -8154,13 +8276,30 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       // authenticate with the credentials file's CLI token. The setTimeout(…, 0)
       // lets the 200 flush before the process goes away (same pattern as
       // force-quit).
+      //
+      // Optional body `{mode?: "stop" | "handoff"}` (missing, empty or invalid
+      // → "stop"; never a 400). "handoff" is the app asking a running headless
+      // core to give up the port: a core the login item launched parks instead
+      // of exiting (`deps.onShutdownRequest("handoff")` in headless.ts decides),
+      // so the supervisor can bring it back when the app quits. "stop" is
+      // `agetor daemon stop`. The app itself ignores the mode — quitting goes
+      // through its own before-quit flow either way.
       "/daemon/shutdown": {
-        POST: authed((req) => {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => null)) as { mode?: unknown } | null;
+          const mode: "stop" | "handoff" = body?.mode === "handoff" ? "handoff" : "stop";
           setTimeout(() => {
             // On the app, quitting goes through the before-quit confirm, which
             // removes the creds file only once the quit is actually allowed —
             // deleting it here first would strand the CLI if the user cancels.
-            if (native) native.quit();
+            if (native) {
+              // `agetor daemon stop` means "stop the core": on the app that is a
+              // complete quit, or a background supervisor parked under it would
+              // just take the port back (a handoff). "handoff" never reaches an
+              // app in practice — only cores hand off to the app.
+              if (mode === "stop") requestQuitCompletely();
+              native.quit();
+            } else if (deps.onShutdownRequest) deps.onShutdownRequest(mode);
             else {
               removeCoreCreds(dataDir);
               process.exit(0);
@@ -8498,7 +8637,7 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       cors: corsHeaders,
       gate: gateCallerPath,
       notAvailableHeadless,
-    }) as never,
+    }), deps.ready, native ? BOOT_GATE_EXEMPT_ALWAYS : [...BOOT_GATE_EXEMPT_ALWAYS, ...BOOT_GATE_EXEMPT_HEADLESS]) as never,
     fetch(req, server) {
       if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
       // WebSocket upgrade for a terminal tab's live byte stream. The routes API
@@ -8525,6 +8664,17 @@ export function startApiServer(deps: { native?: ApiNative; hostname?: string } =
       }
       return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
     },
+  });
+
+  // Background/remote-access changes (turn on/off, start now, remote off, a
+  // supervisor appearing) reach every connected webview as one event, so the
+  // Settings section never needs a poll. Subscribed only once the bind has
+  // succeeded — the app retries `startApiServer` while it takes the port over,
+  // and a failed bind must not leave a listener behind. The subscription then
+  // lives as long as the process (the server is never torn down short of a
+  // process exit).
+  subscribeBackgroundChanges((status) => {
+    broadcastAppEvent({ type: "background_changed", status, ts: Date.now() });
   });
 
   console.log(`[agetor] api listening on http://${formatHostForUrl(HOST)}:${server.port}`);

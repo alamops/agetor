@@ -1,6 +1,7 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import {
   resolveNotifier,
+  mayUseInstalledAppNotifier,
   buildNotifierArgs,
   buildTaskNotifierPostArgs,
   buildNotifierRemoveArgs,
@@ -192,13 +193,31 @@ describe("resolveInstalledAppNotifier", () => {
     expect(resolveInstalledAppNotifier()).toBe("/custom/notifier");
   });
 
-  test("without an override, resolves to the installed app's helper or null", () => {
+  const SUFFIX = "Contents/Resources/app/bin/AgetorNotifier.app/Contents/MacOS/notifier";
+
+  test("prefers /Applications over ~/Applications", () => {
     delete process.env[ENV_VAR];
-    const r = resolveInstalledAppNotifier();
-    expect(
-      r === null ||
-        r === "/Applications/Agetor.app/Contents/Resources/app/bin/AgetorNotifier.app/Contents/MacOS/notifier",
-    ).toBe(true);
+    const seen: string[] = [];
+    const r = resolveInstalledAppNotifier({ home: "/Users/someone", exists: (p) => { seen.push(p); return true; } });
+    expect(r).toBe(`/Applications/Agetor.app/${SUFFIX}`);
+    expect(seen).toEqual([`/Applications/Agetor.app/${SUFFIX}`]);
+  });
+
+  test("falls back to ~/Applications/Agetor.app", () => {
+    delete process.env[ENV_VAR];
+    const home = "/Users/someone";
+    const r = resolveInstalledAppNotifier({ home, exists: (p) => p.startsWith(`${home}/Applications/`) });
+    expect(r).toBe(`${home}/Applications/Agetor.app/${SUFFIX}`);
+  });
+
+  test("null when neither location holds the helper", () => {
+    delete process.env[ENV_VAR];
+    expect(resolveInstalledAppNotifier({ home: "/Users/someone", exists: () => false })).toBeNull();
+  });
+
+  test("the override wins over the seams too", () => {
+    process.env[ENV_VAR] = "/custom/notifier";
+    expect(resolveInstalledAppNotifier({ home: "/h", exists: () => true })).toBe("/custom/notifier");
   });
 });
 
@@ -235,6 +254,45 @@ describe("resolveNotifier", () => {
     expect(
       r === null || r.endsWith("AgetorNotifier.app/Contents/MacOS/notifier"),
     ).toBe(true);
+  });
+});
+
+describe("resolveNotifier: installed-app fallback gate", () => {
+  const none = () => false;
+  const installed = () => "/Applications/Agetor.app/installed/notifier";
+
+  test("a dev / worktree core (no login-item launch, no opt-in) never falls back to the release app's helper", () => {
+    expect(resolveNotifier({ env: {}, exists: none, installedApp: installed })).toBeNull();
+    expect(resolveNotifier({ env: { AGETOR_LAUNCHED_BY: "cli" }, exists: none, installedApp: installed })).toBeNull();
+    expect(resolveNotifier({ env: { AGETOR_NOTIFIER_USE_INSTALLED_APP: "0" }, exists: none, installedApp: installed })).toBeNull();
+  });
+
+  test("a login-item core falls back to the installed app's helper", () => {
+    expect(resolveNotifier({ env: { AGETOR_LAUNCHED_BY: "login-item" }, exists: none, installedApp: installed })).toBe(
+      "/Applications/Agetor.app/installed/notifier",
+    );
+  });
+
+  test("AGETOR_NOTIFIER_USE_INSTALLED_APP=1 is an explicit opt-in", () => {
+    expect(resolveNotifier({ env: { AGETOR_NOTIFIER_USE_INSTALLED_APP: "1" }, exists: none, installedApp: installed })).toBe(
+      "/Applications/Agetor.app/installed/notifier",
+    );
+  });
+
+  test("the bundled or vendor helper still wins over the installed app, for any core", () => {
+    expect(
+      resolveNotifier({ env: { AGETOR_LAUNCHED_BY: "login-item" }, exists: (p) => p.includes("vendor"), installedApp: installed }),
+    ).toContain("vendor");
+  });
+
+  test("the override wins regardless of the gate", () => {
+    expect(resolveNotifier({ env: { AGETOR_NOTIFIER_BIN: "/o" }, exists: none, installedApp: installed })).toBe("/o");
+  });
+
+  test("mayUseInstalledAppNotifier reads the environment", () => {
+    expect(mayUseInstalledAppNotifier({})).toBe(false);
+    expect(mayUseInstalledAppNotifier({ AGETOR_LAUNCHED_BY: "login-item" })).toBe(true);
+    expect(mayUseInstalledAppNotifier({ AGETOR_NOTIFIER_USE_INSTALLED_APP: "1" })).toBe(true);
   });
 });
 

@@ -46,6 +46,7 @@ test("every native-host route returns 501 when running headless", async () => {
     ["/updates/check", { method: "POST", headers: auth() }],
     ["/updates/apply", { method: "POST", headers: auth() }],
     ["/window/focus", { method: "POST", headers: auth() }],
+    ["/background/open-settings", { method: "POST", headers: auth() }],
   ];
   for (const [p, init] of cases) {
     const res = await fetch(u(p), init);

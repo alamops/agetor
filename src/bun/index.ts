@@ -1,3 +1,8 @@
+// MUST stay the first import: it sets the channel's default AGETOR_DATA_DIR /
+// API port as a side effect, and ESM evaluates imports in order — anything below
+// that reaches db.ts (which opens and migrates SQLite on import) would otherwise
+// open the wrong data dir (docs/plans/always-on-host.md §3.6).
+import "./channel-defaults.ts";
 import { writeFileSync, existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
@@ -5,7 +10,18 @@ import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import {
+  freezeLaunches,
+  launchesInFlight,
+  reconcileOrphans,
+  rearmFxAutoResumes,
+  sweepArchivedTeardowns,
+  reapIdleSessions,
+  stopFxAutoResumeTimers,
+  waitForLaunchesToSettle,
+} from "./orchestrator.ts";
+import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
+import { createQuitLaunchGate, decideBeforeQuit } from "./quit-launch-gate.ts";
 import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
 import { resumeIncompleteOpencodeImports } from "./opencode-session-import.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -20,14 +36,41 @@ import { coreSpawn } from "./core-spawn.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
-import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
+import {
+  armForceQuit,
+  broadcastAppEvent,
+  consumeForceQuit,
+  consumeQuitCompletely,
+  requestQuitCompletely,
+} from "./quit-guard.ts";
+import { liveSupervisor, requestSupervisorStop } from "./login-daemon-state.ts";
+import { acquireApiPort } from "./app-takeover.ts";
+import { bootReadySignal } from "./boot-gate.ts";
+import { runRemoteAccessBox } from "./remote-access-box.ts";
+import {
+  getBackgroundStatus,
+  turnOnBackground,
+  startBackgroundNow,
+  openLoginItems,
+  getRemoteAccess,
+  setRemoteAccessOff,
+  setRemoteAccessOnFromNativeBox,
+} from "./background.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
 import { repairFrame } from "./screen-frame.ts";
-import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
+import {
+  writeCoreCreds,
+  removeCoreCreds,
+  readCoreCreds,
+  probeLiveCore,
+  waitForPortFree,
+  isPidAlive,
+  portAcceptsConnections,
+} from "./core-creds.ts";
 import { resolveNotifierApp } from "./notifier.ts";
 import { parseTaskDeepLink } from "./deep-link.ts";
 import { createTaskNotifier } from "./task-notifier.ts";
@@ -71,11 +114,16 @@ function installNativeMenu() {
       submenu: [
         { role: "about" },
         { type: "separator" },
+        { label: "Remote Access…", action: "remote-access" },
+        { type: "separator" },
         { role: "hide", accelerator: "Cmd+H" },
         { role: "hideOthers", accelerator: "Cmd+Alt+H" },
         { role: "showAll" },
         { type: "separator" },
         { role: "quit", accelerator: "Cmd+Q" },
+        // Stops the background host too (D6): a plain quit parks the core under
+        // the login item when "run in the background" is on.
+        { label: "Quit Agetor Completely", action: "quit-completely", accelerator: "Cmd+Alt+Q" },
       ],
     },
     {
@@ -133,17 +181,14 @@ async function getMainViewUrl(): Promise<string> {
 // in dev runs — the merge dedupes.
 rehydratePath();
 
-// Mark any runs that were "running" when we last shut down as orphaned, so the
-// kanban doesn't show stuck cards. Awaited (top-level await — this module is
-// ESM) so the rest of boot, in particular `startApiServer()` below, never
-// runs concurrently with reconciliation: the API must not start serving
-// `/tasks`/`/runs` while a `status='running'` row from a previous process is
-// still being reattached or flipped to `orphaned` underneath it — the same
-// "reconcile before the API starts" invariant CLAUDE.md §5 documents, and the
-// same ordering the old synchronous `reconcileOrphans` gave for free by
-// blocking this whole script until it returned. An unhandled rejection here
-// fails boot loudly, matching that old synchronous-throw behavior — no
-// swallow.
+// Boot order (boot-gate.ts): bind the API port first — taking it over from a
+// live background/CLI core — then restore (`reconcileOrphans` and friends),
+// then `markBootReady()`. Only the port owner may restore, and the API must not
+// serve `/tasks`/`/runs` while a `status='running'` row from a previous process
+// is still being reattached or flipped to `orphaned` underneath it (CLAUDE.md
+// §5): routes wait on the ready signal, so a request that arrives mid-restore
+// is answered once the restore is done. A failed restore ends the process
+// loudly (see `failBoot`), never a swallow.
 //
 // Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
 // C): one `.unref()`'d sampler that names whatever held the single main thread
@@ -156,146 +201,6 @@ rehydratePath();
 // attribute are actually sampled. Unref'd, so an early boot failure can never
 // be held open by it; every shutdown path calls `stopLagMonitor()`.
 startLagMonitor({ sampleMs: 100 });
-
-/**
- * Launch-time question for a stored `disclaimSpawnedAgents = "false"`
- * (docs/plans/master-token-agent-read.md P5, D5): the SQLite file is writable
- * by any process running as the user, an agent included, so a stored "off" is
- * only a request. Returns true ONLY for "Keep it off"; the default button, the
- * cancel button and a dialog that can't be shown all mean "turn it back on"
- * (initDisclaimSwitch fails closed on a throw).
- *
- * `showMessageBox` is a synchronous FFI call that blocks the Bun thread until
- * the user answers — like `openFileDialog` — so it is bracketed with a lag
- * label to keep the expected stall from being reported as a core hang. It runs
- * before the first BrowserWindow and before any service starts, so nothing else
- * is waiting on the thread; if it ever fails to render that early, P5's
- * fallback is to ask right after window creation instead.
- */
-async function confirmKeepOff(): Promise<boolean> {
-  const end = beginLagLabel("native message box");
-  try {
-    const { response } = await Utils.showMessageBox({
-      type: "warning",
-      title: "Permission isolation is off",
-      message:
-        "Agents and Agetor's background programs would run with Agetor's macOS permissions.",
-      detail:
-        "It was turned off in Settings, or by something that edited Agetor's database. Keep it off only if you turned it off yourself.",
-      buttons: ["Turn it back on", "Keep it off"],
-      defaultId: 0,
-      cancelId: 0,
-    });
-    return response === 1;
-  } finally {
-    end();
-  }
-}
-
-// Decide the disclaim switch BEFORE any agent host starts (P5): it stays ON
-// while the question is open, and only an explicit "Keep it off" turns it off.
-// Must also run before reconcileOrphans(): reconciliation issues `has-session`
-// probes against agetor's tmux socket, and the first tmux command to touch
-// a socket auto-starts its server — un-disclaimed, if ensureDisclaimedServer()
-// didn't run first — leaving every session that server ever hosts un-disclaimed too.
-await initDisclaimSwitch("app", {
-  readPref: () => preferences.get(DISCLAIM_PREF_KEY),
-  writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
-  confirmKeepOff,
-  log: (m) => console.log(m),
-});
-await ensureDisclaimedServer();
-// Subscribe the pipeline runner to the global lifecycle stream BEFORE
-// reconcileOrphans() runs, so a step task's boot-time orphan→ready
-// transition (an ordinary `run-status` "orphaned" event, fired by
-// reconcileOrphans below) reaches the runner and flips its pipeline parent
-// back to ready/cancelled-with-retry instead of leaving it silently stuck
-// `running` forever (docs/plans/pipelines.md §3, T3).
-initPipelineRunner();
-await reconcileOrphans();
-
-// M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
-// by a prior process crash/restart — placed right after `reconcileOrphans`
-// (per its own doc, and pipeline-runner.ts's module doc) so every step
-// task's own boot-time orphan→ready transition has already fired and been
-// observed by the pipeline runner's global-event subscriber (wired up by
-// `initPipelineRunner()` above) before this does its own pass over parent
-// rows directly.
-const reconciledPipelineRunCount = await reconcilePipelineRuns();
-if (reconciledPipelineRunCount > 0) {
-  console.log(`[agetor] reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
-}
-
-// Re-arm in-memory auto-resume timers for every fx task still carrying a
-// pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — an
-// in-memory `setTimeout` handle never survives a process restart, so without
-// this a pause recorded in a prior process would sit forever with a
-// persisted `autoResume.at` nothing will ever fire. Awaited, and placed right
-// after `reconcileOrphans` so reattach/orphan resolution — which can itself
-// flip a run's status — settles first.
-const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
-if (rearmedFxAutoResumeCount > 0) {
-  console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
-}
-
-// Heal any archive/delete teardown (tmux kill, terminal shells, worktree
-// detach) that was deferred to the in-memory teardown queue but never ran
-// because agetor quit or crashed before the job fired. Fire-and-forget — it
-// only enqueues jobs onto that queue, keyed to this instance's own task ids.
-sweepArchivedTeardowns();
-
-// Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
-// claude REPL tmux sessions that have sat idle (no turn in flight, nothing
-// pending, no activity) for IDLE_SESSION_REAP_MS, reclaiming their ~300–500MB
-// "node" process and per-session timers. A 30s delay before the first sweep
-// lets `reconcileOrphans` above finish reattaching live sessions first, so a
-// task that's mid-reattach isn't mistaken for idle. Errors are swallowed —
-// this is best-effort background hygiene, never something that should crash
-// the app.
-setTimeout(() => {
-  reapIdleSessions().catch((err) => {
-    console.error("[agetor] idle-session reap (post-boot) failed:", err);
-  });
-}, 30_000);
-setInterval(() => {
-  reapIdleSessions().catch((err) => {
-    console.error("[agetor] idle-session reap (interval) failed:", err);
-  });
-}, SESSION_REAP_SWEEP_MS);
-
-// Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): fetches
-// quota/usage snapshots for every enabled harness on a background cadence, so
-// the topbar meters stay fresh without the webview driving the fetches. A
-// 20s post-boot delay (offset from the reaper's 30s so the two sweeps don't
-// both fire in the same tick) lets boot settle first. Errors are swallowed —
-// `pollAllUsage` already never throws, but the `.catch` matches the reaper's
-// belt-and-suspenders shape.
-setTimeout(() => {
-  pollAllUsage().catch((err) => {
-    console.error("[agetor] usage poll (post-boot) failed:", err);
-  });
-}, 20_000);
-setInterval(() => {
-  pollAllUsage().catch((err) => {
-    console.error("[agetor] usage poll sweep failed", err);
-  });
-}, USAGE_POLL_SWEEP_MS);
-
-installNativeMenu();
-
-// Best-effort: probe the agent CLIs (and every enabled fx harness's own
-// account-scoped catalog) for their model lists so the form can surface
-// anything new the user installed — or logged into — without an app update.
-// Runs in the background — we don't await it so a slow CLI never delays the
-// API/window; the webview polls GET /agent-models/harnesses' `ready` flag
-// until this sweep lands, which is what closes the boot race
-// docs/plans/fx-model-catalog-refresh.md §2 reproduced (fx=0 for the first
-// ~1s after boot). `startPeriodicDiscovery` re-runs the sweep every 15
-// minutes (`.unref()`'d — never itself keeps the app alive) so catalog
-// drift (new models, revoked account access) is eventually noticed even
-// with no triggering event.
-void refreshAllModels();
-startPeriodicDiscovery();
 
 /**
  * Posts and removes task notifications. Each task owns at most one
@@ -390,43 +295,43 @@ if (!requestedApiHost.ok || requestedApiHost.host !== DEFAULT_API_HOST) {
   );
 }
 
+// Bind BEFORE the boot restore (boot-gate.ts): the bind is what makes this
+// process the owner — it hands the port off from a live background/CLI core —
+// and only the owner may reattach sessions, orphan runs or drive pipelines.
+// Until `markBootReady()` every route but the ownership probes waits.
+const { ready: bootReady, markReady: markBootReady } = bootReadySignal();
 let apiServer: ReturnType<typeof startApiServer>;
 try {
-  apiServer = startApiServer({ native });
+  // Port busy? acquireApiPort asks a CLI daemon / login-item core to hand off
+  // (retrying briefly while a daemon's creds file lands, C16); anything else — a
+  // live app, or a foreign process (a stale agetor, or OTLP gRPC which also
+  // defaults to 4317) — falls through to the loud message + exit so the user
+  // sees the real problem rather than a wall of CORS errors in the renderer.
+  apiServer = await acquireApiPort({
+    start: () =>
+      startApiServer({
+        native,
+        // Same post/remove pair `native` offers; the server prefers `native`
+        // when both are given (headless cores get only this).
+        notifications: { post: (n) => taskNotifier.post(n), remove: (r) => taskNotifier.remove(r) },
+        // Requests wait for the boot restore below (markBootReady).
+        ready: bootReady,
+      }),
+    readCreds: () => readCoreCreds(dataDir),
+    probe: probeLiveCore,
+    fetch,
+    waitForPortFree,
+    sleep: (ms) => Bun.sleep(ms),
+    now: () => Date.now(),
+    isPidAlive,
+    portListening: (port) => portAcceptsConnections(port),
+    log: (m) => console.log(m),
+  });
 } catch (e) {
-  // Port busy. If our own cli-daemon owns it (the CLI started a background core
-  // while the app was closed), ask it to hand off, wait for the port to free,
-  // then bind and become the owner. Anything else — a foreign process (stale
-  // agetor, or OTLP gRPC which also defaults to 4317) or a wedged daemon that
-  // won't release — falls through to the loud message + exit so the user sees
-  // the real problem rather than a wall of CORS errors in the renderer.
-  const creds = readCoreCreds(dataDir);
-  let recovered: ReturnType<typeof startApiServer> | null = null;
-  if (creds && creds.kind === "cli-daemon" && (await probeLiveCore(creds))) {
-    console.log("[agetor] a CLI daemon owns the API port — requesting handoff…");
-    try {
-      await fetch(`http://127.0.0.1:${creds.port}/daemon/shutdown`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${creds.token}` },
-      });
-    } catch {
-      /* the daemon drops the connection as it exits — expected */
-    }
-    if (await waitForPortFree(creds.port, 10_000)) {
-      try {
-        recovered = startApiServer({ native });
-      } catch {
-        /* fall through to the loud message below */
-      }
-    }
-  }
-  if (!recovered) {
-    const msg = (e as Error)?.message ?? String(e);
-    console.error(`[agetor] failed to bind API on ${DEFAULT_API_HOST}:${API_PORT}: ${msg}`);
-    console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
-    process.exit(1);
-  }
-  apiServer = recovered;
+  const msg = (e as Error)?.message ?? String(e);
+  console.error(`[agetor] failed to bind API on ${DEFAULT_API_HOST}:${API_PORT}: ${msg}`);
+  console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
+  process.exit(1);
 }
 
 // Publish the per-launch API port + token so the CLI (and a second app launch)
@@ -446,6 +351,205 @@ writeCoreCreds(
   },
   dataDir,
 );
+
+
+/**
+ * Launch-time question for a stored `disclaimSpawnedAgents = "false"`
+ * (docs/plans/master-token-agent-read.md P5, D5): the SQLite file is writable
+ * by any process running as the user, an agent included, so a stored "off" is
+ * only a request. Returns true ONLY for "Keep it off"; the default button, the
+ * cancel button and a dialog that can't be shown all mean "turn it back on"
+ * (initDisclaimSwitch fails closed on a throw).
+ *
+ * `showMessageBox` is a synchronous FFI call that blocks the Bun thread until
+ * the user answers — like `openFileDialog` — so it is bracketed with a lag
+ * label to keep the expected stall from being reported as a core hang. It runs
+ * before the first BrowserWindow and before any agent host starts; the API is
+ * already bound but every route waits for the boot restore, so nothing is
+ * served while it is open. If it ever fails to render that early, P5's
+ * fallback is to ask right after window creation instead.
+ */
+async function confirmKeepOff(): Promise<boolean> {
+  const end = beginLagLabel("native message box");
+  try {
+    const { response } = await Utils.showMessageBox({
+      type: "warning",
+      title: "Permission isolation is off",
+      message:
+        "Agents and Agetor's background programs would run with Agetor's macOS permissions.",
+      detail:
+        "It was turned off in Settings, or by something that edited Agetor's database. Keep it off only if you turned it off yourself.",
+      buttons: ["Turn it back on", "Keep it off"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    return response === 1;
+  } finally {
+    end();
+  }
+}
+
+// Decide the disclaim switch BEFORE any agent host starts (P5): it stays ON
+// while the question is open, and only an explicit "Keep it off" turns it off.
+// Must also run before reconcileOrphans(): reconciliation issues `has-session`
+// probes against agetor's tmux socket, and the first tmux command to touch
+// a socket auto-starts its server — un-disclaimed, if ensureDisclaimedServer()
+// didn't run first — leaving every session that server ever hosts un-disclaimed too.
+/** A boot restore that throws must not leave a bound server whose routes wait
+ *  forever on a ready signal that never comes. */
+function failBoot(err: unknown): never {
+  console.error("[agetor] boot restore failed:", err);
+  removeCoreCreds(dataDir);
+  process.exit(1);
+}
+
+try {
+  await initDisclaimSwitch("app", {
+    readPref: () => preferences.get(DISCLAIM_PREF_KEY),
+    writePref: (v) => preferences.set(DISCLAIM_PREF_KEY, v),
+    confirmKeepOff,
+    log: (m) => console.log(m),
+  });
+  await ensureDisclaimedServer();
+  // Subscribe the pipeline runner to the global lifecycle stream BEFORE
+  // reconcileOrphans() runs, so a step task's boot-time orphan→ready
+  // transition (an ordinary `run-status` "orphaned" event, fired by
+  // reconcileOrphans below) reaches the runner and flips its pipeline parent
+  // back to ready/cancelled-with-retry instead of leaving it silently stuck
+  // `running` forever (docs/plans/pipelines.md §3, T3).
+  initPipelineRunner();
+  await reconcileOrphans();
+
+  // M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
+  // by a prior process crash/restart — placed right after `reconcileOrphans`
+  // (per its own doc, and pipeline-runner.ts's module doc) so every step
+  // task's own boot-time orphan→ready transition has already fired and been
+  // observed by the pipeline runner's global-event subscriber (wired up by
+  // `initPipelineRunner()` above) before this does its own pass over parent
+  // rows directly.
+  const reconciledPipelineRunCount = await reconcilePipelineRuns();
+  if (reconciledPipelineRunCount > 0) {
+    console.log(`[agetor] reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
+  }
+
+  // Re-arm in-memory auto-resume timers for every fx task still carrying a
+  // pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — an
+  // in-memory `setTimeout` handle never survives a process restart, so without
+  // this a pause recorded in a prior process would sit forever with a
+  // persisted `autoResume.at` nothing will ever fire. Awaited, and placed right
+  // after `reconcileOrphans` so reattach/orphan resolution — which can itself
+  // flip a run's status — settles first.
+  const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
+  if (rearmedFxAutoResumeCount > 0) {
+    console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
+  }
+} catch (err) {
+  failBoot(err);
+}
+
+// Heal any archive/delete teardown (tmux kill, terminal shells, worktree
+// detach) that was deferred to the in-memory teardown queue but never ran
+// because agetor quit or crashed before the job fired. Fire-and-forget — it
+// only enqueues jobs onto that queue, keyed to this instance's own task ids.
+sweepArchivedTeardowns();
+
+// Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
+// claude REPL tmux sessions that have sat idle (no turn in flight, nothing
+// pending, no activity) for IDLE_SESSION_REAP_MS, reclaiming their ~300–500MB
+// "node" process and per-session timers. A 30s delay before the first sweep
+// lets `reconcileOrphans` above finish reattaching live sessions first, so a
+// task that's mid-reattach isn't mistaken for idle. Errors are swallowed —
+// this is best-effort background hygiene, never something that should crash
+// the app.
+setTimeout(() => {
+  reapIdleSessions().catch((err) => {
+    console.error("[agetor] idle-session reap (post-boot) failed:", err);
+  });
+}, 30_000);
+setInterval(() => {
+  reapIdleSessions().catch((err) => {
+    console.error("[agetor] idle-session reap (interval) failed:", err);
+  });
+}, SESSION_REAP_SWEEP_MS);
+
+// Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): fetches
+// quota/usage snapshots for every enabled harness on a background cadence, so
+// the topbar meters stay fresh without the webview driving the fetches. A
+// 20s post-boot delay (offset from the reaper's 30s so the two sweeps don't
+// both fire in the same tick) lets boot settle first. Errors are swallowed —
+// `pollAllUsage` already never throws, but the `.catch` matches the reaper's
+// belt-and-suspenders shape.
+setTimeout(() => {
+  pollAllUsage().catch((err) => {
+    console.error("[agetor] usage poll (post-boot) failed:", err);
+  });
+}, 20_000);
+setInterval(() => {
+  pollAllUsage().catch((err) => {
+    console.error("[agetor] usage poll sweep failed", err);
+  });
+}, USAGE_POLL_SWEEP_MS);
+
+installNativeMenu();
+
+/** `Utils.showMessageBox` blocks the Bun thread (synchronous FFI) until the user
+ *  answers, so every box is bracketed with the lag label — same as
+ *  `confirmKeepOff`. */
+async function showLabelledMessageBox(opts: Parameters<typeof Utils.showMessageBox>[0]) {
+  const end = beginLagLabel("native message box");
+  try {
+    return await Utils.showMessageBox(opts);
+  } finally {
+    end();
+  }
+}
+
+Electrobun.events.on("application-menu-clicked", (e: { data?: { action?: string } }) => {
+  const action = e?.data?.action;
+  if (action === "remote-access") {
+    void runRemoteAccessBox({
+      showMessageBox: showLabelledMessageBox,
+      background: {
+        getBackgroundStatus,
+        turnOnBackground,
+        startBackgroundNow,
+        getRemoteAccess,
+        setRemoteAccessOff,
+        setRemoteAccessOnFromNativeBox,
+      },
+      openLoginItems,
+      log: (m) => console.warn(m),
+    });
+  } else if (action === "quit-completely") {
+    // before-quit reads this one-shot; with runs active it still asks first.
+    requestQuitCompletely();
+    Utils.quit();
+  }
+});
+
+// Best-effort: probe the agent CLIs (and every enabled fx harness's own
+// account-scoped catalog) for their model lists so the form can surface
+// anything new the user installed — or logged into — without an app update.
+// Runs in the background — we don't await it so a slow CLI never delays the
+// API/window; the webview polls GET /agent-models/harnesses' `ready` flag
+// until this sweep lands, which is what closes the boot race
+// docs/plans/fx-model-catalog-refresh.md §2 reproduced (fx=0 for the first
+// ~1s after boot). `startPeriodicDiscovery` re-runs the sweep every 15
+// minutes (`.unref()`'d — never itself keeps the app alive) so catalog
+// drift (new models, revoked account access) is eventually noticed even
+// with no triggering event.
+void refreshAllModels();
+startPeriodicDiscovery();
+
+// The boot restore above is done: let the routes through (boot-gate.ts).
+markBootReady();
+
+// C3 reconcile: the first fresh status read lets background.ts heal a login item
+// whose registration drifted (e.g. an app moved or replaced). Fire-and-forget; a
+// source run has no helper, which reads as `unavailable` and is not an error.
+void getBackgroundStatus({ fresh: true }).catch((err) => {
+  console.warn("[agetor] background status reconcile failed:", err);
+});
 
 // Archived-history retention: first pass ~90 s after boot (after the API is
 // up and restore/seed work has settled), then every 24 h; each fire reads the
@@ -497,39 +601,83 @@ setTimeout(() => {
 // Reattached runs (claude-code sessions kept alive across restart) count
 // as running, so the user is still prompted if they try to quit while one
 // is in flight.
+//
+// A quit about to be allowed still waits (bounded, `HANDOFF_LAUNCH_SETTLE_MS`)
+// for agent launches this process is in the middle of — a claude session that
+// hasn't taken its first prompt yet would otherwise die with the app, which
+// breaks "they'll keep running in the background" (quit-launch-gate.ts).
+const quitLaunchGate = createQuitLaunchGate({
+  launchesInFlight,
+  waitForLaunchesToSettle,
+  freezeLaunches,
+  requeueQuit: ({ completely }) => {
+    armForceQuit({ completely });
+    Utils.quit();
+  },
+  timeoutMs: HANDOFF_LAUNCH_SETTLE_MS,
+  log: (m) => console.log(m),
+});
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
-  if (consumeForceQuit()) {
-    removeCoreCreds(dataDir);
-    event.response = { allow: true };
-    return;
-  }
-  let runningCount = 0;
-  let runningTaskTitles: string[] = [];
-  try {
-    const rows = db.query<{ task_id: string }, []>(
-      `SELECT DISTINCT task_id FROM runs WHERE status = 'running'`,
-    ).all();
-    runningCount = rows.length;
-    runningTaskTitles = rows
-      .map((r) => tasks.get(r.task_id)?.title ?? "")
-      .filter((t) => t.length > 0)
-      .slice(0, 10);
-  } catch {
-    // If the DB is unavailable for any reason, allow the quit — the cost
-    // of a missed warning is small; the cost of trapping the user is high.
-  }
-  if (runningCount === 0) {
-    removeCoreCreds(dataDir);
-    event.response = { allow: true };
-    return;
-  }
-  broadcastAppEvent({
-    type: "quit_request",
-    runningRunCount: runningCount,
-    runningTaskTitles,
-    ts: Date.now(),
+  // Background host armed = a live login-item supervisor is parked under this
+  // app, or waiting out a grace window to start. Read synchronously from its
+  // state file — no helper spawn inside before-quit.
+  const supervisor = liveSupervisor(dataDir);
+  const backgroundArmed = supervisor !== null && (supervisor.state === "parked" || supervisor.state === "waiting");
+  // Both one-shots are consumed inside: a vetoed quit loses nothing, since
+  // when the user confirms in the webview `POST /app/force-quit {completely}`
+  // carries the intent again (quit-launch-gate.ts `decideBeforeQuit`).
+  const decision = decideBeforeQuit({
+    consumeForceQuit,
+    consumeQuitCompletely,
+    gate: quitLaunchGate,
+    hasSupervisor: supervisor !== null,
+    runningTaskIds: () => {
+      try {
+        return db
+          .query<{ task_id: string }, []>(`SELECT DISTINCT task_id FROM runs WHERE status = 'running'`)
+          .all()
+          .map((r) => r.task_id);
+      } catch {
+        // If the DB is unavailable for any reason, allow the quit — the cost
+        // of a missed warning is small; the cost of trapping the user is high.
+        return [];
+      }
+    },
   });
-  event.response = { allow: false };
+  if (decision.kind === "veto") {
+    event.response = { allow: false };
+    return;
+  }
+  if (decision.kind === "confirm") {
+    broadcastAppEvent({
+      type: "quit_request",
+      runningRunCount: decision.runningTaskIds.length,
+      runningTaskTitles: decision.runningTaskIds
+        .map((id) => tasks.get(id)?.title ?? "")
+        .filter((t) => t.length > 0)
+        .slice(0, 10),
+      backgroundArmed,
+      completely: decision.completely,
+      ts: Date.now(),
+    });
+    event.response = { allow: false };
+    return;
+  }
+  // Only when a supervisor is alive to read it (`stopSupervisor`): a request
+  // written with none running would otherwise linger for the next supervisor
+  // to start (the background turned on later, or the next login).
+  // takeSupervisorStop also ignores a stale request, as a second line of
+  // defense. The supervisor would otherwise take the port back when this
+  // process dies; this asks it to stay down until the next login (D6).
+  if (decision.stopSupervisor) {
+    try {
+      requestSupervisorStop(dataDir);
+    } catch (err) {
+      console.warn("[agetor] failed to write the supervisor stop request:", err);
+    }
+  }
+  removeCoreCreds(dataDir);
+  event.response = { allow: true };
 });
 
 // Stop the fx auto-resume engine's in-memory timers on the way out (Phase 8

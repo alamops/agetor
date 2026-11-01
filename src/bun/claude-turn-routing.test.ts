@@ -598,6 +598,112 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
   }
 });
 
+// A resume spawn's JSONL already exists, so the boot JSONL wait ends at once —
+// while the oversized first prompt is still waiting for claude's composer. The
+// boot is counted in `claudeBootsInFlight` (what a core handing the port off
+// waits on before it exits) until BOTH have finished; it used to be released
+// with the boot wait alone, so a handoff could exit with the prompt undelivered.
+test("a resume spawn with a deferred large prompt stays counted in flight until the paste settles, even though its JSONL already exists", async () => {
+  const { bin, logPath } = fakeDeferredPasteTmuxBin();
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER; // force the real spawnClaudeViaTmux path
+  process.env.AGETOR_CLAUDE_BIN = "/bin/echo"; // harmless stub launch command
+
+  const { tasks, runs } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const { __forTest, dropSession, jsonlPathFor, claudeBootsInFlight } = await import("./claude-tmux.ts");
+  const { CLAUDE_PROMPT_ARGV_MAX_BYTES } = await import("./agents.ts");
+
+  const taskId = `task-boots-${randomUUID()}`;
+  const priorRunId = `run-boots-${randomUUID()}`;
+  const priorClaudeSessionId = "prior-claude-session-id-boots";
+  const now = Date.now();
+  const workdir = mkdtempSync(path.join(tmpdir(), "agetor-boots-wd-"));
+
+  const expectedJsonlPath = jsonlPathFor(workdir, priorClaudeSessionId, null);
+  mkdirSync(path.dirname(expectedJsonlPath), { recursive: true });
+  writeFileSync(expectedJsonlPath, "");
+
+  // The composer never looks ready until the test says so, so the deferred
+  // paste sits in its readiness poll while the boot JSONL wait is already over.
+  const prevCapture = __forTest.setCaptureModePane(async () => "");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+
+  const largePrompt = "z".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 500);
+  // Other tests in this process may still own a boot; compare relative to it.
+  const baseline = claudeBootsInFlight();
+  let newRunId: string | undefined;
+
+  try {
+    tasks.insert({
+      id: taskId,
+      title: "boots-in-flight",
+      prompt: "p",
+      column: "review",
+      agent: "claude-code",
+      workdir,
+      isolation: "none",
+      taskType: "task",
+      branch: null,
+      branchSource: "created",
+      worktreePath: null,
+      baseRef: null,
+      prUrl: null,
+      mode: null,
+      model: "claude-opus-4-7",
+      effort: "medium",
+      speed: "off",
+      maxMode: false,
+      opencodeServer: "shared",
+      references: [], backlog: [], plans: [], draft: null,
+      runId: priorRunId,
+      hasOpenableRun: false,
+      pendingInteractionCount: 0,
+      openTerminalCount: 0,
+      archivedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    runs.insert({
+      id: priorRunId,
+      taskId,
+      agent: "claude-code",
+      status: "succeeded",
+      startedAt: now,
+      endedAt: now,
+      exitCode: 0,
+      tmuxSession: "agetor-stale-name",
+      claudeSessionId: priorClaudeSessionId,
+      codexSessionId: null,
+      cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+
+    const result = await sendInput(priorRunId, largePrompt);
+    expect(result.delivered).toBe(true);
+    if (!result.delivered) throw new Error(result.reason);
+    newRunId = result.runId;
+
+    // The boot wait is over (JSONL pre-existed → the tailer attached and said
+    // "ready"), yet the prompt has not been pasted and the boot is still counted.
+    expect(await waitForRunStatus(runs, newRunId, "ready (jsonl:")).toBe(true);
+    expect(readLog(logPath).some((e) => e.argv.includes("load-buffer"))).toBe(false);
+    expect(claudeBootsInFlight()).toBe(baseline + 1);
+
+    // Composer idle → the paste goes out and settles → the boot is released.
+    __forTest.setCaptureModePane(async () => "? for shortcuts");
+    await waitForLog(logPath, "Enter");
+    expect(await waitUntil(() => claudeBootsInFlight() === baseline)).toBe(true);
+  } finally {
+    __forTest.setCaptureModePane(prevCapture);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+    if (newRunId) await waitForRunStatus(runs, newRunId, "ready (jsonl:");
+    dropSession(taskId);
+    rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
+  }
+});
+
 // Regression tests for the opus code-review findings on the deferred-paste
 // fix above (commits de27191 + c6242ae): cancel-during-wait must abort the
 // deferred paste instead of pasting a prompt the user already cancelled, and
@@ -1285,6 +1391,99 @@ test("RC2(b): a continuation adopted DURING sendClaudeTurn's has-session await i
         (e) => e.stream === "user" && e.data.includes("any news from the review?"),
       ),
     ).toBe(true);
+  } finally {
+    await cleanupRc2(f);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+  }
+});
+
+// A claude send awaits a `has-session` fork before it pastes or claims the
+// task's "starting" slot. `sendInput` checked the freeze and the archive before
+// that await; either can land during it, and neither may reach the pane or mint
+// a run afterwards.
+
+test("a freeze that lands during sendClaudeTurn's has-session await refuses the send — nothing is pasted, no run is minted", async () => {
+  const { bin, logPath } = fakeAliveTmuxBin(600);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { runs } = await import("./db.ts");
+  const { sendInput, freezeLaunches, __resetLaunchFreezeForTest, LAUNCHES_FROZEN_REASON } = await import(
+    "./orchestrator.ts"
+  );
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+  const f = await seedIdleClaudeTask("freeze-live");
+  try {
+    const sending = sendInput(f.priorRunId, "typed just before the quit");
+    await waitForLog(logPath, "has-session");
+    freezeLaunches();
+
+    expect(await sending).toEqual({ delivered: false, reason: LAUNCHES_FROZEN_REASON });
+    expect(runs.listForTask(f.taskId)).toHaveLength(1);
+    const entries = readLog(logPath);
+    expect(entries.some((e) => e.argv.includes("load-buffer") || e.argv.includes("paste-buffer"))).toBe(false);
+  } finally {
+    __resetLaunchFreezeForTest();
+    await cleanupRc2(f);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+  }
+});
+
+test("an idle-only claude send frozen during the has-session await reads busy, like sendInput's entry check", async () => {
+  const { bin, logPath } = fakeAliveTmuxBin(600);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { runs } = await import("./db.ts");
+  const { sendInput, freezeLaunches, __resetLaunchFreezeForTest } = await import("./orchestrator.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const f = await seedIdleClaudeTask("freeze-idle");
+  try {
+    const sending = sendInput(f.priorRunId, "reminder", { onlyIfIdle: true });
+    await waitForLog(logPath, "has-session");
+    freezeLaunches();
+
+    const result = await sending;
+    expect(result.delivered).toBe(false);
+    if (!result.delivered) expect(result.busy).toBe(true);
+    expect(runs.listForTask(f.taskId)).toHaveLength(1);
+  } finally {
+    __resetLaunchFreezeForTest();
+    await cleanupRc2(f);
+  }
+});
+
+test("a task archived during sendClaudeTurn's has-session await gets no paste and no new run", async () => {
+  const { bin, logPath } = fakeAliveTmuxBin(600);
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER;
+  delete process.env.AGETOR_CLAUDE_BIN;
+
+  const { db, runs } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+  const f = await seedIdleClaudeTask("archive-live");
+  try {
+    const sending = sendInput(f.priorRunId, "typed as it was archived");
+    await waitForLog(logPath, "has-session");
+    // The un-archive in `sendInput` already ran; this is a later archive.
+    db.run(`UPDATE tasks SET archived_at = ? WHERE id = ?`, [Date.now(), f.taskId]);
+
+    expect(await sending).toEqual({
+      delivered: false,
+      reason: "task was archived before the message could be sent",
+    });
+    expect(runs.listForTask(f.taskId)).toHaveLength(1);
+    const entries = readLog(logPath);
+    expect(entries.some((e) => e.argv.includes("load-buffer") || e.argv.includes("paste-buffer"))).toBe(false);
   } finally {
     await cleanupRc2(f);
     __forTest.setBracketedEnterGapMs(prevGap);

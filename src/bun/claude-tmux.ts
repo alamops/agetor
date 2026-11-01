@@ -3197,6 +3197,30 @@ interface TurnSlot {
 
 const sessions = new Map<string, SessionState>(); // taskId → state
 
+/** How long `spawnClaudeViaTmux` waits for a fresh session's JSONL before it
+ *  reports the boot as stuck (re-armed while a startup question or the deferred
+ *  first-prompt paste is still pending). Exported so the boot restore's
+ *  "JSONL may still appear" grace (`CLAUDE_JSONL_APPEAR_GRACE_MS`) can be sized
+ *  past it. */
+export const CLAUDE_BOOT_TIMEOUT_MS = 30_000;
+
+/** One entry per `spawnClaudeViaTmux` boot that hasn't attached its JSONL tail
+ *  (or given up) yet — see `claudeBootsInFlight`. */
+const bootsInFlight = new Set<object>();
+
+/**
+ * How many claude sessions this process launched that haven't written their
+ * JSONL yet. While one is pending, this process may still owe the pane its
+ * first prompt (a > 4 KB prompt is pasted once claude is ready; a startup
+ * consent dialog is confirmed by the boot poller), and a process that exits
+ * then leaves a session that never starts its turn — the next owner's restore
+ * orphans it after the JSONL grace. A core handing the port off waits for this
+ * to reach zero (bounded) before it exits.
+ */
+export function claudeBootsInFlight(): number {
+  return bootsInFlight.size;
+}
+
 /**
  * Per-task FIFO of tmux operations (paste-prompt + modal-dismissal).
  *
@@ -3228,6 +3252,18 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  * for long-lived sessions.
  */
 const pasteChains = new Map<string, Promise<void>>(); // taskId → in-flight chain tail
+
+/**
+ * How many tasks have a tmux op chain still running (a follow-up paste, an
+ * ask-card or plan drive, a modal dismissal, a `/model` picker mirror). A
+ * process that exits mid-chain can leave pasted text in claude's composer
+ * without its Enter, or a modal half-driven — so a core handing the port off
+ * waits for these too (`launchesInFlight` in orchestrator.ts). Entries
+ * self-evict when their chain drains, so this is 0 on an idle process.
+ */
+export function claudeTmuxOpsInFlight(): number {
+  return pasteChains.size;
+}
 
 /**
  * Build a SessionState. Caller supplies the path-/launch-specific fields and
@@ -8412,6 +8448,18 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // (both clocks started together at 30s; the boot wait killed a healthy
   // session whose paste hadn't submitted yet).
   let deferredPasteSettled = !opts.deferredPrompt;
+  // The token `claudeBootsInFlight` counts: released only once BOTH the boot
+  // JSONL wait below has ended AND the deferred paste has settled. On a
+  // `--resume` spawn the JSONL already exists, so the boot wait ends at once
+  // while the first prompt is still to be pasted once claude's composer is up
+  // — releasing on the boot wait alone let a handoff exit with that prompt
+  // undelivered. Whichever finishes last releases it; releasing a token that
+  // was never added (or twice) is a no-op.
+  const bootToken = {};
+  let bootWaitDone = false;
+  const releaseBootToken = (): void => {
+    if (bootWaitDone && deferredPasteSettled) bootsInFlight.delete(bootToken);
+  };
   if (opts.deferredPrompt) {
     const deferredPrompt = opts.deferredPrompt;
     opts.onChunk(
@@ -8539,6 +8587,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
         // flow that bailed (session died, superseded, cancelled) must not
         // hold the boot window open forever.
         deferredPasteSettled = true;
+        releaseBootToken();
       }
     })();
   }
@@ -8548,8 +8597,14 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // configured servers). Generous because on big projects the local
   // skill scan can take 15s+; the fs.watch trigger means we attach as
   // soon as it appears regardless.
-  const BOOT_TIMEOUT_MS = 30_000;
-  (async () => {
+  const BOOT_TIMEOUT_MS = CLAUDE_BOOT_TIMEOUT_MS;
+  // Counted until the JSONL is attached or the boot gives up, and — on the
+  // deferred-prompt path — until that paste has settled too: until then the
+  // first prompt may still be owed to the pane by THIS process (a deferred
+  // paste, a startup dialog's confirm), so a handoff waits for it
+  // (`claudeBootsInFlight`; the token is released by `releaseBootToken`).
+  bootsInFlight.add(bootToken);
+  void (async () => {
     // Concurrently watch the boot pane for a dialog blocking claude from ever
     // writing its JSONL. Two classes are handled:
     //
@@ -8765,7 +8820,10 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     if (sessions.get(opts.taskId) !== state) return;
     reportSlowLaunch(watcherMs);
     opts.onChunk("status", `claude session ${sessionName} ready (jsonl: ${jsonlPath})`);
-  })();
+  })().finally(() => {
+    bootWaitDone = true;
+    releaseBootToken();
+  });
 
   return makeAgent(opts.taskId, done);
 }
@@ -8798,7 +8856,14 @@ export interface ReattachOptions {
    *  a task can have `mode: null` (defaults to `auto`/`workspace-write`
    *  elsewhere) or reattach can be invoked without task context in tests. */
   mode?: string | null;
+  /** Epoch ms: while `Date.now()` is before it, a missing JSONL is waited for
+   *  (polled) instead of reported as `null` — a session spawned just before the
+   *  previous process exited has not written it yet. Omitted = no wait. */
+  jsonlWaitUntil?: number;
 }
+
+/** Poll cadence while waiting for a fresh session's JSONL (`jsonlWaitUntil`). */
+const JSONL_APPEAR_POLL_MS = 250;
 
 /**
  * Reattach to a tmux session that survived an agetor restart. Rebuilds the
@@ -8808,7 +8873,8 @@ export interface ReattachOptions {
  * promise resolves on the next end-of-turn (so the orchestrator can route
  * it through the same `attachDoneHandler` as a fresh run).
  *
- * Returns `null` when the JSONL doesn't exist (caller should treat the run
+ * Returns `null` when the JSONL doesn't exist, after waiting until
+ * `opts.jsonlWaitUntil` for it to appear (caller should treat the run
  * as orphaned and kill the tmux session — without the JSONL we'd have no
  * structured visibility into the session anyway).
  */
@@ -8831,7 +8897,13 @@ export async function reattachSession(opts: ReattachOptions): Promise<SpawnedAge
 async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent | null> {
   const sessionName = sessionNameFor(opts.taskId);
   const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
-  if (!existsSync(jsonlPath)) return null;
+  if (!existsSync(jsonlPath)) {
+    const until = opts.jsonlWaitUntil ?? 0;
+    while (Date.now() < until && !existsSync(jsonlPath)) {
+      await Bun.sleep(Math.min(JSONL_APPEAR_POLL_MS, Math.max(1, until - Date.now())));
+    }
+    if (!existsSync(jsonlPath)) return null;
+  }
 
   let resolveDone: ((code: number) => void) | null = null;
   let rejectDone: ((err: Error) => void) | null = null;

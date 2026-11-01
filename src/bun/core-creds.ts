@@ -46,6 +46,11 @@ export interface CoreCreds {
   version: string;
   /** Unix ms the core started. */
   startedAt: number;
+  /** Set to `"login-item"` when the core was booted by the background
+   *  login-item supervisor (docs/plans/always-on-host.md C15). `kind` stays
+   *  `"cli-daemon"` for it, so an older CLI or app — which ignores unknown
+   *  fields — still treats it as a daemon it can hand off from. */
+  launchedBy?: "login-item";
 }
 
 export const CORE_CREDS_FILENAME = "agetor-core.json";
@@ -100,7 +105,14 @@ export function readCoreCreds(dataDir?: string): CoreCreds | null {
       typeof v.version === "string" &&
       typeof v.startedAt === "number"
     ) {
-      return v as CoreCreds;
+      // `launchedBy` is optional and newer than the file format: an invalid
+      // value is dropped, never a reason to reject the whole file.
+      const creds = v as CoreCreds;
+      if (creds.launchedBy !== undefined && creds.launchedBy !== "login-item") {
+        const { launchedBy: _drop, ...rest } = creds;
+        return rest;
+      }
+      return creds;
     }
   } catch {
     /* corrupt JSON → treat as no core */
@@ -127,6 +139,47 @@ export function isPidAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Bound on the loopback TCP connect `portAcceptsConnections` makes. */
+export const LIVE_CORE_CONNECT_TIMEOUT_MS = 1_000;
+
+/**
+ * Does anything accept TCP connections on 127.0.0.1:`port`? The kernel
+ * completes the handshake for a listening socket on its own, so this answers
+ * `true` for a core whose JS thread is blocked (a native Open panel, a message
+ * box, a VACUUM) — exactly when its HTTP probe can't answer. `false` only on a
+ * failed connect (refused: nothing listens). A connect that neither succeeds
+ * nor fails within `timeoutMs` (a full listen backlog drops SYNs) reads as
+ * `true`: something is listening, it is just not accepting yet.
+ */
+export async function portAcceptsConnections(
+  port: number,
+  timeoutMs = LIVE_CORE_CONNECT_TIMEOUT_MS,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(true), timeoutMs);
+  });
+  const attempt = Bun.connect({
+    hostname: "127.0.0.1",
+    port,
+    socket: {
+      open(socket) {
+        socket.end();
+      },
+      data() {},
+      error() {},
+    },
+  }).then(
+    () => true,
+    () => false,
+  );
+  try {
+    return await Promise.race([attempt, timedOut]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 

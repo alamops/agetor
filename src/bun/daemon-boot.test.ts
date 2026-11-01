@@ -153,3 +153,102 @@ test("headless boot ignores a stored disclaimSpawnedAgents=false and logs it", a
     proc.kill();
   }
 }, 30_000);
+
+// The idle-shutdown rule depends on who launched the core (docs/plans/
+// always-on-host.md §1 item 2): a CLI-spawned daemon keeps its historical
+// 5-minute idle timeout, the login-item (background) core never idles out.
+// The boot line is how an operator reads which one is running, so it is the
+// observable here. Ports 4481 / 4482.
+async function bootAndReadIdle(opts: {
+  port: number;
+  prefix: string;
+  launchedBy?: "login-item";
+}): Promise<{ bootLine: string; creds: Record<string, unknown>; exitCode: number }> {
+  const dir = mkdtempSync(path.join(tmpdir(), opts.prefix));
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    NODE_ENV: "test",
+    AGETOR_DATA_DIR: dir,
+    AGETOR_API_PORT: String(opts.port),
+    AGETOR_HEADLESS_NOTIFICATIONS: "0",
+    AGETOR_TMUX_BIN: "/bin/echo",
+    AGETOR_HARNESS_AUTO_ENABLE: "0",
+  };
+  // The point is the DEFAULT, so neither override may leak in from the runner.
+  delete env.AGETOR_DAEMON_IDLE_MS;
+  delete env.AGETOR_LAUNCHED_BY;
+  if (opts.launchedBy) env.AGETOR_LAUNCHED_BY = opts.launchedBy;
+
+  const proc = Bun.spawn(["bun", "src/bun/headless.ts"], {
+    cwd: process.cwd(),
+    env: env as Record<string, string>,
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  const base = `http://127.0.0.1:${opts.port}`;
+  try {
+    const deadline = Date.now() + 80_000;
+    let up = false;
+    while (Date.now() < deadline) {
+      try {
+        if ((await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) })).ok) {
+          up = true;
+          break;
+        }
+      } catch {
+        /* not up yet */
+      }
+      await Bun.sleep(100);
+    }
+    expect(up).toBe(true);
+
+    const log = readFileSync(path.join(dir, "daemon.log"), "utf8");
+    const bootLine = log.split("\n").find((l) => l.includes("cli-daemon starting")) ?? "";
+    const creds = JSON.parse(readFileSync(path.join(dir, "agetor-core.json"), "utf8"));
+
+    // A plain shutdown (no body) is "stop": exit 0 for either launcher.
+    await fetch(`${base}/daemon/shutdown`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${creds.token}` },
+    });
+    const exitCode = await Promise.race([
+      proc.exited,
+      Bun.sleep(60_000).then(() => {
+        throw new Error("daemon did not exit after /daemon/shutdown");
+      }),
+    ]);
+    return { bootLine, creds, exitCode };
+  } finally {
+    proc.kill();
+  }
+}
+
+test("a CLI-launched core keeps the 5-minute idle timeout", async () => {
+  const { bootLine, creds, exitCode } = await bootAndReadIdle({
+    port: 4481,
+    prefix: "agetor-daemon-idle-cli-",
+  });
+  expect(bootLine).toContain("launchedBy=cli");
+  expect(bootLine).toContain("idle=300000");
+  expect(bootLine).not.toContain("idle=off");
+  // Nothing marks it as the background core, so older and newer clients treat
+  // it exactly as before.
+  expect(creds.launchedBy).toBeUndefined();
+  expect(exitCode).toBe(0);
+}, 120_000);
+
+test("a login-item core never idles out and says so in its creds and boot line", async () => {
+  const { bootLine, creds, exitCode } = await bootAndReadIdle({
+    port: 4482,
+    prefix: "agetor-daemon-idle-login-item-",
+    launchedBy: "login-item",
+  });
+  expect(bootLine).toContain("launchedBy=login-item");
+  expect(bootLine).toContain("idle=off");
+  expect(bootLine).not.toContain("idle=300000");
+  // `kind` stays "cli-daemon" (C15); the extra field is what marks it.
+  expect(creds.kind).toBe("cli-daemon");
+  expect(creds.launchedBy).toBe("login-item");
+  // Run directly (no supervisor), a plain shutdown is still a clean exit 0.
+  expect(exitCode).toBe(0);
+}, 120_000);

@@ -66,6 +66,24 @@ export default {
       // src/bun/disclaim.ts:bundledDisclaimPath() points at it. See
       // docs/plans/stop-agetor-tcc-appdata-spam.md.
       "vendor/disclaim": "bin",
+      // Always-on background host (docs/plans/always-on-host.md §3.9).
+      // `copy` destinations are joined to Contents/Resources/app, so `../../`
+      // climbs to Contents/. SMAppService.agent(plistName:) requires the
+      // plist's BundleProgram to be a path under the app bundle, and the
+      // plist itself under Contents/Library/LaunchAgents — so the generic
+      // login-item helper lands in Contents/MacOS (NOT Resources/app/bin like
+      // the other helpers). That placement is also what gets it signed:
+      // Electrobun's codesign pass signs every Mach-O under Contents/MacOS
+      // (Developer ID, hardened runtime, app entitlements) and never touches
+      // Resources/app/bin; scripts/verify-release.ts asserts the result (A14).
+      // Built by scripts/build-login-item.ts from native/login-item/.
+      "vendor/login-item/agetor-login-item": "../../MacOS/agetor-login-item",
+      "vendor/login-item/LaunchAgents": "../../Library/LaunchAgents",
+      // Plain-JS bundles (supervisor + headless core) the helper's `run`
+      // command execs with the bundle's own bun — the .app has no src/ tree.
+      // Lands at Contents/Resources/app/daemon/; built by
+      // scripts/build-daemon-bundle.ts.
+      "vendor/daemon": "daemon",
     },
     watchIgnore: ["dist/**", ".agetor/**", "vendor/**"],
     mac: {
