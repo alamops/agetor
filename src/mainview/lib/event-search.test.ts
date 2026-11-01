@@ -525,6 +525,16 @@ test("handoffCards: invalid block falls back to its raw inner text; no block is 
   expect(searchableEventText("assistant", "no block here", { handoffCards: true })).toBe("no block here");
 });
 
+test("handoffCards: an invalid block indexes the fence-stripped raw body the card shows, not the fence markers", () => {
+  const fenced = "intro <handoff>\n```json\n{broken-body-token\n```\n</handoff> outro";
+  const text = searchableEventText("assistant", fenced, { handoffCards: true })!;
+  expect(text).toContain("broken-body-token");
+  expect(text).not.toContain("json");
+  const events = [ev("assistant", fenced)];
+  expect(findMatchingEventIds(events, "broken-body-token", { handoffCards: true })).toEqual([0]);
+  expect(findMatchingEventIds(events, "json", { handoffCards: true })).toEqual(NO_MATCHES);
+});
+
 test("handoffCards: a block quoted in code stays raw text", () => {
   const quoted = `see \`${SAMPLE_BLOCK}\``;
   expect(searchableEventText("assistant", quoted, { handoffCards: true })).toBe(quoted);

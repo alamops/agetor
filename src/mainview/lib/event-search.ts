@@ -132,7 +132,12 @@ export function searchableEventText(
       if (!opts?.handoffCards || !mayContainHandoffOpenTag(data)) return data;
       const split = splitHandoffMessageCached(data);
       if (split.block === null) return data;
-      const body = split.block.result.ok ? searchableHandoffText(split.block.result.handoff) : split.block.inner;
+      // An invalid block shows its fence-stripped raw body (`InvalidHandoffCard`
+      // gets `result.raw ?? inner`), so index exactly that: a match on the
+      // fence marker itself would jump to a card with nothing to reveal.
+      const body = split.block.result.ok
+        ? searchableHandoffText(split.block.result.handoff)
+        : (split.block.result.raw ?? split.block.inner);
       return [split.before, body, split.after].filter((p) => p.trim() !== "").join("\n");
     }
     case "thinking":
