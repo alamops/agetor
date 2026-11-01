@@ -20,7 +20,7 @@ import { ASSISTANT_MD_COMPONENTS, MD_URL_TRANSFORM } from "@/components/kanban/m
 import { cardArtifacts, classifyHandoffArtifact } from "@/lib/handoff-artifacts";
 import { handoffMatchLocation, handoffNextLabel, handoffStatusChip, stepIdForName } from "@/lib/handoff-view";
 import type { ExpandOnJumpDetail } from "@/lib/expand-on-jump";
-import { searchHintStillValid, subscribeHandoffSearchSession } from "@/lib/handoff-search-hint";
+import { rawHandoffMatchesJump, searchHintStillValid, subscribeHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
 import { cn } from "@/lib/utils";
 import { HandoffArtifactChips } from "./HandoffArtifactChips";
@@ -241,7 +241,9 @@ export const HandoffCard = memo(function HandoffCard({
 });
 
 /** A real `<handoff>` tag pair whose body doesn't parse (D8): the error in
- *  the danger tone, the raw body collapsed under it. */
+ *  the danger tone, the raw body collapsed under it. Search indexes that raw
+ *  body (`searchableEventText`), so a search jump whose query occurs in it
+ *  opens the section — otherwise the match would sit in a closed `<details>`. */
 export const InvalidHandoffCard = memo(function InvalidHandoffCard({
   error,
   raw,
@@ -249,15 +251,34 @@ export const InvalidHandoffCard = memo(function InvalidHandoffCard({
   error: string;
   raw: string | null;
 }) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [rawOpen, setRawOpen] = useState(false);
+  const onJump = useCallback(
+    (detail: ExpandOnJumpDetail) => {
+      if (raw !== null && raw !== "" && rawHandoffMatchesJump(raw, detail.query)) setRawOpen(true);
+    },
+    [raw],
+  );
+  useExpandOnJump(rootRef, onJump);
+
   return (
-    <div data-testid="handoff-invalid-card" className="rounded-md border border-danger/50 bg-danger/10 p-3 text-foreground">
+    <div
+      ref={rootRef}
+      data-testid="handoff-invalid-card"
+      className="rounded-md border border-danger/50 bg-danger/10 p-3 text-foreground"
+    >
       <div className="flex items-center gap-1.5 text-xs font-medium text-danger">
         <CircleAlert className="size-3.5 shrink-0" aria-hidden />
         Invalid handoff
       </div>
       <p className="mt-1 whitespace-pre-wrap break-words text-xs text-danger">{error}</p>
       {raw !== null && raw !== "" && (
-        <details data-testid="handoff-invalid-raw" className="mt-2 text-xs">
+        <details
+          data-testid="handoff-invalid-raw"
+          open={rawOpen}
+          onToggle={(e) => setRawOpen(e.currentTarget.open)}
+          className="mt-2 text-xs"
+        >
           <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">Raw handoff</summary>
           <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded border border-border/40 bg-muted/40 p-2 font-mono text-[11px]">
             {raw}

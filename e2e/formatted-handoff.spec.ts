@@ -483,6 +483,33 @@ test.describe("formatted handoff", () => {
     await expectBefore(page, reminder, valid);
   });
 
+  test("(6b) search: a match inside an invalid handoff's raw body opens its collapsed Raw handoff section", async ({
+    page,
+    freshBackend,
+  }) => {
+    const backend = freshBackend;
+    const seeded = await runPipeline(backend, ["invalid-then-done"], "done");
+    const panel = await openStepPanel(page, backend, seeded, "A");
+
+    const invalid = panel.getByTestId("handoff-invalid-card");
+    await expect(invalid).toHaveCount(1, { timeout: UI_TIMEOUT });
+    const raw = invalid.getByTestId("handoff-invalid-raw");
+    // The fake driver's invalid body is `{not json`; the section starts closed.
+    expect(await raw.evaluate((el) => (el as HTMLDetailsElement).open)).toBe(false);
+
+    await page.keyboard.press(`${await shortcutModifier(page)}+KeyF`);
+    const input = panel.getByRole("textbox", { name: "Search messages" });
+    await expect(input).toBeFocused();
+    await input.fill("{not json");
+    await expect(panel.getByText("1/1", { exact: true })).toBeVisible({ timeout: UI_TIMEOUT });
+    await input.press("Enter");
+
+    // The jump lands on the invalid card's event and reveals the raw body.
+    await expect(panel.locator("[data-evid].ring-1").locator('[data-testid="handoff-invalid-card"]')).toHaveCount(1);
+    await expect.poll(() => raw.evaluate((el) => (el as HTMLDetailsElement).open), { timeout: UI_TIMEOUT }).toBe(true);
+    await expect(raw).toContainText("{not json");
+  });
+
   test("(7) blocked: a status:\"blocked\" handoff renders a blocked card", async ({ page, freshBackend }) => {
     const backend = freshBackend;
     const seeded = await runPipeline(backend, ["rich-blocked"], "blocked");

@@ -19,6 +19,18 @@ export function searchHintStillValid(hintQuery: string, session: HandoffSearchSe
   return session.open && session.query === hintQuery;
 }
 
+/** Whether a search jump onto an invalid-handoff card should open its
+ *  collapsed "Raw handoff" section: the jump's query occurs in the raw text
+ *  the section shows. The search trims and lower-cases its query
+ *  (`findMatchingEventIds`), so this does too. A jump that carries no query
+ *  reads as a plain "expand me", like every other expand-on-jump listener; a
+ *  blank query matches nothing, as in the search itself. */
+export function rawHandoffMatchesJump(raw: string, query: string | undefined): boolean {
+  if (query === undefined) return true;
+  const needle = query.trim().toLowerCase();
+  return needle !== "" && raw.toLowerCase().includes(needle);
+}
+
 type Listener = (session: HandoffSearchSession) => void;
 
 let current: HandoffSearchSession = { open: false, query: "" };

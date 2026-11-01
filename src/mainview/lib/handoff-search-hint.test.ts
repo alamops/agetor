@@ -3,11 +3,28 @@ import {
   getHandoffSearchSession,
   publishHandoffSearchSession,
   resetHandoffSearchSessionForTest,
+  rawHandoffMatchesJump,
   searchHintStillValid,
   subscribeHandoffSearchSession,
 } from "./handoff-search-hint";
 
 beforeEach(resetHandoffSearchSessionForTest);
+
+describe("rawHandoffMatchesJump", () => {
+  const raw = '{"summary": "Needle in the raw body"';
+
+  test("opens the raw section only when the jump's query occurs in it, like the search (trimmed, case-insensitive)", () => {
+    expect(rawHandoffMatchesJump(raw, "needle")).toBe(true);
+    expect(rawHandoffMatchesJump(raw, "  RAW BODY ")).toBe(true);
+    expect(rawHandoffMatchesJump(raw, "elsewhere")).toBe(false);
+  });
+
+  test("a blank query matches nothing; a jump with no query reads as a plain expand", () => {
+    expect(rawHandoffMatchesJump(raw, "")).toBe(false);
+    expect(rawHandoffMatchesJump(raw, "   ")).toBe(false);
+    expect(rawHandoffMatchesJump(raw, undefined)).toBe(true);
+  });
+});
 
 describe("searchHintStillValid", () => {
   test("valid only while the same query is open", () => {
