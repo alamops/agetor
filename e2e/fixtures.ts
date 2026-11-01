@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test as base } from "@playwright/test";
-import { E2E_BASE_URL, E2E_VITE_PORT, e2eIntEnv } from "../playwright.config";
+import { E2E_BASE_URL, E2E_VITE_PORT, assertBrowserSafePort, e2eIntEnv } from "../playwright.config";
 
 export { expect } from "@playwright/test";
 export type { APIRequestContext, Locator, Page } from "@playwright/test";
@@ -65,7 +65,10 @@ const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..
 // API, both GitHub stubs) by the same amount, so a second checkout can run
 // Playwright while another one holds 4600-4999 (pair it with
 // `AGETOR_E2E_VITE_PORT`, playwright.config.ts). Unset = today's ports; the
-// cap keeps the highest range (4900 + offset + workers) below 65536.
+// cap keeps the highest range (4900 + offset + workers) below 65536. The
+// browser talks to the API ports (not the GitHub stubs, which only the
+// backend calls), so each API port a worker or test allocates below is
+// checked against Chromium's restricted-port list (`assertBrowserSafePort`).
 const E2E_PORT_OFFSET = e2eIntEnv("AGETOR_E2E_PORT_OFFSET", 0, 0, 60_000);
 
 const BASE_API_PORT = 4600 + E2E_PORT_OFFSET;
@@ -762,7 +765,10 @@ export const test = base.extend<
       // restarted worker could reuse another worker's still-live
       // `workerIndex`-derived port. `parallelIndex` never collides with a
       // concurrently-running worker, which is what a port assignment needs.
-      const apiPort = BASE_API_PORT + workerInfo.parallelIndex;
+      const apiPort = assertBrowserSafePort(
+        `worker ${workerInfo.parallelIndex}'s API port (4600 + AGETOR_E2E_PORT_OFFSET + worker index)`,
+        BASE_API_PORT + workerInfo.parallelIndex,
+      );
       // Random, not deterministic: a deterministic per-worker token would
       // let a stale backend still bound to this port (see assertPortFree
       // above) silently authenticate as "ours" if the pre-flight check ever
@@ -797,7 +803,10 @@ export const test = base.extend<
   backendEnv: [{}, { option: true }],
 
   freshBackend: async ({ backendEnv }, use, testInfo) => {
-    const apiPort = FRESH_BASE_API_PORT + testInfo.parallelIndex;
+    const apiPort = assertBrowserSafePort(
+      `fresh-backend API port (4700 + AGETOR_E2E_PORT_OFFSET + worker index ${testInfo.parallelIndex})`,
+      FRESH_BASE_API_PORT + testInfo.parallelIndex,
+    );
     const apiToken = `e2e-fresh-w${testInfo.parallelIndex}-${randomUUID()}`;
     const githubStubPort = FRESH_GITHUB_STUB_BASE_PORT + testInfo.parallelIndex;
     await provisionBackend(apiPort, apiToken, githubStubPort, `test "${testInfo.title}"`, use, backendEnv);

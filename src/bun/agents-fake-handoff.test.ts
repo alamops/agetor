@@ -1,5 +1,5 @@
 import { test, expect, afterAll } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Harness } from "../shared/types.ts";
@@ -20,6 +20,10 @@ const scratchDirs: string[] = [];
 afterAll(() => {
   if (priorDriver === undefined) delete process.env.AGETOR_CLAUDE_DRIVER;
   else process.env.AGETOR_CLAUDE_DRIVER = priorDriver;
+  // The per-turn cwd scratch dirs `newCwd` hands out. Plain `rmSync` is right
+  // here: none of them is a data dir, so the `agetor.sqlite` guard
+  // `rmTestDataDir` adds does not apply.
+  for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true });
   rmTestDataDir(DATA_DIR);
 });
 

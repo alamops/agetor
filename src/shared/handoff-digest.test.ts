@@ -49,8 +49,9 @@ test("blocked handoff leads with the warning headline", () => {
   expect(first).toBe("⚠ blocked → Fix");
 });
 
-test("next: null reads 'last step'", () => {
-  expect(textsOf(block({ next: null }))[0]).toBe("✓ done → last step");
+test("next: null reads 'no named next step', not 'last step' (the digest has no graph to prove the pipeline ends)", () => {
+  expect(textsOf(block({ next: null }))[0]).toBe("✓ done → no named next step");
+  expect(textsOf(block({ next: null })).join("\n")).not.toContain("last step");
 });
 
 test("artifacts and open questions print one '- ' line each; empty fields are left out", () => {
@@ -95,7 +96,7 @@ test("the one-line form counts artifacts and questions, singular and plural", ()
     .toBe("✓ done → Grilling · 7 artifacts · 10 questions");
   expect(handoffDigestLine(splitHandoffMessage(block({ artifacts: ["p"], openQuestions: ["q"] }))))
     .toBe("✓ done → Grilling · 1 artifact · 1 question");
-  expect(handoffDigestLine(splitHandoffMessage(block({ next: null, status: "blocked" })))).toBe("⚠ blocked → last step");
+  expect(handoffDigestLine(splitHandoffMessage(block({ next: null, status: "blocked" })))).toBe("⚠ blocked → no named next step");
 });
 
 test("the one-line form escapes next", () => {

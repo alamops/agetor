@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { e2eIntEnv } from "../playwright.config.ts";
+import { assertBrowserSafePort, CHROMIUM_RESTRICTED_PORTS, e2eIntEnv } from "../playwright.config.ts";
 
 /**
  * `e2eIntEnv` reads the e2e port overrides (`AGETOR_E2E_VITE_PORT`,
@@ -53,5 +53,39 @@ describe("e2eIntEnv", () => {
     expect(() => read("65536", 5173, 1, 65535)).toThrow();
     expect(read("60000", 0, 0, 60_000)).toBe(60_000);
     expect(() => read("60001", 0, 0, 60_000)).toThrow();
+  });
+});
+
+/**
+ * Chromium refuses to connect to a restricted port (`ERR_UNSAFE_PORT`), and a
+ * port offset or Vite override can land the API or Vite port on one — e.g.
+ * offset 1400 puts worker 0's API port on 6000 (X11). `assertBrowserSafePort`
+ * turns that into a clear error and leaves every allowed port alone.
+ */
+describe("assertBrowserSafePort", () => {
+  test("a restricted port throws, naming the variable and the port", () => {
+    expect(() => assertBrowserSafePort("AGETOR_E2E_VITE_PORT", 6000)).toThrow(
+      "AGETOR_E2E_VITE_PORT resolved to port 6000, which Chromium blocks (ERR_UNSAFE_PORT)",
+    );
+    for (const port of [5060, 5061, 6566, 6665, 6669, 6697, 10080, 4045, 3659]) {
+      expect(() => assertBrowserSafePort("p", port)).toThrow(`port ${port}`);
+    }
+  });
+
+  test("an allowed port is returned unchanged, including every default e2e port", () => {
+    expect(assertBrowserSafePort("p", 5173)).toBe(5173);
+    expect(assertBrowserSafePort("p", 65535)).toBe(65535);
+    // API, fresh API and both GitHub stub ranges, 16 workers each, offset 0.
+    for (const base of [4600, 4700, 4800, 4900]) {
+      for (let worker = 0; worker < 16; worker++) {
+        expect(assertBrowserSafePort("p", base + worker)).toBe(base + worker);
+      }
+    }
+  });
+
+  test("every listed port is a valid TCP port", () => {
+    for (const port of CHROMIUM_RESTRICTED_PORTS) {
+      expect(Number.isInteger(port) && port >= 1 && port <= 65535).toBe(true);
+    }
   });
 });

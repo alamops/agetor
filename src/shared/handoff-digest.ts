@@ -23,8 +23,14 @@ function esc(line: string): string {
   return escapeControlChars(line, true);
 }
 
-/** `✓ done → Grilling` / `⚠ blocked → last step` (the `next` already escaped
- *  by the caller's chosen rule). */
+/** What a `next: null` handoff reads as. Deliberately neutral: the digest has
+ *  no pipeline graph, and a null `next` only means the agent named nothing —
+ *  it ends the pipeline on a step with no outgoing edge, but a step that does
+ *  have outgoing edges is blocked on it. "last step" would claim the former. */
+const NO_NEXT_LABEL = "no named next step";
+
+/** `✓ done → Grilling` / `⚠ blocked → no named next step` (the `next` already
+ *  escaped by the caller's chosen rule). */
 function headline(handoff: Handoff, next: string): string {
   return `${handoff.status === "blocked" ? "⚠ blocked" : "✓ done"} → ${next}`;
 }
@@ -57,7 +63,7 @@ function listLines(name: string, items: readonly string[]): string[] {
 /** The digest of one normalized handoff as unlabeled text lines. */
 function handoffTextLines(handoff: Handoff): string[] {
   return [
-    headline(handoff, handoff.next === null ? "last step" : esc(handoff.next.replace(LINE_BREAK_RE, " "))),
+    headline(handoff, handoff.next === null ? NO_NEXT_LABEL : esc(handoff.next.replace(LINE_BREAK_RE, " "))),
     ...fieldLines("purpose", handoff.purpose),
     ...fieldLines("summary", handoff.summary),
     ...fieldLines("reason", handoff.reason),
@@ -68,7 +74,7 @@ function handoffTextLines(handoff: Handoff): string[] {
 
 /** `✓ done → Grilling · 7 artifacts · 10 questions` for one handoff. */
 function handoffSummaryLine(handoff: Handoff): string {
-  const parts = [headline(handoff, handoff.next === null ? "last step" : escapeFreeText(handoff.next))];
+  const parts = [headline(handoff, handoff.next === null ? NO_NEXT_LABEL : escapeFreeText(handoff.next))];
   if (handoff.artifacts.length > 0) parts.push(plural(handoff.artifacts.length, "artifact", "artifacts"));
   if (handoff.openQuestions.length > 0) parts.push(plural(handoff.openQuestions.length, "question", "questions"));
   return parts.join(" · ");
@@ -81,7 +87,7 @@ function invalidLine(error: string): string {
 /**
  * The multi-line digest of a message's handoff block, one {@link PlainLine}
  * per physical line, all labeled {@link HANDOFF_DIGEST_LABEL}: the first line
- * is `✓ done → <next | last step>` (or `⚠ blocked → …`), then `purpose:`,
+ * is `✓ done → <next | no named next step>` (or `⚠ blocked → …`), then `purpose:`,
  * `summary:`, `reason:`, `artifacts:` and `open questions:` — empty fields are
  * left out, list entries get a `- ` line each. A block whose JSON does not
  * parse is a single `✗ invalid handoff — <error>` line (error tone). Every
@@ -96,8 +102,8 @@ export function handoffDigestLines(split: HandoffMessageSplit): PlainLine[] {
 
 /**
  * The one-line digest of a message's handoff block (the TUI's form):
- * `✓ done → Grilling · 7 artifacts · 10 questions`, `… → last step` when
- * `next` is null, `✗ invalid handoff — <error>` for a block that does not
+ * `✓ done → Grilling · 7 artifacts · 10 questions`, `… → no named next step`
+ * when `next` is null, `✗ invalid handoff — <error>` for a block that does not
  * parse. `""` when the message has no real block.
  */
 export function handoffDigestLine(split: HandoffMessageSplit): string {
