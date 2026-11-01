@@ -8448,6 +8448,18 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // (both clocks started together at 30s; the boot wait killed a healthy
   // session whose paste hadn't submitted yet).
   let deferredPasteSettled = !opts.deferredPrompt;
+  // The token `claudeBootsInFlight` counts: released only once BOTH the boot
+  // JSONL wait below has ended AND the deferred paste has settled. On a
+  // `--resume` spawn the JSONL already exists, so the boot wait ends at once
+  // while the first prompt is still to be pasted once claude's composer is up
+  // — releasing on the boot wait alone let a handoff exit with that prompt
+  // undelivered. Whichever finishes last releases it; releasing a token that
+  // was never added (or twice) is a no-op.
+  const bootToken = {};
+  let bootWaitDone = false;
+  const releaseBootToken = (): void => {
+    if (bootWaitDone && deferredPasteSettled) bootsInFlight.delete(bootToken);
+  };
   if (opts.deferredPrompt) {
     const deferredPrompt = opts.deferredPrompt;
     opts.onChunk(
@@ -8575,6 +8587,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
         // flow that bailed (session died, superseded, cancelled) must not
         // hold the boot window open forever.
         deferredPasteSettled = true;
+        releaseBootToken();
       }
     })();
   }
@@ -8585,11 +8598,11 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // skill scan can take 15s+; the fs.watch trigger means we attach as
   // soon as it appears regardless.
   const BOOT_TIMEOUT_MS = CLAUDE_BOOT_TIMEOUT_MS;
-  // Counted until the JSONL is attached or the boot gives up: until then the
+  // Counted until the JSONL is attached or the boot gives up, and — on the
+  // deferred-prompt path — until that paste has settled too: until then the
   // first prompt may still be owed to the pane by THIS process (a deferred
   // paste, a startup dialog's confirm), so a handoff waits for it
-  // (`claudeBootsInFlight`).
-  const bootToken = {};
+  // (`claudeBootsInFlight`; the token is released by `releaseBootToken`).
   bootsInFlight.add(bootToken);
   void (async () => {
     // Concurrently watch the boot pane for a dialog blocking claude from ever
@@ -8808,7 +8821,8 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     reportSlowLaunch(watcherMs);
     opts.onChunk("status", `claude session ${sessionName} ready (jsonl: ${jsonlPath})`);
   })().finally(() => {
-    bootsInFlight.delete(bootToken);
+    bootWaitDone = true;
+    releaseBootToken();
   });
 
   return makeAgent(opts.taskId, done);

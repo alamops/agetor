@@ -20,6 +20,7 @@
  */
 
 import { tasks } from "./db.ts";
+import { resolveNotifier } from "./notifier.ts";
 import { installNotificationRemovalHooks } from "./notification-hooks.ts";
 import { subscribeGlobal } from "./orchestrator.ts";
 import type { ApiNative } from "./server.ts";
@@ -250,6 +251,22 @@ export function isHeadlessNotificationsEnabled(env: NodeJS.ProcessEnv = process.
   if (flag === "0") return false;
   if (flag === "1") return true;
   return env.NODE_ENV !== "test";
+}
+
+/**
+ * Whether this core should wire the notification sink: the policy above AND a
+ * notifier helper that actually resolves (the same `resolveNotifier` the task
+ * notifier posts through). With no helper there is nothing to show — there is
+ * no plain fallback headless — so a sink would swallow `POST /notifications`
+ * as a 200 and the CLI's `logs --notify` would never fall back to the installed
+ * app's helper. Without a sink that route stays 501 and the fallback runs.
+ * `resolve` is a test seam.
+ */
+export function shouldPostHeadlessNotifications(
+  env: NodeJS.ProcessEnv = process.env,
+  resolve: () => string | null = () => resolveNotifier({ env }),
+): boolean {
+  return isHeadlessNotificationsEnabled(env) && resolve() !== null;
 }
 
 function lookupTask(taskId: string): HeadlessTaskInfo | null {

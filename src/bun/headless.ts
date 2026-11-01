@@ -31,7 +31,7 @@ import { bootReadySignal } from "./boot-gate.ts";
 import { CORE_EXIT_PARK, HANDOFF_LAUNCH_SETTLE_MS, launchedBy, resolveIdleTimeoutMs } from "./daemon-mode.ts";
 import {
   installHeadlessNotifications,
-  isHeadlessNotificationsEnabled,
+  shouldPostHeadlessNotifications,
   type HeadlessNotificationSink,
 } from "./headless-notifications.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
@@ -248,12 +248,12 @@ export async function runDaemon(): Promise<void> {
   // no webview is around to decide. Installed only after the bind (a core
   // that loses the port must not post), so the server gets a forwarding sink
   // that drops anything sent before then.
-  // Passed to the server only when headless notifications are on, so a core
-  // that never posts keeps answering `POST /notifications` with 501 — the CLI's
-  // `logs --notify` then falls back to the installed app's helper instead of
-  // reading a silent drop as delivered.
+  // Passed to the server only when headless notifications are on AND a notifier
+  // helper resolves, so a core that never posts keeps answering
+  // `POST /notifications` with 501 — the CLI's `logs --notify` then falls back
+  // to the installed app's helper instead of reading a silent drop as delivered.
   let notificationSink: HeadlessNotificationSink | null = null;
-  const notifications = isHeadlessNotificationsEnabled()
+  const notifications = shouldPostHeadlessNotifications()
     ? {
         post: (n: Parameters<HeadlessNotificationSink["post"]>[0]) => notificationSink?.post(n),
         remove: (r: Parameters<HeadlessNotificationSink["remove"]>[0]) => notificationSink?.remove(r),

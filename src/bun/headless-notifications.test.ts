@@ -22,6 +22,7 @@ let dataDir = "";
 let prevDataDir: string | undefined;
 let headlessNotificationFor: typeof import("./headless-notifications.ts").headlessNotificationFor;
 let isHeadlessNotificationsEnabled: typeof import("./headless-notifications.ts").isHeadlessNotificationsEnabled;
+let shouldPostHeadlessNotifications: typeof import("./headless-notifications.ts").shouldPostHeadlessNotifications;
 
 let createHeadlessNotificationHandler: typeof import("./headless-notifications.ts").createHeadlessNotificationHandler;
 let decideOwedPipelineAlert: typeof import("./headless-notifications.ts").decideOwedPipelineAlert;
@@ -33,6 +34,7 @@ beforeAll(async () => {
   const mod = await import("./headless-notifications.ts");
   headlessNotificationFor = mod.headlessNotificationFor;
   isHeadlessNotificationsEnabled = mod.isHeadlessNotificationsEnabled;
+  shouldPostHeadlessNotifications = mod.shouldPostHeadlessNotifications;
   createHeadlessNotificationHandler = mod.createHeadlessNotificationHandler;
   decideOwedPipelineAlert = mod.decideOwedPipelineAlert;
 });
@@ -273,6 +275,38 @@ describe("isHeadlessNotificationsEnabled", () => {
   test("unset otherwise is on (macOS only)", () => {
     expect(isHeadlessNotificationsEnabled({})).toBe(darwin);
     expect(isHeadlessNotificationsEnabled({ NODE_ENV: "production" })).toBe(darwin);
+  });
+});
+
+describe("shouldPostHeadlessNotifications", () => {
+  const darwin = process.platform === "darwin";
+  const on = { AGETOR_HEADLESS_NOTIFICATIONS: "1" };
+
+  test("needs a notifier helper that resolves, even when forced on", () => {
+    expect(shouldPostHeadlessNotifications(on, () => "/x/notifier")).toBe(darwin);
+    // No helper → no sink: the route keeps answering 501 and `logs --notify`
+    // falls back to the installed app's helper instead of a silent 200.
+    expect(shouldPostHeadlessNotifications(on, () => null)).toBe(false);
+  });
+
+  test("a helper alone doesn't override the policy", () => {
+    expect(shouldPostHeadlessNotifications({ AGETOR_HEADLESS_NOTIFICATIONS: "0" }, () => "/x/notifier")).toBe(false);
+    expect(shouldPostHeadlessNotifications({ NODE_ENV: "test" }, () => "/x/notifier")).toBe(false);
+  });
+
+  test("the helper isn't resolved when the policy already says no", () => {
+    let resolved = 0;
+    expect(
+      shouldPostHeadlessNotifications({ AGETOR_HEADLESS_NOTIFICATIONS: "0" }, () => {
+        resolved += 1;
+        return "/x/notifier";
+      }),
+    ).toBe(false);
+    expect(resolved).toBe(0);
+  });
+
+  test("by default it resolves through the env it was given (AGETOR_NOTIFIER_BIN)", () => {
+    expect(shouldPostHeadlessNotifications({ ...on, AGETOR_NOTIFIER_BIN: "/x/notifier" })).toBe(darwin);
   });
 });
 

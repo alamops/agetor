@@ -285,6 +285,40 @@ describe("C3 reconcile: remote access can't outlive a running host", () => {
     }
   });
 
+  test("a probe overtaken by an action doesn't undo it: remote turned on mid-probe survives the stale status", async () => {
+    // The probe reads the helper (an await) and only then looks at the pref. The
+    // Remote Access box registers the item and turns the pref on in between, so
+    // the probe's `notRegistered` is stale — acting on it would switch the
+    // brand-new setting straight back off.
+    seedFake({ registration: "notRegistered" });
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const stale = bg.getBackgroundStatus({ fresh: true });
+      bg.setRemoteAccessOnFromNativeBox(); // invalidates synchronously, probe still in flight
+      await stale;
+      expect(remotePref()).toBe("on");
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("remote access turned off"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("the next probe that nothing overtook still reconciles", async () => {
+    seedFake({ registration: "notRegistered" });
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const stale = bg.getBackgroundStatus({ fresh: true });
+      bg.setRemoteAccessOnFromNativeBox();
+      await stale;
+      expect(remotePref()).toBe("on");
+      const fresh = await bg.getBackgroundStatus({ fresh: true });
+      expect(fresh.remoteAccess).toBe(false);
+      expect(remotePref()).toBe("off");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   test("a status read with remote already off is silent", async () => {
     seedFake({ registration: "notRegistered" });
     const seen: BackgroundStatus[] = [];

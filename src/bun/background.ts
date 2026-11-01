@@ -145,12 +145,18 @@ async function notifyChanged(): Promise<void> {
 
 let cache: { at: number; status: BackgroundStatus } | null = null;
 let inflight: Promise<BackgroundStatus> | null = null;
+/** Bumped by every `invalidate()`. A probe captures it when it starts, and one
+ *  whose generation has moved on was overtaken by an action (register,
+ *  unregister, the Remote Access box turning the pref on): what it read from the
+ *  helper is stale, so it must not act on it (see the C3 reconcile in `probe`). */
+let generation = 0;
 /** The last failure from a user-triggered helper action (register/unregister/
  *  reregister), shown as the `detail` of an `off` / `needs-approval` state until
  *  the next successful action. In memory only. */
 let lastActionDetail: string | null = null;
 
 function invalidate(): void {
+  generation += 1;
   cache = null;
   inflight = null;
 }
@@ -160,6 +166,7 @@ function errorText(e: unknown): string {
 }
 
 async function probe(): Promise<BackgroundStatus> {
+  const probeGeneration = generation;
   const fake = process.env.AGETOR_FAKE_LOGIN_ITEM === "1";
   const home = homedir();
   const helper = loginItemHelper(dataDir);
@@ -208,8 +215,13 @@ async function probe(): Promise<BackgroundStatus> {
   }
 
   // C3: remote access can't stay on while the host isn't running, parked or
-  // starting (e.g. the user removed the login item in System Settings).
+  // starting (e.g. the user removed the login item in System Settings). Only a
+  // probe nothing has invalidated since it began may act: the helper reads above
+  // are awaits, and an action that finished meanwhile (the Remote Access box
+  // registers the item and then turns the pref on) would otherwise be undone by
+  // a status that was true before it. The next, fresh probe re-checks.
   if (
+    probeGeneration === generation &&
     status.remoteAccess &&
     status.state !== "running" &&
     status.state !== "parked" &&
