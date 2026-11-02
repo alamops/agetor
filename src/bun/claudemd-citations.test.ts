@@ -15,7 +15,7 @@ import path from "node:path";
 const ROOT = path.resolve(import.meta.dir, "..", "..");
 const SCAN_DIRS = ["src", "e2e", "scripts", "native"];
 const SKIP_DIRS = new Set(["node_modules", "build", "dist", ".build"]);
-const EXTENSIONS = [".ts", ".tsx", ".js", ".mjs", ".cjs", ".css", ".html", ".sql", ".sh", ".swift", ".m", ".h"];
+const EXTENSIONS = [".ts", ".tsx", ".js", ".mjs", ".cjs", ".css", ".html", ".sql", ".sh", ".swift", ".c", ".m", ".h"];
 const SELF = path.relative(ROOT, import.meta.path);
 
 /** `CLAUDE.md` (or `CLAUDE.md's`), up to two words, then item/§/section and a digit. */
@@ -69,6 +69,8 @@ describe("CLAUDE.md citations in code", () => {
   test("no source file cites a CLAUDE.md section by number", () => {
     const files = SCAN_DIRS.flatMap(listSources);
     expect(files.length).toBeGreaterThan(100);
+    // C sources are scanned too (native/disclaim/disclaim.c today).
+    expect(files.some((f) => f.endsWith(".c"))).toBe(true);
     const offenders: string[] = [];
     for (const file of files) {
       for (const hit of findNumberedCitations(readFileSync(path.join(ROOT, file), "utf8"))) {

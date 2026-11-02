@@ -5,7 +5,8 @@
 **`claude-code`** → driven through `src/bun/claude-tmux.ts`.
 One tmux session per task hosts the interactive `claude` REPL.
 Launch argv looks like `claude [--model claude-opus-5-5] [--dangerously-skip-permissions | --permission-mode <id>]` (no `--print` — `claude -p` would draw from a separate Agent SDK credit starting 2026-06-15, so we use the regular subscription quota via interactive mode).
-The prompt is delivered as keystrokes via `tmux load-buffer + paste-buffer + send-keys Enter`.
+The initial prompt rides the launch argv as the final positional after `--` (claude's `claude "query"` form) when it fits `CLAUDE_PROMPT_ARGV_MAX_BYTES` (4096 bytes, `agents.ts`); a larger one would push tmux's whole client command past its size cap (`command too long`), so `buildCommand` returns it as `deferredPrompt` and the driver pastes it once claude's composer is up.
+That oversized initial prompt and every follow-up are delivered as keystrokes via `tmux load-buffer + paste-buffer + send-keys Enter`.
 Structured output comes from tailing `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`.
 Effort maps to `CLAUDE_CODE_EFFORT_LEVEL` env, and every launch (fresh, `--resume`, every claude-code harness — set in `buildCommand`) also carries `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` (`??=`, so a harness's own env map may set it back to `true`): on 2.1.296 that turns off both prompt suggestions and the startup `Try "…"` sample, which otherwise sit as dim placeholder text on the `❯` row, and the env var beats the user's `promptSuggestionEnabled` setting (`docs/plans/claude-code-placeholder.md`).
 Tmux is a hard prereq — `checkAgent` reports unavailable if `tmux -V` fails.

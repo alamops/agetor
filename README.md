@@ -31,7 +31,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Local-first.** Everything runs on your machine. There's no Agetor account, no cloud relay and no telemetry.
 - **Non-invasive.** Agetor installs no hooks and no MCP server, and it doesn't edit your `CLAUDE.md`. It drives the real CLI the way you would.
-- **Restart-safe.** Claude Code, Codex, Cursor, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
+- **Restart-safe.** Claude Code, Codex, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx and Cursor are the exceptions: each runs as a child process of Agetor, talking the Agent Client Protocol over stdio, so a turn in progress doesn't survive a restart and can't be reattached. fx stops when Agetor quits.
 
 ---
 
@@ -77,7 +77,7 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 | --- | --- | --- | --- | --- |
 | **Claude Code** | `claude` | Interactive session in a per-task `tmux` session; output is tailed from Claude's own JSONL transcript | Opus 5.5 | `npm i -g @anthropic-ai/claude-code` |
 | **Codex** <sup>experimental</sup> | `codex` | `codex exec --json` for each turn inside `tmux`; the conversation resumes by thread id | GPT-6.1 Sol | `npm i -g @openai/codex` |
-| **Cursor** <sup>experimental</sup> | `cursor-agent` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Grok 4.7 | `curl https://cursor.com/install -fsS \| bash` |
+| **Cursor** <sup>experimental</sup> | `cursor-agent` | `cursor-agent acp`: [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio) as a child process of Agetor, no `tmux`; the conversation resumes by session id | Grok 4.7 | `curl https://cursor.com/install -fsS \| bash` |
 | **Gemini CLI** <sup>experimental</sup> | `gemini` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Gemini 3.1 Pro (preview) | `npm i -g @google/gemini-cli` |
 | **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | DeepSeek V4 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
 | **Antigravity** <sup>experimental</sup> | `agy` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by conversation id | Gemini 3.8 Flash (High) | `brew install --cask antigravity-cli` |
@@ -317,15 +317,15 @@ flowchart LR
     CLI["agetor CLI / TUI"] -- "HTTP + SSE" --> Core
     Core["Bun core<br/>orchestrator · SQLite · git"]
     Core -- "tmux (interactive)" --> Claude["claude"]
-    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini · agy · copilot · opencode"]
-    Core -- "ACP over stdio" --> FX["fx"]
+    Core -- "tmux (one-shot per turn)" --> OneShot["codex · gemini · agy · copilot · opencode"]
+    Core -- "ACP over stdio" --> FX["fx · cursor-agent"]
     Claude --> WT[("git worktree<br/>per task")]
     OneShot --> WT
     FX --> WT
 ```
 
 - **One local API.** The desktop UI and the CLI both talk to the core over HTTP and Server-Sent Events. The API listens only on `127.0.0.1`, and every route except `/health` requires a random token generated at each launch. There are two such tokens: the app's own webview uses one that is never written to disk, and the `agetor` CLI uses a weaker one that is (see [Security model](#security-model)).
-- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Cursor, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run once per turn inside `tmux` and resume by session id. fx talks the Agent Client Protocol.
+- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run once per turn inside `tmux` and resume by session id. fx and Cursor talk the Agent Client Protocol to a child process of Agetor, and Cursor resumes by session id too.
 - **Restart-safe by design.** On boot, Agetor reattaches to any `tmux`-hosted session that is still alive and replays its transcript without duplicates. Runs whose session is gone move back to **Ready**, so no card is left stuck in Running.
 - **Local persistence.** Tasks, runs, events, projects, harnesses and preferences live in a SQLite database with versioned migrations.
 
