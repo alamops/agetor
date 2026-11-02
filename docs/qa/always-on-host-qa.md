@@ -252,4 +252,4 @@ also does nothing, `application-menu-clicked` isn't being delivered.
 
 > **Rollback note (for whoever ships a build without this feature):** keep the login-item helper in
 > the bundle and call `unregister` on launch. Otherwise a user who left the switch on keeps a launchd
-> job whose `BundleProgram` no longer exists, and launchd loops on exit 78. See CLAUDE.md item 22.
+> job whose `BundleProgram` no longer exists, and launchd loops on exit 78. See `docs/architecture/always-on-host.md`.

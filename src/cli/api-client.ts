@@ -244,8 +244,8 @@ export class AgetorClient {
   }
   /** `unresolvedRefs` (omitted when empty) lists the raw `@`-tokens (verbatim,
    *  `@` included) in the task's prompt that didn't resolve to a real file
-   *  under the freshly-materialized worktree/workdir — CLAUDE.md §12's
-   *  send-time expansion contract. Advisory only; the run still starts.
+   *  under the freshly-materialized worktree/workdir — the send-time
+   *  expansion contract in docs/architecture/at-file-references.md. Advisory only; the run still starts.
    *  `pending` (omitted when falsy): spawn hasn't settled yet — run row exists, agent launch continues detached (plan §3.1). */
   startTask(
     id: string,
@@ -511,7 +511,7 @@ export class AgetorClient {
   }
   /** List a scope's files for the `@`-mention picker (`GET /files/index`) —
    *  the same route the webview's `useProjectFiles` calls. Two modes,
-   *  mirroring `src/bun/project-files.ts` / CLAUDE.md §12: pass `ref` to list
+   *  mirroring `src/bun/project-files.ts` / docs/architecture/at-file-references.md: pass `ref` to list
    *  the tracked files at that ref (previewing a worktree that hasn't been
    *  materialized yet — e.g. an isolated task before its first run); omit it
    *  to list the live working tree at `dir` (tracked + untracked-not-

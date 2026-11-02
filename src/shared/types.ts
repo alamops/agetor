@@ -2762,8 +2762,8 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // server-side alias for it now; migration 049 rewrites tasks still pinned
   // to the old id. Deliberately NOT the "auto" alias — a spike showed "auto"
   // internally routes across mixed pro/flash-lite models even for simple
-  // prompts, which fails "always default to the best available model" (root
-  // CLAUDE.md). The CLI's own `pro` alias resolves to 3.1 Pro preview on
+  // prompts, which fails "always default to the best available model" (the rule
+  // docs/architecture/harness-fx.md exempts fx from). The CLI's own `pro` alias resolves to 3.1 Pro preview on
   // accounts with 3.1 preview access (else to 3 Pro preview, or 2.5 Pro with
   // no preview access at all — gemini-cli 0.58.0 resolveModel, 2026-09-02).
   "gemini": "gemini-3.1-pro-preview",
@@ -4032,8 +4032,8 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
  * fx)" rule: the owner explicitly asked for fx's hands-off default to
  * escalate to Full access (`docs/plans/fx-recovery-follow-ups.md` §3.6),
  * since fx's `auto` mode blocks on an interactive permission card whenever
- * its hard-wired reviewer is unreachable (see the fx harness section of
- * CLAUDE.md) — `auto` is not actually hands-off for fx the way it is for
+ * its hard-wired reviewer is unreachable (see
+ * docs/architecture/harness-fx.md) — `auto` is not actually hands-off for fx the way it is for
  * every other kind.
  */
 export function defaultModeFor(kind: AgentKind): string {

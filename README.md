@@ -329,7 +329,7 @@ flowchart LR
 - **Restart-safe by design.** On boot, Agetor reattaches to any `tmux`-hosted session that is still alive and replays its transcript without duplicates. Runs whose session is gone move back to **Ready**, so no card is left stuck in Running.
 - **Local persistence.** Tasks, runs, events, projects, harnesses and preferences live in a SQLite database with versioned migrations.
 
-The architecture, lifecycle and gotchas are documented in depth in [`CLAUDE.md`](./CLAUDE.md). Design notes for individual features are in [`docs/plans/`](./docs/plans).
+The architecture, rules and gotchas are summarized in [`CLAUDE.md`](./CLAUDE.md), and each subsystem is documented in depth in [`docs/architecture/`](./docs/architecture). Design notes for individual features are in [`docs/plans/`](./docs/plans).
 
 ---
 
@@ -382,7 +382,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_LOGIN_DAEMON_TICK_MS` / `AGETOR_LOGIN_DAEMON_HANDOFF_GRACE_MS` / `AGETOR_LOGIN_DAEMON_UPDATE_GRACE_MS` | Test seams: the supervisor's tick (default 1 s), its wait after the app hands the core back (15 s) and after an update (30 s). | `1000` / `15000` / `30000` |
 | `AGETOR_FAKE_LOGIN_ITEM` / `AGETOR_FAKE_REMOTE_ACCESS` | Test seams (set `AGETOR_FAKE_LOGIN_ITEM=1`): replace the macOS login item with a file-backed fake, and start with remote access `on`. | unset |
 
-The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md).
+The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md) and the per-harness docs in [`docs/architecture/`](./docs/architecture).
 
 **Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` (or `::`) in the container so the published port works. The headless core (`agetor daemon`) accepts only `127.0.0.1`, `0.0.0.0` or `::`, and refuses to start on anything else: the CLI inside the container connects over `127.0.0.1`, which a specific address such as the container's own IP, or `localhost`/`::1` (IPv6-only), would break. The desktop app always stays on `127.0.0.1`.
 
@@ -450,7 +450,7 @@ bun run build:cli                               # standalone CLI binary → arti
 
 ### Conventions
 
-- **Read [`CLAUDE.md`](./CLAUDE.md) first.** It covers the architecture, every subsystem and the known traps. Reading it is the single most useful thing you can do before your first PR.
+- **Read [`CLAUDE.md`](./CLAUDE.md) first.** It covers the architecture, the rules every change must keep and the known traps, and its topic map points to the [`docs/architecture/`](./docs/architecture) doc for each subsystem. Reading it, and the doc for the area you're changing, is the single most useful thing you can do before your first PR.
 - **Tests for behavior changes.** Test files set `AGETOR_DATA_DIR` to a temp directory at the **top** of the file, not in `beforeAll`, so they never touch a real database. Use a temp git repo, or `isolation: "none"`, so tests never create real branches.
 - **Never edit an applied migration.** Add a new numbered file to `src/bun/migrations/` and append it to `index.ts`.
 - **Keep `src/shared/` free of runtime imports.** Both processes import it.
@@ -464,7 +464,7 @@ bun run build:cli                               # standalone CLI binary → arti
 4. Add availability and install hints in `src/bun/agent-status.ts`, and model discovery in `src/bun/agent-discovery.ts`.
 5. Wire the follow-up queue, restart reattach and session id handling in `src/bun/orchestrator.ts`, then the Settings, onboarding and picker surfaces in the webview and the e2e fixtures.
 
-The type checker catches most of the tables, and the dispatch functions end in an exhaustive check for an unhandled kind, but the hand-edited lists don't, so a new kind isn't picked up everywhere automatically. [`CLAUDE.md`](./CLAUDE.md#agent-command-shape) has the full checklist.
+The type checker catches most of the tables, and the dispatch functions end in an exhaustive check for an unhandled kind, but the hand-edited lists don't, so a new kind isn't picked up everywhere automatically. [`docs/architecture/harnesses.md`](./docs/architecture/harnesses.md#adding-a-new-agent-kind) has the full checklist.
 
 ---
 

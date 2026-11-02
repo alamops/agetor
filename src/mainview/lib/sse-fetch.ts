@@ -31,7 +31,7 @@
 //     reconnect, and nothing is delivered or reconnected after it.
 //
 // WKWebView caps HTTP/1.1 connections per host at ~6 and two of them are the
-// permanent SSE channels (see the RunPanel note in CLAUDE.md); a fetch body
+// permanent SSE channels (see docs/architecture/run-panel.md); a fetch body
 // holds a connection exactly like an EventSource did, so this changes nothing
 // about that budget.
 import { createSseParser, type SseFrame } from "../../shared/sse-parse.ts";

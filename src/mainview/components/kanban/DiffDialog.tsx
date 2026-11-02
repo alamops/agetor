@@ -503,7 +503,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const composerVisible = totalSelected > 0;
 
   // `@` popover + highlight for the compose-from-diff box — the same scope
-  // table as RunPanel's composer (CLAUDE.md §12): the live worktree once it
+  // table as RunPanel's composer (docs/architecture/at-file-references.md): the live worktree once it
   // exists; a not-yet-started isolated task previews its pinned base ref
   // (existing-branch tasks their branch); else the plain workdir. Gated on
   // the composer actually showing so an open dialog with no selection

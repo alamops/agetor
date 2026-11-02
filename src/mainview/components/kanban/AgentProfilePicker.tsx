@@ -56,7 +56,7 @@ export function AgentProfilePicker({
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       // Consume Escape before an enclosing Dialog's own handler — see the
-      // `data-popover-open` contract (CLAUDE.md UI conventions / arch item 11).
+      // `data-popover-open` contract (docs/architecture/prompt-composer.md).
       e.preventDefault();
       setOpen(false);
     };
@@ -77,8 +77,8 @@ export function AgentProfilePicker({
   const rowCount = filtered.length + 1;
 
   // Reset the highlight whenever the candidate rows change identity — see
-  // the "reset active row on the rows ARRAY's identity" rule (CLAUDE.md
-  // architecture item 12). `filtered` already changes identity on every
+  // the "reset active row on the rows ARRAY's identity" rule
+  // (docs/architecture/at-file-references.md). `filtered` already changes identity on every
   // `query`/`profiles` change, so depending on it alone is sufficient.
   useEffect(() => {
     setActive(0);

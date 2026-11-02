@@ -13,8 +13,8 @@ function sliceKey(slice: { start: number; query: string }): string {
 }
 
 /** How long to wait after the query stops changing before firing
- *  remoteSearch (mirrors the webview's /refs/resolve debounce, CLAUDE.md
- *  section 12) so a fast typist doesn't fire one request per keystroke. */
+ *  remoteSearch (mirrors the webview's /refs/resolve debounce, see
+ *  docs/architecture/at-file-references.md) so a fast typist doesn't fire one request per keystroke. */
 const REMOTE_SEARCH_DEBOUNCE_MS = 200;
 
 /** Cap on remote rows actually rendered, independent of how many the
@@ -36,7 +36,7 @@ const MIN_REMOTE_QUERY_LEN = 2;
  *
  * When `fileEntries` is given, typing an `@`-token opens an inline popover
  * (up to 5 rows) beneath the input — CLI parity for the webview's `@` file
- * autocomplete (CLAUDE.md §12). Omitting `fileEntries` disables the feature
+ * autocomplete (docs/architecture/at-file-references.md). Omitting `fileEntries` disables the feature
  * entirely: no popover, no extra per-keystroke work, identical behavior to
  * before this prop existed.
  */
@@ -55,7 +55,7 @@ export function Composer({
   width?: number;
   fileEntries?: FileEntry[];
   /** Full-depth server-side search for a monorepo whose local listing was
-   *  truncated at the 20k cap (CLAUDE.md §12) — when given, an active `@`
+   *  truncated at the 20k cap (docs/architecture/at-file-references.md) — when given, an active `@`
    *  query is debounced and handed to this instead of relying solely on the
    *  capped `fileEntries` passed in above. Resolves with rows already
    *  ranked/filtered for `q`, or `null` on a failed search — a `null`

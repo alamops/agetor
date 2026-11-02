@@ -326,7 +326,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     // Task wasn't started, so there's no server-side send-time expansion to
     // ask — advisory client-side pre-check instead: list the scope the task
     // will actually run in (the same `fileScopeForTask` table `RunPanel` /
-    // the TUI composer use, CLAUDE.md §12) and flag any `@`-token the user
+    // the TUI composer use, docs/architecture/at-file-references.md) and flag any `@`-token the user
     // typed that won't resolve there. Never blocks or fails the add; a
     // listing that errored or came back empty can't prove a token
     // unresolved, so it's skipped silently rather than false-warning.
@@ -357,8 +357,8 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
           // tokens are exempt regardless of what a search would find, so
           // there's no reason to spend a round-trip on them) and verify each
           // one via the server's full-depth search before trusting it as
-          // missing (`verifyTokensViaSearch`, CLAUDE.md §12's webview
-          // parity). Only PROVEN-missing tokens warn.
+          // missing (`verifyTokensViaSearch`, the webview parity in
+          // docs/architecture/at-file-references.md). Only PROVEN-missing tokens warn.
           const extensionNames = await discoveredExtensionNames(client, task);
           const candidateRaws = new Set(
             filterUnresolvedRefs(

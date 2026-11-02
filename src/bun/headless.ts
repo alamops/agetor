@@ -222,8 +222,9 @@ export async function runDaemon(): Promise<void> {
   // restore, then `markBootReady()`. Routes wait on the ready signal, so the
   // API never serves `/tasks`/`/runs` while a `status='running'` row from a
   // previous process is still being reattached or flipped to `orphaned`
-  // underneath it (CLAUDE.md §5). A restore throw is logged and ends the
-  // process with exit 1 — no swallow.
+  // underneath it (boot reconciliation, step 5 in
+  // docs/architecture/task-lifecycle.md). A restore throw is logged and ends
+  // the process with exit 1 — no swallow.
   rehydratePath();
   // Event-loop lag monitor (docs/plans/non-blocking-session-restore.md, decision
   // C): one `.unref()`'d sampler that names whatever held the single main thread

@@ -4358,7 +4358,7 @@ function RunPanelBody({
         // individually incomplete: `runs` (this component's own polled
         // `GET /tasks/:id/runs` history) is the most truthful match for the
         // orchestrator's own freeze gate (`runs.countForTask(task.id) === 0`,
-        // CLAUDE.md item 15) because it counts a run regardless of outcome,
+        // docs/architecture/agent-profiles.md) because it counts a run regardless of outcome,
         // but reads empty for one brief tick after a task remount before its
         // first poll lands; `task.hasOpenableRun` is available immediately
         // from the task row itself (no fetch race) but excludes
@@ -6617,7 +6617,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
 
   // Display-only: fold expanded absolute paths under the task's own roots
   // back to the `@rel` mention the user typed (send-time expansion produced
-  // them — see CLAUDE.md §12). Applied to the rendered markdown/segment body
+  // them — see docs/architecture/at-file-references.md). Applied to the rendered markdown/segment body
   // ONLY; the references arrays keep absolute paths for chips/previews.
   // Shortening runs BEFORE segmentation below: it never touches tag markup
   // (tags aren't paths) and it already skips code spans itself, so the

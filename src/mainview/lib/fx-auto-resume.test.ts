@@ -3,7 +3,7 @@ import { FX_AUTO_RESUME_MAX, type TaskFxRecovery } from "../../shared/types.ts";
 import { fxPausedBadgeText, fxPausedBadgeTitle } from "./fx-auto-resume.ts";
 
 // Pure text helpers only — no jsdom/testing-library in this repo (see
-// CLAUDE.md), so `useCountdown` (a React hook) is exercised only via
+// docs/architecture/tagged-user-messages.md), so `useCountdown` (a React hook) is exercised only via
 // Playwright. `fxPausedBadgeText`/`fxPausedBadgeTitle` take a plain
 // `TaskFxRecovery` and return a string, so they're testable directly here.
 

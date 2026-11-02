@@ -886,7 +886,7 @@ export function buildCommand(
     // kind's "auto", because fx's own `auto` blocks on an interactive
     // permission card whenever its hard-wired reviewer is unreachable (see
     // `defaultModeFor`'s doc comment in shared/types.ts and the fx harness
-    // section of CLAUDE.md).
+    // doc, docs/architecture/harness-fx.md).
     // fx 0.0.8 also accepts `full-access` as a UI/CLI-wording alias of
     // `yolo` (`--full-access` flag, `/permissions full-access`) — it parses
     // to the identical `.yolo` enum value (config_runtime.zig

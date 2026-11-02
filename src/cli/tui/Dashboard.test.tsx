@@ -1098,7 +1098,7 @@ test("a cached listing is invalidated when the task's column changes (run settle
   unmount();
 });
 
-// ── @ remote search fallback (truncated listing → server-side search, CLAUDE.md §12) ──
+// ── @ remote search fallback (truncated listing → server-side search, docs/architecture/at-file-references.md) ──
 
 test("a truncated listing wires the composer's remoteSearch, which is invoked with a q param after typing", async () => {
   const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });

@@ -35,8 +35,8 @@ export function isFindShortcut(e: FindShortcutKey, isMac: boolean): boolean {
  * AtFileAutocomplete, ExtensionPicker) are excluded from the guard: they
  * only want Escape yielded to them, so ⌘F stays live while the `/` or `@`
  * menu or the Extensions popover is open (see the `data-popover-keys`
- * convention documented in CLAUDE.md's "Shared task-composition modules"
- * bullet, and this exact string previously inline in RunPanel.tsx's
+ * convention documented in
+ * docs/architecture/prompt-composer.md, and this exact string previously inline in RunPanel.tsx's
  * Cmd/Ctrl+F handler).
  */
 export const FIND_SHORTCUT_BLOCKING_LAYERS =

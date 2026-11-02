@@ -185,8 +185,8 @@ function taskCard(page: Page, title: string): Locator {
  *
  * But the app DOES support switching directly (task prop A→B with no
  * intervening `null`, so `RunPanelBody` never unmounts — see
- * `RunPanel.tsx`'s `mountedTask`/`[task.id]` effect and CLAUDE.md's
- * "RunPanel is ONE long-lived instance" note): the task context menu's
+ * `RunPanel.tsx`'s `mountedTask`/`[task.id]` effect and the
+ * "RunPanel is ONE long-lived instance" note in docs/architecture/run-panel.md): the task context menu's
  * "Open details" action calls `setSelected(t)` directly
  * (`App.tsx`'s `runTaskMenuAction`, case `"open"`), and that menu portals to
  * `document.body` at `z-50` (`context-menu.tsx`) — above the backdrop and

@@ -233,7 +233,7 @@ test("suggestions are memoized: an unrelated re-render (arrow-key nav) doesn't r
   expect(suggestCalls).toBe(afterTyping);
 });
 
-// ── remoteSearch (monorepo fallback, CLAUDE.md §12) ─────────────────────────
+// ── remoteSearch (monorepo fallback, docs/architecture/at-file-references.md) ──
 
 test("remoteSearch replaces the local rows once its debounced answer matches the current query", async () => {
   const remoteSearch = async (_q: string) => [{ path: "deep/dir/zzz-target.ts", isDirectory: false }];

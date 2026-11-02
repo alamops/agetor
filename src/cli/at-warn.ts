@@ -8,7 +8,7 @@ import type { Task } from "../shared/types.ts";
 
 // Advisory, non-blocking copy for `@`-tokens that won't resolve to a real
 // project file — the CLI-side twin of the webview's highlight/expansion
-// split (CLAUDE.md §12). The server (or, for the CLI's own pre-send check,
+// split (docs/architecture/at-file-references.md). The server (or, for the CLI's own pre-send check,
 // a local listing) tells us *which* raw tokens didn't resolve; this module
 // decides which of those are worth telling a human about and how to phrase
 // it. Pure filtering/copy helpers plus a thin stderr wrapper — mirrors
@@ -183,7 +183,7 @@ export async function verifyTokensViaSearch<T extends { path: string; isDirector
  *  fail-open lookup rather than one per caller. Discovery params come from
  *  `discoveryParamsForTask` (`src/shared/file-scope.ts`) — the same
  *  worktree-vs-committed-ref rule the webview's `RunPanel`/the TUI/the `@`
- *  file listing use (CLAUDE.md §12), not the raw `task.workdir`/`branch`
+ *  file listing use (docs/architecture/at-file-references.md), not the raw `task.workdir`/`branch`
  *  pair, so a materialized worktree reads its own live tree instead of the
  *  source repo's committed ref. A discovery failure must not block or fail
  *  the caller's own operation: falls back to an empty set (over-warn rather

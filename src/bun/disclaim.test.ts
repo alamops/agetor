@@ -101,7 +101,7 @@ test("disclaimAvailable: false when AGETOR_DISCLAIM_BIN points at a missing file
 
 // These two exercise the real disclaimEnabled()/disclaimArgv() gating end to
 // end, so they need to actually run on darwin (the only platform Agetor
-// ships on — see CLAUDE.md); skip rather than fail on any other host.
+// ships on — see README.md's Install section); skip rather than fail on any other host.
 test.skipIf(process.platform !== "darwin")(
   "disclaimArgv: prepends AGETOR_DISCLAIM_BIN when enabled",
   () => {

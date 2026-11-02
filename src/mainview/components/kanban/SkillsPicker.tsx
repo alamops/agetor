@@ -88,8 +88,8 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
     };
     // Document-level Escape (like `AgentProfilePicker`) so the popover
     // closes before an enclosing Dialog's own Escape handler ever sees the
-    // key — see the `data-popover-open` contract (CLAUDE.md UI conventions
-    // / architecture item 11).
+    // key — see the `data-popover-open` contract
+    // (docs/architecture/prompt-composer.md).
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       e.preventDefault();
@@ -113,7 +113,7 @@ export function SkillsPicker({ value, onChange, harnessId, disabled, className }
 
   // Reset the highlight whenever the candidate rows change identity (a new
   // typed query, a fresh suggestion fetch, …) — see the "reset active row on
-  // the rows ARRAY's identity" rule (CLAUDE.md architecture item 12).
+  // the rows ARRAY's identity" rule (docs/architecture/at-file-references.md).
   useEffect(() => {
     setActive(-1);
   }, [filtered]);

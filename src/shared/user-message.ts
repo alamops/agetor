@@ -903,7 +903,8 @@ export const AGETOR_PASTE_LEAD_IN = "My own message, sent from Agetor:";
 /**
  * Every lead-in spelling agetor has ever shipped, in shipping order — all
  * of them retired. APPEND-ONLY, never pruned: persisted `run_events` rows are
- * raw (see this module's header comment and CLAUDE.md items 13/14), so a
+ * raw (see this module's header comment and
+ * docs/architecture/tagged-user-messages.md / markdown-images.md), so a
  * spelling removed from this list would resurface verbatim in every
  * historical transcript that carries it.
  */

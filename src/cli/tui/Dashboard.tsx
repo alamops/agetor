@@ -148,7 +148,7 @@ export function Dashboard({
   const now = useClockTick(hasPendingAutoResume);
 
   // `@` file-reference listing for the composer's popover — see at-complete.ts
-  // and CLAUDE.md §12. Cached by SCOPE (dir+ref), not by task id: a task
+  // and docs/architecture/at-file-references.md. Cached by SCOPE (dir+ref), not by task id: a task
   // cached pre-run under `{dir: workdir, ref: baseRef}` must NOT keep serving
   // that listing once its worktree materializes and `fileScopeForTask` starts
   // returning `{dir: worktreePath}` — same `cacheKey` shape as the webview's
@@ -157,7 +157,7 @@ export function Dashboard({
   const [composeFileEntries, setComposeFileEntries] = useState<FileEntry[]>([]);
   const [composeListingError, setComposeListingError] = useState<string | null>(null);
   // Whether the last fetch for the CURRENT scope hit the server's
-  // `MAX_PROJECT_FILES` cap (CLAUDE.md §12's monorepo fallback) — when true,
+  // `MAX_PROJECT_FILES` cap (the monorepo fallback in docs/architecture/at-file-references.md) — when true,
   // the local `composeFileEntries` listing is known-incomplete, so the
   // composer's `@` popover falls back to a per-keystroke server-side search
   // instead of ranking only the capped local set (see `composeRemoteSearch`
@@ -244,7 +244,7 @@ export function Dashboard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, targetId, composeScopeKey, composeColumn, client]);
 
-  // Monorepo fallback (CLAUDE.md §12): once the local listing for the
+  // Monorepo fallback (docs/architecture/at-file-references.md): once the local listing for the
   // current scope came back `truncated` (the 20k `MAX_PROJECT_FILES` cap),
   // per-keystroke ranking over only that capped set would miss real matches
   // further down the tree — so hand the composer a server-side search

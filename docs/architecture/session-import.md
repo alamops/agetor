@@ -1,0 +1,41 @@
+# Importing Claude Code and OpenCode sessions started outside Agetor
+
+> Moved from `CLAUDE.md`, where this was the two “Importing … sessions started outside Agetor” sections. Index of all subsystem docs: the [Topic map in CLAUDE.md](../../CLAUDE.md#topic-map).
+
+## Claude Code sessions
+
+`GET /claude-sessions` lists transcripts under each Claude Code harness config dir (and `~/.claude`) that Agetor did not start.
+Import creates an in-place task (`isolation: "none"`, `workdir` = the transcript's cwd) in **review**, bound to that session id, and persists the transcript onto a succeeded seed run (`origin: "imported"`).
+A live session is refused.
+Claude's `default`, missing, and unknown permission modes are stored as `ask` (resume passes `--permission-mode default`).
+A project folder whose plain encoding would exceed 200 characters stays listed with Import disabled ("Folder path is too long to import yet") until `encodeProjectPath` matches the on-disk directory name — the hash is not guessed.
+Start/Run returns 409 `imported-session`; send a message to continue.
+While history is still importing or the import failed, send is refused.
+Archive and delete do not tear down the user's branch.
+A session whose folder is gone is listed with Import disabled ("Session folder no longer exists", `blockedReason: "missing-folder"`), and the commit re-checks the folder under its lock.
+Launch scan (`claudeSessions.launchScan`, default on) runs only after the desktop API has bound and toasts session ids it has not toasted before; with no `/app/events` client connected yet the notice is held and sent to the next one (`flushPendingClaudeSessionsNotice`, called by that route), and ids are recorded as seen only once sent, in the `claude_session_seen` table (migration 071, newest 2,000 kept — not `preferences`, so it never rides `GET /preferences`).
+The scanner reads as little as it can: an id Agetor owns is skipped by file name, a project dir whose name starts with an encoded worktree or temp root is peeked (first 64 KB) for its cwd before a full parse, parsed metadata is cached per file by size + mtime, and `git rev-parse` (5 s timeout) runs only for the rows a list scan (`scanClaudeSessions`) shows; an import by id (`findClaudeSessions`) probes every id it matches, hidden ones included.
+Liveness is a cached `claude agents --json` per config dir, run with that harness's own `bin`; `GET /claude-sessions` returns `livenessCheckedAt` (oldest probe, null when a dir has none) and the dialog and `agetor sessions ls` re-check when it is null or older than `CLAUDE_SESSIONS_LIVENESS_STALE_MS`.
+The task panel's "Switch to X" banner sends the branch it names and hides once the task has an Agetor run.
+A home-less claude-code harness launches with this process's `CLAUDE_CONFIG_DIR` pinned, or unset via `/usr/bin/env -u` (`pinClaudeConfigDir`), so the long-lived tmux server's env can't send claude to a dir `jsonlPathFor` doesn't tail; a harness with a home always launches with that home, even when its `env` map names another `CLAUDE_CONFIG_DIR`; a home-less harness whose `env` map names one launches there, and the spawn tails that dir.
+`agetor sessions import --json` lists requested ids that are blocked or missing in `results` with their reason, and the task panel hides Commit & push while send is refused.
+`tasks.imported_claude`/`imported_claude_session_id` are skipped by the generic `tasks.update` SET clause and written only by `tasks.setImportedClaude`, in one UPDATE.
+
+## OpenCode sessions
+
+Same product surface as the Claude import above (one dialog, `ImportSessionsDialog`, reached from the Projects picker's "Import sessions…", the header import button, and `agetor sessions [ls | import [id…]] [--kind claude|opencode] [--harness <id>]`), but every part is OpenCode's own (`docs/plans/add-opencode-harness.md` D-13, amendments A7/A8).
+`GET /opencode-sessions` (`scanOpencodeSessions`, `src/bun/opencode-session-scan.ts`) runs `opencode session list` **per enabled opencode harness × per existing project dir** (`resolveBin`/`harnessEnv`, `cwd` = the project, `--standalone` on v2 via the major from `cachedCliVersion`), each call bounded by `LIST_TIMEOUT_MS` (5 s), at most `SCAN_CONCURRENCY` (4) in flight, results cached per (harness, dir) for `SCAN_CACHE_TTL_MS` (10 s, failures cached too); `POST /opencode-sessions/recheck` forces a re-scan.
+Rows are filtered fresh after the cache: an id Agetor owns (`hiddenOpencodeSessionIds` = ids on any run's `opencode_session_id` ∪ import claims) is hidden, a folder that no longer exists is listed with `blockedReason: "missing-folder"`, and duplicates are deduped per (harness, session).
+
+**Busy rule** (owner decision, A8c): a session is refused (`blockedReason: "busy"`) only when `session export` reports it **unfinished AND it was updated within `OPENCODE_BUSY_WINDOW_MS` (10 min)**; an unfinished session older than that imports with the status line `OpenCode reported this session unfinished` (uuid `opencode:import:unfinished`).
+Only a row updated inside the window costs an export probe; a failed probe is `busyUnknown: true` (importable, with a warning in the dialog).
+
+**Import** (`importOpencodeSessions(ids, { harnessId? })`, `src/bun/opencode-session-import.ts`) mirrors Claude's: one `session export` (30 s) under the harness that listed the session serves the busy re-check, the launch fields (model = `providerID/id` else the `opencode-default` sentinel; effort = the variant unless `"default"`;
+mode `plan` iff the last agent was `plan`) and the backfill; `createTask` with `isolation: "none"`, column `review`, `opencodeServer: "shared"`; the claim (`tasks.setImportedOpencode`, unique partial index on `imported_opencode_session_id`, throws `ImportedOpencodeSessionTaken`) is written before the succeeded seed run (`origin: "imported"`, `opencodeSessionId`);
+events are written in 20 ms cooperative slices and de-duplicated by `line_uuid` so resume/retry (`retryOpencodeImport`, `POST /tasks/:id/opencode-session/retry`, `resumeIncompleteOpencodeImports` at boot from `index.ts`/`headless.ts`) is idempotent.
+Child (subagent) sessions are not imported.
+Provenance `harnessId` records the harness that **listed** the session (where its data lives) even when `--harness`/`opts.harnessId` overrides the task's agent — and that override is refused unless the target reads the same OpenCode data dir as the listing harness (`XDG_DATA_HOME`, else `$HOME/.local/share`, over the spawn env), since its `-s <id>` follow-ups couldn't see the session otherwise (v2 silently starts an empty one, spike Q4).
+The dialog drops every row of a session once it is imported (the same id may be listed under two harnesses), and a batch imports a session id once.
+The shared surfaces: `importedSessionOf(task)` (`src/shared/imported-session.ts`) is the one reader of `importedClaude`/`importedOpencode` — the start refusal (409 `imported-session`), the send gates (importing / failed / held-elsewhere), `TaskCard`, the context menu and `RunPanel` all go through it instead of testing `task.importedClaude`; import status changes ride the existing `claude_session_import` AppEvent (no OpenCode-specific type, App only refetches on it).
+The launch scan (`startClaudeSessionLaunchScan`, `claude-session-launch.ts`) runs OpenCode's scan after Claude's under the **same** `claudeSessions.launchScan` preference, toasts via the `opencode_sessions_found` AppEvent (`{ count, sessionIds, ts }`), holds the notice until an `/app/events` client connects, and records seen ids only once sent in the **shared** `claude_session_seen` table.
+`tasks.imported_opencode`/`imported_opencode_session_id` are skipped by the generic `tasks.update` SET clause and written only by `tasks.setImportedOpencode`.
