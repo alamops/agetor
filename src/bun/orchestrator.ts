@@ -1652,7 +1652,7 @@ export function __resetLaunchFreezeForTest(): void {
 }
 /**
  * Runs the user asked to Stop while their spawn was still in flight (the
- * bounded-spawn pending window, CLAUDE.md item 16): the run row exists and
+ * bounded-spawn pending window, docs/architecture/core-responsiveness.md): the run row exists and
  * is the task's current run, but no `active` handle is registered yet, so
  * `cancelRun` has nothing to kill. It records the intent here instead and
  * the detached continuation honors it on settle — kills the just-spawned

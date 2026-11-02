@@ -21,7 +21,7 @@ function collect() {
 
 // Event fixtures below are taken verbatim from a real spike against
 // `gemini --output-format stream-json` (CLI 0.54.0, live API) — not
-// inferred from docs. See CLAUDE.md's "Agent command shape" section.
+// inferred from docs. See docs/architecture/harness-gemini.md.
 
 test("init is silent (agetor already knows the session id — it self-issued it)", () => {
   const { chunks, onChunk } = collect();

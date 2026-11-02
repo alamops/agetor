@@ -1,5 +1,5 @@
 // `@` file-reference autocomplete for the TUI Dashboard's message composer —
-// CLI parity for the webview's `@` feature (see CLAUDE.md §12 and
+// CLI parity for the webview's `@` feature (see docs/architecture/at-file-references.md and
 // `src/mainview/components/kanban/AtFileAutocomplete.tsx`). Pure and
 // DOM-free by design (no ink here) so it's unit-testable without rendering
 // anything; `Composer.tsx` is the only consumer of the two suggestion
@@ -22,7 +22,7 @@ const MAX_SUGGESTIONS = 5;
 /**
  * The project scope (`GET /files/index` params) a task's `@` popover should
  * list/validate against — EXACTLY the table `RunPanel.tsx`'s `fileScope`
- * memo uses (see CLAUDE.md §12). Moved to `src/shared/file-scope.ts` (the
+ * memo uses (see docs/architecture/at-file-references.md). Moved to `src/shared/file-scope.ts` (the
  * single source of truth shared by the webview, the TUI, and the CLI's
  * capability discovery) — re-exported here since `Dashboard.tsx` and
  * `commands/add.ts` still import it from this module.

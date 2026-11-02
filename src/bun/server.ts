@@ -7540,7 +7540,7 @@ export function startApiServer(
                 ? `The plan is approved with edits by the user — the approved version is saved at ${relPath}. Read it and follow that version; it supersedes your original plan. Good to go.`
                 : `The plan is approved — proceed with the implementation. It is also saved at ${relPath} for reference.`;
             }
-            // Plan mode (`cursor-agent --mode plan`) is read-only, so an
+            // Plan mode (ACP `session/set_mode` `plan`) is read-only, so an
             // approved plan could never be implemented in it: an unbound task
             // is switched to Auto (force) right before the approval message
             // goes out — the follow-up turn re-reads `task.mode` at spawn, so

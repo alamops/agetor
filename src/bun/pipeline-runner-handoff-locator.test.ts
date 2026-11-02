@@ -20,7 +20,7 @@ process.env.AGETOR_CLAUDE_ARGS = "";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
 // Without the runner subscribed, step settles never propagate and every run
-// hangs in `running` (CLAUDE.md item 19).
+// hangs in `running` (docs/architecture/pipelines.md).
 beforeAll(async () => {
   const { initPipelineRunner } = await import("./pipeline-runner.ts");
   initPipelineRunner();

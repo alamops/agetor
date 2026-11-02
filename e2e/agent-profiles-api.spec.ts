@@ -169,8 +169,8 @@ async function waitForNotRunning(
  *  would otherwise come from never completes a plain fetch). `startTask`
  *  echoes the composed prompt (preamble + "Your task:" + the user's own
  *  text) as a `user` event unconditionally, regardless of agent driver — see
- *  `orchestrator.ts`'s `startTaskInner`, CLAUDE.md orchestration-flow item
- *  15 — and the column stores the RAW text (no JSON envelope), so this reads
+ *  `orchestrator.ts`'s `startTaskInner`, docs/architecture/agent-profiles.md
+ *  — and the column stores the RAW text (no JSON envelope), so this reads
  *  back exactly the string a transcript bubble would render. Opens and
  *  closes its own read-only-in-spirit handle per call, mirroring
  *  `seedHarnessUsage`'s own short-lived-handle rationale. */

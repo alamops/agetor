@@ -31,7 +31,7 @@ Coding agents are good enough now that the limiting factor is you: one terminal,
 
 - **Local-first.** Everything runs on your machine. There's no Agetor account, no cloud relay and no telemetry.
 - **Non-invasive.** Agetor installs no hooks and no MCP server, and it doesn't edit your `CLAUDE.md`. It drives the real CLI the way you would.
-- **Restart-safe.** Claude Code, Codex, Cursor, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx is the exception: it runs as a child process of Agetor and stops when Agetor quits, so an fx turn in progress doesn't survive a restart.
+- **Restart-safe.** Claude Code, Codex, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run inside `tmux`, so quitting Agetor doesn't stop them, and the next launch reconnects to them. fx and Cursor are the exceptions: each runs as a child process of Agetor, talking the Agent Client Protocol over stdio, so a turn in progress doesn't survive a restart and can't be reattached. fx stops when Agetor quits.
 
 ---
 
@@ -77,7 +77,7 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 | --- | --- | --- | --- | --- |
 | **Claude Code** | `claude` | Interactive session in a per-task `tmux` session; output is tailed from Claude's own JSONL transcript | Opus 5.5 | `npm i -g @anthropic-ai/claude-code` |
 | **Codex** <sup>experimental</sup> | `codex` | `codex exec --json` for each turn inside `tmux`; the conversation resumes by thread id | GPT-6.1 Sol | `npm i -g @openai/codex` |
-| **Cursor** <sup>experimental</sup> | `cursor-agent` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Grok 4.7 | `curl https://cursor.com/install -fsS \| bash` |
+| **Cursor** <sup>experimental</sup> | `cursor-agent` | `cursor-agent acp`: [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio) as a child process of Agetor, no `tmux`; the conversation resumes by session id | Grok 4.7 | `curl https://cursor.com/install -fsS \| bash` |
 | **Gemini CLI** <sup>experimental</sup> | `gemini` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by session id | Gemini 3.1 Pro (preview) | `npm i -g @google/gemini-cli` |
 | **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | DeepSeek V4 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
 | **Antigravity** <sup>experimental</sup> | `agy` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by conversation id | Gemini 3.8 Flash (High) | `brew install --cask antigravity-cli` |
@@ -96,9 +96,9 @@ Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast*
 
 ### Cursor notes
 
-- **Three modes.** *Auto (force)* runs hands-off. *Plan* runs `cursor-agent --mode plan`, which plans without editing; the New Task form's Code/Plan toggle picks it for Plan. *Read-only* runs `--mode ask` for questions and answers, with no edits.
+- **Three modes.** *Auto (force)* runs hands-off. *Plan* switches the session to Cursor's plan mode, which plans without editing; the New Task form's Code/Plan toggle picks it for Plan. *Read-only* switches it to ask mode, for questions and answers with no edits.
 - **Approving a plan.** When you approve a Plan task's plan card, Agetor switches the task to *Auto (force)* so Cursor can implement it. A task launched from an Agent keeps Plan, because the Agent defines its mode; detach the Agent or change the mode to implement.
-- **Workspace trust.** Plan and Read-only runs pass `--trust`, so `cursor-agent` accepts the task's fresh worktree and applies its `.cursor` rules, hooks and MCP config, as Auto already does.
+- **No `--trust` flag.** `cursor-agent acp` doesn't read `--trust` or `--sandbox`, so Agetor passes neither; *Auto* passes only `--force`.
 
 ### OpenCode notes
 
@@ -317,19 +317,19 @@ flowchart LR
     CLI["agetor CLI / TUI"] -- "HTTP + SSE" --> Core
     Core["Bun core<br/>orchestrator · SQLite · git"]
     Core -- "tmux (interactive)" --> Claude["claude"]
-    Core -- "tmux (one-shot per turn)" --> OneShot["codex · cursor-agent · gemini · agy · copilot · opencode"]
-    Core -- "ACP over stdio" --> FX["fx"]
+    Core -- "tmux (one-shot per turn)" --> OneShot["codex · gemini · agy · copilot · opencode"]
+    Core -- "ACP over stdio" --> FX["fx · cursor-agent"]
     Claude --> WT[("git worktree<br/>per task")]
     OneShot --> WT
     FX --> WT
 ```
 
 - **One local API.** The desktop UI and the CLI both talk to the core over HTTP and Server-Sent Events. The API listens only on `127.0.0.1`, and every route except `/health` requires a random token generated at each launch. There are two such tokens: the app's own webview uses one that is never written to disk, and the `agetor` CLI uses a weaker one that is (see [Security model](#security-model)).
-- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Cursor, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run once per turn inside `tmux` and resume by session id. fx talks the Agent Client Protocol.
+- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run once per turn inside `tmux` and resume by session id. fx and Cursor talk the Agent Client Protocol to a child process of Agetor, and Cursor resumes by session id too.
 - **Restart-safe by design.** On boot, Agetor reattaches to any `tmux`-hosted session that is still alive and replays its transcript without duplicates. Runs whose session is gone move back to **Ready**, so no card is left stuck in Running.
 - **Local persistence.** Tasks, runs, events, projects, harnesses and preferences live in a SQLite database with versioned migrations.
 
-The architecture, lifecycle and gotchas are documented in depth in [`CLAUDE.md`](./CLAUDE.md). Design notes for individual features are in [`docs/plans/`](./docs/plans).
+The architecture, rules and gotchas are summarized in [`CLAUDE.md`](./CLAUDE.md), and each subsystem is documented in depth in [`docs/architecture/`](./docs/architecture). Design notes for individual features are in [`docs/plans/`](./docs/plans).
 
 ---
 
@@ -347,7 +347,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 ├── attachments/             # files and images attached to prompts
 ├── issue-threads/           # issue snapshots for tasks started from an issue
 ├── pipeline-runs/           # handoffs recorded by each pipeline run
-├── {codex,cursor,gemini,fx,antigravity,copilot,opencode}-logs/   # per-run structured agent output
+├── {codex,gemini,fx,antigravity,copilot,opencode}-logs/   # per-run structured agent output
 ├── daemon.log               # headless core log (CLI daemon and background core)
 └── login-daemon.json        # the background login item's state (when it is turned on)
 ```
@@ -382,7 +382,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_LOGIN_DAEMON_TICK_MS` / `AGETOR_LOGIN_DAEMON_HANDOFF_GRACE_MS` / `AGETOR_LOGIN_DAEMON_UPDATE_GRACE_MS` | Test seams: the supervisor's tick (default 1 s), its wait after the app hands the core back (15 s) and after an update (30 s). | `1000` / `15000` / `30000` |
 | `AGETOR_FAKE_LOGIN_ITEM` / `AGETOR_FAKE_REMOTE_ACCESS` | Test seams (set `AGETOR_FAKE_LOGIN_ITEM=1`): replace the macOS login item with a file-backed fake, and start with remote access `on`. | unset |
 
-The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md).
+The bin, home and env overrides you set per harness in Settings take precedence over these variables. The CLI honors `AGETOR_DATA_DIR` and `AGETOR_API_PORT` too, and so do its `--data-dir` and `--port` flags. Test-only switches (fake drivers, API stubs) are documented in [`CLAUDE.md`](./CLAUDE.md) and the per-harness docs in [`docs/architecture/`](./docs/architecture).
 
 **Running headless in a container.** The API binds to `127.0.0.1` by default, and a Docker port mapping can't reach a loopback-only listener inside the container. Set `AGETOR_API_HOST=0.0.0.0` (or `::`) in the container so the published port works. The headless core (`agetor daemon`) accepts only `127.0.0.1`, `0.0.0.0` or `::`, and refuses to start on anything else: the CLI inside the container connects over `127.0.0.1`, which a specific address such as the container's own IP, or `localhost`/`::1` (IPv6-only), would break. The desktop app always stays on `127.0.0.1`.
 
@@ -450,7 +450,7 @@ bun run build:cli                               # standalone CLI binary → arti
 
 ### Conventions
 
-- **Read [`CLAUDE.md`](./CLAUDE.md) first.** It covers the architecture, every subsystem and the known traps. Reading it is the single most useful thing you can do before your first PR.
+- **Read [`CLAUDE.md`](./CLAUDE.md) first.** It covers the architecture, the rules every change must keep and the known traps, and its topic map points to the [`docs/architecture/`](./docs/architecture) doc for each subsystem. Reading it, and the doc for the area you're changing, is the single most useful thing you can do before your first PR.
 - **Tests for behavior changes.** Test files set `AGETOR_DATA_DIR` to a temp directory at the **top** of the file, not in `beforeAll`, so they never touch a real database. Use a temp git repo, or `isolation: "none"`, so tests never create real branches.
 - **Never edit an applied migration.** Add a new numbered file to `src/bun/migrations/` and append it to `index.ts`.
 - **Keep `src/shared/` free of runtime imports.** Both processes import it.
@@ -464,7 +464,7 @@ bun run build:cli                               # standalone CLI binary → arti
 4. Add availability and install hints in `src/bun/agent-status.ts`, and model discovery in `src/bun/agent-discovery.ts`.
 5. Wire the follow-up queue, restart reattach and session id handling in `src/bun/orchestrator.ts`, then the Settings, onboarding and picker surfaces in the webview and the e2e fixtures.
 
-The type checker catches most of the tables, and the dispatch functions end in an exhaustive check for an unhandled kind, but the hand-edited lists don't, so a new kind isn't picked up everywhere automatically. [`CLAUDE.md`](./CLAUDE.md#agent-command-shape) has the full checklist.
+The type checker catches most of the tables, and the dispatch functions end in an exhaustive check for an unhandled kind, but the hand-edited lists don't, so a new kind isn't picked up everywhere automatically. [`docs/architecture/harnesses.md`](./docs/architecture/harnesses.md#adding-a-new-agent-kind) has the full checklist.
 
 ---
 

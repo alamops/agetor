@@ -185,8 +185,8 @@ rehydratePath();
 // live background/CLI core — then restore (`reconcileOrphans` and friends),
 // then `markBootReady()`. Only the port owner may restore, and the API must not
 // serve `/tasks`/`/runs` while a `status='running'` row from a previous process
-// is still being reattached or flipped to `orphaned` underneath it (CLAUDE.md
-// §5): routes wait on the ready signal, so a request that arrives mid-restore
+// is still being reattached or flipped to `orphaned` underneath it (step 5
+// of docs/architecture/task-lifecycle.md): routes wait on the ready signal, so a request that arrives mid-restore
 // is answered once the restore is done. A failed restore ends the process
 // loudly (see `failBoot`), never a swallow.
 //

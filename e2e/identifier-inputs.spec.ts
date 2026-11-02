@@ -217,8 +217,8 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     await expectIdentifierInput(extSearch);
 
     // The Extensions popover is a `data-popover-open` carrier that closes
-    // itself on Escape (see ExtensionPicker.tsx and CLAUDE.md's carrier
-    // list) — regression guard mirroring the Project/Branch pickers above.
+    // itself on Escape (see ExtensionPicker.tsx and the carrier
+    // list in docs/architecture/prompt-composer.md) — regression guard mirroring the Project/Branch pickers above.
     await page.keyboard.press("Escape");
     await expect(extSearch).toBeHidden();
   });

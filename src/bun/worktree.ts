@@ -1225,8 +1225,8 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
     // Normalize by prefixing the root→cwd path segment onto the emitted
     // DiffFile.path only; the `--no-index` invocation itself keeps using the
     // cwd-relative `rel`, since that's what exists relative to the cwd git
-    // runs in. `path.sep` is "/" here (this app is macOS-only per
-    // CLAUDE.md), so the split/join below is a no-op — kept only for
+    // runs in. `path.sep` is "/" here (this app is macOS-only, see
+    // README.md's Install section), so the split/join below is a no-op — kept only for
     // symmetry with the `path.relative` call it normalizes, not because it
     // does any actual backslash conversion (a backslash is a legal macOS
     // filename char, so it must never be rewritten).

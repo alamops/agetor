@@ -164,7 +164,7 @@ export interface MergeModelOptionsInput {
    *  if it isn't in curated ∪ discovered (rule 6). */
   selected?: string | null;
   /** True for kinds whose CLI catalog is account-scoped
-   *  (`CATALOG_SCOPED_KINDS`, i.e. fx today): curated rows are filtered
+   *  (`CATALOG_SCOPED_KINDS`, i.e. fx and opencode today): curated rows are filtered
    *  down to the discovered set (rule 3) instead of being shown wholesale
    *  (rule 4). */
   scoped: boolean;

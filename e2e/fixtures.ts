@@ -129,7 +129,7 @@ const PREFLIGHT_TIMEOUT_MS = 2_000;
  * row at all, to exercise the discovered-only-id append path. By default it
  * still does NOT answer `status --json` (empty output, exit 0) — that keeps
  * the pre-flight auth check failing OPEN (`loggedIn: null`) against this
- * stub, exactly as documented above and in CLAUDE.md's fx bullet, so no e2e
+ * stub, exactly as documented above and in CLAUDE.md § Agent kinds at a glance, so no e2e
  * spec is ever blocked by the auth pre-flight.
  *
  * Two opt-in env seams let a spec give one harness its own answers without a

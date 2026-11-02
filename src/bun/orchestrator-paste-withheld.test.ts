@@ -1413,8 +1413,9 @@ test("reconcileTaskSession: effort breadcrumb falls back to before.effort when t
  * so `sessionExists(taskId)` is ambient-true here with no extra stubbing —
  * pinning that the mirror still correctly reports "no live session" (rather
  * than crashing, or treating the real tmux session as drivable) is exactly
- * the boot-reconciliation gap CLAUDE.md documents: a tmux session can outlive
- * agetor's process with no SessionState to paste into.
+ * the boot-reconciliation gap docs/architecture/task-lifecycle.md documents:
+ * a tmux session can outlive agetor's process with no SessionState to paste
+ * into.
  * ────────────────────────────────────────────────────────────────────────── */
 
 test("reconcileTaskSession: a model change with NO in-memory session state (even though the real tmux session still exists) reports 'no live session' on the next-run breadcrumb, never the ⚠️ failure framing", async () => {

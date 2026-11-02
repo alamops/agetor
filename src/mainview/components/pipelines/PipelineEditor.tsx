@@ -101,7 +101,7 @@ function isTextEntryTarget(target: EventTarget | null): boolean {
 
 /** A modal dialog or popover is up — every canvas keyboard shortcut yields
  *  to it (the same layer selector the app's Escape coordination uses, see
- *  the `data-popover-open` convention in CLAUDE.md item 11). */
+ *  the `data-popover-open` convention in docs/architecture/prompt-composer.md). */
 function keyboardLayerOpen(): boolean {
   return document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]') != null;
 }

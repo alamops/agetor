@@ -36,7 +36,7 @@ export type MdImageSource =
  *  collapse repeated slashes. A trailing `/` on the input is preserved on
  *  the output (directory refs must round-trip: `@src/bun` stays a directory
  *  mention as `src/bun/`, matching the `@`-expansion convention documented
- *  in CLAUDE.md's "@ file references" section). */
+ *  in docs/architecture/at-file-references.md). */
 function normalizePosixPath(input: string): string {
   const isAbsolute = input.startsWith("/");
   const hadTrailingSlash = input.endsWith("/");

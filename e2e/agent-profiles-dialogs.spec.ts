@@ -17,7 +17,7 @@ import { startGitHubStub, type GitHubStub, type StubRoute } from "./github-stub"
  * own manual block, an unavailable-harness profile disabling Start with a
  * visible reason (finding F2-3 in the plan), the resolve-conflicts
  * `existingBranch` path carrying a profile through, and the dialog-vs-
- * popover Escape contract (CLAUDE.md item 11) with the profile popover as
+ * popover Escape contract (docs/architecture/prompt-composer.md) with the profile popover as
  * the carrier under test.
  *
  * Arrange: one throwaway git repo with `origin` -> `https://github.com/

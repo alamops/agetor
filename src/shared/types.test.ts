@@ -481,9 +481,9 @@ test("cursor offers auto / plan / ask (D23) and CODE_PLAN_MODE.cursor maps Plan 
   const byId = new Map(AGENT_OPTIONS.cursor.modes.map((m) => [m.id, m]));
   expect(byId.get("auto")?.label).toBe("Auto (force)");
   expect(byId.get("plan")?.label).toBe("Plan");
-  expect(byId.get("plan")?.hint).toBe("Read-only planning — cursor-agent --mode plan. Approve the plan to implement.");
+  expect(byId.get("plan")?.hint).toBe("Read-only planning in Cursor's plan mode. Approve the plan to implement.");
   expect(byId.get("ask")?.label).toBe("Read-only");
-  expect(byId.get("ask")?.hint).toBe("Read-only Q&A — cursor-agent --mode ask. Answers questions, makes no edits.");
+  expect(byId.get("ask")?.hint).toBe("Read-only Q&A in Cursor's ask mode. Answers questions, makes no edits.");
   expect(CODE_PLAN_MODE.cursor).toEqual({ code: "auto", plan: "plan" });
   expect(defaultModeFor("cursor")).toBe("auto");
 });

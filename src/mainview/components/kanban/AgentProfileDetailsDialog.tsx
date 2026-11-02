@@ -39,8 +39,8 @@ const TITLE_ID = "agent-profile-details-title";
  * transition — rebases a non-portaled `fixed` descendant to that ancestor
  * instead of the viewport, so `Dialog`'s own `fixed inset-0` backdrop would
  * end up centered within the (wide) aside rather than the full viewport.
- * This is the same rule CLAUDE.md's task-context-menu section (item 9) and
- * markdown-image-rendering section (item 14) both call out. `PlanDialog` is
+ * This is the same rule docs/architecture/task-context-menu.md and
+ * docs/architecture/markdown-images.md both call out. `PlanDialog` is
  * the one dialog opened from inside the aside that renders in place rather
  * than portaling — not a pattern to follow here, since it predates both of
  * those write-ups.

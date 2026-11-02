@@ -2762,8 +2762,8 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // server-side alias for it now; migration 049 rewrites tasks still pinned
   // to the old id. Deliberately NOT the "auto" alias — a spike showed "auto"
   // internally routes across mixed pro/flash-lite models even for simple
-  // prompts, which fails "always default to the best available model" (root
-  // CLAUDE.md). The CLI's own `pro` alias resolves to 3.1 Pro preview on
+  // prompts, which fails "always default to the best available model" (the rule
+  // docs/architecture/harness-fx.md exempts fx from). The CLI's own `pro` alias resolves to 3.1 Pro preview on
   // accounts with 3.1 preview access (else to 3 Pro preview, or 2.5 Pro with
   // no preview access at all — gemini-cli 0.58.0 resolveModel, 2026-09-02).
   "gemini": "gemini-3.1-pro-preview",
@@ -3405,11 +3405,12 @@ export function cursorModelArg(model: string, effort: string | null, fast: boole
 export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
   "claude-code": { code: "auto", plan: "plan" },
   "codex": { code: "auto", plan: "ask" },
-  // cursor-agent has a native read-only planning mode (`--mode plan`,
-  // verified on 2026.10.22 — docs/plans/fx-0.0.14-and-cursor-updates.md
-  // §3.3), so Plan maps to it; approving the plan flips an unbound task to
-  // "auto".
-  // "ask" (`--mode ask`, read-only Q&A) stays an explicit picker choice.
+  // cursor-agent has a native read-only planning mode (ACP `session/set_mode`
+  // `plan`; the pre-ACP `--mode plan` was verified on 2026.10.22 —
+  // docs/plans/fx-0.0.14-and-cursor-updates.md §3.3), so Plan maps to it;
+  // approving the plan flips an unbound task to "auto".
+  // "ask" (`session/set_mode` `ask`, read-only Q&A) stays an explicit
+  // picker choice.
   "cursor": { code: "auto", plan: "plan" },
   // Gemini's `--approval-mode plan` is a real read-only mode (verified via
   // `gemini --help` on CLI 0.54.0), closer to claude's native `plan` than
@@ -4032,8 +4033,8 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
  * fx)" rule: the owner explicitly asked for fx's hands-off default to
  * escalate to Full access (`docs/plans/fx-recovery-follow-ups.md` §3.6),
  * since fx's `auto` mode blocks on an interactive permission card whenever
- * its hard-wired reviewer is unreachable (see the fx harness section of
- * CLAUDE.md) — `auto` is not actually hands-off for fx the way it is for
+ * its hard-wired reviewer is unreachable (see
+ * docs/architecture/harness-fx.md) — `auto` is not actually hands-off for fx the way it is for
  * every other kind.
  */
 export function defaultModeFor(kind: AgentKind): string {
@@ -4100,8 +4101,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     })),
     modes: [
       { id: "auto", label: "Auto (force)", hint: "Hands-off — runs with --force, executing edits and commands without approval prompts." },
-      { id: "plan", label: "Plan", hint: "Read-only planning — cursor-agent --mode plan. Approve the plan to implement." },
-      { id: "ask", label: "Read-only", hint: "Read-only Q&A — cursor-agent --mode ask. Answers questions, makes no edits." },
+      { id: "plan", label: "Plan", hint: "Read-only planning in Cursor's plan mode. Approve the plan to implement." },
+      { id: "ask", label: "Read-only", hint: "Read-only Q&A in Cursor's ask mode. Answers questions, makes no edits." },
     ],
     efforts: EFFORT_OPTIONS,
   },

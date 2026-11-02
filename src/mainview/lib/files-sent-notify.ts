@@ -4,8 +4,8 @@
  * `notifyFilesSent` (`src/mainview/lib/toasts.ts`), which composes these
  * with the actual toast/native-notification calls. Kept
  * separate so the "when does this fire" rules are unit-testable without a
- * jsdom-shaped harness (this repo has none — see CLAUDE.md's test-seam
- * notes).
+ * jsdom-shaped harness (this repo has none — see the test-seam
+ * note in docs/architecture/tagged-user-messages.md).
  */
 
 /** Cap on the notification body derived from the tool call's `caption`,
