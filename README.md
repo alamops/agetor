@@ -96,9 +96,9 @@ Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast*
 
 ### Cursor notes
 
-- **Three modes.** *Auto (force)* runs hands-off. *Plan* runs `cursor-agent --mode plan`, which plans without editing; the New Task form's Code/Plan toggle picks it for Plan. *Read-only* runs `--mode ask` for questions and answers, with no edits.
+- **Three modes.** *Auto (force)* runs hands-off. *Plan* switches the session to Cursor's plan mode, which plans without editing; the New Task form's Code/Plan toggle picks it for Plan. *Read-only* switches it to ask mode, for questions and answers with no edits.
 - **Approving a plan.** When you approve a Plan task's plan card, Agetor switches the task to *Auto (force)* so Cursor can implement it. A task launched from an Agent keeps Plan, because the Agent defines its mode; detach the Agent or change the mode to implement.
-- **Workspace trust.** Plan and Read-only runs pass `--trust`, so `cursor-agent` accepts the task's fresh worktree and applies its `.cursor` rules, hooks and MCP config, as Auto already does.
+- **No `--trust` flag.** `cursor-agent acp` doesn't read `--trust` or `--sandbox`, so Agetor passes neither; *Auto* passes only `--force`.
 
 ### OpenCode notes
 
@@ -347,7 +347,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 ├── attachments/             # files and images attached to prompts
 ├── issue-threads/           # issue snapshots for tasks started from an issue
 ├── pipeline-runs/           # handoffs recorded by each pipeline run
-├── {codex,cursor,gemini,fx,antigravity,copilot,opencode}-logs/   # per-run structured agent output
+├── {codex,gemini,fx,antigravity,copilot,opencode}-logs/   # per-run structured agent output
 ├── daemon.log               # headless core log (CLI daemon and background core)
 └── login-daemon.json        # the background login item's state (when it is turned on)
 ```
