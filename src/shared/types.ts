@@ -3405,11 +3405,12 @@ export function cursorModelArg(model: string, effort: string | null, fast: boole
 export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
   "claude-code": { code: "auto", plan: "plan" },
   "codex": { code: "auto", plan: "ask" },
-  // cursor-agent has a native read-only planning mode (`--mode plan`,
-  // verified on 2026.10.22 — docs/plans/fx-0.0.14-and-cursor-updates.md
-  // §3.3), so Plan maps to it; approving the plan flips an unbound task to
-  // "auto".
-  // "ask" (`--mode ask`, read-only Q&A) stays an explicit picker choice.
+  // cursor-agent has a native read-only planning mode (ACP `session/set_mode`
+  // `plan`; the pre-ACP `--mode plan` was verified on 2026.10.22 —
+  // docs/plans/fx-0.0.14-and-cursor-updates.md §3.3), so Plan maps to it;
+  // approving the plan flips an unbound task to "auto".
+  // "ask" (`session/set_mode` `ask`, read-only Q&A) stays an explicit
+  // picker choice.
   "cursor": { code: "auto", plan: "plan" },
   // Gemini's `--approval-mode plan` is a real read-only mode (verified via
   // `gemini --help` on CLI 0.54.0), closer to claude's native `plan` than
@@ -4100,8 +4101,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     })),
     modes: [
       { id: "auto", label: "Auto (force)", hint: "Hands-off — runs with --force, executing edits and commands without approval prompts." },
-      { id: "plan", label: "Plan", hint: "Read-only planning — cursor-agent --mode plan. Approve the plan to implement." },
-      { id: "ask", label: "Read-only", hint: "Read-only Q&A — cursor-agent --mode ask. Answers questions, makes no edits." },
+      { id: "plan", label: "Plan", hint: "Read-only planning in Cursor's plan mode. Approve the plan to implement." },
+      { id: "ask", label: "Read-only", hint: "Read-only Q&A in Cursor's ask mode. Answers questions, makes no edits." },
     ],
     efforts: EFFORT_OPTIONS,
   },
