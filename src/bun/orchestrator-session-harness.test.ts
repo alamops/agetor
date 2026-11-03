@@ -29,6 +29,14 @@ process.env.AGETOR_OPENCODE_BIN = stub("opencode", 'if [ "$1" = "--version" ]; t
 // No tmux session is ever live here: every probe reads "gone".
 process.env.AGETOR_TMUX_BIN = stub("tmux", "exit 1");
 process.env.AGETOR_FX_AUTO_RESUME_DELAY_MS = "300";
+// fx's version gates Resume (0.0.15+ can't continueRecovery): pin a pre-0.0.15
+// fx so the recovery test doesn't depend on whichever fx is on the host's PATH.
+// `--help` carries the marker `checkHarness` requires of Vercel's fx.
+const prevFxBin = process.env.AGETOR_FX_BIN;
+process.env.AGETOR_FX_BIN = stub(
+  "fx",
+  'case "$1" in --version) echo "0.0.14" ;; --help) echo "fx, a coding agent" ;; esac\nexit 0',
+);
 
 let db: typeof import("./db.ts");
 let restoreHarnesses: (() => void) | undefined;
@@ -42,6 +50,8 @@ beforeAll(async () => {
 
 afterAll(async () => {
   restoreHarnesses?.();
+  if (prevFxBin === undefined) delete process.env.AGETOR_FX_BIN;
+  else process.env.AGETOR_FX_BIN = prevFxBin;
   const { rmTestDataDir } = await import("./test-data-dir.ts");
   rmTestDataDir(DATA_DIR);
 });
