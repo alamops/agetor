@@ -8,6 +8,7 @@ import {
   opencodeAnswerBody,
   opencodeAnswerSummary,
   opencodeCanSubmit,
+  OPENCODE_REJECT_REASON_HELP,
   opencodePermissionBody,
   opencodePermissionOptionBlocked,
   opencodeSetCustom,
@@ -30,6 +31,16 @@ const noCustom: OpencodeQuestionShape = {
   multiSelect: false,
   options: [{ id: "a", label: "Alpha" }],
 };
+
+describe("OPENCODE_REJECT_REASON_HELP", () => {
+  test("says an empty Reject skips the action and the agent continues, never that it stops", () => {
+    expect(OPENCODE_REJECT_REASON_HELP).toContain("Leave empty to skip this action");
+    expect(OPENCODE_REJECT_REASON_HELP).toContain("the agent continues without it");
+    expect(OPENCODE_REJECT_REASON_HELP).toContain("passed to the agent");
+    expect(OPENCODE_REJECT_REASON_HELP).toContain("other pending requests");
+    expect(OPENCODE_REJECT_REASON_HELP.toLowerCase()).not.toContain("stop");
+  });
+});
 
 describe("opencodePermissionBody", () => {
   test("reject with a typed reason sends it, trimmed", () => {

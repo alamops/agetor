@@ -622,7 +622,8 @@ test("opencode permission: Reject asks for a reason and sends it with reject", a
   await wait();
   ui.stdin.write(ENTER);
   await wait();
-  expect(ui.lastFrame() ?? "").toContain("stops the agent's turn");
+  expect(ui.lastFrame() ?? "").toContain("skips this action and the agent continues");
+  expect(ui.lastFrame() ?? "").not.toContain("stops");
   expect(captured).toBeNull();
   ui.stdin.write("use dry-run");
   await wait();
@@ -633,7 +634,7 @@ test("opencode permission: Reject asks for a reason and sends it with reject", a
   ui.unmount();
 });
 
-test("opencode permission: Reject with nothing typed sends a bare reject and says the turn stops", async () => {
+test("opencode permission: Reject with nothing typed sends a bare reject and says the agent continues", async () => {
   let captured: unknown = null;
   let done = "";
   const ui = render(
@@ -649,7 +650,7 @@ test("opencode permission: Reject with nothing typed sends a bare reject and say
   ui.stdin.write(ENTER);
   await wait();
   expect(captured).toEqual({ id: "oc-p", body: { optionId: "reject" } });
-  expect(done).toBe("✓ rejected — the agent's turn stops");
+  expect(done).toBe("✓ rejected — the agent continues without it");
   ui.unmount();
 });
 
@@ -694,6 +695,70 @@ test("opencode question: two options with one label submit the second one's id",
   ui.stdin.write(ENTER);
   await wait();
   expect(captured).toEqual({ id: "oc-q", answers: [{ selected: ["Same"], selectedOptionIds: ["wide"] }] });
+  ui.unmount();
+});
+
+// A model-chosen option id can equal the picker's own sentinel strings.
+const ocCollidingQuestion = (over: Record<string, unknown> = {}) =>
+  ocQuestion({
+    questions: [{
+      id: "scope", question: "Which scope?", allowCustom: true, multiSelect: false,
+      options: [{ id: "__agetor_custom__", label: "First" }, { label: "__opencode_skip__" }, { id: "__opencode_skip__", label: "Third" }],
+      ...over,
+    }],
+  });
+
+test("opencode question: an option whose id is the Other sentinel submits as that option (by position)", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocCollidingQuestion(), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(ENTER); // the first row, id "__agetor_custom__"
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: [{ selected: ["First"], selectedOptionIds: ["__agetor_custom__"] }] });
+  ui.unmount();
+});
+
+test("opencode question: options named like the Skip sentinel are answers, not a skip", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocCollidingQuestion(), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(ENTER); // the third row, id "__opencode_skip__"
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: [{ selected: ["Third"], selectedOptionIds: ["__opencode_skip__"] }] });
+  ui.unmount();
+});
+
+test("opencode question: multi-select with a sentinel-valued option keeps it and adds typed text", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocCollidingQuestion({ multiSelect: true }), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(" "); // toggle row 0 ("__agetor_custom__")
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN); // the Other row
+  await wait();
+  ui.stdin.write(" ");
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  ui.stdin.write("extra");
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: [{ selected: ["First"], selectedOptionIds: ["__agetor_custom__"], custom: "extra" }] });
   ui.unmount();
 });
 

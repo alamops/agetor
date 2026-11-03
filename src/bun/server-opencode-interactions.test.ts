@@ -9,6 +9,7 @@ import { rmTestDataDir } from "./test-data-dir.ts";
 // outside the e2e worker range (4600-4999), the unit-test range and Vite's 5173.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-server-opencode-interactions-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
+const PRIOR_API_PORT = process.env.AGETOR_API_PORT;
 process.env.AGETOR_API_PORT = "5214";
 
 let server: { stop: () => void } | null = null;
@@ -27,6 +28,9 @@ afterAll(async () => {
   // `bun test` shares one process: leave no cards or gate behind.
   const { __testing } = await import("./interactions.ts");
   __testing.reset();
+  // `bun test` shares one process: a later file must not inherit port 5214.
+  if (PRIOR_API_PORT === undefined) delete process.env.AGETOR_API_PORT;
+  else process.env.AGETOR_API_PORT = PRIOR_API_PORT;
   rmTestDataDir(DATA_DIR);
 });
 
@@ -226,6 +230,20 @@ test("opencode ask: refusals are 400 and leave the card pending", async () => {
     expect((await res.json()).error).toContain(fragment);
     expect(await stillPending(a.id)).toBe(true);
   }
+});
+
+test("opencode ask: a message without skip is refused (400), never ignored, and leaves the card pending", async () => {
+  const a = await askCard();
+  const answers = [{ selected: ["Red"] }, { selected: ["X"] }];
+  for (const body of [{ answers, message: "why" }, { message: "why" }, { skip: false, message: "why" }, { answers, message: "" }, { answers, message: null }]) {
+    const res = await post(`/ask-questions/${a.id}/answer`, body);
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("message is only allowed with skip");
+    expect(await stillPending(a.id)).toBe(true);
+  }
+  // the same body without the message still answers
+  expect((await post(`/ask-questions/${a.id}/answer`, { answers })).status).toBe(200);
+  await expect(a.answer).resolves.toEqual({ outcome: "answered", answer: { color: "r", tags: ["x"] } });
 });
 
 test("opencode ask: skip with a typed reason, and skip without one sends no words", async () => {

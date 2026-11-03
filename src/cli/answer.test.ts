@@ -247,11 +247,12 @@ test("opencode permission: Reject with no --reason asks for one; typing it sends
   };
   await cmdAnswer(["t1"], flags);
   expect(asked.length).toBe(1);
-  expect(asked[0]).toContain("stops");
+  expect(asked[0]).toContain("skips");
+  expect(asked[0]).not.toContain("stops");
   expect(calls).toEqual([{ id: "oc1", body: { optionId: "reject", message: "use the dry-run flag" } }]);
 });
 
-test("opencode permission: Reject with an empty reason sends none and says the turn stops", async () => {
+test("opencode permission: Reject with an empty reason sends none and says the agent continues", async () => {
   outputs.length = 0;
   const { client, calls } = makeClient(ocPermReq());
   currentClient = client;
@@ -259,7 +260,8 @@ test("opencode permission: Reject with an empty reason sends none and says the t
   textImpl = async () => "";
   await cmdAnswer(["t1"], flags);
   expect(calls).toEqual([{ id: "oc1", body: { optionId: "reject" } }]);
-  expect(outputs.some((l) => l.includes("turn stops"))).toBe(true);
+  expect(outputs.some((l) => l.includes("action is skipped and the agent continues"))).toBe(true);
+  expect(outputs.some((l) => l.includes("turn stops"))).toBe(false);
 });
 
 test("opencode permission: Esc at the reason prompt posts nothing", async () => {

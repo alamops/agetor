@@ -196,9 +196,9 @@ function resultContent(content: unknown, err: unknown): string {
   return errorMessageOf(err) ?? "";
 }
 
-function errorStatusData(err: unknown): string {
+function errorStatusData(err: unknown, model: string | null): string {
   const msg = opencodeErrorMessage(err);
-  const hint = opencodeQuotaHint(err, msg);
+  const hint = opencodeQuotaHint(err, msg, model);
   return `opencode: ${msg}${hint ? ` — ${hint}` : ""}`;
 }
 
@@ -242,7 +242,7 @@ interface WalkOut {
 
 /** Map one page of messages. `usage` null: no token accounting (no usage chunks). Mutates `st` (the
  *  anchor search) and `usage` (completed messages only, each counted once). */
-function walkMessages(messages: unknown, sid: string, st: WalkState, usage: UsageAcc | null): WalkOut {
+function walkMessages(messages: unknown, sid: string, st: WalkState, usage: UsageAcc | null, model: string | null): WalkOut {
   const out: WalkOut = { chunks: [], toolNames: new Map(), lastAssistantId: null, lastErrorData: null };
   if (!Array.isArray(messages)) return out;
   let start = 0;
@@ -288,7 +288,7 @@ function walkMessages(messages: unknown, sid: string, st: WalkState, usage: Usag
       }
     }
     if (msg.error !== undefined && !isAborted(msg.error)) {
-      const data = errorStatusData(msg.error);
+      const data = errorStatusData(msg.error, model);
       out.lastErrorData = data;
       out.chunks.push({ stream: "status", data, lineUuid: `opencode:${sid}:error:${msgId}` });
     }
@@ -314,11 +314,11 @@ function walkMessages(messages: unknown, sid: string, st: WalkState, usage: Usag
  */
 function snapshotToChunks(
   messages: unknown[],
-  opts: { sessionId: string; afterUserMessageId?: string },
+  opts: { sessionId: string; afterUserMessageId?: string; model?: string | null },
 ): OpencodeMappedChunk[] {
   try {
     const st: WalkState = { anchor: opts.afterUserMessageId, found: !opts.afterUserMessageId };
-    return walkMessages(messages, opts.sessionId, st, { totals: emptyUsage(), seen: new Set() }).chunks;
+    return walkMessages(messages, opts.sessionId, st, { totals: emptyUsage(), seen: new Set() }, opts.model ?? null).chunks;
   } catch {
     return [];
   }
@@ -332,8 +332,14 @@ interface Emitted {
   replaceable: boolean;
 }
 
-export function createOpencodeEventMapper(opts: { sessionId: string }): OpencodeEventMapper {
+/**
+ * `model` is the turn's `provider/model` id. It decides whether an out-of-balance (402) error gets
+ * the OpenCode Zen hint (`opencodeQuotaHint`): only a Zen (`opencode/…`) model does, so omit it
+ * (null) only when the model is unknown.
+ */
+export function createOpencodeEventMapper(opts: { sessionId: string; model?: string | null }): OpencodeEventMapper {
   const sid = opts.sessionId;
+  const model = opts.model ?? null;
   let emitted = new Map<string, Emitted>();
   let toolNames = new Map<string, string>();
   /** Raw input of tool_use chunks emitted with the generic name, to re-emit once the name is known. */
@@ -396,7 +402,7 @@ export function createOpencodeEventMapper(opts: { sessionId: string }): Opencode
       }
       case "session.execution.failed": {
         terminal = { outcome: "failed", error: opencodeErrorMessage(d.error) };
-        const data = errorStatusData(d.error);
+        const data = errorStatusData(d.error, model);
         // A failing step (live, or found in a seeded snapshot) already printed the same line.
         if (data === lastErrorData) return [];
         lastErrorData = data;
@@ -450,7 +456,7 @@ export function createOpencodeEventMapper(opts: { sessionId: string }): Opencode
         if (!msgId) return [];
         const out: OpencodeMappedChunk[] = [];
         if (type === "session.step.failed" && !isAborted(d.error)) {
-          const data = errorStatusData(d.error);
+          const data = errorStatusData(d.error, model);
           lastErrorData = data;
           out.push({ stream: "status", data, lineUuid: `opencode:${sid}:error:${msgId}` });
         }
@@ -515,7 +521,7 @@ export function createOpencodeEventMapper(opts: { sessionId: string }): Opencode
         push(page) {
           if (ended) return [];
           try {
-            return applyWalk(walkMessages(page, sid, st, { totals: usage, seen: usageSeen }));
+            return applyWalk(walkMessages(page, sid, st, { totals: usage, seen: usageSeen }, model));
           } catch {
             return [];
           }

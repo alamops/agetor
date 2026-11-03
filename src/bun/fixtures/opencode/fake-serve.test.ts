@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { startFakeOpencodeServer, type FakeOpencodeOptions, type FakeOpencodeServer } from "./fake-serve.ts";
+import { parentProcessGone, startFakeOpencodeServer, type FakeOpencodeOptions, type FakeOpencodeServer } from "./fake-serve.ts";
 
 // The fake's event orders mirror the live OpenCode 2.1.3 transcripts recorded
 // while verifying plan assumptions A1-A5 (docs/plans/opencode-server-driver.md
@@ -207,7 +207,9 @@ describe("auth, info and the event stream", () => {
 
 describe("sessions and the plain turn", () => {
   test("a plain prompt emits the recorded event order and a snapshot built from it (A4 baseline, q5/q6)", async () => {
-    const { client, sub } = await boot();
+    // Slower than the default: the "running" probe below must land while the turn is still going,
+    // and at the default speed (0.02) a loaded machine finishes the turn before the GET arrives.
+    const { client, sub } = await boot({ speed: 1 });
     const sid = await client.session();
     const created = sub.events.find((e) => e.type === "session.created")!;
     expect(created.data.sessionID).toBe(sid);
@@ -258,7 +260,7 @@ describe("sessions and the plain turn", () => {
     expect((await messages(client, sid)).map((m) => m.type)).toEqual(["user", "assistant", "idle", "user", "assistant", "idle"]);
   });
 
-  test("error shapes match the API: 404 SessionNotFoundError, 400 Missing key, 409 on a reused message id", async () => {
+  test("error shapes match the API: 404 SessionNotFoundError, 400 Missing key, 409 on another session's message id", async () => {
     const { client } = await boot();
     const nf = await client.req("GET", "/api/session/ses_nope");
     expect(nf.status).toBe(404);
@@ -270,9 +272,10 @@ describe("sessions and the plain turn", () => {
     expect(bad.json._tag).toBe("InvalidRequestError");
     const first = await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_fixed", text: "a" });
     expect(first.status).toBe(200);
-    const dup = await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_fixed", text: "b" });
+    const other = await client.session();
+    const dup = await client.req("POST", `/api/session/${other}/prompt`, { id: "msg_fixed", text: "b" });
     expect(dup.status).toBe(409);
-    expect(dup.json._tag).toBe("ConflictError");
+    expect(dup.json).toEqual({ _tag: "ConflictError", message: "Prompt message ID conflicts with an existing durable record: msg_fixed", resource: "msg_fixed" });
     expect((await client.req("POST", `/api/session/${sid}/permission/per_nope/reply`, { decision: "once" })).status).toBe(404);
     expect((await client.req("POST", `/api/session/${sid}/form/frm_nope/reply`, { answer: {} })).status).toBe(404);
     expect((await client.req("DELETE", `/api/session/${sid}/form/frm_nope`)).status).toBe(404);
@@ -418,6 +421,51 @@ describe("scenario: permissions", () => {
     inOrder(sub.types(sid), ["session.tool.failed", "session.step.failed", "session.usage.updated", "session.execution.interrupted"]);
     const s = (await client.req("GET", `/api/session/${sid}`)).json.data;
     expect(s.outcome).toBe("interrupted");
+  });
+
+  // live-verified 2.1.3 (r2)
+  test("reject with a message of one space is a reason: permission.rejected and the turn continues (the driver's skip)", async () => {
+    const { sub, sid, client } = await askOnce("reject", " ");
+    const end = await terminal(sub, sid);
+    expect(end.type).toBe("session.execution.succeeded");
+    expect(sub.events.find((e) => e.type === "session.tool.failed")!.data.error).toEqual({ type: "permission.rejected", message: " " });
+    expect(sub.events.some((e) => e.type === "session.step.failed")).toBe(false);
+    expect((await messages(client, sid)).at(-1)).toMatchObject({ type: "idle", outcome: "succeeded" });
+  });
+
+  // live-verified 2.1.3 (r2)
+  test("reject with an empty or null message is a decline that stops the turn, like no message", async () => {
+    for (const message of ["", null]) {
+      const { client, sub } = await boot();
+      const sid = await client.session();
+      await client.prompt(sid, "run __agetor_fake_oc_permission__");
+      const asked = await sub.waitFor((e) => e.type === "permission.asked");
+      expect((await client.req("POST", `/api/session/${sid}/permission/${asked.data.id}/reply`, { decision: "reject", message })).status).toBe(204);
+      const end = await terminal(sub, sid);
+      expect(end).toMatchObject({ type: "session.execution.interrupted", data: { reason: "shutdown" } });
+      expect(sub.events.find((e) => e.type === "session.tool.failed")!.data.error).toEqual({ type: "aborted", message: "The user declined this tool call" });
+    }
+  });
+
+  // live-verified 2.1.3 (r2)
+  test("one reject also rejects every other pending permission of the session with the same message", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session({ permissions: [{ action: "*", resource: "*", effect: "ask" }] });
+    await client.prompt(sid, "go __agetor_fake_oc_files__");
+    const asks: any[] = [];
+    while (asks.length < 3) asks.push((await sub.waitFor((x) => x.type === "permission.asked" && !asks.includes(x.data), 5000)).data);
+    expect((await client.req("POST", `/api/session/${sid}/permission/${asks[0].id}/reply`, { decision: "reject", message: " " })).status).toBe(204);
+    const end = await terminal(sub, sid);
+    expect(end.type).toBe("session.execution.succeeded");
+    const replied = sub.events.filter((e) => e.type === "permission.replied");
+    expect(replied.map((e) => e.data.requestID).sort()).toEqual(asks.map((a) => a.id).sort());
+    expect(replied.every((e) => e.data.reply === "reject")).toBe(true);
+    const failed = sub.events.filter((e) => e.type === "session.tool.failed");
+    expect(failed).toHaveLength(3);
+    expect(failed.every((e) => e.data.error.type === "permission.rejected" && e.data.error.message === " ")).toBe(true);
+    expect(((await client.req("GET", `/api/session/${sid}/permission`)).json.data as any[])).toEqual([]);
+    // a second reply to an already-rejected sibling is a 404, not a second delivery
+    expect((await client.req("POST", `/api/session/${sid}/permission/${asks[1].id}/reply`, { decision: "once" })).status).toBe(404);
   });
 
   test("an all-ask session raises read, edit (for write) and shell together (A1)", async () => {
@@ -1039,5 +1087,108 @@ describe("stub-opencode.sh", () => {
       proc.kill();
       await proc.exited;
     }
+  });
+});
+
+describe("parentProcessGone (the standalone fake exits when its parent dies)", () => {
+  const throwing = (code: string) => () => { throw Object.assign(new Error(code), { code }); };
+
+  test("ESRCH: the parent is gone", () => {
+    expect(parentProcessGone(123, throwing("ESRCH"))).toBe(true);
+  });
+
+  test("EPERM: the parent exists under another user, so the fake keeps running", () => {
+    expect(parentProcessGone(123, throwing("EPERM"))).toBe(false);
+  });
+
+  test("a live parent, and an error without a code, do not end the fake", () => {
+    expect(parentProcessGone(123, () => true)).toBe(false);
+    expect(parentProcessGone(123, () => { throw new Error("odd"); })).toBe(false);
+  });
+
+  test("the default probe sees this very process as alive and a dead pid as gone", () => {
+    expect(parentProcessGone(process.pid)).toBe(false);
+    // a pid far above any real one: kill(0) answers ESRCH
+    expect(parentProcessGone(2 ** 22 - 3)).toBe(true);
+  });
+});
+
+describe("prompt message ids (live-verified 2.1.3 (r2))", () => {
+  const deliveries = (sub: Collector, sid: string) => sub.events.filter((e) => e.type === "session.inbox.delivered" && e.data.sessionID === sid).length;
+
+  test("a repeated id on the same session returns the original record and delivers nothing twice", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    const first = await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_dup1", text: "hello" });
+    await terminal(sub, sid);
+    const again = await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_dup1", text: "different words" });
+    expect(again.status).toBe(200);
+    expect(again.json).toEqual(first.json);
+    expect(again.json.data.payload.text).toBe("hello");
+    await terminal(sub, sid, 2);
+    expect(deliveries(sub, sid)).toBe(1);
+    expect((await messages(client, sid)).filter((m) => m.type === "user")).toHaveLength(1);
+  });
+
+  test("after idle the repeat runs an empty execution (started, succeeded, no step) unless resume is false", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_dup2", text: "hello" });
+    await terminal(sub, sid);
+    const stepsBefore = sub.events.filter((e) => e.type === "session.step.started").length;
+    await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_dup2", text: "hello", resume: false });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(sub.types(sid).filter((t) => t === "session.execution.started")).toHaveLength(1);
+    await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_dup2", text: "hello" });
+    const second = await terminal(sub, sid, 2);
+    expect(second.type).toBe("session.execution.succeeded");
+    expect(sub.types(sid).filter((t) => t === "session.execution.started")).toHaveLength(2);
+    expect(sub.events.filter((e) => e.type === "session.step.started")).toHaveLength(stepsBefore);
+    expect(deliveries(sub, sid)).toBe(1);
+  });
+
+  test("the same id on another session is a 409 ConflictError; an id without the msg_ prefix is a 400", async () => {
+    const { client } = await boot();
+    const a = await client.session();
+    const b = await client.session();
+    await client.req("POST", `/api/session/${a}/prompt`, { id: "msg_shared", text: "x" });
+    const conflict = await client.req("POST", `/api/session/${b}/prompt`, { id: "msg_shared", text: "y" });
+    expect(conflict.status).toBe(409);
+    expect(conflict.json).toEqual({ _tag: "ConflictError", message: "Prompt message ID conflicts with an existing durable record: msg_shared", resource: "msg_shared" });
+    const bad = await client.req("POST", `/api/session/${b}/prompt`, { id: "notamsg", text: "y" });
+    expect(bad.status).toBe(400);
+    expect(bad.json._tag).toBe("InvalidRequestError");
+  });
+});
+
+describe("interrupting a background child (live-verified 2.1.3 (r2))", () => {
+  test("the parent is woken with a cancelled synthetic and starts a new execution", async () => {
+    const { client, sub } = await boot({ speed: 1 });
+    const sid = await client.session();
+    await client.prompt(sid, "go __agetor_fake_oc_wake__");
+    await terminal(sub, sid, 1);
+    const cid = sub.events.find((e) => e.type === "session.created" && e.data.parentID === sid)!.data.sessionID as string;
+    const cut = await client.req("POST", `/api/session/${cid}/interrupt`);
+    expect(cut.json).toEqual({ interrupted: true });
+    const second = await terminal(sub, sid, 2);
+    expect(second.type).toBe("session.execution.succeeded");
+    expect((await terminal(sub, cid, 1)).type).toBe("session.execution.interrupted");
+    const synthetic = sub.events.find((e) => e.type === "session.inbox.enqueued" && e.data.sessionID === sid && e.data.item.type === "synthetic")!;
+    expect(synthetic.data.item.payload.text).toBe(`<subagent sessionID="${cid}" state="cancelled" description="Run sleep and echo">\nSubagent cancelled\n</subagent>`);
+    expect(synthetic.data.item.payload.metadata).toEqual({ source: "subagent", childID: cid, agent: "General", state: "cancelled" });
+    expect(sub.types(sid).filter((t) => t === "session.execution.started")).toHaveLength(2);
+    expect(finalText(await messages(client, sid))).toContain("was cancelled");
+  });
+
+  test("interrupting the parent never touches the child", async () => {
+    const { client, sub } = await boot({ speed: 1 });
+    const sid = await client.session();
+    await client.prompt(sid, "go __agetor_fake_oc_wake__");
+    await terminal(sub, sid, 1);
+    const cid = sub.events.find((e) => e.type === "session.created" && e.data.parentID === sid)!.data.sessionID as string;
+    await client.req("POST", `/api/session/${sid}/interrupt`);
+    expect((await terminal(sub, cid, 1)).type).toBe("session.execution.succeeded");
+    const synthetic = sub.events.find((e) => e.type === "session.inbox.enqueued" && e.data.sessionID === sid && e.data.item.type === "synthetic")!;
+    expect(synthetic.data.item.payload.metadata.state).toBe("completed");
   });
 });

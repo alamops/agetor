@@ -9,6 +9,7 @@ import {
   readFileSync,
   readSync,
   readdirSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeSync,
@@ -16,10 +17,10 @@ import {
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SCRUBBED_ENV_KEYS, childEnv, coreSpawn, coreSpawnSync } from "./core-spawn.ts";
 import { openReadNoFollow } from "./no-follow.ts";
-import { isLoopbackOpencodeUrl, opencodeAuthHeader } from "./opencode-http.ts";
+import { isLoopbackOpencodeUrl, opencodeAuthHeader, redactSecrets } from "./opencode-http.ts";
 import { escapeFreeText } from "../shared/terminal-text.ts";
 
 /**
@@ -62,7 +63,24 @@ import { escapeFreeText } from "../shared/terminal-text.ts";
  * Test seam (D13): `AGETOR_OPENCODE_SERVER_HOST=direct` hosts the server as a
  * `coreSpawn` child of this core instead of a tmux session (stdout and stderr
  * to the same log file). It exists for unit and e2e tests that must not need
- * tmux; it is not a user setting and nothing in a release flow sets it.
+ * tmux; it is not a user setting and nothing in a release flow sets it. It is
+ * honored ONLY when `NODE_ENV === "test"` (every `bun test` run) or the e2e
+ * backend says so with `AGETOR_E2E_OPENCODE_DIRECT_HOST=1` (the e2e backend does
+ * not run under `NODE_ENV=test`); in any other process the variable is ignored,
+ * so a stray value in a packaged build's environment cannot move the server
+ * out of tmux (and a state file with no tmux session stays "planted").
+ *
+ * Bounded external calls. Every tmux and `ps` call is bounded (`tmuxTimeoutMs`,
+ * the child is killed on expiry) and a timeout is a failed call: "unknown" for a
+ * host check, nothing signalled for a pid lookup. It is never proof a server
+ * died (I3).
+ *
+ * The server directory. It holds the password, so it is re-verified (an lstat:
+ * a plain directory, not a symlink, owned by us, and a realpath equal to its
+ * parent's realpath plus its own name) right before every write and every
+ * unlink batch, the stop paths included, and an operation on a directory that
+ * no longer checks out is refused rather than redirected into a swapped-in
+ * target (fail closed).
  */
 
 /** Idle window before the sweep may stop a server (D6). */
@@ -92,7 +110,15 @@ let serverDirOverride: string | null = null;
 const DEFAULT_ADOPT_BUDGET_MS = 5_000;
 let adoptBudgetMs = DEFAULT_ADOPT_BUDGET_MS;
 /** Bounded wait for each synchronous tmux call on a quit. */
-const SYNC_TMUX_TIMEOUT_MS = 2_000;
+const DEFAULT_SYNC_TMUX_TIMEOUT_MS = 2_000;
+let syncTmuxTimeoutMs = DEFAULT_SYNC_TMUX_TIMEOUT_MS;
+/** Bound on every async tmux query and `ps` call; the child is killed on expiry. */
+const DEFAULT_TMUX_TIMEOUT_MS = 2_000;
+/** `new-session` may have to start the tmux server itself, so it gets more room. */
+const DEFAULT_NEW_SESSION_TIMEOUT_MS = 5_000;
+let tmuxTimeoutMs = DEFAULT_TMUX_TIMEOUT_MS;
+let newSessionTimeoutMs = DEFAULT_NEW_SESSION_TIMEOUT_MS;
+let psBin = "/bin/ps";
 let fetchImpl: typeof fetch | null = null;
 
 export interface OpencodeServerHandle {
@@ -178,18 +204,40 @@ const logPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.lo
 const envPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.env`);
 const sessionNameFor = (id: string): string => `agetor-ocsrv-${safeId(id)}`;
 
-/** Create (or re-check) the 0700 server dir. A symlink, a non-directory or a
- *  directory owned by someone else is refused: it would hold the password. */
-function ensureServerDir(): string {
-  const dir = serverDir();
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+/** Check that the server dir still is what `ensureServerDir` made: a plain
+ *  directory (lstat: not a symlink), owned by us, whose realpath is its
+ *  parent's realpath plus its own name (so no component was swapped for a
+ *  link). Throws when it is not. No side effects. */
+function verifyServerDir(): string {
+  const dir = path.resolve(serverDir());
   const st = lstatSync(dir);
   if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("opencode server directory is not a plain directory");
   if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
     throw new Error("opencode server directory is not owned by the current user");
   }
+  const expected = path.join(realpathSync(path.dirname(dir)), path.basename(dir));
+  if (realpathSync(dir) !== expected) throw new Error("opencode server directory resolves somewhere else");
+  return dir;
+}
+
+/** Create (or re-check) the 0700 server dir. A symlink, a non-directory or a
+ *  directory owned by someone else is refused: it would hold the password. */
+function ensureServerDir(): string {
+  const dir = path.resolve(serverDir());
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  verifyServerDir();
+  const st = lstatSync(dir);
   if ((st.mode & 0o077) !== 0) chmodSync(dir, 0o700);
   return dir;
+}
+
+function dirIntact(): boolean {
+  try {
+    verifyServerDir();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function removeFile(p: string): void {
@@ -200,14 +248,25 @@ function removeFile(p: string): void {
   }
 }
 
-function removeFiles(id: string, opts: { log: boolean }): void {
-  removeFile(statePath(id));
-  removeFile(envPath(id));
-  if (opts.log) removeFile(logPath(id));
+/** Unlink `paths` as one batch, after re-verifying the server dir. A dir that
+ *  no longer checks out gets nothing unlinked (false). Never throws. */
+function removeGuarded(...paths: string[]): boolean {
+  if (!dirIntact()) {
+    console.warn("[opencode-server] the server directory changed; refusing to remove files from it");
+    return false;
+  }
+  for (const p of paths) removeFile(p);
+  return true;
 }
 
-/** Write `data` to `target` as a new 0600 file, atomically (tmp + rename). */
+function removeFiles(id: string, opts: { log: boolean }): boolean {
+  return removeGuarded(statePath(id), envPath(id), ...(opts.log ? [logPath(id)] : []));
+}
+
+/** Write `data` to `target` as a new 0600 file, atomically (tmp + rename). The
+ *  server dir is re-verified first; a dir that changed throws. */
 function writePrivateFile(target: string, data: string): void {
+  verifyServerDir();
   const tmp = `${target}.${randomBytes(6).toString("hex")}.tmp`;
   const fd = openSync(tmp, "wx", 0o600);
   try {
@@ -225,6 +284,7 @@ function writePrivateFile(target: string, data: string): void {
 
 /** A fresh 0600 log, opened for writing without following a symlink. */
 function createPrivateLog(id: string): number {
+  verifyServerDir();
   removeFile(logPath(id));
   return openSync(logPath(id), constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
 }
@@ -251,8 +311,10 @@ function fingerprintOf(spec: OpencodeServerSpec): string {
  * State file (read back no-follow; anything off is treated as absent)
  * ────────────────────────────────────────────────────────────────────────── */
 
+/** The `direct` test host: asked for AND allowed (see the file header). */
 function hostIsDirect(): boolean {
-  return process.env.AGETOR_OPENCODE_SERVER_HOST === "direct";
+  if (process.env.AGETOR_OPENCODE_SERVER_HOST !== "direct") return false;
+  return process.env.NODE_ENV === "test" || process.env.AGETOR_E2E_OPENCODE_DIRECT_HOST === "1";
 }
 
 function posInt(v: unknown): number | undefined {
@@ -263,6 +325,8 @@ function posInt(v: unknown): number | undefined {
  *  file, not ours, broader than 0600, oversized or malformed. A rejected file
  *  is deleted by the caller. */
 function readStateFile(file: string): StateFile | null {
+  // A directory that was swapped for a link is not read from either.
+  if (!dirIntact()) return null;
   let fd: number;
   try {
     fd = openReadNoFollow(file, { maxBytes: STATE_MAX_BYTES });
@@ -376,19 +440,81 @@ async function checkOpencodeServerHealth(h: OpencodeServerHandle, timeoutMs: num
  * tmux, process table and pid authority
  * ────────────────────────────────────────────────────────────────────────── */
 
-async function tmuxQuery(args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+interface BoundedResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  /** The call outlived its bound and the child was killed. `code` is null. */
+  timedOut: boolean;
+}
+
+/** Run `argv` to completion within `timeoutMs`. On expiry the child is killed
+ *  (SIGKILL) and the call reports `timedOut` with a null code; the output is not
+ *  waited for, because a wedged client may never close its pipes. Never throws. */
+async function runBounded(argv: string[], timeoutMs: number): Promise<BoundedResult> {
+  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
   try {
-    const proc = coreSpawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
+    proc = coreSpawn(argv, {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
       env: childEnv(),
     }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
-    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    return { code: await proc.exited, stdout: stdout.trim(), stderr: stderr.trim() };
   } catch (e) {
-    return { code: null, stdout: "", stderr: (e as Error).message };
+    return { code: null, stdout: "", stderr: (e as Error).message, timedOut: false };
   }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      resolve("timeout");
+    }, timeoutMs);
+  });
+  const done = (async (): Promise<BoundedResult> => {
+    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, stdout: stdout.trim(), stderr: stderr.trim(), timedOut: false };
+  })();
+  done.catch(() => {}); // a read error after the timeout won (or lost) must not go unhandled
+  try {
+    const first = await Promise.race([done, expired]);
+    if (first === "timeout") return { code: null, stdout: "", stderr: `${path.basename(argv[0] ?? "")} timed out after ${timeoutMs} ms`, timedOut: true };
+    return first;
+  } catch (e) {
+    return { code: null, stdout: "", stderr: (e as Error).message, timedOut: false };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function tmuxQuery(args: string[]): Promise<BoundedResult> {
+  return runBounded([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], tmuxTimeoutMs);
+}
+
+/** `tmux new-session` (the server launch), bounded and killable. The shared
+ *  `spawnTmuxNewSession` has no timeout and no handle on the child, and one
+ *  wedged tmux would hang the single-flight `ensure` for good. Same preamble
+ *  as it: the disclaimed tmux server must exist first. */
+async function tmuxNewSession(args: string[]): Promise<{ status: number | null; stderr: string }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), newSessionTimeoutMs);
+  });
+  try {
+    const ensured = ensureDisclaimedServer().then(() => "ready" as const);
+    ensured.catch(() => {}); // it may settle after the budget won
+    const ready = await Promise.race([ensured, budget]);
+    if (ready === "timeout") return { status: null, stderr: "tmux new-session timed out (disclaimed server not ready)" };
+  } catch (e) {
+    return { status: null, stderr: (e as Error).message };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const res = await runBounded([resolveTmuxBin(), ...args], newSessionTimeoutMs);
+  return { status: res.code, stderr: res.stderr };
 }
 
 type HostState = "alive" | "gone" | "unknown";
@@ -427,21 +553,11 @@ function hostState(t: TerminateTarget): Promise<HostState> | HostState {
 /** pid → ppid for every process. Empty on failure (callers then signal nothing). */
 async function processTable(): Promise<Map<number, number>> {
   const table = new Map<number, number>();
-  try {
-    const proc = coreSpawn(["/bin/ps", "-axo", "pid=,ppid="], {
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "ignore",
-      env: childEnv(),
-    }) as Bun.Subprocess<"ignore", "pipe", "ignore">;
-    const text = await new Response(proc.stdout).text();
-    await proc.exited;
-    for (const line of text.split("\n")) {
-      const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
-      if (m) table.set(Number(m[1]), Number(m[2]));
-    }
-  } catch {
-    table.clear();
+  const res = await runBounded([psBin, "-axo", "pid=,ppid="], tmuxTimeoutMs);
+  if (res.timedOut || res.code !== 0) return table; // a failed or wedged ps names nothing to signal
+  for (const line of res.stdout.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (m) table.set(Number(m[1]), Number(m[2]));
   }
   return table;
 }
@@ -568,17 +684,17 @@ async function launchInTmux(spec: OpencodeServerSpec, password: string): Promise
     envPath(spec.harnessId), logPath(spec.harnessId),
     spec.bin, "serve", "--hostname", "127.0.0.1", "--port", "0",
   ];
-  let res = await spawnTmuxNewSession(resolveTmuxBin(), args);
+  let res = await tmuxNewSession(args);
   // Stopping the last session makes tmux's server exit, and it unlinks its socket
   // on the way out. A `new-session` that lands in that window starts a server whose
   // socket the dying one then removes, and fails with "server exited unexpectedly"
   // having created nothing, so a capped retry (the old server is gone by then) is safe.
   for (let retry = 0; retry < NEW_SESSION_RETRIES && res.status !== 0 && TMUX_SERVER_RACE_RE.test(res.stderr); retry++) {
     await sleep(NEW_SESSION_RETRY_DELAY_MS);
-    res = await spawnTmuxNewSession(resolveTmuxBin(), args);
+    res = await tmuxNewSession(args);
   }
   if (res.status !== 0) {
-    removeFile(envPath(spec.harnessId));
+    removeGuarded(envPath(spec.harnessId));
     throw new Error(`could not start the OpenCode server session: ${redact(res.stderr || "tmux new-session failed", password)}`);
   }
 }
@@ -604,13 +720,10 @@ function launchDirect(spec: OpencodeServerSpec, password: string, logFd: number)
 // eslint-disable-next-line no-control-regex
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 
+/** Text from the server's log or tmux, safe to show: the one shared redactor
+ *  (`opencode-http.ts`). `password` may be unknown (empty). */
 function redact(text: string, password?: string): string {
-  let out = text;
-  if (password) out = out.split(password).join("[redacted]");
-  return out
-    .replace(/(password[=:\s]+)\S+/gi, "$1[redacted]")
-    .replace(/(authorization:?\s*(?:basic|bearer)\s+)\S+/gi, "$1[redacted]")
-    .replace(/OPENCODE_PASSWORD=\S+/g, "OPENCODE_PASSWORD=[redacted]");
+  return redactSecrets(text, password);
 }
 
 /** The head of the log, bounded. The listening line is the server's first
@@ -662,12 +775,13 @@ function parseListeningUrl(log: string): string | null {
 async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promise<ServerRecord> {
   const id = spec.harnessId;
   ensureServerDir();
-  // A leftover session or file from a crashed start must not collide.
-  await terminate({ tmuxSession: sessionNameFor(id) });
+  const direct = hostIsDirect();
+  // A leftover session or file from a crashed start must not collide. The
+  // direct test host has no session to look for, so it never calls tmux.
+  if (!direct) await terminate({ tmuxSession: sessionNameFor(id) });
   removeFiles(id, { log: true });
 
   const password = randomBytes(32).toString("base64url");
-  const direct = hostIsDirect();
   const tmuxSession = direct ? null : sessionNameFor(id);
   const startedAt = Date.now();
   const rec: ServerRecord = {
@@ -685,8 +799,7 @@ async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promi
   const fail = async (reason: string): Promise<never> => {
     const tail = logTail(id, password);
     await terminate(targetOf(rec));
-    removeFile(statePath(id));
-    removeFile(envPath(id));
+    removeGuarded(statePath(id), envPath(id));
     throw new Error(`OpenCode server failed to start: ${redact(reason, password)}${tail ? `\n${tail}` : ""}`);
   };
 
@@ -780,15 +893,20 @@ type Verdict = "ok" | "dead" | "unresponsive";
  *  refused, or our password rejected twice); any other failure from a host that
  *  is still there (timeout, reset, odd status) is "unresponsive": it may be
  *  busy, so it is kept (I3). */
-async function classify(url: string, password: string, host: TerminateTarget): Promise<{ verdict: Verdict; version?: string }> {
+async function classify(
+  url: string,
+  password: string,
+  host: TerminateTarget,
+  timeoutMs: number = healthTimeoutMs,
+): Promise<{ verdict: Verdict; version?: string }> {
   if ((await hostState(host)) === "gone") return { verdict: "dead" };
-  let res = await probe(url, password, healthTimeoutMs);
-  if (res.timedOut) res = await probe(url, password, healthTimeoutMs * 2);
+  let res = await probe(url, password, timeoutMs);
+  if (res.timedOut) res = await probe(url, password, timeoutMs * 2);
   if (res.ok) return { verdict: "ok", version: res.version };
   if (res.refused) return { verdict: "dead" };
   if (res.status === 401) {
     // One more look: only a 401 that persists means "not our server".
-    const again = await probe(url, password, healthTimeoutMs);
+    const again = await probe(url, password, timeoutMs);
     if (again.ok) return { verdict: "ok", version: again.version };
     if (again.status === 401 || again.refused) return { verdict: "dead" };
     res = again;
@@ -796,6 +914,39 @@ async function classify(url: string, password: string, host: TerminateTarget): P
   // A reset, a closed socket, a timeout or an odd status: the host decides.
   if ((await hostState(host)) === "gone") return { verdict: "dead" };
   return { verdict: "unresponsive" };
+}
+
+/**
+ * What a caller that wants to stop a server on its own judgment (the idle
+ * sweep) may conclude about the harness's in-memory server, with the manager's
+ * own proof rules:
+ *  - `"dead"`: positive proof only (the host is gone, the connection was
+ *    refused, or our password was rejected twice). Safe to clear and replace.
+ *  - `"alive"`: it answered an authenticated `GET /api/info`.
+ *  - `"unresponsive"`: no proof either way (a timeout, a reset, an odd status)
+ *    with a host that is still there. May be busy: never a reason to kill (I3).
+ *  - `"unknown"`: this core holds no server for the harness, or it is being
+ *    started or stopped right now, so there is nothing to judge.
+ * Read-only: it removes and signals nothing. `timeoutMs` bounds each probe
+ * (default: the health timeout); a timed-out probe is retried once at twice that.
+ */
+export async function classifyOpencodeServer(
+  harnessId: string,
+  timeoutMs?: number,
+): Promise<"dead" | "alive" | "unresponsive" | "unknown"> {
+  const rec = servers.get(harnessId);
+  if (!rec || starting.has(harnessId) || stopping.has(harnessId)) return "unknown";
+  const bound = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : healthTimeoutMs;
+  const res = await classify(rec.handle.url, rec.handle.password, targetOf(rec), bound);
+  // Replaced, restarted or stopped while we probed: the verdict is about a
+  // server that is no longer the harness's, so it says nothing about this one.
+  if (servers.get(harnessId) !== rec || starting.has(harnessId) || stopping.has(harnessId)) return "unknown";
+  if (res.verdict === "ok") {
+    rec.healthyAt = Date.now();
+    if (res.version) rec.handle.version = res.version;
+    return "alive";
+  }
+  return res.verdict;
 }
 
 async function healthy(rec: ServerRecord): Promise<Verdict> {
@@ -846,8 +997,7 @@ async function adoptState(file: string, only?: string, ctx: AdoptCtx = {}): Prom
   if (!state || statePath(state.harnessId) !== file || (only !== undefined && state.harnessId !== only)) {
     // Unreadable, a symlink, wrong owner/mode, planted, or filed under the wrong name.
     const stem = path.basename(file, ".json");
-    removeFile(file);
-    removeFile(path.join(serverDir(), `${stem}.env`));
+    removeGuarded(file, path.join(serverDir(), `${stem}.env`));
     return null;
   }
   const target: TerminateTarget = { tmuxSession: state.tmuxSession, hostPid: state.hostPid };
@@ -998,6 +1148,17 @@ export function noteOpencodeActivity(harnessId: string, now: number = Date.now()
   if (rec) rec.lastActivity = now;
 }
 
+/**
+ * The event hub gave up on this harness's server: forget the cached health
+ * verdict so the next `ensure` probes it again (and replaces it when it is
+ * provably gone) instead of handing out a dead url for up to the cache window.
+ * Never stops or signals anything.
+ */
+export function noteOpencodeServerLost(harnessId: string): void {
+  const rec = servers.get(harnessId);
+  if (rec) rec.healthyAt = 0;
+}
+
 function busy(isBusy: (harnessId: string) => boolean, id: string): boolean {
   try {
     return isBusy(id);
@@ -1026,25 +1187,34 @@ export async function opencodeIdleSweep(now: number, isBusy: (harnessId: string)
  * instance socket through `coreSpawnSync` (each call bounded); the direct test
  * host: signal the child this core spawned. State, env and log files go too.
  * Never throws; returns the stopped ids. No escalation and no waiting — the
- * session's SIGHUP is the whole stop.
+ * session's SIGHUP is the whole stop. A server whose `kill-session` failed or
+ * timed out is NOT stopped: it stays registered and its state file stays, so
+ * the next boot finds and judges it instead of losing it. Files are removed
+ * only after a kill that succeeded (or found the session already gone), and
+ * only from a server dir that still checks out.
  */
 export function stopIdleOpencodeServersSync(isBusy: (harnessId: string) => boolean): string[] {
   const stopped: string[] = [];
   for (const [id, rec] of [...servers]) {
     try {
       if (starting.has(id) || busy(isBusy, id)) continue;
-      servers.delete(id);
       const session = rec.handle.tmuxSession;
       if (session) {
-        coreSpawnSync(resolveTmuxBin(), [...tmuxSocketArgs(), "kill-session", "-t", `=${session}:`], {
-          stdio: "ignore",
+        const res = coreSpawnSync(resolveTmuxBin(), [...tmuxSocketArgs(), "kill-session", "-t", `=${session}:`], {
+          stdio: ["ignore", "ignore", "pipe"],
           env: childEnv(),
-          timeout: SYNC_TMUX_TIMEOUT_MS,
+          timeout: syncTmuxTimeoutMs,
+          encoding: "utf8",
         });
+        const err = typeof res.stderr === "string" ? res.stderr : "";
+        // Killed, or tmux said the session (or its server) was already gone.
+        const killed = !res.error && (res.status === 0 || (res.status === 1 && TMUX_GONE_RE.test(err)));
+        if (!killed) continue; // failed or timed out: not proof it stopped
       } else {
         const child = rec.hostPid === undefined ? undefined : directProcs.get(rec.hostPid);
         if (child && child.exitCode === null && child.pid !== process.pid) child.kill("SIGTERM");
       }
+      servers.delete(id);
       removeFiles(id, { log: true });
       stopped.push(id);
     } catch {
@@ -1083,6 +1253,19 @@ export const __forTest = {
   setAdoptBudgetMs(ms: number): void {
     adoptBudgetMs = ms;
   },
+  setTmuxTimeoutMs(ms: number): void {
+    tmuxTimeoutMs = ms;
+  },
+  setNewSessionTimeoutMs(ms: number): void {
+    newSessionTimeoutMs = ms;
+  },
+  setSyncTmuxTimeoutMs(ms: number): void {
+    syncTmuxTimeoutMs = ms;
+  },
+  /** Replace the `ps` binary (null restores `/bin/ps`). */
+  setPsBin(bin: string | null): void {
+    psBin = bin ?? "/bin/ps";
+  },
   /** Replace `fetch` for health probes (null restores it). */
   setFetchImpl(f: typeof fetch | null): void {
     fetchImpl = f;
@@ -1097,6 +1280,10 @@ export const __forTest = {
     healthCacheMs = DEFAULT_HEALTH_CACHE_MS;
     healthTimeoutMs = DEFAULT_HEALTH_TIMEOUT_MS;
     adoptBudgetMs = DEFAULT_ADOPT_BUDGET_MS;
+    tmuxTimeoutMs = DEFAULT_TMUX_TIMEOUT_MS;
+    newSessionTimeoutMs = DEFAULT_NEW_SESSION_TIMEOUT_MS;
+    syncTmuxTimeoutMs = DEFAULT_SYNC_TMUX_TIMEOUT_MS;
+    psBin = "/bin/ps";
     fetchImpl = null;
     serverDirOverride = null;
   },
@@ -1108,4 +1295,8 @@ export const __forTest = {
   safeId,
   redact,
   tmuxHasSession,
+  processTable,
+  hostIsDirect,
+  verifyServerDir,
+  writePrivateFile,
 };

@@ -45,6 +45,9 @@ function serverEnv(speed: string): Record<string, string> {
     AGETOR_OPENCODE_DRIVER: "",
     AGETOR_OPENCODE_BIN: STUB_OPENCODE,
     AGETOR_OPENCODE_SERVER_HOST: "direct",
+    // The e2e backend does not run under NODE_ENV=test; the manager honors
+    // the direct host only under it or with this flag (opencode-server.ts).
+    AGETOR_E2E_OPENCODE_DIRECT_HOST: "1",
     FAKE_OC_SPEED: speed,
     // One heartbeat is plenty; keeps a quiet stream from looking dead.
     FAKE_OC_HEARTBEAT_MS: "2000",
@@ -222,7 +225,7 @@ test.describe("OpenCode v2 server driver (fake opencode serve)", () => {
       expect((await getRuns(backend, task.id))[0]!.status).toBe("succeeded");
     });
 
-    test("(c) Ask mode: Reject with an empty reason stops the turn (cancelled, back to Ready)", async ({
+    test("(c) Ask mode: an empty Reject skips the action and the turn continues to Review", async ({
       page,
       freshBackend: backend,
     }) => {
@@ -235,13 +238,18 @@ test.describe("OpenCode v2 server driver (fake opencode serve)", () => {
       const panel = await openTask(page, backend, title);
       const card = panel.getByTestId("permission-card");
       await expect(card).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
+      await expect(card).toContainText("Leave empty to skip this action");
       await card.getByTestId("permission-option-reject").click();
 
-      await waitForColumn(backend, task.id, "ready");
+      // The driver sends OpenCode a single space (no words of its own), so the fake
+      // takes it as a reason: the tool is refused and the model answers with the
+      // rejection. The turn is not stopped.
+      await expect(panel.getByText(/The command was rejected:/)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
       await expect(panel.getByTestId("permission-card")).toHaveCount(0, { timeout: CONVERGE_TIMEOUT });
+      await waitForColumn(backend, task.id, "review");
       const runs = await getRuns(backend, task.id);
       expect(runs).toHaveLength(1);
-      expect(runs[0]!.status).toBe("cancelled");
+      expect(runs[0]!.status).toBe("succeeded");
     });
 
     test("(d) question card: picking an option answers it and the reply names the pick", async ({

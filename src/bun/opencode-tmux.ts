@@ -17,7 +17,7 @@ import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-reso
 import { childEnv, coreSpawn } from "./core-spawn.ts";
 import { openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 import { createDeathProbe } from "./session-liveness.ts";
-import { opencodeQuotaHint } from "../shared/opencode.ts";
+import { opencodeQuotaHint, opencodeResumeFailedStatusLine } from "../shared/opencode.ts";
 import {
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
@@ -146,6 +146,8 @@ export interface OpencodeLineResult {
 /** Mutable per-turn state the mapper accumulates across lines. */
 export interface OpencodeMapCtx {
   major: 1 | 2;
+  /** The turn's `provider/model` id (null: unknown, e.g. the OpenCode default or a reattach), for the quota hint. */
+  model: string | null;
   sessionId: string | null;
   usage: OpencodeUsageTotals;
   stepStarts: number;
@@ -158,9 +160,10 @@ export interface OpencodeMapCtx {
   awaitingErrorDetail: boolean;
 }
 
-export function createOpencodeMapCtx(major: 1 | 2): OpencodeMapCtx {
+export function createOpencodeMapCtx(major: 1 | 2, model: string | null = null): OpencodeMapCtx {
   return {
     major,
+    model,
     sessionId: null,
     usage: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     stepStarts: 0,
@@ -289,7 +292,7 @@ export function mapOpencodeEvent(line: string, ctx: OpencodeMapCtx, lineIndex: n
       ctx.failed = true;
       ctx.lastError = msg;
       res.failed = true;
-      const hint = opencodeQuotaHint(evt.error, msg);
+      const hint = opencodeQuotaHint(evt.error, msg, ctx.model);
       res.chunks = [{ stream: "status", data: `opencode: ${msg}${hint ? ` — ${hint}` : ""}`, lineUuid: `opencode:error:${lineIndex}` }];
       if (RESUME_NOT_FOUND_MSG_RE.test(msg) && !ctx.sessionId) {
         ctx.resumeNotFound = true;
@@ -311,13 +314,15 @@ export function createOpencodeLineProcessor(opts: {
   onSubagent?: (n: OpencodeSubagentNotice) => void;
   seenLineUuids?: Set<string>;
   major: 1 | 2;
+  /** The turn's `provider/model` id; it decides whether a 402 gets the Zen hint ({@link opencodeQuotaHint}). */
+  model?: string | null;
 }): {
   feed(line: string): void;
   result(): OpencodeLineResult;
   /** Step counts and running usage — the driver's v2 usage reconciliation reads them. */
   stats(): { stepStarts: number; stepFinishes: number; usage: OpencodeUsageTotals };
 } {
-  const ctx = createOpencodeMapCtx(opts.major);
+  const ctx = createOpencodeMapCtx(opts.major, opts.model ?? null);
   const seen = opts.seenLineUuids ?? new Set<string>();
   const notified = new Set<string>();
   let lineIndex = 0;
@@ -367,6 +372,8 @@ export interface OpencodeLaunchOptions {
   cwd: string;
   promptText: string;
   major: 1 | 2;
+  /** The turn's `provider/model` id, for the 402 hint. Defaults to the `-m` value of `argv` (the model without its `#effort` variant stays a valid provider prefix). */
+  model?: string | null;
   onChunk: ChunkHandler;
   onSessionId?: (id: string) => void;
   onSubagent?: (n: OpencodeSubagentNotice) => void;
@@ -594,6 +601,12 @@ async function launchTmux(
   return { ok: false, detail: (res.stderr || "tmux new-session failed").trim() };
 }
 
+/** The `-m` model of an `opencode run` argv (`opencodeModelArgs`), or null when it names none (the OpenCode default). */
+function opencodeModelFromArgv(argv: string[]): string | null {
+  const i = argv.indexOf("-m");
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1]! : null;
+}
+
 function resumeIdFrom(argv: string[]): string {
   const i = argv.indexOf("-s");
   return i >= 0 && i + 1 < argv.length ? argv[i + 1]! : "";
@@ -667,8 +680,7 @@ async function settle(state: OpencodeSessionState, exitCode: number): Promise<vo
     && launch?.freshArgv && launch.freshArgv.length > 0
   ) {
     state.retried = true;
-    const id8 = resumeIdFrom(launch.argv).slice(0, 8);
-    emitOwn(state, "status", `couldn't resume OpenCode session ${id8}… — starting a fresh session`, "opencode:fresh-retry");
+    emitOwn(state, "status", opencodeResumeFailedStatusLine(resumeIdFrom(launch.argv)), "opencode:fresh-retry");
     try { appendFileSync(state.logPath, JSON.stringify({ type: OPENCODE_ATTEMPT_MARKER_TYPE, attempt: 2 }) + "\n"); } catch { /* noop */ }
     try { unlinkSync(opencodeExitPath(state.runId)); } catch { /* noop */ }
     await killSessionByName(state.sessionName);
@@ -709,6 +721,7 @@ function makeState(a: {
   runId: string;
   sessionName: string;
   major: 1 | 2;
+  model: string | null;
   onChunk: ChunkHandler;
   onSessionId?: (id: string) => void;
   onSubagent?: (n: OpencodeSubagentNotice) => void;
@@ -730,6 +743,7 @@ function makeState(a: {
       onSubagent: a.onSubagent,
       seenLineUuids: a.seen,
       major: a.major,
+      model: a.model,
     }),
     seen: a.seen,
     onChunk: a.onChunk,
@@ -811,6 +825,7 @@ export async function spawnOpencodeViaTmux(opts: OpencodeLaunchOptions): Promise
     runId: opts.runId,
     sessionName,
     major: opts.major,
+    model: opts.model ?? opencodeModelFromArgv(opts.argv),
     onChunk: opts.onChunk,
     onSessionId: opts.onSessionId,
     onSubagent: opts.onSubagent,
@@ -837,6 +852,8 @@ export interface OpencodeReattachOptions {
   onChunk: ChunkHandler;
   seenLineUuids: Set<string>;
   major: 1 | 2;
+  /** The run's `provider/model` id when known (a reattach has no argv), for the 402 hint. */
+  model?: string | null;
   onSubagent?: (n: OpencodeSubagentNotice) => void;
   beforeSettle?: OpencodeLaunchOptions["beforeSettle"];
 }
@@ -853,6 +870,7 @@ export async function reattachOpencodeSession(opts: OpencodeReattachOptions): Pr
     runId: opts.runId,
     sessionName: opts.sessionName,
     major: opts.major,
+    model: opts.model ?? null,
     onChunk: opts.onChunk,
     onSubagent: opts.onSubagent,
     seen: opts.seenLineUuids,

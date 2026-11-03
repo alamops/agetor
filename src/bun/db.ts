@@ -3010,6 +3010,35 @@ export const runs = {
     );
     return { ...r, origin: r.origin ?? null };
   },
+  /**
+   * The last run (any status) of every non-archived task that ever recorded
+   * an OpenCode session, when that last run has one: what the server driver's
+   * wake watch is computed from. One pass over those tasks' runs, ranked per
+   * task (no per-row subquery). The task set comes through the partial
+   * `runs_opencode_session_id_idx` (079), pinned: unpinned, the planner walks
+   * all of `idx_runs_task` and reads every run row to test the column. The
+   * runs then come through `idx_runs_task`.
+   */
+  lastOpencodeSessionRunPerTask(): { runId: string; taskId: string; agent: string; sessionId: string }[] {
+    return db
+      .query<{ runId: string; taskId: string; agent: string; sessionId: string }, []>(
+        `WITH oc AS (SELECT DISTINCT task_id FROM runs INDEXED BY runs_opencode_session_id_idx WHERE opencode_session_id IS NOT NULL),
+              ranked AS (
+                SELECT r.id AS run_id, r.task_id AS task_id, r.agent AS agent, r.opencode_session_id AS session_id,
+                       ROW_NUMBER() OVER (PARTITION BY r.task_id ORDER BY r.started_at DESC, r.rowid DESC) AS rn
+                  FROM runs r WHERE r.task_id IN (SELECT task_id FROM oc))
+         SELECT ranked.run_id AS runId, ranked.task_id AS taskId, ranked.agent AS agent, ranked.session_id AS sessionId
+           FROM ranked JOIN tasks t ON t.id = ranked.task_id
+          WHERE ranked.rn = 1 AND ranked.session_id IS NOT NULL AND t.archived_at IS NULL`,
+      )
+      .all();
+  },
+  /** Set (or clear) the tmux session name a run is recorded under. `update`
+   *  leaves the column alone; only an OpenCode follow-up whose transport
+   *  turned out different from the one guessed at insert corrects it. */
+  setTmuxSession(id: string, name: string | null): void {
+    db.run(`UPDATE runs SET tmux_session = ? WHERE id = ?`, [name, id]);
+  },
   update(id: string, patch: Partial<Run>): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
     if (!row) return null;
@@ -4033,6 +4062,16 @@ export const subagents = {
     const rows = db.query<{ task_id: string }, []>(
       `SELECT DISTINCT task_id FROM subagents WHERE status = 'running'`,
     ).all();
+    return rows.map((r) => r.task_id);
+  },
+  /** Tasks with an OpenCode subagent row `orphaned` at or after `sinceMs`
+   *  (its `ended_at`, else its start): the boot linger's candidates besides
+   *  the running rows. */
+  opencodeOrphanedTaskIdsSince(sinceMs: number): string[] {
+    const rows = db.query<{ task_id: string }, [number]>(
+      `SELECT DISTINCT task_id FROM subagents
+        WHERE status = 'orphaned' AND parent_kind = 'opencode_subagent' AND COALESCE(ended_at, started_at) >= ?`,
+    ).all(sinceMs);
     return rows.map((r) => r.task_id);
   },
 };

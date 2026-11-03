@@ -26,11 +26,9 @@ import {
   claudeModelPickerFamily,
   opencodeDriverHooks,
   opencodeEffectiveServerFor,
-  opencodeServerTurnOf,
   opencodeTransportOfTurn,
   OPENCODE_ASK_DRIVER_OFF_STATUS,
   OPENCODE_ASK_NEEDS_V2_STATUS,
-  attachOpencodeServerAgent,
   lingerOpencodeServerAgent,
   type SpawnAgentArgs,
   type SpawnedAgent,
@@ -170,20 +168,35 @@ import {
   opencodeSessionActive,
   reattachOpencodeSession,
 } from "./opencode-tmux.ts";
-import type { OpencodeServerTurn } from "./opencode-driver.ts";
 import {
-  getOpencodeServer,
-  opencodeIdleSweep,
-  stopIdleOpencodeServersSync,
-  stopOpencodeServer,
-} from "./opencode-server.ts";
-import {
-  closeOpencodeHub,
-  setOpencodeWakeHandler,
-  setOpencodeWatchLostHandler,
-  watchOpencodeSessionsForWake,
-} from "./opencode-hub.ts";
-import { createOpencodeClient, type OpencodeEnvelope } from "./opencode-http.ts";
+  addLingeringOpencodeTurn,
+  disposeLingeringOpencodeTurns,
+  dropDeferredOpencodeWake,
+  forgetOpencodeServerTurn,
+  hasDeferredOpencodeWake,
+  hasOpencodeServerTurn,
+  initOpencodeServerOrchestrator,
+  isOpencodeServerTask,
+  liveLingeringOpencodeTurns,
+  opencodeLingerCandidates,
+  opencodeServerTurnForRun,
+  opencodeTurnHooksFor,
+  probeOpencodeSessionsAtBoot,
+  reattachOpencodeServerRun,
+  retryDeferredOpencodeWake,
+  scheduleOpencodeWatchRefresh,
+  steerOpencodeServerTurn,
+  stopOpencodeServerTurnsOfTask,
+  trackOpencodeServerTurn,
+} from "./orchestrator-opencode-server.ts";
+export {
+  __opencodeServerForTest,
+  runOpencodeIdleSweep,
+  startOpencodeServerDriver,
+  stopIdleOpencodeServersOnRealStop,
+  stopOpencodeServerDriver,
+  stopOpencodeServersOnQuit,
+} from "./orchestrator-opencode-server.ts";
 import {
   opencodeTurnOfRun,
   orphanRunningOpencodeSubagents,
@@ -1361,9 +1374,9 @@ export async function reconcileOrphans(): Promise<number> {
         task,
         sessionId: c.sessionId,
         onChunk: makeChunkHandler(c.runId, c.taskId, "opencode", task.mode),
-        hooks: opencodeTurnHooksFor(harness.id, c.runId, c.taskId),
+        hooks: opencodeTurnHooksFor(harness.id, c.runId, c.taskId, "attach"),
       });
-      lingeringOpencodeTurns.set(c.taskId, [...(lingeringOpencodeTurns.get(c.taskId) ?? []), { taskId: c.taskId, harnessId: harness.id, turn }]);
+      addLingeringOpencodeTurn({ taskId: c.taskId, harnessId: harness.id, turn });
       lingeredTaskIds.add(c.taskId);
     } catch (err) {
       console.warn(`[agetor] could not listen for the background subagents of task ${c.taskId}:`, err);
@@ -1373,12 +1386,16 @@ export async function reconcileOrphans(): Promise<number> {
     const task = tasks.get(heldId);
     if (!task) continue;
     const heldKind = resolveHarness(task.agent)?.kind ?? null;
-    // OpenCode rows settle at turn end (the export refresh in the driver's
-    // `beforeSettle`). Only a reattached OpenCode tail (above) will still run
-    // one; with none — the turn died with the restart, or the task has since
-    // switched harness — nothing ever will, so orphan them now. The settle
-    // hook then releases a held card. Runs before the claude branch so a
-    // claude task's leftover OpenCode rows can't hold it either.
+    // OpenCode rows are settled by whatever drives the session: on the
+    // agetor-owned server the driver settles each child live (and a lingering
+    // handle keeps doing so after the root turn ends); on `opencode run` the
+    // export refresh in the tmux driver's `beforeSettle` does it at turn end.
+    // Only a reattached tmux tail, a reattached server turn or a boot linger
+    // (above) will still settle them; with none — the turn died with the
+    // restart, or the task has since switched harness — nothing ever will, so
+    // orphan them now. The settle hook then releases a held card. Runs before
+    // the claude branch so a claude task's leftover OpenCode rows can't hold it
+    // either.
     const openCodeTailLive =
       heldKind === "opencode" && (opencodeSessionActive(heldId) || hasOpencodeServerTurn(heldId) || lingeredTaskIds.has(heldId));
     if (!openCodeTailLive) {
@@ -1786,7 +1803,7 @@ function releaseStartingClaim(taskId: string): void {
   startingTaskIds.delete(taskId);
   pendingCancelTaskIds.delete(taskId);
   // An OpenCode wake that arrived while the claim was held waits for this edge.
-  if (deferredOpencodeWakes.has(taskId)) queueMicrotask(() => retryDeferredOpencodeWake(taskId, false));
+  if (hasDeferredOpencodeWake(taskId)) queueMicrotask(() => retryDeferredOpencodeWake(taskId));
 }
 
 /**
@@ -2063,8 +2080,6 @@ async function startTaskInner(
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
   // directory out from under the freshly-prepared one.
   await pendingTeardown(taskId);
-  // The user starting the task again ends any earlier Stop (it no longer bars an OpenCode wake).
-  clearOpencodeUserStop(taskId);
 
   // Starting an archived task auto-unarchives it — otherwise the card would
   // move through columns (running → review/ready) while hidden behind the
@@ -2336,8 +2351,10 @@ async function startTaskInner(
       // All four kinds now run in a per-task tmux session. fx is the
       // exception — it's driven over ACP/stdio, not tmux — but it still
       // gets a `tmuxSession` name here for symmetry with the run row shape;
-      // `spawnFxViaAcp` simply doesn't use it.
-      tmuxSession: sessionNameFor(taskId),
+      // `spawnFxViaAcp` simply doesn't use it. An OpenCode 2.x turn on the
+      // agetor-owned server has no tmux session of its own (it runs inside
+      // the server's): null, so nothing offers to attach to one.
+      tmuxSession: harness.kind === "opencode" && opencodeTransportOfTurn(status.version) === "server" ? null : sessionNameFor(taskId),
       // Filled in by spawnAgent's onSessionId callback once the session id is
       // known: claude's JSONL uuid → claudeSessionId, codex's thread_id →
       // codexSessionId, cursor's session_id → cursorSessionId, gemini's
@@ -2394,7 +2411,7 @@ async function startTaskInner(
     // fx: a mid-turn steer fx didn't take comes back here as the next turn.
     ...(harness.kind === "fx" ? { onSteerDropped: fxSteerDroppedHandler(taskId, runId, harness.id) } : {}),
     // opencode on OpenCode 2.x: what the server driver needs from this module.
-    ...(harness.kind === "opencode" ? { opencodeTurnHooks: opencodeTurnHooksFor(harness.id, runId, taskId) } : {}),
+    ...(harness.kind === "opencode" ? { opencodeTurnHooks: opencodeTurnHooksFor(harness.id, runId, taskId, "spawn") } : {}),
     opts: {
       mode: task.mode,
       model: task.model ?? DEFAULT_MODEL[harness.kind],
@@ -3463,7 +3480,7 @@ function attachDoneHandler(
       // stands right now to decide whether to skip scheduling.
       noteFxRunSettled(task, runId, newStatus);
       await drainFollowUpQueues(taskId, runId, wasCancelled);
-      if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId, wasCancelled);
+      if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
     })
     .catch(async (err) => {
       const handle = active.get(runId);
@@ -3500,7 +3517,7 @@ function attachDoneHandler(
       // `.then` branch above.
       noteFxRunSettled(task, runId, newStatus);
       await drainFollowUpQueues(taskId, runId, wasCancelled);
-      if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId, wasCancelled);
+      if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
     });
 }
 
@@ -4200,7 +4217,8 @@ function stopActiveHandle(h: ActiveRun, reason: string): void {
   for (const [, handle] of active) {
     if (handle.taskId === h.taskId) handle.cancelled = true;
   }
-  noteOpencodeUserStop(h.taskId);
+  // An OpenCode wake seen during this run is the execution being stopped.
+  dropDeferredOpencodeWake(h.taskId);
   cancelPendingForTask(h.taskId, reason);
   h.kill();
 }
@@ -4213,10 +4231,11 @@ function stopActiveHandle(h: ActiveRun, reason: string): void {
  */
 async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   cancelPendingForTask(taskId, reason);
-  noteOpencodeUserStop(taskId);
   // An OpenCode task on the agetor-owned server has no claude session to
   // interrupt: Stop ends the handle still listening for its background
-  // subagents (which interrupts them) and retires their rows to release the hold.
+  // subagents (which interrupts them) and retires their rows to release the
+  // hold. Whatever the server runs on the session afterwards is a wake like
+  // any other (plan R3): it becomes a run and pulls the card back.
   if (isOpencodeServerTask(taskId)) {
     await disposeLingeringOpencodeTurns(taskId);
     orphanRunningOpencodeSubagents(taskId, reason);
@@ -4249,20 +4268,28 @@ export async function cancelRun(runId: string): Promise<boolean> {
       return true;
     }
     // A settled OpenCode turn may still be listening for its background
-    // subagents with the task not held: Stop with no run active ends that too.
-    // Awaited only when there is one, so any other harness reaches
-    // `pendingCancelRunIds.add` below without yielding first.
+    // subagents with the task not held: Stop with no run active ends that too,
+    // then goes on to the checks below: the Stop may also be meant for a
+    // follow-up turn whose spawn is still pending (its run row is minted
+    // before it registers). Awaited only when there is a linger, so any other
+    // harness reaches `pendingCancelRunIds.add` below without yielding first.
+    let endedLinger = false;
     if (liveLingeringOpencodeTurns(taskId).length > 0) {
-      noteOpencodeUserStop(taskId);
       await disposeLingeringOpencodeTurns(taskId);
-      return true;
+      endedLinger = true;
+      // The pending spawn may have registered while the dispose was awaited.
+      const registered = active.get(runId);
+      if (registered) {
+        stopActiveHandle(registered, "cancelled by user");
+        return true;
+      }
     }
     // A paused fx task has no `active` handle either — there's no live
     // process to interrupt — but Stop should still do something when a
     // pending auto-resume timer is what's left to act on (plan §3 T2 item 8):
     // cancel the schedule rather than reporting failure.
     if (fxAutoResumeTimers.has(taskId)) {
-      return cancelFxAutoResume(taskId, "stopped");
+      return cancelFxAutoResume(taskId, "stopped") || endedLinger;
     }
     // Bounded-spawn pending window: the run is the task's current run and
     // still `running`, but its agent hasn't registered yet. Record the
@@ -4271,11 +4298,11 @@ export async function cancelRun(runId: string): Promise<boolean> {
     const run = runs.get(runId);
     if (run && run.status === "running" && tasks.get(taskId)?.runId === runId) {
       pendingCancelRunIds.add(runId);
-      noteOpencodeUserStop(taskId);
+      dropDeferredOpencodeWake(taskId);
       cancelPendingForTask(taskId, "cancelled by user");
       return true;
     }
-    return false;
+    return endedLinger;
   }
   // Stop targets the whole task, not just one run.
   stopActiveHandle(h, "cancelled by user");
@@ -5753,20 +5780,25 @@ async function drainAntigravityQueue(taskId: string): Promise<void> {
 
 /**
  * Per-task queue of follow-up lines received while an OpenCode turn is in
- * flight. `opencode run` is one-shot per turn, so — like antigravity/gemini/
- * codex — the message is held and a fresh `opencode run -s <id>` turn is
- * spawned for it once the active turn resolves (`drainOpencodeQueue`, called
- * from `attachDoneHandler`). Cleared on delete, archive and agent switch.
+ * flight and could not join it. On the legacy `opencode run` transport (1.x,
+ * or the kill switch) every mid-turn message lands here: the turn is one-shot,
+ * so — like antigravity/gemini/codex — the line waits for a fresh resume turn
+ * once the active one resolves (`drainOpencodeQueue`, called from
+ * `attachDoneHandler`). On the agetor-owned server (2.x) a message steers into
+ * the running turn instead, and queues here only when the server could not
+ * take it (`steerOpencodeServerTurn`). Cleared on delete, archive and agent
+ * switch.
  */
 const opencodeTurnQueue = new Map<string, string[]>();
 
 /**
- * Send a follow-up to an OpenCode task. Each follow-up is its own run row and
- * its own `opencode run -s <id>` turn. When a turn is already running the
- * message is queued (its user bubble recorded on the active run); otherwise
- * it spawns immediately. Returns the run id the message was attached to, or
- * null on lookup failure — or when `spawnOpencodeTurnNow` declined to mint a
- * run because `startingTaskIds` was already claimed for this task.
+ * Send a follow-up to an OpenCode task. With no turn running it spawns at once
+ * as a new run that resumes the task's session. With a turn running: on the
+ * agetor-owned server the message steers into that turn (no new run); on
+ * `opencode run` it is queued (its user bubble recorded on the active run) for
+ * the next turn. Returns the run id the message was attached to, or null on
+ * lookup failure — or when `spawnOpencodeTurnNow` declined to mint a run
+ * because `startingTaskIds` was already claimed for this task.
  */
 async function sendOpencodeTurn(
   taskId: string,
@@ -5778,14 +5810,12 @@ async function sendOpencodeTurn(
   // Idle-only send: refuse before the queue push / user event / spawn (see
   // `sendCodexTurn`).
   if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
-  // A message from the user ends an earlier Stop (it no longer bars a wake).
-  clearOpencodeUserStop(taskId);
   if (task.runId && active.has(task.runId)) {
     const runId = task.runId;
     // OpenCode 2.x on the agetor-owned server: the message joins the turn that
     // is running (a steer). No queue entry and no run row unless the server
     // can't take it right now.
-    const serverRun = opencodeServerTurns.get(runId);
+    const serverRun = opencodeServerTurnForRun(runId);
     if (serverRun) return steerOpencodeServerTurn(taskId, runId, serverRun.turn, line);
     const q = opencodeTurnQueue.get(taskId) ?? [];
     q.push(line);
@@ -5798,11 +5828,12 @@ async function sendOpencodeTurn(
 }
 
 /**
- * Spawn a fresh OpenCode turn that resumes the task's prior session via
- * `-s <id>` — the newest `opencode_session_id` recorded by THIS harness
- * (D-15). New run row, new tmux session (the previous turn's exited). The
- * CLI line comes from the cached `--version` probe (D-2: a follow-up must
- * not pay a 2 s probe per message).
+ * Spawn a fresh OpenCode turn that resumes the task's prior session — the
+ * newest `opencode_session_id` recorded by THIS harness (D-15): a prompt on
+ * the agetor-owned server (2.x), or `opencode run -s <id>` in a new tmux
+ * session. Always a new run row. The CLI line, and with it the transport,
+ * comes from the cached `--version` probe (D-2: a follow-up must not pay a
+ * 2 s probe per message).
  */
 async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, alreadyEchoed = false): Promise<string | null> {
   if (startingTaskIds.has(taskId)) return null;
@@ -5811,6 +5842,11 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
     const priorSessionId = lastSessionIdForTask(task, "opencode_session_id");
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
+    // A server-transport turn has no tmux session of its own. The transport is
+    // only certain once the version below is in; the last one known decides
+    // the row now, and a different answer corrects it.
+    const tmuxNameFor = (transport: OpencodeTransport): string | null => (transport === "server" ? null : sessionNameFor(taskId));
+    const guessedTmux = tmuxNameFor(opencodeTransportOfTurn(harness ? peekCachedCliVersion(harness) : null));
 
     const newRunId = randomUUID();
     const now = Date.now();
@@ -5822,7 +5858,7 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
       startedAt: now,
       endedAt: null,
       exitCode: null,
-      tmuxSession: sessionNameFor(taskId),
+      tmuxSession: guessedTmux,
       claudeSessionId: null,
       codexSessionId: null,
       cursorSessionId: null,
@@ -5852,7 +5888,8 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
     }
 
     const cliVersion = await cachedCliVersion(harness);
-    writeOpencodeTurnOpening(onChunk, harness, task, cliVersion);
+    const transport = writeOpencodeTurnOpening(onChunk, harness, task, cliVersion);
+    if (tmuxNameFor(transport) !== guessedTmux) runs.setTmuxSession(newRunId, tmuxNameFor(transport));
     onChunk(
       "status",
       priorSessionId
@@ -5871,7 +5908,7 @@ async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, al
         runs.update(newRunId, { opencodeSessionId: sessionId });
         scheduleOpencodeWatchRefresh();
       },
-      opencodeTurnHooks: opencodeTurnHooksFor(harness.id, newRunId, taskId),
+      opencodeTurnHooks: opencodeTurnHooksFor(harness.id, newRunId, taskId, "spawn"),
       opts: {
         mode: task.mode,
         model: task.model ?? DEFAULT_MODEL[harness.kind],
@@ -5923,799 +5960,38 @@ async function drainOpencodeQueue(taskId: string): Promise<void> {
 }
 
 
-/* ────────────────────────────────────────────────────────────────────────── *
- * OpenCode 2.x on the agetor-owned server (docs/plans/opencode-server-driver.md, T11)
- *
- * The driver (opencode-driver.ts) owns the turn; this block is the part that
- * needs the orchestrator's private state: which server turns this core is
- * driving, steering them, the wake of a session the server restarted on its
- * own (D7), the server's idle sweep (D6) and its busy gate (I3).
- * ────────────────────────────────────────────────────────────────────────── */
-
-interface OpencodeServerRun {
-  taskId: string;
-  harnessId: string;
-  turn: OpencodeServerTurn;
-}
-
-/** runId -> the server-transport turn this core is driving. Entered when the turn registers, left by its done handler. */
-const opencodeServerTurns = new Map<string, OpencodeServerRun>();
-
-/**
- * After a server turn settles the driver may stay subscribed (child-only) while
- * background subagents it started are unsettled, answering their permissions
- * and raising their cards, until the root's next execution starts or the
- * children settle (`turn.lingering()`). `turn.dispose()` ends that.
+/*
+ * OpenCode 2.x on the agetor-owned server: the orchestrator's half lives in
+ * orchestrator-opencode-server.ts. It borrows this module's run state and
+ * helpers through the deps object below; everything it needs is defined by
+ * now (function declarations are hoisted, and `active`, `startingTaskIds` and
+ * `opencodeTurnQueue` are initialised above).
  */
-/** taskId -> settled-but-lingering turns. Not in `active`, so the task does not read as running. */
-const lingeringOpencodeTurns = new Map<string, OpencodeServerRun[]>();
-
-/** After a steer the server could not take: the line goes to the next turn. */
-const OPENCODE_STEER_QUEUED_STATUS = "couldn't deliver to the running OpenCode turn — sending it next";
-
-/** Stop: how long a delete/archive/agent switch waits for the driver to settle (it confirms or gives up within 10 s). */
-const OPENCODE_SERVER_STOP_WAIT_MS = 12_000;
-
-/** How often the idle sweep looks at the servers, and the budget of its "is anything executing" probe. */
-const OPENCODE_SWEEP_INTERVAL_MS = 60_000;
-const OPENCODE_ACTIVE_PROBE_MS = 5_000;
-
-function trackOpencodeServerTurn(runId: string, taskId: string, task: Task, agent: SpawnedAgent): void {
-  const turn = opencodeServerTurnOf(agent);
-  if (!turn) return;
-  opencodeServerTurns.set(runId, { taskId, harnessId: taskHarnessId(task), turn });
-  scheduleOpencodeWatchRefresh();
-}
-
-/** Called by the run's done handler. True when the run was a server-transport turn. */
-function forgetOpencodeServerTurn(runId: string): boolean {
-  const entry = opencodeServerTurns.get(runId);
-  if (!entry) return false;
-  opencodeServerTurns.delete(runId);
-  if (entry.turn.lingering()) {
-    lingeringOpencodeTurns.set(entry.taskId, [...(lingeringOpencodeTurns.get(entry.taskId) ?? []), entry]);
-  }
-  scheduleOpencodeWatchRefresh();
-  return true;
-}
-
-/** The task's handles that are still lingering; the ones that ended on their own are dropped. */
-function liveLingeringOpencodeTurns(taskId: string): OpencodeServerRun[] {
-  const all = lingeringOpencodeTurns.get(taskId);
-  if (!all) return [];
-  const live = all.filter((e) => e.turn.lingering());
-  if (live.length === 0) lingeringOpencodeTurns.delete(taskId);
-  else if (live.length !== all.length) lingeringOpencodeTurns.set(taskId, live);
-  return live;
-}
-
-/** End the task's lingering handles (delete, archive, agent switch, Stop with no run active). Bounded; never throws. */
-async function disposeLingeringOpencodeTurns(taskId: string): Promise<void> {
-  const entries = lingeringOpencodeTurns.get(taskId);
-  lingeringOpencodeTurns.delete(taskId);
-  if (!entries || entries.length === 0) return;
-  await Promise.all(
-    entries.map((e) =>
-      boundedOpencodeWait(e.turn.dispose().catch(() => undefined), OPENCODE_SERVER_STOP_WAIT_MS),
-    ),
-  );
-}
-
-function boundedOpencodeWait(p: Promise<unknown>, ms: number): Promise<unknown> {
-  return Promise.race([
-    p,
-    new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, ms);
-      (timer as unknown as { unref?: () => void }).unref?.();
-    }),
-  ]);
-}
-
-/** True while this core drives a server-transport turn of the task. */
-function hasOpencodeServerTurn(taskId: string): boolean {
-  for (const t of opencodeServerTurns.values()) if (t.taskId === taskId) return true;
-  return false;
-}
-
-/**
- * The server-restart gate and the idle gate (I3): a harness's server is busy
- * while a server-transport turn of one of its tasks is live here (or a settled
- * one still lingers for background subagents), or any task on that harness has
- * a card open (a permission or question waits on the server holding the
- * request). `exceptRunId` leaves the asking turn itself out, so the restart
- * gate of its own `ensure` doesn't count the turn that is only starting.
- */
-function opencodeHarnessBusy(harnessId: string, opts: { exceptRunId?: string } = {}): boolean {
-  for (const [runId, t] of opencodeServerTurns) {
-    if (t.harnessId === harnessId && runId !== opts.exceptRunId) return true;
-  }
-  for (const taskId of [...lingeringOpencodeTurns.keys()]) {
-    if (liveLingeringOpencodeTurns(taskId).some((e) => e.harnessId === harnessId)) return true;
-  }
-  for (const [taskId, n] of pendingCountsByTask()) {
-    if (n <= 0) continue;
-    const task = tasks.get(taskId);
-    if (task && taskHarnessId(task) === harnessId) return true;
-  }
-  return false;
-}
-
-/** Overwrite a persisted tool_use whose name the mapper learned late, and re-broadcast it under its own row id. */
-function replaceMainEvent(runId: string, taskId: string, lineUuid: string, data: string): void {
-  try {
-    if (!runs.replaceMainEventDataByLineUuid(runId, lineUuid, data)) return;
-    const callId = (JSON.parse(data) as { id?: unknown } | null)?.id;
-    const hit = typeof callId === "string" ? runs.findToolUseEvent(runId, callId) : null;
-    if (hit) emit({ id: hit.id, runId, taskId, stream: "tool_use", data, ts: Date.now() });
-  } catch (err) {
-    console.warn(`[agetor] opencode: couldn't replace event ${lineUuid} of run ${runId}:`, err);
-  }
-}
-
-function opencodeTurnHooksFor(harnessId: string, runId: string, taskId: string): NonNullable<SpawnAgentArgs["opencodeTurnHooks"]> {
-  return {
-    // Excludes this very run: a stale-settings restart of an otherwise idle server must not read the turn being started as "busy".
-    isBusy: () => opencodeHarnessBusy(harnessId, { exceptRunId: runId }),
-    onReplace: (lineUuid, data) => replaceMainEvent(runId, taskId, lineUuid, data),
-    // An empty reject stops the turn: the run reads as cancelled (task to ready, no failure), and nothing wakes it again.
-    onUserStop: () => {
-      const handle = active.get(runId);
-      if (handle) handle.cancelled = true;
-      noteOpencodeUserStop(taskId);
-    },
-  };
-}
-
-/**
- * Tasks the user stopped (Stop, held Stop, delete, archive, harness switch, an
- * empty reject) and has not started or messaged since: a wake must not bring
- * their session back to life, even if a background child finishes or the stop
- * did not reach it. Cleared by the user's next start or sent message.
- */
-const opencodeUserStopped = new Set<string>();
-
-function noteOpencodeUserStop(taskId: string, isOpencode = resolveHarness(tasks.get(taskId)?.agent ?? "")?.kind === "opencode"): void {
-  if (!isOpencode) return;
-  opencodeUserStopped.add(taskId);
-  deferredOpencodeWakes.delete(taskId);
-}
-
-/** A start or a message from the user: the stop no longer applies. */
-function clearOpencodeUserStop(taskId: string): void {
-  opencodeUserStopped.delete(taskId);
-}
-
-/** A task whose last turn ran on the agetor-owned server (breadcrumb `server=agetor`). */
-function isOpencodeServerTask(taskId: string): boolean {
-  const task = tasks.get(taskId);
-  if (!task || resolveHarness(task.agent)?.kind !== "opencode") return false;
-  return opencodeTurnOfRun(task.runId)?.server === "agetor";
-}
-
-/**
- * A message sent while a server-transport turn runs: the user bubble goes on
- * the active run and the text is steered into the turn (no new run, no queue
- * entry). When the server can't take it (unreachable, the turn ending, an
- * earlier message already waiting in the queue, or a Stop in progress) it
- * queues for the next turn like `opencode run` does, with a status line saying
- * so. A turn that ended while the steer was in flight starts the message as
- * its own turn at once, since nothing would drain a queue for it.
- */
-async function steerOpencodeServerTurn(
-  taskId: string,
-  runId: string,
-  turn: OpencodeServerTurn,
-  line: string,
-): Promise<string | null> {
-  const queueEmpty = (opencodeTurnQueue.get(taskId)?.length ?? 0) === 0;
-  const stopping = active.get(runId)?.cancelled === true;
-  saveAndEmit({ runId, taskId, stream: "user", data: normalizeUserText(line) });
-  let outcome: "accepted" | "unavailable" = "unavailable";
-  const attempted = queueEmpty && !stopping;
-  if (attempted) {
-    try {
-      outcome = await turn.steer(line);
-    } catch (err) {
-      console.warn(`[agetor] opencode steer failed for task ${taskId}:`, err);
-    }
-  }
-  if (outcome === "accepted") return runId;
-  if (attempted) saveStatusLineQuietly(runId, taskId, OPENCODE_STEER_QUEUED_STATUS);
-  const task = tasks.get(taskId);
-  if (!task) return runId;
-  // Settled while we waited: its done handler may have drained already, so
-  // nothing would drain a queue for this line. Start it as its own turn, unless
-  // another run of the task (or a start in flight) took over meanwhile: that
-  // one drains the queue when it settles.
-  const taken = startingTaskIds.has(taskId) || [...active.values()].some((h) => h.taskId === taskId);
-  if (!active.has(runId) && !stopping && !taken) {
-    const next = await spawnOpencodeTurnNow(task, taskId, line, true);
-    return next ?? runId;
-  }
-  const q = opencodeTurnQueue.get(taskId) ?? [];
-  q.push(line);
-  opencodeTurnQueue.set(taskId, q);
-  return runId;
-}
-
-/** Stop every server-transport turn of the task and cancel its open cards; never waits past the driver's own confirm window. */
-async function stopOpencodeServerTurnsOfTask(taskId: string, reason: string): Promise<void> {
-  deferredOpencodeWakes.delete(taskId);
-  const mine = [...opencodeServerTurns].filter(([, t]) => t.taskId === taskId);
-  if (mine.length > 0) {
-    for (const [runId] of mine) {
-      const handle = active.get(runId);
-      if (handle) handle.cancelled = true;
-    }
-    cancelPendingForTask(taskId, reason);
-    for (const [, t] of mine) t.turn.kill();
-    await Promise.all(mine.map(([, t]) => boundedOpencodeWait(t.turn.done.catch(() => 0), OPENCODE_SERVER_STOP_WAIT_MS)));
-  }
-  await disposeLingeringOpencodeTurns(taskId);
-}
-
-/* ── Boot reattach ─────────────────────────────────────────────────────── */
-
-/**
- * Reattach to a server-transport turn that was running when agetor stopped
- * (boot reconcile). The server lives in its own tmux session and keeps the
- * turn going, so this joins it: null (→ the run is orphaned) when no server
- * was adopted for the harness or it no longer has the session (`probe`, taken
- * for all runs at once by {@link probeOpencodeSessionsAtBoot}). An unreachable
- * server is not "gone": the driver tries and settles the run `failed` with a
- * status line if it can't.
- */
-function reattachOpencodeServerRun(
-  row: { id: string; task_id: string; agent: string; opencode_session_id: string; started_at: number },
-  task: Task,
-  onChunk: ReturnType<typeof makeChunkHandler>,
-  probe: SessionProbe,
-): SpawnedAgent | null {
-  const harness = resolveHarness(row.agent);
-  if (!harness || harness.kind !== "opencode") return null;
-  if (!getOpencodeServer(harness.id) || probe === "gone") return null;
-  return attachOpencodeServerAgent({
-    taskId: row.task_id,
-    runId: row.id,
-    harness,
-    cwd: task.worktreePath ?? task.workdir,
-    task,
-    sessionId: row.opencode_session_id,
-    sinceMs: row.started_at,
-    reason: "reattach",
-    onChunk,
-    hooks: opencodeTurnHooksFor(harness.id, row.id, row.task_id),
-  });
-}
-
-/** Whether an adopted server still has a session: `unknown` when it could not be asked in time. */
-type SessionProbe = "ok" | "gone" | "unknown";
-
-const OPENCODE_BOOT_PROBE_MS = 5_000;
-
-/**
- * Ask the adopted servers about many sessions at once, under one overall
- * budget (a slow server must not hold the boot for every run in turn). A
- * missing server or a 404 is `gone`; an answer is `ok`; no answer in time or a
- * failure is `unknown`.
- */
-async function probeOpencodeSessionsAtBoot(
-  items: { key: string; harnessId: string; sessionId: string }[],
-): Promise<Map<string, SessionProbe>> {
-  const out = new Map<string, SessionProbe>();
-  if (items.length === 0) return out;
-  const all = Promise.all(
-    items.map(async (it) => {
-      const server = getOpencodeServer(it.harnessId);
-      if (!server) {
-        out.set(it.key, "gone");
-        return;
-      }
-      try {
-        const session = await createOpencodeClient(server, { timeoutMs: OPENCODE_BOOT_PROBE_MS }).getSession(it.sessionId);
-        out.set(it.key, session === null ? "gone" : "ok");
-      } catch {
-        out.set(it.key, "unknown");
-      }
-    }),
-  );
-  await boundedOpencodeWait(all, OPENCODE_BOOT_PROBE_MS + 500);
-  return out;
-}
-
-/**
- * Tasks to listen for again at boot: on the agetor-owned server, last turn over
- * (no run of theirs is `running`), with OpenCode subagent rows still `running`
- * or `orphaned` (a restart or a hand-over left them).
- */
-function opencodeLingerCandidates(
-  runningTaskIds: string[],
-): { taskId: string; runId: string; harnessId: string; sessionId: string }[] {
-  const ids = new Set<string>(subagents.taskIdsWithRunning());
-  for (const r of db
-    .query<{ task_id: string }, []>(
-      `SELECT DISTINCT task_id FROM subagents WHERE status = 'orphaned' AND parent_kind = 'opencode_subagent'`,
-    )
-    .all()) {
-    ids.add(r.task_id);
-  }
-  const live = new Set(runningTaskIds);
-  const out: { taskId: string; runId: string; harnessId: string; sessionId: string }[] = [];
-  for (const taskId of ids) {
-    if (live.has(taskId)) continue;
-    const task = tasks.get(taskId);
-    const harness = task && task.archivedAt == null ? resolveHarness(task.agent) : null;
-    if (!task || !harness || harness.kind !== "opencode") continue;
-    const last = runs.listForTask(taskId)[0];
-    if (!last?.opencodeSessionId || opencodeTurnOfRun(last.id)?.server !== "agetor") continue;
-    out.push({ taskId, runId: last.id, harnessId: harness.id, sessionId: last.opencodeSessionId });
-  }
-  return out;
-}
-
-/* ── Server wake (D7) ──────────────────────────────────────────────────── */
-
-/** harness id -> OpenCode session id -> task id: the sessions the hub watches for an execution the server starts by itself. */
-let opencodeWakeTargets = new Map<string, Map<string, string>>();
-let opencodeDriverStarted = false;
-let opencodeWatchScheduled = false;
-let opencodeWatchRefreshing = false;
-let opencodeWatchDirty = false;
-let opencodeSweepTimer: ReturnType<typeof setInterval> | null = null;
-let opencodeSweepInFlight = false;
-
-/** A wake the orchestrator could not act on because the task's own turn was still settling; retried once that turn is done. */
-const deferredOpencodeWakes = new Map<string, { serverKey: string; sessionId: string; envelope: OpencodeEnvelope }>();
-
-const WAKE_SLICE_MS = 15;
-
-/**
- * Recompute what the hub watches (D7): the session of every non-archived
- * task on an OpenCode harness whose last run recorded `server=agetor`. Cheap
- * to call; calls coalesce, and the work is sliced. A no-op before
- * `startOpencodeServerDriver()` (the wake handler is installed only after the
- * boot restore).
- */
-function scheduleOpencodeWatchRefresh(): void {
-  if (!opencodeDriverStarted) return;
-  if (opencodeWatchRefreshing) {
-    opencodeWatchDirty = true;
-    return;
-  }
-  if (opencodeWatchScheduled) return;
-  opencodeWatchScheduled = true;
-  setImmediate(() => {
-    opencodeWatchScheduled = false;
-    void runOpencodeWatchRefresh();
-  });
-}
-
-async function runOpencodeWatchRefresh(): Promise<void> {
-  opencodeWatchRefreshing = true;
-  try {
-    do {
-      opencodeWatchDirty = false;
-      await refreshOpencodeWatchesOnce();
-    } while (opencodeWatchDirty && opencodeDriverStarted);
-  } catch (err) {
-    console.warn("[agetor] opencode: refreshing the wake watch failed:", err);
-  } finally {
-    opencodeWatchRefreshing = false;
-  }
-}
-
-async function refreshOpencodeWatchesOnce(): Promise<void> {
-  // The last run (any status) of every non-archived task that ever had an
-  // OpenCode session: one pass over those tasks' runs, ranked per task (no
-  // per-row subquery), restricted through the session-id index.
-  const rows = db
-    .query<{ run_id: string; task_id: string; agent: string; session_id: string | null }, []>(
-      `WITH oc AS (SELECT DISTINCT task_id FROM runs WHERE opencode_session_id IS NOT NULL),
-            ranked AS (
-              SELECT r.id AS run_id, r.task_id AS task_id, r.agent AS agent, r.opencode_session_id AS session_id,
-                     ROW_NUMBER() OVER (PARTITION BY r.task_id ORDER BY r.started_at DESC, r.rowid DESC) AS rn
-                FROM runs r WHERE r.task_id IN (SELECT task_id FROM oc))
-       SELECT ranked.run_id, ranked.task_id, ranked.agent, ranked.session_id
-         FROM ranked JOIN tasks t ON t.id = ranked.task_id
-        WHERE ranked.rn = 1 AND ranked.session_id IS NOT NULL AND t.archived_at IS NULL`,
-    )
-    .all();
-  const next = new Map<string, Map<string, string>>();
-  let sliceStart = Date.now();
-  for (const row of rows) {
-    if (Date.now() - sliceStart > WAKE_SLICE_MS) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      sliceStart = Date.now();
-      if (!opencodeDriverStarted) return;
-    }
-    const harness = resolveHarness(row.agent);
-    if (!harness || harness.kind !== "opencode") continue;
-    if (opencodeTurnOfRun(row.run_id)?.server !== "agetor") continue;
-    let sessions = next.get(harness.id);
-    if (!sessions) next.set(harness.id, (sessions = new Map()));
-    sessions.set(row.session_id!, row.task_id);
-  }
-  const previous = opencodeWakeTargets;
-  opencodeWakeTargets = next;
-  for (const harnessId of new Set([...previous.keys(), ...next.keys()])) {
-    const server = getOpencodeServer(harnessId);
-    // No server: nothing to watch. Every turn that starts one schedules a refresh again.
-    if (!server) continue;
-    watchOpencodeSessionsForWake(
-      harnessId,
-      { url: server.url, password: server.password, epoch: server.startedAt },
-      [...(next.get(harnessId)?.keys() ?? [])],
-    );
-  }
-}
-
-type OpencodeWakeDecision =
-  | { kind: "go"; taskId: string; task: Task; harness: Harness }
-  | { kind: "defer"; taskId: string }
-  | { kind: "refuse" };
-
-/**
- * Whether the server's own execution on `sessionId` becomes a run now. Every
- * check is synchronous (the hub calls the wake handler on its read path), and
- * the caller claims the task before anything awaits. Refuses when the task is
- * gone, archived, tearing down, stopped by the user since their last start or
- * message, parked by the user (Done, Backlog, Blocked: the same intent
- * `pullBackParkedTask` respects), moved to another harness or session, or no
- * longer server-driven; DEFERS when a start is in flight or one of its own runs
- * is still live or settling (the execution may be the tail of that turn: a
- * steer that raced its end).
- */
-function decideOpencodeWake(serverKey: string, sessionId: string): OpencodeWakeDecision {
-  if (launchesFrozenFlag) return { kind: "refuse" };
-  const taskId = opencodeWakeTargets.get(serverKey)?.get(sessionId);
-  if (!taskId) return { kind: "refuse" };
-  const task = tasks.get(taskId);
-  if (!task || task.archivedAt != null || isTaskTearingDown(taskId)) return { kind: "refuse" };
-  const harness = resolveHarness(task.agent);
-  if (!harness || harness.kind !== "opencode" || harness.id !== serverKey || !harness.enabled) return { kind: "refuse" };
-  if (opencodeTransportOfTurn(peekCachedCliVersion(harness)) !== "server") return { kind: "refuse" };
-  if (findLastSessionIdForHarness(taskId, "opencode_session_id", harness.id) !== sessionId) return { kind: "refuse" };
-  if (opencodeUserStopped.has(taskId)) return { kind: "refuse" };
-  if (task.column === "done" || task.column === "backlog" || task.column === "blocked") return { kind: "refuse" };
-  // A start or send holds the task: decide again when it releases the claim.
-  if (startingTaskIds.has(taskId)) return { kind: "defer", taskId };
-  // The task's own turn is still live or settling. The execution is usually
-  // that turn's tail (a steer that landed right after `execution.succeeded`, or
-  // a background child's result starting the next one), and the hub fires this
-  // in the same dispatch that settled the driver, before the done handler has
-  // moved the run row. Wait for the settle, then decide again. Not after a Stop:
-  // the execution seen is the one being interrupted.
-  for (const [runId, t] of opencodeServerTurns) {
-    if (t.taskId === taskId && active.get(runId)?.cancelled === true) return { kind: "refuse" };
-  }
-  if (runs.listForTask(taskId).some((r) => r.status === "running")) return { kind: "defer", taskId };
-  for (const handle of active.values()) if (handle.taskId === taskId) return { kind: "defer", taskId };
-  return { kind: "go", taskId, task, harness };
-}
-
-/** The hub's wake handler: OpenCode started an execution on a watched session no agetor turn is listening to. */
-function onOpencodeServerWake(serverKey: string, sessionId: string, envelope: OpencodeEnvelope): void {
-  try {
-    const decision = decideOpencodeWake(serverKey, sessionId);
-    if (decision.kind === "refuse") return;
-    if (decision.kind === "defer") {
-      deferredOpencodeWakes.set(decision.taskId, { serverKey, sessionId, envelope });
-      return;
-    }
-    // Claim in this same synchronous run: nothing between the checks above and
-    // the claim awaits, so a concurrent start/send for the task sees it.
-    const { taskId } = decision;
-    startingTaskIds.add(taskId);
-    queueMicrotask(() => {
-      mintOpencodeWakeRun(taskId, serverKey, sessionId, envelope)
-        .catch((err) => console.warn(`[agetor] opencode: wake of task ${taskId} failed:`, err))
-        .finally(() => releaseStartingClaim(taskId));
-    });
-  } catch (err) {
-    console.warn("[agetor] opencode: wake handler failed:", err);
-  }
-}
-
-/** Mint the run for a server-started execution (`origin: "agent"`) and attach the driver to it. */
-async function mintOpencodeWakeRun(
-  taskId: string,
-  serverKey: string,
-  sessionId: string,
-  envelope: OpencodeEnvelope,
-): Promise<void> {
-  // The claim is held; re-check what could have changed since the handler ran.
-  const decision = decideOpencodeWakeClaimed(serverKey, sessionId);
-  if (!decision) return;
-  const { task, harness } = decision;
-  const newRunId = randomUUID();
-  const now = Date.now();
-  runs.insert({
-    id: newRunId,
-    taskId,
-    agent: task.agent,
-    status: "running",
-    startedAt: now,
-    endedAt: null,
-    exitCode: null,
-    tmuxSession: sessionNameFor(taskId),
-    claudeSessionId: null,
-    codexSessionId: null,
-    cursorSessionId: null,
-    geminiSessionId: null,
-    fxSessionId: null,
-    antigravitySessionId: null,
-    opencodeSessionId: sessionId,
-    origin: "agent",
-  });
-  const prevColumn: ColumnId = task.column;
-  tasks.update(taskId, { column: "running", runId: newRunId });
-  adoptPendingTaskCancel(taskId, newRunId);
-  if (prevColumn !== "running") {
-    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
-  }
-  const onChunk = makeChunkHandler(newRunId, taskId, "opencode", task.mode);
-  onChunk("status", opencodeTurnBreadcrumb(harness, task, null, "server"));
-  onChunk("status", "OpenCode continued this session on its own");
-  const agent = attachOpencodeServerAgent({
-    taskId,
-    runId: newRunId,
-    harness,
-    cwd: task.worktreePath ?? task.workdir,
-    task,
-    sessionId,
-    sinceMs: typeof envelope.created === "number" ? envelope.created : now,
-    reason: "wake",
-    onChunk,
-    hooks: opencodeTurnHooksFor(harness.id, newRunId, taskId),
-  });
-  if (await consumePendingCancel(newRunId, taskId, agent, onChunk, { dropClaudeSession: false })) return;
-  registerActiveRun(newRunId, taskId, task, agent);
-  attachDoneHandler(newRunId, taskId, agent);
-}
-
-/** {@link decideOpencodeWake} again once the claim is held: the start/send guards now see our own claim, so it only re-checks what the claim does not cover. */
-function decideOpencodeWakeClaimed(serverKey: string, sessionId: string): { task: Task; harness: Harness } | null {
-  if (launchesFrozenFlag) return null;
-  const taskId = opencodeWakeTargets.get(serverKey)?.get(sessionId);
-  if (!taskId) return null;
-  const task = tasks.get(taskId);
-  if (!task || task.archivedAt != null || isTaskTearingDown(taskId)) return null;
-  const harness = resolveHarness(task.agent);
-  if (!harness || harness.kind !== "opencode" || harness.id !== serverKey) return null;
-  if (opencodeUserStopped.has(taskId)) return null;
-  if (findLastSessionIdForHarness(taskId, "opencode_session_id", harness.id) !== sessionId) return null;
-  if (runs.listForTask(taskId).some((r) => r.status === "running")) return null;
-  for (const handle of active.values()) if (handle.taskId === taskId) return null;
-  return { task, harness };
-}
-
-/**
- * After a server-transport run settled (its done handler finished, queue
- * drained): decide again on a wake that arrived while it was settling. The
- * gates run afresh, so a run the drain just started still defers it. Not after
- * a Stop. The driver's attach catches up from the message snapshot since the
- * execution started, so an execution that already ended by now still lands as
- * a run with its reply.
- */
-function retryDeferredOpencodeWake(taskId: string, cancelled: boolean): void {
-  const wake = deferredOpencodeWakes.get(taskId);
-  if (!wake) return;
-  deferredOpencodeWakes.delete(taskId);
-  if (cancelled) return;
-  const created = typeof wake.envelope.created === "number" ? wake.envelope.created : 0;
-  const latest = runs.listForTask(taskId)[0];
-  if (latest && latest.startedAt > created) {
-    // A run began after the execution did (a drained queue turn took the same
-    // message over): wake only if the server still has the session executing.
-    void (async () => {
-      const server = getOpencodeServer(wake.serverKey);
-      if (!server) return;
-      try {
-        const running = await createOpencodeClient(server, { timeoutMs: OPENCODE_ACTIVE_PROBE_MS }).activeSessions();
-        if (!(wake.sessionId in running)) return;
-      } catch {
-        return;
-      }
-      onOpencodeServerWake(wake.serverKey, wake.sessionId, wake.envelope);
-    })();
-    return;
-  }
-  onOpencodeServerWake(wake.serverKey, wake.sessionId, wake.envelope);
-}
-
-/* ── Server lifecycle (D6) ─────────────────────────────────────────────── */
-
-/** What one look at the servers found. */
-interface OpencodeServerProbe {
-  /** Harness ids whose server has a session executing, or could not be asked (counted busy). */
-  executing: Set<string>;
-  /** The ones that could not be asked. */
-  unreachable: Set<string>;
-}
-
-/**
- * What the last probe found, kept for a quit, which cannot await a probe of its
- * own. `null` until the first probe: nothing is known, so a quit stops nothing.
- */
-let lastSweepExecuting: Set<string> | null = null;
-
-async function probeOpencodeServers(timeoutMs: number): Promise<OpencodeServerProbe> {
-  const probe: OpencodeServerProbe = { executing: new Set(), unreachable: new Set() };
-  await Promise.all(
-    harnesses
-      .list()
-      .filter((h) => h.kind === "opencode")
-      .map(async (h) => {
-        const server = getOpencodeServer(h.id);
-        if (!server) return;
-        try {
-          const running = await createOpencodeClient(server, { timeoutMs }).activeSessions();
-          if (Object.keys(running).length > 0) probe.executing.add(h.id);
-        } catch {
-          probe.executing.add(h.id);
-          probe.unreachable.add(h.id);
-        }
-      }),
-  );
-  return probe;
-}
-
-/** Whether the harness's server answers an authenticated info request at all. */
-async function opencodeServerAnswers(harnessId: string): Promise<boolean> {
-  const server = getOpencodeServer(harnessId);
-  if (!server) return false;
-  try {
-    await createOpencodeClient(server, { timeoutMs: OPENCODE_ACTIVE_PROBE_MS }).info();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * One idle sweep: stop the servers idle for 30 minutes unless a turn or card is
- * using them OR the server reports an executing session (a background subagent
- * may be running with no agetor run). The async probe runs first, so the
- * predicate `opencodeIdleSweep` takes stays synchronous. A server that can't be
- * asked anything and isn't in use is classified: one that doesn't answer an info
- * request either is dead and is stopped and forgotten (so nothing keeps
- * reconnecting to it). Each harness's hub stream closes right after its own
- * stop. Single-flight.
- */
-export async function runOpencodeIdleSweep(now: number = Date.now()): Promise<string[]> {
-  if (opencodeSweepInFlight) return [];
-  opencodeSweepInFlight = true;
-  try {
-    const probe = await probeOpencodeServers(OPENCODE_ACTIVE_PROBE_MS);
-    const stopped: string[] = [];
-    for (const id of probe.unreachable) {
-      if (opencodeHarnessBusy(id) || (await opencodeServerAnswers(id))) continue;
-      await stopOpencodeServer(id);
-      closeOpencodeHub(id);
-      probe.executing.delete(id);
-      stopped.push(id);
-    }
-    lastSweepExecuting = probe.executing;
-    const known = harnesses.list().filter((h) => h.kind === "opencode" && getOpencodeServer(h.id)).map((h) => h.id);
-    const inUse = (id: string): boolean => probe.executing.has(id) || opencodeHarnessBusy(id);
-    for (const id of known) {
-      // One server per pass, so its stream closes before the next stop starts.
-      const done = await opencodeIdleSweep(now, (hid) => hid !== id || inUse(hid));
-      if (done.includes(id)) {
-        closeOpencodeHub(id);
-        stopped.push(id);
-      }
-    }
-    // Servers of harnesses that no longer exist: nothing to probe, only the plain gate.
-    for (const id of await opencodeIdleSweep(now, (hid) => known.includes(hid) || inUse(hid))) {
-      closeOpencodeHub(id);
-      stopped.push(id);
-    }
-    if (stopped.length > 0) scheduleOpencodeWatchRefresh();
-    return stopped;
-  } catch (err) {
-    console.warn("[agetor] opencode: idle sweep failed:", err);
-    return [];
-  } finally {
-    opencodeSweepInFlight = false;
-  }
-}
-
-/**
- * Start the server driver's background parts, once the boot restore is done
- * (after `markBootReady()`): the wake handler and its watch, and the idle sweep.
- */
-export function startOpencodeServerDriver(): void {
-  if (opencodeDriverStarted) return;
-  opencodeDriverStarted = true;
-  setOpencodeWakeHandler(onOpencodeServerWake);
-  setOpencodeWatchLostHandler(() => scheduleOpencodeWatchRefresh());
-  scheduleOpencodeWatchRefresh();
-  // A quit can't await a probe: know what is executing from the start.
-  void probeOpencodeServers(OPENCODE_ACTIVE_PROBE_MS)
-    .then((probe) => {
-      lastSweepExecuting ??= probe.executing;
-    })
-    .catch(() => {});
-  opencodeSweepTimer = setInterval(() => {
-    void runOpencodeIdleSweep();
-  }, OPENCODE_SWEEP_INTERVAL_MS);
-  (opencodeSweepTimer as unknown as { unref?: () => void }).unref?.();
-}
-
-/**
- * The process is going away or handing over: stop the driver's background
- * parts and close the hub's streams. The servers are left running (they live in
- * their own tmux sessions; the next core adopts them), and so are the turns.
- */
-export function stopOpencodeServerDriver(): void {
-  opencodeDriverStarted = false;
-  // Detach, don't settle: closing the hub tells a live subscriber its server was
-  // lost, which would fail a run that is still going fine on the server. The
-  // next core reattaches the turns.
-  for (const t of opencodeServerTurns.values()) t.turn.detach();
-  for (const entries of lingeringOpencodeTurns.values()) for (const e of entries) e.turn.detach();
-  // A detached turn is inert: it is no longer a turn this core drives.
-  opencodeServerTurns.clear();
-  lingeringOpencodeTurns.clear();
-  if (opencodeSweepTimer) clearInterval(opencodeSweepTimer);
-  opencodeSweepTimer = null;
-  setOpencodeWakeHandler(null);
-  setOpencodeWatchLostHandler(null);
-  opencodeWakeTargets = new Map();
-  deferredOpencodeWakes.clear();
-  lastSweepExecuting = null;
-  closeOpencodeHub();
-}
-
-/**
- * A real stop of this core (a real quit of the app, `agetor daemon stop`, a CLI
- * daemon's idle exit): stop every OpenCode server nothing is using, fully
- * synchronously, because the process dies right after the hook that calls this
- * (Electrobun's `quit()` runs a synchronous forced exit). "Nothing is using" =
- * no turn, lingering handle or open card here, and no executing session at the
- * last probe; with no probe yet, nothing is stopped. Returns the stopped ids.
- */
-export function stopIdleOpencodeServersOnRealStop(): string[] {
-  const executing = lastSweepExecuting;
-  return stopIdleOpencodeServersSync((id) => executing === null || executing.has(id) || opencodeHarnessBusy(id));
-}
-
-/**
- * The app's before-quit decision for the servers: a quit that hands the port to
- * the background host (armed, not "quit completely") leaves them for it to
- * adopt; any other quit is a real stop. Returns the stopped ids.
- */
-export function stopOpencodeServersOnQuit(quit: { completely: boolean; backgroundArmed: boolean }): string[] {
-  if (!quit.completely && quit.backgroundArmed) return [];
-  return stopIdleOpencodeServersOnRealStop();
-}
-
-/** Test seam for the server driver's wake and watch state; production code never calls it. */
-export const __opencodeServerForTest = {
-  /** Feed the hub's wake handler directly (what the hub does when OpenCode starts an execution by itself). */
-  wake(serverKey: string, sessionId: string, envelope: OpencodeEnvelope): void {
-    onOpencodeServerWake(serverKey, sessionId, envelope);
-  },
-  /** Wakes waiting for their task's own run to settle. */
-  deferredWakes(): number {
-    return deferredOpencodeWakes.size;
-  },
-  /** The task a watched session belongs to, or null when the session is not watched. */
-  watchedTask(serverKey: string, sessionId: string): string | null {
-    return opencodeWakeTargets.get(serverKey)?.get(sessionId) ?? null;
-  },
-  /** The hooks a turn of `runId` is spawned with (its `isBusy` is the server's restart gate). */
-  turnHooks(harnessId: string, runId: string, taskId: string): NonNullable<SpawnAgentArgs["opencodeTurnHooks"]> {
-    return opencodeTurnHooksFor(harnessId, runId, taskId);
-  },
-  /** Server-transport turns this core drives, and settled turns still lingering for children. */
-  liveTurns(): { driving: number; lingering: number } {
-    let lingering = 0;
-    for (const taskId of [...lingeringOpencodeTurns.keys()]) lingering += liveLingeringOpencodeTurns(taskId).length;
-    return { driving: opencodeServerTurns.size, lingering };
-  },
-};
+initOpencodeServerOrchestrator({
+  active,
+  startingTaskIds,
+  releaseStartingClaim,
+  launchesFrozen: () => launchesFrozenFlag,
+  isTaskTearingDown,
+  resolveHarness,
+  taskHarnessId,
+  findLastSessionIdForHarness,
+  makeChunkHandler,
+  registerActiveRun,
+  attachDoneHandler,
+  consumePendingCancel,
+  adoptPendingTaskCancel,
+  emit,
+  emitGlobal,
+  saveAndEmit,
+  saveStatusLineQuietly,
+  normalizeUserText,
+  spawnFollowUpTurn: spawnOpencodeTurnNow,
+  followUpQueue: opencodeTurnQueue,
+  isPipelineStepTaskId,
+  stashQueuedFollowUpsOfStoppedStep,
+  opencodeTurnBreadcrumb,
+});
 
 /**
  * Tear down a task's OpenCode session (D-10) and orphan any subagent row the
@@ -6727,9 +6003,9 @@ export const __opencodeServerForTest = {
 async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
   // A server-transport turn has no tmux session: it is stopped over HTTP
   // (the driver's `kill` interrupts the session) and its open cards cancelled.
-  // Delete, archive and an agent switch all end the session for good: nothing
-  // may wake it again.
-  noteOpencodeUserStop(taskId, true);
+  // Delete, archive and an agent switch leave no card for this session: an
+  // execution the server starts on it later is interrupted, not woken
+  // (`decideOpencodeWake`).
   await stopOpencodeServerTurnsOfTask(taskId, reason);
   await dropOpencodeSession(taskId);
   orphanRunningOpencodeSubagents(taskId, reason);
@@ -6784,11 +6060,13 @@ function opencodeModelLabel(harness: Harness, model: string | null): string {
 
 /**
  * D-19: the opening status line of every OpenCode turn
- * (`formatOpencodeTurnBreadcrumb`). The server is the EFFECTIVE one (a
- * harness with a home always runs Standalone; v1 has none → `n/a`), and the
- * effort is the one actually passed (the sentinel model carries no variant
- * → `auto`). The line is also the run's durable record of its server mode,
- * read back by `opencodeTurnOfRun` (teardown, boot, reattach).
+ * (`formatOpencodeTurnBreadcrumb`). The server is the one the turn really
+ * uses: `agetor` for a turn on the agetor-owned server (plan D9); on `opencode
+ * run` (1.x has none → `n/a`; 2.x under the kill switch) the legacy
+ * effective mode `opencodeEffectiveServerFor` picks. The effort is the one
+ * actually passed (the sentinel model carries no variant → `auto`). The line is
+ * also the run's durable record of its server mode, read back by
+ * `opencodeTurnOfRun` (teardown, boot, reattach).
  */
 function opencodeTurnBreadcrumb(
   harness: Harness,
@@ -9935,8 +9213,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   // goes (plan §3 T2 item 8).
   clearFxRecovery(taskId);
   // A wake still waiting on a settling turn has nothing left to wake.
-  deferredOpencodeWakes.delete(taskId);
-  opencodeUserStopped.delete(taskId);
+  dropDeferredOpencodeWake(taskId);
   // Routed through the same per-workdir teardown queue archiveTask uses —
   // DELETE's semantics are unchanged (still awaited before `tasks.delete`
   // below), but this serializes it behind any archive teardown already in
@@ -9995,8 +9272,6 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     throw err;
   } finally {
     deletingTaskIds.delete(taskId);
-    // The teardown above re-notes the stop for an OpenCode task; the row is gone now.
-    if (!tasks.get(taskId)) opencodeUserStopped.delete(taskId);
   }
 }
 

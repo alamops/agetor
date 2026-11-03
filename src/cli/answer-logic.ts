@@ -30,10 +30,17 @@ export function buildAskAnswer(
  * dashboard's AnswerOverlay.
  * ────────────────────────────────────────────────────────────────────────── */
 
-/** Printed when an OpenCode permission is rejected with no reason: OpenCode
- *  ends the turn on a bare reject, and continues when the reject has words. */
+/** Printed when an OpenCode permission is rejected with no reason: the action
+ *  is skipped and the agent continues without it (the core sends OpenCode the
+ *  one space it needs to keep the turn going; a typed reason goes to the agent
+ *  as written). OpenCode also declines the session's other pending requests. */
 export const OPENCODE_REJECT_NO_REASON_NOTICE =
-  "Rejected without a reason: the agent's turn stops. Reject with a reason and it continues.";
+  "Rejected without a reason: the action is skipped and the agent continues without it. " +
+  "Rejecting also declines the agent's other pending requests in this session.";
+
+/** The reason prompt of an OpenCode Reject (`agetor answer`). */
+export const OPENCODE_REJECT_REASON_PROMPT =
+  "Reason (empty skips this action; the agent continues; a reason is passed to the agent)";
 
 /** The permission card's Reject option id (`opencodePermissionOptions`). */
 export const OPENCODE_REJECT_OPTION = "reject";
@@ -114,34 +121,75 @@ export function planOpencodePermissionReply(
   return { ok: true, body: text !== "" ? { optionId, message: text } : { optionId } };
 }
 
-/** One OpenCode question's answer from the picks (option ids, plus
- *  {@link CUSTOM_OPTION} for the typed-text row) and the typed text. Ids go
- *  out as `selectedOptionIds` (the labels too, for older readers). A
- *  single-select takes an option or typed text, never both; typed text needs
- *  the question's `allowCustom`. */
-export function buildOpencodeAnswer(
+/** The `Other — type an answer` and `Skip` picker rows of an OpenCode
+ *  question. A model-chosen option id or label can equal any string, so the
+ *  option rows are NUMBERS (their index in `q.options`) and these two stay
+ *  strings: no option row can collide with either sentinel. */
+export const OPENCODE_SKIP_CHOICE = "__opencode_skip__";
+
+/** What one OpenCode question's picker value means: an option index, or a sentinel. */
+export type OpencodeAskChoice = number | typeof CUSTOM_OPTION | typeof OPENCODE_SKIP_CHOICE;
+
+/** The entry both builders assemble: labels (older readers), option ids, typed text. */
+type OpencodeAskEntry = { selected: string[]; selectedOptionIds?: string[]; custom?: string };
+type OpencodeAskResult = { ok: true; entry: OpencodeAskEntry } | { ok: false; error: string };
+
+/** The shared tail: validate the typed text against the question and emit the entry. */
+function assembleOpencodeEntry(
   q: AskQuestion,
-  picks: string[],
-  custom: string | null,
-): { ok: true; entry: { selected: string[]; selectedOptionIds?: string[]; custom?: string } } | { ok: false; error: string } {
-  const base = buildAskAnswer(picks, custom);
-  if (!base) return { ok: false, error: "Pick an option or type an answer." };
-  const text = base.custom;
+  picked: ReadonlyArray<{ label: string; id?: string }>,
+  text: string | undefined,
+): OpencodeAskResult {
   if (text !== undefined && q.allowCustom !== true) {
     return { ok: false, error: "This question does not take a typed answer — pick an option." };
   }
-  if (!q.multiSelect && base.selected.length > 0 && text !== undefined) {
+  if (!q.multiSelect && picked.length > 0 && text !== undefined) {
     return { ok: false, error: "Pick an option or type an answer, not both." };
   }
-  const opts = base.selected.map((pick) => q.options.find((o) => (o.id ?? o.label) === pick));
-  const labels = base.selected.map((pick, i) => opts[i]?.label ?? pick);
-  const ids = opts.every((o) => o?.id !== undefined) ? opts.map((o) => o!.id!) : undefined;
+  const ids = picked.every((o) => o.id !== undefined) ? picked.map((o) => o.id!) : undefined;
   return {
     ok: true,
     entry: {
-      selected: labels,
+      selected: picked.map((o) => o.label),
       ...(ids && ids.length > 0 ? { selectedOptionIds: ids } : {}),
       ...(text !== undefined ? { custom: text } : {}),
     },
   };
+}
+
+/** One OpenCode question's answer from the picks (option ids, plus
+ *  {@link CUSTOM_OPTION} for the typed-text row) and the typed text. Ids go
+ *  out as `selectedOptionIds` (the labels too, for older readers). A
+ *  single-select takes an option or typed text, never both; typed text needs
+ *  the question's `allowCustom`. A pick equal to {@link CUSTOM_OPTION} is the
+ *  typed-text row, so a caller whose picks may hold a model-chosen id uses
+ *  {@link buildOpencodeAnswerByIndex} instead. */
+export function buildOpencodeAnswer(q: AskQuestion, picks: string[], custom: string | null): OpencodeAskResult {
+  const base = buildAskAnswer(picks, custom);
+  if (!base) return { ok: false, error: "Pick an option or type an answer." };
+  const picked = base.selected.map((pick) => {
+    const o = q.options.find((opt) => (opt.id ?? opt.label) === pick);
+    return o ? { label: o.label, id: o.id } : { label: pick };
+  });
+  return assembleOpencodeEntry(q, picked, base.custom);
+}
+
+/** Like {@link buildOpencodeAnswer} for `agetor answer`'s picker, whose option
+ *  rows are indexes into `q.options` (see {@link OpencodeAskChoice}): an option
+ *  whose id or label is `__agetor_custom__` or `__opencode_skip__` is still
+ *  just an option, and two options sharing an id or label stay distinct. The
+ *  {@link OPENCODE_SKIP_CHOICE} row is the caller's to handle before this. */
+export function buildOpencodeAnswerByIndex(
+  q: AskQuestion,
+  choices: ReadonlyArray<OpencodeAskChoice>,
+  custom: string | null,
+): OpencodeAskResult {
+  const text = custom?.trim() || undefined;
+  const picked = choices.flatMap((ch) => {
+    if (typeof ch !== "number") return [];
+    const o = q.options[ch];
+    return o ? [{ label: o.label, id: o.id }] : [];
+  });
+  if (picked.length === 0 && text === undefined) return { ok: false, error: "Pick an option or type an answer." };
+  return assembleOpencodeEntry(q, picked, text);
 }

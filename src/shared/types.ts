@@ -1153,7 +1153,7 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     id: "opencode-additional",
     label: "Additional OpenCode",
     description:
-      "Another OpenCode harness with its own HOME and XDG dirs so login, sessions and config are isolated from the built-in. It always runs OpenCode 2 turns with --standalone, since the shared background service can't be separated per account.",
+      "Another OpenCode harness with its own HOME and XDG dirs, so its login, sessions and config are isolated from the built-in one. On OpenCode 2 it also gets its own agetor-managed OpenCode server, separate from the built-in harness's.",
     kind: "opencode",
     suggestedHarnessId: "opencode-2",
     home: "{dataDir}/harnesses/opencode-2",

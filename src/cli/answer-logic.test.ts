@@ -24,6 +24,7 @@ import type { AnyRequest, AskQuestion } from "../bun/interactions.ts";
 import {
   answerFlagsError,
   buildOpencodeAnswer,
+  buildOpencodeAnswerByIndex,
   parseAnswerArgs,
   planOpencodePermissionReply,
 } from "./answer-logic.ts";
@@ -94,6 +95,42 @@ test("buildOpencodeAnswer: typed text needs allowCustom; a single-select takes a
   const multi = buildOpencodeAnswer(q({ allowCustom: true, multiSelect: true }), ["a", "b"], "extra");
   expect(multi).toEqual({ ok: true, entry: { selected: ["Same", "Same"], selectedOptionIds: ["a", "b"], custom: "extra" } });
   expect(buildOpencodeAnswer(q(), [], null).ok).toBe(false);
+});
+
+// A model-chosen option id or label can be any string, including the picker's own sentinels.
+const colliding = (over: Partial<AskQuestion> = {}): AskQuestion => ({
+  id: "k",
+  question: "Which?",
+  options: [
+    { id: "__agetor_custom__", label: "__opencode_skip__" },
+    { label: "__agetor_custom__" },
+    { id: "__opencode_skip__", label: "Third" },
+  ],
+  ...over,
+});
+
+test("buildOpencodeAnswerByIndex: an option whose id or label equals a sentinel is still just an option", () => {
+  expect(buildOpencodeAnswerByIndex(colliding(), [0], null))
+    .toEqual({ ok: true, entry: { selected: ["__opencode_skip__"], selectedOptionIds: ["__agetor_custom__"] } });
+  // no id on the second option: labels only, nothing dropped as the typed-text sentinel
+  expect(buildOpencodeAnswerByIndex(colliding(), [1], null))
+    .toEqual({ ok: true, entry: { selected: ["__agetor_custom__"] } });
+  expect(buildOpencodeAnswerByIndex(colliding({ multiSelect: true }), [0, 2], null))
+    .toEqual({ ok: true, entry: { selected: ["__opencode_skip__", "Third"], selectedOptionIds: ["__agetor_custom__", "__opencode_skip__"] } });
+});
+
+test("buildOpencodeAnswerByIndex: the typed-text row is the sentinel string, never an option", () => {
+  expect(buildOpencodeAnswerByIndex(colliding({ allowCustom: true }), [CUSTOM_OPTION], "mine"))
+    .toEqual({ ok: true, entry: { selected: [], custom: "mine" } });
+  expect(buildOpencodeAnswerByIndex(colliding(), [CUSTOM_OPTION], "mine").ok).toBe(false);
+  expect(buildOpencodeAnswerByIndex(colliding({ allowCustom: true }), [0], "and more").ok).toBe(false);
+  expect(buildOpencodeAnswerByIndex(colliding(), [], null).ok).toBe(false);
+  expect(buildOpencodeAnswerByIndex(colliding(), [9], null).ok).toBe(false);
+});
+
+test("buildOpencodeAnswerByIndex: two options sharing id and label stay distinct by position", () => {
+  const dup = q({ options: [{ id: "a", label: "Same" }, { id: "a", label: "Other" }] });
+  expect(buildOpencodeAnswerByIndex(dup, [1], null)).toEqual({ ok: true, entry: { selected: ["Other"], selectedOptionIds: ["a"] } });
 });
 
 test("answerFlagsError: --reason with several permission cards pending is refused up front", () => {

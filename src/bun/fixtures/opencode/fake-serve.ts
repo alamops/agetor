@@ -422,10 +422,10 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
   }
 
   // ------------------------------------------------------- execution
-  function maybeStart(s: Session, script?: Scenario): Exec | undefined {
+  function maybeStart(s: Session, script?: Scenario, force = false): Exec | undefined {
     const r = rt(s.id);
     if (r.exec || !sessions.has(s.id)) return r.exec;
-    if (!s.inbox.some((i) => !i.delivered)) return undefined;
+    if (!force && !s.inbox.some((i) => !i.delivered)) return undefined;
     let finish!: () => void;
     const done = new Promise<void>((res) => (finish = res));
     const ex: Exec = { ac: new AbortController(), done, unanswered: [], script };
@@ -846,7 +846,10 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
   const scenarios: Record<ScenarioName, (c: Ctx, initial: InboxItem[]) => Promise<void>> = {
     default: async (c, initial) => {
       const wake = initial.find((i) => i.type === "synthetic" && i.payload?.metadata?.source === "subagent");
-      if (wake) await c.answer(`The background subagent finished: ${wake.payload.description ?? "done"}.`);
+      if (wake) {
+        const verb = wake.payload.metadata?.state === "cancelled" ? "was cancelled" : "finished";
+        await c.answer(`The background subagent ${verb}: ${wake.payload.description ?? "done"}.`);
+      }
       else await c.answer(`ACK: ${snippet(initial)}`);
     },
 
@@ -1110,8 +1113,11 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
             await cc.answer("Output: `LATE`\n\nThe command completed after the 8-second sleep and printed `LATE` as expected.");
           });
           void cex.done.then(() => {
-            const state = cex.failed ? "failed" : "completed";
-            const text = `<subagent sessionID="${child.id}" state="${state}" description="${description}">\n${cex.failed ? String(cex.failed.message) : (cex.finalText ?? "")}\n</subagent>`;
+            // live-verified 2.1.3 (r2): interrupting the child (POST its /interrupt) wakes the parent
+            // with a "cancelled" synthetic; interrupting the parent never touches the child.
+            const state = cex.failed ? "failed" : child.outcome === "interrupted" ? "cancelled" : "completed";
+            const body = cex.failed ? String(cex.failed.message) : state === "cancelled" ? "Subagent cancelled" : (cex.finalText ?? "");
+            const text = `<subagent sessionID="${child.id}" state="${state}" description="${description}">\n${body}\n</subagent>`;
             if (stopped || !sessions.has(c.s.id)) return;
             enqueue(c.s, {
               id: newId("msg"),
@@ -1300,7 +1306,22 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       if (typeof body.text !== "string") return err.invalid('Missing key\n  at ["text"]');
       const delivery = body.delivery === "queue" ? "queue" : "steer";
       const id = typeof body.id === "string" && body.id ? body.id : newId("msg");
-      if (s.inbox.some((i) => i.id === id) || s.messages.some((x) => x.id === id)) return err.conflict(`Message already exists: ${id}`, id);
+      // live-verified 2.1.3 (r2): a prompt id must be a message id.
+      if (!id.startsWith("msg_")) return err.invalid('Expected a string starting with "msg_"\n  at ["id"]');
+      // live-verified 2.1.3 (r2): a repeated id on the SAME session returns the original record
+      // and delivers nothing again; the same id on ANOTHER session is a 409.
+      const original = s.inbox.find((i) => i.id === id);
+      if (original) {
+        // After idle the repeat still runs an empty execution (started, then succeeded, no step),
+        // unless the body says `resume: false`.
+        if (!rt(s.id).exec && body.resume !== false) maybeStart(s, async () => {}, true);
+        return jsonResponse(200, { data: { id: original.id, sessionID: sid, time: original.time, type: "user", payload: original.payload, delivery: original.delivery } });
+      }
+      for (const other of sessions.values()) {
+        if (other !== s && (other.inbox.some((i) => i.id === id) || other.messages.some((x) => x.id === id))) {
+          return err.conflict(`Prompt message ID conflicts with an existing durable record: ${id}`, id);
+        }
+      }
       const item = enqueue(s, { id, type: "user", payload: { text: body.text, ...(body.metadata ? { metadata: body.metadata } : {}) }, delivery });
       return jsonResponse(200, { data: { id: item.id, sessionID: sid, time: item.time, type: "user", payload: item.payload, delivery } });
     }
@@ -1326,7 +1347,19 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       if (!rec) return jsonResponse(404, { _tag: "PermissionNotFoundError", requestID: rid, message: `Permission request not found: ${rid}` });
       r.perms.delete(rid);
       publish("permission.replied", { sessionID: sid, requestID: rid, reply: body.decision });
-      rec.resolve({ decision: body.decision, ...(typeof body.message === "string" && body.message ? { message: body.message } : {}) });
+      const reply = { decision: body.decision, ...(typeof body.message === "string" && body.message ? { message: body.message } : {}) };
+      // live-verified 2.1.3 (r2): ONE reject also rejects every other pending permission of the
+      // session with the same message (a permission.replied for each).
+      const others: PermRec[] = [];
+      if (body.decision === "reject") {
+        for (const [otherId, other] of [...r.perms]) {
+          r.perms.delete(otherId);
+          publish("permission.replied", { sessionID: sid, requestID: otherId, reply: "reject" });
+          others.push(other);
+        }
+      }
+      rec.resolve(reply);
+      for (const other of others) other.resolve(reply);
       return jsonResponse(204);
     }
 
@@ -1445,6 +1478,20 @@ function argOf(argv: string[], name: string): string | undefined {
   return eq ? eq.slice(name.length + 1) : undefined;
 }
 
+/**
+ * True only when `pid` no longer exists (`ESRCH`). `EPERM` is a parent that is
+ * alive but belongs to another user (or a sandbox): the fake keeps running.
+ * `probe` defaults to `process.kill`.
+ */
+export function parentProcessGone(pid: number, probe: (pid: number, signal: 0) => unknown = process.kill): boolean {
+  try {
+    probe(pid, 0);
+    return false;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
 if (import.meta.main) {
   const argv = process.argv.slice(2);
   const given = process.env.OPENCODE_PASSWORD;
@@ -1480,10 +1527,6 @@ if (import.meta.main) {
   // (Bun caches process.ppid, so probe the original parent pid instead.)
   const parent = process.ppid;
   setInterval(() => {
-    try {
-      process.kill(parent, 0);
-    } catch {
-      quit();
-    }
+    if (parentProcessGone(parent)) quit();
   }, 1000);
 }

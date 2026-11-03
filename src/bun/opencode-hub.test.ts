@@ -129,7 +129,7 @@ describe("routing", () => {
       expect(x.origin.sessionId).toBe(b);
       expect(x.e.data.sessionID).toBe(b);
     }
-    expect(__forTest.streamStats()).toEqual({ opened: 1, maxConcurrent: 1 });
+    expect(__forTest.streamStats()).toEqual({ opened: 1, maxConcurrent: 1, open: 1 });
     expect(__forTest.probe(KEY)?.subscribers).toBe(2);
   });
 
@@ -214,14 +214,14 @@ describe("reconnect and resync", () => {
     // created while the hub is (probably) between streams: its session.created is not seen live
     const gapChild = await newSession(srv, a);
     await until(() => ra.resyncs >= 1 && rb.resyncs >= 1, "resync");
-    await Bun.sleep(300); // no second resync may follow
-    expect(ra.resyncs).toBe(1);
-    expect(rb.resyncs).toBe(1);
     expect(__forTest.probe(KEY)?.owned).toContain(gapChild);
 
     // events flow again, with one stream at a time
     await prompt(srv, a, "after the gap");
     await until(() => ra.count("session.execution.succeeded", a) === 1, "turn after reconnect");
+    // the whole turn went by on the new stream and no second resync followed
+    expect(ra.resyncs).toBe(1);
+    expect(rb.resyncs).toBe(1);
     expect(__forTest.streamStats().maxConcurrent).toBe(1);
     expect(__forTest.streamStats().opened).toBe(2);
   });
@@ -396,8 +396,8 @@ describe("wake", () => {
   test("a server-initiated execution on a watched root with no subscriber calls the wake handler once", async () => {
     const srv = await boot({ speed: 0.15 });
     const root = await newSession(srv);
-    const woke: Array<{ key: string; sid: string; e: OpencodeEnvelope }> = [];
-    setOpencodeWakeHandler((key, sid, e) => woke.push({ key, sid, e }));
+    const woke: Array<{ key: string; sid: string; e: OpencodeEnvelope; trigger?: unknown }> = [];
+    setOpencodeWakeHandler((key, sid, e, trigger) => woke.push({ key, sid, e, trigger }));
     const ref = { url: srv.url, password: srv.password };
     watchOpencodeSessionsForWake(KEY, ref, [root]);
 
@@ -411,13 +411,109 @@ describe("wake", () => {
     };
     await prompt(srv, root, "go __agetor_fake_oc_wake__");
     await until(() => woke.length >= 1, "wake handler called");
-    await Bun.sleep(600); // the second execution runs to its end; no second wake may follow
+    // The second execution runs to its end (the hub sees its terminal event and
+    // the server has nothing active); only then can "no second wake" be asserted.
+    await until(() => !__forTest.probe(KEY)!.openExec.includes(root), "the woken execution ended on the hub");
+    expect((await api(srv, "GET", "/api/session/active")).data[root]).toBeUndefined();
     expect(woke).toHaveLength(1);
     expect(woke[0]!.key).toBe(KEY);
     expect(woke[0]!.sid).toBe(root);
     expect(woke[0]!.e.type).toBe("session.execution.started");
     expect(woke[0]!.e.data.sessionID).toBe(root);
+    // the fake wakes the parent through a synthetic inbox item for the finished background child
+    expect(woke[0]!.trigger).toMatchObject({ source: "subagent", state: "completed" });
+    expect(typeof (woke[0]!.trigger as { childID?: unknown }).childID).toBe("string");
     expect(rec.count("session.execution.started", root)).toBe(1); // only the subscribed turn
+  });
+
+  describe("wake trigger", () => {
+    // A scripted event stream: the test pushes SSE envelopes by hand.
+    function scripted() {
+      let ctl!: ReadableStreamDefaultController<Uint8Array>;
+      const enc = new TextEncoder();
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch(req) {
+          const u = new URL(req.url);
+          if (u.pathname === "/api/event") {
+            const body = new ReadableStream<Uint8Array>({
+              start(c) {
+                ctl = c;
+                c.enqueue(enc.encode(`data: ${JSON.stringify({ type: "server.connected" })}\n\n`));
+              },
+            });
+            return new Response(body, { headers: { "content-type": "text/event-stream" } });
+          }
+          if (u.pathname === "/api/session/active") return Response.json({ data: {} });
+          return new Response("nf", { status: 404 });
+        },
+      });
+      let n = 0;
+      const push = (type: string, data: Record<string, unknown>) =>
+        ctl.enqueue(enc.encode(`data: ${JSON.stringify({ id: `evt_${++n}`, created: n, type, data })}\n\n`));
+      return { server, push, ref: { url: `http://127.0.0.1:${server.port}`, password: "pw-scripted" } };
+    }
+    const synthetic = (sid: string, metadata: Record<string, unknown>) => ({
+      inboxID: "msg_x",
+      sessionID: sid,
+      item: { type: "synthetic", payload: { text: "t", metadata }, delivery: "steer" },
+    });
+
+    test("synthetic(cancelled) then started passes the trigger; a wake with no synthetic passes undefined; an execution end clears it", async () => {
+      const { server, push, ref } = scripted();
+      try {
+        const woke: Array<{ sid: string; trigger: unknown }> = [];
+        setOpencodeWakeHandler((_k, sid, _e, trigger) => woke.push({ sid, trigger }));
+        watchOpencodeSessionsForWake(KEY, ref, ["ses_root"]);
+        await until(() => __forTest.probe(KEY)?.connected === true, "connected");
+
+        push("session.inbox.enqueued", synthetic("ses_root", { source: "subagent", childID: "ses_kid", state: "cancelled", agent: "General" }));
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.length === 1, "first wake");
+        expect(woke[0]).toEqual({ sid: "ses_root", trigger: { source: "subagent", childID: "ses_kid", state: "cancelled" } });
+
+        // its end forgets the trigger: the next wake has none
+        push("session.execution.succeeded", { sessionID: "ses_root" });
+        await until(() => !__forTest.probe(KEY)!.woken.includes("ses_root"), "first execution ended");
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.length === 2, "second wake");
+        expect(woke[1]!.trigger).toBeUndefined();
+        push("session.execution.succeeded", { sessionID: "ses_root" });
+
+        // a user-type inbox item or one with no metadata is no trigger; the latest synthetic wins
+        await until(() => !__forTest.probe(KEY)!.woken.includes("ses_root"), "second execution ended");
+        push("session.inbox.enqueued", { inboxID: "m1", sessionID: "ses_root", item: { type: "user", payload: { text: "hi" } } });
+        push("session.inbox.enqueued", synthetic("ses_root", { source: "subagent", childID: "ses_a", state: "error" }));
+        push("session.inbox.enqueued", synthetic("ses_root", { source: "subagent", childID: "ses_b", state: "completed" }));
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.length === 3, "third wake");
+        expect(woke[2]!.trigger).toEqual({ source: "subagent", childID: "ses_b", state: "completed" });
+      } finally {
+        server.stop(true);
+      }
+    });
+
+    test("the open-execution wake on the last unsubscribe carries the trigger too", async () => {
+      const { server, push, ref } = scripted();
+      try {
+        const woke: Array<{ sid: string; trigger: unknown }> = [];
+        setOpencodeWakeHandler((_k, sid, _e, trigger) => woke.push({ sid, trigger }));
+        watchOpencodeSessionsForWake(KEY, ref, ["ses_root"]);
+        const rec = new Rec();
+        const sub = subscribeOpencodeSession({ key: KEY, ...ref }, "ses_root", rec);
+        await sub.ready;
+        push("session.inbox.enqueued", synthetic("ses_root", { source: "subagent", childID: "ses_kid", state: "cancelled" }));
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => rec.count("session.execution.started", "ses_root") === 1, "the subscriber saw the started");
+        expect(woke).toHaveLength(0); // attached: its driver owns the execution
+        sub.unsubscribe(); // the execution is still open
+        await until(() => woke.length === 1, "wake on unsubscribe");
+        expect(woke[0]!.trigger).toEqual({ source: "subagent", childID: "ses_kid", state: "cancelled" });
+      } finally {
+        server.stop(true);
+      }
+    });
   });
 
   test("a subscribed session never triggers the wake handler", async () => {
@@ -859,7 +955,7 @@ describe("server restart and late watches", () => {
     const rb = new Rec();
     await subscribeOpencodeSession({ key: KEY, url: srvA.url, password: srvA.password, epoch: 1 }, a, ra).ready;
     const subB = subscribeOpencodeSession({ key: KEY, url: srvB.url, password: srvB.password, epoch: 2 }, b, rb);
-    expect(ra.lost).toHaveLength(1);
+    await until(() => ra.lost.length === 1, "the lost notification (delivered after the new subscriber registered)");
     expect(String((ra.lost[0] as Error).message)).toBe("OpenCode server restarted");
     expect(ra.resyncs).toBe(0);
     await subB.ready;
@@ -871,6 +967,57 @@ describe("server restart and late watches", () => {
     expect(ra.lost).toHaveLength(1);
     expect(rb.lost).toHaveLength(0);
     expect(__forTest.streamStats().maxConcurrent).toBe(1);
+  });
+
+  test("a lost driver that unsubscribes inside onServerLost does not orphan the new subscriber (S3)", async () => {
+    const srvA = await boot();
+    const srvB = await boot({ password: "pw-restarted" });
+    const a = await newSession(srvA);
+    const b = await newSession(srvB);
+    const ra = new Rec();
+    let subA!: { unsubscribe(): void; ready: Promise<void> };
+    // what the driver's settle() does when told the server is gone
+    ra.onServerLost = (err?: unknown) => {
+      ra.lost.push(err ?? "lost");
+      subA.unsubscribe();
+    };
+    subA = subscribeOpencodeSession({ key: KEY, url: srvA.url, password: srvA.password, epoch: 1 }, a, ra);
+    await subA.ready;
+    const rb = new Rec();
+    const subB = subscribeOpencodeSession({ key: KEY, url: srvB.url, password: srvB.password, epoch: 2 }, b, rb);
+    const verdict = await Promise.race([subB.ready.then(() => "ready"), Bun.sleep(5000).then(() => "timeout")]);
+    expect(verdict).toBe("ready");
+    expect(ra.lost).toHaveLength(1);
+    // the record survived the old driver's unsubscribe: B's stream is the live one
+    expect(__forTest.probe(KEY)?.subscribers).toBe(1);
+    expect(__forTest.probe(KEY)?.streamOpen).toBe(true);
+    await prompt(srvB, b, "heard on the new server");
+    await until(() => rb.count("session.execution.succeeded") === 1, "turn on the new server");
+    subB.unsubscribe();
+    // nothing leaked: the record is gone and so is its stream
+    expect(__forTest.probe(KEY)).toBeNull();
+    expect(__forTest.streamStats().open).toBe(0);
+  });
+
+  test("a newer epoch resets the failure count (S3)", async () => {
+    __forTest.setBackoff({ baseMs: 5000, maxMs: 5000, maxFailures: 10, stableMs: 60_000 });
+    const dead = await boot();
+    const deadUrl = dead.url;
+    await dead.stop();
+    const deadB = await boot();
+    const deadBUrl = deadB.url;
+    await deadB.stop();
+    const live = await boot({ password: "pw-restarted" });
+    const sid = await newSession(live);
+    const first = subscribeOpencodeSession({ key: KEY, url: deadUrl, password: "pw-hub-test", epoch: 1 }, "ses_old", new Rec());
+    await until(() => __forTest.probe(KEY)?.failures === 1, "one failed attempt");
+    // a newer epoch whose server is unreachable too: the count restarts from this attempt, not 2
+    const second = subscribeOpencodeSession({ key: KEY, url: deadBUrl, password: "pw-hub-test", epoch: 2 }, "ses_mid", new Rec());
+    await until(() => __forTest.probe(KEY)?.retryPending === true, "the new epoch's first attempt failed");
+    expect(__forTest.probe(KEY)?.failures).toBe(1);
+    await subscribeOpencodeSession({ key: KEY, url: live.url, password: live.password, epoch: 3 }, sid, new Rec()).ready;
+    first.unsubscribe();
+    second.unsubscribe();
   });
 
   test("a pending subscriber of the old server gets its ready rejected by the restart", async () => {

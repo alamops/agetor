@@ -4,7 +4,7 @@ import type { OpencodeSubagentNotice } from "./opencode-tmux.ts";
 import { exportOutcome, exportToEvents, runOpencodeExport, type OpencodeExport } from "./opencode-export.ts";
 import { createOpencodeEventMapper, type OpencodeMappedChunk } from "./opencode-events.ts";
 import { opencodeErrorMessage } from "./opencode-map-helpers.ts";
-import type { OpencodeClient } from "./opencode-http.ts";
+import { OpencodeHttpError, type OpencodeClient } from "./opencode-http.ts";
 import {
   opencodeChildrenDieWithTurn,
   opencodeTurnBreadcrumbPrefix,
@@ -211,6 +211,28 @@ export function opencodeTurnOfRun(runId: string | null): { major: 1 | 2; server:
  *  background child that hasn't finished a day after its turn ended is
  *  dead (its Shared service restarted or was killed). */
 export const ORPHAN_RECHECK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The OpenCode child sessions of a task that are still worth following: rows
+ * `running`, plus rows `orphaned` within {@link ORPHAN_RECHECK_MAX_AGE_MS} of
+ * being orphaned. An older orphan is dead weight (its server restarted, or it
+ * predates this server): offering it to the driver's relist / catch-up / boot
+ * linger would keep a linger and the server alive on every boot. Never throws.
+ */
+export function listOpenOpencodeChildSessions(taskId: string, now: number = Date.now()): string[] {
+  const out: string[] = [];
+  try {
+    for (const row of subagents.listForTask(taskId)) {
+      if (!isOpencodeSubagentRow(row) || (row.status !== "running" && row.status !== "orphaned")) continue;
+      if (row.status === "orphaned" && now - (row.endedAt ?? row.startedAt) >= ORPHAN_RECHECK_MAX_AGE_MS) continue;
+      const id = opencodeChildSessionOf(row);
+      if (id) out.push(id);
+    }
+  } catch (e) {
+    console.error("[opencode-subagents] could not list open subagent rows:", e);
+  }
+  return out;
+}
 
 function settleRow(row: Subagent, status: SubagentStatus): void {
   const endedAt = Date.now();
@@ -514,13 +536,18 @@ function ingestChunk(row: Subagent, runId: string, chunk: OpencodeMappedChunk): 
  * {@link syncOpencodeChildFromServer}, which yields between slices. Never throws.
  */
 export function ingestOpencodeChildChunks(a: { taskId: string; childSessionId: string; chunks: OpencodeMappedChunk[] }): void {
+  ingestChildChunks(a, true);
+}
+
+/** `revive: false` is for a catch-up replaying history, which proves nothing about the child being alive now. */
+function ingestChildChunks(a: { taskId: string; childSessionId: string; chunks: OpencodeMappedChunk[] }, revive: boolean): void {
   if (a.chunks.length === 0) return;
   try {
     const found = subagents.get(opencodeSubagentId(a.childSessionId));
     if (!found || found.taskId !== a.taskId) return;
     const runId = runIdFor(found);
     if (!runId) return;
-    const row = reviveIfOrphaned(found);
+    const row = revive ? reviveIfOrphaned(found) : found;
     for (const chunk of a.chunks) ingestChunk(row, runId, chunk);
   } catch (e) {
     console.error(`[opencode-subagents] failed to ingest chunks of ${a.childSessionId}:`, e);
@@ -582,7 +609,7 @@ async function ingestSliced(a: { taskId: string; childSessionId: string; chunks:
     const deadline = performance.now() + INGEST_SLICE_MS;
     let to = from;
     while (to < a.chunks.length && (to === from || performance.now() < deadline)) to++;
-    ingestOpencodeChildChunks({ taskId: a.taskId, childSessionId: a.childSessionId, chunks: a.chunks.slice(from, to) });
+    ingestChildChunks({ taskId: a.taskId, childSessionId: a.childSessionId, chunks: a.chunks.slice(from, to) }, false);
     from = to;
     if (from < a.chunks.length) await yieldToLoop();
   }
@@ -597,7 +624,10 @@ const inFlightSyncs = new Map<string, Promise<void>>();
  * the event mapper's seed anchored on the child's first user message (when the
  * whole history was read), ingests what the tab doesn't have yet, and settles
  * the row from the trailing `idle` message's outcome. A child without an
- * `idle` tail is still running: an `orphaned` row comes back to `running`.
+ * `idle` tail may still be running: an `orphaned` row comes back to `running`
+ * only when the server lists the child among its active sessions (history
+ * proves nothing about now); otherwise it stays orphaned. A child the server
+ * answers 404 for is settled for good ({@link settleGoneChild}).
  * Creates the row when missing (title and agent from `getSession`; none when
  * the server has no such session). Yields to the event loop between pages and
  * between slices of a page. Calls for the same child share one run. Never throws.
@@ -648,7 +678,17 @@ async function syncChild(a: { taskId: string; runId: string; client: OpencodeCli
       truncated = true;
       break;
     }
-    const res = await a.client.listMessages(a.childSessionId, { limit: SYNC_PAGE_LIMIT, ...(cursor ? { cursor } : { order: "desc" as const }) });
+    let res: Awaited<ReturnType<OpencodeClient["listMessages"]>>;
+    try {
+      res = await a.client.listMessages(a.childSessionId, { limit: SYNC_PAGE_LIMIT, ...(cursor ? { cursor } : { order: "desc" as const }) });
+    } catch (e) {
+      if (e instanceof OpencodeHttpError && e.status === 404) {
+        const gone = subagents.get(id);
+        if (gone) settleGoneChild(gone);
+        return;
+      }
+      throw e;
+    }
     if (res.data.length > 0) pages.push(res.data);
     const next = res.cursor?.next;
     if (res.data.length === 0 || !next || next === cursor) break;
@@ -678,5 +718,33 @@ async function syncChild(a: { taskId: string; runId: string; client: OpencodeCli
     return;
   }
   const row = subagents.get(id);
-  if (row) reviveIfOrphaned(row);
+  if (row && row.status === "orphaned" && (await isChildActive(a.client, a.childSessionId))) reviveIfOrphaned(row);
+}
+
+/** True only when the server positively lists the session as active; any error or doubt is "not active". */
+async function isChildActive(client: OpencodeClient, childSessionId: string): Promise<boolean> {
+  try {
+    const active = await client.activeSessions();
+    return active[childSessionId] !== undefined;
+  } catch (e) {
+    console.error(`[opencode-subagents] could not check whether ${childSessionId} is active:`, e);
+    return false;
+  }
+}
+
+/**
+ * The server answered 404 for this child: it will never run again here (a 1.x
+ * era child, a wiped or replaced server). A `running` row is parked `orphaned`
+ * with a status line; an `orphaned` row is left exactly as it is — its
+ * `endedAt` is not refreshed, so the age limit ({@link ORPHAN_RECHECK_MAX_AGE_MS})
+ * keeps running down — and a terminal row is untouched. It is never revived by a
+ * later sync, since only a child the server lists as active can be.
+ */
+function settleGoneChild(row: Subagent): void {
+  if (row.status !== "running") return;
+  const runId = runIdFor(row);
+  if (runId) {
+    append(row, runId, "status", `OpenCode subagent "${label(row)}" is no longer known to the OpenCode server`, `opencode:subagent:${row.id}:gone`, null);
+  }
+  settleRow(row, "orphaned");
 }

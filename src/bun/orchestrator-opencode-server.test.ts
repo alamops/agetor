@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Run, Task } from "../shared/types.ts";
@@ -8,9 +8,11 @@ import type { Run, Task } from "../shared/types.ts";
 // (docs/plans/opencode-server-driver.md, T11): the REAL driver, hub and server
 // manager against the fake OpenCode server (`fixtures/opencode/fake-serve.ts`,
 // hosted by the stub binary as a child of this process, no tmux). Covers
-// start, steer, queued steer, Stop, restart reattach, server wake (and its
-// deferral), the transports that must NOT take the server path, the 402 hint,
-// permission cards, delete with a card open, the idle sweep and the quit stop.
+// start, steer, queued steer, Stop, restart reattach, server wake (its
+// deferral, and plan R3: a wake after a Stop or onto a parked card runs, one
+// with no card is interrupted), the transports that must NOT take the server
+// path, the 402 hint, permission cards, delete with a card open, a server crash
+// mid-turn, the idle sweep and the quit stop.
 
 setDefaultTimeout(60_000);
 
@@ -33,6 +35,11 @@ mkdirSync(WORKDIR, { recursive: true });
 const V1_BIN = path.join(DATA_DIR, "opencode-v1");
 writeFileSync(V1_BIN, ['#!/bin/sh', 'if [ "$1" = "--version" ]; then echo "1.19.4"; exit 0; fi', 'if [ "$1" = "auth" ]; then echo "[]"; exit 0; fi', "exit 0", ""].join("\n"));
 chmodSync(V1_BIN, 0o755);
+/** The stub behind a `--version` that takes 3 s while SLOW_VERSION_FLAG exists (a follow-up's version probe holds its spawn). */
+const SLOW_VERSION_FLAG = path.join(DATA_DIR, "slow-version");
+const SLOW_VERSION_BIN = path.join(DATA_DIR, "opencode-slow-version");
+writeFileSync(SLOW_VERSION_BIN, ["#!/bin/sh", `if [ "$1" = "--version" ] && [ -f "${SLOW_VERSION_FLAG}" ]; then sleep 3; fi`, `exec "${STUB_BIN}" "$@"`, ""].join("\n"));
+chmodSync(SLOW_VERSION_BIN, 0o755);
 /** A tmux that refuses everything: a launch through the legacy driver fails at once, after its breadcrumb is written. */
 const NO_TMUX = path.join(DATA_DIR, "tmux-refuses");
 writeFileSync(NO_TMUX, "#!/bin/sh\nexit 1\n");
@@ -45,6 +52,7 @@ let hubMod: typeof import("./opencode-hub.ts");
 let interactions: typeof import("./interactions.ts");
 let http: typeof import("./opencode-http.ts");
 let subagentsMod: typeof import("./opencode-subagents.ts");
+let agentStatus: typeof import("./agent-status.ts");
 let fakeMarkers: typeof import("./fixtures/opencode/fake-serve.ts").FAKE_OC_MARKERS;
 let restoreHarnesses: (() => void) | undefined;
 
@@ -56,7 +64,11 @@ beforeAll(async () => {
   setEnv("AGETOR_OPENCODE_SERVER_HOST", "direct");
   setEnv("FAKE_OC_BUN", process.execPath);
   setEnv("FAKE_OC_SPEED", "0.1");
-  setEnv("FAKE_OC_HEARTBEAT_MS", "60000");
+  // Well under the hub's 45 s stall watchdog, so a quiet stream is never read as stalled.
+  setEnv("FAKE_OC_HEARTBEAT_MS", "2000");
+  // Sibling files leave a fake tmux (often /bin/echo) behind: this file's
+  // servers run on the direct host, and the legacy-path tests pin their own.
+  setEnv("AGETOR_TMUX_BIN", undefined);
   db = await import("./db.ts");
   restoreHarnesses = (await import("./test-harness-state.ts")).snapshotHarnessState();
   orch = await import("./orchestrator.ts");
@@ -65,6 +77,7 @@ beforeAll(async () => {
   interactions = await import("./interactions.ts");
   http = await import("./opencode-http.ts");
   subagentsMod = await import("./opencode-subagents.ts");
+  agentStatus = await import("./agent-status.ts");
   fakeMarkers = (await import("./fixtures/opencode/fake-serve.ts")).FAKE_OC_MARKERS;
   db.harnesses.setEnabled("opencode", true);
   // Boot order: servers adopted, orphans reconciled, THEN the wake handler.
@@ -76,7 +89,9 @@ beforeAll(async () => {
 afterAll(async () => {
   orch.stopOpencodeServerDriver();
   hubMod.closeOpencodeHub();
-  for (const id of ["opencode", "opencode-ks", "opencode-v1", "opencode-fp", "opencode-dead", "opencode-cold"]) await serverMod.stopOpencodeServer(id).catch(() => {});
+  hubMod.__forTest.resetBackoff();
+  interactions.__testing.reset();
+  for (const id of HARNESS_IDS) await serverMod.stopOpencodeServer(id).catch(() => {});
   serverMod.__forTest.reapDirect();
   serverMod.__forTest.forget();
   restoreHarnesses?.();
@@ -87,6 +102,12 @@ afterAll(async () => {
   const { rmTestDataDir } = await import("./test-data-dir.ts");
   rmTestDataDir(DATA_DIR);
 });
+
+/** Every harness a test here starts a server for (afterAll stops them all). */
+const HARNESS_IDS = [
+  "opencode", "opencode-ks", "opencode-v1", "opencode-fp", "opencode-fp2", "opencode-dead", "opencode-cold",
+  "opencode-cold2", "opencode-cold3", "opencode-slow", "opencode-crash", "opencode-s1",
+];
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function waitFor(pred: () => boolean, ms = 30_000, what = "condition"): Promise<void> {
@@ -125,16 +146,30 @@ const assistantOf = (runId: string) => eventsOf(runId, "assistant").join("\n");
 const pending = (taskId: string) => interactions.listPendingForTask(taskId);
 const sessionOf = (taskId: string) => db.runs.sessionIdsForTask(taskId, "opencode_session_id")[0]?.sessionId ?? null;
 /** The server no longer has this session executing (Stop/delete really interrupted it). */
-async function expectInterrupted(sessionId: string): Promise<void> {
-  const c = serverClient();
-  for (let i = 0; i < 100 && sessionId in (await c.activeSessions()); i++) await sleep(50);
+async function expectInterrupted(sessionId: string, harnessId = "opencode"): Promise<void> {
+  const c = serverClient(harnessId);
+  for (let i = 0; i < 200 && sessionId in (await c.activeSessions()); i++) await sleep(50);
   expect(Object.keys(await c.activeSessions())).not.toContain(sessionId);
 }
-const serverClient = () => {
-  const h = serverMod.getOpencodeServer("opencode");
+const serverClient = (harnessId = "opencode") => {
+  const h = serverMod.getOpencodeServer(harnessId);
   if (!h) throw new Error("no OpenCode server is running");
   return http.createOpencodeClient({ url: h.url, password: h.password });
 };
+/** Start an execution on `sessionId` from outside agetor (what a background child's result does). */
+async function executeOnServer(sessionId: string, text: string, harnessId = "opencode"): Promise<void> {
+  const c = serverClient(harnessId);
+  await c.prompt(sessionId, { text, delivery: "steer" });
+  for (let i = 0; i < 200 && !(sessionId in (await c.activeSessions())); i++) await sleep(25);
+}
+/** The run's done handler has finished (its last line is the exit status). */
+const doneHandled = (runId: string) => statusOf(runId).some((l) => /^(cancelled \(exit:|exit:|cancelled$)/.test(l));
+function addHarness(id: string, bin = STUB_BIN): void {
+  db.harnesses.insert({ id, kind: "opencode", label: `OpenCode (${id})`, bin });
+  db.harnesses.setEnabled(id, true);
+}
+const hostPidOf = (harnessId: string) =>
+  (JSON.parse(readFileSync(serverMod.__forTest.statePath(harnessId), "utf8")) as { hostPid: number }).hostPid;
 
 test("start: the turn runs on the agetor-owned server, breadcrumb server=agetor, review", async () => {
   const task = await newTask({ prompt: "hello   there" });
@@ -166,10 +201,9 @@ test("steer: a message sent mid-turn folds into the same run (no new run row)", 
   expect(statusOf(runId).some((s) => s.includes("couldn't deliver"))).toBe(false);
 });
 
-test("a message sent before the prompt reached the server still folds into the same turn", async () => {
+test("a message sent before the prompt reached the server still folds into the same turn; after a Stop OpenCode answers it as a wake, never as a user turn", async () => {
   // A harness whose server is not running yet: starting it takes far longer than the send.
-  db.harnesses.insert({ id: "opencode-cold", kind: "opencode", label: "OpenCode (cold)", bin: STUB_BIN });
-  db.harnesses.setEnabled("opencode-cold", true);
+  addHarness("opencode-cold");
   const task = await newTask({ prompt: `first ${fakeMarkers.slow}`, agent: "opencode-cold" });
   const runId = await start(task);
   const sent = await orch.sendInput(runId, "second");
@@ -177,12 +211,19 @@ test("a message sent before the prompt reached the server still folds into the s
   // The turn is still running (it only ends on a Stop), and the message went into it.
   await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
   expect(await orch.cancelRun(runId)).toBe(true);
-  await settled(task.id, 20_000);
-  // A steer that had been queued instead would start a second turn once this one stopped.
-  await sleep(500);
-  expect(runsOf(task.id)).toHaveLength(1);
+  await waitFor(() => doneHandled(runId), 20_000, "the done handler");
   expect(eventsOf(runId, "user")).toHaveLength(2);
   expect(statusOf(runId).some((l) => l.includes("couldn't deliver"))).toBe(false);
+  // Nothing queued it as a turn of agetor's own (that would be a user run).
+  expect(orch.__opencodeServerForTest.queuedFollowUps(task.id)).toBe(0);
+  // The steered message was still waiting in the stopped turn: OpenCode runs it
+  // next, and that execution is a wake (plan R3), whenever the hub sees it.
+  await waitFor(() => runsOf(task.id).length === 2 && allSettled(task.id), 30_000, "the wake run");
+  const [first, woke] = runsOf(task.id);
+  expect(first!.status).toBe("cancelled");
+  expect(woke!.origin).toBe("agent");
+  expect(eventsOf(woke!.id, "user")).toHaveLength(0);
+  expect(assistantOf(woke!.id)).toContain("ACK: second");
 });
 
 test("a message sent while a Stop is in progress is queued as the next turn", async () => {
@@ -216,7 +257,8 @@ test("Stop interrupts the session: run cancelled, task back to ready", async () 
 });
 
 test("a provider 402 fails the run with the error line and the quota hint", async () => {
-  const task = await newTask({ prompt: `fail ${fakeMarkers.error}` });
+  // A Zen model: the hint names the Go models only for OpenCode's own provider.
+  const task = await newTask({ prompt: `fail ${fakeMarkers.error}`, model: "opencode/deepseek-v4.1-flash" });
   const runId = await start(task);
   await settled(task.id);
   expect(db.runs.get(runId)!.status).toBe("failed");
@@ -323,28 +365,51 @@ test("a wake that arrived during a turn the user then stops is dropped, not mint
   orch.__opencodeServerForTest.wake("opencode", sid, { type: "session.execution.started", id: "evt_test_wake_2", created: Date.now() });
   expect(orch.__opencodeServerForTest.deferredWakes()).toBe(1);
   expect(await orch.cancelRun(runId)).toBe(true);
-  await settled(task.id, 20_000);
-  await sleep(300);
-  expect(runsOf(task.id)).toHaveLength(1);
+  // The Stop drops the deferred wake at once: the execution it saw is the one being interrupted.
   expect(orch.__opencodeServerForTest.deferredWakes()).toBe(0);
+  await settled(task.id, 20_000);
+  await waitFor(() => doneHandled(runId), 10_000, "the done handler");
+  await expectInterrupted(sid);
+  expect(runsOf(task.id)).toHaveLength(1);
 });
 
-test("a wake for a task that was watched and then archived mints nothing", async () => {
+test("a wake for a task that was archived interrupts the execution: no card to pull back, nothing runs unattended", async () => {
   const task = await newTask({ prompt: "quick" });
   await start(task);
   await settled(task.id);
   const sid = sessionOf(task.id)!;
-  // Watched first: the refusal below is the archived check, not an unknown session.
   await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode", sid) === task.id, 10_000, "the wake watch");
   db.tasks.update(task.id, { column: "done" });
   const archived = await orch.archiveTask(task.id);
   expect(archived).not.toHaveProperty("error");
+  // The refresh drops the archived task from the watch; a wake racing it still names the task.
+  await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode", sid) === null, 10_000, "the watch refresh");
+  await executeOnServer(sid, `again ${fakeMarkers.slow}`);
+  expect(sid in (await serverClient().activeSessions())).toBe(true);
+  orch.__opencodeServerForTest.pinWatch("opencode", sid, task.id);
   orch.__opencodeServerForTest.wake("opencode", sid, { type: "session.execution.started", id: "evt_test_wake_4", created: Date.now() });
-  await sleep(300);
+  await expectInterrupted(sid);
   expect(runsOf(task.id)).toHaveLength(1);
 });
 
-test("a wake never revives a task the user stopped, until their next message; parked columns refuse too", async () => {
+test("a wake for a task that moved to another harness interrupts the execution on the old server", async () => {
+  addHarness("opencode-cold2");
+  const task = await newTask({ prompt: "quick" });
+  await start(task);
+  await settled(task.id);
+  const sid = sessionOf(task.id)!;
+  await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode", sid) === task.id, 10_000, "the wake watch");
+  const before = db.tasks.get(task.id)!;
+  db.tasks.update(task.id, { agent: "opencode-cold2" });
+  await orch.reconcileTaskSession(task.id, before, db.tasks.get(task.id)!);
+  // The hub still watches the session on the old harness's server: the execution there has no card.
+  await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode", sid) === task.id, 10_000, "the old watch");
+  await executeOnServer(sid, `again ${fakeMarkers.slow}`);
+  await expectInterrupted(sid);
+  expect(runsOf(task.id)).toHaveLength(1);
+});
+
+test("a wake after the user's Stop becomes an agent run and pulls a parked card (Done, Backlog, Blocked) back to Running", async () => {
   const task = await newTask({ prompt: `run ${fakeMarkers.slow}` });
   const runId = await start(task);
   await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
@@ -353,30 +418,27 @@ test("a wake never revives a task the user stopped, until their next message; pa
   expect(await orch.cancelRun(runId)).toBe(true);
   await settled(task.id, 20_000);
   await expectInterrupted(sid);
-  // Stopped by the user: the server starting something on the session is not a reason to run again.
-  orch.__opencodeServerForTest.wake("opencode", sid, { type: "session.execution.started", id: "evt_test_wake_5", created: Date.now() });
-  await sleep(300);
-  expect(runsOf(task.id)).toHaveLength(1);
-  // The user's next message ends the stop...
-  const sent = await orch.sendInput(runId, "carry on");
-  expect(sent).toMatchObject({ delivered: true });
-  await waitFor(() => runsOf(task.id).length === 2 && allSettled(task.id), 40_000, "the follow-up turn");
-  await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode", sid) === task.id, 10_000, "the wake watch again");
-  // ...but a card parked in Done, Backlog or Blocked still refuses.
-  for (const column of ["done", "backlog", "blocked"] as const) {
+  let expected = 1;
+  for (const column of ["ready", "done", "backlog", "blocked"] as const) {
     db.tasks.update(task.id, { column });
-    orch.__opencodeServerForTest.wake("opencode", sid, { type: "session.execution.started", id: `evt_test_wake_6_${column}`, created: Date.now() });
-    await sleep(200);
-    expect(runsOf(task.id)).toHaveLength(2);
+    // OpenCode starts an execution on the session by itself (the hub's real wake).
+    await executeOnServer(sid, `wake ${column} ${fakeMarkers.slow}`);
+    expected += 1;
+    await waitFor(() => runsOf(task.id).length === expected, 30_000, `the wake run from ${column}`);
+    const woke = runsOf(task.id)[expected - 1]!;
+    expect(woke.origin).toBe("agent");
+    expect(woke.opencodeSessionId).toBe(sid);
+    expect(woke.tmuxSession).toBeNull(); // a server turn has no tmux session of its own
+    expect(db.tasks.get(task.id)!.column).toBe("running");
+    expect(db.tasks.get(task.id)!.runId).toBe(woke.id);
+    await waitFor(() => eventsOf(woke.id, "tool_use").length > 0, 30_000, "the woken turn's tool step");
+    expect(await orch.cancelRun(woke.id)).toBe(true);
+    await settled(task.id, 20_000);
+    await expectInterrupted(sid);
   }
-  // In review it wakes: the stop really was cleared.
-  db.tasks.update(task.id, { column: "review" });
-  orch.__opencodeServerForTest.wake("opencode", sid, { type: "session.execution.started", id: "evt_test_wake_7", created: Date.now() });
-  await waitFor(() => runsOf(task.id).length === 3 && allSettled(task.id), 30_000, "the wake run");
-  expect(runsOf(task.id)[2]!.origin).toBe("agent");
 });
 
-test("Stop on a held task (background child running) disposes the lingering handle; the child finishing wakes nothing", async () => {
+test("Stop on a held task interrupts its background child; the cancelled child's report is the Stop's tail (refused, interrupted), a later execution is a wake like any other", async () => {
   // Slow motion, so the child is still running when the Stop lands.
   await serverMod.stopOpencodeServer("opencode");
   setEnv("FAKE_OC_SPEED", "3");
@@ -385,19 +447,85 @@ test("Stop on a held task (background child running) disposes the lingering hand
     const first = await start(task);
     await waitFor(() => db.runs.get(first)!.status === "succeeded", 60_000, "the first turn");
     await waitFor(() => db.subagents.listForTask(task.id).some((x) => x.status === "running"), 30_000, "the background child");
+    const children = subagentsMod.listOpenOpencodeChildSessions(task.id);
+    expect(children.length).toBeGreaterThan(0);
     expect(db.tasks.get(task.id)!.column).toBe("running"); // held
     expect(orch.__opencodeServerForTest.liveTurns().lingering).toBe(1);
     expect(await orch.cancelRun(first)).toBe(true);
     expect(orch.__opencodeServerForTest.liveTurns().lingering).toBe(0);
     await waitFor(() => !db.subagents.listForTask(task.id).some((x) => x.status === "running"), 20_000, "the child row to settle");
-    // The server finishes the child and hands its result to the parent; with no stop-marker that was a wake.
-    await sleep(6000);
+    // The server side: the child really stopped.
+    for (const child of children) await expectInterrupted(child);
+    const sid = sessionOf(task.id)!;
+    // OpenCode reports the cancelled child to the parent and starts an execution
+    // for it (plan R4): the tail of this Stop, so no run, and it is interrupted.
+    await waitFor(() => doneHandled(first), 10_000, "the first run's done handler");
+    orch.__opencodeServerForTest.wake(
+      "opencode",
+      sid,
+      { type: "session.execution.started", id: "evt_test_wake_tail", created: Date.now() },
+      { source: "subagent", childID: children[0]!, state: "cancelled" },
+    );
+    await expectInterrupted(sid);
     expect(runsOf(task.id)).toHaveLength(1);
-    expect(db.tasks.get(task.id)!.column).not.toBe("running");
+    // Whatever OpenCode runs on the parent next is not refused because of that Stop (plan R3).
+    await executeOnServer(sid, `carry on ${fakeMarkers.slow}`);
+    await waitFor(() => runsOf(task.id).some((r) => r.origin === "agent" && r.status === "running"), 60_000, "the wake run");
+    expect(db.tasks.get(task.id)!.column).toBe("running");
+    const woke = runsOf(task.id).find((r) => r.origin === "agent" && r.status === "running")!;
+    expect(await orch.cancelRun(woke.id)).toBe(true);
+    await settled(task.id, 30_000);
   } finally {
     await serverMod.stopOpencodeServer("opencode");
     setEnv("FAKE_OC_SPEED", "0.1");
   }
+});
+
+test("Stop during a follow-up's pending spawn, with a linger listening: the linger ends AND the new turn is cancelled", async () => {
+  addHarness("opencode-s1", SLOW_VERSION_BIN);
+  setEnv("FAKE_OC_SPEED", "3"); // only the server this test starts runs slow
+  try {
+    const task = await newTask({ prompt: `launch ${fakeMarkers.wake}`, agent: "opencode-s1" });
+    const first = await start(task);
+    setEnv("FAKE_OC_SPEED", "0.1");
+    await waitFor(() => db.runs.get(first)!.status === "succeeded", 60_000, "the first turn");
+    await waitFor(() => orch.__opencodeServerForTest.liveTurns().lingering === 1, 30_000, "the linger");
+    // The follow-up's version probe takes 3 s: its run row is minted, its agent not yet registered.
+    writeFileSync(SLOW_VERSION_FLAG, "");
+    agentStatus.__testing.clearStatusCache();
+    const sending = orch.sendInput(first, "a follow-up");
+    await waitFor(() => (db.tasks.get(task.id)!.runId ?? first) !== first, 10_000, "the follow-up's run row");
+    const next = db.tasks.get(task.id)!.runId!;
+    expect(db.runs.get(next)!.status).toBe("running");
+    expect(await orch.cancelRun(next)).toBe(true);
+    expect(orch.__opencodeServerForTest.liveTurns().lingering).toBe(0);
+    await sending;
+    await waitFor(() => db.runs.get(next)!.status !== "running", 30_000, "the follow-up to settle");
+    expect(db.runs.get(next)!.status).toBe("cancelled");
+    expect(assistantOf(next)).not.toContain("ACK: a follow-up");
+  } finally {
+    rmSync(SLOW_VERSION_FLAG, { force: true });
+    setEnv("FAKE_OC_SPEED", "0.1");
+    await serverMod.stopOpencodeServer("opencode-s1");
+  }
+});
+
+test("boot linger candidates: a recently orphaned child counts, one orphaned past the re-check window does not", async () => {
+  const task = await newTask({ prompt: "quick" });
+  const runId = await start(task);
+  await settled(task.id);
+  const sid = sessionOf(task.id)!;
+  const child = `ses_lingerchild${task.id.replace(/-/g, "").slice(0, 12)}`;
+  subagentsMod.registerOpencodeChildSession({ taskId: task.id, runId, parentSessionId: sid, childSessionId: child, depth: 1, background: true });
+  const now = Date.now();
+  const mine = () => orch.__opencodeServerForTest.lingerCandidates([], now).filter((c) => c.taskId === task.id);
+  db.subagents.setStatus(subagentsMod.opencodeSubagentId(child), "orphaned", now - subagentsMod.ORPHAN_RECHECK_MAX_AGE_MS - 1000);
+  expect(mine()).toEqual([]);
+  db.subagents.setStatus(subagentsMod.opencodeSubagentId(child), "orphaned", now - 60_000);
+  expect(mine()).toEqual([{ taskId: task.id, runId, harnessId: "opencode", sessionId: sid }]);
+  // A task with a run still running is reattached instead, never lingered.
+  expect(orch.__opencodeServerForTest.lingerCandidates([task.id], now).filter((c) => c.taskId === task.id)).toEqual([]);
+  db.subagents.setStatus(subagentsMod.opencodeSubagentId(child), "failed", now);
 });
 
 test("restart with a held task: the next core listens for the child again instead of orphaning it, and the wake still lands", async () => {
@@ -426,28 +554,125 @@ test("restart with a held task: the next core listens for the child again instea
   }
 });
 
-test("Ask card answered with an empty reject stops the turn: run cancelled, task ready, not failed", async () => {
+test("Ask card answered with an empty reject refuses the tool and the turn continues: run succeeds, task to review (plan R1)", async () => {
   const task = await newTask({ prompt: `do it ${fakeMarkers.permission}`, mode: "ask" });
   const runId = await start(task);
   await waitFor(() => pending(task.id).length === 1, 30_000, "the permission card");
-  const sid = sessionOf(task.id)!;
   interactions.answerOpencodePermission(pending(task.id)[0]!.id, { decision: "reject" });
   await settled(task.id, 30_000);
-  expect(db.runs.get(runId)!.status).toBe("cancelled");
-  expect(db.tasks.get(task.id)!.column).toBe("ready");
-  await expectInterrupted(sid);
+  expect(db.runs.get(runId)!.status).toBe("succeeded");
+  expect(db.tasks.get(task.id)!.column).toBe("review");
+  expect(runsOf(task.id)).toHaveLength(1);
 });
 
-test("the server's restart gate does not count the turn that is asking, but counts every other", async () => {
+test("the server's restart gate: a fresh spawn does not count itself, an attach always counts, every other turn counts", async () => {
   const task = await newTask({ prompt: `run ${fakeMarkers.slow}` });
   const runId = await start(task);
   await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
-  const own = orch.__opencodeServerForTest.turnHooks("opencode", runId, task.id);
+  const own = orch.__opencodeServerForTest.turnHooks("opencode", runId, task.id, "spawn");
+  const attached = orch.__opencodeServerForTest.turnHooks("opencode", runId, task.id, "attach");
   const other = orch.__opencodeServerForTest.turnHooks("opencode", "some-other-run", "some-other-task");
   expect(own.isBusy()).toBe(false); // idle apart from itself: a changed config may restart the server
+  expect(attached.isBusy()).toBe(true); // joining a running execution: a restart would kill it
   expect(other.isBusy()).toBe(true); // a different turn is using it
   expect(await orch.cancelRun(runId)).toBe(true);
   await settled(task.id, 20_000);
+});
+
+test("restart with changed harness settings: the reattached turn keeps its server (no restart under it) and completes", async () => {
+  addHarness("opencode-fp2");
+  const task = await newTask({ prompt: `do it ${fakeMarkers.permission}`, mode: "ask", agent: "opencode-fp2" });
+  const runId = await start(task);
+  await waitFor(() => pending(task.id).length === 1, 30_000, "the permission card");
+  const before = serverMod.getOpencodeServer("opencode-fp2")!;
+  expect(db.runs.get(runId)!.tmuxSession).toBeNull(); // a server turn has no tmux session of its own
+  orch.stopOpencodeServerDriver();
+  interactions.__testing.reset();
+  serverMod.__forTest.forget();
+  await serverMod.adoptOpencodeServers();
+  // The settings changed while the core was away: the adopted server no longer matches them.
+  db.harnesses.update("opencode-fp2", { env: { AGETOR_TEST_FINGERPRINT: "changed-under-a-live-turn" } });
+  expect(await orch.reconcileOrphans()).toBe(0);
+  orch.startOpencodeServerDriver();
+  await waitFor(() => pending(task.id).length === 1, 30_000, "the card to be re-raised");
+  expect(serverMod.getOpencodeServer("opencode-fp2")!.startedAt).toBe(before.startedAt);
+  interactions.answerOpencodePermission(pending(task.id)[0]!.id, { decision: "once" });
+  await settled(task.id);
+  expect(db.runs.get(runId)!.status).toBe("succeeded");
+  expect(assistantOf(runId)).toContain("The command ran: hi");
+  expect(serverMod.getOpencodeServer("opencode-fp2")!.startedAt).toBe(before.startedAt);
+});
+
+test("a message whose steer was still waiting when the user stopped a pipeline step goes to the backlog, not a new turn", async () => {
+  addHarness("opencode-cold3");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const profile = db.agentProfiles.insert({
+    name: `oc-step-${Date.now()}`,
+    harness: "opencode-cold3",
+    model: "opencode-go/deepseek-v4.1-flash",
+    effort: null,
+    mode: null,
+    speed: "off",
+    maxMode: false,
+    instructions: "",
+    skills: [],
+  });
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `do A ${fakeMarkers.slow}` });
+  const pipeline = db.pipelines.insert({ name: `oc-step-${Date.now()}`, graph: { steps: [A], edges: [], startStepId: A.id }, maxSteps: 25 });
+  const created = await orch.createTask({ title: "oc step", prompt: `goal ${fakeMarkers.slow}`, workdir: WORKDIR, isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const started = await orch.startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  let step: Task | undefined;
+  await waitFor(() => {
+    step = db.tasks.stepsForParent(created.task.id)[0];
+    return step?.column === "running" && !!step.runId && orch.__opencodeServerForTest.liveTurns().driving > 0;
+  }, 30_000, "the step's turn");
+  const stepRun = step!.runId!;
+  // The server is still starting: the steer waits for the turn's first prompt.
+  const sending = orch.sendInput(stepRun, "typed before the stop");
+  // Its bubble is on the run once the steer is in flight.
+  await waitFor(() => eventsOf(stepRun, "user").length === 2, 10_000, "the steer to be in flight");
+  expect(await orch.cancelRun(stepRun)).toBe(true);
+  await sending;
+  await waitFor(() => db.runs.get(stepRun)!.status === "cancelled" && doneHandled(stepRun), 30_000, "the stopped step");
+  await waitFor(() => db.tasks.get(step!.id)!.backlog.some((b) => b.text === "typed before the stop"), 10_000, "the backlog entry");
+  expect(db.runs.listForTask(step!.id).map((r) => r.id)).toEqual([stepRun]);
+  expect(statusOf(stepRun).some((l) => l.startsWith("queued message not sent — this pipeline step was stopped"))).toBe(true);
+});
+
+test("a server crash mid-turn fails the run with a status line; the next turn starts a new server and resumes the same session", async () => {
+  addHarness("opencode-crash");
+  db.harnesses.update("opencode-crash", { env: { FAKE_OC_STATE_FILE: path.join(DATA_DIR, "crash-sessions.json") } });
+  // Give up on the dead server in seconds, not the production minutes; the
+  // manager's 5 s health cache would then still vouch for the dead server
+  // (production's give-up takes far longer than that window).
+  hubMod.__forTest.setBackoff({ baseMs: 50, maxMs: 200, maxFailures: 3 });
+  serverMod.__forTest.setHealthCacheMs(0);
+  try {
+  const task = await newTask({ prompt: `run ${fakeMarkers.slow}`, agent: "opencode-crash" });
+  const runId = await start(task);
+  await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+  const sid = sessionOf(task.id)!;
+  const before = serverMod.getOpencodeServer("opencode-crash")!;
+  process.kill(hostPidOf("opencode-crash"), "SIGKILL");
+  await waitFor(() => db.runs.get(runId)!.status !== "running", 90_000, "the run to give up on the dead server");
+  expect(db.runs.get(runId)!.status).toBe("failed");
+  expect(db.tasks.get(task.id)!.column).toBe("ready");
+  expect(statusOf(runId).some((l) => l.startsWith("OpenCode server connection lost"))).toBe(true);
+  const sent = await orch.sendInput(runId, "after the crash");
+  expect(sent).toMatchObject({ delivered: true });
+  await waitFor(() => runsOf(task.id).length === 2 && allSettled(task.id), 60_000, "the next turn");
+  const next = runsOf(task.id)[1]!;
+  expect(next.status).toBe("succeeded");
+  expect(next.opencodeSessionId).toBe(sid);
+  expect(assistantOf(next.id)).toContain("ACK: after the crash");
+  expect(statusOf(next.id).some((l) => l.includes("couldn't resume"))).toBe(false);
+  expect(serverMod.getOpencodeServer("opencode-crash")!.startedAt).not.toBe(before.startedAt);
+  } finally {
+    hubMod.__forTest.resetBackoff();
+    serverMod.__forTest.setHealthCacheMs(5_000);
+  }
 });
 
 test("a changed harness config restarts an otherwise idle server for the next turn (the turn doesn't count itself as busy)", async () => {
@@ -500,7 +725,7 @@ test("the kill switch sends an OpenCode 2 turn down the legacy tmux path (no ser
     expect(statusOf(runId).some((l) => l.includes("Ask mode needs OpenCode 2"))).toBe(false);
   } finally {
     setEnv("AGETOR_OPENCODE_TRANSPORT", undefined);
-    setEnv("AGETOR_TMUX_BIN", savedEnv.AGETOR_TMUX_BIN);
+    setEnv("AGETOR_TMUX_BIN", undefined);
   }
 });
 
@@ -517,7 +742,7 @@ test("an OpenCode 1.x CLI takes the tmux path; Ask there runs without approvals 
     expect(statusOf(runId).some((s) => s.includes("Ask mode needs OpenCode 2"))).toBe(true);
     expect(serverMod.getOpencodeServer("opencode-v1")).toBeNull();
   } finally {
-    setEnv("AGETOR_TMUX_BIN", savedEnv.AGETOR_TMUX_BIN);
+    setEnv("AGETOR_TMUX_BIN", undefined);
   }
 });
 
@@ -559,9 +784,46 @@ test("a sweep classifies a dead server that can't be asked anything: stopped and
   const hostPid = (JSON.parse(readFileSync(serverMod.__forTest.statePath("opencode-dead"), "utf8")) as { hostPid: number }).hostPid;
   process.kill(hostPid, "SIGKILL");
   await sleep(300);
-  const stopped = await orch.runOpencodeIdleSweep(Date.now());
+  // Positive proof of death (the host is gone) and past the idle window.
+  const stopped = await orch.runOpencodeIdleSweep(Date.now() + 60 * 60_000);
   expect(stopped).toContain("opencode-dead");
   expect(serverMod.getOpencodeServer("opencode-dead")).toBeNull();
+});
+
+test("a sweep keeps a server that is only slow: a timeout is no proof of death", async () => {
+  addHarness("opencode-slow");
+  const task = await newTask({ agent: "opencode-slow", prompt: "hi" });
+  await start(task);
+  await settled(task.id);
+  const handle = serverMod.getOpencodeServer("opencode-slow")!;
+  const hostPid = hostPidOf("opencode-slow");
+  process.kill(hostPid, "SIGSTOP"); // alive, but answers nothing
+  try {
+    const stopped = await orch.runOpencodeIdleSweep(Date.now() + 60 * 60_000);
+    expect(stopped).not.toContain("opencode-slow");
+    expect(serverMod.getOpencodeServer("opencode-slow")?.startedAt).toBe(handle.startedAt);
+  } finally {
+    process.kill(hostPid, "SIGCONT");
+  }
+  // Answering again: the next turn uses the same server.
+  const again = await newTask({ agent: "opencode-slow", prompt: "again" });
+  await start(again);
+  await settled(again.id);
+  expect(serverMod.getOpencodeServer("opencode-slow")?.startedAt).toBe(handle.startedAt);
+});
+
+test("quit right after a long turn: the probe that saw it executing no longer counts once it ended", async () => {
+  const task = await newTask({ prompt: `run ${fakeMarkers.slow}` });
+  const runId = await start(task);
+  await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+  const sid = sessionOf(task.id)!;
+  // The sweep's probe sees the session executing (and stops nothing: inside the idle window).
+  expect(await orch.runOpencodeIdleSweep(Date.now())).not.toContain("opencode");
+  expect(await orch.cancelRun(runId)).toBe(true);
+  await settled(task.id, 20_000);
+  await expectInterrupted(sid);
+  expect(orch.stopIdleOpencodeServersOnRealStop()).toContain("opencode");
+  expect(serverMod.getOpencodeServer("opencode")).toBeNull();
 });
 
 test("quit: the before-quit decision stops idle servers synchronously; a hand-over to the background host and busy servers are left alone", async () => {

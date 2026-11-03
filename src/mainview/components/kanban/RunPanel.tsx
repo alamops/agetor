@@ -32,6 +32,7 @@ import {
   opencodeCanSubmit,
   opencodeOptionValue,
   OPENCODE_REASON_ALLOW_HINT,
+  OPENCODE_REJECT_REASON_HELP,
   opencodePermissionBody,
   opencodePermissionOptionBlocked,
   opencodeSetCustom,
@@ -9014,7 +9015,7 @@ function FxPermissionCard({
             className="mt-1 text-[12px]"
           />
           <p className="mt-1 text-[11px] text-muted-foreground">
-            Leave empty to stop the agent. Add a reason to let it continue without this action.
+            {OPENCODE_REJECT_REASON_HELP}
           </p>
           {reason.trim().length > 0 && (
             <p className="mt-1 text-[11px] text-warning" data-testid="permission-reason-hint">

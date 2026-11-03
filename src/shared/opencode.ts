@@ -1,7 +1,9 @@
 /**
  * Pure helpers for the `opencode` agent kind (OpenCode, `anomalyco/opencode`,
  * binary `opencode`) shared by the bun side (`buildCommand`, the driver, the
- * routes), the webview (the OpenCode server picker) and the CLI. Kept free of
+ * routes), the webview (the model picker and run panel; the Shared/Standalone
+ * server picker is retired, `parseOpencodeServerInput` only keeps old requests
+ * valid) and the CLI. Kept free of
  * runtime imports from either process side, like every other `src/shared/`
  * module — the only import is a type.
  *
@@ -173,20 +175,39 @@ export function disambiguateOpencodeLabels<T extends { id: string; label?: strin
   });
 }
 
+/** Text that names Zen outright: the product, or an `opencode/…` (Zen) model id. `opencode-go/…` has no match. */
+const ZEN_TEXT_RE = /\bzen\b|\bopencode\/[\w.-]/i;
+
 /**
  * A hint for a turn that failed because the provider has no balance (v2
  * `{type: "provider.quota", status: 402}`, or the "Insufficient account
- * funds" text), else null. The usual cause is a Zen (`opencode/…`) model
- * picked by an account that pays through a Go subscription, whose copy of
- * the same model is `opencode-go/…`: the terminal works because OpenCode's
- * own default there is the Go one.
+ * funds" text), else null. The hint only fits OpenCode Zen (`opencode/…`),
+ * the pay-as-you-go provider: its usual cause is a Zen model picked by an
+ * account that pays through a Go subscription, whose copy of the same model
+ * is `opencode-go/…`. So it is given only when `model`'s provider is
+ * `opencode`. A model of any other provider (a Go model, a BYOK one) gets no
+ * hint: telling that user to switch to Go would be wrong. An unknown model
+ * (null/absent, or an id with no provider such as the "OpenCode default"
+ * sentinel) gets the hint only when the error text itself names Zen
+ * (`Zen`, `opencode/…`); otherwise there is nothing to blame.
  */
-export function opencodeQuotaHint(err: unknown, message: string): string | null {
+export function opencodeQuotaHint(err: unknown, message: string, model?: string | null): string | null {
   const rec = err && typeof err === "object" ? (err as { type?: unknown; status?: unknown }) : null;
   const quota = rec?.type === "provider.quota" || rec?.status === 402 || /insufficient (account )?funds/i.test(message);
   if (!quota) return null;
+  const provider = model ? opencodeProviderOf(model) : null;
+  if (provider !== null) {
+    if (provider !== "opencode") return null;
+  } else if (!ZEN_TEXT_RE.test(message)) {
+    return null;
+  }
   return "the model's provider has no balance for this account. OpenCode Zen models (opencode/…) bill your Zen balance; " +
     "a Go subscription runs the opencode-go/… models, labelled (OpenCode Go) in the model picker — switch the task's model to one of those.";
+}
+
+/** The D-9 status line a failed resume posts before the fresh session (the one copy agents.ts, opencode-tmux.ts and opencode-driver.ts share). */
+export function opencodeResumeFailedStatusLine(sessionId: string): string {
+  return `couldn't resume OpenCode session ${sessionId.slice(0, 8)}… — starting a fresh session`;
 }
 
 /** The 400 text every route uses for a bad `opencodeServer` value. */

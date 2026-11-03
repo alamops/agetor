@@ -12,13 +12,16 @@ import type {
 import {
   answerFlagsError,
   buildAskAnswer,
-  buildOpencodeAnswer,
+  buildOpencodeAnswerByIndex,
   CUSTOM_OPTION,
   isOpencodeAsk,
   isOpencodePermission,
   OPENCODE_REJECT_NO_REASON_NOTICE,
   OPENCODE_REJECT_OPTION,
+  OPENCODE_REJECT_REASON_PROMPT,
+  OPENCODE_SKIP_CHOICE,
   parseAnswerArgs,
+  type OpencodeAskChoice,
   planOpencodePermissionReply,
   type AnswerArgs,
 } from "../answer-logic.ts";
@@ -27,7 +30,6 @@ import { CURSOR_ASK_FREEFORM } from "../../shared/cursor-ask-verdict.ts";
 import { cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues } from "../../shared/cursor-ask.ts";
 
 const CURSOR_SKIP = "__cursor_skip__";
-const OPENCODE_SKIP = "__opencode_skip__";
 
 export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
   const opts = parseAnswerArgs(args);
@@ -102,7 +104,7 @@ async function answerOpencodePermission(
   if (!picked) return cancel();
   let reason = opts.reason;
   if (picked.optionId === OPENCODE_REJECT_OPTION && reason === undefined && req.allowReason) {
-    const typed = await promptReason("Reason (empty stops the agent's turn)");
+    const typed = await promptReason(OPENCODE_REJECT_REASON_PROMPT);
     if (typed === null) return cancel();
     reason = typed;
   }
@@ -137,9 +139,10 @@ async function skipOpencodeAsk(client: AgetorClient, req: AskQuestionsRequest, r
   return true;
 }
 
-/** An OpenCode question form: options (values are the option ids, so two
- *  options with one label stay distinct), a typed-text row where the question
- *  takes one, and Skip, which may carry a reason. `--skip` skips without the
+/** An OpenCode question form: options (values are indexes into the question's
+ *  options, so two options with one id or label stay distinct and a
+ *  model-chosen id can never equal the Other/Skip sentinels), a typed-text row
+ *  where the question takes one, and Skip, which may carry a reason. `--skip` skips without the
  *  picker. */
 async function answerOpencodeAsk(client: AgetorClient, req: AskQuestionsRequest, opts: AnswerArgs): Promise<boolean> {
   if (req.title) out(c.bold(escapeFreeText(req.title)));
@@ -147,42 +150,44 @@ async function answerOpencodeAsk(client: AgetorClient, req: AskQuestionsRequest,
   const answers: Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }> = [];
   for (const q of req.questions) {
     p.note(escapeFreeText(q.question), escapeFreeText(q.header ?? "question"));
-    const options = [
-      ...q.options.map((o) => ({
-        value: o.id ?? o.label,
+    type Row = { value: OpencodeAskChoice; label: string; hint?: string };
+    const custom: Row[] = q.allowCustom ? [{ value: CUSTOM_OPTION, label: "✎ Other — type a custom answer" }] : [];
+    const options: Row[] = [
+      ...q.options.map((o, i): Row => ({
+        value: i,
         label: escapeFreeText(o.label),
         hint: o.description ? escapeFreeText(o.description) : undefined,
       })),
-      ...(q.allowCustom ? [{ value: CUSTOM_OPTION, label: "✎ Other — type a custom answer" }] : []),
-      { value: OPENCODE_SKIP, label: "Skip" },
+      ...custom,
+      { value: OPENCODE_SKIP_CHOICE, label: "Skip" },
     ];
     let entry: { selected: string[]; selectedOptionIds?: string[]; custom?: string } | null = null;
     while (entry === null) {
-      let picks: string[];
+      let picks: OpencodeAskChoice[];
       if (q.multiSelect) {
-        const sel = await p.multiselect({ message: "Select (space to pick)", options, required: false });
+        const sel = await p.multiselect<OpencodeAskChoice>({ message: "Select (space to pick)", options, required: false });
         if (p.isCancel(sel)) return cancel();
-        picks = sel as string[];
+        picks = sel as OpencodeAskChoice[];
       } else {
-        const sel = await p.select({ message: "Select", options });
+        const sel = await p.select<OpencodeAskChoice>({ message: "Select", options });
         if (p.isCancel(sel)) return cancel();
-        picks = [sel as string];
+        picks = [sel as OpencodeAskChoice];
       }
-      if (picks.includes(OPENCODE_SKIP)) {
+      if (picks.includes(OPENCODE_SKIP_CHOICE)) {
         let reason: string | undefined;
         if (req.allowReason) {
-          const typed = await promptReason("Reason for skipping (optional)");
-          if (typed === null) return cancel();
-          reason = typed;
+          const text = await promptReason("Reason for skipping (optional)");
+          if (text === null) return cancel();
+          reason = text;
         }
         return skipOpencodeAsk(client, req, reason);
       }
-      let custom: string | null = null;
+      let typed: string | null = null;
       if (picks.includes(CUSTOM_OPTION)) {
-        custom = await promptCustom();
-        if (custom === null) return cancel();
+        typed = await promptCustom();
+        if (typed === null) return cancel();
       }
-      const built = buildOpencodeAnswer(q, picks, custom);
+      const built = buildOpencodeAnswerByIndex(q, picks, typed);
       if (!built.ok) {
         p.note(escapeFreeText(built.error), "required");
         continue;

@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import type { RunEventStream } from "../shared/types.ts";
 import { FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
+import { opencodeResumeFailedStatusLine } from "../shared/opencode.ts";
 
 // db.ts captures AGETOR_DATA_DIR at first import — set it at module top
 // level, before the dynamic imports below (same convention as siblings).
@@ -39,7 +40,7 @@ function fixtureLines(name: string): string[] {
 }
 
 type Chunk = { stream: RunEventStream; data: string; lineUuid?: string };
-function runFixture(name: string, major: 1 | 2) {
+function runFixture(name: string, major: 1 | 2, model?: string | null) {
   const chunks: Chunk[] = [];
   const subagents: unknown[] = [];
   const sessionIds: string[] = [];
@@ -50,6 +51,7 @@ function runFixture(name: string, major: 1 | 2) {
     onSubagent: (n) => subagents.push(n),
     seenLineUuids: seen,
     major,
+    model,
   });
   for (const l of fixtureLines(name)) proc.feed(l);
   return { chunks, subagents, sessionIds, proc, seen };
@@ -167,7 +169,7 @@ describe("mapOpencodeEvent — v2 fixtures", () => {
   });
 
   test("provider.quota 402 (empty Zen balance): the status line carries the Zen-vs-Go hint, lastError stays raw", () => {
-    const { chunks, proc } = runFixture("v2-run-error-insufficient-funds.jsonl", 2);
+    const { chunks, proc } = runFixture("v2-run-error-insufficient-funds.jsonl", 2, "opencode/deepseek-v4.1-flash");
     const st = chunks.filter((c) => c.stream === "status");
     expect(st).toHaveLength(1);
     expect(st[0]!.data).toStartWith("opencode: Upstream request failed: Insufficient account funds — ");
@@ -177,6 +179,14 @@ describe("mapOpencodeEvent — v2 fixtures", () => {
     // The 429 free-limit error is a different failure and gets no hint.
     const free = runFixture("v2-run-error-in-session.jsonl", 2).chunks.filter((c) => c.stream === "status");
     expect(free[0]!.data).not.toContain("opencode-go/");
+  });
+
+  test("402 on a Go model, a BYOK model or an unknown model: the status line has no Zen/Go hint", () => {
+    for (const model of ["opencode-go/deepseek-v4.1-flash", "anthropic/claude-sonnet-5", null, undefined]) {
+      const st = runFixture("v2-run-error-insufficient-funds.jsonl", 2, model).chunks.filter((c) => c.stream === "status");
+      expect(st).toHaveLength(1);
+      expect(st[0]!.data).toBe("opencode: Upstream request failed: Insufficient account funds");
+    }
   });
 
   test("interrupted Shared run: only step_start, no error", () => {
@@ -482,6 +492,26 @@ test("settle on exit 130: Stop sends C-c, the trap keeps sh alive to record 130"
   expect(chunks.some((c) => c.data.startsWith("opencode: exited with code"))).toBe(false);
 });
 
+test("a spawned turn hints a 402 from its argv model: Zen yes, Go no (the -m value, effort variant included)", async () => {
+  const fixture = path.join(FIXTURES, "v2-run-error-insufficient-funds.jsonl");
+  const statusOf = async (model: string, explicit?: string) => {
+    const { taskId, runId } = ids();
+    const bin = fakeOpencode(`cat > /dev/null\ncat ${JSON.stringify(fixture)}\nexit 1`);
+    const { chunks, onChunk } = collectChunks();
+    const agent = await spawnOpencodeViaTmux({
+      taskId, runId, argv: [bin, "run", "-m", model], env: {}, cwd: TMUX_DIR, promptText: "x", major: 2, onChunk, ...(explicit ? { model: explicit } : {}),
+    });
+    await agent.done;
+    return chunks.filter((c) => c.stream === "status" && c.data.includes("Insufficient account funds")).map((c) => c.data);
+  };
+  const zen = await statusOf("opencode/deepseek-v4.1-flash#high");
+  expect(zen).toHaveLength(1);
+  expect(zen[0]).toContain("(OpenCode Go)");
+  expect(await statusOf("opencode-go/deepseek-v4.1-flash")).toEqual(["opencode: Upstream request failed: Insufficient account funds"]);
+  // an explicit model wins over argv
+  expect((await statusOf("opencode/x", "opencode-go/x"))[0]).not.toContain("(OpenCode Go)");
+});
+
 test("fresh retry (D-9): v1 resume-not-found relaunches once with freshArgv and posts the breadcrumb", async () => {
   const { taskId, runId } = ids();
   const notFound = path.join(FIXTURES, "v1-resume-not-found.txt");
@@ -500,6 +530,7 @@ test("fresh retry (D-9): v1 resume-not-found relaunches once with freshArgv and 
   });
   expect(await agent.done).toBe(0);
   expect(chunks.some((c) => c.data === "couldn't resume OpenCode session ses_e825… — starting a fresh session")).toBe(true);
+  expect(chunks.some((c) => c.data === opencodeResumeFailedStatusLine("ses_e825ffffffffUnknownSpike01"))).toBe(true);
   expect(sessionIds).toEqual(["ses_e8258cb06ffe2TIM1rQNRs9f1p"]);
   const launches = tmuxCalls().slice(before).filter((a) => a.includes("new-session"));
   expect(launches).toHaveLength(2);

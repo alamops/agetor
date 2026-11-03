@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -30,6 +31,8 @@ const {
   adoptOpencodeServers,
   getOpencodeServer,
   noteOpencodeActivity,
+  noteOpencodeServerLost,
+  classifyOpencodeServer,
   opencodeIdleSweep,
   stopOpencodeServer,
   stopIdleOpencodeServersSync,
@@ -320,6 +323,22 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
       expect(JSON.parse(readFileSync(__forTest.statePath(id), "utf8")).password).toBe(second.password);
     });
 
+    test("a server the hub lost is probed again within the health-cache window, and replaced when dead", async () => {
+      __forTest.setHealthCacheMs(60_000);
+      const id = newId();
+      const first = await ensureOpencodeServer(spec(id));
+      process.kill(await pidOf(first), "SIGKILL");
+      await waitFor(async () => !(await checkOpencodeServerHealth(first, 300)));
+      // Still inside the cache window: without the lost note the dead url is handed out again.
+      expect((await ensureOpencodeServer(spec(id))).url).toBe(first.url);
+      noteOpencodeServerLost(id);
+      expect(getOpencodeServer(id)?.url).toBe(first.url); // the note stops nothing by itself
+      const second = await ensureOpencodeServer(spec(id));
+      expect(second.url).not.toBe(first.url);
+      expect(await checkOpencodeServerHealth(second)).toBe(true);
+      noteOpencodeServerLost(newId()); // unknown harness: a no-op
+    });
+
     const slowOn = (ms: number): void => writeFileSync(path.join(stubDir, "slow"), String(ms));
     const slowOff = (): void => rmSync(path.join(stubDir, "slow"), { force: true });
     const alive = (pid: number): boolean => {
@@ -591,16 +610,226 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
         expect(stopIdleOpencodeServersSync(() => false).sort()).toEqual([gate, working].sort());
       });
 
-      test.skipIf(host !== "tmux")("a broken tmux never makes it throw", async () => {
+      test.skipIf(host !== "tmux")("a broken tmux never makes it throw and loses nothing (N7)", async () => {
         const id = newId();
-        await ensureOpencodeServer(spec(id));
+        const h = await ensureOpencodeServer(spec(id));
         setEnv("AGETOR_TMUX_BIN", path.join(STUB_ROOT, "no-such-tmux"));
         try {
-          expect(stopIdleOpencodeServersSync(() => false)).toEqual([id]);
+          // The kill failed: the server is not reported stopped, still registered,
+          // and its state, env and log stay for the next boot to judge.
+          expect(stopIdleOpencodeServersSync(() => false)).toEqual([]);
         } finally {
           useRealTmux();
         }
+        expect(getOpencodeServer(id)).toBe(h);
+        expect(existsSync(__forTest.statePath(id))).toBe(true);
+        expect(existsSync(__forTest.logPath(id))).toBe(true);
+        expect(await checkOpencodeServerHealth(h)).toBe(true);
+        // With tmux back, the same call really stops it and removes the files.
+        expect(stopIdleOpencodeServersSync(() => false)).toEqual([id]);
+        expect(existsSync(__forTest.statePath(id))).toBe(false);
+        expect(existsSync(__forTest.logPath(id))).toBe(false);
       });
+
+      test.skipIf(host !== "tmux")("a kill-session that times out keeps the state file (N7)", async () => {
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        const wrapper = path.join(stubDir, "tmux-hang-kill");
+        writeFileSync(wrapper, `#!/bin/sh\ncase "$*" in *kill-session*) exec sleep 30;; esac\nexec "${Bun.which("tmux")}" "$@"\n`);
+        chmodSync(wrapper, 0o755);
+        setEnv("AGETOR_TMUX_BIN", wrapper);
+        __forTest.setSyncTmuxTimeoutMs(300);
+        try {
+          expect(stopIdleOpencodeServersSync(() => false)).toEqual([]);
+        } finally {
+          useRealTmux();
+        }
+        expect(existsSync(__forTest.statePath(id))).toBe(true);
+        expect(getOpencodeServer(id)).not.toBeNull();
+      });
+
+      test.skipIf(host !== "tmux")("a session that is already gone counts as stopped and its files go", async () => {
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        Bun.spawnSync(["tmux", ...tmuxSocketArgs(), "kill-session", "-t", `=${h.tmuxSession}:`]);
+        expect(stopIdleOpencodeServersSync(() => false)).toEqual([id]);
+        expect(existsSync(__forTest.statePath(id))).toBe(false);
+      });
+    });
+
+    describe("the server directory is re-verified before every write and unlink (S12)", () => {
+      /** Move the real dir aside and put a symlink to `evil` in its place. */
+      function swapForSymlink(id: string): { evil: string; decoys: Map<string, string> } {
+        const dir = __forTest.serverDir();
+        const evil = mkdtempSync(path.join(STUB_ROOT, "evil-"));
+        const decoys = new Map<string, string>();
+        for (const ext of ["json", "env", "log"]) {
+          const f = path.join(evil, `${id}.${ext}`);
+          writeFileSync(f, `decoy-${ext}`);
+          decoys.set(f, `decoy-${ext}`);
+        }
+        renameSync(dir, `${dir}.moved`);
+        symlinkSync(evil, dir);
+        return { evil, decoys };
+      }
+      const untouched = (evil: string, decoys: Map<string, string>): void => {
+        expect(readdirSync(evil).sort()).toEqual([...decoys.keys()].map((f) => path.basename(f)).sort());
+        for (const [f, content] of decoys) expect(readFileSync(f, "utf8")).toBe(content);
+      };
+
+      test("a symlinked dir swapped in after ensure: stopOpencodeServer still stops the server but unlinks nothing through the link", async () => {
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        const { evil, decoys } = swapForSymlink(id);
+        await stopOpencodeServer(id);
+        expect(alive(pid)).toBe(false);
+        expect(getOpencodeServer(id)).toBeNull();
+        untouched(evil, decoys);
+      });
+
+      test("the sync quit stop likewise unlinks nothing through the link", async () => {
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        const { evil, decoys } = swapForSymlink(id);
+        expect(stopIdleOpencodeServersSync(() => false)).toEqual([id]);
+        untouched(evil, decoys);
+      });
+
+      test("a write into a swapped dir is refused", async () => {
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        const { evil, decoys } = swapForSymlink(id);
+        expect(() => __forTest.writePrivateFile(path.join(__forTest.serverDir(), `${id}.json`), "{}")).toThrow(/plain directory|resolves somewhere else/);
+        untouched(evil, decoys);
+      });
+
+      test("a start whose dir is swapped mid-start fails without writing or unlinking through the link", async () => {
+        __forTest.setStartBudgetMs(1_500);
+        const id = newId();
+        rmSync(path.join(stubDir, "pid"), { force: true });
+        // Swap as soon as the stub has launched (state and log already exist).
+        const pending = ensureOpencodeServer(spec(id)).then(() => null, (e: Error) => e);
+        await waitFor(() => existsSync(path.join(stubDir, "pid")), 10_000);
+        const { evil, decoys } = swapForSymlink(id);
+        const err = await pending;
+        expect(err).toBeInstanceOf(Error);
+        untouched(evil, decoys);
+        expect(getOpencodeServer(id)).toBeNull();
+      });
+
+      test("a state file in a swapped dir is not read, so it never names what to kill", async () => {
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        const { evil } = swapForSymlink(id);
+        // A decoy that looks like a perfectly good state file.
+        writeFileSync(path.join(evil, `${id}.json`), JSON.stringify({ harnessId: id, url: "", password: "x", tmuxSession: host === "tmux" ? __forTest.sessionNameFor(id) : null, startedAt: 1 }), { mode: 0o600 });
+        expect(__forTest.verifyServerDir).toThrow();
+        __forTest.forget();
+        await expect(adoptOpencodeServers()).resolves.toEqual([]);
+        expect(existsSync(path.join(evil, `${id}.json`))).toBe(true); // not even "cleaned up"
+      });
+
+      test("an intact dir passes", () => {
+        __forTest.setServerDir(mkdtempSync(path.join(STUB_ROOT, "intact-")));
+        expect(() => __forTest.verifyServerDir()).not.toThrow();
+      });
+    });
+
+    describe("classifyOpencodeServer", () => {
+      const slow = (ms: number): void => writeFileSync(path.join(stubDir, "slow"), String(ms));
+
+      test("unknown when this core holds no server for the harness", async () => {
+        expect(await classifyOpencodeServer(newId())).toBe("unknown");
+      });
+
+      test("alive for a server that answers", async () => {
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        expect(await classifyOpencodeServer(id)).toBe("alive");
+      });
+
+      test("dead once the server process is gone, and it removes nothing itself", async () => {
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        process.kill(await pidOf(h), "SIGKILL");
+        await waitFor(async () => !(await checkOpencodeServerHealth(h, 300)));
+        expect(await classifyOpencodeServer(id, 500)).toBe("dead");
+        expect(getOpencodeServer(id)).toBe(h);
+        expect(existsSync(__forTest.statePath(id))).toBe(true);
+      });
+
+      test("dead when the password is rejected twice in a row", async () => {
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        writeFileSync(path.join(stubDir, "unauth"), "");
+        expect(await classifyOpencodeServer(id, 500)).toBe("dead");
+      });
+
+      test("unresponsive, not dead, for a live host that only times out", async () => {
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        slow(3_000);
+        expect(await classifyOpencodeServer(id, 150)).toBe("unresponsive");
+        expect(alive(pid)).toBe(true);
+        expect(getOpencodeServer(id)).toBe(h);
+        rmSync(path.join(stubDir, "slow"), { force: true });
+        expect(await classifyOpencodeServer(id, 1_000)).toBe("alive"); // it recovered
+      });
+
+      test("unknown while the harness's server is being replaced", async () => {
+        __forTest.setHealthCacheMs(0);
+        const id = newId();
+        const first = await ensureOpencodeServer(spec(id));
+        process.kill(await pidOf(first), "SIGKILL");
+        await waitFor(async () => !(await checkOpencodeServerHealth(first, 300)));
+        const replacing = ensureOpencodeServer(spec(id));
+        expect(await classifyOpencodeServer(id, 500)).toBe("unknown");
+        await replacing;
+      });
+    });
+
+    test.skipIf(host !== "direct")("a fresh start never calls tmux on the direct host (S19)", async () => {
+      const record = path.join(stubDir, "tmux-calls.log");
+      const wrapper = path.join(stubDir, "tmux-record");
+      writeFileSync(record, "");
+      writeFileSync(wrapper, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${record}"\nexec "${Bun.which("tmux") ?? "/usr/bin/true"}" "$@"\n`);
+      chmodSync(wrapper, 0o755);
+      setEnv("AGETOR_TMUX_BIN", wrapper);
+      try {
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        await stopOpencodeServer(id);
+      } finally {
+        useRealTmux();
+      }
+      expect(readFileSync(record, "utf8")).toBe("");
+    });
+
+    test.skipIf(host !== "tmux")("a wedged new-session is bounded, killed, and leaves nothing behind (S8)", async () => {
+      const pidFile = path.join(stubDir, "wedged-new-session.pid");
+      const wrapper = path.join(stubDir, "tmux-wedge-new");
+      rmSync(pidFile, { force: true });
+      writeFileSync(wrapper, `#!/bin/sh\ncase "$*" in *new-session*) echo $$ > "${pidFile}"; exec sleep 30;; esac\nexec "${Bun.which("tmux")}" "$@"\n`);
+      chmodSync(wrapper, 0o755);
+      setEnv("AGETOR_TMUX_BIN", wrapper);
+      __forTest.setNewSessionTimeoutMs(1_000);
+      const id = newId();
+      const t0 = Date.now();
+      try {
+        await expect(ensureOpencodeServer(spec(id))).rejects.toThrow(/timed out/);
+      } finally {
+        useRealTmux();
+      }
+      expect(Date.now() - t0).toBeLessThan(8_000);
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(pid).toBeGreaterThan(1);
+      await waitFor(() => !alive(pid)); // the wedged client was killed
+      expect(existsSync(__forTest.statePath(id))).toBe(false);
+      expect(existsSync(__forTest.envPath(id))).toBe(false);
+      expect(getOpencodeServer(id)).toBeNull();
+      expect(launches()).toBe(0);
     });
 
     describe("a tmux server that dies under a new-session", () => {
@@ -954,6 +1183,99 @@ exec "${real}" "$@"
   });
 }
 
+describe("bounded external calls (S8)", () => {
+  const dir = mkdtempSync(path.join(STUB_ROOT, "bounded-"));
+  const alivePid = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  afterEach(() => {
+    useRealTmux();
+    __forTest.restoreDefaults();
+  });
+
+  test("a wedged tmux has-session is 'unknown' (never proof of death) and the client is killed", async () => {
+    const pidFile = path.join(dir, "has-session.pid");
+    const wrapper = path.join(dir, "tmux-hang");
+    writeFileSync(wrapper, `#!/bin/sh\necho $$ > "${pidFile}"\nexec sleep 30\n`);
+    chmodSync(wrapper, 0o755);
+    setEnv("AGETOR_TMUX_BIN", wrapper);
+    __forTest.setTmuxTimeoutMs(1_000);
+    const t0 = Date.now();
+    expect(await __forTest.tmuxHasSession("agetor-ocsrv-anything")).toBe("unknown");
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    await waitFor(() => !alivePid(pid));
+  });
+
+  test("a wedged ps yields an empty table, so nothing is signalled", async () => {
+    const pidFile = path.join(dir, "ps.pid");
+    const wrapper = path.join(dir, "ps-hang");
+    writeFileSync(wrapper, `#!/bin/sh\necho $$ > "${pidFile}"\nexec sleep 30\n`);
+    chmodSync(wrapper, 0o755);
+    __forTest.setPsBin(wrapper);
+    __forTest.setTmuxTimeoutMs(1_000); // room for the wrapper to start on a loaded machine
+    const t0 = Date.now();
+    expect((await __forTest.processTable()).size).toBe(0);
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    await waitFor(() => !alivePid(Number(readFileSync(pidFile, "utf8"))));
+  });
+
+  test("a healthy ps still lists processes", async () => {
+    const table = await __forTest.processTable();
+    expect(table.get(process.pid)).toBe(process.ppid);
+  });
+});
+
+describe("the direct test host is gated (N1)", () => {
+  const withEnv = (vars: Record<string, string | undefined>, fn: () => void): void => {
+    const keys = Object.keys(vars);
+    const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    try {
+      for (const k of keys) {
+        if (vars[k] === undefined) delete process.env[k];
+        else process.env[k] = vars[k];
+      }
+      fn();
+    } finally {
+      for (const k of keys) {
+        if (prev[k] === undefined) delete process.env[k];
+        else process.env[k] = prev[k];
+      }
+    }
+  };
+
+  test("honored under NODE_ENV=test", () => {
+    withEnv({ AGETOR_OPENCODE_SERVER_HOST: "direct", NODE_ENV: "test", AGETOR_E2E_OPENCODE_DIRECT_HOST: undefined }, () => {
+      expect(__forTest.hostIsDirect()).toBe(true);
+    });
+  });
+  test("honored with the e2e flag outside NODE_ENV=test", () => {
+    withEnv({ AGETOR_OPENCODE_SERVER_HOST: "direct", NODE_ENV: undefined, AGETOR_E2E_OPENCODE_DIRECT_HOST: "1" }, () => {
+      expect(__forTest.hostIsDirect()).toBe(true);
+    });
+  });
+  test("ignored in a packaged-build-like environment", () => {
+    for (const nodeEnv of [undefined, "production"]) {
+      withEnv({ AGETOR_OPENCODE_SERVER_HOST: "direct", NODE_ENV: nodeEnv, AGETOR_E2E_OPENCODE_DIRECT_HOST: undefined }, () => {
+        expect(__forTest.hostIsDirect()).toBe(false);
+      });
+    }
+    withEnv({ AGETOR_OPENCODE_SERVER_HOST: "direct", NODE_ENV: "production", AGETOR_E2E_OPENCODE_DIRECT_HOST: "0" }, () => {
+      expect(__forTest.hostIsDirect()).toBe(false);
+    });
+  });
+  test("never on without the host variable", () => {
+    withEnv({ AGETOR_OPENCODE_SERVER_HOST: undefined, NODE_ENV: "test", AGETOR_E2E_OPENCODE_DIRECT_HOST: "1" }, () => {
+      expect(__forTest.hostIsDirect()).toBe(false);
+    });
+  });
+});
+
 describe("id handling", () => {
   test("filenames and session names only ever contain [A-Za-z0-9_-]", () => {
     expect(__forTest.safeId("opencode")).toBe("opencode");
@@ -964,7 +1286,7 @@ describe("id handling", () => {
   });
 
   test("redact removes the password and password-looking text", () => {
-    const out = __forTest.redact("server password abc123 OPENCODE_PASSWORD=zzz Authorization: Basic Zm9v hi sekret!", "sekret!");
+    const out = __forTest.redact("server password: abc123 OPENCODE_PASSWORD=zzz Authorization: Basic Zm9v hi sekret!", "sekret!");
     expect(out).not.toContain("abc123");
     expect(out).not.toContain("zzz");
     expect(out).not.toContain("Zm9v");

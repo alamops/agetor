@@ -14,6 +14,7 @@ import {
   opencodeProviderOf,
   opencodeTransportFor,
   opencodeQuotaHint,
+  opencodeResumeFailedStatusLine,
   opencodeTurnBreadcrumbPrefix,
   parseOpencodeServerInput,
   parseOpencodeTurnBreadcrumb,
@@ -331,11 +332,40 @@ describe("OpenCode provider labels", () => {
   });
 
   test("opencodeQuotaHint: only for an out-of-balance error", () => {
-    expect(opencodeQuotaHint({ type: "provider.quota", status: 402 }, "Upstream request failed: Insufficient account funds"))
+    const zen = "opencode/deepseek-v4.1-flash";
+    expect(opencodeQuotaHint({ type: "provider.quota", status: 402 }, "Upstream request failed: Insufficient account funds", zen))
       .toContain("opencode-go/");
-    expect(opencodeQuotaHint({ status: 402 }, "x")).not.toBeNull();
-    expect(opencodeQuotaHint(null, "Insufficient funds")).not.toBeNull();
-    expect(opencodeQuotaHint({ type: "provider.free-limit", status: 429 }, "Free usage limit reached.")).toBeNull();
-    expect(opencodeQuotaHint({ type: "unknown" }, "File not found")).toBeNull();
+    expect(opencodeQuotaHint({ status: 402 }, "x", zen)).not.toBeNull();
+    expect(opencodeQuotaHint(null, "Insufficient funds", zen)).not.toBeNull();
+    // an effort variant on a Zen model id is still Zen
+    expect(opencodeQuotaHint({ status: 402 }, "x", `${zen}#high`)).not.toBeNull();
+    expect(opencodeQuotaHint({ type: "provider.free-limit", status: 429 }, "Free usage limit reached.", zen)).toBeNull();
+    expect(opencodeQuotaHint({ type: "unknown" }, "File not found", zen)).toBeNull();
+  });
+
+  test("opencodeQuotaHint: a Go model or a BYOK provider gets no hint (switching to Go would be wrong advice)", () => {
+    const quota = { type: "provider.quota", status: 402 };
+    const msg = "Upstream request failed: Insufficient account funds";
+    expect(opencodeQuotaHint(quota, msg, "opencode-go/deepseek-v4.1-flash")).toBeNull();
+    expect(opencodeQuotaHint(quota, msg, "anthropic/claude-sonnet-5")).toBeNull();
+    expect(opencodeQuotaHint(quota, msg, "openrouter/some/model")).toBeNull();
+    // the provider decides even when the error text names Zen
+    expect(opencodeQuotaHint(quota, "OpenCode Zen: insufficient funds", "anthropic/claude-sonnet-5")).toBeNull();
+  });
+
+  test("opencodeQuotaHint: an unknown model hints only when the error text itself names Zen", () => {
+    const quota = { type: "provider.quota", status: 402 };
+    for (const model of [undefined, null, "", "opencode-default"]) {
+      expect(opencodeQuotaHint(quota, "Upstream request failed: Insufficient account funds", model)).toBeNull();
+      expect(opencodeQuotaHint(quota, "OpenCode Zen: insufficient funds", model)).not.toBeNull();
+      expect(opencodeQuotaHint(quota, "model opencode/big-pickle has insufficient funds", model)).not.toBeNull();
+      // a Go model id in the text is not Zen
+      expect(opencodeQuotaHint(quota, "model opencode-go/x has insufficient funds", model)).toBeNull();
+    }
+  });
+
+  test("opencodeResumeFailedStatusLine: the D-9 line names the first 8 chars of the session id", () => {
+    expect(opencodeResumeFailedStatusLine("ses_e8250f036ffepNNRrhaD7yBOwE"))
+      .toBe("couldn't resume OpenCode session ses_e825… — starting a fresh session");
   });
 });

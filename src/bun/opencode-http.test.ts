@@ -1,12 +1,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   OPENCODE_HTTP_TIMEOUT_MS,
+  OPENCODE_MAX_RESPONSE_BYTES,
   OPENCODE_SSE_STALL_MS,
   OpencodeHttpError,
   createOpencodeClient,
   isLoopbackOpencodeUrl,
   openOpencodeEventStream,
   opencodeAuthHeader,
+  redactSecrets,
   type OpencodeEnvelope,
   type OpencodeServerRef,
 } from "./opencode-http.ts";
@@ -392,6 +394,45 @@ describe("errors", () => {
     expect(err.message.length).toBeLessThan(500);
   });
 
+  test("a streamed response body past the cap is a BadResponse (status 0) and never reaches JSON.parse (S13)", async () => {
+    let chunksSent = 0; // far more than the cap if read to the end
+    reset({
+      "GET /api/info": () => {
+        const body = new ReadableStream({
+          pull(c) {
+            chunksSent++;
+            c.enqueue(enc.encode(chunksSent === 1 ? '{"version":"' : "x".repeat(400)));
+            if (chunksSent > 1000) c.close();
+          },
+        });
+        return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    const err = await createOpencodeClient(ref, { maxResponseBytes: 2048 }).info().catch((e) => e);
+    expect(err).toBeInstanceOf(OpencodeHttpError);
+    expect(err).toMatchObject({ status: 0, tag: "BadResponse", op: "info" });
+    expect(err.message).toContain("2048");
+    expect(`${err.message} ${err.stack ?? ""}`).not.toContain(PASSWORD);
+  });
+
+  test("a declared content-length past the cap is refused before the body is read (S13)", async () => {
+    const err = await createOpencodeClient(ref, {
+      maxResponseBytes: 100,
+      fetchImpl: (async () => new Response("{}", { status: 200, headers: { "content-length": "101" } })) as unknown as typeof fetch,
+    })
+      .info()
+      .catch((e) => e);
+    expect(err).toMatchObject({ status: 0, tag: "BadResponse", op: "info" });
+  });
+
+  test("a body at the cap is accepted, and the default cap is 32 MiB (S13)", async () => {
+    const body = JSON.stringify({ version: "2.1.3", pad: "y".repeat(500) });
+    reset({ "GET /api/info": () => new Response(body, { status: 200 }) });
+    const ok = await createOpencodeClient(ref, { maxResponseBytes: Buffer.byteLength(body) }).info();
+    expect(ok.version).toBe("2.1.3");
+    expect(OPENCODE_MAX_RESPONSE_BYTES).toBe(32 * 1024 * 1024);
+  });
+
   test("a 2xx non-JSON body is a BadResponse", async () => {
     reset({ "GET /api/info": () => new Response("<html>nope</html>", { status: 200 }) });
     const err = await createOpencodeClient(ref).info().catch((e) => e);
@@ -745,5 +786,36 @@ describe("openOpencodeEventStream", () => {
     expect(closes[0]!.reason).toBe("error");
     expect((closes[0]!.err as Error).message).toBe("mapper blew up");
     expect(n).toBe(1); // the second frame in the same chunk is not delivered
+  });
+});
+
+describe("redactSecrets (N11)", () => {
+  const b64 = AUTH.slice("Basic ".length);
+
+  test("strips the raw password and its base64 form", () => {
+    const out = redactSecrets(`a ${PASSWORD} b ${b64} c`, PASSWORD);
+    expect(out).not.toContain(PASSWORD);
+    expect(out).not.toContain(b64);
+    expect(out).toBe("a [redacted] b [redacted] c");
+  });
+
+  test("strips password=, OPENCODE_PASSWORD=, Authorization and Basic/Bearer values even for a password it was not told", () => {
+    const out = redactSecrets(
+      "cmd password=hunter2 OPENCODE_PASSWORD=zzz Authorization: Basic Zm9vOmJhcmJheg== authorization: Bearer tok-1234567890 also Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ== end",
+      "unrelated",
+    );
+    for (const leaked of ["hunter2", "zzz", "Zm9vOmJhcmJheg==", "tok-1234567890", "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="]) {
+      expect(out).not.toContain(leaked);
+    }
+    expect(out).toContain("password=[redacted]");
+    expect(out).toContain("Authorization: [redacted]");
+    expect(out).toContain("end");
+    // The space-separated form the server manager's old redactor covered.
+    expect(redactSecrets("bad password hunter3 given")).toBe("bad password [redacted] given");
+  });
+
+  test("works without a password and leaves ordinary text alone", () => {
+    expect(redactSecrets("opencode serve listening on http://127.0.0.1:4096")).toBe("opencode serve listening on http://127.0.0.1:4096");
+    expect(redactSecrets("Basic usage is documented")).toBe("Basic usage is documented");
   });
 });

@@ -4,7 +4,7 @@ import { ApiError, type AgetorClient } from "../api-client.ts";
 import type { AnyRequest, AskQuestionsRequest, FxPermissionRequest } from "../../bun/interactions.ts";
 import {
   buildAskAnswer,
-  buildOpencodeAnswer,
+  buildOpencodeAnswerByIndex,
   isOpencodeAsk,
   isOpencodePermission,
   OPENCODE_REJECT_OPTION,
@@ -26,7 +26,7 @@ const SKIP = "Skip";
  * a tmux_prompt or fx_permission as a single choice list (fx's trailing row is
  * "Dismiss (reject)" rather than "Reject / Esc"). OpenCode cards differ in
  * three ways: a permission has its own Reject, which asks for an optional
- * reason (none stops the agent's turn); a question has the "Other" row only
+ * reason (none skips the action and the agent continues); a question has the "Other" row only
  * where it takes typed text; and a "Skip" row that also asks for a reason.
  * Esc always just closes the
  * overlay (`onCancel`) without answering — the interaction stays pending for
@@ -86,7 +86,10 @@ export function AnswerOverlay({
 
   // Record this question's answer, then advance or submit. Returns false when
   // the (selected, custom) pair is empty so the caller can surface a hint.
-  const commitAnswer = (selected: string[], customText: string | null): boolean => {
+  // `indexes` are the picked rows' positions in `question.options`: an OpenCode
+  // card is answered by position, so a model-chosen id equal to a sentinel
+  // (`__agetor_custom__`) is still just an option.
+  const commitAnswer = (selected: string[], customText: string | null, indexes: number[] = []): boolean => {
     if (!req || req.kind !== "ask_questions") return true;
     const question = req.questions[qIndex];
     let posted: { selected: string[]; selectedOptionIds?: string[]; custom?: string };
@@ -94,7 +97,7 @@ export function AnswerOverlay({
     let typed: string | undefined;
     if (isOpencodeAsk(req) && question) {
       // Option ids and typed text, checked against what the question takes.
-      const built = buildOpencodeAnswer(question, selected, customText);
+      const built = buildOpencodeAnswerByIndex(question, indexes, customText);
       if (!built.ok) {
         setHint(built.error);
         setCustom(null);
@@ -171,7 +174,8 @@ export function AnswerOverlay({
   };
 
   // Answer an OpenCode permission card. A reason rides Reject only; a Reject
-  // with none ends the agent's turn, which the closing message says.
+  // with none skips the action and the agent continues (the driver sends the
+  // one space OpenCode needs for that), which the closing message says.
   const postOpencodePermission = (r: FxPermissionRequest, optionId: string, text: string | undefined) => {
     const plan = planOpencodePermissionReply(optionId, text);
     if (!plan.ok) {
@@ -185,7 +189,7 @@ export function AnswerOverlay({
       .then((res) => {
         if (!res.ok) return onDone("already resolved");
         if (!rejected) return onDone("✓ answered");
-        onDone(plan.body.message ? "✓ rejected with a reason" : "✓ rejected — the agent's turn stops");
+        onDone(plan.body.message ? "✓ rejected with a reason" : "✓ rejected — the agent continues without it");
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 400) {
@@ -230,10 +234,9 @@ export function AnswerOverlay({
           const text = custom.trim();
           if (!text) return setCustom(null);
           const q = req.kind === "ask_questions" ? req.questions[qIndex] : undefined;
-          const selected = q?.multiSelect
-            ? [...toggled].filter((i) => i < q.options.length).map((i) => optionPickValue(req, q.options[i]!))
-            : [];
-          commitAnswer(selected, text);
+          const indexes = q?.multiSelect ? [...toggled].filter((i) => i < q.options.length) : [];
+          const selected = q ? indexes.map((i) => optionPickValue(req, q.options[i]!)) : [];
+          commitAnswer(selected, text, indexes);
           return;
         }
         if (key.backspace || key.delete) return setCustom((s) => (s ?? "").slice(0, -1));
@@ -284,14 +287,15 @@ export function AnswerOverlay({
         if (key.return) {
           if (q.multiSelect) {
             if (toggled.has(otherIndex)) return setCustom(""); // collect free text, then submit
-            const selected = [...toggled].filter((i) => i < q.options.length).map((i) => optionPickValue(req, q.options[i]!));
-            if (!commitAnswer(selected, null)) setHint("pick an option or ✎ Other to answer");
+            const indexes = [...toggled].filter((i) => i < q.options.length);
+            const selected = indexes.map((i) => optionPickValue(req, q.options[i]!));
+            if (!commitAnswer(selected, null, indexes)) setHint("pick an option or ✎ Other to answer");
             return;
           }
           if (cursor === otherIndex) return setCustom(""); // single-select "Other"
           const pick = q.options[cursor];
           if (!pick) return;
-          commitAnswer([optionPickValue(req, pick)], null);
+          commitAnswer([optionPickValue(req, pick)], null, [cursor]);
           return;
         }
         return;
@@ -378,7 +382,7 @@ export function AnswerOverlay({
           <Text dimColor wrap="truncate-end">
             {reasonFor === "skip"
               ? "Reason for skipping (Enter with none skips without one, Esc goes back)"
-              : "Reason (Enter with none stops the agent's turn, Esc goes back)"}
+              : "Reason (Enter with none skips this action and the agent continues, Esc goes back)"}
           </Text>
           <Text wrap="truncate-start">
             <Text color="cyan">✎ </Text>

@@ -25,6 +25,14 @@ export function opencodePermissionBody(
   return message !== undefined ? { optionId, message } : { optionId };
 }
 
+/** Helper text under an OpenCode permission card's reason box. An empty
+ *  Reject skips the action and the agent continues without it (the core adds
+ *  the one space OpenCode needs for that; nothing is added to a typed reason),
+ *  and OpenCode declines the session's other pending requests with it. */
+export const OPENCODE_REJECT_REASON_HELP =
+  "Leave empty to skip this action — the agent continues without it. A reason you type is passed to the agent. " +
+  "Rejecting also declines the agent's other pending requests in this session.";
+
 /** Copy shown while a typed reason blocks the Allow options. */
 export const OPENCODE_REASON_ALLOW_HINT = "A reason is only sent with Reject — clear it to allow";
 

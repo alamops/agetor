@@ -113,7 +113,15 @@ export interface OpencodeHubSubscriber {
 
 /** `epoch` (optional) orders refs of one server key: the server's `startedAt` works. */
 export type OpencodeHubServer = { key: string; epoch?: number } & OpencodeServerRef;
-export type OpencodeWakeHandler = (serverKey: string, sessionId: string, e: OpencodeEnvelope) => void;
+/**
+ * What woke a session, when the server told it: the metadata of the latest
+ * synthetic inbox item (`session.inbox.enqueued`) seen for the session since
+ * its previous execution ended. For a background subagent it is
+ * `{ source: "subagent", childID, state: "completed" | "cancelled" | "error" }`.
+ */
+export type OpencodeWakeTrigger = { source?: string; childID?: string; state?: string };
+/** `trigger` is undefined when no synthetic item preceded the execution (or it is unknown). */
+export type OpencodeWakeHandler = (serverKey: string, sessionId: string, e: OpencodeEnvelope, trigger?: OpencodeWakeTrigger) => void;
 export type OpencodeWatchLostHandler = (serverKey: string) => void;
 
 /** Children of children are followed this deep (the root is depth 0). */
@@ -122,6 +130,7 @@ const MAX_CHILD_DEPTH = 4;
 const MAX_OWNED_PER_ROOT = 500;
 /** Envelope ids remembered for wake dedupe. */
 const WAKE_DEDUPE_MAX = 256;
+const TRIGGERS_MAX = 256;
 
 const DEFAULT_BACKOFF = {
   baseMs: 1000,
@@ -178,6 +187,8 @@ interface HubServer {
   lastExec: Map<string, number>;
   execSeq: number;
   wakeSeen: Set<string>;
+  /** Per watched session: the latest synthetic inbox item's metadata since its last execution end (bounded). */
+  triggers: Map<string, OpencodeWakeTrigger>;
 }
 
 const servers = new Map<string, HubServer>();
@@ -439,6 +450,7 @@ function route(srv: HubServer, e: OpencodeEnvelope): void {
 
   // Execution bookkeeping for watched roots comes BEFORE dispatch, so a
   // subscriber that unsubscribes from inside onEvent sees the up-to-date state.
+  noteTrigger(srv, sid, e);
   const started = e.type === "session.execution.started";
   if ((started || isExecutionEnd(e.type)) && srv.watched.has(sid)) {
     srv.lastExec.set(sid, ++srv.execSeq);
@@ -455,6 +467,30 @@ function route(srv: HubServer, e: OpencodeEnvelope): void {
   if (!list || list.length === 0) return;
   for (const entry of list.length === 1 ? list : [...list]) {
     callGuarded(srv, sid, "onEvent", () => entry.sub.onEvent(e, owner!.origin));
+  }
+}
+
+/** Remember a synthetic inbox item's metadata as the likely cause of the session's next execution; any execution end forgets it. */
+function noteTrigger(srv: HubServer, sid: string, e: OpencodeEnvelope): void {
+  if (isExecutionEnd(e.type)) {
+    srv.triggers.delete(sid);
+    return;
+  }
+  if (e.type !== "session.inbox.enqueued" || !srv.watched.has(sid)) return;
+  const item = (e.data as { item?: { type?: unknown; payload?: { metadata?: unknown } } } | undefined)?.item;
+  if (!item || item.type !== "synthetic") return;
+  const meta = item.payload?.metadata;
+  if (!meta || typeof meta !== "object") return;
+  const m = meta as Record<string, unknown>;
+  const trigger: OpencodeWakeTrigger = {};
+  if (typeof m.source === "string") trigger.source = m.source;
+  if (typeof m.childID === "string") trigger.childID = m.childID;
+  if (typeof m.state === "string") trigger.state = m.state;
+  srv.triggers.delete(sid); // re-insert as the newest
+  srv.triggers.set(sid, trigger);
+  if (srv.triggers.size > TRIGGERS_MAX) {
+    const oldest = srv.triggers.keys().next().value;
+    if (oldest !== undefined) srv.triggers.delete(oldest);
   }
 }
 
@@ -479,7 +515,8 @@ function fireWake(srv: HubServer, sid: string, e: OpencodeEnvelope): void {
   srv.woken.add(sid);
   const fn = wakeHandler;
   if (!fn) return;
-  callGuarded(srv, sid, "wake handler", () => fn(srv.key, sid, e));
+  const trigger = srv.triggers.get(sid);
+  callGuarded(srv, sid, "wake handler", () => fn(srv.key, sid, e, trigger ? { ...trigger } : undefined));
 }
 
 function onConnected(srv: HubServer, gen: number): void {
@@ -633,6 +670,8 @@ function getOrCreate(key: string, ref: OpencodeServerRef, epoch: number | undefi
     srv.woken.clear();
     srv.openExec.clear();
     srv.lastExec.clear();
+    srv.triggers.clear();
+    if (restarted) srv.failures = 0; // a new server process: its first hiccup is not a continuation of the old one's
     if (lostEntries.length > 0) {
       const err = new Error("OpenCode server restarted");
       for (const entry of lostEntries) {
@@ -640,9 +679,17 @@ function getOrCreate(key: string, ref: OpencodeServerRef, epoch: number | undefi
           entry.settleReady.done = true;
           entry.settleReady.reject(err);
         }
-        const fn = entry.sub.onServerLost;
-        if (fn) callGuarded(srv, entry.root, "onServerLost", () => fn.call(entry.sub, err));
       }
+      // Told on a microtask, after the caller has registered its own entry on this
+      // record: a lost driver unsubscribes inside the callback, and that must not
+      // find the record empty and dispose it from under the new subscriber.
+      const lost = srv;
+      queueMicrotask(() => {
+        for (const entry of lostEntries) {
+          const fn = entry.sub.onServerLost;
+          if (fn) callGuarded(lost, entry.root, "onServerLost", () => fn.call(entry.sub, err));
+        }
+      });
     }
     return srv;
   }
@@ -668,6 +715,7 @@ function getOrCreate(key: string, ref: OpencodeServerRef, epoch: number | undefi
       lastExec: new Map(),
       execSeq: 0,
       wakeSeen: new Set(),
+      triggers: new Map(),
     };
     servers.set(key, srv);
   }
@@ -782,6 +830,7 @@ export function watchOpencodeSessionsForWake(serverKey: string, ref: OpencodeSer
       srv.woken.clear();
       srv.openExec.clear();
       srv.lastExec.clear();
+    srv.triggers.clear();
       maybeDispose(srv);
     }
     return;
@@ -794,7 +843,7 @@ export function watchOpencodeSessionsForWake(serverKey: string, ref: OpencodeSer
   const srv = getOrCreate(serverKey, ref, ref.epoch);
   const added = new Set(ids.filter((s) => !srv.watched.has(s)));
   srv.watched = new Set(ids);
-  for (const m of [srv.woken, srv.openExec, srv.lastExec] as Array<Set<string> | Map<string, unknown>>) {
+  for (const m of [srv.woken, srv.openExec, srv.lastExec, srv.triggers] as Array<Set<string> | Map<string, unknown>>) {
     for (const sid of [...m.keys()]) if (!srv.watched.has(sid)) m.delete(sid);
   }
   connect(srv);
@@ -830,6 +879,7 @@ export function closeOpencodeHub(serverKey?: string): void {
     srv.woken.clear();
     srv.openExec.clear();
     srv.lastExec.clear();
+    srv.triggers.clear();
     disposeServer(srv);
   }
   // After the records are gone, so a callback that subscribes again starts afresh.
@@ -896,9 +946,9 @@ export const __forTest = {
   serverKeys(): string[] {
     return [...servers.keys()];
   },
-  /** Streams ever opened and the most that existed at once (must stay 1 per key). */
-  streamStats(): { opened: number; maxConcurrent: number } {
-    return { opened: stats.streamsOpened, maxConcurrent: stats.maxConcurrent };
+  /** Streams ever opened, the most that existed at once (must stay 1 per key) and how many are open now. */
+  streamStats(): { opened: number; maxConcurrent: number; open: number } {
+    return { opened: stats.streamsOpened, maxConcurrent: stats.maxConcurrent, open: stats.concurrent };
   },
   resetStreamStats(): void {
     stats.streamsOpened = 0;

@@ -6899,6 +6899,11 @@ export function startApiServer(
             // An OpenCode form: validate against the fields it was registered
             // with, then release the driver's awaiter. Claimed before any
             // await, like the siblings, so a second submit gets a 409.
+            // A reason rides a skip only; an answered question takes none.
+            // Refused, never ignored, like the permission route's `message`.
+            if (body.skip !== true && (body as { message?: unknown }).message !== undefined) {
+              return json({ error: "message is only allowed with skip" }, { status: 400, headers: corsHeaders(req) });
+            }
             if (askAnswersInFlight.has(req.params.id)) {
               return json(
                 { error: "this question is already being answered" },
@@ -7253,8 +7258,8 @@ export function startApiServer(
           }
           // A reason the user typed for Reject: OpenCode cards only, and only
           // with the `reject` option. Anything else is refused, never ignored.
-          // (A reject with no reason ends the OpenCode turn; one with a reason
-          // lets it continue. The driver relays, this route adds nothing.)
+          // (Either way the turn continues: the driver relays the reason, or a
+          // single space when there is none — plan R1. This route adds nothing.)
           let message: string | undefined;
           if (body.message !== undefined) {
             if (pending.harness !== "opencode") {

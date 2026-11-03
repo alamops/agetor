@@ -83,8 +83,10 @@ export const USAGE: Record<string, string> = {
   options, a tmux prompt or a permission request.
   OpenCode cards:
     --reason <text>  the reason sent with a Reject on a permission request, or
-                     with --skip on a question. A reject WITHOUT a reason stops
-                     the agent's turn; with one, the agent continues and sees it.
+                     with --skip on a question. A reject WITHOUT a reason skips
+                     the action and the agent continues without it; a reason you
+                     give is passed to the agent. Rejecting also declines the
+                     agent's other pending requests in that session.
                      Refused with Allow once / Always allow, and on a card that
                      takes no reason.
     --skip           skip an OpenCode question (the agent continues without an

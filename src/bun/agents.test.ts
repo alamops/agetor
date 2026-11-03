@@ -52,11 +52,11 @@ const {
   FAKE_OPENCODE_ERROR_PROMPT_MARKER,
   FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER,
   fakeOpencodeChildSessionId,
-  opencodeResumeFailedStatusLine,
   opencodeTransportOfTurn,
   OPENCODE_ASK_NEEDS_V2_STATUS,
 } = await import("./agents.ts");
 const { FX_STEER_DROPPED_STATUS, fxSpeedNotOfferedLine } = await import("./fx-acp.ts");
+const { opencodeResumeFailedStatusLine } = await import("../shared/opencode.ts");
 const { dataDir, tasks, runs, subagents: subagentsDb } = await import("./db.ts");
 
 // `bun test` runs every file in one process: restore the bin/args/driver

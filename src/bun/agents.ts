@@ -1,7 +1,14 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
-import { effectiveOpencodeServer, opencodeMajor, opencodeModelArgs, opencodeTransportFor, type OpencodeTransport } from "../shared/opencode.ts";
+import {
+  effectiveOpencodeServer,
+  opencodeMajor,
+  opencodeModelArgs,
+  opencodeResumeFailedStatusLine,
+  opencodeTransportFor,
+  type OpencodeTransport,
+} from "../shared/opencode.ts";
 import { compactionStatusLine } from "../shared/compaction.ts";
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { HANDOFF_TAG } from "../shared/pipeline.ts";
@@ -3555,11 +3562,6 @@ export function fakeOpencodeChildSessionId(taskId: string): string {
   return `ses_fakechild${fakeOpencodeIdPart(taskId)}`;
 }
 
-/** The D-9 status line a failed resume posts before the fresh session. */
-export function opencodeResumeFailedStatusLine(sessionId: string): string {
-  return `couldn't resume OpenCode session ${sessionId.slice(0, 8)}… — starting a fresh session`;
-}
-
 /** Makes every fake turn's part ids unique, so two turns of one task never
  *  share a `line_uuid`. */
 let fakeOpencodeTurnCounter = 0;
@@ -3786,7 +3788,7 @@ export interface SpawnAgentArgs {
   opencodeTurnHooks?: {
     isBusy: () => boolean;
     onReplace: (lineUuid: string, data: string) => void;
-    /** The user stopped the turn from a card (an empty reject): called once, before `done` resolves 130. */
+    /** Another client (not agetor) interrupted the root turn: called once, before `done` resolves 130. */
     onUserStop: () => void;
   };
   opts?: AgentRunOptions;
@@ -3822,24 +3824,6 @@ export function buildFxLaunchOptions(args: SpawnAgentArgs, built: AgentCommand):
   };
 }
 
-/**
- * Start a new agent run. For claude-code this creates the per-task tmux
- * session (or reuses one that survived a previous run). For codex this is
- * a fresh `Bun.spawn`.
- *
- * Returns a unified `SpawnedAgent` so the orchestrator's bookkeeping is the
- * same for both agents.
- *
- * Async: `spawnClaudeViaTmux`/`spawnCodexViaTmux`/`spawnGeminiViaTmux` are
- * `Bun.spawn`-backed tmux drivers (wave 1 of
- * docs/plans/fix-task-details-load-delay.md — no more `Bun.spawnSync` on the
- * warm-up path), so those dispatch branches await their driver spawn.
- * `spawnFxViaAcp` and `spawnCursorViaAcp` stay synchronous (neither uses
- * tmux — see fx-acp.ts and cursor-acp.ts) and the fake-driver branches stay
- * synchronous too (`makeFakeAgent` / `makeFakeCursorPlanAgent` /
- * `spawnFakeCursorAsk`); both are still valid returns from this `async`
- * function, just resolved immediately.
- */
 /** The Ask/Auto/Plan mode the server driver understands; an unknown id reads as Ask (a card per request, never a silent allow). */
 function opencodeServerMode(mode: string | null | undefined): "auto" | "ask" | "plan" {
   const m = mode ?? defaultModeFor("opencode");
@@ -3953,6 +3937,24 @@ export function attachOpencodeServerAgent(
   );
 }
 
+/**
+ * Start a new agent run. For claude-code this creates the per-task tmux
+ * session (or reuses one that survived a previous run). For codex this is
+ * a fresh `Bun.spawn`.
+ *
+ * Returns a unified `SpawnedAgent` so the orchestrator's bookkeeping is the
+ * same for both agents.
+ *
+ * Async: `spawnClaudeViaTmux`/`spawnCodexViaTmux`/`spawnGeminiViaTmux` are
+ * `Bun.spawn`-backed tmux drivers (wave 1 of
+ * docs/plans/fix-task-details-load-delay.md — no more `Bun.spawnSync` on the
+ * warm-up path), so those dispatch branches await their driver spawn.
+ * `spawnFxViaAcp` and `spawnCursorViaAcp` stay synchronous (neither uses
+ * tmux — see fx-acp.ts and cursor-acp.ts) and the fake-driver branches stay
+ * synchronous too (`makeFakeAgent` / `makeFakeCursorPlanAgent` /
+ * `spawnFakeCursorAsk`); both are still valid returns from this `async`
+ * function, just resolved immediately.
+ */
 export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
   const { taskId, runId, harness, prompt, cwd, onChunk, onSessionId, opts = {} } = args;
 

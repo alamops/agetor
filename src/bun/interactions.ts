@@ -993,9 +993,10 @@ export function normalizeReplyText(
 /**
  * Register an OpenCode permission request as a card. The answer promise
  * resolves with the user's decision; the driver relays it to the server. A
- * `reject` WITHOUT a reason ends the OpenCode turn, while one WITH the user's
- * typed reason lets the turn continue (plan D5), which is why Reject offers a
- * reason field (`allowReason`) and nothing here invents one.
+ * `reject` always lets the turn continue (plan R1): the driver passes the
+ * user's typed reason, or a single space when there is none, because OpenCode
+ * stops the turn on a reject with no message. The answer here carries only
+ * what the user typed (`allowReason`); nothing here invents a reason.
  */
 export function registerOpencodePermission(args: {
   taskId: string;

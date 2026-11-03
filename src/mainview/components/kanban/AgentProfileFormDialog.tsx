@@ -241,7 +241,8 @@ function AgentProfileFormBody({
   // its reset effects call its own internal setters, so a value diff would
   // read an untouched form as dirty. Only a pick made through the setters
   // `TaskLaunchPickers` calls marks the form touched
-  // (`trackLaunchInteractions`, which covers the OpenCode server picker too).
+  // (`trackLaunchInteractions`: agent, mode, model, effort, speed, max mode;
+  // the OpenCode Shared/Standalone server picker is retired).
   const [launchTouched, setLaunchTouched] = useState(false);
   const trackedLaunch = useMemo<TaskLaunch>(
     () => trackLaunchInteractions(launch, () => setLaunchTouched(true)),

@@ -73,6 +73,8 @@ const CHILD_PAGE_LIMIT = 200;
 const CHILD_MAX_PAGES = 10;
 /** Cap on the server-supplied text that is folded into an error message. */
 const MAX_ERROR_TEXT_CHARS = 300;
+/** The most bytes of one request op's response body the client reads. */
+export const OPENCODE_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 
 /** A failed OpenCode HTTP call. `status` is 0 for a transport failure or a
  *  timeout (`tag` is then `"Timeout"`, `"NetworkError"` or `"BadResponse"`);
@@ -119,13 +121,24 @@ function assertServerRef(ref: OpencodeServerRef): string {
   return new URL(ref.url).origin;
 }
 
-/** Strip the password and its base64 form out of text bound for an error. */
-function redactSecrets(text: string, password: string): string {
+/**
+ * Strip the password out of text bound for an error, a log or a status line:
+ * the raw password and its base64 `opencode:<password>` form, then anything
+ * that looks like it travels with a credential (`password=...`,
+ * `OPENCODE_PASSWORD=...`, `Authorization: ...`, `Basic <b64>`, `Bearer <tok>`).
+ * The single redactor for the OpenCode server code.
+ */
+export function redactSecrets(text: string, password?: string): string {
   let out = text;
-  for (const secret of [password, Buffer.from(`opencode:${password}`).toString("base64")]) {
-    if (secret) out = out.split(secret).join("[redacted]");
+  if (password) {
+    for (const secret of [password, Buffer.from(`opencode:${password}`).toString("base64")]) {
+      if (secret) out = out.split(secret).join("[redacted]");
+    }
   }
-  return out;
+  return out
+    .replace(/(password(?:\s*[=:]\s*|\s+))\S+/gi, "$1[redacted]")
+    .replace(/(authorization\s*[:=]\s*)(?:(?:basic|bearer)\s+)?\S+/gi, "$1[redacted]")
+    .replace(/\b(basic|bearer)(\s+)[A-Za-z0-9+/=._~-]{8,}/gi, "$1$2[redacted]");
 }
 
 /** Server-supplied text folded into an error: redacted, control characters
@@ -193,13 +206,44 @@ function defined<T extends Record<string, unknown>>(o: T): Partial<T> {
   return out;
 }
 
+/**
+ * The response body as text, read incrementally and refused once it passes
+ * `max` bytes (a declared `content-length` over the cap is refused before any
+ * body is read), so a misbehaving server cannot make the core buffer an
+ * unbounded reply. The message carries no server text.
+ */
+async function readCappedText(op: string, res: Response, max: number): Promise<string> {
+  const tooBig = () => new OpencodeHttpError(op, 0, `${op} reply is larger than ${max} bytes`, "BadResponse");
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig();
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => {});
+      throw tooBig();
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 export function createOpencodeClient(
   ref: OpencodeServerRef,
-  opts: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+  opts: { fetchImpl?: typeof fetch; timeoutMs?: number; maxResponseBytes?: number } = {},
 ): OpencodeClient {
   const origin = assertServerRef(ref);
   const fetchImpl = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? OPENCODE_HTTP_TIMEOUT_MS;
+  const maxBytes = opts.maxResponseBytes ?? OPENCODE_MAX_RESPONSE_BYTES;
   const authorization = opencodeAuthHeader(ref.password);
   const password = ref.password;
 
@@ -237,8 +281,9 @@ export function createOpencodeClient(
         });
         // Read the body inside the same timeout: a server that sends headers
         // and then stalls must not hang the caller.
-        text = await res.text();
+        text = await readCappedText(a.op, res, maxBytes);
       } catch (err) {
+        if (err instanceof OpencodeHttpError) throw err;
         if (timedOut) {
           throw new OpencodeHttpError(a.op, 0, `${a.op} timed out after ${timeoutMs} ms`, "Timeout");
         }

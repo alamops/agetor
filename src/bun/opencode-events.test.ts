@@ -30,12 +30,14 @@ function sessionOf(evts: OpencodeEventLike[]): string {
 function feedAll(m: ReturnType<typeof createOpencodeEventMapper>, evts: OpencodeEventLike[]): OpencodeMappedChunk[] {
   return evts.flatMap((e) => m.feed(e));
 }
-function run(name: string) {
+function run(name: string, model?: string | null) {
   const evts = events(name);
   const sessionId = sessionOf(evts);
-  const mapper = createOpencodeEventMapper({ sessionId });
+  const mapper = createOpencodeEventMapper({ sessionId, model });
   return { evts, sessionId, mapper, chunks: feedAll(mapper, evts) };
 }
+/** A Zen model: the only provider whose 402 gets the "switch to Go" hint. */
+const ZEN_MODEL = "opencode/deepseek-v4.1-flash";
 function usageOf(c: OpencodeMappedChunk): FxUsagePayload {
   expect(c.stream).toBe("status");
   expect(c.data.startsWith(FX_USAGE_STATUS_PREFIX)).toBe(true);
@@ -150,7 +152,7 @@ describe("reasoning and todowrite (v2-http-todowrite)", () => {
 
 describe("errors, quota hint and retry", () => {
   test("402: one status line with the quota hint (step.failed and execution.failed do not double); terminal failed", () => {
-    const { chunks, mapper } = run("v2-http-quota-402.jsonl");
+    const { chunks, mapper } = run("v2-http-quota-402.jsonl", ZEN_MODEL);
     expect(chunks).toHaveLength(1);
     expect(chunks[0]!.stream).toBe("status");
     expect(chunks[0]!.data).toStartWith("opencode: Upstream request failed: Insufficient account funds — the model's provider has no balance");
@@ -161,11 +163,33 @@ describe("errors, quota hint and retry", () => {
 
   test("execution.failed alone (no failing step) yields its own status line", () => {
     const evts = events("v2-http-quota-402.jsonl").filter((e) => e.type !== "session.step.failed");
-    const m = createOpencodeEventMapper({ sessionId: "ses_fixture0020" });
+    const m = createOpencodeEventMapper({ sessionId: "ses_fixture0020", model: ZEN_MODEL });
     const chunks = feedAll(m, evts);
     expect(chunks).toHaveLength(1);
     expect(chunks[0]!.lineUuid).toBe("opencode:ses_fixture0020:error:execution:msg_fixture0021");
     expect(chunks[0]!.data).toContain("Insufficient account funds");
+    expect(chunks[0]!.data).toContain("(OpenCode Go)");
+  });
+
+  test("402 on a Go model, a BYOK model, an unknown model or the default sentinel: the same line, no Zen hint", () => {
+    for (const model of ["opencode-go/deepseek-v4.1-flash", "anthropic/claude-sonnet-5", "opencode-default", null, undefined]) {
+      const { chunks } = run("v2-http-quota-402.jsonl", model);
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]!.data).toBe("opencode: Upstream request failed: Insufficient account funds");
+    }
+  });
+
+  test("a snapshot of the 402 gets the hint by the same model rule as the live stream", () => {
+    const msgs = jsonl("v2-http-messages-quota-402.jsonl");
+    const opts = { sessionId: "ses_fixture0020", afterUserMessageId: "msg_fixture0020" };
+    expect(snapshotToChunks(msgs, { ...opts, model: ZEN_MODEL })[0]!.data).toContain("(OpenCode Go)");
+    expect(snapshotToChunks(msgs, { ...opts, model: "opencode-go/x" })[0]!.data).not.toContain("(OpenCode Go)");
+  });
+
+  test("an unknown model gets the hint only when the error text itself names Zen", () => {
+    const m = createOpencodeEventMapper({ sessionId: "ses_s" });
+    const [c] = m.feed({ type: "session.execution.failed", data: { sessionID: "ses_s", error: { type: "provider.quota", status: 402, message: "OpenCode Zen: insufficient funds" } } });
+    expect(c!.data).toContain("(OpenCode Go)");
   });
 
   test("a non-quota error has no hint", () => {
@@ -281,8 +305,8 @@ describe("snapshotToChunks", () => {
   });
 
   test("a failed tool and an assistant error are mapped like their live counterparts", () => {
-    const quota = snapshotToChunks(jsonl("v2-http-messages-quota-402.jsonl"), { sessionId: "ses_fixture0020", afterUserMessageId: "msg_fixture0020" });
-    const live = run("v2-http-quota-402.jsonl").chunks;
+    const quota = snapshotToChunks(jsonl("v2-http-messages-quota-402.jsonl"), { sessionId: "ses_fixture0020", afterUserMessageId: "msg_fixture0020", model: ZEN_MODEL });
+    const live = run("v2-http-quota-402.jsonl", ZEN_MODEL).chunks;
     expect(quota).toEqual(live);
   });
 
@@ -549,6 +573,13 @@ describe("seed restores error state (R-S5)", () => {
     expect(seeded.map((c) => c.lineUuid)).toEqual([`opencode:${SID}:error:a`]);
     expect(m.feed({ type: "session.execution.failed", data: { sessionID: SID, error: quotaErr } })).toEqual([]);
     expect(m.terminal()).toMatchObject({ outcome: "failed" });
+  });
+
+  test("a catch-up seed hints by the mapper's model: Zen yes, Go no", () => {
+    const seed = (model: string) => createOpencodeEventMapper({ sessionId: SID, model })
+      .seedFromSnapshot([user("u"), assistant("a", [], { error: quotaErr, time: { created: 2, completed: 3 } })], { afterUserMessageId: "u" })[0]!.data;
+    expect(seed("opencode/x")).toContain("(OpenCode Go)");
+    expect(seed("opencode-go/x")).not.toContain("(OpenCode Go)");
   });
 
   test("the execution error uuid is keyed on the last assistant message, live or seeded, never a counter", () => {

@@ -184,5 +184,7 @@ test("the answer help documents --reason and --skip", () => {
   expect(block.split("\n", 1)[0]).toBe("usage: agetor answer <task-id> [--reason <text>] [--skip]");
   expect(block).toContain("--reason");
   expect(block).toContain("--skip");
-  expect(block).toContain("stops");
+  // an empty Reject skips the action and the agent continues (owner decision R1)
+  expect(block).toContain("the action and the agent continues");
+  expect(block).not.toContain("stops");
 });
