@@ -20,6 +20,14 @@
  *                                  parent turn, which then wakes the parent
  *   __agetor_fake_oc_error__       step.failed + execution.failed (402 quota)
  *   __agetor_fake_oc_slow__        a shell tool that runs until interrupted
+ *   __agetor_fake_oc_stuck__       like slow, but the execution ignores `POST /interrupt`: the call
+ *                                  answers `{interrupted:true}` and nothing ends (no terminal event),
+ *                                  so a client's "the server didn't confirm the stop" path runs. Only
+ *                                  DELETE of the session or stopping the server ends it ("shutdown").
+ *   __agetor_fake_oc_bgslow__      a background child (a shell that runs until interrupted), then the
+ *                                  parent itself runs a shell until interrupted: both stay busy, so a
+ *                                  child interrupted while the parent's execution is open puts its
+ *                                  "cancelled" synthetic on the parent's inbox mid-execution (r3 Q2)
  *   __agetor_fake_oc_todo__        a `todowrite` call with three todos
  *   __agetor_fake_oc_retry__       two `session.retry.scheduled` then success
  *   __agetor_fake_oc_tool__        one `echo hi` shell step, then `OK` (the v2-http-tool-turn shape)
@@ -36,6 +44,17 @@
  *   FAKE_OC_QUOTA_MODELS     comma list of `provider/model` ids that fail with
  *                            the 402 quota error, default `opencode/deepseek-v4.1-flash`
  *   FAKE_OC_VERSION          reported version, default 2.1.3
+ *   FAKE_OC_INTERRUPT_DELAY_MS
+ *                            `POST /api/session/{id}/interrupt` waits this long before it acts and
+ *                            answers, default 0 (a value above the client's interrupt timeout makes
+ *                            the call itself time out; the interrupt still lands afterwards)
+ *
+ * Inbox (live-verified 2.1.3, r3 Q2/Q2b/Q5/Q6/Q7): an item enqueued on an idle session starts an
+ * execution at once. An item still undelivered when an execution ends `interrupted` stays parked: no
+ * new execution, no event; the next execution (the next prompt's) delivers the parked items first, in
+ * enqueue order, then its own prompt. `GET /api/session/{id}/inbox` lists the undelivered items
+ * (`{data:[…]}`), `DELETE /api/session/{id}/inbox/{inboxID}` cancels one (204 and one
+ * `session.inbox.cancelled`; 204 and no event for an unknown, delivered or already cancelled id).
  *
  * The behaviours marked "unverified" in comments were not observed live and
  * are the fake's best guess; everything else follows a recorded transcript.
@@ -56,6 +75,8 @@ export interface FakeOpencodeOptions {
   stateFile?: string;
   version?: string;
   quotaModels?: string[];
+  /** `POST …/interrupt` waits this long before acting and answering (FAKE_OC_INTERRUPT_DELAY_MS). */
+  interruptDelayMs?: number;
 }
 
 export interface FakeOpencodeServer {
@@ -77,7 +98,9 @@ const QUOTA_ERROR = {
 
 /** The markers, in priority order when a prompt carries more than one. */
 export const FAKE_OC_MARKERS = {
+  stuck: "__agetor_fake_oc_stuck__",
   slow: "__agetor_fake_oc_slow__",
+  bgslow: "__agetor_fake_oc_bgslow__",
   steer: "__agetor_fake_oc_steer__",
   permission: "__agetor_fake_oc_permission__",
   question: "__agetor_fake_oc_question__",
@@ -169,6 +192,8 @@ interface InboxItem {
   payload: J;
   delivery: "steer" | "queue";
   delivered?: boolean;
+  /** Cancelled by `DELETE …/inbox/{id}` before delivery; kept only so a repeated prompt id stays idempotent (unverified). */
+  cancelled?: boolean;
 }
 interface Session {
   id: string;
@@ -207,6 +232,12 @@ interface Exec {
   /** Items delivered mid-execution that no final answer has acknowledged yet. */
   unanswered: InboxItem[];
   step?: Step;
+  /** How the execution ended, set just before its terminal event. */
+  outcome?: "succeeded" | "failed" | "interrupted";
+  /** The stuck scenario: `POST /interrupt` answers true and does nothing. */
+  ignoreInterrupt?: boolean;
+  /** Runs just before `session.execution.interrupted` is published (a background child's parent notice). */
+  beforeInterruptedTerminal?: () => void;
 }
 interface Runtime { exec?: Exec; perms: Map<string, PermRec>; forms: Map<string, FormRec> }
 interface ToolRec {
@@ -268,6 +299,7 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
   const password = opts.password ?? randomBytes(16).toString("hex");
   const expectedAuth = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
   const stateFile = opts.stateFile;
+  const interruptDelayMs = Math.max(0, opts.interruptDelayMs ?? 0);
 
   const sessions = new Map<string, Session>();
   const runtimes = new Map<string, Runtime>();
@@ -393,28 +425,40 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
   function enqueue(s: Session, item: Omit<InboxItem, "sessionID" | "time"> & { time?: InboxItem["time"] }, script?: Scenario): InboxItem {
     const full: InboxItem = { ...item, sessionID: s.id, time: item.time ?? { created: Date.now() } };
     s.inbox.push(full);
+    // Decided now, not in the microtask: an item that arrives while an execution is open belongs to
+    // that execution's end (delivered at a boundary, carried into the next one, or parked).
+    const busy = rt(s.id).exec !== undefined;
     publish(
       "session.inbox.enqueued",
       { inboxID: full.id, sessionID: s.id, item: { type: full.type, payload: full.payload, delivery: full.delivery } },
       { location: { directory: s.directory } },
     );
-    queueMicrotask(() => {
-      if (!stopped) maybeStart(s, script);
-    });
+    // live-verified 2.1.3 (r2, r3 Q7): an item enqueued on an idle session starts an execution at once.
+    if (!busy) {
+      queueMicrotask(() => {
+        if (!stopped) maybeStart(s, script);
+      });
+    }
     return full;
   }
   const itemText = (i: InboxItem): string => String(i.payload?.text ?? "");
+  const isPending = (i: InboxItem): boolean => !i.delivered && !i.cancelled;
+  /** The raw `GET …/inbox` record (r3 Q4: `{id, sessionID, time, type, payload, delivery}`). */
+  const inboxJson = (i: InboxItem): J => ({ id: i.id, sessionID: i.sessionID, time: i.time, type: i.type, payload: i.payload, delivery: i.delivery });
 
   function promote(s: Session, mode: "steer" | "input"): InboxItem[] {
-    const pending = s.inbox.filter((i) => !i.delivered);
+    const pending = s.inbox.filter(isPending);
     let take = pending.filter((i) => i.delivery === "steer");
     if (take.length === 0 && mode === "input") take = pending.filter((i) => i.delivery === "queue").slice(0, 1);
     for (const it of take) {
       it.delivered = true;
       s.messages.push(
         it.type === "user"
-          ? { id: it.id, time: it.time, text: itemText(it), type: "user" }
-          : { id: it.id, metadata: it.payload.metadata, time: it.time, text: itemText(it), description: it.payload.description, type: "synthetic" },
+          ? // The user message keeps its enqueue time (unverified: r3 Q4 pinned only the synthetic's).
+            { id: it.id, time: it.time, text: itemText(it), type: "user" }
+          : // live-verified 2.1.3 (r3 Q4): a synthetic becomes a message only on delivery, id = inboxID,
+            // and its time.created is the DELIVERY time, not the enqueue time.
+            { id: it.id, metadata: it.payload.metadata, time: { created: Date.now() }, text: itemText(it), description: it.payload.description, type: "synthetic" },
       );
       publish("session.inbox.delivered", { sessionID: s.id, inboxID: it.id });
     }
@@ -425,7 +469,7 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
   function maybeStart(s: Session, script?: Scenario, force = false): Exec | undefined {
     const r = rt(s.id);
     if (r.exec || !sessions.has(s.id)) return r.exec;
-    if (!force && !s.inbox.some((i) => !i.delivered)) return undefined;
+    if (!force && !s.inbox.some(isPending)) return undefined;
     let finish!: () => void;
     const done = new Promise<void>((res) => (finish = res));
     const ex: Exec = { ac: new AbortController(), done, unanswered: [], script };
@@ -433,7 +477,11 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
     void runExecution(s, ex).finally(() => {
       r.exec = undefined;
       finish();
-      // Anything that arrived while the turn was ending starts the next one.
+      // live-verified 2.1.3 (r3 Q2/Q2b/Q5): after an `interrupted` end, whatever is still undelivered
+      // stays parked (no new execution, no event) until the next execution delivers it first.
+      if (ex.outcome === "interrupted") return;
+      // After a succeeded/failed end, anything that arrived while the turn was ending starts the
+      // next one (unverified live: r3 only pinned the interrupted case).
       queueMicrotask(() => {
         if (!stopped && sessions.has(s.id)) maybeStart(s);
       });
@@ -466,14 +514,17 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       const model = `${s.model.providerID}/${s.model.id}`;
       if (quotaModels.has(model)) await scenarioError(c);
       else await (ex.script ?? pickScenario(initial.map(itemText).join("\n")))(c, initial);
+      ex.outcome = "succeeded";
       publish("session.execution.succeeded", { sessionID: s.id });
     } catch (e) {
       if (e instanceof Interrupted) {
         outcome = "interrupted";
+        ex.outcome = outcome;
         closeInterrupted(c, e.reason);
       } else {
         // A bug in the fake itself is surfaced as a failed turn, never a hung one.
         outcome = "failed";
+        ex.outcome = outcome;
         error = e instanceof ExecFailed ? e.error : { type: "fake.internal", message: String((e as Error)?.stack ?? e) };
         ex.failed = error;
         publish("session.execution.failed", { sessionID: s.id, error });
@@ -512,6 +563,8 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       }
       failStep(c, step, { type: "aborted", message: "Step interrupted" }, true);
     }
+    // A server stop sends no notice (the parent goes away with it).
+    if (!stopped) c.ex.beforeInterruptedTerminal?.();
     publish("session.execution.interrupted", { sessionID: c.s.id, reason });
   }
 
@@ -874,6 +927,45 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       if (c.ex.unanswered.length) await c.answer("");
     },
 
+    stuck: async (c) => {
+      c.ex.ignoreInterrupt = true;
+      await scenarios.slow(c, []);
+    },
+
+    bgslow: async (c) => {
+      const prompt = "Run this shell command and report its output: `sleep 3600 && echo LATE`";
+      const description = "Run a long sleep";
+      const step = c.startStep();
+      await c.think(step, "Launch the subagent in the background, then run my own long command.");
+      const input = { agent: "general", description, prompt, background: true };
+      const rec = c.declare(step, "subagent", input);
+      c.streamed(step);
+      const child = spawnChild(c, description, "general");
+      await c.tool(step, rec, {
+        run: async () => {
+          c.emit("session.tool.progress", { assistantMessageID: step.id, id: rec.id, metadata: { sessionID: child.id, status: "running" } });
+          const cex = startChild(child, prompt, async (cc) => {
+            const cs = cc.startStep();
+            const crec = cc.declare(cs, "shell", { command: "sleep 3600 && echo LATE" });
+            cc.streamed(cs);
+            // Only an interrupt of the child ends it.
+            await cc.tool(cs, crec, shellSpec(cc, cs, "sleep 3600 && echo LATE", 0, {}, () => cc.wait(new Promise<void>(() => {}))));
+            cc.endStep(cs, "tool-calls");
+            await cc.answer("LATE");
+          });
+          notifyParentWhenDone(c.s, child, cex, description);
+          return { content: [{ type: "text", text: backgroundToolText(child.id) }], metadata: { sessionID: child.id, status: "running", truncated: false } };
+        },
+      });
+      c.endStep(step, "tool-calls");
+      const step2 = c.startStep();
+      const sh = c.declare(step2, "shell", { command: "sleep 3600" });
+      c.streamed(step2);
+      await c.tool(step2, sh, shellSpec(c, step2, "sleep 3600", 0, {}, () => c.wait(new Promise<void>(() => {}))));
+      c.endStep(step2, "tool-calls");
+      await c.answer("Finished.");
+    },
+
     slow: async (c) => {
       const step = c.startStep();
       await c.think(step, "Run the long command.");
@@ -1112,31 +1204,47 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
             cc.endStep(cs, "tool-calls");
             await cc.answer("Output: `LATE`\n\nThe command completed after the 8-second sleep and printed `LATE` as expected.");
           });
-          void cex.done.then(() => {
-            // live-verified 2.1.3 (r2): interrupting the child (POST its /interrupt) wakes the parent
-            // with a "cancelled" synthetic; interrupting the parent never touches the child.
-            const state = cex.failed ? "failed" : child.outcome === "interrupted" ? "cancelled" : "completed";
-            const body = cex.failed ? String(cex.failed.message) : state === "cancelled" ? "Subagent cancelled" : (cex.finalText ?? "");
-            const text = `<subagent sessionID="${child.id}" state="${state}" description="${description}">\n${body}\n</subagent>`;
-            if (stopped || !sessions.has(c.s.id)) return;
-            enqueue(c.s, {
-              id: newId("msg"),
-              type: "synthetic",
-              payload: { text, description, metadata: { source: "subagent", childID: child.id, agent: "General", state } },
-              delivery: "steer",
-            });
-          });
-          const text =
-            `The subagent is working in the background (sessionID: ${child.id}). You will be notified automatically when it finishes.\n` +
-            "DO NOT sleep, poll for progress, ask the subagent for status, or duplicate this subagent's work; avoid working with the same files or topics it is using.\n" +
-            "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.";
-          return { content: [{ type: "text", text }], metadata: { sessionID: child.id, status: "running", truncated: false } };
+          notifyParentWhenDone(c.s, child, cex, description);
+          return { content: [{ type: "text", text: backgroundToolText(child.id) }], metadata: { sessionID: child.id, status: "running", truncated: false } };
         },
       });
       c.endStep(step, "tool-calls");
       await c.answer("LAUNCHED");
     },
   };
+
+  function backgroundToolText(childId: string): string {
+    return (
+      `The subagent is working in the background (sessionID: ${childId}). You will be notified automatically when it finishes.\n` +
+      "DO NOT sleep, poll for progress, ask the subagent for status, or duplicate this subagent's work; avoid working with the same files or topics it is using.\n" +
+      "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response."
+    );
+  }
+  /**
+   * A background child's end enqueues a synthetic on its parent. live-verified 2.1.3 (r2):
+   * interrupting the child (POST its /interrupt) wakes the parent with a "cancelled" synthetic;
+   * interrupting the parent never touches the child. live-verified (r3 Q2): the parent's
+   * "cancelled" enqueue is published just BEFORE the child's execution.interrupted; a completed
+   * child's comes after its execution.succeeded (r2 A5).
+   */
+  function notifyParentWhenDone(parent: Session, child: Session, cex: Exec, description: string): void {
+    let sent = false;
+    const send = (state: "failed" | "cancelled" | "completed"): void => {
+      if (sent) return;
+      sent = true;
+      const body = cex.failed ? String(cex.failed.message) : state === "cancelled" ? "Subagent cancelled" : (cex.finalText ?? "");
+      const text = `<subagent sessionID="${child.id}" state="${state}" description="${description}">\n${body}\n</subagent>`;
+      if (stopped || !sessions.has(parent.id)) return;
+      enqueue(parent, {
+        id: newId("msg"),
+        type: "synthetic",
+        payload: { text, description, metadata: { source: "subagent", childID: child.id, agent: "General", state } },
+        delivery: "steer",
+      });
+    };
+    cex.beforeInterruptedTerminal = () => send("cancelled");
+    void cex.done.then(() => send(cex.failed ? "failed" : child.outcome === "interrupted" ? "cancelled" : "completed"));
+  }
 
   function spawnChild(c: Ctx, title: string, agent: string): Session {
     const made = createSession({ parentID: c.s.id, title, agent });
@@ -1224,15 +1332,54 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
         if (dir) list = list.filter((s) => s.directory === dir);
         if (archived !== null) list = list.filter((s) => (archived === "true") === (s.time.archived !== undefined));
         if (search) list = list.filter((s) => (s.title ?? "").toLowerCase().includes(search));
-        list.sort((a, b) => b.time.updated - a.time.updated);
-        if (url.searchParams.get("order") === "asc") list.reverse();
+        // live-verified 2.1.3 (r3 Q3): ordered by time.updated, newest first by default (`order=asc`
+        // reverses it), and the cursor is a keyset on (updated, id): base64 JSON
+        // `{order?, parentID?, anchor:{id, time:<updated>, direction}}`, `order` present only when the
+        // request named one. `cursor.next` is a string even on the last page, whose next page is
+        // empty. (The id tie-break and the cursor of an empty page are unverified.)
+        type Anchor = { id: string; time: number; direction: "next" | "previous" };
+        let decoded: { order?: "asc" | "desc"; anchor?: Anchor } | undefined;
+        const rawCursor = url.searchParams.get("cursor");
+        if (rawCursor) {
+          try {
+            decoded = JSON.parse(Buffer.from(rawCursor, "base64url").toString("utf8"));
+          } catch {
+            decoded = undefined;
+          }
+          const a = decoded?.anchor;
+          if (!a || typeof a.id !== "string" || typeof a.time !== "number" || (a.direction !== "next" && a.direction !== "previous")) {
+            return jsonResponse(400, { _tag: "InvalidCursorError", message: "Invalid cursor" });
+          }
+        }
+        const named = decoded ? decoded.order : url.searchParams.get("order") === "asc" ? "asc" : url.searchParams.get("order") === "desc" ? "desc" : undefined;
+        const order = named ?? "desc";
+        const cmp = (a: { time: number; id: string }, b: { time: number; id: string }): number =>
+          a.time !== b.time ? a.time - b.time : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+        const key = (x: Session): { time: number; id: string } => ({ time: x.time.updated, id: x.id });
+        list.sort((a, b) => (order === "asc" ? cmp(key(a), key(b)) : cmp(key(b), key(a))));
         const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1), 200);
-        const page = list.slice(0, limit).map(sessionJson);
-        const first = page[0];
-        const last = page.at(-1);
+        let pageS: Session[];
+        const anchor = decoded?.anchor;
+        if (anchor) {
+          // "after" in list order: further from the start of the order.
+          const after = (x: Session): boolean => (order === "asc" ? cmp(key(x), anchor) > 0 : cmp(key(x), anchor) < 0);
+          if (anchor.direction === "next") pageS = list.filter(after).slice(0, limit);
+          else {
+            const before = list.filter((x) => !after(x) && !(x.id === anchor.id && x.time.updated === anchor.time));
+            pageS = before.slice(Math.max(0, before.length - limit));
+          }
+        } else {
+          pageS = list.slice(0, limit);
+        }
+        const enc = (x: Session, direction: "next" | "previous"): string =>
+          Buffer.from(
+            JSON.stringify({ ...(named ? { order: named } : {}), ...(parent ? { parentID: parent } : {}), anchor: { id: x.id, time: x.time.updated, direction } }),
+          ).toString("base64url");
+        const first = pageS[0];
+        const last = pageS.at(-1);
         return jsonResponse(200, {
-          data: page,
-          cursor: { ...(first ? { previous: Buffer.from(JSON.stringify({ id: first.id, direction: "previous" })).toString("base64url") } : {}), ...(last ? { next: Buffer.from(JSON.stringify({ id: last.id, direction: "next" })).toString("base64url") } : {}) },
+          data: pageS.map(sessionJson),
+          cursor: { ...(first ? { previous: enc(first, "previous") } : {}), ...(last ? { next: enc(last, "next") } : {}) },
         });
       }
       if (method === "POST") {
@@ -1326,13 +1473,39 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       return jsonResponse(200, { data: { id: item.id, sessionID: sid, time: item.time, type: "user", payload: item.payload, delivery } });
     }
     if (rest === "interrupt" && method === "POST") {
-      const ex = r.exec;
+      if (interruptDelayMs > 0) await new Promise((res) => setTimeout(res, interruptDelayMs));
+      const ex = rt(sid).exec;
       if (!ex) return jsonResponse(200, { interrupted: false });
-      ex.ac.abort("user");
+      // The stuck scenario: the server says yes and the execution runs on.
+      if (!ex.ignoreInterrupt) ex.ac.abort("user");
       return jsonResponse(200, { interrupted: true });
+    }
+    if (rest === "inbox" && method === "GET") {
+      // live-verified 2.1.3 (r3 Q2/Q4): `{data:[…]}`, undelivered items in enqueue order.
+      return jsonResponse(200, { data: s.inbox.filter(isPending).map(inboxJson) });
+    }
+    const im = /^inbox\/([^/]+)$/.exec(rest);
+    if (im && method === "DELETE") {
+      const iid = decodeURIComponent(im[1]!);
+      // live-verified 2.1.3 (r3 Q6): a malformed id is a 400; an unknown, delivered or already
+      // cancelled one is a silent 204; a pending one is cancelled with one session.inbox.cancelled.
+      if (!iid.startsWith("msg_")) return err.invalid('Expected a string starting with "msg_"\n  at ["inboxID"]', "Params");
+      const item = s.inbox.find((i) => i.id === iid);
+      if (item && isPending(item)) {
+        item.cancelled = true;
+        publish("session.inbox.cancelled", { sessionID: sid, inboxID: iid });
+      }
+      return jsonResponse(204);
     }
     if (rest === "message" && method === "GET") return listMessages(s, url.searchParams);
     if (rest === "permission" && method === "GET") return jsonResponse(200, { data: [...r.perms.values()].map((p) => p.req) });
+    const permNotFound = (rid: string): Response => jsonResponse(404, { _tag: "PermissionNotFoundError", requestID: rid, message: `Permission request not found: ${rid}` });
+    const pg = /^permission\/([^/]+)$/.exec(rest);
+    if (pg && method === "GET") {
+      // live-verified 2.1.3 (r3 Q1): a settled request is a 404 (the 200 shape is unverified).
+      const rec = r.perms.get(decodeURIComponent(pg[1]!));
+      return rec ? jsonResponse(200, { data: rec.req }) : permNotFound(decodeURIComponent(pg[1]!));
+    }
     if (rest === "form" && method === "GET") {
       return jsonResponse(200, { data: [...r.forms.values()].filter((f) => f.state.status === "pending").map((f) => f.form) });
     }
@@ -1344,22 +1517,35 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       if (body instanceof Response) return body;
       if (!["once", "always", "reject"].includes(body.decision)) return err.invalid('Expected "once" | "always" | "reject"\n  at ["decision"]');
       const rec = r.perms.get(rid);
-      if (!rec) return jsonResponse(404, { _tag: "PermissionNotFoundError", requestID: rid, message: `Permission request not found: ${rid}` });
+      if (!rec) return permNotFound(rid);
       r.perms.delete(rid);
-      publish("permission.replied", { sessionID: sid, requestID: rid, reply: body.decision });
       const reply = { decision: body.decision, ...(typeof body.message === "string" && body.message ? { message: body.message } : {}) };
-      // live-verified 2.1.3 (r2): ONE reject also rejects every other pending permission of the
-      // session with the same message (a permission.replied for each).
-      const others: PermRec[] = [];
+      // live-verified 2.1.3 (r2, r3 Q1): ONE reject also rejects every other pending permission of
+      // the SAME session (another session's, a background child's included, is untouched), and a
+      // later reply to any of them is a 404. Every sibling is settled before the 204.
+      const siblings: Array<[string, PermRec]> = [];
       if (body.decision === "reject") {
         for (const [otherId, other] of [...r.perms]) {
+          if (other.req.sessionID !== sid) continue;
           r.perms.delete(otherId);
-          publish("permission.replied", { sessionID: sid, requestID: otherId, reply: "reject" });
-          others.push(other);
+          siblings.push([otherId, other]);
         }
       }
+      publish("permission.replied", { sessionID: sid, requestID: rid, reply: body.decision });
       rec.resolve(reply);
-      for (const other of others) other.resolve(reply);
+      if (reply.message !== undefined) {
+        // r3 Q1: with a reason the turn goes on, and each request's replied is followed by its own
+        // tool.failed before the next sibling's replied. The microtasks of each tool run between.
+        for (const [otherId, other] of siblings) {
+          await new Promise((res) => setImmediate(res));
+          publish("permission.replied", { sessionID: sid, requestID: otherId, reply: "reject" });
+          other.resolve(reply);
+        }
+      } else {
+        // A decline ends the turn: every replied first, then the interrupt (unverified with siblings).
+        for (const [otherId] of siblings) publish("permission.replied", { sessionID: sid, requestID: otherId, reply: "reject" });
+        for (const [, other] of siblings) other.resolve(reply);
+      }
       return jsonResponse(204);
     }
 
@@ -1461,10 +1647,15 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       stopped = true;
       for (const r of runtimes.values()) r.exec?.ac.abort("shutdown");
       await Promise.all([...runtimes.values()].map((r) => r.exec?.done));
+      // Stop the server (closing every socket) BEFORE closing the event streams' controllers. Closed
+      // the other way round, an `/api/event` stream whose client had just aborted (its cancel()
+      // not run yet) after the turn's events were written to it left `server.stop(true)` pending
+      // forever under Bun 1.3: the response never finished, so the force close never resolved.
+      const closing = server.stop(true);
       for (const sub of [...subscribers]) sub.close();
       subscribers.clear();
       saveNow();
-      await server.stop(true);
+      await closing;
     },
   };
 }
@@ -1509,6 +1700,7 @@ if (import.meta.main) {
     stateFile: process.env.FAKE_OC_STATE_FILE || undefined,
     version: process.env.FAKE_OC_VERSION || undefined,
     quotaModels: process.env.FAKE_OC_QUOTA_MODELS ? process.env.FAKE_OC_QUOTA_MODELS.split(",").map((x) => x.trim()).filter(Boolean) : undefined,
+    interruptDelayMs: num(process.env.FAKE_OC_INTERRUPT_DELAY_MS, 0),
   });
   console.log(`server listening on ${srv.url}`);
   // Like the real serve, print a generated password only when none was given.

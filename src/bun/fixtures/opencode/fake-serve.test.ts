@@ -172,6 +172,15 @@ async function messages(client: Client, sid: string): Promise<any[]> {
   expect(r.status).toBe(200);
   return r.json.data;
 }
+/**
+ * A positive barrier: a fresh session's `session.created` on the stream. The fake publishes every
+ * event to every stream in order, so anything published before this call (an execution started
+ * synchronously or on a microtask after an earlier event) is already in `sub.events` once it returns.
+ */
+async function barrier(client: Client, sub: Collector): Promise<void> {
+  const id = await client.session({ title: "barrier" });
+  await sub.waitFor((e) => e.type === "session.created" && e.data.sessionID === id);
+}
 const finalText = (msgs: any[]): string => {
   const a = msgs.filter((m) => m.type === "assistant").at(-1);
   return (a?.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
@@ -447,7 +456,7 @@ describe("scenario: permissions", () => {
     }
   });
 
-  // live-verified 2.1.3 (r2)
+  // live-verified 2.1.3 (r2, r3 Q1)
   test("one reject also rejects every other pending permission of the session with the same message", async () => {
     const { client, sub } = await boot();
     const sid = await client.session({ permissions: [{ action: "*", resource: "*", effect: "ask" }] });
@@ -701,7 +710,11 @@ describe("scenario: failures, interrupts, todo, retry", () => {
     const sid = await client.session();
     await client.prompt(sid, "__agetor_fake_oc_slow__");
     await sub.waitFor((e) => e.type === "shell.created");
-    await new Promise((r) => setTimeout(r, 60));
+    // Barrier: a whole plain turn on another session, started after the shell, runs to its end
+    // (at speed 0 a shell that did finish would have ended its turn well before this one).
+    const other = await client.session();
+    await client.prompt(other, "meanwhile");
+    await terminal(sub, other);
     expect(sub.types(sid)).not.toContain("session.execution.succeeded");
     expect((await client.req("GET", "/api/session/active")).json.data[sid]).toEqual({ type: "running" });
     const intr = await client.req("POST", `/api/session/${sid}/interrupt`);
@@ -1137,7 +1150,8 @@ describe("prompt message ids (live-verified 2.1.3 (r2))", () => {
     await terminal(sub, sid);
     const stepsBefore = sub.events.filter((e) => e.type === "session.step.started").length;
     await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_dup2", text: "hello", resume: false });
-    await new Promise((r) => setTimeout(r, 150));
+    // An execution the repeat started would be published before the barrier's session.created.
+    await barrier(client, sub);
     expect(sub.types(sid).filter((t) => t === "session.execution.started")).toHaveLength(1);
     await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_dup2", text: "hello" });
     const second = await terminal(sub, sid, 2);
@@ -1190,5 +1204,338 @@ describe("interrupting a background child (live-verified 2.1.3 (r2))", () => {
     expect((await terminal(sub, cid, 1)).type).toBe("session.execution.succeeded");
     const synthetic = sub.events.find((e) => e.type === "session.inbox.enqueued" && e.data.sessionID === sid && e.data.item.type === "synthetic")!;
     expect(synthetic.data.item.payload.metadata.state).toBe("completed");
+  });
+});
+
+describe("the inbox after an interrupt (live-verified 2.1.3 (r3 Q2/Q2b/Q4/Q5/Q6))", () => {
+  const delivered = (sub: Collector, sid: string): string[] =>
+    sub.events.filter((e) => e.type === "session.inbox.delivered" && e.data.sessionID === sid).map((e) => e.data.inboxID);
+  const started = (sub: Collector, sid: string): number => sub.types(sid).filter((t) => t === "session.execution.started").length;
+
+  /** A slow turn, a steer that arrives mid-step, then an interrupt: the steer is left undelivered. */
+  async function parkedSteer() {
+    const ctx = await boot({ speed: 0 });
+    const { client, sub } = ctx;
+    const sid = await client.session();
+    const first = await client.prompt(sid, "__agetor_fake_oc_slow__");
+    await sub.waitFor((e) => e.type === "shell.created");
+    const steer = await client.prompt(sid, "Also say BANANA.", "steer");
+    await sub.waitFor((e) => e.type === "session.inbox.enqueued" && e.data.inboxID === steer.json.data.id);
+    expect((await client.req("POST", `/api/session/${sid}/interrupt`)).json).toEqual({ interrupted: true });
+    expect((await terminal(sub, sid)).type).toBe("session.execution.interrupted");
+    await barrier(client, sub);
+    return { ...ctx, sid, firstId: first.json.data.id as string, steerId: steer.json.data.id as string };
+  }
+
+  test("a steer pending at the interrupt is parked: no new execution, no delivery, listed by GET inbox (Q2b)", async () => {
+    const { client, sub, sid, steerId } = await parkedSteer();
+    expect(started(sub, sid)).toBe(1);
+    expect(delivered(sub, sid)).not.toContain(steerId);
+    const inbox = await client.req("GET", `/api/session/${sid}/inbox`);
+    expect(inbox.status).toBe(200);
+    expect(inbox.json).toEqual({
+      data: [{ id: steerId, sessionID: sid, time: { created: expect.any(Number) }, type: "user", payload: { text: "Also say BANANA." }, delivery: "steer" }],
+    });
+    expect((await client.req("GET", `/api/session/${sid}`)).json.data.outcome).toBe("interrupted");
+    expect((await client.req("GET", "/api/session/active")).json.data[sid]).toBeUndefined();
+
+    // Q5: the next prompt's execution delivers the parked steer first, then the prompt itself.
+    const ok = await client.prompt(sid, "Reply with the single word OK.");
+    expect((await terminal(sub, sid, 2)).type).toBe("session.execution.succeeded");
+    expect(started(sub, sid)).toBe(2);
+    expect(delivered(sub, sid).slice(-2)).toEqual([steerId, ok.json.data.id]);
+    const t = sub.types(sid);
+    inOrder(t.slice(t.lastIndexOf("session.execution.started")), ["session.execution.started", "session.inbox.delivered", "session.inbox.delivered", "session.step.started"]);
+    expect((await client.req("GET", `/api/session/${sid}/inbox`)).json).toEqual({ data: [] });
+    const users = (await messages(client, sid)).filter((m) => m.type === "user").map((m) => m.id);
+    expect(users.slice(-2)).toEqual([steerId, ok.json.data.id]);
+  });
+
+  test("a child's cancelled notice enqueued while the parent runs is parked by the parent's interrupt, then delivered first (Q2, Q4)", async () => {
+    const { client, sub } = await boot({ speed: 0 });
+    const sid = await client.session();
+    await client.prompt(sid, "go __agetor_fake_oc_bgslow__");
+    // The parent's own long shell (its second shell; the child's runs too).
+    await sub.waitFor((e) => e.type === "shell.created" && e.data.info?.metadata?.sessionID === sid);
+    const cid = sub.events.find((e) => e.type === "session.created" && e.data.parentID === sid)!.data.sessionID as string;
+    await sub.waitFor((e) => e.type === "shell.created" && e.data.info?.metadata?.sessionID === cid);
+
+    expect((await client.req("POST", `/api/session/${cid}/interrupt`)).json).toEqual({ interrupted: true });
+    const enq = await sub.waitFor((e) => e.type === "session.inbox.enqueued" && e.data.sessionID === sid && e.data.item.type === "synthetic");
+    const childEnd = await terminal(sub, cid);
+    expect(childEnd.type).toBe("session.execution.interrupted");
+    // live: the parent's enqueue comes just before the child's execution.interrupted
+    expect(sub.events.indexOf(enq)).toBeLessThan(sub.events.indexOf(childEnd));
+    expect(enq.data.item).toEqual({
+      type: "synthetic",
+      payload: {
+        text: `<subagent sessionID="${cid}" state="cancelled" description="Run a long sleep">\nSubagent cancelled\n</subagent>`,
+        description: "Run a long sleep",
+        metadata: { source: "subagent", childID: cid, agent: "General", state: "cancelled" },
+      },
+      delivery: "steer",
+    });
+    // the parent is still in its first execution
+    expect(sub.events.filter(finished(sid))).toHaveLength(0);
+
+    expect((await client.req("POST", `/api/session/${sid}/interrupt`)).json).toEqual({ interrupted: true });
+    expect((await terminal(sub, sid)).type).toBe("session.execution.interrupted");
+    await barrier(client, sub);
+    expect(started(sub, sid)).toBe(1);
+    expect(delivered(sub, sid)).not.toContain(enq.data.inboxID);
+
+    const inbox = (await client.req("GET", `/api/session/${sid}/inbox`)).json;
+    expect(inbox.data).toHaveLength(1);
+    const item = inbox.data[0];
+    expect(Object.keys(item).sort()).toEqual(["delivery", "id", "payload", "sessionID", "time", "type"]);
+    expect(item).toEqual({ id: enq.data.inboxID, sessionID: sid, time: { created: expect.any(Number) }, type: "synthetic", payload: enq.data.item.payload, delivery: "steer" });
+    // Q4: a pending synthetic is not a message yet
+    expect((await messages(client, sid)).some((m) => m.type === "synthetic")).toBe(false);
+
+    while (Date.now() <= item.time.created) await Bun.sleep(1);
+    const ok = await client.prompt(sid, "Reply with the single word OK.");
+    expect((await terminal(sub, sid, 2)).type).toBe("session.execution.succeeded");
+    expect(delivered(sub, sid).slice(-2)).toEqual([enq.data.inboxID, ok.json.data.id]);
+    const msgs = await messages(client, sid);
+    const synthetic = msgs.filter((m) => m.type === "synthetic");
+    expect(synthetic).toHaveLength(1);
+    expect(synthetic[0]).toEqual({
+      id: enq.data.inboxID,
+      metadata: { source: "subagent", childID: cid, agent: "General", state: "cancelled" },
+      time: { created: expect.any(Number) },
+      text: enq.data.item.payload.text,
+      description: "Run a long sleep",
+      type: "synthetic",
+    });
+    // Q4: its time is the delivery time, not the enqueue time
+    expect(synthetic[0].time.created).toBeGreaterThan(item.time.created);
+    expect((await client.req("GET", `/api/session/${sid}/inbox`)).json).toEqual({ data: [] });
+  });
+
+  test("an item enqueued on an idle session starts an execution at once (r2, Q7)", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    const p = await client.prompt(sid, "hi", "steer");
+    await terminal(sub, sid);
+    inOrder(sub.types(sid), ["session.inbox.enqueued", "session.execution.started", "session.inbox.delivered", "session.execution.succeeded"]);
+    expect(delivered(sub, sid)).toEqual([p.json.data.id]);
+  });
+
+  test("DELETE inbox/{id}: a parked item is cancelled with one session.inbox.cancelled and never delivered (Q6)", async () => {
+    const { client, sub, sid, firstId, steerId } = await parkedSteer();
+    const del = await client.req("DELETE", `/api/session/${sid}/inbox/${steerId}`);
+    expect(del.status).toBe(204);
+    expect(del.text).toBe("");
+    const cancelled = await sub.waitFor((e) => e.type === "session.inbox.cancelled");
+    expect(cancelled.data).toEqual({ sessionID: sid, inboxID: steerId });
+    expect((await client.req("GET", `/api/session/${sid}/inbox`)).json).toEqual({ data: [] });
+
+    // already cancelled, already delivered, unknown: a silent 204
+    for (const id of [steerId, firstId, "msg_doesnotexist000"]) {
+      const r = await client.req("DELETE", `/api/session/${sid}/inbox/${id}`);
+      expect(r.status).toBe(204);
+      expect(r.text).toBe("");
+    }
+    const bad = await client.req("DELETE", `/api/session/${sid}/inbox/abc123`);
+    expect(bad.status).toBe(400);
+    expect(bad.json).toMatchObject({ _tag: "InvalidRequestError", kind: "Params" });
+    expect(bad.json.message).toStartWith('Expected a string starting with "msg_"');
+    const nf = await client.req("DELETE", `/api/session/ses_nope/inbox/${steerId}`);
+    expect(nf.status).toBe(404);
+    expect(nf.json._tag).toBe("SessionNotFoundError");
+    await barrier(client, sub);
+    expect(sub.events.filter((e) => e.type === "session.inbox.cancelled")).toHaveLength(1);
+
+    const ok = await client.prompt(sid, "Reply with the single word OK.");
+    await terminal(sub, sid, 2);
+    expect(delivered(sub, sid)).toEqual([firstId, ok.json.data.id]);
+    const msgs = await messages(client, sid);
+    expect(msgs.some((m) => m.id === steerId)).toBe(false);
+    expect(JSON.stringify(msgs)).not.toContain("BANANA");
+  });
+
+  test("DELETE inbox/{id} of a queued prompt during an execution: it is never delivered", async () => {
+    const { client, sub } = await boot({ speed: 0.1 });
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_steer__ first");
+    await sub.waitFor((e) => e.type === "shell.created");
+    const queued = await client.prompt(sid, "second one", "queue");
+    expect((await client.req("DELETE", `/api/session/${sid}/inbox/${queued.json.data.id}`)).status).toBe(204);
+    await terminal(sub, sid);
+    expect(delivered(sub, sid)).not.toContain(queued.json.data.id);
+    expect(finalText(await messages(client, sid))).not.toContain("second one");
+  });
+});
+
+describe("permission rejects across siblings (live-verified 2.1.3 (r3 Q1))", () => {
+  async function threeAsks(client: Client, sub: Collector, sid: string): Promise<any[]> {
+    const asks: any[] = [];
+    while (asks.length < 3) asks.push((await sub.waitFor((x) => x.type === "permission.asked" && x.data.sessionID === sid && !asks.includes(x.data), 5000)).data);
+    return asks;
+  }
+
+  test("each sibling's permission.replied is followed by its own tool.failed; later replies and GETs are 404", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session({ permissions: [{ action: "*", resource: "*", effect: "ask" }] });
+    await client.prompt(sid, "go __agetor_fake_oc_files__");
+    const asks = await threeAsks(client, sub, sid);
+    expect((await client.req("POST", `/api/session/${sid}/permission/${asks[0].id}/reply`, { decision: "reject", message: " " })).status).toBe(204);
+    expect((await terminal(sub, sid)).type).toBe("session.execution.succeeded");
+    const seq = sub.events.filter((e) => e.type === "permission.replied" || (e.type === "session.tool.failed" && e.data.sessionID === sid));
+    expect(seq.map((e) => e.type)).toEqual(["permission.replied", "session.tool.failed", "permission.replied", "session.tool.failed", "permission.replied", "session.tool.failed"]);
+    expect(seq[0]!.data.requestID).toBe(asks[0].id);
+    for (const a of asks) {
+      const notFound = { _tag: "PermissionNotFoundError", requestID: a.id, message: `Permission request not found: ${a.id}` };
+      const get = await client.req("GET", `/api/session/${sid}/permission/${a.id}`);
+      expect(get.status).toBe(404);
+      expect(get.json).toEqual(notFound);
+      const again = await client.req("POST", `/api/session/${sid}/permission/${a.id}/reply`, { decision: "once" });
+      expect(again.status).toBe(404);
+      expect(again.json).toEqual(notFound);
+    }
+  });
+
+  test("a pending request answers GET permission/{id} with itself", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_permission__");
+    const asked = await sub.waitFor((e) => e.type === "permission.asked");
+    expect((await client.req("GET", `/api/session/${sid}/permission/${asked.data.id}`)).json).toEqual({ data: asked.data });
+    await client.req("POST", `/api/session/${sid}/permission/${asked.data.id}/reply`, { decision: "once" });
+    await terminal(sub, sid);
+  });
+
+  test("a reject never declines another session's pending requests", async () => {
+    const { client, sub } = await boot();
+    const all = [{ action: "*", resource: "*", effect: "ask" }];
+    const a = await client.session({ permissions: all });
+    const b = await client.session({ permissions: all });
+    await client.prompt(a, "__agetor_fake_oc_files__");
+    await client.prompt(b, "__agetor_fake_oc_files__");
+    const asksA = await threeAsks(client, sub, a);
+    const asksB = await threeAsks(client, sub, b);
+    await client.req("POST", `/api/session/${a}/permission/${asksA[0].id}/reply`, { decision: "reject", message: " " });
+    await terminal(sub, a);
+    expect(sub.events.filter((e) => e.type === "permission.replied" && e.data.sessionID === b)).toEqual([]);
+    expect(((await client.req("GET", `/api/session/${b}/permission`)).json.data as any[]).map((p) => p.id).sort()).toEqual(asksB.map((x) => x.id).sort());
+    for (const x of asksB) expect((await client.req("POST", `/api/session/${b}/permission/${x.id}/reply`, { decision: "once" })).status).toBe(204);
+    expect((await terminal(sub, b)).type).toBe("session.execution.succeeded");
+    expect(finalText(await messages(client, b))).toBe("FINISHED");
+  });
+});
+
+describe("listing children (live-verified 2.1.3 (r3 Q3))", () => {
+  const ids = (r: { json: any }): string[] => r.json.data.map((s: any) => s.id);
+  const decode = (c: string): any => JSON.parse(Buffer.from(c, "base64url").toString("utf8"));
+  async function tick(): Promise<void> {
+    const t = Date.now();
+    while (Date.now() <= t) await Bun.sleep(1);
+  }
+
+  test("newest time.updated first, order=asc reverses, keyset cursor on updated, an empty page after the last", async () => {
+    const { client } = await boot();
+    const parent = await client.session();
+    const c1 = await client.session({ parentID: parent });
+    await tick();
+    const c2 = await client.session({ parentID: parent });
+    await tick();
+    const c3 = await client.session({ parentID: parent });
+    await tick();
+    const list = (q = "") => client.req("GET", `/api/session?parentID=${parent}${q}`);
+    expect(ids(await list())).toEqual([c3, c2, c1]);
+    expect((await client.req("PATCH", `/api/session/${c1}`, { title: "c1-renamed" })).status).toBe(204);
+    expect(ids(await list())).toEqual([c1, c3, c2]);
+    expect(ids(await list("&order=asc"))).toEqual([c2, c3, c1]);
+    expect(ids(await list("&order=desc"))).toEqual([c1, c3, c2]);
+
+    const p1 = await list("&limit=2");
+    expect(ids(p1)).toEqual([c1, c3]);
+    const updatedC3 = (await client.req("GET", `/api/session/${c3}`)).json.data.time.updated;
+    expect(decode(p1.json.cursor.next)).toEqual({ parentID: parent, anchor: { id: c3, time: updatedC3, direction: "next" } });
+    const p2 = await list(`&limit=2&cursor=${p1.json.cursor.next}`);
+    expect(ids(p2)).toEqual([c2]);
+    expect(typeof p2.json.cursor.next).toBe("string");
+    expect(ids(await list(`&limit=2&cursor=${p2.json.cursor.next}`))).toEqual([]);
+    // the cursor names the order only when the request did
+    expect(decode((await list("&order=desc&limit=1")).json.cursor.next).order).toBe("desc");
+    const asc1 = await list("&order=asc&limit=2");
+    expect(ids(asc1)).toEqual([c2, c3]);
+    expect(ids(await list(`&limit=2&cursor=${asc1.json.cursor.next}`))).toEqual([c1]);
+    // previous from page 2 goes back to page 1
+    expect(ids(await list(`&limit=2&cursor=${p2.json.cursor.previous}`))).toEqual([c1, c3]);
+  });
+
+  test("a child updated between page fetches moves across the boundary (keyset: it is skipped)", async () => {
+    const { client } = await boot();
+    const parent = await client.session();
+    const c1 = await client.session({ parentID: parent });
+    await tick();
+    const c2 = await client.session({ parentID: parent });
+    await tick();
+    const c3 = await client.session({ parentID: parent });
+    await tick();
+    const p1 = await client.req("GET", `/api/session?parentID=${parent}&limit=1`);
+    expect(ids(p1)).toEqual([c3]);
+    await client.req("PATCH", `/api/session/${c2}`, { title: "moved" });
+    const p2 = await client.req("GET", `/api/session?parentID=${parent}&limit=5&cursor=${p1.json.cursor.next}`);
+    expect(ids(p2)).toEqual([c1]);
+  });
+});
+
+describe("knobs for the driver's unconfirmed-stop paths", () => {
+  test("the stuck marker: interrupt answers true and the execution runs on until the session is deleted", async () => {
+    const { client, sub } = await boot({ speed: 0 });
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_stuck__");
+    await sub.waitFor((e) => e.type === "shell.created");
+    expect((await client.req("POST", `/api/session/${sid}/interrupt`)).json).toEqual({ interrupted: true });
+    expect((await client.req("POST", `/api/session/${sid}/interrupt`)).json).toEqual({ interrupted: true });
+    // Barrier: a whole turn on another session runs to its end meanwhile.
+    const other = await client.session();
+    await client.prompt(other, "meanwhile");
+    await terminal(sub, other);
+    expect(sub.events.filter(finished(sid))).toHaveLength(0);
+    expect((await client.req("GET", "/api/session/active")).json.data[sid]).toEqual({ type: "running" });
+    expect((await client.req("DELETE", `/api/session/${sid}`)).status).toBe(204);
+    const end = await terminal(sub, sid);
+    expect(end).toMatchObject({ type: "session.execution.interrupted", data: { reason: "shutdown" } });
+  });
+
+  test("interruptDelayMs delays the interrupt call's answer and its effect", async () => {
+    const { client, sub } = await boot({ speed: 0, interruptDelayMs: 250 });
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_slow__");
+    await sub.waitFor((e) => e.type === "shell.created");
+    const t0 = Date.now();
+    expect((await client.req("POST", `/api/session/${sid}/interrupt`)).json).toEqual({ interrupted: true });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(240);
+    const end = await terminal(sub, sid);
+    expect(end.type).toBe("session.execution.interrupted");
+    expect(end.created!).toBeGreaterThanOrEqual(t0 + 240);
+  });
+});
+
+describe("stop()", () => {
+  test("resolves when an event stream's client aborted just before, right after a turn was interrupted", async () => {
+    for (let n = 0; n < 3; n++) {
+      const srv = await startFakeOpencodeServer({ password: "pw-test", speed: 0.05, heartbeatMs: 1000 });
+      const client = new Client(srv.url, srv.password);
+      const hubSide = client.subscribe();
+      const observer = client.subscribe();
+      try {
+        await (hubSide as any).connected;
+        await (observer as any).connected;
+        const sid = await client.session();
+        await client.prompt(sid, "__agetor_fake_oc_slow__");
+        await observer.waitFor((e) => e.type === "shell.created");
+        await client.req("POST", `/api/session/${sid}/interrupt`);
+        observer.close();
+        const result = await Promise.race([srv.stop().then(() => "stopped"), Bun.sleep(3000).then(() => "hung")]);
+        expect(result).toBe("stopped");
+      } finally {
+        hubSide.close();
+        observer.close();
+      }
+    }
   });
 });
