@@ -903,16 +903,6 @@ export async function dropOpencodeSession(taskId: string, opts: { graceMs?: numb
   }
 }
 
-/** Stop without a handle (e.g. after a restart): `C-c` only. False when the
- *  session is already gone. */
-export async function interruptOpencodeTurn(taskId: string): Promise<boolean> {
-  const name = opencodeSessionNameFor(taskId);
-  if (!(await sessionExistsByName(name))) return false;
-  const state = opencodeSessions.get(taskId);
-  if (state) state.cancelled = true;
-  return sendCtrlC(name);
-}
-
 export const __forTest = {
   setStopEscalateMs(ms: number | null): number {
     const prev = stopEscalateMs;

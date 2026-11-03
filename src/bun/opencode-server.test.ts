@@ -33,10 +33,10 @@ const {
   opencodeIdleSweep,
   stopOpencodeServer,
   stopIdleOpencodeServersOnQuit,
-  checkOpencodeServerHealth,
   OPENCODE_SERVER_IDLE_MS,
   __forTest,
 } = mod;
+const checkOpencodeServerHealth = __forTest.checkHealth;
 type Handle = Awaited<ReturnType<typeof ensureOpencodeServer>>;
 
 const STUB_ROOT = mkdtempSync(path.join(tmpdir(), "agetor-opencode-server-stub-"));

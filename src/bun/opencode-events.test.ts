@@ -6,10 +6,12 @@ import { deriveTodoProgress } from "../shared/todo-progress.ts";
 import { mapOpencodePart, opencodeUsagePayload } from "./opencode-map-helpers.ts";
 import {
   createOpencodeEventMapper,
-  snapshotToChunks,
+  __forTest as eventsForTest,
   type OpencodeEventLike,
   type OpencodeMappedChunk,
 } from "./opencode-events.ts";
+
+const { snapshotToChunks } = eventsForTest;
 
 const FIXTURES = path.join(import.meta.dir, "fixtures", "opencode");
 function jsonl<T = Record<string, any>>(name: string): T[] {

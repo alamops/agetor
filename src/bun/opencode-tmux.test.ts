@@ -19,7 +19,6 @@ const {
   opencodeInnerScript,
   spawnOpencodeViaTmux,
   dropOpencodeSession,
-  interruptOpencodeTurn,
   opencodeSessionActive,
   opencodeLogPath,
   opencodePromptPath,
@@ -598,11 +597,10 @@ test("death watch after a Stop: a dead pane with no exit file reads as cancelled
   const { chunks, onChunk } = collectChunks();
   const agent = await spawnOpencodeViaTmux({ taskId, runId, argv: [bin], env: {}, cwd: TMUX_DIR, promptText: "x", major: 1, onChunk });
   await new Promise((r) => setTimeout(r, 300));
-  expect(await interruptOpencodeTurn(taskId)).toBe(true); // ignored by the client, but marks the turn cancelled
+  agent.kill(); // Stop: ignored by the client (trap), but marks the turn cancelled
   Bun.spawnSync([TMUX_BIN, "kill-session", "-t", `=${opencodeSessionNameFor(taskId)}`]);
   expect(await agent.done).toBe(130);
   expect(chunks.some((c) => c.data.startsWith(SESSION_DIED_STATUS_PREFIX))).toBe(false);
-  expect(await interruptOpencodeTurn(taskId)).toBe(false); // session gone
 }, 15_000);
 
 test("reattach: null when the session is gone; otherwise replays the log deduped and settles on the exit file", async () => {

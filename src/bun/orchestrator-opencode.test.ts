@@ -463,7 +463,7 @@ test("createTask: a valid opencodeServer is stored, anything else reads as share
   expect((await newTask({ opencodeServer: "bogus" as never })).opencodeServer).toBe("shared");
 });
 
-test("profile freeze copies opencodeServer: create takes the profile's, a live edit before the first run is copied down", async () => {
+test("profile freeze: create takes the profile's opencodeServer; a live edit of ONLY that retired option is not drift, an edit with real drift copies it down", async () => {
   const profile = db.agentProfiles.insert({
     name: `oc-profile-${randomUUID().slice(0, 8)}`,
     harness: "opencode",
@@ -473,15 +473,23 @@ test("profile freeze copies opencodeServer: create takes the profile's, a live e
   // The profile wins over a body value.
   const task = await newTask({ agentProfileId: profile.id, opencodeServer: "shared" });
   expect(task.opencodeServer).toBe("standalone");
+  // Retired option (plan D2): changing only it is not worth rewriting the row.
   db.agentProfiles.update(profile.id, { opencodeServer: "shared" });
   const started = await orch.startTask(task.id);
   if ("error" in started) throw new Error(started.error);
   await waitFor(() => allSettled(task.id));
-  const fresh = db.tasks.get(task.id)!;
-  expect(fresh.opencodeServer).toBe("shared");
-  expect(fresh.agentProfile?.opencodeServer).toBe("shared");
-  const [run] = runsOf(task.id);
-  expect(statusLines(run!.id)[0]).toContain("server=shared");
+  expect(db.tasks.get(task.id)!.opencodeServer).toBe("standalone");
+
+  // A real drift (the mode) rewrites the row, and the retired option rides along.
+  const second = await newTask({ agentProfileId: profile.id });
+  db.agentProfiles.update(profile.id, { mode: "plan", opencodeServer: "standalone" });
+  const started2 = await orch.startTask(second.id);
+  if ("error" in started2) throw new Error(started2.error);
+  await waitFor(() => allSettled(second.id));
+  const fresh = db.tasks.get(second.id)!;
+  expect(fresh.mode).toBe("plan");
+  expect(fresh.opencodeServer).toBe("standalone");
+  expect(fresh.agentProfile?.opencodeServer).toBe("standalone");
 });
 
 test("breadcrumb: a harness with a home runs Standalone; a v1 CLI reports server=n/a; a real model and effort are named", async () => {

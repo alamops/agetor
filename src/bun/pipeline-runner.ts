@@ -3565,10 +3565,16 @@ function isTurnSinceStop(latest: Run, historyEntry: PipelineStepRecord | undefin
  * (its opening status line, `CONTINUATION_STATUS_TEXT.user`). A continuation
  * after a background task, Claude continuing on its own, or an fx
  * auto-resume (`origin: "auto-resume"`) is not.
+ * An OpenCode server wake (`origin: "agent"`) is not either.
  */
 function turnStartedByUser(taskId: string, latest: Run, historyEntry: PipelineStepRecord | undefined): boolean {
   if (remindersInFlight.has(taskId) || historyEntry?.reminder?.runId === latest.id) return false;
   if (latest.origin === "auto-resume") return false;
+  // OpenCode started this execution by itself (a background subagent finished):
+  // nobody asked for it, so on a stopped step it is stopped again like Claude's
+  // own continuation. A wake on a step that already handed off is inert here
+  // already: its settle finds the step gone from `run.active` and returns.
+  if (latest.origin === "agent") return false;
   if (latest.origin !== "continuation") return true;
   // `startContinuationRun` writes the opening status line before it emits
   // the `running` column event that brings us here.

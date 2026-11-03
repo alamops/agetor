@@ -12,6 +12,9 @@ import { CLI_TOKEN, DEFAULT_API_HOST, resolveApiHost } from "./api-config.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
 import {
   freezeLaunches,
+  startOpencodeServerDriver,
+  stopIdleOpencodeServersOnRealQuit,
+  stopOpencodeServerDriver,
   launchesInFlight,
   reconcileOrphans,
   rearmFxAutoResumes,
@@ -22,6 +25,7 @@ import {
 } from "./orchestrator.ts";
 import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
 import { createQuitLaunchGate, decideBeforeQuit } from "./quit-launch-gate.ts";
+import { adoptOpencodeServers } from "./opencode-server.ts";
 import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
 import { resumeIncompleteOpencodeImports } from "./opencode-session-import.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -418,6 +422,10 @@ try {
   // back to ready/cancelled-with-retry instead of leaving it silently stuck
   // `running` forever (docs/plans/pipelines.md §3, T3).
   initPipelineRunner();
+  // OpenCode 2.x servers a previous core left running (docs/plans/opencode-server-driver.md D6/D9):
+  // adopted after the port bind (this process is the owner) and before the
+  // reconcile, whose reattach of a `server=agetor` run needs the adopted server.
+  await adoptOpencodeServers();
   await reconcileOrphans();
 
   // M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
@@ -543,6 +551,9 @@ startPeriodicDiscovery();
 
 // The boot restore above is done: let the routes through (boot-gate.ts).
 markBootReady();
+
+// OpenCode server wake + idle sweep: after the reattached turns are registered.
+startOpencodeServerDriver();
 
 // C3 reconcile: the first fresh status read lets background.ts heal a login item
 // whose registration drifted (e.g. an app moved or replaced). Fire-and-forget; a
@@ -676,6 +687,14 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
       console.warn("[agetor] failed to write the supervisor stop request:", err);
     }
   }
+  // A real quit (the background host is not taking over) stops the OpenCode
+  // servers nothing is using; a hand-over to the background core leaves them
+  // running for it to adopt. Best effort: the process is exiting.
+  if (decision.completely || !backgroundArmed) {
+    void stopIdleOpencodeServersOnRealQuit().catch((err) => {
+      console.warn("[agetor] stopping idle OpenCode servers on quit failed:", err);
+    });
+  }
   removeCoreCreds(dataDir);
   event.response = { allow: true };
 });
@@ -695,6 +714,9 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
 // about letting the process exit at all; it touches no persisted
 // `fxRecovery` row — `rearmFxAutoResumes()` re-arms from the DB on next boot.
 process.on("exit", stopFxAutoResumeTimers);
+// Detach the OpenCode turns and close the hub's streams (the servers and their
+// turns keep running; the next core adopts and reattaches them).
+process.on("exit", stopOpencodeServerDriver);
 // Same for the retention timers (a running pass is told to stop between
 // chunks; trimmed rows stay trimmed and the next boot resumes) and the lag
 // sampler.

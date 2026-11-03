@@ -353,7 +353,7 @@ async function probe(url: string, password: string, timeoutMs: number): Promise<
 }
 
 /** Authenticated `GET /api/info` against `h`. */
-export async function checkOpencodeServerHealth(h: OpencodeServerHandle, timeoutMs: number = healthTimeoutMs): Promise<boolean> {
+async function checkOpencodeServerHealth(h: OpencodeServerHandle, timeoutMs: number = healthTimeoutMs): Promise<boolean> {
   return (await probe(h.url, h.password, timeoutMs)).ok;
 }
 
@@ -927,6 +927,8 @@ export async function stopIdleOpencodeServersOnQuit(isBusy: (harnessId: string) 
 
 /** Test-only helpers; production code never calls these. */
 export const __forTest = {
+  /** Authenticated `/api/info` probe (production uses it internally through `healthy`). */
+  checkHealth: checkOpencodeServerHealth,
   /** Forget every in-memory server (their hosts are left alone). */
   forget(): void {
     servers.clear();

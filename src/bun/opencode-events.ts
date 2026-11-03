@@ -312,7 +312,7 @@ function walkMessages(messages: unknown, sid: string, st: WalkState, usage: Usag
  * `messages`, the result is empty. Pure and stateless; the mapper's `seedFromSnapshot` is the same
  * mapping plus state.
  */
-export function snapshotToChunks(
+function snapshotToChunks(
   messages: unknown[],
   opts: { sessionId: string; afterUserMessageId?: string },
 ): OpencodeMappedChunk[] {
@@ -540,3 +540,6 @@ export function createOpencodeEventMapper(opts: { sessionId: string }): Opencode
   };
   return mapper;
 }
+
+/** Test-only: the stateless snapshot mapper (production seeds through `beginSeed`). */
+export const __forTest = { snapshotToChunks };

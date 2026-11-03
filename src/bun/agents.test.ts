@@ -53,6 +53,8 @@ const {
   FAKE_OPENCODE_RESUME_FAIL_PROMPT_MARKER,
   fakeOpencodeChildSessionId,
   opencodeResumeFailedStatusLine,
+  opencodeTransportOfTurn,
+  OPENCODE_ASK_NEEDS_V2_STATUS,
 } = await import("./agents.ts");
 const { FX_STEER_DROPPED_STATUS, fxSpeedNotOfferedLine } = await import("./fx-acp.ts");
 const { dataDir, tasks, runs, subagents: subagentsDb } = await import("./db.ts");
@@ -3197,4 +3199,66 @@ test("fake opencode subagent marker: the subagent tool registers an opencode_sub
   expect(rows).toHaveLength(1);
   expect(rows[0]!.sourcePath).toBe(`opencode-session:${child}`);
   expect(rows[0]!.status).not.toBe("running");
+});
+
+// ── opencode transport (docs/plans/opencode-server-driver.md D3/D10, T11) ──
+
+/** Run `fn` with the given env values set (undefined = unset), then put them back. */
+async function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
+  const before = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  for (const [k, v] of Object.entries(vars)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    await fn();
+  } finally {
+    for (const [k, v] of Object.entries(before)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test("opencode transport: v2 and an unparseable version take the server; v1, the kill switch and the fake driver take opencode run", async () => {
+  await withEnv({ AGETOR_OPENCODE_TRANSPORT: undefined, AGETOR_OPENCODE_DRIVER: undefined }, () => {
+    expect(opencodeTransportOfTurn("opencode v2.1.3")).toBe("server");
+    expect(opencodeTransportOfTurn("2.0.0")).toBe("server");
+    expect(opencodeTransportOfTurn(null)).toBe("server");
+    expect(opencodeTransportOfTurn("not a version")).toBe("server");
+    expect(opencodeTransportOfTurn("1.19.4")).toBe("run");
+  });
+  await withEnv({ AGETOR_OPENCODE_TRANSPORT: " RUN ", AGETOR_OPENCODE_DRIVER: undefined }, () => {
+    expect(opencodeTransportOfTurn("opencode v2.1.3")).toBe("run");
+  });
+  await withEnv({ AGETOR_OPENCODE_TRANSPORT: "server", AGETOR_OPENCODE_DRIVER: undefined }, () => {
+    expect(opencodeTransportOfTurn("opencode v2.1.3")).toBe("server");
+    expect(opencodeTransportOfTurn("1.19.4")).toBe("run"); // v1 has no server whatever the env says
+  });
+  await withEnv({ AGETOR_OPENCODE_TRANSPORT: undefined, AGETOR_OPENCODE_DRIVER: "fake" }, () => {
+    expect(opencodeTransportOfTurn("opencode v2.1.3")).toBe("run"); // the fake replays `opencode run` NDJSON
+  });
+});
+
+test("opencode Ask mode on opencode run: no --auto and no --agent (OpenCode denies every ask); the status line says why", () => {
+  const { cmd } = buildCommand(builtin("opencode"), "hi", { mode: "ask", model: "opencode-default", effort: "auto", cliVersion: V1 });
+  expect(cmd).toEqual(BASE);
+  expect(OPENCODE_ASK_NEEDS_V2_STATUS).toContain("Ask mode needs OpenCode 2");
+  expect(OPENCODE_ASK_NEEDS_V2_STATUS).not.toMatch(/agetor/i);
+});
+
+test("opencode server transport: spawnAgent refuses to start without the orchestrator's turn hooks", async () => {
+  await withEnv({ AGETOR_OPENCODE_TRANSPORT: undefined, AGETOR_OPENCODE_DRIVER: undefined }, async () => {
+    await expect(
+      spawnAgent({
+        taskId: "t-hooks",
+        runId: "r-hooks",
+        harness: builtin("opencode"),
+        prompt: "hi",
+        cwd: process.cwd(),
+        onChunk: () => {},
+        opts: { cliVersion: V2 },
+      }),
+    ).rejects.toThrow("opencodeTurnHooks");
+  });
 });

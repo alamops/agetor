@@ -4,6 +4,8 @@ import { db, dataDir, subagents, preferences } from "./db.ts";
 import {
   freezeLaunches,
   launchesInFlight,
+  startOpencodeServerDriver,
+  stopOpencodeServerDriver,
   reconcileOrphans,
   rearmFxAutoResumes,
   reapIdleSessions,
@@ -11,6 +13,7 @@ import {
   waitForLaunchesToSettle,
 } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { adoptOpencodeServers } from "./opencode-server.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
@@ -178,6 +181,9 @@ function shutdown(reason: string, code = 0): void {
   // the lag sampler. Trimmed rows stay trimmed, the next boot resumes.
   stopRetentionTimers();
   stopLagMonitor();
+  // OpenCode: detach the turns and close the hub streams. The servers and their
+  // turns live on in their own tmux sessions for the next core (a handoff is not a quit).
+  stopOpencodeServerDriver();
   // Remove the creds file only when it is still ours: the pid check also
   // covers a successor (the app taking over) that already rewrote it.
   if (ownsCreds && readCoreCreds(dataDir)?.pid === process.pid) {
@@ -347,6 +353,9 @@ export async function runDaemon(): Promise<void> {
     // to the global lifecycle stream before reconcileOrphans() so a step
     // task's boot-time orphan→ready transition reaches it too.
     initPipelineRunner();
+    // Adopt the OpenCode servers a previous core left running before the
+    // reconcile reattaches `server=agetor` runs to them (index.ts has the same step).
+    await adoptOpencodeServers();
     await reconcileOrphans();
     // M16: same ordering as index.ts's desktop boot path — reconcile every
     // pipeline parent left mid-flight by a prior crash/restart right after
@@ -421,6 +430,9 @@ export async function runDaemon(): Promise<void> {
 
   // The boot restore is done: let the routes through.
   markBootReady();
+
+  // OpenCode server wake + idle sweep, once the reattached turns are registered.
+  startOpencodeServerDriver();
 
   // The desktop process resumes a crashed Claude import from its launch scan.
   // This process never runs that scan, so resume here too — otherwise a task
