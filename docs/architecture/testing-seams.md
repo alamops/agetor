@@ -1,4 +1,4 @@
-# Test seams: native pickers and downloads
+# Test seams: native pickers, downloads and the fake OpenCode server
 
 > Moved from `CLAUDE.md`, where this was the `POST /refs/pick` bullet of “Things that will trip you up”. Index of all subsystem docs: the [Topic map in CLAUDE.md](../../CLAUDE.md#topic-map).
 
@@ -8,3 +8,12 @@
 Drops are drivable without a seam (a `text/uri-list` of `file://` URLs dispatched on `refs-dropzone`), but `capture-refs.ts`'s `isTransientPath` filters `/tmp` and `/var/folders`, so a dropped fixture file must live outside the temp dirs (the repo checkout works).
 The [bundle](bundle.md) routes reuse the same seam — `/bundle/export/save` with `target: "folder"` writes into that directory and `/bundle/pick-file` returns its first `*.json` file (name order) — and add `AGETOR_DOWNLOADS_DIR=<dir>` for Save to Downloads (`e2e/fixtures.ts` points it at `<dataDir>/fake-downloads`, exposed as `backend.downloadsDir`).
 A bundle drop needs no seam: the drop handler reads the dropped `File` with `File.text()`.
+
+**The fake OpenCode server.** The OpenCode 2.x server driver ([harness-opencode.md](harness-opencode.md)) is tested against `src/bun/fixtures/opencode/fake-serve.ts`, a Bun implementation of the `/api` subset it uses (Basic auth, a global SSE stream, sessions in memory), started by a stub `opencode` binary (`stub-opencode.sh`, set as `AGETOR_OPENCODE_BIN`) whose `serve` subcommand execs it.
+Unlike the seams above this one exercises the real driver, hub and server manager end to end; only the OpenCode binary is faked.
+The scenario is chosen by a marker in the prompt: `__agetor_fake_oc_steer__`, `_permission__`, `_question__`, `_subagent__`, `_wake__`, `_error__`, `_slow__`, `_todo__`, `_retry__`, `_files__`, `_tool__`.
+Its knobs are `FAKE_OC_SPEED`, `FAKE_OC_HEARTBEAT_MS`, `FAKE_OC_STATE_FILE`, `FAKE_OC_QUOTA_MODELS`, `FAKE_OC_VERSION` and `FAKE_OC_BUN`, all documented in the file's header.
+`AGETOR_OPENCODE_SERVER_HOST=direct` hosts the server as a `coreSpawn` child of the core instead of in tmux, so unit and e2e runs need no tmux; it is test-only and nothing in a release flow sets it.
+`AGETOR_OPENCODE_TRANSPORT=run` forces the legacy `opencode run` driver, and `AGETOR_OPENCODE_DRIVER=fake` keeps its canned-NDJSON path.
+A test that runs the real driver must restore every one of these env vars, since `bun test` shares one process.
+

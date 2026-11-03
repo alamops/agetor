@@ -56,6 +56,13 @@ Either way a quit about to be allowed first goes through `quit-launch-gate.ts` (
 
 **Test seams:** `AGETOR_FAKE_LOGIN_ITEM=1` (a file-backed fake helper at `<dataDir>/fake-login-item.json` `{registration, info?, calls[], failNext?}`; it also makes `background.ts` treat the platform as darwin and `POST /background` work headless, so e2e reaches every state), `AGETOR_FAKE_REMOTE_ACCESS=on` (with the fake: seeds the pref on at first read), `AGETOR_LOGIN_ITEM_HELPER` (helper path), `AGETOR_LOGIN_DAEMON_CORE` (core entry the supervisor runs), `AGETOR_LOGIN_DAEMON_TICK_MS` / `AGETOR_LOGIN_DAEMON_HANDOFF_GRACE_MS` / `AGETOR_LOGIN_DAEMON_UPDATE_GRACE_MS`, and the helper-set `AGETOR_LAUNCHED_BY=login-item`, `AGETOR_LOGIN_ITEM_BUNDLE`, `AGETOR_LOGIN_ITEM_LABEL`.
 
+**OpenCode servers outlive every core** ([harness-opencode.md](harness-opencode.md)): the agetor-owned `opencode serve` of an OpenCode 2.x harness is hosted in a detached tmux session on the instance socket, not as a child of the app or the background core, so a quit, a crash or a handoff leaves it (and a turn running in it) alone.
+Whichever core owns the port next adopts it at boot (`adoptOpencodeServers()`, before `reconcileOrphans`), reattaches the in-flight turns, and the server's password stays in its 0600 state file, not in the core.
+**A handoff between the app and the background core is not a quit**: neither side stops a server on a handoff.
+Stop rules are the same everywhere: a server stops after 30 minutes with no running turn and no open card (the idle sweep, a 60 s timer in the owning core), and on a real quit when it is idle; it never stops while a turn runs or a card is open.
+The quit hook (`stopIdleOpencodeServersOnQuit`) runs only on a real quit, not on a handoff to a core that keeps running, and it skips any busy server.
+The supervisor never imports the OpenCode modules (it never imports `db.ts`); only a core does.
+
 **Rollback rule (C21):** a later build that drops this feature MUST keep the helper in the bundle and call `unregister` on launch — otherwise a user who turned the switch on keeps a launchd job whose `BundleProgram` no longer exists and loops on exit 78.
 Turning the switch off is the per-user rollback; there is no feature flag (the switch defaults to off).
 Registration is by bundle id, so a canary and the release share one Login Items row (spike A8): toggling it can leave one label `notFound`, which Settings shows honestly as Off.
