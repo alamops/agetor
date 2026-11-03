@@ -1004,12 +1004,6 @@ export async function opencodeIdleSweep(now: number, isBusy: (harnessId: string)
   return stopped;
 }
 
-/** A real quit: stop every server that is not busy. */
-export async function stopIdleOpencodeServersOnQuit(isBusy: (harnessId: string) => boolean): Promise<void> {
-  const ids = [...servers.keys()].filter((id) => !starting.has(id) && !busy(isBusy, id));
-  await Promise.allSettled(ids.map((id) => stopOpencodeServer(id)));
-}
-
 /**
  * A real quit that cannot await (Electrobun's `quit()` runs synchronous FFI
  * right after the before-quit event): stop every in-memory server that is not

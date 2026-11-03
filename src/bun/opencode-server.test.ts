@@ -32,7 +32,6 @@ const {
   noteOpencodeActivity,
   opencodeIdleSweep,
   stopOpencodeServer,
-  stopIdleOpencodeServersOnQuit,
   stopIdleOpencodeServersSync,
   OPENCODE_SERVER_IDLE_MS,
   __forTest,
@@ -813,18 +812,6 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
 
     test("the default idle window is 30 minutes", () => {
       expect(OPENCODE_SERVER_IDLE_MS).toBe(30 * 60_000);
-    });
-
-    test("a real quit stops every server that is not busy", async () => {
-      const [idle, working] = [newId(), newId()];
-      const hi = await ensureOpencodeServer(spec(idle));
-      const hw = await ensureOpencodeServer(spec(working));
-      await stopIdleOpencodeServersOnQuit((hid) => hid === working);
-      expect(getOpencodeServer(idle)).toBeNull();
-      await waitFor(async () => !(await checkOpencodeServerHealth(hi, 300)));
-      expect(getOpencodeServer(working)).toBe(hw);
-      expect(await checkOpencodeServerHealth(hw)).toBe(true);
-      expect(existsSync(__forTest.statePath(working))).toBe(true);
     });
 
     test("stop kills the server, removes its files, and is idempotent", async () => {
