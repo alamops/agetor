@@ -206,6 +206,7 @@ import {
   answerFxPermission,
   answerOpencodeAsk,
   answerOpencodePermission,
+  awaitOpencodeAskClaimGate,
   getOpencodeAskFields,
   normalizeReplyText,
   opencodeAskAnswerFromBody,
@@ -6903,11 +6904,8 @@ export function startApiServer(
             }
             askAnswersInFlight.add(req.params.id);
             try {
-              // Unset in production; lets the 409 test hold the claim open.
-              const holdMs = Number(process.env.AGETOR_TEST_HOLD_OPENCODE_ASK_MS ?? "");
-              if (Number.isFinite(holdMs) && holdMs > 0) {
-                await new Promise((r) => setTimeout(r, holdMs));
-              }
+              // No-op in production; a test holds the claim open here.
+              await awaitOpencodeAskClaimGate(req.params.id);
               const fields = getOpencodeAskFields(req.params.id);
               if (!fields) return json({ ok: false }, { headers: corsHeaders(req) });
               if (body.skip === true) {
@@ -7245,6 +7243,8 @@ export function startApiServer(
           }
           // A reason the user typed for Reject: OpenCode cards only, and only
           // with the `reject` option. Anything else is refused, never ignored.
+          // (A reject with no reason ends the OpenCode turn; one with a reason
+          // lets it continue. The driver relays, this route adds nothing.)
           let message: string | undefined;
           if (body.message !== undefined) {
             if (pending.harness !== "opencode") {

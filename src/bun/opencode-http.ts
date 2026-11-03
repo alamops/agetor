@@ -561,12 +561,16 @@ export function openOpencodeEventStream(
       h.onOpen?.();
       reader = res.body.getReader();
       const decoder = new TextDecoder();
-      // Line assembly. `pending` is the unterminated tail; a trailing "\r" is
-      // held back because the "\n" of a CRLF pair may arrive in the next chunk.
-      let pending = "";
+      // Line assembly. Only the newly decoded text is scanned, and the
+      // unterminated tail is kept as a list of pieces joined once its line
+      // ends, so a large single-line frame costs O(n), not O(n^2), on the
+      // shared main thread. A CR ends a line at once; `crPending` swallows the
+      // LF of a CRLF pair that arrives in the next chunk.
+      let tail: string[] = [];
+      let tailChars = 0;
+      let crPending = false;
       let dataLines: string[] = [];
       let frameChars = 0;
-
       const handleLine = (line: string) => {
         if (line === "") {
           dispatch(dataLines);
@@ -582,39 +586,52 @@ export function openOpencodeEventStream(
         // event:, id:, retry: carry nothing this API uses.
       };
 
-      const consume = (final: boolean) => {
+      const emit = (segment: string) => {
+        const line = tail.length > 0 ? tail.join("") + segment : segment;
+        tail = [];
+        tailChars = 0;
+        handleLine(line);
+      };
+
+      const consume = (text: string) => {
         let start = 0;
-        for (let i = 0; i < pending.length && !finished; i++) {
-          const ch = pending.charCodeAt(i);
-          if (ch !== 10 && ch !== 13) continue;
-          if (ch === 13) {
-            if (i + 1 >= pending.length && !final) break; // maybe CRLF split across chunks
-            handleLine(pending.slice(start, i));
-            if (pending.charCodeAt(i + 1) === 10) i++;
-            start = i + 1;
-          } else {
-            handleLine(pending.slice(start, i));
-            start = i + 1;
-          }
+        let i = 0;
+        if (crPending) {
+          crPending = false;
+          if (text.charCodeAt(0) === 10) start = i = 1;
         }
-        pending = pending.slice(start);
+        for (; i < text.length && !finished; i++) {
+          const ch = text.charCodeAt(i);
+          if (ch !== 10 && ch !== 13) continue;
+          emit(text.slice(start, i));
+          if (ch === 13) {
+            if (i + 1 < text.length) {
+              if (text.charCodeAt(i + 1) === 10) i++;
+            } else {
+              crPending = true;
+            }
+          }
+          start = i + 1;
+        }
+        if (!finished && start < text.length) {
+          tail.push(text.slice(start));
+          tailChars += text.length - start;
+        }
       };
 
       for (;;) {
         const { done, value } = await reader.read();
         if (finished) return;
         if (done) {
-          pending += decoder.decode();
-          consume(true);
+          consume(decoder.decode());
           // A final unterminated line is not a complete frame; drop it.
           finish("ended");
           return;
         }
         armWatchdog();
-        pending += decoder.decode(value, { stream: true });
-        consume(false);
+        consume(decoder.decode(value, { stream: true }));
         if (finished) return;
-        if (pending.length + frameChars > MAX_SSE_PENDING_CHARS) {
+        if (tailChars + frameChars > MAX_SSE_PENDING_CHARS) {
           finish("error", new Error("OpenCode event stream line exceeded the size cap"));
           return;
         }

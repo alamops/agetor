@@ -1,16 +1,19 @@
-import { test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
+import { test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-// Top-level: db.ts captures AGETOR_DATA_DIR at first import.
-process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-server-opencode-interactions-"));
-process.env.AGETOR_API_PORT = "4617";
+import { rmTestDataDir } from "./test-data-dir.ts";
+
+// Top-level: db.ts captures AGETOR_DATA_DIR at first import. Port 5214 sits
+// outside the e2e worker range (4600-4999), the unit-test range and Vite's 5173.
+const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-server-opencode-interactions-"));
+process.env.AGETOR_DATA_DIR = DATA_DIR;
+process.env.AGETOR_API_PORT = "5214";
 
 let server: { stop: () => void } | null = null;
 let token: string;
-const url = (p: string) => `http://127.0.0.1:4617${p}`;
-const savedHold = process.env.AGETOR_TEST_HOLD_OPENCODE_ASK_MS;
+const url = (p: string) => `http://127.0.0.1:5214${p}`;
 
 beforeAll(async () => {
   await import("./db.ts");
@@ -19,8 +22,12 @@ beforeAll(async () => {
   token = API_TOKEN;
 });
 
-afterAll(() => {
+afterAll(async () => {
   server?.stop?.();
+  // `bun test` shares one process: leave no cards or gate behind.
+  const { __testing } = await import("./interactions.ts");
+  __testing.reset();
+  rmTestDataDir(DATA_DIR);
 });
 
 beforeEach(async () => {
@@ -28,10 +35,23 @@ beforeEach(async () => {
   __testing.reset();
 });
 
-afterEach(() => {
-  if (savedHold === undefined) delete process.env.AGETOR_TEST_HOLD_OPENCODE_ASK_MS;
-  else process.env.AGETOR_TEST_HOLD_OPENCODE_ASK_MS = savedHold;
-});
+/** Hold the ask route's in-flight claim open until `release()`. `entered`
+ *  resolves with the card id each time a request reaches the claimed section
+ *  (only a request that passed the claim check gets there). */
+async function holdAskClaim() {
+  const { __testing } = await import("./interactions.ts");
+  const enteredIds: string[] = [];
+  let signalEntered!: () => void;
+  const entered = new Promise<void>((r) => { signalEntered = r; });
+  let release!: () => void;
+  const released = new Promise<void>((r) => { release = r; });
+  __testing.setOpencodeAskClaimGate(async (cardId) => {
+    enteredIds.push(cardId);
+    signalEntered();
+    await released;
+  });
+  return { entered, release, enteredIds };
+}
 
 function post(p: string, body: unknown): Promise<Response> {
   return fetch(url(p), {
@@ -201,32 +221,51 @@ test("opencode ask: skip with a typed reason, and skip without one sends no word
 });
 
 test("opencode ask: a second submit while the first is in flight is a 409 and the first still lands", async () => {
-  process.env.AGETOR_TEST_HOLD_OPENCODE_ASK_MS = "300";
+  const gate = await holdAskClaim();
   const a = await askCard();
   const body = { answers: [{ selected: ["Red"] }, { selected: ["X"] }] };
   const first = post(`/ask-questions/${a.id}/answer`, body);
-  await new Promise((r) => setTimeout(r, 100));
+  await gate.entered; // the first request now holds the claim
   const second = await post(`/ask-questions/${a.id}/answer`, body);
   expect(second.status).toBe(409);
+  expect(await stillPending(a.id)).toBe(true);
+  gate.release();
   const done = await first;
   expect(done.status).toBe(200);
+  expect((await done.json()).ok).toBe(true);
   await expect(a.answer).resolves.toEqual({ outcome: "answered", answer: { color: "r", tags: ["x"] } });
-  // Once settled, a late third submit is the ordinary ok:false.
+  // The claim is released: a late submit is the ordinary ok:false, not a 409.
   const late = await post(`/ask-questions/${a.id}/answer`, body);
   expect(late.status).toBe(200);
   expect((await late.json()).ok).toBe(false);
+  expect(gate.enteredIds).toEqual([a.id]);
 });
 
-test("opencode ask: a card swept while the answer was in flight answers ok:false and the awaiter keeps the cancellation", async () => {
-  process.env.AGETOR_TEST_HOLD_OPENCODE_ASK_MS = "200";
+test("opencode ask: a card swept while its answer is in flight settles once as cancelled and the held answer is refused", async () => {
   const { cancelPendingForTask } = await import("./interactions.ts");
+  const gate = await holdAskClaim();
   const a = await askCard("t-oc-sweep");
-  const pending = post(`/ask-questions/${a.id}/answer`, { answers: [{ selected: ["Red"] }, { selected: ["X"] }] });
-  await new Promise((r) => setTimeout(r, 50));
+  const inFlight = post(`/ask-questions/${a.id}/answer`, { answers: [{ selected: ["Red"] }, { selected: ["X"] }] });
+  await gate.entered;
   cancelPendingForTask("t-oc-sweep", "stop");
-  const res = await pending;
+  gate.release();
+  const res = await inFlight;
   expect((await res.json()).ok).toBe(false);
+  // The in-flight path (and only it) reached the claimed section, and the
+  // awaiter kept the sweep's cancellation instead of being answered twice.
+  expect(gate.enteredIds).toEqual([a.id]);
   await expect(a.answer).resolves.toEqual({ outcome: "cancelled" });
+});
+
+test("opencode ask: an answer for a card already swept never reaches the claimed section", async () => {
+  const { cancelPendingForTask } = await import("./interactions.ts");
+  const gate = await holdAskClaim();
+  const a = await askCard("t-oc-swept-before");
+  cancelPendingForTask("t-oc-swept-before", "stop");
+  const res = await post(`/ask-questions/${a.id}/answer`, { answers: [{ selected: ["Red"] }, { selected: ["X"] }] });
+  expect((await res.json()).ok).toBe(false);
+  expect(gate.enteredIds).toEqual([]);
+  gate.release();
 });
 
 test("ask-questions answer on an unknown id stays ok:false at 200", async () => {

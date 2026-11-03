@@ -990,6 +990,13 @@ export function normalizeReplyText(
   return { ok: true, text: text.length > 0 ? text : undefined };
 }
 
+/**
+ * Register an OpenCode permission request as a card. The answer promise
+ * resolves with the user's decision; the driver relays it to the server. A
+ * `reject` WITHOUT a reason ends the OpenCode turn, while one WITH the user's
+ * typed reason lets the turn continue (plan D5), which is why Reject offers a
+ * reason field (`allowReason`) and nothing here invents one.
+ */
 export function registerOpencodePermission(args: {
   taskId: string;
   runId: string;
@@ -1185,6 +1192,17 @@ export function resolveOpencodeCardsForRequest(
   }
 }
 
+/** Test seam: awaited by the ask answer route right after it claims the card,
+ *  so a test can hold the claim open and release it on demand. Null in
+ *  production. */
+let opencodeAskClaimGate: ((cardId: string) => Promise<void>) | null = null;
+
+/** Called by the `/ask-questions/:id/answer` route for an OpenCode card once it
+ *  holds the in-flight claim. A no-op unless a test installed a gate. */
+export async function awaitOpencodeAskClaimGate(cardId: string): Promise<void> {
+  if (opencodeAskClaimGate) await opencodeAskClaimGate(cardId);
+}
+
 type OpencodeAskBodyAnswer = { selected?: unknown; selectedOptionIds?: unknown; custom?: unknown };
 
 function stringArray(v: unknown): string[] | null {
@@ -1351,6 +1369,12 @@ export function pendingCountsByTask(): Map<string, number> {
 
 /** Test-only handle for asserting the registry state. */
 export const __testing = {
+  /** Install (or clear with null) the claim gate; returns the previous one. */
+  setOpencodeAskClaimGate(fn: ((cardId: string) => Promise<void>) | null) {
+    const prev = opencodeAskClaimGate;
+    opencodeAskClaimGate = fn;
+    return prev;
+  },
   opencodeIndexSizes: () => ({ perm: opencodePermByRequest.size, ask: opencodeAskByForm.size }),
   askQuestionsSize: () => askQuestions.size,
   tmuxPromptsSize: () => tmuxPrompts.size,
@@ -1365,6 +1389,7 @@ export const __testing = {
     cursorAskByTool.clear();
     opencodePermByRequest.clear();
     opencodeAskByForm.clear();
+    opencodeAskClaimGate = null;
     tmuxPrompts.clear();
     fxPermissions.clear();
   },

@@ -22,6 +22,7 @@
  *   __agetor_fake_oc_slow__        a shell tool that runs until interrupted
  *   __agetor_fake_oc_todo__        a `todowrite` call with three todos
  *   __agetor_fake_oc_retry__       two `session.retry.scheduled` then success
+ *   __agetor_fake_oc_tool__        one `echo hi` shell step, then `OK` (the v2-http-tool-turn shape)
  *   __agetor_fake_oc_files__       read + write + shell in one step (three
  *                                  parallel permission asks in an all-ask session)
  *
@@ -86,6 +87,7 @@ export const FAKE_OC_MARKERS = {
   todo: "__agetor_fake_oc_todo__",
   retry: "__agetor_fake_oc_retry__",
   files: "__agetor_fake_oc_files__",
+  tool: "__agetor_fake_oc_tool__",
 } as const;
 type ScenarioName = keyof typeof FAKE_OC_MARKERS | "default";
 
@@ -225,7 +227,8 @@ interface Step {
   closed: boolean;
   usage: J;
 }
-type ToolResult = { content: J[]; metadata: J };
+/** `after` runs once tool.success has been published (a shell that exits just after its result). */
+type ToolResult = { content: J[]; metadata: J; after?: () => void };
 type ToolOutcome = { ok: true } | { ok: false; kind: "rejected" | "denied"; message?: string };
 type Scenario = (c: Ctx, initial: InboxItem[]) => Promise<void>;
 
@@ -604,10 +607,9 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
         const part: J = { type: "text", text: "" };
         step.msg.content.push(part);
         c.emit("session.text.started", { assistantMessageID: step.id, ordinal });
+        // The real message updater applies no deltas: a streaming part stays `text: ""` until text.ended.
         for (let i = 0; i < text.length; i += 14) {
-          const delta = text.slice(i, i + 14);
-          part.text += delta;
-          c.emit("session.text.delta", { assistantMessageID: step.id, ordinal, delta });
+          c.emit("session.text.delta", { assistantMessageID: step.id, ordinal, delta: text.slice(i, i + 14) });
           await c.pause(4);
         }
         part.text = text;
@@ -621,11 +623,10 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
         step.msg.content.push(part);
         c.emit("session.reasoning.started", { assistantMessageID: step.id, ordinal, native });
         for (let i = 0; i < text.length; i += 24) {
-          const delta = text.slice(i, i + 24);
-          part.text += delta;
-          c.emit("session.reasoning.delta", { assistantMessageID: step.id, ordinal, delta });
+          c.emit("session.reasoning.delta", { assistantMessageID: step.id, ordinal, delta: text.slice(i, i + 24) });
           await c.pause(4);
         }
+        part.text = text;
         part.time.completed = Date.now();
         c.emit("session.reasoning.ended", { assistantMessageID: step.id, ordinal, text, native });
       },
@@ -704,6 +705,7 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
           const result = await spec.run(rec);
           settle("completed", { content: result.content, metadata: result.metadata });
           c.emit("session.tool.success", { assistantMessageID: step.id, id: rec.id, content: result.content, metadata: result.metadata, executed: false });
+          result.after?.();
           return { ok: true };
         } catch (e) {
           if (e instanceof ToolFail) {
@@ -776,8 +778,13 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
     return m ? `${m[1]!.replace(/^["']|["']$/g, "")}\n` : "(no output)";
   }
 
-  /** The shell tool: shell.created → tool.progress → (wait) → shell.exited → result. */
-  function shellRun(c: Ctx, step: Step, command: string, durationMs: number, gate?: () => Promise<void>) {
+  /**
+   * The shell tool: shell.created, tool.progress, (wait), shell.exited, result.
+   * `order` is which of tool.success and shell.exited comes first: the live
+   * transcripts show both (v2-http-tool-turn: exited first; v2-http-steer: success first).
+   * An interrupt kills the shell the way the real server does: exited(killed), then deleted.
+   */
+  function shellRun(c: Ctx, step: Step, command: string, durationMs: number, gate?: () => Promise<void>, order: "exit-first" | "success-first" = "exit-first") {
     return async (rec: ToolRec): Promise<ToolResult> => {
       const shellID = newId("sh");
       rec.shellID = shellID;
@@ -794,17 +801,38 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
         },
       });
       c.emit("session.tool.progress", { assistantMessageID: step.id, id: rec.id, metadata: { shellID } });
-      if (gate) await gate();
-      await c.pause(durationMs);
-      publish("shell.exited", { id: shellID, exit: 0, status: "exited" });
-      return { content: [{ type: "text", text: shellOutput(command) }], metadata: { status: "completed", truncated: false, exit: 0 } };
+      try {
+        if (gate) await gate();
+        await c.pause(durationMs);
+      } catch (e) {
+        if (e instanceof Interrupted) {
+          publish("shell.exited", { id: shellID, status: "killed" });
+          publish("shell.deleted", { id: shellID });
+        }
+        throw e;
+      }
+      const exited = (): void => publish("shell.exited", { id: shellID, exit: 0, status: "exited" });
+      if (order === "exit-first") exited();
+      return {
+        content: [{ type: "text", text: shellOutput(command) }],
+        metadata: { status: "completed", truncated: false, exit: 0 },
+        ...(order === "success-first" ? { after: exited } : {}),
+      };
     };
   }
-  const shellSpec = (c: Ctx, step: Step, command: string, ms: number, extra: Partial<ToolSpec> = {}, gate?: () => Promise<void>): ToolSpec => ({
+  const shellSpec = (
+    c: Ctx,
+    step: Step,
+    command: string,
+    ms: number,
+    extra: Partial<ToolSpec> = {},
+    gate?: () => Promise<void>,
+    order?: "exit-first" | "success-first",
+  ): ToolSpec => ({
     action: "shell",
     resources: [command],
     save: [`${command.split(/\s+/)[0] ?? ""} *`],
-    run: shellRun(c, step, command, ms, gate),
+    run: shellRun(c, step, command, ms, gate, order),
     ...extra,
   });
 
@@ -845,7 +873,7 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
 
     slow: async (c) => {
       const step = c.startStep();
-      await c.say(step, "Working on it.");
+      await c.think(step, "Run the long command.");
       const rec = c.declare(step, "shell", { command: "sleep 3600" });
       c.streamed(step);
       // Never resolves: only an interrupt ends this tool, whatever FAKE_OC_SPEED is.
@@ -856,10 +884,10 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
 
     steer: async (c) => {
       const step = c.startStep();
-      await c.say(step, "Starting the long step.");
+      await c.think(step, "Run the long command, then answer.");
       const rec = c.declare(step, "shell", { command: "sleep 2" });
       c.streamed(step);
-      const out = await c.tool(step, rec, shellSpec(c, step, "sleep 2", 1500));
+      const out = await c.tool(step, rec, shellSpec(c, step, "sleep 2", 1500, {}, undefined, "success-first"));
       c.endStep(step, "tool-calls");
       await c.answer(out.ok ? "Done." : "The step did not run.");
     },
@@ -972,6 +1000,15 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       ]);
       c.endStep(step, "tool-calls");
       await c.answer("FINISHED");
+    },
+
+    tool: async (c) => {
+      const step = c.startStep();
+      const rec = c.declare(step, "shell", { command: "echo hi" });
+      c.streamed(step);
+      await c.tool(step, rec, shellSpec(c, step, "echo hi", 30));
+      c.endStep(step, "tool-calls");
+      await c.answer("OK");
     },
 
     todo: async (c) => {

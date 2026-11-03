@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
+  OPENCODE_HTTP_TIMEOUT_MS,
+  OPENCODE_SSE_STALL_MS,
   OpencodeHttpError,
   createOpencodeClient,
   isLoopbackOpencodeUrl,
@@ -115,6 +117,13 @@ describe("opencodeAuthHeader / isLoopbackOpencodeUrl", () => {
     const c = createOpencodeClient({ url: `${ref.url}/some/prefix/`, password: PASSWORD });
     expect(await c.info()).toEqual({ version: "2.1.3", pid: 7 });
     expect(seen[0]!.path).toBe("/api/info");
+  });
+});
+
+describe("defaults", () => {
+  test("pins the documented timeout and stall budgets", () => {
+    expect(OPENCODE_HTTP_TIMEOUT_MS).toBe(10_000);
+    expect(OPENCODE_SSE_STALL_MS).toBe(45_000);
   });
 });
 
@@ -399,11 +408,30 @@ describe("errors", () => {
     expect(err.message).not.toContain(PASSWORD);
   });
 
-  test("a redirect is refused rather than followed with the credentials", async () => {
-    reset({ "GET /api/info": () => new Response(null, { status: 302, headers: { location: "http://example.invalid/" } }) });
-    const err = await createOpencodeClient(ref).info().catch((e) => e);
-    expect(err).toBeInstanceOf(OpencodeHttpError);
-    expect(err.status).toBe(0);
+  test("a redirect is refused: the second loopback server is never contacted and no credentials reach it", async () => {
+    const hits: Array<{ path: string; auth: string | null }> = [];
+    const target = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        hits.push({ path: new URL(req.url).pathname, auth: req.headers.get("authorization") });
+        return json({ version: "evil", pid: 1 });
+      },
+    });
+    try {
+      reset({
+        "GET /api/info": () =>
+          new Response(null, { status: 302, headers: { location: `http://127.0.0.1:${target.port}/stolen` } }),
+      });
+      const err = await createOpencodeClient(ref).info().catch((e) => e);
+      expect(err).toBeInstanceOf(OpencodeHttpError);
+      expect(err).toMatchObject({ status: 0, tag: "NetworkError", op: "info" });
+      expect(err.message).toMatch(/UnexpectedRedirect/);
+      expect(err.message).not.toContain(PASSWORD);
+      expect(hits).toEqual([]);
+    } finally {
+      target.stop(true);
+    }
   });
 
   test("the per-call timeout fires, for a stalled reply and a stalled body", async () => {
@@ -552,18 +580,18 @@ describe("openOpencodeEventStream", () => {
     reset();
     sseRoute();
     const c = collect();
-    const s = openOpencodeEventStream(ref, c.h, { stallMs: 200 });
+    const s = openOpencodeEventStream(ref, c.h, { stallMs: 400 });
     await until(() => handles.length === 1);
-    // Heartbeats every 80 ms for ~400 ms: no stall.
-    for (let i = 0; i < 5; i++) {
+    // Heartbeats every 50 ms for ~800 ms (twice the budget): no stall.
+    for (let i = 0; i < 16; i++) {
       push(0, ": heartbeat\n\n");
-      await new Promise((r) => setTimeout(r, 80));
+      await new Promise((r) => setTimeout(r, 50));
     }
     expect(c.closes).toHaveLength(0);
     const t0 = Date.now();
     await until(() => c.closes.length === 1);
     expect(c.closes[0]!.reason).toBe("stalled");
-    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(Date.now() - t0).toBeLessThan(3000);
     s.close(); // after the fact: no second onClose
     await new Promise((r) => setTimeout(r, 30));
     expect(c.closes).toHaveLength(1);
@@ -628,6 +656,64 @@ describe("openOpencodeEventStream", () => {
     expect((err as OpencodeHttpError).status).toBe(401);
     expect(String((err as Error).message)).not.toContain(PASSWORD);
     expect(c.opened).toBe(0);
+  });
+
+  test("a redirect on open is refused: the second loopback server is never contacted", async () => {
+    const hits: Array<{ auth: string | null }> = [];
+    const target = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        hits.push({ auth: req.headers.get("authorization") });
+        return new Response('data: {"type":"evil"}\n\n', { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    try {
+      reset({
+        "GET /api/event": () =>
+          new Response(null, { status: 302, headers: { location: `http://127.0.0.1:${target.port}/stolen` } }),
+      });
+      const c = collect();
+      openOpencodeEventStream(ref, c.h);
+      await until(() => c.closes.length === 1);
+      expect(c.closes[0]!.reason).toBe("error");
+      expect(String((c.closes[0]!.err as Error).message)).toMatch(/UnexpectedRedirect/);
+      expect(String((c.closes[0]!.err as Error).message)).not.toContain(PASSWORD);
+      expect(c.opened).toBe(0);
+      expect(c.events).toHaveLength(0);
+      expect(hits).toEqual([]);
+    } finally {
+      target.stop(true);
+    }
+  });
+
+  test("a ~4 MB single-line frame in 1 KB chunks yields one event in linear time", async () => {
+    // fetchImpl hands the reader exact chunks (a socket would coalesce them).
+    const payload = "x".repeat(4 * 1024 * 1024);
+    const bytes = enc.encode(`data: {"type":"big","data":{"blob":"${payload}"}}\n\n`);
+    const CHUNK = 1024;
+    let off = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        if (off >= bytes.length) {
+          ctrl.close();
+          return;
+        }
+        ctrl.enqueue(bytes.slice(off, off + CHUNK));
+        off += CHUNK;
+      },
+    });
+    const fetchImpl = (async () => new Response(stream, { headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch;
+    const c = collect();
+    const t0 = Date.now();
+    const s = openOpencodeEventStream(ref, c.h, { fetchImpl });
+    await until(() => c.closes.length === 1, 10_000);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(c.closes[0]!.reason).toBe("ended");
+    expect(c.events).toHaveLength(1);
+    expect(c.events[0]!.type).toBe("big");
+    expect(c.events[0]!.data.blob.length).toBe(payload.length);
+    expect(s.stats()).toEqual({ events: 1, dropped: 0 });
   });
 
   test("a connection error reports 'error' without leaking the password", async () => {

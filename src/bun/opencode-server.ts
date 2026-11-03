@@ -1,6 +1,7 @@
 import {
   chmodSync,
   closeSync,
+  constants,
   fstatSync,
   lstatSync,
   mkdirSync,
@@ -18,7 +19,7 @@ import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
 import { SCRUBBED_ENV_KEYS, childEnv, coreSpawn } from "./core-spawn.ts";
 import { openReadNoFollow } from "./no-follow.ts";
-import { killSessionByName, sessionExistsByName } from "./claude-tmux.ts";
+import { isLoopbackOpencodeUrl, opencodeAuthHeader } from "./opencode-http.ts";
 import { escapeFreeText } from "../shared/terminal-text.ts";
 
 /**
@@ -39,10 +40,24 @@ import { escapeFreeText } from "../shared/terminal-text.ts";
  * exactly that for its non-secret env, so this module does NOT: it writes the
  * server's whole env to a 0600 env file in the 0700 server dir, and the inner
  * `sh` redirects its output to the log, sources the file, deletes it and
- * `exec`s the server. The only things in argv are the env file's PATH, the log
+ * `exec`s the server. The only things in argv are the env file's path, the log
  * path and the server command. The password is in the env file (briefly), the
  * 0600 state file, the server's environment and the Authorization header —
  * never a log, an argv, a URL or an error message.
+ *
+ * Signals. A state file is data an agent could have planted, so no pid read
+ * from it (or reported by the server about itself) is ever signalled. A pid is
+ * signalled only when it is (a) a live child this core spawned for the `direct`
+ * test host, or (b) the pid of the harness's own tmux pane (the `exec` above
+ * makes that the server itself) or a descendant of it, and never this process
+ * or one of its ancestors. Stopping a tmux-hosted server is `kill-session` on
+ * the exact session name first; signals are only the escalation.
+ *
+ * Removal needs positive proof. Adoption and `ensure` delete a server's state
+ * only when it is provably gone: tmux answered "no such session", the direct
+ * child is dead, the connection was refused, or the server rejected our
+ * password. A probe that merely times out, or a tmux call that failed, leaves a
+ * live (maybe busy) server and its state alone (I3).
  *
  * Test seam (D13): `AGETOR_OPENCODE_SERVER_HOST=direct` hosts the server as a
  * `coreSpawn` child of this core instead of a tmux session (stdout and stderr
@@ -57,7 +72,7 @@ export const OPENCODE_SERVER_IDLE_MS = 30 * 60_000;
 const DEFAULT_START_BUDGET_MS = 15_000;
 /** How long a successful health check is trusted before the next one. */
 const DEFAULT_HEALTH_CACHE_MS = 5_000;
-const HEALTH_TIMEOUT_MS = 2_000;
+const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
 const POLL_MS = 100;
 /** Every Nth poll also asks the host whether the server died. */
 const LIVENESS_EVERY_POLLS = 10;
@@ -70,6 +85,8 @@ const TAIL_LINES = 12;
 let idleMs = OPENCODE_SERVER_IDLE_MS;
 let startBudgetMs = DEFAULT_START_BUDGET_MS;
 let healthCacheMs = DEFAULT_HEALTH_CACHE_MS;
+let healthTimeoutMs = DEFAULT_HEALTH_TIMEOUT_MS;
+let serverDirOverride: string | null = null;
 
 export interface OpencodeServerHandle {
   harnessId: string;
@@ -80,6 +97,10 @@ export interface OpencodeServerHandle {
   tmuxSession: string | null;
   startedAt: number;
   version?: string;
+  /** Set on the handle `ensure` returns when the running server was started
+   *  with a different bin/env/cwd than the spec asks for but is busy, so it
+   *  was kept: the caller may post a status line. */
+  stale?: boolean;
 }
 
 export interface OpencodeServerSpec {
@@ -89,14 +110,18 @@ export interface OpencodeServerSpec {
   env: Record<string, string>;
   /** The harness home, or `$HOME`. */
   cwd: string;
+  /** Whether a turn or an open card is using this harness's server right now.
+   *  Consulted only when the running server's launch fingerprint differs from
+   *  this spec: idle → restart on the new settings, busy → keep it and return
+   *  a `stale` handle. Default: not busy. */
+  isBusy?: () => boolean;
 }
 
 interface ServerRecord {
   handle: OpencodeServerHandle;
-  /** `/api/info` pid; lets stop prove a survivor is still our server. */
-  pid?: number;
-  /** Set only for the `direct` test host started by this process. */
-  proc?: ReturnType<typeof coreSpawn>;
+  /** Pid of the child this core spawned (`direct` host only). */
+  hostPid?: number;
+  fingerprint?: string;
   lastActivity: number;
   healthyAt: number;
 }
@@ -108,12 +133,21 @@ interface StateFile {
   tmuxSession: string | null;
   startedAt: number;
   version?: string;
-  pid?: number;
+  hostPid?: number;
+  fingerprint?: string;
+}
+
+interface TerminateTarget {
+  tmuxSession: string | null;
+  hostPid?: number;
 }
 
 const servers = new Map<string, ServerRecord>();
 const starting = new Map<string, Promise<OpencodeServerHandle>>();
 const stopping = new Map<string, Promise<void>>();
+/** Live `direct`-host children this process spawned, by pid: the only pids
+ *  outside a tmux pane tree that may ever be signalled. */
+const directProcs = new Map<number, ReturnType<typeof coreSpawn>>();
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Paths and names
@@ -130,7 +164,7 @@ function safeId(harnessId: string): string {
 }
 
 function serverDir(): string {
-  return path.join(dataDir, "opencode-servers");
+  return serverDirOverride ?? path.join(dataDir, "opencode-servers");
 }
 const statePath = (id: string): string => path.join(serverDir(), `${safeId(id)}.json`);
 const logPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.log`);
@@ -182,19 +216,40 @@ function writePrivateFile(target: string, data: string): void {
   }
 }
 
+/** A fresh 0600 log, opened for writing without following a symlink. */
+function createPrivateLog(id: string): number {
+  removeFile(logPath(id));
+  return openSync(logPath(id), constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Launch fingerprint
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function specEnvEntries(spec: OpencodeServerSpec): Array<[string, string]> {
+  return Object.entries(spec.env)
+    .filter(([k, v]) => typeof v === "string" && ENV_KEY_RE.test(k) && !SCRUBBED_ENV_KEYS.includes(k))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** sha256 of what a launch is made of (bin, cwd, the harness env). Only the
+ *  digest is stored; the env values themselves are not. */
+function fingerprintOf(spec: OpencodeServerSpec): string {
+  return createHash("sha256").update(JSON.stringify([spec.bin, spec.cwd, specEnvEntries(spec)])).digest("hex");
+}
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * State file (read back no-follow; anything off is treated as absent)
  * ────────────────────────────────────────────────────────────────────────── */
 
-function isLoopbackUrl(raw: string): boolean {
-  try {
-    const u = new URL(raw);
-    if (u.protocol !== "http:") return false;
-    if (u.username || u.password) return false;
-    return u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "[::1]";
-  } catch {
-    return false;
-  }
+function hostIsDirect(): boolean {
+  return process.env.AGETOR_OPENCODE_SERVER_HOST === "direct";
+}
+
+function posInt(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }
 
 /** The state at `file`, or null when it is absent, a symlink, not a regular
@@ -217,9 +272,14 @@ function readStateFile(file: string): StateFile | null {
     if (typeof o.harnessId !== "string" || o.harnessId === "") return null;
     if (typeof o.password !== "string" || o.password === "") return null;
     if (typeof o.url !== "string") return null;
-    if (o.url !== "" && !isLoopbackUrl(o.url)) return null;
-    if (o.tmuxSession !== null && typeof o.tmuxSession !== "string") return null;
-    if (typeof o.tmuxSession === "string" && o.tmuxSession !== sessionNameFor(o.harnessId)) return null;
+    if (o.url !== "" && !isLoopbackOpencodeUrl(o.url)) return null;
+    // A null session means the direct test host; any other build only writes
+    // a tmux session name, so a null in a release flow is a planted file.
+    if (o.tmuxSession === null) {
+      if (!hostIsDirect()) return null;
+    } else if (typeof o.tmuxSession !== "string" || o.tmuxSession !== sessionNameFor(o.harnessId)) {
+      return null;
+    }
     if (typeof o.startedAt !== "number" || !Number.isFinite(o.startedAt)) return null;
     return {
       harnessId: o.harnessId,
@@ -228,7 +288,8 @@ function readStateFile(file: string): StateFile | null {
       tmuxSession: o.tmuxSession,
       startedAt: o.startedAt,
       version: typeof o.version === "string" ? o.version : undefined,
-      pid: typeof o.pid === "number" && Number.isInteger(o.pid) && o.pid > 0 ? o.pid : undefined,
+      hostPid: posInt(o.hostPid),
+      fingerprint: typeof o.fingerprint === "string" && /^[0-9a-f]{64}$/.test(o.fingerprint) ? o.fingerprint : undefined,
     };
   } catch {
     return null;
@@ -246,7 +307,8 @@ function writeState(rec: ServerRecord): void {
     tmuxSession: h.tmuxSession,
     startedAt: h.startedAt,
     version: h.version,
-    pid: rec.pid,
+    hostPid: rec.hostPid,
+    fingerprint: rec.fingerprint,
   };
   writePrivateFile(statePath(h.harnessId), JSON.stringify(state));
 }
@@ -261,19 +323,14 @@ interface ProbeResult {
   status?: number;
   timedOut?: boolean;
   version?: string;
-  pid?: number;
-}
-
-function basicAuth(password: string): string {
-  return `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
 }
 
 async function probe(url: string, password: string, timeoutMs: number): Promise<ProbeResult> {
   // The password only ever goes to a loopback origin.
-  if (!isLoopbackUrl(url)) return { ok: false };
+  if (!isLoopbackOpencodeUrl(url)) return { ok: false };
   try {
     const res = await fetch(`${url}/api/info`, {
-      headers: { Authorization: basicAuth(password), Accept: "application/json" },
+      headers: { Authorization: opencodeAuthHeader(password), Accept: "application/json" },
       redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -282,15 +339,13 @@ async function probe(url: string, password: string, timeoutMs: number): Promise<
       return { ok: false, status: res.status };
     }
     let version: string | undefined;
-    let pid: number | undefined;
     try {
-      const body = (await res.json()) as { version?: unknown; pid?: unknown };
+      const body = (await res.json()) as { version?: unknown };
       if (typeof body.version === "string") version = body.version;
-      if (typeof body.pid === "number" && Number.isInteger(body.pid) && body.pid > 0) pid = body.pid;
     } catch {
       /* a 200 with an odd body still proves the authenticated server */
     }
-    return { ok: true, status: 200, version, pid };
+    return { ok: true, status: 200, version };
   } catch (e) {
     const name = (e as { name?: string }).name;
     return { ok: false, timedOut: name === "TimeoutError" || name === "AbortError" };
@@ -298,80 +353,40 @@ async function probe(url: string, password: string, timeoutMs: number): Promise<
 }
 
 /** Authenticated `GET /api/info` against `h`. */
-export async function checkOpencodeServerHealth(h: OpencodeServerHandle, timeoutMs = HEALTH_TIMEOUT_MS): Promise<boolean> {
+export async function checkOpencodeServerHealth(h: OpencodeServerHandle, timeoutMs: number = healthTimeoutMs): Promise<boolean> {
   return (await probe(h.url, h.password, timeoutMs)).ok;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
- * Hosting (tmux, or the `direct` test seam)
+ * tmux, process table and pid authority
  * ────────────────────────────────────────────────────────────────────────── */
 
-function hostIsDirect(): boolean {
-  return process.env.AGETOR_OPENCODE_SERVER_HOST === "direct";
-}
-
-function shellQuote(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
-}
-
-const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/** The server's whole environment, as plain values. A spec value wins over the
- *  `OPENCODE_DISABLE_AUTOUPDATE` default (like discovery); the password is
- *  always agetor's. */
-function serverEnv(spec: OpencodeServerSpec, password: string): Record<string, string> {
-  const env: Record<string, string> = { OPENCODE_DISABLE_AUTOUPDATE: "1" };
-  for (const [k, v] of Object.entries(spec.env)) {
-    if (typeof v === "string" && ENV_KEY_RE.test(k) && !SCRUBBED_ENV_KEYS.includes(k)) env[k] = v;
-  }
-  if (env.PATH === undefined && process.env.PATH) env.PATH = process.env.PATH;
-  env.OPENCODE_PASSWORD = password;
-  return env;
-}
-
-/** The inner `sh -c` script: output to the log first (so a bad env file is
- *  visible), then source the env file, delete it, exec the server. `$1` env
- *  file, `$2` log, the rest is the server command. */
-const TMUX_INNER_SCRIPT = 'exec >"$2" 2>&1; . "$1" || exit 1; rm -f -- "$1"; shift 2; exec "$@"';
-
-async function launchInTmux(spec: OpencodeServerSpec, password: string): Promise<string> {
-  const name = sessionNameFor(spec.harnessId);
-  const env = serverEnv(spec, password);
-  const lines = Object.keys(env)
-    .sort()
-    .map((k) => `export ${k}=${shellQuote(env[k]!)}`);
-  writePrivateFile(envPath(spec.harnessId), `${lines.join("\n")}\n`);
-  const res = await spawnTmuxNewSession(resolveTmuxBin(), [
-    ...tmuxSocketArgs(),
-    "new-session", "-d", "-s", name,
-    "-x", "200", "-y", "50",
-    "-c", spec.cwd,
-    "--", "sh", "-c", TMUX_INNER_SCRIPT, "sh",
-    envPath(spec.harnessId), logPath(spec.harnessId),
-    spec.bin, "serve", "--hostname", "127.0.0.1", "--port", "0",
-  ]);
-  if (res.status !== 0) {
-    removeFile(envPath(spec.harnessId));
-    throw new Error(`could not start the OpenCode server session: ${redact(res.stderr || "tmux new-session failed", password)}`);
-  }
-  return name;
-}
-
-function launchDirect(spec: OpencodeServerSpec, password: string): ReturnType<typeof coreSpawn> {
-  const fd = openSync(logPath(spec.harnessId), "w", 0o600);
+async function tmuxQuery(args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
   try {
-    const proc = coreSpawn([spec.bin, "serve", "--hostname", "127.0.0.1", "--port", "0"], {
-      cwd: spec.cwd,
+    const proc = coreSpawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
       stdin: "ignore",
-      stdout: fd,
-      stderr: fd,
-      env: childEnv(serverEnv(spec, password)),
-    });
-    proc.unref();
-    return proc;
-  } finally {
-    closeSync(fd);
+      stdout: "pipe",
+      stderr: "pipe",
+      env: childEnv(),
+    }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
+    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, stdout: stdout.trim(), stderr: stderr.trim() };
+  } catch (e) {
+    return { code: null, stdout: "", stderr: (e as Error).message };
   }
+}
+
+type HostState = "alive" | "gone" | "unknown";
+
+const TMUX_GONE_RE = /can't find session|no server running|error connecting to/i;
+
+/** `has-session` on the exact name. "gone" only when tmux itself said so; a
+ *  failed tmux call is "unknown" and never counts as proof. */
+async function tmuxHasSession(name: string): Promise<HostState> {
+  const res = await tmuxQuery(["has-session", "-t", `=${name}:`]);
+  if (res.code === 0) return "alive";
+  if (res.code === 1 && TMUX_GONE_RE.test(res.stderr)) return "gone";
+  return "unknown";
 }
 
 function pidAlive(pid: number): boolean {
@@ -383,13 +398,173 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** Whether the host still runs the server (a tmux session, the direct child,
- *  or — for an adopted direct server — its pid). */
-async function hostAlive(rec: { tmuxSession: string | null; proc?: ServerRecord["proc"]; pid?: number }): Promise<boolean> {
-  if (rec.tmuxSession) return sessionExistsByName(rec.tmuxSession);
-  if (rec.proc) return rec.proc.exitCode === null && !rec.proc.killed;
-  if (rec.pid) return pidAlive(rec.pid);
-  return false;
+function isAlive(pid: number): boolean {
+  const child = directProcs.get(pid);
+  return child ? child.exitCode === null : pidAlive(pid);
+}
+
+function hostState(t: TerminateTarget): Promise<HostState> | HostState {
+  if (t.tmuxSession) return tmuxHasSession(t.tmuxSession);
+  if (t.hostPid === undefined) return "unknown";
+  return isAlive(t.hostPid) ? "alive" : "gone";
+}
+
+/** pid → ppid for every process. Empty on failure (callers then signal nothing). */
+async function processTable(): Promise<Map<number, number>> {
+  const table = new Map<number, number>();
+  try {
+    const proc = coreSpawn(["/bin/ps", "-axo", "pid=,ppid="], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      env: childEnv(),
+    }) as Bun.Subprocess<"ignore", "pipe", "ignore">;
+    const text = await new Response(proc.stdout).text();
+    await proc.exited;
+    for (const line of text.split("\n")) {
+      const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      if (m) table.set(Number(m[1]), Number(m[2]));
+    }
+  } catch {
+    table.clear();
+  }
+  return table;
+}
+
+/** This process and its ancestors: never signalled. */
+function protectedPids(table: Map<number, number>): Set<number> {
+  const out = new Set<number>([process.pid]);
+  let cur = process.pid;
+  for (let i = 0; i < 64; i++) {
+    const parent = table.get(cur);
+    if (parent === undefined || parent <= 1 || out.has(parent)) break;
+    out.add(parent);
+    cur = parent;
+  }
+  return out;
+}
+
+/** The pids `terminate` may signal for this target (see the file header). */
+async function authorizedPids(t: TerminateTarget): Promise<number[]> {
+  if (!t.tmuxSession) {
+    const child = t.hostPid === undefined ? undefined : directProcs.get(t.hostPid);
+    if (!child || child.exitCode !== null || child.pid === process.pid) return [];
+    return [child.pid];
+  }
+  const panes = await tmuxQuery(["list-panes", "-t", `=${t.tmuxSession}:`, "-F", "#{pane_pid}"]);
+  if (panes.code !== 0) return [];
+  const roots = panes.stdout.split("\n").map((l) => Number(l.trim())).filter((n) => Number.isInteger(n) && n > 1);
+  if (roots.length === 0) return [];
+  const table = await processTable();
+  if (table.size === 0) return [];
+  const keep = new Set<number>(roots);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [pid, ppid] of table) if (keep.has(ppid) && !keep.has(pid)) { keep.add(pid); grew = true; }
+  }
+  const never = protectedPids(table);
+  return [...keep].filter((pid) => pid > 1 && !never.has(pid));
+}
+
+function signal(pid: number, sig: NodeJS.Signals): void {
+  try {
+    process.kill(pid, sig);
+  } catch {
+    /* gone */
+  }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+async function waitUntil(cond: () => Promise<boolean>, ms: number): Promise<boolean> {
+  const until = Date.now() + ms;
+  for (;;) {
+    if (await cond()) return true;
+    if (Date.now() >= until) return false;
+    await sleep(POLL_MS);
+  }
+}
+
+/** Stop the host: `kill-session` on the exact name (tmux) or a signal to the
+ *  child this core spawned (direct), then wait a bounded time and escalate to
+ *  the pids `authorizedPids` named before the session was killed. Never throws. */
+async function terminate(t: TerminateTarget): Promise<void> {
+  try {
+    const auth = await authorizedPids(t);
+    if (t.tmuxSession) await tmuxQuery(["kill-session", "-t", `=${t.tmuxSession}:`]);
+    else for (const pid of auth) signal(pid, "SIGTERM");
+    const settled = async (): Promise<boolean> => {
+      if (auth.some(isAlive)) return false;
+      return t.tmuxSession ? (await tmuxHasSession(t.tmuxSession)) !== "alive" : true;
+    };
+    if (await waitUntil(settled, STOP_GRACE_MS)) return;
+    for (const pid of auth) if (isAlive(pid)) signal(pid, "SIGTERM");
+    if (await waitUntil(settled, STOP_GRACE_MS)) return;
+    for (const pid of auth) if (isAlive(pid)) signal(pid, "SIGKILL");
+  } catch {
+    /* best-effort: stop never throws */
+  }
+}
+
+const targetOf = (rec: ServerRecord): TerminateTarget => ({ tmuxSession: rec.handle.tmuxSession, hostPid: rec.hostPid });
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Hosting (tmux, or the `direct` test seam)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** The server's whole environment, as plain values. A spec value wins over the
+ *  `OPENCODE_DISABLE_AUTOUPDATE` default (like discovery); the password is
+ *  always agetor's. */
+function serverEnv(spec: OpencodeServerSpec, password: string): Record<string, string> {
+  const env: Record<string, string> = { OPENCODE_DISABLE_AUTOUPDATE: "1" };
+  for (const [k, v] of specEnvEntries(spec)) env[k] = v;
+  if (env.PATH === undefined && process.env.PATH) env.PATH = process.env.PATH;
+  env.OPENCODE_PASSWORD = password;
+  return env;
+}
+
+/** The inner `sh -c` script: output to the log first (so a bad env file is
+ *  visible), then source the env file, delete it, exec the server — so the
+ *  pane's pid IS the server. `$1` env file, `$2` log, the rest is the command. */
+const TMUX_INNER_SCRIPT = 'exec >"$2" 2>&1; . "$1" || exit 1; rm -f -- "$1"; shift 2; exec "$@"';
+
+async function launchInTmux(spec: OpencodeServerSpec, password: string): Promise<void> {
+  const env = serverEnv(spec, password);
+  const lines = Object.keys(env)
+    .sort()
+    .map((k) => `export ${k}=${shellQuote(env[k]!)}`);
+  writePrivateFile(envPath(spec.harnessId), `${lines.join("\n")}\n`);
+  const res = await spawnTmuxNewSession(resolveTmuxBin(), [
+    ...tmuxSocketArgs(),
+    "new-session", "-d", "-s", sessionNameFor(spec.harnessId),
+    "-x", "200", "-y", "50",
+    "-c", spec.cwd,
+    "--", "sh", "-c", TMUX_INNER_SCRIPT, "sh",
+    envPath(spec.harnessId), logPath(spec.harnessId),
+    spec.bin, "serve", "--hostname", "127.0.0.1", "--port", "0",
+  ]);
+  if (res.status !== 0) {
+    removeFile(envPath(spec.harnessId));
+    throw new Error(`could not start the OpenCode server session: ${redact(res.stderr || "tmux new-session failed", password)}`);
+  }
+}
+
+function launchDirect(spec: OpencodeServerSpec, password: string, logFd: number): ReturnType<typeof coreSpawn> {
+  const proc = coreSpawn([spec.bin, "serve", "--hostname", "127.0.0.1", "--port", "0"], {
+    cwd: spec.cwd,
+    stdin: "ignore",
+    stdout: logFd,
+    stderr: logFd,
+    env: childEnv(serverEnv(spec, password)),
+  });
+  proc.unref();
+  directProcs.set(proc.pid, proc);
+  void proc.exited.then(() => directProcs.delete(proc.pid)).catch(() => {});
+  return proc;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -444,23 +619,21 @@ function parseListeningUrl(log: string): string | null {
   if (!m) return null;
   try {
     const u = new URL(m[1]!);
-    return isLoopbackUrl(u.origin) ? u.origin : null;
+    return isLoopbackOpencodeUrl(u.origin) ? u.origin : null;
   } catch {
     return null;
   }
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
 /* ────────────────────────────────────────────────────────────────────────── *
  * Start
  * ────────────────────────────────────────────────────────────────────────── */
 
-async function startServer(spec: OpencodeServerSpec): Promise<ServerRecord> {
+async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promise<ServerRecord> {
   const id = spec.harnessId;
   ensureServerDir();
   // A leftover session or file from a crashed start must not collide.
-  await killSessionByName(sessionNameFor(id));
+  await terminate({ tmuxSession: sessionNameFor(id) });
   removeFiles(id, { log: true });
 
   const password = randomBytes(32).toString("base64url");
@@ -469,6 +642,7 @@ async function startServer(spec: OpencodeServerSpec): Promise<ServerRecord> {
   const startedAt = Date.now();
   const rec: ServerRecord = {
     handle: { harnessId: id, url: "", password, tmuxSession, startedAt },
+    fingerprint,
     lastActivity: startedAt,
     healthyAt: 0,
   };
@@ -476,30 +650,38 @@ async function startServer(spec: OpencodeServerSpec): Promise<ServerRecord> {
   // launch and the final write leaves something the next boot can clean up
   // (an empty url means "never became healthy").
   writeState(rec);
-  // Pre-create the log 0600 (the shell's `>` keeps the mode).
-  closeSync(openSync(logPath(id), "w", 0o600));
+  const logFd = createPrivateLog(id);
 
   const fail = async (reason: string): Promise<never> => {
     const tail = logTail(id, password);
-    await terminate(rec);
+    await terminate(targetOf(rec));
     removeFile(statePath(id));
     removeFile(envPath(id));
     throw new Error(`OpenCode server failed to start: ${redact(reason, password)}${tail ? `\n${tail}` : ""}`);
   };
 
+  let child: ReturnType<typeof coreSpawn> | undefined;
   try {
-    if (direct) rec.proc = launchDirect(spec, password);
-    else await launchInTmux(spec, password);
+    if (direct) {
+      child = launchDirect(spec, password, logFd);
+      rec.hostPid = child.pid;
+    } else {
+      await launchInTmux(spec, password);
+    }
   } catch (e) {
     return fail((e as Error).message);
+  } finally {
+    closeSync(logFd);
   }
 
+  const exited = (): boolean => child !== undefined && child.exitCode !== null;
   const deadline = Date.now() + startBudgetMs;
   let url: string | null = null;
   for (let poll = 0; Date.now() < deadline; poll++) {
     url = parseListeningUrl(readLogHead(id));
     if (url) break;
-    if (poll > 0 && poll % LIVENESS_EVERY_POLLS === 0 && !(await hostAlive({ tmuxSession, proc: rec.proc }))) {
+    if (exited()) return fail("the server exited before it started listening");
+    if (tmuxSession && poll > 0 && poll % LIVENESS_EVERY_POLLS === 0 && (await tmuxHasSession(tmuxSession)) === "gone") {
       return fail("the server exited before it started listening");
     }
     await sleep(POLL_MS);
@@ -509,15 +691,14 @@ async function startServer(spec: OpencodeServerSpec): Promise<ServerRecord> {
   rec.handle.url = url;
   let last: ProbeResult = { ok: false };
   while (Date.now() < deadline) {
-    last = await probe(url, password, HEALTH_TIMEOUT_MS);
+    last = await probe(url, password, healthTimeoutMs);
     if (last.ok) break;
-    if (rec.proc && rec.proc.exitCode !== null) return fail("the server exited before it answered");
+    if (exited()) return fail("the server exited before it answered");
     await sleep(POLL_MS);
   }
   if (!last.ok) return fail(`the server did not answer an authenticated info request${last.status ? ` (HTTP ${last.status})` : ""}`);
 
   rec.handle.version = last.version;
-  rec.pid = last.pid;
   rec.healthyAt = Date.now();
   writeState(rec);
   return rec;
@@ -526,53 +707,6 @@ async function startServer(spec: OpencodeServerSpec): Promise<ServerRecord> {
 /* ────────────────────────────────────────────────────────────────────────── *
  * Stop
  * ────────────────────────────────────────────────────────────────────────── */
-
-/** Kill the host and wait (bounded) for the server to go; a survivor that is
- *  still answering as our server is signalled by pid. Never throws. */
-async function terminate(rec: ServerRecord | StateFile): Promise<void> {
-  const isRec = "handle" in rec;
-  const tmuxSession = isRec ? rec.handle.tmuxSession : rec.tmuxSession;
-  const proc = isRec ? rec.proc : undefined;
-  const pid = rec.pid;
-  const url = isRec ? rec.handle.url : rec.url;
-  const password = isRec ? rec.handle.password : rec.password;
-  try {
-    if (tmuxSession) await killSessionByName(tmuxSession);
-    if (proc) proc.kill("SIGTERM");
-    else if (!tmuxSession && pid && pidAlive(pid)) process.kill(pid, "SIGTERM");
-
-    const gone = async (): Promise<boolean> => {
-      if (proc) return proc.exitCode !== null || proc.killed;
-      if (pid) return !pidAlive(pid);
-      if (url) return !(await probe(url, password, 500)).ok;
-      return true;
-    };
-    const until = Date.now() + STOP_GRACE_MS;
-    while (Date.now() < until && !(await gone())) await sleep(POLL_MS);
-    if (await gone()) return;
-    // Still there. Signal by pid only while it still answers as our server.
-    if (pid && url && (await probe(url, password, 500)).ok) {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch {
-        /* gone */
-      }
-      const until2 = Date.now() + STOP_GRACE_MS;
-      while (Date.now() < until2 && !(await gone())) await sleep(POLL_MS);
-      if (!(await gone()) && (await probe(url, password, 500)).ok) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          /* gone */
-        }
-      }
-    } else if (proc && proc.exitCode === null) {
-      proc.kill("SIGKILL");
-    }
-  } catch {
-    /* best-effort: stop never throws */
-  }
-}
 
 /** Stop the harness's server: kill the session, remove state and log, drop it
  *  from the map. Idempotent; concurrent calls share one stop. */
@@ -587,13 +721,12 @@ export function stopOpencodeServer(harnessId: string): Promise<void> {
     const rec = servers.get(harnessId);
     servers.delete(harnessId);
     if (rec) {
-      await terminate(rec);
+      await terminate(targetOf(rec));
     } else {
       // Nothing in memory: a state file may still describe a server (not yet
-      // adopted, or left by a crashed start). Kill by its recorded host.
+      // adopted, or left by a crashed start). Stop its recorded host.
       const state = readStateFile(statePath(harnessId));
-      if (state) await terminate(state);
-      else await killSessionByName(sessionNameFor(harnessId));
+      await terminate(state ?? { tmuxSession: hostIsDirect() ? null : sessionNameFor(harnessId) });
     }
     removeFiles(harnessId, { log: true });
   })().finally(() => {
@@ -607,23 +740,55 @@ export function stopOpencodeServer(harnessId: string): Promise<void> {
  * Ensure / adopt
  * ────────────────────────────────────────────────────────────────────────── */
 
-async function healthy(rec: ServerRecord): Promise<"ok" | "dead" | "unresponsive"> {
-  if (Date.now() - rec.healthyAt < healthCacheMs) return "ok";
-  let res = await probe(rec.handle.url, rec.handle.password, HEALTH_TIMEOUT_MS);
-  if (res.timedOut) res = await probe(rec.handle.url, rec.handle.password, HEALTH_TIMEOUT_MS * 2);
-  if (res.ok) {
-    rec.healthyAt = Date.now();
-    if (res.version) rec.handle.version = res.version;
-    return "ok";
-  }
-  // A server that is alive but slow may be mid-turn: never replace it (I3).
-  if (res.timedOut && (await hostAlive({ tmuxSession: rec.handle.tmuxSession, proc: rec.proc, pid: rec.pid }))) {
-    return "unresponsive";
-  }
-  return "dead";
+type Verdict = "ok" | "dead" | "unresponsive";
+
+/** Decide a server's fate. "dead" needs positive proof (host gone, connection
+ *  refused, or our password rejected); a timeout or an odd answer from a host
+ *  that is still there is "unresponsive": it may be busy, so it is kept (I3). */
+async function classify(url: string, password: string, host: TerminateTarget): Promise<{ verdict: Verdict; version?: string }> {
+  if ((await hostState(host)) === "gone") return { verdict: "dead" };
+  let res = await probe(url, password, healthTimeoutMs);
+  if (res.timedOut) res = await probe(url, password, healthTimeoutMs * 2);
+  if (res.ok) return { verdict: "ok", version: res.version };
+  if (res.status === 401 || (res.status === undefined && !res.timedOut)) return { verdict: "dead" };
+  if ((await hostState(host)) === "gone") return { verdict: "dead" };
+  return { verdict: "unresponsive" };
 }
 
-function recordFromState(state: StateFile, probeResult: ProbeResult): ServerRecord {
+async function healthy(rec: ServerRecord): Promise<Verdict> {
+  if (Date.now() - rec.healthyAt < healthCacheMs) return "ok";
+  const res = await classify(rec.handle.url, rec.handle.password, targetOf(rec));
+  if (res.verdict === "ok") {
+    rec.healthyAt = Date.now();
+    if (res.version) rec.handle.version = res.version;
+  }
+  return res.verdict;
+}
+
+/** Adopt the server a state file describes. A server that answers is adopted;
+ *  one that is only slow is adopted too, marked unhealthy (`healthyAt: 0`), so
+ *  the next `ensure` re-probes it instead of replacing it; one provably gone,
+ *  or a file that cannot be trusted, is cleaned up. */
+async function adoptState(file: string, only?: string): Promise<ServerRecord | null> {
+  const state = readStateFile(file);
+  // Boot adoption must not touch a server this process is starting or holds.
+  if (state && only === undefined && (starting.has(state.harnessId) || servers.has(state.harnessId))) return null;
+  if (!state || statePath(state.harnessId) !== file || (only !== undefined && state.harnessId !== only)) {
+    // Unreadable, a symlink, wrong owner/mode, planted, or filed under the wrong name.
+    const stem = path.basename(file, ".json");
+    removeFile(file);
+    removeFile(path.join(serverDir(), `${stem}.env`));
+    return null;
+  }
+  const target: TerminateTarget = { tmuxSession: state.tmuxSession, hostPid: state.hostPid };
+  const gone = async (): Promise<null> => {
+    await terminate(target);
+    removeFiles(state.harnessId, { log: true });
+    return null;
+  };
+  if (state.url === "") return gone();
+  const res = await classify(state.url, state.password, target);
+  if (res.verdict === "dead") return gone();
   return {
     handle: {
       harnessId: state.harnessId,
@@ -631,64 +796,53 @@ function recordFromState(state: StateFile, probeResult: ProbeResult): ServerReco
       password: state.password,
       tmuxSession: state.tmuxSession,
       startedAt: state.startedAt,
-      version: probeResult.version ?? state.version,
+      version: res.version ?? state.version,
     },
-    pid: probeResult.pid ?? state.pid,
+    hostPid: state.hostPid,
+    fingerprint: state.fingerprint,
     lastActivity: Date.now(),
-    healthyAt: Date.now(),
+    healthyAt: res.verdict === "ok" ? Date.now() : 0,
   };
 }
 
-/** Adopt the server a state file describes if its host and an authenticated
- *  info request both check out; otherwise clean it up. */
-async function adoptState(file: string, only?: string): Promise<ServerRecord | null> {
-  const state = readStateFile(file);
-  // Boot adoption must not touch a server this process is starting or holds.
-  if (state && only === undefined && (starting.has(state.harnessId) || servers.has(state.harnessId))) return null;
-  if (!state || statePath(state.harnessId) !== file || (only !== undefined && state.harnessId !== only)) {
-    // Unreadable, a symlink, wrong owner/mode, or filed under the wrong name.
-    const stem = path.basename(file, ".json");
-    removeFile(file);
-    removeFile(path.join(serverDir(), `${stem}.env`));
-    return null;
+function specBusy(spec: OpencodeServerSpec): boolean {
+  if (!spec.isBusy) return false;
+  try {
+    return spec.isBusy();
+  } catch {
+    return true; // an unanswerable gate never lets a restart through (I3)
   }
-  const dead = async (): Promise<null> => {
-    await terminate(state);
-    removeFiles(state.harnessId, { log: true });
-    return null;
-  };
-  if (state.url === "") return dead();
-  if (!(await hostAlive({ tmuxSession: state.tmuxSession, pid: state.pid }))) return dead();
-  const res = await probe(state.url, state.password, HEALTH_TIMEOUT_MS);
-  if (!res.ok) return dead();
-  return recordFromState(state, res);
 }
 
 async function ensureInner(spec: OpencodeServerSpec): Promise<OpencodeServerHandle> {
   const id = spec.harnessId;
   await stopping.get(id);
+  const fingerprint = fingerprintOf(spec);
   let rec = servers.get(id);
-  if (rec) {
-    const state = await healthy(rec);
-    if (state === "ok") {
-      rec.lastActivity = Date.now();
-      return rec.handle;
-    }
-    if (state === "unresponsive") throw new Error("The OpenCode server is not responding.");
-    servers.delete(id);
-    await terminate(rec);
-    removeFiles(id, { log: true });
-  } else {
+  if (!rec) {
     // Not in memory (boot adoption not run, or it ran before this harness
-    // existed): a healthy server from an earlier core is reused.
+    // existed): a server from an earlier core is reused.
     ensureServerDir();
     const adopted = await adoptState(statePath(id), id);
     if (adopted) {
       servers.set(id, adopted);
-      return adopted.handle;
+      rec = adopted;
     }
   }
-  rec = await startServer(spec);
+  if (rec) {
+    const verdict = await healthy(rec);
+    if (verdict === "unresponsive") throw new Error("The OpenCode server is not responding.");
+    if (verdict === "ok") {
+      rec.lastActivity = Date.now();
+      if (rec.fingerprint === fingerprint) return rec.handle;
+      // Started with other settings (bin, env or cwd changed since).
+      if (specBusy(spec)) return { ...rec.handle, stale: true };
+    }
+    servers.delete(id);
+    await terminate(targetOf(rec));
+    removeFiles(id, { log: true });
+  }
+  rec = await startServer(spec, fingerprint);
   servers.set(id, rec);
   return rec.handle;
 }
@@ -705,8 +859,8 @@ export function ensureOpencodeServer(spec: OpencodeServerSpec): Promise<Opencode
   return p;
 }
 
-/** Boot: keep the servers a previous core left running and healthy, clean up
- *  every other state file and its session. */
+/** Boot: keep the servers a previous core left running, clean up the ones that
+ *  are provably gone. A server that is only slow to answer is kept. */
 export async function adoptOpencodeServers(): Promise<OpencodeServerHandle[]> {
   let names: string[];
   try {
@@ -779,6 +933,10 @@ export const __forTest = {
     starting.clear();
     stopping.clear();
   },
+  /** SIGKILL every direct-host child this process still holds. */
+  reapDirect(): void {
+    for (const child of directProcs.values()) child.kill("SIGKILL");
+  },
   setIdleMs(ms: number): void {
     idleMs = ms;
   },
@@ -788,10 +946,19 @@ export const __forTest = {
   setHealthCacheMs(ms: number): void {
     healthCacheMs = ms;
   },
+  setHealthTimeoutMs(ms: number): void {
+    healthTimeoutMs = ms;
+  },
+  /** Point the manager at a private directory (one per test). */
+  setServerDir(dir: string | null): void {
+    serverDirOverride = dir;
+  },
   restoreDefaults(): void {
     idleMs = OPENCODE_SERVER_IDLE_MS;
     startBudgetMs = DEFAULT_START_BUDGET_MS;
     healthCacheMs = DEFAULT_HEALTH_CACHE_MS;
+    healthTimeoutMs = DEFAULT_HEALTH_TIMEOUT_MS;
+    serverDirOverride = null;
   },
   statePath,
   logPath,
@@ -800,4 +967,5 @@ export const __forTest = {
   serverDir,
   safeId,
   redact,
+  tmuxHasSession,
 };

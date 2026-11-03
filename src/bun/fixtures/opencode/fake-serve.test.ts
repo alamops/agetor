@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { startFakeOpencodeServer, type FakeOpencodeOptions, type FakeOpencodeServer } from "./fake-serve.ts";
@@ -706,6 +706,234 @@ describe("scenario: failures, interrupts, todo, retry", () => {
     const retries = sub.events.filter((e) => e.type === "session.retry.scheduled");
     expect(retries.map((e) => e.data.attempt)).toEqual([1, 2]);
     expect(retries[0]!.data.error).toMatchObject({ type: "provider.rate-limit", status: 429, retryAfterMs: 5000 });
+  });
+});
+
+describe("event order matches the live transcripts", () => {
+  // T4 acceptance: "each scenario's event order matches the live spike
+  // transcripts". The reference is either a recorded v2-http-*.jsonl fixture or
+  // an ordering list copied (sanitized) from the T4 verification runs, whose
+  // raw files live in the spike scratchpad and not in the repo.
+  //
+  // Both sides go through `normalize`. What it drops, and why, is the complete
+  // allow-list of orderings known to vary between runs:
+  //   1. *.delta, server.connected, session.instructions.updated and the
+  //      session.created of a top-level session: high-volume or per-connection
+  //      noise that the recorded fixtures were already stripped of.
+  //   2. session.reasoning.*: reasoning is optional per model turn, and its
+  //      position against text and tool-input events is token-stream timing
+  //      (reasoning.started, tool.input.started, reasoning.ended was seen live).
+  //   3. session.text.* inside a step that calls a tool: preamble text is
+  //      model-optional and interleaves with tool.input.* (a2-empty: text.started,
+  //      tool.input.*, tool.called, text.ended). Text in a final step is kept.
+  //   4. shell.exited and session.tool.success are a race: both orders were seen
+  //      live (v2-http-tool-turn: exited first; v2-http-steer: success first).
+  //      They are compared as success, then exited.
+  //   5. shell.* altogether where the reference has none (v2-http-subagent and the
+  //      T4 transcripts record sessions only; shell events are not session-tagged).
+  // Everything else, including cross-session order in the subagent fixture, is exact.
+
+  type Opt = { shell: boolean; session?: string };
+  const sessionOf = (e: Ev): string | undefined => e.data?.sessionID ?? e.data?.form?.sessionID ?? e.data?.info?.metadata?.sessionID;
+
+  function normalize(events: Ev[], opt: Opt): string[] {
+    const items: Array<{ type: string; session: string | undefined; keep: boolean }> = [];
+    const stepText = new Map<string, number[]>();
+    const stepTool = new Set<string>();
+    for (const e of events) {
+      const session = sessionOf(e);
+      if (opt.session && session !== opt.session) continue;
+      const t = e.type;
+      let keep = true;
+      if (t.endsWith(".delta") || t === "server.connected" || t === "session.instructions.updated") keep = false;
+      else if (t === "session.created" && !e.data?.parentID) keep = false;
+      else if (t.startsWith("session.reasoning.")) keep = false;
+      else if (t.startsWith("shell.") && !opt.shell) keep = false;
+      items.push({ type: t, session, keep });
+      const key = session ?? "";
+      if (t === "session.text.started" || t === "session.text.ended") {
+        const list = stepText.get(key) ?? [];
+        list.push(items.length - 1);
+        stepText.set(key, list);
+      } else if (t === "session.tool.called") {
+        stepTool.add(key);
+      } else if (t === "session.step.ended" || t === "session.step.failed") {
+        if (stepTool.has(key)) for (const i of stepText.get(key) ?? []) items[i]!.keep = false;
+        stepTool.delete(key);
+        stepText.delete(key);
+      }
+    }
+    const out = items.filter((i) => i.keep).map((i) => i.type);
+    for (let i = 0; i + 1 < out.length; i++) {
+      if (out[i] === "shell.exited" && out[i + 1] === "session.tool.success") [out[i], out[i + 1]] = [out[i + 1]!, out[i]!];
+    }
+    return out;
+  }
+  const fixture = (name: string): Ev[] =>
+    readFileSync(path.join(import.meta.dir, name), "utf8")
+      .split("\n")
+      .filter((l) => l.trim() !== "")
+      .map((l) => JSON.parse(l) as Ev);
+  const words = (s: string): string[] => s.split(/\s+/).filter(Boolean);
+  const expectSeq = (got: string[], want: string[]): void => {
+    expect(want.length).toBeGreaterThan(5); // a reference that normalized to nothing would pass vacuously
+    expect(got.join("\n")).toBe(want.join("\n"));
+  };
+
+  test("the normalizer is not vacuous: it keeps order-sensitive events and applies the swap", () => {
+    const evs = (types: string[]): Ev[] => types.map((type) => ({ id: "e", type, data: { sessionID: "s" } }));
+    expect(normalize(evs(["session.step.started", "shell.exited", "session.tool.success", "session.step.ended"]), { shell: true })).toEqual(["session.step.started", "session.tool.success", "shell.exited", "session.step.ended"]);
+    expect(normalize(evs(["session.step.started", "session.text.started", "session.tool.called", "session.text.ended", "session.step.ended", "session.step.started", "session.text.started", "session.step.ended"]), { shell: false })).toEqual(["session.step.started", "session.tool.called", "session.step.ended", "session.step.started", "session.text.started", "session.step.ended"]);
+    expect(normalize(evs(["session.tool.success", "session.step.ended"]), { shell: true })).not.toEqual(normalize(evs(["session.step.ended", "session.tool.success"]), { shell: true }));
+  });
+
+  test("tool turn matches v2-http-tool-turn.jsonl", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "go __agetor_fake_oc_tool__");
+    await terminal(sub, sid);
+    expectSeq(normalize(sub.events, { shell: true }), normalize(fixture("v2-http-tool-turn.jsonl"), { shell: true }));
+  });
+
+  test("steer matches v2-http-steer.jsonl", async () => {
+    const { client, sub } = await boot({ speed: 0.1 });
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_steer__");
+    await sub.waitFor((e) => e.type === "shell.created");
+    await client.prompt(sid, "also say BANANA", "steer");
+    await terminal(sub, sid);
+    expectSeq(normalize(sub.events, { shell: true }), normalize(fixture("v2-http-steer.jsonl"), { shell: true }));
+  });
+
+  test("interrupt (slow marker) matches v2-http-interrupt.jsonl, including the second execution", async () => {
+    const { client, sub } = await boot({ speed: 0 });
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_slow__");
+    await sub.waitFor((e) => e.type === "shell.created");
+    await client.req("POST", `/api/session/${sid}/interrupt`);
+    await terminal(sub, sid);
+    await client.prompt(sid, "next");
+    await terminal(sub, sid, 2);
+    const got = normalize(sub.events, { shell: true });
+    expect(got).toContain("shell.deleted");
+    expectSeq(got, normalize(fixture("v2-http-interrupt.jsonl"), { shell: true }));
+    expect(sub.events.find((e) => e.type === "shell.exited")!.data.status).toBe("killed");
+  });
+
+  test("subagent matches v2-http-subagent.jsonl (parent and child interleaved)", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_subagent__");
+    await terminal(sub, sid);
+    expectSeq(normalize(sub.events, { shell: false }), normalize(fixture("v2-http-subagent.jsonl"), { shell: false }));
+  });
+
+  test("the 402 quota failure matches v2-http-quota-402.jsonl and the A4 transcript", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_error__");
+    await terminal(sub, sid);
+    const got = normalize(sub.events, { shell: false });
+    expectSeq(got, normalize(fixture("v2-http-quota-402.jsonl"), { shell: false }));
+    // T4 A4 (live, opencode/deepseek-v4.1-flash): the same six events, no usage.updated, no retry.
+    expectSeq(got, words("session.inbox.enqueued session.execution.started session.inbox.delivered session.step.started session.step.failed session.execution.failed"));
+  });
+
+  // Ordering lists copied from the T4 live runs (a6-perm, a6-form, a2-empty, a5).
+  const A6_PERM_REJECT = words(
+    "session.inbox.enqueued session.execution.started session.inbox.delivered session.step.started session.tool.input.started session.tool.input.ended session.tool.called session.step.streamed permission.asked permission.replied session.tool.failed session.step.failed session.usage.updated session.execution.interrupted",
+  );
+  const A6_FORM_CANCEL_MESSAGE = words(
+    "session.inbox.enqueued session.execution.started session.inbox.delivered session.step.started session.tool.input.started session.tool.input.ended session.tool.called session.step.streamed form.created form.cancelled session.tool.failed session.step.ended session.usage.updated session.step.started session.text.started session.text.ended session.step.streamed session.step.ended session.usage.updated session.execution.succeeded",
+  );
+  const A2_FORM_EMPTY_ANSWER = words(
+    "session.inbox.enqueued session.execution.started session.inbox.delivered session.step.started session.tool.input.started session.tool.input.ended session.tool.called session.step.streamed form.created form.replied session.tool.success session.step.ended session.usage.updated session.step.started session.text.started session.text.ended session.step.streamed session.step.ended session.usage.updated session.execution.succeeded",
+  );
+  const A5_PARENT = words(
+    "session.inbox.enqueued session.execution.started session.inbox.delivered session.step.started session.tool.input.started session.tool.input.ended session.tool.called session.step.streamed session.tool.progress session.tool.success session.step.ended session.usage.updated session.step.started session.text.started session.text.ended session.step.streamed session.step.ended session.usage.updated session.execution.succeeded " +
+      "session.inbox.enqueued session.execution.started session.inbox.delivered session.step.started session.text.started session.text.ended session.step.streamed session.step.ended session.usage.updated session.execution.succeeded",
+  );
+  const A5_CHILD = words(
+    "session.created session.inbox.enqueued session.execution.started session.inbox.delivered session.step.started session.tool.input.started session.tool.input.ended session.tool.called session.step.streamed session.tool.progress session.tool.success session.step.ended session.usage.updated session.step.started session.text.started session.text.ended session.step.streamed session.step.ended session.usage.updated session.execution.succeeded",
+  );
+
+  test("permission reject without a message matches the A6 transcript", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_permission__");
+    const asked = await sub.waitFor((e) => e.type === "permission.asked");
+    await client.req("POST", `/api/session/${sid}/permission/${asked.data.id}/reply`, { decision: "reject" });
+    await terminal(sub, sid);
+    expectSeq(normalize(sub.events, { shell: false }), A6_PERM_REJECT);
+  });
+
+  test("question cancelled with a message matches the A6 transcript", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_question__");
+    const created = await sub.waitFor((e) => e.type === "form.created");
+    await client.req("DELETE", `/api/session/${sid}/form/${created.data.form.id}?message=${encodeURIComponent("not now")}`);
+    await terminal(sub, sid);
+    expectSeq(normalize(sub.events, { shell: false }), A6_FORM_CANCEL_MESSAGE);
+  });
+
+  test("question answered with {} matches the A2 transcript", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_question__");
+    const created = await sub.waitFor((e) => e.type === "form.created");
+    await client.req("POST", `/api/session/${sid}/form/${created.data.form.id}/reply`, { answer: {} });
+    await terminal(sub, sid);
+    expectSeq(normalize(sub.events, { shell: false }), A2_FORM_EMPTY_ANSWER);
+  });
+
+  test("the background-subagent wake matches the A5 transcript, per session", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_wake__");
+    await terminal(sub, sid, 2);
+    const cid = sub.events.find((e) => e.type === "session.created" && e.data.parentID === sid)!.data.sessionID as string;
+    // Cross-session interleaving is timing, so each session is compared on its own.
+    expectSeq(normalize(sub.events, { shell: false, session: sid }), A5_PARENT);
+    expectSeq(normalize(sub.events, { shell: false, session: cid }), A5_CHILD);
+  });
+});
+
+describe("snapshots of a streaming message", () => {
+  // Verified against live OpenCode 2.1.3 (T4 fix round, a polled turn of 150 lines) and
+  // against core/src/session/message-updater.ts: there is no delta handler, so a text or
+  // reasoning part is pushed as `text: ""` on *.started and only filled by *.ended.
+  test("a part streamed so far has text '' until its .ended event; the assistant has no tokens or finish yet", async () => {
+    const { client, sub } = await boot({ speed: 20 });
+    const sid = await client.session();
+    await client.prompt(sid, "a prompt long enough for the answer to stream for a while okay");
+    await sub.waitFor((e) => e.type === "session.text.started");
+    const mid = (await messages(client, sid)).filter((m) => m.type === "assistant").at(-1)!;
+    expect(mid.content).toEqual([{ type: "text", text: "" }]);
+    expect(mid.finish).toBeUndefined();
+    expect(mid.tokens).toBeUndefined();
+    expect(mid.cost).toBeUndefined();
+    expect(mid.time.completed).toBeUndefined();
+    expect(mid.time.streamed).toBeUndefined();
+    await terminal(sub, sid);
+    const done = (await messages(client, sid)).filter((m) => m.type === "assistant").at(-1)!;
+    expect(done.content[0].text).toMatch(/^ACK: a prompt long enough/);
+    expect(done.finish).toBe("stop");
+    expect(done.time.streamed).toBeGreaterThan(0);
+  });
+
+  test("a reasoning part is the same: text '' with time.created only, until reasoning.ended", async () => {
+    const { client, sub } = await boot({ speed: 20 });
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_todo__");
+    await sub.waitFor((e) => e.type === "session.reasoning.started");
+    const mid = (await messages(client, sid)).filter((m) => m.type === "assistant").at(-1)!;
+    expect(mid.content[0]).toMatchObject({ type: "reasoning", text: "", native: { reasoningField: "reasoning_content" } });
+    expect(mid.content[0].time.completed).toBeUndefined();
+    await terminal(sub, sid);
+    const done = (await messages(client, sid)).find((m) => m.type === "assistant")!;
+    expect(done.content[0].text).toBe("Write the todo list, then reply OK.");
+    expect(done.content[0].time.completed).toBeGreaterThan(0);
   });
 });
 

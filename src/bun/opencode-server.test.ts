@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   symlinkSync,
   lstatSync,
@@ -23,6 +24,7 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 
 const mod = await import("./opencode-server.ts");
 const { rmTestDataDir } = await import("./test-data-dir.ts");
+const { tmuxSocketArgs } = await import("./tmux-resolution.ts");
 const {
   ensureOpencodeServer,
   adoptOpencodeServers,
@@ -63,8 +65,9 @@ else {
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(req) {
+    async fetch(req) {
       const u = new URL(req.url);
+      if (fs.existsSync(dir + "/slow")) await Bun.sleep(Number(fs.readFileSync(dir + "/slow", "utf8")));
       if (u.pathname !== "/api/info") return new Response("not found", { status: 404 });
       if (req.headers.get("authorization") !== "Basic " + btoa("opencode:" + pw)) return new Response("no", { status: 401 });
       return Response.json({ version: "2.1.3-stub", pid: process.pid });
@@ -152,11 +155,26 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
     beforeAll(() => {
       setEnv("AGETOR_OPENCODE_SERVER_HOST", host === "direct" ? "direct" : undefined);
     });
+    // Every test gets its own server directory, so none depends on (or can see)
+    // another's state files.
+    beforeEach(() => {
+      __forTest.setServerDir(mkdtempSync(path.join(STUB_ROOT, `${host}-dir-`)));
+      rmSync(path.join(stubDir, "slow"), { force: true });
+    });
     afterEach(async () => {
-      for (const id of ids) await stopOpencodeServer(id);
-      __forTest.forget();
-      __forTest.restoreDefaults();
-      writeFileSync(path.join(stubDir, "launches"), "");
+      try {
+        for (const id of ids) await stopOpencodeServer(id);
+      } finally {
+        // Reap whatever a failed expect left behind: direct children by
+        // pid, tmux sessions by exact name.
+        __forTest.reapDirect();
+        for (const id of ids) Bun.spawnSync(["tmux", ...tmuxSocketArgs(), "kill-session", "-t", `=${__forTest.sessionNameFor(id)}:`]);
+        ids.clear();
+        __forTest.forget();
+        __forTest.restoreDefaults();
+        rmSync(path.join(stubDir, "slow"), { force: true });
+        writeFileSync(path.join(stubDir, "launches"), "");
+      }
     });
 
     test("starts a server, health-checks it, and keeps state private", async () => {
@@ -271,6 +289,235 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
       expect(await checkOpencodeServerHealth(second)).toBe(true);
       expect(launches()).toBe(2);
       expect(JSON.parse(readFileSync(__forTest.statePath(id), "utf8")).password).toBe(second.password);
+    });
+
+    const slowOn = (ms: number): void => writeFileSync(path.join(stubDir, "slow"), String(ms));
+    const slowOff = (): void => rmSync(path.join(stubDir, "slow"), { force: true });
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    test("a stopped server is really gone: its process dies and, under tmux, the session too", async () => {
+      const id = newId();
+      const h = await ensureOpencodeServer(spec(id));
+      const pid = await pidOf(h);
+      if (host === "tmux") {
+        // `exec` in the inner script makes the pane's pid the server itself;
+        // without it the pane is a `sh` wrapper and signals miss the server.
+        const panes = Bun.spawnSync(["tmux", ...tmuxSocketArgs(), "list-panes", "-t", `=${h.tmuxSession}:`, "-F", "#{pane_pid}"]);
+        expect(Number(panes.stdout.toString().trim())).toBe(pid);
+        expect(await __forTest.tmuxHasSession(h.tmuxSession!)).toBe("alive");
+      }
+      await stopOpencodeServer(id);
+      expect(alive(pid)).toBe(false);
+      if (host === "tmux") {
+        expect(await __forTest.tmuxHasSession(h.tmuxSession!)).toBe("gone");
+        const has = Bun.spawnSync(["tmux", ...tmuxSocketArgs(), "has-session", "-t", `=${h.tmuxSession}:`]);
+        expect(has.exitCode).toBe(1);
+      }
+    });
+
+    describe("a planted state file never makes agetor signal a foreign pid", () => {
+      const plant = (id: string, pid: number, url: string): void => {
+        mkdirSync(__forTest.serverDir(), { recursive: true, mode: 0o700 });
+        writeFileSync(
+          __forTest.statePath(id),
+          JSON.stringify({
+            harnessId: id,
+            url,
+            password: "planted-password",
+            tmuxSession: host === "tmux" ? __forTest.sessionNameFor(id) : null,
+            startedAt: 1,
+            hostPid: pid,
+          }),
+          { mode: 0o600 },
+        );
+      };
+      const withSacrificial = async (fn: (pid: number) => Promise<void>): Promise<void> => {
+        const sac = Bun.spawn(["sleep", "120"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+        try {
+          await fn(sac.pid);
+          expect(alive(sac.pid)).toBe(true);
+          expect(sac.exitCode).toBeNull();
+        } finally {
+          sac.kill("SIGKILL");
+          await sac.exited;
+        }
+      };
+
+      test("adoption of a never-healthy or refused state leaves the pid alone, and does not wait out the grace", async () => {
+        await withSacrificial(async (pid) => {
+          const [a, b] = [newId(), newId()];
+          plant(a, pid, "");
+          plant(b, pid, "http://127.0.0.1:9");
+          const t0 = Date.now();
+          expect(await adoptOpencodeServers()).toEqual([]);
+          expect(Date.now() - t0).toBeLessThan(1_500);
+          expect(existsSync(__forTest.statePath(a))).toBe(false);
+          expect(existsSync(__forTest.statePath(b))).toBe(false);
+        });
+      });
+
+      test("stop and ensure over a planted state leave the pid alone", async () => {
+        await withSacrificial(async (pid) => {
+          const [a, b] = [newId(), newId()];
+          plant(a, pid, "http://127.0.0.1:9");
+          await stopOpencodeServer(a);
+          plant(b, pid, "http://127.0.0.1:9");
+          const h = await ensureOpencodeServer(spec(b));
+          expect(await checkOpencodeServerHealth(h)).toBe(true);
+          expect(h.password).not.toBe("planted-password");
+        });
+      });
+
+      test.skipIf(host !== "tmux")("a null tmux session outside the direct host is refused as planted", async () => {
+        await withSacrificial(async (pid) => {
+          // A copy of a live, healthy server's state with the session nulled:
+          // the only thing wrong with it is the null.
+          const id = newId();
+          await ensureOpencodeServer(spec(id));
+          const state = JSON.parse(readFileSync(__forTest.statePath(id), "utf8"));
+          writeFileSync(__forTest.statePath(id), JSON.stringify({ ...state, tmuxSession: null, hostPid: pid }), { mode: 0o600 });
+          __forTest.forget();
+          expect(await adoptOpencodeServers()).toEqual([]);
+          expect(getOpencodeServer(id)).toBeNull();
+          expect(existsSync(__forTest.statePath(id))).toBe(false);
+        });
+      });
+    });
+
+    describe("a live but slow server is never destroyed (I3)", () => {
+      test("adoption keeps a server whose info times out, state intact", async () => {
+        __forTest.setHealthCacheMs(0);
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        const stateBefore = readFileSync(__forTest.statePath(id), "utf8");
+        __forTest.setHealthTimeoutMs(200);
+        slowOn(1_500);
+        __forTest.forget();
+
+        const adopted = await adoptOpencodeServers();
+        expect(adopted.map((a) => a.harnessId)).toEqual([id]);
+        expect(getOpencodeServer(id)?.url).toBe(h.url);
+        expect(readFileSync(__forTest.statePath(id), "utf8")).toBe(stateBefore);
+        expect(alive(pid)).toBe(true);
+        if (host === "tmux") expect(await __forTest.tmuxHasSession(h.tmuxSession!)).toBe("alive");
+
+        // ensure refuses to replace it...
+        await expect(ensureOpencodeServer(spec(id))).rejects.toThrow(/not responding/);
+        expect(alive(pid)).toBe(true);
+        expect(launches()).toBe(1);
+        // ...and reuses it as soon as it answers.
+        slowOff();
+        const again = await ensureOpencodeServer(spec(id));
+        expect(again.url).toBe(h.url);
+        expect(launches()).toBe(1);
+      });
+
+      test("ensure on a running server that stops answering throws instead of replacing it", async () => {
+        __forTest.setHealthCacheMs(0);
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        __forTest.setHealthTimeoutMs(200);
+        slowOn(1_500);
+        await expect(ensureOpencodeServer(spec(id))).rejects.toThrow(/not responding/);
+        expect(alive(pid)).toBe(true);
+        expect(getOpencodeServer(id)).toBe(h);
+        expect(existsSync(__forTest.statePath(id))).toBe(true);
+        expect(launches()).toBe(1);
+        slowOff();
+        expect(await ensureOpencodeServer(spec(id))).toBe(h);
+      });
+
+      test.skipIf(host !== "tmux")("a failed tmux call is not proof the server is gone", async () => {
+        __forTest.setHealthCacheMs(0);
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        const real = Bun.which("tmux")!;
+        const wrapper = path.join(stubDir, "tmux-failing");
+        writeFileSync(wrapper, `#!/bin/sh\ncase "$*" in *has-session*) echo "server exited unexpectedly" >&2; exit 2;; esac\nexec "${real}" "$@"\n`);
+        chmodSync(wrapper, 0o755);
+        __forTest.setHealthTimeoutMs(200);
+        slowOn(1_500);
+        __forTest.forget();
+        setEnv("AGETOR_TMUX_BIN", wrapper);
+        try {
+          const adopted = await adoptOpencodeServers();
+          expect(adopted.map((a) => a.harnessId)).toEqual([id]);
+          expect(existsSync(__forTest.statePath(id))).toBe(true);
+          expect(alive(pid)).toBe(true);
+        } finally {
+          setEnv("AGETOR_TMUX_BIN", savedEnv.AGETOR_TMUX_BIN);
+        }
+        expect(await __forTest.tmuxHasSession(h.tmuxSession!)).toBe("alive");
+      });
+
+      test("a server that rejects our password is provably not ours and is cleaned up", async () => {
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        const state = JSON.parse(readFileSync(__forTest.statePath(id), "utf8"));
+        writeFileSync(__forTest.statePath(id), JSON.stringify({ ...state, password: "not-the-password" }), { mode: 0o600 });
+        __forTest.forget();
+        expect(await adoptOpencodeServers()).toEqual([]);
+        expect(existsSync(__forTest.statePath(id))).toBe(false);
+        await waitFor(() => !alive(pid));
+      });
+    });
+
+    describe("a changed launch (bin, env, cwd) is noticed", () => {
+      test("an idle server is restarted on the new settings", async () => {
+        const id = newId();
+        const a = await ensureOpencodeServer(spec(id, { STUB_EXTRA: "one" }));
+        const same = await ensureOpencodeServer(spec(id, { STUB_EXTRA: "one" }));
+        expect(same).toBe(a);
+        expect(same.stale).toBeUndefined();
+        const b = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => false });
+        expect(b.url).not.toBe(a.url);
+        expect(b.stale).toBeUndefined();
+        expect(readFileSync(path.join(stubDir, "extra"), "utf8")).toBe("two");
+        expect(launches()).toBe(2);
+        expect(await checkOpencodeServerHealth(a, 300)).toBe(false);
+        // Only the digest is stored, never the env values.
+        const raw = readFileSync(__forTest.statePath(id), "utf8");
+        expect(JSON.parse(raw).fingerprint).toMatch(/^[0-9a-f]{64}$/);
+        expect(raw).not.toContain("two");
+      });
+
+      test("a busy server is kept and the handle says it is stale", async () => {
+        const id = newId();
+        const a = await ensureOpencodeServer(spec(id, { STUB_EXTRA: "one" }));
+        const kept = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => true });
+        expect(kept.stale).toBe(true);
+        expect(kept.url).toBe(a.url);
+        expect(kept.password).toBe(a.password);
+        const unsure = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => { throw new Error("no gate"); } });
+        expect(unsure.stale).toBe(true);
+        expect(launches()).toBe(1);
+        expect(await checkOpencodeServerHealth(a)).toBe(true);
+        // Once idle, the same request restarts it.
+        const fresh = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => false });
+        expect(fresh.url).not.toBe(a.url);
+        expect(fresh.stale).toBeUndefined();
+      });
+
+      test("a changed cwd counts, and so does an adopted server's launch", async () => {
+        const id = newId();
+        const a = await ensureOpencodeServer(spec(id));
+        __forTest.forget();
+        await adoptOpencodeServers();
+        const moved = await ensureOpencodeServer({ ...spec(id), cwd: mkdtempSync(path.join(STUB_ROOT, "cwd-")) });
+        expect(moved.url).not.toBe(a.url);
+        expect(launches()).toBe(2);
+      });
     });
 
     describe("state file hygiene", () => {

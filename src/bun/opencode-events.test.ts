@@ -1,24 +1,15 @@
-import { test, expect, describe, afterAll } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { test, expect, describe } from "bun:test";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { FX_USAGE_STATUS_PREFIX, type FxUsagePayload } from "../shared/types.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
-
-// opencode-events.ts reuses the tmux mapper's helpers, so it transitively loads db.ts, which captures
-// AGETOR_DATA_DIR at first import: set it at module top level and load the modules dynamically.
-const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-opencode-events-"));
-process.env.AGETOR_DATA_DIR = DATA_DIR;
-
-const { createOpencodeEventMapper, snapshotToChunks } = await import("./opencode-events.ts");
-const { mapOpencodePart, mapOpencodeEvent, createOpencodeMapCtx } = await import("./opencode-tmux.ts");
-const { rmTestDataDir } = await import("./test-data-dir.ts");
-type OpencodeMappedChunk = import("./opencode-events.ts").OpencodeMappedChunk;
-type OpencodeEventLike = import("./opencode-events.ts").OpencodeEventLike;
-
-afterAll(() => {
-  rmTestDataDir(DATA_DIR);
-});
+import { mapOpencodePart, opencodeUsagePayload } from "./opencode-map-helpers.ts";
+import {
+  createOpencodeEventMapper,
+  snapshotToChunks,
+  type OpencodeEventLike,
+  type OpencodeMappedChunk,
+} from "./opencode-events.ts";
 
 const FIXTURES = path.join(import.meta.dir, "fixtures", "opencode");
 function jsonl<T = Record<string, any>>(name: string): T[] {
@@ -91,7 +82,7 @@ describe("basic tool turn (v2-http-tool-turn)", () => {
 });
 
 describe("shape compatibility with the tmux mapper", () => {
-  const { chunks, sessionId } = run("v2-http-tool-turn.jsonl");
+  const { chunks } = run("v2-http-tool-turn.jsonl");
 
   test("tool_use / tool_result / assistant data are byte-identical to mapOpencodePart for the equivalent part", () => {
     const part = {
@@ -129,14 +120,9 @@ describe("shape compatibility with the tmux mapper", () => {
   });
 
   test("the usage status line equals the tmux step_finish line for the same tokens", () => {
-    const ctx = createOpencodeMapCtx(2);
-    const line = JSON.stringify({
-      type: "step_finish",
-      sessionID: sessionId,
-      part: { id: "prt_f", type: "step-finish", cost: 0.0019127999999999999, tokens: { input: 12596, output: 39, reasoning: 0, cache: { read: 0, write: 0 } } },
-    });
-    const tmux = mapOpencodeEvent(line, ctx, 0).chunks[0]!;
-    expect(chunks.find(isUsage)!.data).toBe(tmux.data);
+    // The tmux mapper builds its line from exactly these two helpers.
+    const expected = FX_USAGE_STATUS_PREFIX + JSON.stringify(opencodeUsagePayload({ input: 12596, output: 39, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0.0019127999999999999 }));
+    expect(chunks.find(isUsage)!.data).toBe(expected);
   });
 });
 
@@ -176,7 +162,7 @@ describe("errors, quota hint and retry", () => {
     const m = createOpencodeEventMapper({ sessionId: "ses_fixture0020" });
     const chunks = feedAll(m, evts);
     expect(chunks).toHaveLength(1);
-    expect(chunks[0]!.lineUuid).toBe("opencode:ses_fixture0020:error:execution:1");
+    expect(chunks[0]!.lineUuid).toBe("opencode:ses_fixture0020:error:execution:msg_fixture0021");
     expect(chunks[0]!.data).toContain("Insufficient account funds");
   });
 
@@ -248,8 +234,14 @@ describe("subagent: parent and child interleaved on one event stream (v2-http-su
     const cc = feedAll(c, evts);
     expect(pc.length).toBeGreaterThan(0);
     expect(cc.length).toBeGreaterThan(0);
-    expect(pc.every((x) => x.lineUuid.startsWith(`opencode:${parent}:`))).toBe(true);
-    expect(cc.every((x) => x.lineUuid.startsWith(`opencode:${child}:`))).toBe(true);
+    // Each mapper's output equals what it produces from ONLY its own session's events: a missing
+    // session filter would also stamp the other session's content with this session's uuid prefix.
+    const own = (id: string) => evts.filter((e) => (e.data as any)?.sessionID === id);
+    expect(pc).toEqual(feedAll(createOpencodeEventMapper({ sessionId: parent }), own(parent)));
+    expect(cc).toEqual(feedAll(createOpencodeEventMapper({ sessionId: child }), own(child)));
+    expect(own(parent).length + own(child).length).toBeLessThan(evts.length + 1);
+    expect(pc.filter((x) => x.stream === "tool_use").length).toBe(1);
+    expect(cc.filter((x) => x.stream === "tool_use").length).toBe(1);
     expect(cc.some((x) => x.stream === "tool_result" && x.data.includes("CHILD"))).toBe(true);
     expect(p.terminal()).toEqual({ outcome: "succeeded" });
     expect(c.terminal()).toEqual({ outcome: "succeeded" });
@@ -417,6 +409,13 @@ describe("mapper lifecycle and robustness", () => {
       { type: "session.retry.scheduled", data: { sessionID: "ses_s", assistantMessageID: "m" } },
       { type: "session.unknown.future", data: { sessionID: "ses_s" } },
       { type: "session.inbox.delivered", data: { sessionID: "ses_s", inboxID: "i" } },
+      { type: "session.tool.input.ended", data: { sessionID: "ses_s", assistantMessageID: "m", id: "c1", text: "{}" } },
+      { type: "session.tool.input.delta", data: { sessionID: "ses_s", assistantMessageID: "m", id: "c1", delta: "{" } },
+      { type: "session.tool.progress", data: { sessionID: "ses_s", assistantMessageID: "m", id: "c1", metadata: {} } },
+      { type: "session.usage.updated", data: { sessionID: "ses_s", cost: 1, tokens: { input: 1, output: 1 } } },
+      { type: "permission.asked", data: { sessionID: "ses_s" } },
+      { type: "form.created", data: { sessionID: "ses_s" } },
+      { type: "session.agent.selected", data: { sessionID: "ses_s", agent: "build" } },
     ];
     for (const b of bad) expect(m.feed(b as any)).toEqual([]);
     expect(m.terminal()).toBeNull();
@@ -434,5 +433,195 @@ describe("mapper lifecycle and robustness", () => {
     const m = createOpencodeEventMapper({ sessionId: "ses_s" });
     const [res] = m.feed({ type: "session.tool.failed", data: { sessionID: "ses_s", assistantMessageID: "m", id: "c1", error: { type: "permission.rejected", message: "no thanks" } } });
     expect(JSON.parse(res!.data)).toEqual({ toolUseId: "c1", content: "no thanks", isError: true });
+  });
+});
+
+/* ── fix round: provisional blocks, paging, error state, name fallback, usage gating ────────────── */
+
+const SID = "ses_prov";
+const MODEL = { id: "m", providerID: "p" };
+function user(id: string) {
+  return { id, type: "user", text: "go", time: { created: 1 } };
+}
+function assistant(id: string, content: unknown[], extra: Record<string, unknown> = {}) {
+  return { id, type: "assistant", agent: "build", model: MODEL, content, time: { created: 2 }, ...extra };
+}
+const done = (extra: Record<string, unknown> = {}) => ({ time: { created: 2, completed: 3 }, finish: "stop", ...extra });
+const textEnded = (msg: string, ordinal: number, text: string): OpencodeEventLike => ({
+  type: "session.text.ended",
+  data: { sessionID: SID, assistantMessageID: msg, ordinal, text },
+});
+const tok = (input: number) => ({ input, output: 1, reasoning: 0, cache: { read: 0, write: 0 } });
+
+describe("snapshot of a streaming message (R-M2: blocks are empty until their .ended)", () => {
+  test("an empty text/reasoning item of an unfinished message emits nothing and records no uuid; the live .ended inserts it", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    const seeded = m.seedFromSnapshot(
+      [user("u"), assistant("a", [{ type: "reasoning", text: "" }, { type: "text", text: "" }])],
+      { afterUserMessageId: "u" },
+    );
+    expect(seeded).toEqual([]);
+    expect(m.provisionalUuids()).toEqual([]);
+    expect(m.feed(textEnded("a", 0, "the whole answer"))).toEqual([
+      { stream: "assistant", data: "the whole answer", lineUuid: `opencode:${SID}:text:a:0` },
+    ]);
+    const [r] = m.feed({ type: "session.reasoning.ended", data: { sessionID: SID, assistantMessageID: "a", ordinal: 0, text: "hmm" } });
+    expect(r).toEqual({ stream: "thinking", data: "hmm", lineUuid: `opencode:${SID}:reasoning:a:0` });
+    expect(m.feed(textEnded("a", 0, "the whole answer"))).toEqual([]);
+  });
+
+  test("a non-empty item of an unfinished message is final: emitted once, its live .ended dropped, nothing replaced", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    const seeded = m.seedFromSnapshot(
+      [user("u"), assistant("a", [{ type: "text", text: "block one" }, { type: "text", text: "" }])],
+      { afterUserMessageId: "u" },
+    );
+    expect(seeded).toEqual([{ stream: "assistant", data: "block one", lineUuid: `opencode:${SID}:text:a:0` }]);
+    expect(m.provisionalUuids()).toEqual([]);
+    expect(m.feed(textEnded("a", 0, "block one"))).toEqual([]);
+    expect(m.feed(textEnded("a", 1, "block two")).map((c) => [c.lineUuid.slice(-1), c.replace])).toEqual([["1", undefined]]);
+  });
+
+  test("a lost .ended is recovered by seeding again: only the missing uuid is emitted", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    m.seedFromSnapshot([user("u"), assistant("a", [{ type: "text", text: "" }])], { afterUserMessageId: "u" });
+    const again = m.seedFromSnapshot(
+      [user("u"), assistant("a", [{ type: "text", text: "final" }], done({ tokens: tok(5) }))],
+      { afterUserMessageId: "u" },
+    );
+    expect(again.map((c) => [c.stream, c.replace])).toEqual([["assistant", undefined], ["status", undefined]]);
+    expect(m.seedFromSnapshot([user("u"), assistant("a", [{ type: "text", text: "final" }], done({ tokens: tok(5) }))], { afterUserMessageId: "u" })).toEqual([]);
+    expect(m.usage().input).toBe(5);
+  });
+});
+
+describe("paged seeding (R-S4)", () => {
+  const older = [user("u0"), assistant("a0", [{ type: "text", text: "old" }], done({ tokens: tok(7) }))];
+  const page1 = [user("u"), assistant("a1", [{ type: "text", text: "one" }], done({ tokens: tok(200), cost: 0.5 }))];
+  const page2 = [assistant("a2", [{ type: "text", text: "two" }], done({ tokens: tok(100), cost: 0.25 })), { id: "i", type: "idle", outcome: "succeeded" }];
+
+  test("totals merge across pages; the anchor may be on an earlier page; pages before it map nothing", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    const seed = m.beginSeed({ afterUserMessageId: "u" });
+    expect(seed.push(older)).toEqual([]);
+    expect(seed.anchorFound()).toBe(false);
+    const c1 = seed.push(page1);
+    const c2 = seed.push(page2);
+    expect(seed.anchorFound()).toBe(true);
+    seed.end();
+    expect(seed.push(page2)).toEqual([]);
+    const usages = [...c1, ...c2].filter(isUsage).map(usageOf);
+    expect(usages.map((u) => u.turn!.inputTokens)).toEqual([200, 300]);
+    expect(usages[1]!.cost!.amount).toBeCloseTo(0.75, 9);
+    expect(m.usage()).toMatchObject({ input: 300, output: 2 });
+    expect([...c1, ...c2].filter((c) => c.stream === "assistant").map((c) => c.data)).toEqual(["one", "two"]);
+    // A live step.ended for an already-seeded message adds nothing.
+    expect(m.feed({ type: "session.step.ended", data: { sessionID: SID, assistantMessageID: "a2", finish: "stop", cost: 0.25, tokens: tok(100) } })).toEqual([]);
+    expect(m.usage().input).toBe(300);
+  });
+
+  test("an anchor that never shows up maps nothing", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    const seed = m.beginSeed({ afterUserMessageId: "missing" });
+    expect(seed.push(older)).toEqual([]);
+    expect(seed.push(page2)).toEqual([]);
+    expect(seed.anchorFound()).toBe(false);
+  });
+
+  test("seedFromSnapshot is the one-page case and equals a one-push seed", () => {
+    const a = createOpencodeEventMapper({ sessionId: SID });
+    const b = createOpencodeEventMapper({ sessionId: SID });
+    const all = [...page1, ...page2];
+    const viaSeed = b.beginSeed({ afterUserMessageId: "u" }).push(all);
+    expect(a.seedFromSnapshot(all, { afterUserMessageId: "u" })).toEqual(viaSeed);
+    expect(a.usage()).toEqual(b.usage());
+  });
+});
+
+describe("seed restores error state (R-S5)", () => {
+  const quotaErr = { type: "provider.quota", message: "Insufficient account funds", status: 402 };
+
+  test("step.failed seen only in the snapshot: execution.failed does not print the line again", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    const seeded = m.seedFromSnapshot([user("u"), assistant("a", [], { error: quotaErr, time: { created: 2, completed: 3 } })], { afterUserMessageId: "u" });
+    expect(seeded.map((c) => c.lineUuid)).toEqual([`opencode:${SID}:error:a`]);
+    expect(m.feed({ type: "session.execution.failed", data: { sessionID: SID, error: quotaErr } })).toEqual([]);
+    expect(m.terminal()).toMatchObject({ outcome: "failed" });
+  });
+
+  test("the execution error uuid is keyed on the last assistant message, live or seeded, never a counter", () => {
+    const live = createOpencodeEventMapper({ sessionId: SID });
+    live.feed({ type: "session.step.started", data: { sessionID: SID, assistantMessageID: "a" } });
+    const seeded = createOpencodeEventMapper({ sessionId: SID });
+    seeded.seedFromSnapshot([user("u"), assistant("a", [{ type: "text", text: "x" }], done())], { afterUserMessageId: "u" });
+    const fail = { type: "session.execution.failed", data: { sessionID: SID, error: { type: "x", message: "boom" } } };
+    expect(live.feed(fail)).toEqual(seeded.feed(fail));
+    expect(live.feed(fail)).toEqual([]);
+    expect(createOpencodeEventMapper({ sessionId: SID }).feed(fail)[0]!.lineUuid).toBe(`opencode:${SID}:error:execution:none`);
+  });
+});
+
+describe("a live chunk fed before the seed (R-S6)", () => {
+  const todos = { todos: [{ content: "a", status: "pending" }] };
+  const called: OpencodeEventLike = { type: "session.tool.called", data: { sessionID: SID, assistantMessageID: "a", id: "c1", input: todos, executed: false } };
+
+  test("a tool_use emitted with the generic name is replaced with the real name when the snapshot arrives", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    const [first] = m.feed(called);
+    expect(JSON.parse(first!.data).name).toBe("tool");
+    expect(first!.provisional).toBe(true);
+    expect(m.provisionalUuids()).toEqual([`opencode:${SID}:tool:c1:use`]);
+    const seeded = m.seedFromSnapshot(
+      [user("u"), assistant("a", [{ type: "tool", id: "c1", name: "todowrite", state: { status: "running", input: todos, metadata: {} } }])],
+      { afterUserMessageId: "u" },
+    );
+    expect(seeded).toHaveLength(1);
+    expect(seeded[0]).toMatchObject({ stream: "tool_use", replace: true, lineUuid: `opencode:${SID}:tool:c1:use` });
+    expect(seeded[0]!.provisional).toBeUndefined();
+    expect(JSON.parse(seeded[0]!.data).name).toBe("TodoWrite");
+    expect(m.provisionalUuids()).toEqual([]);
+  });
+
+  test("the same when the snapshot still shows the tool as streaming (name only)", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    m.feed(called);
+    const seeded = m.seedFromSnapshot(
+      [user("u"), assistant("a", [{ type: "tool", id: "c1", name: "todowrite", state: { status: "streaming", input: "{" } }])],
+      { afterUserMessageId: "u" },
+    );
+    expect(seeded.map((c) => [c.replace, JSON.parse(c.data).name])).toEqual([[true, "TodoWrite"]]);
+  });
+
+  test("a snapshot taken first keeps the real name when the live tool.called arrives after it", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    m.seedFromSnapshot([user("u"), assistant("a", [{ type: "tool", id: "c1", name: "todowrite", state: { status: "streaming", input: "{" } }])], { afterUserMessageId: "u" });
+    const [use] = m.feed(called);
+    expect(JSON.parse(use!.data).name).toBe("TodoWrite");
+    expect(use!.provisional).toBeUndefined();
+  });
+});
+
+describe("usage only for completed messages (R-S7)", () => {
+  test("an in-progress message with zeroed tokens neither counts nor swallows the live step.ended", () => {
+    const m = createOpencodeEventMapper({ sessionId: SID });
+    const seeded = m.seedFromSnapshot(
+      [user("u"), assistant("a", [{ type: "text", text: "par" }], { tokens: tok(0), cost: 0 })],
+      { afterUserMessageId: "u" },
+    );
+    expect(seeded.some(isUsage)).toBe(false);
+    expect(m.usage().input).toBe(0);
+    const live = m.feed({ type: "session.step.ended", data: { sessionID: SID, assistantMessageID: "a", finish: "stop", cost: 0.1, tokens: tok(42) } });
+    expect(live.filter(isUsage).map(usageOf)[0]!.turn!.inputTokens).toBe(42);
+    expect(m.usage().input).toBe(42);
+  });
+});
+
+describe("db-free module graph (R-S8)", () => {
+  test("opencode-events.ts and opencode-map-helpers.ts import neither db.ts nor the tmux driver", () => {
+    for (const f of ["opencode-events.ts", "opencode-map-helpers.ts"]) {
+      const src = readFileSync(path.join(import.meta.dir, f), "utf8");
+      const imports = [...src.matchAll(/from\s+"([^"]+)"/g)].map((m) => m[1]!);
+      expect(imports.filter((i) => /db\.ts|opencode-tmux|claude-tmux|core-spawn|orchestrator/.test(i))).toEqual([]);
+    }
   });
 });
