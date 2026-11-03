@@ -7,7 +7,7 @@ OpenCode **2.x** takes the **server driver**: agetor owns an `opencode serve` pe
 OpenCode **1.x** takes the **`opencode run` driver**: one `opencode run --format json` per turn inside tmux (`src/bun/opencode-tmux.ts`).
 `AGETOR_OPENCODE_TRANSPORT=run` (trimmed, case-insensitive) is the kill switch: it forces the `run` driver on 2.x too, with no release needed.
 An unparseable or missing version counts as 2 (`opencodeMajor`).
-The design is `docs/plans/opencode-server-driver.md` (decisions D1–D13, invariants I1–I9), and the live OpenCode 2.1.3 facts it rests on (steering, snapshots, reject/skip semantics, the password reaching tool envs, wakes) are recorded in `docs/plans/opencode-server-driver-spikes.md`; the older `docs/plans/add-opencode-harness.md` and its spike notes `add-opencode-harness-spikes.md` (amendments A1–A15) still describe the `run` driver and the CLI facts.
+The design is `docs/plans/opencode-server-driver.md` (decisions D1–D13, the owner decisions R1–R4 of its §8, invariants I1–I9), and the live OpenCode 2.1.3 facts it rests on (steering, snapshots, reject/skip semantics, the password reaching tool envs, wakes) are recorded in `docs/plans/opencode-server-driver-spikes.md`; the older `docs/plans/add-opencode-harness.md` and its spike notes `add-opencode-harness-spikes.md` (amendments A1–A15) still describe the `run` driver and the CLI facts.
 Fixtures and test doubles live in `src/bun/fixtures/opencode/` (see its README).
 
 ## The server driver (OpenCode 2.x)
@@ -22,6 +22,7 @@ The modules, bottom up:
 | `opencode-hub.ts` | one SSE connection per server, fanned out to per-session subscribers |
 | `opencode-events.ts`, `opencode-map-helpers.ts` | pure mapper from live events and message snapshots to run-event chunks |
 | `opencode-driver.ts` | one turn: session, prompt, steer, cards, Stop, reattach, wake |
+| `orchestrator-opencode-server.ts` | the orchestrator's half: the live turns and lingering handles, steering a message into a turn, the wake, boot reattach and linger, the idle sweep, the quit stop and the busy gate; it gets what it needs from `orchestrator.ts` through one deps object (`initOpencodeServerOrchestrator`) and never imports it |
 | `opencode-subagents.ts` | live subagent tabs from child-session events |
 
 ### Server manager (`opencode-server.ts`)
@@ -37,16 +38,17 @@ It must not appear in any argv, and tmux's own `new-session -e` would put it in 
 So the manager writes the variables it sets (the harness env minus `SCRUBBED_ENV_KEYS`, `OPENCODE_DISABLE_AUTOUPDATE=1` unless the harness sets it, `PATH` if the harness env has none, the password) to a 0600 env file in the 0700 server directory, and the inner `sh` redirects its output to the log, sources the file, deletes it and `exec`s the server.
 Everything else the server sees is the tmux server's global environment, which the core launched with `childEnv()` (under the `direct` test host: `childEnv()` of the scrubbed `process.env` plus the harness env), so the master token is never in it.
 The password then lives in four places only: the 0600 state file, the server's environment, the `Authorization` header and, for a moment, the env file.
-It is in no log, argv, URL, event or error message (`redact`, and `opencode-http` redacts its errors).
+It is in no log, argv, URL, event or error message: there is one redactor, `redactSecrets` in `opencode-http.ts` (the raw password, its base64 form and `password=`, `Authorization`, `Basic` and `Bearer` patterns), and the manager imports it.
 
 State is `dataDir/opencode-servers/<harnessId>.json` (0600; url, password, tmux session, start time, version, launch fingerprint), next to a `.log`.
-The directory is refused if it is a symlink, not a directory, or owned by someone else.
+The directory is refused if it is a symlink, not a directory, or owned by someone else, and it is checked again (an `lstat` and a realpath) right before every write and every unlink batch, the stop paths included; a directory that no longer checks out is refused, never followed.
 The state file is read back no-follow (`openReadNoFollow`) and treated as absent when it is a symlink, owned by another user, broader than 0600, oversized, malformed, filed under the wrong name, carries a non-loopback url, or names a tmux session other than the one this harness would get.
 
 **Fingerprint restart.** The state records a sha256 of the launch (binary, cwd, harness env; only the digest is stored).
-When the settings change, `ensure` restarts the server if it is idle.
-If it is busy it keeps it and returns a `stale` handle, and the driver posts the status line “OpenCode will pick up the changed harness settings after this turn”.
-“Busy” is the `isBusy` predicate the orchestrator passes in: a running turn or an open card on that harness.
+When the settings change, `ensure` restarts the server only for a **fresh spawn**, and only if it is idle.
+A reattach, a wake and a boot linger never restart a server for changed settings: they join an execution the server is running right now, so their `isBusy` is always true and they get the running server back as it is.
+A busy server is kept and `ensure` returns a `stale` handle, and the driver posts the status line “OpenCode will pick up the changed harness settings after this turn”.
+“Busy” is the `isBusy` predicate the orchestrator passes in (`opencodeHarnessBusy`): a server turn or lingering handle on that harness, or an open card on one of its tasks; a spawn leaves out its own run, whose prompt has not reached the server yet.
 
 **Adoption.** `adoptOpencodeServers()` runs at boot, before `reconcileOrphans` (see [task-lifecycle.md](task-lifecycle.md)).
 It reuses a server whose tmux session is alive and which answers an authenticated info request.
@@ -54,19 +56,31 @@ Servers are judged in parallel under one 5 s budget; a server still undecided wh
 A server is declared **dead only on positive proof**: the host is provably gone (tmux said “no such session”, or the direct child exited), the connection was refused, or the server answered 401 and still did on a second look.
 A dead server is cleaned up: its tmux session is killed (and, as below, only provably-ours pids signalled) and its state, env and log files removed.
 A probe that merely times out, resets or answers something odd, or a tmux call that failed, leaves the server and its state alone, because it may be busy.
-`ensure` never restarts a server that is busy: it answers “The OpenCode server is not responding.” instead of killing a running turn.
+`classifyOpencodeServer(harnessId, timeoutMs?)` applies the same rule to a server the manager holds, read-only, and answers `dead`, `alive`, `unresponsive` (no proof either way) or `unknown` (not held, or being started or stopped, or replaced while it probed).
+`ensure` never replaces a server that is unresponsive, or that refuses connections while its host is still there and a turn is using it: it answers “The OpenCode server is not responding.” instead of killing a running turn.
+
+**Bounded calls.** Every tmux and `ps` call is bounded (2 s; 5 s for `new-session`, which may have to start the tmux server) and the child is killed on expiry.
+A timeout counts as a failed call, never as proof that a server died, so a wedged tmux cannot hang the single-flight `ensure` or the sweep.
+The driver's own connect to the server has a deadline too (45 s): past it the turn posts a status line and fails.
+
+**Health cache.** `ensure` trusts a successful health check for 5 s.
+When the hub gives up on a server, the driver's `onServerLost` calls `noteOpencodeServerLost`, which drops that cache, so the next `ensure` probes again instead of handing out a dead URL.
 
 **Signals.** No pid read from the state file, or reported by the server about itself, is ever signalled.
 Stopping a tmux-hosted server is `kill-session` on the exact session name; signals are only the escalation, and only for the pane's own pid and its descendants (never this process or its ancestors).
 Under the test host (below) the only signalled pid is a child this core spawned.
 
-**Stop rules (D6).** `opencodeIdleSweep(now, isBusy)` stops a server idle for 30 minutes (`OPENCODE_SERVER_IDLE_MS`) when `isBusy(harnessId)` is false.
-The orchestrator runs the sweep every 60 s (`runOpencodeIdleSweep`, single-flight, `unref`'d), and its `isBusy` is a turn or lingering handle on the harness, an open card, or an executing session found by an `activeSessions` probe (a background subagent may be running with no agetor run); a server that cannot be asked and is not otherwise busy is classified, and one whose info request fails too is dead, so it is stopped and its hub stream closed.
+**Stop rules (D6).** `opencodeIdleSweep(now, isBusy)` stops a server idle for 30 minutes (`OPENCODE_SERVER_IDLE_MS`) when `isBusy(harnessId)` is false and no start is in flight.
+The orchestrator runs the sweep every 60 s (`runOpencodeIdleSweep`, single-flight, `unref`'d), and its `isBusy` is a turn or lingering handle on the harness, an open card, or an executing session found by an `activeSessions` probe (a background subagent may be running with no agetor run).
+A server that cannot be asked is stopped only when `classifyOpencodeServer` has positive proof it is dead (refused, a persistent 401 or its host gone; a timeout never is), and then only through the same idle window and start guard as any other stop, with the busy check made again after the await.
+Each stopped server's hub stream closes right after its own stop.
 A server is never stopped while a turn runs or a card is open, and a gate that throws counts as busy.
 
 **Quit.** The process dies right after the before-quit hook (Electrobun's `quit()` runs a synchronous forced exit), so a quit cannot await anything.
-On a **real stop** (a real app quit, `agetor daemon stop`, a CLI daemon's idle exit) the orchestrator calls `stopIdleOpencodeServersOnRealStop`, which uses `stopIdleOpencodeServersSync`: for every idle server, `tmux kill-session` on the exact name through `coreSpawnSync` (2 s bound each), then its state files removed.
-“Idle” uses the last sweep's probe plus the busy predicate; the driver takes one probe at start-up, and **until a probe has run a quit stops nothing**.
+On a **real stop** (a real app quit, `agetor daemon stop`, a CLI daemon's idle exit) the orchestrator calls `stopIdleOpencodeServersOnRealStop`, which uses `stopIdleOpencodeServersSync`: for every idle server, `tmux kill-session` on the exact name through `coreSpawnSync` (2 s bound each), then its state files removed from a server directory that still checks out.
+A server whose kill failed or timed out is not stopped: it stays registered and keeps its state file, so the next boot finds and judges it.
+“Idle” uses the last probe plus the busy predicate; the driver takes one probe at start-up, and **until a probe has run a quit stops nothing**.
+Each probe is stamped with the time it started, and when a server turn or lingering handle on a harness ends, a fresh probe is scheduled; an “executing” result older than the harness's last settle is ignored, since it may only have seen the turn that has ended since.
 The app's quit hook is `stopOpencodeServersOnQuit`: a quit that hands the port to the background host (armed, not “Quit Agetor Completely”) stops nothing, since a handoff is not a quit ([always-on-host.md](always-on-host.md)).
 `stopOpencodeServerDriver` (process exit, handoff) detaches the live turns without interrupting them and closes the hub, and leaves every server running for the next core.
 
@@ -75,6 +89,7 @@ The app's quit hook is `stopOpencodeServersOnQuit`: a quit that hands the port t
 HTTP Basic `opencode:<password>`.
 It talks to a plain `http:` loopback origin only (`127.0.0.1`, `::1`, `localhost`, no userinfo); both constructors refuse anything else, so a bad state file can never send the password off the machine.
 Client requests use `redirect: "error"` and a 10 s timeout per call (the manager's own health probe uses `redirect: "manual"`, so it never follows one either); the SSE fetch has no overall timeout and a 45 s stall watchdog (three missed heartbeats) instead.
+A response body is read through a cap of 32 MiB (`OPENCODE_MAX_RESPONSE_BYTES`); a larger one is a `BadResponse` error.
 Errors are typed (`OpencodeHttpError`: `status` 0 for transport, otherwise the HTTP status and the server's `_tag`).
 There is no reconnect here; the hub owns it.
 
@@ -91,12 +106,21 @@ The hub gives up after 10 attempts that never connected, or 30 short-lived drops
 The wake handler fires once per execution.
 The same check runs on every connect against the server's list of active sessions, since the start may have fallen into a gap or predate this core.
 A driver that unsubscribes inside the dispatch that delivers its own terminal event also produces a wake, before the orchestrator's done handler has finished the run; the orchestrator therefore **defers** such a wake and decides again once the run has settled (`retryDeferredOpencodeWake`; it runs the gates afresh, so a turn the queue drain just started still defers it).
-A newer server epoch handed to the hub (the server process restarted) means every execution is gone: existing subscribers get `onServerLost("OpenCode server restarted")` and are dropped before the stream is swapped, and the driver ends the turn failed with a status line.
+The wake handler also receives the **trigger** of the execution: the hub remembers the metadata of the synthetic inbox item (`source`, `childID`, `state`) that preceded it, and any execution end forgets it.
+A newer server epoch handed to the hub (the server process restarted) means every execution is gone: existing subscribers are dropped and get `onServerLost("OpenCode server restarted")` on a microtask, after the caller has registered its own entry on the new record, so the new subscriber is not disposed with the old ones; the failure count restarts, and the driver ends the turn failed with a status line.
 
-**What the orchestrator does with a wake** (`decideOpencodeWake`, all synchronous).
-It **refuses** when launches are frozen, the session is not one it watches, the task is gone, archived or tearing down, the harness was switched, disabled or is not OpenCode, the transport is no longer `server`, the session id is no longer the task's own, the user stopped the task since their last start or message (Stop, delete, archive, a harness switch or an empty Reject; cleared by the next start or sent message), or the card is parked in Done, Backlog or Blocked.
-It **defers** while a start or send holds the task, or while one of the task's runs is still running or settling, except after a Stop, where it refuses.
-Otherwise it claims the task and mints the run (`origin: "agent"`, a status line “OpenCode continued this session on its own”), moves the card to Running and attaches the driver with `reason: "wake"`.
+**What the orchestrator does with a wake** (`decideOpencodeWake` in `orchestrator-opencode-server.ts`, all synchronous; owner decisions R3 and R4).
+A wake is never refused because the user stopped the task, or because its card is parked in Done, Backlog or Blocked: it goes through and pulls the card back to Running.
+It is **refused**, with nothing done, only when launches are frozen (the process is exiting) or the session is not one it watches.
+It is **interrupted** when the task has no card to pull back: the task is gone, archived or tearing down, its harness was switched, disabled or is not OpenCode, the transport is no longer `server`, or the session id is no longer the task's own.
+The orchestrator then interrupts that execution on the harness's server (`interruptOrphanOpencodeExecution`, 5 s bound, best effort), so nothing runs unattended.
+The **tail of a Stop** is interrupted too.
+Interrupting a background subagent makes OpenCode wake its parent with a `state="cancelled"` message; when the wake's trigger is that message for a child agetor itself interrupted (`wasOpencodeChildStoppedByAgetor`, remembered for 2 minutes), it is the Stop's own tail and not new work, unless a live turn of the task that is not being stopped listens to the session.
+Every other wake, including one from a child the user did not stop, goes through.
+It **defers** while a start or send holds the task, or while one of the task's runs is live, settling or being stopped, and decides again once the run has settled (`retryDeferredOpencodeWake`; the gates run afresh, so a turn the queue drain just started still defers it).
+A wake already waiting when a Stop lands is dropped by that Stop (`dropDeferredOpencodeWake`): it is the execution being interrupted.
+One seen after the Stop began is new work and becomes a run after the settle.
+Otherwise it claims the task and mints the run (`origin: "agent"`, a status line “OpenCode continued this session on its own”), moves the card to Running from whatever column it is in and attaches the driver with `reason: "wake"`.
 A wake is not a start: it does not run `startTask`'s pre-flights.
 
 ### Event mapper (`opencode-events.ts`)
@@ -115,6 +139,8 @@ The one chunk that changes already-emitted content is a tool call whose name was
 
 `spawnOpencodeServerTurn` starts a turn and `attachOpencodeServerTurn` joins one already running (an agetor restart, or a wake).
 Both share one core: ensure the server, ensure the session, subscribe through the hub and wait for it to be ready, send the prompt, map events until a terminal `session.execution.*`.
+The prompt carries a client-chosen `msg_` id.
+OpenCode treats the same id on the same session as idempotent, so a prompt that timed out is first looked up in the session's newest messages and sent again, once and with the same id, only if it did not land; the same id on another session is a 409, which is an error.
 `done` resolves 0 (succeeded), 1 (failed or unclear) or 130 (stopped); it never rejects and never hangs.
 A terminal only counts once the turn's own prompt was delivered (`session.inbox.delivered`), so the tail of an earlier execution cannot end it, and a slow liveness check (30 s) re-reads the session if a terminal is lost.
 
@@ -132,22 +158,29 @@ On OpenCode 1.x Ask runs without `--auto`, which makes OpenCode reject every ask
 **Steering.** `steer(text)` posts `prompt` with `delivery: "steer"` into the running execution and returns `"accepted"` or `"unavailable"`.
 The orchestrator's `sendInput` writes the user bubble on the active run and mints no new run.
 `"unavailable"` (the server is unreachable or refused the message) queues the message for the next turn and posts the fixed status line “couldn't deliver to the running OpenCode turn — sending it next” (`OPENCODE_STEER_QUEUED_STATUS`).
+Steers are sent one at a time, in call order.
 A message sent while the turn is being stopped, or while earlier messages are already queued, joins the queue without trying to steer and without that line.
+One that was waiting for the first prompt when a Stop landed is routed like a message to a cancelled run (queued, or kept off a stopped pipeline step).
 If the turn settled while the steer was in flight, the message starts as its own turn.
 A message sent before the turn's first prompt has returned **waits** (bounded, 20 s) for it and is then sent in order, rather than falling back to the queue.
 A steer that arrives while a card is open is still sent; OpenCode delivers it after the card is answered.
 A steer that races the very end of the turn can land after the execution closed; OpenCode then starts a new execution for it, which the hub reports as a wake, so the message is not lost.
 
 **Stop.** `kill()` calls `interrupt` (3 s HTTP budget) and waits up to **10 s** for OpenCode's `execution.interrupted`; if none arrives the run settles anyway as stopped with a status line, so Stop can never leave a run hanging.
+A Stop that lands while a follow-up is still spawning, even with a lingering handle listening, is not lost.
 Stop, delete, archive and an agent switch go through the same interrupt, cancel the task's open cards, and also interrupt every unsettled background subagent the driver knows (and the hub's owned sessions), so a stopped task is not woken later by a child that finishes.
+Only a child the server reports as interrupted is settled `interrupted`; one that had already finished is synced to its real outcome.
+OpenCode wakes the parent of an interrupted child, and interrupting the parent never reaches its children, so the children are interrupted explicitly and the cancelled-child wake that follows is recognised as the Stop's tail (see the wake rules above).
 `detach()` stops listening without interrupting, for a teardown that must not end the run.
 
-**Reattach and wake attach.** After an agetor restart the orchestrator adopts the server, probes each run's session once at boot, and `reattachOpencodeServerRun` (`orchestrator.ts`) calls `attachOpencodeServerAgent` (`agents.ts`), which calls the driver's `attachOpencodeServerTurn` with the run's start time; no adopted server, or a session the server no longer has, orphans the run, while an unreachable server lets the driver try and settle the run failed with a status line.
+**Reattach and wake attach.** After an agetor restart the orchestrator adopts the server, probes each run's session once at boot, and `reattachOpencodeServerRun` (`orchestrator-opencode-server.ts`) calls `attachOpencodeServerAgent` (`agents.ts`), which calls the driver's `attachOpencodeServerTurn` with the run's start time; no adopted server, or a session the server no longer has, orphans the run, while an unreachable server lets the driver try and settle the run failed with a status line.
 A task whose last turn is over but whose **background subagents still run** on the server (a held task after a restart or a hand-over) gets a lingering handle instead (`attachOpencodeServerLinger`): its child rows are synced from the server, child events, permissions and cards are served again, and they are not orphaned.
+Only rows that are `running`, or `orphaned` within `ORPHAN_RECHECK_MAX_AGE_MS` (24 h), make a task a boot linger candidate (`opencodeLingerCandidates`), so an old orphan never keeps a listener and the server alive on every boot.
 If the session is active, the driver snapshots from the run's user message, re-lists pending permissions and forms (re-registering cards by id), and streams the rest into the same run.
 If the session is idle, the run settles from the session's `outcome`.
 The anchor is the run's own user message when its id is known; otherwise the first user or synthetic message after the last `idle` marker that is not newer than the turn's start, never a time window alone, which could settle this turn from the previous turn's outcome.
 A server wake attaches the same way with `reason: "wake"` and mints a run with `origin: "agent"`, moving the card to Running; see [task-lifecycle.md](task-lifecycle.md).
+A server-transport run has **no tmux session**: its `runs.tmux_session` is null (the turn lives on the server, not in a session of its own), and `agetor attach` on such a task says so and points at the app, `agetor logs` and `agetor show`.
 
 **Breadcrumb.** Every turn's first status line is `opencode <M>.x · server=<agetor|shared|standalone|n/a> · model=<label> · effort=<id> · mode=<id>` (`formatOpencodeTurnBreadcrumb`).
 A server-driver turn writes `server=agetor`; `parseOpencodeTurnBreadcrumb` reads it and the older values.
@@ -162,14 +195,19 @@ Agetor never writes words of its own into an answer.
 A **permission card** is the fx permission card with `harness: "opencode"`.
 It offers exactly OpenCode's three decisions: Allow once, Always allow (OpenCode's own `always`, stored by OpenCode in its own project state) and Reject.
 Reject has an optional reason box.
-**An empty Reject stops the turn; a Reject with a reason lets the turn continue and the model sees the reason.** This is OpenCode's behavior (live-verified on 2.1.3: a bare reject becomes `execution.interrupted`), not something agetor adds, and the card, the CLI and the docs tell the user so.
-The driver reports the stop to the orchestrator (`onUserStop`), which marks the run **cancelled**, so the task goes to Ready with no failure, and nothing wakes the session again until the user's next start or message.
+**An empty Reject skips the action and the turn continues; a Reject with a reason also continues, and the model sees the reason** (owner decision R1).
+OpenCode continues a rejected tool only when the reply carries a truthy `message`: an empty, null or omitted one is a decline that interrupts the whole turn (live-verified on 2.1.3, `docs/plans/opencode-server-driver-spikes.md`).
+So the driver sends `message: " "` (`OPENCODE_EMPTY_REJECT_MESSAGE`, one space) for a Reject the user gave no reason for.
+That single byte is the only machine-added text in any reply agetor sends, it carries no words, and the model sees nothing but the space ([pasted-content.md](pasted-content.md)); a typed reason is sent exactly as typed.
+One reject also declines every other pending request of that session, and their cards close when OpenCode reports the replies.
+The card, the CLI and the docs say that a Reject without a reason skips the action and the agent continues.
+The driver's `onUserStop` hook fires only for a stop agetor did not issue: another OpenCode client interrupting the turn marks the run **cancelled**, so the task goes to Ready with no failure.
 The reason is user text only, at most 4096 characters, and the route refuses one with any other option or on an fx card (400).
 `cancel` is reserved for the internal Stop and delete sweep: the route answers an OpenCode card's `cancel` with a 400, because a card dropped by the user would leave the server blocked with nothing to answer.
 Both routes are `app+cli`, so a CLI-token holder can answer these cards ([security.md](security.md)).
 
 A **question card** is the shared ask card with `source: "opencode"`, shown in every mode.
-Each question takes an option or typed free text, and **Skip** carries an optional reason.
+Each question takes an option or typed free text, and **Skip** carries an optional reason; a `message` without `skip` is a 400, like on the permission route.
 An empty Skip is a reply with an empty answer, and the model continues without an answer.
 A Skip with a reason dismisses the form with the user's words and the model continues.
 A form that is not a question (an MCP elicitation) is left alone.
@@ -186,9 +224,13 @@ On the server driver a child session's events stream into its subagent tab **liv
 The hub reports `session.created{parentID}`; the driver calls `registerOpencodeChildSession` (a `subagents` row with `parentKind: "opencode_subagent"` and `sourcePath: "opencode-session:<child>"`, status `running`), maps the child's events through its own mapper into `ingestOpencodeChildChunks`, and settles the row on the child's own terminal (`settleOpencodeChild`).
 There is no turn-end `session export` refresh for these turns.
 The server outlives the turn, so a child still running when its turn ends is not dead: a background child keeps its row `running` until its own terminal, and a row left unfinished by a teardown goes `orphaned`, never `failed`.
-After a resync, reattach or wake, `syncOpencodeChildFromServer` catches the row up from the server.
+After a resync, reattach or wake, `syncOpencodeChildFromServer` catches the row up from the server: it revives an `orphaned` row only when the server lists the child as active (a history alone proves nothing about now), and settles for good a child the server answers 404 for.
+Children whose row is already settled are not listed, synced or interrupted again.
 `opencodeTurnOfRun(runId)` reads the run's breadcrumb to decide which rule applies.
 When the root settles with a background child still running, the driver stays subscribed in a child-only mode (a lingering handle): it ingests and settles child events and serves child permissions and cards until every background child settles, `dispose()`, 24 h, or the root's next `session.execution.started`, which the wake path then takes over.
+Leaving for the next execution does not close the children's open cards: the next driver re-lists the server's requests and takes the same cards over, deduplicated by request and form id.
+A driver whose card was cancelled by someone else while it can still act raises it again from the server's list.
+A catch-up stops at the next execution of the root, so the next turn's events never land in the finished one.
 
 ## The `opencode run` driver (OpenCode 1.x, and the kill switch)
 
@@ -222,7 +264,7 @@ The `--title` value rides as one `--title=<t>` argv item, because v2's parser re
 **Models and effort.** The one curated row is the pinned **“OpenCode default”** sentinel `opencode-default` (`OPENCODE_DEFAULT_MODEL`, `DEFAULT_MODEL.opencode`): it carries no `/`, and means send no model and so no effort. A real model with a `null` or `"auto"` effort keeps the model and omits only the variant; `mergeModelOptions` rule 9 (`AgentOption.pinned`) always lists a pinned curated row first.
 Discovery (`discoverOpencode`, `agent-discovery.ts`; per harness, 8 s budget) runs `models --standalone` and `api --standalone model.list` on v2 and `models --verbose` on v1.
 Discovery and `session list` keep using `--standalone` on v2 (one-shot, no server). **A discovered entry with `efforts: []` means “no variants” (the effort picker collapses), whereas an absent `efforts` key means unknown (`[auto]`).**
-**Provider-qualified labels**: OpenCode's two hosted providers serve the same models under the same names. `opencode/…` is **Zen** (pay-as-you-go balance; an empty one fails with `provider.quota` HTTP 402 “Insufficient account funds”) and `opencode-go/…` is the **Go subscription**. `disambiguateOpencodeLabels` appends ` (OpenCode Zen)` or ` (OpenCode Go)`, then ` (<id>)` if a label still collides. A 402 error line carries `opencodeQuotaHint` (status line only; `lastError` stays raw).
+**Provider-qualified labels**: OpenCode's two hosted providers serve the same models under the same names. `opencode/…` is **Zen** (pay-as-you-go balance; an empty one fails with `provider.quota` HTTP 402 “Insufficient account funds”) and `opencode-go/…` is the **Go subscription**. `disambiguateOpencodeLabels` appends ` (OpenCode Zen)` or ` (OpenCode Go)`, then ` (<id>)` if a label still collides. A 402 error line carries `opencodeQuotaHint` (status line only; `lastError` stays raw) only when the turn's model is a Zen one (`opencode/…`), or its provider is unknown and the error text names Zen: telling a Go or bring-your-own-key user to switch to Go would be wrong.
 `supportedEfforts` keeps `auto` (“Model default”) ahead of the discovered variants.
 
 **TODO tracker.** `todowrite` maps to a synthetic legacy-`TodoWrite` `tool_use` (`normalizeOpencodeTodos`). On v2 the tool only exists with `experimental.todo: true` in the user's own OpenCode config; owner decision G10: agetor injects no config and documents the requirement.
@@ -232,7 +274,8 @@ Install `brew install opencode` (v1: `npm i -g opencode-ai`). The status probe f
 An old `ses_…` id resumes on the agetor-owned server when its data dir is the same one the retired shared service used (same HOME/XDG); otherwise the not-found path above applies.
 
 **CLI parity** (`src/cli`). `--opencode-server` is still accepted on `agetor add`, `agetor edit` and `agetor profile add|edit` and ignored, with a one-line stderr notice (`warnOpencodeServerFlagIgnored`); `agetor edit` and `agetor profile edit` with only that flag resolve the task or profile reference first, so a bad reference errors before the warning; it is gone from help and the add wizard, and `agetor show` and `agetor profile show` no longer print the server line.
-`agetor answer <task-id>` handles the OpenCode cards: `--reason <text>` rides a Reject (and a `--skip`), `--skip` skips a question, the question picker has an “Other” row for free text, and a Reject with no reason prints that the turn stops.
+`agetor answer <task-id>` handles the OpenCode cards: `--reason <text>` rides a Reject (and a `--skip`), `--skip` skips a question, the question picker has an “Other” row for free text, and a Reject with no reason prints that the action is skipped and the agent continues.
+The picker's option values are indexes into the question's options, so no model-chosen option id can collide with the Other or Skip rows.
 `agetor harness ls` prints `HarnessStatus.notices`; `agetor sessions` lists both Claude and OpenCode sessions and routes `ses_…` ids to the OpenCode import; `agetor start` refuses an imported session of either kind with the core's 409 copy.
 Capability discovery (`commands.ts`, `ref-tree.ts`) reads user commands under `<home>/.config/opencode/command(s)`, user skills from `OPENCODE_USER_SKILL_DIRS`, project `.opencode/command(s)` and skills, and MCP servers from `opencode.json[c]` (v1 `mcp.<name>`, v2 `mcp.servers.<name>`; `enabled:false` omitted, no env or headers leaked).
 
@@ -243,7 +286,7 @@ Capability discovery (`commands.ts`, `ref-tree.ts`) reads user commands under `<
 **Unit tests never run the real binary** (it writes into `$HOME` on every call): `src/test-preload.ts`, registered in `bunfig.toml`, defaults `AGETOR_OPENCODE_BIN` to a nonexistent path, so a test that needs OpenCode plants a stub and sets it explicitly.
 
 - **Fake server.** `src/bun/fixtures/opencode/fake-serve.ts` is a Bun implementation of the `/api` subset the driver uses (Basic auth, global SSE, sessions in memory). `stub-opencode.sh` is an `opencode` stand-in for `AGETOR_OPENCODE_BIN`: `--version` prints `opencode v2.1.3`, `serve …` execs the fake server, `models`, `api --standalone model.list` and `auth list` answer canned data. The scenario is chosen by a marker in the prompt text: `__agetor_fake_oc_steer__`, `_permission__`, `_question__`, `_subagent__`, `_wake__`, `_error__` (402), `_slow__` (runs until interrupted), `_todo__`, `_retry__`, `_files__`, `_tool__`; no marker is one `ACK: <prompt>` step. Env knobs: `FAKE_OC_SPEED` (delay multiplier), `FAKE_OC_HEARTBEAT_MS`, `FAKE_OC_STATE_FILE` (persist sessions across a server restart), `FAKE_OC_QUOTA_MODELS`, `FAKE_OC_VERSION`; `FAKE_OC_BUN` (documented in `stub-opencode.sh`) names the `bun` the stub execs when `bun` is not on `PATH`.
-- **`AGETOR_OPENCODE_SERVER_HOST=direct`.** Hosts the server as a `coreSpawn` child of the core instead of a tmux session. It is for unit and e2e tests that must not need tmux, is not a user setting, and nothing in a release flow sets it. A state file with no tmux session is accepted only under it.
+- **`AGETOR_OPENCODE_SERVER_HOST=direct`.** Hosts the server as a `coreSpawn` child of the core instead of a tmux session. It is for unit and e2e tests that must not need tmux, is not a user setting, and nothing in a release flow sets it. It is honored only under `NODE_ENV=test` (every `bun test` run) or when the e2e backend sets `AGETOR_E2E_OPENCODE_DIRECT_HOST=1` (that backend does not run under `NODE_ENV=test`); in any other process it is ignored, so a stray value in a packaged build cannot move the server out of tmux. A state file with no tmux session is accepted only under it.
 - **`AGETOR_OPENCODE_DRIVER=fake`** bypasses tmux and the real CLI for the `run` driver and v1 paths: `makeFakeOpencodeAgent` feeds canned v2 NDJSON through the real `createOpencodeLineProcessor`; markers `__agetor_fake_opencode_subagent__` (the child id `ses_fakechild<id8>` is served by `runOpencodeExport`'s fake branch), `__agetor_fake_opencode_error__`, `__agetor_fake_opencode_resume_fail__`; `kill()` resolves 130.
 - **`AGETOR_OPENCODE_TRANSPORT=run`** is also the way a test forces the `run` driver on a v2 stub.
 - Other env: `AGETOR_OPENCODE_BIN`, `AGETOR_OPENCODE_ARGS` (spliced after the built-in flags), `AGETOR_HARNESS_AUTO_ENABLE`.

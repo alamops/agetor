@@ -13,7 +13,7 @@ A bundle drop needs no seam: the drop handler reads the dropped `File` with `Fil
 Unlike the seams above this one exercises the real driver, hub and server manager end to end; only the OpenCode binary is faked.
 The scenario is chosen by a marker in the prompt: `__agetor_fake_oc_steer__`, `_permission__`, `_question__`, `_subagent__`, `_wake__`, `_error__`, `_slow__`, `_todo__`, `_retry__`, `_files__`, `_tool__`.
 Its knobs are `FAKE_OC_SPEED`, `FAKE_OC_HEARTBEAT_MS`, `FAKE_OC_STATE_FILE`, `FAKE_OC_QUOTA_MODELS`, `FAKE_OC_VERSION` and `FAKE_OC_BUN`, all documented in the file's header.
-`AGETOR_OPENCODE_SERVER_HOST=direct` hosts the server as a `coreSpawn` child of the core instead of in tmux, so unit and e2e runs need no tmux; it is test-only and nothing in a release flow sets it.
+`AGETOR_OPENCODE_SERVER_HOST=direct` hosts the server as a `coreSpawn` child of the core instead of in tmux, so unit and e2e runs need no tmux; it is test-only and nothing in a release flow sets it. It is honored only under `NODE_ENV=test` (every `bun test` run) or `AGETOR_E2E_OPENCODE_DIRECT_HOST=1`, which the e2e backend sets because it does not run under `NODE_ENV=test`; elsewhere it is ignored.
 `AGETOR_OPENCODE_TRANSPORT=run` forces the legacy `opencode run` driver, and `AGETOR_OPENCODE_DRIVER=fake` keeps its canned-NDJSON path.
-A test that runs the real driver must restore every one of these env vars, since `bun test` shares one process.
+A test that runs the real driver must restore every one of these env vars, since `bun test` shares one process, and should set `FAKE_OC_HEARTBEAT_MS` well under the driver's 45 s stall watchdog (about 2 s) and wait on events rather than sleeping to prove something did not happen.
 

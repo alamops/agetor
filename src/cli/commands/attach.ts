@@ -35,8 +35,9 @@ async function harnessKindOf(client: AgetorClient, harnessId: string): Promise<s
 
 /**
  * The text of the error `agetor attach` gives when an OpenCode 2.x turn has
- * no tmux session because it runs on the agetor-managed OpenCode server (a
- * child of the core, hosted for the whole app, not one session per turn), or
+ * no tmux session because it runs on the agetor-managed OpenCode server (one
+ * `opencode serve` per harness in its own tmux session, outliving the core and
+ * shared by every turn — not one session per turn), or
  * null when `latest` (the task's newest run) is not such a turn. A server turn
  * is stamped with no tmux session; an OpenCode 1.x (or `opencode run`) turn
  * always has one. Only the follow commands that exist are named: `agetor logs`
