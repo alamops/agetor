@@ -413,7 +413,14 @@ test("harnessAutoEnabled rows survive deleting the harness (no FK)", () => {
 // ---------------------------------------------------------------------------
 
 function planOf(sql: string, ...params: (string | number | null)[]): string[] {
-  return db.query<{ detail: string }, (string | number | null)[]>(`EXPLAIN QUERY PLAN ${sql}`).all(...params).map((r) => r.detail);
+  // Prepared and finalized, not `db.query` (cached): a cached EXPLAIN of a write statement stays
+  // "in progress" and makes a later transaction's COMMIT fail in another file sharing this db.
+  const stmt = db.prepare<{ detail: string }, (string | number | null)[]>(`EXPLAIN QUERY PLAN ${sql}`);
+  try {
+    return stmt.all(...params).map((r) => r.detail);
+  } finally {
+    stmt.finalize();
+  }
 }
 
 test("runs.lastOpencodeSessionRunPerTask: live tasks only by default; archivedSinceMs adds recently archived ones flagged archived", () => {
