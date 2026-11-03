@@ -11,14 +11,13 @@ import { gotoApp } from "./helpers";
  * mapper); every other CLI call goes to the stub `opencode` binary that
  * e2e/fixtures.ts writes (`opencode v2.1.4`, `auth list` → `[]`).
  *
- * - (a) New Task → OpenCode: the model reads "OpenCode default", the server
- *   picker defaults to Shared; the run renders assistant text, a thinking
- *   block, a tool card, the TODO card plus its board badge and the usage
- *   chip; a follow-up resumes the same session.
- * - (b) Task details → Standalone: the next turn's D-19 breadcrumb reads
- *   `server=standalone`.
+ * - (a) New Task → OpenCode: the model reads "OpenCode default" and the
+ *   retired Shared/Standalone server picker is gone; the run renders assistant
+ *   text, a thinking block, a tool card, the TODO card plus its board badge
+ *   and the usage chip; a follow-up resumes the same session.
+ * - (b) Task details has no server picker either; the next turn still runs.
  * - (c) Settings → Add harness → "Additional OpenCode": the home copy shows,
- *   and the harness's tasks show the locked Standalone note.
+ *   and the harness's tasks show no picker or locked note.
  * - (d) The subagent marker: a subagent tab appears and holds the child
  *   transcript after the turn.
  * - (e) Settings shows the "No OpenCode credentials found" notice.
@@ -30,9 +29,21 @@ import { gotoApp } from "./helpers";
  *  — specs can't import `src/bun/*` (see e2e/fx-interactions.spec.ts). */
 const FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER = "__agetor_fake_opencode_subagent__";
 
-/** The pinned picker copy (OpencodeServerPicker.tsx `HOME_LOCK_REASON`). */
-const HOME_LOCK_REASON =
-  "This harness has its own home, so it always runs OpenCode standalone (a shared server would mix accounts).";
+/** Test ids of the retired Shared/Standalone server picker and its locked-home
+ *  note (docs/plans/opencode-server-driver.md criterion 9): none may render. */
+const RETIRED_PICKER_TEST_IDS = [
+  "new-task-opencode-server",
+  "new-task-opencode-server-shared",
+  "new-task-opencode-server-standalone",
+  "task-opencode-server",
+  "task-opencode-server-shared",
+  "task-opencode-server-standalone",
+  "opencode-server-locked-note",
+] as const;
+
+async function expectNoServerPicker(scope: Locator): Promise<void> {
+  for (const id of RETIRED_PICKER_TEST_IDS) await expect(scope.getByTestId(id)).toHaveCount(0);
+}
 
 /** Runs settle in a few hundred ms on an idle box; the e2e machine is often
  *  under heavy load, so every wait on server-side progress gets headroom. */
@@ -216,7 +227,9 @@ function harnessRow(dialog: Locator, id: string, kind: string): Locator {
     .locator("xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' rounded-md ')][1]");
 }
 
-/** A D-19 opening breadcrumb with the given server. */
+/** A D-19 opening breadcrumb with the given server. The `run` transport (the
+ *  fake driver every spec here uses) still records the legacy server mode: a
+ *  home harness resolves to `standalone`, any other to `shared`. */
 function breadcrumb(server: string): RegExp {
   return new RegExp(`^opencode 2\\.x · server=${server} · model=OpenCode default · effort=auto · mode=\\S+$`);
 }
@@ -256,12 +269,7 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     const modelSelect = newTaskModelSelect(page);
     await expect(modelSelect).toHaveValue("opencode-default", { timeout: CONVERGE_TIMEOUT });
     await expect(modelSelect.locator("option:checked")).toHaveText("OpenCode default");
-    const server = form.getByTestId("new-task-opencode-server");
-    await expect(server).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await expect(server).toHaveAttribute("data-value", "shared");
-    await expect(server.getByTestId("new-task-opencode-server-shared")).toHaveAttribute("aria-pressed", "true");
-    await expect(server.getByTestId("new-task-opencode-server-standalone")).toHaveAttribute("aria-pressed", "false");
-    await expect(form.getByTestId("opencode-server-locked-note")).toHaveCount(0);
+    await expectNoServerPicker(form);
 
     await selectProject(form, projectName);
     formTaskTitle = `opencode-e2e ${suffix}`;
@@ -281,7 +289,6 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     const stored = await getTask(request, backend, formTaskId);
     expect(stored.agent).toBe("opencode");
     expect(stored.model).toBe("opencode-default");
-    expect(stored.opencodeServer).toBe("shared");
 
     const card = taskCard(page, formTaskTitle);
     await card.scrollIntoViewIfNeeded();
@@ -329,7 +336,7 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     expect(runs.map((r) => r.status)).toEqual(["succeeded", "succeeded"]);
   });
 
-  test("(b) Task details → Standalone: the next turn's breadcrumb reads server=standalone", async ({
+  test("(b) Task details has no server picker, and the next turn still resumes the session", async ({
     page,
     request,
     backend,
@@ -340,36 +347,24 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, formTaskTitle);
     await panel.getByText("Task details", { exact: true }).click();
-    const picker = panel.getByTestId("task-opencode-server");
-    await expect(picker).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await expect(picker).toHaveAttribute("data-value", "shared");
-    await expect(picker.getByTestId("task-opencode-server-shared")).toHaveAttribute("aria-pressed", "true");
-    await expect(panel.getByTestId("opencode-server-locked-note")).toHaveCount(0);
-
-    await picker.getByTestId("task-opencode-server-standalone").click();
-    await expect.poll(async () => (await getTask(request, backend, formTaskId)).opencodeServer, {
-      timeout: CONVERGE_TIMEOUT,
-    }).toBe("standalone");
-    await expect(picker.getByTestId("task-opencode-server-standalone")).toHaveAttribute("aria-pressed", "true");
-    await expect(picker.getByTestId("task-opencode-server-shared")).toHaveAttribute("aria-pressed", "false");
+    // The details grid is open (Effort's select is part of it) and the retired
+    // Shared/Standalone picker is nowhere in it.
+    await expect(panel.getByText("Effort", { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expectNoServerPicker(panel);
     // Fold Task details back up: expanded, it pushes the composer below the
     // 720 px viewport.
     await panel.getByText("Task details", { exact: true }).click();
-    await expect(picker).toBeHidden();
 
-    // The change applies to the next turn only: the earlier breadcrumbs stay
-    // `server=shared`, the new one reads `server=standalone`.
     await sendFollowUp(panel, `third turn ${suffix}`);
-    await expect(panel.getByText(breadcrumb("standalone"))).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
-    await expect(panel.getByText(breadcrumb("shared"))).toHaveCount(2);
     await expect(panel.getByText(`fake response to: third turn ${suffix}`, { exact: true })).toBeVisible({
       timeout: CONVERGE_TIMEOUT,
     });
+    await expect(panel.getByText(breadcrumb("shared"))).toHaveCount(3);
     const runs = await waitForIdle(request, backend, formTaskId, 3);
     expect(new Set(runs.map((r) => r.opencodeSessionId)).size).toBe(1);
   });
 
-  test("(c) Settings → Add harness → Additional OpenCode: home copy, then its tasks show the locked Standalone note", async ({
+  test("(c) Settings → Add harness → Additional OpenCode: home copy, then its tasks run standalone with no picker", async ({
     page,
     request,
     backend,
@@ -416,17 +411,14 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     await page.keyboard.press("Escape");
     await expect(dialog.getByRole("heading", { name: "Settings" })).toBeHidden();
 
-    // New Task form on that harness: the picker is forced to Standalone.
+    // New Task form on that harness: no picker and no locked-home note.
     await gotoApp(page, backend.bootBase);
     await selectHarness(page, label);
-    const formPicker = newTaskFormPanel(page).getByTestId("new-task-opencode-server");
-    await expect(formPicker).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await expect(formPicker).toHaveAttribute("data-locked", "true");
-    await expect(formPicker).toHaveAttribute("data-value", "standalone");
-    await expect(formPicker.getByTestId("new-task-opencode-server-shared")).toBeDisabled();
-    await expect(newTaskFormPanel(page).getByTestId("opencode-server-locked-note")).toHaveText(HOME_LOCK_REASON);
+    await expect(newTaskModelSelect(page)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expectNoServerPicker(newTaskFormPanel(page));
 
-    // A task on it stores Shared but shows — and runs — Standalone.
+    // A task on it still runs against the harness's own home (the `run`
+    // transport's breadcrumb reads `standalone`).
     const workdir = await registerProject(backend, `opencode-e2e-home-${suffix}`);
     const title = `opencode-home-e2e ${suffix}`;
     const task = await createTaskRest(request, backend, {
@@ -436,7 +428,6 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
       workdir,
       opencodeServer: "shared",
     });
-    expect((await getTask(request, backend, task.id)).opencodeServer).toBe("shared");
     await startTaskRest(request, backend, task.id);
     await waitForIdle(request, backend, task.id, 1);
 
@@ -444,13 +435,8 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     const panel = await openTask(page, title);
     await expect(panel.getByText(breadcrumb("standalone"))).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
     await panel.getByText("Task details", { exact: true }).click();
-    const picker = panel.getByTestId("task-opencode-server");
-    await expect(picker).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await expect(picker).toHaveAttribute("data-locked", "true");
-    await expect(picker).toHaveAttribute("data-value", "standalone");
-    await expect(picker.getByTestId("task-opencode-server-standalone")).toHaveAttribute("aria-pressed", "true");
-    await expect(picker.getByTestId("task-opencode-server-shared")).toBeDisabled();
-    await expect(panel.getByTestId("opencode-server-locked-note")).toHaveText(HOME_LOCK_REASON);
+    await expect(panel.getByText("Effort", { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expectNoServerPicker(panel);
   });
 
   test("(d) the subagent marker opens a subagent tab that holds the child transcript after the turn", async ({
