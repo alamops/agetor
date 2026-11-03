@@ -155,7 +155,11 @@ Owner decisions (grill, 2026-11-03): approach = full HTTP client (over steering-
 
 Orchestrator decisions taken in the Phase-5 fix round (reversible; raise with the owner): O1 — a user Stop (or delete/archive/agent switch) also interrupts background subagents and blocks server wakes for that task until the user's next start or message; O2 — a wake never pulls a card out of Done, Backlog or Blocked; O3 — a real stop of a headless core (`agetor daemon stop`, a CLI daemon's idle exit) stops idle servers like an app quit; a handoff does not; O4 — the quit-time stop is synchronous (tmux kill of idle servers) because Electrobun exits before async work runs. Live evidence for every OpenCode fact: `docs/plans/opencode-server-driver-spikes.md`.
 
-Unratified (raise with the owner): U1 — empty Reject stops the turn (D5; live fact contradicts the grill copy). U2 — Plan-mode asks show as cards (D4 amendment).
+Owner decisions after the /code-review of ffba5cb1 (2026-11-03), superseding U1, O1 and O2:
+- **R1 (replaces U1):** an empty Reject must behave like a skip: the tool is refused and the turn CONTINUES; it never stops the turn. (How agetor achieves that without adding words of its own is settled by the r2 live spike, recorded in `docs/plans/opencode-server-driver-spikes.md`.)
+- **R2 (ratifies U2):** Plan-mode asks show as cards.
+- **R3 (replaces O1's wake block and O2):** a server wake is never refused because the user stopped the task or because the card is parked in Done, Backlog or Blocked: the wake goes through as an `origin:"agent"` run and pulls the card back to Running. Stop still interrupts the root and its background subagents (O1's interrupt half stands). A wake for a task that no longer exists, is archived or being torn down, or whose harness/transport changed has no card to pull back: agetor interrupts that execution instead (bounded, best effort), so nothing runs unattended.
+- O3 and O4 stand.
 
 Assumptions verified live in wave 1 (T4, all confirmed — transcripts in the session scratchpad `spikes/t4-verify/`):
 - A1 Session rule `{action:"*",resource:"*",effect:"ask"}` makes every tool ask (spike verified `shell` only). Fallback: enumerate tool actions from `GET /api/agent`/schema.
