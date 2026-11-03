@@ -31,7 +31,9 @@ import {
   opencodeAnswerSummary,
   opencodeCanSubmit,
   opencodeOptionValue,
+  OPENCODE_REASON_ALLOW_HINT,
   opencodePermissionBody,
+  opencodePermissionOptionBlocked,
   opencodeSetCustom,
   opencodeTogglePick,
 } from "@/lib/opencode-interactions";
@@ -9014,6 +9016,11 @@ function FxPermissionCard({
           <p className="mt-1 text-[11px] text-muted-foreground">
             Leave empty to stop the agent. Add a reason to let it continue without this action.
           </p>
+          {reason.trim().length > 0 && (
+            <p className="mt-1 text-[11px] text-warning" data-testid="permission-reason-hint">
+              {OPENCODE_REASON_ALLOW_HINT}
+            </p>
+          )}
         </div>
       )}
       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
@@ -9032,7 +9039,8 @@ function FxPermissionCard({
               onClick={() => void choose(opt.optionId)}
               size="sm"
               variant={isReject ? "outline" : "default"}
-              disabled={submitting !== null}
+              disabled={submitting !== null || (opencode && opencodePermissionOptionBlocked(opt.optionId, reason))}
+              title={opencode && opencodePermissionOptionBlocked(opt.optionId, reason) ? OPENCODE_REASON_ALLOW_HINT : undefined}
             >
               {submitting === opt.optionId ? "Sending…" : opt.name}
             </Button>

@@ -95,3 +95,10 @@ test("buildOpencodeAnswer: typed text needs allowCustom; a single-select takes a
   expect(multi).toEqual({ ok: true, entry: { selected: ["Same", "Same"], selectedOptionIds: ["a", "b"], custom: "extra" } });
   expect(buildOpencodeAnswer(q(), [], null).ok).toBe(false);
 });
+
+test("answerFlagsError: --reason with several permission cards pending is refused up front", () => {
+  expect(answerFlagsError([ocPerm, ocPerm], { reason: "no", skip: false })).toContain("several are pending");
+  // Without --reason the same list is fine; so is --skip --reason over several questions.
+  expect(answerFlagsError([ocPerm, ocPerm], { skip: false })).toBeNull();
+  expect(answerFlagsError([ocAsk, ocAsk], { reason: "n/a", skip: true })).toBeNull();
+});

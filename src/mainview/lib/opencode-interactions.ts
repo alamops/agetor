@@ -25,6 +25,16 @@ export function opencodePermissionBody(
   return message !== undefined ? { optionId, message } : { optionId };
 }
 
+/** Copy shown while a typed reason blocks the Allow options. */
+export const OPENCODE_REASON_ALLOW_HINT = "A reason is only sent with Reject — clear it to allow";
+
+/** A typed reason is only ever sent with Reject, so every other option is
+ *  unavailable while the reason box holds text (the CLI refuses the same
+ *  combination). */
+export function opencodePermissionOptionBlocked(optionId: string, reason: string): boolean {
+  return optionId !== "reject" && trimmedOrUndefined(reason) !== undefined;
+}
+
 /** Body for skipping an OpenCode question card. An empty reason sends none. */
 export function opencodeSkipBody(reason: string | null | undefined): { skip: true; message?: string } {
   const message = trimmedOrUndefined(reason);

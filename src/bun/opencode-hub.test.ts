@@ -3,13 +3,15 @@ import { startFakeOpencodeServer, type FakeOpencodeOptions, type FakeOpencodeSer
 import {
   __forTest,
   closeOpencodeHub,
+  opencodeOwnedSessions,
   setOpencodeWakeHandler,
+  setOpencodeWatchLostHandler,
   subscribeOpencodeSession,
   watchOpencodeSessionsForWake,
   type OpencodeHubOrigin,
   type OpencodeHubSubscriber,
 } from "./opencode-hub.ts";
-import type { OpencodeEnvelope } from "./opencode-http.ts";
+import { createOpencodeClient, type OpencodeEnvelope } from "./opencode-http.ts";
 
 // Tests run against the in-process fake OpenCode server. The machine can be
 // heavily loaded, so every wait is generous and nothing asserts a tight timing.
@@ -33,6 +35,8 @@ beforeEach(() => {
 afterEach(async () => {
   closeOpencodeHub();
   setOpencodeWakeHandler(null);
+  setOpencodeWatchLostHandler(null);
+  __forTest.clearHooks();
   __forTest.resetBackoff();
   warnSpy.mockRestore();
   for (const s of servers.splice(0)) await s.stop();
@@ -52,13 +56,14 @@ async function api(srv: FakeOpencodeServer, method: string, path: string, body?:
   return text ? JSON.parse(text) : undefined;
 }
 
-async function newSession(srv: FakeOpencodeServer, parentID?: string): Promise<string> {
+async function newSession(srv: FakeOpencodeServer, parentID?: string, permissions?: unknown[]): Promise<string> {
   const j = await api(srv, "POST", "/api/session", {
     title: "t",
     location: { directory: "/tmp/hub-project" },
     model: { providerID: "opencode-go", id: "deepseek-v4.1-flash" },
     agent: "build",
     ...(parentID ? { parentID } : {}),
+    ...(permissions ? { permissions } : {}),
   });
   return j.data.id as string;
 }
@@ -78,14 +83,16 @@ async function until(pred: () => boolean, what: string, ms = 10_000): Promise<vo
 class Rec implements OpencodeHubSubscriber {
   events: Array<{ e: OpencodeEnvelope; origin: OpencodeHubOrigin }> = [];
   resyncs = 0;
+  owned: OpencodeHubOrigin[][] = [];
   lost: unknown[] = [];
   onEventHook?: (e: OpencodeEnvelope, o: OpencodeHubOrigin) => void;
   onEvent(e: OpencodeEnvelope, origin: OpencodeHubOrigin): void {
     this.events.push({ e, origin });
     this.onEventHook?.(e, origin);
   }
-  onResync(): void {
+  onResync(owned: ReadonlyArray<OpencodeHubOrigin>): void {
     this.resyncs++;
+    this.owned.push([...owned]);
   }
   onServerLost(err?: unknown): void {
     this.lost.push(err ?? "lost");
@@ -464,5 +471,374 @@ describe("wake", () => {
     expect(woke).toHaveLength(1);
     expect(woke[0]!.sid).toBe(root);
     await api(srv, "POST", `/api/session/${root}/interrupt`);
+  });
+});
+
+function hold(): { wait: Promise<void>; release(): void } {
+  let release!: () => void;
+  const wait = new Promise<void>((r) => (release = r));
+  return { wait, release };
+}
+
+describe("wake: executions that begin under a subscribed driver (M1)", () => {
+  test("unsubscribing after an await while the next execution is still open wakes, once", async () => {
+    const srv = await boot();
+    const root = await newSession(srv);
+    const woke: Array<{ sid: string; e: OpencodeEnvelope }> = [];
+    setOpencodeWakeHandler((_k, sid, e) => woke.push({ sid, e }));
+    const ref = { url: srv.url, password: srv.password };
+    watchOpencodeSessionsForWake(KEY, ref, [root]);
+    const rec = new Rec();
+    const sub = subscribeOpencodeSession({ key: KEY, ...ref }, root, rec);
+    await sub.ready;
+    await prompt(srv, root, "__agetor_fake_oc_slow__"); // runs until interrupted
+    await until(() => rec.count("session.execution.started", root) === 1, "execution started");
+    await Bun.sleep(30); // the driver's await
+    expect(woke).toHaveLength(0);
+    expect(__forTest.probe(KEY)?.openExec).toEqual([root]);
+    sub.unsubscribe();
+    expect(woke).toHaveLength(1);
+    expect(woke[0]!.sid).toBe(root);
+    expect(woke[0]!.e.id).toBe(rec.events.find((x) => x.e.type === "session.execution.started")!.e.id);
+    // attaching and detaching again must not wake a second time for the same execution
+    const again = subscribeOpencodeSession({ key: KEY, ...ref }, root, new Rec());
+    await again.ready;
+    again.unsubscribe();
+    expect(woke).toHaveLength(1);
+    await api(srv, "POST", `/api/session/${root}/interrupt`);
+  });
+
+  test("a driver that unsubscribes from inside the onEvent of the next execution.started wakes once", async () => {
+    const srv = await boot({ speed: 0.15 });
+    const root = await newSession(srv);
+    const woke: string[] = [];
+    setOpencodeWakeHandler((_k, sid, e) => woke.push(`${sid}:${e.type}`));
+    const ref = { url: srv.url, password: srv.password };
+    watchOpencodeSessionsForWake(KEY, ref, [root]);
+    const rec = new Rec();
+    const sub = subscribeOpencodeSession({ key: KEY, ...ref }, root, rec);
+    await sub.ready;
+    rec.onEventHook = (e) => {
+      if (e.type === "session.execution.started" && rec.count("session.execution.started", root) === 2) sub.unsubscribe();
+    };
+    await prompt(srv, root, "go __agetor_fake_oc_wake__");
+    await until(() => woke.length >= 1, "wake");
+    await Bun.sleep(500);
+    expect(woke).toEqual([`${root}:session.execution.started`]);
+  });
+
+  test("unsubscribing after the turn ended does not wake", async () => {
+    const srv = await boot();
+    const root = await newSession(srv);
+    const woke: string[] = [];
+    setOpencodeWakeHandler((_k, sid) => woke.push(sid));
+    const ref = { url: srv.url, password: srv.password };
+    watchOpencodeSessionsForWake(KEY, ref, [root]);
+    const rec = new Rec();
+    const sub = subscribeOpencodeSession({ key: KEY, ...ref }, root, rec);
+    await sub.ready;
+    await prompt(srv, root, "plain turn");
+    await until(() => rec.count("session.execution.succeeded", root) === 1, "turn done");
+    await Bun.sleep(30);
+    sub.unsubscribe();
+    expect(woke).toHaveLength(0);
+    expect(__forTest.probe(KEY)?.openExec).toEqual([]);
+  });
+});
+
+describe("resync carries the owned sessions (M2)", () => {
+  test("a child permission raised while the stream was down is discoverable from the owned list after resync", async () => {
+    __forTest.setBackoff({ baseMs: 250, maxMs: 400, maxFailures: 10, stableMs: 60_000 });
+    const srv = await boot();
+    const root = await newSession(srv);
+    const rec = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: srv.url, password: srv.password }, root, rec).ready;
+    expect(opencodeOwnedSessions(KEY, root)).toEqual([{ sessionId: root, isChild: false, depth: 0 }]);
+
+    srv.dropEventStreams();
+    const child = await newSession(srv, root, [{ action: "*", resource: "*", effect: "ask" }]);
+    await prompt(srv, child, "__agetor_fake_oc_permission__"); // asks, with nobody listening
+    await until(() => rec.resyncs === 1, "resync");
+
+    const owned = rec.owned[0]!;
+    expect(owned.map((o) => o.sessionId).sort()).toEqual([root, child].sort());
+    expect(owned.find((o) => o.sessionId === child)).toEqual({ sessionId: child, isChild: true, childOf: root, depth: 1 });
+    expect(opencodeOwnedSessions(KEY, root).map((o) => o.sessionId).sort()).toEqual([root, child].sort());
+    // what the driver does with it: refetch the pending requests of every owned session
+    const client = createOpencodeClient({ url: srv.url, password: srv.password });
+    const pending: Array<{ sid: string; action: string }> = [];
+    for (const o of owned) for (const p of await client.listPermissions(o.sessionId)) pending.push({ sid: o.sessionId, action: p.action });
+    expect(pending).toEqual([{ sid: child, action: "shell" }]);
+    expect(opencodeOwnedSessions(KEY, "ses_unknown")).toEqual([]);
+    await api(srv, "POST", `/api/session/${child}/interrupt`);
+  });
+});
+
+describe("wake checks on connect, watch loss, close (S1, S2, S3, S6)", () => {
+  test("a fresh watch on a session that is already running with nobody attached wakes (first connect)", async () => {
+    const srv = await boot();
+    const root = await newSession(srv);
+    await prompt(srv, root, "__agetor_fake_oc_slow__");
+    const woke: Array<{ sid: string; id?: string }> = [];
+    setOpencodeWakeHandler((_k, sid, e) => woke.push({ sid, id: e.id }));
+    watchOpencodeSessionsForWake(KEY, { url: srv.url, password: srv.password }, [root]);
+    await until(() => woke.length >= 1, "wake from the active-session check");
+    await Bun.sleep(200);
+    expect(woke).toHaveLength(1);
+    expect(woke[0]!.id).toMatch(/^resync:1:/);
+    await api(srv, "POST", `/api/session/${root}/interrupt`);
+  });
+
+  test("the active-session snapshot is discarded when a live execution event arrived after it was requested (stale snapshot)", async () => {
+    const srv = await boot();
+    const root = await newSession(srv);
+    await prompt(srv, root, "__agetor_fake_oc_slow__");
+    const gate = hold();
+    __forTest.setHooks({
+      afterActiveSessions: async () => {
+        // the snapshot says "active"; the turn ends (live) before the hub looks at it
+        await api(srv, "POST", `/api/session/${root}/interrupt`);
+        await Bun.sleep(300);
+        await gate.wait;
+      },
+    });
+    const woke: string[] = [];
+    setOpencodeWakeHandler((_k, sid) => woke.push(sid));
+    watchOpencodeSessionsForWake(KEY, { url: srv.url, password: srv.password }, [root]);
+    await Bun.sleep(600);
+    gate.release();
+    await Bun.sleep(300);
+    expect(woke).toHaveLength(0);
+  });
+
+  test("a live execution.started during the wake check wins: no duplicate wake and the woken mark survives", async () => {
+    const srv = await boot();
+    const root = await newSession(srv);
+    const woke: string[] = [];
+    setOpencodeWakeHandler((_k, sid, e) => woke.push(`${sid}:${e.id}`));
+    const gate = hold();
+    __forTest.setHooks({
+      afterActiveSessions: async () => {
+        await prompt(srv, root, "__agetor_fake_oc_slow__"); // the snapshot (idle) is now stale
+        await until(() => woke.length === 1, "live wake");
+        await gate.wait;
+      },
+    });
+    watchOpencodeSessionsForWake(KEY, { url: srv.url, password: srv.password }, [root]);
+    await until(() => woke.length === 1, "live wake");
+    gate.release();
+    await Bun.sleep(300);
+    expect(woke).toHaveLength(1);
+    expect(woke[0]).not.toContain("resync:");
+    expect(__forTest.probe(KEY)?.woken).toEqual([root]);
+    await api(srv, "POST", `/api/session/${root}/interrupt`);
+  });
+
+  test("giving up on a watched-only server tells the watch-lost handler and deletes the watch", async () => {
+    __forTest.setBackoff({ baseMs: 2, maxMs: 5, maxFailures: 3, stableMs: 60_000 });
+    const srv = await boot();
+    const root = await newSession(srv);
+    const lost: string[] = [];
+    setOpencodeWatchLostHandler((k) => lost.push(k));
+    watchOpencodeSessionsForWake(KEY, { url: srv.url, password: srv.password }, [root]);
+    await until(() => __forTest.probe(KEY)?.connected === true, "connected");
+    await srv.stop();
+    await until(() => lost.length === 1, "watch-lost handler");
+    expect(lost).toEqual([KEY]);
+    expect(__forTest.probe(KEY)).toBeNull();
+    // re-watching starts afresh
+    const live = await boot();
+    const sid = await newSession(live);
+    watchOpencodeSessionsForWake(KEY, { url: live.url, password: live.password }, [sid]);
+    await until(() => __forTest.probe(KEY)?.connected === true, "re-watched");
+  });
+
+  test("closeOpencodeHub tells ready subscribers via onServerLost and rejects pending ones", async () => {
+    const live = await boot();
+    const sid = await newSession(live);
+    const readyRec = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: live.url, password: live.password }, sid, readyRec).ready;
+    const dead = await boot();
+    const deadUrl = dead.url;
+    await dead.stop();
+    __forTest.setBackoff({ baseMs: 5000, maxMs: 5000, maxFailures: 10, stableMs: 60_000 });
+    const pendingRec = new Rec();
+    const pending = subscribeOpencodeSession({ key: "other-key", url: deadUrl, password: "pw-hub-test" }, "ses_p", pendingRec);
+    await until(() => __forTest.probe("other-key")?.retryPending === true, "pending attempt failed");
+    closeOpencodeHub();
+    expect(readyRec.lost).toHaveLength(1);
+    await expect(pending.ready).rejects.toBeTruthy();
+    expect(pendingRec.lost).toHaveLength(0);
+    expect(__forTest.serverKeys()).toEqual([]);
+  });
+});
+
+describe("ref epochs and failure accounting (S4, S7)", () => {
+  test("a ref with an older epoch is ignored; a newer one swaps the stream", async () => {
+    const srvA = await boot();
+    const srvB = await boot({ password: "pw-other" });
+    const a = await newSession(srvA);
+    const b = await newSession(srvB);
+    const rb = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: srvB.url, password: srvB.password, epoch: 5 }, b, rb).ready;
+    const stale = subscribeOpencodeSession({ key: KEY, url: srvA.url, password: srvA.password, epoch: 3 }, a, new Rec());
+    await stale.ready;
+    expect(__forTest.streamStats().opened).toBe(1); // no swap
+    expect(rb.resyncs).toBe(0);
+    await prompt(srvB, b, "still heard");
+    await until(() => rb.count("session.execution.succeeded") === 1, "turn on B");
+
+    const rbNew = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: srvA.url, password: srvA.password, epoch: 7 }, a, rbNew).ready;
+    await until(() => rb.resyncs === 1, "resync after the newer ref");
+    expect(__forTest.streamStats().opened).toBe(2);
+    expect(__forTest.streamStats().maxConcurrent).toBe(1);
+  });
+
+  test("a ref swap does not reset the failure count; connecting does", async () => {
+    __forTest.setBackoff({ baseMs: 5000, maxMs: 5000, maxFailures: 10, stableMs: 60_000 });
+    const dead = await boot();
+    const deadUrl = dead.url;
+    await dead.stop();
+    const live = await boot();
+    const sid = await newSession(live);
+    const first = subscribeOpencodeSession({ key: KEY, url: deadUrl, password: "pw-hub-test" }, sid, new Rec());
+    await until(() => __forTest.probe(KEY)?.failures === 1, "one failed attempt");
+    const rec = new Rec();
+    const second = subscribeOpencodeSession({ key: KEY, url: live.url, password: live.password }, sid, rec);
+    expect(__forTest.probe(KEY)?.failures).toBe(1);
+    await second.ready;
+    expect(__forTest.probe(KEY)?.failures).toBe(0);
+    first.unsubscribe();
+  });
+
+  test("a reachable but flapping server is declared lost after the drop cap, not before", async () => {
+    __forTest.setBackoff({ baseMs: 5, maxMs: 10, maxFailures: 2, maxDrops: 3, stableMs: 60_000 });
+    const srv = await boot();
+    const a = await newSession(srv);
+    const rec = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: srv.url, password: srv.password }, a, rec).ready;
+    for (let i = 1; i <= 2; i++) {
+      srv.dropEventStreams();
+      await until(() => rec.resyncs === i, `resync ${i}`);
+    }
+    expect(rec.lost).toHaveLength(0);
+    srv.dropEventStreams(); // the third short-lived stream
+    await until(() => rec.lost.length === 1, "lost after the drop cap");
+    expect(rec.resyncs).toBe(2);
+  });
+
+  test("streams that stayed up past stableMs never count toward the drop cap", async () => {
+    __forTest.setBackoff({ baseMs: 5, maxMs: 10, maxFailures: 2, maxDrops: 2, stableMs: 0 });
+    const srv = await boot();
+    const a = await newSession(srv);
+    const rec = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: srv.url, password: srv.password }, a, rec).ready;
+    for (let i = 1; i <= 4; i++) {
+      srv.dropEventStreams();
+      await until(() => rec.resyncs === i, `resync ${i}`);
+    }
+    expect(rec.lost).toHaveLength(0);
+    expect(__forTest.probe(KEY)?.drops).toBe(0);
+  });
+});
+
+describe("stream open edge cases (S8)", () => {
+  test("a fetch that throws synchronously cannot wedge the hub: the cap is reached and the subscriber told", async () => {
+    __forTest.setBackoff({ baseMs: 2, maxMs: 4, maxFailures: 3, stableMs: 60_000 });
+    __forTest.setFetchImpl((() => {
+      throw new Error("sync boom");
+    }) as unknown as typeof fetch);
+    const rec = new Rec();
+    const sub = subscribeOpencodeSession({ key: KEY, url: "http://127.0.0.1:9", password: "pw" }, "ses_x", rec);
+    await expect(sub.ready).rejects.toBeTruthy();
+    await until(() => rec.lost.length === 1, "onServerLost");
+    expect(__forTest.probe(KEY)).toBeNull();
+    expect(__forTest.streamStats().maxConcurrent).toBeLessThanOrEqual(1);
+  });
+
+  test("a fetch that throws synchronously a couple of times, then works, still connects", async () => {
+    __forTest.setBackoff({ baseMs: 2, maxMs: 4, maxFailures: 10, stableMs: 60_000 });
+    const srv = await boot();
+    const sid = await newSession(srv);
+    let calls = 0;
+    __forTest.setFetchImpl(((...args: Parameters<typeof fetch>) => {
+      if (calls++ < 2) throw new Error("sync boom");
+      return fetch(...args);
+    }) as unknown as typeof fetch);
+    const rec = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: srv.url, password: srv.password }, sid, rec).ready;
+    expect(calls).toBe(3);
+    await prompt(srv, sid, "hello");
+    await until(() => rec.count("session.execution.succeeded") === 1, "turn after the retries");
+    expect(__forTest.streamStats().maxConcurrent).toBe(1);
+  });
+});
+
+describe("re-seeding on reconnect (S9)", () => {
+  async function twoRoots() {
+    __forTest.setBackoff({ baseMs: 20, maxMs: 40, maxFailures: 10, stableMs: 60_000 });
+    const srv = await boot();
+    const a = await newSession(srv);
+    const b = await newSession(srv);
+    const ra = new Rec();
+    const rb = new Rec();
+    const ref = { key: KEY, url: srv.url, password: srv.password };
+    const subA = subscribeOpencodeSession(ref, a, ra);
+    const subB = subscribeOpencodeSession(ref, b, rb);
+    await Promise.all([subA.ready, subB.ready]);
+    return { srv, a, b, ra, rb, subA, subB };
+  }
+  function holdRoot(root: string) {
+    const gate = hold();
+    let held = false;
+    __forTest.setHooks({
+      beforeSeed: async (_k, r) => {
+        if (r !== root || held) return;
+        held = true;
+        await gate.wait;
+      },
+    });
+    return gate;
+  }
+
+  test("roots re-seed independently: a slow tree does not delay another root's resync", async () => {
+    const { srv, a, rb, ra } = await twoRoots();
+    const gate = holdRoot(a);
+    srv.dropEventStreams();
+    await until(() => rb.resyncs === 1, "root B resynced");
+    expect(ra.resyncs).toBe(0);
+    gate.release();
+    await until(() => ra.resyncs === 1, "root A resynced after its own seed");
+    await Bun.sleep(100);
+    expect(ra.resyncs).toBe(1);
+    expect(rb.resyncs).toBe(1);
+  });
+
+  test("unsubscribing while its root is re-seeding: no resync and nothing left owned", async () => {
+    const { srv, a, rb, ra, subA } = await twoRoots();
+    const gate = holdRoot(a);
+    srv.dropEventStreams();
+    await until(() => rb.resyncs === 1, "root B resynced");
+    subA.unsubscribe();
+    gate.release();
+    await Bun.sleep(150);
+    expect(ra.resyncs).toBe(0);
+    expect(__forTest.probe(KEY)?.owned).not.toContain(a);
+  });
+
+  test("a ref change while re-seeding: the old seed is abandoned and the subscriber resyncs once, from the new connection", async () => {
+    const { srv, a, ra } = await twoRoots();
+    const other = await boot({ password: "pw-other" });
+    const gate = holdRoot(a);
+    srv.dropEventStreams();
+    await until(() => __forTest.probe(KEY)?.connects === 2, "reconnected, seed held");
+    const c = await newSession(other);
+    await subscribeOpencodeSession({ key: KEY, url: other.url, password: other.password }, c, new Rec()).ready;
+    await until(() => ra.resyncs === 1, "resync from the new connection");
+    gate.release();
+    await Bun.sleep(150);
+    expect(ra.resyncs).toBe(1);
+    expect(__forTest.streamStats().maxConcurrent).toBe(1);
   });
 });

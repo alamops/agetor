@@ -459,3 +459,20 @@ test("opencode question: text from the card prints escaped", async () => {
   await cmdAnswer(["t1"], flags);
   expect(outputs.join("\n")).not.toContain("\u001b");
 });
+
+test("opencode permission: --reason with two permission cards pending answers neither", async () => {
+  const calls: Array<{ id: string; body: unknown }> = [];
+  currentClient = {
+    listTasks: async () => [{ id: "t1", title: "T" }],
+    pendingInteractions: async () => [ocPermReq({ id: "oc1" }), ocPermReq({ id: "oc2" })],
+    answerFxPermission: async (id: string, body: unknown) => {
+      calls.push({ id, body });
+      return { ok: true };
+    },
+  } as unknown as AgetorClient;
+  selectImpl = async () => {
+    throw new Error("must not prompt");
+  };
+  await expect(cmdAnswer(["t1", "--reason", "no"], flags)).rejects.toThrow("several are pending");
+  expect(calls).toEqual([]);
+});

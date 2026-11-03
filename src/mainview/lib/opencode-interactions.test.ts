@@ -9,6 +9,7 @@ import {
   opencodeAnswerSummary,
   opencodeCanSubmit,
   opencodePermissionBody,
+  opencodePermissionOptionBlocked,
   opencodeSetCustom,
   opencodeSkipBody,
   opencodeTogglePick,
@@ -48,6 +49,20 @@ describe("opencodePermissionBody", () => {
       optionId: "reject",
       message: "use  `ls`\n  instead",
     });
+  });
+});
+
+describe("opencodePermissionOptionBlocked", () => {
+  test("a typed reason blocks both Allow options and never Reject", () => {
+    expect(opencodePermissionOptionBlocked("once", "why")).toBe(true);
+    expect(opencodePermissionOptionBlocked("always", " why ")).toBe(true);
+    expect(opencodePermissionOptionBlocked("reject", "why")).toBe(false);
+  });
+  test("an empty or blank reason blocks nothing", () => {
+    for (const id of ["once", "always", "reject"]) {
+      expect(opencodePermissionOptionBlocked(id, "")).toBe(false);
+      expect(opencodePermissionOptionBlocked(id, "  \n ")).toBe(false);
+    }
   });
 });
 

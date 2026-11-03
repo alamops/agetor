@@ -75,10 +75,17 @@ export function parseAnswerArgs(args: string[]): AnswerArgs {
  *  earlier card is never answered and a later one refused. `--reason` must be
  *  something every pending card can use (an OpenCode permission, where it goes
  *  with Reject, or an OpenCode question with `--skip`); `--skip` skips OpenCode
- *  questions only. Returns the error text, or null. */
+ *  questions only. A `--reason` with several permission cards pending is
+ *  refused too. Returns the error text, or null. */
 export function answerFlagsError(pending: readonly AnyRequest[], o: AnswerArgs): string | null {
   if (o.skip && !pending.every(isOpencodeAsk)) return "--skip only skips an OpenCode question";
   if (o.reason === undefined) return null;
+  // A reason rides one Reject. With several permission cards pending, Reject on
+  // one then Allow on the next would fail after the first was already answered,
+  // so refuse up front and let the user answer them one at a time.
+  if (pending.filter(isOpencodePermission).length > 1) {
+    return "--reason applies to one permission request, but several are pending — answer without --reason (it is asked for on Reject)";
+  }
   for (const req of pending) {
     if (isOpencodePermission(req)) {
       if (o.skip) return "--reason with --skip applies to an OpenCode question, not a permission request";
