@@ -6,7 +6,7 @@ import { c, out, printJson } from "../output.ts";
 import { ApiError, type PatchTaskInput } from "../api-client.ts";
 import { COLUMNS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
-import { parseOpencodeServerFlag, parseSpeedFlag, usageError } from "../usage.ts";
+import { parseOpencodeServerFlag, parseSpeedFlag, usageError, warnOpencodeServerFlagIgnored } from "../usage.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -15,6 +15,7 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("edit");
   const patch: PatchTaskInput = {};
   let detachProfile = false;
+  let opencodeServerIgnored = false;
   for (let i = 1; i < args.length; i++) {
     const a = args[i]!;
     const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
@@ -40,18 +41,22 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
       case "--no-fast": patch.speed = "off"; break;
       case "--max-mode": patch.maxMode = true; break;
       case "--no-max-mode": patch.maxMode = false; break;
-      // OpenCode 2's server option; validated here with the routes' own
-      // parser, applied by the core on the task's next turn.
-      case "--opencode-server": patch.opencodeServer = parseOpencodeServerFlag(val()); break;
+      // Retired: validated so an old script's typo still fails, then dropped
+      // (never sent) with one stderr notice.
+      case "--opencode-server": opencodeServerIgnored = parseOpencodeServerFlag(val()); break;
       case "--type": patch.taskType = val(); break;
       case "--column": patch.column = val(); break;
       case "--detach-profile": detachProfile = true; break;
       default: break;
     }
   }
+  if (opencodeServerIgnored) warnOpencodeServerFlagIgnored();
   if (Object.keys(patch).length === 0 && !detachProfile) {
+    // An old script whose only flag was the retired one still succeeds: there
+    // is nothing to change, and the notice above said why.
+    if (opencodeServerIgnored) return;
     throw new Error(
-      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--opencode-server/--type/--column/--detach-profile",
+      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column/--detach-profile",
     );
   }
   if (patch.column && !COLUMN_IDS.includes(patch.column as (typeof COLUMN_IDS)[number])) {
@@ -62,7 +67,7 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   // Detach first so a combined `--detach-profile --model …` unlocks the
   // bound fields before the patch that wants to change them — the server
   // 409s a PATCH that touches agent/mode/model/effort/speed/maxMode while
-  // still bound (opencodeServer included). That 409's message says "agent" (the server's own
+  // still bound. That 409's message says "agent" (the server's own
   // vocabulary — "agent" = harness there), which would read as nonsense at
   // the CLI boundary where "agent" = harness and "profile" = agent profile
   // (docs/plans/task-details-agent-row.md D4); rewrite it in place rather

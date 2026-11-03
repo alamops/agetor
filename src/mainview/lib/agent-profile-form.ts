@@ -1,5 +1,5 @@
 /** The text-like fields of the agent-profile form — everything except the
- *  harness/mode/model/effort/speed/maxMode/opencodeServer block, which `useTaskLaunch` owns
+ *  harness/mode/model/effort/speed/maxMode block, which `useTaskLaunch` owns
  *  and seeds asynchronously (so it is tracked by interaction, not by value —
  *  see `AgentProfileFormBody`). */
 export interface AgentProfileTextDraft {
@@ -32,7 +32,6 @@ export const LAUNCH_INTERACTION_SETTERS = {
   setEffort: "effort",
   setSpeed: "speed",
   setMaxMode: "maxMode",
-  setOpencodeServer: "opencodeServer",
 } as const;
 
 type LaunchSetterName = keyof typeof LAUNCH_INTERACTION_SETTERS;

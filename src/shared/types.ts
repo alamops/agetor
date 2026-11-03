@@ -4355,8 +4355,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     ],
     modes: [
       { id: "auto", label: "Auto", hint: "Build agent; approves every tool call" },
-      { id: "ask", label: "Ask", hint: "Build agent; every tool call waits for your approval on a card (OpenCode 2)" },
-      { id: "plan", label: "Plan", hint: "OpenCode's Plan agent: no file edits; anything it still asks to do shows as a card" },
+      { id: "ask", label: "Ask", hint: "Build agent; every tool call waits for your approval on a card. OpenCode 2 only — on OpenCode 1 every ask is rejected" },
+      { id: "plan", label: "Plan", hint: "OpenCode's Plan agent: no file edits; anything it still asks to do shows as a card (on OpenCode 1 those asks are rejected)" },
     ],
     // Variants are discovered per model; `supportedEfforts` adds any variant
     // id outside EFFORT_OPTIONS as a synthesized row (D-6).

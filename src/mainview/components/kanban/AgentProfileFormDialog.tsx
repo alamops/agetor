@@ -65,7 +65,7 @@ const PAGE_FOOTER_CLASS = "border-t border-border/60 pt-3";
 
 /**
  * The agent-profile create/edit form — name, harness/mode/model/effort/speed/
- * maxMode/opencodeServer (via `<TaskLaunchPickers hideProfilePicker>`), instructions and
+ * maxMode (via `<TaskLaunchPickers hideProfilePicker>`), instructions and
  * skills. Extracted out of `AgentProfilesSection` (Settings → Agents) so it
  * can be hosted twice without duplicating the save/validation logic: as the
  * Settings modal's agent-editor subpage (`variant="page"`) and inside
@@ -232,7 +232,6 @@ function AgentProfileFormBody({
           effort: editingProfile.effort,
           speed: editingProfile.speed,
           maxMode: editingProfile.maxMode,
-          opencodeServer: editingProfile.opencodeServer,
         }
       : undefined,
   });
@@ -287,7 +286,6 @@ function AgentProfileFormBody({
         mode: launch.mode,
         speed: launch.speed,
         maxMode: launch.maxMode,
-        opencodeServer: launch.opencodeServer,
         instructions: form.instructions,
         skills: form.skills,
       };

@@ -74,7 +74,6 @@ import type {
   HarnessStatus,
   HarnessUsage,
   Isolation,
-  OpencodeServerMode,
   OpencodeSessionList,
   Pipeline,
   PipelineInput,
@@ -110,6 +109,7 @@ import type {
 import type { BundleImportOptions, BundleImportPlan, BundleImportResponse } from "../../shared/bundle-import.ts";
 import { ApiTransitError, fetchWithRecovery } from "./net-retry.ts";
 import { configureCoreBusy, suspendCoreBusy, trackRequest } from "./core-busy.ts";
+import { opencodeSkipBody } from "./opencode-interactions.ts";
 import { openEventStream } from "./sse-fetch.ts";
 
 export interface UpdateSnapshot {
@@ -250,9 +250,15 @@ export interface PendingAskQuestions {
     header?: string;
     multiSelect?: boolean;
     options: Array<{ id?: string; label: string; description?: string; preview?: string }>;
+    /** OpenCode cards only: this field takes typed free text. */
+    allowCustom?: boolean;
   }>;
   createdAt: number;
-  source?: "scraper" | "cursor";
+  source?: "scraper" | "cursor" | "opencode";
+  /** OpenCode cards only: at least one field takes typed free text. */
+  allowCustom?: boolean;
+  /** OpenCode cards only: Skip may carry a reason the user types. */
+  allowReason?: boolean;
   title?: string;
   toolCallId?: string;
   delivery?: "live" | "restart-followup";
@@ -314,9 +320,13 @@ export interface PendingFxPermission {
   createdAt: number;
   toolCall: FxPermissionToolCall;
   options: FxPermissionOption[];
-  /** The agetor mode (`auto` | `ask`) that caused this request to surface
-   *  as a card — `yolo` auto-allows and never reaches here. */
-  mode: "auto" | "ask";
+  /** The agetor mode (`auto` | `ask` | `plan`) that caused this request to
+   *  surface as a card — `yolo` auto-allows and never reaches here. */
+  mode: "auto" | "ask" | "plan";
+  /** Which harness raised the card. Absent means fx. */
+  harness?: "fx" | "opencode";
+  /** OpenCode cards only: Reject may carry a reason the user types. */
+  allowReason?: boolean;
 }
 
 export type PendingInteraction =
@@ -545,10 +555,6 @@ export interface AgentProfileInput {
   mode: string | null;
   speed: Speed;
   maxMode: boolean;
-  /** OpenCode's server option (D-4). Omitted ⇒ `"shared"` on create,
-   *  unchanged on PATCH, copied from the source on duplicate; any value but
-   *  `shared`/`standalone` is a 400. */
-  opencodeServer?: OpencodeServerMode;
   instructions: string;
   skills: string[];
 }
@@ -810,7 +816,6 @@ export const api = {
     effort?: string | null;
     speed?: Speed;
     maxMode?: boolean;
-    opencodeServer?: OpencodeServerMode;
     agentProfileId?: string;
     /** Client-minted uuid so the caller can subscribe to this clone's
      *  `clone_progress` AppEvents (via `subscribeCloneProgress`) BEFORE
@@ -1620,9 +1625,6 @@ export const api = {
     effort?: string | null;
     speed?: Speed;
     maxMode?: boolean;
-    /** OpenCode's server option (D-4); `"shared"` when omitted. A selected
-     *  profile's own value wins. */
-    opencodeServer?: OpencodeServerMode;
     /** Initial column. Defaults to "backlog" if omitted. */
     column?: ColumnId;
     references?: TaskReference[];
@@ -1636,7 +1638,7 @@ export const api = {
      *  alongside `issueUrl`. */
     issueSnapshot?: string;
     /** Id of an {@link AgentProfile} to launch from — the server resolves it
-     *  and overrides `agent`/`model`/`effort`/`mode`/`speed`/`maxMode`/`opencodeServer` from the
+     *  and overrides `agent`/`model`/`effort`/`mode`/`speed`/`maxMode` from the
      *  profile (body-provided values for those fields are ignored); 400 on an
      *  unknown id. */
     agentProfileId?: string | null;
@@ -2049,8 +2051,12 @@ export const api = {
    *  present alongside `ok: false`, and only for that free-text path — see
    *  `/ask-questions/:id/answer` in server.ts. A request for a card that
    *  another request is still answering is refused 409 (thrown as `ApiError`). */
-  skipAskQuestions: (id: string) =>
-    j<{ ok: boolean; error?: string }>(`/ask-questions/${id}/answer`, { method: "POST", body: JSON.stringify({ skip: true }) }),
+  skipAskQuestions: (id: string, reason?: string) =>
+    j<{ ok: boolean; error?: string }>(`/ask-questions/${id}/answer`, {
+      method: "POST",
+      // `reason` is an OpenCode card's optional user-typed note; empty sends none.
+      body: JSON.stringify(opencodeSkipBody(reason)),
+    }),
   answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }> }) =>
     j<{
       ok: boolean;
@@ -2078,8 +2084,10 @@ export const api = {
   /** Answer an fx ACP permission request. `{ optionId }` must be one of the
    *  option ids the request advertised — the server validates against the
    *  recorded set before echoing it back into the ACP RPC reply.
-   *  `{ cancel: true }` is the Stop/delete path. */
-  answerFxPermission: (id: string, body: { optionId: string } | { cancel: true }) =>
+   *  `{ cancel: true }` is the Stop/delete path. `message` is an OpenCode
+   *  card's optional user-typed reason and rides only with `optionId:
+   *  "reject"` (the server refuses it anywhere else). */
+  answerFxPermission: (id: string, body: { optionId: string; message?: string } | { cancel: true }) =>
     j<{ ok: boolean }>(`/fx-permissions/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),

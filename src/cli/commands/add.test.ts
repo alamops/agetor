@@ -71,8 +71,8 @@ const {
   resolveInitialModel,
   defaultNonInteractiveMode,
   wizardSpeedChoices,
-  wizardOpencodeServerChoices,
 } = await import("./add.ts");
+const addModule = await import("./add.ts");
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -1365,11 +1365,28 @@ describe("--pipeline", () => {
   });
 });
 
-describe("--opencode-server", () => {
-  test("parseAdd: takes shared and standalone, refuses anything else with the mode list", () => {
-    expect(parseAdd(["--opencode-server", "shared"]).opencodeServer).toBe("shared");
-    expect(parseAdd(["--opencode-server", "standalone"]).opencodeServer).toBe("standalone");
-    expect(parseAdd(["--title", "T"]).opencodeServer).toBeUndefined();
+describe("--opencode-server (retired: accepted, warned about, never sent)", () => {
+  const NOTICE = "--opencode-server is no longer used: OpenCode 2 tasks run on an agetor-managed server";
+
+  /** Run `fn` with stderr captured, restoring the real writer afterwards. */
+  async function captureStderr<T>(fn: () => Promise<T>): Promise<{ result: T; stderr: string }> {
+    const real = process.stderr.write.bind(process.stderr);
+    let stderr = "";
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      return { result: await fn(), stderr };
+    } finally {
+      process.stderr.write = real;
+    }
+  }
+
+  test("parseAdd: still validates the value, refusing anything but shared | standalone", () => {
+    expect(parseAdd(["--opencode-server", "shared"]).opencodeServerIgnored).toBe(true);
+    expect(parseAdd(["--opencode-server", "standalone"]).opencodeServerIgnored).toBe(true);
+    expect(parseAdd(["--title", "T"]).opencodeServerIgnored).toBeUndefined();
     expect(() => parseAdd(["--opencode-server", "Shared"])).toThrow(
       "'--opencode-server' must be one of shared, standalone (got 'Shared')",
     );
@@ -1378,16 +1395,30 @@ describe("--opencode-server", () => {
     expect(() => parseAdd(["--opencode-server", "x\u001b[2J"])).toThrow("(got 'x\\u001b[2J')");
   });
 
-  test("cmdAdd: --opencode-server is sent on the create payload", async () => {
+  test("cmdAdd: the flag is NOT sent on the create payload, and one stderr line says why", async () => {
     reset();
     const { client, createTaskCalls } = makePlainClient();
     currentClient = client;
-    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode", "--opencode-server", "standalone"], flags());
-    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode"], flags());
-    expect(createTaskCalls.map((c) => c.opencodeServer)).toEqual(["standalone", undefined]);
+    const { stderr } = await captureStderr(() =>
+      cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode", "--opencode-server", "standalone"], flags()),
+    );
+    expect(createTaskCalls.length).toBe(1);
+    expect("opencodeServer" in createTaskCalls[0]!).toBe(false);
+    expect(createTaskCalls[0]!.agent).toBe("opencode");
+    expect(stderr.split("\n").filter((l) => l.includes(NOTICE)).length).toBe(1);
   });
 
-  test("cmdAdd: an invalid --opencode-server fails before any request", async () => {
+  test("cmdAdd: no flag, no warning", async () => {
+    reset();
+    const { client } = makePlainClient();
+    currentClient = client;
+    const { stderr } = await captureStderr(() =>
+      cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode"], flags()),
+    );
+    expect(stderr).not.toContain("no longer used");
+  });
+
+  test("cmdAdd: an invalid --opencode-server still fails before any request", async () => {
     reset();
     const { client, createTaskCalls } = makePlainClient();
     currentClient = client;
@@ -1397,29 +1428,39 @@ describe("--opencode-server", () => {
     expect(createTaskCalls).toEqual([]);
   });
 
-  test("cmdAdd: --profile or --pipeline with --opencode-server is the usage error", async () => {
+  test("cmdAdd: --profile with --opencode-server is no longer a usage error (the flag does nothing)", async () => {
     reset();
-    await expect(cmdAdd(["--profile", "Reviewer", "--opencode-server", "shared"], flags())).rejects.toThrow(
-      /--profile cannot be combined with .*--opencode-server/,
+    const { client, createTaskCalls } = makeProfileClient([makeAgentProfile()]);
+    currentClient = client;
+    const { stderr } = await captureStderr(() =>
+      cmdAdd(["--title", "T", "--prompt", "P", "--profile", "Reviewer", "--opencode-server", "shared"], flags()),
     );
-    await expect(cmdAdd(["--pipeline", "Flow", "--opencode-server", "standalone"], flags())).rejects.toThrow(
-      /--pipeline cannot be combined with .*--opencode-server/,
+    expect(createTaskCalls.length).toBe(1);
+    expect(createTaskCalls[0]!.agentProfileId).toBe("profile-1");
+    expect("opencodeServer" in createTaskCalls[0]!).toBe(false);
+    expect(stderr).toContain(NOTICE);
+    // The real manual-launch flags still conflict with --profile.
+    await expect(cmdAdd(["--profile", "Reviewer", "--agent", "codex"], flags())).rejects.toThrow(
+      /--profile cannot be combined with/,
     );
   });
 
-  test("wizardOpencodeServerChoices: opencode 2 or an unknown version offers Shared / Standalone", () => {
-    for (const version of ["opencode v2.1.3", null, "garbage"]) {
-      const rows = wizardOpencodeServerChoices("opencode", { home: null }, version);
-      expect(rows.map((r) => [r.id, r.label])).toEqual([["shared", "Shared"], ["standalone", "Standalone"]]);
-    }
-    expect(wizardOpencodeServerChoices("opencode", undefined, "2.0.0").map((r) => r.id)).toEqual(["shared", "standalone"]);
+  test("the add wizard has no OpenCode server step", () => {
+    expect(addModule).not.toHaveProperty("wizardOpencodeServerChoices");
+  });
+});
+
+describe("opencode ask mode", () => {
+  test("parseAdd takes --mode ask and cmdAdd sends it to the core verbatim", async () => {
+    expect(parseAdd(["--agent", "opencode", "--mode", "ask"])).toMatchObject({ agent: "opencode", mode: "ask" });
+    reset();
+    const { client, createTaskCalls } = makePlainClient();
+    currentClient = client;
+    await cmdAdd(["--title", "T", "--prompt", "P", "--agent", "opencode", "--mode", "ask"], flags());
+    expect(createTaskCalls[0]).toMatchObject({ agent: "opencode", mode: "ask" });
   });
 
-  test("wizardOpencodeServerChoices: no step on OpenCode 1, for a harness with a home, or another kind", () => {
-    expect(wizardOpencodeServerChoices("opencode", { home: null }, "1.19.4")).toEqual([]);
-    expect(wizardOpencodeServerChoices("opencode", { home: "/Users/me/.agetor/oc-2" }, "opencode v2.1.3")).toEqual([]);
-    // A blank home is no home.
-    expect(wizardOpencodeServerChoices("opencode", { home: "  " }, null).length).toBe(2);
-    expect(wizardOpencodeServerChoices("codex", { home: null }, null)).toEqual([]);
+  test("the wizard's Mode step (AGENT_OPTIONS) offers ask for opencode", () => {
+    expect(AGENT_OPTIONS.opencode.modes.map((m) => m.id)).toContain("ask");
   });
 });

@@ -134,43 +134,35 @@ function opencodeClient(task: Task, harness: { id: string; home: string | null; 
   } as unknown as AgetorClient;
 }
 
-test("show prints the OpenCode server option for an opencode task", async () => {
+test("show prints no opencode server line for an opencode task, whatever the harness or its stored option", async () => {
   currentClient = opencodeClient(makeTask({ agent: "oc-a", opencodeServer: "standalone" }), {
     id: "oc-a",
     home: null,
     version: "opencode v2.1.3",
   });
   await cmdShow(["abcdefgh"], flags);
-  expect(outputs).toContain("  opencode server: standalone");
-});
+  expect(outputs.some((l) => l.includes("opencode server"))).toBe(false);
+  expect(outputs.some((l) => l.includes("standalone"))).toBe(false);
 
-test("show notes a forced standalone for a harness with a home, and OpenCode 1", async () => {
+  outputs.length = 0;
   currentClient = opencodeClient(makeTask({ agent: "oc-b", opencodeServer: "shared" }), {
     id: "oc-b",
     home: "/Users/me/oc-b",
-    version: "2.1.3",
+    version: "1.19.4",
   });
   await cmdShow(["abcdefgh"], flags);
-  expect(outputs).toContain("  opencode server: shared (runs standalone: the harness has its own home)");
-
-  outputs.length = 0;
-  currentClient = opencodeClient(makeTask({ agent: "oc-c" }), { id: "oc-c", home: null, version: "1.19.4" });
-  await cmdShow(["abcdefgh"], flags);
-  expect(outputs).toContain("  opencode server: shared (not used by OpenCode 1)");
+  expect(outputs.some((l) => l.includes("opencode server") || l.includes("OpenCode 1"))).toBe(false);
 });
 
-test("show prints the built-in opencode harness's option when the harness lookup fails, and no line for other kinds", async () => {
+test("show skips the harness lookup for a built-in opencode task with a stored mode", async () => {
+  let lookups = 0;
   currentClient = {
-    ...fakeClient(makeTask({ agent: "opencode" })),
-    listHarnesses: async () => { throw new Error("down"); },
+    ...fakeClient(makeTask({ agent: "opencode", mode: "ask" })),
+    listHarnesses: async () => { lookups++; throw new Error("down"); },
   } as unknown as AgetorClient;
   await cmdShow(["abcdefgh"], flags);
-  expect(outputs).toContain("  opencode server: shared");
-
-  outputs.length = 0;
-  currentClient = fakeClient(makeTask({ agent: "codex" }));
-  await cmdShow(["abcdefgh"], flags);
-  expect(outputs.some((l) => l.includes("opencode server"))).toBe(false);
+  expect(lookups).toBe(0);
+  expect(outputs.some((l) => l.includes("mode: ask"))).toBe(true);
 });
 
 test("show prints an imported OpenCode session, with the error of a failed import", async () => {

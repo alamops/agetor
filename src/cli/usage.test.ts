@@ -172,3 +172,17 @@ test("parseSpeedFlag accepts the three tiers and refuses anything else with the 
   // A typed value is echoed escaped, never as a raw control character.
   expect(() => parseSpeedFlag("x\u001b[31m")).toThrow("(got 'x\\u001b[31m')");
 });
+
+test("--opencode-server is gone from every help block (the flag is only accepted, with a warning)", () => {
+  for (const [name, block] of Object.entries(USAGE)) {
+    expect(block, name).not.toContain("opencode-server");
+  }
+});
+
+test("the answer help documents --reason and --skip", () => {
+  const block = USAGE.answer!;
+  expect(block.split("\n", 1)[0]).toBe("usage: agetor answer <task-id> [--reason <text>] [--skip]");
+  expect(block).toContain("--reason");
+  expect(block).toContain("--skip");
+  expect(block).toContain("stops");
+});

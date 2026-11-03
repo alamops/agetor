@@ -27,7 +27,6 @@ import type {
   DbCompactResult,
   RetentionPassResult,
   Speed,
-  OpencodeServerMode,
   OpencodeSessionList,
   BackgroundStatus,
   RemoteAccessStatus,
@@ -327,12 +326,17 @@ export class AgetorClient {
   pendingInteractions(taskId: string): Promise<AnyRequest[]> {
     return this.req("GET", `/tasks/${taskId}/interactions/pending`);
   }
+  /** `{ skip: true }` skips the card. `message` is the reason an OpenCode
+   *  skip may carry (the core refuses it elsewhere); omitted ⇒ none. */
   answerAskQuestions(
     id: string,
-    answers: AskQuestionsAnswer["answers"] | { skip: true },
+    answers: AskQuestionsAnswer["answers"] | { skip: true; message?: string },
   ): Promise<{ ok: boolean; error?: string }> {
     if (!Array.isArray(answers)) {
-      return this.req("POST", `/ask-questions/${id}/answer`, { skip: true });
+      return this.req("POST", `/ask-questions/${id}/answer`, {
+        skip: true,
+        ...(answers.message !== undefined ? { message: answers.message } : {}),
+      });
     }
     return this.req("POST", `/ask-questions/${id}/answer`, { answers });
   }
@@ -342,9 +346,11 @@ export class AgetorClient {
   ): Promise<{ ok: boolean; error?: string }> {
     return this.req("POST", `/tmux-prompts/${id}/answer`, body);
   }
+  /** `message` is the reason an OpenCode card's `reject` may carry; the core
+   *  refuses it with any other option and on any other harness's card. */
   answerFxPermission(
     id: string,
-    body: { optionId: string } | { cancel: true },
+    body: { optionId: string; message?: string } | { cancel: true },
   ): Promise<{ ok: boolean }> {
     return this.req("POST", `/fx-permissions/${id}/answer`, body);
   }
@@ -847,8 +853,6 @@ export interface CreateTaskInput {
    *  alias (`resolveSpeedInput` on the server still accepts it). */
   speed?: Speed;
   maxMode?: boolean;
-  /** OpenCode's server option (D-4); the server defaults it to `"shared"`. */
-  opencodeServer?: OpencodeServerMode;
   taskType?: string;
   /** Match the app's "Run task", which creates the task in "ready" before
    *  starting (vs "backlog" when queued). */
@@ -861,8 +865,8 @@ export interface CreateTaskInput {
   issueSnapshot?: string;
   /** Id of an {@link AgentProfile} to launch from (create-only) — the server
    *  resolves it and overrides `agent`/`model`/`effort`/`mode`/`speed`/
-   *  `maxMode`/`opencodeServer` from the profile; 400 on an unknown id.
-   *  Mutually exclusive with setting those seven fields yourself — the CLI (`agetor add
+   *  `maxMode` from the profile; 400 on an unknown id.
+   *  Mutually exclusive with setting those six fields yourself — the CLI (`agetor add
    *  --profile`) enforces that client-side before this ever reaches the
    *  wire. */
   agentProfileId?: string;
@@ -887,9 +891,6 @@ export interface AgentProfileInput {
   mode: string | null;
   speed: Speed;
   maxMode: boolean;
-  /** OpenCode's server option (D-4). Omitted ⇒ `"shared"` on create,
-   *  unchanged on PATCH, copied from the source on duplicate. */
-  opencodeServer?: OpencodeServerMode;
   instructions: string;
   skills: string[];
 }
@@ -917,7 +918,6 @@ export interface PatchTaskInput {
   effort?: string | null;
   speed?: Speed;
   maxMode?: boolean;
-  opencodeServer?: OpencodeServerMode;
   taskType?: string;
 }
 

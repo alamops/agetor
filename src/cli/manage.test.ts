@@ -386,9 +386,25 @@ test("cmdEdit: --speed / --fast / --no-fast patch the task's speed, the later fl
   });
 }, 30_000);
 
-// docs/plans/add-opencode-harness.md D-4: `agetor edit --opencode-server`,
-// validated with the routes' own parser and applied by the core on the
-// task's next turn.
+// `agetor edit --opencode-server` is retired: still validated, never sent, and
+// one stderr line says why (docs/plans/opencode-server-driver.md T10).
+
+/** Run `fn` with stderr captured, restoring the real writer afterwards. */
+async function captureStderr<T>(fn: () => Promise<T>): Promise<{ result: T; stderr: string }> {
+  const real = process.stderr.write.bind(process.stderr);
+  let stderr = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    return { result: await fn(), stderr };
+  } finally {
+    process.stderr.write = real;
+  }
+}
+
+const OPENCODE_SERVER_NOTICE = "--opencode-server is no longer used: OpenCode 2 tasks run on an agetor-managed server";
 
 test("cmdEdit: an invalid --opencode-server is a usage error before any client is created", async () => {
   // Same no-core setup as the --speed case above.
@@ -407,21 +423,33 @@ test("cmdEdit: an invalid --opencode-server is a usage error before any client i
   }
 });
 
-test("cmdEdit: --opencode-server patches the task's server option", async () => {
+test("cmdEdit: --opencode-server alone succeeds with the notice and no client (an old script keeps working)", async () => {
+  // noDaemon + a fresh dir with no core: a request would throw, so passing
+  // proves nothing was sent.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-mg-ocserver-only-"));
+  const f = { dataDir: dir, port: 4545, json: false, plain: true, noDaemon: true };
+  try {
+    const { stderr } = await captureStderr(() => cmdEdit(["abcd1234", "--opencode-server", "standalone"], f));
+    expect(stderr.split("\n").filter((l) => l.includes(OPENCODE_SERVER_NOTICE)).length).toBe(1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cmdEdit: --opencode-server next to another flag warns and patches only the other flag", async () => {
   await withClient(4543, async (client, dir) => {
     const workdir = mkdtempSync(path.join(tmpdir(), "agetor-mg-ocserver-"));
     const t = await client.createTask({ title: "OpenCode", prompt: "p", isolation: "none", workdir, agent: "opencode" });
-    expect(t.opencodeServer).toBe("shared");
     const f = { dataDir: dir, json: false, plain: true, noDaemon: false };
 
-    await cmdEdit([t.id, "--opencode-server", "standalone"], f);
-    expect((await client.getTask(t.id)).opencodeServer).toBe("standalone");
-
-    // Combined with another field, both apply.
-    await cmdEdit([t.id, "--opencode-server", "shared", "--title", "OpenCode (shared)"], f);
+    const { stderr } = await captureStderr(() =>
+      cmdEdit([t.id, "--opencode-server", "standalone", "--title", "OpenCode (renamed)"], f),
+    );
+    expect(stderr).toContain(OPENCODE_SERVER_NOTICE);
     const after = await client.getTask(t.id);
-    expect(after.opencodeServer).toBe("shared");
-    expect(after.title).toBe("OpenCode (shared)");
+    expect(after.title).toBe("OpenCode (renamed)");
+    // The stored option did not move: the value never reached the core.
+    expect(after.opencodeServer).toBe(t.opencodeServer);
 
     await client.deleteTask(t.id);
     rmSync(workdir, { recursive: true, force: true });
