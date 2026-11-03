@@ -13,7 +13,7 @@ import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts
 import {
   freezeLaunches,
   startOpencodeServerDriver,
-  stopIdleOpencodeServersOnRealQuit,
+  stopOpencodeServersOnQuit,
   stopOpencodeServerDriver,
   launchesInFlight,
   reconcileOrphans,
@@ -689,11 +689,12 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
   }
   // A real quit (the background host is not taking over) stops the OpenCode
   // servers nothing is using; a hand-over to the background core leaves them
-  // running for it to adopt. Best effort: the process is exiting.
-  if (decision.completely || !backgroundArmed) {
-    void stopIdleOpencodeServersOnRealQuit().catch((err) => {
-      console.warn("[agetor] stopping idle OpenCode servers on quit failed:", err);
-    });
+  // running for it to adopt. Synchronous on purpose: Electrobun's quit() runs a
+  // forced exit right after this hook returns, so nothing here may await.
+  try {
+    stopOpencodeServersOnQuit({ completely: decision.completely, backgroundArmed });
+  } catch (err) {
+    console.warn("[agetor] stopping idle OpenCode servers on quit failed:", err);
   }
   removeCoreCreds(dataDir);
   event.response = { allow: true };

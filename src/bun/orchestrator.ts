@@ -26,10 +26,12 @@ import {
   claudeModelPickerFamily,
   opencodeDriverHooks,
   opencodeEffectiveServerFor,
-  attachOpencodeServerAgent,
   opencodeServerTurnOf,
   opencodeTransportOfTurn,
+  OPENCODE_ASK_DRIVER_OFF_STATUS,
   OPENCODE_ASK_NEEDS_V2_STATUS,
+  attachOpencodeServerAgent,
+  lingerOpencodeServerAgent,
   type SpawnAgentArgs,
   type SpawnedAgent,
 } from "./agents.ts";
@@ -172,7 +174,8 @@ import type { OpencodeServerTurn } from "./opencode-driver.ts";
 import {
   getOpencodeServer,
   opencodeIdleSweep,
-  stopIdleOpencodeServersOnQuit,
+  stopIdleOpencodeServersSync,
+  stopOpencodeServer,
 } from "./opencode-server.ts";
 import {
   closeOpencodeHub,
@@ -1063,6 +1066,19 @@ export async function reconcileOrphans(): Promise<number> {
   const reattachedTaskIds = new Set<string>();
   const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null; kind: AgentKind | null }[] = [];
 
+  // OpenCode 2.x server runs: ask the adopted servers, all at once under one
+  // budget, which sessions they still have (the loop below reads the answers).
+  const lingerCandidates = opencodeLingerCandidates(stale.map((r) => r.task_id));
+  const sessionProbes = await probeOpencodeSessionsAtBoot([
+    ...stale.flatMap((r) => {
+      const harness = resolveHarness(r.agent);
+      return harness?.kind === "opencode" && r.opencode_session_id && opencodeTurnOfRun(r.id)?.server === "agetor"
+        ? [{ key: r.id, harnessId: harness.id, sessionId: r.opencode_session_id }]
+        : [];
+    }),
+    ...lingerCandidates.map((c) => ({ key: `task:${c.taskId}`, harnessId: c.harnessId, sessionId: c.sessionId })),
+  ]);
+
   for (const row of stale) {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
@@ -1110,7 +1126,7 @@ export async function reconcileOrphans(): Promise<number> {
       const endLag = beginLagLabel(`boot reattach · task ${row.task_id}`, { taskId: row.task_id, runId: row.id });
       try {
         const onChunk = makeChunkHandler(row.id, row.task_id, "opencode", task.mode);
-        const spawned = await reattachOpencodeServerRun({ ...row, opencode_session_id: row.opencode_session_id }, task, onChunk);
+        const spawned = reattachOpencodeServerRun({ ...row, opencode_session_id: row.opencode_session_id }, task, onChunk, sessionProbes.get(row.id) ?? "unknown");
         if (spawned) {
           registerActiveRun(row.id, row.task_id, task, spawned);
           attachDoneHandler(row.id, row.task_id, spawned);
@@ -1327,6 +1343,32 @@ export async function reconcileOrphans(): Promise<number> {
   let reArmed = 0;
   let released = 0;
   const heldTaskIds = subagents.taskIdsWithRunning();
+  // A server=agetor task whose last turn is over but whose background subagents
+  // still run on the server (after a restart or a hand-over): listen for them
+  // again instead of orphaning their rows.
+  const lingeredTaskIds = new Set<string>();
+  for (const c of lingerCandidates) {
+    if (reattachedTaskIds.has(c.taskId) || sessionProbes.get(`task:${c.taskId}`) !== "ok") continue;
+    const task = tasks.get(c.taskId);
+    const harness = task ? resolveHarness(task.agent) : null;
+    if (!task || !harness || harness.id !== c.harnessId) continue;
+    try {
+      const turn = lingerOpencodeServerAgent({
+        taskId: c.taskId,
+        runId: c.runId,
+        harness,
+        cwd: task.worktreePath ?? task.workdir,
+        task,
+        sessionId: c.sessionId,
+        onChunk: makeChunkHandler(c.runId, c.taskId, "opencode", task.mode),
+        hooks: opencodeTurnHooksFor(harness.id, c.runId, c.taskId),
+      });
+      lingeringOpencodeTurns.set(c.taskId, [...(lingeringOpencodeTurns.get(c.taskId) ?? []), { taskId: c.taskId, harnessId: harness.id, turn }]);
+      lingeredTaskIds.add(c.taskId);
+    } catch (err) {
+      console.warn(`[agetor] could not listen for the background subagents of task ${c.taskId}:`, err);
+    }
+  }
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
@@ -1337,7 +1379,8 @@ export async function reconcileOrphans(): Promise<number> {
     // switched harness — nothing ever will, so orphan them now. The settle
     // hook then releases a held card. Runs before the claude branch so a
     // claude task's leftover OpenCode rows can't hold it either.
-    const openCodeTailLive = heldKind === "opencode" && (opencodeSessionActive(heldId) || hasOpencodeServerTurn(heldId));
+    const openCodeTailLive =
+      heldKind === "opencode" && (opencodeSessionActive(heldId) || hasOpencodeServerTurn(heldId) || lingeredTaskIds.has(heldId));
     if (!openCodeTailLive) {
       released += orphanRunningOpencodeSubagents(heldId, "agetor restarted while it was running");
     }
@@ -1742,6 +1785,8 @@ function adoptPendingTaskCancel(taskId: string, runId: string): boolean {
 function releaseStartingClaim(taskId: string): void {
   startingTaskIds.delete(taskId);
   pendingCancelTaskIds.delete(taskId);
+  // An OpenCode wake that arrived while the claim was held waits for this edge.
+  if (deferredOpencodeWakes.has(taskId)) queueMicrotask(() => retryDeferredOpencodeWake(taskId, false));
 }
 
 /**
@@ -2018,6 +2063,8 @@ async function startTaskInner(
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
   // directory out from under the freshly-prepared one.
   await pendingTeardown(taskId);
+  // The user starting the task again ends any earlier Stop (it no longer bars an OpenCode wake).
+  clearOpencodeUserStop(taskId);
 
   // Starting an archived task auto-unarchives it — otherwise the card would
   // move through columns (running → review/ready) while hidden behind the
@@ -4153,6 +4200,7 @@ function stopActiveHandle(h: ActiveRun, reason: string): void {
   for (const [, handle] of active) {
     if (handle.taskId === h.taskId) handle.cancelled = true;
   }
+  noteOpencodeUserStop(h.taskId);
   cancelPendingForTask(h.taskId, reason);
   h.kill();
 }
@@ -4165,6 +4213,15 @@ function stopActiveHandle(h: ActiveRun, reason: string): void {
  */
 async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   cancelPendingForTask(taskId, reason);
+  noteOpencodeUserStop(taskId);
+  // An OpenCode task on the agetor-owned server has no claude session to
+  // interrupt: Stop ends the handle still listening for its background
+  // subagents (which interrupts them) and retires their rows to release the hold.
+  if (isOpencodeServerTask(taskId)) {
+    await disposeLingeringOpencodeTurns(taskId);
+    orphanRunningOpencodeSubagents(taskId, reason);
+    return;
+  }
   // Ordering rule (§7 of the async-warmup plan): the interrupt must complete
   // — not fire-and-forget — before this returns, matching `deleteTask`'s and
   // `enqueueArchiveTeardown`'s kill-before-teardown discipline. Awaited here
@@ -4184,14 +4241,20 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // already succeeded, so the card advances to `review`.
     const taskId = runs.get(runId)?.taskId;
     if (!taskId) return false;
-    // A settled OpenCode turn may still be listening for its background
-    // subagents: Stop with no run active ends that too.
-    await disposeLingeringOpencodeTurns(taskId);
     if (isHeldByBackgroundAgents(taskId)) {
       // Before the interrupt: the runner queues its record of the stop
       // ahead of the settle the hold's release triggers.
       reportHeldStepStopped(taskId);
       await stopHeldTask(taskId, "cancelled by user");
+      return true;
+    }
+    // A settled OpenCode turn may still be listening for its background
+    // subagents with the task not held: Stop with no run active ends that too.
+    // Awaited only when there is one, so any other harness reaches
+    // `pendingCancelRunIds.add` below without yielding first.
+    if (liveLingeringOpencodeTurns(taskId).length > 0) {
+      noteOpencodeUserStop(taskId);
+      await disposeLingeringOpencodeTurns(taskId);
       return true;
     }
     // A paused fx task has no `active` handle either — there's no live
@@ -4208,6 +4271,7 @@ export async function cancelRun(runId: string): Promise<boolean> {
     const run = runs.get(runId);
     if (run && run.status === "running" && tasks.get(taskId)?.runId === runId) {
       pendingCancelRunIds.add(runId);
+      noteOpencodeUserStop(taskId);
       cancelPendingForTask(taskId, "cancelled by user");
       return true;
     }
@@ -5714,6 +5778,8 @@ async function sendOpencodeTurn(
   // Idle-only send: refuse before the queue push / user event / spawn (see
   // `sendCodexTurn`).
   if (onlyIfIdle && isAnyRunOfTaskLive(taskId)) return { busy: true };
+  // A message from the user ends an earlier Stop (it no longer bars a wake).
+  clearOpencodeUserStop(taskId);
   if (task.runId && active.has(task.runId)) {
     const runId = task.runId;
     // OpenCode 2.x on the agetor-owned server: the message joins the turn that
@@ -5893,7 +5959,6 @@ const OPENCODE_SERVER_STOP_WAIT_MS = 12_000;
 /** How often the idle sweep looks at the servers, and the budget of its "is anything executing" probe. */
 const OPENCODE_SWEEP_INTERVAL_MS = 60_000;
 const OPENCODE_ACTIVE_PROBE_MS = 5_000;
-const OPENCODE_QUIT_PROBE_MS = 1_500;
 
 function trackOpencodeServerTurn(runId: string, taskId: string, task: Task, agent: SpawnedAgent): void {
   const turn = opencodeServerTurnOf(agent);
@@ -5954,12 +6019,16 @@ function hasOpencodeServerTurn(taskId: string): boolean {
 
 /**
  * The server-restart gate and the idle gate (I3): a harness's server is busy
- * while a server-transport turn of one of its tasks is live here, or any task
- * on that harness has a card open (a permission or question waits on the
- * server holding the request).
+ * while a server-transport turn of one of its tasks is live here (or a settled
+ * one still lingers for background subagents), or any task on that harness has
+ * a card open (a permission or question waits on the server holding the
+ * request). `exceptRunId` leaves the asking turn itself out, so the restart
+ * gate of its own `ensure` doesn't count the turn that is only starting.
  */
-function opencodeHarnessBusy(harnessId: string): boolean {
-  for (const t of opencodeServerTurns.values()) if (t.harnessId === harnessId) return true;
+function opencodeHarnessBusy(harnessId: string, opts: { exceptRunId?: string } = {}): boolean {
+  for (const [runId, t] of opencodeServerTurns) {
+    if (t.harnessId === harnessId && runId !== opts.exceptRunId) return true;
+  }
   for (const taskId of [...lingeringOpencodeTurns.keys()]) {
     if (liveLingeringOpencodeTurns(taskId).some((e) => e.harnessId === harnessId)) return true;
   }
@@ -5985,9 +6054,42 @@ function replaceMainEvent(runId: string, taskId: string, lineUuid: string, data:
 
 function opencodeTurnHooksFor(harnessId: string, runId: string, taskId: string): NonNullable<SpawnAgentArgs["opencodeTurnHooks"]> {
   return {
-    isBusy: () => opencodeHarnessBusy(harnessId),
+    // Excludes this very run: a stale-settings restart of an otherwise idle server must not read the turn being started as "busy".
+    isBusy: () => opencodeHarnessBusy(harnessId, { exceptRunId: runId }),
     onReplace: (lineUuid, data) => replaceMainEvent(runId, taskId, lineUuid, data),
+    // An empty reject stops the turn: the run reads as cancelled (task to ready, no failure), and nothing wakes it again.
+    onUserStop: () => {
+      const handle = active.get(runId);
+      if (handle) handle.cancelled = true;
+      noteOpencodeUserStop(taskId);
+    },
   };
+}
+
+/**
+ * Tasks the user stopped (Stop, held Stop, delete, archive, harness switch, an
+ * empty reject) and has not started or messaged since: a wake must not bring
+ * their session back to life, even if a background child finishes or the stop
+ * did not reach it. Cleared by the user's next start or sent message.
+ */
+const opencodeUserStopped = new Set<string>();
+
+function noteOpencodeUserStop(taskId: string, isOpencode = resolveHarness(tasks.get(taskId)?.agent ?? "")?.kind === "opencode"): void {
+  if (!isOpencode) return;
+  opencodeUserStopped.add(taskId);
+  deferredOpencodeWakes.delete(taskId);
+}
+
+/** A start or a message from the user: the stop no longer applies. */
+function clearOpencodeUserStop(taskId: string): void {
+  opencodeUserStopped.delete(taskId);
+}
+
+/** A task whose last turn ran on the agetor-owned server (breadcrumb `server=agetor`). */
+function isOpencodeServerTask(taskId: string): boolean {
+  const task = tasks.get(taskId);
+  if (!task || resolveHarness(task.agent)?.kind !== "opencode") return false;
+  return opencodeTurnOfRun(task.runId)?.server === "agetor";
 }
 
 /**
@@ -6021,8 +6123,12 @@ async function steerOpencodeServerTurn(
   if (attempted) saveStatusLineQuietly(runId, taskId, OPENCODE_STEER_QUEUED_STATUS);
   const task = tasks.get(taskId);
   if (!task) return runId;
-  if (!active.has(runId) && !stopping) {
-    // Settled while we waited: its done handler may have drained already.
+  // Settled while we waited: its done handler may have drained already, so
+  // nothing would drain a queue for this line. Start it as its own turn, unless
+  // another run of the task (or a start in flight) took over meanwhile: that
+  // one drains the queue when it settles.
+  const taken = startingTaskIds.has(taskId) || [...active.values()].some((h) => h.taskId === taskId);
+  if (!active.has(runId) && !stopping && !taken) {
     const next = await spawnOpencodeTurnNow(task, taskId, line, true);
     return next ?? runId;
   }
@@ -6054,25 +6160,20 @@ async function stopOpencodeServerTurnsOfTask(taskId: string, reason: string): Pr
  * Reattach to a server-transport turn that was running when agetor stopped
  * (boot reconcile). The server lives in its own tmux session and keeps the
  * turn going, so this joins it: null (→ the run is orphaned) when no server
- * was adopted for the harness or it no longer has the session. An unreachable
+ * was adopted for the harness or it no longer has the session (`probe`, taken
+ * for all runs at once by {@link probeOpencodeSessionsAtBoot}). An unreachable
  * server is not "gone": the driver tries and settles the run `failed` with a
  * status line if it can't.
  */
-async function reattachOpencodeServerRun(
+function reattachOpencodeServerRun(
   row: { id: string; task_id: string; agent: string; opencode_session_id: string; started_at: number },
   task: Task,
   onChunk: ReturnType<typeof makeChunkHandler>,
-): Promise<SpawnedAgent | null> {
+  probe: SessionProbe,
+): SpawnedAgent | null {
   const harness = resolveHarness(row.agent);
   if (!harness || harness.kind !== "opencode") return null;
-  const server = getOpencodeServer(harness.id);
-  if (!server) return null;
-  try {
-    const session = await createOpencodeClient(server, { timeoutMs: OPENCODE_ACTIVE_PROBE_MS }).getSession(row.opencode_session_id);
-    if (session === null) return null;
-  } catch {
-    /* can't tell: attach and let the driver decide */
-  }
+  if (!getOpencodeServer(harness.id) || probe === "gone") return null;
   return attachOpencodeServerAgent({
     taskId: row.task_id,
     runId: row.id,
@@ -6085,6 +6186,71 @@ async function reattachOpencodeServerRun(
     onChunk,
     hooks: opencodeTurnHooksFor(harness.id, row.id, row.task_id),
   });
+}
+
+/** Whether an adopted server still has a session: `unknown` when it could not be asked in time. */
+type SessionProbe = "ok" | "gone" | "unknown";
+
+const OPENCODE_BOOT_PROBE_MS = 5_000;
+
+/**
+ * Ask the adopted servers about many sessions at once, under one overall
+ * budget (a slow server must not hold the boot for every run in turn). A
+ * missing server or a 404 is `gone`; an answer is `ok`; no answer in time or a
+ * failure is `unknown`.
+ */
+async function probeOpencodeSessionsAtBoot(
+  items: { key: string; harnessId: string; sessionId: string }[],
+): Promise<Map<string, SessionProbe>> {
+  const out = new Map<string, SessionProbe>();
+  if (items.length === 0) return out;
+  const all = Promise.all(
+    items.map(async (it) => {
+      const server = getOpencodeServer(it.harnessId);
+      if (!server) {
+        out.set(it.key, "gone");
+        return;
+      }
+      try {
+        const session = await createOpencodeClient(server, { timeoutMs: OPENCODE_BOOT_PROBE_MS }).getSession(it.sessionId);
+        out.set(it.key, session === null ? "gone" : "ok");
+      } catch {
+        out.set(it.key, "unknown");
+      }
+    }),
+  );
+  await boundedOpencodeWait(all, OPENCODE_BOOT_PROBE_MS + 500);
+  return out;
+}
+
+/**
+ * Tasks to listen for again at boot: on the agetor-owned server, last turn over
+ * (no run of theirs is `running`), with OpenCode subagent rows still `running`
+ * or `orphaned` (a restart or a hand-over left them).
+ */
+function opencodeLingerCandidates(
+  runningTaskIds: string[],
+): { taskId: string; runId: string; harnessId: string; sessionId: string }[] {
+  const ids = new Set<string>(subagents.taskIdsWithRunning());
+  for (const r of db
+    .query<{ task_id: string }, []>(
+      `SELECT DISTINCT task_id FROM subagents WHERE status = 'orphaned' AND parent_kind = 'opencode_subagent'`,
+    )
+    .all()) {
+    ids.add(r.task_id);
+  }
+  const live = new Set(runningTaskIds);
+  const out: { taskId: string; runId: string; harnessId: string; sessionId: string }[] = [];
+  for (const taskId of ids) {
+    if (live.has(taskId)) continue;
+    const task = tasks.get(taskId);
+    const harness = task && task.archivedAt == null ? resolveHarness(task.agent) : null;
+    if (!task || !harness || harness.kind !== "opencode") continue;
+    const last = runs.listForTask(taskId)[0];
+    if (!last?.opencodeSessionId || opencodeTurnOfRun(last.id)?.server !== "agetor") continue;
+    out.push({ taskId, runId: last.id, harnessId: harness.id, sessionId: last.opencodeSessionId });
+  }
+  return out;
 }
 
 /* ── Server wake (D7) ──────────────────────────────────────────────────── */
@@ -6139,12 +6305,19 @@ async function runOpencodeWatchRefresh(): Promise<void> {
 }
 
 async function refreshOpencodeWatchesOnce(): Promise<void> {
+  // The last run (any status) of every non-archived task that ever had an
+  // OpenCode session: one pass over those tasks' runs, ranked per task (no
+  // per-row subquery), restricted through the session-id index.
   const rows = db
-    .query<{ run_id: string; task_id: string; agent: string; session_id: string }, []>(
-      `SELECT r.id AS run_id, r.task_id AS task_id, r.agent AS agent, r.opencode_session_id AS session_id
-         FROM runs r JOIN tasks t ON t.id = r.task_id
-        WHERE r.opencode_session_id IS NOT NULL AND t.archived_at IS NULL
-          AND r.id = (SELECT r2.id FROM runs r2 WHERE r2.task_id = r.task_id ORDER BY r2.started_at DESC, r2.rowid DESC LIMIT 1)`,
+    .query<{ run_id: string; task_id: string; agent: string; session_id: string | null }, []>(
+      `WITH oc AS (SELECT DISTINCT task_id FROM runs WHERE opencode_session_id IS NOT NULL),
+            ranked AS (
+              SELECT r.id AS run_id, r.task_id AS task_id, r.agent AS agent, r.opencode_session_id AS session_id,
+                     ROW_NUMBER() OVER (PARTITION BY r.task_id ORDER BY r.started_at DESC, r.rowid DESC) AS rn
+                FROM runs r WHERE r.task_id IN (SELECT task_id FROM oc))
+       SELECT ranked.run_id, ranked.task_id, ranked.agent, ranked.session_id
+         FROM ranked JOIN tasks t ON t.id = ranked.task_id
+        WHERE ranked.rn = 1 AND ranked.session_id IS NOT NULL AND t.archived_at IS NULL`,
     )
     .all();
   const next = new Map<string, Map<string, string>>();
@@ -6160,7 +6333,7 @@ async function refreshOpencodeWatchesOnce(): Promise<void> {
     if (opencodeTurnOfRun(row.run_id)?.server !== "agetor") continue;
     let sessions = next.get(harness.id);
     if (!sessions) next.set(harness.id, (sessions = new Map()));
-    sessions.set(row.session_id, row.task_id);
+    sessions.set(row.session_id!, row.task_id);
   }
   const previous = opencodeWakeTargets;
   opencodeWakeTargets = next;
@@ -6185,10 +6358,12 @@ type OpencodeWakeDecision =
  * Whether the server's own execution on `sessionId` becomes a run now. Every
  * check is synchronous (the hub calls the wake handler on its read path), and
  * the caller claims the task before anything awaits. Refuses when the task is
- * gone, archived, tearing down, moved to another harness or session, no longer
- * server-driven, or a start is in flight; DEFERS when one of its own runs is
- * still live or settling (the execution may be the tail of that turn: a steer
- * that raced its end).
+ * gone, archived, tearing down, stopped by the user since their last start or
+ * message, parked by the user (Done, Backlog, Blocked: the same intent
+ * `pullBackParkedTask` respects), moved to another harness or session, or no
+ * longer server-driven; DEFERS when a start is in flight or one of its own runs
+ * is still live or settling (the execution may be the tail of that turn: a
+ * steer that raced its end).
  */
 function decideOpencodeWake(serverKey: string, sessionId: string): OpencodeWakeDecision {
   if (launchesFrozenFlag) return { kind: "refuse" };
@@ -6200,7 +6375,10 @@ function decideOpencodeWake(serverKey: string, sessionId: string): OpencodeWakeD
   if (!harness || harness.kind !== "opencode" || harness.id !== serverKey || !harness.enabled) return { kind: "refuse" };
   if (opencodeTransportOfTurn(peekCachedCliVersion(harness)) !== "server") return { kind: "refuse" };
   if (findLastSessionIdForHarness(taskId, "opencode_session_id", harness.id) !== sessionId) return { kind: "refuse" };
-  if (startingTaskIds.has(taskId)) return { kind: "refuse" };
+  if (opencodeUserStopped.has(taskId)) return { kind: "refuse" };
+  if (task.column === "done" || task.column === "backlog" || task.column === "blocked") return { kind: "refuse" };
+  // A start or send holds the task: decide again when it releases the claim.
+  if (startingTaskIds.has(taskId)) return { kind: "defer", taskId };
   // The task's own turn is still live or settling. The execution is usually
   // that turn's tail (a steer that landed right after `execution.succeeded`, or
   // a background child's result starting the next one), and the hub fires this
@@ -6304,6 +6482,7 @@ function decideOpencodeWakeClaimed(serverKey: string, sessionId: string): { task
   if (!task || task.archivedAt != null || isTaskTearingDown(taskId)) return null;
   const harness = resolveHarness(task.agent);
   if (!harness || harness.kind !== "opencode" || harness.id !== serverKey) return null;
+  if (opencodeUserStopped.has(taskId)) return null;
   if (findLastSessionIdForHarness(taskId, "opencode_session_id", harness.id) !== sessionId) return null;
   if (runs.listForTask(taskId).some((r) => r.status === "running")) return null;
   for (const handle of active.values()) if (handle.taskId === taskId) return null;
@@ -6323,14 +6502,45 @@ function retryDeferredOpencodeWake(taskId: string, cancelled: boolean): void {
   if (!wake) return;
   deferredOpencodeWakes.delete(taskId);
   if (cancelled) return;
+  const created = typeof wake.envelope.created === "number" ? wake.envelope.created : 0;
+  const latest = runs.listForTask(taskId)[0];
+  if (latest && latest.startedAt > created) {
+    // A run began after the execution did (a drained queue turn took the same
+    // message over): wake only if the server still has the session executing.
+    void (async () => {
+      const server = getOpencodeServer(wake.serverKey);
+      if (!server) return;
+      try {
+        const running = await createOpencodeClient(server, { timeoutMs: OPENCODE_ACTIVE_PROBE_MS }).activeSessions();
+        if (!(wake.sessionId in running)) return;
+      } catch {
+        return;
+      }
+      onOpencodeServerWake(wake.serverKey, wake.sessionId, wake.envelope);
+    })();
+    return;
+  }
   onOpencodeServerWake(wake.serverKey, wake.sessionId, wake.envelope);
 }
 
 /* ── Server lifecycle (D6) ─────────────────────────────────────────────── */
 
-/** The OpenCode harness ids whose server has a session executing right now; one that can't be asked counts as busy. */
-async function opencodeServersWithActiveSessions(timeoutMs: number): Promise<Set<string>> {
-  const busy = new Set<string>();
+/** What one look at the servers found. */
+interface OpencodeServerProbe {
+  /** Harness ids whose server has a session executing, or could not be asked (counted busy). */
+  executing: Set<string>;
+  /** The ones that could not be asked. */
+  unreachable: Set<string>;
+}
+
+/**
+ * What the last probe found, kept for a quit, which cannot await a probe of its
+ * own. `null` until the first probe: nothing is known, so a quit stops nothing.
+ */
+let lastSweepExecuting: Set<string> | null = null;
+
+async function probeOpencodeServers(timeoutMs: number): Promise<OpencodeServerProbe> {
+  const probe: OpencodeServerProbe = { executing: new Set(), unreachable: new Set() };
   await Promise.all(
     harnesses
       .list()
@@ -6340,28 +6550,67 @@ async function opencodeServersWithActiveSessions(timeoutMs: number): Promise<Set
         if (!server) return;
         try {
           const running = await createOpencodeClient(server, { timeoutMs }).activeSessions();
-          if (Object.keys(running).length > 0) busy.add(h.id);
+          if (Object.keys(running).length > 0) probe.executing.add(h.id);
         } catch {
-          busy.add(h.id);
+          probe.executing.add(h.id);
+          probe.unreachable.add(h.id);
         }
       }),
   );
-  return busy;
+  return probe;
+}
+
+/** Whether the harness's server answers an authenticated info request at all. */
+async function opencodeServerAnswers(harnessId: string): Promise<boolean> {
+  const server = getOpencodeServer(harnessId);
+  if (!server) return false;
+  try {
+    await createOpencodeClient(server, { timeoutMs: OPENCODE_ACTIVE_PROBE_MS }).info();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
  * One idle sweep: stop the servers idle for 30 minutes unless a turn or card is
  * using them OR the server reports an executing session (a background subagent
  * may be running with no agetor run). The async probe runs first, so the
- * predicate `opencodeIdleSweep` takes stays synchronous. Single-flight.
+ * predicate `opencodeIdleSweep` takes stays synchronous. A server that can't be
+ * asked anything and isn't in use is classified: one that doesn't answer an info
+ * request either is dead and is stopped and forgotten (so nothing keeps
+ * reconnecting to it). Each harness's hub stream closes right after its own
+ * stop. Single-flight.
  */
 export async function runOpencodeIdleSweep(now: number = Date.now()): Promise<string[]> {
   if (opencodeSweepInFlight) return [];
   opencodeSweepInFlight = true;
   try {
-    const executing = await opencodeServersWithActiveSessions(OPENCODE_ACTIVE_PROBE_MS);
-    const stopped = await opencodeIdleSweep(now, (id) => executing.has(id) || opencodeHarnessBusy(id));
-    for (const id of stopped) closeOpencodeHub(id);
+    const probe = await probeOpencodeServers(OPENCODE_ACTIVE_PROBE_MS);
+    const stopped: string[] = [];
+    for (const id of probe.unreachable) {
+      if (opencodeHarnessBusy(id) || (await opencodeServerAnswers(id))) continue;
+      await stopOpencodeServer(id);
+      closeOpencodeHub(id);
+      probe.executing.delete(id);
+      stopped.push(id);
+    }
+    lastSweepExecuting = probe.executing;
+    const known = harnesses.list().filter((h) => h.kind === "opencode" && getOpencodeServer(h.id)).map((h) => h.id);
+    const inUse = (id: string): boolean => probe.executing.has(id) || opencodeHarnessBusy(id);
+    for (const id of known) {
+      // One server per pass, so its stream closes before the next stop starts.
+      const done = await opencodeIdleSweep(now, (hid) => hid !== id || inUse(hid));
+      if (done.includes(id)) {
+        closeOpencodeHub(id);
+        stopped.push(id);
+      }
+    }
+    // Servers of harnesses that no longer exist: nothing to probe, only the plain gate.
+    for (const id of await opencodeIdleSweep(now, (hid) => known.includes(hid) || inUse(hid))) {
+      closeOpencodeHub(id);
+      stopped.push(id);
+    }
     if (stopped.length > 0) scheduleOpencodeWatchRefresh();
     return stopped;
   } catch (err) {
@@ -6382,6 +6631,12 @@ export function startOpencodeServerDriver(): void {
   setOpencodeWakeHandler(onOpencodeServerWake);
   setOpencodeWatchLostHandler(() => scheduleOpencodeWatchRefresh());
   scheduleOpencodeWatchRefresh();
+  // A quit can't await a probe: know what is executing from the start.
+  void probeOpencodeServers(OPENCODE_ACTIVE_PROBE_MS)
+    .then((probe) => {
+      lastSweepExecuting ??= probe.executing;
+    })
+    .catch(() => {});
   opencodeSweepTimer = setInterval(() => {
     void runOpencodeIdleSweep();
   }, OPENCODE_SWEEP_INTERVAL_MS);
@@ -6409,18 +6664,31 @@ export function stopOpencodeServerDriver(): void {
   setOpencodeWatchLostHandler(null);
   opencodeWakeTargets = new Map();
   deferredOpencodeWakes.clear();
+  lastSweepExecuting = null;
   closeOpencodeHub();
 }
 
 /**
- * A real quit (not a hand-over to the background core): stop every OpenCode
- * server nothing is using. Best effort: the process is exiting, so a stop that
- * has not finished is left to the next boot, which adopts the server and the
- * idle sweep.
+ * A real stop of this core (a real quit of the app, `agetor daemon stop`, a CLI
+ * daemon's idle exit): stop every OpenCode server nothing is using, fully
+ * synchronously, because the process dies right after the hook that calls this
+ * (Electrobun's `quit()` runs a synchronous forced exit). "Nothing is using" =
+ * no turn, lingering handle or open card here, and no executing session at the
+ * last probe; with no probe yet, nothing is stopped. Returns the stopped ids.
  */
-export async function stopIdleOpencodeServersOnRealQuit(): Promise<void> {
-  const executing = await opencodeServersWithActiveSessions(OPENCODE_QUIT_PROBE_MS);
-  await stopIdleOpencodeServersOnQuit((id) => executing.has(id) || opencodeHarnessBusy(id));
+export function stopIdleOpencodeServersOnRealStop(): string[] {
+  const executing = lastSweepExecuting;
+  return stopIdleOpencodeServersSync((id) => executing === null || executing.has(id) || opencodeHarnessBusy(id));
+}
+
+/**
+ * The app's before-quit decision for the servers: a quit that hands the port to
+ * the background host (armed, not "quit completely") leaves them for it to
+ * adopt; any other quit is a real stop. Returns the stopped ids.
+ */
+export function stopOpencodeServersOnQuit(quit: { completely: boolean; backgroundArmed: boolean }): string[] {
+  if (!quit.completely && quit.backgroundArmed) return [];
+  return stopIdleOpencodeServersOnRealStop();
 }
 
 /** Test seam for the server driver's wake and watch state; production code never calls it. */
@@ -6436,6 +6704,10 @@ export const __opencodeServerForTest = {
   /** The task a watched session belongs to, or null when the session is not watched. */
   watchedTask(serverKey: string, sessionId: string): string | null {
     return opencodeWakeTargets.get(serverKey)?.get(sessionId) ?? null;
+  },
+  /** The hooks a turn of `runId` is spawned with (its `isBusy` is the server's restart gate). */
+  turnHooks(harnessId: string, runId: string, taskId: string): NonNullable<SpawnAgentArgs["opencodeTurnHooks"]> {
+    return opencodeTurnHooksFor(harnessId, runId, taskId);
   },
   /** Server-transport turns this core drives, and settled turns still lingering for children. */
   liveTurns(): { driving: number; lingering: number } {
@@ -6455,6 +6727,9 @@ export const __opencodeServerForTest = {
 async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
   // A server-transport turn has no tmux session: it is stopped over HTTP
   // (the driver's `kill` interrupts the session) and its open cards cancelled.
+  // Delete, archive and an agent switch all end the session for good: nothing
+  // may wake it again.
+  noteOpencodeUserStop(taskId, true);
   await stopOpencodeServerTurnsOfTask(taskId, reason);
   await dropOpencodeSession(taskId);
   orphanRunningOpencodeSubagents(taskId, reason);
@@ -6545,7 +6820,8 @@ function writeOpencodeTurnOpening(
   const transport = opencodeTransportOfTurn(cliVersion);
   onChunk("status", opencodeTurnBreadcrumb(harness, task, cliVersion, transport));
   if (transport === "run" && (task.mode ?? defaultModeFor("opencode")) === "ask") {
-    onChunk("status", OPENCODE_ASK_NEEDS_V2_STATUS);
+    // OpenCode 1.x can't show approvals at all; on 2.x only the (switched-off) server driver can.
+    onChunk("status", opencodeMajor(cliVersion) === 1 ? OPENCODE_ASK_NEEDS_V2_STATUS : OPENCODE_ASK_DRIVER_OFF_STATUS);
   }
   return transport;
 }
@@ -9660,6 +9936,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   clearFxRecovery(taskId);
   // A wake still waiting on a settling turn has nothing left to wake.
   deferredOpencodeWakes.delete(taskId);
+  opencodeUserStopped.delete(taskId);
   // Routed through the same per-workdir teardown queue archiveTask uses —
   // DELETE's semantics are unchanged (still awaited before `tasks.delete`
   // below), but this serializes it behind any archive teardown already in
@@ -9718,6 +9995,8 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     throw err;
   } finally {
     deletingTaskIds.delete(taskId);
+    // The teardown above re-notes the stop for an OpenCode task; the row is gone now.
+    if (!tasks.get(taskId)) opencodeUserStopped.delete(taskId);
   }
 }
 

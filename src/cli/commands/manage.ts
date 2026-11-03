@@ -50,11 +50,8 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
       default: break;
     }
   }
-  if (opencodeServerIgnored) warnOpencodeServerFlagIgnored();
-  if (Object.keys(patch).length === 0 && !detachProfile) {
-    // An old script whose only flag was the retired one still succeeds: there
-    // is nothing to change, and the notice above said why.
-    if (opencodeServerIgnored) return;
+  const nothingToPatch = Object.keys(patch).length === 0 && !detachProfile;
+  if (nothingToPatch && !opencodeServerIgnored) {
     throw new Error(
       "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column/--detach-profile",
     );
@@ -64,6 +61,11 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   }
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
+  // The retired flag's notice comes after the ref resolved, so a typo'd ref
+  // is still an error. An old script whose only flag was the retired one
+  // then succeeds: there is nothing to change, and the notice says why.
+  if (opencodeServerIgnored) warnOpencodeServerFlagIgnored();
+  if (nothingToPatch) return;
   // Detach first so a combined `--detach-profile --model …` unlocks the
   // bound fields before the patch that wants to change them — the server
   // 409s a PATCH that touches agent/mode/model/effort/speed/maxMode while

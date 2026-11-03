@@ -30,7 +30,7 @@ import {
   type OpencodeSubagentNotice,
 } from "./opencode-tmux.ts";
 import { refreshOpencodeSubagents, registerOpencodeSubagent } from "./opencode-subagents.ts";
-import { attachOpencodeServerTurn, spawnOpencodeServerTurn, type OpencodeServerTurn } from "./opencode-driver.ts";
+import { attachOpencodeServerLinger, attachOpencodeServerTurn, spawnOpencodeServerTurn, type OpencodeServerTurn } from "./opencode-driver.ts";
 import { copilotHome } from "./copilot-home.ts";
 import { fakeCopilotScript, playFakeCopilotTurn } from "./copilot-fake.ts";
 import { copilotUsagePath, spawnCopilotViaTmux, type CopilotSubagentSink } from "./copilot-tmux.ts";
@@ -911,8 +911,12 @@ export function buildCommand(
   }
 
   if (harness.kind === "opencode") {
-    // opencode — hosted in tmux via opencode-tmux.ts, one-shot `opencode run`
-    // per turn (D-1/D-3, spike A10). The prompt is NOT an argv element: a
+    // opencode `run` argv — the legacy transport (OpenCode 1.x, the
+    // `AGETOR_OPENCODE_TRANSPORT=run` kill switch, the in-process fake):
+    // hosted in tmux via opencode-tmux.ts, one-shot `opencode run` per turn
+    // (D-1/D-3, spike A10). OpenCode 2.x turns normally never use this argv:
+    // `spawnAgent` sends them to the agetor-owned server over HTTP
+    // (`spawnOpencodeServerAgent`, opencode-driver.ts). The prompt is NOT an argv element: a
     // positional prompt gets wrapped in literal quotes by OpenCode, so the
     // driver feeds the prompt file on stdin (`"$@" < '<prompt>'`) and no user
     // text touches argv or the shell wrapper — which also means there is no
@@ -1168,6 +1172,10 @@ export function opencodeTransportOfTurn(cliVersion: string | null | undefined): 
  */
 export const OPENCODE_ASK_NEEDS_V2_STATUS =
   "Ask mode needs OpenCode 2 — on this OpenCode every tool request that needs approval is denied";
+
+/** The same, for OpenCode 2 with the server driver switched off (`AGETOR_OPENCODE_TRANSPORT=run`): only the driver can show approval cards. */
+export const OPENCODE_ASK_DRIVER_OFF_STATUS =
+  "Ask mode needs the OpenCode server driver, which is switched off — every tool request that needs approval is denied";
 
 /** What `spawnAgent` returns for a server-transport OpenCode turn: the generic handle plus the driver's turn (its `steer` is async). */
 export type SpawnedOpencodeServerAgent = SpawnedAgent & { opencodeServerTurn: OpencodeServerTurn };
@@ -3778,6 +3786,8 @@ export interface SpawnAgentArgs {
   opencodeTurnHooks?: {
     isBusy: () => boolean;
     onReplace: (lineUuid: string, data: string) => void;
+    /** The user stopped the turn from a card (an empty reject): called once, before `done` resolves 130. */
+    onUserStop: () => void;
   };
   opts?: AgentRunOptions;
 }
@@ -3867,6 +3877,7 @@ function opencodeServerBaseArgs(a: OpencodeServerAgentBase) {
     isBusy: a.hooks.isBusy,
     onChunk: a.onChunk,
     onReplace: a.hooks.onReplace,
+    onUserStop: a.hooks.onUserStop,
     onSessionId: (sessionId: string) => a.onSessionId?.(sessionId),
   };
 }
@@ -3898,6 +3909,24 @@ function spawnOpencodeServerAgent(args: SpawnAgentArgs, harness: Harness): Spawn
       resumeSessionId: opts.resumeSessionId ?? null,
     }),
   );
+}
+
+/**
+ * A handle that only listens for the background subagents of an OpenCode
+ * session whose last turn is over (a held task after a restart or a hand-over):
+ * its `done` resolves 0 at once and it lingers child-only, answering and
+ * settling the children. Not a run: the orchestrator holds it per task.
+ */
+export function lingerOpencodeServerAgent(
+  a: Omit<OpencodeServerAgentBase, "mode" | "model" | "effort"> & {
+    task: { mode: string | null; model: string | null; effort: string | null };
+    sessionId: string;
+  },
+): OpencodeServerTurn {
+  return attachOpencodeServerLinger({
+    ...opencodeServerBaseArgs({ ...a, mode: a.task.mode, model: a.task.model ?? DEFAULT_MODEL.opencode, effort: a.task.effort }),
+    sessionId: a.sessionId,
+  });
 }
 
 /**
@@ -4149,7 +4178,11 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
   }
 
   if (harness.kind === "opencode") {
-    // opencode — hosted in a per-task tmux session via opencode-tmux.ts (so a
+    // opencode — two transports (`opencodeTransportOfTurn`). OpenCode 2.x runs
+    // on the harness's agetor-owned `opencode serve` over HTTP
+    // (opencode-driver.ts): steering, permission and question cards, restart
+    // survival. OpenCode 1.x, the kill switch and the fake driver use the
+    // legacy path below: a per-task tmux session via opencode-tmux.ts (so a
     // mid-turn run survives an agetor restart and is reattachable), one-shot
     // `opencode run --format json` per turn with the prompt on stdin,
     // streaming structured events by tailing its NDJSON log. The session id

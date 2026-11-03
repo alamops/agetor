@@ -33,6 +33,7 @@ const {
   opencodeIdleSweep,
   stopOpencodeServer,
   stopIdleOpencodeServersOnQuit,
+  stopIdleOpencodeServersSync,
   OPENCODE_SERVER_IDLE_MS,
   __forTest,
 } = mod;
@@ -53,6 +54,7 @@ const fs = require("node:fs");
 fs.writeFileSync(dir + "/pw", pw);
 fs.writeFileSync(dir + "/autoupdate", process.env.OPENCODE_DISABLE_AUTOUPDATE ?? "");
 fs.writeFileSync(dir + "/extra", process.env.STUB_EXTRA ?? "");
+fs.writeFileSync(dir + "/pid", String(process.pid));
 if (mode === "exit") { console.log("boom: cannot open database"); process.exit(1); }
 if (mode === "leak") {
   console.log("server password " + pw);
@@ -69,6 +71,7 @@ else {
       const u = new URL(req.url);
       if (fs.existsSync(dir + "/slow")) await Bun.sleep(Number(fs.readFileSync(dir + "/slow", "utf8")));
       if (u.pathname !== "/api/info") return new Response("not found", { status: 404 });
+      if (fs.existsSync(dir + "/unauth")) return new Response("no", { status: 401 });
       if (req.headers.get("authorization") !== "Basic " + btoa("opencode:" + pw)) return new Response("no", { status: 401 });
       return Response.json({ version: "2.1.3-stub", pid: process.pid });
     },
@@ -160,6 +163,7 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
     beforeEach(() => {
       __forTest.setServerDir(mkdtempSync(path.join(STUB_ROOT, `${host}-dir-`)));
       rmSync(path.join(stubDir, "slow"), { force: true });
+      rmSync(path.join(stubDir, "unauth"), { force: true });
     });
     afterEach(async () => {
       try {
@@ -173,6 +177,7 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
         __forTest.forget();
         __forTest.restoreDefaults();
         rmSync(path.join(stubDir, "slow"), { force: true });
+        rmSync(path.join(stubDir, "unauth"), { force: true });
         writeFileSync(path.join(stubDir, "launches"), "");
       }
     });
@@ -473,6 +478,160 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
       });
     });
 
+    describe("health never kills a busy server (I3)", () => {
+      const reset = (): Promise<Response> => Promise.reject(Object.assign(new Error("socket closed"), { code: "ECONNRESET" }));
+      const refused = (): Promise<Response> => Promise.reject(Object.assign(new Error("Unable to connect"), { code: "ConnectionRefused" }));
+
+      test("a connection reset against a live host is neither adopted-away nor replaced", async () => {
+        __forTest.setHealthCacheMs(0);
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        const stateBefore = readFileSync(__forTest.statePath(id), "utf8");
+        __forTest.forget();
+        __forTest.setFetchImpl(reset as unknown as typeof fetch);
+
+        expect((await adoptOpencodeServers()).map((a) => a.harnessId)).toEqual([id]);
+        expect(readFileSync(__forTest.statePath(id), "utf8")).toBe(stateBefore);
+        for (const isBusy of [() => true, () => false, undefined]) {
+          await expect(ensureOpencodeServer({ ...spec(id), isBusy })).rejects.toThrow(/not responding/);
+        }
+        expect(alive(pid)).toBe(true);
+        expect(launches()).toBe(1);
+        expect(getOpencodeServer(id)?.url).toBe(h.url);
+        __forTest.setFetchImpl(null);
+        expect((await ensureOpencodeServer(spec(id))).url).toBe(h.url);
+      });
+
+      test("a refused connection is dead, but a busy turn still blocks the restart", async () => {
+        __forTest.setHealthCacheMs(0);
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        __forTest.setFetchImpl(refused as unknown as typeof fetch);
+        await expect(ensureOpencodeServer({ ...spec(id), isBusy: () => true })).rejects.toThrow(/not responding/);
+        await expect(ensureOpencodeServer({ ...spec(id), isBusy: () => { throw new Error("no gate"); } })).rejects.toThrow(/not responding/);
+        expect(alive(pid)).toBe(true);
+        expect(launches()).toBe(1);
+        // Idle: the same proof replaces it.
+        __forTest.setFetchImpl(null);
+        const live = await ensureOpencodeServer(spec(id)); // still the same, healthy server
+        expect(live.url).toBe(h.url);
+        // Only the first probe is refused; the replacement's own probes must go through.
+        let n = 0;
+        __forTest.setFetchImpl(((...a: Parameters<typeof fetch>) => (n++ < 1 ? refused() : fetch(...a))) as typeof fetch);
+        const next = await ensureOpencodeServer({ ...spec(id), isBusy: () => false });
+        expect(next.url).not.toBe(h.url);
+        expect(launches()).toBe(2);
+      });
+
+      test("a single 401 is re-probed, a persistent one is proof", async () => {
+        __forTest.setHealthCacheMs(0);
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        let n = 0;
+        __forTest.setFetchImpl(((...a: Parameters<typeof fetch>) => (n++ < 1 ? Promise.resolve(new Response("no", { status: 401 })) : fetch(...a))) as typeof fetch);
+        expect((await ensureOpencodeServer(spec(id))).url).toBe(h.url); // transient 401: kept
+        expect(launches()).toBe(1);
+
+        const pid = await pidOf(h);
+        writeFileSync(path.join(stubDir, "unauth"), "");
+        __forTest.setFetchImpl(null);
+        await expect(ensureOpencodeServer({ ...spec(id), isBusy: () => true })).rejects.toThrow(/not responding/);
+        expect(alive(pid)).toBe(true);
+      });
+    });
+
+    describe("a quit that cannot await", () => {
+      test("stopIdleOpencodeServersSync stops idle servers before it returns, never a busy one", async () => {
+        const [idle, working, gate] = [newId(), newId(), newId()];
+        const hi = await ensureOpencodeServer(spec(idle));
+        const hw = await ensureOpencodeServer(spec(working));
+        const hg = await ensureOpencodeServer(spec(gate));
+        const idlePid = await pidOf(hi);
+        const stopped = stopIdleOpencodeServersSync((hid) => {
+          if (hid === working) return true;
+          if (hid === gate) throw new Error("gate unavailable");
+          return false;
+        });
+        // Synchronous effects: already visible with no await in between.
+        expect(stopped).toEqual([idle]);
+        expect(getOpencodeServer(idle)).toBeNull();
+        expect(existsSync(__forTest.statePath(idle))).toBe(false);
+        expect(existsSync(__forTest.logPath(idle))).toBe(false);
+        await waitFor(() => !alive(idlePid));
+        if (host === "tmux") expect(await __forTest.tmuxHasSession(hi.tmuxSession!)).toBe("gone");
+        expect(await checkOpencodeServerHealth(hw)).toBe(true);
+        expect(await checkOpencodeServerHealth(hg)).toBe(true);
+        expect(existsSync(__forTest.statePath(working))).toBe(true);
+        expect(stopIdleOpencodeServersSync(() => false).sort()).toEqual([gate, working].sort());
+      });
+
+      test.skipIf(host !== "tmux")("a broken tmux never makes it throw", async () => {
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        setEnv("AGETOR_TMUX_BIN", path.join(STUB_ROOT, "no-such-tmux"));
+        try {
+          expect(stopIdleOpencodeServersSync(() => false)).toEqual([id]);
+        } finally {
+          setEnv("AGETOR_TMUX_BIN", savedEnv.AGETOR_TMUX_BIN);
+        }
+      });
+    });
+
+    describe("adoption is parallel and bounded", () => {
+      test("slow servers are judged concurrently, not one after another", async () => {
+        __forTest.setHealthCacheMs(0);
+        const ids = [newId(), newId(), newId()];
+        const hs = await Promise.all(ids.map((id) => ensureOpencodeServer(spec(id))));
+        const pids = await Promise.all(hs.map(pidOf));
+        __forTest.setHealthTimeoutMs(250); // each judgement: 250 + 500 ms
+        slowOn(2_000);
+        __forTest.forget();
+        const t0 = Date.now();
+        const adopted = await adoptOpencodeServers();
+        const took = Date.now() - t0;
+        expect(adopted.map((a) => a.harnessId).sort()).toEqual([...ids].sort());
+        expect(took).toBeLessThan(1_300); // serial would be >= 2.25 s
+        for (const id of ids) expect(existsSync(__forTest.statePath(id))).toBe(true);
+        for (const pid of pids) expect(alive(pid)).toBe(true);
+      });
+
+      test("a server undecided at the budget is kept unhealthy, and a late verdict cannot kill it", async () => {
+        __forTest.setHealthCacheMs(0);
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        const stateBefore = readFileSync(__forTest.statePath(id), "utf8");
+        // Slow, then a persistent 401 (two answers of 300 ms each): judged
+        // "dead", but only after ~600 ms, well past the 150 ms budget.
+        __forTest.setHealthTimeoutMs(400);
+        writeFileSync(path.join(stubDir, "unauth"), "");
+        slowOn(300);
+        __forTest.setAdoptBudgetMs(150);
+        __forTest.forget();
+        const adopted = await adoptOpencodeServers();
+        expect(adopted.map((a) => a.harnessId)).toEqual([id]);
+        await new Promise((r) => setTimeout(r, 1_800)); // let the late verdict land
+        expect(alive(pid)).toBe(true);
+        expect(readFileSync(__forTest.statePath(id), "utf8")).toBe(stateBefore);
+        expect(getOpencodeServer(id)?.url).toBe(h.url);
+      });
+    });
+
+    test("stop never acts on a state file that names another harness's server", async () => {
+      const [victim, other] = [newId(), newId()];
+      const hv = await ensureOpencodeServer(spec(victim));
+      const pid = await pidOf(hv);
+      mkdirSync(__forTest.serverDir(), { recursive: true, mode: 0o700 });
+      writeFileSync(__forTest.statePath(other), readFileSync(__forTest.statePath(victim), "utf8"), { mode: 0o600 });
+      await stopOpencodeServer(other);
+      expect(existsSync(__forTest.statePath(other))).toBe(false);
+      expect(alive(pid)).toBe(true);
+      expect(await checkOpencodeServerHealth(hv)).toBe(true);
+      expect(existsSync(__forTest.statePath(victim))).toBe(true);
+    });
+
     describe("a changed launch (bin, env, cwd) is noticed", () => {
       test("an idle server is restarted on the new settings", async () => {
         const id = newId();
@@ -722,6 +881,11 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
       expect(err?.message).toContain("did not report a listening address");
       expect(getOpencodeServer(id)).toBeNull();
       expect(existsSync(__forTest.statePath(id))).toBe(false);
+      // The server really died (not left for afterEach to reap).
+      const pid = Number(readFileSync(path.join(stubDir, "pid"), "utf8"));
+      expect(pid).toBeGreaterThan(1);
+      await waitFor(() => !alive(pid));
+      if (host === "tmux") expect(await __forTest.tmuxHasSession(__forTest.sessionNameFor(id))).toBe("gone");
     });
   });
 }

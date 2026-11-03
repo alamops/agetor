@@ -298,15 +298,15 @@ export function isApprovalPrompt(text: string): boolean {
 export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini" | "fx" | "antigravity" | "opencode" | "copilot";
 
 /**
- * Which OpenCode server an `opencode` task's turns run against
- * (`docs/plans/add-opencode-harness.md` D-4, G3–G3c). `"shared"` (default)
- * reuses OpenCode 2's background service, so sessions show up in the user's
- * own OpenCode apps; `"standalone"` passes `--standalone` for a private,
- * per-turn server. Stored on `tasks.opencode_server` /
- * `agent_profiles.opencode_server`; non-OpenCode tasks store and ignore it,
- * the way `maxMode` works. The value a turn actually uses comes from
- * `effectiveOpencodeServer` in `./opencode.ts` (null on v1, always
- * standalone for a harness with a home).
+ * Retired (`docs/plans/opencode-server-driver.md` D2): stored, exported and
+ * imported for compatibility; read only by the legacy `opencode run`
+ * transport (OpenCode 1.x or `AGETOR_OPENCODE_TRANSPORT=run`). It was
+ * introduced by `docs/plans/add-opencode-harness.md` D-4 to pick between
+ * `"shared"` (OpenCode 2's background service) and `"standalone"`
+ * (`--standalone`, a private per-turn server) for that transport; the legacy
+ * path still resolves it through `effectiveOpencodeServer` in `./opencode.ts`.
+ * Stored on `tasks.opencode_server` / `agent_profiles.opencode_server`;
+ * non-OpenCode tasks store and ignore it.
  */
 export type OpencodeServerMode = "shared" | "standalone";
 export const OPENCODE_SERVER_MODES = ["shared", "standalone"] as const satisfies readonly OpencodeServerMode[];
@@ -370,9 +370,10 @@ export interface Harness {
    *  - opencode: emitted as HOME=<home> plus XDG_CONFIG_HOME / XDG_DATA_HOME /
    *    XDG_STATE_HOME / XDG_CACHE_HOME under it — OpenCode keeps its config,
    *    sessions and credentials under the XDG dirs. A harness with a home
-   *    always runs `--standalone` on v2 (`effectiveOpencodeServer`): the
-   *    shared background service binds a fixed port that HOME/XDG can't
-   *    isolate.
+   *    always uses its own agetor-managed server on v2 (the legacy
+   *    `opencode run` transport: `--standalone` via `effectiveOpencodeServer`),
+   *    because the shared background service binds a fixed port that
+   *    HOME/XDG can't isolate.
    *  - copilot: emitted as COPILOT_HOME=<home>. GitHub Copilot CLI has a
    *    dedicated state-dir env var (config, logins, session state and
    *    `session-state/<id>/plan.md` all live under it), so like gemini there
@@ -443,9 +444,10 @@ export interface AgentProfile {
    *  by agetor code. */
   fast?: boolean;
   maxMode: boolean; // cursor only
-  /** opencode only (`agent_profiles.opencode_server`): which OpenCode server
-   *  a task launched from this profile runs against. Stored and ignored for
-   *  other kinds, like `maxMode`. See {@link OpencodeServerMode}. */
+  /** Retired (docs/plans/opencode-server-driver.md D2): stored, exported and
+   *  imported for compatibility (`agent_profiles.opencode_server`); read only
+   *  by the legacy `opencode run` transport (OpenCode 1.x or
+   *  `AGETOR_OPENCODE_TRANSPORT=run`). See {@link OpencodeServerMode}. */
   opencodeServer: OpencodeServerMode;
   instructions: string; // may be ""
   skills: string[]; // bare skill names, no leading "/", deduped, max 50, each ≤ 100 chars
@@ -1701,11 +1703,12 @@ export interface Task {
    */
   maxMode: boolean;
   /**
-   * opencode only (`tasks.opencode_server`, default `"shared"`): which
-   * OpenCode server this task's turns run against — see
-   * {@link OpencodeServerMode}. Patchable; a change between turns applies on
-   * the next turn, and an agent switch resets it to `"shared"`. Other kinds
-   * store and ignore it, like `maxMode`.
+   * Retired (docs/plans/opencode-server-driver.md D2): stored, exported and
+   * imported for compatibility (`tasks.opencode_server`, default `"shared"`);
+   * read only by the legacy `opencode run` transport (OpenCode 1.x or
+   * `AGETOR_OPENCODE_TRANSPORT=run`). Still patchable (accepted, not
+   * profile-locked); an agent switch resets it to `"shared"`. See
+   * {@link OpencodeServerMode}.
    */
   opencodeServer: OpencodeServerMode;
   /**

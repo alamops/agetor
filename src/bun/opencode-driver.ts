@@ -64,6 +64,16 @@
  * answerable; cards of the root session close at settle. `lingering()` tells
  * the orchestrator to keep the handle.
  *
+ * A boot can re-create a lingering handle for a run that settled before the
+ * restart: `attachOpencodeServerLinger` resolves `done` 0 at once and lingers
+ * exactly like a settled turn with open background children, after syncing the
+ * task's running or orphaned child rows.
+ *
+ * Stop reaches the children: `kill()` and `dispose()` also interrupt every
+ * unsettled child session this driver knows (and the hub's owned sessions), so a
+ * background subagent does not keep running and later wake the stopped task.
+ * `onUserStop` marks a stop the orchestrator did not issue (empty Reject).
+ *
  * Steering. `steer(text)` posts `prompt(delivery:"steer")` with a client
  * message id; the orchestrator writes the user bubble. A steer that races the
  * very end of the turn can land after the execution closed; OpenCode then
@@ -85,7 +95,7 @@ import {
   type OpencodePermissionRule,
   type OpencodeServerRef,
 } from "./opencode-http.ts";
-import { subscribeOpencodeSession, type OpencodeHubOrigin } from "./opencode-hub.ts";
+import { opencodeOwnedSessions, subscribeOpencodeSession, type OpencodeHubOrigin } from "./opencode-hub.ts";
 import {
   createOpencodeEventMapper,
   type OpencodeEventMapper,
@@ -146,6 +156,13 @@ export interface OpencodeServerTurnArgs {
   onSessionId: (sessionId: string) => void;
   /** Status lines (UI-only). Defaults to `onChunk("status", text)`. */
   onStatus?: (text: string) => void;
+  /**
+   * Called exactly once, synchronously, BEFORE `done` resolves 130, when the user stopped the turn some
+   * way the orchestrator did not issue itself: an empty Reject (OpenCode ends the turn with
+   * `interrupted/shutdown`) or a stop from another client. Not called for `kill()`/`dispose()`.
+   * The orchestrator marks the run cancelled here.
+   */
+  onUserStop?: () => void;
 }
 
 export interface OpencodeServerAttachArgs extends Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resumeSessionId"> {
@@ -154,6 +171,9 @@ export interface OpencodeServerAttachArgs extends Omit<OpencodeServerTurnArgs, "
   sinceMs: number;
   reason: "reattach" | "wake";
 }
+
+/** `attachOpencodeServerLinger`: an attach without a turn to follow (see there). */
+export type OpencodeServerLingerArgs = Omit<OpencodeServerAttachArgs, "reason" | "sinceMs">;
 
 /** A running turn. `SpawnedAgent` with an awaitable `steer` (the orchestrator's `steer?` is a sync boolean). */
 export interface OpencodeServerTurn extends Omit<SpawnedAgent, "steer"> {
@@ -270,6 +290,8 @@ const DEFAULT_LINGER_MAX_MS = 24 * 60 * 60_000;
 let timings = {
   /** Per-request HTTP budget of the main client; undefined: the client's default. */
   requestMs: undefined as number | undefined,
+  /** How long `steer()` waits for the first prompt POST to return before giving up. */
+  steerWaitMs: 20_000,
   catchRetryMs: 1000,
   lingerMaxMs: DEFAULT_LINGER_MAX_MS,
   stopConfirmMs: DEFAULT_STOP_CONFIRM_MS,
@@ -422,7 +444,8 @@ function questionFields(raw: unknown): OpencodeAskField[] | null {
 
 type StartSpec =
   | { kind: "spawn"; prompt: string; title: string | null; resumeSessionId: string | null }
-  | { kind: "attach"; sessionId: string; sinceMs: number; reason: "reattach" | "wake" };
+  | { kind: "attach"; sessionId: string; sinceMs: number; reason: "reattach" | "wake" }
+  | { kind: "linger"; sessionId: string };
 
 interface ChildState {
   parent: string;
@@ -444,28 +467,30 @@ interface SubagentCall {
 function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resumeSessionId">, start: StartSpec): OpencodeServerTurn {
   const { taskId, runId, harnessId, mode } = a;
   const startedAt = start.kind === "attach" ? start.sinceMs : Date.now();
+  const onUserStop = a.onUserStop;
   const modelRef = opencodeModelRefFor(a.model, a.effort);
 
-  let sessionId: string | null = start.kind === "attach" ? start.sessionId : null;
+  let sessionId: string | null = start.kind === "spawn" ? null : start.sessionId;
   let client: OpencodeClient | null = null;
   let stopClient: OpencodeClient | null = null;
   let mapper: OpencodeEventMapper | null = null;
   let subscription: { unsubscribe(): void } | null = null;
 
-  let settled = false;
+  let settled = start.kind === "linger";
   let detached = false;
   let killed = false;
   let disposed = false;
   /** Settled root turn, still following background children (see the header). */
-  let lingerOn = false;
+  let lingerOn = start.kind === "linger";
   let lingerTimer: ReturnType<typeof setTimeout> | null = null;
   /** The hub gave up on the server: nothing to linger on. */
   let serverLost = false;
   let promptSent = false;
   /** The first prompt POST returned (spawn) or the execution is already running (attach): steering is possible. */
   let steerable = start.kind === "attach";
+  const steerWaiters = new Set<() => void>();
   /** Our prompt (or, on attach, the execution) is known to be in flight on the server. */
-  let delivered = start.kind === "attach";
+  let delivered = start.kind !== "spawn";
   let ourMessageId: string | null = null;
   const deliveredIds = new Set<string>();
 
@@ -505,6 +530,25 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
   const done = new Promise<number>((resolve) => {
     resolveDone = resolve;
   });
+  // A lingering-only handle (boot): its run settled before the restart.
+  if (start.kind === "linger") resolveDone(0);
+
+  function wakeSteerWaiters(): void {
+    const waiting = [...steerWaiters];
+    steerWaiters.clear();
+    for (const w of waiting) w();
+  }
+
+  let userStopReported = false;
+  function reportUserStop(): void {
+    if (userStopReported || killed) return;
+    userStopReported = true;
+    try {
+      onUserStop?.();
+    } catch (e) {
+      console.error("[opencode-driver] onUserStop failed:", e);
+    }
+  }
 
   /** The root turn no longer needs work (settled, or stopped listening). Lingering children are separate: see `canAct`. */
   const inactive = (): boolean => settled || detached;
@@ -613,6 +657,7 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     settled = true;
     clearTimers();
     buffer = [];
+    wakeSteerWaiters();
     const linger = shouldLinger();
     if (linger) {
       lingerOn = true;
@@ -632,7 +677,11 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     if (t.outcome === "succeeded") return settle(0);
     if (t.outcome === "failed") return settle(1); // the mapper already posted the error line
     const reason = (t.reason ?? "").replace(/[^a-z-]/gi, "").slice(0, 40);
-    if (killed || reason === "user" || ((reason === "shutdown" || reason === "") && emptyRejectPending)) return settle(130);
+    if (killed) return settle(130);
+    if (reason === "user" || ((reason === "shutdown" || reason === "") && emptyRejectPending)) {
+      reportUserStop(); // before done resolves: the orchestrator marks the run cancelled
+      return settle(130);
+    }
     status(`opencode: the turn was interrupted${reason ? ` (${reason})` : ""}`);
     settle(1);
   }
@@ -885,7 +934,8 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     for (const o of lastOwned) {
       if (!o.isChild || seen.has(o.sessionId)) continue;
       seen.add(o.sessionId);
-      if (ensureChild(o.sessionId, o.childOf ?? sessionId, o.depth)) toSync.push(o.sessionId);
+      // Still unsettled when the sync looks: it may well outlive this turn (see the linger rules).
+      if (ensureChild(o.sessionId, o.childOf ?? sessionId, o.depth, { background: true })) toSync.push(o.sessionId);
     }
     while (queue.length > 0 && seen.size <= CHILD_SYNC_MAX && canAct()) {
       const cur = queue.shift()!;
@@ -919,6 +969,10 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
       if (seen.has(id) || seen.size > CHILD_SYNC_MAX) continue;
       seen.add(id);
       if (ensureChild(id, sessionId, 1, { background: true })) toSync.push(id);
+    }
+    for (const id of open) {
+      const st = children.get(id);
+      if (st) st.background = true; // its subagent row is still open: it outlives any turn
     }
     for (const [id, st] of children) if (!st.settled && !toSync.includes(id)) toSync.push(id);
     for (const id of toSync) {
@@ -1293,9 +1347,46 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     (confirmTimer as unknown as { unref?: () => void }).unref?.();
   }
 
+  /** Interrupt (and settle in the subagent table) every unsettled child this driver knows. Bounded, best effort. */
+  async function interruptChildren(): Promise<void> {
+    const c = stopClient;
+    const sid = sessionId;
+    if (!c || !sid) return;
+    const ids = new Set<string>();
+    for (const [id, st] of children) if (!st.settled) ids.add(id);
+    try {
+      for (const o of opencodeOwnedSessions(harnessId, sid)) {
+        if (o.isChild && !children.get(o.sessionId)?.settled) ids.add(o.sessionId);
+      }
+    } catch {
+      /* the hub has no record: the known children are enough */
+    }
+    await Promise.allSettled(
+      [...ids].slice(0, CHILD_SYNC_MAX).map(async (id) => {
+        await c.interrupt(id);
+        const st = children.get(id);
+        if (st) st.settled = true;
+        try {
+          deps.settleChild({ taskId, childSessionId: id, outcome: "interrupted" });
+        } catch (e) {
+          console.error("[opencode-driver] child settle failed:", e);
+        }
+      }),
+    );
+  }
+
   function kill(): void {
-    if (killed || settled) return;
+    if (settled) {
+      // A lingering handle has no turn to stop: stopping it means stopping what it follows.
+      if (lingerOn && !killed) {
+        killed = true;
+        background(dispose());
+      }
+      return;
+    }
+    if (killed) return;
     killed = true;
+    wakeSteerWaiters();
     if (detached) {
       settle(130); // nobody listens anymore; do not leave `done` pending
       return;
@@ -1308,7 +1399,10 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     // A spawn with its prompt on the way, or an attach (the execution is already running): interrupt, and
     // settle anyway when OpenCode does not confirm. Without a client yet, `connect()` interrupts as soon as it has one.
     armConfirm();
-    if (client) background(requestInterrupt());
+    if (client) {
+      background(requestInterrupt());
+      background(interruptChildren());
+    }
   }
 
   /** Send text to the session as a user message with our own message id; retries once on a timeout. */
@@ -1328,6 +1422,17 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
   }
 
   async function steer(text: string): Promise<"accepted" | "unavailable"> {
+    if (!steerable && start.kind === "spawn" && !inactive() && !killed) {
+      // The initial prompt is POSTed first: wait (bounded) for it to return, then send in order.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, timings.steerWaitMs);
+        (timer as unknown as { unref?: () => void }).unref?.();
+        steerWaiters.add(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
     if (inactive() || killed || !client || !sessionId || !steerable) return "unavailable";
     try {
       await sendUserMessage(client, sessionId, text);
@@ -1344,6 +1449,7 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     clearTimers();
     unsubscribeHub();
     buffer = [];
+    wakeSteerWaiters();
   }
 
   async function dispose(): Promise<void> {
@@ -1360,6 +1466,7 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
         } catch {
           /* best effort: the server may already be gone */
         }
+        await interruptChildren();
       }
       if (lingerOn) leaveLinger();
       settle(130);
@@ -1385,10 +1492,11 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
       });
     } catch (e) {
       status(`couldn't start the OpenCode server: ${errText(e)}`);
-      settle(killed ? 130 : 1);
+      if (settled) leaveLinger();
+      else settle(killed ? 130 : 1);
       return null;
     }
-    if (inactive()) return null;
+    if (detached || disposed || (settled && !lingerOn)) return null;
     activity();
     if (handle.stale) status(OPENCODE_STALE_SERVER_STATUS);
     serverEpoch = handle.startedAt;
@@ -1526,6 +1634,15 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
       return;
     }
     if (inactive()) return;
+    // A request a previous (lingering) driver closed without replying gets its card again.
+    refreshOwned();
+    // Children of an earlier turn whose subagent row is still open: follow them (and linger for them).
+    const open = new Set(deps.openChildSessions(taskId));
+    for (const o of lastOwned) {
+      if (o.isChild && open.has(o.sessionId)) ensureChild(o.sessionId, o.childOf ?? sid, o.depth, { background: true });
+    }
+    await relistCards(c);
+    if (inactive()) return;
     promptSent = true; // set with the call below: no await between the checks above and the send
     try {
       ourMessageId = await sendUserMessage(c, sid, s.prompt);
@@ -1537,6 +1654,7 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
       return;
     }
     steerable = true;
+    wakeSteerWaiters();
     if (deliveredIds.has(ourMessageId)) {
       markDelivered();
       // The execution may have ended before the POST answered; its terminal was held back until now.
@@ -1545,6 +1663,38 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
     startLiveness();
     // A Stop that landed while the prompt was in flight.
     if (killed && !settled) background(requestInterrupt());
+  }
+
+  function refreshOwned(): void {
+    if (!sessionId) return;
+    try {
+      lastOwned = opencodeOwnedSessions(harnessId, sessionId);
+    } catch {
+      lastOwned = [];
+    }
+  }
+
+  async function runLinger(s: Extract<StartSpec, { kind: "linger" }>): Promise<void> {
+    lingerTimer = setTimeout(leaveLinger, timings.lingerMaxMs);
+    (lingerTimer as unknown as { unref?: () => void }).unref?.();
+    const ref = await connect();
+    if (!ref || !client) return;
+    const c = client;
+    try {
+      await subscribe(ref, s.sessionId);
+    } catch (e) {
+      if (lingerOn) {
+        status(`couldn't watch the OpenCode session: ${errText(e)}`);
+        leaveLinger();
+      }
+      return;
+    }
+    if (!lingerOn || !canAct()) return;
+    refreshOwned();
+    await relistCards(c);
+    if (!lingerOn) return;
+    await syncChildren();
+    if (lingerOn && !hasUnsettledBackground()) leaveLinger();
   }
 
   async function runAttach(s: Extract<StartSpec, { kind: "attach" }>): Promise<void> {
@@ -1568,13 +1718,19 @@ function createTurn(a: Omit<OpencodeServerTurnArgs, "prompt" | "title" | "resume
 
   const guardedRun = (p: Promise<void>): void => {
     p.catch((e) => {
+      if (start.kind === "linger") {
+        status(`OpenCode linger failed: ${errText(e)}`);
+        leaveLinger();
+        return;
+      }
       if (inactive()) return;
       status(`OpenCode turn failed: ${errText(e)}`);
       settle(killed ? 130 : 1);
     });
   };
   if (start.kind === "spawn") guardedRun(runSpawn(start));
-  else guardedRun(runAttach(start));
+  else if (start.kind === "attach") guardedRun(runAttach(start));
+  else guardedRun(runLinger(start));
 
   return {
     kill,
@@ -1605,6 +1761,17 @@ export function spawnOpencodeServerTurn(a: OpencodeServerTurnArgs): OpencodeServ
 /** Join a turn that is already running on the server (agetor restart, or an execution the server started itself). */
 export function attachOpencodeServerTurn(a: OpencodeServerAttachArgs): OpencodeServerTurn {
   return createTurn(a, { kind: "attach", sessionId: a.sessionId, sinceMs: a.sinceMs, reason: a.reason });
+}
+
+/**
+ * A lingering-only handle for a run that settled before an agetor restart, with background subagents
+ * possibly still running (the orchestrator calls it at boot for a held `server=agetor` task). `done`
+ * resolves 0 at once. The handle then follows the task's open child rows exactly like a settled turn:
+ * it syncs the task's running or orphaned child rows, re-raises their cards, ingests and settles
+ * their events, and leaves when they have settled, on the root's next execution, on `dispose()` or after 24 h.
+ */
+export function attachOpencodeServerLinger(a: OpencodeServerLingerArgs): OpencodeServerTurn {
+  return createTurn(a, { kind: "linger", sessionId: a.sessionId });
 }
 
 /** Test seams; production code never calls these. */

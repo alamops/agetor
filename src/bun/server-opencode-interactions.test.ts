@@ -128,7 +128,7 @@ test("opencode permission: refusals are 400 and leave the card pending", async (
     [{ optionId: "allow-once" }, "unknown option"],
     [{ optionId: "once", message: "why" }, "only allowed with reject"],
     [{ optionId: "always", message: "why" }, "only allowed with reject"],
-    [{ cancel: true, message: "why" }, "only allowed with reject"],
+    [{ cancel: true, message: "why" }, "cancel is not available"],
     [{ message: "why" }, "only allowed with reject"],
     [{ optionId: "reject", message: "x".repeat(4097) }, "too long"],
     [{ optionId: "reject", message: 42 }, "must be a string"],
@@ -147,13 +147,35 @@ test("opencode permission: refusals are 400 and leave the card pending", async (
   await expect(c.answer).resolves.toEqual({ decision: "reject", message: at });
 });
 
-test("opencode permission: cancel resolves the cancellation; a second answer is ok:false", async () => {
+test("opencode permission: cancel is refused with 400 and the card stays pending and answerable", async () => {
   const c = await permCard();
-  expect((await (await post(`/fx-permissions/${c.id}/answer`, { cancel: true })).json()).ok).toBe(true);
-  await expect(c.answer).resolves.toEqual({ cancelled: true });
+  const res = await post(`/fx-permissions/${c.id}/answer`, { cancel: true });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toContain("cancel is not available");
+  expect(await stillPending(c.id)).toBe(true);
+  // The awaiter was not released: a real answer still lands.
+  const ok = await post(`/fx-permissions/${c.id}/answer`, { optionId: "once" });
+  expect((await ok.json()).ok).toBe(true);
+  await expect(c.answer).resolves.toEqual({ decision: "once" });
+  // Settled: a late answer is the ordinary ok:false.
   const again = await post(`/fx-permissions/${c.id}/answer`, { optionId: "once" });
   expect(again.status).toBe(200);
   expect((await again.json()).ok).toBe(false);
+});
+
+test("opencode permission: the internal Stop sweep still cancels the card", async () => {
+  const { cancelPendingForTask } = await import("./interactions.ts");
+  const c = await permCard("t-oc-stop");
+  cancelPendingForTask("t-oc-stop", "stop");
+  await expect(c.answer).resolves.toEqual({ cancelled: true });
+});
+
+test("fx permission: cancel still resolves the card (unchanged)", async () => {
+  const c = await fxCard();
+  const res = await post(`/fx-permissions/${c.id}/answer`, { cancel: true });
+  expect(res.status).toBe(200);
+  expect((await res.json()).ok).toBe(true);
+  await expect(c.answer).resolves.toEqual({ cancelled: true });
 });
 
 test("fx permission regression: optionId works, a message is refused", async () => {

@@ -10,7 +10,11 @@
  *     restart) for the same key replaces the stream; callers may pass an
  *     `epoch` (the server's `startedAt`) and a ref with an OLDER epoch than the
  *     one held is ignored, so a stale caller cannot swap out a healthy stream.
- *     Without epochs the last ref wins. A swap does not reset the failure count.
+ *     Without epochs, or with an equal one, the last ref wins and existing
+ *     subscribers are kept and resynced. A NEWER epoch means the server process
+ *     restarted: its executions are gone, so existing subscribers get
+ *     `onServerLost(Error("OpenCode server restarted"))` and are dropped before
+ *     the swap. A swap does not reset the failure count.
  *     Exactly one stream per key exists at any time (single-flight connect, a
  *     generation counter drops callbacks of a stale stream, and a stream that
  *     closes synchronously inside its own open call is not kept).
@@ -50,6 +54,8 @@
  *     `execution.started` may have fallen into the gap or predate this core;
  *     that snapshot is discarded for any session that saw a live execution
  *     event after the request began.
+ *     The same check runs for sessions newly added by a `watch` call on an
+ *     already-connected stream.
  *
  * Contract notes for callers:
  *   - `ready` resolves once the stream is open (`server.connected`) and the
@@ -526,7 +532,7 @@ function ownedOrigins(srv: HubServer, root: string): OpencodeHubOrigin[] {
 }
 
 /** Wake for watched sessions the server reports running while nobody is attached (a gap, or a fresh core). */
-async function wakeResync(srv: HubServer, gen: number): Promise<void> {
+async function wakeResync(srv: HubServer, gen: number, only?: ReadonlySet<string>): Promise<void> {
   if (srv.watched.size === 0) return;
   const startSeq = srv.execSeq;
   let active: Record<string, unknown>;
@@ -538,7 +544,8 @@ async function wakeResync(srv: HubServer, gen: number): Promise<void> {
   }
   if (hooks.afterActiveSessions) await hooks.afterActiveSessions(srv.key);
   if (srv.gen !== gen || servers.get(srv.key) !== srv) return;
-  for (const sid of srv.watched) {
+  for (const sid of only ?? srv.watched) {
+    if (!srv.watched.has(sid)) continue;
     // A live execution event arrived after the request began: it is newer than the snapshot.
     if ((srv.lastExec.get(sid) ?? 0) > startSeq) continue;
     if (active[sid] === undefined) {
@@ -605,14 +612,37 @@ function getOrCreate(key: string, ref: OpencodeServerRef, epoch: number | undefi
       warn("ignoring a server ref older than the current one", key);
       return srv;
     }
-    // The server restarted (new url or password): replace the stream, keep the
-    // subscribers. The failure count carries over; only a connect resets it.
+    // A newer epoch means the server process was restarted: every execution the
+    // existing subscribers were following died with it, so they are told and
+    // dropped (the driver settles them) instead of resynced onto a new server.
+    const restarted = epoch !== undefined && srv.epoch !== undefined && epoch > srv.epoch;
+    const lostEntries: Entry[] = [];
+    if (restarted) {
+      for (const list of srv.entries.values()) lostEntries.push(...list);
+      srv.entries.clear();
+      srv.owned.clear();
+      srv.ownedByRoot.clear();
+    }
+    // Otherwise (same or unknown epoch) keep the subscribers and resync them on
+    // the new stream. The failure count carries over; only a connect resets it.
     clearTimers(srv);
     dropStream(srv);
     srv.ref = { url: ref.url, password: ref.password };
     if (epoch !== undefined) srv.epoch = epoch;
     srv.woken.clear();
     srv.openExec.clear();
+    srv.lastExec.clear();
+    if (lostEntries.length > 0) {
+      const err = new Error("OpenCode server restarted");
+      for (const entry of lostEntries) {
+        if (!entry.settleReady.done) {
+          entry.settleReady.done = true;
+          entry.settleReady.reject(err);
+        }
+        const fn = entry.sub.onServerLost;
+        if (fn) callGuarded(srv, entry.root, "onServerLost", () => fn.call(entry.sub, err));
+      }
+    }
     return srv;
   }
   if (!srv) {
@@ -761,11 +791,17 @@ export function watchOpencodeSessionsForWake(serverKey: string, ref: OpencodeSer
     return;
   }
   const srv = getOrCreate(serverKey, ref, ref.epoch);
+  const added = new Set(ids.filter((s) => !srv.watched.has(s)));
   srv.watched = new Set(ids);
   for (const m of [srv.woken, srv.openExec, srv.lastExec] as Array<Set<string> | Map<string, unknown>>) {
     for (const sid of [...m.keys()]) if (!srv.watched.has(sid)) m.delete(sid);
   }
   connect(srv);
+  // On a stream that is already connected nothing else looks at the newly
+  // watched sessions (onConnected only runs on connect): one may be running.
+  if (srv.connected && added.size > 0) {
+    wakeResync(srv, srv.gen, added).catch((err) => warn("active-session check failed", srv.key, undefined, err));
+  }
 }
 
 /**

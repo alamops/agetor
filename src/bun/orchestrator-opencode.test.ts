@@ -479,6 +479,8 @@ test("profile freeze: create takes the profile's opencodeServer; a live edit of 
   if ("error" in started) throw new Error(started.error);
   await waitFor(() => allSettled(task.id));
   expect(db.tasks.get(task.id)!.opencodeServer).toBe("standalone");
+  // The fake driver replays `opencode run`, so the breadcrumb still names the stored server.
+  expect(statusLines(runsOf(task.id)[0]!.id)[0]).toContain("server=standalone");
 
   // A real drift (the mode) rewrites the row, and the retired option rides along.
   const second = await newTask({ agentProfileId: profile.id });

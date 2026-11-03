@@ -183,6 +183,47 @@ test("cmdAgentProfile edit: renames and appends a skill", async () => {
   expect(updated.skills).toEqual(["code-review", "simplify"]);
 });
 
+/** Run `fn` with stderr captured, restoring the real writer afterwards. */
+async function captureStderr(fn: () => Promise<void>): Promise<string> {
+  const real = process.stderr.write.bind(process.stderr);
+  let stderr = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await fn();
+  } finally {
+    process.stderr.write = real;
+  }
+  return stderr;
+}
+
+const OPENCODE_SERVER_NOTICE = "--opencode-server is no longer used";
+
+test("cmdAgentProfile edit --opencode-server alone: a real ref succeeds with one notice and changes nothing", async () => {
+  reset();
+  const stderr = await captureStderr(() =>
+    cmdAgentProfile(["edit", createdProfileId, "--opencode-server", "standalone"], flags()),
+  );
+  expect(stderr.split("\n").filter((l) => l.includes(OPENCODE_SERVER_NOTICE)).length).toBe(1);
+  expect(outputs).toEqual([]);
+});
+
+test("cmdAgentProfile edit --opencode-server alone: a typo'd ref is still an error, with no notice", async () => {
+  reset();
+  let thrown: unknown = null;
+  const stderr = await captureStderr(async () => {
+    try {
+      await cmdAgentProfile(["edit", "no-such-profile-ref", "--opencode-server", "standalone"], flags());
+    } catch (err) {
+      thrown = err;
+    }
+  });
+  expect(thrown).toBeInstanceOf(Error);
+  expect(stderr).not.toContain(OPENCODE_SERVER_NOTICE);
+});
+
 test("cmdAdd --profile: resolves the profile by name, creates a task carrying agentProfileId, and rejects --profile combined with --model", async () => {
   reset();
   await cmdAdd(

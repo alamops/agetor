@@ -17,7 +17,7 @@ import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
-import { SCRUBBED_ENV_KEYS, childEnv, coreSpawn } from "./core-spawn.ts";
+import { SCRUBBED_ENV_KEYS, childEnv, coreSpawn, coreSpawnSync } from "./core-spawn.ts";
 import { openReadNoFollow } from "./no-follow.ts";
 import { isLoopbackOpencodeUrl, opencodeAuthHeader } from "./opencode-http.ts";
 import { escapeFreeText } from "../shared/terminal-text.ts";
@@ -87,6 +87,13 @@ let startBudgetMs = DEFAULT_START_BUDGET_MS;
 let healthCacheMs = DEFAULT_HEALTH_CACHE_MS;
 let healthTimeoutMs = DEFAULT_HEALTH_TIMEOUT_MS;
 let serverDirOverride: string | null = null;
+/** Overall budget for boot adoption: a server still undecided at the end is
+ *  kept (as unhealthy), never killed. */
+const DEFAULT_ADOPT_BUDGET_MS = 5_000;
+let adoptBudgetMs = DEFAULT_ADOPT_BUDGET_MS;
+/** Bounded wait for each synchronous tmux call on a quit. */
+const SYNC_TMUX_TIMEOUT_MS = 2_000;
+let fetchImpl: typeof fetch | null = null;
 
 export interface OpencodeServerHandle {
   harnessId: string;
@@ -322,6 +329,10 @@ interface ProbeResult {
   /** HTTP status when the server answered. */
   status?: number;
   timedOut?: boolean;
+  /** The connection was refused: nothing listens there. The only transport
+   *  error that proves the server is gone (a reset or a closed keep-alive
+   *  socket says nothing about a busy server). */
+  refused?: boolean;
   version?: string;
 }
 
@@ -329,7 +340,7 @@ async function probe(url: string, password: string, timeoutMs: number): Promise<
   // The password only ever goes to a loopback origin.
   if (!isLoopbackOpencodeUrl(url)) return { ok: false };
   try {
-    const res = await fetch(`${url}/api/info`, {
+    const res = await (fetchImpl ?? fetch)(`${url}/api/info`, {
       headers: { Authorization: opencodeAuthHeader(password), Accept: "application/json" },
       redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs),
@@ -347,8 +358,12 @@ async function probe(url: string, password: string, timeoutMs: number): Promise<
     }
     return { ok: true, status: 200, version };
   } catch (e) {
-    const name = (e as { name?: string }).name;
-    return { ok: false, timedOut: name === "TimeoutError" || name === "AbortError" };
+    const err = e as { name?: string; code?: string };
+    return {
+      ok: false,
+      timedOut: err.name === "TimeoutError" || err.name === "AbortError",
+      refused: err.code === "ConnectionRefused" || err.code === "ECONNREFUSED",
+    };
   }
 }
 
@@ -725,8 +740,12 @@ export function stopOpencodeServer(harnessId: string): Promise<void> {
     } else {
       // Nothing in memory: a state file may still describe a server (not yet
       // adopted, or left by a crashed start). Stop its recorded host.
+      // Only a state file that really is this harness's (same checks as
+      // adoption: filed under its own name, naming its own session) may name
+      // what to kill; anything else is a planted file and is just removed.
       const state = readStateFile(statePath(harnessId));
-      await terminate(state ?? { tmuxSession: hostIsDirect() ? null : sessionNameFor(harnessId) });
+      const own = state !== null && state.harnessId === harnessId && statePath(state.harnessId) === statePath(harnessId);
+      await terminate(own ? { tmuxSession: state.tmuxSession, hostPid: state.hostPid } : { tmuxSession: hostIsDirect() ? null : sessionNameFor(harnessId) });
     }
     removeFiles(harnessId, { log: true });
   })().finally(() => {
@@ -743,14 +762,23 @@ export function stopOpencodeServer(harnessId: string): Promise<void> {
 type Verdict = "ok" | "dead" | "unresponsive";
 
 /** Decide a server's fate. "dead" needs positive proof (host gone, connection
- *  refused, or our password rejected); a timeout or an odd answer from a host
- *  that is still there is "unresponsive": it may be busy, so it is kept (I3). */
+ *  refused, or our password rejected twice); any other failure from a host that
+ *  is still there (timeout, reset, odd status) is "unresponsive": it may be
+ *  busy, so it is kept (I3). */
 async function classify(url: string, password: string, host: TerminateTarget): Promise<{ verdict: Verdict; version?: string }> {
   if ((await hostState(host)) === "gone") return { verdict: "dead" };
   let res = await probe(url, password, healthTimeoutMs);
   if (res.timedOut) res = await probe(url, password, healthTimeoutMs * 2);
   if (res.ok) return { verdict: "ok", version: res.version };
-  if (res.status === 401 || (res.status === undefined && !res.timedOut)) return { verdict: "dead" };
+  if (res.refused) return { verdict: "dead" };
+  if (res.status === 401) {
+    // One more look: only a 401 that persists means "not our server".
+    const again = await probe(url, password, healthTimeoutMs);
+    if (again.ok) return { verdict: "ok", version: again.version };
+    if (again.status === 401 || again.refused) return { verdict: "dead" };
+    res = again;
+  }
+  // A reset, a closed socket, a timeout or an odd status: the host decides.
   if ((await hostState(host)) === "gone") return { verdict: "dead" };
   return { verdict: "unresponsive" };
 }
@@ -765,11 +793,38 @@ async function healthy(rec: ServerRecord): Promise<Verdict> {
   return res.verdict;
 }
 
+/** What decides, mid-flight, whether adoption may still destroy anything. */
+interface AdoptCtx {
+  /** Boot adoption's budget ran out: the server was kept as unhealthy, so a
+   *  late "dead" verdict must not clean it up. */
+  expired?: boolean;
+  /** The caller's busy gate (ensure): a busy server is never cleaned up while
+   *  its host is still there. */
+  busy?: () => boolean;
+}
+
+function recordFromState(state: StateFile, healthyAt: number, version?: string): ServerRecord {
+  return {
+    handle: {
+      harnessId: state.harnessId,
+      url: state.url,
+      password: state.password,
+      tmuxSession: state.tmuxSession,
+      startedAt: state.startedAt,
+      version: version ?? state.version,
+    },
+    hostPid: state.hostPid,
+    fingerprint: state.fingerprint,
+    lastActivity: Date.now(),
+    healthyAt,
+  };
+}
+
 /** Adopt the server a state file describes. A server that answers is adopted;
  *  one that is only slow is adopted too, marked unhealthy (`healthyAt: 0`), so
  *  the next `ensure` re-probes it instead of replacing it; one provably gone,
  *  or a file that cannot be trusted, is cleaned up. */
-async function adoptState(file: string, only?: string): Promise<ServerRecord | null> {
+async function adoptState(file: string, only?: string, ctx: AdoptCtx = {}): Promise<ServerRecord | null> {
   const state = readStateFile(file);
   // Boot adoption must not touch a server this process is starting or holds.
   if (state && only === undefined && (starting.has(state.harnessId) || servers.has(state.harnessId))) return null;
@@ -782,27 +837,24 @@ async function adoptState(file: string, only?: string): Promise<ServerRecord | n
   }
   const target: TerminateTarget = { tmuxSession: state.tmuxSession, hostPid: state.hostPid };
   const gone = async (): Promise<null> => {
+    if (ctx.expired) return null;
     await terminate(target);
     removeFiles(state.harnessId, { log: true });
     return null;
   };
   if (state.url === "") return gone();
   const res = await classify(state.url, state.password, target);
-  if (res.verdict === "dead") return gone();
-  return {
-    handle: {
-      harnessId: state.harnessId,
-      url: state.url,
-      password: state.password,
-      tmuxSession: state.tmuxSession,
-      startedAt: state.startedAt,
-      version: res.version ?? state.version,
-    },
-    hostPid: state.hostPid,
-    fingerprint: state.fingerprint,
-    lastActivity: Date.now(),
-    healthyAt: res.verdict === "ok" ? Date.now() : 0,
-  };
+  if (res.verdict === "dead") {
+    let busy = false;
+    try {
+      busy = ctx.busy?.() ?? false;
+    } catch {
+      busy = true;
+    }
+    if (busy && (await hostState(target)) !== "gone") return recordFromState(state, 0);
+    return gone();
+  }
+  return recordFromState(state, res.verdict === "ok" ? Date.now() : 0, res.version);
 }
 
 function specBusy(spec: OpencodeServerSpec): boolean {
@@ -823,7 +875,7 @@ async function ensureInner(spec: OpencodeServerSpec): Promise<OpencodeServerHand
     // Not in memory (boot adoption not run, or it ran before this harness
     // existed): a server from an earlier core is reused.
     ensureServerDir();
-    const adopted = await adoptState(statePath(id), id);
+    const adopted = await adoptState(statePath(id), id, { busy: spec.isBusy ? () => specBusy(spec) : undefined });
     if (adopted) {
       servers.set(id, adopted);
       rec = adopted;
@@ -837,6 +889,14 @@ async function ensureInner(spec: OpencodeServerSpec): Promise<OpencodeServerHand
       if (rec.fingerprint === fingerprint) return rec.handle;
       // Started with other settings (bin, env or cwd changed since).
       if (specBusy(spec)) return { ...rec.handle, stale: true };
+    }
+    if (verdict === "dead") {
+      // Re-check the host right before destroying anything: a refused
+      // connection or a persistent 401 from a host that is still there, with a
+      // turn running, is not a licence to restart (I3).
+      if ((await hostState(targetOf(rec))) !== "gone" && specBusy(spec)) {
+        throw new Error("The OpenCode server is not responding.");
+      }
     }
     servers.delete(id);
     await terminate(targetOf(rec));
@@ -860,7 +920,9 @@ export function ensureOpencodeServer(spec: OpencodeServerSpec): Promise<Opencode
 }
 
 /** Boot: keep the servers a previous core left running, clean up the ones that
- *  are provably gone. A server that is only slow to answer is kept. */
+ *  are provably gone. Servers are judged in parallel under one overall budget;
+ *  a server still undecided when it runs out is kept as unhealthy (the next
+ *  `ensure` re-probes it), never killed. A server that is only slow is kept. */
 export async function adoptOpencodeServers(): Promise<OpencodeServerHandle[]> {
   let names: string[];
   try {
@@ -870,17 +932,40 @@ export async function adoptOpencodeServers(): Promise<OpencodeServerHandle[]> {
     return [];
   }
   const adopted: OpencodeServerHandle[] = [];
-  for (const name of names) {
+  const ctx: AdoptCtx = {};
+  const undecided = new Map<string, ServerRecord>(); // file → fallback record
+  const register = (rec: ServerRecord): void => {
+    if (servers.has(rec.handle.harnessId)) return;
+    servers.set(rec.handle.harnessId, rec);
+    adopted.push(rec.handle);
+  };
+  const tasks = names.map(async (name) => {
     const file = path.join(serverDir(), name);
     try {
-      const rec = await adoptState(file);
-      if (!rec) continue;
-      if (servers.has(rec.handle.harnessId)) continue;
-      servers.set(rec.handle.harnessId, rec);
-      adopted.push(rec.handle);
+      const state = readStateFile(file);
+      if (state && state.url !== "" && statePath(state.harnessId) === file) undecided.set(file, recordFromState(state, 0));
+      const rec = await adoptState(file, undefined, ctx);
+      undecided.delete(file);
+      if (rec && !ctx.expired) register(rec);
+      else if (rec && ctx.expired && servers.get(rec.handle.harnessId)?.healthyAt === 0 && rec.healthyAt !== 0) {
+        // Decided healthy after the budget: upgrade the fallback entry.
+        servers.get(rec.handle.harnessId)!.healthyAt = rec.healthyAt;
+      }
     } catch {
+      undecided.delete(file);
       /* one bad entry must not stop the rest */
     }
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<"budget">((resolve) => {
+    timer = setTimeout(() => resolve("budget"), adoptBudgetMs);
+  });
+  const outcome = await Promise.race([Promise.allSettled(tasks).then(() => "done" as const), budget]);
+  if (timer) clearTimeout(timer);
+  if (outcome === "budget") {
+    ctx.expired = true;
+    for (const rec of undecided.values()) register(rec);
+    undecided.clear();
   }
   return adopted;
 }
@@ -925,6 +1010,41 @@ export async function stopIdleOpencodeServersOnQuit(isBusy: (harnessId: string) 
   await Promise.allSettled(ids.map((id) => stopOpencodeServer(id)));
 }
 
+/**
+ * A real quit that cannot await (Electrobun's `quit()` runs synchronous FFI
+ * right after the before-quit event): stop every in-memory server that is not
+ * busy, fully synchronously. tmux: `kill-session` on the exact name on the
+ * instance socket through `coreSpawnSync` (each call bounded); the direct test
+ * host: signal the child this core spawned. State, env and log files go too.
+ * Never throws; returns the stopped ids. No escalation and no waiting — the
+ * session's SIGHUP is the whole stop.
+ */
+export function stopIdleOpencodeServersSync(isBusy: (harnessId: string) => boolean): string[] {
+  const stopped: string[] = [];
+  for (const [id, rec] of [...servers]) {
+    try {
+      if (starting.has(id) || busy(isBusy, id)) continue;
+      servers.delete(id);
+      const session = rec.handle.tmuxSession;
+      if (session) {
+        coreSpawnSync(resolveTmuxBin(), [...tmuxSocketArgs(), "kill-session", "-t", `=${session}:`], {
+          stdio: "ignore",
+          env: childEnv(),
+          timeout: SYNC_TMUX_TIMEOUT_MS,
+        });
+      } else {
+        const child = rec.hostPid === undefined ? undefined : directProcs.get(rec.hostPid);
+        if (child && child.exitCode === null && child.pid !== process.pid) child.kill("SIGTERM");
+      }
+      removeFiles(id, { log: true });
+      stopped.push(id);
+    } catch {
+      /* best-effort: a quit never throws */
+    }
+  }
+  return stopped;
+}
+
 /** Test-only helpers; production code never calls these. */
 export const __forTest = {
   /** Authenticated `/api/info` probe (production uses it internally through `healthy`). */
@@ -951,6 +1071,13 @@ export const __forTest = {
   setHealthTimeoutMs(ms: number): void {
     healthTimeoutMs = ms;
   },
+  setAdoptBudgetMs(ms: number): void {
+    adoptBudgetMs = ms;
+  },
+  /** Replace `fetch` for health probes (null restores it). */
+  setFetchImpl(f: typeof fetch | null): void {
+    fetchImpl = f;
+  },
   /** Point the manager at a private directory (one per test). */
   setServerDir(dir: string | null): void {
     serverDirOverride = dir;
@@ -960,6 +1087,8 @@ export const __forTest = {
     startBudgetMs = DEFAULT_START_BUDGET_MS;
     healthCacheMs = DEFAULT_HEALTH_CACHE_MS;
     healthTimeoutMs = DEFAULT_HEALTH_TIMEOUT_MS;
+    adoptBudgetMs = DEFAULT_ADOPT_BUDGET_MS;
+    fetchImpl = null;
     serverDirOverride = null;
   },
   statePath,

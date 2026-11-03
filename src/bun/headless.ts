@@ -5,6 +5,7 @@ import {
   freezeLaunches,
   launchesInFlight,
   startOpencodeServerDriver,
+  stopIdleOpencodeServersOnRealStop,
   stopOpencodeServerDriver,
   reconcileOrphans,
   rearmFxAutoResumes,
@@ -148,7 +149,7 @@ async function handOffPort(reason: string, code: number): Promise<void> {
  *  lost the port to a live core, or got a signal mid-boot) must not delete the
  *  winner's creds on its way out. */
 let ownsCreds = false;
-function shutdown(reason: string, code = 0): void {
+function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): void {
   if (shuttingDown) return;
   shuttingDown = true;
   daemonLog(`shutting down (${reason})`);
@@ -181,6 +182,16 @@ function shutdown(reason: string, code = 0): void {
   // the lag sampler. Trimmed rows stay trimmed, the next boot resumes.
   stopRetentionTimers();
   stopLagMonitor();
+  // A real stop (`agetor daemon stop`, the CLI daemon's idle exit) also stops the
+  // OpenCode servers nothing is using; a hand-over to the app does not. Before
+  // the driver is stopped: its turns and probe results say what is in use.
+  if (opts.realStop) {
+    try {
+      stopIdleOpencodeServersOnRealStop();
+    } catch (err) {
+      daemonLog(`stopping idle OpenCode servers failed: ${String(err)}`);
+    }
+  }
   // OpenCode: detach the turns and close the hub streams. The servers and their
   // turns live on in their own tmux sessions for the next core (a handoff is not a quit).
   stopOpencodeServerDriver();
@@ -284,7 +295,7 @@ export async function runDaemon(): Promise<void> {
       ready: bootReady,
       onShutdownRequest: (request) => {
         const reason = `shutdown request (${request})`;
-        if (request !== "handoff") return shutdown(reason, 0);
+        if (request !== "handoff") return shutdown(reason, 0, { realStop: true });
         void handOffPort(reason, isLoginItem ? CORE_EXIT_PARK : 0);
       },
     });
@@ -495,7 +506,7 @@ export async function runDaemon(): Promise<void> {
         return;
       }
       if (idleSince == null) idleSince = Date.now();
-      else if (Date.now() - idleSince >= idleTimeoutMs) shutdown("idle timeout");
+      else if (Date.now() - idleSince >= idleTimeoutMs) shutdown("idle timeout", 0, { realStop: true });
     }, IDLE_CHECK_MS);
     timer.unref();
   }

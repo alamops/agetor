@@ -594,20 +594,25 @@ describe("wake checks on connect, watch loss, close (S1, S2, S3, S6)", () => {
     const root = await newSession(srv);
     await prompt(srv, root, "__agetor_fake_oc_slow__");
     const gate = hold();
+    let entered = false;
+    let finished = false;
     __forTest.setHooks({
       afterActiveSessions: async () => {
+        entered = true;
         // the snapshot says "active"; the turn ends (live) before the hub looks at it
         await api(srv, "POST", `/api/session/${root}/interrupt`);
         await Bun.sleep(300);
         await gate.wait;
+        finished = true;
       },
     });
     const woke: string[] = [];
     setOpencodeWakeHandler((_k, sid) => woke.push(sid));
     watchOpencodeSessionsForWake(KEY, { url: srv.url, password: srv.password }, [root]);
-    await Bun.sleep(600);
+    await until(() => entered, "the wake check reached its hook");
     gate.release();
-    await Bun.sleep(300);
+    await until(() => finished, "the hook finished");
+    await Bun.sleep(50); // the wake check resumes right after the hook; let it run to its end
     expect(woke).toHaveLength(0);
   });
 
@@ -674,7 +679,7 @@ describe("wake checks on connect, watch loss, close (S1, S2, S3, S6)", () => {
 });
 
 describe("ref epochs and failure accounting (S4, S7)", () => {
-  test("a ref with an older epoch is ignored; a newer one swaps the stream", async () => {
+  test("a ref with an older epoch is ignored; a newer one swaps the stream and reports the restart", async () => {
     const srvA = await boot();
     const srvB = await boot({ password: "pw-other" });
     const a = await newSession(srvA);
@@ -690,7 +695,8 @@ describe("ref epochs and failure accounting (S4, S7)", () => {
 
     const rbNew = new Rec();
     await subscribeOpencodeSession({ key: KEY, url: srvA.url, password: srvA.password, epoch: 7 }, a, rbNew).ready;
-    await until(() => rb.resyncs === 1, "resync after the newer ref");
+    await until(() => rb.lost.length === 1, "restart reported after the newer ref");
+    expect(rb.resyncs).toBe(0);
     expect(__forTest.streamStats().opened).toBe(2);
     expect(__forTest.streamStats().maxConcurrent).toBe(1);
   });
@@ -840,5 +846,99 @@ describe("re-seeding on reconnect (S9)", () => {
     await Bun.sleep(150);
     expect(ra.resyncs).toBe(1);
     expect(__forTest.streamStats().maxConcurrent).toBe(1);
+  });
+});
+
+describe("server restart and late watches", () => {
+  test("a newer epoch tells existing subscribers the server was lost and drops them; the new subscriber continues", async () => {
+    const srvA = await boot();
+    const srvB = await boot({ password: "pw-restarted" });
+    const a = await newSession(srvA);
+    const b = await newSession(srvB);
+    const ra = new Rec();
+    const rb = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: srvA.url, password: srvA.password, epoch: 1 }, a, ra).ready;
+    const subB = subscribeOpencodeSession({ key: KEY, url: srvB.url, password: srvB.password, epoch: 2 }, b, rb);
+    expect(ra.lost).toHaveLength(1);
+    expect(String((ra.lost[0] as Error).message)).toBe("OpenCode server restarted");
+    expect(ra.resyncs).toBe(0);
+    await subB.ready;
+    expect(__forTest.probe(KEY)?.subscribers).toBe(1);
+    expect(opencodeOwnedSessions(KEY, a)).toEqual([]);
+    await prompt(srvB, b, "on the new server");
+    await until(() => rb.count("session.execution.succeeded") === 1, "turn on the new server");
+    await Bun.sleep(100);
+    expect(ra.lost).toHaveLength(1);
+    expect(rb.lost).toHaveLength(0);
+    expect(__forTest.streamStats().maxConcurrent).toBe(1);
+  });
+
+  test("a pending subscriber of the old server gets its ready rejected by the restart", async () => {
+    __forTest.setBackoff({ baseMs: 5000, maxMs: 5000, maxFailures: 10, stableMs: 60_000 });
+    const dead = await boot();
+    const deadUrl = dead.url;
+    await dead.stop();
+    const live = await boot({ password: "pw-restarted" });
+    const sid = await newSession(live);
+    const old = new Rec();
+    const pending = subscribeOpencodeSession({ key: KEY, url: deadUrl, password: "pw-hub-test", epoch: 1 }, "ses_old", old);
+    await until(() => __forTest.probe(KEY)?.retryPending === true, "first attempt failed");
+    const fresh = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: live.url, password: live.password, epoch: 2 }, sid, fresh).ready;
+    await expect(pending.ready).rejects.toBeTruthy();
+    expect(old.lost).toHaveLength(1);
+  });
+
+  test("an equal or unknown epoch keeps existing subscribers and resyncs them (today's behavior)", async () => {
+    const srvA = await boot();
+    const srvB = await boot({ password: "pw-other" });
+    const a = await newSession(srvA);
+    const b = await newSession(srvB);
+    const ra = new Rec();
+    await subscribeOpencodeSession({ key: KEY, url: srvA.url, password: srvA.password, epoch: 4 }, a, ra).ready;
+    await subscribeOpencodeSession({ key: KEY, url: srvB.url, password: srvB.password, epoch: 4 }, b, new Rec()).ready;
+    await until(() => ra.resyncs === 1, "resync");
+    expect(ra.lost).toHaveLength(0);
+  });
+
+  test("watching more sessions on a connected stream wakes for one that is already running; the old ids are not re-woken", async () => {
+    const srv = await boot();
+    const x = await newSession(srv);
+    const y = await newSession(srv);
+    const woke: Array<{ sid: string; id?: string }> = [];
+    setOpencodeWakeHandler((_k, sid, e) => woke.push({ sid, id: e.id }));
+    const ref = { url: srv.url, password: srv.password };
+    watchOpencodeSessionsForWake(KEY, ref, [x]);
+    await until(() => __forTest.probe(KEY)?.connected === true, "connected");
+    await prompt(srv, y, "__agetor_fake_oc_slow__"); // y is not watched yet: no wake
+    await prompt(srv, x, "__agetor_fake_oc_slow__"); // x is watched: live wake
+    await until(() => woke.length === 1, "live wake for x");
+    watchOpencodeSessionsForWake(KEY, ref, [x, y]);
+    await until(() => woke.length === 2, "wake for the newly watched, running y");
+    await Bun.sleep(200);
+    expect(woke.map((w) => w.sid).sort()).toEqual([x, y].sort());
+    expect(woke.find((w) => w.sid === y)!.id).toMatch(/^resync:/);
+    watchOpencodeSessionsForWake(KEY, ref, [x, y]); // nothing new
+    await Bun.sleep(200);
+    expect(woke).toHaveLength(2);
+    await api(srv, "POST", `/api/session/${x}/interrupt`);
+    await api(srv, "POST", `/api/session/${y}/interrupt`);
+  });
+
+  test("a newly watched session that is idle does not wake", async () => {
+    const srv = await boot();
+    const x = await newSession(srv);
+    const y = await newSession(srv);
+    const woke: string[] = [];
+    setOpencodeWakeHandler((_k, sid) => woke.push(sid));
+    const ref = { url: srv.url, password: srv.password };
+    watchOpencodeSessionsForWake(KEY, ref, [x]);
+    await until(() => __forTest.probe(KEY)?.connected === true, "connected");
+    let seen = false;
+    __forTest.setHooks({ afterActiveSessions: () => void (seen = true) });
+    watchOpencodeSessionsForWake(KEY, ref, [x, y]);
+    await until(() => seen, "the check for the new ids ran");
+    await Bun.sleep(100);
+    expect(woke).toHaveLength(0);
   });
 });

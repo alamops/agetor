@@ -423,18 +423,36 @@ test("cmdEdit: an invalid --opencode-server is a usage error before any client i
   }
 });
 
-test("cmdEdit: --opencode-server alone succeeds with the notice and no client (an old script keeps working)", async () => {
-  // noDaemon + a fresh dir with no core: a request would throw, so passing
-  // proves nothing was sent.
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-mg-ocserver-only-"));
-  const f = { dataDir: dir, port: 4545, json: false, plain: true, noDaemon: true };
-  try {
-    const { stderr } = await captureStderr(() => cmdEdit(["abcd1234", "--opencode-server", "standalone"], f));
+test("cmdEdit: --opencode-server alone resolves the ref, then succeeds with the notice and changes nothing", async () => {
+  await withClient(4508, async (client, dir) => {
+    const workdir = mkdtempSync(path.join(tmpdir(), "agetor-mg-ocserver-only-"));
+    const t = await client.createTask({ title: "OpenCode", prompt: "p", isolation: "none", workdir, agent: "opencode" });
+    const f = { dataDir: dir, json: false, plain: true, noDaemon: false };
+    const { stderr } = await captureStderr(() => cmdEdit([t.id, "--opencode-server", "standalone"], f));
     expect(stderr.split("\n").filter((l) => l.includes(OPENCODE_SERVER_NOTICE)).length).toBe(1);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
+    const after = await client.getTask(t.id);
+    expect(after.title).toBe("OpenCode");
+    expect(after.opencodeServer).toBe(t.opencodeServer);
+    await client.deleteTask(t.id);
+    rmSync(workdir, { recursive: true, force: true });
+  });
+}, 30_000);
+
+test("cmdEdit: --opencode-server alone with a typo'd ref is still an error and prints no notice", async () => {
+  await withClient(4509, async (_client, dir) => {
+    const f = { dataDir: dir, json: false, plain: true, noDaemon: false };
+    let thrown: unknown = null;
+    const { stderr } = await captureStderr(async () => {
+      try {
+        await cmdEdit(["zzzzzzzz", "--opencode-server", "standalone"], f);
+      } catch (err) {
+        thrown = err;
+      }
+    });
+    expect((thrown as Error).message).toContain('no task matches "zzzzzzzz"');
+    expect(stderr).not.toContain(OPENCODE_SERVER_NOTICE);
+  });
+}, 30_000);
 
 test("cmdEdit: --opencode-server next to another flag warns and patches only the other flag", async () => {
   await withClient(4543, async (client, dir) => {

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Run, Task } from "../shared/types.ts";
@@ -76,7 +76,7 @@ beforeAll(async () => {
 afterAll(async () => {
   orch.stopOpencodeServerDriver();
   hubMod.closeOpencodeHub();
-  for (const id of ["opencode", "opencode-ks", "opencode-v1"]) await serverMod.stopOpencodeServer(id).catch(() => {});
+  for (const id of ["opencode", "opencode-ks", "opencode-v1", "opencode-fp", "opencode-dead", "opencode-cold"]) await serverMod.stopOpencodeServer(id).catch(() => {});
   serverMod.__forTest.reapDirect();
   serverMod.__forTest.forget();
   restoreHarnesses?.();
@@ -124,6 +124,12 @@ const statusOf = (runId: string) => eventsOf(runId, "status");
 const assistantOf = (runId: string) => eventsOf(runId, "assistant").join("\n");
 const pending = (taskId: string) => interactions.listPendingForTask(taskId);
 const sessionOf = (taskId: string) => db.runs.sessionIdsForTask(taskId, "opencode_session_id")[0]?.sessionId ?? null;
+/** The server no longer has this session executing (Stop/delete really interrupted it). */
+async function expectInterrupted(sessionId: string): Promise<void> {
+  const c = serverClient();
+  for (let i = 0; i < 100 && sessionId in (await c.activeSessions()); i++) await sleep(50);
+  expect(Object.keys(await c.activeSessions())).not.toContain(sessionId);
+}
 const serverClient = () => {
   const h = serverMod.getOpencodeServer("opencode");
   if (!h) throw new Error("no OpenCode server is running");
@@ -160,29 +166,53 @@ test("steer: a message sent mid-turn folds into the same run (no new run row)", 
   expect(statusOf(runId).some((s) => s.includes("couldn't deliver"))).toBe(false);
 });
 
-test("a steer the server can't take yet is queued as the next turn, with a status line", async () => {
-  const task = await newTask({ prompt: "first" });
+test("a message sent before the prompt reached the server still folds into the same turn", async () => {
+  // A harness whose server is not running yet: starting it takes far longer than the send.
+  db.harnesses.insert({ id: "opencode-cold", kind: "opencode", label: "OpenCode (cold)", bin: STUB_BIN });
+  db.harnesses.setEnabled("opencode-cold", true);
+  const task = await newTask({ prompt: `first ${fakeMarkers.slow}`, agent: "opencode-cold" });
   const runId = await start(task);
-  // The prompt has not been sent (server, session and subscription come first): steer answers "unavailable".
   const sent = await orch.sendInput(runId, "second");
   expect(sent).toMatchObject({ delivered: true, runId });
+  // The turn is still running (it only ends on a Stop), and the message went into it.
+  await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+  expect(await orch.cancelRun(runId)).toBe(true);
+  await settled(task.id, 20_000);
+  // A steer that had been queued instead would start a second turn once this one stopped.
+  await sleep(500);
+  expect(runsOf(task.id)).toHaveLength(1);
+  expect(eventsOf(runId, "user")).toHaveLength(2);
+  expect(statusOf(runId).some((l) => l.includes("couldn't deliver"))).toBe(false);
+});
+
+test("a message sent while a Stop is in progress is queued as the next turn", async () => {
+  const task = await newTask({ prompt: `run ${fakeMarkers.slow}` });
+  const runId = await start(task);
+  await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+  const stopping = orch.cancelRun(runId); // the handle is flagged cancelled synchronously
+  const sent = await orch.sendInput(runId, "after the stop");
+  expect(sent).toMatchObject({ delivered: true, runId });
+  await stopping;
   await waitFor(() => runsOf(task.id).length === 2 && allSettled(task.id), 40_000, "the queued turn");
   const [first, second] = runsOf(task.id);
-  expect(statusOf(first!.id).some((s) => s.includes("couldn't deliver to the running OpenCode turn — sending it next"))).toBe(true);
+  expect(first!.status).toBe("cancelled");
   expect(eventsOf(first!.id, "user")).toHaveLength(2); // both bubbles sit on the first run
   expect(eventsOf(second!.id, "user")).toHaveLength(1); // the queued turn is a run of its own, like every queued OpenCode turn
   expect(second!.opencodeSessionId).toBe(first!.opencodeSessionId);
-  expect(assistantOf(second!.id)).toContain("ACK: second");
+  expect(assistantOf(second!.id)).toContain("ACK: after the stop");
 });
 
 test("Stop interrupts the session: run cancelled, task back to ready", async () => {
   const task = await newTask({ prompt: `run ${fakeMarkers.slow}` });
   const runId = await start(task);
   await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+  const sid = sessionOf(task.id)!;
+  expect(sid in (await serverClient().activeSessions())).toBe(true); // it is executing before the Stop
   expect(await orch.cancelRun(runId)).toBe(true);
   await settled(task.id, 20_000);
   expect(db.runs.get(runId)!.status).toBe("cancelled");
   expect(db.tasks.get(task.id)!.column).toBe("ready");
+  await expectInterrupted(sid);
 });
 
 test("a provider 402 fails the run with the error line and the quota hint", async () => {
@@ -212,9 +242,12 @@ test("restart: a running server turn reattaches over HTTP and its run completes 
   const task = await newTask({ prompt: `do it ${fakeMarkers.permission}`, mode: "ask" });
   const runId = await start(task);
   await waitFor(() => pending(task.id).length === 1, 30_000, "the permission card");
-  const cardId = pending(task.id)[0]!.id;
+  const oldCardId = pending(task.id)[0]!.id;
   // The core goes away: turns detach (not settled), servers keep running; the next core adopts them.
+  // A new process has an EMPTY card registry: only the server still knows the request.
   orch.stopOpencodeServerDriver();
+  interactions.__testing.reset();
+  expect(pending(task.id)).toHaveLength(0);
   serverMod.__forTest.forget();
   expect(serverMod.getOpencodeServer("opencode")).toBeNull();
   expect((await serverMod.adoptOpencodeServers()).map((h) => h.harnessId)).toContain("opencode");
@@ -222,11 +255,10 @@ test("restart: a running server turn reattaches over HTTP and its run completes 
   expect(await orch.reconcileOrphans()).toBe(0); // reattached, nothing orphaned
   orch.startOpencodeServerDriver();
   await waitFor(() => statusOf(runId).some((s) => s.includes("reconnected to live session")), 30_000, "the reattach");
-  // The same card, still open; answer it and the one run finishes.
-  await waitFor(() => orch.__opencodeServerForTest.liveTurns().driving === 1, 30_000, "the reattached turn");
-  // The card never left the registry; the new driver takes it over once its catch-up has run.
-  await sleep(1500);
-  expect(pending(task.id).map((c) => c.id)).toEqual([cardId]);
+  // The reattached driver re-lists the server's open request and raises a NEW card for it.
+  await waitFor(() => pending(task.id).length === 1, 30_000, "the card to be re-raised");
+  const cardId = pending(task.id)[0]!.id;
+  expect(cardId).not.toBe(oldCardId);
   interactions.answerOpencodePermission(cardId, { decision: "once" });
   await settled(task.id);
   expect(runsOf(task.id)).toHaveLength(1);
@@ -297,12 +329,13 @@ test("a wake that arrived during a turn the user then stops is dropped, not mint
   expect(orch.__opencodeServerForTest.deferredWakes()).toBe(0);
 });
 
-test("a wake for a session nobody watches (archived, unknown) mints nothing", async () => {
+test("a wake for a task that was watched and then archived mints nothing", async () => {
   const task = await newTask({ prompt: "quick" });
   await start(task);
   await settled(task.id);
   const sid = sessionOf(task.id)!;
-  orch.__opencodeServerForTest.wake("opencode", "ses_unknownsession", { type: "session.execution.started", id: "evt_test_wake_3", created: Date.now() });
+  // Watched first: the refusal below is the archived check, not an unknown session.
+  await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode", sid) === task.id, 10_000, "the wake watch");
   db.tasks.update(task.id, { column: "done" });
   const archived = await orch.archiveTask(task.id);
   expect(archived).not.toHaveProperty("error");
@@ -311,10 +344,135 @@ test("a wake for a session nobody watches (archived, unknown) mints nothing", as
   expect(runsOf(task.id)).toHaveLength(1);
 });
 
+test("a wake never revives a task the user stopped, until their next message; parked columns refuse too", async () => {
+  const task = await newTask({ prompt: `run ${fakeMarkers.slow}` });
+  const runId = await start(task);
+  await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+  const sid = sessionOf(task.id)!;
+  await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode", sid) === task.id, 10_000, "the wake watch");
+  expect(await orch.cancelRun(runId)).toBe(true);
+  await settled(task.id, 20_000);
+  await expectInterrupted(sid);
+  // Stopped by the user: the server starting something on the session is not a reason to run again.
+  orch.__opencodeServerForTest.wake("opencode", sid, { type: "session.execution.started", id: "evt_test_wake_5", created: Date.now() });
+  await sleep(300);
+  expect(runsOf(task.id)).toHaveLength(1);
+  // The user's next message ends the stop...
+  const sent = await orch.sendInput(runId, "carry on");
+  expect(sent).toMatchObject({ delivered: true });
+  await waitFor(() => runsOf(task.id).length === 2 && allSettled(task.id), 40_000, "the follow-up turn");
+  await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode", sid) === task.id, 10_000, "the wake watch again");
+  // ...but a card parked in Done, Backlog or Blocked still refuses.
+  for (const column of ["done", "backlog", "blocked"] as const) {
+    db.tasks.update(task.id, { column });
+    orch.__opencodeServerForTest.wake("opencode", sid, { type: "session.execution.started", id: `evt_test_wake_6_${column}`, created: Date.now() });
+    await sleep(200);
+    expect(runsOf(task.id)).toHaveLength(2);
+  }
+  // In review it wakes: the stop really was cleared.
+  db.tasks.update(task.id, { column: "review" });
+  orch.__opencodeServerForTest.wake("opencode", sid, { type: "session.execution.started", id: "evt_test_wake_7", created: Date.now() });
+  await waitFor(() => runsOf(task.id).length === 3 && allSettled(task.id), 30_000, "the wake run");
+  expect(runsOf(task.id)[2]!.origin).toBe("agent");
+});
+
+test("Stop on a held task (background child running) disposes the lingering handle; the child finishing wakes nothing", async () => {
+  // Slow motion, so the child is still running when the Stop lands.
+  await serverMod.stopOpencodeServer("opencode");
+  setEnv("FAKE_OC_SPEED", "3");
+  try {
+    const task = await newTask({ prompt: `launch ${fakeMarkers.wake}` });
+    const first = await start(task);
+    await waitFor(() => db.runs.get(first)!.status === "succeeded", 60_000, "the first turn");
+    await waitFor(() => db.subagents.listForTask(task.id).some((x) => x.status === "running"), 30_000, "the background child");
+    expect(db.tasks.get(task.id)!.column).toBe("running"); // held
+    expect(orch.__opencodeServerForTest.liveTurns().lingering).toBe(1);
+    expect(await orch.cancelRun(first)).toBe(true);
+    expect(orch.__opencodeServerForTest.liveTurns().lingering).toBe(0);
+    await waitFor(() => !db.subagents.listForTask(task.id).some((x) => x.status === "running"), 20_000, "the child row to settle");
+    // The server finishes the child and hands its result to the parent; with no stop-marker that was a wake.
+    await sleep(6000);
+    expect(runsOf(task.id)).toHaveLength(1);
+    expect(db.tasks.get(task.id)!.column).not.toBe("running");
+  } finally {
+    await serverMod.stopOpencodeServer("opencode");
+    setEnv("FAKE_OC_SPEED", "0.1");
+  }
+});
+
+test("restart with a held task: the next core listens for the child again instead of orphaning it, and the wake still lands", async () => {
+  await serverMod.stopOpencodeServer("opencode");
+  setEnv("FAKE_OC_SPEED", "3");
+  try {
+    const task = await newTask({ prompt: `launch ${fakeMarkers.wake}` });
+    const first = await start(task);
+    await waitFor(() => db.runs.get(first)!.status === "succeeded", 60_000, "the first turn");
+    await waitFor(() => db.subagents.listForTask(task.id).some((x) => x.status === "running"), 30_000, "the background child");
+    orch.stopOpencodeServerDriver(); // the core goes away
+    interactions.__testing.reset();
+    serverMod.__forTest.forget();
+    await serverMod.adoptOpencodeServers();
+    expect(await orch.reconcileOrphans()).toBe(0);
+    orch.startOpencodeServerDriver();
+    // Not orphaned: still running, and a handle is listening for it.
+    expect(db.subagents.listForTask(task.id).map((x) => x.status)).toContain("running");
+    expect(db.subagents.listForTask(task.id).map((x) => x.status)).not.toContain("orphaned");
+    expect(orch.__opencodeServerForTest.liveTurns().lingering).toBe(1);
+    await waitFor(() => runsOf(task.id).length === 2 && allSettled(task.id), 60_000, "the wake run after the restart");
+    expect(runsOf(task.id)[1]!.origin).toBe("agent");
+  } finally {
+    await serverMod.stopOpencodeServer("opencode");
+    setEnv("FAKE_OC_SPEED", "0.1");
+  }
+});
+
+test("Ask card answered with an empty reject stops the turn: run cancelled, task ready, not failed", async () => {
+  const task = await newTask({ prompt: `do it ${fakeMarkers.permission}`, mode: "ask" });
+  const runId = await start(task);
+  await waitFor(() => pending(task.id).length === 1, 30_000, "the permission card");
+  const sid = sessionOf(task.id)!;
+  interactions.answerOpencodePermission(pending(task.id)[0]!.id, { decision: "reject" });
+  await settled(task.id, 30_000);
+  expect(db.runs.get(runId)!.status).toBe("cancelled");
+  expect(db.tasks.get(task.id)!.column).toBe("ready");
+  await expectInterrupted(sid);
+});
+
+test("the server's restart gate does not count the turn that is asking, but counts every other", async () => {
+  const task = await newTask({ prompt: `run ${fakeMarkers.slow}` });
+  const runId = await start(task);
+  await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+  const own = orch.__opencodeServerForTest.turnHooks("opencode", runId, task.id);
+  const other = orch.__opencodeServerForTest.turnHooks("opencode", "some-other-run", "some-other-task");
+  expect(own.isBusy()).toBe(false); // idle apart from itself: a changed config may restart the server
+  expect(other.isBusy()).toBe(true); // a different turn is using it
+  expect(await orch.cancelRun(runId)).toBe(true);
+  await settled(task.id, 20_000);
+});
+
+test("a changed harness config restarts an otherwise idle server for the next turn (the turn doesn't count itself as busy)", async () => {
+  db.harnesses.insert({ id: "opencode-fp", kind: "opencode", label: "OpenCode (fingerprint)", bin: STUB_BIN });
+  db.harnesses.setEnabled("opencode-fp", true);
+  const a = await newTask({ agent: "opencode-fp", prompt: "one" });
+  const runA = await start(a);
+  await settled(a.id);
+  const before = serverMod.getOpencodeServer("opencode-fp")!;
+  expect(before).not.toBeNull();
+  db.harnesses.update("opencode-fp", { env: { AGETOR_TEST_FINGERPRINT: "changed" } });
+  const b = await newTask({ agent: "opencode-fp", prompt: "two" });
+  const runB = await start(b);
+  await settled(b.id);
+  const after = serverMod.getOpencodeServer("opencode-fp")!;
+  expect(after.startedAt).not.toBe(before.startedAt); // a new server: the old one was idle
+  expect(db.runs.get(runB)!.status).toBe("succeeded");
+  expect(statusOf(runA).concat(statusOf(runB)).some((l) => l.includes("changed harness settings"))).toBe(false);
+});
+
 test("delete with a permission card open cancels the card and tears the turn down without hanging", async () => {
   const task = await newTask({ prompt: `do it ${fakeMarkers.permission}`, mode: "ask" });
   const runId = await start(task);
   await waitFor(() => pending(task.id).length === 1, 30_000, "the permission card");
+  const sid = sessionOf(task.id)!;
   const t0 = Date.now();
   await orch.deleteTask(task.id);
   expect(Date.now() - t0).toBeLessThan(25_000);
@@ -322,6 +480,7 @@ test("delete with a permission card open cancels the card and tears the turn dow
   expect(db.tasks.get(task.id)).toBeNull();
   expect(db.runs.get(runId)).toBeNull();
   await waitFor(() => orch.__opencodeServerForTest.liveTurns().driving === 0, 10_000, "the turn to be forgotten");
+  await expectInterrupted(sid);
 });
 
 test("the kill switch sends an OpenCode 2 turn down the legacy tmux path (no server, breadcrumb without agetor)", async () => {
@@ -330,12 +489,15 @@ test("the kill switch sends an OpenCode 2 turn down the legacy tmux path (no ser
   try {
     db.harnesses.insert({ id: "opencode-ks", kind: "opencode", label: "OpenCode (kill switch)", bin: STUB_BIN });
     db.harnesses.setEnabled("opencode-ks", true);
-    const task = await newTask({ agent: "opencode-ks" });
+    const task = await newTask({ agent: "opencode-ks", mode: "ask" });
     const res = await orch.startTask(task.id);
     const runId = "runId" in res ? res.runId : (db.runs.listForTask(task.id)[0]?.id ?? "");
     await settled(task.id);
     expect(statusOf(runId)[0]).toMatch(/^opencode 2\.x · server=(shared|standalone) · /);
     expect(serverMod.getOpencodeServer("opencode-ks")).toBeNull();
+    // Ask can't show approvals without the driver: said so, and not as an OpenCode 1 limitation.
+    expect(statusOf(runId).some((l) => l.includes("server driver, which is switched off"))).toBe(true);
+    expect(statusOf(runId).some((l) => l.includes("Ask mode needs OpenCode 2"))).toBe(false);
   } finally {
     setEnv("AGETOR_OPENCODE_TRANSPORT", undefined);
     setEnv("AGETOR_TMUX_BIN", savedEnv.AGETOR_TMUX_BIN);
@@ -365,7 +527,7 @@ test("idle sweep: a server a turn or card is using, or that has an executing ses
   const task = await newTask({ prompt: `do it ${fakeMarkers.permission}`, mode: "ask" });
   await start(task);
   await waitFor(() => pending(task.id).length === 1, 30_000, "the permission card");
-  expect(await orch.runOpencodeIdleSweep(farFuture)).toEqual([]);
+  expect(await orch.runOpencodeIdleSweep(farFuture)).not.toContain("opencode");
   expect(serverMod.getOpencodeServer("opencode")).not.toBeNull();
   interactions.answerOpencodePermission(pending(task.id)[0]!.id, { decision: "once" });
   await settled(task.id);
@@ -376,24 +538,60 @@ test("idle sweep: a server a turn or card is using, or that has an executing ses
   await c.prompt(created.id, { text: `run ${fakeMarkers.slow}`, delivery: "steer" });
   await sleep(300);
   expect(Object.keys(await c.activeSessions())).toContain(created.id);
-  expect(await orch.runOpencodeIdleSweep(farFuture)).toEqual([]);
+  expect(await orch.runOpencodeIdleSweep(farFuture)).not.toContain("opencode");
   expect(serverMod.getOpencodeServer("opencode")).not.toBeNull();
   await c.interrupt(created.id);
   for (let i = 0; i < 100 && Object.keys(await c.activeSessions()).length > 0; i++) await sleep(50);
 
   // (3) idle, past the window: stopped, and its hub stream closed
-  expect(await orch.runOpencodeIdleSweep(farFuture)).toEqual(["opencode"]);
+  expect(await orch.runOpencodeIdleSweep(farFuture)).toContain("opencode");
   expect(serverMod.getOpencodeServer("opencode")).toBeNull();
 });
 
-test("a real quit stops an idle server; the next turn starts a new one", async () => {
+test("a sweep classifies a dead server that can't be asked anything: stopped and forgotten, not retried forever", async () => {
+  db.harnesses.insert({ id: "opencode-dead", kind: "opencode", label: "OpenCode (dead)", bin: STUB_BIN });
+  db.harnesses.setEnabled("opencode-dead", true);
+  const task = await newTask({ agent: "opencode-dead", prompt: "hi" });
+  await start(task);
+  await settled(task.id);
+  expect(serverMod.getOpencodeServer("opencode-dead")).not.toBeNull();
+  // The host dies behind the manager's back (only this harness's server).
+  const hostPid = (JSON.parse(readFileSync(serverMod.__forTest.statePath("opencode-dead"), "utf8")) as { hostPid: number }).hostPid;
+  process.kill(hostPid, "SIGKILL");
+  await sleep(300);
+  const stopped = await orch.runOpencodeIdleSweep(Date.now());
+  expect(stopped).toContain("opencode-dead");
+  expect(serverMod.getOpencodeServer("opencode-dead")).toBeNull();
+});
+
+test("quit: the before-quit decision stops idle servers synchronously; a hand-over to the background host and busy servers are left alone", async () => {
   const task = await newTask({ prompt: "again" });
   await start(task);
   await settled(task.id);
   expect(serverMod.getOpencodeServer("opencode")).not.toBeNull();
-  await orch.stopIdleOpencodeServersOnRealQuit();
+  await orch.runOpencodeIdleSweep(Date.now()); // the quit can't probe: it uses the last probe's answer
+  // A hand-over (background host armed, not "quit completely") leaves every server running.
+  expect(orch.stopOpencodeServersOnQuit({ completely: false, backgroundArmed: true })).toEqual([]);
+  expect(serverMod.getOpencodeServer("opencode")).not.toBeNull();
+  // A real quit with a card open: busy, untouched.
+  const busy = await newTask({ prompt: `do it ${fakeMarkers.permission}`, mode: "ask" });
+  await start(busy);
+  await waitFor(() => pending(busy.id).length === 1, 30_000, "the permission card");
+  expect(orch.stopOpencodeServersOnQuit({ completely: false, backgroundArmed: false })).toEqual([]);
+  expect(serverMod.getOpencodeServer("opencode")).not.toBeNull();
+  interactions.answerOpencodePermission(pending(busy.id)[0]!.id, { decision: "once" });
+  await settled(busy.id);
+  // A real quit, idle: stopped before the call returns (no await: the process exits right after).
+  const stopped = orch.stopOpencodeServersOnQuit({ completely: false, backgroundArmed: false });
+  expect(stopped).toEqual(["opencode"]);
   expect(serverMod.getOpencodeServer("opencode")).toBeNull();
-  // A follow-up on the same session starts a fresh server and resumes (the fake server keeps no state across restarts: fresh session).
+  // "Quit completely" stops them even with the background host armed.
+  const again = await newTask({ prompt: "once more" });
+  await start(again);
+  await settled(again.id);
+  expect(orch.stopOpencodeServersOnQuit({ completely: true, backgroundArmed: true })).toEqual(["opencode"]);
+  expect(serverMod.getOpencodeServer("opencode")).toBeNull();
+  // The next turn starts a new server.
   const task2 = await newTask({ prompt: "after the quit" });
   const runId = await start(task2);
   await settled(task2.id);

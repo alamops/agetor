@@ -72,7 +72,6 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       const ref = args[1];
       if (!ref) throw usageError("profile edit");
       const f = parseAgentProfileFlags(args.slice(2));
-      if (f.opencodeServerIgnored) warnOpencodeServerFlagIgnored();
       const hasAnyFlag =
         f.name !== undefined ||
         f.harness !== undefined ||
@@ -85,14 +84,16 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
         f.instructionsFile !== undefined ||
         f.skills.length > 0 ||
         f.clearSkills;
-      if (!hasAnyFlag) {
-        // An old script whose only flag was the retired one still succeeds.
-        if (f.opencodeServerIgnored) return;
+      if (!hasAnyFlag && !f.opencodeServerIgnored) {
         throw new Error(
           "nothing to edit — pass at least one of --name/--harness/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--instructions/--instructions-file/--skill/--clear-skills",
         );
       }
       const profile = await resolveProfile(client, ref);
+      // After the ref resolved, so a typo'd ref is still an error. An old
+      // script whose only flag was the retired one then succeeds.
+      if (f.opencodeServerIgnored) warnOpencodeServerFlagIgnored();
+      if (!hasAnyFlag) return;
       const instructions = await resolveInstructions(f);
       const patch: Partial<AgentProfileInput> = {};
       if (f.name !== undefined) patch.name = f.name;
