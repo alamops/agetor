@@ -34,6 +34,14 @@ Live facts the server driver (`docs/plans/opencode-server-driver.md`) and its do
 - **Reject with a message**: the tool fails with `permission.rejected` and the model continues. **Reject without a message**: `tool.failed{aborted}` → `step.failed` → `execution.interrupted{reason:"shutdown"}` — the turn stops.
 - Questions arrive as `form.created{metadata.kind:"question"}`. `POST …/form/{fid}/reply {answer:{}}` (empty) → 204, the model continues ("you gave no answer"). `DELETE …/form/{fid}?message=…` → the tool fails with the message and the model continues. `DELETE` without a message → `execution.interrupted`.
 
+## Reject, duplicate ids and cancelled children (r2 spike, 2026-11-03)
+
+Checked live on 2.1.3 and in the bundled source (`strings` on the Homebrew binary).
+
+- The permission reply handler is `reply === "reject" → message ? CorrectedError{feedback} : DeclinedError`. `{decision:"reject", message:""}` → 204, then `tool.failed{type:"aborted","The user declined this tool call"}`, `step.failed`, `execution.interrupted{reason:"shutdown"}` (same as omitting it). `message:" "` → `tool.failed{type:"permission.rejected", message:" "}` and the model continues in a new step; the provider only rewrites an exactly-empty error value. One reject also rejects every other pending permission of that session with the same message. The reply body is `{decision: once|always|reject, message?: string|null}` (no other field). A session rule with effect `deny` removes the tool from the model's tool list entirely; the shell tool's action name is `shell`.
+- Prompt ids must start with `msg_` (else 400 `InvalidRequestError`). Re-posting the same id on the same session is idempotent: 200 with the original record, the text is delivered once (a replay after the turn went idle runs an empty execution unless `resume:false`). The same id on another session → 409 `ConflictError` "Prompt message ID conflicts with an existing durable record".
+- `POST /api/session/{child}/interrupt` on a background subagent → child `execution.interrupted{reason:"user"}`, then the parent gets `session.inbox.enqueued{item:{type:"synthetic", payload:{text:"<subagent … state=\"cancelled\" …>\nSubagent cancelled\n</subagent>", metadata:{source:"subagent", childID, agent, state:"cancelled"}}}}` and a new execution. Interrupting the parent returns `{interrupted:false}` when it is idle and never touches its children. Subagent states: `completed`, `error`, `cancelled`.
+
 ## Subagents and wakes
 
 - The `subagent` tool creates a child session (`session.created{parentID}`); child events carry only the child's id on the same stream.
