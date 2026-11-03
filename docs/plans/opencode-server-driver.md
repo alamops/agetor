@@ -7,7 +7,7 @@
 | Config | AGENTS_CONFIG.yml (balanced; host claude_code) |
 | Flags | none |
 | Gates | grilled by owner (2 passes, 6 decisions); plan approved by owner 2026-11-03; one orchestrator amendment (D4 Plan-mode cards) |
-| Status | wave 1 landed (8885b0d0); wave 2 in progress |
+| Status | waves 1–4 landed; Phase 5 review fix round in progress |
 | Branch | `fix/fix-opencode-insufficient-funds` (kept: agetor worktree is bound to it) |
 | Base SHA | `9b581445` (after W0a, the Zen/Go label fix) |
 
@@ -152,6 +152,8 @@ Blast radius: every OpenCode v2 task; agent profiles/pipelines using OpenCode (f
 ## 8. Open questions / assumptions
 
 Owner decisions (grill, 2026-11-03): approach = full HTTP client (over steering-on-tmux and ACP); servers = one per harness, Shared/Standalone retired; v1 = keep tmux driver; modes = Auto + Ask + Plan; server wake = new run, card to Running; Skip/Reject = optional user-typed reason, empty sends no text; server stop = 30 min idle + quit when idle.
+
+Orchestrator decisions taken in the Phase-5 fix round (reversible; raise with the owner): O1 — a user Stop (or delete/archive/agent switch) also interrupts background subagents and blocks server wakes for that task until the user's next start or message; O2 — a wake never pulls a card out of Done, Backlog or Blocked; O3 — a real stop of a headless core (`agetor daemon stop`, a CLI daemon's idle exit) stops idle servers like an app quit; a handoff does not; O4 — the quit-time stop is synchronous (tmux kill of idle servers) because Electrobun exits before async work runs. Live evidence for every OpenCode fact: `docs/plans/opencode-server-driver-spikes.md`.
 
 Unratified (raise with the owner): U1 — empty Reject stops the turn (D5; live fact contradicts the grill copy). U2 — Plan-mode asks show as cards (D4 amendment).
 
