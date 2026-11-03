@@ -1471,4 +1471,19 @@ if (import.meta.main) {
   };
   process.on("SIGTERM", quit);
   process.on("SIGINT", quit);
+  // A test double must not outlive whoever started it: the direct test host
+  // (AGETOR_OPENCODE_SERVER_HOST=direct) spawns this as a child of the bun
+  // test process or an e2e backend, and when that process exits without
+  // stopping it the child was re-parented to launchd and ran forever. Exit as
+  // soon as the parent changes (under tmux the parent is the tmux server, so a
+  // kill-session/kill-server ends it too).
+  // (Bun caches process.ppid, so probe the original parent pid instead.)
+  const parent = process.ppid;
+  setInterval(() => {
+    try {
+      process.kill(parent, 0);
+    } catch {
+      quit();
+    }
+  }, 1000);
 }

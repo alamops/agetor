@@ -7,7 +7,7 @@
 | Config | AGENTS_CONFIG.yml (balanced; host claude_code) |
 | Flags | none |
 | Gates | grilled by owner (2 passes, 6 decisions); plan approved by owner 2026-11-03; one orchestrator amendment (D4 Plan-mode cards) |
-| Status | waves 1–4 landed; Phase 5 review fix round in progress |
+| Status | tests green (2026-11-03): typecheck; bun src/bun 6699 pass / 2 pre-existing fail; src/shared+mainview 3706/0; src/cli 1005/0; e2e 412/413 (1 pre-existing); OpenCode e2e 15/15 |
 | Branch | `fix/fix-opencode-insufficient-funds` (kept: agetor worktree is bound to it) |
 | Base SHA | `9b581445` (after W0a, the Zen/Go label fix) |
 
