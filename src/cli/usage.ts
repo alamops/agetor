@@ -126,10 +126,11 @@ export const USAGE: Record<string, string> = {
 
   attach: `usage: agetor attach <task-id>
 
-  Attach your terminal to the task's live tmux session (every tmux-hosted
-  agent kind; fx has none). For the one-shot kinds — codex, cursor, gemini,
-  antigravity and opencode — it exists only while a turn is in flight.
-  Detach with Ctrl-b d.`,
+  Attach your terminal to the task's live tmux session. claude-code keeps one
+  for the whole task; for the one-shot kinds — codex, gemini, antigravity,
+  copilot and an OpenCode 1.x turn — it exists only while a turn is in flight.
+  fx, cursor and an OpenCode 2.x turn (it runs on the agetor-managed OpenCode
+  server) have none. Detach with Ctrl-b d.`,
 
   shell: `usage: agetor shell <task-id> [--print]
 

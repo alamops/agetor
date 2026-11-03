@@ -6,7 +6,7 @@
 | Source | Owner conversation 2026-11-02/03 ("let's make it now, acp brings the flexibility of responding while the agent is working"); grill answers recorded in §8 |
 | Config | AGENTS_CONFIG.yml (balanced; host claude_code) |
 | Flags | none |
-| Gates | grilled by owner (2 passes, 6 decisions); plan approved by owner 2026-11-03; one orchestrator amendment (D4 Plan-mode cards) |
+| Gates | grilled by owner (2 passes, 7 decisions; owner decisions R1–R4 after the first review, §8); plan approved by owner 2026-11-03; one orchestrator amendment (D4 Plan-mode cards) |
 | Status | second review fixed (45329f2b, c9553a91); full suite green 2026-11-03: typecheck; bun src/bun 6795 pass / 2 pre-existing; src/shared+mainview 3710/0; src/cli 1014/0; e2e 412 pass incl. OpenCode 15/15 (1 pre-existing: harness-auto-enable:64) |
 | Branch | `fix/fix-opencode-insufficient-funds` (kept: agetor worktree is bound to it) |
 | Base SHA | `9b581445` (after W0a, the Zen/Go label fix) |
@@ -131,7 +131,7 @@ Risk tags pick build-rules sections. "Wired by" names the production caller.
 | 4 | T11, T13 | typecheck + full unit suite; wiring audit |
 | 5 | Phase 5 review → 6 tests → 7 run → 8 fix | green |
 
-One PR (repo precedent for feature-sized harness changes, e.g. #285/#286), reviewable by wave commits. Expected size: ~3.5–5k changed lines incl. tests. Actual: about 20k changed lines (100 files, ~22k added) including tests and docs, after the review rounds.
+One PR (repo precedent for feature-sized harness changes, e.g. #285/#286), reviewable by wave commits. Expected size: ~3.5–5k changed lines incl. tests. Actual, after three review rounds and including tests and docs: about 27.5k changed lines in 108 files (about 26.5k added, 1.1k removed; `git diff --shortstat 83e2dc5e` with the working tree, 2026-11-03).
 
 ## 7. Invariants, runtime shape & risks
 
@@ -162,6 +162,7 @@ Owner decisions after the /code-review of ffba5cb1 (2026-11-03), superseding U1,
 - **R3 (replaces O1's wake block and O2):** a server wake is never refused because the user stopped the task or because the card is parked in Done, Backlog or Blocked: the wake goes through as an `origin:"agent"` run and pulls the card back to Running. Stop still interrupts the root and its background subagents (O1's interrupt half stands). A wake for a task that no longer exists, is archived or being torn down, or whose harness/transport changed has no card to pull back: agetor interrupts that execution instead (bounded, best effort), so nothing runs unattended.
 - **R1 mechanism (r2 spike):** OpenCode continues a rejected tool only when the reply carries a truthy `message`; `""`, `null` and an omitted message all decline and stop the turn. An empty Reject therefore sends `message: " "` (one space): the tool fails with `permission.rejected` and the model continues, seeing only the space. It is the only machine-added byte in any reply, and carries no words.
 - **R4 (Stop's tail):** interrupting a background subagent makes OpenCode wake its parent with a `state="cancelled"` subagent message, and interrupting the parent never reaches the children (r2 spike). A wake whose trigger is the cancellation of a child that agetor itself interrupted for a Stop is the tail of that Stop, not a new turn: agetor interrupts it instead of minting a run. Every other wake goes through (R3).
+- **R3 correction (r3 spike, 2026-11-03; flagged for the owner's awareness):** the wake code written for R3 assumed that a message steered into a turn just before a Stop starts a new execution once the interrupt lands, and treated that execution as new work. Live, it does not: OpenCode parks input an interrupt left pending, with no event, until the next prompt's execution delivers it first. Agetor now takes its own parked steers back out of the inbox after a Stop (only when it can confirm the removal; otherwise they stay parked and go in with the next prompt) and puts them at the front of the task's follow-up queue as the next turn, following the existing rule that a message typed during a Stop becomes the next turn (a stopped pipeline step stashes them to its backlog). R4 is now judged from the execution's whole pending input rather than the last synthetic item, and the note of a child agetor stopped is durable for 24 h (migration 082).
 - O3 and O4 stand.
 
 Assumptions verified live in wave 1 (T4, all confirmed — transcripts in the session scratchpad `spikes/t4-verify/`):

@@ -60,10 +60,10 @@ export function opencodeServerTurnAttachError(
 /**
  * Attach the current terminal to a task's live tmux session — the
  * in-terminal equivalent of the app's "Open in tmux". Every tmux-hosted
- * agent kind runs in a per-task tmux session (fx alone is a plain child
- * process with none): claude-code's lives for the whole task, while for the
- * turn-only kinds — codex, cursor, gemini and antigravity — it exists only
- * while a turn is in flight (each turn is a fresh one-shot session). The
+ * agent kind runs in a per-task tmux session: claude-code's lives for the
+ * whole task, while for the turn-only kinds — codex, gemini, antigravity and
+ * copilot — it exists only while a turn is in flight (each turn is a fresh
+ * one-shot session). The
  * kinds without one: fx and cursor (child processes speaking ACP), and an
  * OpenCode 2.x turn, which runs on the agetor-managed OpenCode server
  * ({@link opencodeServerTurnAttachError}); an OpenCode 1.x (`opencode run`)
