@@ -7,7 +7,7 @@
 | Config | AGENTS_CONFIG.yml (balanced; host claude_code) |
 | Flags | none |
 | Gates | grilled by owner (2 passes, 7 decisions; owner decisions R1–R4 after the first review, §8); plan approved by owner 2026-11-03; one orchestrator amendment (D4 Plan-mode cards) |
-| Status | second review fixed (45329f2b, c9553a91); full suite green 2026-11-03: typecheck; bun src/bun 6795 pass / 2 pre-existing; src/shared+mainview 3710/0; src/cli 1014/0; e2e 412 pass incl. OpenCode 15/15 (1 pre-existing: harness-auto-enable:64) |
+| Status | third review fixed (233394aa, 2f057ec6, 96baa062, f4960d1f, a9c6d3e1; r3 live spike in the spikes doc); suite 2026-11-03: typecheck clean; bun src/bun 6874 pass / 2 pre-existing (background.test C3 reconcile); src/shared+mainview 3702/0; src/cli 1014/0; e2e 408 pass, 1 load flake (at-file-autocomplete:616, passes on rerun with the OpenCode specs, 29/29), 4 skipped behind it |
 | Branch | `fix/fix-opencode-insufficient-funds` (kept: agetor worktree is bound to it) |
 | Base SHA | `9b581445` (after W0a, the Zen/Go label fix) |
 
