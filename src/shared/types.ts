@@ -4354,8 +4354,9 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: OPENCODE_DEFAULT_MODEL, label: "OpenCode default", hint: "Use the model configured in OpenCode (no -m)", pinned: true },
     ],
     modes: [
-      { id: "auto", label: "Auto", hint: "Build agent; approves every tool call (--auto)" },
-      { id: "plan", label: "Plan", hint: "OpenCode's Plan agent: no file edits, but shell commands still run; permission asks are rejected" },
+      { id: "auto", label: "Auto", hint: "Build agent; approves every tool call" },
+      { id: "ask", label: "Ask", hint: "Build agent; every tool call waits for your approval on a card (OpenCode 2)" },
+      { id: "plan", label: "Plan", hint: "OpenCode's Plan agent: no file edits; anything it still asks to do shows as a card" },
     ],
     // Variants are discovered per model; `supportedEfforts` adds any variant
     // id outside EFFORT_OPTIONS as a synthesized row (D-6).
@@ -4491,8 +4492,11 @@ export interface Run {
    * `"auto-resume"` = an fx continue-recovery run the auto-resume timer
    * started (`resumeFxRecovery` with `origin: "auto"`) — no user action; a
    * manual Resume stays `null`. Same column, a new value.
+   * `"agent"` = OpenCode started an execution on the task's session by itself
+   * (e.g. a background subagent finished) and agetor recorded it as a run
+   * (plan D7). Same column, a new value.
    */
-  origin?: "continuation" | "imported" | "auto-resume" | null;
+  origin?: "continuation" | "imported" | "auto-resume" | "agent" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

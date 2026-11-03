@@ -1,11 +1,12 @@
 import { runs, subagents, type AppendedEvent } from "./db.ts";
-import type { OpencodeServerMode, RunEvent, RunEventStream, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
+import type { RunEvent, RunEventStream, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
 import type { OpencodeSubagentNotice } from "./opencode-tmux.ts";
 import { exportOutcome, exportToEvents, runOpencodeExport, type OpencodeExport } from "./opencode-export.ts";
 import {
   opencodeChildrenDieWithTurn,
   opencodeTurnBreadcrumbPrefix,
   parseOpencodeTurnBreadcrumb,
+  type OpencodeTurnServer,
 } from "../shared/opencode.ts";
 
 /**
@@ -176,7 +177,7 @@ function label(row: Subagent): string {
  * `task.opencodeServer` may have changed since and a boot has no memory of
  * the launch. Null when the run has no such line (or the read fails).
  */
-export function opencodeTurnOfRun(runId: string | null): { major: 1 | 2; server: OpencodeServerMode | null } | null {
+export function opencodeTurnOfRun(runId: string | null): { major: 1 | 2; server: OpencodeTurnServer | null } | null {
   if (!runId) return null;
   try {
     // Per-major prefixes: `LIKE` is case-insensitive, and a bare `opencode `

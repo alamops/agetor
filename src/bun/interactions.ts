@@ -81,6 +81,9 @@ export interface AskQuestion {
    *  `Chat about this`), where typed characters would act as hotkeys; absent
    *  means unknown / the normal layout. */
   hasTypeRow?: boolean;
+  /** OpenCode cards only: whether this field accepts typed free text next to
+   *  (or instead of) its options. Absent on every other source. */
+  allowCustom?: boolean;
 }
 
 export interface AskQuestionsRequest {
@@ -101,9 +104,10 @@ export interface AskQuestionsRequest {
    * How the answer is delivered. `"scraper"` is Claude's pane modal
    * (keystrokes via `planAskAnswers` + `driveAskAnswers`). `"cursor"` is an
    * ACP `cursor/ask_question` awaiter: the answer route resolves the promise
-   * instead of sending keys.
+   * instead of sending keys. `"opencode"` is an OpenCode v2 form: the answer
+   * route resolves the driver's awaiter and the driver replies to the server.
    */
-  source?: "scraper" | "cursor";
+  source?: "scraper" | "cursor" | "opencode";
   /** Cursor tool title (`args.title`). Omitted when the call set none. */
   title?: string;
   /** Raw Cursor tool-call id. Stored for the row key; never a URL segment. */
@@ -120,6 +124,11 @@ export interface AskQuestionsRequest {
   /** Pane fingerprint — used by the scraper for two-tick stability, dup
    *  suppression, and auto-cancel when the modal leaves the pane. */
   fingerprint?: string;
+  /** OpenCode cards only: true when at least one field takes typed free text
+   *  (each question carries its own `allowCustom`). */
+  allowCustom?: boolean;
+  /** OpenCode cards only: Skip may carry a reason the user types. */
+  allowReason?: boolean;
 }
 
 /** What a Cursor ask promise resolves to. The driver turns this into the
@@ -297,7 +306,12 @@ export interface FxPermissionRequest {
    *  first place — `yolo` auto-allows and never reaches this registry.
    *  Carried through so the UI can tailor copy without having to re-derive
    *  it from the task row. */
-  mode: "auto" | "ask";
+  mode: "auto" | "ask" | "plan";
+  /** Which harness raised the card. Absent means fx (every card that
+   *  predates OpenCode). */
+  harness?: "fx" | "opencode";
+  /** OpenCode cards only: Reject may carry a reason the user types. */
+  allowReason?: boolean;
 }
 
 /** `{ optionId }` echoes the user's pick straight back to fx's
@@ -321,6 +335,13 @@ interface AskQuestionsEntry {
   resolve: (answer: AskQuestionsAnswer) => void;
   resolveCursor?: (answer: CursorAskAnswer) => void;
   cursorAnswer?: Promise<CursorAskAnswer>;
+  /** OpenCode cards only. `key` is the `opencodeAskByForm` index key. */
+  opencode?: {
+    key: string;
+    fields: OpencodeAskField[];
+    resolve: (answer: OpencodeAskAnswer) => void;
+    answer: Promise<OpencodeAskAnswer>;
+  };
 }
 interface TmuxPromptEntry {
   req: TmuxPromptRequest;
@@ -328,7 +349,15 @@ interface TmuxPromptEntry {
 }
 interface FxPermissionEntry {
   req: FxPermissionRequest;
+  /** For an OpenCode card this maps the fx-shaped answer onto the OpenCode
+   *  one, so `cancelPendingForTask` settles both kinds through one call. */
   resolve: (answer: FxPermissionAnswer) => void;
+  /** OpenCode cards only. `key` is the `opencodePermByRequest` index key. */
+  opencode?: {
+    key: string;
+    resolve: (answer: OpencodePermissionAnswer) => void;
+    answer: Promise<OpencodePermissionAnswer>;
+  };
 }
 
 const askQuestions = new Map<string, AskQuestionsEntry>();
@@ -340,6 +369,27 @@ function cursorAskKey(taskId: string, toolCallId: string): string {
 }
 const tmuxPrompts = new Map<string, TmuxPromptEntry>();
 const fxPermissions = new Map<string, FxPermissionEntry>();
+/** `taskId + OpenCode request id` → permission card id. A second register returns the card already here. */
+const opencodePermByRequest = new Map<string, string>();
+/** `taskId + OpenCode form id` → ask card id. A second register returns the card already here. */
+const opencodeAskByForm = new Map<string, string>();
+
+function opencodeKey(taskId: string, serverId: string): string {
+  return `${taskId}\0${serverId}`;
+}
+
+/** Every removal of a permission card goes through here so the OpenCode
+ *  request index never outlives its card. */
+function deleteFxPermission(id: string, entry: FxPermissionEntry): void {
+  fxPermissions.delete(id);
+  if (entry.opencode) opencodePermByRequest.delete(entry.opencode.key);
+}
+
+/** Same for ask cards and the OpenCode form index. */
+function deleteAskEntry(id: string, entry: AskQuestionsEntry): void {
+  askQuestions.delete(id);
+  if (entry.opencode) opencodeAskByForm.delete(entry.opencode.key);
+}
 
 /**
  * `"register"` is a new card (also raises the app-level pending alert).
@@ -870,7 +920,11 @@ export function registerFxPermission(args: {
 export function answerFxPermission(id: string, answer: FxPermissionAnswer): boolean {
   const entry = fxPermissions.get(id);
   if (!entry) return false;
-  fxPermissions.delete(id);
+  // An OpenCode card takes only its own three decisions (or a cancel); the
+  // route uses `answerOpencodePermission`, this guard keeps any other caller
+  // from settling it with an id OpenCode never offered.
+  if (entry.opencode && !("cancelled" in answer) && !isOpencodeDecision(answer.optionId)) return false;
+  deleteFxPermission(id, entry);
   entry.resolve(answer);
   fanoutResolved(entry.req);
   return true;
@@ -881,6 +935,322 @@ export function answerFxPermission(id: string, answer: FxPermissionAnswer): bool
  *  resolving the driver's awaiter. */
 export function findFxPermissionById(id: string): FxPermissionRequest | null {
   return fxPermissions.get(id)?.req ?? null;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * OpenCode v2 permission requests and question forms.
+ *
+ * The OpenCode server owns the pending request; agetor mirrors it as a card so
+ * the user can answer from the board. Nothing here is persisted: the server is
+ * the source of truth and the driver re-registers each still-pending request
+ * after a restart, which is why registration is idempotent per
+ * (taskId, server id). Permission cards share the fx card and its map (the
+ * same sweep, counts and UI); forms share the ask-questions card.
+ *
+ * Words: the only strings that ever reach the model through these cards are
+ * option values and what the user typed (`normalizeReplyText`). Cancel and
+ * Skip-without-reason carry no text at all.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Longest reason or free-text answer the answer routes accept, in chars
+ *  after trimming. */
+export const OPENCODE_REPLY_TEXT_MAX = 4096;
+
+export type OpencodePermissionDecision = "once" | "always" | "reject";
+
+export type OpencodePermissionAnswer =
+  | { decision: OpencodePermissionDecision; message?: string }
+  | { cancelled: true };
+
+export function isOpencodeDecision(v: unknown): v is OpencodePermissionDecision {
+  return v === "once" || v === "always" || v === "reject";
+}
+
+/** Exactly what OpenCode offers for a permission request. */
+function opencodePermissionOptions(): FxPermissionOption[] {
+  return [
+    { optionId: "once", name: "Allow once", kind: "allow_once" },
+    { optionId: "always", name: "Always allow", kind: "allow_always" },
+    { optionId: "reject", name: "Reject", kind: "reject_once" },
+  ];
+}
+
+/** Validate a user-typed reason or free-text answer. Trimmed; empty means
+ *  "none given"; over the cap or not a string is refused. Never rewritten. */
+export function normalizeReplyText(
+  value: unknown,
+  label: string,
+): { ok: true; text: string | undefined } | { ok: false; error: string } {
+  if (value === undefined) return { ok: true, text: undefined };
+  if (typeof value !== "string") return { ok: false, error: `${label} must be a string` };
+  const text = value.trim();
+  if (text.length > OPENCODE_REPLY_TEXT_MAX) {
+    return { ok: false, error: `${label} is too long (max ${OPENCODE_REPLY_TEXT_MAX} characters)` };
+  }
+  return { ok: true, text: text.length > 0 ? text : undefined };
+}
+
+export function registerOpencodePermission(args: {
+  taskId: string;
+  runId: string;
+  sessionId: string;
+  requestId: string;
+  toolCall: FxPermissionToolCall;
+  mode: "ask" | "plan";
+}): { id: string; req: FxPermissionRequest; answer: Promise<OpencodePermissionAnswer> } {
+  const key = opencodeKey(args.taskId, args.requestId);
+  const existingId = opencodePermByRequest.get(key);
+  if (existingId) {
+    const existing = fxPermissions.get(existingId);
+    if (existing?.opencode) return { id: existingId, req: existing.req, answer: existing.opencode.answer };
+  }
+  const id = randomUUID();
+  const req: FxPermissionRequest = {
+    kind: "fx_permission",
+    id,
+    taskId: args.taskId,
+    runId: args.runId,
+    ...pipelineParentFor(args.taskId),
+    createdAt: Date.now(),
+    toolCall: args.toolCall,
+    options: opencodePermissionOptions(),
+    mode: args.mode,
+    harness: "opencode",
+    allowReason: true,
+  };
+  let resolveOpencode!: (answer: OpencodePermissionAnswer) => void;
+  const answer = new Promise<OpencodePermissionAnswer>((resolve) => {
+    resolveOpencode = resolve;
+  });
+  const entry: FxPermissionEntry = {
+    req,
+    resolve: (a) => {
+      if ("cancelled" in a) resolveOpencode({ cancelled: true });
+      else if (isOpencodeDecision(a.optionId)) resolveOpencode({ decision: a.optionId });
+      else resolveOpencode({ cancelled: true });
+    },
+    opencode: { key, resolve: resolveOpencode, answer },
+  };
+  fxPermissions.set(id, entry);
+  opencodePermByRequest.set(key, id);
+  try {
+    broadcast(req);
+  } catch (err) {
+    deleteFxPermission(id, entry);
+    try {
+      fanoutResolved(req);
+    } catch {
+      /* the original broadcast error is authoritative */
+    }
+    throw err;
+  }
+  return { id, req, answer };
+}
+
+/** Settle an OpenCode permission card with the user's decision. Returns false
+ *  when the id is unknown, already settled, or not an OpenCode card. */
+export function answerOpencodePermission(id: string, answer: OpencodePermissionAnswer): boolean {
+  const entry = fxPermissions.get(id);
+  if (!entry?.opencode) return false;
+  deleteFxPermission(id, entry);
+  entry.opencode.resolve(answer);
+  fanoutResolved(entry.req);
+  return true;
+}
+
+export type OpencodeAskAnswer =
+  | { outcome: "answered"; answer: Record<string, string | string[]> }
+  | { outcome: "skipped"; message?: string }
+  | { outcome: "cancelled" };
+
+export interface OpencodeAskField {
+  key: string;
+  question: string;
+  header?: string;
+  multiple: boolean;
+  custom: boolean;
+  options: Array<{ value: string; label: string; description?: string }>;
+}
+
+export function registerOpencodeAskQuestions(args: {
+  taskId: string;
+  runId: string;
+  sessionId: string;
+  formId: string;
+  title?: string;
+  fields: OpencodeAskField[];
+}): { id: string; req: AskQuestionsRequest; answer: Promise<OpencodeAskAnswer> } {
+  const key = opencodeKey(args.taskId, args.formId);
+  const existingId = opencodeAskByForm.get(key);
+  if (existingId) {
+    const existing = askQuestions.get(existingId);
+    if (existing?.opencode) return { id: existingId, req: existing.req, answer: existing.opencode.answer };
+  }
+  const fields = args.fields.map((f) => ({ ...f, options: f.options.map((o) => ({ ...o })) }));
+  const questions: AskQuestion[] = fields.map((f) => ({
+    id: f.key,
+    question: f.question,
+    ...(f.header !== undefined ? { header: f.header } : {}),
+    multiSelect: f.multiple,
+    allowCustom: f.custom,
+    options: f.options.map((o) => ({
+      id: o.value,
+      label: o.label,
+      ...(o.description !== undefined ? { description: o.description } : {}),
+    })),
+  }));
+  const title = typeof args.title === "string" && args.title.length > 0 ? args.title : undefined;
+  const id = randomUUID();
+  const req: AskQuestionsRequest = {
+    kind: "ask_questions",
+    id,
+    taskId: args.taskId,
+    runId: args.runId,
+    ...pipelineParentFor(args.taskId),
+    questions,
+    createdAt: Date.now(),
+    source: "opencode",
+    delivery: "live",
+    allowCustom: fields.some((f) => f.custom),
+    allowReason: true,
+    ...(title !== undefined ? { title } : {}),
+  };
+  let resolveOpencode!: (answer: OpencodeAskAnswer) => void;
+  const answer = new Promise<OpencodeAskAnswer>((resolve) => {
+    resolveOpencode = resolve;
+  });
+  const entry: AskQuestionsEntry = {
+    req,
+    resolve: () => { /* opencode: the awaiter is opencode.resolve */ },
+    opencode: { key, fields, resolve: resolveOpencode, answer },
+  };
+  askQuestions.set(id, entry);
+  opencodeAskByForm.set(key, id);
+  try {
+    broadcast(req);
+  } catch (err) {
+    deleteAskEntry(id, entry);
+    try {
+      fanoutResolved(req);
+    } catch {
+      /* the original broadcast error is authoritative */
+    }
+    throw err;
+  }
+  return { id, req, answer };
+}
+
+/** The fields an OpenCode ask card was registered with (the answer route
+ *  validates against these, not against what the client says). */
+export function getOpencodeAskFields(id: string): OpencodeAskField[] | null {
+  return askQuestions.get(id)?.opencode?.fields ?? null;
+}
+
+/** Settle an OpenCode ask card. Returns false when the id is unknown, already
+ *  settled, or not an OpenCode card. */
+export function answerOpencodeAsk(id: string, answer: OpencodeAskAnswer): boolean {
+  const entry = askQuestions.get(id);
+  if (!entry?.opencode) return false;
+  deleteAskEntry(id, entry);
+  entry.opencode.resolve(answer);
+  fanoutResolved(entry.req);
+  return true;
+}
+
+/** The server already settled these (a `permission.replied`, `form.replied` or
+ *  `form.cancelled` seen on the stream, for instance because another client
+ *  answered). Close the cards and release the awaiters with a cancellation;
+ *  the driver must not reply to a request the server no longer holds. */
+export function resolveOpencodeCardsForRequest(
+  taskId: string,
+  ids: { requestId?: string; formId?: string },
+): void {
+  if (ids.requestId !== undefined) {
+    const id = opencodePermByRequest.get(opencodeKey(taskId, ids.requestId));
+    const entry = id ? fxPermissions.get(id) : undefined;
+    if (id && entry?.opencode) {
+      deleteFxPermission(id, entry);
+      entry.opencode.resolve({ cancelled: true });
+      fanoutResolved(entry.req);
+    }
+  }
+  if (ids.formId !== undefined) {
+    const id = opencodeAskByForm.get(opencodeKey(taskId, ids.formId));
+    const entry = id ? askQuestions.get(id) : undefined;
+    if (id && entry?.opencode) {
+      deleteAskEntry(id, entry);
+      entry.opencode.resolve({ outcome: "cancelled" });
+      fanoutResolved(entry.req);
+    }
+  }
+}
+
+type OpencodeAskBodyAnswer = { selected?: unknown; selectedOptionIds?: unknown; custom?: unknown };
+
+function stringArray(v: unknown): string[] | null {
+  if (v === undefined) return [];
+  if (!Array.isArray(v)) return null;
+  return v.every((s) => typeof s === "string") ? (v as string[]) : null;
+}
+
+/** Turn the answer route's `answers` into OpenCode's `{key: value | values}`
+ *  record. Every string in the result is an option value from the card or
+ *  text the user typed. Option ids win over labels; a label maps to its
+ *  value. A field with no usable answer, an unknown option, free text on a
+ *  field that does not take it, or an ambiguous single-select is refused. */
+export function opencodeAskAnswerFromBody(
+  fields: OpencodeAskField[],
+  answers: unknown,
+): { ok: true; answer: Record<string, string | string[]> } | { ok: false; error: string } {
+  const list = answers === undefined ? [] : answers;
+  if (!Array.isArray(list)) return { ok: false, error: "answers must be an array" };
+  if (list.length !== fields.length) {
+    return { ok: false, error: "answers required: one entry per question" };
+  }
+  const entries: Array<[string, string | string[]]> = [];
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]!;
+    const raw = list[i];
+    const a: OpencodeAskBodyAnswer = raw !== null && typeof raw === "object" ? (raw as OpencodeAskBodyAnswer) : {};
+    const labels = stringArray(a.selected);
+    const ids = stringArray(a.selectedOptionIds);
+    if (labels === null || ids === null) return { ok: false, error: `invalid answer for "${field.key}"` };
+    const typed = normalizeReplyText(a.custom, "custom answer");
+    if (!typed.ok) return typed;
+    if (typed.text !== undefined && !field.custom) {
+      return { ok: false, error: `"${field.key}" does not accept a typed answer` };
+    }
+    let values: string[];
+    if (ids.length > 0) {
+      values = ids;
+      for (const v of values) {
+        if (!field.options.some((o) => o.value === v)) return { ok: false, error: `unknown option for "${field.key}"` };
+      }
+    } else {
+      values = [];
+      for (const label of labels) {
+        const match = field.options.find((o) => o.label === label);
+        if (!match) return { ok: false, error: `unknown option for "${field.key}"` };
+        values.push(match.value);
+      }
+    }
+    values = [...new Set(values)];
+    if (!field.multiple) {
+      if (values.length > 1) return { ok: false, error: `"${field.key}" takes one option` };
+      if (values.length === 1 && typed.text !== undefined) {
+        return { ok: false, error: `"${field.key}" takes an option or typed text, not both` };
+      }
+      const single = values[0] ?? typed.text;
+      if (single === undefined) return { ok: false, error: `answer required for "${field.key}"` };
+      entries.push([field.key, single]);
+    } else {
+      const many = typed.text !== undefined ? [...values, typed.text] : values;
+      if (many.length === 0) return { ok: false, error: `answer required for "${field.key}"` };
+      entries.push([field.key, many]);
+    }
+  }
+  // fromEntries defines own properties, so a field key like "__proto__" is data.
+  return { ok: true, answer: Object.fromEntries(entries) };
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -900,8 +1270,11 @@ export function findFxPermissionById(id: string): FxPermissionRequest | null {
 export function cancelPendingForTask(taskId: string, reason: string): void {
   for (const [id, entry] of askQuestions) {
     if (entry.req.taskId !== taskId) continue;
-    askQuestions.delete(id);
-    if (entry.resolveCursor) {
+    deleteAskEntry(id, entry);
+    if (entry.opencode) {
+      // No text of our own: the driver turns this into a dismissal.
+      entry.opencode.resolve({ outcome: "cancelled" });
+    } else if (entry.resolveCursor) {
       const toolCallId = entry.req.toolCallId;
       if (toolCallId) {
         cursorAskByTool.delete(cursorAskKey(taskId, toolCallId));
@@ -932,7 +1305,7 @@ export function cancelPendingForTask(taskId: string, reason: string): void {
   }
   for (const [id, entry] of fxPermissions) {
     if (entry.req.taskId !== taskId) continue;
-    fxPermissions.delete(id);
+    deleteFxPermission(id, entry);
     // Unblocks the fx-acp driver's awaiter — it answers fx's RPC with
     // `outcome: "cancelled"` instead of ever registering a resolved pick.
     entry.resolve({ cancelled: true });
@@ -978,6 +1351,7 @@ export function pendingCountsByTask(): Map<string, number> {
 
 /** Test-only handle for asserting the registry state. */
 export const __testing = {
+  opencodeIndexSizes: () => ({ perm: opencodePermByRequest.size, ask: opencodeAskByForm.size }),
   askQuestionsSize: () => askQuestions.size,
   tmuxPromptsSize: () => tmuxPrompts.size,
   fxPermissionsSize: () => fxPermissions.size,
@@ -989,6 +1363,8 @@ export const __testing = {
   reset() {
     askQuestions.clear();
     cursorAskByTool.clear();
+    opencodePermByRequest.clear();
+    opencodeAskByForm.clear();
     tmuxPrompts.clear();
     fxPermissions.clear();
   },

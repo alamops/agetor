@@ -68,6 +68,36 @@ export function effectiveOpencodeServer(a: {
 }
 
 /**
+ * The server a recorded turn ran against: the two stored {@link OpencodeServerMode}
+ * values the legacy v2 tmux path used, plus `"agetor"` (plan D9) for a turn
+ * that ran on the agetor-owned OpenCode server (the HTTP driver). Only the
+ * turn breadcrumb carries `"agetor"`; the stored `tasks.opencode_server` /
+ * `agent_profiles.opencode_server` field and every route that validates it
+ * stay on {@link OpencodeServerMode} (`shared` | `standalone`).
+ */
+export type OpencodeTurnServer = OpencodeServerMode | "agetor";
+
+/** How an OpenCode turn is carried: the agetor-owned HTTP server, or one-shot `opencode run` in tmux. */
+export type OpencodeTransport = "server" | "run";
+
+/**
+ * Which transport a turn uses (plan D-transport): v1 has no server API, so it
+ * always runs `opencode run`; `transportEnv` (the caller passes
+ * `process.env.AGETOR_OPENCODE_TRANSPORT`) set to `run` (trimmed,
+ * case-insensitive) is the kill switch back to `opencode run` on v2; anything
+ * else, an unparseable version included, takes the server. Pure: this module
+ * never reads `process.env`.
+ */
+export function opencodeTransportFor(a: {
+  version: string | null | undefined;
+  transportEnv?: string | null;
+}): OpencodeTransport {
+  if (opencodeMajor(a.version) === 1) return "run";
+  if ((a.transportEnv ?? "").trim().toLowerCase() === "run") return "run";
+  return "server";
+}
+
+/**
  * The model/effort argv for one `opencode run` (D-3, D-6):
  *  - the sentinel ({@link OPENCODE_DEFAULT_MODEL}) or a null model → `[]`
  *    (no `-m`, and so no effort either — a variant needs a model);
@@ -185,13 +215,13 @@ export function opencodeTurnBreadcrumbPrefix(major: 1 | 2): string {
 
 /**
  * D-19: the opening status line of every OpenCode turn —
- * `opencode <major>.x · server=<shared|standalone|n/a> · model=<label> ·
+ * `opencode <major>.x · server=<shared|standalone|agetor|n/a> · model=<label> ·
  * effort=<id> · mode=<id>`. `server` is the EFFECTIVE mode (`null` → `n/a`,
- * v1). {@link parseOpencodeTurnBreadcrumb} is its inverse for the head.
+ * v1; `agetor` = ran on the agetor-owned server, plan D9). {@link parseOpencodeTurnBreadcrumb} is its inverse for the head.
  */
 export function formatOpencodeTurnBreadcrumb(a: {
   major: 1 | 2;
-  server: OpencodeServerMode | null;
+  server: OpencodeTurnServer | null;
   modelLabel: string;
   effort: string;
   mode: string;
@@ -199,7 +229,7 @@ export function formatOpencodeTurnBreadcrumb(a: {
   return `${opencodeTurnBreadcrumbPrefix(a.major)}${a.server ?? "n/a"} · model=${a.modelLabel} · effort=${a.effort} · mode=${a.mode}`;
 }
 
-const TURN_BREADCRUMB_RE = /^opencode ([12])\.x · server=(shared|standalone|n\/a)(?: · |$)/;
+const TURN_BREADCRUMB_RE = /^opencode ([12])\.x · server=(shared|standalone|agetor|n\/a)(?: · |$)/;
 
 /**
  * The CLI line and effective server mode a {@link formatOpencodeTurnBreadcrumb}
@@ -207,18 +237,19 @@ const TURN_BREADCRUMB_RE = /^opencode ([12])\.x · server=(shared|standalone|n\/
  */
 export function parseOpencodeTurnBreadcrumb(
   text: string | null | undefined,
-): { major: 1 | 2; server: OpencodeServerMode | null } | null {
+): { major: 1 | 2; server: OpencodeTurnServer | null } | null {
   if (!text) return null;
   const m = TURN_BREADCRUMB_RE.exec(text);
   if (!m) return null;
-  return { major: m[1] === "1" ? 1 : 2, server: m[2] === "n/a" ? null : (m[2] as OpencodeServerMode) };
+  return { major: m[1] === "1" ? 1 : 2, server: m[2] === "n/a" ? null : (m[2] as OpencodeTurnServer) };
 }
 
 /**
  * True when a turn's subagent children cannot outlive it (A6a): every v1
  * child is foreground, and a Standalone v2 child dies with the turn's
- * private server. Only a v2 Shared child may keep running in the service.
+ * private server. A v2 Shared child may keep running in the service, and so
+ * may a child of an `agetor` turn: the agetor-owned server outlives the turn.
  */
-export function opencodeChildrenDieWithTurn(t: { major: 1 | 2; server: OpencodeServerMode | null }): boolean {
+export function opencodeChildrenDieWithTurn(t: { major: 1 | 2; server: OpencodeTurnServer | null }): boolean {
   return t.major === 1 || t.server === "standalone";
 }

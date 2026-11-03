@@ -1,0 +1,37 @@
+{"type":"session.inbox.enqueued","data":{"inboxID":"msg_fixture0001","sessionID":"ses_fixture0001","item":{"type":"user","payload":{"text":"Run `sleep 40` in the shell, then reply DONE."},"delivery":"steer"}}}
+{"type":"session.execution.started","data":{"sessionID":"ses_fixture0001"}}
+{"type":"session.inbox.delivered","data":{"sessionID":"ses_fixture0001","inboxID":"msg_fixture0001"}}
+{"type":"session.step.started","data":{"sessionID":"ses_fixture0001","agent":"build","model":{"id":"deepseek-v4.1-flash","providerID":"opencode-go","variant":"default"},"assistantMessageID":"msg_fixture0002","started":1793683885420}}
+{"type":"session.reasoning.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","ordinal":0,"native":{"reasoningField":"reasoning_content"}}}
+{"type":"session.reasoning.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","ordinal":0,"delta":"The user wants me to run a shell command with sleep 40, then reply DONE. Simple."}}
+{"type":"session.tool.input.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","name":"shell"}}
+{"type":"session.reasoning.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","ordinal":0,"text":"The user wants me to run a shell command with sleep 40, then reply DONE. Simple.","native":{"reasoningField":"reasoning_content"}}}
+{"type":"session.tool.input.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","text":"{\"command\": \"sleep 40\", \"timeout\": 60000}"}}
+{"type":"session.tool.called","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","input":{"command":"sleep 40","timeout":60000},"executed":false}}
+{"type":"session.step.streamed","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002"}}
+{"type":"shell.created","data":{"info":{"id":"sh_fixture0001","status":"running","command":"sleep 40","cwd":"/work/repo","shell":"/bin/zsh","file":"/work/repo","metadata":{"sessionID":"ses_fixture0001"},"time":{"started":1793683886800}}}}
+{"type":"session.tool.progress","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","metadata":{"shellID":"sh_fixture0001"}}}
+{"type":"shell.exited","data":{"id":"sh_fixture0001","status":"killed"}}
+{"type":"shell.deleted","data":{"id":"sh_fixture0001"}}
+{"type":"session.tool.failed","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","error":{"type":"aborted","message":"Tool execution interrupted"},"metadata":{"shellID":"sh_fixture0001"},"executed":false}}
+{"type":"session.step.failed","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","error":{"type":"aborted","message":"Step interrupted"},"rawFinish":"tool_calls","cost":9.268199999999999e-05,"tokens":{"input":55,"output":57,"reasoning":21,"cache":{"read":12544,"write":0}}}}
+{"type":"session.usage.updated","data":{"sessionID":"ses_fixture0001","cost":9.268199999999999e-05,"tokens":{"input":55,"output":57,"reasoning":21,"cache":{"read":12544,"write":0}}}}
+{"type":"session.execution.interrupted","data":{"sessionID":"ses_fixture0001","reason":"user"}}
+{"type":"session.inbox.enqueued","data":{"inboxID":"msg_fixture0003","sessionID":"ses_fixture0001","item":{"type":"user","payload":{"text":"Reply with the single word READY."},"delivery":"steer"}}}
+{"type":"session.execution.started","data":{"sessionID":"ses_fixture0001"}}
+{"type":"session.inbox.delivered","data":{"sessionID":"ses_fixture0001","inboxID":"msg_fixture0003"}}
+{"type":"session.step.started","data":{"sessionID":"ses_fixture0001","agent":"build","model":{"id":"deepseek-v4.1-flash","providerID":"opencode-go","variant":"default"},"assistantMessageID":"msg_fixture0004","started":1793683890716}}
+{"type":"session.reasoning.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"native":{"reasoningField":"reasoning_content"}}}
+{"type":"session.reasoning.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"delta":"The user asks to reply with the single word READY. But the previous command"}}
+{"type":"session.reasoning.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"delta":" was interrupted/aborted. Instruction"}}
+{"type":"session.reasoning.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"delta":" now"}}
+{"type":"session.reasoning.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"delta":": Reply with the single word READY. Just do that... but should I mention the sleep didn't complete? They said reply with the single word READY. Follow"}}
+{"type":"session.reasoning.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"delta":" it."}}
+{"type":"session.text.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0}}
+{"type":"session.reasoning.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"text":"The user asks to reply with the single word READY. But the previous command was interrupted/aborted. Instruction now: Reply with the single word READY. Just do that... but should I mention the sleep didn't complete? They said reply with the single word READY. Follow it.","native":{"reasoningField":"reasoning_content"}}}
+{"type":"session.text.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"delta":"READY"}}
+{"type":"session.text.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"text":"READY"}}
+{"type":"session.step.streamed","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004"}}
+{"type":"session.step.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","finish":"stop","rawFinish":"stop","cost":0.00010093199999999999,"tokens":{"input":170,"output":3,"reasoning":60,"cache":{"read":12544,"write":0}}}}
+{"type":"session.usage.updated","data":{"sessionID":"ses_fixture0001","cost":0.000193614,"tokens":{"input":225,"output":60,"reasoning":81,"cache":{"read":25088,"write":0}}}}
+{"type":"session.execution.succeeded","data":{"sessionID":"ses_fixture0001"}}

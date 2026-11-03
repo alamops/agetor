@@ -204,6 +204,11 @@ import { getMainWindow } from "./window.ts";
 import {
   answerCursorAsk,
   answerFxPermission,
+  answerOpencodeAsk,
+  answerOpencodePermission,
+  getOpencodeAskFields,
+  normalizeReplyText,
+  opencodeAskAnswerFromBody,
   recordCursorAskToolResult,
   answerTmuxPrompt,
   findFxPermissionById,
@@ -6886,6 +6891,48 @@ export function startApiServer(
             custom: typeof a?.custom === "string" ? a.custom : undefined,
           }));
           const pending = getAskQuestionsById(req.params.id);
+          if (pending && pending.source === "opencode") {
+            // An OpenCode form: validate against the fields it was registered
+            // with, then release the driver's awaiter. Claimed before any
+            // await, like the siblings, so a second submit gets a 409.
+            if (askAnswersInFlight.has(req.params.id)) {
+              return json(
+                { error: "this question is already being answered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            askAnswersInFlight.add(req.params.id);
+            try {
+              // Unset in production; lets the 409 test hold the claim open.
+              const holdMs = Number(process.env.AGETOR_TEST_HOLD_OPENCODE_ASK_MS ?? "");
+              if (Number.isFinite(holdMs) && holdMs > 0) {
+                await new Promise((r) => setTimeout(r, holdMs));
+              }
+              const fields = getOpencodeAskFields(req.params.id);
+              if (!fields) return json({ ok: false }, { headers: corsHeaders(req) });
+              if (body.skip === true) {
+                // Skip carries only a reason the user typed; none, or an
+                // empty one, sends no words at all.
+                const reason = normalizeReplyText((body as { message?: unknown }).message, "message");
+                if (!reason.ok) {
+                  return json({ error: reason.error }, { status: 400, headers: corsHeaders(req) });
+                }
+                const ok = answerOpencodeAsk(req.params.id, {
+                  outcome: "skipped",
+                  ...(reason.text !== undefined ? { message: reason.text } : {}),
+                });
+                return json({ ok }, { headers: corsHeaders(req) });
+              }
+              const mapped = opencodeAskAnswerFromBody(fields, (body as { answers?: unknown }).answers);
+              if (!mapped.ok) {
+                return json({ error: mapped.error }, { status: 400, headers: corsHeaders(req) });
+              }
+              const ok = answerOpencodeAsk(req.params.id, { outcome: "answered", answer: mapped.answer });
+              return json({ ok }, { headers: corsHeaders(req) });
+            } finally {
+              askAnswersInFlight.delete(req.params.id);
+            }
+          }
           if (pending && pending.source === "cursor") {
             if (askAnswersInFlight.has(req.params.id)) {
               return json(
@@ -7187,10 +7234,30 @@ export function startApiServer(
       // stay 400.
       "/fx-permissions/:id/answer": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { optionId?: unknown; cancel?: unknown };
+          const body = (await req.json().catch(() => ({}))) as {
+            optionId?: unknown;
+            cancel?: unknown;
+            message?: unknown;
+          };
           const pending = findFxPermissionById(req.params.id);
           if (!pending) {
             return json({ ok: false }, { headers: corsHeaders(req) });
+          }
+          // A reason the user typed for Reject: OpenCode cards only, and only
+          // with the `reject` option. Anything else is refused, never ignored.
+          let message: string | undefined;
+          if (body.message !== undefined) {
+            if (pending.harness !== "opencode") {
+              return json({ error: "message is not supported for this request" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (body.cancel === true || body.optionId !== "reject") {
+              return json({ error: "message is only allowed with reject" }, { status: 400, headers: corsHeaders(req) });
+            }
+            const reason = normalizeReplyText(body.message, "message");
+            if (!reason.ok) {
+              return json({ error: reason.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            message = reason.text;
           }
           if (body.cancel === true) {
             const ok = answerFxPermission(req.params.id, { cancelled: true });
@@ -7206,6 +7273,15 @@ export function startApiServer(
           // to inject an arbitrary outcome into the ACP reply.
           if (!pending.options.some((o) => o.optionId === optionId)) {
             return json({ error: "unknown option" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (pending.harness === "opencode") {
+            // The recorded options are exactly OpenCode's three decisions.
+            const decision = optionId as "once" | "always" | "reject";
+            const ok = answerOpencodePermission(req.params.id, {
+              decision,
+              ...(message !== undefined ? { message } : {}),
+            });
+            return json({ ok }, { headers: corsHeaders(req) });
           }
           const ok = answerFxPermission(req.params.id, { optionId });
           return json({ ok }, { headers: corsHeaders(req) });

@@ -1,0 +1,23 @@
+{"type":"server.connected","data":{}}
+{"type":"session.inbox.enqueued","data":{"inboxID":"msg_fixture0001","sessionID":"ses_fixture0001","item":{"type":"user","payload":{"text":"Run `echo hi` in the shell then reply OK"},"delivery":"steer"}}}
+{"type":"session.execution.started","data":{"sessionID":"ses_fixture0001"}}
+{"type":"session.inbox.delivered","data":{"sessionID":"ses_fixture0001","inboxID":"msg_fixture0001"}}
+{"type":"session.step.started","data":{"sessionID":"ses_fixture0001","agent":"build","model":{"id":"deepseek-v4.1-flash","providerID":"opencode-go","variant":"max"},"assistantMessageID":"msg_fixture0002","started":1793682958674}}
+{"type":"session.tool.input.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","name":"shell"}}
+{"type":"session.tool.input.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","text":"{\"command\":\"echo hi\"}"}}
+{"type":"session.tool.called","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","input":{"command":"echo hi"},"executed":false}}
+{"type":"session.step.streamed","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002"}}
+{"type":"shell.created","data":{"info":{"id":"sh_fixture0001","status":"running","command":"echo hi","cwd":"/work/repo","shell":"/bin/zsh","file":"/work/repo","metadata":{"sessionID":"ses_fixture0001"},"time":{"started":1793682959798}}}}
+{"type":"session.tool.progress","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","metadata":{"shellID":"sh_fixture0001"}}}
+{"type":"shell.exited","data":{"id":"sh_fixture0001","exit":0,"status":"exited"}}
+{"type":"session.tool.success","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","content":[{"type":"text","text":"hi\n"}],"metadata":{"status":"completed","truncated":false,"exit":0},"executed":false}}
+{"type":"session.step.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","finish":"tool-calls","rawFinish":"tool_calls","cost":0.0019127999999999999,"tokens":{"input":12596,"output":39,"reasoning":0,"cache":{"read":0,"write":0}}}}
+{"type":"session.usage.updated","data":{"sessionID":"ses_fixture0001","cost":0.0019127999999999999,"tokens":{"input":12596,"output":39,"reasoning":0,"cache":{"read":0,"write":0}}}}
+{"type":"session.step.started","data":{"sessionID":"ses_fixture0001","agent":"build","model":{"id":"deepseek-v4.1-flash","providerID":"opencode-go","variant":"max"},"assistantMessageID":"msg_fixture0003","started":1793682959888}}
+{"type":"session.text.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0003","ordinal":0}}
+{"type":"session.text.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0003","ordinal":0,"delta":"OK"}}
+{"type":"session.text.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0003","ordinal":0,"text":"OK"}}
+{"type":"session.step.streamed","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0003"}}
+{"type":"session.step.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0003","finish":"stop","rawFinish":"stop","cost":7.384799999999999e-05,"tokens":{"input":232,"output":3,"reasoning":0,"cache":{"read":12416,"write":0}}}}
+{"type":"session.usage.updated","data":{"sessionID":"ses_fixture0001","cost":0.0019866479999999997,"tokens":{"input":12828,"output":42,"reasoning":0,"cache":{"read":12416,"write":0}}}}
+{"type":"session.execution.succeeded","data":{"sessionID":"ses_fixture0001"}}

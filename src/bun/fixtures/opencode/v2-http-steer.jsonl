@@ -1,0 +1,29 @@
+{"type":"session.inbox.enqueued","data":{"inboxID":"msg_fixture0001","sessionID":"ses_fixture0001","item":{"type":"user","payload":{"text":"Run `sleep 12` in the shell, then reply with the word DONE."},"delivery":"steer"}}}
+{"type":"session.execution.started","data":{"sessionID":"ses_fixture0001"}}
+{"type":"session.inbox.delivered","data":{"sessionID":"ses_fixture0001","inboxID":"msg_fixture0001"}}
+{"type":"session.step.started","data":{"sessionID":"ses_fixture0001","agent":"build","model":{"id":"deepseek-v4.1-flash","providerID":"opencode-go","variant":"default"},"assistantMessageID":"msg_fixture0002","started":1793683205383}}
+{"type":"session.reasoning.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","ordinal":0,"native":{"reasoningField":"reasoning_content"}}}
+{"type":"session.reasoning.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","ordinal":0,"delta":"The user wants me to run sleep 12 in the shell, then reply D"}}
+{"type":"session.reasoning.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","ordinal":0,"delta":"ONE. Simple."}}
+{"type":"session.tool.input.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","name":"shell"}}
+{"type":"session.reasoning.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","ordinal":0,"text":"The user wants me to run sleep 12 in the shell, then reply DONE. Simple.","native":{"reasoningField":"reasoning_content"}}}
+{"type":"session.tool.input.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","text":"{\"command\": \"sleep 12\", \"timeout\": 30000}"}}
+{"type":"session.tool.called","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","input":{"command":"sleep 12","timeout":30000},"executed":false}}
+{"type":"session.step.streamed","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002"}}
+{"type":"shell.created","data":{"info":{"id":"sh_fixture0001","status":"running","command":"sleep 12","cwd":"/work/repo","shell":"/bin/zsh","file":"/work/repo","metadata":{"sessionID":"ses_fixture0001"},"time":{"started":1793683206721}}}}
+{"type":"session.tool.progress","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","metadata":{"shellID":"sh_fixture0001"}}}
+{"type":"session.inbox.enqueued","data":{"inboxID":"msg_fixture0003","sessionID":"ses_fixture0001","item":{"type":"user","payload":{"text":"Also: end your final reply with the word BANANA."},"delivery":"steer"}}}
+{"type":"session.tool.success","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","id":"call_fixture0001","content":[{"type":"text","text":"(no output)"}],"metadata":{"status":"completed","truncated":false,"exit":0},"executed":false}}
+{"type":"shell.exited","data":{"id":"sh_fixture0001","exit":0,"status":"exited"}}
+{"type":"session.step.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0002","finish":"tool-calls","rawFinish":"tool_calls","cost":0.0006201299999999999,"tokens":{"input":3643,"output":58,"reasoning":20,"cache":{"read":8960,"write":0}}}}
+{"type":"session.usage.updated","data":{"sessionID":"ses_fixture0001","cost":0.0006201299999999999,"tokens":{"input":3643,"output":58,"reasoning":20,"cache":{"read":8960,"write":0}}}}
+{"type":"session.inbox.delivered","data":{"sessionID":"ses_fixture0001","inboxID":"msg_fixture0003"}}
+{"type":"session.step.started","data":{"sessionID":"ses_fixture0001","agent":"build","model":{"id":"deepseek-v4.1-flash","providerID":"opencode-go","variant":"default"},"assistantMessageID":"msg_fixture0004","started":1793683218921}}
+{"type":"session.text.started","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0}}
+{"type":"session.text.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"delta":"DONE\n\n"}}
+{"type":"session.text.delta","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"delta":"BANANA"}}
+{"type":"session.text.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","ordinal":0,"text":"DONE\n\nBANANA"}}
+{"type":"session.step.streamed","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004"}}
+{"type":"session.step.ended","data":{"sessionID":"ses_fixture0001","assistantMessageID":"msg_fixture0004","finish":"stop","rawFinish":"stop","cost":4.8066000000000004e-05,"tokens":{"input":35,"output":8,"reasoning":0,"cache":{"read":12672,"write":0}}}}
+{"type":"session.usage.updated","data":{"sessionID":"ses_fixture0001","cost":0.0006681959999999999,"tokens":{"input":3678,"output":66,"reasoning":20,"cache":{"read":21632,"write":0}}}}
+{"type":"session.execution.succeeded","data":{"sessionID":"ses_fixture0001"}}

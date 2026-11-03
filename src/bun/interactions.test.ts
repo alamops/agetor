@@ -1004,3 +1004,238 @@ test("registerTmuxPrompt accepts a single-letter confirmKey regardless of case",
     confirmKey: "S",
     fingerprint: "fp-confirmkey-upper",
   })).not.toThrow();});
+
+
+/* ───────────────────────── OpenCode permission + form cards ───────────────────────── */
+
+async function makeOpencodePermission(taskId: string, requestId: string, mode: "ask" | "plan" = "ask") {
+  const { registerOpencodePermission } = await import("./interactions.ts");
+  return registerOpencodePermission({
+    taskId, runId: "rOc", sessionId: "ses_1", requestId,
+    toolCall: { toolCallId: `call-${requestId}`, title: "bash", kind: "execute", rawInput: { command: "ls" } },
+    mode,
+  });
+}
+
+async function makeOpencodeAsk(taskId: string, formId: string) {
+  const { registerOpencodeAskQuestions } = await import("./interactions.ts");
+  return registerOpencodeAskQuestions({
+    taskId, runId: "rOc", sessionId: "ses_1", formId, title: "Pick",
+    fields: [
+      { key: "color", question: "Color?", header: "Hue", multiple: false, custom: true,
+        options: [{ value: "r", label: "Red", description: "warm" }, { value: "b", label: "Blue" }] },
+      { key: "tags", question: "Tags?", multiple: true, custom: false,
+        options: [{ value: "x", label: "X" }, { value: "y", label: "Y" }] },
+    ],
+  });
+}
+
+test("registerOpencodePermission builds an fx-shaped card with OpenCode's fixed options and an opt-in reason", async () => {
+  const { listPendingForTask } = await import("./interactions.ts");
+  const { id, req } = await makeOpencodePermission("tOcP1", "per_1", "plan");
+  expect(req.kind).toBe("fx_permission");
+  expect(req.harness).toBe("opencode");
+  expect(req.allowReason).toBe(true);
+  expect(req.mode).toBe("plan");
+  expect(req.options).toEqual([
+    { optionId: "once", name: "Allow once", kind: "allow_once" },
+    { optionId: "always", name: "Always allow", kind: "allow_always" },
+    { optionId: "reject", name: "Reject", kind: "reject_once" },
+  ]);
+  expect(listPendingForTask("tOcP1").map((r) => r.id)).toEqual([id]);
+});
+
+test("registerOpencodePermission is idempotent per (task, request id): same card, same promise", async () => {
+  const { __testing } = await import("./interactions.ts");
+  const a = await makeOpencodePermission("tOcP2", "per_2");
+  const b = await makeOpencodePermission("tOcP2", "per_2");
+  expect(b.id).toBe(a.id);
+  expect(b.req).toBe(a.req);
+  expect(b.answer).toBe(a.answer);
+  expect(__testing.fxPermissionsSize()).toBe(1);
+  // A different request id, and the same id on another task, are separate cards.
+  const c = await makeOpencodePermission("tOcP2", "per_3");
+  const d = await makeOpencodePermission("tOcP2b", "per_2");
+  expect(new Set([a.id, c.id, d.id]).size).toBe(3);
+});
+
+test("answerOpencodePermission resolves the decision (and a reason), removes the card and its index entry", async () => {
+  const { answerOpencodePermission, findFxPermissionById, __testing } = await import("./interactions.ts");
+  const a = await makeOpencodePermission("tOcP3", "per_4");
+  expect(answerOpencodePermission(a.id, { decision: "reject", message: "no thanks" })).toBe(true);
+  await expect(a.answer).resolves.toEqual({ decision: "reject", message: "no thanks" });
+  expect(findFxPermissionById(a.id)).toBeNull();
+  expect(__testing.opencodeIndexSizes().perm).toBe(0);
+  // Settled once: a second answer is a no-op.
+  expect(answerOpencodePermission(a.id, { decision: "once" })).toBe(false);
+  // After settling, the same server request id registers a fresh card.
+  const again = await makeOpencodePermission("tOcP3", "per_4");
+  expect(again.id).not.toBe(a.id);
+});
+
+test("answerOpencodePermission refuses an fx card, and answerFxPermission refuses an unoffered id on an OpenCode card", async () => {
+  const { answerOpencodePermission, answerFxPermission } = await import("./interactions.ts");
+  const fx = await makeFxPermission("tOcP4", "rFx");
+  expect(answerOpencodePermission(fx.id, { decision: "once" })).toBe(false);
+  const oc = await makeOpencodePermission("tOcP4", "per_5");
+  expect(answerFxPermission(oc.id, { optionId: "allow-once" })).toBe(false);
+  expect(answerFxPermission(oc.id, { optionId: "always" })).toBe(true);
+  await expect(oc.answer).resolves.toEqual({ decision: "always" });
+});
+
+test("registerOpencodeAskQuestions maps fields onto an ask card with source opencode", async () => {
+  const { listPendingForTask, getOpencodeAskFields } = await import("./interactions.ts");
+  const { id, req } = await makeOpencodeAsk("tOcA1", "form_1");
+  expect(req.source).toBe("opencode");
+  expect(req.title).toBe("Pick");
+  expect(req.allowCustom).toBe(true);
+  expect(req.allowReason).toBe(true);
+  expect(req.delivery).toBe("live");
+  expect(req.questions).toEqual([
+    { id: "color", question: "Color?", header: "Hue", multiSelect: false, allowCustom: true,
+      options: [{ id: "r", label: "Red", description: "warm" }, { id: "b", label: "Blue" }] },
+    { id: "tags", question: "Tags?", multiSelect: true, allowCustom: false,
+      options: [{ id: "x", label: "X" }, { id: "y", label: "Y" }] },
+  ]);
+  expect(listPendingForTask("tOcA1").map((r) => r.id)).toEqual([id]);
+  expect(getOpencodeAskFields(id)?.map((f) => f.key)).toEqual(["color", "tags"]);
+});
+
+test("registerOpencodeAskQuestions is idempotent per (task, form id)", async () => {
+  const { __testing } = await import("./interactions.ts");
+  const a = await makeOpencodeAsk("tOcA2", "form_2");
+  const b = await makeOpencodeAsk("tOcA2", "form_2");
+  expect(b.id).toBe(a.id);
+  expect(b.answer).toBe(a.answer);
+  expect(__testing.askQuestionsSize()).toBe(1);
+});
+
+test("answerOpencodeAsk resolves answered / skipped once, and a scraper or cursor card is not answerable through it", async () => {
+  const { answerOpencodeAsk, registerScrapedAskQuestions, __testing } = await import("./interactions.ts");
+  const a = await makeOpencodeAsk("tOcA3", "form_3");
+  expect(answerOpencodeAsk(a.id, { outcome: "answered", answer: { color: "r", tags: ["x"] } })).toBe(true);
+  await expect(a.answer).resolves.toEqual({ outcome: "answered", answer: { color: "r", tags: ["x"] } });
+  expect(answerOpencodeAsk(a.id, { outcome: "skipped" })).toBe(false);
+  expect(__testing.opencodeIndexSizes().ask).toBe(0);
+
+  const b = await makeOpencodeAsk("tOcA3", "form_4");
+  expect(answerOpencodeAsk(b.id, { outcome: "skipped", message: "later" })).toBe(true);
+  await expect(b.answer).resolves.toEqual({ outcome: "skipped", message: "later" });
+
+  const scraped = registerScrapedAskQuestions({
+    taskId: "tOcA3", runId: "r", questions: [{ question: "?", options: [{ label: "A" }] }], fingerprint: "fp-oc-a3",
+  });
+  expect(answerOpencodeAsk(scraped.id, { outcome: "skipped" })).toBe(false);
+});
+
+test("cancelPendingForTask sweeps OpenCode cards with a text-free cancellation and clears the indexes", async () => {
+  const { cancelPendingForTask, __testing, listPendingForTask } = await import("./interactions.ts");
+  const p = await makeOpencodePermission("tOcSweep", "per_s");
+  const q = await makeOpencodeAsk("tOcSweep", "form_s");
+  const other = await makeOpencodePermission("tOcSweepOther", "per_s");
+  cancelPendingForTask("tOcSweep", "stop");
+  await expect(p.answer).resolves.toEqual({ cancelled: true });
+  await expect(q.answer).resolves.toEqual({ outcome: "cancelled" });
+  expect(listPendingForTask("tOcSweep")).toEqual([]);
+  expect(listPendingForTask("tOcSweepOther").map((r) => r.id)).toEqual([other.id]);
+  expect(__testing.opencodeIndexSizes()).toEqual({ perm: 1, ask: 0 });
+  // The same server ids register fresh cards after a sweep (a restart re-register).
+  const re = await makeOpencodePermission("tOcSweep", "per_s");
+  expect(re.id).not.toBe(p.id);
+});
+
+test("listPendingForTask / countPendingForTask / pendingCountsByTask include OpenCode cards", async () => {
+  const { listPendingForTask, countPendingForTask, pendingCountsByTask } = await import("./interactions.ts");
+  await makeOpencodePermission("tOcCount", "per_c");
+  await makeOpencodeAsk("tOcCount", "form_c");
+  await makeOpencodePermission("tOcCountB", "per_c");
+  expect(listPendingForTask("tOcCount").map((r) => r.kind).sort()).toEqual(["ask_questions", "fx_permission"]);
+  expect(countPendingForTask("tOcCount")).toBe(2);
+  const counts = pendingCountsByTask();
+  expect(counts.get("tOcCount")).toBe(2);
+  expect(counts.get("tOcCountB")).toBe(1);
+});
+
+test("resolveOpencodeCardsForRequest closes cards the server settled, cancelling the awaiters and firing resolved", async () => {
+  const { resolveOpencodeCardsForRequest, setResolvedBroadcaster, listPendingForTask, __testing } = await import("./interactions.ts");
+  const resolved: Array<{ id: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, kind: r.kind }));
+  const p = await makeOpencodePermission("tOcRes", "per_r");
+  const q = await makeOpencodeAsk("tOcRes", "form_r");
+
+  resolveOpencodeCardsForRequest("tOcRes", { requestId: "per_r" });
+  await expect(p.answer).resolves.toEqual({ cancelled: true });
+  expect(listPendingForTask("tOcRes").map((r) => r.id)).toEqual([q.id]);
+
+  // Another task's ids, and unknown ids, are ignored.
+  resolveOpencodeCardsForRequest("tOcResOther", { formId: "form_r" });
+  resolveOpencodeCardsForRequest("tOcRes", { formId: "nope" });
+  expect(listPendingForTask("tOcRes").map((r) => r.id)).toEqual([q.id]);
+
+  resolveOpencodeCardsForRequest("tOcRes", { formId: "form_r" });
+  await expect(q.answer).resolves.toEqual({ outcome: "cancelled" });
+  expect(listPendingForTask("tOcRes")).toEqual([]);
+  expect(resolved.map((r) => r.kind)).toEqual(["fx_permission", "ask_questions"]);
+  expect(__testing.opencodeIndexSizes()).toEqual({ perm: 0, ask: 0 });
+  // Idempotent.
+  resolveOpencodeCardsForRequest("tOcRes", { requestId: "per_r", formId: "form_r" });
+});
+
+test("an OpenCode registration rolls back (map and index) when the broadcaster throws", async () => {
+  const { setBroadcaster, registerOpencodePermission, registerOpencodeAskQuestions, __testing } = await import("./interactions.ts");
+  setBroadcaster(() => { throw new Error("listener boom"); });
+  expect(() => registerOpencodePermission({
+    taskId: "tOcRb", runId: "r", sessionId: "s", requestId: "per_rb",
+    toolCall: { toolCallId: "c" }, mode: "ask",
+  })).toThrow("listener boom");
+  expect(() => registerOpencodeAskQuestions({
+    taskId: "tOcRb", runId: "r", sessionId: "s", formId: "form_rb", fields: [],
+  })).toThrow("listener boom");
+  expect(__testing.fxPermissionsSize()).toBe(0);
+  expect(__testing.askQuestionsSize()).toBe(0);
+  expect(__testing.opencodeIndexSizes()).toEqual({ perm: 0, ask: 0 });
+});
+
+test("opencodeAskAnswerFromBody maps ids, labels and typed text, and refuses everything ambiguous", async () => {
+  const { opencodeAskAnswerFromBody } = await import("./interactions.ts");
+  const fields = [
+    { key: "color", question: "Color?", multiple: false, custom: true,
+      options: [{ value: "r", label: "Red" }, { value: "b", label: "Blue" }] },
+    { key: "tags", question: "Tags?", multiple: true, custom: false,
+      options: [{ value: "x", label: "X" }, { value: "y", label: "Y" }] },
+  ];
+  // Labels map to values; ids win over labels; multiple dedupes.
+  expect(opencodeAskAnswerFromBody(fields, [{ selected: ["Red"] }, { selectedOptionIds: ["y", "x", "y"], selected: ["X"] }]))
+    .toEqual({ ok: true, answer: { color: "r", tags: ["y", "x"] } });
+  expect(opencodeAskAnswerFromBody(fields, [{ selected: ["Red"], selectedOptionIds: ["b"] }, { selected: ["X"] }]))
+    .toEqual({ ok: true, answer: { color: "b", tags: ["x"] } });
+  // Typed text: single-select free text, trimmed.
+  expect(opencodeAskAnswerFromBody(fields, [{ custom: "  teal " }, { selected: ["Y"] }]))
+    .toEqual({ ok: true, answer: { color: "teal", tags: ["y"] } });
+  const bad = (answers: unknown) => {
+    const r = opencodeAskAnswerFromBody(fields, answers);
+    return r.ok ? null : r.error;
+  };
+  expect(bad(undefined)).toContain("answers required");
+  expect(bad([{ selected: ["Red"] }])).toContain("answers required");
+  expect(bad([{ selected: ["Green"] }, { selected: ["X"] }])).toContain("unknown option");
+  expect(bad([{ selectedOptionIds: ["zz"] }, { selected: ["X"] }])).toContain("unknown option");
+  expect(bad([{}, { selected: ["X"] }])).toContain('answer required for "color"');
+  expect(bad([{ custom: "   " }, { selected: ["X"] }])).toContain('answer required for "color"');
+  expect(bad([{ selected: ["Red"] }, { custom: "free" }])).toContain("does not accept a typed answer");
+  expect(bad([{ selected: ["Red", "Blue"] }, { selected: ["X"] }])).toContain("takes one option");
+  expect(bad([{ selected: ["Red"], custom: "also" }, { selected: ["X"] }])).toContain("not both");
+  expect(bad([{ custom: "x".repeat(4097) }, { selected: ["X"] }])).toContain("too long");
+  expect(bad([{ custom: 5 }, { selected: ["X"] }])).toContain("must be a string");
+  expect(bad([{ selected: "Red" }, { selected: ["X"] }])).toContain("invalid answer");
+  // A multiple field with typed text appends it after the options.
+  const multiCustom = [{ key: "k", question: "?", multiple: true, custom: true, options: [{ value: "a", label: "A" }] }];
+  expect(opencodeAskAnswerFromBody(multiCustom, [{ selected: ["A"], custom: "more" }]))
+    .toEqual({ ok: true, answer: { k: ["a", "more"] } });
+  expect(opencodeAskAnswerFromBody(multiCustom, [{ custom: "only" }]))
+    .toEqual({ ok: true, answer: { k: ["only"] } });
+  // A hostile field key stays data.
+  const proto = [{ key: "__proto__", question: "?", multiple: false, custom: true, options: [] }];
+  const r = opencodeAskAnswerFromBody(proto, [{ custom: "v" }]);
+  expect(r.ok && Object.keys(r.answer)).toEqual(["__proto__"]);
+});

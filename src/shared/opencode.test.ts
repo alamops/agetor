@@ -12,6 +12,7 @@ import {
   opencodeModelArgs,
   opencodeProviderLabel,
   opencodeProviderOf,
+  opencodeTransportFor,
   opencodeQuotaHint,
   opencodeTurnBreadcrumbPrefix,
   parseOpencodeServerInput,
@@ -21,7 +22,9 @@ import { importedSessionOf } from "./imported-session.ts";
 import {
   AGENT_OPTIONS,
   AUTO_ENABLE_KINDS,
+  CODE_PLAN_MODE,
   DEFAULT_MODEL,
+  defaultModeFor,
   HARNESS_TEMPLATES,
   OPENCODE_SERVER_MODES,
   type ImportedClaudeSession,
@@ -137,13 +140,24 @@ describe("parseOpencodeServerInput", () => {
 
 describe("turn breadcrumb (D-19)", () => {
   test("format → parse round-trips the CLI line and effective server", () => {
-    for (const [major, server] of [[2, "shared"], [2, "standalone"], [1, null]] as const) {
+    for (const [major, server] of [[2, "shared"], [2, "standalone"], [2, "agetor"], [1, null]] as const) {
       const line = formatOpencodeTurnBreadcrumb({ major, server, modelLabel: "OpenCode default", effort: "auto", mode: "auto" });
       expect(line.startsWith(opencodeTurnBreadcrumbPrefix(major))).toBe(true);
       expect(parseOpencodeTurnBreadcrumb(line)).toEqual({ major, server });
     }
     expect(formatOpencodeTurnBreadcrumb({ major: 1, server: null, modelLabel: "M", effort: "high", mode: "plan" }))
       .toBe("opencode 1.x · server=n/a · model=M · effort=high · mode=plan");
+  });
+
+  test("an agetor-server turn formats and parses; old lines still parse exactly as before", () => {
+    expect(formatOpencodeTurnBreadcrumb({ major: 2, server: "agetor", modelLabel: "M", effort: "auto", mode: "ask" }))
+      .toBe("opencode 2.x · server=agetor · model=M · effort=auto · mode=ask");
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=agetor · model=M · effort=auto · mode=ask")).toEqual({ major: 2, server: "agetor" });
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=agetor")).toEqual({ major: 2, server: "agetor" });
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=shared · model=M · effort=auto · mode=auto")).toEqual({ major: 2, server: "shared" });
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=standalone · model=M")).toEqual({ major: 2, server: "standalone" });
+    expect(parseOpencodeTurnBreadcrumb("opencode 1.x · server=n/a · model=M · effort=high · mode=plan")).toEqual({ major: 1, server: null });
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=agetorx · model=x")).toBeNull();
   });
 
   test("anything else parses as null", () => {
@@ -157,6 +171,37 @@ describe("turn breadcrumb (D-19)", () => {
     expect(opencodeChildrenDieWithTurn({ major: 2, server: "standalone" })).toBe(true);
     expect(opencodeChildrenDieWithTurn({ major: 2, server: "shared" })).toBe(false);
   });
+
+  test("an agetor-server turn's children outlive it (server-owned)", () => {
+    expect(opencodeChildrenDieWithTurn({ major: 2, server: "agetor" })).toBe(false);
+  });
+});
+
+describe("opencodeTransportFor", () => {
+  test("v1 always runs `opencode run`, whatever the env says", () => {
+    expect(opencodeTransportFor({ version: "1.19.4" })).toBe("run");
+    expect(opencodeTransportFor({ version: "1.19.4", transportEnv: "server" })).toBe("run");
+  });
+
+  test("v2 and an unparseable, empty or missing version take the server", () => {
+    expect(opencodeTransportFor({ version: "opencode v2.1.3" })).toBe("server");
+    expect(opencodeTransportFor({ version: "garbage" })).toBe("server");
+    expect(opencodeTransportFor({ version: "" })).toBe("server");
+    expect(opencodeTransportFor({ version: null })).toBe("server");
+    expect(opencodeTransportFor({ version: undefined, transportEnv: null })).toBe("server");
+  });
+
+  test("AGETOR_OPENCODE_TRANSPORT=run (trimmed, any case) forces `run` on v2", () => {
+    for (const env of ["run", "RUN", " run ", "Run\n"]) {
+      expect(opencodeTransportFor({ version: "2.1.3", transportEnv: env })).toBe("run");
+    }
+  });
+
+  test("any other env value leaves v2 on the server", () => {
+    for (const env of ["server", "", "  ", "running", "1", null, undefined]) {
+      expect(opencodeTransportFor({ version: "2.1.3", transportEnv: env })).toBe("server");
+    }
+  });
 });
 
 describe("opencode constants and tables", () => {
@@ -169,8 +214,11 @@ describe("opencode constants and tables", () => {
     expect(OPENCODE_DEFAULT_MODEL).not.toBe("default");
   });
 
-  test("modes are Auto then Plan; efforts are just Model default", () => {
-    expect(AGENT_OPTIONS.opencode.modes.map((m) => m.id)).toEqual(["auto", "plan"]);
+  test("modes are Auto, Ask then Plan (Auto the default); efforts are just Model default", () => {
+    expect(AGENT_OPTIONS.opencode.modes.map((m) => m.id)).toEqual(["auto", "ask", "plan"]);
+    expect(defaultModeFor("opencode")).toBe("auto");
+    expect(CODE_PLAN_MODE.opencode).toEqual({ code: "auto", plan: "plan" });
+    for (const m of AGENT_OPTIONS.opencode.modes) expect(m.hint).not.toMatch(/--[a-z]/);
     expect(AGENT_OPTIONS.opencode.efforts.map((e) => e.id)).toEqual(["auto"]);
   });
 

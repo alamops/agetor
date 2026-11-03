@@ -519,8 +519,8 @@ test("opencode tables: sentinel default, auto effort, Code/Plan → auto/plan, s
   expect(DEFAULT_EFFORT.opencode).toBe("auto");
   expect(CODE_PLAN_MODE.opencode).toEqual({ code: "auto", plan: "plan" });
   expect(MODEL_EFFORT_SUPPORT.opencode).toEqual({ "opencode-default": [] });
-  expect(supportedModes("opencode", null).map((m) => m.id)).toEqual(["auto", "plan"]);
-  expect(supportedModes("opencode", "anthropic/claude-x").map((m) => m.id)).toEqual(["auto", "plan"]);
+  expect(supportedModes("opencode", null).map((m) => m.id)).toEqual(["auto", "ask", "plan"]);
+  expect(supportedModes("opencode", "anthropic/claude-x").map((m) => m.id)).toEqual(["auto", "ask", "plan"]);
 });
 
 /* ── gemini 3.8 Flash + retired gemini-3-pro-preview default (docs/plans/add-gemini-3-8-flash.md §5 TEST-2) ── */
