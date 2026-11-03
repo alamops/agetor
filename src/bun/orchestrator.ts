@@ -29,7 +29,6 @@ import {
   opencodeTransportOfTurn,
   OPENCODE_ASK_DRIVER_OFF_STATUS,
   OPENCODE_ASK_NEEDS_V2_STATUS,
-  lingerOpencodeServerAgent,
   type SpawnAgentArgs,
   type SpawnedAgent,
 } from "./agents.ts";
@@ -169,24 +168,24 @@ import {
   reattachOpencodeSession,
 } from "./opencode-tmux.ts";
 import {
-  addLingeringOpencodeTurn,
   disposeLingeringOpencodeTurns,
   dropDeferredOpencodeWake,
   forgetOpencodeServerTurn,
   hasDeferredOpencodeWake,
   hasOpencodeServerTurn,
   initOpencodeServerOrchestrator,
+  interruptOpencodeSessionsOfDroppedTask,
   isOpencodeServerTask,
   liveLingeringOpencodeTurns,
-  opencodeLingerCandidates,
+  noteOpencodeStopRequested,
   opencodeServerTurnForRun,
   opencodeTurnHooksFor,
-  probeOpencodeSessionsAtBoot,
-  reattachOpencodeServerRun,
+  reconcileOpencodeServerRuns,
   retryDeferredOpencodeWake,
   scheduleOpencodeWatchRefresh,
   steerOpencodeServerTurn,
   stopOpencodeServerTurnsOfTask,
+  tombstoneOpencodeSessionsOfTask,
   trackOpencodeServerTurn,
 } from "./orchestrator-opencode-server.ts";
 export {
@@ -1079,18 +1078,10 @@ export async function reconcileOrphans(): Promise<number> {
   const reattachedTaskIds = new Set<string>();
   const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null; kind: AgentKind | null }[] = [];
 
-  // OpenCode 2.x server runs: ask the adopted servers, all at once under one
-  // budget, which sessions they still have (the loop below reads the answers).
-  const lingerCandidates = opencodeLingerCandidates(stale.map((r) => r.task_id));
-  const sessionProbes = await probeOpencodeSessionsAtBoot([
-    ...stale.flatMap((r) => {
-      const harness = resolveHarness(r.agent);
-      return harness?.kind === "opencode" && r.opencode_session_id && opencodeTurnOfRun(r.id)?.server === "agetor"
-        ? [{ key: r.id, harnessId: harness.id, sessionId: r.opencode_session_id }]
-        : [];
-    }),
-    ...lingerCandidates.map((c) => ({ key: `task:${c.taskId}`, harnessId: c.harnessId, sessionId: c.sessionId })),
-  ]);
+  // OpenCode 2.x server runs (orchestrator-opencode-server.ts): the adopted
+  // servers are asked, all at once under one budget, which sessions they still
+  // have; the loop below and the held-task pass read the answers.
+  const opencodeServer = await reconcileOpencodeServerRuns(stale);
 
   for (const row of stale) {
     const task = tasks.get(row.task_id);
@@ -1125,31 +1116,15 @@ export async function reconcileOrphans(): Promise<number> {
       continue;
     }
 
-    // OpenCode 2.x on the agetor-owned server (plan D9): the turn lives in the
-    // server's own tmux session, not a per-run one, so the run reattaches over
-    // HTTP (breadcrumb `server=agetor`). `shared`/`standalone` runs — a v2 turn
-    // from before this driver, or the kill switch — keep the tmux reattach below.
-    if (
-      kind === "opencode"
-      && task !== null
-      && row.opencode_session_id !== null
-      && !reattachedTaskIds.has(row.task_id)
-      && opencodeTurnOfRun(row.id)?.server === "agetor"
-    ) {
-      const endLag = beginLagLabel(`boot reattach · task ${row.task_id}`, { taskId: row.task_id, runId: row.id });
-      try {
-        const onChunk = makeChunkHandler(row.id, row.task_id, "opencode", task.mode);
-        const spawned = reattachOpencodeServerRun({ ...row, opencode_session_id: row.opencode_session_id }, task, onChunk, sessionProbes.get(row.id) ?? "unknown");
-        if (spawned) {
-          registerActiveRun(row.id, row.task_id, task, spawned);
-          attachDoneHandler(row.id, row.task_id, spawned);
-          reattachedTaskIds.add(row.task_id);
-          onChunk("status", "reconnected to live session after agetor restart");
-          continue;
-        }
-      } finally {
-        endLag();
-      }
+    // OpenCode 2.x on the agetor-owned server (plan D9, breadcrumb
+    // `server=agetor`): reattached over HTTP, or orphaned. Any other run
+    // (`shared`/`standalone`, or not OpenCode) gets null and the paths below.
+    const serverReattach = kind === "opencode" ? opencodeServer.reattach(row, task, reattachedTaskIds.has(row.task_id)) : null;
+    if (serverReattach === true) {
+      reattachedTaskIds.add(row.task_id);
+      continue;
+    }
+    if (serverReattach === false) {
       orphaned.push({ id: row.id, task_id: row.task_id, prevColumn, kind });
       continue;
     }
@@ -1359,29 +1334,7 @@ export async function reconcileOrphans(): Promise<number> {
   // A server=agetor task whose last turn is over but whose background subagents
   // still run on the server (after a restart or a hand-over): listen for them
   // again instead of orphaning their rows.
-  const lingeredTaskIds = new Set<string>();
-  for (const c of lingerCandidates) {
-    if (reattachedTaskIds.has(c.taskId) || sessionProbes.get(`task:${c.taskId}`) !== "ok") continue;
-    const task = tasks.get(c.taskId);
-    const harness = task ? resolveHarness(task.agent) : null;
-    if (!task || !harness || harness.id !== c.harnessId) continue;
-    try {
-      const turn = lingerOpencodeServerAgent({
-        taskId: c.taskId,
-        runId: c.runId,
-        harness,
-        cwd: task.worktreePath ?? task.workdir,
-        task,
-        sessionId: c.sessionId,
-        onChunk: makeChunkHandler(c.runId, c.taskId, "opencode", task.mode),
-        hooks: opencodeTurnHooksFor(harness.id, c.runId, c.taskId, "attach"),
-      });
-      addLingeringOpencodeTurn({ taskId: c.taskId, harnessId: harness.id, turn });
-      lingeredTaskIds.add(c.taskId);
-    } catch (err) {
-      console.warn(`[agetor] could not listen for the background subagents of task ${c.taskId}:`, err);
-    }
-  }
+  const lingeredTaskIds = opencodeServer.lingerHeldTasks(reattachedTaskIds);
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
@@ -4214,13 +4167,21 @@ function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult
  * (`stopRun`) so the two can't drift.
  */
 function stopActiveHandle(h: ActiveRun, reason: string): void {
+  // OpenCode: a wake for an execution that started before this moment is the
+  // one this Stop interrupts (`orchestrator-opencode-server.ts`).
+  noteOpencodeStopRequested(h.taskId);
   for (const [, handle] of active) {
     if (handle.taskId === h.taskId) handle.cancelled = true;
   }
-  // An OpenCode wake seen during this run is the execution being stopped.
+  // An OpenCode wake seen during this run: nobody listens to its execution,
+  // so the Stop interrupts it too.
   dropDeferredOpencodeWake(h.taskId);
   cancelPendingForTask(h.taskId, reason);
   h.kill();
+  // An earlier OpenCode turn of the task may still linger for its background
+  // subagents (a follow-up registered, its prompt not sent yet: the linger
+  // ends only on the root's next execution). The Stop reaches them too.
+  if (liveLingeringOpencodeTurns(h.taskId).length > 0) void disposeLingeringOpencodeTurns(h.taskId);
 }
 
 /**
@@ -4237,6 +4198,8 @@ async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   // hold. Whatever the server runs on the session afterwards is a wake like
   // any other (plan R3): it becomes a run and pulls the card back.
   if (isOpencodeServerTask(taskId)) {
+    noteOpencodeStopRequested(taskId);
+    dropDeferredOpencodeWake(taskId);
     await disposeLingeringOpencodeTurns(taskId);
     orphanRunningOpencodeSubagents(taskId, reason);
     return;
@@ -4275,6 +4238,7 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // harness reaches `pendingCancelRunIds.add` below without yielding first.
     let endedLinger = false;
     if (liveLingeringOpencodeTurns(taskId).length > 0) {
+      noteOpencodeStopRequested(taskId);
       await disposeLingeringOpencodeTurns(taskId);
       endedLinger = true;
       // The pending spawn may have registered while the dispose was awaited.
@@ -5988,6 +5952,7 @@ initOpencodeServerOrchestrator({
   normalizeUserText,
   spawnFollowUpTurn: spawnOpencodeTurnNow,
   followUpQueue: opencodeTurnQueue,
+  drainFollowUpQueue: drainOpencodeQueue,
   isPipelineStepTaskId,
   stashQueuedFollowUpsOfStoppedStep,
   opencodeTurnBreadcrumb,
@@ -6000,13 +5965,19 @@ initOpencodeServerOrchestrator({
  * `running` row would hold the task's next turn — on any harness — in
  * `running` forever (`isTaskHeldByBackgroundAgents`).
  */
-async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
+async function dropOpencodeTask(taskId: string, reason: string, opts: { deleting?: boolean } = {}): Promise<void> {
   // A server-transport turn has no tmux session: it is stopped over HTTP
   // (the driver's `kill` interrupts the session) and its open cards cancelled.
   // Delete, archive and an agent switch leave no card for this session: an
   // execution the server starts on it later is interrupted, not woken
-  // (`decideOpencodeWake`).
+  // (`decideOpencodeWake`). A deleted task's runs are about to go, so its
+  // sessions stay watched through a tombstone (24 h); an archived task's are
+  // watched through its archived runs for as long.
+  if (opts.deleting) tombstoneOpencodeSessionsOfTask(taskId);
   await stopOpencodeServerTurnsOfTask(taskId, reason);
+  // With or without a local handle: what the server still runs for the task
+  // (its sessions, then their executing subagents) is interrupted over HTTP.
+  await interruptOpencodeSessionsOfDroppedTask(taskId);
   await dropOpencodeSession(taskId);
   orphanRunningOpencodeSubagents(taskId, reason);
   scheduleOpencodeWatchRefresh();
@@ -9235,7 +9206,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
     else if (deleteKind === "antigravity") await dropAntigravitySession(taskId);
-    else if (deleteKind === "opencode") await dropOpencodeTask(taskId, "the task was deleted"); // graceful C-c, then kill (D-10)
+    else if (deleteKind === "opencode") await dropOpencodeTask(taskId, "the task was deleted", { deleting: true }); // graceful C-c, then kill (D-10)
     else if (deleteKind === "copilot") await dropCopilotSession(taskId);
     else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // A step task's worktree is the shared parent's (D2) — never remove it

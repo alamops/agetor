@@ -57,6 +57,21 @@
  *     event after the request began.
  *     The same check runs for sessions newly added by a `watch` call on an
  *     already-connected stream.
+ *   - Wake input: for each watched session the hub keeps the inbox items
+ *     enqueued (`session.inbox.enqueued`, any item type) and not yet delivered,
+ *     keyed by inbox id. An item leaves only on its `session.inbox.delivered`
+ *     or `session.inbox.cancelled`, never at an execution end: an interrupted
+ *     execution leaves its undelivered items parked for the next one. Each wake gets `OpencodeWakeInput`, the items pending when
+ *     its execution started (oldest first) and `known`. `known` is false when
+ *     the hub can have missed an enqueue: a wake from a snapshot (connect,
+ *     reconnect, adopted or newly watched session), and any execution of a
+ *     session that is "blind" (watched since less than a snapshot, or the
+ *     stream was (re)connected or replaced) or whose pending set a cap
+ *     trimmed. An active-session snapshot showing the session idle clears both
+ *     (an idle session has nothing pending); a blind or trimmed session asks
+ *     for one after each of its execution ends. A trim alone also clears when
+ *     a delivery empties the set. The sets are bounded per session and in
+ *     total, and dropped when a session leaves the watch set.
  *
  * Contract notes for callers:
  *   - `ready` resolves once the stream is open (`server.connected`) and the
@@ -114,14 +129,20 @@ export interface OpencodeHubSubscriber {
 /** `epoch` (optional) orders refs of one server key: the server's `startedAt` works. */
 export type OpencodeHubServer = { key: string; epoch?: number } & OpencodeServerRef;
 /**
- * What woke a session, when the server told it: the metadata of the latest
- * synthetic inbox item (`session.inbox.enqueued`) seen for the session since
- * its previous execution ended. For a background subagent it is
- * `{ source: "subagent", childID, state: "completed" | "cancelled" | "error" }`.
+ * One inbox item (`session.inbox.enqueued`) of a watched session. `synthetic`
+ * is `item.type === "synthetic"`; `source`, `childID` and `state` come from the
+ * item's `payload.metadata` when they are strings. For a background subagent
+ * that ended they are `{ source: "subagent", childID, state: "completed" |
+ * "cancelled" | "error" }`.
  */
-export type OpencodeWakeTrigger = { source?: string; childID?: string; state?: string };
-/** `trigger` is undefined when no synthetic item preceded the execution (or it is unknown). */
-export type OpencodeWakeHandler = (serverKey: string, sessionId: string, e: OpencodeEnvelope, trigger?: OpencodeWakeTrigger) => void;
+export type OpencodeWakeItem = { inboxId: string; synthetic: boolean; source?: string; childID?: string; state?: string };
+export type OpencodeWakeInput = {
+  /** The session's inbox items enqueued and not yet delivered when this execution started, oldest first. */
+  items: OpencodeWakeItem[];
+  /** false when the hub can't have seen every enqueue (a wake from a resync/reconnect/adopt or a newly watched session, or a pending set trimmed by a cap). */
+  known: boolean;
+};
+export type OpencodeWakeHandler = (serverKey: string, sessionId: string, e: OpencodeEnvelope, input: OpencodeWakeInput) => void;
 export type OpencodeWatchLostHandler = (serverKey: string) => void;
 
 /** Children of children are followed this deep (the root is depth 0). */
@@ -130,7 +151,9 @@ const MAX_CHILD_DEPTH = 4;
 const MAX_OWNED_PER_ROOT = 500;
 /** Envelope ids remembered for wake dedupe. */
 const WAKE_DEDUPE_MAX = 256;
-const TRIGGERS_MAX = 256;
+/** Pending (enqueued, not yet delivered) inbox items remembered per watched session, and per server in total. */
+const DEFAULT_PENDING_CAPS = { perSession: 64, total: 1024 };
+let pendingCaps = { ...DEFAULT_PENDING_CAPS };
 
 const DEFAULT_BACKOFF = {
   baseMs: 1000,
@@ -158,6 +181,28 @@ interface Owned {
   origin: Readonly<OpencodeHubOrigin>;
 }
 
+interface PendingItem {
+  item: OpencodeWakeItem;
+  /** `execSeq` when it was enqueued (orders it against snapshots and other sessions' items). */
+  seq: number;
+}
+
+interface PendingSet {
+  /** By inbox id, in enqueue order. */
+  items: Map<string, PendingItem>;
+  /**
+   * A cap dropped an item: the set is incomplete until a delivery empties it
+   * or an idle snapshot clears it (the set is kept, empty, while still marked).
+   */
+  trimmed: boolean;
+}
+
+interface OpenExec {
+  e: OpencodeEnvelope;
+  /** What the execution started with (the wake fired on a later unsubscribe passes this). */
+  input: OpencodeWakeInput;
+}
+
 interface HubServer {
   key: string;
   ref: OpencodeServerRef;
@@ -182,13 +227,31 @@ interface HubServer {
   /** Watched sessions the wake handler fired for whose execution has not ended. */
   woken: Set<string>;
   /** Per watched root: the latest `execution.started` with no matching end yet, subscribed or not. */
-  openExec: Map<string, OpencodeEnvelope>;
+  openExec: Map<string, OpenExec>;
   /** Per watched root: `execSeq` of its latest execution event (a live event beats an older snapshot). */
   lastExec: Map<string, number>;
+  /** Orders execution events and inbox enqueues against the active-session snapshots. */
   execSeq: number;
   wakeSeen: Set<string>;
-  /** Per watched session: the latest synthetic inbox item's metadata since its last execution end (bounded). */
-  triggers: Map<string, OpencodeWakeTrigger>;
+  /**
+   * Per watched session: inbox items enqueued and not yet delivered, kept
+   * until `session.inbox.delivered` or `session.inbox.cancelled` (never
+   * dropped at an execution end: an interrupted execution leaves its
+   * undelivered items parked for the next one).
+   */
+  pending: Map<string, PendingSet>;
+  /** Items in `pending`, all sessions together. */
+  pendingTotal: number;
+  /**
+   * Watched sessions whose enqueues the hub may have missed: newly watched, or
+   * the stream was (re)connected or replaced since. Cleared when an
+   * active-session snapshot taken after that shows the session idle (an idle
+   * session has nothing pending), checked at connect, on a newly watched id,
+   * and after each execution end of a session still marked.
+   */
+  blind: Set<string>;
+  /** Sessions whose post-execution inbox check is in flight. */
+  rechecking: Set<string>;
 }
 
 const servers = new Map<string, HubServer>();
@@ -450,17 +513,21 @@ function route(srv: HubServer, e: OpencodeEnvelope): void {
 
   // Execution bookkeeping for watched roots comes BEFORE dispatch, so a
   // subscriber that unsubscribes from inside onEvent sees the up-to-date state.
-  noteTrigger(srv, sid, e);
+  noteInbox(srv, sid, e);
   const started = e.type === "session.execution.started";
+  let input: OpencodeWakeInput | undefined;
   if ((started || isExecutionEnd(e.type)) && srv.watched.has(sid)) {
     srv.lastExec.set(sid, ++srv.execSeq);
-    if (started) srv.openExec.set(sid, e);
-    else {
+    if (started) {
+      input = wakeInputOf(srv, sid);
+      srv.openExec.set(sid, { e, input });
+    } else {
       srv.openExec.delete(sid);
       srv.woken.delete(sid);
+      if (srv.blind.has(sid) || srv.pending.get(sid)?.trimmed) recheckInbox(srv, srv.gen, sid);
     }
   }
-  if (started) maybeWake(srv, sid, e, owner);
+  if (started && input) maybeWake(srv, sid, e, owner, input);
 
   if (!owner) return;
   const list = srv.entries.get(owner.root);
@@ -470,41 +537,151 @@ function route(srv: HubServer, e: OpencodeEnvelope): void {
   }
 }
 
-/** Remember a synthetic inbox item's metadata as the likely cause of the session's next execution; any execution end forgets it. */
-function noteTrigger(srv: HubServer, sid: string, e: OpencodeEnvelope): void {
-  if (isExecutionEnd(e.type)) {
-    srv.triggers.delete(sid);
+/**
+ * Track the watched session's pending inbox items: added on enqueue (any item
+ * type), removed only on delivery or cancellation (`DELETE …/inbox/{id}`
+ * publishes `session.inbox.cancelled`). An interrupt leaves undelivered items
+ * parked with no event; the next execution takes them first.
+ */
+function noteInbox(srv: HubServer, sid: string, e: OpencodeEnvelope): void {
+  const gone = e.type === "session.inbox.delivered" || e.type === "session.inbox.cancelled";
+  if (e.type !== "session.inbox.enqueued" && !gone) return;
+  if (!srv.watched.has(sid)) return;
+  const d = e.data as { inboxID?: unknown; item?: { type?: unknown; payload?: { metadata?: unknown } } } | undefined;
+  const inboxId = d?.inboxID;
+  if (typeof inboxId !== "string" || inboxId.length === 0) return;
+  if (gone) {
+    const set = srv.pending.get(sid);
+    if (!set || !set.items.delete(inboxId)) return;
+    srv.pendingTotal--;
+    if (set.items.size === 0) srv.pending.delete(sid); // empty again: complete again
     return;
   }
-  if (e.type !== "session.inbox.enqueued" || !srv.watched.has(sid)) return;
-  const item = (e.data as { item?: { type?: unknown; payload?: { metadata?: unknown } } } | undefined)?.item;
-  if (!item || item.type !== "synthetic") return;
-  const meta = item.payload?.metadata;
-  if (!meta || typeof meta !== "object") return;
-  const m = meta as Record<string, unknown>;
-  const trigger: OpencodeWakeTrigger = {};
-  if (typeof m.source === "string") trigger.source = m.source;
-  if (typeof m.childID === "string") trigger.childID = m.childID;
-  if (typeof m.state === "string") trigger.state = m.state;
-  srv.triggers.delete(sid); // re-insert as the newest
-  srv.triggers.set(sid, trigger);
-  if (srv.triggers.size > TRIGGERS_MAX) {
-    const oldest = srv.triggers.keys().next().value;
-    if (oldest !== undefined) srv.triggers.delete(oldest);
+  const item: OpencodeWakeItem = { inboxId, synthetic: d?.item?.type === "synthetic" };
+  const meta = d?.item?.payload?.metadata;
+  if (meta && typeof meta === "object") {
+    const m = meta as Record<string, unknown>;
+    if (typeof m.source === "string") item.source = m.source;
+    if (typeof m.childID === "string") item.childID = m.childID;
+    if (typeof m.state === "string") item.state = m.state;
+  }
+  let set = srv.pending.get(sid);
+  if (!set) {
+    set = { items: new Map(), trimmed: false };
+    srv.pending.set(sid, set);
+  }
+  const existing = set.items.get(inboxId);
+  if (existing) {
+    existing.item = item; // a replayed enqueue keeps its place
+    return;
+  }
+  set.items.set(inboxId, { item, seq: ++srv.execSeq });
+  srv.pendingTotal++;
+  if (set.items.size > pendingCaps.perSession) trimOldest(srv, set);
+  while (srv.pendingTotal > pendingCaps.total) {
+    // The session holding the oldest item overall gives it up.
+    let victim: PendingSet | undefined;
+    let oldest = Infinity;
+    for (const ps of srv.pending.values()) {
+      const first = ps.items.values().next().value;
+      if (first && first.seq < oldest) {
+        oldest = first.seq;
+        victim = ps;
+      }
+    }
+    if (!victim) break;
+    trimOldest(srv, victim);
   }
 }
 
-function maybeWake(srv: HubServer, sid: string, e: OpencodeEnvelope, owner: Owned | undefined): void {
+function trimOldest(srv: HubServer, set: PendingSet): void {
+  const oldest = set.items.keys().next().value;
+  if (oldest === undefined) return;
+  set.items.delete(oldest);
+  srv.pendingTotal--;
+  // Kept even when empty: the dropped item is still pending on the server.
+  set.trimmed = true;
+}
+
+/** Drop a session's pending items (it left the watch set, or the server changed). */
+function dropPending(srv: HubServer, sid: string): void {
+  const set = srv.pending.get(sid);
+  if (!set) return;
+  srv.pendingTotal -= set.items.size;
+  srv.pending.delete(sid);
+}
+
+function clearPending(srv: HubServer): void {
+  srv.pending.clear();
+  srv.pendingTotal = 0;
+}
+
+/** The session's pending items right now (copies, oldest first) and whether the hub can have seen every enqueue. */
+function wakeInputOf(srv: HubServer, sid: string, forceUnknown = false): OpencodeWakeInput {
+  const set = srv.pending.get(sid);
+  const items = set ? [...set.items.values()].map((p) => ({ ...p.item })) : [];
+  const known = !forceUnknown && !srv.blind.has(sid) && !(set?.trimmed ?? false);
+  return { items, known };
+}
+
+function copyInput(input: OpencodeWakeInput): OpencodeWakeInput {
+  return { items: input.items.map((i) => ({ ...i })), known: input.known };
+}
+
+/**
+ * An active-session snapshot requested at `startSeq` shows `sid` idle, and no
+ * execution event for it arrived since: nothing can be pending on it now, so
+ * the hub has seen every enqueue from here on. Items enqueued before the
+ * snapshot are stale (delivered while the hub could not see it).
+ */
+function markInboxSeen(srv: HubServer, sid: string, startSeq: number): void {
+  srv.blind.delete(sid);
+  const set = srv.pending.get(sid);
+  if (!set) return;
+  for (const [id, p] of [...set.items]) {
+    if (p.seq > startSeq) continue;
+    set.items.delete(id);
+    srv.pendingTotal--;
+  }
+  // Whatever a cap dropped was enqueued before the snapshot too.
+  set.trimmed = false;
+  if (set.items.size === 0) srv.pending.delete(sid);
+}
+
+/** After an execution end of a session whose pending set may be incomplete (blind or trimmed): ask once whether it is idle now. */
+function recheckInbox(srv: HubServer, gen: number, sid: string): void {
+  if (srv.rechecking.has(sid)) return;
+  srv.rechecking.add(sid);
+  const startSeq = srv.execSeq;
+  let client;
+  try {
+    client = createOpencodeClient(srv.ref);
+  } catch {
+    srv.rechecking.delete(sid);
+    return;
+  }
+  client
+    .activeSessions()
+    .then((active) => {
+      if (srv.gen !== gen || servers.get(srv.key) !== srv || !srv.watched.has(sid)) return;
+      if ((srv.lastExec.get(sid) ?? 0) > startSeq) return; // a newer execution: its own end checks again
+      if (active[sid] === undefined) markInboxSeen(srv, sid, startSeq);
+    })
+    .catch((err) => warn("inbox check failed", srv.key, sid, err))
+    .finally(() => srv.rechecking.delete(sid));
+}
+
+function maybeWake(srv: HubServer, sid: string, e: OpencodeEnvelope, owner: Owned | undefined, input: OpencodeWakeInput): void {
   if (!srv.watched.has(sid)) return;
   // A subscribed session does not wake now: its driver handles the next
   // execution itself, and `openExec` makes the wake fire if the driver
   // unsubscribes while that execution is still open.
   if ((srv.entries.get(sid)?.length ?? 0) > 0 || owner) return;
   if (srv.woken.has(sid)) return; // an earlier wake (e.g. from a snapshot) already covers this execution
-  fireWake(srv, sid, e);
+  fireWake(srv, sid, e, input);
 }
 
-function fireWake(srv: HubServer, sid: string, e: OpencodeEnvelope): void {
+function fireWake(srv: HubServer, sid: string, e: OpencodeEnvelope, input: OpencodeWakeInput): void {
   const key = wakeKey(sid, e);
   if (srv.wakeSeen.has(key)) return;
   srv.wakeSeen.add(key);
@@ -515,8 +692,8 @@ function fireWake(srv: HubServer, sid: string, e: OpencodeEnvelope): void {
   srv.woken.add(sid);
   const fn = wakeHandler;
   if (!fn) return;
-  const trigger = srv.triggers.get(sid);
-  callGuarded(srv, sid, "wake handler", () => fn(srv.key, sid, e, trigger ? { ...trigger } : undefined));
+  const copy = copyInput(input);
+  callGuarded(srv, sid, "wake handler", () => fn(srv.key, sid, e, copy));
 }
 
 function onConnected(srv: HubServer, gen: number): void {
@@ -524,6 +701,8 @@ function onConnected(srv: HubServer, gen: number): void {
   srv.connectedAt = Date.now();
   srv.connects++;
   srv.failures = 0; // consecutive attempts that never connected: this one did
+  // Enqueues before this stream existed were not seen; the snapshot below clears idle sessions.
+  for (const sid of srv.watched) srv.blind.add(sid);
 
   const resyncSet = new Set<Entry>();
   const freshSet = new Set<Entry>();
@@ -589,17 +768,20 @@ async function wakeResync(srv: HubServer, gen: number, only?: ReadonlySet<string
     if (active[sid] === undefined) {
       srv.woken.delete(sid);
       srv.openExec.delete(sid);
+      markInboxSeen(srv, sid, startSeq);
       continue;
     }
     const e: OpencodeEnvelope = { id: `resync:${srv.connects}:${sid}`, type: "session.execution.started", data: { sessionID: sid } };
+    // The execution began while the hub could not see it: what it started with is unknown.
+    const input = wakeInputOf(srv, sid, true);
     if ((srv.entries.get(sid)?.length ?? 0) > 0) {
       // Attached: remember the open execution so unsubscribing while it runs wakes.
-      if (!srv.openExec.has(sid)) srv.openExec.set(sid, e);
+      if (!srv.openExec.has(sid)) srv.openExec.set(sid, { e, input });
       continue;
     }
     if (srv.woken.has(sid)) continue;
-    srv.openExec.set(sid, e);
-    fireWake(srv, sid, e);
+    srv.openExec.set(sid, { e, input });
+    fireWake(srv, sid, e, input);
   }
 }
 
@@ -670,7 +852,9 @@ function getOrCreate(key: string, ref: OpencodeServerRef, epoch: number | undefi
     srv.woken.clear();
     srv.openExec.clear();
     srv.lastExec.clear();
-    srv.triggers.clear();
+    clearPending(srv);
+    for (const sid of srv.watched) srv.blind.add(sid);
+    srv.rechecking.clear();
     if (restarted) srv.failures = 0; // a new server process: its first hiccup is not a continuation of the old one's
     if (lostEntries.length > 0) {
       const err = new Error("OpenCode server restarted");
@@ -715,7 +899,10 @@ function getOrCreate(key: string, ref: OpencodeServerRef, epoch: number | undefi
       lastExec: new Map(),
       execSeq: 0,
       wakeSeen: new Set(),
-      triggers: new Map(),
+      pending: new Map(),
+      pendingTotal: 0,
+      blind: new Set(),
+      rechecking: new Set(),
     };
     servers.set(key, srv);
   }
@@ -795,7 +982,7 @@ export function subscribeOpencodeSession(
       // The turn this driver was attached to has ended, but the server started
       // another one meanwhile (its terminal event has not come): wake for it.
       const open = last && srv.watched.has(rootSessionId) ? srv.openExec.get(rootSessionId) : undefined;
-      if (open && !srv.woken.has(rootSessionId)) fireWake(srv, rootSessionId, open);
+      if (open && !srv.woken.has(rootSessionId)) fireWake(srv, rootSessionId, open.e, open.input);
     },
   };
 }
@@ -830,7 +1017,8 @@ export function watchOpencodeSessionsForWake(serverKey: string, ref: OpencodeSer
       srv.woken.clear();
       srv.openExec.clear();
       srv.lastExec.clear();
-    srv.triggers.clear();
+      clearPending(srv);
+      srv.blind.clear();
       maybeDispose(srv);
     }
     return;
@@ -843,9 +1031,12 @@ export function watchOpencodeSessionsForWake(serverKey: string, ref: OpencodeSer
   const srv = getOrCreate(serverKey, ref, ref.epoch);
   const added = new Set(ids.filter((s) => !srv.watched.has(s)));
   srv.watched = new Set(ids);
-  for (const m of [srv.woken, srv.openExec, srv.lastExec, srv.triggers] as Array<Set<string> | Map<string, unknown>>) {
+  for (const m of [srv.woken, srv.openExec, srv.lastExec, srv.blind] as Array<Set<string> | Map<string, unknown>>) {
     for (const sid of [...m.keys()]) if (!srv.watched.has(sid)) m.delete(sid);
   }
+  for (const sid of [...srv.pending.keys()]) if (!srv.watched.has(sid)) dropPending(srv, sid);
+  // A newly watched session's earlier enqueues were not seen.
+  for (const sid of added) srv.blind.add(sid);
   connect(srv);
   // On a stream that is already connected nothing else looks at the newly
   // watched sessions (onConnected only runs on connect): one may be running.
@@ -879,7 +1070,8 @@ export function closeOpencodeHub(serverKey?: string): void {
     srv.woken.clear();
     srv.openExec.clear();
     srv.lastExec.clear();
-    srv.triggers.clear();
+    clearPending(srv);
+    srv.blind.clear();
     disposeServer(srv);
   }
   // After the records are gone, so a callback that subscribes again starts afresh.
@@ -896,6 +1088,13 @@ export const __forTest = {
   },
   resetBackoff(): void {
     backoff = { ...DEFAULT_BACKOFF };
+  },
+  /** Shrink the pending-inbox caps; call `resetPendingCaps()` in afterEach. */
+  setPendingCaps(o: Partial<typeof DEFAULT_PENDING_CAPS>): void {
+    pendingCaps = { ...pendingCaps, ...o };
+  },
+  resetPendingCaps(): void {
+    pendingCaps = { ...DEFAULT_PENDING_CAPS };
   },
   /** Awaited at the start of a root's child seeding / after the wake check's active-session fetch. */
   setHooks(h: { beforeSeed?: typeof hooks.beforeSeed; afterActiveSessions?: typeof hooks.afterActiveSessions }): void {
@@ -924,6 +1123,12 @@ export const __forTest = {
     watched: string[];
     owned: string[];
     woken: string[];
+    /** Pending inbox ids per watched session, oldest first. */
+    pending: Record<string, string[]>;
+    /** Watched sessions whose enqueues the hub may have missed. */
+    blind: string[];
+    /** Watched sessions the hub has seen a live execution event for. */
+    execSeen: string[];
   } | null {
     const srv = servers.get(key);
     if (!srv) return null;
@@ -941,6 +1146,9 @@ export const __forTest = {
       watched: [...srv.watched],
       owned: [...srv.owned.keys()],
       woken: [...srv.woken],
+      pending: Object.fromEntries([...srv.pending].map(([sid, ps]) => [sid, [...ps.items.keys()]])),
+      blind: [...srv.blind],
+      execSeen: [...srv.lastExec.keys()],
     };
   },
   serverKeys(): string[] {
