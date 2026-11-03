@@ -728,7 +728,12 @@ function redact(text: string, password?: string): string {
 
 /** The head of the log, bounded. The listening line is the server's first
  *  output; a log grown past the cap is never read whole. */
+/** The head of the server's log. Throws when the server directory no longer
+ *  checks out (S12): the no-follow open guards only the last path component,
+ *  so a directory swapped for a symlink would otherwise hand back an
+ *  attacker's file. A missing or unreadable log reads as empty. */
 function readLogHead(id: string): string {
+  verifyServerDir();
   let fd: number;
   try {
     fd = openReadNoFollow(logPath(id));
@@ -747,7 +752,13 @@ function readLogHead(id: string): string {
 }
 
 function logTail(id: string, password: string): string {
-  const lines = readLogHead(id)
+  let head: string;
+  try {
+    head = readLogHead(id);
+  } catch {
+    return ""; // a directory that fails the check is not read, not even for an error message
+  }
+  const lines = head
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l !== "");
@@ -821,7 +832,11 @@ async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promi
   const deadline = Date.now() + startBudgetMs;
   let url: string | null = null;
   for (let poll = 0; Date.now() < deadline; poll++) {
-    url = parseListeningUrl(readLogHead(id));
+    try {
+      url = parseListeningUrl(readLogHead(id));
+    } catch (e) {
+      return fail((e as Error).message);
+    }
     if (url) break;
     if (exited()) return fail("the server exited before it started listening");
     if (tmuxSession && poll > 0 && poll % LIVENESS_EVERY_POLLS === 0 && (await tmuxHasSession(tmuxSession)) === "gone") {

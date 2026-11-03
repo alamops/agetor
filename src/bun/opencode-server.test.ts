@@ -705,18 +705,26 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
       });
 
       test("a start whose dir is swapped mid-start fails without writing or unlinking through the link", async () => {
-        __forTest.setStartBudgetMs(1_500);
+        __forTest.setStartBudgetMs(5_000);
         const id = newId();
         rmSync(path.join(stubDir, "pid"), { force: true });
-        // Swap as soon as the stub has launched (state and log already exist).
-        const pending = ensureOpencodeServer(spec(id)).then(() => null, (e: Error) => e);
-        await waitFor(() => existsSync(path.join(stubDir, "pid")), 10_000);
-        const { evil, decoys } = swapForSymlink(id);
-        const err = await pending;
-        expect(err).toBeInstanceOf(Error);
-        untouched(evil, decoys);
-        expect(getOpencodeServer(id)).toBeNull();
-      });
+        // Hold the start in its health wait (a slow /api/info) so the swap
+        // lands deterministically between the launch and the writes after it,
+        // however loaded the machine is.
+        slowOn(700);
+        try {
+          const pending = ensureOpencodeServer(spec(id)).then(() => null, (e: Error) => e);
+          await waitFor(() => existsSync(path.join(stubDir, "pid")), 10_000);
+          const { evil, decoys } = swapForSymlink(id);
+          const err = await pending;
+          expect(err).toBeInstanceOf(Error);
+          expect(String(err?.message)).toMatch(/directory/); // the dir check refused, not a timeout
+          untouched(evil, decoys);
+          expect(getOpencodeServer(id)).toBeNull();
+        } finally {
+          slowOff();
+        }
+      }, 30_000);
 
       test("a state file in a swapped dir is not read, so it never names what to kill", async () => {
         const id = newId();
