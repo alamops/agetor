@@ -56,6 +56,18 @@ export interface OpencodeModelRef {
   variant?: string;
 }
 
+/** One undelivered inbox item of a session (`GET /api/session/{id}/inbox`).
+ *  `text` and `metadata` come from the item's `payload`. A user prompt or
+ *  steer is `type: "user"`; a subagent's notice to its parent is
+ *  `type: "synthetic"` with `metadata.source === "subagent"`. */
+export type OpencodeInboxItem = {
+  id: string;
+  type: string;
+  delivery?: string;
+  text?: string;
+  metadata?: { source?: string; childID?: string; agent?: string; state?: string };
+};
+
 export interface OpencodePermissionRule {
   action: string;
   resource: string;
@@ -125,7 +137,10 @@ function assertServerRef(ref: OpencodeServerRef): string {
  * Strip the password out of text bound for an error, a log or a status line:
  * the raw password and its base64 `opencode:<password>` form, then anything
  * that looks like it travels with a credential (`password=...`,
- * `OPENCODE_PASSWORD=...`, `Authorization: ...`, `Basic <b64>`, `Bearer <tok>`).
+ * `OPENCODE_PASSWORD=...`, `Authorization: ...`, `Basic <b64>`, `Bearer <tok>`),
+ * JSON-quoted keys and values included (`"password":"x"`,
+ * `"OPENCODE_PASSWORD": "x"`, `"authorization":"Basic x"`), so a password it
+ * was not told is still caught in a dumped config or request.
  * The single redactor for the OpenCode server code.
  */
 export function redactSecrets(text: string, password?: string): string {
@@ -135,10 +150,17 @@ export function redactSecrets(text: string, password?: string): string {
       if (secret) out = out.split(secret).join("[redacted]");
     }
   }
-  return out
-    .replace(/(password(?:\s*[=:]\s*|\s+))\S+/gi, "$1[redacted]")
-    .replace(/(authorization\s*[:=]\s*)(?:(?:basic|bearer)\s+)?\S+/gi, "$1[redacted]")
-    .replace(/\b(basic|bearer)(\s+)[A-Za-z0-9+/=._~-]{8,}/gi, "$1$2[redacted]");
+  return (
+    out
+      // A quoted value (`password: "a b"`, `"password":"x"`, `password "x"`), up
+      // to its closing quote or the end of the line when it has none.
+      .replace(/(password(?:"?\s*[=:]\s*|\s+))"(?:[^"\\\n]|\\.)*"?/gi, '$1"[redacted]"')
+      // A bare value (`password=x`, `"password": 12`, `password x`). It never
+      // starts with a quote, so a value the line above redacted stays as it is.
+      .replace(/(password(?:"?\s*[=:]\s*|\s+))(?!")\S+/gi, "$1[redacted]")
+      .replace(/(authorization"?\s*[:=]\s*"?)(?:(?:basic|bearer)\s+)?[^\s"]+/gi, "$1[redacted]")
+      .replace(/\b(basic|bearer)(\s+)[A-Za-z0-9+/=._~-]{8,}/gi, "$1$2[redacted]")
+  );
 }
 
 /** Server-supplied text folded into an error: redacted, control characters
@@ -166,7 +188,8 @@ export interface OpencodeClient {
   updateSession(id: string, a: { title?: string; permissions?: OpencodePermissionRule[] }): Promise<void>;
   switchModel(id: string, model: OpencodeModelRef): Promise<void>;
   switchAgent(id: string, agent: string): Promise<void>;
-  prompt(id: string, a: { id?: string; text: string; delivery?: "steer" | "queue" }): Promise<{ id: string; delivery?: string }>;
+  /** `resume: false` enqueues without starting an execution (a replay after idle otherwise runs an empty one; live: docs/plans/opencode-server-driver-spikes.md). */
+  prompt(id: string, a: { id?: string; text: string; delivery?: "steer" | "queue"; resume?: boolean }): Promise<{ id: string; delivery?: string }>;
   /** True when an execution was actually interrupted. */
   interrupt(id: string): Promise<boolean>;
   activeSessions(): Promise<Record<string, { type: string }>>;
@@ -182,6 +205,17 @@ export interface OpencodeClient {
   listForms(sessionId: string): Promise<any[]>;
   replyForm(sessionId: string, formId: string, answer: Record<string, unknown>): Promise<void>;
   cancelForm(sessionId: string, formId: string, message?: string): Promise<void>;
+  /** The session's inbox: items enqueued and not yet delivered, in enqueue
+   *  order. Malformed entries (no string `id` or `type`) are dropped. */
+  listInbox(sessionId: string): Promise<OpencodeInboxItem[]>;
+  /** Ask the server to cancel one undelivered inbox item. True when it accepted
+   *  the request (2xx). That does NOT prove the item was removed: live 2.1.3
+   *  answers 204 for any well-formed `msg_…` id, whether it removed a pending
+   *  item or the item was already delivered, already cancelled or unknown; only
+   *  a real removal publishes `session.inbox.cancelled{sessionID, inboxID}`.
+   *  False on 404 (no such session). Throws on anything else, a 400
+   *  (`InvalidRequestError`, a malformed id) included. */
+  cancelInboxItem(sessionId: string, inboxId: string): Promise<boolean>;
   /** Child (subagent) sessions of `sessionId`, newest page first, all pages up
    *  to a cap. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -210,9 +244,12 @@ function defined<T extends Record<string, unknown>>(o: T): Partial<T> {
  * The response body as text, read incrementally and refused once it passes
  * `max` bytes (a declared `content-length` over the cap is refused before any
  * body is read), so a misbehaving server cannot make the core buffer an
- * unbounded reply. The message carries no server text.
+ * unbounded reply. The message carries no server text. Over the cap it throws
+ * an `OpencodeHttpError` (`status` 0, `tag` `"BadResponse"`); a failed read
+ * rethrows the stream's own error. Also used by the server manager's health
+ * probe (`opencode-server.ts`), so every body read from the server is capped.
  */
-async function readCappedText(op: string, res: Response, max: number): Promise<string> {
+export async function readCappedText(op: string, res: Response, max: number): Promise<string> {
   const tooBig = () => new OpencodeHttpError(op, 0, `${op} reply is larger than ${max} bytes`, "BadResponse");
   const declared = Number(res.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > max) {
@@ -234,6 +271,32 @@ async function readCappedText(op: string, res: Response, max: number): Promise<s
     chunks.push(value);
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+const optStr = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+
+/** One raw inbox entry → `OpencodeInboxItem`, or null when it has no string
+ *  `id`/`type`. Only known fields are copied, and only when they are strings. */
+function parseInboxItem(raw: unknown): OpencodeInboxItem | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.id !== "string" || o.id === "" || typeof o.type !== "string") return null;
+  const item: OpencodeInboxItem = { id: o.id, type: o.type };
+  const delivery = optStr(o.delivery);
+  if (delivery !== undefined) item.delivery = delivery;
+  const payload = o.payload && typeof o.payload === "object" ? (o.payload as Record<string, unknown>) : undefined;
+  const text = optStr(payload?.text);
+  if (text !== undefined) item.text = text;
+  const m = payload?.metadata && typeof payload.metadata === "object" ? (payload.metadata as Record<string, unknown>) : undefined;
+  if (m) {
+    const metadata: NonNullable<OpencodeInboxItem["metadata"]> = {};
+    for (const k of ["source", "childID", "agent", "state"] as const) {
+      const v = optStr(m[k]);
+      if (v !== undefined) metadata[k] = v;
+    }
+    item.metadata = metadata;
+  }
+  return item;
 }
 
 export function createOpencodeClient(
@@ -382,7 +445,7 @@ export function createOpencodeClient(
         op: "prompt",
         method: "POST",
         path: `${sid(id)}/prompt`,
-        body: defined({ id: a.id, text: a.text, delivery: a.delivery }),
+        body: defined({ id: a.id, text: a.text, delivery: a.delivery, resume: a.resume }),
       });
       const item = dataOf("prompt", json) as { id?: unknown; delivery?: unknown } | null;
       if (!item || typeof item.id !== "string") {
@@ -464,6 +527,23 @@ export function createOpencodeClient(
         path: `${sid(sessionId)}/form/${encodeURIComponent(formId)}`,
         query: { message },
       });
+    },
+
+    async listInbox(sessionId) {
+      const { json } = await call({ op: "listInbox", method: "GET", path: `${sid(sessionId)}/inbox` });
+      // `{ data: [...] }` like the other lists; a bare array is accepted too.
+      const data = Array.isArray(json) ? json : dataOf("listInbox", json);
+      return Array.isArray(data) ? data.map(parseInboxItem).filter((x): x is OpencodeInboxItem => x !== null) : [];
+    },
+
+    async cancelInboxItem(sessionId, inboxId) {
+      const { status } = await call({
+        op: "cancelInboxItem",
+        method: "DELETE",
+        path: `${sid(sessionId)}/inbox/${encodeURIComponent(inboxId)}`,
+        passStatuses: [404],
+      });
+      return status >= 200 && status < 300;
     },
 
     async listChildren(sessionId) {

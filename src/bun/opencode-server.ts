@@ -11,6 +11,7 @@ import {
   readdirSync,
   realpathSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -20,7 +21,15 @@ import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SCRUBBED_ENV_KEYS, childEnv, coreSpawn, coreSpawnSync } from "./core-spawn.ts";
 import { openReadNoFollow } from "./no-follow.ts";
-import { isLoopbackOpencodeUrl, opencodeAuthHeader, redactSecrets } from "./opencode-http.ts";
+import {
+  OPENCODE_MAX_RESPONSE_BYTES,
+  OpencodeHttpError,
+  createOpencodeClient,
+  isLoopbackOpencodeUrl,
+  opencodeAuthHeader,
+  readCappedText,
+  redactSecrets,
+} from "./opencode-http.ts";
 import { escapeFreeText } from "../shared/terminal-text.ts";
 
 /**
@@ -69,18 +78,33 @@ import { escapeFreeText } from "../shared/terminal-text.ts";
  * not run under `NODE_ENV=test`); in any other process the variable is ignored,
  * so a stray value in a packaged build's environment cannot move the server
  * out of tmux (and a state file with no tmux session stays "planted").
+ * An env gate is enough here because setting the core's own environment
+ * already takes control of the process that launches agetor, and that grants
+ * more than this seam does (`AGETOR_OPENCODE_BIN`, `PATH`, `AGETOR_DATA_DIR`
+ * pick what runs and where). What the gate must not do is let an agent that
+ * can only write files turn a planted state file into an adoption or a
+ * signal, so even with the seam on, a state file with no tmux session is
+ * trusted only when its `hostPid` is a live child THIS process spawned
+ * (`directProcs`): a direct-host server never outlives the core that spawned
+ * it as something that core can prove is its own, so any other such file is
+ * planted. It is not adopted, its pid is never signalled, and it is removed
+ * only through the guarded remove.
  *
  * Bounded external calls. Every tmux and `ps` call is bounded (`tmuxTimeoutMs`,
  * the child is killed on expiry) and a timeout is a failed call: "unknown" for a
  * host check, nothing signalled for a pid lookup. It is never proof a server
  * died (I3).
  *
- * The server directory. It holds the password, so it is re-verified (an lstat:
- * a plain directory, not a symlink, owned by us, and a realpath equal to its
- * parent's realpath plus its own name) right before every write and every
- * unlink batch, the stop paths included, and an operation on a directory that
- * no longer checks out is refused rather than redirected into a swapped-in
- * target (fail closed).
+ * The server directory. It holds the password, so it is re-verified right
+ * before every write, every log read and every unlink batch, the stop paths
+ * included (`verifyServerDir` lists the checks: a plain directory owned by us
+ * whose device and inode, and its parent's, are the ones this process first
+ * saw), and an operation on a directory that no longer checks out is refused
+ * rather than redirected into a swapped-in target (fail closed). The check and
+ * the syscall after it are separate steps, so a swap that lands in between is
+ * not caught (a check-then-use race); the no-follow open of the final
+ * component and the 0600/owner checks on what is read limit what such a swap
+ * can do.
  */
 
 /** Idle window before the sweep may stop a server (D6). */
@@ -95,7 +119,13 @@ const POLL_MS = 100;
 /** Every Nth poll also asks the host whether the server died. */
 const LIVENESS_EVERY_POLLS = 10;
 /** How long `stop` waits for the server to go away before escalating. */
-const STOP_GRACE_MS = 2_000;
+const DEFAULT_STOP_GRACE_MS = 2_000;
+let stopGraceMs = DEFAULT_STOP_GRACE_MS;
+/** Bound on the restart gate's `GET /api/session/active` (C4). */
+const DEFAULT_RESTART_GATE_TIMEOUT_MS = 2_000;
+let restartGateTimeoutMs = DEFAULT_RESTART_GATE_TIMEOUT_MS;
+/** Cap on the health probe's response body (the client's cap). */
+let probeMaxBytes = OPENCODE_MAX_RESPONSE_BYTES;
 const LOG_READ_BYTES = 64 * 1024;
 const STATE_MAX_BYTES = 16 * 1024;
 const TAIL_LINES = 12;
@@ -177,10 +207,13 @@ interface TerminateTarget {
 
 const servers = new Map<string, ServerRecord>();
 const starting = new Map<string, Promise<OpencodeServerHandle>>();
-const stopping = new Map<string, Promise<void>>();
+const stopping = new Map<string, Promise<boolean>>();
 /** Live `direct`-host children this process spawned, by pid: the only pids
  *  outside a tmux pane tree that may ever be signalled. */
 const directProcs = new Map<number, ReturnType<typeof coreSpawn>>();
+/** Every judgement of the last boot adoption, settled (a test barrier: a
+ *  verdict may land after the adoption budget returned). */
+let lastAdoption: Promise<unknown> = Promise.resolve();
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Paths and names
@@ -204,10 +237,28 @@ const logPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.lo
 const envPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.env`);
 const sessionNameFor = (id: string): string => `agetor-ocsrv-${safeId(id)}`;
 
-/** Check that the server dir still is what `ensureServerDir` made: a plain
- *  directory (lstat: not a symlink), owned by us, whose realpath is its
- *  parent's realpath plus its own name (so no component was swapped for a
- *  link). Throws when it is not. No side effects. */
+interface FileId {
+  dev: number;
+  ino: number;
+}
+/** The server dir's (and its parent's) device and inode, by resolved path, as
+ *  this process first saw them. */
+const dirPins = new Map<string, { dir: FileId; parent: FileId }>();
+const fileId = (st: { dev: number; ino: number }): FileId => ({ dev: st.dev, ino: st.ino });
+const sameFile = (a: FileId, b: FileId): boolean => a.dev === b.dev && a.ino === b.ino;
+
+/** Check that the server dir still is the one this process made or first
+ *  validated:
+ *  - the path itself is a plain directory (lstat: not a symlink) owned by us;
+ *  - its realpath is its parent's realpath plus its own name;
+ *  - its device and inode, and those of its parent directory (stat, so a
+ *    legitimately symlinked ancestor such as `/tmp` still resolves), are the
+ *    ones pinned the first time this process validated it. The first check
+ *    pins them. A swap of the directory or of any ancestor (for a symlink to a
+ *    copy, say) changes one of the two, so it fails from then on.
+ *  Throws when any of that is not so. It is a check only: the syscall that
+ *  follows it is a separate step, and a swap landing between the two is not
+ *  caught (a check-then-use race). The only side effect is the first pin. */
 function verifyServerDir(): string {
   const dir = path.resolve(serverDir());
   const st = lstatSync(dir);
@@ -217,14 +268,36 @@ function verifyServerDir(): string {
   }
   const expected = path.join(realpathSync(path.dirname(dir)), path.basename(dir));
   if (realpathSync(dir) !== expected) throw new Error("opencode server directory resolves somewhere else");
+  const parent = fileId(statSync(path.dirname(dir)));
+  const pin = dirPins.get(dir);
+  if (!pin) dirPins.set(dir, { dir: fileId(st), parent });
+  else if (!sameFile(pin.dir, fileId(st)) || !sameFile(pin.parent, parent)) {
+    throw new Error("opencode server directory was replaced since it was first checked");
+  }
   return dir;
 }
 
 /** Create (or re-check) the 0700 server dir. A symlink, a non-directory or a
- *  directory owned by someone else is refused: it would hold the password. */
+ *  directory owned by someone else is refused: it would hold the password. A
+ *  directory this call creates itself (it was removed) is pinned afresh, but
+ *  only under the same parent the earlier pin names. */
 function ensureServerDir(): string {
   const dir = path.resolve(serverDir());
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 });
+  let created = false;
+  try {
+    mkdirSync(dir, { mode: 0o700 }); // not recursive: EEXIST tells "made here" from "already there"
+    created = true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+  }
+  const pin = dirPins.get(dir);
+  if (created && pin) {
+    if (!sameFile(pin.parent, fileId(statSync(path.dirname(dir))))) {
+      throw new Error("opencode server directory was replaced since it was first checked");
+    }
+    dirPins.delete(dir); // verifyServerDir pins the new directory
+  }
   verifyServerDir();
   const st = lstatSync(dir);
   if ((st.mode & 0o077) !== 0) chmodSync(dir, 0o700);
@@ -414,9 +487,18 @@ async function probe(url: string, password: string, timeoutMs: number): Promise<
       return { ok: false, status: res.status };
     }
     let version: string | undefined;
+    let text = "";
     try {
-      const body = (await res.json()) as { version?: unknown };
-      if (typeof body.version === "string") version = body.version;
+      // The same capped reader as the client: a body past the cap is not a
+      // healthy answer, and the core never buffers an unbounded one.
+      text = await readCappedText("info", res, probeMaxBytes);
+    } catch (e) {
+      if (e instanceof OpencodeHttpError) return { ok: false, status: 200 };
+      /* a body that failed mid-read: the authenticated 200 still stands */
+    }
+    try {
+      const body = JSON.parse(text) as { version?: unknown };
+      if (typeof body?.version === "string") version = body.version;
     } catch {
       /* a 200 with an odd body still proves the authenticated server */
     }
@@ -497,8 +579,11 @@ async function tmuxQuery(args: string[]): Promise<BoundedResult> {
 /** `tmux new-session` (the server launch), bounded and killable. The shared
  *  `spawnTmuxNewSession` has no timeout and no handle on the child, and one
  *  wedged tmux would hang the single-flight `ensure` for good. Same preamble
- *  as it: the disclaimed tmux server must exist first. */
+ *  as it: the disclaimed tmux server must exist first. The preamble and the
+ *  call share ONE budget (`newSessionTimeoutMs`): the call gets only what the
+ *  preamble left, so the whole launch attempt is bounded by it. */
 async function tmuxNewSession(args: string[]): Promise<{ status: number | null; stderr: string }> {
+  const deadline = Date.now() + newSessionTimeoutMs;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const budget = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => resolve("timeout"), newSessionTimeoutMs);
@@ -513,7 +598,9 @@ async function tmuxNewSession(args: string[]): Promise<{ status: number | null; 
   } finally {
     if (timer) clearTimeout(timer);
   }
-  const res = await runBounded([resolveTmuxBin(), ...args], newSessionTimeoutMs);
+  const left = deadline - Date.now();
+  if (left <= 0) return { status: null, stderr: "tmux new-session timed out (disclaimed server not ready)" };
+  const res = await runBounded([resolveTmuxBin(), ...args], left);
   return { status: res.code, stderr: res.stderr };
 }
 
@@ -537,6 +624,13 @@ function pidAlive(pid: number): boolean {
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+/** A live `direct`-host child this process spawned (and not this process). */
+function isOwnDirectChild(pid: number | undefined): boolean {
+  if (pid === undefined || pid === process.pid) return false;
+  const child = directProcs.get(pid);
+  return child !== undefined && child.exitCode === null;
 }
 
 function isAlive(pid: number): boolean {
@@ -618,22 +712,31 @@ async function waitUntil(cond: () => Promise<boolean>, ms: number): Promise<bool
 
 /** Stop the host: `kill-session` on the exact name (tmux) or a signal to the
  *  child this core spawned (direct), then wait a bounded time and escalate to
- *  the pids `authorizedPids` named before the session was killed. Never throws. */
-async function terminate(t: TerminateTarget): Promise<void> {
+ *  the pids `authorizedPids` named before the session was killed. Never throws.
+ *
+ *  Resolves true only when the stop is confirmed: every authorized pid is dead
+ *  and, for tmux, `has-session` said the session is gone. A tmux call that
+ *  failed or timed out ("unknown") is never a confirmation (I3), so a wedged
+ *  tmux resolves false and the caller must keep the server's record and state
+ *  (its password included) for a later stop or the next boot to judge. On the
+ *  direct host with no child of ours to signal there is nothing this core may
+ *  stop, which counts as done. */
+async function terminate(t: TerminateTarget): Promise<boolean> {
   try {
     const auth = await authorizedPids(t);
     if (t.tmuxSession) await tmuxQuery(["kill-session", "-t", `=${t.tmuxSession}:`]);
     else for (const pid of auth) signal(pid, "SIGTERM");
     const settled = async (): Promise<boolean> => {
       if (auth.some(isAlive)) return false;
-      return t.tmuxSession ? (await tmuxHasSession(t.tmuxSession)) !== "alive" : true;
+      return t.tmuxSession ? (await tmuxHasSession(t.tmuxSession)) === "gone" : true;
     };
-    if (await waitUntil(settled, STOP_GRACE_MS)) return;
+    if (await waitUntil(settled, stopGraceMs)) return true;
     for (const pid of auth) if (isAlive(pid)) signal(pid, "SIGTERM");
-    if (await waitUntil(settled, STOP_GRACE_MS)) return;
+    if (await waitUntil(settled, stopGraceMs)) return true;
     for (const pid of auth) if (isAlive(pid)) signal(pid, "SIGKILL");
+    return await waitUntil(settled, stopGraceMs);
   } catch {
-    /* best-effort: stop never throws */
+    return false; // best-effort: stop never throws, and an error confirms nothing
   }
 }
 
@@ -726,12 +829,12 @@ function redact(text: string, password?: string): string {
   return redactSecrets(text, password);
 }
 
-/** The head of the log, bounded. The listening line is the server's first
- *  output; a log grown past the cap is never read whole. */
-/** The head of the server's log. Throws when the server directory no longer
- *  checks out (S12): the no-follow open guards only the last path component,
- *  so a directory swapped for a symlink would otherwise hand back an
- *  attacker's file. A missing or unreadable log reads as empty. */
+/** The head of the server's log, at most `LOG_READ_BYTES` (the listening line
+ *  is the server's first output, so a log grown past the cap is never read
+ *  whole). Throws when the server directory no longer checks out (S12): the
+ *  no-follow open guards only the last path component, so a swapped directory
+ *  would otherwise hand back an attacker's file. A missing or unreadable log
+ *  reads as empty. */
 function readLogHead(id: string): string {
   verifyServerDir();
   let fd: number;
@@ -788,8 +891,12 @@ async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promi
   ensureServerDir();
   const direct = hostIsDirect();
   // A leftover session or file from a crashed start must not collide. The
-  // direct test host has no session to look for, so it never calls tmux.
-  if (!direct) await terminate({ tmuxSession: sessionNameFor(id) });
+  // direct test host has no session to look for, so it never calls tmux. A
+  // leftover whose stop is not confirmed keeps its files (its password) and
+  // fails this start: it may still be running.
+  if (!direct && !(await terminate({ tmuxSession: sessionNameFor(id) }))) {
+    throw new Error("OpenCode server failed to start: an earlier server session could not be confirmed stopped");
+  }
   removeFiles(id, { log: true });
 
   const password = randomBytes(32).toString("base64url");
@@ -807,10 +914,13 @@ async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promi
   writeState(rec);
   const logFd = createPrivateLog(id);
 
+  // Every failure from here on goes through `fail`, so the launched host is
+  // stopped. Its state file goes only once that stop is confirmed; a server
+  // that may still run keeps it for the next ensure or boot to judge.
   const fail = async (reason: string): Promise<never> => {
     const tail = logTail(id, password);
-    await terminate(targetOf(rec));
-    removeGuarded(statePath(id), envPath(id));
+    const stopped = await terminate(targetOf(rec));
+    removeGuarded(...(stopped ? [statePath(id)] : []), envPath(id));
     throw new Error(`OpenCode server failed to start: ${redact(reason, password)}${tail ? `\n${tail}` : ""}`);
   };
 
@@ -830,35 +940,44 @@ async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promi
 
   const exited = (): boolean => child !== undefined && child.exitCode !== null;
   const deadline = Date.now() + startBudgetMs;
-  let url: string | null = null;
-  for (let poll = 0; Date.now() < deadline; poll++) {
-    try {
+  /** Wait for the listening line and an authenticated answer, then record the
+   *  server. The failure reason, or null once it is recorded. A throw (the
+   *  directory check on a log read or the final state write) is a failure. */
+  const becomeHealthy = async (): Promise<string | null> => {
+    let url: string | null = null;
+    for (let poll = 0; Date.now() < deadline; poll++) {
       url = parseListeningUrl(readLogHead(id));
-    } catch (e) {
-      return fail((e as Error).message);
+      if (url) break;
+      if (exited()) return "the server exited before it started listening";
+      if (tmuxSession && poll > 0 && poll % LIVENESS_EVERY_POLLS === 0 && (await tmuxHasSession(tmuxSession)) === "gone") {
+        return "the server exited before it started listening";
+      }
+      await sleep(POLL_MS);
     }
-    if (url) break;
-    if (exited()) return fail("the server exited before it started listening");
-    if (tmuxSession && poll > 0 && poll % LIVENESS_EVERY_POLLS === 0 && (await tmuxHasSession(tmuxSession)) === "gone") {
-      return fail("the server exited before it started listening");
+    if (!url) return "the server did not report a listening address in time";
+
+    rec.handle.url = url;
+    let last: ProbeResult = { ok: false };
+    while (Date.now() < deadline) {
+      last = await probe(url, password, healthTimeoutMs);
+      if (last.ok) break;
+      if (exited()) return "the server exited before it answered";
+      await sleep(POLL_MS);
     }
-    await sleep(POLL_MS);
-  }
-  if (!url) return fail("the server did not report a listening address in time");
+    if (!last.ok) return `the server did not answer an authenticated info request${last.status ? ` (HTTP ${last.status})` : ""}`;
 
-  rec.handle.url = url;
-  let last: ProbeResult = { ok: false };
-  while (Date.now() < deadline) {
-    last = await probe(url, password, healthTimeoutMs);
-    if (last.ok) break;
-    if (exited()) return fail("the server exited before it answered");
-    await sleep(POLL_MS);
+    rec.handle.version = last.version;
+    rec.healthyAt = Date.now();
+    writeState(rec); // a directory swapped mid-start makes this throw (S12)
+    return null;
+  };
+  let failure: string | null;
+  try {
+    failure = await becomeHealthy();
+  } catch (e) {
+    failure = (e as Error).message;
   }
-  if (!last.ok) return fail(`the server did not answer an authenticated info request${last.status ? ` (HTTP ${last.status})` : ""}`);
-
-  rec.handle.version = last.version;
-  rec.healthyAt = Date.now();
-  writeState(rec);
+  if (failure !== null) return fail(failure);
   return rec;
 }
 
@@ -867,19 +986,31 @@ async function startServer(spec: OpencodeServerSpec, fingerprint: string): Promi
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** Stop the harness's server: kill the session, remove state and log, drop it
- *  from the map. Idempotent; concurrent calls share one stop. */
-export function stopOpencodeServer(harnessId: string): Promise<void> {
+ *  from the map. Idempotent; concurrent calls share one stop.
+ *
+ *  Resolves true when the server is confirmed stopped (or there was none).
+ *  false means the kill was not confirmed (a wedged or failing tmux: "unknown"
+ *  is never proof, I3): the server may still be running, so its record stays
+ *  registered (marked for a re-probe) and its state, env and log files stay,
+ *  and the next sweep, `ensure` or boot judges it again. A caller must not
+ *  treat it as gone (the idle sweep keeps its hub open). */
+export function stopOpencodeServer(harnessId: string): Promise<boolean> {
   const existing = stopping.get(harnessId);
   if (existing) return existing;
   const inflight = starting.get(harnessId);
-  const p = (async () => {
+  const p = (async (): Promise<boolean> => {
     // A start still in flight finishes (or fails) first, so its server is
     // registered before it is stopped.
     await inflight?.catch(() => {});
     const rec = servers.get(harnessId);
     servers.delete(harnessId);
+    let stopped: boolean;
     if (rec) {
-      await terminate(targetOf(rec));
+      stopped = await terminate(targetOf(rec));
+      if (!stopped) {
+        rec.healthyAt = 0;
+        if (!servers.has(harnessId)) servers.set(harnessId, rec);
+      }
     } else {
       // Nothing in memory: a state file may still describe a server (not yet
       // adopted, or left by a crashed start). Stop its recorded host.
@@ -888,9 +1019,14 @@ export function stopOpencodeServer(harnessId: string): Promise<void> {
       // what to kill; anything else is a planted file and is just removed.
       const state = readStateFile(statePath(harnessId));
       const own = state !== null && state.harnessId === harnessId && statePath(state.harnessId) === statePath(harnessId);
-      await terminate(own ? { tmuxSession: state.tmuxSession, hostPid: state.hostPid } : { tmuxSession: hostIsDirect() ? null : sessionNameFor(harnessId) });
+      stopped = await terminate(own ? { tmuxSession: state.tmuxSession, hostPid: state.hostPid } : { tmuxSession: hostIsDirect() ? null : sessionNameFor(harnessId) });
+    }
+    if (!stopped) {
+      console.warn("[opencode-server] could not confirm the OpenCode server stopped; keeping its state for the next check");
+      return false;
     }
     removeFiles(harnessId, { log: true });
+    return true;
   })().finally(() => {
     stopping.delete(harnessId);
   });
@@ -1009,7 +1145,15 @@ async function adoptState(file: string, only?: string, ctx: AdoptCtx = {}): Prom
   const state = readStateFile(file);
   // Boot adoption must not touch a server this process is starting or holds.
   if (state && only === undefined && (starting.has(state.harnessId) || servers.has(state.harnessId))) return null;
-  if (!state || statePath(state.harnessId) !== file || (only !== undefined && state.harnessId !== only)) {
+  if (
+    !state ||
+    statePath(state.harnessId) !== file ||
+    (only !== undefined && state.harnessId !== only) ||
+    // The direct host: only a live child this process spawned is provably ours
+    // (see the file header). Anything else is planted: not adopted, its pid
+    // never signalled, the file removed only through the guarded remove.
+    (state.tmuxSession === null && !isOwnDirectChild(state.hostPid))
+  ) {
     // Unreadable, a symlink, wrong owner/mode, planted, or filed under the wrong name.
     const stem = path.basename(file, ".json");
     removeGuarded(file, path.join(serverDir(), `${stem}.env`));
@@ -1018,8 +1162,9 @@ async function adoptState(file: string, only?: string, ctx: AdoptCtx = {}): Prom
   const target: TerminateTarget = { tmuxSession: state.tmuxSession, hostPid: state.hostPid };
   const gone = async (): Promise<null> => {
     if (ctx.expired) return null;
-    await terminate(target);
-    removeFiles(state.harnessId, { log: true });
+    // Files go only once the stop is confirmed; otherwise the state stays for
+    // the next ensure or boot to judge again.
+    if (await terminate(target)) removeFiles(state.harnessId, { log: true });
     return null;
   };
   if (state.url === "") return gone();
@@ -1035,6 +1180,20 @@ async function adoptState(file: string, only?: string, ctx: AdoptCtx = {}): Prom
     return gone();
   }
   return recordFromState(state, res.verdict === "ok" ? Date.now() : 0, res.version);
+}
+
+/** True only when the server answered `GET /api/session/active` (bounded by
+ *  `restartGateTimeoutMs`) with no session executing. Any failure is false. */
+async function serverReportsIdle(h: OpencodeServerHandle): Promise<boolean> {
+  try {
+    const client = createOpencodeClient(
+      { url: h.url, password: h.password },
+      { timeoutMs: restartGateTimeoutMs, ...(fetchImpl ? { fetchImpl } : {}) },
+    );
+    return Object.keys(await client.activeSessions()).length === 0;
+  } catch {
+    return false;
+  }
 }
 
 function specBusy(spec: OpencodeServerSpec): boolean {
@@ -1069,6 +1228,11 @@ async function ensureInner(spec: OpencodeServerSpec): Promise<OpencodeServerHand
       if (rec.fingerprint === fingerprint) return rec.handle;
       // Started with other settings (bin, env or cwd changed since).
       if (specBusy(spec)) return { ...rec.handle, stale: true };
+      // C4: agetor's own view (turns, cards, lingers) can miss work the server
+      // is doing for nobody agetor tracks (a pending wake, subagents whose
+      // linger ended). Ask the server itself, bounded: an executing session, or
+      // no answer, keeps it. The busy gate is asked again after the await.
+      if (!(await serverReportsIdle(rec.handle)) || specBusy(spec)) return { ...rec.handle, stale: true };
     }
     if (verdict === "dead") {
       // Re-check the host right before destroying anything: a refused
@@ -1079,7 +1243,13 @@ async function ensureInner(spec: OpencodeServerSpec): Promise<OpencodeServerHand
       }
     }
     servers.delete(id);
-    await terminate(targetOf(rec));
+    if (!(await terminate(targetOf(rec)))) {
+      // Not confirmed stopped: it may still run (and hold sessions), so it stays
+      // registered with its state, to be probed again on the next ensure.
+      rec.healthyAt = 0;
+      if (!servers.has(id)) servers.set(id, rec);
+      throw new Error("The OpenCode server is not responding.");
+    }
     removeFiles(id, { log: true });
   }
   rec = await startServer(spec, fingerprint);
@@ -1136,11 +1306,13 @@ export async function adoptOpencodeServers(): Promise<OpencodeServerHandle[]> {
       /* one bad entry must not stop the rest */
     }
   });
+  const settled = Promise.allSettled(tasks);
+  lastAdoption = settled;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const budget = new Promise<"budget">((resolve) => {
     timer = setTimeout(() => resolve("budget"), adoptBudgetMs);
   });
-  const outcome = await Promise.race([Promise.allSettled(tasks).then(() => "done" as const), budget]);
+  const outcome = await Promise.race([settled.then(() => "done" as const), budget]);
   if (timer) clearTimeout(timer);
   if (outcome === "budget") {
     ctx.expired = true;
@@ -1183,14 +1355,15 @@ function busy(isBusy: (harnessId: string) => boolean, id: string): boolean {
 }
 
 /** Stop every server idle for at least the idle window whose `isBusy` is false.
- *  Returns the stopped ids. */
+ *  Returns the ids confirmed stopped (see `stopOpencodeServer`). */
 export async function opencodeIdleSweep(now: number, isBusy: (harnessId: string) => boolean): Promise<string[]> {
   const stopped: string[] = [];
   for (const [id, rec] of [...servers]) {
     if (now - rec.lastActivity < idleMs) continue;
     if (starting.has(id) || busy(isBusy, id)) continue;
-    await stopOpencodeServer(id);
-    stopped.push(id);
+    // A stop that was not confirmed is not reported: the server may still run,
+    // so the caller keeps its hub, and the next sweep judges it again.
+    if (await stopOpencodeServer(id)) stopped.push(id);
   }
   return stopped;
 }
@@ -1277,11 +1450,26 @@ export const __forTest = {
   setSyncTmuxTimeoutMs(ms: number): void {
     syncTmuxTimeoutMs = ms;
   },
+  setStopGraceMs(ms: number): void {
+    stopGraceMs = ms;
+  },
+  setRestartGateTimeoutMs(ms: number): void {
+    restartGateTimeoutMs = ms;
+  },
+  setProbeMaxBytes(n: number): void {
+    probeMaxBytes = n;
+  },
+  /** Resolves once every judgement of the last `adoptOpencodeServers` call has
+   *  settled, including those still running when its budget returned. */
+  adoptionSettled(): Promise<void> {
+    return lastAdoption.then(() => {});
+  },
   /** Replace the `ps` binary (null restores `/bin/ps`). */
   setPsBin(bin: string | null): void {
     psBin = bin ?? "/bin/ps";
   },
-  /** Replace `fetch` for health probes (null restores it). */
+  /** Replace `fetch` for every request this module makes: the health probes
+   *  and the restart gate (null restores it). */
   setFetchImpl(f: typeof fetch | null): void {
     fetchImpl = f;
   },
@@ -1298,6 +1486,9 @@ export const __forTest = {
     tmuxTimeoutMs = DEFAULT_TMUX_TIMEOUT_MS;
     newSessionTimeoutMs = DEFAULT_NEW_SESSION_TIMEOUT_MS;
     syncTmuxTimeoutMs = DEFAULT_SYNC_TMUX_TIMEOUT_MS;
+    stopGraceMs = DEFAULT_STOP_GRACE_MS;
+    restartGateTimeoutMs = DEFAULT_RESTART_GATE_TIMEOUT_MS;
+    probeMaxBytes = OPENCODE_MAX_RESPONSE_BYTES;
     psBin = "/bin/ps";
     fetchImpl = null;
     serverDirOverride = null;
@@ -1313,5 +1504,7 @@ export const __forTest = {
   processTable,
   hostIsDirect,
   verifyServerDir,
+  ensureServerDir,
   writePrivateFile,
+  tmuxNewSession,
 };

@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -71,10 +72,18 @@ else {
     port: 0,
     async fetch(req) {
       const u = new URL(req.url);
-      if (fs.existsSync(dir + "/slow")) await Bun.sleep(Number(fs.readFileSync(dir + "/slow", "utf8")));
-      if (u.pathname !== "/api/info") return new Response("not found", { status: 404 });
+      if (fs.existsSync(dir + "/slow")) {
+        // A barrier for tests: the manager is inside this (slow) request now.
+        fs.writeFileSync(dir + "/probed", u.pathname);
+        await Bun.sleep(Number(fs.readFileSync(dir + "/slow", "utf8")));
+      }
       if (fs.existsSync(dir + "/unauth")) return new Response("no", { status: 401 });
       if (req.headers.get("authorization") !== "Basic " + btoa("opencode:" + pw)) return new Response("no", { status: 401 });
+      if (u.pathname === "/api/session/active") {
+        if (fs.existsSync(dir + "/active-fail")) return Response.json({ _tag: "InternalError", message: "boom" }, { status: 500 });
+        return Response.json({ data: fs.existsSync(dir + "/active") ? { ses_busy: { type: "running" } } : {} });
+      }
+      if (u.pathname !== "/api/info") return new Response("not found", { status: 404 });
       return Response.json({ version: "2.1.3-stub", pid: process.pid });
     },
   });
@@ -187,10 +196,10 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
     });
     // Every test gets its own server directory, so none depends on (or can see)
     // another's state files.
+    const MARKERS = ["slow", "unauth", "probed", "active", "active-fail"];
     beforeEach(() => {
       __forTest.setServerDir(mkdtempSync(path.join(STUB_ROOT, `${host}-dir-`)));
-      rmSync(path.join(stubDir, "slow"), { force: true });
-      rmSync(path.join(stubDir, "unauth"), { force: true });
+      for (const m of MARKERS) rmSync(path.join(stubDir, m), { force: true });
     });
     afterEach(async () => {
       try {
@@ -203,8 +212,7 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
         ids.clear();
         __forTest.forget();
         __forTest.restoreDefaults();
-        rmSync(path.join(stubDir, "slow"), { force: true });
-        rmSync(path.join(stubDir, "unauth"), { force: true });
+        for (const m of MARKERS) rmSync(path.join(stubDir, m), { force: true });
         writeFileSync(path.join(stubDir, "launches"), "");
       }
     });
@@ -704,27 +712,60 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
         untouched(evil, decoys);
       });
 
-      test("a start whose dir is swapped mid-start fails without writing or unlinking through the link", async () => {
-        __forTest.setStartBudgetMs(5_000);
+      test("a start whose dir is swapped mid-start fails without writing or unlinking through the link, and stops the server it launched (SF6)", async () => {
+        __forTest.setStartBudgetMs(8_000);
         const id = newId();
         rmSync(path.join(stubDir, "pid"), { force: true });
-        // Hold the start in its health wait (a slow /api/info) so the swap
-        // lands deterministically between the launch and the writes after it,
-        // however loaded the machine is.
+        // Hold the start in its health probe (a slow /api/info) and swap only
+        // once the stub reports the probe is in flight: the manager is then
+        // past every log read, so the swap lands right before the final state
+        // write, however loaded the machine is.
         slowOn(700);
         try {
           const pending = ensureOpencodeServer(spec(id)).then(() => null, (e: Error) => e);
-          await waitFor(() => existsSync(path.join(stubDir, "pid")), 10_000);
+          await waitFor(() => existsSync(path.join(stubDir, "probed")), 10_000);
+          const pid = Number(readFileSync(path.join(stubDir, "pid"), "utf8"));
+          expect(pid).toBeGreaterThan(1);
           const { evil, decoys } = swapForSymlink(id);
           const err = await pending;
           expect(err).toBeInstanceOf(Error);
           expect(String(err?.message)).toMatch(/directory/); // the dir check refused, not a timeout
           untouched(evil, decoys);
           expect(getOpencodeServer(id)).toBeNull();
+          // The launched server did not outlive the failed start.
+          expect(alive(pid)).toBe(false);
+          if (host === "tmux") expect(await __forTest.tmuxHasSession(__forTest.sessionNameFor(id))).toBe("gone");
         } finally {
           slowOff();
         }
       }, 30_000);
+
+      test("a swapped parent directory (a symlink to a copy) is refused too", () => {
+        const base = mkdtempSync(path.join(STUB_ROOT, "parent-swap-"));
+        const parent = path.join(base, "data");
+        const dir = path.join(parent, "opencode-servers");
+        __forTest.setServerDir(dir);
+        __forTest.ensureServerDir();
+        writeFileSync(path.join(dir, "x.json"), "{}", { mode: 0o600 });
+        expect(() => __forTest.verifyServerDir()).not.toThrow();
+        // The copy passes every lstat, owner and realpath check: only the pin catches it.
+        cpSync(parent, `${parent}.copy`, { recursive: true });
+        renameSync(parent, `${parent}.moved`);
+        symlinkSync(`${parent}.copy`, parent);
+        expect(() => __forTest.verifyServerDir()).toThrow(/replaced/);
+        expect(() => __forTest.writePrivateFile(path.join(dir, "y.json"), "{}")).toThrow(/replaced/);
+        expect(existsSync(path.join(`${parent}.copy`, "opencode-servers", "y.json"))).toBe(false);
+        expect(() => __forTest.ensureServerDir()).toThrow(/replaced/);
+      });
+
+      test("a server directory removed and made again by this process is accepted", () => {
+        const dir = path.join(mkdtempSync(path.join(STUB_ROOT, "remade-")), "opencode-servers");
+        __forTest.setServerDir(dir);
+        __forTest.ensureServerDir();
+        rmSync(dir, { recursive: true });
+        expect(() => __forTest.ensureServerDir()).not.toThrow();
+        expect(() => __forTest.verifyServerDir()).not.toThrow();
+      });
 
       test("a state file in a swapped dir is not read, so it never names what to kill", async () => {
         const id = newId();
@@ -840,6 +881,27 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
       expect(launches()).toBe(0);
     });
 
+    test.skipIf(host !== "tmux")("new-session's preamble and call share one budget", async () => {
+      // start-server (the preamble) takes most of the budget, then new-session
+      // wedges: the call gets only what is left, not a fresh budget of its own.
+      const wrapper = path.join(stubDir, "tmux-slow-start");
+      writeFileSync(wrapper, `#!/bin/sh\ncase "$*" in *start-server*) exec sleep 1.5;; *new-session*) exec sleep 30;; esac\nexec "${Bun.which("tmux")}" "$@"\n`);
+      chmodSync(wrapper, 0o755);
+      setEnv("AGETOR_TMUX_BIN", wrapper);
+      __forTest.setNewSessionTimeoutMs(2_000);
+      try {
+        const t0 = Date.now();
+        const res = await __forTest.tmuxNewSession([...tmuxSocketArgs(), "new-session", "-d", "-s", `agetor-ocsrv-budget-${process.pid}`, "--", "true"]);
+        const took = Date.now() - t0;
+        expect(res.status).toBeNull();
+        expect(res.stderr).toMatch(/timed out/);
+        expect(took).toBeGreaterThanOrEqual(1_900);
+        expect(took).toBeLessThan(2_900); // two separate budgets would be >= 3.5 s
+      } finally {
+        useRealTmux();
+      }
+    });
+
     describe("a tmux server that dies under a new-session", () => {
       // A wrapper that fails the first `failures` new-session calls the way tmux
       // does when its server exits under the client, then runs the real tmux.
@@ -925,7 +987,7 @@ exec "${real}" "$@"
         __forTest.forget();
         const adopted = await adoptOpencodeServers();
         expect(adopted.map((a) => a.harnessId)).toEqual([id]);
-        await new Promise((r) => setTimeout(r, 1_800)); // let the late verdict land
+        await __forTest.adoptionSettled(); // the late verdict has landed
         expect(alive(pid)).toBe(true);
         expect(readFileSync(__forTest.statePath(id), "utf8")).toBe(stateBefore);
         expect(getOpencodeServer(id)?.url).toBe(h.url);
@@ -990,6 +1052,106 @@ exec "${real}" "$@"
         expect(moved.url).not.toBe(a.url);
         expect(launches()).toBe(2);
       });
+
+      describe("the server itself is asked before a settings restart (C4)", () => {
+        test("a session executing on the server keeps it, as stale", async () => {
+          const id = newId();
+          const a = await ensureOpencodeServer(spec(id, { STUB_EXTRA: "one" }));
+          writeFileSync(path.join(stubDir, "active"), ""); // the server reports ses_busy running
+          const kept = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => false });
+          expect(kept.stale).toBe(true);
+          expect(kept.url).toBe(a.url);
+          expect(kept.startedAt).toBe(a.startedAt);
+          expect(launches()).toBe(1);
+          expect(await checkOpencodeServerHealth(a)).toBe(true);
+        });
+
+        test("a failed or slow session/active keeps it, as stale", async () => {
+          const id = newId();
+          const a = await ensureOpencodeServer(spec(id, { STUB_EXTRA: "one" }));
+          writeFileSync(path.join(stubDir, "active-fail"), "");
+          const failed = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => false });
+          expect(failed).toMatchObject({ stale: true, url: a.url, startedAt: a.startedAt });
+          rmSync(path.join(stubDir, "active-fail"), { force: true });
+          // An answer slower than the gate's bound counts as no answer.
+          __forTest.setRestartGateTimeoutMs(150);
+          __forTest.setHealthCacheMs(60_000); // only the gate sees the slow server
+          slowOn(1_000);
+          const slow = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => false });
+          expect(slow).toMatchObject({ stale: true, url: a.url, startedAt: a.startedAt });
+          slowOff();
+          expect(launches()).toBe(1);
+        });
+
+        test("an idle server is restarted as before", async () => {
+          const id = newId();
+          const a = await ensureOpencodeServer(spec(id, { STUB_EXTRA: "one" }));
+          const b = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => false });
+          expect(b.stale).toBeUndefined();
+          expect(b.startedAt).not.toBe(a.startedAt);
+          expect(b.url).not.toBe(a.url);
+          expect(launches()).toBe(2);
+        });
+      });
+    });
+
+    test.skipIf(host !== "tmux")("a stop that tmux never confirms keeps the record and the state (SF7)", async () => {
+      const id = newId();
+      const h = await ensureOpencodeServer(spec(id));
+      const stateBefore = readFileSync(__forTest.statePath(id), "utf8");
+      // Every tmux call wedges, so has-session can only say "unknown".
+      const wrapper = path.join(stubDir, "tmux-wedge-all");
+      writeFileSync(wrapper, `#!/bin/sh\nexec sleep 30\n`);
+      chmodSync(wrapper, 0o755);
+      setEnv("AGETOR_TMUX_BIN", wrapper);
+      __forTest.setTmuxTimeoutMs(200);
+      __forTest.setStopGraceMs(300);
+      __forTest.setIdleMs(0);
+      try {
+        expect(await stopOpencodeServer(id)).toBe(false);
+        expect(getOpencodeServer(id)?.url).toBe(h.url);
+        expect(readFileSync(__forTest.statePath(id), "utf8")).toBe(stateBefore);
+        expect(existsSync(__forTest.logPath(id))).toBe(true);
+        // The sweep does not report it stopped, so its caller keeps the hub.
+        expect(await opencodeIdleSweep(Date.now() + 1_000, () => false)).toEqual([]);
+        expect(getOpencodeServer(id)?.url).toBe(h.url);
+      } finally {
+        useRealTmux();
+      }
+      expect(await checkOpencodeServerHealth(h)).toBe(true);
+      // With tmux back, the next sweep judges it again and really stops it.
+      expect(await opencodeIdleSweep(Date.now() + 1_000, () => false)).toEqual([id]);
+      expect(getOpencodeServer(id)).toBeNull();
+      expect(existsSync(__forTest.statePath(id))).toBe(false);
+    }, 20_000);
+
+    test.skipIf(host !== "direct")("a state file with no tmux session is adopted only for a child this process spawned", async () => {
+      const sac = Bun.spawn(["sleep", "120"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+      try {
+        // A copy of a live, healthy server's state naming a pid that is not ours.
+        const id = newId();
+        await ensureOpencodeServer(spec(id));
+        const state = JSON.parse(readFileSync(__forTest.statePath(id), "utf8"));
+        expect(state.tmuxSession).toBeNull();
+        writeFileSync(__forTest.statePath(id), JSON.stringify({ ...state, hostPid: sac.pid }), { mode: 0o600 });
+        __forTest.forget();
+        expect(await adoptOpencodeServers()).toEqual([]);
+        expect(getOpencodeServer(id)).toBeNull();
+        expect(existsSync(__forTest.statePath(id))).toBe(false);
+        expect(sac.exitCode).toBeNull();
+        // ensure never adopts it either: it starts its own server.
+        writeFileSync(__forTest.statePath(id), JSON.stringify({ ...state, hostPid: sac.pid }), { mode: 0o600 });
+        const fresh = await ensureOpencodeServer(spec(id));
+        expect(fresh.password).not.toBe(state.password);
+        expect(launches()).toBe(2);
+        expect(sac.exitCode).toBeNull();
+        // The genuine article (this process's own child) is still adopted.
+        __forTest.forget();
+        expect((await adoptOpencodeServers()).map((a) => a.harnessId)).toEqual([id]);
+      } finally {
+        sac.kill("SIGKILL");
+        await sac.exited;
+      }
     });
 
     describe("state file hygiene", () => {
@@ -1239,6 +1401,53 @@ describe("bounded external calls (S8)", () => {
   });
 });
 
+describe("the health probe reads a capped body (S13)", () => {
+  afterEach(() => {
+    __forTest.restoreDefaults();
+  });
+  const handle = { harnessId: "cap", url: "http://127.0.0.1:9", password: "pw", tmuxSession: null, startedAt: 1 };
+  /** A 200 whose body streams `chunks` chunks of 1 KiB, counting what was pulled. */
+  function streaming(chunks: number): { fetch: typeof fetch; pulled: () => number } {
+    let pulled = 0;
+    const f = (async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(c) {
+            pulled++;
+            if (pulled === 1) c.enqueue(new TextEncoder().encode(`{"version":"2.1.3","pad":"`));
+            else if (pulled <= chunks) c.enqueue(new Uint8Array(1024).fill(0x61));
+            else {
+              c.enqueue(new TextEncoder().encode(`"}`));
+              c.close();
+            }
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    return { fetch: f, pulled: () => pulled };
+  }
+
+  test("a body past the cap fails the probe, and is not read to the end", async () => {
+    __forTest.setProbeMaxBytes(16 * 1024);
+    const s = streaming(1_000); // ~1 MiB
+    __forTest.setFetchImpl(s.fetch);
+    expect(await __forTest.checkHealth(handle)).toBe(false);
+    expect(s.pulled()).toBeLessThan(100);
+  });
+
+  test("a body within the cap passes", async () => {
+    __forTest.setProbeMaxBytes(16 * 1024);
+    __forTest.setFetchImpl(streaming(4).fetch);
+    expect(await __forTest.checkHealth(handle)).toBe(true);
+  });
+
+  test("a declared content-length past the cap fails before any body is read", async () => {
+    __forTest.setProbeMaxBytes(100);
+    __forTest.setFetchImpl((async () => new Response("{}", { status: 200, headers: { "content-length": "101" } })) as unknown as typeof fetch);
+    expect(await __forTest.checkHealth(handle)).toBe(false);
+  });
+});
+
 describe("the direct test host is gated (N1)", () => {
   const withEnv = (vars: Record<string, string | undefined>, fn: () => void): void => {
     const keys = Object.keys(vars);
@@ -1299,6 +1508,7 @@ describe("id handling", () => {
     expect(out).not.toContain("zzz");
     expect(out).not.toContain("Zm9v");
     expect(out).not.toContain("sekret!");
+    expect(__forTest.redact('{"password":"q1","OPENCODE_PASSWORD": "q2"}')).toBe('{"password":"[redacted]","OPENCODE_PASSWORD": "[redacted]"}');
   });
 });
 

@@ -237,6 +237,10 @@ describe("request ops: method, path, body, auth", () => {
     reset({ "POST /api/session/ses_abc/prompt": () => json({ data: { id: "msg_2", delivery: "queue" } }) });
     await c.prompt("ses_abc", { text: "x" });
     expect(seen[0]!.body).toEqual({ text: "x" });
+
+    reset({ "POST /api/session/ses_abc/prompt": () => json({ data: { id: "msg_3", delivery: "steer" } }) });
+    await c.prompt("ses_abc", { id: "msg_3", text: "y", resume: false });
+    expect(seen[0]!.body).toEqual({ id: "msg_3", text: "y", resume: false });
   });
 
   test("prompt 409 maps to a typed error", async () => {
@@ -348,6 +352,72 @@ describe("request ops: method, path, body, auth", () => {
     const all = await c.listChildren("ses_parent");
     expect(calls).toBe(10);
     expect(all).toHaveLength(10);
+  });
+
+  test("listInbox maps the pending items in order, payload text and metadata included (C8)", async () => {
+    // Shapes from the live 2.1.3 spike: a cancelled-subagent notice and a user steer.
+    const synthetic = {
+      id: "msg_syn1",
+      sessionID: "ses_p",
+      time: { created: 1 },
+      type: "synthetic",
+      payload: {
+        text: "<subagent ...>Subagent cancelled</subagent>",
+        description: "Background sleep test",
+        metadata: { source: "subagent", childID: "ses_child", agent: "General", state: "cancelled", extra: 5 },
+      },
+      delivery: "steer",
+    };
+    const user = { id: "msg_usr1", sessionID: "ses_p", time: { created: 2 }, type: "user", payload: { text: "Also say BANANA." }, delivery: "steer" };
+    reset({
+      "GET /api/session/ses_p/inbox": () =>
+        json({ data: [synthetic, user, { id: 7, type: "user" }, { id: "msg_x" }, null, "junk", { id: "msg_odd", type: "user", delivery: 3, payload: { text: 4, metadata: { state: 9 } } }] }),
+    });
+    const c = createOpencodeClient(ref);
+    expect(await c.listInbox("ses_p")).toEqual([
+      {
+        id: "msg_syn1",
+        type: "synthetic",
+        delivery: "steer",
+        text: "<subagent ...>Subagent cancelled</subagent>",
+        metadata: { source: "subagent", childID: "ses_child", agent: "General", state: "cancelled" },
+      },
+      { id: "msg_usr1", type: "user", delivery: "steer", text: "Also say BANANA." },
+      { id: "msg_odd", type: "user", metadata: {} },
+    ]);
+    expect(seen[0]).toMatchObject({ method: "GET", path: "/api/session/ses_p/inbox", auth: AUTH });
+
+    reset({ "GET /api/session/ses_p/inbox": () => json({ data: [] }) });
+    expect(await c.listInbox("ses_p")).toEqual([]);
+    reset({ "GET /api/session/ses_p/inbox": () => json([user]) }); // a bare array is accepted too
+    expect((await c.listInbox("ses_p")).map((i) => i.id)).toEqual(["msg_usr1"]);
+    reset({ "GET /api/session/ses_p/inbox": () => json({ nope: true }) });
+    await expect(c.listInbox("ses_p")).rejects.toMatchObject({ op: "listInbox", tag: "BadResponse" });
+    reset({ "GET /api/session/ses_p/inbox": () => json({ _tag: "SessionNotFoundError", message: "no" }, 404) });
+    await expect(c.listInbox("ses_p")).rejects.toMatchObject({ op: "listInbox", status: 404 });
+  });
+
+  test("cancelInboxItem: true on 2xx (accepted, not proof of removal), false on 404, throws on 400 and the rest (C8)", async () => {
+    const c = createOpencodeClient(ref);
+    const path = "DELETE /api/session/ses_p/inbox/msg_a%2Fb";
+    for (const [res, want] of [
+      [() => new Response(null, { status: 204 }), true], // the live answer for any well-formed id
+      [() => json({ data: true }), true],
+      [() => json({ _tag: "SessionNotFoundError", message: "no such session" }, 404), false],
+    ] as Array<[() => Response, boolean]>) {
+      reset({ [path]: res });
+      expect(await c.cancelInboxItem("ses_p", "msg_a/b")).toBe(want);
+      expect(seen[0]).toMatchObject({ method: "DELETE", path: "/api/session/ses_p/inbox/msg_a%2Fb", auth: AUTH });
+    }
+    for (const [res, status] of [
+      [() => json({ _tag: "InvalidRequestError", message: "bad id" }, 400), 400],
+      [() => json({ _tag: "ConflictError", message: "conflict" }, 409), 409],
+      [() => json({ _tag: "InternalError", message: "boom" }, 500), 500],
+      [() => new Response("no", { status: 401 }), 401],
+    ] as Array<[() => Response, number]>) {
+      reset({ [path]: res });
+      await expect(c.cancelInboxItem("ses_p", "msg_a/b")).rejects.toMatchObject({ op: "cancelInboxItem", status });
+    }
   });
 });
 
@@ -512,6 +582,8 @@ describe("errors", () => {
 describe("openOpencodeEventStream", () => {
   interface Handle {
     ctrl: ReadableStreamDefaultController<Uint8Array>;
+    /** The client tore the connection down (the server-side stream was cancelled). */
+    cancelled: boolean;
   }
   let handles: Handle[] = [];
   let sseHits: Seen[] = [];
@@ -520,9 +592,14 @@ describe("openOpencodeEventStream", () => {
     handles = [];
     sseHits = [];
     script["GET /api/event"] = () => {
+      const handle = { cancelled: false } as Handle;
       const stream = new ReadableStream<Uint8Array>({
         start(ctrl) {
-          handles.push({ ctrl });
+          handle.ctrl = ctrl;
+          handles.push(handle);
+        },
+        cancel() {
+          handle.cancelled = true;
         },
       });
       return new Response(stream, { headers: { "content-type": "text/event-stream" } });
@@ -634,7 +711,7 @@ describe("openOpencodeEventStream", () => {
     expect(c.closes[0]!.reason).toBe("stalled");
     expect(Date.now() - t0).toBeLessThan(3000);
     s.close(); // after the fact: no second onClose
-    await new Promise((r) => setTimeout(r, 30));
+    await until(() => handles[0]!.cancelled); // the stalled connection is really torn down
     expect(c.closes).toHaveLength(1);
   });
 
@@ -658,17 +735,32 @@ describe("openOpencodeEventStream", () => {
     s.close();
     s.close();
     push(0, 'data: {"type":"late"}\n\n'); // after close: dropped
-    await new Promise((r) => setTimeout(r, 50));
+    // The server sees the connection go away only after the client dropped
+    // its reader, so nothing sent before can still be delivered.
+    await until(() => handles[0]!.cancelled);
     expect(c.closes.map((x) => x.reason)).toEqual(["aborted"]);
     expect(c.events).toHaveLength(1);
   });
 
   test("close() before the response arrives is also single-shot", async () => {
-    reset({ "GET /api/event": () => new Promise<Response>(() => {}) });
+    // The worst case: the response turns up only after close(). The stream
+    // must drop it (cancel its body) without opening or closing again.
+    let lateBodyCancelled = false;
+    const late = ((_url: string, init: RequestInit) =>
+      new Promise<Response>((resolve) => {
+        init.signal!.addEventListener("abort", () => {
+          const body = new ReadableStream<Uint8Array>({
+            cancel() {
+              lateBodyCancelled = true;
+            },
+          });
+          resolve(new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }));
+        });
+      })) as unknown as typeof fetch;
     const c = collect();
-    const s = openOpencodeEventStream(ref, c.h);
+    const s = openOpencodeEventStream(ref, c.h, { fetchImpl: late });
     s.close();
-    await new Promise((r) => setTimeout(r, 50));
+    await until(() => lateBodyCancelled); // the late response reached the stream and was dropped
     expect(c.closes.map((x) => x.reason)).toEqual(["aborted"]);
     expect(c.opened).toBe(0);
   });
@@ -812,6 +904,17 @@ describe("redactSecrets (N11)", () => {
     expect(out).toContain("end");
     // The space-separated form the server manager's old redactor covered.
     expect(redactSecrets("bad password hunter3 given")).toBe("bad password [redacted] given");
+  });
+
+  test("strips JSON-quoted keys and values for a password it was not told", () => {
+    const quoted = redactSecrets('{"password":"hunter4","OPENCODE_PASSWORD": "two words","authorization":"Basic Zm9vYmFyYmF6","user":"bob"}');
+    for (const leaked of ["hunter4", "two words", "Zm9vYmFyYmF6"]) expect(quoted).not.toContain(leaked);
+    expect(quoted).toBe('{"password":"[redacted]","OPENCODE_PASSWORD": "[redacted]","authorization":"[redacted]","user":"bob"}');
+    // A bare value after a quoted key, an escaped quote, an unterminated value, a spaced quote.
+    expect(redactSecrets('{"password": 123456, "x": 1}')).toBe('{"password": [redacted] "x": 1}');
+    expect(redactSecrets('"password":"a\\"b" tail')).toBe('"password":"[redacted]" tail');
+    expect(redactSecrets('password="never closed secret5\nnext line')).toBe('password="[redacted]"\nnext line');
+    expect(redactSecrets('bad password "x y" given')).toBe('bad password "[redacted]" given');
   });
 
   test("works without a password and leaves ordinary text alone", () => {
