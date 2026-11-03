@@ -107,7 +107,32 @@ function setEnv(k: string, v: string | undefined): void {
   if (v === undefined) delete process.env[k];
   else process.env[k] = v;
 }
+
+// `bun test` runs every file in ONE process, and about forty sibling files set
+// `AGETOR_TMUX_BIN=/bin/echo` at their top level and never restore it. Left in
+// place, `has-session` "succeeds" forever (every start/stop burns its grace
+// windows, so even the direct host overruns the test timeout) and `new-session`
+// starts nothing. So this file pins its own tmux seams for its whole run: the
+// real tmux (no override) on a socket of its own, which also keeps a sibling's
+// `kill-server` on the shared `agetor-test` socket from reaching these sessions.
+// Tests that swap in a wrapper put it back with `useRealTmux()`, never with the
+// value `savedEnv` captured (that may be the leak).
+const OWN_TMUX_SOCKET = `agetor-test-ocsrv-${process.pid}`;
+function useRealTmux(): void {
+  setEnv("AGETOR_TMUX_BIN", undefined);
+}
+beforeAll(() => {
+  useRealTmux();
+  setEnv("AGETOR_TMUX_SOCKET", OWN_TMUX_SOCKET);
+  setEnv("AGETOR_DISCLAIM_BIN", undefined);
+});
+
 afterAll(() => {
+  if (tmuxAvailable) {
+    Bun.spawnSync(["tmux", "-L", OWN_TMUX_SOCKET, "kill-server"], { stdout: "ignore", stderr: "ignore" });
+    // The server is gone but tmux leaves its socket file; one per run would pile up.
+    rmSync(path.join(process.env.TMUX_TMPDIR || "/tmp", `tmux-${process.getuid?.() ?? 0}`, OWN_TMUX_SOCKET), { force: true });
+  }
   for (const [k, v] of Object.entries(savedEnv)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
@@ -252,7 +277,7 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
         expect(seen).not.toContain("api-key-value"); // the whole server env stays out of argv
         await stopOpencodeServer(id);
       } finally {
-        setEnv("AGETOR_TMUX_BIN", savedEnv.AGETOR_TMUX_BIN);
+        useRealTmux();
       }
     });
 
@@ -459,7 +484,7 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
           expect(existsSync(__forTest.statePath(id))).toBe(true);
           expect(alive(pid)).toBe(true);
         } finally {
-          setEnv("AGETOR_TMUX_BIN", savedEnv.AGETOR_TMUX_BIN);
+          useRealTmux();
         }
         expect(await __forTest.tmuxHasSession(h.tmuxSession!)).toBe("alive");
       });
@@ -573,8 +598,60 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
         try {
           expect(stopIdleOpencodeServersSync(() => false)).toEqual([id]);
         } finally {
-          setEnv("AGETOR_TMUX_BIN", savedEnv.AGETOR_TMUX_BIN);
+          useRealTmux();
         }
+      });
+    });
+
+    describe("a tmux server that dies under a new-session", () => {
+      // A wrapper that fails the first `failures` new-session calls the way tmux
+      // does when its server exits under the client, then runs the real tmux.
+      function racingTmux(failures: number): { counter: string } {
+        const real = Bun.which("tmux")!;
+        const wrapper = path.join(stubDir, "tmux-racing");
+        const counter = path.join(stubDir, "tmux-new-session-count");
+        writeFileSync(counter, "");
+        writeFileSync(
+          wrapper,
+          `#!/bin/sh
+case "$*" in
+  *new-session*)
+    echo x >> "${counter}"
+    if [ "$(wc -l < "${counter}")" -le ${failures} ]; then echo "server exited unexpectedly" >&2; exit 1; fi;;
+esac
+exec "${real}" "$@"
+`,
+        );
+        chmodSync(wrapper, 0o755);
+        setEnv("AGETOR_TMUX_BIN", wrapper);
+        return { counter };
+      }
+      const newSessionCalls = (counter: string): number => readFileSync(counter, "utf8").split("\n").filter(Boolean).length;
+
+      test.skipIf(host !== "tmux")("a transient failure is retried and the server still starts", async () => {
+        const { counter } = racingTmux(1);
+        try {
+          const h = await ensureOpencodeServer(spec(newId()));
+          expect(await checkOpencodeServerHealth(h)).toBe(true);
+          expect(newSessionCalls(counter)).toBe(2);
+          expect(launches()).toBe(1); // the failed attempt never ran the server
+        } finally {
+          useRealTmux();
+        }
+      });
+
+      test.skipIf(host !== "tmux")("a persistent failure gives up after the retry cap and leaves nothing behind", async () => {
+        const { counter } = racingTmux(100);
+        const id = newId();
+        try {
+          await expect(ensureOpencodeServer(spec(id))).rejects.toThrow(/server exited unexpectedly/);
+          expect(newSessionCalls(counter)).toBe(3); // the first try plus two retries
+        } finally {
+          useRealTmux();
+        }
+        expect(existsSync(__forTest.statePath(id))).toBe(false);
+        expect(existsSync(__forTest.envPath(id))).toBe(false);
+        expect(launches()).toBe(0);
       });
     });
 

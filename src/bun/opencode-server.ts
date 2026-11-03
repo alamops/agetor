@@ -542,6 +542,12 @@ function serverEnv(spec: OpencodeServerSpec, password: string): Record<string, s
   return env;
 }
 
+/** tmux's message when a server it just started (or was talking to) went away
+ *  mid-command, and the retry that rides it out. */
+const TMUX_SERVER_RACE_RE = /server exited unexpectedly/i;
+const NEW_SESSION_RETRIES = 2;
+const NEW_SESSION_RETRY_DELAY_MS = 200;
+
 /** The inner `sh -c` script: output to the log first (so a bad env file is
  *  visible), then source the env file, delete it, exec the server — so the
  *  pane's pid IS the server. `$1` env file, `$2` log, the rest is the command. */
@@ -553,7 +559,7 @@ async function launchInTmux(spec: OpencodeServerSpec, password: string): Promise
     .sort()
     .map((k) => `export ${k}=${shellQuote(env[k]!)}`);
   writePrivateFile(envPath(spec.harnessId), `${lines.join("\n")}\n`);
-  const res = await spawnTmuxNewSession(resolveTmuxBin(), [
+  const args = [
     ...tmuxSocketArgs(),
     "new-session", "-d", "-s", sessionNameFor(spec.harnessId),
     "-x", "200", "-y", "50",
@@ -561,7 +567,16 @@ async function launchInTmux(spec: OpencodeServerSpec, password: string): Promise
     "--", "sh", "-c", TMUX_INNER_SCRIPT, "sh",
     envPath(spec.harnessId), logPath(spec.harnessId),
     spec.bin, "serve", "--hostname", "127.0.0.1", "--port", "0",
-  ]);
+  ];
+  let res = await spawnTmuxNewSession(resolveTmuxBin(), args);
+  // Stopping the last session makes tmux's server exit, and it unlinks its socket
+  // on the way out. A `new-session` that lands in that window starts a server whose
+  // socket the dying one then removes, and fails with "server exited unexpectedly"
+  // having created nothing, so a capped retry (the old server is gone by then) is safe.
+  for (let retry = 0; retry < NEW_SESSION_RETRIES && res.status !== 0 && TMUX_SERVER_RACE_RE.test(res.stderr); retry++) {
+    await sleep(NEW_SESSION_RETRY_DELAY_MS);
+    res = await spawnTmuxNewSession(resolveTmuxBin(), args);
+  }
   if (res.status !== 0) {
     removeFile(envPath(spec.harnessId));
     throw new Error(`could not start the OpenCode server session: ${redact(res.stderr || "tmux new-session failed", password)}`);
