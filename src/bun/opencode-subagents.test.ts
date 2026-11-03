@@ -671,19 +671,31 @@ test("sync of a child with no idle tail leaves it running and revives an orphane
   expect(db.subagents.hasRunning(taskId)).toBe(true);
 });
 
-test("sync does not revive an orphaned row the server does not list as active, whatever the history looks like (S10)", async () => {
+test("sync never revives an orphaned row the server does not list as active; a positive 'not active' with no idle tail settles it for good (S10, S6)", async () => {
   installEmitter();
+  const fired: string[] = [];
+  const prevHook = mod.setOpencodeSubagentSettleHook((id) => fired.push(id));
   const { taskId, runId } = seedTask();
   const msgs = [userMsg("msg_u1"), asstMsg("msg_a1", "working")]; // no idle tail: an old child that never finished
 
   const idle = childId("s10a");
-  reg(taskId, runId, idle);
+  reg(taskId, runId, idle, { title: "Dig" });
   const orphanedAt = Date.now() - 1000;
   db.subagents.setStatus(mod.opencodeSubagentId(idle), "orphaned", orphanedAt);
   const notActive = stubClient(msgs, undefined, { ses_someone_else: { type: "running" } });
-  await mod.syncOpencodeChildFromServer({ taskId, runId, client: notActive.client, childSessionId: idle });
+  try {
+    await mod.syncOpencodeChildFromServer({ taskId, runId, client: notActive.client, childSessionId: idle });
+  } finally {
+    mod.setOpencodeSubagentSettleHook(prevHook);
+  }
   expect(notActive.calls.activeSessions).toBe(1);
-  expect(row(idle)).toMatchObject({ status: "orphaned", endedAt: orphanedAt });
+  expect(row(idle).status).toBe("failed");
+  expect(row(idle).endedAt).not.toBe(orphanedAt);
+  expect(fired).toEqual([taskId]);
+  expect(mod.listOpenOpencodeChildSessions(taskId)).not.toContain(idle);
+  expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
+    'OpenCode subagent "Dig" is no longer running on the OpenCode server',
+  ]);
   expect(childEvents(idle).map((e) => e.data)).toEqual(["working"]); // the history is still filled in
 
   // The active-session listing failing is "not active", not "assume alive".
@@ -709,7 +721,7 @@ test("sync does not revive an orphaned row the server does not list as active, w
   expect(finished.calls.activeSessions).toBe(0);
 });
 
-test("a child the server answers 404 for is settled for good: orphaned once, never revived by a later sync (S6)", async () => {
+test("a child the server answers 404 for is settled for good: failed once, never revived by a later sync (S6)", async () => {
   installEmitter();
   const fired: string[] = [];
   const prev = mod.setOpencodeSubagentSettleHook((id) => fired.push(id));
@@ -726,8 +738,9 @@ test("a child the server answers 404 for is settled for good: orphaned once, nev
     } as unknown as OpencodeClient;
     await mod.syncOpencodeChildFromServer({ taskId, runId, client: notFound, childSessionId: gone });
     const first = row(gone);
-    expect(first.status).toBe("orphaned");
+    expect(first.status).toBe("failed");
     expect(first.endedAt).not.toBeNull();
+    expect(mod.listOpenOpencodeChildSessions(taskId)).not.toContain(gone);
     const goneLines = () => emitted.filter((e) => e.stream === "status" && e.data.includes("no longer known to the OpenCode server"));
     expect(goneLines()).toHaveLength(1);
     expect(fired).toEqual([taskId]);
@@ -735,15 +748,27 @@ test("a child the server answers 404 for is settled for good: orphaned once, nev
     // Later syncs: still 404 -> untouched (endedAt is not refreshed, nothing fires or is written again).
     await Bun.sleep(5);
     await mod.syncOpencodeChildFromServer({ taskId, runId, client: notFound, childSessionId: gone });
-    expect(row(gone)).toMatchObject({ status: "orphaned", endedAt: first.endedAt });
+    expect(row(gone)).toMatchObject({ status: "failed", endedAt: first.endedAt });
     expect(goneLines()).toHaveLength(1);
     expect(fired).toEqual([taskId]);
 
     // ... and even a server that now answers with an unfinished history and no active entry does not revive it.
     await mod.syncOpencodeChildFromServer({
-      taskId, runId, client: stubClient([userMsg("msg_u1"), asstMsg("msg_a1", "x")]).client, childSessionId: gone,
+      taskId, runId, client: stubClient([userMsg("msg_u1"), asstMsg("msg_a1", "x")], undefined, { [gone]: { type: "running" } }).client, childSessionId: gone,
     });
-    expect(row(gone).status).toBe("orphaned");
+    expect(row(gone).status).toBe("failed");
+
+    // A recently orphaned row (a turn or a lost server parked it) that now 404s is settled too, not kept
+    // open for the 24 h re-check window.
+    const parked = childId("s6p");
+    reg(taskId, runId, parked);
+    db.subagents.setStatus(mod.opencodeSubagentId(parked), "orphaned", Date.now() - 1000);
+    expect(mod.listOpenOpencodeChildSessions(taskId)).toContain(parked);
+    fired.length = 0;
+    await mod.syncOpencodeChildFromServer({ taskId, runId, client: notFound, childSessionId: parked });
+    expect(row(parked).status).toBe("failed");
+    expect(mod.listOpenOpencodeChildSessions(taskId)).not.toContain(parked);
+    expect(fired).toEqual([taskId]);
 
     // A terminal row is left alone by a 404.
     const done = childId("s6b");
@@ -857,4 +882,172 @@ test("orphanRunningOpencodeSubagents leaves an agetor-server child orphaned, nev
   expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
     'OpenCode subagent "Job" was left unfinished — agetor restarted',
   ]);
+});
+
+/* ── fix round 3: dead orphans, a lost server, the stopped-by-agetor store, the settled list ── */
+
+test("an orphaned child stays open while the server can't be asked, and is settled only once it positively answers (S6)", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const msgs = [userMsg("msg_u1"), asstMsg("msg_a1", "working")];
+  const child = childId("s6u");
+  reg(taskId, runId, child);
+  const orphanedAt = Date.now() - 1000;
+  db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", orphanedAt);
+  const err = console.error;
+  console.error = () => {};
+  try {
+    // The listing fails: nothing is known, so nothing is settled.
+    await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient(msgs, undefined, new Error("ECONNREFUSED")).client, childSessionId: child });
+    expect(row(child)).toMatchObject({ status: "orphaned", endedAt: orphanedAt });
+    expect(mod.listOpenOpencodeChildSessions(taskId)).toContain(child);
+    // The history read itself fails (server down): same.
+    const down = { getSession: async () => null, listMessages: async () => { throw new Error("connection refused"); }, activeSessions: async () => ({}) } as unknown as OpencodeClient;
+    await mod.syncOpencodeChildFromServer({ taskId, runId, client: down, childSessionId: child });
+    expect(row(child)).toMatchObject({ status: "orphaned", endedAt: orphanedAt });
+  } finally {
+    console.error = err;
+  }
+  // The server is back and lists the child as running: revived.
+  await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient(msgs, undefined, { [child]: { type: "running" } }).client, childSessionId: child });
+  expect(row(child).status).toBe("running");
+});
+
+test("an orphaned child with no messages that the server doesn't list as active is settled; a running one is left to the live stream", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const orphan = childId("s6e");
+  reg(taskId, runId, orphan);
+  db.subagents.setStatus(mod.opencodeSubagentId(orphan), "orphaned", Date.now() - 1000);
+  await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([]).client, childSessionId: orphan });
+  expect(row(orphan).status).toBe("failed");
+
+  // A running row is never settled by the active listing: it may be about to start.
+  const running = childId("s6r");
+  reg(taskId, runId, running);
+  const { client, calls } = stubClient([userMsg("msg_u1"), asstMsg("msg_a1", "x")]);
+  await mod.syncOpencodeChildFromServer({ taskId, runId, client, childSessionId: running });
+  await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([]).client, childSessionId: running });
+  expect(row(running).status).toBe("running");
+  expect(calls.activeSessions).toBe(0);
+});
+
+test("a dead child agetor itself stopped settles as cancelled, not failed", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const child = childId("s6c");
+  reg(taskId, runId, child);
+  db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", Date.now() - 1000);
+  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: child });
+  await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([userMsg("msg_u1")]).client, childSessionId: child });
+  expect(row(child).status).toBe("cancelled");
+});
+
+test("orphanRunningOpencodeChildrenOfTask parks a lost server's running children orphaned, leaves settled rows and other tasks alone (S10)", async () => {
+  installEmitter();
+  const fired: string[] = [];
+  const prev = mod.setOpencodeSubagentSettleHook((id) => fired.push(id));
+  try {
+    const { taskId, runId } = seedTask();
+    seedBreadcrumb(runId, 2, "agetor");
+    const a = childId("lsa");
+    const b = childId("lsb");
+    const done = childId("lsd");
+    for (const c of [a, b, done]) reg(taskId, runId, c, { title: "Job" });
+    mod.settleOpencodeChild({ taskId, childSessionId: done, outcome: "completed" });
+    const other = seedTask();
+    const otherChild = childId("lso");
+    reg(other.taskId, other.runId, otherChild);
+    fired.length = 0;
+
+    expect(db.subagents.hasRunning(taskId)).toBe(true);
+    expect(mod.orphanRunningOpencodeChildrenOfTask(taskId)).toBe(2);
+    expect([row(a).status, row(b).status, row(done).status]).toEqual(["orphaned", "orphaned", "completed"]);
+    expect(row(otherChild).status).toBe("running");
+    expect(db.subagents.hasRunning(taskId)).toBe(false);
+    expect(fired).toEqual([taskId]);
+    expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
+      'OpenCode subagent "Job" was left unfinished — the OpenCode server stopped',
+      'OpenCode subagent "Job" was left unfinished — the OpenCode server stopped',
+    ]);
+    // Idempotent.
+    expect(mod.orphanRunningOpencodeChildrenOfTask(taskId)).toBe(0);
+    expect(fired).toEqual([taskId]);
+
+    // The next sync against a server that no longer runs them settles them for good.
+    await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([userMsg("msg_u1")]).client, childSessionId: a });
+    expect(row(a).status).toBe("failed");
+  } finally {
+    mod.setOpencodeSubagentSettleHook(prev);
+  }
+});
+
+test("stopped-by-agetor notes: recorded without a subagent row, read from the DB, unknown ids false, expire after 24 h (C2)", async () => {
+  const { taskId } = seedTask();
+  const child = childId("stop");
+  expect(mod.wasOpencodeChildStoppedByAgetor(child)).toBe(false);
+  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: child });
+  expect(mod.wasOpencodeChildStoppedByAgetor(child)).toBe(true);
+  // No subagent row (no tab) was invented for it.
+  expect(db.subagents.get(mod.opencodeSubagentId(child))).toBeNull();
+  expect(db.subagents.listForTask(taskId)).toEqual([]);
+  // The DB row is the record.
+  const stored = db.db.query<{ task_id: string; stopped_at: number }, [string]>(
+    `SELECT task_id, stopped_at FROM opencode_stopped_children WHERE child_session_id = ?`,
+  ).get(child);
+  expect(stored?.task_id).toBe(taskId);
+
+  // A fresh copy of the module (a restarted core has no in-memory state) still knows.
+  const fresh = (await import(`./opencode-subagents.ts?restart=${randomUUID()}`)) as typeof import("./opencode-subagents.ts");
+  expect(fresh).not.toBe(mod);
+  expect(fresh.wasOpencodeChildStoppedByAgetor(child)).toBe(true);
+  // ... including a note an earlier core wrote straight into the table.
+  const earlier = childId("stope");
+  db.db.run(`INSERT INTO opencode_stopped_children (child_session_id, task_id, stopped_at) VALUES (?, ?, ?)`, [earlier, taskId, Date.now() - 60_000]);
+  expect(fresh.wasOpencodeChildStoppedByAgetor(earlier)).toBe(true);
+
+  // Unknown and empty ids.
+  expect(mod.wasOpencodeChildStoppedByAgetor(childId("never"))).toBe(false);
+  expect(mod.wasOpencodeChildStoppedByAgetor("")).toBe(false);
+
+  // Expiry: true just inside the window, false at its edge and after.
+  const t0 = Date.now();
+  const old = childId("stopo");
+  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: old }, t0);
+  expect(mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS - 1)).toBe(true);
+  expect(mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS)).toBe(false);
+  // Re-noting refreshes the time.
+  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: old }, t0 + 1000);
+  expect(mod.wasOpencodeChildStoppedByAgetor(old, t0 + mod.OPENCODE_STOPPED_CHILD_TTL_MS)).toBe(true);
+  // A later note prunes the expired rows.
+  mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: childId("stopn") }, t0 + 2 * mod.OPENCODE_STOPPED_CHILD_TTL_MS);
+  expect(db.db.query(`SELECT 1 FROM opencode_stopped_children WHERE child_session_id = ?`).get(old)).toBeNull();
+});
+
+test("listSettledOpencodeChildSessions is exactly the OpenCode rows listOpenOpencodeChildSessions leaves out", () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const now = Date.now();
+  const ids = {
+    running: childId("lr"), fresh: childId("lf"), old: childId("lo"), edge: childId("le"),
+    done: childId("ld"), failed: childId("lx"), cancelled: childId("lc"),
+  };
+  for (const c of Object.values(ids)) reg(taskId, runId, c);
+  const set = (c: string, st: Subagent["status"], at: number) => db.subagents.setStatus(mod.opencodeSubagentId(c), st, at);
+  set(ids.fresh, "orphaned", now - 60_000);
+  set(ids.old, "orphaned", now - mod.ORPHAN_RECHECK_MAX_AGE_MS - 60_000);
+  set(ids.edge, "orphaned", now - mod.ORPHAN_RECHECK_MAX_AGE_MS);
+  set(ids.done, "completed", now);
+  set(ids.failed, "failed", now);
+  set(ids.cancelled, "cancelled", now);
+  // A Claude subagent row on the same task is never listed.
+  db.subagents.insertIfAbsent({
+    id: `claude-${randomUUID()}`, taskId, runId, parentKind: "subagent", agentType: null, description: null, spawnDepth: 1,
+    sourcePath: "/tmp/agent-x.jsonl", toolUseId: null, status: "completed", startedAt: now, endedAt: now,
+  });
+  const open = mod.listOpenOpencodeChildSessions(taskId, now).sort();
+  const settled = mod.listSettledOpencodeChildSessions(taskId, now).sort();
+  expect(open).toEqual([ids.running, ids.fresh].sort());
+  expect(settled).toEqual([ids.old, ids.edge, ids.done, ids.failed, ids.cancelled].sort());
+  expect(mod.OPENCODE_SUBAGENT_SOURCE_PREFIX).toBe("opencode-session:");
 });

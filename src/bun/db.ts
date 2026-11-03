@@ -2980,6 +2980,15 @@ export const runs = {
       `SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC`,
     ).all(taskId).map(toRun);
   },
+  /** The newest run of a task (any status), or null: `listForTask(taskId)[0]`
+   *  without materializing the rest. Ties on `started_at` go to the later
+   *  insert. */
+  latestForTask(taskId: string): Run | null {
+    const row = db.query<RunRow, [string]>(
+      `SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+    ).get(taskId);
+    return row ? toRun(row) : null;
+  },
   /**
    * Total run count for a task, across every status — the "has this task
    * ever run" test `effectiveAgentProfile` (docs/plans/agent-profiles.md D2)
@@ -3018,20 +3027,36 @@ export const runs = {
    * `runs_opencode_session_id_idx` (079), pinned: unpinned, the planner walks
    * all of `idx_runs_task` and reads every run row to test the column. The
    * runs then come through `idx_runs_task`.
+   *
+   * `archivedSinceMs` also returns the tasks archived at or after that
+   * epoch-ms, flagged `archived: true`, so the watch can keep interrupting
+   * what such a task's session still starts for a bounded time. Without it
+   * every row is a live task (`archived: false`). A deleted task has no runs,
+   * so it is never returned.
    */
-  lastOpencodeSessionRunPerTask(): { runId: string; taskId: string; agent: string; sessionId: string }[] {
+  lastOpencodeSessionRunPerTask(opts: { archivedSinceMs?: number } = {}): {
+    runId: string;
+    taskId: string;
+    agent: string;
+    sessionId: string;
+    archived: boolean;
+  }[] {
+    const since = typeof opts.archivedSinceMs === "number" && Number.isFinite(opts.archivedSinceMs) ? opts.archivedSinceMs : null;
     return db
-      .query<{ runId: string; taskId: string; agent: string; sessionId: string }, []>(
+      .query<{ runId: string; taskId: string; agent: string; sessionId: string; archived: number }, [number | null]>(
         `WITH oc AS (SELECT DISTINCT task_id FROM runs INDEXED BY runs_opencode_session_id_idx WHERE opencode_session_id IS NOT NULL),
               ranked AS (
                 SELECT r.id AS run_id, r.task_id AS task_id, r.agent AS agent, r.opencode_session_id AS session_id,
                        ROW_NUMBER() OVER (PARTITION BY r.task_id ORDER BY r.started_at DESC, r.rowid DESC) AS rn
                   FROM runs r WHERE r.task_id IN (SELECT task_id FROM oc))
-         SELECT ranked.run_id AS runId, ranked.task_id AS taskId, ranked.agent AS agent, ranked.session_id AS sessionId
+         SELECT ranked.run_id AS runId, ranked.task_id AS taskId, ranked.agent AS agent, ranked.session_id AS sessionId,
+                (t.archived_at IS NOT NULL) AS archived
            FROM ranked JOIN tasks t ON t.id = ranked.task_id
-          WHERE ranked.rn = 1 AND ranked.session_id IS NOT NULL AND t.archived_at IS NULL`,
+          WHERE ranked.rn = 1 AND ranked.session_id IS NOT NULL
+            AND (t.archived_at IS NULL OR (?1 IS NOT NULL AND t.archived_at >= ?1))`,
       )
-      .all();
+      .all(since)
+      .map((r) => ({ runId: r.runId, taskId: r.taskId, agent: r.agent, sessionId: r.sessionId, archived: r.archived === 1 }));
   },
   /** Set (or clear) the tmux session name a run is recorded under. `update`
    *  leaves the column alone; only an OpenCode follow-up whose transport
@@ -4068,11 +4093,63 @@ export const subagents = {
    *  (its `ended_at`, else its start): the boot linger's candidates besides
    *  the running rows. */
   opencodeOrphanedTaskIdsSince(sinceMs: number): string[] {
+    // `idx_subagents_opencode_status` (082) carries both terms; pinned so a
+    // planner without `sqlite_stat1` can't fall back to a table scan.
     const rows = db.query<{ task_id: string }, [number]>(
-      `SELECT DISTINCT task_id FROM subagents
+      `SELECT DISTINCT task_id FROM subagents INDEXED BY idx_subagents_opencode_status
         WHERE status = 'orphaned' AND parent_kind = 'opencode_subagent' AND COALESCE(ended_at, started_at) >= ?`,
     ).all(sinceMs);
     return rows.map((r) => r.task_id);
+  },
+  /** The child session ids of a task's OpenCode subagent rows that are done
+   *  with: settled (`completed`/`failed`/`cancelled`), or `orphaned` before
+   *  `orphanedBeforeMs` (its `ended_at`, else its start). The driver's relist
+   *  skips these. Status-filtered through `idx_subagents_opencode_status`
+   *  (082), so a relist doesn't load every subagent row of the task. */
+  settledOpencodeChildSessionIds(taskId: string, orphanedBeforeMs: number): string[] {
+    const rows = db.query<{ child: string }, [string, number]>(
+      `SELECT substr(source_path, ${OPENCODE_CHILD_SOURCE_PREFIX.length + 1}) AS child
+         FROM subagents INDEXED BY idx_subagents_opencode_status
+        WHERE status IN ('completed', 'failed', 'cancelled', 'orphaned') AND task_id = ?1
+          AND parent_kind = 'opencode_subagent'
+          AND substr(source_path, 1, ${OPENCODE_CHILD_SOURCE_PREFIX.length}) = '${OPENCODE_CHILD_SOURCE_PREFIX}'
+          AND (status != 'orphaned' OR COALESCE(ended_at, started_at) < ?2)
+        ORDER BY started_at ASC, id ASC`,
+    ).all(taskId, orphanedBeforeMs);
+    return rows.map((r) => r.child).filter((c) => c.length > 0);
+  },
+};
+
+/** The pseudo `source_path` prefix of an OpenCode child-session subagent row
+ *  (`opencode-session:<child id>`, never a file). opencode-subagents.ts
+ *  re-exports it as `OPENCODE_SUBAGENT_SOURCE_PREFIX`; it lives here so the
+ *  SQL above can match it. */
+export const OPENCODE_CHILD_SOURCE_PREFIX = "opencode-session:";
+
+/**
+ * The OpenCode child sessions agetor itself interrupted (migration 082,
+ * decision R4). Only `opencode-subagents.ts` reads and writes it. Every
+ * statement goes through the primary key or the `stopped_at` index.
+ */
+export const opencodeStoppedChildren = {
+  /** Record (or refresh) the note for a child, and drop notes older than
+   *  `pruneBeforeMs` in the same transaction. */
+  note(childSessionId: string, taskId: string, at: number, pruneBeforeMs: number): void {
+    db.transaction(() => {
+      db.run(`DELETE FROM opencode_stopped_children WHERE stopped_at < ?`, [pruneBeforeMs]);
+      db.run(
+        `INSERT INTO opencode_stopped_children (child_session_id, task_id, stopped_at) VALUES (?, ?, ?)
+           ON CONFLICT(child_session_id) DO UPDATE SET task_id = excluded.task_id, stopped_at = excluded.stopped_at`,
+        [childSessionId, taskId, at],
+      );
+    })();
+  },
+  /** When agetor last noted this child as stopped (epoch ms), or null. */
+  stoppedAt(childSessionId: string): number | null {
+    const row = db.query<{ at: number }, [string]>(
+      `SELECT stopped_at AS at FROM opencode_stopped_children WHERE child_session_id = ?`,
+    ).get(childSessionId);
+    return row ? row.at : null;
   },
 };
 

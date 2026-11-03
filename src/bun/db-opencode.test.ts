@@ -407,3 +407,143 @@ test("harnessAutoEnabled rows survive deleting the harness (no FK)", () => {
   db.run(`DELETE FROM harnesses WHERE id = 'opencode-tmp'`);
   expect(harnessAutoEnabled.has("opencode-tmp")).toBe(true);
 });
+
+// ---------------------------------------------------------------------------
+// OpenCode server driver queries (fix round 3; migration 082)
+// ---------------------------------------------------------------------------
+
+function planOf(sql: string, ...params: (string | number | null)[]): string[] {
+  return db.query<{ detail: string }, (string | number | null)[]>(`EXPLAIN QUERY PLAN ${sql}`).all(...params).map((r) => r.detail);
+}
+
+test("runs.lastOpencodeSessionRunPerTask: live tasks only by default; archivedSinceMs adds recently archived ones flagged archived", () => {
+  const live = tasks.insert(makeTaskRow());
+  const archivedNew = tasks.insert(makeTaskRow());
+  const archivedOld = tasks.insert(makeTaskRow());
+  const noSession = tasks.insert(makeTaskRow());
+  const lastLacksSession = tasks.insert(makeTaskRow());
+  const t = 1_800_000_000_000;
+  runs.insert(makeRun(live.id, { startedAt: t, opencodeSessionId: "ses_old" }));
+  const liveLast = runs.insert(makeRun(live.id, { startedAt: t + 10, opencodeSessionId: "ses_live" }));
+  const newLast = runs.insert(makeRun(archivedNew.id, { startedAt: t, opencodeSessionId: "ses_new", agent: "opencode-2" }));
+  runs.insert(makeRun(archivedOld.id, { startedAt: t, opencodeSessionId: "ses_gone" }));
+  runs.insert(makeRun(noSession.id, { startedAt: t }));
+  runs.insert(makeRun(lastLacksSession.id, { startedAt: t, opencodeSessionId: "ses_before" }));
+  runs.insert(makeRun(lastLacksSession.id, { startedAt: t + 5, agent: "codex" }));
+  db.run(`UPDATE tasks SET archived_at = ? WHERE id = ?`, [t + 1000, archivedNew.id]);
+  db.run(`UPDATE tasks SET archived_at = ? WHERE id = ?`, [t - 1000, archivedOld.id]);
+
+  const byTask = (rows: ReturnType<typeof runs.lastOpencodeSessionRunPerTask>) =>
+    Object.fromEntries(rows.map((r) => [r.taskId, r]));
+
+  const plain = byTask(runs.lastOpencodeSessionRunPerTask());
+  expect(Object.keys(plain)).toEqual([live.id]);
+  expect(plain[live.id]).toEqual({ runId: liveLast.id, taskId: live.id, agent: "opencode", sessionId: "ses_live", archived: false });
+
+  const since = byTask(runs.lastOpencodeSessionRunPerTask({ archivedSinceMs: t + 1000 })); // "at or after"
+  expect(Object.keys(since).sort()).toEqual([live.id, archivedNew.id].sort());
+  expect(since[live.id]!.archived).toBe(false);
+  expect(since[archivedNew.id]).toEqual({ runId: newLast.id, taskId: archivedNew.id, agent: "opencode-2", sessionId: "ses_new", archived: true });
+
+  const wider = byTask(runs.lastOpencodeSessionRunPerTask({ archivedSinceMs: 0 }));
+  expect(Object.keys(wider).sort()).toEqual([live.id, archivedNew.id, archivedOld.id].sort());
+  expect(Object.keys(byTask(runs.lastOpencodeSessionRunPerTask({ archivedSinceMs: t + 1001 })))).toEqual([live.id]);
+  // A deleted task has no runs, so it is never listed.
+  tasks.delete(live.id);
+  expect(byTask(runs.lastOpencodeSessionRunPerTask({ archivedSinceMs: 0 }))[live.id]).toBeUndefined();
+});
+
+test("runs.lastOpencodeSessionRunPerTask keeps its task set on the pinned partial session-id index", () => {
+  const seen: string[] = [];
+  const realQuery = db.query;
+  // Capture the statement the method prepares, then plan it.
+  (db as unknown as { query: typeof db.query }).query = function (this: typeof db, sql: string) {
+    if (sql.includes("runs_opencode_session_id_idx")) seen.push(sql);
+    return realQuery.call(this, sql);
+  } as typeof db.query;
+  try {
+    runs.lastOpencodeSessionRunPerTask({ archivedSinceMs: 1 });
+  } finally {
+    (db as unknown as { query: typeof db.query }).query = realQuery;
+  }
+  expect(seen).toHaveLength(1);
+  const plans = seen.map((sql) => planOf(sql, 1));
+  expect(plans[0]!.some((d) => d.includes("USING COVERING INDEX runs_opencode_session_id_idx") || d.includes("USING INDEX runs_opencode_session_id_idx"))).toBe(true);
+  expect(plans[0]!.some((d) => /^SCAN (runs|r)\b(?!.*INDEX)/.test(d))).toBe(false);
+});
+
+test("runs.latestForTask returns the newest run (later insert on a tie), or null", () => {
+  const task = tasks.insert(makeTaskRow());
+  expect(runs.latestForTask(task.id)).toBeNull();
+  const t = 1_800_000_000_000;
+  runs.insert(makeRun(task.id, { startedAt: t }));
+  const newest = runs.insert(makeRun(task.id, { startedAt: t + 50, opencodeSessionId: "ses_x" }));
+  runs.insert(makeRun(task.id, { startedAt: t + 10 }));
+  expect(runs.latestForTask(task.id)).toEqual(runs.get(newest.id));
+  expect(runs.latestForTask(task.id)!.id).toBe(runs.listForTask(task.id)[0]!.id);
+  const tie = runs.insert(makeRun(task.id, { startedAt: t + 50 }));
+  expect(runs.latestForTask(task.id)!.id).toBe(tie.id);
+  expect(runs.latestForTask("no-such-task")).toBeNull();
+  expect(planOf(`SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1`, task.id).join(" | ")).toContain("idx_runs_task");
+});
+
+test("subagents.opencodeOrphanedTaskIdsSince and settledOpencodeChildSessionIds SEARCH idx_subagents_opencode_status", async () => {
+  const { subagents } = await import("./db.ts");
+  const task = tasks.insert(makeTaskRow());
+  const other = tasks.insert(makeTaskRow());
+  const run = runs.insert(makeRun(task.id));
+  const t = 1_800_000_000_000;
+  const add = (taskId: string, child: string, status: string, endedAt: number | null, kind = "opencode_subagent") =>
+    subagents.insertIfAbsent({
+      id: `opencode-${child}`, taskId, runId: taskId === task.id ? run.id : null, parentKind: kind as "opencode_subagent",
+      agentType: null, description: null, spawnDepth: 1, sourcePath: `opencode-session:${child}`, toolUseId: null,
+      status: status as "running", startedAt: t, endedAt,
+    });
+  add(task.id, "ses_run", "running", null);
+  add(task.id, "ses_orph_new", "orphaned", t + 100);
+  add(task.id, "ses_orph_old", "orphaned", t - 100);
+  add(task.id, "ses_done", "completed", t);
+  add(task.id, "ses_fail", "failed", t);
+  add(task.id, "ses_cancel", "cancelled", t);
+  add(task.id, "ses_claude", "completed", t, "subagent");
+  add(other.id, "ses_other", "orphaned", t + 100);
+
+  expect(subagents.opencodeOrphanedTaskIdsSince(t).sort()).toEqual([task.id, other.id].sort());
+  expect(subagents.opencodeOrphanedTaskIdsSince(t + 101)).toEqual([]);
+  expect(subagents.settledOpencodeChildSessionIds(task.id, t).sort()).toEqual(["ses_cancel", "ses_done", "ses_fail", "ses_orph_old"]);
+  expect(subagents.settledOpencodeChildSessionIds(task.id, t + 101).sort()).toEqual(["ses_cancel", "ses_done", "ses_fail", "ses_orph_new", "ses_orph_old"]);
+  expect(subagents.settledOpencodeChildSessionIds(other.id, t)).toEqual([]);
+
+  const orphanedPlan = planOf(
+    `SELECT DISTINCT task_id FROM subagents
+      WHERE status = 'orphaned' AND parent_kind = 'opencode_subagent' AND COALESCE(ended_at, started_at) >= ?`,
+    t,
+  );
+  // Unpinned, the planner picks the 082 index on its own; the method pins it anyway.
+  expect(orphanedPlan.join(" | ")).toContain("SEARCH subagents USING INDEX idx_subagents_opencode_status (status=?)");
+  expect(orphanedPlan.some((d) => /^SCAN subagents/.test(d))).toBe(false);
+  const settledPlan = planOf(
+    `SELECT source_path FROM subagents INDEXED BY idx_subagents_opencode_status
+      WHERE status IN ('completed', 'failed', 'cancelled', 'orphaned') AND task_id = ?1 AND parent_kind = 'opencode_subagent'
+        AND (status != 'orphaned' OR COALESCE(ended_at, started_at) < ?2)`,
+    task.id, t,
+  );
+  expect(settledPlan.join(" | ")).toContain("SEARCH subagents USING INDEX idx_subagents_opencode_status (status=? AND task_id=?)");
+});
+
+test("opencodeStoppedChildren notes by primary key, refreshes on re-note and prunes through its time index", async () => {
+  const { opencodeStoppedChildren } = await import("./db.ts");
+  db.run(`DELETE FROM opencode_stopped_children`);
+  opencodeStoppedChildren.note("ses_a", "task-1", 100, 0);
+  opencodeStoppedChildren.note("ses_b", "task-1", 200, 0);
+  expect(opencodeStoppedChildren.stoppedAt("ses_a")).toBe(100);
+  opencodeStoppedChildren.note("ses_a", "task-2", 300, 0);
+  expect(db.query<{ task_id: string; stopped_at: number }, []>(`SELECT task_id, stopped_at FROM opencode_stopped_children WHERE child_session_id = 'ses_a'`).get())
+    .toEqual({ task_id: "task-2", stopped_at: 300 });
+  opencodeStoppedChildren.note("ses_c", "task-1", 400, 250); // prunes ses_b (200 < 250)
+  expect(opencodeStoppedChildren.stoppedAt("ses_b")).toBeNull();
+  expect(opencodeStoppedChildren.stoppedAt("ses_a")).toBe(300);
+  expect(opencodeStoppedChildren.stoppedAt("ses_none")).toBeNull();
+  expect(planOf(`SELECT stopped_at FROM opencode_stopped_children WHERE child_session_id = ?`, "x").join(" | ")).toContain("USING INDEX sqlite_autoindex_opencode_stopped_children_1");
+  expect(planOf(`DELETE FROM opencode_stopped_children WHERE stopped_at < ?`, 1).join(" | ")).toContain("opencode_stopped_children_at_idx");
+});

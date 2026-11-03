@@ -1,4 +1,4 @@
-import { runs, subagents, type AppendedEvent } from "./db.ts";
+import { OPENCODE_CHILD_SOURCE_PREFIX, opencodeStoppedChildren, runs, subagents, type AppendedEvent } from "./db.ts";
 import { FX_USAGE_STATUS_PREFIX, type RunEvent, type RunEventStream, type Subagent, type SubagentEvent, type SubagentStatus } from "../shared/types.ts";
 import type { OpencodeSubagentNotice } from "./opencode-tmux.ts";
 import { exportOutcome, exportToEvents, runOpencodeExport, type OpencodeExport } from "./opencode-export.ts";
@@ -89,7 +89,7 @@ function fireSettle(taskId: string): void {
   }
 }
 
-export const OPENCODE_SUBAGENT_SOURCE_PREFIX = "opencode-session:";
+export const OPENCODE_SUBAGENT_SOURCE_PREFIX = OPENCODE_CHILD_SOURCE_PREFIX;
 
 /** Deterministic row id for a child session (one row per child, ever). */
 export function opencodeSubagentId(childSessionId: string): string {
@@ -234,6 +234,63 @@ export function listOpenOpencodeChildSessions(taskId: string, now: number = Date
   return out;
 }
 
+/**
+ * The OpenCode child sessions of a task whose subagent row is done with:
+ * settled, or orphaned for at least {@link ORPHAN_RECHECK_MAX_AGE_MS} — exactly
+ * the rows {@link listOpenOpencodeChildSessions} leaves out. One
+ * status-filtered, indexed query (`subagents.settledOpencodeChildSessionIds`),
+ * not a load of every row of the task. Never throws.
+ */
+export function listSettledOpencodeChildSessions(taskId: string, now: number = Date.now()): string[] {
+  try {
+    // Open while `now - orphanedAt < MAX`, so settled from `orphanedAt <= now - MAX`.
+    return subagents.settledOpencodeChildSessionIds(taskId, now - ORPHAN_RECHECK_MAX_AGE_MS + 1);
+  } catch (e) {
+    console.error("[opencode-subagents] could not list settled subagent rows:", e);
+    return [];
+  }
+}
+
+/* ── children agetor itself stopped (decision R4) ─────────────────────────── */
+
+/** How long a "stopped by agetor" note counts. The "subagent cancelled" wake it
+ *  explains comes within seconds; the day covers a Stop followed by a quit and
+ *  a later boot of the background core. */
+export const OPENCODE_STOPPED_CHILD_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Record, before the interrupt goes out, that agetor itself is interrupting
+ * this child session, so the parent's "subagent cancelled" wake that follows
+ * is recognized as the tail of agetor's Stop (decision R4). Durable: it is a
+ * row in `opencode_stopped_children` (migration 082), so a core restart
+ * between the Stop and the wake still knows. Recorded whether or not the
+ * child's subagent row exists yet. Re-noting refreshes the time. Notes older
+ * than {@link OPENCODE_STOPPED_CHILD_TTL_MS} are pruned on each write. Never
+ * throws.
+ */
+export function noteOpencodeChildStoppedByAgetor(a: { taskId: string; childSessionId: string }, now: number = Date.now()): void {
+  if (!a.childSessionId) return;
+  try {
+    opencodeStoppedChildren.note(a.childSessionId, a.taskId, now, now - OPENCODE_STOPPED_CHILD_TTL_MS);
+  } catch (e) {
+    console.error(`[opencode-subagents] could not record that ${a.childSessionId} was stopped:`, e);
+  }
+}
+
+/** Whether agetor noted this child session as stopped within the last
+ *  {@link OPENCODE_STOPPED_CHILD_TTL_MS} (see {@link noteOpencodeChildStoppedByAgetor}).
+ *  One primary-key lookup; false on any read error. */
+export function wasOpencodeChildStoppedByAgetor(childSessionId: string, now: number = Date.now()): boolean {
+  if (!childSessionId) return false;
+  try {
+    const at = opencodeStoppedChildren.stoppedAt(childSessionId);
+    return at !== null && now - at < OPENCODE_STOPPED_CHILD_TTL_MS;
+  } catch (e) {
+    console.error(`[opencode-subagents] could not read whether ${childSessionId} was stopped:`, e);
+    return false;
+  }
+}
+
 function settleRow(row: Subagent, status: SubagentStatus): void {
   const endedAt = Date.now();
   subagents.setStatus(row.id, status, endedAt);
@@ -360,6 +417,20 @@ export function orphanRunningOpencodeSubagents(taskId: string, reason: string): 
   }
   if (flipped > 0) fireSettle(taskId);
   return flipped;
+}
+
+/**
+ * The OpenCode server carrying a task's turn was lost (it crashed, or stopped
+ * answering) and the turn ended because of it: the task's `running` OpenCode
+ * child rows will hear nothing more from that stream. Parks them `orphaned`,
+ * with the same rule and status line {@link orphanRunningOpencodeSubagents}
+ * applies at boot, so they stop holding the task. A later sync against a
+ * server that answers settles each one for good (404, or not active with no
+ * idle tail) or revives it (listed active). Returns how many rows it flipped;
+ * never throws.
+ */
+export function orphanRunningOpencodeChildrenOfTask(taskId: string): number {
+  return orphanRunningOpencodeSubagents(taskId, "the OpenCode server stopped");
 }
 
 const REFRESH_EXPORT_TIMEOUT_MS = 10_000;
@@ -626,8 +697,10 @@ const inFlightSyncs = new Map<string, Promise<void>>();
  * the row from the trailing `idle` message's outcome. A child without an
  * `idle` tail may still be running: an `orphaned` row comes back to `running`
  * only when the server lists the child among its active sessions (history
- * proves nothing about now); otherwise it stays orphaned. A child the server
- * answers 404 for is settled for good ({@link settleGoneChild}).
+ * proves nothing about now), is settled for good when the server's listing
+ * positively leaves it out, and stays orphaned while that listing can't be
+ * read ({@link settleOrReviveOrphan}). A child the server answers 404 for is
+ * settled for good ({@link settleGoneChild}).
  * Creates the row when missing (title and agent from `getSession`; none when
  * the server has no such session). Yields to the event loop between pages and
  * between slices of a page. Calls for the same child share one run. Never throws.
@@ -696,7 +769,9 @@ async function syncChild(a: { taskId: string; runId: string; client: OpencodeCli
     await yieldToLoop();
   }
   if (pages.length === 0) {
-    // No messages yet: the child exists but hasn't started; leave the row as it is.
+    // No messages yet: a `running` child exists but hasn't started, so it is
+    // left as it is; an `orphaned` one is alive only if the server lists it.
+    await settleOrReviveOrphan(a.client, id, a.childSessionId);
     return;
   }
   // Ascending pages, each ascending.
@@ -717,34 +792,62 @@ async function syncChild(a: { taskId: string; runId: string; client: OpencodeCli
     settleOpencodeChild({ taskId: a.taskId, childSessionId: a.childSessionId, outcome: tail.outcome, error: tail.error });
     return;
   }
-  const row = subagents.get(id);
-  if (row && row.status === "orphaned" && (await isChildActive(a.client, a.childSessionId))) reviveIfOrphaned(row);
+  await settleOrReviveOrphan(a.client, id, a.childSessionId);
 }
 
-/** True only when the server positively lists the session as active; any error or doubt is "not active". */
-async function isChildActive(client: OpencodeClient, childSessionId: string): Promise<boolean> {
+/**
+ * An `orphaned` row whose child has no `idle` tail: the server's active list
+ * decides. Listed → `running` again. Positively not listed → the child is dead
+ * (its execution was cut off, by a crash or a restart, and nothing will finish
+ * it), so the row is settled for good ({@link settleDeadChild}) instead of being
+ * offered to every relist and boot linger for {@link ORPHAN_RECHECK_MAX_AGE_MS}.
+ * The listing failing says nothing: the row stays `orphaned` for a later sync.
+ * A `running` row is left alone (the live stream owns it).
+ */
+async function settleOrReviveOrphan(client: OpencodeClient, id: string, childSessionId: string): Promise<void> {
+  if (subagents.get(id)?.status !== "orphaned") return;
+  const active = await childActivity(client, childSessionId);
+  // Re-read: a live event may have revived or settled the row during the call.
+  const row = subagents.get(id);
+  if (!row || row.status !== "orphaned") return;
+  if (active === "active") reviveIfOrphaned(row);
+  else if (active === "inactive") settleDeadChild(row, "is no longer running on the OpenCode server", "dead");
+}
+
+/** Whether the server lists the session as active. `unknown` when the listing can't be read. */
+async function childActivity(client: OpencodeClient, childSessionId: string): Promise<"active" | "inactive" | "unknown"> {
   try {
     const active = await client.activeSessions();
-    return active[childSessionId] !== undefined;
+    if (typeof active !== "object" || active === null) return "unknown";
+    return active[childSessionId] !== undefined ? "active" : "inactive";
   } catch (e) {
     console.error(`[opencode-subagents] could not check whether ${childSessionId} is active:`, e);
-    return false;
+    return "unknown";
   }
 }
 
 /**
  * The server answered 404 for this child: it will never run again here (a 1.x
- * era child, a wiped or replaced server). A `running` row is parked `orphaned`
- * with a status line; an `orphaned` row is left exactly as it is — its
- * `endedAt` is not refreshed, so the age limit ({@link ORPHAN_RECHECK_MAX_AGE_MS})
- * keeps running down — and a terminal row is untouched. It is never revived by a
- * later sync, since only a child the server lists as active can be.
+ * era child, a wiped or replaced server). A `running` or `orphaned` row is
+ * settled for good ({@link settleDeadChild}); a terminal row is untouched.
  */
 function settleGoneChild(row: Subagent): void {
-  if (row.status !== "running") return;
+  if (row.status !== "running" && row.status !== "orphaned") return;
+  settleDeadChild(row, "is no longer known to the OpenCode server", "gone");
+}
+
+/**
+ * Settle a child the server positively reports as not running, with a status
+ * line in the run: `cancelled` when agetor itself stopped it
+ * ({@link wasOpencodeChildStoppedByAgetor}), else `failed`. Fires the settle
+ * hook (the held-task release). Never revived later: a sync only revives an
+ * `orphaned` row.
+ */
+function settleDeadChild(row: Subagent, what: string, tag: "gone" | "dead"): void {
+  const child = opencodeChildSessionOf(row);
   const runId = runIdFor(row);
   if (runId) {
-    append(row, runId, "status", `OpenCode subagent "${label(row)}" is no longer known to the OpenCode server`, `opencode:subagent:${row.id}:gone`, null);
+    append(row, runId, "status", `OpenCode subagent "${label(row)}" ${what}`, `opencode:subagent:${row.id}:${tag}`, null);
   }
-  settleRow(row, "orphaned");
+  settleRow(row, child && wasOpencodeChildStoppedByAgetor(child) ? "cancelled" : "failed");
 }
