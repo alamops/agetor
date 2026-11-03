@@ -89,6 +89,76 @@ export function opencodeModelArgs(a: {
   return a.major === 2 ? ["-m", `${model}#${effort}`] : ["-m", model, "--variant", effort];
 }
 
+/**
+ * Display names for OpenCode's own hosted providers. Both serve many of the
+ * same models under the same `name` (`opencode/deepseek-v4.1-flash` and
+ * `opencode-go/deepseek-v4.1-flash` are both "DeepSeek V4.1 Flash"), but
+ * they bill differently: `opencode` (Zen) draws on the account's
+ * pay-as-you-go balance and answers 402 "Insufficient account funds" when it
+ * is empty, while `opencode-go` runs on the Go subscription.
+ */
+const OPENCODE_PROVIDER_LABELS: Readonly<Record<string, string>> = {
+  opencode: "OpenCode Zen",
+  "opencode-go": "OpenCode Go",
+};
+
+/** The provider half of a `provider/model` id, or null when there is none. */
+export function opencodeProviderOf(modelId: string): string | null {
+  const slash = modelId.indexOf("/");
+  return slash > 0 ? modelId.slice(0, slash) : null;
+}
+
+/** A provider id's display name: the known OpenCode-hosted ones by name, any other as itself. */
+export function opencodeProviderLabel(providerId: string): string {
+  return OPENCODE_PROVIDER_LABELS[providerId] ?? providerId;
+}
+
+/**
+ * Makes discovered OpenCode model labels unique. OpenCode reports a model's
+ * `name` without its provider, so the same model offered by two providers
+ * (Zen and Go above, or a BYOK provider) shows up as two identical rows in the
+ * picker, and picking the wrong one can bill the wrong account. A label
+ * shared by two or more ids gets ` (<provider>)` appended; one that still
+ * collides after that (two ids of one provider) gets ` (<id>)` instead. Ids,
+ * order, efforts and unshared labels are untouched; a model with no label
+ * shows its id and needs nothing. Pure.
+ */
+export function disambiguateOpencodeLabels<T extends { id: string; label?: string }>(models: T[]): T[] {
+  const count = (labels: Array<string | undefined>): Map<string, number> => {
+    const m = new Map<string, number>();
+    for (const l of labels) if (l !== undefined) m.set(l, (m.get(l) ?? 0) + 1);
+    return m;
+  };
+  const shared = count(models.map((m) => m.label));
+  const withProvider = models.map((m) => {
+    if (m.label === undefined || (shared.get(m.label) ?? 0) < 2) return m.label;
+    const provider = opencodeProviderOf(m.id);
+    return provider ? `${m.label} (${opencodeProviderLabel(provider)})` : `${m.label} (${m.id})`;
+  });
+  const still = count(withProvider);
+  return models.map((m, i) => {
+    const label = withProvider[i];
+    if (label === m.label || label === undefined) return m;
+    return { ...m, label: (still.get(label) ?? 0) > 1 ? `${m.label} (${m.id})` : label };
+  });
+}
+
+/**
+ * A hint for a turn that failed because the provider has no balance (v2
+ * `{type: "provider.quota", status: 402}`, or the "Insufficient account
+ * funds" text), else null. The usual cause is a Zen (`opencode/…`) model
+ * picked by an account that pays through a Go subscription, whose copy of
+ * the same model is `opencode-go/…`: the terminal works because OpenCode's
+ * own default there is the Go one.
+ */
+export function opencodeQuotaHint(err: unknown, message: string): string | null {
+  const rec = err && typeof err === "object" ? (err as { type?: unknown; status?: unknown }) : null;
+  const quota = rec?.type === "provider.quota" || rec?.status === 402 || /insufficient (account )?funds/i.test(message);
+  if (!quota) return null;
+  return "the model's provider has no balance for this account. OpenCode Zen models (opencode/…) bill your Zen balance; " +
+    "a Go subscription runs the opencode-go/… models, labelled (OpenCode Go) in the model picker — switch the task's model to one of those.";
+}
+
 /** The 400 text every route uses for a bad `opencodeServer` value. */
 export const OPENCODE_SERVER_INPUT_ERROR = "opencodeServer must be one of shared, standalone";
 

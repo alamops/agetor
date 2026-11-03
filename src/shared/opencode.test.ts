@@ -4,11 +4,15 @@ import {
   OPENCODE_SERVER_INPUT_ERROR,
   OPENCODE_SESSION_ID_RE,
   OPENCODE_VERSION_RE,
+  disambiguateOpencodeLabels,
   effectiveOpencodeServer,
   formatOpencodeTurnBreadcrumb,
   opencodeChildrenDieWithTurn,
   opencodeMajor,
   opencodeModelArgs,
+  opencodeProviderLabel,
+  opencodeProviderOf,
+  opencodeQuotaHint,
   opencodeTurnBreadcrumbPrefix,
   parseOpencodeServerInput,
   parseOpencodeTurnBreadcrumb,
@@ -240,5 +244,50 @@ describe("importedSessionOf", () => {
 
   test("Claude wins if both are set", () => {
     expect(importedSessionOf({ importedClaude: claude, importedOpencode: opencode })?.kind).toBe("claude-code");
+  });
+});
+
+describe("OpenCode provider labels", () => {
+  test("opencodeProviderOf / opencodeProviderLabel", () => {
+    expect(opencodeProviderOf("opencode-go/deepseek-v4.1-flash")).toBe("opencode-go");
+    expect(opencodeProviderOf(OPENCODE_DEFAULT_MODEL)).toBeNull();
+    expect(opencodeProviderOf("/x")).toBeNull();
+    expect(opencodeProviderLabel("opencode")).toBe("OpenCode Zen");
+    expect(opencodeProviderLabel("opencode-go")).toBe("OpenCode Go");
+    expect(opencodeProviderLabel("anthropic")).toBe("anthropic");
+  });
+
+  test("disambiguateOpencodeLabels: a name shared across providers gets the provider; unique names, ids, order and efforts stay", () => {
+    const out = disambiguateOpencodeLabels([
+      { id: "opencode-go/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", efforts: ["max"] },
+      { id: "opencode/big-pickle", label: "Big Pickle", efforts: [] },
+      { id: "opencode/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", efforts: ["max"] },
+      { id: "openrouter/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash" },
+      { id: "anthropic/claude-x" },
+    ]);
+    expect(out).toEqual([
+      { id: "opencode-go/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash (OpenCode Go)", efforts: ["max"] },
+      { id: "opencode/big-pickle", label: "Big Pickle", efforts: [] },
+      { id: "opencode/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash (OpenCode Zen)", efforts: ["max"] },
+      { id: "openrouter/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash (openrouter)" },
+      { id: "anthropic/claude-x" },
+    ]);
+  });
+
+  test("disambiguateOpencodeLabels: two ids of one provider sharing a name fall back to the id", () => {
+    expect(disambiguateOpencodeLabels([
+      { id: "p/a", label: "Same" },
+      { id: "p/b", label: "Same" },
+      { id: "q/c", label: "Same" },
+    ]).map((m) => m.label)).toEqual(["Same (p/a)", "Same (p/b)", "Same (q)"]);
+  });
+
+  test("opencodeQuotaHint: only for an out-of-balance error", () => {
+    expect(opencodeQuotaHint({ type: "provider.quota", status: 402 }, "Upstream request failed: Insufficient account funds"))
+      .toContain("opencode-go/");
+    expect(opencodeQuotaHint({ status: 402 }, "x")).not.toBeNull();
+    expect(opencodeQuotaHint(null, "Insufficient funds")).not.toBeNull();
+    expect(opencodeQuotaHint({ type: "provider.free-limit", status: 429 }, "Free usage limit reached.")).toBeNull();
+    expect(opencodeQuotaHint({ type: "unknown" }, "File not found")).toBeNull();
   });
 });

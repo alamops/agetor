@@ -4,7 +4,7 @@ import type { Subprocess } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import type { AgentKind } from "../shared/types.ts";
 import { coreSpawn } from "./core-spawn.ts";
-import { opencodeMajor } from "../shared/opencode.ts";
+import { disambiguateOpencodeLabels, opencodeMajor } from "../shared/opencode.ts";
 
 /**
  * A model id (and optional human label) surfaced by the agent CLI itself.
@@ -1103,12 +1103,12 @@ async function discoverOpencode(env?: Record<string, string>, bin?: string): Pro
       if (!api.ok) api = await runOpencodeProbe(apiCmd, probeEnv, remaining());
       const idList = ids.ok ? parseOpencodeModels(ids.stdout) : [];
       const apiList = api.ok ? parseOpencodeApiModelList(api.stdout) : [];
-      return mergeOpencodeV2(idList, apiList.length > 0 ? apiList : null);
+      return disambiguateOpencodeLabels(mergeOpencodeV2(idList, apiList.length > 0 ? apiList : null));
     }
 
     const verbose = await runOpencodeProbe([resolved, "models", "--verbose"], probeEnv, remaining());
     const fromVerbose = verbose.ok ? parseOpencodeVerboseModels(verbose.stdout) : [];
-    if (fromVerbose.length > 0) return fromVerbose;
+    if (fromVerbose.length > 0) return disambiguateOpencodeLabels(fromVerbose);
     const plain = await runOpencodeProbe([resolved, "models"], probeEnv, remaining());
     return plain.ok ? parseOpencodeModels(plain.stdout) : [];
   } catch {

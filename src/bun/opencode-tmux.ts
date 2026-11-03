@@ -17,6 +17,7 @@ import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-reso
 import { childEnv, coreSpawn } from "./core-spawn.ts";
 import { openReadNoFollow, readTextNoFollow } from "./no-follow.ts";
 import { createDeathProbe } from "./session-liveness.ts";
+import { opencodeQuotaHint } from "../shared/opencode.ts";
 import {
   FX_USAGE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
@@ -457,7 +458,8 @@ export function mapOpencodeEvent(line: string, ctx: OpencodeMapCtx, lineIndex: n
       ctx.failed = true;
       ctx.lastError = msg;
       res.failed = true;
-      res.chunks = [{ stream: "status", data: `opencode: ${msg}`, lineUuid: `opencode:error:${lineIndex}` }];
+      const hint = opencodeQuotaHint(evt.error, msg);
+      res.chunks = [{ stream: "status", data: `opencode: ${msg}${hint ? ` — ${hint}` : ""}`, lineUuid: `opencode:error:${lineIndex}` }];
       if (RESUME_NOT_FOUND_MSG_RE.test(msg) && !ctx.sessionId) {
         ctx.resumeNotFound = true;
         res.resumeNotFound = true;

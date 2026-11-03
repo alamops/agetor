@@ -167,6 +167,19 @@ describe("mapOpencodeEvent — v2 fixtures", () => {
       .toBe("Variant unavailable for opencode/deepseek-v4.1-flash-free: bogus");
   });
 
+  test("provider.quota 402 (empty Zen balance): the status line carries the Zen-vs-Go hint, lastError stays raw", () => {
+    const { chunks, proc } = runFixture("v2-run-error-insufficient-funds.jsonl", 2);
+    const st = chunks.filter((c) => c.stream === "status");
+    expect(st).toHaveLength(1);
+    expect(st[0]!.data).toStartWith("opencode: Upstream request failed: Insufficient account funds — ");
+    expect(st[0]!.data).toContain("opencode-go/");
+    expect(st[0]!.lineUuid).toBe("opencode:error:1");
+    expect(proc.result()).toMatchObject({ failed: true, lastError: "Upstream request failed: Insufficient account funds" });
+    // The 429 free-limit error is a different failure and gets no hint.
+    const free = runFixture("v2-run-error-in-session.jsonl", 2).chunks.filter((c) => c.stream === "status");
+    expect(free[0]!.data).not.toContain("opencode-go/");
+  });
+
   test("interrupted Shared run: only step_start, no error", () => {
     const { chunks, proc } = runFixture("v2-run-interrupted-shared.jsonl", 2);
     expect(chunks).toEqual([]);
