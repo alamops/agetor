@@ -40,6 +40,8 @@ const { createOpencodeClient } = await import("./opencode-http.ts");
 const { startFakeOpencodeServer, FAKE_OC_MARKERS } = await import("./fixtures/opencode/fake-serve.ts");
 const { rmTestDataDir } = await import("./test-data-dir.ts");
 const { FX_USAGE_STATUS_PREFIX } = await import("../shared/types.ts");
+const db = await import("./db.ts");
+import type { Task } from "../shared/types.ts";
 
 type Turn = ReturnType<typeof spawnOpencodeServerTurn>;
 type FakeServer = Awaited<ReturnType<typeof startFakeOpencodeServer>>;
@@ -136,14 +138,39 @@ function pending(taskId: string) {
   return listPendingForTask(taskId);
 }
 
+/** A task and run row, so the real subagent storage (T12) accepts child rows. */
+function seedTask(): { taskId: string; runId: string } {
+  const taskId = `task-drv-${++seq}-${Date.now()}`;
+  const runId = `run-drv-${seq}-${Date.now()}`;
+  const now = Date.now();
+  const t: Task = {
+    id: taskId, title: "t", prompt: "p", agent: "opencode", workdir: "/tmp", isolation: "none", taskType: "task",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null,
+    mode: null, model: null, effort: null, speed: "off", maxMode: false, opencodeServer: "shared",
+    references: [], backlog: [], plans: [], draft: null, column: "running", runId: null,
+    createdAt: now, updatedAt: now, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, archivedAt: null,
+  };
+  db.tasks.insert(t);
+  db.runs.insert({
+    id: runId, taskId, agent: "opencode", status: "running", startedAt: now, endedAt: null, exitCode: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+  });
+  return { taskId, runId };
+}
+const childRows = (taskId: string) => db.subagents.listForTask(taskId);
+
 /** An in-process fake server plus a driver `ensureServer` that points at it. */
-async function inproc(speed = 0.4, urlOverride?: string): Promise<FakeServer> {
+async function inproc(speed = 0.4, opts: { realChildren?: boolean } = {}): Promise<FakeServer> {
   const fake = await startFakeOpencodeServer({ speed, password: `pw-${++seq}`, heartbeatMs: 60_000 });
-  cleanups.push(() => fake.stop());
+  cleanups.push(() => {
+    // Streams whose consumer vanished (a proxy, a detached driver) would keep `stop()` waiting.
+    fake.dropEventStreams();
+    return fake.stop();
+  });
   const restore = __forTest.setDeps({
     ensureServer: async () => ({
       harnessId: H_INPROC,
-      url: urlOverride ?? fake.url,
+      url: fake.url,
       password: fake.password,
       tmuxSession: null,
       startedAt: Date.now(),
@@ -151,9 +178,17 @@ async function inproc(speed = 0.4, urlOverride?: string): Promise<FakeServer> {
   });
   cleanups.push(restore);
   // Child rows need task and run rows in the db; these tests are about the driver, not T12's storage.
-  cleanups.push(
-    __forTest.setDeps({ registerChild: () => {}, ingestChildChunks: () => {}, settleChild: () => {}, syncChild: async () => {} }),
-  );
+  if (!opts.realChildren) {
+    cleanups.push(
+      __forTest.setDeps({
+        registerChild: () => {},
+        ingestChildChunks: () => {},
+        settleChild: () => {},
+        syncChild: async () => {},
+        openChildSessions: () => [],
+      }),
+    );
+  }
   return fake;
 }
 /**
@@ -164,7 +199,17 @@ function flakyProxy(fake: FakeServer) {
   let blocked = false;
   const controllers = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const requests: string[] = [];
-  const hooks: { beforePrompt: (() => void) | null } = { beforePrompt: null };
+  const gets: string[] = [];
+  const hooks = {
+    beforePrompt: null as (() => void) | null,
+    /** The next N permission replies are answered 400 by the proxy (the fake never sees them). */
+    failReplies: 0,
+    /** The first prompt POST is forwarded, then its answer is held this long. */
+    delayFirstPromptMs: 0,
+    /** The next N message listings answer 500. */
+    failMessageLists: 0,
+    promptBodies: [] as string[],
+  };
   const enc = new TextEncoder();
   const proxy = Bun.serve({
     hostname: "127.0.0.1",
@@ -195,9 +240,30 @@ function flakyProxy(fake: FakeServer) {
           { headers: { "content-type": "text/event-stream" } },
         );
       }
-      if (req.method !== "GET") requests.push(`${req.method} ${u.pathname}`);
-      if (u.pathname.endsWith("/prompt") && req.method === "POST") hooks.beforePrompt?.();
-      return fetch(`${fake.url}${u.pathname}${u.search}`, { method: req.method, headers: req.headers, body: req.body });
+      const hasBody = req.method !== "GET" && req.method !== "HEAD";
+      const bodyText = hasBody ? await req.text() : undefined;
+      if (req.method === "GET") gets.push(u.pathname);
+      else requests.push(`${req.method} ${u.pathname}`);
+      const isPrompt = u.pathname.endsWith("/prompt") && req.method === "POST";
+      if (req.method === "POST" && /\/permission\/[^/]+\/reply$/.test(u.pathname) && hooks.failReplies > 0) {
+        hooks.failReplies--;
+        return Response.json({ _tag: "InvalidRequestError", message: "rejected by the test" }, { status: 400 });
+      }
+      if (req.method === "GET" && u.pathname.endsWith("/message") && hooks.failMessageLists > 0) {
+        hooks.failMessageLists--;
+        return Response.json({ _tag: "UnknownError", message: "boom" }, { status: 500 });
+      }
+      if (isPrompt) {
+        hooks.promptBodies.push(bodyText ?? "");
+        hooks.beforePrompt?.();
+      }
+      const res = await fetch(`${fake.url}${u.pathname}${u.search}`, { method: req.method, headers: req.headers, body: bodyText });
+      if (isPrompt && hooks.delayFirstPromptMs > 0) {
+        const ms = hooks.delayFirstPromptMs;
+        hooks.delayFirstPromptMs = 0;
+        await sleep(ms);
+      }
+      return res;
     },
   });
   cleanups.push(() => void proxy.stop(true));
@@ -211,6 +277,7 @@ function flakyProxy(fake: FakeServer) {
     hooks,
     url,
     requests,
+    gets,
     setBlocked(v: boolean) {
       blocked = v;
     },
@@ -304,8 +371,10 @@ describe("a turn on the stub-hosted server", () => {
     const t = start(run);
     t.kill();
     expect(await doneWithin(t)).toBe(130);
-    await sleep(300);
+    // Give a (wrongly) continuing start sequence ample time to reach createSession and the prompt.
+    await sleep(1500);
     expect(run.sessionIds.length).toBe(0);
+    expect(statusesOf(run)).toEqual([]);
   });
 
   test("provider error: done 1 with the error line and the quota hint", async () => {
@@ -432,15 +501,52 @@ describe("permission cards", () => {
     expect(pending(run.taskId).length).toBe(0);
   });
 
-  test("an answer the server settled elsewhere closes the card without a reply", async () => {
-    const { run, t, card } = await askTurn();
-    // Another client answers it first.
+  test("an answer the server settled elsewhere closes the card without a reply from us", async () => {
+    const fake = await inproc();
+    const proxy = flakyProxy(fake);
+    const run = mk({ ...inprocArgs, prompt: `do it ${M.permission}`, mode: "ask" });
+    const t = start(run);
+    await waitFor(() => pending(run.taskId).length === 1, 15_000, "the permission card");
+    // Another client answers it first (straight to the server, not through the proxy).
     const sid = t.sessionId()!;
-    void card;
-    const perms = await stubClient().listPermissions(sid);
-    await stubClient().replyPermission(sid, perms[0].id, { decision: "once" });
+    const c = inprocClient(fake);
+    const perms = await c.listPermissions(sid);
+    await c.replyPermission(sid, perms[0].id, { decision: "once" });
     await waitFor(() => pending(run.taskId).length === 0, 10_000, "the card to close");
     expect(await doneWithin(t)).toBe(0);
+    expect(proxy.requests.filter((r) => /\/permission\/[^/]+\/reply$/.test(r))).toEqual([]);
+  });
+
+  test("a failed reply puts the card back; the second answer goes through (done 0)", async () => {
+    const fake = await inproc();
+    const proxy = flakyProxy(fake);
+    proxy.hooks.failReplies = 1;
+    const run = mk({ ...inprocArgs, prompt: `do it ${M.permission}`, mode: "ask" });
+    const t = start(run);
+    await waitFor(() => pending(run.taskId).length === 1, 15_000, "the permission card");
+    const first = pending(run.taskId)[0]!.id;
+    answerOpencodePermission(first, { decision: "once" });
+    // The reply is refused; the card comes back from the server's list under a new id.
+    await waitFor(() => pending(run.taskId).length === 1 && pending(run.taskId)[0]!.id !== first, 15_000, "the card to come back");
+    expect(statusesOf(run).some((s) => s.includes("didn't accept the permission answer"))).toBe(true);
+    answerOpencodePermission(pending(run.taskId)[0]!.id, { decision: "once" });
+    expect(await doneWithin(t)).toBe(0);
+    expect(textOf(run)).toContain("The command ran: hi");
+  });
+
+  test("no reply goes out after Stop, even for an answered card", async () => {
+    const fake = await inproc();
+    const proxy = flakyProxy(fake);
+    cleanups.push(__forTest.setTimings({ stopConfirmMs: 400, livenessMs: 60_000 }));
+    const run = mk({ ...inprocArgs, prompt: `do it ${M.permission}`, mode: "ask" });
+    const t = start(run);
+    await waitFor(() => pending(run.taskId).length === 1, 15_000, "the permission card");
+    const id = pending(run.taskId)[0]!.id;
+    proxy.setBlocked(true); // the interrupt's terminal will not arrive; the confirm timer settles
+    t.kill();
+    answerOpencodePermission(id, { decision: "once" });
+    expect(await doneWithin(t, 8000)).toBe(130);
+    expect(proxy.requests.filter((r) => /\/permission\/[^/]+\/reply$/.test(r))).toEqual([]);
   });
 });
 
@@ -547,8 +653,9 @@ describe("subagents", () => {
 });
 
 describe("restart survival and server wake (attach)", () => {
-  test("reattach mid-turn: remaining chunks once, the same card, done 0", async () => {
+  test("reattach mid-turn: remaining chunks once, the same card, one reply, done 0", async () => {
     const fake = await inproc();
+    const proxy = flakyProxy(fake);
     const since = Date.now();
     const a = mk({ ...inprocArgs, prompt: `do it ${M.permission}`, mode: "ask" });
     const first = start(a);
@@ -561,7 +668,8 @@ describe("restart survival and server wake (attach)", () => {
     const { prompt: _p, title: _t, resumeSessionId: _r, ...attachBase } = b.args;
     const second = attachOpencodeServerTurn({ ...attachBase, sessionId: sid, sinceMs: since, reason: "reattach" });
     liveTurns.push(second as Turn);
-    await waitFor(() => b.chunks.some((c) => c.stream === "assistant"), 15_000, "the snapshot seed");
+    // The catch-up lists permissions, then forms: once the forms were asked for, the request was taken up.
+    await waitFor(() => proxy.gets.some((g) => g.endsWith("/form")), 15_000, "the catch-up to re-list the session");
     // Still exactly one card, and it is the one the first driver raised.
     expect(pending(a.taskId).map((c) => c.id)).toEqual([cardId]);
     answerOpencodePermission(cardId, { decision: "once" });
@@ -572,7 +680,8 @@ describe("restart survival and server wake (attach)", () => {
     expect(text).toContain("The command ran: hi"); // live
     expect(text.split("The command ran: hi").length).toBe(2);
     expect(pending(a.taskId).length).toBe(0);
-    void fake;
+    // The detached driver never answers: exactly one reply reached the server.
+    expect(proxy.requests.filter((r) => /\/permission\/[^/]+\/reply$/.test(r)).length).toBe(1);
   });
 
   test("attach to a turn that already finished settles from the snapshot, 0 and 1", async () => {
@@ -733,8 +842,13 @@ describe("failure and edge paths", () => {
       type: "form.created",
       data: { form: { id: "frm_elicit1", sessionID: sid, title: "Server asks", metadata: { kind: "mcp-elicitation" }, fields: [{ key: "a", type: "string" }] } },
     });
-    await sleep(250);
-    expect(pending(run.taskId).length).toBe(0);
+    // Events are handled in order: once a LATER question form has its card, the earlier one has been seen.
+    proxy.inject({
+      type: "form.created",
+      data: { form: { id: "frm_sentinel", sessionID: sid, title: "Questions", metadata: { kind: "question" }, fields: [{ key: "q0", description: "Sentinel?", type: "string" }] } },
+    });
+    await waitFor(() => pending(run.taskId).length === 1, 10_000, "the sentinel card");
+    expect(pending(run.taskId).length).toBe(1); // only the sentinel: the elicitation raised nothing
     expect(proxy.requests.filter((r) => r.includes("/form"))).toEqual([]);
     t.kill();
     expect(await doneWithin(t)).toBe(130);
@@ -754,18 +868,203 @@ describe("failure and edge paths", () => {
       fields: [{ key: "q0", title: "Pick", description: "Pick several", type: "multiselect", options: [{ value: "a", label: "A" }, { value: "b", label: "B" }] }],
     };
     proxy.inject({ type: "form.created", data: { form } });
-    proxy.inject({ type: "form.created", data: { form } });
-    await waitFor(() => pending(run.taskId).length === 1, 5000, "the card");
-    await sleep(100);
-    expect(pending(run.taskId).length).toBe(1);
-    const q = (pending(run.taskId)[0] as import("./interactions.ts").AskQuestionsRequest).questions[0]!;
+    proxy.inject({ type: "form.created", data: { form } }); // the same form again
+    proxy.inject({ type: "form.created", data: { form: { ...form, id: "frm_q2" } } }); // a sentinel behind it
+    await waitFor(() => pending(run.taskId).length >= 2, 5000, "the cards");
+    expect(pending(run.taskId).length).toBe(2); // three events, two forms: the repeat raised nothing
+    const q = (pending(run.taskId).find((r) => r.kind === "ask_questions" && r.questions[0]!.id === "q0" ) as import("./interactions.ts").AskQuestionsRequest).questions[0]!;
     expect(q.multiSelect).toBe(true);
     expect(q.allowCustom).toBe(false);
     // The server settled it elsewhere: the card closes and no reply goes out.
     proxy.inject({ type: "form.cancelled", data: { id: "frm_q1", sessionID: t.sessionId() } });
-    await waitFor(() => pending(run.taskId).length === 0, 5000, "the card to close");
+    proxy.inject({ type: "form.cancelled", data: { id: "frm_q2", sessionID: t.sessionId() } });
+    await waitFor(() => pending(run.taskId).length === 0, 5000, "the cards to close");
     expect(proxy.requests.filter((r) => r.includes("/form"))).toEqual([]);
     t.kill();
     expect(await doneWithin(t)).toBe(130);
+  });
+});
+
+
+describe("Stop on an attached turn", () => {
+  test("a Stop right after attach interrupts the server (it does not just mark the run cancelled)", async () => {
+    const fake = await inproc();
+    const proxy = flakyProxy(fake);
+    const since = Date.now();
+    const a = mk({ ...inprocArgs, prompt: `run ${M.slow}` });
+    const first = start(a);
+    await waitFor(() => a.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    const sid = first.sessionId()!;
+    first.detach();
+    const b = mk({ ...inprocArgs, taskId: a.taskId, runId: a.runId });
+    const { prompt: _p, title: _t, resumeSessionId: _r, ...base } = b.args;
+    const second = attachOpencodeServerTurn({ ...base, sessionId: sid, sinceMs: since, reason: "reattach" });
+    liveTurns.push(second as Turn);
+    second.kill(); // still connecting
+    expect(await doneWithin(second, 10_000)).toBe(130);
+    expect(proxy.requests).toContain(`POST /api/session/${sid}/interrupt`);
+    expect(await inprocClient(fake).activeSessions()).toEqual({});
+  });
+
+  test("kill after detach settles 130 instead of leaving done pending", async () => {
+    await inproc();
+    const run = mk({ ...inprocArgs, prompt: `run ${M.slow}` });
+    const t = start(run);
+    await waitFor(() => run.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    t.detach();
+    t.kill();
+    expect(await doneWithin(t, 5000)).toBe(130);
+  });
+});
+
+describe("client message ids and retries", () => {
+  test("the prompt and a steer carry ascending msg_ ids; a timed-out prompt is retried once with the same id", async () => {
+    const fake = await inproc(0.4);
+    const proxy = flakyProxy(fake);
+    proxy.hooks.delayFirstPromptMs = 1500; // forwarded, but the answer is held past the client's budget
+    cleanups.push(__forTest.setTimings({ requestMs: 600 }));
+    const run = mk({ ...inprocArgs, prompt: `go ${M.slow}` });
+    const t = start(run);
+    // Steering waits for the first prompt POST to return (here: the retry, answered "already exists").
+    expect(await t.steer("too early")).toBe("unavailable");
+    await waitFor(() => proxy.hooks.promptBodies.length >= 2, 15_000, "the retry");
+    let steered: "accepted" | "unavailable" = "unavailable";
+    const t0 = Date.now();
+    while (steered !== "accepted" && Date.now() - t0 < 15_000) {
+      steered = await t.steer("second thought");
+      if (steered !== "accepted") await sleep(25);
+    }
+    expect(steered).toBe("accepted");
+    t.kill();
+    expect(await doneWithin(t, 10_000)).toBe(130);
+    const ids = proxy.hooks.promptBodies.map((b) => (JSON.parse(b) as { id: string }).id);
+    expect(ids.length).toBe(3); // first try, the retry, the steer
+    expect(ids[0]).toBe(ids[1]);
+    for (const id of ids) expect(id).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    expect(ids[2]! > ids[0]!).toBe(true);
+    const msgs = await inprocClient(fake).listMessages(t.sessionId()!, { limit: 50, order: "asc" });
+    const users = msgs.data.filter((m: { type: string }) => m.type === "user");
+    expect(users.map((m: { text: string }) => m.text)).toEqual([`go ${M.slow}`, "second thought"]);
+    expect(users[0].id).toBe(ids[0]);
+  });
+});
+
+describe("catch-up rules", () => {
+  test("an idle after the anchor settles the turn even though a newer execution is active; later content is not replayed", async () => {
+    const fake = await inproc();
+    const since = Date.now();
+    const one = mk({ ...inprocArgs, prompt: "first turn" });
+    const first = start(one);
+    expect(await doneWithin(first)).toBe(0);
+    // A second execution is now running on the same session (not ours).
+    const sid = first.sessionId()!;
+    await inprocClient(fake).prompt(sid, { text: `later ${M.slow}`, delivery: "steer" });
+    const c = inprocClient(fake);
+    const t0 = Date.now();
+    while ((await c.activeSessions())[sid] === undefined) {
+      if (Date.now() - t0 > 10_000) throw new Error("the second execution never started");
+      await sleep(20);
+    }
+    const again = mk({ ...inprocArgs });
+    const { prompt: _p, title: _t, resumeSessionId: _r, ...base } = again.args;
+    const twin = attachOpencodeServerTurn({ ...base, sessionId: sid, sinceMs: since, reason: "reattach" });
+    liveTurns.push(twin as Turn);
+    expect(await doneWithin(twin, 10_000)).toBe(0);
+    expect(textOf(again)).toContain("ACK: first turn");
+    expect(textOf(again)).not.toContain("later");
+    // The newer execution is untouched.
+    expect(await c.interrupt(sid)).toBe(true); // still running: the attach did not touch it
+  });
+
+  test("a catch-up that cannot read the server is retried (capped backoff) and then settles the turn", async () => {
+    const fake = await inproc();
+    const proxy = flakyProxy(fake);
+    const since = Date.now();
+    const one = mk({ ...inprocArgs, prompt: "already done" });
+    const first = start(one);
+    expect(await doneWithin(first)).toBe(0);
+    cleanups.push(__forTest.setTimings({ catchRetryMs: 40, livenessMs: 60_000 }));
+    proxy.hooks.failMessageLists = 2;
+    const again = mk({ ...inprocArgs });
+    const { prompt: _p, title: _t, resumeSessionId: _r, ...base } = again.args;
+    const twin = attachOpencodeServerTurn({ ...base, sessionId: first.sessionId()!, sinceMs: since, reason: "reattach" });
+    liveTurns.push(twin as Turn);
+    expect(await doneWithin(twin, 10_000)).toBe(0);
+    expect(proxy.hooks.failMessageLists).toBe(0);
+    expect(textOf(again)).toContain("ACK: already done");
+  });
+});
+
+describe("background subagents outlive the turn (real subagent rows)", () => {
+  test("Auto: the turn settles, the driver lingers, the child row completes, the linger ends", async () => {
+    await inproc(0.4, { realChildren: true });
+    const { taskId, runId } = seedTask();
+    const run = mk({ ...inprocArgs, taskId, runId, prompt: `launch ${M.wake}` });
+    const t = start(run);
+    expect(await doneWithin(t)).toBe(0);
+    expect(t.lingering()).toBe(true);
+    expect(childRows(taskId).map((r) => r.status)).toEqual(["running"]);
+    await waitFor(() => childRows(taskId)[0]?.status === "completed", 20_000, "the background child to complete");
+    await waitFor(() => !t.lingering(), 5000, "the linger to end");
+    expect(hub.__forTest.probe(H_INPROC)?.subscribers ?? 0).toBe(0);
+  });
+
+  test("Ask: a child's permission card survives the turn's end and stays answerable", async () => {
+    await inproc(0.4, { realChildren: true });
+    const { taskId, runId } = seedTask();
+    const run = mk({ ...inprocArgs, taskId, runId, prompt: `launch ${M.wake}`, mode: "ask" });
+    const t = start(run);
+    expect(await doneWithin(t)).toBe(0);
+    expect(t.lingering()).toBe(true);
+    await waitFor(() => pending(taskId).length === 1, 10_000, "the child's permission card");
+    const card = pending(taskId)[0]! as import("./interactions.ts").FxPermissionRequest;
+    expect(card.runId).toBe(runId);
+    expect(card.toolCall.title).toContain("shell:");
+    answerOpencodePermission(card.id, { decision: "once" });
+    await waitFor(() => childRows(taskId)[0]?.status === "completed", 20_000, "the background child to complete");
+    expect(pending(taskId).length).toBe(0);
+    await waitFor(() => !t.lingering(), 5000, "the linger to end");
+  });
+
+  test("dispose ends the linger, closes the cards and unsubscribes", async () => {
+    await inproc(0.4, { realChildren: true });
+    const { taskId, runId } = seedTask();
+    const run = mk({ ...inprocArgs, taskId, runId, prompt: `launch ${M.wake}`, mode: "ask" });
+    const t = start(run);
+    expect(await doneWithin(t)).toBe(0);
+    await waitFor(() => pending(taskId).length === 1, 10_000, "the child's permission card");
+    await t.dispose();
+    expect(t.lingering()).toBe(false);
+    expect(pending(taskId).length).toBe(0);
+    expect(hub.__forTest.probe(H_INPROC)?.subscribers ?? 0).toBe(0);
+    await t.dispose(); // idempotent
+  });
+
+  test("a wake attach also settles the children of an earlier turn whose row is still open", async () => {
+    // Slow enough that the child began more than 2 s before the wake message: only the open-row rule finds it.
+    const fake = await inproc(2.5, { realChildren: true });
+    const { taskId, runId } = seedTask();
+    const a = mk({ ...inprocArgs, taskId, runId, prompt: `launch ${M.wake}` });
+    const first = start(a);
+    expect(await doneWithin(first, 30_000)).toBe(0);
+    await first.dispose(); // the core is gone; the child row stays running
+    expect(childRows(taskId).map((r) => r.status)).toEqual(["running"]);
+    const sid = first.sessionId()!;
+    const c = inprocClient(fake);
+    let syntheticAt = 0;
+    const t0 = Date.now();
+    while (syntheticAt === 0 && Date.now() - t0 < 30_000) {
+      const msgs = await c.listMessages(sid, { limit: 50, order: "desc" });
+      const syn = msgs.data.find((m: { type: string }) => m.type === "synthetic");
+      if (syn) syntheticAt = syn.time.created;
+      else await sleep(50);
+    }
+    expect(syntheticAt).toBeGreaterThan(0);
+    const b = mk({ ...inprocArgs, taskId, runId });
+    const { prompt: _p, title: _t, resumeSessionId: _r, ...base } = b.args;
+    const woken = attachOpencodeServerTurn({ ...base, sessionId: sid, sinceMs: syntheticAt + 1, reason: "wake" });
+    liveTurns.push(woken as Turn);
+    expect(await doneWithin(woken, 30_000)).toBe(0);
+    expect(childRows(taskId).map((r) => r.status)).toEqual(["completed"]);
   });
 });
