@@ -48,8 +48,9 @@
  *     that execution still open, the wake fires then (the next execution began
  *     under the previous turn's driver). A driver that unsubscribes BEFORE the
  *     terminal event of its own turn (a kill that does not wait) therefore
- *     produces a wake; the orchestrator gates those (a task with a running run
- *     refuses a wake). On EVERY connect (first or reconnect) watched sessions
+ *     produces a wake; the orchestrator gates those (it defers a wake while
+ *     the task's own run is live or settling, and refuses one after a user
+ *     Stop — docs/architecture/harness-opencode.md). On EVERY connect (first or reconnect) watched sessions
  *     that the server reports active are checked too, since the
  *     `execution.started` may have fallen into the gap or predate this core;
  *     that snapshot is discarded for any session that saw a live execution

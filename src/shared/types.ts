@@ -369,11 +369,11 @@ export interface Harness {
    *    re-homing the whole process, same approach as cursor.
    *  - opencode: emitted as HOME=<home> plus XDG_CONFIG_HOME / XDG_DATA_HOME /
    *    XDG_STATE_HOME / XDG_CACHE_HOME under it — OpenCode keeps its config,
-   *    sessions and credentials under the XDG dirs. A harness with a home
-   *    always uses its own agetor-managed server on v2 (the legacy
-   *    `opencode run` transport: `--standalone` via `effectiveOpencodeServer`),
-   *    because the shared background service binds a fixed port that
-   *    HOME/XDG can't isolate.
+   *    sessions and credentials under the XDG dirs. Every OpenCode 2
+   *    harness gets its own agetor-managed server, keyed by harness id (the
+   *    legacy `opencode run` transport: `--standalone` for a harness with a
+   *    home, via `effectiveOpencodeServer`), because the shared background
+   *    service binds a fixed port that HOME/XDG can't isolate.
    *  - copilot: emitted as COPILOT_HOME=<home>. GitHub Copilot CLI has a
    *    dedicated state-dir env var (config, logins, session state and
    *    `session-state/<id>/plan.md` all live under it), so like gemini there
