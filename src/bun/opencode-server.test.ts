@@ -65,6 +65,13 @@ if (mode === "leak") {
   console.log(pw);
   process.exit(1);
 }
+// Ignores the hangup a kill-session sends and the SIGTERM a stop sends: only SIGKILL ends it.
+if (mode === "stubborn") { process.on("SIGHUP", () => {}); process.on("SIGTERM", () => {}); }
+// Never outlive the test process: if it dies without reaping this stub, exit.
+const parent = process.ppid;
+setInterval(() => {
+  try { process.kill(parent, 0); } catch (e) { if (e && e.code === "ESRCH") process.exit(0); }
+}, 1000);
 if (mode === "silent") { setInterval(() => {}, 1000); }
 else {
   const server = Bun.serve({
@@ -430,8 +437,10 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
           const t0 = Date.now();
           expect(await adoptOpencodeServers()).toEqual([]);
           expect(Date.now() - t0).toBeLessThan(1_500);
-          expect(existsSync(__forTest.statePath(a))).toBe(false);
-          expect(existsSync(__forTest.statePath(b))).toBe(false);
+          // Under the direct host a live pid that is not our child is never
+          // trusted, but its file is kept (it may hold a live server's password).
+          expect(existsSync(__forTest.statePath(a))).toBe(host === "direct");
+          expect(existsSync(__forTest.statePath(b))).toBe(host === "direct");
         });
       });
 
@@ -609,6 +618,60 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
       });
     });
 
+    describe("only tmux saying the session does not exist counts as gone", () => {
+      /** A tmux that answers every call with `stderr` and exit 1 (tmux 3.6a's wording for each case). */
+      const tmuxSaying = (name: string, stderr: string): string => {
+        const wrapper = path.join(stubDir, `tmux-${name}`);
+        writeFileSync(wrapper, `#!/bin/sh\necho ${JSON.stringify(stderr)} >&2\nexit 1\n`);
+        chmodSync(wrapper, 0o755);
+        return wrapper;
+      };
+      const GONE = {
+        "no-session": "can't find session: agetor-ocsrv-x",
+        "refused": "no server running on /private/tmp/tmux-501/agetor-x",
+        "no-socket": "error connecting to /private/tmp/tmux-501/agetor-x (No such file or directory)",
+      };
+      const CANNOT_ASK = {
+        "eacces": "error connecting to /private/tmp/tmux-501/agetor-x (Permission denied)",
+        "emfile": "error connecting to /private/tmp/tmux-501/agetor-x (Too many open files)",
+        "enametoolong": "error connecting to /private/tmp/tmux-501/agetor-x (File name too long)",
+      };
+
+      test.skipIf(host !== "tmux")("has-session: no such session, no server, no socket are gone; a socket tmux could not connect to is unknown", async () => {
+        try {
+          for (const [k, msg] of Object.entries(GONE)) {
+            setEnv("AGETOR_TMUX_BIN", tmuxSaying(k, msg));
+            expect([k, await __forTest.tmuxHasSession("agetor-ocsrv-x")]).toEqual([k, "gone"]);
+          }
+          for (const [k, msg] of Object.entries(CANNOT_ASK)) {
+            setEnv("AGETOR_TMUX_BIN", tmuxSaying(k, msg));
+            expect([k, await __forTest.tmuxHasSession("agetor-ocsrv-x")]).toEqual([k, "unknown"]);
+          }
+        } finally {
+          useRealTmux();
+        }
+      });
+
+      test.skipIf(host !== "tmux")("a tmux that cannot reach its socket (permission denied) never confirms a stop: the server and its state stay", async () => {
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const pid = await pidOf(h);
+        const stateBefore = readFileSync(__forTest.statePath(id), "utf8");
+        __forTest.setStopGraceMs(200);
+        setEnv("AGETOR_TMUX_BIN", tmuxSaying("eacces-stop", CANNOT_ASK.eacces));
+        try {
+          expect(await stopOpencodeServer(id)).toBe(false);
+          expect(stopIdleOpencodeServersSync(() => false)).toEqual([]);
+        } finally {
+          useRealTmux();
+        }
+        expect(alive(pid)).toBe(true);
+        expect(getOpencodeServer(id)?.url).toBe(h.url);
+        expect(readFileSync(__forTest.statePath(id), "utf8")).toBe(stateBefore);
+        expect(await checkOpencodeServerHealth(h)).toBe(true);
+      });
+    });
+
     describe("a quit that cannot await", () => {
       test("stopIdleOpencodeServersSync stops idle servers before it returns, never a busy one", async () => {
         const [idle, working, gate] = [newId(), newId(), newId()];
@@ -670,6 +733,45 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
         }
         expect(existsSync(__forTest.statePath(id))).toBe(true);
         expect(getOpencodeServer(id)).not.toBeNull();
+      });
+
+      test("a server that outlives its kill is not reported stopped: it stays registered and keeps its state until it really is gone", async () => {
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id, { STUB_MODE: "stubborn" }));
+        const pid = await pidOf(h);
+        __forTest.setSyncStopWaitMs(300);
+        try {
+          // The hangup (tmux) or SIGTERM (direct) was sent and ignored: the stop is not confirmed.
+          expect(stopIdleOpencodeServersSync(() => false)).toEqual([]);
+          expect(alive(pid)).toBe(true);
+          expect(getOpencodeServer(id)).toBe(h);
+          expect(JSON.parse(readFileSync(__forTest.statePath(id), "utf8")).password).toBe(h.password);
+          expect(existsSync(__forTest.logPath(id))).toBe(true);
+        } finally {
+          process.kill(pid, "SIGKILL");
+        }
+        await waitFor(() => !alive(pid));
+        // Once it is really gone, the next quit stops it and its files go.
+        expect(stopIdleOpencodeServersSync(() => false)).toEqual([id]);
+        expect(getOpencodeServer(id)).toBeNull();
+        expect(existsSync(__forTest.statePath(id))).toBe(false);
+      });
+
+      test.skipIf(host !== "tmux")("a kill-session that exits 0 but leaves the session listed is not a stop", async () => {
+        const id = newId();
+        const h = await ensureOpencodeServer(spec(id));
+        const wrapper = path.join(stubDir, "tmux-noop-kill");
+        writeFileSync(wrapper, `#!/bin/sh\ncase "$*" in *kill-session*) exit 0;; esac\nexec "${Bun.which("tmux")}" "$@"\n`);
+        chmodSync(wrapper, 0o755);
+        setEnv("AGETOR_TMUX_BIN", wrapper);
+        try {
+          expect(stopIdleOpencodeServersSync(() => false)).toEqual([]);
+        } finally {
+          useRealTmux();
+        }
+        expect(getOpencodeServer(id)).toBe(h);
+        expect(existsSync(__forTest.statePath(id))).toBe(true);
+        expect(await checkOpencodeServerHealth(h)).toBe(true);
       });
 
       test.skipIf(host !== "tmux")("a session that is already gone counts as stopped and its files go", async () => {
@@ -1059,6 +1161,20 @@ exec "${real}" "$@"
         expect(fresh.stale).toBeUndefined();
       });
 
+      test("a settings change never hands back a dead server as stale on the health cache alone", async () => {
+        __forTest.setHealthCacheMs(60_000);
+        const id = newId();
+        const a = await ensureOpencodeServer(spec(id, { STUB_EXTRA: "one" }));
+        process.kill(await pidOf(a), "SIGKILL");
+        await waitFor(async () => !(await checkOpencodeServerHealth(a, 300)));
+        // Busy, so a live server would be kept as stale; this one is dead, so it is replaced.
+        const next = await ensureOpencodeServer({ ...spec(id, { STUB_EXTRA: "two" }), isBusy: () => true });
+        expect(next.stale).toBeUndefined();
+        expect(next.url).not.toBe(a.url);
+        expect(await checkOpencodeServerHealth(next)).toBe(true);
+        expect(launches()).toBe(2);
+      });
+
       test("a changed cwd counts, and so does an adopted server's launch", async () => {
         const id = newId();
         const a = await ensureOpencodeServer(spec(id));
@@ -1153,7 +1269,10 @@ exec "${real}" "$@"
         __forTest.forget();
         expect(await adoptOpencodeServers()).toEqual([]);
         expect(getOpencodeServer(id)).toBeNull();
-        expect(existsSync(__forTest.statePath(id))).toBe(false);
+        // Not adopted, not signalled, and kept: it may be an earlier core's
+        // live server, and this file is the only copy of its password.
+        const kept = readFileSync(__forTest.statePath(id), "utf8");
+        expect(JSON.parse(kept)).toEqual({ ...state, hostPid: sac.pid });
         expect(sac.exitCode).toBeNull();
         // ensure never adopts it either: it starts its own server.
         writeFileSync(__forTest.statePath(id), JSON.stringify({ ...state, hostPid: sac.pid }), { mode: 0o600 });
@@ -1168,6 +1287,16 @@ exec "${real}" "$@"
         sac.kill("SIGKILL");
         await sac.exited;
       }
+      // A file naming a pid that is provably dead is removed.
+      const dead = newId();
+      mkdirSync(__forTest.serverDir(), { recursive: true, mode: 0o700 });
+      writeFileSync(
+        __forTest.statePath(dead),
+        JSON.stringify({ harnessId: dead, url: "http://127.0.0.1:9", password: "p", tmuxSession: null, startedAt: 1, hostPid: sac.pid }),
+        { mode: 0o600 },
+      );
+      expect(await adoptOpencodeServers()).toEqual([]);
+      expect(existsSync(__forTest.statePath(dead))).toBe(false);
     });
 
     describe("state file hygiene", () => {

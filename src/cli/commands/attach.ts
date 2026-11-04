@@ -87,7 +87,7 @@ export async function cmdAttach(args: string[], flags: Flags): Promise<void> {
   if (!session) {
     throw new Error(
       "no tmux session — attach needs a task that has run (try 'agetor start' first); " +
-        "for codex, gemini, antigravity and an OpenCode 1.x turn it only exists while a turn is in flight",
+        "for codex, gemini, antigravity, copilot and an OpenCode 1.x turn it only exists while a turn is in flight",
     );
   }
 

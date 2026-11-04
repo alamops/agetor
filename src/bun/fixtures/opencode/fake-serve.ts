@@ -49,8 +49,10 @@
  *                            answers, default 0 (a value above the client's interrupt timeout makes
  *                            the call itself time out; the interrupt still lands afterwards)
  *
- * Inbox (live-verified 2.1.3, r3 Q2/Q2b/Q5/Q6/Q7): an item enqueued on an idle session starts an
- * execution at once. An item still undelivered when an execution ends `interrupted` stays parked: no
+ * Inbox (live-verified 2.1.3, r3 Q2/Q2b/Q5/Q6/Q7/Q8): an item enqueued on an idle session starts an
+ * execution at once, unless the prompt said `resume: false`: then it only waits in the inbox, and a
+ * re-post of the same id (no `resume`) answers the same record and starts the execution that delivers
+ * it once. An item still undelivered when an execution ends `interrupted` stays parked: no
  * new execution, no event; the next execution (the next prompt's) delivers the parked items first, in
  * enqueue order, then its own prompt. `GET /api/session/{id}/inbox` lists the undelivered items
  * (`{data:[…]}`), `DELETE /api/session/{id}/inbox/{inboxID}` cancels one (204 and one
@@ -422,7 +424,12 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
   }
 
   // ------------------------------------------------------- inbox
-  function enqueue(s: Session, item: Omit<InboxItem, "sessionID" | "time"> & { time?: InboxItem["time"] }, script?: Scenario): InboxItem {
+  function enqueue(
+    s: Session,
+    item: Omit<InboxItem, "sessionID" | "time"> & { time?: InboxItem["time"] },
+    script?: Scenario,
+    opts: { start?: boolean } = {},
+  ): InboxItem {
     const full: InboxItem = { ...item, sessionID: s.id, time: item.time ?? { created: Date.now() } };
     s.inbox.push(full);
     // Decided now, not in the microtask: an item that arrives while an execution is open belongs to
@@ -433,8 +440,9 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       { inboxID: full.id, sessionID: s.id, item: { type: full.type, payload: full.payload, delivery: full.delivery } },
       { location: { directory: s.directory } },
     );
-    // live-verified 2.1.3 (r2, r3 Q7): an item enqueued on an idle session starts an execution at once.
-    if (!busy) {
+    // live-verified 2.1.3 (r2, r3 Q7): an item enqueued on an idle session starts an execution at once;
+    // (Q8) not when the prompt said `resume: false` — only `session.inbox.enqueued`, nothing active.
+    if (!busy && opts.start !== false) {
       queueMicrotask(() => {
         if (!stopped) maybeStart(s, script);
       });
@@ -1459,9 +1467,14 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
       // and delivers nothing again; the same id on ANOTHER session is a 409.
       const original = s.inbox.find((i) => i.id === id);
       if (original) {
-        // After idle the repeat still runs an empty execution (started, then succeeded, no step),
-        // unless the body says `resume: false`.
-        if (!rt(s.id).exec && body.resume !== false) maybeStart(s, async () => {}, true);
+        if (!rt(s.id).exec && body.resume !== false) {
+          // live-verified 2.1.3 (r3 Q8): the repeat of an id still waiting in the inbox (posted with
+          // `resume: false`) is not enqueued again; it starts the execution that delivers it, once.
+          if (isPending(original)) maybeStart(s);
+          // After idle the repeat of a delivered id still runs an empty execution (started, then
+          // succeeded, no step).
+          else maybeStart(s, async () => {}, true);
+        }
         return jsonResponse(200, { data: { id: original.id, sessionID: sid, time: original.time, type: "user", payload: original.payload, delivery: original.delivery } });
       }
       for (const other of sessions.values()) {
@@ -1469,7 +1482,12 @@ export async function startFakeOpencodeServer(opts: FakeOpencodeOptions = {}): P
           return err.conflict(`Prompt message ID conflicts with an existing durable record: ${id}`, id);
         }
       }
-      const item = enqueue(s, { id, type: "user", payload: { text: body.text, ...(body.metadata ? { metadata: body.metadata } : {}) }, delivery });
+      const item = enqueue(
+        s,
+        { id, type: "user", payload: { text: body.text, ...(body.metadata ? { metadata: body.metadata } : {}) }, delivery },
+        undefined,
+        { start: body.resume !== false },
+      );
       return jsonResponse(200, { data: { id: item.id, sessionID: sid, time: item.time, type: "user", payload: item.payload, delivery } });
     }
     if (rest === "interrupt" && method === "POST") {

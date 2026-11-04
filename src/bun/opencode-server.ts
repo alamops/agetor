@@ -87,8 +87,10 @@ import { escapeFreeText } from "../shared/terminal-text.ts";
  * trusted only when its `hostPid` is a live child THIS process spawned
  * (`directProcs`): a direct-host server never outlives the core that spawned
  * it as something that core can prove is its own, so any other such file is
- * planted. It is not adopted, its pid is never signalled, and it is removed
- * only through the guarded remove.
+ * not trusted. It is not adopted and its pid is never signalled; adoption
+ * keeps the file while that pid is alive (it may be an earlier core's server,
+ * and the file holds the only copy of its password) and removes it, only
+ * through the guarded remove, once the pid is dead.
  *
  * Bounded external calls. Every tmux and `ps` call is bounded (`tmuxTimeoutMs`,
  * the child is killed on expiry) and a timeout is a failed call: "unknown" for a
@@ -139,9 +141,13 @@ let serverDirOverride: string | null = null;
  *  kept (as unhealthy), never killed. */
 const DEFAULT_ADOPT_BUDGET_MS = 5_000;
 let adoptBudgetMs = DEFAULT_ADOPT_BUDGET_MS;
-/** Bounded wait for each synchronous tmux call on a quit. */
+/** Bounded wait for each synchronous tmux (and `ps`) call on a quit. */
 const DEFAULT_SYNC_TMUX_TIMEOUT_MS = 2_000;
 let syncTmuxTimeoutMs = DEFAULT_SYNC_TMUX_TIMEOUT_MS;
+/** How long a quit waits, in all, for the stopped servers' processes to exit. */
+const DEFAULT_SYNC_STOP_WAIT_MS = 1_000;
+let syncStopWaitMs = DEFAULT_SYNC_STOP_WAIT_MS;
+const SYNC_STOP_POLL_MS = 20;
 /** Bound on every async tmux query and `ps` call; the child is killed on expiry. */
 const DEFAULT_TMUX_TIMEOUT_MS = 2_000;
 /** `new-session` may have to start the tmux server itself, so it gets more room. */
@@ -616,7 +622,12 @@ async function tmuxNewSession(args: string[]): Promise<{ status: number | null; 
 
 type HostState = "alive" | "gone" | "unknown";
 
-const TMUX_GONE_RE = /can't find session|no server running|error connecting to/i;
+/** What tmux prints when the session provably does not exist: no such session
+ *  on a live server, no server listening on the socket (`ECONNREFUSED`), or no
+ *  socket file at all (`ENOENT`). Any other "error connecting to … (<errno>)" —
+ *  permission denied, too many open files, a path too long — means tmux could
+ *  not ask, so the session may well still be running: never "gone". */
+const TMUX_GONE_RE = /can't find session|no server running on |error connecting to .*\(No such file or directory\)/i;
 
 /** `has-session` on the exact name. "gone" only when tmux itself said so; a
  *  failed tmux call is "unknown" and never counts as proof. */
@@ -1156,12 +1167,28 @@ async function adoptState(file: string, only?: string, ctx: AdoptCtx = {}): Prom
   // Boot adoption must not touch a server this process is starting or holds.
   if (state && only === undefined && (starting.has(state.harnessId) || servers.has(state.harnessId))) return null;
   if (
+    state &&
+    statePath(state.harnessId) === file &&
+    (only === undefined || state.harnessId === only) &&
+    state.tmuxSession === null &&
+    !isOwnDirectChild(state.hostPid) &&
+    state.hostPid !== undefined &&
+    pidAlive(state.hostPid)
+  ) {
+    // The direct host, naming a live pid that is not a child of this process:
+    // maybe a server an earlier core spawned and left running, maybe a planted
+    // file. Nothing proves either, so it is neither adopted nor signalled, and
+    // the file is kept: deleting it would lose the only record of a possibly
+    // live server's password. (A dead pid is proof enough: that file goes.)
+    return null;
+  }
+  if (
     !state ||
     statePath(state.harnessId) !== file ||
     (only !== undefined && state.harnessId !== only) ||
     // The direct host: only a live child this process spawned is provably ours
-    // (see the file header). Anything else is planted: not adopted, its pid
-    // never signalled, the file removed only through the guarded remove.
+    // (see the file header). A file naming a dead pid (or none) is removed
+    // through the guarded remove; a live foreign pid was kept above.
     (state.tmuxSession === null && !isOwnDirectChild(state.hostPid))
   ) {
     // Unreadable, a symlink, wrong owner/mode, planted, or filed under the wrong name.
@@ -1231,7 +1258,14 @@ async function ensureInner(spec: OpencodeServerSpec): Promise<OpencodeServerHand
     }
   }
   if (rec) {
-    const verdict = await healthy(rec);
+    let verdict = await healthy(rec);
+    // A settings change hands back the running server as `stale` (kept for the
+    // turn that's using it): never on the 5 s health cache alone, which can still
+    // vouch for a server that just died. Probe it for real first.
+    if (verdict === "ok" && rec.fingerprint !== fingerprint) {
+      rec.healthyAt = 0;
+      verdict = await healthy(rec);
+    }
     if (verdict === "unresponsive") throw new Error("The OpenCode server is not responding.");
     if (verdict === "ok") {
       rec.lastActivity = Date.now();
@@ -1378,46 +1412,144 @@ export async function opencodeIdleSweep(now: number, isBusy: (harnessId: string)
   return stopped;
 }
 
+/** One bounded synchronous tmux call on the instance socket. `code` is null
+ *  when it could not run or timed out (never proof of anything). */
+function tmuxSync(args: string[]): { code: number | null; stdout: string; stderr: string } {
+  const res = coreSpawnSync(resolveTmuxBin(), [...tmuxSocketArgs(), ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: childEnv(),
+    timeout: syncTmuxTimeoutMs,
+    encoding: "utf8",
+  });
+  const stdout = typeof res.stdout === "string" ? res.stdout.trim() : "";
+  const stderr = typeof res.stderr === "string" ? res.stderr.trim() : "";
+  if (res.error || typeof res.status !== "number") return { code: null, stdout, stderr };
+  return { code: res.status, stdout, stderr };
+}
+
+/** A bounded synchronous `ps`; null when it failed or timed out. */
+function psSync(args: string[]): string | null {
+  const res = coreSpawnSync(psBin, args, { stdio: ["ignore", "pipe", "ignore"], env: childEnv(), timeout: syncTmuxTimeoutMs, encoding: "utf8" });
+  if (res.error || typeof res.status !== "number") return null;
+  return typeof res.stdout === "string" ? res.stdout : "";
+}
+
+/** The sync twin of `authorizedPids` for a tmux session: its pane pids and,
+ *  when `ps` answers, their descendants (never this process or an ancestor).
+ *  Null when `list-panes` could not run or timed out (a wedged tmux: the quit
+ *  then leaves this server alone instead of spending more of its budget). */
+function sessionPidsSync(session: string): number[] | null {
+  const panes = tmuxSync(["list-panes", "-t", `=${session}:`, "-F", "#{pane_pid}"]);
+  if (panes.code === null) return null;
+  if (panes.code !== 0) return []; // no such session (the kill and has-session below decide)
+  const roots = panes.stdout.split("\n").map((l) => Number(l.trim())).filter((n) => Number.isInteger(n) && n > 1);
+  const keep = new Set<number>(roots);
+  const table = new Map<number, number>();
+  for (const line of (psSync(["-axo", "pid=,ppid="]) ?? "").split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (m) table.set(Number(m[1]), Number(m[2]));
+  }
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [pid, ppid] of table) if (keep.has(ppid) && !keep.has(pid)) { keep.add(pid); grew = true; }
+  }
+  const never = protectedPids(table);
+  return [...keep].filter((pid) => !never.has(pid));
+}
+
+/** Which of `pids` are still running, synchronously. A pid `kill(pid, 0)`
+ *  cannot find is dead; one it finds is dead only if `ps` shows it as a zombie
+ *  (a direct child this core has not reaped yet: the event loop that would
+ *  reap it does not run during a synchronous quit). A failed `ps` keeps every
+ *  such pid counted as running. */
+function runningPidsSync(pids: number[]): Set<number> {
+  const maybe = pids.filter(pidAlive);
+  const running = new Set<number>(maybe);
+  if (maybe.length === 0) return running;
+  const out = psSync(["-o", "pid=,stat=", "-p", maybe.join(",")]);
+  if (out === null) return running;
+  for (const line of out.split("\n")) {
+    const m = /^\s*(\d+)\s+(\S+)/.exec(line);
+    if (m && m[2]!.startsWith("Z")) running.delete(Number(m[1]));
+  }
+  return running;
+}
+
 /**
  * A real quit that cannot await (Electrobun's `quit()` runs synchronous FFI
  * right after the before-quit event): stop every in-memory server that is not
- * busy, fully synchronously. tmux: `kill-session` on the exact name on the
- * instance socket through `coreSpawnSync` (each call bounded); the direct test
- * host: signal the child this core spawned. State, env and log files go too.
- * Never throws; returns the stopped ids. No escalation and no waiting — the
- * session's SIGHUP is the whole stop. A server whose `kill-session` failed or
- * timed out is NOT stopped: it stays registered and its state file stays, so
- * the next boot finds and judges it instead of losing it. Files are removed
- * only after a kill that succeeded (or found the session already gone), and
- * only from a server dir that still checks out.
+ * busy, fully synchronously, with every external call bounded. tmux: the
+ * session's pane pids and their descendants are read first, then
+ * `kill-session` on the exact name on the instance socket (its SIGHUP is the
+ * stop), then `has-session` must say the session is gone; the direct test
+ * host: SIGTERM to the child this core spawned. Then one shared wait of at most
+ * `syncStopWaitMs` for those pids to exit; nothing is escalated. A stop counts
+ * as done, and the server's state, env and log files go (only from a server
+ * dir that still checks out), only when the session is gone and every one of
+ * those pids is dead: a server whose kill failed or timed out, whose session
+ * is still listed (or tmux could not say), or whose process outlived the wait
+ * is NOT stopped — it stays registered and its state file (its password
+ * included) stays for the next boot to judge. Never throws; returns the
+ * stopped ids.
  */
 export function stopIdleOpencodeServersSync(isBusy: (harnessId: string) => boolean): string[] {
-  const stopped: string[] = [];
+  const killed: Array<{ id: string; rec: ServerRecord; pids: number[] }> = [];
   for (const [id, rec] of [...servers]) {
     try {
       if (starting.has(id) || busy(isBusy, id)) continue;
       const session = rec.handle.tmuxSession;
       if (session) {
-        const res = coreSpawnSync(resolveTmuxBin(), [...tmuxSocketArgs(), "kill-session", "-t", `=${session}:`], {
-          stdio: ["ignore", "ignore", "pipe"],
-          env: childEnv(),
-          timeout: syncTmuxTimeoutMs,
-          encoding: "utf8",
-        });
-        const err = typeof res.stderr === "string" ? res.stderr : "";
+        const pids = sessionPidsSync(session);
+        if (pids === null) continue; // tmux is wedged: not proof of anything
+        const kill = tmuxSync(["kill-session", "-t", `=${session}:`]);
         // Killed, or tmux said the session (or its server) was already gone.
-        const killed = !res.error && (res.status === 0 || (res.status === 1 && TMUX_GONE_RE.test(err)));
-        if (!killed) continue; // failed or timed out: not proof it stopped
+        if (!(kill.code === 0 || (kill.code === 1 && TMUX_GONE_RE.test(kill.stderr)))) continue;
+        const has = tmuxSync(["has-session", "-t", `=${session}:`]);
+        if (!(has.code === 1 && TMUX_GONE_RE.test(has.stderr))) continue; // still listed, or tmux could not say
+        killed.push({ id, rec, pids });
       } else {
         const child = rec.hostPid === undefined ? undefined : directProcs.get(rec.hostPid);
-        if (child && child.exitCode === null && child.pid !== process.pid) child.kill("SIGTERM");
+        if (child && child.exitCode === null && child.pid !== process.pid) {
+          child.kill("SIGTERM");
+          killed.push({ id, rec, pids: [child.pid] });
+        } else {
+          killed.push({ id, rec, pids: [] }); // nothing of ours to stop (see `terminate`)
+        }
       }
-      servers.delete(id);
-      removeFiles(id, { log: true });
-      stopped.push(id);
     } catch {
       /* best-effort: a quit never throws */
     }
+  }
+  const stopped: string[] = [];
+  const deadline = Date.now() + syncStopWaitMs;
+  let left = killed;
+  for (;;) {
+    let running: Set<number>;
+    try {
+      running = runningPidsSync(left.flatMap((k) => k.pids));
+    } catch {
+      break;
+    }
+    const next: typeof left = [];
+    for (const k of left) {
+      if (k.pids.some((pid) => running.has(pid))) {
+        next.push(k);
+        continue;
+      }
+      try {
+        if (servers.get(k.id) === k.rec) servers.delete(k.id);
+        removeFiles(k.id, { log: true });
+        stopped.push(k.id);
+      } catch {
+        /* best-effort: a quit never throws */
+      }
+    }
+    left = next;
+    if (left.length === 0 || Date.now() >= deadline) break;
+    Bun.sleepSync(SYNC_STOP_POLL_MS);
+  }
+  if (left.length > 0) {
+    console.warn("[opencode-server] an OpenCode server was still running after the quit's wait; keeping its state for the next boot");
   }
   return stopped;
 }
@@ -1460,6 +1592,9 @@ export const __forTest = {
   setSyncTmuxTimeoutMs(ms: number): void {
     syncTmuxTimeoutMs = ms;
   },
+  setSyncStopWaitMs(ms: number): void {
+    syncStopWaitMs = ms;
+  },
   setStopGraceMs(ms: number): void {
     stopGraceMs = ms;
   },
@@ -1496,6 +1631,7 @@ export const __forTest = {
     tmuxTimeoutMs = DEFAULT_TMUX_TIMEOUT_MS;
     newSessionTimeoutMs = DEFAULT_NEW_SESSION_TIMEOUT_MS;
     syncTmuxTimeoutMs = DEFAULT_SYNC_TMUX_TIMEOUT_MS;
+    syncStopWaitMs = DEFAULT_SYNC_STOP_WAIT_MS;
     stopGraceMs = DEFAULT_STOP_GRACE_MS;
     restartGateTimeoutMs = DEFAULT_RESTART_GATE_TIMEOUT_MS;
     probeMaxBytes = OPENCODE_MAX_RESPONSE_BYTES;

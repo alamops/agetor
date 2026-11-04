@@ -698,13 +698,21 @@ describe("openOpencodeEventStream", () => {
     reset();
     sseRoute();
     const c = collect();
-    const s = openOpencodeEventStream(ref, c.h, { stallMs: 400 });
+    const s = openOpencodeEventStream(ref, c.h, { stallMs: 600 });
     await until(() => handles.length === 1);
-    // Heartbeats every 50 ms for ~800 ms (twice the budget): no stall.
-    for (let i = 0; i < 16; i++) {
+    // Heartbeats every 50 ms until more than twice the budget has passed.
+    const hb0 = Date.now();
+    while (Date.now() - hb0 < 1_300) {
       push(0, ": heartbeat\n\n");
       await new Promise((r) => setTimeout(r, 50));
     }
+    // Barrier: an event pushed now arrives only over a connection the watchdog
+    // never tore down (a stall cancels it and nothing more is read from it).
+    push(0, 'data: {"type":"still.alive"}\n\n');
+    await until(() => c.events.length === 1);
+    expect(c.events[0]!.type).toBe("still.alive");
+    expect(handles).toHaveLength(1);
+    expect(handles[0]!.cancelled).toBe(false);
     expect(c.closes).toHaveLength(0);
     const t0 = Date.now();
     await until(() => c.closes.length === 1);
@@ -917,8 +925,22 @@ describe("redactSecrets (N11)", () => {
     expect(redactSecrets('bad password "x y" given')).toBe('bad password "[redacted]" given');
   });
 
+  test("strips single-quoted keys and values for a password it was not told", () => {
+    expect(redactSecrets("{'password': 'hunter6', 'user': 'bob'}")).toBe("{'password': '[redacted]', 'user': 'bob'}");
+    expect(redactSecrets("OPENCODE_PASSWORD='two words' next")).toBe("OPENCODE_PASSWORD='[redacted]' next");
+    expect(redactSecrets("{'authorization': 'Basic Zm9vYmFyYmF6'}")).toBe("{'authorization': '[redacted]'}");
+    expect(redactSecrets("password='never closed secret7\nnext")).toBe("password='[redacted]'\nnext");
+  });
+
+  test("strips the password from URL userinfo for a password it was not told", () => {
+    expect(redactSecrets("opencode:hunter8@127.0.0.1")).toBe("opencode:[redacted]@127.0.0.1");
+    expect(redactSecrets("GET http://opencode:hunter9@127.0.0.1:4096/api/info failed")).toBe("GET http://opencode:[redacted]@127.0.0.1:4096/api/info failed");
+    expect(redactSecrets('{"url":"http://u:a/b+c@127.0.0.1"}')).toBe('{"url":"http://u:[redacted]@127.0.0.1"}');
+  });
+
   test("works without a password and leaves ordinary text alone", () => {
     expect(redactSecrets("opencode serve listening on http://127.0.0.1:4096")).toBe("opencode serve listening on http://127.0.0.1:4096");
     expect(redactSecrets("Basic usage is documented")).toBe("Basic usage is documented");
+    expect(redactSecrets("see [::1]:80, mail bob@example.com, ses_a:msg_b")).toBe("see [::1]:80, mail bob@example.com, ses_a:msg_b");
   });
 });

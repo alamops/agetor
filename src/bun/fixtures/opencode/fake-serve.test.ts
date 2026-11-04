@@ -1354,17 +1354,6 @@ describe("the inbox after an interrupt (live-verified 2.1.3 (r3 Q2/Q2b/Q4/Q5/Q6)
     expect(JSON.stringify(msgs)).not.toContain("BANANA");
   });
 
-  test("DELETE inbox/{id} of a queued prompt during an execution: it is never delivered", async () => {
-    const { client, sub } = await boot({ speed: 0.1 });
-    const sid = await client.session();
-    await client.prompt(sid, "__agetor_fake_oc_steer__ first");
-    await sub.waitFor((e) => e.type === "shell.created");
-    const queued = await client.prompt(sid, "second one", "queue");
-    expect((await client.req("DELETE", `/api/session/${sid}/inbox/${queued.json.data.id}`)).status).toBe(204);
-    await terminal(sub, sid);
-    expect(delivered(sub, sid)).not.toContain(queued.json.data.id);
-    expect(finalText(await messages(client, sid))).not.toContain("second one");
-  });
 });
 
 describe("permission rejects across siblings (live-verified 2.1.3 (r3 Q1))", () => {
@@ -1393,16 +1382,6 @@ describe("permission rejects across siblings (live-verified 2.1.3 (r3 Q1))", () 
       expect(again.status).toBe(404);
       expect(again.json).toEqual(notFound);
     }
-  });
-
-  test("a pending request answers GET permission/{id} with itself", async () => {
-    const { client, sub } = await boot();
-    const sid = await client.session();
-    await client.prompt(sid, "__agetor_fake_oc_permission__");
-    const asked = await sub.waitFor((e) => e.type === "permission.asked");
-    expect((await client.req("GET", `/api/session/${sid}/permission/${asked.data.id}`)).json).toEqual({ data: asked.data });
-    await client.req("POST", `/api/session/${sid}/permission/${asked.data.id}/reply`, { decision: "once" });
-    await terminal(sub, sid);
   });
 
   test("a reject never declines another session's pending requests", async () => {
@@ -1482,6 +1461,79 @@ describe("listing children (live-verified 2.1.3 (r3 Q3))", () => {
   });
 });
 
+describe("resume: false (live-verified 2.1.3 (r3 Q8))", () => {
+  const started = (sub: Collector, sid: string): number => sub.types(sid).filter((t) => t === "session.execution.started").length;
+
+  test("a new id posted with resume:false on an idle session is only enqueued; a re-post of the same id starts the execution that delivers it once", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    const first = await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_q8new", text: "hello q8", resume: false });
+    expect(first.status).toBe(200);
+    await sub.waitFor((e) => e.type === "session.inbox.enqueued" && e.data.inboxID === "msg_q8new");
+    // An execution the post started would be published before the barrier's session.created.
+    await barrier(client, sub);
+    expect(started(sub, sid)).toBe(0);
+    expect((await client.req("GET", "/api/session/active")).json).toEqual({ data: {} });
+    expect(((await client.req("GET", `/api/session/${sid}/inbox`)).json.data as any[]).map((i) => i.id)).toEqual(["msg_q8new"]);
+
+    const again = await client.req("POST", `/api/session/${sid}/prompt`, { id: "msg_q8new", text: "hello q8" });
+    expect(again.status).toBe(200);
+    expect(again.json).toEqual(first.json);
+    expect((await terminal(sub, sid)).type).toBe("session.execution.succeeded");
+    expect(started(sub, sid)).toBe(1);
+    expect(sub.events.filter((e) => e.type === "session.inbox.enqueued" && e.data.sessionID === sid)).toHaveLength(1);
+    expect(sub.events.filter((e) => e.type === "session.inbox.delivered" && e.data.sessionID === sid).map((e) => e.data.inboxID)).toEqual(["msg_q8new"]);
+    const msgs = await messages(client, sid);
+    expect(msgs.filter((m) => m.type === "user").map((m) => m.id)).toEqual(["msg_q8new"]);
+    // The execution the re-post started is the prompt's own turn, not an empty one.
+    expect(finalText(msgs)).toBe("ACK: hello q8");
+    expect((await client.req("GET", `/api/session/${sid}/inbox`)).json.data).toEqual([]);
+  });
+});
+
+describe("the active list while a card is pending (live-verified 2.1.3 (r3 Q10))", () => {
+  test("a session waiting on a permission or a question is listed as running", async () => {
+    const { client, sub } = await boot();
+    const perm = await client.session();
+    const quest = await client.session();
+    await client.prompt(perm, "__agetor_fake_oc_permission__");
+    await client.prompt(quest, "__agetor_fake_oc_question__");
+    const asked = await sub.waitFor((e) => e.type === "permission.asked" && e.data.sessionID === perm);
+    const form = await sub.waitFor((e) => e.type === "form.created" && e.data.form.sessionID === quest);
+    expect((await client.req("GET", "/api/session/active")).json).toEqual({ data: { [perm]: { type: "running" }, [quest]: { type: "running" } } });
+    await client.req("POST", `/api/session/${perm}/permission/${asked.data.id}/reply`, { decision: "once" });
+    await client.req("DELETE", `/api/session/${quest}/form/${form.data.form.id}?message=no`);
+    await terminal(sub, perm);
+    await terminal(sub, quest);
+    expect((await client.req("GET", "/api/session/active")).json).toEqual({ data: {} });
+  });
+});
+
+describe("not verified live (the fake's best guess)", () => {
+  test("DELETE inbox/{id} of a queued prompt during an execution: it is never delivered", async () => {
+    const { client, sub } = await boot({ speed: 0.1 });
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_steer__ first");
+    await sub.waitFor((e) => e.type === "shell.created");
+    const queued = await client.prompt(sid, "second one", "queue");
+    expect((await client.req("DELETE", `/api/session/${sid}/inbox/${queued.json.data.id}`)).status).toBe(204);
+    await terminal(sub, sid);
+    const delivered = sub.events.filter((e) => e.type === "session.inbox.delivered" && e.data.sessionID === sid).map((e) => e.data.inboxID);
+    expect(delivered).not.toContain(queued.json.data.id);
+    expect(finalText(await messages(client, sid))).not.toContain("second one");
+  });
+
+  test("a pending request answers GET permission/{id} with itself", async () => {
+    const { client, sub } = await boot();
+    const sid = await client.session();
+    await client.prompt(sid, "__agetor_fake_oc_permission__");
+    const asked = await sub.waitFor((e) => e.type === "permission.asked");
+    expect((await client.req("GET", `/api/session/${sid}/permission/${asked.data.id}`)).json).toEqual({ data: asked.data });
+    await client.req("POST", `/api/session/${sid}/permission/${asked.data.id}/reply`, { decision: "once" });
+    await terminal(sub, sid);
+  });
+});
+
 describe("knobs for the driver's unconfirmed-stop paths", () => {
   test("the stuck marker: interrupt answers true and the execution runs on until the session is deleted", async () => {
     const { client, sub } = await boot({ speed: 0 });
@@ -1530,12 +1582,16 @@ describe("stop()", () => {
         await observer.waitFor((e) => e.type === "shell.created");
         await client.req("POST", `/api/session/${sid}/interrupt`);
         observer.close();
-        const result = await Promise.race([srv.stop().then(() => "stopped"), Bun.sleep(3000).then(() => "hung")]);
+        // A hung stop never resolves; a working one does within milliseconds. The bound is only
+        // there to turn a hang into a failure, so it is generous enough for a loaded machine.
+        const result = await Promise.race([srv.stop().then(() => "stopped"), Bun.sleep(20_000).then(() => "hung")]);
         expect(result).toBe("stopped");
+        // Stopped for real: the port no longer answers.
+        expect(await fetch(`${srv.url}/api/info`).then(() => "answered", () => "refused")).toBe("refused");
       } finally {
         hubSide.close();
         observer.close();
       }
     }
-  });
+  }, 90_000);
 });

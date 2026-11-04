@@ -137,10 +137,11 @@ function assertServerRef(ref: OpencodeServerRef): string {
  * Strip the password out of text bound for an error, a log or a status line:
  * the raw password and its base64 `opencode:<password>` form, then anything
  * that looks like it travels with a credential (`password=...`,
- * `OPENCODE_PASSWORD=...`, `Authorization: ...`, `Basic <b64>`, `Bearer <tok>`),
- * JSON-quoted keys and values included (`"password":"x"`,
- * `"OPENCODE_PASSWORD": "x"`, `"authorization":"Basic x"`), so a password it
- * was not told is still caught in a dumped config or request.
+ * `OPENCODE_PASSWORD=...`, `Authorization: ...`, `Basic <b64>`, `Bearer <tok>`,
+ * URL userinfo `user:<password>@host`), keys and values quoted either way
+ * included (`"password":"x"`, `'password': 'x'`, `"OPENCODE_PASSWORD": "x"`,
+ * `"authorization":"Basic x"`), so a password it was not told is still caught
+ * in a dumped config, request or URL.
  * The single redactor for the OpenCode server code.
  */
 export function redactSecrets(text: string, password?: string): string {
@@ -152,14 +153,19 @@ export function redactSecrets(text: string, password?: string): string {
   }
   return (
     out
-      // A quoted value (`password: "a b"`, `"password":"x"`, `password "x"`), up
-      // to its closing quote or the end of the line when it has none.
-      .replace(/(password(?:"?\s*[=:]\s*|\s+))"(?:[^"\\\n]|\\.)*"?/gi, '$1"[redacted]"')
+      // A quoted value, double- or single-quoted, its key quoted either way too
+      // (`password: "a b"`, `"password":"x"`, `'password': 'x'`, `password "x"`),
+      // up to its closing quote or the end of the line when it has none.
+      .replace(/(password(?:["']?\s*[=:]\s*|\s+))"(?:[^"\\\n]|\\.)*"?/gi, '$1"[redacted]"')
+      .replace(/(password(?:["']?\s*[=:]\s*|\s+))'(?:[^'\\\n]|\\.)*'?/gi, "$1'[redacted]'")
       // A bare value (`password=x`, `"password": 12`, `password x`). It never
-      // starts with a quote, so a value the line above redacted stays as it is.
-      .replace(/(password(?:"?\s*[=:]\s*|\s+))(?!")\S+/gi, "$1[redacted]")
-      .replace(/(authorization"?\s*[:=]\s*"?)(?:(?:basic|bearer)\s+)?[^\s"]+/gi, "$1[redacted]")
+      // starts with a quote, so a value the lines above redacted stays as it is.
+      .replace(/(password(?:["']?\s*[=:]\s*|\s+))(?!["'])\S+/gi, "$1[redacted]")
+      .replace(/(authorization["']?\s*[:=]\s*["']?)(?:(?:basic|bearer)\s+)?[^\s"']+/gi, "$1[redacted]")
       .replace(/\b(basic|bearer)(\s+)[A-Za-z0-9+/=._~-]{8,}/gi, "$1$2[redacted]")
+      // URL userinfo (`http://opencode:pw@127.0.0.1`, `opencode:pw@host`): the
+      // password part, whatever the user name.
+      .replace(/([a-z][a-z0-9+.-]*:\/\/|^|[\s"'(<=,;[{])([^\s:/@"'<>]+):(?!\/\/)[^\s@"'<>]+@/gi, "$1$2:[redacted]@")
   );
 }
 
