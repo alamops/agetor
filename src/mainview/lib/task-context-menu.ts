@@ -124,7 +124,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
       entries.push({ action: "cancel-auto-resume", label: "Cancel auto-resume", group: "primary" });
     }
   }
-  if (task.column === "review" && !archived && !gatePending) {
+  if (task.column === "review" && !archived && !gatePending && !(isPipelineParent && task.pipelineRun?.status !== "done")) {
     entries.push({ action: "mark-done", label: "Mark done", group: "primary" });
   }
   if (!archived && !isStepTask && (task.column === "done" || active)) {

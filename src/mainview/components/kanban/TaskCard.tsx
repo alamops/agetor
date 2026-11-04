@@ -391,7 +391,8 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
               <UserCheck className="mr-1 size-3" /> Review
             </Button>
           )}
-          {!archived && task.column === "review" && !gatePending && (
+          {!archived && task.column === "review" && !gatePending
+            && !(task.pipelineId && task.pipelineRun?.status !== "done") && (
             <Button size="sm" variant="outline" onClick={() => onMarkDone(task)} title="Mark this task as done">
               <CheckCircle2 className="mr-1 size-3" /> Done
             </Button>

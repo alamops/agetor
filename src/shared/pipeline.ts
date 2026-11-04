@@ -390,6 +390,7 @@ export function nextRunSeq(run: PipelineRunState): number {
   let max = run.seqCounter ?? 0;
   for (const h of run.history) if (h.seq > max) max = h.seq;
   for (const g of run.humanSteps ?? []) if (g.seq > max) max = g.seq;
+  for (const a of run.active) if (a.seq > max) max = a.seq;
   return max + 1;
 }
 
