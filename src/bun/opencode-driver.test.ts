@@ -195,8 +195,8 @@ function seedTask(): { taskId: string; runId: string } {
 const childRows = (taskId: string) => db.subagents.listForTask(taskId);
 
 /** Where a Stop's undelivered steers go (the orchestrator's follow-up queue in production). */
-function captureRequeue(): Array<{ taskId: string; runId: string; texts: string[] }> {
-  const got: Array<{ taskId: string; runId: string; texts: string[] }> = [];
+function captureRequeue(): Array<{ taskId: string; runId: string; texts: string[]; uncertain: string[] }> {
+  const got: Array<{ taskId: string; runId: string; texts: string[]; uncertain: string[] }> = [];
   const prev = setOpencodeSteerRequeueHandler((a) => void got.push(a));
   cleanups.push(() => void setOpencodeSteerRequeueHandler(prev));
   return got;
@@ -397,6 +397,19 @@ function flakyProxy(fake: FakeServer) {
     inject(envelope: Record<string, unknown>) {
       for (const c of controllers) c.enqueue(enc.encode(`data: ${JSON.stringify({ id: `evt_inject${++seq}`, ...envelope })}\n\n`));
     },
+    /** The server "crashes" for the driver: the proxy stops answering and its event streams end (the fake behind it keeps running). */
+    crash() {
+      blocked = true;
+      void proxy.stop(true);
+      for (const c of [...controllers]) {
+        try {
+          c.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      controllers.clear();
+    },
   };
 }
 const inprocClient = (fake: FakeServer) => createOpencodeClient({ url: fake.url, password: fake.password });
@@ -469,7 +482,7 @@ describe("a turn on the stub-hosted server", () => {
     t.kill();
     expect(await doneWithin(t, 10_000)).toBe(130);
     // Stopped before it was delivered: taken back out of the inbox and handed back for the next turn.
-    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: ["early words"] }]);
+    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: ["early words"], uncertain: [] }]);
     expect(await stubClient().listInbox(sid)).toEqual([]);
   });
 
@@ -1292,7 +1305,10 @@ describe("background subagents outlive the turn (real subagent rows)", () => {
     const a = mk({ ...inprocArgs, taskId, runId, prompt: `launch ${M.wake}` });
     const first = start(a);
     expect(await doneWithin(first, 30_000)).toBe(0);
-    closeOpencodeHub(); // the core is gone (no dispose: that would interrupt the child); the row stays running
+    // The core is gone the way a handover leaves it (`stopOpencodeServerDriver`: detach, then the hub closes; no
+    // dispose, that would interrupt the child): the row stays running.
+    first.detach();
+    closeOpencodeHub();
     expect(childRows(taskId).map((r) => r.status)).toEqual(["running"]);
     const sid = first.sessionId()!;
     const c = inprocClient(fake);
@@ -1384,7 +1400,9 @@ describe("a boot-time lingering handle and re-raised child cards", () => {
     await waitFor(() => pending(taskId).length === 1, 10_000, "the child's permission card");
     const oldCard = pending(taskId)[0]!.id;
     const sid = first.sessionId()!;
-    // The core restarts: the stream and the in-memory card registry are gone; the server still holds the request.
+    // The core restarts (`stopOpencodeServerDriver`: detach, then the hub closes): the stream and the in-memory
+    // card registry are gone; the server still holds the request.
+    first.detach();
     closeOpencodeHub();
     interactionsTest.reset();
     expect(first.lingering()).toBe(false);
@@ -1638,7 +1656,7 @@ describe("cards shared between drivers, re-lists and stops (review round 2)", ()
     expect(await doneWithin(t)).toBe(130);
     // The steers waited in the inbox behind the slow tool; the interrupt parks them (r3 spike), and the
     // Stop takes them back out and hands them to the orchestrator in the order they were sent.
-    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: ["one", "two"] }]);
+    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: ["one", "two"], uncertain: [] }]);
     const msgs = await inprocClient(fake).listMessages(t.sessionId()!, { limit: 50, order: "asc" });
     expect(msgs.data.filter((m: { type: string }) => m.type === "user").map((m: { text: string }) => m.text)).toEqual([`go ${M.slow}`]);
     expect(await inprocClient(fake).listInbox(t.sessionId()!)).toEqual([]);
@@ -1698,46 +1716,46 @@ describe("cards shared between drivers, re-lists and stops (review round 2)", ()
   });
 });
 
+/** A request straight to the in-process fake (sessions the client cannot make, such as children). */
+async function rawPost(fake: FakeServer, p: string, body: unknown): Promise<any> {
+  const res = await fetch(`${fake.url}${p}`, {
+    method: "POST",
+    headers: { authorization: `Basic ${btoa(`opencode:${fake.password}`)}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+/** Wrap the driver's HTTP clients: every `prompt` call is recorded, and a test can override calls. */
+function watchClients(over: { prompt?: (orig: (id: string, a: any) => Promise<any>, id: string, a: any) => Promise<any>; [k: string]: unknown } = {}) {
+  const prompts: any[] = [];
+  cleanups.push(
+    __forTest.setDeps({
+      createClient: (ref, opts) => {
+        const real = createOpencodeClient(ref, opts);
+        const wrapped: any = { ...real };
+        const origPrompt = real.prompt.bind(real);
+        wrapped.prompt = (id: string, a: any) => {
+          prompts.push({ ...a });
+          return over.prompt ? over.prompt(origPrompt, id, a) : origPrompt(id, a);
+        };
+        for (const [k, fn] of Object.entries(over)) {
+          if (k === "prompt" || typeof fn !== "function") continue;
+          const orig = (real as any)[k].bind(real);
+          wrapped[k] = (...args: unknown[]) => (fn as (o: unknown, ...r: unknown[]) => unknown)(orig, ...args);
+        }
+        return wrapped;
+      },
+    }),
+  );
+  return prompts;
+}
+const flush = async () => {
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+};
+
 describe("Stop order, wake take-over, sends and child syncs (review round 3)", () => {
   const replies = (proxy: ReturnType<typeof flakyProxy>) => proxy.requests.filter((r) => /\/permission\/[^/]+\/reply$/.test(r));
-  /** A request straight to the in-process fake (sessions the client cannot make, such as children). */
-  async function rawPost(fake: FakeServer, p: string, body: unknown): Promise<any> {
-    const res = await fetch(`${fake.url}${p}`, {
-      method: "POST",
-      headers: { authorization: `Basic ${btoa(`opencode:${fake.password}`)}`, "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    return text ? JSON.parse(text) : null;
-  }
-  /** Wrap the driver's HTTP clients: every `prompt` call is recorded, and a test can override calls. */
-  function watchClients(over: { prompt?: (orig: (id: string, a: any) => Promise<any>, id: string, a: any) => Promise<any>; [k: string]: unknown } = {}) {
-    const prompts: any[] = [];
-    cleanups.push(
-      __forTest.setDeps({
-        createClient: (ref, opts) => {
-          const real = createOpencodeClient(ref, opts);
-          const wrapped: any = { ...real };
-          const origPrompt = real.prompt.bind(real);
-          wrapped.prompt = (id: string, a: any) => {
-            prompts.push({ ...a });
-            return over.prompt ? over.prompt(origPrompt, id, a) : origPrompt(id, a);
-          };
-          for (const [k, fn] of Object.entries(over)) {
-            if (k === "prompt" || typeof fn !== "function") continue;
-            const orig = (real as any)[k].bind(real);
-            wrapped[k] = (...args: unknown[]) => (fn as (o: unknown, ...r: unknown[]) => unknown)(orig, ...args);
-          }
-          return wrapped;
-        },
-      }),
-    );
-    return prompts;
-  }
-  const flush = async () => {
-    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-  };
-
   test("C3: a Stop on a live turn with a background child answers the root's interrupt before the child's goes out", async () => {
     const fake = await inproc(0.4, { realChildren: true });
     const proxy = flakyProxy(fake);
@@ -1853,11 +1871,10 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
   test("SF4: a park-only resend whose id is then absent starts the execution with one more post", async () => {
     const fake = await inproc(0.4);
     const proxy = flakyProxy(fake);
-    // The park-only post is admitted without running (the real server's resume:false; the fake ignores it
-    // for a new id, so the test answers it here without forwarding).
-    const prompts = watchClients({
-      prompt: (orig, id, a) => (a.resume === false ? Promise.resolve({ id: a.id }) : orig(id, a)),
-    });
+    // Every post reaches the fake, which honors resume:false as live 2.1.3 does (r3 Q8): the park-only post
+    // on the idle session only enqueues the message, and the re-post of the same pending id starts the
+    // execution that delivers it, once.
+    const prompts = watchClients();
     proxy.hooks.swallowFirstPromptMs = 1500; // never reaches the server
     proxy.hooks.failMessageLists = 3;
     cleanups.push(__forTest.setTimings({ requestMs: 600, lookupRetryMs: 50 }));
@@ -1867,6 +1884,10 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
     expect(prompts.map((p) => p.resume)).toEqual([undefined, false, undefined]);
     expect(new Set(prompts.map((p) => p.id)).size).toBe(1);
     expect(textOf(run)).toContain("ACK: never got there");
+    // One delivery and one execution on the server.
+    const msgs = (await inprocClient(fake).listMessages(t.sessionId()!, { limit: 50, order: "asc" })).data as Array<{ type: string; id?: string; text?: string }>;
+    expect(msgs.filter((m) => m.type === "user").map((m) => [m.id, m.text])).toEqual([[prompts[0].id, "never got there"]]);
+    expect(msgs.filter((m) => m.type === "idle").length).toBe(1);
   });
 
   test("SF8: settled children do not count toward the sync cap: a running child after 60 settled ones is followed", async () => {
@@ -1893,6 +1914,9 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
     }
     const h0 = mk({ ...inprocArgs, mode: "ask" });
     let openCalls = 0;
+    /** `lingering()` at the moment the live child settled (null: it never did). */
+    let lingeringAtSettle: boolean | null = null;
+    let h: Turn | null = null;
     cleanups.push(
       __forTest.setDeps({
         openChildSessions: (tid) => {
@@ -1901,17 +1925,28 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
           return [live];
         },
         settledChildSessions: (tid) => (tid === h0.taskId ? settledIds : []),
+        settleChild: (a) => {
+          if (a.childSessionId === live && lingeringAtSettle === null) lingeringAtSettle = h?.lingering() ?? null;
+        },
       }),
     );
+    const activeReads = { n: 0 };
+    watchClients({ activeSessions: (orig: () => Promise<unknown>) => (activeReads.n++, orig()) });
     const { prompt: _p, title: _t, resumeSessionId: _r, ...rest } = h0.args;
-    const h = attachOpencodeServerLinger({ ...rest, sessionId: sid });
+    h = attachOpencodeServerLinger({ ...rest, sessionId: sid });
     liveTurns.push(h);
     expect(await doneWithin(h, 2000)).toBe(0);
-    // The sync reads the open rows at its start and again at its end: then the linger decides.
-    await waitFor(() => openCalls >= 2, 15_000, "the child sync to finish");
+    await waitFor(() => pending(h0.taskId).length === 1, 15_000, "the live child's card");
+    // The sync reads the open rows at its start and at its end, then asks the server which adopted
+    // children are executing: after that read the linger decides whether it stays.
+    await waitFor(() => openCalls >= 2 && activeReads.n >= 1, 15_000, "the child sync and the active-sessions read");
     await flush();
-    expect(h.lingering()).toBe(true);
-    expect(pending(h0.taskId).length).toBe(1);
+    // The positive signal: the live child's own end reaches this handle while it still lingers for it (a
+    // handle that had not followed it would have left and unsubscribed, and never see that end).
+    await c.interrupt(live);
+    await waitFor(() => lingeringAtSettle !== null, 15_000, "the live child's end to reach the lingering handle");
+    expect(lingeringAtSettle as boolean | null).toBe(true);
+    await waitFor(() => !h!.lingering(), 10_000, "the linger to end once the child settled");
   });
 
   test("a child that moved to the front while the children were paged is still followed", async () => {
@@ -1994,7 +2029,7 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
   });
 
   /** A task with a finished turn, plus a child session of it the server holds with no outcome and an orphaned row (a crash's leftover). */
-  async function crashLeftover(fake: FakeServer, live: boolean) {
+  async function crashLeftover(fake: FakeServer, live: boolean, orphan = true) {
     const { taskId, runId } = seedTask();
     const first = start(mk({ ...inprocArgs, taskId, runId, prompt: "before the crash" }));
     expect(await doneWithin(first)).toBe(0);
@@ -2011,7 +2046,7 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
       }
     }
     registerOpencodeChildSession({ taskId, runId, parentSessionId: sid, childSessionId: child, depth: 1, background: true });
-    expect(orphanRunningOpencodeChildrenOfTask(taskId)).toBe(1);
+    if (orphan) expect(orphanRunningOpencodeChildrenOfTask(taskId)).toBe(1);
     return { taskId, runId, sid, child };
   }
 
@@ -2022,6 +2057,34 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
     expect(await doneWithin(t)).toBe(0);
     expect(t.lingering()).toBe(false);
     await waitFor(() => !["running", "orphaned"].includes(childRows(taskId)[0]!.status), 10_000, "the orphan's row to be retired");
+  });
+
+  test("K2: a child row left RUNNING that the server lists but not as executing is parked, then retired, by the next turn", async () => {
+    const fake = await inproc(0.4, { realChildren: true });
+    // A crash's leftover nothing orphaned (the core died with the row `running`): a sync alone leaves a
+    // `running` row with no outcome as it is, so the new turn must park it first.
+    const { taskId, runId, sid } = await crashLeftover(fake, false, false);
+    expect(childRows(taskId).map((r) => r.status)).toEqual(["running"]);
+    const t = start(mk({ ...inprocArgs, taskId, runId, prompt: "after the crash", resumeSessionId: sid }));
+    expect(await doneWithin(t)).toBe(0);
+    expect(t.lingering()).toBe(false);
+    await waitFor(() => !["running", "orphaned"].includes(childRows(taskId)[0]!.status), 10_000, "the leftover row to be retired");
+  });
+
+  test("K2: a dead adopted row next to a live child: only the dead one is parked and retired, the live one keeps the turn lingering", async () => {
+    const fake = await inproc(0.4, { realChildren: true });
+    // The live child waits on a permission; neither row was orphaned (the core died with both `running`).
+    const { taskId, runId, sid, child: live } = await crashLeftover(fake, true, false);
+    const dead = (await rawPost(fake, "/api/session", { parentID: sid, title: "cut off" })).data.id as string;
+    registerOpencodeChildSession({ taskId, runId, parentSessionId: sid, childSessionId: dead, depth: 1, background: true });
+    const rowOf = (child: string) => childRows(taskId).find((r) => opencodeChildSessionOf(r) === child)!;
+    expect([rowOf(live).status, rowOf(dead).status]).toEqual(["running", "running"]);
+    const t = start(mk({ ...inprocArgs, taskId, runId, prompt: "after the crash", mode: "ask", resumeSessionId: sid }));
+    expect(await doneWithin(t)).toBe(0);
+    await waitFor(() => !["running", "orphaned"].includes(rowOf(dead).status), 10_000, "the dead row to be retired");
+    expect(rowOf(live).status).toBe("running");
+    expect(t.lingering()).toBe(true);
+    await waitFor(() => pending(taskId).length === 1, 10_000, "the live child's card");
   });
 
   test("an orphaned child row the server lists as executing is adopted: the next turn lingers for it", async () => {
@@ -2061,5 +2124,334 @@ describe("Stop order, wake take-over, sends and child syncs (review round 3)", (
     expect(await doneWithin(t)).toBe(130); // done waits for the hand-back attempt
     expect(requeued).toEqual([]);
     expect((await inprocClient(fake).listInbox(t.sessionId()!)).map((i) => i.text)).toEqual(["keep me"]);
+  });
+});
+
+describe("Stop hand-back, children and sync bookkeeping (review round 4)", () => {
+  /** The steer's fate once the parent is idle again: delivered user messages with that text, and the inbox. */
+  async function steerFate(fake: FakeServer, sid: string, text: string): Promise<{ delivered: number; parked: number }> {
+    const c = inprocClient(fake);
+    const msgs = (await c.listMessages(sid, { limit: 200, order: "asc" })).data as Array<{ type: string; text?: string }>;
+    return {
+      delivered: msgs.filter((m) => m.type === "user" && m.text === text).length,
+      parked: (await c.listInbox(sid)).filter((i) => i.text === text).length,
+    };
+  }
+  /** Wait until the parent ran the execution its interrupted background child's "cancelled" notice started, and is idle again. */
+  async function cancelledNoticeRan(fake: FakeServer, sid: string): Promise<void> {
+    const c = inprocClient(fake);
+    const t0 = Date.now();
+    for (;;) {
+      const msgs = (await c.listMessages(sid, { limit: 200, order: "asc" })).data as Array<{ type: string; metadata?: { state?: string } }>;
+      const at = msgs.findIndex((m) => m.type === "synthetic" && m.metadata?.state === "cancelled");
+      if (at >= 0 && msgs.slice(at + 1).some((m) => m.type === "idle") && !(sid in (await c.activeSessions()))) return;
+      if (Date.now() - t0 > 20_000) throw new Error("the cancelled notice's execution never ran");
+      await sleep(25);
+    }
+  }
+  /** A live turn whose parent and background child both run until interrupted, with one steer parked behind them. */
+  async function bgslowWithSteer(fake: FakeServer, over: Partial<Args> = {}) {
+    const run = mk({ ...inprocArgs, prompt: `go ${M.bgslow}`, ...over });
+    const t = start(run);
+    // The parent's own shell (its second tool step): the background child is running by then.
+    await waitFor(() => run.chunks.filter((c) => c.stream === "tool_use").length >= 2, 20_000, "the parent's shell step");
+    expect(await t.steer("keep me")).toBe("accepted");
+    const sid = t.sessionId()!;
+    expect((await inprocClient(fake).listInbox(sid)).map((i) => i.text)).toEqual(["keep me"]);
+    return { run, t, sid };
+  }
+  const deletes = (proxy: ReturnType<typeof flakyProxy>) => proxy.requests.filter((r) => /^DELETE \/api\/session\/[^/]+\/inbox\//.test(r));
+
+  test("K3: a Stop takes the parked steer back BEFORE it interrupts the background child: requeued once, never delivered", async () => {
+    const requeued = captureRequeue();
+    const fake = await inproc();
+    const { run, t, sid } = await bgslowWithSteer(fake);
+    t.kill();
+    expect(await doneWithin(t)).toBe(130);
+    // The child's interrupt woke the parent with its "cancelled" notice; that execution ran and ended.
+    await cancelledNoticeRan(fake, sid);
+    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: ["keep me"], uncertain: [] }]);
+    expect(await steerFate(fake, sid, "keep me")).toEqual({ delivered: 0, parked: 0 });
+  });
+
+  test("K1: a removal the re-read can't confirm is proven by the hub's cancel event", async () => {
+    const requeued = captureRequeue();
+    const fake = await inproc();
+    let deleted = 0;
+    watchClients({
+      cancelInboxItem: (orig: (s: string, i: string) => Promise<boolean>, s: unknown, i: unknown) =>
+        orig(s as string, i as string).finally(() => void deleted++),
+      listInbox: (orig: (s: string) => Promise<unknown>, s: unknown) => (deleted > 0 ? Promise.reject(new Error("read failed after the delete")) : orig(s as string)),
+      listMessages: (orig: (s: string, q: unknown) => Promise<unknown>, s: unknown, q: unknown) =>
+        deleted > 0 ? Promise.reject(new Error("read failed after the delete")) : orig(s as string, q),
+    });
+    const run = mk({ ...inprocArgs, prompt: `go ${M.slow}` });
+    const t = start(run);
+    await waitFor(() => run.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    // The orchestrator watches the task's session (for wakes): the hub sees its inbox events, the cancel included.
+    hub.watchOpencodeSessionsForWake(H_INPROC, { url: fake.url, password: fake.password }, [t.sessionId()!]);
+    await waitFor(() => hub.__forTest.probe(H_INPROC)?.connected === true, 10_000, "the hub's stream");
+    expect(await t.steer("keep me")).toBe("accepted");
+    t.kill();
+    expect(await doneWithin(t)).toBe(130);
+    expect(deleted).toBe(1);
+    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: ["keep me"], uncertain: [] }]);
+  });
+
+  test("K1: with no word from the hub, a re-read inbox and message list that both lack the steer prove its removal", async () => {
+    const requeued = captureRequeue();
+    const fake = await inproc();
+    const asked: string[] = [];
+    cleanups.push(
+      __forTest.setDeps({
+        inboxItemCancelled: (_k, _s, id) => (asked.push(id), null),
+        waitInboxItemCancelled: async () => null,
+      }),
+    );
+    const run = mk({ ...inprocArgs, prompt: `go ${M.slow}` });
+    const t = start(run);
+    await waitFor(() => run.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    expect(await t.steer("keep me")).toBe("accepted");
+    t.kill();
+    expect(await doneWithin(t)).toBe(130);
+    expect(asked.length).toBeGreaterThan(0); // the hub was asked first, and could not tell
+    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: ["keep me"], uncertain: [] }]);
+    expect(await steerFate(fake, t.sessionId()!, "keep me")).toEqual({ delivered: 0, parked: 0 });
+  });
+
+  test("K3: a read that fails after the delete, with no word from the hub, hands the steer back as uncertain (never dropped)", async () => {
+    const requeued = captureRequeue();
+    const fake = await inproc();
+    const waits: number[] = [];
+    cleanups.push(
+      __forTest.setDeps({
+        inboxItemCancelled: () => null,
+        waitInboxItemCancelled: async (_k, _s, _i, ms) => (waits.push(ms), null),
+      }),
+    );
+    let deleted = 0;
+    watchClients({
+      cancelInboxItem: (orig: (s: string, i: string) => Promise<boolean>, s: unknown, i: unknown) =>
+        orig(s as string, i as string).finally(() => void deleted++),
+      listMessages: (orig: (s: string, q: unknown) => Promise<unknown>, s: unknown, q: unknown) =>
+        deleted > 0 ? Promise.reject(new Error("read failed after the delete")) : orig(s as string, q),
+    });
+    const run = mk({ ...inprocArgs, prompt: `go ${M.slow}` });
+    const t = start(run);
+    await waitFor(() => run.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    expect(await t.steer("keep me")).toBe("accepted");
+    t.kill();
+    expect(await doneWithin(t)).toBe(130);
+    expect(deleted).toBe(1);
+    expect(waits.length).toBe(1); // the hub's word was awaited, bounded
+    expect(waits[0]).toBeLessThanOrEqual(2000);
+    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: [], uncertain: ["keep me"] }]);
+  });
+
+  test("K3: with no requeue handler installed (a handover, a quit), a Stop deletes nothing: the steer stays parked", async () => {
+    const prev = setOpencodeSteerRequeueHandler(null);
+    cleanups.push(() => void setOpencodeSteerRequeueHandler(prev));
+    const fake = await inproc();
+    const proxy = flakyProxy(fake);
+    const run = mk({ ...inprocArgs, prompt: `go ${M.slow}` });
+    const t = start(run);
+    await waitFor(() => run.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    expect(await t.steer("keep me")).toBe("accepted");
+    t.kill();
+    // `done` waits for the Stop's tail (the hand-back attempt included).
+    expect(await doneWithin(t)).toBe(130);
+    expect(proxy.requests).toContain(`POST /api/session/${t.sessionId()}/interrupt`);
+    expect(deletes(proxy)).toEqual([]);
+    expect(await steerFate(fake, t.sessionId()!, "keep me")).toEqual({ delivered: 0, parked: 1 });
+  });
+
+  test("NIT6: when a newer turn of the task started while the Stop's hand-back ran, the steer goes back as uncertain, not ahead of it", async () => {
+    const requeued = captureRequeue();
+    const fake = await inproc();
+    let deleteStarted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    watchClients({
+      cancelInboxItem: async (orig: (s: string, i: string) => Promise<boolean>, s: unknown, i: unknown) => {
+        deleteStarted = true;
+        await gate;
+        return orig(s as string, i as string);
+      },
+    });
+    const run = mk({ ...inprocArgs, prompt: `go ${M.slow}` });
+    const t = start(run);
+    await waitFor(() => run.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    expect(await t.steer("keep me")).toBe("accepted");
+    t.kill();
+    await waitFor(() => deleteStarted, 10_000, "the Stop's delete");
+    // The user's next message already became a turn of its own (the Stop's tail outlived its cap).
+    const newer = start(mk({ ...inprocArgs, taskId: run.taskId, prompt: "the newer message" }));
+    release();
+    await waitFor(() => requeued.length === 1, 15_000, "the hand-back");
+    expect(requeued).toEqual([{ taskId: run.taskId, runId: run.runId, texts: [], uncertain: ["keep me"] }]);
+    expect(await doneWithin(t)).toBe(130);
+    expect(await doneWithin(newer)).toBe(0);
+  });
+
+  test("K2: a server crash while a settled turn lingers parks the child rows orphaned; the next turn does not linger", async () => {
+    const fake = await inproc(1.5, { realChildren: true });
+    const proxy = flakyProxy(fake);
+    hub.__forTest.setBackoff({ baseMs: 50, maxMs: 200, maxFailures: 3 });
+    const { taskId, runId } = seedTask();
+    const first = start(mk({ ...inprocArgs, taskId, runId, prompt: `launch ${M.wake}` }));
+    expect(await doneWithin(first, 30_000)).toBe(0);
+    expect(first.lingering()).toBe(true);
+    expect(childRows(taskId).map((r) => r.status)).toEqual(["running"]);
+    proxy.crash();
+    await waitFor(() => !first.lingering(), 20_000, "the linger to give up on the lost server");
+    // Parked at once, in the same step that ended the linger: nothing else would ever settle them.
+    expect(childRows(taskId).map((r) => r.status)).toEqual(["orphaned"]);
+    // The next turn on a fresh server: the row does not hold it.
+    await inproc(0.4, { realChildren: true });
+    const next = start(mk({ ...inprocArgs, taskId, runId, prompt: "after the crash", resumeSessionId: first.sessionId()! }));
+    expect(await doneWithin(next)).toBe(0);
+    expect(next.lingering()).toBe(false);
+    expect(childRows(taskId).map((r) => r.status)).not.toContain("running");
+  });
+
+  test("K2: a Stop whose child interrupt fails parks the task's child rows orphaned", async () => {
+    const fake = await inproc();
+    const children: string[] = [];
+    const orphaned: string[] = [];
+    cleanups.push(
+      __forTest.setDeps({
+        registerChild: (a) => void children.push(a.childSessionId),
+        orphanChildrenOfTask: (taskId) => void orphaned.push(taskId),
+      }),
+    );
+    watchClients({
+      interrupt: (orig: (s: string) => Promise<boolean>, s: unknown) =>
+        children.includes(s as string) ? Promise.reject(Object.assign(new Error("interrupt failed"), { status: 0 })) : orig(s as string),
+    });
+    const run = mk({ ...inprocArgs, prompt: `go ${M.bgslow}` });
+    const t = start(run);
+    await waitFor(() => run.chunks.filter((c) => c.stream === "tool_use").length >= 2 && children.length === 1, 20_000, "the parent's shell step");
+    t.kill();
+    expect(await doneWithin(t)).toBe(130);
+    await waitFor(() => orphaned.length > 0, 10_000, "the child rows to be parked");
+    expect(orphaned).toEqual([run.taskId]);
+    void fake;
+  });
+
+  test("K2: a linger that reaches its maximum duration with a background child unsettled parks the rows orphaned", async () => {
+    const fake = await inproc(0.4);
+    const seeded = mk({ ...inprocArgs, prompt: "plain" });
+    const first = start(seeded);
+    expect(await doneWithin(first)).toBe(0);
+    const sid = first.sessionId()!;
+    const live = (await rawPost(fake, "/api/session", { parentID: sid, title: "live", permissions: [{ action: "*", resource: "*", effect: "ask" }] })).data.id as string;
+    await rawPost(fake, `/api/session/${live}/prompt`, { text: `do it ${M.permission}` });
+    const c = inprocClient(fake);
+    const t0 = Date.now();
+    while ((await c.listPermissions(live)).length === 0) {
+      if (Date.now() - t0 > 10_000) throw new Error("the live child never asked");
+      await sleep(20);
+    }
+    const h0 = mk({ ...inprocArgs, mode: "ask" });
+    const orphaned: string[] = [];
+    cleanups.push(
+      __forTest.setDeps({
+        openChildSessions: (tid) => (tid === h0.taskId ? [live] : []),
+        orphanChildrenOfTask: (taskId) => void orphaned.push(taskId),
+      }),
+    );
+    cleanups.push(__forTest.setTimings({ lingerMaxMs: 3000 }));
+    const { prompt: _p, title: _t, resumeSessionId: _r, ...rest } = h0.args;
+    const h = attachOpencodeServerLinger({ ...rest, sessionId: sid });
+    liveTurns.push(h);
+    await waitFor(() => pending(h0.taskId).length === 1, 10_000, "the live child's card");
+    expect(h.lingering()).toBe(true);
+    await waitFor(() => !h.lingering(), 15_000, "the linger to reach its maximum duration");
+    expect(orphaned).toEqual([h0.taskId]);
+  });
+
+  test("K2: a boot-time linger that can't start its server parks the task's child rows orphaned", async () => {
+    const orphaned: string[] = [];
+    cleanups.push(
+      __forTest.setDeps({
+        ensureServer: () => Promise.reject(new Error("the server would not start")),
+        orphanChildrenOfTask: (taskId) => void orphaned.push(taskId),
+      }),
+    );
+    const h0 = mk({ ...inprocArgs });
+    const { prompt: _p, title: _t, resumeSessionId: _r, ...rest } = h0.args;
+    const h = attachOpencodeServerLinger({ ...rest, sessionId: "ses_boot_linger_r4" });
+    liveTurns.push(h);
+    await waitFor(() => statusesOf(h0).some((l) => l.startsWith("couldn't start the OpenCode server")), 10_000, "the failed start");
+    expect(h.lingering()).toBe(false);
+    expect(orphaned).toEqual([h0.taskId]);
+  });
+
+  test("children this driver already settled are not followed or counted: a live child after 55 settled ones is synced", async () => {
+    const fake = await inproc();
+    const proxy = flakyProxy(fake);
+    const settledHere: string[] = [];
+    const synced: string[] = [];
+    cleanups.push(
+      __forTest.setDeps({
+        settleChild: (a) => void settledHere.push(a.childSessionId),
+        syncChild: async (a) => void synced.push(a.childSessionId),
+      }),
+    );
+    const run = mk({ ...inprocArgs, prompt: `run ${M.slow}` });
+    const t = start(run);
+    await waitFor(() => run.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    const sid = t.sessionId()!;
+    // 55 children of this turn start and end on the stream: the driver itself settles each one.
+    for (let i = 0; i < 55; i++) {
+      const child = `ses_done_r4_${String(i).padStart(2, "0")}`;
+      proxy.inject({ type: "session.created", data: { sessionID: child, parentID: sid } });
+      proxy.inject({ type: "session.execution.started", data: { sessionID: child } });
+      proxy.inject({ type: "session.execution.succeeded", data: { sessionID: child } });
+    }
+    await waitFor(() => settledHere.length === 55, 15_000, "the 55 children to settle");
+    // Then a live background child (it runs until interrupted).
+    const live = (await rawPost(fake, "/api/session", { parentID: sid, title: "live" })).data.id as string;
+    await rawPost(fake, `/api/session/${live}/prompt`, { text: `go ${M.slow}` });
+    await waitFor(() => hub.opencodeOwnedSessions(H_INPROC, sid).some((o) => o.sessionId === live), 10_000, "the hub to own the live child");
+    // A reconnect makes the driver catch up and re-sync its children.
+    fake.dropEventStreams();
+    await waitFor(() => synced.includes(live), 20_000, "the live child to be synced");
+    expect(synced.filter((id) => id.startsWith("ses_done_r4_"))).toEqual([]);
+    t.kill();
+    expect(await doneWithin(t)).toBe(130);
+  });
+
+  test("a card another driver closes more often than the failed-reply cap is still raised again each time", async () => {
+    const run = mk({ prompt: `do it ${M.permission}`, mode: "ask" });
+    const t = start(run);
+    await waitFor(() => pending(run.taskId).length === 1, 15_000, "the permission card");
+    const [perm] = await stubClient().listPermissions(t.sessionId()!);
+    for (let i = 0; i < 4; i++) {
+      const before = pending(run.taskId)[0]!.id;
+      __forTest.closeCardAsDriver(run.taskId, { requestId: perm.id });
+      await waitFor(() => pending(run.taskId).length === 1 && pending(run.taskId)[0]!.id !== before, 15_000, `the card to come back (close ${i + 1})`);
+    }
+    answerOpencodePermission(pending(run.taskId)[0]!.id, { decision: "once" });
+    expect(await doneWithin(t)).toBe(0);
+    expect(textOf(run)).toContain("The command ran: hi");
+  });
+
+  test("an answer to a request OpenCode had already declined (a sibling of a Reject) closes the card with a status line", async () => {
+    const fake = await inproc();
+    const proxy = flakyProxy(fake);
+    const run = mk({ ...inprocArgs, prompt: `run ${M.slow}`, mode: "plan" });
+    const t = start(run);
+    await waitFor(() => run.chunks.some((c) => c.stream === "tool_use"), 15_000, "the tool step");
+    const sid = t.sessionId()!;
+    // A request the server no longer holds (declined with a sibling) whose `permission.replied` has not arrived yet.
+    proxy.inject({ type: "permission.asked", data: { id: "per_declined_sib", sessionID: sid, action: "shell", resources: ["echo b"] } });
+    await waitFor(() => pending(run.taskId).length === 1, 10_000, "the sibling's card");
+    answerOpencodePermission(pending(run.taskId)[0]!.id, { decision: "once" });
+    await waitFor(() => statusesOf(run).includes(driver.STALE_PERMISSION_ANSWER_STATUS), 10_000, "the status line");
+    expect(pending(run.taskId).length).toBe(0);
+    expect(proxy.hooks.replyBodies.map((r) => r.path)).toEqual([`/api/session/${sid}/permission/per_declined_sib/reply`]);
+    t.kill();
+    expect(await doneWithin(t)).toBe(130);
   });
 });

@@ -54,7 +54,10 @@
  *     that the server reports active are checked too, since the
  *     `execution.started` may have fallen into the gap or predate this core;
  *     that snapshot is discarded for any session that saw a live execution
- *     event after the request began.
+ *     event after the request began. A wake from a snapshot carries a
+ *     synthetic `session.execution.started` envelope whose `created` is the
+ *     time the snapshot answered (the execution started no later than that),
+ *     so the orchestrator's "started before the Stop" check works for it.
  *     The same check runs for sessions newly added by a `watch` call on an
  *     already-connected stream.
  *   - Wake input: for each watched session the hub keeps the inbox items
@@ -67,11 +70,30 @@
  *     reconnect, adopted or newly watched session), and any execution of a
  *     session that is "blind" (watched since less than a snapshot, or the
  *     stream was (re)connected or replaced) or whose pending set a cap
- *     trimmed. An active-session snapshot showing the session idle clears both
- *     (an idle session has nothing pending); a blind or trimmed session asks
- *     for one after each of its execution ends. A trim alone also clears when
- *     a delivery empties the set. The sets are bounded per session and in
+ *     trimmed. Idle does NOT mean the inbox is empty: an interrupted
+ *     execution leaves its undelivered items (a steer, a subagent's notice)
+ *     parked with no event, and the next execution delivers them first (live
+ *     2.1.3, r3 Q2/Q2b/Q5). So when an active-session snapshot shows a blind
+ *     or trimmed session idle, the hub reads `GET /api/session/{id}/inbox`
+ *     (one request under the client's timeout, at most
+ *     `INBOX_READ_CONCURRENCY` at a time) and takes the answer as the
+ *     session's pending set, items the hub never saw included. Only a read
+ *     that succeeded, on the same connected stream, with no inbox or
+ *     execution event for the session since the snapshot was requested,
+ *     clears the marks; otherwise they stay and the next execution end of the
+ *     session asks again (snapshot, then read). A delivery that empties a
+ *     trimmed set does not clear the trim (a `queue` item can stay parked
+ *     behind a delivered `steer`). The sets are bounded per session and in
  *     total, and dropped when a session leaves the watch set.
+ *   - Inbox fates (`opencodeInboxItemCancelled`, `waitOpencodeInboxItemCancelled`):
+ *     for each watched session the hub remembers, for about 5 minutes and
+ *     bounded per session and in total, the inbox ids it saw enqueued,
+ *     delivered or cancelled. `true` = a `session.inbox.cancelled` was seen
+ *     (proven removed). `false` = the stream is connected and the hub saw the
+ *     item delivered, or saw it enqueued on this same connection and no
+ *     cancel since. `null` = it can't tell: not watched, not connected, the
+ *     enqueue predates a reconnect (a cancel could have fallen into the gap),
+ *     never seen, or forgotten (age or cap).
  *
  * Contract notes for callers:
  *   - `ready` resolves once the stream is open (`server.connected`) and the
@@ -101,6 +123,7 @@ import {
   openOpencodeEventStream,
   type OpencodeEnvelope,
   type OpencodeEventStream,
+  type OpencodeInboxItem,
   type OpencodeServerRef,
 } from "./opencode-http.ts";
 
@@ -154,6 +177,13 @@ const WAKE_DEDUPE_MAX = 256;
 /** Pending (enqueued, not yet delivered) inbox items remembered per watched session, and per server in total. */
 const DEFAULT_PENDING_CAPS = { perSession: 64, total: 1024 };
 let pendingCaps = { ...DEFAULT_PENDING_CAPS };
+/** Inbox reads in flight at once for one snapshot (each is one request under the client's timeout). */
+const INBOX_READ_CONCURRENCY = 4;
+/** Inbox fates (enqueued / delivered / cancelled) remembered per watched session: how long, how many per session and per server. */
+const DEFAULT_FATE_MEMORY = { ttlMs: 5 * 60_000, perSession: 256, total: 4096 };
+let fateMemory = { ...DEFAULT_FATE_MEMORY };
+/** The fate memory's clock (a test seam). */
+let fateClock: () => number = () => Date.now();
 
 const DEFAULT_BACKOFF = {
   baseMs: 1000,
@@ -191,10 +221,19 @@ interface PendingSet {
   /** By inbox id, in enqueue order. */
   items: Map<string, PendingItem>;
   /**
-   * A cap dropped an item: the set is incomplete until a delivery empties it
-   * or an idle snapshot clears it (the set is kept, empty, while still marked).
+   * A cap dropped an item: the set is incomplete until an inbox read on an
+   * idle session replaces it (the set is kept, empty, while still marked).
    */
   trimmed: boolean;
+}
+
+/** What the hub last saw of one inbox item of a watched session. */
+interface InboxFate {
+  state: "pending" | "delivered" | "cancelled";
+  /** `fateClock()` when that was seen. */
+  at: number;
+  /** `connects` of the stream it was seen on. */
+  conn: number;
 }
 
 interface OpenExec {
@@ -230,7 +269,9 @@ interface HubServer {
   openExec: Map<string, OpenExec>;
   /** Per watched root: `execSeq` of its latest execution event (a live event beats an older snapshot). */
   lastExec: Map<string, number>;
-  /** Orders execution events and inbox enqueues against the active-session snapshots. */
+  /** Per watched session: `execSeq` of its latest inbox event (enqueued, delivered or cancelled). */
+  lastInbox: Map<string, number>;
+  /** Orders execution events and inbox events against the active-session snapshots and inbox reads. */
   execSeq: number;
   wakeSeen: Set<string>;
   /**
@@ -244,23 +285,31 @@ interface HubServer {
   pendingTotal: number;
   /**
    * Watched sessions whose enqueues the hub may have missed: newly watched, or
-   * the stream was (re)connected or replaced since. Cleared when an
-   * active-session snapshot taken after that shows the session idle (an idle
-   * session has nothing pending), checked at connect, on a newly watched id,
-   * and after each execution end of a session still marked.
+   * the stream was (re)connected or replaced since. Cleared only by a clean
+   * inbox read of the session while it is idle (an idle session can still
+   * hold parked items, so idle alone proves nothing), tried after the connect
+   * snapshot, on a newly watched id, and after each execution end of a
+   * session still marked.
    */
   blind: Set<string>;
-  /** Sessions whose post-execution inbox check is in flight. */
+  /** Sessions whose inbox check (snapshot and/or inbox read) is in flight. */
   rechecking: Set<string>;
+  /** Per watched session: inbox id -> what the hub last saw of it, oldest first (K1). */
+  fates: Map<string, Map<string, InboxFate>>;
+  /** Entries in `fates`, all sessions together. */
+  fatesTotal: number;
 }
 
 const servers = new Map<string, HubServer>();
+/** `waitOpencodeInboxItemCancelled` callers, by `fateKey`. */
+const cancelWaiters = new Map<string, Set<(v: boolean) => void>>();
 let wakeHandler: OpencodeWakeHandler | null = null;
 let watchLostHandler: OpencodeWatchLostHandler | null = null;
 let testFetch: typeof fetch | null = null;
 const hooks: {
   beforeSeed?: (serverKey: string, root: string) => Promise<void> | void;
   afterActiveSessions?: (serverKey: string) => Promise<void> | void;
+  afterInboxRead?: (serverKey: string, sessionId: string) => Promise<void> | void;
 } = {};
 const stats = { streamsOpened: 0, concurrent: 0, maxConcurrent: 0 };
 
@@ -541,45 +590,62 @@ function route(srv: HubServer, e: OpencodeEnvelope): void {
  * Track the watched session's pending inbox items: added on enqueue (any item
  * type), removed only on delivery or cancellation (`DELETE …/inbox/{id}`
  * publishes `session.inbox.cancelled`). An interrupt leaves undelivered items
- * parked with no event; the next execution takes them first.
+ * parked with no event; the next execution takes them first. Every inbox event
+ * also updates the item's fate (K1) and the session's `lastInbox`.
  */
 function noteInbox(srv: HubServer, sid: string, e: OpencodeEnvelope): void {
-  const gone = e.type === "session.inbox.delivered" || e.type === "session.inbox.cancelled";
-  if (e.type !== "session.inbox.enqueued" && !gone) return;
+  const delivered = e.type === "session.inbox.delivered";
+  const cancelled = e.type === "session.inbox.cancelled";
+  if (e.type !== "session.inbox.enqueued" && !delivered && !cancelled) return;
   if (!srv.watched.has(sid)) return;
   const d = e.data as { inboxID?: unknown; item?: { type?: unknown; payload?: { metadata?: unknown } } } | undefined;
   const inboxId = d?.inboxID;
   if (typeof inboxId !== "string" || inboxId.length === 0) return;
-  if (gone) {
+  srv.lastInbox.set(sid, ++srv.execSeq);
+  noteFate(srv, sid, inboxId, cancelled ? "cancelled" : delivered ? "delivered" : "pending");
+  if (delivered || cancelled) {
     const set = srv.pending.get(sid);
     if (!set || !set.items.delete(inboxId)) return;
     srv.pendingTotal--;
-    if (set.items.size === 0) srv.pending.delete(sid); // empty again: complete again
+    // Empty again: complete again, unless a cap dropped an item the server may still hold.
+    if (set.items.size === 0 && !set.trimmed) srv.pending.delete(sid);
     return;
   }
-  const item: OpencodeWakeItem = { inboxId, synthetic: d?.item?.type === "synthetic" };
   const meta = d?.item?.payload?.metadata;
-  if (meta && typeof meta === "object") {
-    const m = meta as Record<string, unknown>;
-    if (typeof m.source === "string") item.source = m.source;
-    if (typeof m.childID === "string") item.childID = m.childID;
-    if (typeof m.state === "string") item.state = m.state;
+  addPending(srv, sid, wakeItemOf(inboxId, d?.item?.type, meta && typeof meta === "object" ? (meta as Record<string, unknown>) : undefined));
+  enforcePendingTotal(srv);
+}
+
+function wakeItemOf(inboxId: string, type: unknown, meta: Record<string, unknown> | undefined): OpencodeWakeItem {
+  const item: OpencodeWakeItem = { inboxId, synthetic: type === "synthetic" };
+  if (meta) {
+    if (typeof meta.source === "string") item.source = meta.source;
+    if (typeof meta.childID === "string") item.childID = meta.childID;
+    if (typeof meta.state === "string") item.state = meta.state;
   }
+  return item;
+}
+
+/** Add (or, for an id already pending, refresh in place) one item; the per-session cap trims the oldest. */
+function addPending(srv: HubServer, sid: string, item: OpencodeWakeItem): void {
   let set = srv.pending.get(sid);
   if (!set) {
     set = { items: new Map(), trimmed: false };
     srv.pending.set(sid, set);
   }
-  const existing = set.items.get(inboxId);
+  const existing = set.items.get(item.inboxId);
   if (existing) {
     existing.item = item; // a replayed enqueue keeps its place
     return;
   }
-  set.items.set(inboxId, { item, seq: ++srv.execSeq });
+  set.items.set(item.inboxId, { item, seq: ++srv.execSeq });
   srv.pendingTotal++;
   if (set.items.size > pendingCaps.perSession) trimOldest(srv, set);
+}
+
+/** The total cap: the session holding the oldest item overall gives it up, until under the cap. */
+function enforcePendingTotal(srv: HubServer): void {
   while (srv.pendingTotal > pendingCaps.total) {
-    // The session holding the oldest item overall gives it up.
     let victim: PendingSet | undefined;
     let oldest = Infinity;
     for (const ps of srv.pending.values()) {
@@ -616,6 +682,83 @@ function clearPending(srv: HubServer): void {
   srv.pendingTotal = 0;
 }
 
+// ------------------------------------------------------------ inbox fates (K1)
+
+function fateKey(serverKey: string, sid: string, inboxId: string): string {
+  return `${serverKey}\u0000${sid}\u0000${inboxId}`;
+}
+
+/** Forget the session's fates older than the memory's age limit (oldest first, so it stops at the first young one). */
+function expireFates(srv: HubServer, sid: string, now: number): void {
+  const m = srv.fates.get(sid);
+  if (!m) return;
+  for (const [id, f] of m) {
+    if (now - f.at < fateMemory.ttlMs) break;
+    m.delete(id);
+    srv.fatesTotal--;
+  }
+  if (m.size === 0) srv.fates.delete(sid);
+}
+
+function noteFate(srv: HubServer, sid: string, inboxId: string, state: InboxFate["state"]): void {
+  const now = fateClock();
+  expireFates(srv, sid, now);
+  let m = srv.fates.get(sid);
+  if (!m) {
+    m = new Map();
+    srv.fates.set(sid, m);
+  }
+  const prev = m.get(inboxId);
+  // A final fate stays final: a replayed enqueue does not make a cancelled or delivered item pending again.
+  if (prev && prev.state !== "pending" && state === "pending") return;
+  if (prev) {
+    m.delete(inboxId); // re-inserted at the end: the map stays ordered by `at`
+    srv.fatesTotal--;
+  }
+  m.set(inboxId, { state, at: now, conn: srv.connects });
+  srv.fatesTotal++;
+  while (m.size > fateMemory.perSession) {
+    const oldest = m.keys().next().value;
+    if (oldest === undefined) break;
+    m.delete(oldest);
+    srv.fatesTotal--;
+  }
+  while (srv.fatesTotal > fateMemory.total) {
+    // The session holding the oldest fate overall gives it up.
+    let victim: string | undefined;
+    let oldestAt = Infinity;
+    for (const [vs, fm] of srv.fates) {
+      const first = fm.values().next().value;
+      if (first && first.at < oldestAt) {
+        oldestAt = first.at;
+        victim = vs;
+      }
+    }
+    const vm = victim === undefined ? undefined : srv.fates.get(victim);
+    const id = vm?.keys().next().value;
+    if (!vm || id === undefined) break;
+    vm.delete(id);
+    srv.fatesTotal--;
+    if (vm.size === 0) srv.fates.delete(victim!);
+  }
+  if (state === "cancelled") {
+    const waiters = cancelWaiters.get(fateKey(srv.key, sid, inboxId));
+    if (waiters) for (const w of [...waiters]) w(true);
+  }
+}
+
+function dropFates(srv: HubServer, sid: string): void {
+  const m = srv.fates.get(sid);
+  if (!m) return;
+  srv.fatesTotal -= m.size;
+  srv.fates.delete(sid);
+}
+
+function clearFates(srv: HubServer): void {
+  srv.fates.clear();
+  srv.fatesTotal = 0;
+}
+
 /** The session's pending items right now (copies, oldest first) and whether the hub can have seen every enqueue. */
 function wakeInputOf(srv: HubServer, sid: string, forceUnknown = false): OpencodeWakeInput {
   const set = srv.pending.get(sid);
@@ -629,46 +772,56 @@ function copyInput(input: OpencodeWakeInput): OpencodeWakeInput {
 }
 
 /**
- * An active-session snapshot requested at `startSeq` shows `sid` idle, and no
- * execution event for it arrived since: nothing can be pending on it now, so
- * the hub has seen every enqueue from here on. Items enqueued before the
- * snapshot are stale (delivered while the hub could not see it).
+ * Read an idle session's inbox and take it as its pending set: the items the
+ * server still holds, parked ones the hub never saw included, oldest first;
+ * whatever the hub had and the server no longer lists was delivered or
+ * cancelled unseen. Taken only when the read succeeded, the stream is the same
+ * one and connected, and no inbox or execution event for the session arrived
+ * after `sinceSeq` (the snapshot that found it idle): then every later enqueue
+ * reaches the hub live, and the session stops being blind. Otherwise nothing
+ * changes and the next execution end asks again. A read longer than the
+ * per-session cap keeps the newest items and stays trimmed (not known).
  */
-function markInboxSeen(srv: HubServer, sid: string, startSeq: number): void {
-  srv.blind.delete(sid);
-  const set = srv.pending.get(sid);
-  if (!set) return;
-  for (const [id, p] of [...set.items]) {
-    if (p.seq > startSeq) continue;
-    set.items.delete(id);
-    srv.pendingTotal--;
-  }
-  // Whatever a cap dropped was enqueued before the snapshot too.
-  set.trimmed = false;
-  if (set.items.size === 0) srv.pending.delete(sid);
-}
-
-/** After an execution end of a session whose pending set may be incomplete (blind or trimmed): ask once whether it is idle now. */
-function recheckInbox(srv: HubServer, gen: number, sid: string): void {
-  if (srv.rechecking.has(sid)) return;
-  srv.rechecking.add(sid);
-  const startSeq = srv.execSeq;
-  let client;
+async function readInbox(srv: HubServer, gen: number, sid: string, sinceSeq: number): Promise<void> {
+  let items: OpencodeInboxItem[];
   try {
-    client = createOpencodeClient(srv.ref);
-  } catch {
-    srv.rechecking.delete(sid);
+    items = await createOpencodeClient(srv.ref).listInbox(sid);
+  } catch (err) {
+    warn("inbox read failed", srv.key, sid, err);
     return;
   }
-  client
-    .activeSessions()
-    .then((active) => {
-      if (srv.gen !== gen || servers.get(srv.key) !== srv || !srv.watched.has(sid)) return;
-      if ((srv.lastExec.get(sid) ?? 0) > startSeq) return; // a newer execution: its own end checks again
-      if (active[sid] === undefined) markInboxSeen(srv, sid, startSeq);
-    })
-    .catch((err) => warn("inbox check failed", srv.key, sid, err))
-    .finally(() => srv.rechecking.delete(sid));
+  if (hooks.afterInboxRead) await hooks.afterInboxRead(srv.key, sid);
+  if (srv.gen !== gen || !srv.connected || servers.get(srv.key) !== srv || !srv.watched.has(sid)) return;
+  if ((srv.lastExec.get(sid) ?? 0) > sinceSeq || (srv.lastInbox.get(sid) ?? 0) > sinceSeq) return;
+  dropPending(srv, sid);
+  for (const it of items) addPending(srv, sid, wakeItemOf(it.id, it.type, it.metadata));
+  enforcePendingTotal(srv);
+  srv.blind.delete(sid);
+}
+
+/** One inbox check per session at a time; run `fn` unless one is already in flight. */
+async function inboxCheck(srv: HubServer, sid: string, fn: () => Promise<void>): Promise<void> {
+  if (srv.rechecking.has(sid)) return;
+  srv.rechecking.add(sid);
+  try {
+    await fn();
+  } catch (err) {
+    warn("inbox check failed", srv.key, sid, err);
+  } finally {
+    srv.rechecking.delete(sid);
+  }
+}
+
+/** After an execution end of a session whose pending set may be incomplete (blind or trimmed): if it is idle now, read its inbox. */
+function recheckInbox(srv: HubServer, gen: number, sid: string): void {
+  const startSeq = srv.execSeq;
+  void inboxCheck(srv, sid, async () => {
+    const active = await createOpencodeClient(srv.ref).activeSessions();
+    if (srv.gen !== gen || servers.get(srv.key) !== srv || !srv.watched.has(sid)) return;
+    if ((srv.lastExec.get(sid) ?? 0) > startSeq) return; // a newer execution: its own end checks again
+    if (active[sid] !== undefined) return;
+    await readInbox(srv, gen, sid, startSeq);
+  });
 }
 
 function maybeWake(srv: HubServer, sid: string, e: OpencodeEnvelope, owner: Owned | undefined, input: OpencodeWakeInput): void {
@@ -748,7 +901,7 @@ function ownedOrigins(srv: HubServer, root: string): OpencodeHubOrigin[] {
   return out;
 }
 
-/** Wake for watched sessions the server reports running while nobody is attached (a gap, or a fresh core). */
+/** Wake for watched sessions the server reports running while nobody is attached (a gap, or a fresh core); read the inbox of the idle blind ones. */
 async function wakeResync(srv: HubServer, gen: number, only?: ReadonlySet<string>): Promise<void> {
   if (srv.watched.size === 0) return;
   const startSeq = srv.execSeq;
@@ -759,8 +912,11 @@ async function wakeResync(srv: HubServer, gen: number, only?: ReadonlySet<string
     warn("active-session check failed", srv.key, undefined, err);
     return;
   }
+  // The execution of a session reported active started no later than this.
+  const snapshotAt = Date.now();
   if (hooks.afterActiveSessions) await hooks.afterActiveSessions(srv.key);
   if (srv.gen !== gen || servers.get(srv.key) !== srv) return;
+  const toRead: string[] = [];
   for (const sid of only ?? srv.watched) {
     if (!srv.watched.has(sid)) continue;
     // A live execution event arrived after the request began: it is newer than the snapshot.
@@ -768,10 +924,16 @@ async function wakeResync(srv: HubServer, gen: number, only?: ReadonlySet<string
     if (active[sid] === undefined) {
       srv.woken.delete(sid);
       srv.openExec.delete(sid);
-      markInboxSeen(srv, sid, startSeq);
+      // Idle is not empty (parked items): the inbox itself says what is pending.
+      if (srv.blind.has(sid) || srv.pending.get(sid)?.trimmed) toRead.push(sid);
       continue;
     }
-    const e: OpencodeEnvelope = { id: `resync:${srv.connects}:${sid}`, type: "session.execution.started", data: { sessionID: sid } };
+    const e: OpencodeEnvelope = {
+      id: `resync:${srv.connects}:${sid}`,
+      type: "session.execution.started",
+      created: snapshotAt,
+      data: { sessionID: sid },
+    };
     // The execution began while the hub could not see it: what it started with is unknown.
     const input = wakeInputOf(srv, sid, true);
     if ((srv.entries.get(sid)?.length ?? 0) > 0) {
@@ -783,6 +945,14 @@ async function wakeResync(srv: HubServer, gen: number, only?: ReadonlySet<string
     srv.openExec.set(sid, { e, input });
     fireWake(srv, sid, e, input);
   }
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < toRead.length) {
+      const sid = toRead[next++]!;
+      await inboxCheck(srv, sid, () => readInbox(srv, gen, sid, startSeq));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(INBOX_READ_CONCURRENCY, toRead.length) }, worker));
 }
 
 /** Learn `root`'s existing descendants (bounded breadth-first walk, one request per session). */
@@ -852,7 +1022,9 @@ function getOrCreate(key: string, ref: OpencodeServerRef, epoch: number | undefi
     srv.woken.clear();
     srv.openExec.clear();
     srv.lastExec.clear();
+    srv.lastInbox.clear();
     clearPending(srv);
+    clearFates(srv);
     for (const sid of srv.watched) srv.blind.add(sid);
     srv.rechecking.clear();
     if (restarted) srv.failures = 0; // a new server process: its first hiccup is not a continuation of the old one's
@@ -897,12 +1069,15 @@ function getOrCreate(key: string, ref: OpencodeServerRef, epoch: number | undefi
       woken: new Set(),
       openExec: new Map(),
       lastExec: new Map(),
+      lastInbox: new Map(),
       execSeq: 0,
       wakeSeen: new Set(),
       pending: new Map(),
       pendingTotal: 0,
       blind: new Set(),
       rechecking: new Set(),
+      fates: new Map(),
+      fatesTotal: 0,
     };
     servers.set(key, srv);
   }
@@ -1017,7 +1192,9 @@ export function watchOpencodeSessionsForWake(serverKey: string, ref: OpencodeSer
       srv.woken.clear();
       srv.openExec.clear();
       srv.lastExec.clear();
+      srv.lastInbox.clear();
       clearPending(srv);
+      clearFates(srv);
       srv.blind.clear();
       maybeDispose(srv);
     }
@@ -1031,10 +1208,11 @@ export function watchOpencodeSessionsForWake(serverKey: string, ref: OpencodeSer
   const srv = getOrCreate(serverKey, ref, ref.epoch);
   const added = new Set(ids.filter((s) => !srv.watched.has(s)));
   srv.watched = new Set(ids);
-  for (const m of [srv.woken, srv.openExec, srv.lastExec, srv.blind] as Array<Set<string> | Map<string, unknown>>) {
+  for (const m of [srv.woken, srv.openExec, srv.lastExec, srv.lastInbox, srv.blind] as Array<Set<string> | Map<string, unknown>>) {
     for (const sid of [...m.keys()]) if (!srv.watched.has(sid)) m.delete(sid);
   }
   for (const sid of [...srv.pending.keys()]) if (!srv.watched.has(sid)) dropPending(srv, sid);
+  for (const sid of [...srv.fates.keys()]) if (!srv.watched.has(sid)) dropFates(srv, sid);
   // A newly watched session's earlier enqueues were not seen.
   for (const sid of added) srv.blind.add(sid);
   connect(srv);
@@ -1043,6 +1221,45 @@ export function watchOpencodeSessionsForWake(serverKey: string, ref: OpencodeSer
   if (srv.connected && added.size > 0) {
     wakeResync(srv, srv.gen, added).catch((err) => warn("active-session check failed", srv.key, undefined, err));
   }
+}
+
+/** Whether the hub saw `session.inbox.cancelled` for this item on a watched session: true = proven removed;
+ *  false = the hub was watching (connected) and saw no cancel; null = the hub can't tell (not watching / not connected / evicted). */
+export function opencodeInboxItemCancelled(serverKey: string, sessionId: string, inboxId: string): boolean | null {
+  const srv = servers.get(serverKey);
+  if (!srv || !srv.watched.has(sessionId)) return null;
+  const f = srv.fates.get(sessionId)?.get(inboxId);
+  // Forgotten by age reads as never seen.
+  const fate = f && fateClock() - f.at < fateMemory.ttlMs ? f : undefined;
+  if (fate?.state === "cancelled") return true;
+  if (!fate || !srv.connected) return null;
+  if (fate.state === "delivered") return false; // delivered can't be cancelled any more
+  // Pending: only a cancel published on this same connection would have been seen.
+  return fate.conn === srv.connects ? false : null;
+}
+
+/** Resolve as soon as that cancel is seen (true), or at `ms` with the same false/null meaning as above. */
+export function waitOpencodeInboxItemCancelled(serverKey: string, sessionId: string, inboxId: string, ms: number): Promise<boolean | null> {
+  const now = opencodeInboxItemCancelled(serverKey, sessionId, inboxId);
+  if (now === true || !(ms > 0)) return Promise.resolve(now);
+  return new Promise((resolve) => {
+    const key = fateKey(serverKey, sessionId, inboxId);
+    let set = cancelWaiters.get(key);
+    if (!set) {
+      set = new Set();
+      cancelWaiters.set(key, set);
+    }
+    const waiters = set;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (v: boolean | null): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      waiters.delete(done);
+      if (waiters.size === 0 && cancelWaiters.get(key) === waiters) cancelWaiters.delete(key);
+      resolve(v);
+    };
+    timer = setTimeout(() => done(opencodeInboxItemCancelled(serverKey, sessionId, inboxId)), ms);
+    waiters.add(done);
+  });
 }
 
 /**
@@ -1070,7 +1287,9 @@ export function closeOpencodeHub(serverKey?: string): void {
     srv.woken.clear();
     srv.openExec.clear();
     srv.lastExec.clear();
+    srv.lastInbox.clear();
     clearPending(srv);
+    clearFates(srv);
     srv.blind.clear();
     disposeServer(srv);
   }
@@ -1096,10 +1315,25 @@ export const __forTest = {
   resetPendingCaps(): void {
     pendingCaps = { ...DEFAULT_PENDING_CAPS };
   },
-  /** Awaited at the start of a root's child seeding / after the wake check's active-session fetch. */
-  setHooks(h: { beforeSeed?: typeof hooks.beforeSeed; afterActiveSessions?: typeof hooks.afterActiveSessions }): void {
+  /** Shrink the inbox-fate memory or replace its clock; call `resetFateMemory()` in afterEach. */
+  setFateMemory(o: Partial<typeof DEFAULT_FATE_MEMORY> & { clock?: () => number }): void {
+    const { clock, ...rest } = o;
+    fateMemory = { ...fateMemory, ...rest };
+    if (clock) fateClock = clock;
+  },
+  resetFateMemory(): void {
+    fateMemory = { ...DEFAULT_FATE_MEMORY };
+    fateClock = () => Date.now();
+  },
+  /** Awaited at the start of a root's child seeding / after the wake check's active-session fetch / after an inbox read answered. */
+  setHooks(h: {
+    beforeSeed?: typeof hooks.beforeSeed;
+    afterActiveSessions?: typeof hooks.afterActiveSessions;
+    afterInboxRead?: typeof hooks.afterInboxRead;
+  }): void {
     hooks.beforeSeed = h.beforeSeed;
     hooks.afterActiveSessions = h.afterActiveSessions;
+    hooks.afterInboxRead = h.afterInboxRead;
   },
   /** Route the event stream through this fetch (null restores the default); also clears the hooks. */
   setFetchImpl(f: typeof fetch | null): void {
@@ -1108,6 +1342,7 @@ export const __forTest = {
   clearHooks(): void {
     hooks.beforeSeed = undefined;
     hooks.afterActiveSessions = undefined;
+    hooks.afterInboxRead = undefined;
     testFetch = null;
   },
   /** Internal state of one server, or null when the hub holds no record of it. */

@@ -110,6 +110,7 @@ import m079 from "./079_opencode_task_fields.sql" with { type: "text" };
 import m080 from "./080_harness_auto_enabled.sql" with { type: "text" };
 import m081 from "./081_cursor_asks.sql" with { type: "text" };
 import m082 from "./082_opencode_child_bookkeeping.sql" with { type: "text" };
+import m083 from "./083_opencode_watch_tombstones.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -210,4 +211,5 @@ export const migrations: Migration[] = [
   { id: "080_harness_auto_enabled", sql: m080, aliases: ["079_harness_auto_enabled"] },
   { id: "081_cursor_asks", sql: m081 },
   { id: "082_opencode_child_bookkeeping", sql: m082 },
+  { id: "083_opencode_watch_tombstones", sql: m083 },
 ];

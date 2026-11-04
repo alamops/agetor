@@ -396,27 +396,35 @@ export function orphanRunningOpencodeSubagents(taskId: string, reason: string): 
     return 0;
   }
   let flipped = 0;
-  for (const row of rows) {
-    try {
-      const runId = runIdFor(row);
-      const turn = opencodeTurnOfRun(runId);
-      const status: SubagentStatus = turn && opencodeChildrenDieWithTurn(turn) ? "failed" : "orphaned";
-      const endedAt = Date.now();
-      subagents.setStatus(row.id, status, endedAt);
-      emitLifecycle({ ...row, status, endedAt }, "finished");
-      flipped++;
-      if (runId) {
-        const text = status === "failed"
-          ? `OpenCode subagent "${label(row)}" stopped — ${reason}`
-          : `OpenCode subagent "${label(row)}" was left unfinished — ${reason}`;
-        append(row, runId, "status", text, `opencode:subagent:${row.id}:left`, null);
-      }
-    } catch (e) {
-      console.error(`[opencode-subagents] failed to orphan ${row.id}:`, e);
-    }
-  }
+  for (const row of rows) if (orphanRow(row, reason)) flipped++;
   if (flipped > 0) fireSettle(taskId);
   return flipped;
+}
+
+/**
+ * Flip one `running` OpenCode row the way {@link orphanRunningOpencodeSubagents}
+ * does (the row's turn decides `failed` vs `orphaned`, with its status line).
+ * Does not fire the settle hook. True when it flipped the row; never throws.
+ */
+function orphanRow(row: Subagent, reason: string): boolean {
+  try {
+    const runId = runIdFor(row);
+    const turn = opencodeTurnOfRun(runId);
+    const status: SubagentStatus = turn && opencodeChildrenDieWithTurn(turn) ? "failed" : "orphaned";
+    const endedAt = Date.now();
+    subagents.setStatus(row.id, status, endedAt);
+    emitLifecycle({ ...row, status, endedAt }, "finished");
+    if (runId) {
+      const text = status === "failed"
+        ? `OpenCode subagent "${label(row)}" stopped — ${reason}`
+        : `OpenCode subagent "${label(row)}" was left unfinished — ${reason}`;
+      append(row, runId, "status", text, `opencode:subagent:${row.id}:left`, null);
+    }
+    return true;
+  } catch (e) {
+    console.error(`[opencode-subagents] failed to orphan ${row.id}:`, e);
+    return false;
+  }
 }
 
 /**
@@ -431,6 +439,31 @@ export function orphanRunningOpencodeSubagents(taskId: string, reason: string): 
  */
 export function orphanRunningOpencodeChildrenOfTask(taskId: string): number {
   return orphanRunningOpencodeSubagents(taskId, "the OpenCode server stopped");
+}
+
+/**
+ * One child of a task whose execution was cut off: the server positively lists
+ * it as not executing, and its row is still `running` (a crash's leftover a new
+ * turn adopted). Parks that one row exactly as
+ * {@link orphanRunningOpencodeChildrenOfTask} parks each of a task's rows (same
+ * rule, same status line), leaving the task's other rows alone, so a live
+ * sibling keeps its row. The sync that follows then settles it for good, or
+ * revives it if the server lists it again. Fires the settle hook when it
+ * flipped the row. Idempotent: a row that is not `running` (or not this task's,
+ * or not an OpenCode row) is left as it is and false returned. Never throws.
+ */
+export function orphanOpencodeChild(taskId: string, childSessionId: string): boolean {
+  let row: Subagent | null | undefined;
+  try {
+    row = subagents.get(opencodeSubagentId(childSessionId));
+  } catch (e) {
+    console.error("[opencode-subagents] failed to read a subagent row:", e);
+    return false;
+  }
+  if (!row || row.taskId !== taskId || !isOpencodeSubagentRow(row) || row.status !== "running") return false;
+  if (!orphanRow(row, "the OpenCode server stopped")) return false;
+  fireSettle(taskId);
+  return true;
 }
 
 const REFRESH_EXPORT_TIMEOUT_MS = 10_000;
@@ -699,7 +732,8 @@ const inFlightSyncs = new Map<string, Promise<void>>();
  * only when the server lists the child among its active sessions (history
  * proves nothing about now), is settled for good when the server's listing
  * positively leaves it out, and stays orphaned while that listing can't be
- * read ({@link settleOrReviveOrphan}). A child the server answers 404 for is
+ * read ({@link settleOrReviveOrphan}). For an `orphaned` row that listing is
+ * read before the messages, never after ({@link syncChildPass}). A child the server answers 404 for is
  * settled for good ({@link settleGoneChild}).
  * Creates the row when missing (title and agent from `getSession`; none when
  * the server has no such session). Yields to the event loop between pages and
@@ -726,11 +760,32 @@ export function syncOpencodeChildFromServer(a: {
 }
 
 async function syncChild(a: { taskId: string; runId: string; client: OpencodeClient; childSessionId: string }): Promise<void> {
+  // A row that turns `orphaned` while the pass runs had no activity read
+  // ahead of its messages, so it gets one more pass that has one.
+  if ((await syncChildPass(a, subagents.get(opencodeSubagentId(a.childSessionId))?.status === "orphaned")) === "again") {
+    await syncChildPass(a, true);
+  }
+}
+
+/**
+ * One sync pass. With `activityFirst`, the server's active list is read BEFORE
+ * the messages: OpenCode records a child's `idle` message and drops it from the
+ * active list at the same instant, so a child the list leaves out has its
+ * `idle` tail in the messages read after it, and a missing tail then proves the
+ * child dead. (Read the other way round, a child that finished between the
+ * two reads would be settled `failed` for good, its last output never read.)
+ * "again" asks for one more pass, with the list read first.
+ */
+async function syncChildPass(
+  a: { taskId: string; runId: string; client: OpencodeClient; childSessionId: string },
+  activityFirst: boolean,
+): Promise<"done" | "again"> {
   const id = opencodeSubagentId(a.childSessionId);
+  const activity = activityFirst ? await childActivity(a.client, a.childSessionId) : null;
   if (!subagents.get(id)) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const session: any = await a.client.getSession(a.childSessionId);
-    if (!session) return; // the server no longer has it: nothing to show
+    if (!session) return "done"; // the server no longer has it: nothing to show
     registerOpencodeChildSession({
       taskId: a.taskId,
       runId: a.runId,
@@ -758,7 +813,7 @@ async function syncChild(a: { taskId: string; runId: string; client: OpencodeCli
       if (e instanceof OpencodeHttpError && e.status === 404) {
         const gone = subagents.get(id);
         if (gone) settleGoneChild(gone);
-        return;
+        return "done";
       }
       throw e;
     }
@@ -771,8 +826,7 @@ async function syncChild(a: { taskId: string; runId: string; client: OpencodeCli
   if (pages.length === 0) {
     // No messages yet: a `running` child exists but hasn't started, so it is
     // left as it is; an `orphaned` one is alive only if the server lists it.
-    await settleOrReviveOrphan(a.client, id, a.childSessionId);
-    return;
+    return settleOrReviveOrphan(id, activity);
   }
   // Ascending pages, each ascending.
   const asc = pages.reverse().map((p) => p.slice().reverse());
@@ -790,28 +844,30 @@ async function syncChild(a: { taskId: string; runId: string; client: OpencodeCli
 
   if (tail) {
     settleOpencodeChild({ taskId: a.taskId, childSessionId: a.childSessionId, outcome: tail.outcome, error: tail.error });
-    return;
+    return "done";
   }
-  await settleOrReviveOrphan(a.client, id, a.childSessionId);
+  return settleOrReviveOrphan(id, activity);
 }
 
 /**
- * An `orphaned` row whose child has no `idle` tail: the server's active list
- * decides. Listed → `running` again. Positively not listed → the child is dead
- * (its execution was cut off, by a crash or a restart, and nothing will finish
- * it), so the row is settled for good ({@link settleDeadChild}) instead of being
- * offered to every relist and boot linger for {@link ORPHAN_RECHECK_MAX_AGE_MS}.
- * The listing failing says nothing: the row stays `orphaned` for a later sync.
- * A `running` row is left alone (the live stream owns it).
+ * An `orphaned` row whose child has no `idle` tail: the server's active list,
+ * read before the messages ({@link syncChildPass}), decides. Listed → `running`
+ * again. Positively not listed → the child is dead (its execution was cut off,
+ * by a crash or a restart, and nothing will finish it), so the row is settled
+ * for good ({@link settleDeadChild}) instead of being offered to every relist
+ * and boot linger for {@link ORPHAN_RECHECK_MAX_AGE_MS}. The listing failing
+ * says nothing: the row stays `orphaned` for a later sync. A `running` row is
+ * left alone (the live stream owns it). A row that became `orphaned` during a
+ * pass that read no activity asks for another pass ("again").
  */
-async function settleOrReviveOrphan(client: OpencodeClient, id: string, childSessionId: string): Promise<void> {
-  if (subagents.get(id)?.status !== "orphaned") return;
-  const active = await childActivity(client, childSessionId);
-  // Re-read: a live event may have revived or settled the row during the call.
+function settleOrReviveOrphan(id: string, activity: "active" | "inactive" | "unknown" | null): "done" | "again" {
+  // Re-read: a live event may have revived or settled the row during the pass.
   const row = subagents.get(id);
-  if (!row || row.status !== "orphaned") return;
-  if (active === "active") reviveIfOrphaned(row);
-  else if (active === "inactive") settleDeadChild(row, "is no longer running on the OpenCode server", "dead");
+  if (!row || row.status !== "orphaned") return "done";
+  if (activity === null) return "again";
+  if (activity === "active") reviveIfOrphaned(row);
+  else if (activity === "inactive") settleDeadChild(row, "is no longer running on the OpenCode server", "dead");
+  return "done";
 }
 
 /** Whether the server lists the session as active. `unknown` when the listing can't be read. */

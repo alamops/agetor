@@ -5801,6 +5801,11 @@ async function sendOpencodeTurn(
  */
 async function spawnOpencodeTurnNow(task: Task, taskId: string, line: string, alreadyEchoed = false): Promise<string | null> {
   if (startingTaskIds.has(taskId)) return null;
+  // Defence in depth: nothing starts a turn on a task that is archived, being
+  // torn down or being deleted (a Stop that is part of the archive, delete or
+  // switch hands undelivered messages back while it settles). A send to an
+  // archived task un-archives it, and waits out its teardown, before this.
+  if (!canTakeOpencodeTurn(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
     const priorSessionId = lastSessionIdForTask(task, "opencode_session_id");
@@ -5913,8 +5918,20 @@ async function drainOpencodeQueue(taskId: string): Promise<void> {
   const q = opencodeTurnQueue.get(taskId);
   if (!q || q.length === 0) return;
   const task = tasks.get(taskId);
-  if (!task || resolveHarness(task.agent)?.kind !== "opencode") {
+  if (!task || deletingTaskIds.has(taskId) || resolveHarness(task.agent)?.kind !== "opencode") {
     opencodeTurnQueue.delete(taskId);
+    return;
+  }
+  if (launchesFrozenFlag) {
+    // This process is exiting (`freezeLaunches`), as in `drainFollowUpQueues`:
+    // the queue goes to the tray instead of a turn that would be cut off.
+    stashQueuedFollowUps(taskId, task.runId, "Agetor stopped before it could run");
+    return;
+  }
+  if (!canTakeOpencodeTurn(taskId)) {
+    // Archived or being torn down: keep the text in the tray (an unarchive
+    // shows it), never run it on a card the user put away.
+    keepQueuedOpencodeFollowUps(taskId, task.runId, task.archivedAt != null ? "the task was archived" : "the task is being archived");
     return;
   }
   if (task.runId && active.has(task.runId)) return;
@@ -5923,6 +5940,34 @@ async function drainOpencodeQueue(taskId: string): Promise<void> {
   if (next !== undefined) await spawnOpencodeTurnNow(task, taskId, next);
 }
 
+
+/** Whether an OpenCode follow-up turn may start on the task now: it exists, and is not archived, torn down or being deleted. */
+function canTakeOpencodeTurn(taskId: string): boolean {
+  const task = tasks.get(taskId);
+  return task != null && task.archivedAt == null && !isTaskTearingDown(taskId);
+}
+
+/**
+ * Move the task's queued OpenCode follow-ups into its backlog tray, keeping
+ * them on an archived task too (`stashQueuedFollowUps` keeps nothing there):
+ * newest restashed first, an identical draft not added twice, and a status
+ * line on `runId` saying why.
+ */
+function keepQueuedOpencodeFollowUps(taskId: string, runId: string | null, why: string): void {
+  const lines = opencodeTurnQueue.get(taskId) ?? [];
+  opencodeTurnQueue.delete(taskId);
+  if (lines.length === 0) return;
+  let saved = false;
+  for (const text of [...lines].reverse()) {
+    const task = tasks.get(taskId);
+    if (!task) break;
+    if (!task.backlog.some((item) => item.text === text)) backlog.add(taskId, { text });
+    saved = true;
+  }
+  if (!saved || runId === null) return;
+  const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
+  saveAndEmit({ runId, taskId, stream: "status", data: `${what} — ${why}; saved to your backlog, resend from the tray` });
+}
 
 /*
  * OpenCode 2.x on the agetor-owned server: the orchestrator's half lives in
@@ -5937,6 +5982,7 @@ initOpencodeServerOrchestrator({
   releaseStartingClaim,
   launchesFrozen: () => launchesFrozenFlag,
   isTaskTearingDown,
+  isTaskBeingDeleted: (taskId) => deletingTaskIds.has(taskId),
   resolveHarness,
   taskHarnessId,
   findLastSessionIdForHarness,
@@ -5965,15 +6011,16 @@ initOpencodeServerOrchestrator({
  * `running` row would hold the task's next turn — on any harness — in
  * `running` forever (`isTaskHeldByBackgroundAgents`).
  */
-async function dropOpencodeTask(taskId: string, reason: string, opts: { deleting?: boolean } = {}): Promise<void> {
+async function dropOpencodeTask(taskId: string, reason: string): Promise<void> {
   // A server-transport turn has no tmux session: it is stopped over HTTP
   // (the driver's `kill` interrupts the session) and its open cards cancelled.
   // Delete, archive and an agent switch leave no card for this session: an
   // execution the server starts on it later is interrupted, not woken
-  // (`decideOpencodeWake`). A deleted task's runs are about to go, so its
-  // sessions stay watched through a tombstone (24 h); an archived task's are
-  // watched through its archived runs for as long.
-  if (opts.deleting) tombstoneOpencodeSessionsOfTask(taskId);
+  // (`decideOpencodeWake`). Every session of the task stays watched for 24 h
+  // through a persisted tombstone (migration 083): a deleted task's runs are
+  // about to go, and the watch otherwise names only a task's last session (an
+  // archived task's older ones, or the old harness's after a switch).
+  tombstoneOpencodeSessionsOfTask(taskId);
   await stopOpencodeServerTurnsOfTask(taskId, reason);
   // With or without a local handle: what the server still runs for the task
   // (its sessions, then their executing subagents) is interrupted over HTTP.
@@ -9206,7 +9253,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     else if (deleteKind === "cursor") await dropCursorSession(taskId);
     else if (deleteKind === "gemini") await dropGeminiSession(taskId);
     else if (deleteKind === "antigravity") await dropAntigravitySession(taskId);
-    else if (deleteKind === "opencode") await dropOpencodeTask(taskId, "the task was deleted", { deleting: true }); // graceful C-c, then kill (D-10)
+    else if (deleteKind === "opencode") await dropOpencodeTask(taskId, "the task was deleted"); // graceful C-c, then kill (D-10)
     else if (deleteKind === "copilot") await dropCopilotSession(taskId);
     else if (deleteKind === "fx") dropFxSession(taskId); // fx has no tmux session — stays sync
     // A step task's worktree is the shared parent's (D2) — never remove it

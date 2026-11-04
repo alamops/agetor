@@ -114,6 +114,8 @@ const HARNESS_IDS = [
   "opencode", "opencode-ks", "opencode-v1", "opencode-fp", "opencode-fp2", "opencode-dead", "opencode-cold",
   "opencode-cold2", "opencode-cold3", "opencode-slow", "opencode-crash", "opencode-s1",
   "opencode-r4", "opencode-r4b", "opencode-r4c", "opencode-sf1", "opencode-sf3", "opencode-sf5", "opencode-stuck", "opencode-crash2", "opencode-gone",
+  "opencode-k3", "opencode-k3b", "opencode-k3c", "opencode-k3d", "opencode-k3e", "opencode-k3f", "opencode-blind", "opencode-stuck2",
+  "opencode-ts1", "opencode-ts2", "opencode-ts3", "opencode-ts4", "opencode-mint",
 ];
 /** A fake running at this speed answers slowly enough that an interrupt sent at an execution's start always lands before it ends. */
 const R4_SPEED = "50";
@@ -385,6 +387,7 @@ test("server wake: a background child finishing mints a run with origin agent, c
   expect(b!.opencodeSessionId).toBe(a!.opencodeSessionId);
   expect(statusOf(b!.id)[0]).toMatch(/server=agetor/);
   expect(assistantOf(b!.id)).toContain("The background subagent finished");
+  expect(statusOf(b!.id)).toContain(ocsMod.OPENCODE_WAKE_ON_ITS_OWN_STATUS);
   expect(assistantOf(b!.id)).not.toContain("LAUNCHED");
   await waitFor(() => db.tasks.get(task.id)!.column === "review", 15_000, "the card to reach review");
 });
@@ -602,6 +605,7 @@ test("Stop on a held task lingering for two background subagents: both are inter
     await waitFor(() => runsOf(task.id).some((r) => r.origin === "agent" && r.status === "running"), 60_000, "the wake run");
     expect(db.tasks.get(task.id)!.column).toBe("running");
     const woke = runsOf(task.id).find((r) => r.origin === "agent" && r.status === "running")!;
+    expect(statusOf(woke.id)).toContain(ocsMod.OPENCODE_WAKE_QUEUED_MESSAGE_STATUS);
     expect(await orch.cancelRun(woke.id)).toBe(true);
     await settled(task.id, 30_000);
     await expectInterrupted(sid, "opencode-r4b");
@@ -1063,6 +1067,358 @@ test("an OpenCode 1.x CLI takes the tmux path; Ask there runs without approvals 
     expect(serverMod.getOpencodeServer("opencode-v1")).toBeNull();
   } finally {
     setEnv("AGETOR_TMUX_BIN", undefined);
+  }
+});
+
+/* ── A Stop's undelivered steers (K3), the wake input rebuild, the persisted watch ── */
+
+const backlogTexts = (taskId: string): string[] => db.tasks.get(taskId)?.backlog.map((b) => b.text) ?? [];
+/** The steer-requeue handler the orchestrator installed (what the driver calls on a Stop). */
+function installedRequeueHandler(): (a: { taskId: string; runId: string; texts: string[]; uncertain: string[] }) => void {
+  const h = driverMod.setOpencodeSteerRequeueHandler(null);
+  driverMod.setOpencodeSteerRequeueHandler(h);
+  if (!h) throw new Error("no steer-requeue handler is installed");
+  return h;
+}
+/** Wrap the installed handler; `after` sees the task right after the orchestrator handled the call. Returns the restore. */
+function watchRequeue(after: (a: { taskId: string; runId: string; texts: string[]; uncertain: string[] }) => void): () => void {
+  const prev = installedRequeueHandler();
+  driverMod.setOpencodeSteerRequeueHandler((a) => {
+    prev(a);
+    after(a);
+  });
+  return () => driverMod.setOpencodeSteerRequeueHandler(prev);
+}
+/** A finished task on `agent` (one quick turn): its task row and that run. */
+async function finishedTask(agent = "opencode"): Promise<{ task: Task; runId: string }> {
+  const task = await newTask({ prompt: "quick", agent });
+  const runId = await start(task);
+  await settled(task.id);
+  return { task: db.tasks.get(task.id)!, runId };
+}
+
+test("a Stop's undelivered messages: proven ones become the next turn and uncertain ones go to the tray; archived, tearing down, exiting or switched tasks get them all in the tray; a task being deleted keeps nothing", async () => {
+  addHarness("opencode-k3");
+  addHarness("opencode-k3b");
+  const requeue = installedRequeueHandler();
+  try {
+    // An ordinary idle task: the proven text starts a turn at once (the run row
+    // is minted in the same call), the uncertain one waits in the tray.
+    const plain = await finishedTask("opencode-k3");
+    requeue({ taskId: plain.task.id, runId: plain.runId, texts: ["PROVEN-ONE"], uncertain: ["MAYBE-ONE"] });
+    expect(runsOf(plain.task.id)).toHaveLength(2);
+    expect(backlogTexts(plain.task.id)).toEqual(["MAYBE-ONE"]);
+    expect(statusOf(plain.runId).some((l) => l.startsWith("couldn't confirm OpenCode withdrew a message from the stopped turn"))).toBe(true);
+    await settled(plain.task.id);
+    expect(assistantOf(runsOf(plain.task.id)[1]!.id)).toContain("ACK: PROVEN-ONE");
+
+    // Archived: nothing runs, everything goes to the tray (kept: an unarchive shows it).
+    const archived = await finishedTask("opencode-k3");
+    db.tasks.update(archived.task.id, { column: "done" });
+    expect(await orch.archiveTask(archived.task.id)).not.toHaveProperty("error");
+    await orch.pendingTeardown(archived.task.id);
+    requeue({ taskId: archived.task.id, runId: archived.runId, texts: ["ARCH-P"], uncertain: ["ARCH-U"] });
+    expect(runsOf(archived.task.id)).toHaveLength(1);
+    expect(orch.__opencodeServerForTest.queuedFollowUps(archived.task.id)).toBe(0);
+    expect(backlogTexts(archived.task.id)).toEqual(["ARCH-P", "ARCH-U"]);
+    expect(statusOf(archived.runId)).toContain("2 undelivered messages not sent — the task was archived; saved to your backlog, resend from the tray");
+
+    // A teardown in progress (archive or delete queued): the tray.
+    const tearing = await finishedTask("opencode-k3");
+    let releaseTeardown!: () => void;
+    const teardownGate = new Promise<void>((r) => (releaseTeardown = r));
+    const held = orch.__enqueueTeardownForTest(tearing.task.id, `k3-${tearing.task.id}`, () => teardownGate);
+    try {
+      requeue({ taskId: tearing.task.id, runId: tearing.runId, texts: ["TEAR-P"], uncertain: [] });
+      expect(runsOf(tearing.task.id)).toHaveLength(1);
+      expect(backlogTexts(tearing.task.id)).toEqual(["TEAR-P"]);
+    } finally {
+      releaseTeardown();
+      await held;
+    }
+
+    // The process is exiting: the tray, never a turn that would be cut off.
+    const frozen = await finishedTask("opencode-k3");
+    orch.freezeLaunches();
+    try {
+      requeue({ taskId: frozen.task.id, runId: frozen.runId, texts: ["FROZEN-P"], uncertain: [] });
+    } finally {
+      orch.__resetLaunchFreezeForTest();
+    }
+    expect(runsOf(frozen.task.id)).toHaveLength(1);
+    expect(backlogTexts(frozen.task.id)).toEqual(["FROZEN-P"]);
+
+    // Switched to another OpenCode harness since the stopped run: the tray, not a turn on the new harness.
+    const switched = await finishedTask("opencode-k3");
+    db.tasks.update(switched.task.id, { agent: "opencode-k3b" });
+    requeue({ taskId: switched.task.id, runId: switched.runId, texts: ["SWITCH-P"], uncertain: [] });
+    expect(runsOf(switched.task.id)).toHaveLength(1);
+    expect(backlogTexts(switched.task.id)).toEqual(["SWITCH-P"]);
+    expect(statusOf(switched.runId)).toContain("undelivered message not sent — the task switched harness; saved to your backlog, resend from the tray");
+
+    // Being deleted (its delete waits behind a teardown here): nothing is kept or run.
+    const doomed = await finishedTask("opencode-k3");
+    let releaseDelete!: () => void;
+    const deleteGate = new Promise<void>((r) => (releaseDelete = r));
+    const gate = orch.__enqueueTeardownForTest(doomed.task.id, doomed.task.workdir, () => deleteGate);
+    const deleting = orch.deleteTask(doomed.task.id);
+    try {
+      requeue({ taskId: doomed.task.id, runId: doomed.runId, texts: ["DEL-P"], uncertain: ["DEL-U"] });
+      expect(runsOf(doomed.task.id)).toHaveLength(1);
+      expect(orch.__opencodeServerForTest.queuedFollowUps(doomed.task.id)).toBe(0);
+      expect(backlogTexts(doomed.task.id)).toEqual([]);
+    } finally {
+      releaseDelete();
+      await gate;
+      await deleting;
+    }
+    expect(db.tasks.get(doomed.task.id)).toBeNull();
+  } finally {
+    await serverMod.stopOpencodeServer("opencode-k3");
+  }
+});
+
+test("archive with Stop of a turn holding a steer OpenCode never delivered: the steer goes to the archived task's tray, and no turn starts on it", async () => {
+  addHarness("opencode-k3c");
+  try {
+    const task = await newTask({ prompt: `first ${fakeMarkers.slow}`, agent: "opencode-k3c" });
+    const runId = await start(task);
+    await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+    expect(await orch.sendInput(runId, "PARKED-ARCHIVE")).toMatchObject({ delivered: true, runId });
+    await waitFor(() => eventsOf(runId, "user").length === 2, 10_000, "the steered bubble");
+    expect(await orch.archiveTask(task.id, { force: true, stopRun: true })).not.toHaveProperty("error");
+    await waitFor(() => backlogTexts(task.id).includes("PARKED-ARCHIVE"), 20_000, "the steer in the tray");
+    await waitFor(() => doneHandled(runId), 20_000, "the done handler");
+    expect(db.runs.get(runId)!.status).toBe("cancelled");
+    expect(runsOf(task.id)).toHaveLength(1);
+    expect(orch.__opencodeServerForTest.queuedFollowUps(task.id)).toBe(0);
+    expect(db.tasks.get(task.id)!.archivedAt).not.toBeNull();
+    expect(await serverClient("opencode-k3c").listInbox(sessionOf(task.id)!)).toEqual([]);
+  } finally {
+    await serverMod.stopOpencodeServer("opencode-k3c");
+  }
+});
+
+test("delete of a turn holding a steer OpenCode never delivered: the steer is dropped with the task, never queued or run", async () => {
+  addHarness("opencode-k3d");
+  const seen: { texts: string[]; queued: number; runs: number }[] = [];
+  const restore = watchRequeue((a) =>
+    seen.push({ texts: [...a.texts, ...a.uncertain], queued: orch.__opencodeServerForTest.queuedFollowUps(a.taskId), runs: db.runs.listForTask(a.taskId).length }),
+  );
+  try {
+    const task = await newTask({ prompt: `first ${fakeMarkers.slow}`, agent: "opencode-k3d" });
+    const runId = await start(task);
+    await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+    const sid = sessionOf(task.id)!;
+    expect(await orch.sendInput(runId, "PARKED-DELETE")).toMatchObject({ delivered: true, runId });
+    await waitFor(() => eventsOf(runId, "user").length === 2, 10_000, "the steered bubble");
+    await orch.deleteTask(task.id);
+    await waitFor(() => seen.length > 0, 20_000, "the Stop handing the steer back");
+    expect(seen[0]!.texts).toEqual(["PARKED-DELETE"]);
+    // Right after the orchestrator handled it: not queued, and no run minted for it.
+    expect(seen[0]!).toMatchObject({ queued: 0, runs: 1 });
+    expect(db.tasks.get(task.id)).toBeNull();
+    const msgs = (await serverClient("opencode-k3d").listMessages(sid, { limit: 200, order: "asc" })).data as { type?: string; text?: string }[];
+    expect(msgs.some((m) => m.type === "user" && String(m.text ?? "").includes("PARKED-DELETE"))).toBe(false);
+  } finally {
+    restore();
+    await serverMod.stopOpencodeServer("opencode-k3d");
+  }
+});
+
+test("a harness switch (to another OpenCode harness, or away from OpenCode) during a turn holding an undelivered steer: the steer goes to the tray, no turn runs it on the new harness", async () => {
+  addHarness("opencode-k3e");
+  addHarness("opencode-k3f");
+  try {
+    for (const target of ["opencode-k3f", "codex"]) {
+      const task = await newTask({ prompt: `first ${fakeMarkers.slow}`, agent: "opencode-k3e" });
+      const runId = await start(task);
+      await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+      const text = `PARKED-SWITCH-${target}`;
+      expect(await orch.sendInput(runId, text)).toMatchObject({ delivered: true, runId });
+      await waitFor(() => eventsOf(runId, "user").length === 2, 10_000, "the steered bubble");
+      const before = db.tasks.get(task.id)!;
+      const after = db.tasks.update(task.id, { agent: target })!;
+      await orch.reconcileTaskSession(task.id, before, after);
+      await waitFor(() => backlogTexts(task.id).includes(text), 20_000, `the steer in the tray (${target})`);
+      await waitFor(() => doneHandled(runId), 20_000, "the done handler");
+      expect(runsOf(task.id)).toHaveLength(1);
+      expect(orch.__opencodeServerForTest.queuedFollowUps(task.id)).toBe(0);
+      expect(statusOf(runId)).toContain("undelivered message not sent — the task switched harness; saved to your backlog, resend from the tray");
+    }
+  } finally {
+    await serverMod.stopOpencodeServer("opencode-k3e");
+  }
+});
+
+test("a wake the hub could not see enqueued is classified at once, from the idle record before it started: a Stop's tail that already ended is interrupted, never minted", async () => {
+  addSlowHarness("opencode-blind");
+  try {
+    const task = await newTask({ prompt: `launch ${fakeMarkers.wake}`, agent: "opencode-blind" });
+    const first = await start(task);
+    await waitFor(() => db.runs.get(first)!.status === "succeeded", 60_000, "the first turn");
+    await waitFor(() => db.subagents.listForTask(task.id).some((x) => x.status === "running"), 30_000, "the background child");
+    const sid = sessionOf(task.id)!;
+    const [child] = subagentsMod.listOpenOpencodeChildSessions(task.id);
+    const c = serverClient("opencode-blind");
+    // agetor stops the child while no core listens (the hub never sees the
+    // notice enqueued nor the execution it starts on the parent).
+    orch.stopOpencodeServerDriver();
+    let startedAt = 0;
+    try {
+      subagentsMod.noteOpencodeChildStoppedByAgetor({ taskId: task.id, childSessionId: child! });
+      startedAt = Date.now();
+      expect(await c.interrupt(child!)).toBe(true);
+      for (let i = 0; i < 200 && !(sid in (await c.activeSessions())); i++) await sleep(10);
+      expect(sid in (await c.activeSessions())).toBe(true);
+      // That execution is over (its own idle record is now the newest one).
+      await c.interrupt(sid);
+      for (let i = 0; i < 400 && sid in (await c.activeSessions()); i++) await sleep(25);
+    } finally {
+      orch.startOpencodeServerDriver();
+    }
+    await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode-blind", sid) === task.id, 10_000, "the wake watch");
+    const before = orch.__opencodeServerForTest.wakeLog().length;
+    // What the hub reports for such a session after a reconnect: `known: false`.
+    orch.__opencodeServerForTest.wake("opencode-blind", sid, { type: "session.execution.started", id: `evt_blind_${task.id}`, created: startedAt }, { items: [], known: false });
+    await waitFor(() => orch.__opencodeServerForTest.wakeLog().length > before, 15_000, "the wake decision");
+    expect(wakesOf(sid)).toContain("interrupted-tail");
+    expect(wakesOf(sid)).not.toContain("minted");
+    expect(runsOf(task.id)).toHaveLength(1);
+  } finally {
+    await serverMod.stopOpencodeServer("opencode-blind");
+  }
+});
+
+test("restart, reattach, then a Stop OpenCode never confirms: the still-open execution is interrupted on retry, never minted as a wake run", async () => {
+  addHarness("opencode-stuck2");
+  const restoreTimings = driverMod.__forTest.setTimings({ stopConfirmMs: 500 });
+  try {
+    const task = await newTask({ prompt: `run ${fakeMarkers.stuck}`, agent: "opencode-stuck2" });
+    const runId = await start(task);
+    await waitFor(() => eventsOf(runId, "tool_use").length > 0, 30_000, "the tool step");
+    const sid = sessionOf(task.id)!;
+    // The core goes away and comes back: the run reattaches to the execution.
+    orch.stopOpencodeServerDriver();
+    serverMod.__forTest.forget();
+    expect((await serverMod.adoptOpencodeServers()).map((h) => h.harnessId)).toContain("opencode-stuck2");
+    await orch.reconcileOrphans();
+    expect(db.runs.get(runId)!.status).toBe("running");
+    orch.startOpencodeServerDriver();
+    await waitFor(() => statusOf(runId).some((s) => s.includes("reconnected to live session")), 30_000, "the reattach");
+    await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode-stuck2", sid) === task.id, 10_000, "the wake watch");
+    expect(await orch.cancelRun(runId)).toBe(true);
+    await waitFor(() => doneHandled(runId), 20_000, "the done handler");
+    expect(db.runs.get(runId)!.status).toBe("cancelled");
+    await waitFor(() => wakesOf(sid).includes("interrupted-stopped"), 15_000, "the stopped execution's interrupt");
+    expect(sid in (await serverClient("opencode-stuck2").activeSessions())).toBe(true); // the stuck fake ignores interrupts
+    expect(wakesOf(sid)).not.toContain("minted");
+    expect(runsOf(task.id)).toHaveLength(1);
+    expect(runsOf(task.id).some((r) => r.origin === "agent")).toBe(false);
+  } finally {
+    restoreTimings();
+    await serverMod.stopOpencodeServer("opencode-stuck2");
+  }
+});
+
+test("a harness switch keeps the old session watched (persisted tombstone): an execution on it after the task ran on the new harness is interrupted", async () => {
+  addHarness("opencode-ts1");
+  addHarness("opencode-ts2");
+  try {
+    const { task } = await finishedTask("opencode-ts1");
+    const oldSid = sessionOf(task.id)!;
+    const before = db.tasks.get(task.id)!;
+    await orch.reconcileTaskSession(task.id, before, db.tasks.update(task.id, { agent: "opencode-ts2" })!);
+    // A turn on the new harness: the task's last run names a new session now.
+    const next = await start(db.tasks.get(task.id)!);
+    await settled(task.id);
+    expect(db.runs.get(next)!.opencodeSessionId).not.toBe(oldSid);
+    await orch.__opencodeServerForTest.refreshWatchNow();
+    expect(orch.__opencodeServerForTest.watchedTask("opencode-ts1", oldSid)).toBe(task.id);
+    expect(db.opencodeWatchTombstones.live(Date.now()).some((t) => t.sessionId === oldSid && t.harnessId === "opencode-ts1")).toBe(true);
+    await executeOnServer(oldSid, `stray ${fakeMarkers.slow}`, "opencode-ts1");
+    await expectInterrupted(oldSid, "opencode-ts1");
+    expect(wakesOf(oldSid)).toContain("interrupted-no-card");
+  } finally {
+    await serverMod.stopOpencodeServer("opencode-ts1");
+    await serverMod.stopOpencodeServer("opencode-ts2");
+  }
+});
+
+test("a tombstone written by an earlier core is watched at refresh: an execution on a deleted task's session is interrupted", async () => {
+  addHarness("opencode-ts3");
+  try {
+    const { task } = await finishedTask("opencode-ts3");
+    const sid = sessionOf(task.id)!;
+    // An earlier core deleted the task and left only its tombstone (this core never ran the delete).
+    db.tasks.delete(task.id);
+    expect(db.runs.listForTask(task.id)).toHaveLength(0);
+    const now = Date.now();
+    db.opencodeWatchTombstones.put([{ sessionId: sid, harnessId: "opencode-ts3", taskId: task.id }], now + 60 * 60_000, now);
+    await orch.__opencodeServerForTest.refreshWatchNow();
+    expect(orch.__opencodeServerForTest.watchedTask("opencode-ts3", sid)).toBe(task.id);
+    await executeOnServer(sid, `later ${fakeMarkers.slow}`, "opencode-ts3");
+    await expectInterrupted(sid, "opencode-ts3");
+    expect(wakesOf(sid)).toContain("interrupted-no-card");
+    // And a delete run here writes one.
+    const other = await finishedTask("opencode-ts3");
+    const otherSid = sessionOf(other.task.id)!;
+    await orch.deleteTask(other.task.id);
+    expect(db.opencodeWatchTombstones.live(Date.now()).find((t) => t.sessionId === otherSid)).toMatchObject({ harnessId: "opencode-ts3", taskId: other.task.id });
+  } finally {
+    await serverMod.stopOpencodeServer("opencode-ts3");
+  }
+});
+
+test("archive keeps every OpenCode session of the task watched, not only its last run's: an execution on an older one is interrupted", async () => {
+  addHarness("opencode-ts4");
+  try {
+    const { task } = await finishedTask("opencode-ts4");
+    const olderSid = sessionOf(task.id)!;
+    // A later run of the task on another session (its last run names that one).
+    const t = Date.now();
+    db.runs.insert({
+      id: crypto.randomUUID(), taskId: task.id, agent: "opencode-ts4", status: "succeeded", startedAt: t, endedAt: t, exitCode: 0,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
+      fxSessionId: null, antigravitySessionId: null, opencodeSessionId: `ses_later${task.id.replace(/-/g, "").slice(0, 12)}`,
+    });
+    expect(sessionOf(task.id)).not.toBe(olderSid);
+    db.tasks.update(task.id, { column: "done" });
+    expect(await orch.archiveTask(task.id)).not.toHaveProperty("error");
+    await orch.pendingTeardown(task.id);
+    await orch.__opencodeServerForTest.refreshWatchNow();
+    expect(orch.__opencodeServerForTest.watchedTask("opencode-ts4", olderSid)).toBe(task.id);
+    await executeOnServer(olderSid, `stray ${fakeMarkers.slow}`, "opencode-ts4");
+    await expectInterrupted(olderSid, "opencode-ts4");
+    expect(wakesOf(olderSid)).toContain("interrupted-no-card");
+  } finally {
+    await serverMod.stopOpencodeServer("opencode-ts4");
+  }
+});
+
+test("a wake run being minted counts as the server busy, and one whose input holds a message says OpenCode picked up a queued message", async () => {
+  addHarness("opencode-mint");
+  try {
+    const { task } = await finishedTask("opencode-mint");
+    const sid = sessionOf(task.id)!;
+    await waitFor(() => orch.__opencodeServerForTest.watchedTask("opencode-mint", sid) === task.id, 10_000, "the wake watch");
+    expect(orch.__opencodeServerForTest.turnHooks("opencode-mint", "another-run", "another-task").isBusy()).toBe(false);
+    orch.__opencodeServerForTest.wake(
+      "opencode-mint",
+      sid,
+      { type: "session.execution.started", id: `evt_mint_${task.id}`, created: Date.now() },
+      { items: [{ inboxId: "msg_queued_user", synthetic: false }], known: true },
+    );
+    // The claim is held and the run not registered yet: the restart gate is closed.
+    expect(orch.__opencodeServerForTest.turnHooks("opencode-mint", "another-run", "another-task").isBusy()).toBe(true);
+    await waitFor(() => runsOf(task.id).length === 2, 10_000, "the wake run");
+    const woke = runsOf(task.id)[1]!;
+    expect(woke.origin).toBe("agent");
+    expect(statusOf(woke.id)).toContain(ocsMod.OPENCODE_WAKE_QUEUED_MESSAGE_STATUS);
+    expect(statusOf(woke.id)).not.toContain(ocsMod.OPENCODE_WAKE_ON_ITS_OWN_STATUS);
+    await settled(task.id, 30_000);
+  } finally {
+    await serverMod.stopOpencodeServer("opencode-mint");
   }
 });
 

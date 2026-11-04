@@ -718,7 +718,69 @@ test("sync never revives an orphaned row the server does not list as active; a p
   const finished = stubClient([...msgs, idleMsg("succeeded")]);
   await mod.syncOpencodeChildFromServer({ taskId, runId, client: finished.client, childSessionId: done });
   expect(row(done).status).toBe("completed");
-  expect(finished.calls.activeSessions).toBe(0);
+  expect(finished.calls.activeSessions).toBe(1); // read ahead of the messages, then the tail decides
+});
+
+// A server whose child finishes the moment the first of the sync's reads has
+// been answered, whichever read that is: from then on the messages carry the
+// final output and the idle record, and the active list leaves the child out
+// (OpenCode does both at the same instant, live-verified 2.1.3, Q11).
+function finishingClient(child: string, before: unknown[], after: unknown[], onFirstListMessages?: () => void) {
+  let finished = false;
+  let listed = 0;
+  const calls: string[] = [];
+  const client = {
+    async activeSessions() {
+      calls.push("active");
+      const out = finished ? {} : { [child]: { type: "running" } };
+      finished = true;
+      return out;
+    },
+    async getSession() {
+      return null;
+    },
+    async listMessages() {
+      calls.push("messages");
+      const out = finished ? after : before;
+      if (listed++ === 0) onFirstListMessages?.();
+      finished = true;
+      return { data: out.slice().reverse(), cursor: {} };
+    },
+  };
+  return { client: client as unknown as OpencodeClient, calls };
+}
+
+test("an orphaned child that finishes during the sync settles from its idle record with its last output, never failed (active list read first)", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const child = childId("race1");
+  reg(taskId, runId, child);
+  db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", Date.now() - 1000);
+  const before = [userMsg("msg_u1"), asstMsg("msg_a1", "working")];
+  const after = [...before, asstMsg("msg_a2", "the last words"), idleMsg("succeeded")];
+  const { client, calls } = finishingClient(child, before, after);
+  await mod.syncOpencodeChildFromServer({ taskId, runId, client, childSessionId: child });
+  expect(calls).toEqual(["active", "messages"]);
+  expect(row(child).status).toBe("completed");
+  expect(childEvents(child).map((e) => e.data)).toEqual(["working", "the last words"]);
+  expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([]);
+});
+
+test("a row orphaned while the sync reads its messages gets a second pass with the active list first, so a child that finished meanwhile is not failed", async () => {
+  installEmitter();
+  const { taskId, runId } = seedTask();
+  const child = childId("race2");
+  reg(taskId, runId, child);
+  const before = [userMsg("msg_u1"), asstMsg("msg_a1", "working")];
+  const after = [...before, asstMsg("msg_a2", "done now"), idleMsg("succeeded")];
+  // The turn's teardown parks the running row while the first page is in flight.
+  const { client, calls } = finishingClient(child, before, after, () => {
+    db.subagents.setStatus(mod.opencodeSubagentId(child), "orphaned", Date.now());
+  });
+  await mod.syncOpencodeChildFromServer({ taskId, runId, client, childSessionId: child });
+  expect(calls).toEqual(["messages", "active", "messages"]);
+  expect(row(child).status).toBe("completed");
+  expect(childEvents(child).map((e) => e.data)).toEqual(["working", "done now"]);
 });
 
 test("a child the server answers 404 for is settled for good: failed once, never revived by a later sync (S6)", async () => {
@@ -941,6 +1003,44 @@ test("a dead child agetor itself stopped settles as cancelled, not failed", asyn
   mod.noteOpencodeChildStoppedByAgetor({ taskId, childSessionId: child });
   await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([userMsg("msg_u1")]).client, childSessionId: child });
   expect(row(child).status).toBe("cancelled");
+});
+
+test("orphanOpencodeChild parks one running row (same status line), leaves its siblings and other tasks alone, and is idempotent", async () => {
+  installEmitter();
+  const fired: string[] = [];
+  const prev = mod.setOpencodeSubagentSettleHook((id) => fired.push(id));
+  try {
+    const { taskId, runId } = seedTask();
+    seedBreadcrumb(runId, 2, "agetor");
+    const dead = childId("ocd");
+    const live = childId("ocl");
+    for (const c of [dead, live]) reg(taskId, runId, c, { title: "Job" });
+    const other = seedTask();
+    const otherChild = childId("oco");
+    reg(other.taskId, other.runId, otherChild);
+    fired.length = 0;
+
+    expect(mod.orphanOpencodeChild(taskId, dead)).toBe(true);
+    expect([row(dead).status, row(live).status]).toEqual(["orphaned", "running"]);
+    expect(fired).toEqual([taskId]);
+    expect(emitted.filter((e) => e.stream === "status").map((e) => e.data)).toEqual([
+      'OpenCode subagent "Job" was left unfinished — the OpenCode server stopped',
+    ]);
+    // Idempotent, and never another task's row or an unknown child.
+    expect(mod.orphanOpencodeChild(taskId, dead)).toBe(false);
+    expect(mod.orphanOpencodeChild(taskId, otherChild)).toBe(false);
+    expect(mod.orphanOpencodeChild(taskId, childId("ocx"))).toBe(false);
+    expect(row(otherChild).status).toBe("running");
+    expect(fired).toEqual([taskId]);
+    expect(emitted.filter((e) => e.stream === "status").length).toBe(1);
+
+    // The next sync against a server that no longer runs it settles it for good.
+    await mod.syncOpencodeChildFromServer({ taskId, runId, client: stubClient([userMsg("msg_u1")]).client, childSessionId: dead });
+    expect(row(dead).status).toBe("failed");
+    expect(row(live).status).toBe("running");
+  } finally {
+    mod.setOpencodeSubagentSettleHook(prev);
+  }
 });
 
 test("orphanRunningOpencodeChildrenOfTask parks a lost server's running children orphaned, leaves settled rows and other tasks alone (S10)", async () => {

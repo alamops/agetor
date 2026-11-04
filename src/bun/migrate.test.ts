@@ -1995,9 +1995,9 @@ test("077_copilot_harness is only backfilled, never re-run, on a DB that already
   db.close();
 });
 
-test("082 (opencode child bookkeeping) is the last registered migration, after 081 (cursor asks)", () => {
+test("082 (opencode child bookkeeping) follows 081 (cursor asks)", () => {
   const at = migrations.findIndex((m) => m.id === "082_opencode_child_bookkeeping");
-  expect(at).toBe(migrations.length - 1);
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("081_cursor_asks");
   expect(migrations[at]?.aliases).toBeUndefined();
   expect(migrations[at]?.sql).toContain("CREATE TABLE opencode_stopped_children");
@@ -2012,7 +2012,7 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
     INSERT INTO subagents (id, task_id, parent_kind, source_path, status, started_at, ended_at)
       VALUES ('opencode-ses_1', 't1', 'opencode_subagent', 'opencode-session:ses_1', 'orphaned', 1, 2);
   `);
-  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping"]);
+  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones"]);
   expect(columnNames(db, "opencode_stopped_children")).toEqual(["child_session_id", "task_id", "stopped_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_stopped_children)`).all()).toEqual([]);
   // A note for a task id that doesn't exist (or no longer does) is accepted.
@@ -2022,6 +2022,32 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
   const indexes = db.query<{ name: string }, []>(`SELECT name FROM sqlite_master WHERE type = 'index'`).all().map((r) => r.name);
   expect(indexes).toEqual(expect.arrayContaining(["idx_subagents_opencode_status", "opencode_stopped_children_at_idx"]));
   expect(db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM subagents INDEXED BY idx_subagents_opencode_status WHERE status = 'orphaned' AND parent_kind = 'opencode_subagent'`).get()?.n).toBe(1);
+  db.close();
+});
+
+test("083 (opencode watch tombstones) is the last registered migration, after 082 (opencode child bookkeeping)", () => {
+  const at = migrations.findIndex((m) => m.id === "083_opencode_watch_tombstones");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("082_opencode_child_bookkeeping");
+  expect(migrations[at]?.aliases).toBeUndefined();
+  expect(migrations[at]?.sql).toContain("CREATE TABLE opencode_watch_tombstones");
+  expect(migrations[at]?.sql).toContain("CREATE INDEX opencode_watch_tombstones_expires_idx");
+});
+
+test("083 adds opencode_watch_tombstones (no foreign key, session id primary key, expiry index) on an 082 DB", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "082_opencode_child_bookkeeping");
+  db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'opencode', '/w', 1, 1)`);
+  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones"]);
+  expect(columnNames(db, "opencode_watch_tombstones")).toEqual(["session_id", "harness_id", "task_id", "expires_at"]);
+  expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_watch_tombstones)`).all()).toEqual([]);
+  // A tombstone outlives its task: a task id that doesn't exist is accepted.
+  db.exec(`PRAGMA foreign_keys = ON`);
+  db.run(`INSERT INTO opencode_watch_tombstones (session_id, harness_id, task_id, expires_at) VALUES ('ses_x', 'opencode', 'gone-task', 5)`);
+  expect(() => db.run(`INSERT INTO opencode_watch_tombstones (session_id, harness_id, task_id, expires_at) VALUES ('ses_x', 'opencode', 't1', 6)`)).toThrow();
+  const indexes = db.query<{ name: string }, []>(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'opencode_watch_tombstones'`).all().map((r) => r.name);
+  expect(indexes).toEqual(expect.arrayContaining(["opencode_watch_tombstones_expires_idx"]));
+  expect(migrate(db, migrations)).toEqual([]);
   db.close();
 });
 
@@ -2067,6 +2093,7 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
     "080_harness_auto_enabled",
     "081_cursor_asks",
     "082_opencode_child_bookkeeping",
+    "083_opencode_watch_tombstones",
   ]);
   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 

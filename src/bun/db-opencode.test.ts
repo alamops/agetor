@@ -529,13 +529,23 @@ test("subagents.opencodeOrphanedTaskIdsSince and settledOpencodeChildSessionIds 
   // Unpinned, the planner picks the 082 index on its own; the method pins it anyway.
   expect(orphanedPlan.join(" | ")).toContain("SEARCH subagents USING INDEX idx_subagents_opencode_status (status=?)");
   expect(orphanedPlan.some((d) => /^SCAN subagents/.test(d))).toBe(false);
-  const settledPlan = planOf(
-    `SELECT source_path FROM subagents INDEXED BY idx_subagents_opencode_status
-      WHERE status IN ('completed', 'failed', 'cancelled', 'orphaned') AND task_id = ?1 AND parent_kind = 'opencode_subagent'
-        AND (status != 'orphaned' OR COALESCE(ended_at, started_at) < ?2)`,
-    task.id, t,
-  );
+  // The statement the method really prepares (captured, as for
+  // `lastOpencodeSessionRunPerTask`), not a hand-written copy of it.
+  const seen: string[] = [];
+  const realQuery = db.query;
+  (db as unknown as { query: typeof db.query }).query = function (this: typeof db, sql: string) {
+    if (sql.includes("FROM subagents") && sql.includes("source_path")) seen.push(sql);
+    return realQuery.call(this, sql);
+  } as typeof db.query;
+  try {
+    subagents.settledOpencodeChildSessionIds(task.id, t);
+  } finally {
+    (db as unknown as { query: typeof db.query }).query = realQuery;
+  }
+  expect(seen).toHaveLength(1);
+  const settledPlan = planOf(seen[0]!, task.id, t);
   expect(settledPlan.join(" | ")).toContain("SEARCH subagents USING INDEX idx_subagents_opencode_status (status=? AND task_id=?)");
+  expect(settledPlan.some((d) => /^SCAN subagents/.test(d))).toBe(false);
 });
 
 test("opencodeStoppedChildren notes by primary key, refreshes on re-note and prunes through its time index", async () => {
@@ -553,4 +563,40 @@ test("opencodeStoppedChildren notes by primary key, refreshes on re-note and pru
   expect(opencodeStoppedChildren.stoppedAt("ses_none")).toBeNull();
   expect(planOf(`SELECT stopped_at FROM opencode_stopped_children WHERE child_session_id = ?`, "x").join(" | ")).toContain("USING INDEX sqlite_autoindex_opencode_stopped_children_1");
   expect(planOf(`DELETE FROM opencode_stopped_children WHERE stopped_at < ?`, 1).join(" | ")).toContain("opencode_stopped_children_at_idx");
+});
+
+test("opencodeWatchTombstones: put records and extends by session, live lists only unexpired rows soonest first, writes prune expired rows and cap the table", async () => {
+  const { opencodeWatchTombstones } = await import("./db.ts");
+  db.run(`DELETE FROM opencode_watch_tombstones`);
+  opencodeWatchTombstones.put([{ sessionId: "ses_a", harnessId: "opencode", taskId: "task-1" }, { sessionId: "ses_b", harnessId: "opencode-2", taskId: "task-1" }], 1_000, 0);
+  expect(opencodeWatchTombstones.live(0)).toEqual([
+    { sessionId: "ses_a", harnessId: "opencode", taskId: "task-1", expiresAt: 1_000 },
+    { sessionId: "ses_b", harnessId: "opencode-2", taskId: "task-1", expiresAt: 1_000 },
+  ]);
+  // Re-tombstoned (another task, later): moves to the new task, and never shortens.
+  opencodeWatchTombstones.put([{ sessionId: "ses_a", harnessId: "opencode", taskId: "task-2" }], 2_000, 10);
+  opencodeWatchTombstones.put([{ sessionId: "ses_a", harnessId: "opencode", taskId: "task-2" }], 1_500, 10);
+  expect(opencodeWatchTombstones.live(10).map((r) => [r.sessionId, r.taskId, r.expiresAt])).toEqual([["ses_b", "task-1", 1_000], ["ses_a", "task-2", 2_000]]);
+  // Expired rows are not live, and the next write removes them.
+  expect(opencodeWatchTombstones.live(1_000).map((r) => r.sessionId)).toEqual(["ses_a"]);
+  opencodeWatchTombstones.put([{ sessionId: "ses_c", harnessId: "opencode", taskId: "task-3" }], 3_000, 1_000);
+  expect(db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM opencode_watch_tombstones WHERE session_id = 'ses_b'`).get()!.n).toBe(0);
+  // The cap keeps the rows expiring last.
+  opencodeWatchTombstones.put(
+    [{ sessionId: "ses_d", harnessId: "opencode", taskId: "t" }, { sessionId: "ses_e", harnessId: "opencode", taskId: "t" }],
+    4_000,
+    1_000,
+    3,
+  );
+  expect(opencodeWatchTombstones.live(1_000).map((r) => r.sessionId).sort()).toEqual(["ses_c", "ses_d", "ses_e"]);
+  expect(opencodeWatchTombstones.live(1_000, 2).map((r) => r.sessionId)).toEqual(["ses_c", expect.stringMatching(/^ses_[de]$/)]);
+  // Every statement goes through the expiry index or the primary key.
+  expect(planOf(`SELECT session_id FROM opencode_watch_tombstones WHERE expires_at > ? ORDER BY expires_at ASC LIMIT ?`, 1, 5).join(" | ")).toContain("opencode_watch_tombstones_expires_idx");
+  expect(planOf(`DELETE FROM opencode_watch_tombstones WHERE expires_at <= ?`, 1).join(" | ")).toContain("opencode_watch_tombstones_expires_idx");
+  const capPlan = planOf(
+    `DELETE FROM opencode_watch_tombstones WHERE expires_at < (SELECT expires_at FROM opencode_watch_tombstones ORDER BY expires_at DESC LIMIT 1 OFFSET ?)`,
+    1,
+  );
+  expect(capPlan.some((d) => /^SCAN opencode_watch_tombstones\b(?!.*INDEX)/.test(d))).toBe(false);
+  db.run(`DELETE FROM opencode_watch_tombstones`);
 });

@@ -4153,6 +4153,58 @@ export const opencodeStoppedChildren = {
   },
 };
 
+/** One OpenCode session still watched after its task let go of it (migration 083). */
+export interface OpencodeWatchTombstone {
+  sessionId: string;
+  harnessId: string;
+  taskId: string;
+  expiresAt: number;
+}
+
+/**
+ * The OpenCode sessions watched after their task was deleted, archived or
+ * switched to another harness (migration 083): an execution the server starts
+ * on one is interrupted. Only `orchestrator-opencode-server.ts` reads and
+ * writes it. Bounded: expired rows go on every write, and the table keeps at
+ * most `max` rows (the ones expiring last).
+ */
+export const opencodeWatchTombstones = {
+  /** Record (or extend) a tombstone per session until `expiresAt`, dropping expired rows and the overflow in the same transaction. */
+  put(
+    rows: { sessionId: string; harnessId: string; taskId: string }[],
+    expiresAt: number,
+    now: number,
+    max = 500,
+  ): void {
+    db.transaction(() => {
+      db.run(`DELETE FROM opencode_watch_tombstones WHERE expires_at <= ?`, [now]);
+      for (const r of rows) {
+        db.run(
+          `INSERT INTO opencode_watch_tombstones (session_id, harness_id, task_id, expires_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET harness_id = excluded.harness_id, task_id = excluded.task_id,
+               expires_at = MAX(expires_at, excluded.expires_at)`,
+          [r.sessionId, r.harnessId, r.taskId, expiresAt],
+        );
+      }
+      // Fewer than `max` rows: the subquery is NULL and nothing goes.
+      db.run(
+        `DELETE FROM opencode_watch_tombstones WHERE expires_at < (
+           SELECT expires_at FROM opencode_watch_tombstones ORDER BY expires_at DESC LIMIT 1 OFFSET ?)`,
+        [Math.max(0, max - 1)],
+      );
+    })();
+  },
+  /** The tombstones still in force at `now`, soonest to expire first (at most `limit`). */
+  live(now: number, limit = 500): OpencodeWatchTombstone[] {
+    return db
+      .query<OpencodeWatchTombstone, [number, number]>(
+        `SELECT session_id AS sessionId, harness_id AS harnessId, task_id AS taskId, expires_at AS expiresAt
+           FROM opencode_watch_tombstones WHERE expires_at > ? ORDER BY expires_at ASC LIMIT ?`,
+      )
+      .all(now, limit);
+  },
+};
+
 /** Outcome stored on `cursor_asks`. Null in the table means still open. */
 export type CursorAskOutcome = "answered" | "skipped" | "cancelled";
 

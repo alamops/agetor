@@ -5,8 +5,10 @@ import {
   closeOpencodeHub,
   opencodeOwnedSessions,
   setOpencodeWakeHandler,
+  opencodeInboxItemCancelled,
   setOpencodeWatchLostHandler,
   subscribeOpencodeSession,
+  waitOpencodeInboxItemCancelled,
   watchOpencodeSessionsForWake,
   type OpencodeHubOrigin,
   type OpencodeHubSubscriber,
@@ -40,6 +42,7 @@ afterEach(async () => {
   __forTest.clearHooks();
   __forTest.resetBackoff();
   __forTest.resetPendingCaps();
+  __forTest.resetFateMemory();
   warnSpy.mockRestore();
   for (const s of servers.splice(0)) await s.stop();
 });
@@ -472,11 +475,24 @@ describe("wake", () => {
 
   describe("wake input (C1)", () => {
     // A scripted event stream: the test pushes SSE envelopes by hand. `active`
-    // is what GET /api/session/active answers.
+    // is what GET /api/session/active answers. `inbox` models each session's
+    // undelivered items the way OpenCode keeps them: a pushed enqueue adds one,
+    // a pushed delivery or cancel removes it, and nothing else does (an
+    // interrupted execution leaves its items parked, r3 Q2/Q2b/Q5). A test can
+    // also `park` an item the hub never saw (enqueued while it was not
+    // listening). GET /api/session/{id}/inbox answers it, or 500 while
+    // `inboxFail` is set.
+    type RawInbox = { id: string; sessionID: string; type: string; payload: { text: string; metadata?: Record<string, unknown> }; delivery: string };
     function scripted() {
       let ctl!: ReadableStreamDefaultController<Uint8Array>;
       const enc = new TextEncoder();
-      const state = { active: {} as Record<string, unknown>, activeCalls: 0 };
+      const state = {
+        active: {} as Record<string, unknown>,
+        activeCalls: 0,
+        inbox: {} as Record<string, RawInbox[]>,
+        inboxCalls: {} as Record<string, number>,
+        inboxFail: false,
+      };
       const server = Bun.serve({
         port: 0,
         hostname: "127.0.0.1",
@@ -495,14 +511,31 @@ describe("wake", () => {
             state.activeCalls++;
             return Response.json({ data: state.active });
           }
+          const im = /^\/api\/session\/([^/]+)\/inbox$/.exec(u.pathname);
+          if (im && req.method === "GET") {
+            const sid = decodeURIComponent(im[1]!);
+            state.inboxCalls[sid] = (state.inboxCalls[sid] ?? 0) + 1;
+            if (state.inboxFail) return Response.json({ name: "UnknownError", data: { message: "boom" } }, { status: 500 });
+            return Response.json({ data: state.inbox[sid] ?? [] });
+          }
           return new Response("nf", { status: 404 });
         },
       });
+      const park = (sid: string, raw: Omit<RawInbox, "sessionID">) => (state.inbox[sid] ??= []).push({ ...raw, sessionID: sid });
       let n = 0;
-      const push = (type: string, data: Record<string, unknown>) =>
+      const push = (type: string, data: Record<string, unknown>) => {
+        const sid = data.sessionID as string;
+        const id = data.inboxID as string;
+        if (type === "session.inbox.enqueued") {
+          const item = data.item as { type: string; payload: RawInbox["payload"]; delivery: string };
+          if (!(state.inbox[sid] ?? []).some((i) => i.id === id)) park(sid, { id, type: item.type, payload: item.payload, delivery: item.delivery });
+        } else if (type === "session.inbox.delivered" || type === "session.inbox.cancelled") {
+          state.inbox[sid] = (state.inbox[sid] ?? []).filter((i) => i.id !== id);
+        }
         ctl.enqueue(enc.encode(`data: ${JSON.stringify({ id: `evt_${++n}`, created: n, type, data })}\n\n`));
+      };
       const drop = () => ctl.close();
-      return { server, push, drop, state, ref: { url: `http://127.0.0.1:${server.port}`, password: "pw-scripted" } };
+      return { server, push, drop, park, state, ref: { url: `http://127.0.0.1:${server.port}`, password: "pw-scripted" } };
     }
     type Push = (type: string, data: Record<string, unknown>) => void;
     const enqueueSynthetic = (push: Push, sid: string, inboxID: string, metadata: Record<string, unknown>) =>
@@ -685,7 +718,7 @@ describe("wake", () => {
       }
     });
 
-    test("(e) a wake from the connect snapshot is not known; after its end an idle re-check makes the next one known", async () => {
+    test("(e) a wake from the connect snapshot is not known; after its end an idle re-check that reads the inbox makes the next one known", async () => {
       const { server, push, state, ref } = scripted();
       try {
         const woke = recordWakes();
@@ -703,11 +736,13 @@ describe("wake", () => {
         push("session.execution.started", { sessionID: "ses_root" });
         await until(() => woke.length === 2, "second wake");
         expect(woke[1]!.input).toEqual({ items: [cancelledItem("inb_1", "ses_kid")], known: false });
-        // this time the session is idle after the end: from now on every enqueue is seen
+        expect(state.inboxCalls.ses_root ?? 0).toBe(0); // busy every time: no inbox read
+        // this time the session is idle after the end: its inbox is read (empty), and from now on every enqueue is seen
         delivered(push, "ses_root", "inb_1");
         state.active = {};
         push("session.execution.succeeded", { sessionID: "ses_root" });
-        await until(() => !__forTest.probe(KEY)!.blind.includes("ses_root"), "the post-end check saw the session idle");
+        await until(() => !__forTest.probe(KEY)!.blind.includes("ses_root"), "the post-end check read the idle session's inbox");
+        expect(state.inboxCalls.ses_root).toBe(1);
         push("session.execution.started", { sessionID: "ses_root" });
         await until(() => woke.length === 3, "live wake");
         expect(woke[2]!.input).toEqual({ items: [], known: true });
@@ -769,9 +804,9 @@ describe("wake", () => {
       }
     });
 
-    test("(f) a pending set trimmed by the per-session cap is not known until a delivery empties it", async () => {
+    test("(f) a pending set trimmed by the per-session cap stays not known when deliveries empty it; the idle inbox read restores the dropped item", async () => {
       __forTest.setPendingCaps({ perSession: 2 });
-      const { server, push, ref } = scripted();
+      const { server, push, state, ref } = scripted();
       try {
         const woke = recordWakes();
         await watchSeen(ref, ["ses_root"]);
@@ -779,21 +814,25 @@ describe("wake", () => {
         push("session.execution.started", { sessionID: "ses_root" });
         await until(() => woke.length === 1, "first wake");
         expect(woke[0]!.input).toEqual({ items: [cancelledItem("inb_2", "kid_inb_2"), cancelledItem("inb_3", "kid_inb_3")], known: false });
+        // the two the hub kept are delivered; inb_1 (dropped by the cap) is still parked on the server
         delivered(push, "ses_root", "inb_2");
         delivered(push, "ses_root", "inb_3");
         push("session.execution.succeeded", { sessionID: "ses_root" });
-        await until(() => !__forTest.probe(KEY)!.woken.includes("ses_root"), "first execution ended");
+        // the end asks the server: idle, so the inbox is read and becomes the pending set
+        // (the connect snapshot read it once already, empty)
+        await until(() => state.inboxCalls.ses_root === 2 && __forTest.probe(KEY)!.pending.ses_root?.length === 1, "the inbox read replaced the trimmed set");
+        expect(__forTest.probe(KEY)!.pending).toEqual({ ses_root: ["inb_1"] });
         push("session.execution.started", { sessionID: "ses_root" });
         await until(() => woke.length === 2, "second wake");
-        expect(woke[1]!.input).toEqual({ items: [], known: true });
+        expect(woke[1]!.input).toEqual({ items: [cancelledItem("inb_1", "kid_inb_1")], known: true });
       } finally {
         server.stop(true);
       }
     });
 
-    test("(f) the total cap trims the oldest item of all sessions; that session is not known until an idle check", async () => {
+    test("(f) the total cap trims the oldest item of all sessions; that session is not known until its idle inbox read, which brings the item back", async () => {
       __forTest.setPendingCaps({ total: 2 });
-      const { server, push, ref } = scripted();
+      const { server, push, state, ref } = scripted();
       try {
         const woke = recordWakes();
         await watchSeen(ref, ["ses_x", "ses_y"]);
@@ -805,12 +844,14 @@ describe("wake", () => {
         await until(() => woke.length === 2, "both wakes");
         expect(woke.find((w) => w.sid === "ses_x")!.input).toEqual({ items: [], known: false });
         expect(woke.find((w) => w.sid === "ses_y")!.input).toEqual({ items: [cancelledItem("y1", "ky1"), cancelledItem("y2", "ky2")], known: true });
-        // its end asks the server; idle clears the trim
-        push("session.execution.succeeded", { sessionID: "ses_x" });
-        await until(() => __forTest.probe(KEY)!.pending.ses_x === undefined, "the trimmed set was cleared by the idle check");
+        // x's end asks the server: idle, and its inbox still holds x1 (interrupted executions park, never discard)
+        push("session.execution.interrupted", { sessionID: "ses_x" });
+        await until(() => state.inboxCalls.ses_x === 2 && (__forTest.probe(KEY)!.pending.ses_x ?? []).includes("x1"), "the inbox read brought x1 back");
+        // under the total cap of 2 the oldest item overall (y1) gives way now
+        expect(__forTest.probe(KEY)!.pending).toEqual({ ses_x: ["x1"], ses_y: ["y2"] });
         push("session.execution.started", { sessionID: "ses_x" });
         await until(() => woke.length === 3, "third wake");
-        expect(woke[2]!.input).toEqual({ items: [], known: true });
+        expect(woke[2]!.input).toEqual({ items: [cancelledItem("x1", "kx")], known: true });
       } finally {
         server.stop(true);
       }
@@ -846,6 +887,285 @@ describe("wake", () => {
       } finally {
         server.stop(true);
       }
+    });
+
+    const steer = (id: string, text = "Also say BANANA.") => ({ id, type: "user", payload: { text }, delivery: "steer" });
+    const warned = (what: string) => warnSpy.mock.calls.some((c: unknown[]) => String(c[0]).includes(what));
+
+    test("an idle snapshot of a blind session keeps a steer OpenCode holds parked; the next execution's wake carries it, known", async () => {
+      const { server, push, park, state, ref } = scripted();
+      try {
+        const woke = recordWakes();
+        // parked before this core was listening (an interrupted execution left it, r3 Q2b): the hub never saw its enqueue
+        park("ses_root", steer("inb_steer"));
+        watchOpencodeSessionsForWake(KEY, ref, ["ses_root"]);
+        await until(() => __forTest.probe(KEY)?.connected === true && !__forTest.probe(KEY)!.blind.includes("ses_root"), "the connect snapshot read the idle session's inbox");
+        expect(state.inboxCalls.ses_root).toBe(1);
+        expect(__forTest.probe(KEY)!.pending).toEqual({ ses_root: ["inb_steer"] });
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.length === 1, "wake");
+        expect(woke[0]!.input).toEqual({ items: [{ inboxId: "inb_steer", synthetic: false }], known: true });
+      } finally {
+        server.stop(true);
+      }
+    });
+
+    test("an idle snapshot after a reconnect keeps an item an interrupt parked, instead of forgetting it", async () => {
+      __forTest.setBackoff({ baseMs: 20, maxMs: 40, maxFailures: 10, stableMs: 60_000 });
+      const { server, push, drop, state, ref } = scripted();
+      try {
+        const woke = recordWakes();
+        await watchSeen(ref, ["ses_root"]);
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.length === 1, "first wake");
+        enqueueUser(push, "ses_root", "inb_late");
+        push("session.execution.interrupted", { sessionID: "ses_root" }); // inb_late stays parked, no event
+        await until(() => !__forTest.probe(KEY)!.woken.includes("ses_root"), "the interrupt reached the hub");
+        const readsBefore = state.inboxCalls.ses_root ?? 0;
+        drop();
+        await until(() => __forTest.probe(KEY)!.connects === 2 && (state.inboxCalls.ses_root ?? 0) > readsBefore && !__forTest.probe(KEY)!.blind.includes("ses_root"), "reconnected; the snapshot read the inbox");
+        expect(__forTest.probe(KEY)!.pending).toEqual({ ses_root: ["inb_late"] });
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.length === 2, "second wake");
+        expect(woke[1]!.input).toEqual({ items: [{ inboxId: "inb_late", synthetic: false }], known: true });
+      } finally {
+        server.stop(true);
+      }
+    });
+
+    test("a failed inbox read leaves the session not known; the read after its next execution end makes it known", async () => {
+      const { server, push, park, state, ref } = scripted();
+      try {
+        const woke = recordWakes();
+        park("ses_root", steer("inb_steer"));
+        state.inboxFail = true;
+        watchOpencodeSessionsForWake(KEY, ref, ["ses_root"]);
+        await until(() => warned("inbox read failed"), "the inbox read failed");
+        expect(__forTest.probe(KEY)!.blind).toEqual(["ses_root"]);
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.length === 1, "first wake");
+        expect(woke[0]!.input).toEqual({ items: [], known: false });
+        // OpenCode delivered the parked steer to that execution; the next read works
+        delivered(push, "ses_root", "inb_steer");
+        state.inboxFail = false;
+        push("session.execution.succeeded", { sessionID: "ses_root" });
+        await until(() => !__forTest.probe(KEY)!.blind.includes("ses_root"), "the post-end read succeeded");
+        expect(state.inboxCalls.ses_root).toBe(2);
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.length === 2, "second wake");
+        expect(woke[1]!.input).toEqual({ items: [], known: true });
+      } finally {
+        server.stop(true);
+      }
+    });
+
+    test("an inbox event that arrives while the read is in flight voids the read: the session stays not known", async () => {
+      const { server, push, park, state, ref } = scripted();
+      try {
+        const woke = recordWakes();
+        await watchSeen(ref, ["ses_marker"]);
+        park("ses_root", steer("inb_old"));
+        const gate = hold();
+        let entered = false;
+        __forTest.setHooks({
+          afterInboxRead: async (_k, sid) => {
+            if (sid !== "ses_root") return;
+            entered = true;
+            await gate.wait;
+          },
+        });
+        watchOpencodeSessionsForWake(KEY, ref, ["ses_marker", "ses_root"]);
+        await until(() => entered, "the read of ses_root answered and is held");
+        // enqueued after the server answered the read: the answer lacks it
+        enqueueUser(push, "ses_root", "inb_new");
+        await until(() => (__forTest.probe(KEY)!.pending.ses_root ?? []).includes("inb_new"), "the live enqueue reached the hub");
+        gate.release();
+        // Barrier: a later event on the stream; the released read finished long before it is routed.
+        await marker(push, woke);
+        expect(__forTest.probe(KEY)!.blind).toEqual(["ses_root"]);
+        expect(__forTest.probe(KEY)!.pending).toEqual({ ses_root: ["inb_new"] });
+        expect(state.inboxCalls.ses_root).toBe(1);
+        push("session.execution.started", { sessionID: "ses_root" });
+        await until(() => woke.some((w) => w.sid === "ses_root"), "wake");
+        expect(woke.find((w) => w.sid === "ses_root")!.input).toEqual({ items: [{ inboxId: "inb_new", synthetic: false }], known: false });
+      } finally {
+        server.stop(true);
+      }
+    });
+
+    test("(K4) a wake from the snapshot carries a numeric created: the time the snapshot answered", async () => {
+      const { server, state, ref } = scripted();
+      try {
+        const woke: OpencodeEnvelope[] = [];
+        setOpencodeWakeHandler((_k, _sid, e) => woke.push(e));
+        state.active = { ses_root: { type: "busy" } };
+        const before = Date.now();
+        watchOpencodeSessionsForWake(KEY, ref, ["ses_root"]);
+        await until(() => woke.length === 1, "snapshot wake");
+        const after = Date.now();
+        expect(woke[0]!.id).toMatch(/^resync:1:/);
+        expect(typeof woke[0]!.created).toBe("number");
+        expect(woke[0]!.created!).toBeGreaterThanOrEqual(before);
+        expect(woke[0]!.created!).toBeLessThanOrEqual(after);
+      } finally {
+        server.stop(true);
+      }
+    });
+
+    test("(K4) the wake on the last unsubscribe of a reattached run carries the snapshot's created", async () => {
+      const { server, state, ref } = scripted();
+      try {
+        const woke: OpencodeEnvelope[] = [];
+        setOpencodeWakeHandler((_k, _sid, e) => woke.push(e));
+        const rec = new Rec();
+        const sub = subscribeOpencodeSession({ key: KEY, ...ref }, "ses_root", rec);
+        await sub.ready;
+        state.active = { ses_root: { type: "busy" } };
+        const before = Date.now();
+        watchOpencodeSessionsForWake(KEY, ref, ["ses_root"]);
+        await until(() => __forTest.probe(KEY)!.openExec.includes("ses_root"), "the snapshot recorded the open execution");
+        const after = Date.now();
+        expect(woke).toHaveLength(0);
+        sub.unsubscribe();
+        expect(woke).toHaveLength(1);
+        expect(woke[0]!.created!).toBeGreaterThanOrEqual(before);
+        expect(woke[0]!.created!).toBeLessThanOrEqual(after);
+      } finally {
+        server.stop(true);
+      }
+    });
+
+    describe("inbox fates (K1)", () => {
+      const fate = (sid: string, id: string) => opencodeInboxItemCancelled(KEY, sid, id);
+
+      test("a cancel seen on a watched session is true, and a waiter resolves as soon as it arrives", async () => {
+        const { server, push, ref } = scripted();
+        try {
+          const woke = recordWakes();
+          await watchSeen(ref, ["ses_root", "ses_marker"]);
+          enqueueUser(push, "ses_root", "inb_1");
+          await marker(push, woke);
+          expect(fate("ses_root", "inb_1")).toBe(false); // seen enqueued on this connection, no cancel
+          const waiting = waitOpencodeInboxItemCancelled(KEY, "ses_root", "inb_1", 60_000);
+          push("session.inbox.cancelled", { sessionID: "ses_root", inboxID: "inb_1" });
+          // resolves on the event, long before its 60 s budget (the test's own timeout is 5 s)
+          expect(await waiting).toBe(true);
+          expect(fate("ses_root", "inb_1")).toBe(true);
+          // already seen: resolves at once
+          expect(await waitOpencodeInboxItemCancelled(KEY, "ses_root", "inb_1", 60_000)).toBe(true);
+          // a replayed enqueue does not undo it
+          enqueueUser(push, "ses_root", "inb_1");
+          await marker(push, woke);
+          expect(fate("ses_root", "inb_1")).toBe(true);
+        } finally {
+          server.stop(true);
+        }
+      });
+
+      test("delivered is false; never seen, unwatched or unknown server is null; a waiter times out with that answer", async () => {
+        const { server, push, ref } = scripted();
+        try {
+          const woke = recordWakes();
+          await watchSeen(ref, ["ses_root", "ses_marker"]);
+          enqueueUser(push, "ses_root", "inb_d");
+          delivered(push, "ses_root", "inb_d");
+          enqueueUser(push, "ses_root", "inb_p");
+          await marker(push, woke);
+          expect(fate("ses_root", "inb_d")).toBe(false);
+          expect(fate("ses_root", "inb_never")).toBeNull();
+          expect(fate("ses_other", "inb_d")).toBeNull();
+          expect(opencodeInboxItemCancelled("no-such-key", "ses_root", "inb_d")).toBeNull();
+          expect(await waitOpencodeInboxItemCancelled(KEY, "ses_root", "inb_p", 30)).toBe(false);
+          expect(await waitOpencodeInboxItemCancelled(KEY, "ses_root", "inb_never", 30)).toBeNull();
+          expect(await waitOpencodeInboxItemCancelled(KEY, "ses_root", "inb_p", 0)).toBe(false);
+          // a cancel for an unwatched session is not remembered
+          push("session.inbox.cancelled", { sessionID: "ses_other", inboxID: "inb_x" });
+          await marker(push, woke);
+          expect(fate("ses_other", "inb_x")).toBeNull();
+          // leaving the watch set forgets the session
+          push("session.inbox.cancelled", { sessionID: "ses_root", inboxID: "inb_p" });
+          await marker(push, woke);
+          expect(fate("ses_root", "inb_p")).toBe(true);
+          watchOpencodeSessionsForWake(KEY, ref, ["ses_marker"]);
+          expect(fate("ses_root", "inb_p")).toBeNull();
+        } finally {
+          server.stop(true);
+        }
+      });
+
+      test("a reconnect makes a pending item unknown (a cancel could have fallen into the gap); a seen cancel stays true; disconnected is null", async () => {
+        __forTest.setBackoff({ baseMs: 20, maxMs: 40, maxFailures: 10, stableMs: 60_000 });
+        // The reconnect's stream request waits for `gate`: the disconnected window lasts until the test releases it.
+        const gate = hold();
+        let streamFetches = 0;
+        __forTest.setFetchImpl((async (...args: Parameters<typeof fetch>) => {
+          if (++streamFetches > 1) await gate.wait;
+          return fetch(...args);
+        }) as unknown as typeof fetch);
+        const { server, push, drop, ref } = scripted();
+        try {
+          const woke = recordWakes();
+          await watchSeen(ref, ["ses_root", "ses_marker"]);
+          enqueueUser(push, "ses_root", "inb_p");
+          enqueueUser(push, "ses_root", "inb_c");
+          enqueueUser(push, "ses_root", "inb_d");
+          push("session.inbox.cancelled", { sessionID: "ses_root", inboxID: "inb_c" });
+          delivered(push, "ses_root", "inb_d");
+          await marker(push, woke);
+          expect([fate("ses_root", "inb_p"), fate("ses_root", "inb_c"), fate("ses_root", "inb_d")]).toEqual([false, true, false]);
+          drop();
+          await until(() => streamFetches === 2, "the stream dropped and the reconnect is held");
+          expect(__forTest.probe(KEY)!.connected).toBe(false);
+          expect([fate("ses_root", "inb_p"), fate("ses_root", "inb_c"), fate("ses_root", "inb_d")]).toEqual([null, true, null]);
+          gate.release();
+          await until(() => __forTest.probe(KEY)!.connects === 2 && __forTest.probe(KEY)!.connected, "reconnected");
+          expect([fate("ses_root", "inb_p"), fate("ses_root", "inb_c"), fate("ses_root", "inb_d")]).toEqual([null, true, false]);
+          // an item enqueued on the new connection is covered again
+          enqueueUser(push, "ses_root", "inb_new");
+          await marker(push, woke);
+          expect(fate("ses_root", "inb_new")).toBe(false);
+        } finally {
+          server.stop(true);
+        }
+      });
+
+      test("the memory is bounded: an id evicted by the per-session cap or by age reads null", async () => {
+        let now = 1_000_000;
+        __forTest.setFateMemory({ perSession: 2, ttlMs: 60_000, clock: () => now });
+        const { server, push, ref } = scripted();
+        try {
+          const woke = recordWakes();
+          await watchSeen(ref, ["ses_root", "ses_marker"]);
+          for (const id of ["inb_1", "inb_2", "inb_3"]) push("session.inbox.cancelled", { sessionID: "ses_root", inboxID: id });
+          await marker(push, woke);
+          expect([fate("ses_root", "inb_1"), fate("ses_root", "inb_2"), fate("ses_root", "inb_3")]).toEqual([null, true, true]);
+          now += 60_000;
+          expect(fate("ses_root", "inb_3")).toBeNull();
+        } finally {
+          server.stop(true);
+        }
+      });
+
+      test("the total cap evicts the oldest fate of all sessions", async () => {
+        let now = 1_000_000;
+        __forTest.setFateMemory({ total: 2, clock: () => now });
+        const { server, push, ref } = scripted();
+        try {
+          const woke = recordWakes();
+          await watchSeen(ref, ["ses_a", "ses_b", "ses_marker"]);
+          push("session.inbox.cancelled", { sessionID: "ses_a", inboxID: "a1" });
+          await until(() => fate("ses_a", "a1") === true, "a1 seen");
+          now += 1;
+          push("session.inbox.cancelled", { sessionID: "ses_b", inboxID: "b1" });
+          await until(() => fate("ses_b", "b1") === true, "b1 seen");
+          now += 1;
+          push("session.inbox.cancelled", { sessionID: "ses_b", inboxID: "b2" });
+          await marker(push, woke);
+          expect([fate("ses_a", "a1"), fate("ses_b", "b1"), fate("ses_b", "b2")]).toEqual([null, true, true]);
+        } finally {
+          server.stop(true);
+        }
+      });
     });
   });
 
