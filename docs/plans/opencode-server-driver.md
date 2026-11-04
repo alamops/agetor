@@ -7,7 +7,7 @@
 | Config | AGENTS_CONFIG.yml (balanced; host claude_code) |
 | Flags | none |
 | Gates | grilled by owner (2 passes, 7 decisions; owner decisions R1–R4 after the first review, §8); plan approved by owner 2026-11-03; one orchestrator amendment (D4 Plan-mode cards) |
-| Status | fourth review fixed (06e0d993, ac62749e, 5cecca1d, 0a006243) after a live smoke on `~/.agetor-dev`; second live smoke 2026-11-03 passed (a Stop with a background subagent and a parked steer: the steer requeued and answered once, no agent run; an archive with a parked steer: no run, the steer saved to the tray); suite: typecheck clean; bun src/bun 6929 pass / 2 pre-existing (background.test C3 reconcile); src/shared+mainview 3702/0; src/cli 1014/0; e2e 413/413 |
+| Status | fourth review fixed (06e0d993, ac62749e, 5cecca1d, 0a006243) after a live smoke on `~/.agetor-dev`; second live smoke 2026-11-03 passed (a Stop with a background subagent and a parked steer: the steer requeued and answered once, no agent run; an archive with a parked steer: no run, the steer saved to the tray); suite: typecheck clean; bun src/bun 6931 pass / 0 fail; src/shared+mainview 3702/0; src/cli 1014/0; e2e 413/413 |
 | Branch | `fix/fix-opencode-insufficient-funds` (kept: agetor worktree is bound to it) |
 | Base SHA | `9b581445` (after W0a, the Zen/Go label fix) |
 

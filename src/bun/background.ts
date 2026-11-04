@@ -415,4 +415,15 @@ export const __testing = {
     startGraceUntil = 0;
     invalidate();
   },
+  /** Set aside every change listener (the API server's, from another test file
+   *  in the same `bun test` process, lives as long as the process) until the
+   *  returned function puts them back. With one in place, `notifyChanged` runs
+   *  a fresh probe of its own, which a test of one specific probe must not get. */
+  suspendListeners(): () => void {
+    const held = [...listeners];
+    listeners.clear();
+    return () => {
+      for (const fn of held) listeners.add(fn);
+    };
+  },
 };
