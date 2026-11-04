@@ -493,11 +493,12 @@ Verification at this commit:
 
 ```
 bun run typecheck                                   ✅
-bun test src/shared/pipeline.test.ts ...           ✅ 1004 pass (14 files)
+bun test src/shared/pipeline.test.ts ...           ✅ 1005 pass (15 files)
 bun test src/bun/pipeline-runner.test.ts \
          src/bun/pipeline-human-step-resume-spike.test.ts  ✅ 123 pass
 bun --bun x playwright test e2e/pipelines-human-step.spec.ts \
-         e2e/pipelines-editor.spec.ts e2e/pipelines-run.spec.ts  ✅ (see report)
+         e2e/pipelines-editor.spec.ts e2e/pipelines-run.spec.ts
+                                                    ✅ 4 + 14 + 28 passed
 ```
 
 Inferences recorded in §8 that shipped as planned: default Return mode
