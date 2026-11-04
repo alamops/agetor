@@ -286,3 +286,85 @@ RunPanel's strip shows "pipeline task no longer exists" on a 404 and disables "O
 CLI/TUI: `pipeline retry --from` is documented; `advance --next` matches name → id → edge label; the four task-scoped subcommands refuse a step task id by naming its parent; `export`/`import` now write and read the [agetor bundle](bundle.md) — the pre-bundle `profileName`-hint writer is gone, while a legacy hinted file still imports through the shared reader (an unresolved profile id is remapped by unique name, else warned about in the preview), `show` marks `(missing)` profiles;
 `logs <parent>` prints the hint and returns unless `--notify`; retry/advance parse flags before any network call; `add --start` reports a failed start; `ls --steps` marks steps `↳ … step of <parent>` and parents `»`; the TUI's `p` expands a selected parent's step rows (`dashboardRows`), `s`/`x` on a parent route to `retryPipeline`/`cancelPipeline`, and a parent's detail pane shows a hint instead of a silent stream;
 `retryPipeline`/`advancePipeline` use `START_TIMEOUT_MS`; `src/cli/test-fixtures.ts`'s `makeTask()` replaces the `as unknown as Task` fixture casts.
+
+## 11. Human steps (pause / review gates)
+
+A pipeline step may be a **human gate**: `PipelineStep.type: "human"` (missing
+means `"agent"`). A gate spawns nothing — no task row, no worktree, no agent —
+and exists to pause the run for an owner decision. Rules enforced by
+`validatePipelineGraph` (`src/shared/pipeline.ts`):
+
+- never the start step (`startStepId` and the unique-root fallback both
+  refuse it);
+- exactly one incoming edge (0 or 2+ is an error), so it is never a root; no
+  human→human edges;
+- no `agentProfileId`, no `subagents`, `join` normalized to `"any"`;
+- `transition: "choose" | "all"` still applies to Accept; it may be terminal
+  (0 outgoing) or have several outgoing edges.
+
+**Run state.** A pending gate lives in `PipelineRunState.humanSteps`
+(`{stepId, seq, startedAt, arrivals}`) and gets its own `history` record with
+`taskId: null`. `seq` comes from the run-wide monotonic `seqCounter`;
+`stepCount` stays agent-execution-only (what `maxSteps` caps), so a gate never
+consumes the step cap. `PipelineJoinArrival.comment` carries trusted
+owner feedback to the next step, rendered by `composeStepPrompt` as a
+`## Human review feedback` section **outside** the untrusted-handoff markers;
+a `Handoff` never carries it.
+
+**Status.** `PipelineRunStatus` gains non-terminal `"review"`: a pending gate
+maps to the board's Review column. `deriveRunStatus` precedence is
+`cancelled (stopped) > review (gate pending) > blocked > running > done`; a
+gate with a live sibling stays Review, and Review outranks a blocked sibling.
+The step cap is checked only on agent launches, before a gate.
+
+**Decisions.** `reviewHumanStep` (behind `POST /tasks/:id/pipeline/review`) is
+the only mutator, run under `runExclusive(parentId)`. It removes the gate and
+records the decision in one critical section, so `stepId`+`seq` is idempotent
+(a second submit 409s). Body: `{stepId, seq, decision:"accept"|"return",
+comment?, nextStepIds?, mode?}`; 400 for a bad body / blank Return comment /
+over-cap comment / bad next target / `mode` on Accept / `nextStepIds` on
+Return; 409 for not-a-pipeline, never-run, archived, no pending gate, stale
+seq, already decided, resume unavailable, or launches frozen.
+
+- **Accept** reuses the gate's `transition`: 0 outgoing finishes the run;
+  `all` launches every outgoing; `choose` with one launches it; `choose` with
+  several requires `nextStepIds` naming outgoing targets. The comment is
+  optional and rides the launch as `PipelineJoinArrival.comment` (through
+  joins and pending-launch holds, so a Retry after a step-cap/launch failure
+  keeps it).
+- **Return** targets the gate's sole incoming source (or the step a manual
+  Advance entered from). The comment is required, trimmed, capped at
+  `PIPELINE_LIMITS.handoffField` (8,000), control characters other than
+  `\n`/`\t` refused, `\r\n` normalized. `mode` is `"fresh"` (default; a new
+  task/session/seq via `launchStep`) or `"resume"` (a `sendInput` turn on the
+  previous step's existing task, re-armed as a new execution under the lock
+  first; a refused send rolls the re-arm back and 409s, leaving the gate).
+  Either path records `returnToStepId` on the new execution, and
+  `settleStepRun` resolves that edge unconditionally — the handoff's `next`
+  and the graph's transition are ignored, and a missing/invalid handoff still
+  returns to the gate (with a `null` handoff). See
+  `docs/plans/pipeline-human-step-resume-spike.md` for the resume proof.
+
+**Stop / Restart / reconcile.** `cancelPipelineRun` accepts a gate-only run:
+it records `stopRequestedAt`, dismisses every gate (`cancelled` history
+records), drops `run.blocked` so the card reaches Ready, and keeps history. A
+plain Run on a `review` run refuses ("accept or return it first"); Restart
+(`startPipelineRun({restart:true})`) clears all human state and starts fresh.
+`reconcilePipelineRuns` sweeps a review run only when it still has live
+`active` executions; a gate-only run is never flipped to done.
+
+**Archived parents.** A gate reached while the parent is archived is recorded
+on the run (no column write, no event); the review route refuses the archived
+parent with 409, and the gate is reviewable after unarchive.
+
+**Surfaces.** The run view's `HumanStepPanel` (opened from the human node, the
+run-view "Human review" section, the card's Review button, or the review
+toast) shows the goal, the gate's "What to check", the last handoff, run
+history with transcript links, prior rounds and a worktree diff. The board
+card stays in Review, offers **Review** (no **Done**), and its Stop confirms.
+The context menu offers **Review pipeline** and no **Mark done**. The CLI has
+`agetor pipeline review <ref> --accept|--return` (`--comment`, `--next`,
+`--step`, `--mode`), and `status`/`show` print pending gates and `(human)` for
+a null task id. A `pipeline` GlobalEvent carries `humanStepSeqs` and
+`runStartedAt`; the webview and headless notifier each raise one "Pipeline
+needs your review" alert per `(runStartedAt, gate.seq)`.

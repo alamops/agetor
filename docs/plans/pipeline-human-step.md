@@ -6,7 +6,7 @@
 | Source | `docs/specs/pipeline-human-step.md` (owner task text) + `docs/plans/pipeline-human-step-investigation.md` + `docs/plans/pipeline-human-step-grill.md` + `docs/plans/pipeline-human-step-grill/round-{1,2}/` |
 | Flags | none |
 | Gates | grilled + approved by owner: all 21 required round-1 questions answered, 4 overrides (`fanout`, `return-mechanics`, `pending-actions`, `bundle-compat`), 3 round-2 consequence answers. One unratified gate remains: the resume spike (`T0`) is a go/no-go — see §8. |
-| Status | planned |
+| Status | implemented (waves 0–7, all targeted suites green; see §11) |
 | Branch | `feature/agetor-pipeline-human-step` |
 | Base SHA | `e4cc58e5` |
 
@@ -483,3 +483,37 @@ None. All work is in this repo; the fake drivers are local test seams.
 | PRD or design mock | Not provided | The spec is the task text; the optional mock was blank (grill assumption 12). A later mock refines the panel. |
 | Multi-tenant/auth | Not applicable | Local single-user desktop app with loopback tokens. |
 | DB migration/backfill | Not applicable | JSON columns; old rows default (investigation §5.6). |
+
+## 11. Landed notes (verification)
+
+The resume spike (T0) **passed** — see `docs/plans/pipeline-human-step-resume-spike.md`;
+`mode: "resume"` ships. All waves landed in one build.
+
+Verification at this commit:
+
+```
+bun run typecheck                                   ✅
+bun test src/shared/pipeline.test.ts ...           ✅ 1004 pass (14 files)
+bun test src/bun/pipeline-runner.test.ts \
+         src/bun/pipeline-human-step-resume-spike.test.ts  ✅ 123 pass
+bun --bun x playwright test e2e/pipelines-human-step.spec.ts \
+         e2e/pipelines-editor.spec.ts e2e/pipelines-run.spec.ts  ✅ (see report)
+```
+
+Inferences recorded in §8 that shipped as planned: default Return mode
+`fresh`; Stop with a gate drops `run.blocked` so the card reaches Ready;
+missing `type` = agent and unknown values rejected; human `join` normalized
+to `any`; human entries never consume `stepCount`; multiple pending gates open
+the oldest on the card and require `--step` in the CLI.
+
+Deviations from the plan's file list (all within the same owned modules):
+
+- `createTask` now re-validates the stored pipeline graph before accepting it
+  (`orchestrator.ts`), which is what actually rejects a hand-edited human
+  step carrying an agent or a human start step (the table's own read path
+  returns a shape-safe invalid graph unmodified).
+- `e2e/scroll-memory-helpers.ts` (`makeStep`) gained `type` and a nullable
+  `agentProfileId`, plus a `reviewPipelineRest` helper — the e2e seed helpers
+  the plan names.
+- The existing `pipelines-run.spec.ts` Stop test was updated to accept the
+  new confirmation dialog (a required behavior change, not a weakening).
