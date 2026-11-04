@@ -226,7 +226,7 @@ describe("opencodeServer validation", () => {
 });
 
 describe("bound-profile lock", () => {
-  test("a profile's value overrides the body, and a differing PATCH 409s", async () => {
+  test("a profile's value overrides the body; the retired field is no longer locked (plan D2)", async () => {
     const profile = (await (await createProfile({ harness: "claude-code", model: "claude-opus-5-5" })).json()) as AgentProfile;
     expect(profile.opencodeServer).toBe("shared");
     const created = await createTask({ agentProfileId: profile.id, opencodeServer: "standalone" });
@@ -235,12 +235,14 @@ describe("bound-profile lock", () => {
     expect(task.agentProfileId).toBe(profile.id);
     expect(task.opencodeServer).toBe("shared");
 
-    const refused = await call("PATCH", `/tasks/${task.id}`, { opencodeServer: "standalone" });
+    // Shared/Standalone is retired: a differing PATCH is accepted (validated
+    // and stored, never acted on) instead of 409ing like a live bound field.
+    const accepted = await call("PATCH", `/tasks/${task.id}`, { opencodeServer: "standalone" });
+    expect(accepted.status).toBe(200);
+    // A live bound field still refuses.
+    const refused = await call("PATCH", `/tasks/${task.id}`, { model: "claude-sonnet-5-5" });
     expect(refused.status).toBe(409);
     expect(((await refused.json()) as { error: string }).error).toContain("detach it first");
-    // A same-value resend is a no-op and passes.
-    const same = await call("PATCH", `/tasks/${task.id}`, { opencodeServer: "shared" });
-    expect(same.status).toBe(200);
   });
 });
 

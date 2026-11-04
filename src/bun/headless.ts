@@ -4,6 +4,9 @@ import { db, dataDir, subagents, preferences } from "./db.ts";
 import {
   freezeLaunches,
   launchesInFlight,
+  startOpencodeServerDriver,
+  stopIdleOpencodeServersOnRealStop,
+  stopOpencodeServerDriver,
   reconcileOrphans,
   rearmFxAutoResumes,
   reapIdleSessions,
@@ -11,6 +14,7 @@ import {
   waitForLaunchesToSettle,
 } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { adoptOpencodeServers } from "./opencode-server.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
 import { scheduleRetention, stopRetentionTimers } from "./retention.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
@@ -145,7 +149,7 @@ async function handOffPort(reason: string, code: number): Promise<void> {
  *  lost the port to a live core, or got a signal mid-boot) must not delete the
  *  winner's creds on its way out. */
 let ownsCreds = false;
-function shutdown(reason: string, code = 0): void {
+function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): void {
   if (shuttingDown) return;
   shuttingDown = true;
   daemonLog(`shutting down (${reason})`);
@@ -178,6 +182,19 @@ function shutdown(reason: string, code = 0): void {
   // the lag sampler. Trimmed rows stay trimmed, the next boot resumes.
   stopRetentionTimers();
   stopLagMonitor();
+  // A real stop (`agetor daemon stop`, the CLI daemon's idle exit) also stops the
+  // OpenCode servers nothing is using; a hand-over to the app does not. Before
+  // the driver is stopped: its turns and probe results say what is in use.
+  if (opts.realStop) {
+    try {
+      stopIdleOpencodeServersOnRealStop();
+    } catch (err) {
+      daemonLog(`stopping idle OpenCode servers failed: ${String(err)}`);
+    }
+  }
+  // OpenCode: detach the turns and close the hub streams. The servers and their
+  // turns live on in their own tmux sessions for the next core (a handoff is not a quit).
+  stopOpencodeServerDriver();
   // Remove the creds file only when it is still ours: the pid check also
   // covers a successor (the app taking over) that already rewrote it.
   if (ownsCreds && readCoreCreds(dataDir)?.pid === process.pid) {
@@ -278,7 +295,7 @@ export async function runDaemon(): Promise<void> {
       ready: bootReady,
       onShutdownRequest: (request) => {
         const reason = `shutdown request (${request})`;
-        if (request !== "handoff") return shutdown(reason, 0);
+        if (request !== "handoff") return shutdown(reason, 0, { realStop: true });
         void handOffPort(reason, isLoginItem ? CORE_EXIT_PARK : 0);
       },
     });
@@ -347,6 +364,9 @@ export async function runDaemon(): Promise<void> {
     // to the global lifecycle stream before reconcileOrphans() so a step
     // task's boot-time orphan→ready transition reaches it too.
     initPipelineRunner();
+    // Adopt the OpenCode servers a previous core left running before the
+    // reconcile reattaches `server=agetor` runs to them (index.ts has the same step).
+    await adoptOpencodeServers();
     await reconcileOrphans();
     // M16: same ordering as index.ts's desktop boot path — reconcile every
     // pipeline parent left mid-flight by a prior crash/restart right after
@@ -422,6 +442,9 @@ export async function runDaemon(): Promise<void> {
   // The boot restore is done: let the routes through.
   markBootReady();
 
+  // OpenCode server wake + idle sweep, once the reattached turns are registered.
+  startOpencodeServerDriver();
+
   // The desktop process resumes a crashed Claude import from its launch scan.
   // This process never runs that scan, so resume here too — otherwise a task
   // left `importing` stays unable to Send. Scheduled only after the API binds:
@@ -483,7 +506,7 @@ export async function runDaemon(): Promise<void> {
         return;
       }
       if (idleSince == null) idleSince = Date.now();
-      else if (Date.now() - idleSince >= idleTimeoutMs) shutdown("idle timeout");
+      else if (Date.now() - idleSince >= idleTimeoutMs) shutdown("idle timeout", 0, { realStop: true });
     }, IDLE_CHECK_MS);
     timer.unref();
   }

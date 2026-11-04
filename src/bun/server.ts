@@ -204,6 +204,12 @@ import { getMainWindow } from "./window.ts";
 import {
   answerCursorAsk,
   answerFxPermission,
+  answerOpencodeAsk,
+  answerOpencodePermission,
+  awaitOpencodeAskClaimGate,
+  getOpencodeAskFields,
+  normalizeReplyText,
+  opencodeAskAnswerFromBody,
   recordCursorAskToolResult,
   answerTmuxPrompt,
   findFxPermissionById,
@@ -576,17 +582,18 @@ function consumeWsTicket(ticket: string | null, terminalId: string): boolean {
  * from `startTask`'s live-profile refresh and the detach route below),
  * never through this generic PATCH. See the bound-agent 409 guard in
  * `PATCH /tasks/:id` for the other half of that lock: even a listed field
- * here (`agent`/`mode`/`model`/`effort`/`speed`/`maxMode`/`opencodeServer`) is refused once a
+ * here (`agent`/`mode`/`model`/`effort`/`speed`/`maxMode`) is refused once a
  * task is bound to a profile, until it's detached.
  *
  * `fast` is the legacy boolean alias of `speed` (D13): `filterPatch` maps it
  * through `resolveSpeedInput` (`true` → `"fast"`, `false` → `"off"`; an
  * explicit `speed` wins) and never forwards `fast` itself to the db layer.
  *
- * `opencodeServer` (OpenCode's per-task server option, D-4) is validated by
- * `filterPatch` through `parseOpencodeServerInput` — anything but `shared`/
- * `standalone` is a 400. A non-OpenCode task stores it and ignores it, like
- * `maxMode`. It is one of the profile-bound fields below.
+ * `opencodeServer` (OpenCode's per-task server option, D-4) is retired
+ * (docs/plans/opencode-server-driver.md D2). `filterPatch` still validates it
+ * through `parseOpencodeServerInput` — anything but `shared`/`standalone` is a
+ * 400 — and stores it for compatibility. It is not a profile-bound field: a
+ * bound task accepts it.
  *
  * `checkoutBranch` (the last-seen worktree checkout, migration 063) is
  * server-managed the same way: only `tasks.setCheckoutBranch` writes it, at
@@ -5574,11 +5581,11 @@ export function startApiServer(
             }
           }
           // A task bound to an agent profile (docs/plans/agent-profiles.md
-          // D5) has its agent/mode/model/effort/speed/maxMode/opencodeServer
-          // locked — the profile owns those seven fields, and the only sanctioned way to
+          // D5) has its agent/mode/model/effort/speed/maxMode
+          // locked — the profile owns those six fields, and the only sanctioned way to
           // change them is to detach first (`DELETE /tasks/:id/agent-profile`)
           // or edit the profile itself. Refuse the whole PATCH with 409 if it
-          // touches any of the seven with a value that actually differs from
+          // touches any of the six with a value that actually differs from
           // what's already on the row — a same-value resend (e.g. a stale
           // form re-submitting unchanged fields) is allowed through rather
           // than punishing a no-op.
@@ -5586,7 +5593,9 @@ export function startApiServer(
             // `speed` is already resolved from a `speed` or legacy `fast`
             // body field by `filterPatch`, so a tier change through either
             // spelling is compared against the row here.
-            const boundFields = ["agent", "mode", "model", "effort", "speed", "maxMode", "opencodeServer"] as const;
+            // `opencodeServer` is retired (docs/plans/opencode-server-driver.md
+            // D2): accepted and ignored, so it never locks a bound task.
+            const boundFields = ["agent", "mode", "model", "effort", "speed", "maxMode"] as const;
             const touchesBoundField = boundFields.some(
               (field) => field in patch && patch[field] !== before[field],
             );
@@ -6886,6 +6895,50 @@ export function startApiServer(
             custom: typeof a?.custom === "string" ? a.custom : undefined,
           }));
           const pending = getAskQuestionsById(req.params.id);
+          if (pending && pending.source === "opencode") {
+            // An OpenCode form: validate against the fields it was registered
+            // with, then release the driver's awaiter. Claimed before any
+            // await, like the siblings, so a second submit gets a 409.
+            // A reason rides a skip only; an answered question takes none.
+            // Refused, never ignored, like the permission route's `message`.
+            if (body.skip !== true && (body as { message?: unknown }).message !== undefined) {
+              return json({ error: "message is only allowed with skip" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (askAnswersInFlight.has(req.params.id)) {
+              return json(
+                { error: "this question is already being answered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            askAnswersInFlight.add(req.params.id);
+            try {
+              // No-op in production; a test holds the claim open here.
+              await awaitOpencodeAskClaimGate(req.params.id);
+              const fields = getOpencodeAskFields(req.params.id);
+              if (!fields) return json({ ok: false }, { headers: corsHeaders(req) });
+              if (body.skip === true) {
+                // Skip carries only a reason the user typed; none, or an
+                // empty one, sends no words at all.
+                const reason = normalizeReplyText((body as { message?: unknown }).message, "message");
+                if (!reason.ok) {
+                  return json({ error: reason.error }, { status: 400, headers: corsHeaders(req) });
+                }
+                const ok = answerOpencodeAsk(req.params.id, {
+                  outcome: "skipped",
+                  ...(reason.text !== undefined ? { message: reason.text } : {}),
+                });
+                return json({ ok }, { headers: corsHeaders(req) });
+              }
+              const mapped = opencodeAskAnswerFromBody(fields, (body as { answers?: unknown }).answers);
+              if (!mapped.ok) {
+                return json({ error: mapped.error }, { status: 400, headers: corsHeaders(req) });
+              }
+              const ok = answerOpencodeAsk(req.params.id, { outcome: "answered", answer: mapped.answer });
+              return json({ ok }, { headers: corsHeaders(req) });
+            } finally {
+              askAnswersInFlight.delete(req.params.id);
+            }
+          }
           if (pending && pending.source === "cursor") {
             if (askAnswersInFlight.has(req.params.id)) {
               return json(
@@ -7187,10 +7240,39 @@ export function startApiServer(
       // stay 400.
       "/fx-permissions/:id/answer": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { optionId?: unknown; cancel?: unknown };
+          const body = (await req.json().catch(() => ({}))) as {
+            optionId?: unknown;
+            cancel?: unknown;
+            message?: unknown;
+          };
           const pending = findFxPermissionById(req.params.id);
           if (!pending) {
             return json({ ok: false }, { headers: corsHeaders(req) });
+          }
+          // Cancel is reserved for the internal Stop/delete sweep
+          // (`cancelPendingForTask`) on an OpenCode card: the server keeps
+          // waiting for a reply, so a card dropped here would leave it
+          // blocked with nothing for the user to answer.
+          if (pending.harness === "opencode" && body.cancel === true) {
+            return json({ error: "cancel is not available for this request" }, { status: 400, headers: corsHeaders(req) });
+          }
+          // A reason the user typed for Reject: OpenCode cards only, and only
+          // with the `reject` option. Anything else is refused, never ignored.
+          // (Either way the turn continues: the driver relays the reason, or a
+          // single space when there is none — plan R1. This route adds nothing.)
+          let message: string | undefined;
+          if (body.message !== undefined) {
+            if (pending.harness !== "opencode") {
+              return json({ error: "message is not supported for this request" }, { status: 400, headers: corsHeaders(req) });
+            }
+            if (body.optionId !== "reject") {
+              return json({ error: "message is only allowed with reject" }, { status: 400, headers: corsHeaders(req) });
+            }
+            const reason = normalizeReplyText(body.message, "message");
+            if (!reason.ok) {
+              return json({ error: reason.error }, { status: 400, headers: corsHeaders(req) });
+            }
+            message = reason.text;
           }
           if (body.cancel === true) {
             const ok = answerFxPermission(req.params.id, { cancelled: true });
@@ -7206,6 +7288,15 @@ export function startApiServer(
           // to inject an arbitrary outcome into the ACP reply.
           if (!pending.options.some((o) => o.optionId === optionId)) {
             return json({ error: "unknown option" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (pending.harness === "opencode") {
+            // The recorded options are exactly OpenCode's three decisions.
+            const decision = optionId as "once" | "always" | "reject";
+            const ok = answerOpencodePermission(req.params.id, {
+              decision,
+              ...(message !== undefined ? { message } : {}),
+            });
+            return json({ ok }, { headers: corsHeaders(req) });
           }
           const ok = answerFxPermission(req.params.id, { optionId });
           return json({ ok }, { headers: corsHeaders(req) });

@@ -22,14 +22,12 @@ import {
   type AgentProfile,
   type AgentStatus,
   type Harness,
-  type OpencodeServerMode,
   type Speed,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
-import { OpencodeServerPicker, opencodeServerLock, showOpencodeServerPicker } from "./OpencodeServerPicker";
 import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 
 const initialMode = (kind: AgentKind) => defaultModeFor(kind);
@@ -71,14 +69,6 @@ export interface TaskLaunch {
   maxMode: boolean;
   setSpeed: (speed: Speed) => void;
   setMaxMode: (maxMode: boolean) => void;
-  /** OpenCode's server option (D-4) — the user's stored choice, sent on
-   *  every create payload whatever the kind (a non-OpenCode task stores and
-   *  ignores it, like `maxMode`). Resets to `"shared"` when `switchAgent`
-   *  changes kind. A harness with a home still holds the picked value here;
-   *  the picker only DISPLAYS it locked to Standalone and the server
-   *  computes the effective mode. */
-  opencodeServer: OpencodeServerMode;
-  setOpencodeServer: (v: OpencodeServerMode) => void;
   /** The tiers the current kind/model/effort offers (`supportedSpeeds`, fed
    *  the selected model's merged option so fx's discovery flags count). */
   speedOptions: Speed[];
@@ -94,8 +84,7 @@ export interface TaskLaunch {
   setEffort: (effort: string | null) => void;
   /** Switches the selected harness, resetting mode/model/effort to the new
    *  kind's defaults when the kind actually changes (matches
-   *  `ResolveConflictsDialog`'s `switchAgent`; speed resets to `"off"`,
-   *  `opencodeServer` to `"shared"`). */
+   *  `ResolveConflictsDialog`'s `switchAgent`; speed resets to `"off"`). */
   switchAgent: (nextId: string) => void;
   /** Persists the current mode/model/effort as `lastMode/lastModel/lastEffort:<kind>`
    *  preferences — call this right after a successful `createAndStartTask()`,
@@ -145,7 +134,6 @@ export interface TaskLaunch {
     effort: string | null;
     speed: Speed;
     maxMode: boolean;
-    opencodeServer: OpencodeServerMode;
   }>) => void;
 }
 
@@ -187,8 +175,6 @@ export function useTaskLaunch(
       effort: string | null;
       speed: Speed;
       maxMode: boolean;
-      /** Absent ⇒ `"shared"` (an `AgentProfileSnapshot`-shaped caller). */
-      opencodeServer?: OpencodeServerMode;
     };
   },
 ): TaskLaunch {
@@ -236,7 +222,6 @@ export function useTaskLaunch(
   const [effort, setEffort] = useState<string | null>(initial ? initial.effort : DEFAULT_EFFORT["claude-code"]);
   const [speed, setSpeed] = useState<Speed>(initial?.speed ?? "off");
   const [maxMode, setMaxMode] = useState(initial?.maxMode ?? false);
-  const [opencodeServer, setOpencodeServer] = useState<OpencodeServerMode>(initial?.opencodeServer ?? "shared");
 
   const [agentProfileId, setAgentProfileId] = useState<string | null>(null);
   const { profiles: fetchedProfiles, refresh: refreshProfiles } = useAgentProfiles({
@@ -279,7 +264,6 @@ export function useTaskLaunch(
           setEffort(initial.effort);
           setSpeed(initial.speed);
           setMaxMode(initial.maxMode);
-          setOpencodeServer(initial.opencodeServer ?? "shared");
           return;
         }
 
@@ -408,7 +392,6 @@ export function useTaskLaunch(
       setModel(DEFAULT_MODEL[nextKind]);
       setEffort(DEFAULT_EFFORT[nextKind]);
       setSpeed("off");
-      setOpencodeServer("shared");
     }
   };
 
@@ -432,7 +415,6 @@ export function useTaskLaunch(
     effort: string | null;
     speed: Speed;
     maxMode: boolean;
-    opencodeServer: OpencodeServerMode;
   }>) => {
     if (values.agent !== undefined) switchAgent(values.agent);
     if (values.mode !== undefined) setMode(values.mode);
@@ -440,7 +422,6 @@ export function useTaskLaunch(
     if (values.effort !== undefined) setEffort(values.effort);
     if (values.speed !== undefined) setSpeed(values.speed);
     if (values.maxMode !== undefined) setMaxMode(values.maxMode);
-    if (values.opencodeServer !== undefined) setOpencodeServer(values.opencodeServer);
   };
 
   const rememberPicks = () => {
@@ -483,8 +464,6 @@ export function useTaskLaunch(
     maxMode,
     setSpeed,
     setMaxMode,
-    opencodeServer,
-    setOpencodeServer,
     speedOptions,
     maxModeAvailable,
     models,
@@ -544,8 +523,6 @@ export function TaskLaunchPickers({
     maxMode,
     setSpeed,
     setMaxMode,
-    opencodeServer,
-    setOpencodeServer,
     speedOptions,
     maxModeAvailable,
     switchAgent,
@@ -688,18 +665,6 @@ export function TaskLaunchPickers({
             <div className="space-y-1">
               <label className="text-muted-foreground">Speed</label>
               <SpeedPicker options={speedOptions} value={speed} onChange={setSpeed} testId="launch-speed" />
-            </div>
-          )}
-
-          {showOpencodeServerPicker(kind, selectedStatus?.version) && (
-            <div className="space-y-1">
-              <label className="text-muted-foreground">OpenCode server</label>
-              <OpencodeServerPicker
-                value={opencodeServer}
-                onChange={setOpencodeServer}
-                locked={opencodeServerLock(harnesses.find((h) => h.id === agent))}
-                testId="launch-opencode-server"
-              />
             </div>
           )}
 

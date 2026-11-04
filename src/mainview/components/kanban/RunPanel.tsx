@@ -25,6 +25,19 @@ import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
 import { fileScopeForTask } from "../../../shared/file-scope.ts";
+import {
+  emptyOpencodeDrafts,
+  opencodeAnswerBody,
+  opencodeAnswerSummary,
+  opencodeCanSubmit,
+  opencodeOptionValue,
+  OPENCODE_REASON_ALLOW_HINT,
+  OPENCODE_REJECT_REASON_HELP,
+  opencodePermissionBody,
+  opencodePermissionOptionBlocked,
+  opencodeSetCustom,
+  opencodeTogglePick,
+} from "@/lib/opencode-interactions";
 import { cursorAskCanAdvance, cursorAskCardHeading, cursorAskFromToolUse, cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues, cursorAskToolFooter, cursorAskWireCustom } from "../../../shared/cursor-ask.ts";
 import { CURSOR_ASK_FREEFORM } from "../../../shared/cursor-ask-verdict.ts";
 import { foldToolUseRevisions, supersededToolUseIndexes } from "../../../shared/tool-use-revisions.ts";
@@ -147,7 +160,6 @@ import { HandoffViewContext, stepNameFor, useHandoffView, type HandoffViewValue 
 import { AssistantHandoffMessage, UserHandoffMarkdown } from "@/components/handoff/HandoffMessage";
 import { handoffCardsEnabled, handoffUsage, indexLastHandoffEventByRun } from "@/lib/handoff-view";
 import { SpeedPicker } from "./SpeedPicker";
-import { OpencodeServerPicker, opencodeServerLock, showOpencodeServerPicker } from "./OpencodeServerPicker";
 import { importedSessionOf } from "../../../shared/imported-session.ts";
 
 /**
@@ -5506,6 +5518,16 @@ function RunsList({
               Imported
             </Badge>
           )}
+          {latest.origin === "agent" && (
+            <Badge
+              variant="secondary"
+              data-testid="run-origin-agent"
+              className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+              title={AGENT_ORIGIN_BADGE_TITLE}
+            >
+              Started by OpenCode
+            </Badge>
+          )}
           <span className="truncate">
             Run #{ordinalFor(latest.id)} · {formatTime(latest.startedAt)}
           </span>
@@ -5554,6 +5576,15 @@ function RunsList({
                     className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
                   >
                     Imported
+                  </Badge>
+                )}
+                {r.origin === "agent" && (
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+                    title={AGENT_ORIGIN_BADGE_TITLE}
+                  >
+                    Started by OpenCode
                   </Badge>
                 )}
                 <span className="truncate text-muted-foreground">
@@ -6837,6 +6868,10 @@ const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
  *  (`CONTINUATION_STATUS_TEXT`) — so the badge stays neutral. */
 const CONTINUATION_BADGE_TITLE = "a turn Agetor didn't send — its first status line says what started it";
 
+/** `origin: "agent"` runs: OpenCode began a turn on the task's session on its
+ *  own, with no message from the user (a background task finished, say). */
+const AGENT_ORIGIN_BADGE_TITLE = "OpenCode started this turn itself — you didn't send a message";
+
 const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -7707,7 +7742,6 @@ function TaskDetails({
     return options;
   }, [allowedEfforts, retainable, task.effort, harnesses, task.agent, kind]);
   const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
-  const opencodeLock = opencodeServerLock(harnesses.find((h) => h.id === task.agent));
   // Speed tiers for the task's model: cursor's come from the curated
   // fast-variant table, fx's only from discovery (the merged row's
   // `fast`/`ultrafast` flags, rule 8), every other kind offers `off` only.
@@ -8040,28 +8074,6 @@ function TaskDetails({
               </>
             )}
 
-            {/* OpenCode server mode (D-4): shown on v2 or an unknown version
-                only (v1 has no shared service). Locked like the effort
-                select — by a running turn or a bound profile — and, for a
-                harness with its own home, forced to Standalone with the
-                picker's own note. The server reads it per turn, so a change
-                lands on the next one. */}
-            {showOpencodeServerPicker(kind, selectedStatus?.version) && (
-              <>
-                <dt className="text-muted-foreground">Server</dt>
-                <dd className="min-w-0">
-                  <OpencodeServerPicker
-                    testId="task-opencode-server"
-                    value={opencodeLock ? "standalone" : task.opencodeServer}
-                    onChange={(opencodeServer) => void save({ opencodeServer })}
-                    locked={opencodeLock}
-                    disabled={!editable}
-                  />
-                  <p className="mt-0.5 text-[10px] text-muted-foreground">Applies on the next turn.</p>
-                </dd>
-              </>
-            )}
-
             <dt className="text-muted-foreground">Project</dt>
             <dd className="min-w-0 truncate font-mono" title={task.workdir}>
               {abbreviateHome(task.workdir, homeDir)}
@@ -8320,17 +8332,24 @@ function AskQuestionsCard({
 }) {
   // One entry per question. selected = picked option labels; custom = optional free-text.
   const [answers, setAnswers] = useState<Array<{ selected: string[]; custom: string }>>(
-    () => req.questions.map(() => ({ selected: [], custom: "" })),
+    () => emptyOpencodeDrafts(req.questions),
   );
   const [submitting, setSubmitting] = useState(false);
   // Two-phase flow mirroring claude's native modal: answer every question,
   // then a review screen ("✔ Submit" tab) before the final submit.
   const [phase, setPhase] = useState<"answer" | "review">("answer");
 
+  const opencode = req.source === "opencode";
+  // OpenCode's optional reason for Skip. The card is keyed by its id, so this
+  // starts empty for every new card.
+  const [skipReason, setSkipReason] = useState("");
+
   const togglePick = (qi: number, label: string, multi: boolean) => {
     setAnswers((cur) =>
       cur.map((a, i) => {
         if (i !== qi) return a;
+        // OpenCode: choosing a single-select option clears typed text.
+        if (opencode) return opencodeTogglePick(a, label, multi);
         if (multi) {
           return a.selected.includes(label)
             ? { ...a, selected: a.selected.filter((s) => s !== label) }
@@ -8342,7 +8361,14 @@ function AskQuestionsCard({
   };
 
   const setCustom = (qi: number, value: string) =>
-    setAnswers((cur) => cur.map((a, i) => (i === qi ? { ...a, custom: value } : a)));
+    setAnswers((cur) =>
+      cur.map((a, i) => {
+        if (i !== qi) return a;
+        // OpenCode: typing into a single-select clears the picked option.
+        if (opencode) return opencodeSetCustom(a, value, req.questions[qi]?.multiSelect === true);
+        return { ...a, custom: value };
+      }),
+    );
 
   const cursor = req.source === "cursor";
   /** Cursor cannot deliver typed text. A selected option is the answer;
@@ -8353,7 +8379,9 @@ function AskQuestionsCard({
   // Every question needs a real answer before Review or submit. Claude
   // accepts the custom field. Cursor with unsupported freeform does not
   // accept typed text alone, or typed text added to a multi-select.
-  const canSubmit = cursor
+  const canSubmit = opencode
+    ? opencodeCanSubmit(req.questions, answers)
+    : cursor
     ? cursorAskCanAdvance(req.questions, answers)
     : answers.every((a) => a.selected.length > 0 || a.custom.trim().length > 0);
 
@@ -8361,7 +8389,7 @@ function AskQuestionsCard({
     if (!canSubmit || submitting) return;
     setSubmitting(true);
     try {
-      const res = await api.answerAskQuestions(req.id, {
+      const res = await api.answerAskQuestions(req.id, opencode ? opencodeAnswerBody(req.questions, answers) : {
         answers: answers.map((a, qi) => {
           const multi = req.questions[qi]?.multiSelect === true;
           const custom = cursor
@@ -8420,6 +8448,12 @@ function AskQuestionsCard({
         toast.error(e.message || "Cursor cannot accept a custom answer — pick an option");
         return;
       }
+      // OpenCode validates the answer against the form it registered; the
+      // card stays up so the user can fix it.
+      if (e instanceof ApiError && e.status === 400 && opencode) {
+        toast.error(e.message || "OpenCode could not accept this answer");
+        return;
+      }
       throw e;
     } finally {
       setSubmitting(false);
@@ -8427,11 +8461,12 @@ function AskQuestionsCard({
   };
 
   const skip = async () => {
-    if (submitting || req.source !== "cursor") return;
+    if (submitting || (req.source !== "cursor" && !opencode)) return;
     setSubmitting(true);
     try {
-      const res = await api.skipAskQuestions(req.id);
-      if (!res.ok) toast.error("Skip didn't reach Cursor");
+      // Only an OpenCode card carries a reason; empty sends no text at all.
+      const res = await api.skipAskQuestions(req.id, opencode ? skipReason : undefined);
+      if (!res.ok) toast.error(`Skip didn't reach ${opencode ? "OpenCode" : "Cursor"}`);
       onResolved(req.id);
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
@@ -8451,9 +8486,11 @@ function AskQuestionsCard({
 
   const heading = phase === "review"
     ? "Review your answers"
-    : cursor
-      ? cursorAskCardHeading(req.delivery, req.followupCause)
-      : "Claude is asking";
+    : opencode
+      ? "OpenCode is asking"
+      : cursor
+        ? cursorAskCardHeading(req.delivery, req.followupCause)
+        : "Claude is asking";
 
   const displayPick = (qi: number, key: string): string => {
     const options = req.questions[qi]?.options ?? [];
@@ -8473,6 +8510,7 @@ function AskQuestionsCard({
    *  Cursor picks are option ids; the summary shows the label. */
   const answerSummary = (qi: number): string => {
     const a = answers[qi] ?? { selected: [], custom: "" };
+    if (opencode) return opencodeAnswerSummary(req.questions[qi]!, a);
     const custom = a.custom.trim();
     const keys = !req.questions[qi]?.multiSelect && custom && !cursorIgnoresCustom ? [] : [...a.selected];
     const pieces = keys.map((key) => displayPick(qi, key));
@@ -8533,7 +8571,7 @@ function AskQuestionsCard({
                 <div className="mb-1.5 whitespace-pre-wrap text-[13px] font-medium">{q.question}</div>
                 <div className="space-y-1">
                   {q.options.map((opt, oi) => {
-                    const value = cursor ? cursorAskOptionValue(opt) : opt.label;
+                    const value = opencode ? opencodeOptionValue(opt) : cursor ? cursorAskOptionValue(opt) : opt.label;
                     const picked = answers[qi]?.selected.includes(value) ?? false;
                     const shown = cursor ? cursorAskOptionChoiceLabel(opt, q.options) : opt.label;
                     return (
@@ -8564,24 +8602,50 @@ function AskQuestionsCard({
                     );
                   })}
                 </div>
-                <Textarea
-                  value={answers[qi]?.custom ?? ""}
-                  onChange={(e) => setCustom(qi, e.target.value)}
-                  placeholder={
-                    cursorIgnoresCustom
-                      ? "Custom answer — Cursor can't accept typed text; pick an option"
-                      : q.multiSelect
-                        ? "Custom answer — added to the selection"
-                        : "Custom answer — replaces the selection"
-                  }
-                  rows={2}
-                  className="mt-2 text-[12px]"
-                />
+                {(!opencode || q.allowCustom === true) && (
+                  <Textarea
+                    value={answers[qi]?.custom ?? ""}
+                    onChange={(e) => setCustom(qi, e.target.value)}
+                    data-testid={opencode ? `ask-questions-custom-${qi}` : undefined}
+                    placeholder={
+                      opencode
+                        ? q.multiSelect
+                          ? "Type your own answer — added to the selection"
+                          : "Type your own answer — replaces the selection"
+                        : cursorIgnoresCustom
+                          ? "Custom answer — Cursor can't accept typed text; pick an option"
+                          : q.multiSelect
+                            ? "Custom answer — added to the selection"
+                            : "Custom answer — replaces the selection"
+                    }
+                    rows={2}
+                    className="mt-2 text-[12px]"
+                  />
+                )}
               </div>
             ))}
           </div>
+          {opencode && req.allowReason === true && (
+            <div className="mt-3 rounded-md border border-border/40 bg-muted/20 p-2">
+              <label className="text-[11px] text-muted-foreground" htmlFor={`ask-skip-reason-${req.id}`}>
+                Reason (optional)
+              </label>
+              <Textarea
+                id={`ask-skip-reason-${req.id}`}
+                value={skipReason}
+                onChange={(e) => setSkipReason(e.target.value)}
+                data-testid="ask-questions-skip-reason"
+                placeholder="Why you are skipping"
+                rows={2}
+                className="mt-1 text-[12px]"
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Skip — the agent continues without an answer. A reason you type is sent along with it.
+              </p>
+            </div>
+          )}
           <div className="mt-3 flex items-center justify-between">
-            {cursor ? (
+            {cursor || opencode ? (
               <Button variant="ghost" size="sm" data-testid="ask-questions-skip" onClick={() => void skip()} disabled={submitting}>
                 Skip
               </Button>
@@ -8851,6 +8915,10 @@ function FxPermissionCard({
 }) {
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // OpenCode only: the optional reason sent with Reject. The card is keyed by
+  // its id, so this starts empty for every new card.
+  const opencode = req.harness === "opencode";
+  const [reason, setReason] = useState("");
 
   // `{ ok: false }` (HTTP 200) means the request was already resolved
   // server-side — a sibling `answer`/`cancel` call won the race — so the
@@ -8865,7 +8933,7 @@ function FxPermissionCard({
     setSubmitting(optionId);
     setError(null);
     try {
-      await api.answerFxPermission(req.id, { optionId });
+      await api.answerFxPermission(req.id, opencode ? opencodePermissionBody(optionId, reason) : { optionId });
       onResolved(req.id);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to send the answer.");
@@ -8893,10 +8961,19 @@ function FxPermissionCard({
   const title = req.toolCall.title || req.toolCall.kind || "tool call";
 
   return (
-    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+    <div
+      className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40"
+      data-testid="permission-card"
+      data-harness={opencode ? "opencode" : "fx"}
+    >
       <div className="mb-2 flex items-center justify-between">
         <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
-          <ShieldAlert className="size-3.5" aria-hidden /> Fx is requesting permission
+          <ShieldAlert className="size-3.5" aria-hidden />{" "}
+          {opencode
+            ? req.mode === "plan"
+              ? "OpenCode’s Plan agent is requesting permission"
+              : "OpenCode is requesting permission"
+            : "Fx is requesting permission"}
         </span>
         {/* The agetor mode (`auto`/`ask`) that caused this to surface as a
          *  card — `yolo` auto-allows and never reaches here, so an auto-mode
@@ -8923,6 +9000,30 @@ function FxPermissionCard({
           </pre>
         )}
       </div>
+      {opencode && req.allowReason === true && (
+        <div className="mt-3">
+          <label className="text-[11px] text-muted-foreground" htmlFor={`perm-reason-${req.id}`}>
+            Reason (optional)
+          </label>
+          <Textarea
+            id={`perm-reason-${req.id}`}
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            data-testid="permission-reason"
+            placeholder="Why you are rejecting this"
+            rows={2}
+            className="mt-1 text-[12px]"
+          />
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {OPENCODE_REJECT_REASON_HELP}
+          </p>
+          {reason.trim().length > 0 && (
+            <p className="mt-1 text-[11px] text-warning" data-testid="permission-reason-hint">
+              {OPENCODE_REASON_ALLOW_HINT}
+            </p>
+          )}
+        </div>
+      )}
       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
         {/* Defensive only — the driver guards against fx sending a request
          *  with zero options — but if it ever happens, Dismiss is the only
@@ -8935,23 +9036,29 @@ function FxPermissionCard({
           return (
             <Button
               key={opt.optionId}
+              data-testid={`permission-option-${opt.optionId}`}
               onClick={() => void choose(opt.optionId)}
               size="sm"
               variant={isReject ? "outline" : "default"}
-              disabled={submitting !== null}
+              disabled={submitting !== null || (opencode && opencodePermissionOptionBlocked(opt.optionId, reason))}
+              title={opencode && opencodePermissionOptionBlocked(opt.optionId, reason) ? OPENCODE_REASON_ALLOW_HINT : undefined}
             >
               {submitting === opt.optionId ? "Sending…" : opt.name}
             </Button>
           );
         })}
-        <Button
-          onClick={() => void dismiss()}
-          size="sm"
-          variant="outline"
-          disabled={submitting !== null}
-        >
-          {submitting === FX_DISMISS_SUBMIT_KEY ? "Dismissing…" : "Dismiss (reject)"}
-        </Button>
+        {/* OpenCode's own Reject is the deny path (with or without a reason);
+         *  `cancel` is reserved for Stop/delete/driver teardown there. */}
+        {!opencode && (
+          <Button
+            onClick={() => void dismiss()}
+            size="sm"
+            variant="outline"
+            disabled={submitting !== null}
+          >
+            {submitting === FX_DISMISS_SUBMIT_KEY ? "Dismissing…" : "Dismiss (reject)"}
+          </Button>
+        )}
       </div>
       {error && (
         <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>

@@ -3,18 +3,15 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table } from "../output.ts";
 import { flagValue } from "../args.ts";
 import type { AgetorClient, AgentProfileInput } from "../api-client.ts";
-import { parseOpencodeServerFlag, parseSpeedFlag, usageError } from "../usage.ts";
+import { parseOpencodeServerFlag, parseSpeedFlag, usageError, warnOpencodeServerFlagIgnored } from "../usage.ts";
 import { cmdExportOne, cmdImportAs, printableLines } from "./bundle.ts";
 import { asProfileError, matchAgentProfileRef, normalizeSkillName } from "../../shared/agent-profile.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
-import { effectiveOpencodeServer, opencodeMajor } from "../../shared/opencode.ts";
 import {
   AGENT_OPTIONS,
   type AgentKind,
   type AgentProfile,
   type Harness,
-  type HarnessStatus,
-  type OpencodeServerMode,
   type Speed,
 } from "../../shared/types.ts";
 
@@ -45,17 +42,14 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       if (!ref) throw usageError("profile");
       const profile = await resolveProfile(client, ref);
       if (flags.json) return printJson(profile);
-      // The harness row + status decide whether the OpenCode server line
-      // applies and what it actually runs as; a failed lookup falls back to
-      // the built-in-id heuristic and prints the stored value alone.
-      const harnessInfo = await client.listHarnesses().catch(() => null);
-      for (const line of formatAgentProfileShow(profile, profileHarnessContext(profile.harness, harnessInfo))) out(line);
+      for (const line of formatAgentProfileShow(profile)) out(line);
       return;
     }
     case "add": {
       const name = args[1];
       if (!name || name.startsWith("-")) throw usageError("profile add");
       const f = parseAgentProfileFlags(args.slice(2));
+      if (f.opencodeServerIgnored) warnOpencodeServerFlagIgnored();
       if (!f.harness || !f.model) throw usageError("profile add");
       const instructions = await resolveInstructions(f);
       const input: AgentProfileInput = {
@@ -66,7 +60,6 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
         mode: f.mode ?? null,
         speed: f.speed ?? "off",
         maxMode: f.maxMode ?? false,
-        ...(f.opencodeServer !== undefined ? { opencodeServer: f.opencodeServer } : {}),
         instructions: instructions ?? "",
         skills: normalizeSkillList(f.skills),
       };
@@ -87,17 +80,20 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
         f.mode !== undefined ||
         f.speed !== undefined ||
         f.maxMode !== undefined ||
-        f.opencodeServer !== undefined ||
         f.instructions !== undefined ||
         f.instructionsFile !== undefined ||
         f.skills.length > 0 ||
         f.clearSkills;
-      if (!hasAnyFlag) {
+      if (!hasAnyFlag && !f.opencodeServerIgnored) {
         throw new Error(
-          "nothing to edit — pass at least one of --name/--harness/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--opencode-server/--instructions/--instructions-file/--skill/--clear-skills",
+          "nothing to edit — pass at least one of --name/--harness/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--instructions/--instructions-file/--skill/--clear-skills",
         );
       }
       const profile = await resolveProfile(client, ref);
+      // After the ref resolved, so a typo'd ref is still an error. An old
+      // script whose only flag was the retired one then succeeds.
+      if (f.opencodeServerIgnored) warnOpencodeServerFlagIgnored();
+      if (!hasAnyFlag) return;
       const instructions = await resolveInstructions(f);
       const patch: Partial<AgentProfileInput> = {};
       if (f.name !== undefined) patch.name = f.name;
@@ -107,7 +103,6 @@ export async function cmdAgentProfile(args: string[], flags: Flags): Promise<voi
       if (f.mode !== undefined) patch.mode = f.mode;
       if (f.speed !== undefined) patch.speed = f.speed;
       if (f.maxMode !== undefined) patch.maxMode = f.maxMode;
-      if (f.opencodeServer !== undefined) patch.opencodeServer = f.opencodeServer;
       if (instructions !== undefined) patch.instructions = instructions;
       if (f.clearSkills) {
         patch.skills = normalizeSkillList(f.skills);
@@ -228,13 +223,10 @@ export function formatAgentProfileListRow(pr: AgentProfile): string[] {
   ];
 }
 
-/** What `profile show` knows about the profile's harness: its kind (for
- *  the opencode-only line) and, when the harness row was found, its home and
- *  probed version (for what the stored server option actually runs as). */
+/** What `agetor show` knows about a task's harness: its kind, which decides
+ *  the default mode text. */
 export interface ProfileHarnessContext {
   kind: AgentKind | null;
-  home?: string | null;
-  version?: string | null;
 }
 
 /** Resolve {@link ProfileHarnessContext} from a `listHarnesses()` answer
@@ -242,48 +234,22 @@ export interface ProfileHarnessContext {
  *  harness id itself when it names a built-in kind, else unknown. */
 export function profileHarnessContext(
   harnessId: string,
-  info: { harnesses: Harness[]; statuses?: HarnessStatus[] } | null,
+  info: { harnesses: Harness[] } | null,
 ): ProfileHarnessContext {
   const harness = info?.harnesses.find((h) => h.id === harnessId);
-  if (harness) {
-    return {
-      kind: harness.kind,
-      home: harness.home ?? null,
-      version: info?.statuses?.find((s) => s.harnessId === harnessId)?.version ?? null,
-    };
-  }
+  if (harness) return { kind: harness.kind };
   return { kind: harnessId in AGENT_OPTIONS ? (harnessId as AgentKind) : null };
-}
-
-/** The `opencode server:` value for an opencode task or profile: the stored
- *  mode, plus a note when the harness makes it run otherwise — standalone for
- *  a harness with its own home, unused on OpenCode 1. Shared with
- *  `agetor show`. */
-export function opencodeServerText(
-  stored: OpencodeServerMode,
-  ctx: { home?: string | null; version?: string | null },
-): string {
-  if (ctx.version !== undefined && ctx.version !== null && opencodeMajor(ctx.version) === 1) {
-    return `${stored} ${c.dim("(not used by OpenCode 1)")}`;
-  }
-  const effective = effectiveOpencodeServer({ mode: stored, harnessHome: ctx.home ?? null, major: 2 });
-  if (effective !== stored) return `${stored} ${c.dim("(runs standalone: the harness has its own home)")}`;
-  return stored;
 }
 
 /** Pure line formatter for `agetor profile show` — exported so the printed
  *  fields (the `speed:` tier among them) are unit-testable without a
- *  client/daemon, like {@link formatAgentProfileListRow}. `harness` adds the
- *  `opencode server:` line for an OpenCode profile. */
-export function formatAgentProfileShow(profile: AgentProfile, harness?: ProfileHarnessContext): string[] {
+ *  client/daemon, like {@link formatAgentProfileListRow}. */
+export function formatAgentProfileShow(profile: AgentProfile): string[] {
   const lines = [
     `${c.bold(safe(profile.name))}  ${c.dim(profile.id)}`,
     `  ${label("harness")} ${safe(profile.harness)}   ${label("model")} ${safe(profile.model)}` +
       `   ${label("effort")} ${safe(profile.effort ?? "-")}   ${label("mode")} ${safe(profile.mode ?? "-")}`,
     `  ${label("speed")} ${safe(profile.speed)}   ${label("max mode")} ${profile.maxMode ? "yes" : "no"}`,
-    ...(harness?.kind === "opencode"
-      ? [`  ${label("opencode server")} ${opencodeServerText(profile.opencodeServer ?? "shared", harness)}`]
-      : []),
     `  ${label("skills")} ${profile.skills.length ? profile.skills.map((s) => `/${safe(s)}`).join(", ") : c.dim("none")}`,
     `  ${label("used by")} ${taskCountText(profile.taskCount ?? 0)}`,
     `  ${label("instructions")}${profile.instructions ? "" : ` ${c.dim("none")}`}`,
@@ -324,8 +290,8 @@ export interface AgentProfileFlags {
    *  later of several speed flags wins. */
   speed?: Speed;
   maxMode?: boolean;
-  /** `--opencode-server shared|standalone` (OpenCode 2's server option). */
-  opencodeServer?: OpencodeServerMode;
+  /** The retired `--opencode-server` flag was passed (validated, never sent). */
+  opencodeServerIgnored?: boolean;
   instructions?: string;
   instructionsFile?: string;
   skills: string[];
@@ -352,7 +318,7 @@ export function parseAgentProfileFlags(args: string[]): AgentProfileFlags {
       case "--no-fast": f.speed = "off"; break;
       case "--max-mode": f.maxMode = true; break;
       case "--no-max-mode": f.maxMode = false; break;
-      case "--opencode-server": f.opencodeServer = parseOpencodeServerFlag(val()); break;
+      case "--opencode-server": f.opencodeServerIgnored = parseOpencodeServerFlag(val()); break;
       case "--instructions": f.instructions = val(); break;
       case "--instructions-file": f.instructionsFile = val(true); break;
       case "--skill": f.skills.push(val()); break;

@@ -4,11 +4,17 @@ import {
   OPENCODE_SERVER_INPUT_ERROR,
   OPENCODE_SESSION_ID_RE,
   OPENCODE_VERSION_RE,
+  disambiguateOpencodeLabels,
   effectiveOpencodeServer,
   formatOpencodeTurnBreadcrumb,
   opencodeChildrenDieWithTurn,
   opencodeMajor,
   opencodeModelArgs,
+  opencodeProviderLabel,
+  opencodeProviderOf,
+  opencodeTransportFor,
+  opencodeQuotaHint,
+  opencodeResumeFailedStatusLine,
   opencodeTurnBreadcrumbPrefix,
   parseOpencodeServerInput,
   parseOpencodeTurnBreadcrumb,
@@ -17,7 +23,9 @@ import { importedSessionOf } from "./imported-session.ts";
 import {
   AGENT_OPTIONS,
   AUTO_ENABLE_KINDS,
+  CODE_PLAN_MODE,
   DEFAULT_MODEL,
+  defaultModeFor,
   HARNESS_TEMPLATES,
   OPENCODE_SERVER_MODES,
   type ImportedClaudeSession,
@@ -133,13 +141,24 @@ describe("parseOpencodeServerInput", () => {
 
 describe("turn breadcrumb (D-19)", () => {
   test("format → parse round-trips the CLI line and effective server", () => {
-    for (const [major, server] of [[2, "shared"], [2, "standalone"], [1, null]] as const) {
+    for (const [major, server] of [[2, "shared"], [2, "standalone"], [2, "agetor"], [1, null]] as const) {
       const line = formatOpencodeTurnBreadcrumb({ major, server, modelLabel: "OpenCode default", effort: "auto", mode: "auto" });
       expect(line.startsWith(opencodeTurnBreadcrumbPrefix(major))).toBe(true);
       expect(parseOpencodeTurnBreadcrumb(line)).toEqual({ major, server });
     }
     expect(formatOpencodeTurnBreadcrumb({ major: 1, server: null, modelLabel: "M", effort: "high", mode: "plan" }))
       .toBe("opencode 1.x · server=n/a · model=M · effort=high · mode=plan");
+  });
+
+  test("an agetor-server turn formats and parses; old lines still parse exactly as before", () => {
+    expect(formatOpencodeTurnBreadcrumb({ major: 2, server: "agetor", modelLabel: "M", effort: "auto", mode: "ask" }))
+      .toBe("opencode 2.x · server=agetor · model=M · effort=auto · mode=ask");
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=agetor · model=M · effort=auto · mode=ask")).toEqual({ major: 2, server: "agetor" });
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=agetor")).toEqual({ major: 2, server: "agetor" });
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=shared · model=M · effort=auto · mode=auto")).toEqual({ major: 2, server: "shared" });
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=standalone · model=M")).toEqual({ major: 2, server: "standalone" });
+    expect(parseOpencodeTurnBreadcrumb("opencode 1.x · server=n/a · model=M · effort=high · mode=plan")).toEqual({ major: 1, server: null });
+    expect(parseOpencodeTurnBreadcrumb("opencode 2.x · server=agetorx · model=x")).toBeNull();
   });
 
   test("anything else parses as null", () => {
@@ -153,6 +172,37 @@ describe("turn breadcrumb (D-19)", () => {
     expect(opencodeChildrenDieWithTurn({ major: 2, server: "standalone" })).toBe(true);
     expect(opencodeChildrenDieWithTurn({ major: 2, server: "shared" })).toBe(false);
   });
+
+  test("an agetor-server turn's children outlive it (server-owned)", () => {
+    expect(opencodeChildrenDieWithTurn({ major: 2, server: "agetor" })).toBe(false);
+  });
+});
+
+describe("opencodeTransportFor", () => {
+  test("v1 always runs `opencode run`, whatever the env says", () => {
+    expect(opencodeTransportFor({ version: "1.19.4" })).toBe("run");
+    expect(opencodeTransportFor({ version: "1.19.4", transportEnv: "server" })).toBe("run");
+  });
+
+  test("v2 and an unparseable, empty or missing version take the server", () => {
+    expect(opencodeTransportFor({ version: "opencode v2.1.3" })).toBe("server");
+    expect(opencodeTransportFor({ version: "garbage" })).toBe("server");
+    expect(opencodeTransportFor({ version: "" })).toBe("server");
+    expect(opencodeTransportFor({ version: null })).toBe("server");
+    expect(opencodeTransportFor({ version: undefined, transportEnv: null })).toBe("server");
+  });
+
+  test("AGETOR_OPENCODE_TRANSPORT=run (trimmed, any case) forces `run` on v2", () => {
+    for (const env of ["run", "RUN", " run ", "Run\n"]) {
+      expect(opencodeTransportFor({ version: "2.1.3", transportEnv: env })).toBe("run");
+    }
+  });
+
+  test("any other env value leaves v2 on the server", () => {
+    for (const env of ["server", "", "  ", "running", "1", null, undefined]) {
+      expect(opencodeTransportFor({ version: "2.1.3", transportEnv: env })).toBe("server");
+    }
+  });
 });
 
 describe("opencode constants and tables", () => {
@@ -165,8 +215,11 @@ describe("opencode constants and tables", () => {
     expect(OPENCODE_DEFAULT_MODEL).not.toBe("default");
   });
 
-  test("modes are Auto then Plan; efforts are just Model default", () => {
-    expect(AGENT_OPTIONS.opencode.modes.map((m) => m.id)).toEqual(["auto", "plan"]);
+  test("modes are Auto, Ask then Plan (Auto the default); efforts are just Model default", () => {
+    expect(AGENT_OPTIONS.opencode.modes.map((m) => m.id)).toEqual(["auto", "ask", "plan"]);
+    expect(defaultModeFor("opencode")).toBe("auto");
+    expect(CODE_PLAN_MODE.opencode).toEqual({ code: "auto", plan: "plan" });
+    for (const m of AGENT_OPTIONS.opencode.modes) expect(m.hint).not.toMatch(/--[a-z]/);
     expect(AGENT_OPTIONS.opencode.efforts.map((e) => e.id)).toEqual(["auto"]);
   });
 
@@ -240,5 +293,79 @@ describe("importedSessionOf", () => {
 
   test("Claude wins if both are set", () => {
     expect(importedSessionOf({ importedClaude: claude, importedOpencode: opencode })?.kind).toBe("claude-code");
+  });
+});
+
+describe("OpenCode provider labels", () => {
+  test("opencodeProviderOf / opencodeProviderLabel", () => {
+    expect(opencodeProviderOf("opencode-go/deepseek-v4.1-flash")).toBe("opencode-go");
+    expect(opencodeProviderOf(OPENCODE_DEFAULT_MODEL)).toBeNull();
+    expect(opencodeProviderOf("/x")).toBeNull();
+    expect(opencodeProviderLabel("opencode")).toBe("OpenCode Zen");
+    expect(opencodeProviderLabel("opencode-go")).toBe("OpenCode Go");
+    expect(opencodeProviderLabel("anthropic")).toBe("anthropic");
+  });
+
+  test("disambiguateOpencodeLabels: a name shared across providers gets the provider; unique names, ids, order and efforts stay", () => {
+    const out = disambiguateOpencodeLabels([
+      { id: "opencode-go/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", efforts: ["max"] },
+      { id: "opencode/big-pickle", label: "Big Pickle", efforts: [] },
+      { id: "opencode/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", efforts: ["max"] },
+      { id: "openrouter/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash" },
+      { id: "anthropic/claude-x" },
+    ]);
+    expect(out).toEqual([
+      { id: "opencode-go/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash (OpenCode Go)", efforts: ["max"] },
+      { id: "opencode/big-pickle", label: "Big Pickle", efforts: [] },
+      { id: "opencode/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash (OpenCode Zen)", efforts: ["max"] },
+      { id: "openrouter/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash (openrouter)" },
+      { id: "anthropic/claude-x" },
+    ]);
+  });
+
+  test("disambiguateOpencodeLabels: two ids of one provider sharing a name fall back to the id", () => {
+    expect(disambiguateOpencodeLabels([
+      { id: "p/a", label: "Same" },
+      { id: "p/b", label: "Same" },
+      { id: "q/c", label: "Same" },
+    ]).map((m) => m.label)).toEqual(["Same (p/a)", "Same (p/b)", "Same (q)"]);
+  });
+
+  test("opencodeQuotaHint: only for an out-of-balance error", () => {
+    const zen = "opencode/deepseek-v4.1-flash";
+    expect(opencodeQuotaHint({ type: "provider.quota", status: 402 }, "Upstream request failed: Insufficient account funds", zen))
+      .toContain("opencode-go/");
+    expect(opencodeQuotaHint({ status: 402 }, "x", zen)).not.toBeNull();
+    expect(opencodeQuotaHint(null, "Insufficient funds", zen)).not.toBeNull();
+    // an effort variant on a Zen model id is still Zen
+    expect(opencodeQuotaHint({ status: 402 }, "x", `${zen}#high`)).not.toBeNull();
+    expect(opencodeQuotaHint({ type: "provider.free-limit", status: 429 }, "Free usage limit reached.", zen)).toBeNull();
+    expect(opencodeQuotaHint({ type: "unknown" }, "File not found", zen)).toBeNull();
+  });
+
+  test("opencodeQuotaHint: a Go model or a BYOK provider gets no hint (switching to Go would be wrong advice)", () => {
+    const quota = { type: "provider.quota", status: 402 };
+    const msg = "Upstream request failed: Insufficient account funds";
+    expect(opencodeQuotaHint(quota, msg, "opencode-go/deepseek-v4.1-flash")).toBeNull();
+    expect(opencodeQuotaHint(quota, msg, "anthropic/claude-sonnet-5")).toBeNull();
+    expect(opencodeQuotaHint(quota, msg, "openrouter/some/model")).toBeNull();
+    // the provider decides even when the error text names Zen
+    expect(opencodeQuotaHint(quota, "OpenCode Zen: insufficient funds", "anthropic/claude-sonnet-5")).toBeNull();
+  });
+
+  test("opencodeQuotaHint: an unknown model hints only when the error text itself names Zen", () => {
+    const quota = { type: "provider.quota", status: 402 };
+    for (const model of [undefined, null, "", "opencode-default"]) {
+      expect(opencodeQuotaHint(quota, "Upstream request failed: Insufficient account funds", model)).toBeNull();
+      expect(opencodeQuotaHint(quota, "OpenCode Zen: insufficient funds", model)).not.toBeNull();
+      expect(opencodeQuotaHint(quota, "model opencode/big-pickle has insufficient funds", model)).not.toBeNull();
+      // a Go model id in the text is not Zen
+      expect(opencodeQuotaHint(quota, "model opencode-go/x has insufficient funds", model)).toBeNull();
+    }
+  });
+
+  test("opencodeResumeFailedStatusLine: the D-9 line names the first 8 chars of the session id", () => {
+    expect(opencodeResumeFailedStatusLine("ses_e8250f036ffepNNRrhaD7yBOwE"))
+      .toBe("couldn't resume OpenCode session ses_e825… — starting a fresh session");
   });
 });

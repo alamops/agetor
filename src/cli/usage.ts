@@ -1,7 +1,8 @@
-import { COLUMNS, OPENCODE_SERVER_MODES, SPEEDS, type OpencodeServerMode, type Speed } from "../shared/types.ts";
+import { COLUMNS, OPENCODE_SERVER_MODES, SPEEDS, type Speed } from "../shared/types.ts";
 import { isSpeed } from "../shared/speed.ts";
 import { parseOpencodeServerInput } from "../shared/opencode.ts";
-import { escapeControlChars } from "../shared/terminal-text.ts";
+import { escapeControlChars, escapeFreeText } from "../shared/terminal-text.ts";
+import { c, errln } from "./output.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id).join(", ");
 
@@ -24,18 +25,13 @@ export const USAGE: Record<string, string> = {
                         Fast variants, fx Gateway lanes); --fast = --speed
                         fast, --no-fast = --speed off — the later flag wins
     --max-mode | --no-max-mode   cursor Max Mode
-    --opencode-server <s>  shared | standalone — OpenCode 2 only: shared runs
-                        through OpenCode's background service, standalone
-                        starts a private server per turn (a harness with its
-                        own home always runs standalone)
     --profile <id|name>  launch from a saved agent profile (agetor profile ls) —
                         cannot combine with --agent/--model/--mode/--effort/
                         --speed/--fast/--max-mode, the profile defines them
-                        (and --opencode-server)
     --pipeline <id|name> launch a pipeline (agetor pipeline ls) instead of a
                         single agent — cannot combine with --profile or any
                         of --agent/--model/--mode/--effort/--speed/--fast/
-                        --max-mode/--opencode-server
+                        --max-mode
     --type <t>         task | subtask | epic | feature | bug | spike
     --ref <path>       attach a file/folder reference (repeatable)
     --issue <url>      seed title/prompt from a GitHub/GitLab issue + its thread
@@ -81,10 +77,21 @@ export const USAGE: Record<string, string> = {
   Ask the agent to commit all changes and push the branch. Resumes the session
   like 'send'; refused while the task is still running.`,
 
-  answer: `usage: agetor answer <task-id>
+  answer: `usage: agetor answer <task-id> [--reason <text>] [--skip]
 
   Answer a task that needs input — an interactive picker for AskUserQuestion
-  options or a tmux prompt.`,
+  options, a tmux prompt or a permission request.
+  OpenCode cards:
+    --reason <text>  the reason sent with a Reject on a permission request, or
+                     with --skip on a question. A reject WITHOUT a reason skips
+                     the action and the agent continues without it; a reason you
+                     give is passed to the agent. Rejecting also declines the
+                     agent's other pending requests in that session.
+                     Refused with Allow once / Always allow, and on a card that
+                     takes no reason.
+    --skip           skip an OpenCode question (the agent continues without an
+                     answer; add --reason to tell it why).
+  A question that takes typed text has a '✎ Other' row.`,
 
   resume: `usage: agetor resume <task-id> [--cancel]
 
@@ -119,10 +126,11 @@ export const USAGE: Record<string, string> = {
 
   attach: `usage: agetor attach <task-id>
 
-  Attach your terminal to the task's live tmux session (every tmux-hosted
-  agent kind; fx has none). For the one-shot kinds — codex, cursor, gemini,
-  antigravity and opencode — it exists only while a turn is in flight.
-  Detach with Ctrl-b d.`,
+  Attach your terminal to the task's live tmux session. claude-code keeps one
+  for the whole task; for the one-shot kinds — codex, gemini, antigravity,
+  copilot and an OpenCode 1.x turn — it exists only while a turn is in flight.
+  fx, cursor and an OpenCode 2.x turn (it runs on the agetor-managed OpenCode
+  server) have none. Detach with Ctrl-b d.`,
 
   shell: `usage: agetor shell <task-id> [--print]
 
@@ -133,16 +141,14 @@ export const USAGE: Record<string, string> = {
   edit: `usage: agetor edit <task-id> [flags]   (at least one flag)
 
   Patch a task. Changing model / mode / effort applies to a live session mid-run.
-  A task bound to an agent profile refuses agent/mode/model/effort/speed/max-mode/
-  opencode-server edits (409) — pass --detach-profile first (or alongside) to
+  A task bound to an agent profile refuses agent/mode/model/effort/speed/max-mode
+  edits (409) — pass --detach-profile first (or alongside) to
   unlock them.
     --title <s>   --prompt <s> | --prompt-file <p>   --agent <id>   --workdir <p>
     --model <id>   --mode <id>   --effort <id>   --type <t>   --column <c>
     --speed <s>   off | fast | ultrafast; --fast = --speed fast, --no-fast =
                   --speed off — the later flag wins
     --max-mode | --no-max-mode   cursor Max Mode
-    --opencode-server <s>   shared | standalone (OpenCode 2; applies on the
-                  next turn)
     --detach-profile   unbind from the task's agent profile (keeps its values)`,
 
   move: `usage: agetor move <task-id> <column>   (columns: ${COLUMN_IDS})
@@ -268,16 +274,14 @@ export const USAGE: Record<string, string> = {
   env, bin on PATH). Run 'claude /login' (or 'codex login', 'opencode auth login')
   here to authenticate a parallel account against its own config. Ctrl-D to exit.`,
 
-  "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--opencode-server shared|standalone] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
+  "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
 
   Create a reusable agent profile. --harness and --model are required.
-  --opencode-server (OpenCode 2 harnesses) picks the shared background
-  service or a private server per turn; default shared.
   --instructions-file - reads instructions from stdin. --skill is repeatable.
   --fast is the same as --speed fast and --no-fast as --speed off; when
   several speed flags are given, the later one wins.`,
 
-  "profile edit": `usage: agetor profile edit <ref> [--name <new>] [--harness <id>] [--model <id>] [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--opencode-server shared|standalone] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …] [--clear-skills]   (at least one flag)
+  "profile edit": `usage: agetor profile edit <ref> [--name <new>] [--harness <id>] [--model <id>] [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …] [--clear-skills]   (at least one flag)
 
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced). --fast is the
@@ -445,12 +449,27 @@ export function parseSpeedFlag(value: string): Speed {
   throw new Error(`'--speed' must be one of ${SPEEDS.join(", ")} (got '${escapeControlChars(value)}')`);
 }
 
-/** Parse an `--opencode-server` value (`shared | standalone`) with the same
- *  validator the routes use (`parseOpencodeServerInput`). Anything else is a
- *  usage error naming the two modes. */
-export function parseOpencodeServerFlag(value: string): OpencodeServerMode {
+/** The one stderr line printed when a script still passes `--opencode-server`.
+ *  The flag is retired: OpenCode 2 tasks run on an agetor-managed server, so
+ *  the value is validated (an old script's typo still fails the same way) and
+ *  then dropped. */
+export const OPENCODE_SERVER_FLAG_NOTICE =
+  "--opencode-server is no longer used: OpenCode 2 tasks run on an agetor-managed server";
+
+/** Print {@link OPENCODE_SERVER_FLAG_NOTICE} (yellow, stderr). Called once per
+ *  command that saw the flag. */
+export function warnOpencodeServerFlagIgnored(): void {
+  errln(c.yellow("! " + escapeFreeText(OPENCODE_SERVER_FLAG_NOTICE)));
+}
+
+/** Validate a retired `--opencode-server` value (`shared | standalone`) with
+ *  the same validator the routes use (`parseOpencodeServerInput`) and return
+ *  nothing: callers only record that the flag was given, so they can print
+ *  {@link OPENCODE_SERVER_FLAG_NOTICE} once and never send the value to the
+ *  core. Anything else is a usage error naming the two modes. */
+export function parseOpencodeServerFlag(value: string): true {
   const parsed = parseOpencodeServerInput(value);
-  if (parsed === "shared" || parsed === "standalone") return parsed;
+  if (parsed === "shared" || parsed === "standalone") return true;
   throw new Error(
     `'--opencode-server' must be one of ${OPENCODE_SERVER_MODES.join(", ")} (got '${escapeControlChars(value)}')`,
   );

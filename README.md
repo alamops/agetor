@@ -82,7 +82,7 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 | **fx** (Vercel Labs) <sup>experimental</sup> | `fx` | [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio), through Vercel AI Gateway | DeepSeek V4 Flash | `curl -fsSL https://fx.sh/setup.sh \| bash` |
 | **Antigravity** <sup>experimental</sup> | `agy` | `stream-json` headless mode for each turn inside `tmux`; the conversation resumes by conversation id | Gemini 3.8 Flash (High) | `brew install --cask antigravity-cli` |
 | **GitHub Copilot** <sup>experimental</sup> | `copilot` | `--output-format json` headless mode for each turn inside `tmux`, prompt on stdin; the conversation resumes by session id | Auto | `brew install --cask copilot-cli` |
-| **OpenCode** <sup>experimental</sup> | `opencode` | `opencode run --format json` for each turn inside `tmux`; the conversation resumes by session id | OpenCode's own configured model | `brew install opencode` (the `opencode-ai` npm package, OpenCode 1.x, also works) |
+| **OpenCode** <sup>experimental</sup> | `opencode` | OpenCode 2 runs on a server Agetor starts and manages for each harness; OpenCode 1.x runs `opencode run` for each turn inside `tmux`. The conversation resumes by session id | OpenCode's own configured model | `brew install opencode` (the `opencode-ai` npm package, OpenCode 1.x, also works) |
 
 Claude Code, Antigravity and GitHub Copilot are enabled out of the box. Codex, Cursor, Gemini CLI, fx and OpenCode turn on by themselves, once, the first time Agetor finds their CLI installed, and a toast tells you which ones it turned on. If you turn one off in **Settings → Harnesses**, it stays off, even though the CLI is still installed. Extra-account harnesses you add are never touched. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
 
@@ -104,11 +104,13 @@ Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast*
 
 - **Two CLI lines.** Agetor supports both OpenCode 2 (Homebrew's `opencode`) and OpenCode 1.x (the `opencode-ai` npm package), and picks the right flags from `opencode --version`. Settings → Harnesses and the onboarding checklist note when no OpenCode credentials are found (`opencode auth login`) and, on 1.x, that OpenCode 2 is available. OpenCode 1.x and 2 can't share one OpenCode data directory: once OpenCode 2 has run in a home, OpenCode 1.x commands in that same home fail, and Agetor then tells you to give the 1.x harness its own Home in Settings → Harnesses.
 - **Default model.** The first model row, **OpenCode default**, passes no `-m` at all, so OpenCode runs whatever model its own config names. Pick a specific model to override it. Pickers list the models your OpenCode install reports, and a model's variants (for example `high` or `max`) appear as its effort choices; a model with no variants has no effort picker.
-- **Modes.** *Auto* runs hands-off. *Plan* runs OpenCode's `plan` agent.
-- **Shared or Standalone server.** On OpenCode 2, each task can use OpenCode's shared background server (the default) or run with its own in-process server (**Standalone**). The picker is in the New Task form, in an Agent and in task details, and doesn't exist on OpenCode 1.x. On the CLI, use `--opencode-server shared|standalone` with `agetor add`, `agetor edit` and `agetor profile add|edit`. On the CLI, use `--opencode-server shared|standalone` with `agetor add`, `agetor edit` and `agetor profile add|edit`. An additional-account harness (one with its own `$HOME`) always runs Standalone, so it never reaches another account's server.
-- **Subagents.** OpenCode's subagents appear as tabs on the task. Their transcripts are filled in when the turn ends, not while it runs.
+- **Modes.** *Auto* runs hands-off. *Ask* shows a card for every tool call, where you choose **Allow once**, **Always allow** or **Reject**. *Plan* runs OpenCode's `plan` agent, and anything it still asks to do shows as a card too. Rejecting skips that action and the agent continues without it; a reason you type is passed to the agent. Rejecting also declines the agent's other pending requests in that session. Ask and the cards need OpenCode 2; on OpenCode 1.x every ask is rejected.
+- **Steering.** On OpenCode 2, a message you send while the agent is working goes into the running turn, so you can redirect it without stopping it.
+- **Questions.** When OpenCode asks you a question, it appears as a card. Pick an option or type your own answer, or **Skip** (optionally with a reason). `agetor answer` handles the same cards from the terminal, with `--reason` and `--skip`.
+- **Server.** On OpenCode 2, Agetor starts one OpenCode server for each harness and keeps it running between turns. It stops after about 30 minutes with nothing running, and when you quit, if nothing is running. The old Shared/Standalone choice is gone, and `--opencode-server` is accepted and ignored so existing scripts keep working. Every OpenCode harness gets its own server, and one with its own Home also gets its own OpenCode data.
+- **Subagents.** OpenCode's subagents appear as tabs on the task and fill in as they work on OpenCode 2; on OpenCode 1.x they fill in when the turn ends. When a background subagent finishes after the turn and OpenCode carries on by itself, the task moves back to Running, whichever column it was in. *Stop* interrupts the task's background subagents too.
 - **To-do progress.** The to-do card and the board badge need OpenCode 2's `experimental.todo` setting turned on in your own OpenCode config. Agetor doesn't change your config.
-- **Stopping.** *Stop* interrupts the turn the way `Ctrl+C` does, and Agetor ends the session if OpenCode hasn't exited after about 10 seconds.
+- **Stopping.** *Stop* interrupts the turn, and Agetor settles it anyway if OpenCode hasn't confirmed after about 10 seconds. A message you sent into the turn that OpenCode hadn't picked up yet is sent as the next turn instead. If Agetor can't confirm OpenCode withdrew it, or the task was archived or switched to another harness meanwhile, the message goes to the task's backlog tray for you to resend. Deleting or archiving a task interrupts whatever OpenCode is still running for it, its background subagents included.
 - **Importing sessions.** **Projects → Import sessions…** (or `agetor sessions`) lists OpenCode sessions started outside Agetor, for each enabled OpenCode harness and each project folder you've added. A session OpenCode reports as unfinished is refused only if it was also updated in the last 10 minutes; an older unfinished session imports with a status line saying so. A session whose folder no longer exists is listed but can't be imported. Launch-time discovery shares the Claude Code toggle in Settings → General.
 
 ### fx notes
@@ -317,15 +319,17 @@ flowchart LR
     CLI["agetor CLI / TUI"] -- "HTTP + SSE" --> Core
     Core["Bun core<br/>orchestrator · SQLite · git"]
     Core -- "tmux (interactive)" --> Claude["claude"]
-    Core -- "tmux (one-shot per turn)" --> OneShot["codex · gemini · agy · copilot · opencode"]
+    Core -- "tmux (one-shot per turn)" --> OneShot["codex · gemini · agy · copilot · opencode 1.x"]
+    Core -- "HTTP + SSE" --> OC["opencode serve<br/>(OpenCode 2, in tmux)"]
     Core -- "ACP over stdio" --> FX["fx · cursor-agent"]
     Claude --> WT[("git worktree<br/>per task")]
     OneShot --> WT
     FX --> WT
+    OC --> WT
 ```
 
 - **One local API.** The desktop UI and the CLI both talk to the core over HTTP and Server-Sent Events. The API listens only on `127.0.0.1`, and every route except `/health` requires a random token generated at each launch. There are two such tokens: the app's own webview uses one that is never written to disk, and the `agetor` CLI uses a weaker one that is (see [Security model](#security-model)).
-- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Gemini CLI, Antigravity, GitHub Copilot and OpenCode run once per turn inside `tmux` and resume by session id. fx and Cursor talk the Agent Client Protocol to a child process of Agetor, and Cursor resumes by session id too.
+- **Drive the real CLI; don't re-implement it.** Claude Code runs as an interactive session inside `tmux` and receives prompts as keystrokes. Its structured output comes from the transcript Claude writes itself. Codex, Gemini CLI, Antigravity and GitHub Copilot run once per turn inside `tmux` and resume by session id. OpenCode 2 runs on a server Agetor starts for each harness (itself inside `tmux`), and OpenCode 1.x runs once per turn inside `tmux`. fx and Cursor talk the Agent Client Protocol to a child process of Agetor, and Cursor resumes by session id too.
 - **Restart-safe by design.** On boot, Agetor reattaches to any `tmux`-hosted session that is still alive and replays its transcript without duplicates. Runs whose session is gone move back to **Ready**, so no card is left stuck in Running.
 - **Local persistence.** Tasks, runs, events, projects, harnesses and preferences live in a SQLite database with versioned migrations.
 
@@ -370,6 +374,7 @@ Most settings live in the app under **Settings**: General, Harnesses, Agents, Pi
 | `AGETOR_ANTIGRAVITY_BIN` / `AGETOR_ANTIGRAVITY_ARGS` | Same, for Antigravity. | `agy` on `PATH` |
 | `AGETOR_COPILOT_BIN` / `AGETOR_COPILOT_ARGS` | Same, for GitHub Copilot. | `copilot` on `PATH` |
 | `AGETOR_OPENCODE_BIN` / `AGETOR_OPENCODE_ARGS` | Same, for OpenCode. | `opencode` on `PATH` |
+| `AGETOR_OPENCODE_TRANSPORT` | Set to `run` to make OpenCode 2 use one `opencode run` per turn in `tmux`, as OpenCode 1.x does, instead of Agetor's managed server. | the managed server |
 | `AGETOR_HARNESS_AUTO_ENABLE` | Set to `0` to stop Agetor turning installed built-in harnesses on by itself (see [Supported harnesses](#supported-harnesses)). | on |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary. | `tmux` on `PATH` |
 | `AGETOR_SKIP_CLI_VERSION_FLOOR` | Set to `1` to skip the per-model minimum CLI version check. | unset |

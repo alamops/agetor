@@ -186,7 +186,10 @@ test("reconcileOrphans emits run-status → orphaned + column → ready", async 
     if (e.kind !== "update" && e.taskId === taskId) events.push(e);
   });
 
-  reconcileOrphans();
+  // reconcileOrphans is async: boot awaits it, and it now awaits the OpenCode
+  // session probes before it flips the stale runs, so an unawaited call has
+  // emitted nothing yet when the next line runs.
+  await reconcileOrphans();
   unsub();
 
   const orphan = events.find(

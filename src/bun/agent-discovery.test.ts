@@ -1219,6 +1219,28 @@ test("discoverOpencode v2: ids from models --standalone, labels + variants from 
   expect(argv.filter((a) => a !== "--version").every((a) => a.includes("--standalone"))).toBe(true);
 });
 
+test("discoverOpencode v2: a model name shared by Zen and Go gets the provider in its label", async () => {
+  __testing.resetForTests();
+  const list = JSON.stringify({
+    data: [
+      { providerID: "opencode-go", id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", variants: [{ id: "max" }] },
+      { providerID: "opencode", id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", variants: [{ id: "max" }] },
+      { providerID: "opencode", id: "big-pickle", name: "Big Pickle", variants: [] },
+    ],
+  });
+  const { bin } = plantFakeOpencode({
+    "--version": catFixture("v2-version.txt"),
+    "models --standalone": "    printf 'opencode-go/deepseek-v4.1-flash\\nopencode/big-pickle\\nopencode/deepseek-v4.1-flash\\n'",
+    "api --standalone model.list": `    cat <<'JSON'\n${list}\nJSON`,
+  });
+  const models = await refreshHarnessTarget({ harnessId: "opencode-v2-dup", kind: "opencode", env: {}, bin });
+  expect(models).toEqual([
+    { id: "opencode-go/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash (OpenCode Go)", efforts: ["max"] },
+    { id: "opencode/big-pickle", label: "Big Pickle", efforts: [] },
+    { id: "opencode/deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash (OpenCode Zen)", efforts: ["max"] },
+  ]);
+});
+
 test("discoverOpencode: probes under the target env, with OPENCODE_DISABLE_AUTOUPDATE defaulting to 1", async () => {
   __testing.resetForTests();
   const { bin } = plantFakeOpencode({

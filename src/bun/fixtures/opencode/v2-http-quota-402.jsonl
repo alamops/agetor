@@ -1,0 +1,6 @@
+{"type":"session.inbox.enqueued","data":{"sessionID":"ses_fixture0020","inboxID":"msg_fixture0020","item":{"type":"user","payload":{"text":"hello"},"delivery":"steer"}}}
+{"type":"session.execution.started","data":{"sessionID":"ses_fixture0020"}}
+{"type":"session.inbox.delivered","data":{"sessionID":"ses_fixture0020","inboxID":"msg_fixture0020"}}
+{"type":"session.step.started","data":{"sessionID":"ses_fixture0020","agent":"build","model":{"id":"deepseek-v4.1-flash","providerID":"opencode-go","variant":"max"},"assistantMessageID":"msg_fixture0021","started":1}}
+{"type":"session.step.failed","data":{"sessionID":"ses_fixture0020","assistantMessageID":"msg_fixture0021","error":{"type":"provider.quota","message":"Upstream request failed: Insufficient account funds","status":402,"response":{"body":"{\"error\": {\"type\": \"server_error\", \"message\": \"Upstream request failed: Insufficient account funds\"}}"}}}}
+{"type":"session.execution.failed","data":{"sessionID":"ses_fixture0020","error":{"type":"provider.quota","message":"Upstream request failed: Insufficient account funds","status":402,"response":{"body":"{\"error\": {\"type\": \"server_error\", \"message\": \"Upstream request failed: Insufficient account funds\"}}"}}}}

@@ -1,7 +1,9 @@
 /**
  * Pure helpers for the `opencode` agent kind (OpenCode, `anomalyco/opencode`,
  * binary `opencode`) shared by the bun side (`buildCommand`, the driver, the
- * routes), the webview (the OpenCode server picker) and the CLI. Kept free of
+ * routes), the webview (the model picker and run panel; the Shared/Standalone
+ * server picker is retired, `parseOpencodeServerInput` only keeps old requests
+ * valid) and the CLI. Kept free of
  * runtime imports from either process side, like every other `src/shared/`
  * module — the only import is a type.
  *
@@ -68,6 +70,36 @@ export function effectiveOpencodeServer(a: {
 }
 
 /**
+ * The server a recorded turn ran against: the two stored {@link OpencodeServerMode}
+ * values the legacy v2 tmux path used, plus `"agetor"` (plan D9) for a turn
+ * that ran on the agetor-owned OpenCode server (the HTTP driver). Only the
+ * turn breadcrumb carries `"agetor"`; the stored `tasks.opencode_server` /
+ * `agent_profiles.opencode_server` field and every route that validates it
+ * stay on {@link OpencodeServerMode} (`shared` | `standalone`).
+ */
+export type OpencodeTurnServer = OpencodeServerMode | "agetor";
+
+/** How an OpenCode turn is carried: the agetor-owned HTTP server, or one-shot `opencode run` in tmux. */
+export type OpencodeTransport = "server" | "run";
+
+/**
+ * Which transport a turn uses (plan D-transport): v1 has no server API, so it
+ * always runs `opencode run`; `transportEnv` (the caller passes
+ * `process.env.AGETOR_OPENCODE_TRANSPORT`) set to `run` (trimmed,
+ * case-insensitive) is the kill switch back to `opencode run` on v2; anything
+ * else, an unparseable version included, takes the server. Pure: this module
+ * never reads `process.env`.
+ */
+export function opencodeTransportFor(a: {
+  version: string | null | undefined;
+  transportEnv?: string | null;
+}): OpencodeTransport {
+  if (opencodeMajor(a.version) === 1) return "run";
+  if ((a.transportEnv ?? "").trim().toLowerCase() === "run") return "run";
+  return "server";
+}
+
+/**
  * The model/effort argv for one `opencode run` (D-3, D-6):
  *  - the sentinel ({@link OPENCODE_DEFAULT_MODEL}) or a null model → `[]`
  *    (no `-m`, and so no effort either — a variant needs a model);
@@ -87,6 +119,95 @@ export function opencodeModelArgs(a: {
   const effort = a.effort?.trim() ?? "";
   if (effort === "" || effort === "auto") return ["-m", model];
   return a.major === 2 ? ["-m", `${model}#${effort}`] : ["-m", model, "--variant", effort];
+}
+
+/**
+ * Display names for OpenCode's own hosted providers. Both serve many of the
+ * same models under the same `name` (`opencode/deepseek-v4.1-flash` and
+ * `opencode-go/deepseek-v4.1-flash` are both "DeepSeek V4.1 Flash"), but
+ * they bill differently: `opencode` (Zen) draws on the account's
+ * pay-as-you-go balance and answers 402 "Insufficient account funds" when it
+ * is empty, while `opencode-go` runs on the Go subscription.
+ */
+const OPENCODE_PROVIDER_LABELS: Readonly<Record<string, string>> = {
+  opencode: "OpenCode Zen",
+  "opencode-go": "OpenCode Go",
+};
+
+/** The provider half of a `provider/model` id, or null when there is none. */
+export function opencodeProviderOf(modelId: string): string | null {
+  const slash = modelId.indexOf("/");
+  return slash > 0 ? modelId.slice(0, slash) : null;
+}
+
+/** A provider id's display name: the known OpenCode-hosted ones by name, any other as itself. */
+export function opencodeProviderLabel(providerId: string): string {
+  return OPENCODE_PROVIDER_LABELS[providerId] ?? providerId;
+}
+
+/**
+ * Makes discovered OpenCode model labels unique. OpenCode reports a model's
+ * `name` without its provider, so the same model offered by two providers
+ * (Zen and Go above, or a BYOK provider) shows up as two identical rows in the
+ * picker, and picking the wrong one can bill the wrong account. A label
+ * shared by two or more ids gets ` (<provider>)` appended; one that still
+ * collides after that (two ids of one provider) gets ` (<id>)` instead. Ids,
+ * order, efforts and unshared labels are untouched; a model with no label
+ * shows its id and needs nothing. Pure.
+ */
+export function disambiguateOpencodeLabels<T extends { id: string; label?: string }>(models: T[]): T[] {
+  const count = (labels: Array<string | undefined>): Map<string, number> => {
+    const m = new Map<string, number>();
+    for (const l of labels) if (l !== undefined) m.set(l, (m.get(l) ?? 0) + 1);
+    return m;
+  };
+  const shared = count(models.map((m) => m.label));
+  const withProvider = models.map((m) => {
+    if (m.label === undefined || (shared.get(m.label) ?? 0) < 2) return m.label;
+    const provider = opencodeProviderOf(m.id);
+    return provider ? `${m.label} (${opencodeProviderLabel(provider)})` : `${m.label} (${m.id})`;
+  });
+  const still = count(withProvider);
+  return models.map((m, i) => {
+    const label = withProvider[i];
+    if (label === m.label || label === undefined) return m;
+    return { ...m, label: (still.get(label) ?? 0) > 1 ? `${m.label} (${m.id})` : label };
+  });
+}
+
+/** Text that names Zen outright: the product, or an `opencode/…` (Zen) model id. `opencode-go/…` has no match. */
+const ZEN_TEXT_RE = /\bzen\b|\bopencode\/[\w.-]/i;
+
+/**
+ * A hint for a turn that failed because the provider has no balance (v2
+ * `{type: "provider.quota", status: 402}`, or the "Insufficient account
+ * funds" text), else null. The hint only fits OpenCode Zen (`opencode/…`),
+ * the pay-as-you-go provider: its usual cause is a Zen model picked by an
+ * account that pays through a Go subscription, whose copy of the same model
+ * is `opencode-go/…`. So it is given only when `model`'s provider is
+ * `opencode`. A model of any other provider (a Go model, a BYOK one) gets no
+ * hint: telling that user to switch to Go would be wrong. An unknown model
+ * (null/absent, or an id with no provider such as the "OpenCode default"
+ * sentinel) gets the hint only when the error text itself names Zen
+ * (`Zen`, `opencode/…`); otherwise there is nothing to blame.
+ */
+export function opencodeQuotaHint(err: unknown, message: string, model?: string | null): string | null {
+  const rec = err && typeof err === "object" ? (err as { type?: unknown; status?: unknown }) : null;
+  const quota = rec?.type === "provider.quota" || rec?.status === 402 || /insufficient (account )?funds/i.test(message);
+  if (!quota) return null;
+  const provider = model ? opencodeProviderOf(model) : null;
+  if (provider !== null) {
+    if (provider !== "opencode") return null;
+  } else if (!ZEN_TEXT_RE.test(message)) {
+    return null;
+  }
+  return "the model's provider has no balance for this account. OpenCode Zen models (opencode/…) bill your Zen balance; " +
+    "a Go subscription runs the opencode-go/… models, labelled (OpenCode Go) in the model picker — switch the task's model to one of those.";
+}
+
+/** The D-9 status line a failed resume posts before the fresh session (the one copy agents.ts, opencode-tmux.ts and opencode-driver.ts share). */
+export function opencodeResumeFailedStatusLine(sessionId: string): string {
+  return `couldn't resume OpenCode session ${sessionId.slice(0, 8)}… — starting a fresh session`;
 }
 
 /** The 400 text every route uses for a bad `opencodeServer` value. */
@@ -115,13 +236,13 @@ export function opencodeTurnBreadcrumbPrefix(major: 1 | 2): string {
 
 /**
  * D-19: the opening status line of every OpenCode turn —
- * `opencode <major>.x · server=<shared|standalone|n/a> · model=<label> ·
+ * `opencode <major>.x · server=<shared|standalone|agetor|n/a> · model=<label> ·
  * effort=<id> · mode=<id>`. `server` is the EFFECTIVE mode (`null` → `n/a`,
- * v1). {@link parseOpencodeTurnBreadcrumb} is its inverse for the head.
+ * v1; `agetor` = ran on the agetor-owned server, plan D9). {@link parseOpencodeTurnBreadcrumb} is its inverse for the head.
  */
 export function formatOpencodeTurnBreadcrumb(a: {
   major: 1 | 2;
-  server: OpencodeServerMode | null;
+  server: OpencodeTurnServer | null;
   modelLabel: string;
   effort: string;
   mode: string;
@@ -129,7 +250,7 @@ export function formatOpencodeTurnBreadcrumb(a: {
   return `${opencodeTurnBreadcrumbPrefix(a.major)}${a.server ?? "n/a"} · model=${a.modelLabel} · effort=${a.effort} · mode=${a.mode}`;
 }
 
-const TURN_BREADCRUMB_RE = /^opencode ([12])\.x · server=(shared|standalone|n\/a)(?: · |$)/;
+const TURN_BREADCRUMB_RE = /^opencode ([12])\.x · server=(shared|standalone|agetor|n\/a)(?: · |$)/;
 
 /**
  * The CLI line and effective server mode a {@link formatOpencodeTurnBreadcrumb}
@@ -137,18 +258,19 @@ const TURN_BREADCRUMB_RE = /^opencode ([12])\.x · server=(shared|standalone|n\/
  */
 export function parseOpencodeTurnBreadcrumb(
   text: string | null | undefined,
-): { major: 1 | 2; server: OpencodeServerMode | null } | null {
+): { major: 1 | 2; server: OpencodeTurnServer | null } | null {
   if (!text) return null;
   const m = TURN_BREADCRUMB_RE.exec(text);
   if (!m) return null;
-  return { major: m[1] === "1" ? 1 : 2, server: m[2] === "n/a" ? null : (m[2] as OpencodeServerMode) };
+  return { major: m[1] === "1" ? 1 : 2, server: m[2] === "n/a" ? null : (m[2] as OpencodeTurnServer) };
 }
 
 /**
  * True when a turn's subagent children cannot outlive it (A6a): every v1
  * child is foreground, and a Standalone v2 child dies with the turn's
- * private server. Only a v2 Shared child may keep running in the service.
+ * private server. A v2 Shared child may keep running in the service, and so
+ * may a child of an `agetor` turn: the agetor-owned server outlives the turn.
  */
-export function opencodeChildrenDieWithTurn(t: { major: 1 | 2; server: OpencodeServerMode | null }): boolean {
+export function opencodeChildrenDieWithTurn(t: { major: 1 | 2; server: OpencodeTurnServer | null }): boolean {
   return t.major === 1 || t.server === "standalone";
 }

@@ -5,7 +5,7 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, isTTY } from "../output.ts";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
-import { parseOpencodeServerFlag, parseSpeedFlag } from "../usage.ts";
+import { parseOpencodeServerFlag, parseSpeedFlag, warnOpencodeServerFlagIgnored } from "../usage.ts";
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import {
   discoveredExtensionNames,
@@ -35,12 +35,9 @@ import {
   type AgentKind,
   type AgentOption,
   type AgentProfile,
-  type Harness,
-  type OpencodeServerMode,
   type Pipeline,
   type Speed,
 } from "../../shared/types.ts";
-import { opencodeMajor } from "../../shared/opencode.ts";
 import { isSpeed, supportedSpeeds, SPEED_OPTIONS } from "../../shared/speed.ts";
 import {
   mergeModelOptions,
@@ -66,10 +63,11 @@ interface AddOpts {
    *  aliases — whichever came last on the command line. */
   speed?: Speed;
   maxMode?: boolean;
-  /** `--opencode-server shared|standalone` — OpenCode 2's server option
-   *  (validated by `parseOpencodeServerFlag`). A launch flag like the six
-   *  above, so `--profile`/`--pipeline` refuse it too. */
-  opencodeServer?: OpencodeServerMode;
+  /** The retired `--opencode-server` flag was passed (and validated by
+   *  `parseOpencodeServerFlag`). It is never sent to the core and is not a
+   *  launch flag, so `--profile`/`--pipeline` accept it; `cmdAdd` prints the
+   *  one-line notice. */
+  opencodeServerIgnored?: boolean;
   workdir?: string;
   isolation?: "worktree" | "none";
   baseRef?: string;
@@ -112,7 +110,7 @@ export function parseAdd(args: string[]): AddOpts {
       case "--no-fast": o.speed = "off"; break;
       case "--max-mode": o.maxMode = true; break;
       case "--no-max-mode": o.maxMode = false; break;
-      case "--opencode-server": o.opencodeServer = parseOpencodeServerFlag(val()); break;
+      case "--opencode-server": o.opencodeServerIgnored = parseOpencodeServerFlag(val()); break;
       case "--workdir": o.workdir = val(); break;
       case "--isolation": o.isolation = val() === "none" ? "none" : "worktree"; break;
       case "--base-ref": o.baseRef = val(); break;
@@ -128,8 +126,8 @@ export function parseAdd(args: string[]): AddOpts {
   return o;
 }
 
-/** Whether any of the manual harness/model/mode/effort/speed/maxMode/
- *  opencode-server flags were given — the block `--profile`/`--pipeline` each replace
+/** Whether any of the manual harness/model/mode/effort/speed/maxMode flags
+ *  were given — the block `--profile`/`--pipeline` each replace
  *  wholesale. Shared by `assertProfileFlagCombo`/`assertPipelineFlagCombo`
  *  (flag-vs-flag conflicts) and the wizard's Pipeline-step gating below (m20
  *  review fix) so the two can't drift. */
@@ -140,8 +138,7 @@ function hasManualLaunchFlags(o: AddOpts): boolean {
     o.mode !== undefined ||
     o.effort !== undefined ||
     o.speed !== undefined ||
-    o.maxMode !== undefined ||
-    o.opencodeServer !== undefined
+    o.maxMode !== undefined
   );
 }
 
@@ -153,7 +150,7 @@ function assertProfileFlagCombo(o: AddOpts): void {
   if (!o.profile) return;
   if (hasManualLaunchFlags(o)) {
     throw new Error(
-      "--profile cannot be combined with --agent/--model/--mode/--effort/--speed/--fast/--max-mode/--opencode-server (the agent defines them)",
+      "--profile cannot be combined with --agent/--model/--mode/--effort/--speed/--fast/--max-mode (the agent defines them)",
     );
   }
 }
@@ -167,7 +164,7 @@ function assertPipelineFlagCombo(o: AddOpts): void {
   if (!o.pipeline) return;
   if (o.profile !== undefined || hasManualLaunchFlags(o)) {
     throw new Error(
-      "--pipeline cannot be combined with --profile/--agent/--model/--mode/--effort/--speed/--fast/--max-mode/--opencode-server (the pipeline defines the launch)",
+      "--pipeline cannot be combined with --profile/--agent/--model/--mode/--effort/--speed/--fast/--max-mode (the pipeline defines the launch)",
     );
   }
 }
@@ -176,6 +173,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   const o = parseAdd(args);
   assertProfileFlagCombo(o);
   assertPipelineFlagCombo(o);
+  if (o.opencodeServerIgnored) warnOpencodeServerFlagIgnored();
   let prompt = o.prompt;
   if (o.promptFile) {
     prompt = o.promptFile === "-" ? (await Bun.stdin.text()).trim() : readFileSync(o.promptFile, "utf8");
@@ -496,7 +494,6 @@ function baseInput(
     input.effort = o.effort;
     input.speed = o.speed;
     input.maxMode = o.maxMode;
-    input.opencodeServer = o.opencodeServer;
   }
   return input;
 }
@@ -657,7 +654,6 @@ async function wizard(
   // Only a speed the user actually picked is remembered — a kind/model with
   // nothing beyond "off" must not overwrite `lastSpeed:<kind>`.
   let speedPicked = false;
-  let opencodeServer = o.opencodeServer;
   let kind: AgentKind | undefined;
 
   if (!profileId && !pipelineId) {
@@ -751,20 +747,6 @@ async function wizard(
         speed = "off";
       }
     }
-    if (opencodeServer === undefined) {
-      // OpenCode 2 (or an unknown version) only, and not for a harness with
-      // its own home, which always runs standalone — the same rule as the
-      // app's OpenCode server picker. Otherwise nothing is sent and the core
-      // stores its default ("shared").
-      const harness = harnesses.find((h) => h.id === agent);
-      const version = statuses.find((s) => s.harnessId === agent)?.version ?? null;
-      const choices = wizardOpencodeServerChoices(kind, harness, version);
-      if (choices.length > 0) {
-        const picked = await pickOption("OpenCode server", choices, "shared");
-        if (picked === null) return cancelled();
-        opencodeServer = picked as OpencodeServerMode;
-      }
-    }
   }
 
   let workdir = o.workdir;
@@ -804,35 +786,12 @@ async function wizard(
 
   p.outro(c.green("creating…"));
   return baseInput(
-    { ...o, agent, model, mode, effort, speed, opencodeServer, workdir },
+    { ...o, agent, model, mode, effort, speed, workdir },
     title,
     prompt,
     profileId,
     pipelineId,
   );
-}
-
-/** The wizard's OpenCode server step rows (Shared / Standalone, same copy as
- *  the app's picker), or `[]` when the step doesn't apply: a kind other than
- *  opencode, OpenCode 1 (no `--standalone`, no background service — a
- *  missing or unparseable version counts as 2, per `opencodeMajor`), or a
- *  harness with its own home (Standalone is forced, so there's no choice). */
-export function wizardOpencodeServerChoices(
-  kind: AgentKind,
-  harness: Pick<Harness, "home"> | null | undefined,
-  version: string | null | undefined,
-): AgentOption[] {
-  if (kind !== "opencode") return [];
-  if (opencodeMajor(version) !== 2) return [];
-  if (harness?.home && harness.home.trim() !== "") return [];
-  return [
-    {
-      id: "shared",
-      label: "Shared",
-      hint: "Runs through OpenCode's background service (faster start, shared with your other OpenCode clients)",
-    },
-    { id: "standalone", label: "Standalone", hint: "Starts a private OpenCode server for each turn" },
-  ];
 }
 
 /** The Speed step's rows for the wizard: the tiers `supportedSpeeds` offers

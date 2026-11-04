@@ -9,42 +9,209 @@ import type {
   TmuxPromptRequest,
   FxPermissionRequest,
 } from "../../bun/interactions.ts";
-import { buildAskAnswer, CUSTOM_OPTION } from "../answer-logic.ts";
+import {
+  answerFlagsError,
+  buildAskAnswer,
+  buildOpencodeAnswerByIndex,
+  CUSTOM_OPTION,
+  isOpencodeAsk,
+  isOpencodePermission,
+  OPENCODE_REJECT_NO_REASON_NOTICE,
+  OPENCODE_REJECT_OPTION,
+  OPENCODE_REJECT_REASON_PROMPT,
+  OPENCODE_SKIP_CHOICE,
+  parseAnswerArgs,
+  type OpencodeAskChoice,
+  planOpencodePermissionReply,
+  type AnswerArgs,
+} from "../answer-logic.ts";
+import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import { CURSOR_ASK_FREEFORM } from "../../shared/cursor-ask-verdict.ts";
 import { cursorAskOptionChoiceLabel, cursorAskOptionValue, cursorAskPicksFromValues } from "../../shared/cursor-ask.ts";
 
 const CURSOR_SKIP = "__cursor_skip__";
 
 export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
-  const ref = args[0];
-  if (!ref) throw usageError("answer");
-  if (!isTTY) {
+  const opts = parseAnswerArgs(args);
+  if (!opts.ref) throw usageError("answer");
+  // `--skip` needs no picker, so it also works from a script.
+  if (!isTTY && !opts.skip) {
     throw new Error("agetor answer needs an interactive terminal (TTY)");
   }
   const client = await getClient(flags);
-  const task = await resolveTask(client, ref);
+  const task = await resolveTask(client, opts.ref);
   const pending = await client.pendingInteractions(task.id);
   if (pending.length === 0) {
     out(c.dim("nothing pending for this task"));
     return;
   }
+  const flagError = answerFlagsError(pending, opts);
+  if (flagError) throw new Error(flagError);
 
   for (const req of pending) {
     // A pipeline parent's pending list aggregates its hidden step tasks'
     // cards — say which step task this one belongs to when it isn't the
     // task the user named.
     if (req.taskId !== task.id) out(c.dim(`↳ on step task ${req.taskId.slice(0, 8)}`));
-    if (req.kind === "ask_questions") {
+    if (isOpencodeAsk(req)) {
+      const ok = await answerOpencodeAsk(client, req, opts);
+      if (!ok) return;
+    } else if (req.kind === "ask_questions") {
       const ok = await answerAsk(client, req);
       if (!ok) return; // cancelled
     } else if (req.kind === "tmux_prompt") {
       const ok = await answerTmux(client, req);
+      if (!ok) return;
+    } else if (isOpencodePermission(req)) {
+      const ok = await answerOpencodePermission(client, req, opts);
       if (!ok) return;
     } else {
       const ok = await answerFx(client, req);
       if (!ok) return;
     }
   }
+}
+
+/** Prompt for a reason, which may stay empty. Returns null on cancel. */
+async function promptReason(message: string): Promise<string | null> {
+  const text = await p.text({ message, placeholder: "leave empty for none" });
+  if (p.isCancel(text)) return null;
+  return (text as string).trim();
+}
+
+/** An OpenCode permission request: Allow once / Always allow / Reject, with
+ *  the reason (`--reason`, else asked for) riding Reject only. */
+async function answerOpencodePermission(
+  client: AgetorClient,
+  req: FxPermissionRequest,
+  opts: AnswerArgs,
+): Promise<boolean> {
+  const title = escapeFreeText(req.toolCall.title ?? req.toolCall.kind ?? "tool call");
+  const kindBadge = req.toolCall.kind ? c.dim(` [${escapeControlChars(req.toolCall.kind)}]`) : "";
+  out(`${title}${kindBadge} ${c.dim(`(${req.mode})`)}`);
+  if (req.toolCall.rawInput !== undefined) {
+    const raw = JSON.stringify(req.toolCall.rawInput) ?? "";
+    if (raw) out(c.dim(escapeFreeText(truncateText(raw, 300))));
+  }
+  // Values are indexes into req.options, as for fx. The card carries its own
+  // Reject, so there is no extra Dismiss row: Esc leaves the card pending.
+  const choice = await p.select({
+    message: "Choose",
+    options: req.options.map((o, i) => ({ value: i, label: escapeControlChars(o.name) })),
+  });
+  if (p.isCancel(choice)) return cancel();
+  const picked = req.options[choice as number];
+  if (!picked) return cancel();
+  let reason = opts.reason;
+  if (picked.optionId === OPENCODE_REJECT_OPTION && reason === undefined && req.allowReason) {
+    const typed = await promptReason(OPENCODE_REJECT_REASON_PROMPT);
+    if (typed === null) return cancel();
+    reason = typed;
+  }
+  const plan = planOpencodePermissionReply(picked.optionId, reason);
+  if (!plan.ok) throw new Error(plan.error);
+  if (picked.optionId === OPENCODE_REJECT_OPTION && plan.body.message === undefined) {
+    out(c.yellow(OPENCODE_REJECT_NO_REASON_NOTICE));
+  }
+  const res = await client.answerFxPermission(req.id, plan.body);
+  out(res.ok ? c.green("✓ answered") : c.dim("already resolved (answered elsewhere or cancelled)"));
+  return true;
+}
+
+/** Skip an OpenCode question, optionally with a reason. Returns false when
+ *  the card stays pending (a refused skip), true otherwise. */
+async function skipOpencodeAsk(client: AgetorClient, req: AskQuestionsRequest, reason: string | undefined): Promise<boolean> {
+  const text = reason?.trim() ?? "";
+  try {
+    const res = await client.answerAskQuestions(req.id, { skip: true, ...(text !== "" ? { message: text } : {}) });
+    out(res.ok ? c.green("✓ skipped") : c.red("failed to skip"));
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 409) {
+      out(c.dim("already being answered elsewhere"));
+      return true;
+    }
+    if (e instanceof ApiError && e.status === 400) {
+      out(c.red(escapeFreeText(e.message || "could not skip")));
+      return false;
+    }
+    throw e;
+  }
+  return true;
+}
+
+/** An OpenCode question form: options (values are indexes into the question's
+ *  options, so two options with one id or label stay distinct and a
+ *  model-chosen id can never equal the Other/Skip sentinels), a typed-text row
+ *  where the question takes one, and Skip, which may carry a reason. `--skip` skips without the
+ *  picker. */
+async function answerOpencodeAsk(client: AgetorClient, req: AskQuestionsRequest, opts: AnswerArgs): Promise<boolean> {
+  if (req.title) out(c.bold(escapeFreeText(req.title)));
+  if (opts.skip) return skipOpencodeAsk(client, req, opts.reason);
+  const answers: Array<{ selected: string[]; selectedOptionIds?: string[]; custom?: string }> = [];
+  for (const q of req.questions) {
+    p.note(escapeFreeText(q.question), escapeFreeText(q.header ?? "question"));
+    type Row = { value: OpencodeAskChoice; label: string; hint?: string };
+    const custom: Row[] = q.allowCustom ? [{ value: CUSTOM_OPTION, label: "✎ Other — type a custom answer" }] : [];
+    const options: Row[] = [
+      ...q.options.map((o, i): Row => ({
+        value: i,
+        label: escapeFreeText(o.label),
+        hint: o.description ? escapeFreeText(o.description) : undefined,
+      })),
+      ...custom,
+      { value: OPENCODE_SKIP_CHOICE, label: "Skip" },
+    ];
+    let entry: { selected: string[]; selectedOptionIds?: string[]; custom?: string } | null = null;
+    while (entry === null) {
+      let picks: OpencodeAskChoice[];
+      if (q.multiSelect) {
+        const sel = await p.multiselect<OpencodeAskChoice>({ message: "Select (space to pick)", options, required: false });
+        if (p.isCancel(sel)) return cancel();
+        picks = sel as OpencodeAskChoice[];
+      } else {
+        const sel = await p.select<OpencodeAskChoice>({ message: "Select", options });
+        if (p.isCancel(sel)) return cancel();
+        picks = [sel as OpencodeAskChoice];
+      }
+      if (picks.includes(OPENCODE_SKIP_CHOICE)) {
+        let reason: string | undefined;
+        if (req.allowReason) {
+          const text = await promptReason("Reason for skipping (optional)");
+          if (text === null) return cancel();
+          reason = text;
+        }
+        return skipOpencodeAsk(client, req, reason);
+      }
+      let typed: string | null = null;
+      if (picks.includes(CUSTOM_OPTION)) {
+        typed = await promptCustom();
+        if (typed === null) return cancel();
+      }
+      const built = buildOpencodeAnswerByIndex(q, picks, typed);
+      if (!built.ok) {
+        p.note(escapeFreeText(built.error), "required");
+        continue;
+      }
+      entry = built.entry;
+    }
+    answers.push(entry);
+  }
+  try {
+    const res = await client.answerAskQuestions(req.id, answers);
+    out(res.ok ? c.green("✓ answered") : c.red("failed to answer"));
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 409) {
+      out(c.dim("already being answered elsewhere"));
+      return true;
+    }
+    // 400: the core refused the payload; the card stays pending.
+    if (e instanceof ApiError && e.status === 400) {
+      out(c.red(escapeFreeText(e.message || "could not answer")));
+      return false;
+    }
+    throw e;
+  }
+  return true;
 }
 
 async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promise<boolean> {

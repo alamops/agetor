@@ -292,6 +292,9 @@ describe("C3 reconcile: remote access can't outlive a running host", () => {
     // brand-new setting straight back off.
     seedFake({ registration: "notRegistered" });
     const warn = spyOn(console, "warn").mockImplementation(() => {});
+    // Only the probes this test starts: a listener another file left (the API
+    // server's) would make the box's own notifyChanged probe reconcile too.
+    const restoreListeners = bg.__testing.suspendListeners();
     try {
       const stale = bg.getBackgroundStatus({ fresh: true });
       bg.setRemoteAccessOnFromNativeBox(); // invalidates synchronously, probe still in flight
@@ -299,6 +302,7 @@ describe("C3 reconcile: remote access can't outlive a running host", () => {
       expect(remotePref()).toBe("on");
       expect(warn.mock.calls.some((c) => String(c[0]).includes("remote access turned off"))).toBe(false);
     } finally {
+      restoreListeners();
       warn.mockRestore();
     }
   });
@@ -306,6 +310,9 @@ describe("C3 reconcile: remote access can't outlive a running host", () => {
   test("the next probe that nothing overtook still reconciles", async () => {
     seedFake({ registration: "notRegistered" });
     const warn = spyOn(console, "warn").mockImplementation(() => {});
+    // Only the probes this test starts: a listener another file left (the API
+    // server's) would make the box's own notifyChanged probe reconcile too.
+    const restoreListeners = bg.__testing.suspendListeners();
     try {
       const stale = bg.getBackgroundStatus({ fresh: true });
       bg.setRemoteAccessOnFromNativeBox();
@@ -315,6 +322,7 @@ describe("C3 reconcile: remote access can't outlive a running host", () => {
       expect(fresh.remoteAccess).toBe(false);
       expect(remotePref()).toBe("off");
     } finally {
+      restoreListeners();
       warn.mockRestore();
     }
   });

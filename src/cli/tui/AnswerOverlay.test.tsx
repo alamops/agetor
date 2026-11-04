@@ -569,3 +569,284 @@ test("a cursor 400 leaves the overlay open", async () => {
   expect(lastFrame() ?? "").toContain("Cursor cannot accept a custom answer");
   expect(lastFrame() ?? "").toContain("Which?");
 });
+
+// ── OpenCode cards (docs/plans/opencode-server-driver.md T10) ─────────────
+
+const ocPermission = {
+  kind: "fx_permission", id: "oc-p", taskId: "t1", runId: "r1", createdAt: 0,
+  toolCall: { toolCallId: "tc", title: "bash", kind: "execute" },
+  options: [
+    { optionId: "once", name: "Allow once" },
+    { optionId: "always", name: "Always allow" },
+    { optionId: "reject", name: "Reject" },
+  ],
+  mode: "ask", harness: "opencode", allowReason: true,
+} as unknown as AnyRequest;
+
+test("opencode permission: shows its own three options and no Dismiss row", async () => {
+  const { lastFrame, unmount } = render(
+    <AnswerOverlay client={fakeClient(ocPermission, () => {})} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("Allow once");
+  expect(frame).toContain("Reject");
+  expect(frame).not.toContain("Dismiss");
+  unmount();
+});
+
+test("opencode permission: Allow once posts { optionId: once } with no message", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const { stdin, unmount } = render(
+    <AnswerOverlay client={fakeClient(ocPermission, (a) => { captured = a; })} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-p", body: { optionId: "once" } });
+  expect(done).toBe("✓ answered");
+  unmount();
+});
+
+test("opencode permission: Reject asks for a reason and sends it with reject", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocPermission, (a) => { captured = a; })} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(ui.lastFrame() ?? "").toContain("skips this action and the agent continues");
+  expect(ui.lastFrame() ?? "").not.toContain("stops");
+  expect(captured).toBeNull();
+  ui.stdin.write("use dry-run");
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-p", body: { optionId: "reject", message: "use dry-run" } });
+  expect(done).toBe("✓ rejected with a reason");
+  ui.unmount();
+});
+
+test("opencode permission: Reject with nothing typed sends a bare reject and says the agent continues", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocPermission, (a) => { captured = a; })} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-p", body: { optionId: "reject" } });
+  expect(done).toBe("✓ rejected — the agent continues without it");
+  ui.unmount();
+});
+
+test("opencode permission: Esc at the reason prompt goes back to the list without answering", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocPermission, (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  ui.stdin.write(ESC);
+  await wait(80);
+  expect(captured).toBeNull();
+  expect(ui.lastFrame() ?? "").toContain("Always allow");
+  ui.unmount();
+});
+
+const ocQuestion = (over: Record<string, unknown> = {}) =>
+  ({
+    kind: "ask_questions", id: "oc-q", taskId: "t1", runId: "r1", createdAt: 0,
+    source: "opencode", delivery: "live", allowReason: true, allowCustom: true,
+    questions: [{
+      id: "scope", question: "Which scope?", allowCustom: true,
+      options: [{ id: "narrow", label: "Same" }, { id: "wide", label: "Same" }],
+    }],
+    ...over,
+  }) as unknown as AnyRequest;
+
+test("opencode question: two options with one label submit the second one's id", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocQuestion(), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: [{ selected: ["Same"], selectedOptionIds: ["wide"] }] });
+  ui.unmount();
+});
+
+// A model-chosen option id can equal the picker's own sentinel strings.
+const ocCollidingQuestion = (over: Record<string, unknown> = {}) =>
+  ocQuestion({
+    questions: [{
+      id: "scope", question: "Which scope?", allowCustom: true, multiSelect: false,
+      options: [{ id: "__agetor_custom__", label: "First" }, { label: "__opencode_skip__" }, { id: "__opencode_skip__", label: "Third" }],
+      ...over,
+    }],
+  });
+
+test("opencode question: an option whose id is the Other sentinel submits as that option (by position)", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocCollidingQuestion(), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(ENTER); // the first row, id "__agetor_custom__"
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: [{ selected: ["First"], selectedOptionIds: ["__agetor_custom__"] }] });
+  ui.unmount();
+});
+
+test("opencode question: options named like the Skip sentinel are answers, not a skip", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocCollidingQuestion(), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(ENTER); // the third row, id "__opencode_skip__"
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: [{ selected: ["Third"], selectedOptionIds: ["__opencode_skip__"] }] });
+  ui.unmount();
+});
+
+test("opencode question: multi-select with a sentinel-valued option keeps it and adds typed text", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocCollidingQuestion({ multiSelect: true }), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  ui.stdin.write(" "); // toggle row 0 ("__agetor_custom__")
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN); // the Other row
+  await wait();
+  ui.stdin.write(" ");
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  ui.stdin.write("extra");
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: [{ selected: ["First"], selectedOptionIds: ["__agetor_custom__"], custom: "extra" }] });
+  ui.unmount();
+});
+
+test("opencode question: Other takes typed text where allowCustom, and is absent where it is not", async () => {
+  let captured: unknown = null;
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocQuestion(), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  expect(ui.lastFrame() ?? "").toContain("Other");
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(DOWN);
+  await wait();
+  ui.stdin.write(ENTER); // the Other row
+  await wait();
+  ui.stdin.write("something else");
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: [{ selected: [], custom: "something else" }] });
+  ui.unmount();
+
+  const base = ocQuestion() as unknown as { questions: Array<Record<string, unknown>> };
+  const noText = render(
+    <AnswerOverlay
+      client={fakeClient(ocQuestion({ allowCustom: false, questions: [{ ...base.questions[0], allowCustom: false }] }), () => {})}
+      taskId="t1" onDone={() => {}} onCancel={() => {}}
+    />,
+  );
+  await wait();
+  const frame = noText.lastFrame() ?? "";
+  expect(frame).not.toContain("Other");
+  expect(frame).toContain("Skip");
+  noText.unmount();
+});
+
+test("opencode question: Skip asks for a reason and sends { skip, message }; none sends a bare skip", async () => {
+  let captured: unknown = null;
+  let done = "";
+  const ui = render(
+    <AnswerOverlay client={fakeClient(ocQuestion(), (a) => { captured = a; })} taskId="t1" onDone={(m) => { done = m; }} onCancel={() => {}} />,
+  );
+  await wait();
+  // rows: Same, Same, Other, Skip
+  for (let i = 0; i < 3; i++) {
+    ui.stdin.write(DOWN);
+    await wait();
+  }
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(ui.lastFrame() ?? "").toContain("Reason for skipping");
+  ui.stdin.write("not needed");
+  await wait();
+  ui.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: { skip: true, message: "not needed" } });
+  expect(done).toBe("✓ skipped");
+  ui.unmount();
+
+  captured = null;
+  const bare = render(
+    <AnswerOverlay client={fakeClient(ocQuestion(), (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  for (let i = 0; i < 3; i++) {
+    bare.stdin.write(DOWN);
+    await wait();
+  }
+  bare.stdin.write(ENTER);
+  await wait();
+  bare.stdin.write(ENTER);
+  await wait();
+  expect(captured).toEqual({ id: "oc-q", answers: { skip: true } });
+  bare.unmount();
+});
+
+test("opencode question: card text with control characters is shown escaped", async () => {
+  const base = ocQuestion() as unknown as { questions: Array<Record<string, unknown>> };
+  const ui = render(
+    <AnswerOverlay
+      client={fakeClient(ocQuestion({ questions: [{ ...base.questions[0], question: "Which\u001b[2J scope?" }] }), () => {})}
+      taskId="t1" onDone={() => {}} onCancel={() => {}}
+    />,
+  );
+  await wait();
+  const frame = ui.lastFrame() ?? "";
+  expect(frame).not.toContain("\u001b[2J");
+  expect(frame).toContain("\\u001b");
+  ui.unmount();
+});

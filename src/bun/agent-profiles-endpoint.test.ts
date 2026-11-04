@@ -638,6 +638,26 @@ test("PATCH /tasks/:id with the SAME model value on a bound task → 200 (no-op 
   expect(updated.agentProfileId).toBe(profile.id);
 });
 
+test("PATCH /tasks/:id with a different opencodeServer on a bound task → 200 (the option is retired, not profile-locked)", async () => {
+  const profile = await createProfile({ name: "Retired Option Agent" });
+  const task = await createTask({ agentProfileId: profile.id });
+  const other = task.opencodeServer === "shared" ? "standalone" : "shared";
+
+  const res = await call(`/tasks/${task.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ opencodeServer: other }),
+  });
+  expect(res.status).toBe(200);
+  const updated = (await res.json()) as Task;
+  expect(updated.agentProfileId).toBe(profile.id);
+  // A locked field still 409s alongside it, so the guard itself is intact.
+  const locked = await call(`/tasks/${task.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ model: "claude-fable-5", opencodeServer: other }),
+  });
+  expect(locked.status).toBe(409);
+});
+
 test("PATCH /tasks/:id with an unrelated field (title) on a bound task → 200", async () => {
   const profile = await createProfile({ name: "Title Edit Agent" });
   const task = await createTask({ agentProfileId: profile.id });

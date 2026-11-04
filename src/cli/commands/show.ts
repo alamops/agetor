@@ -7,7 +7,7 @@ import { defaultModeFor, type Run, type Task } from "../../shared/types.ts";
 import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import { colorRunStatus } from "./pipeline.ts";
-import { opencodeServerText, profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
+import { profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -21,12 +21,12 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
 
   if (flags.json) return printJson({ task, runs, pending });
 
-  // One harness lookup serves the mode default and the OpenCode server line;
-  // a failed lookup falls back to the built-in-id heuristic. It is skipped
-  // when neither needs it: a stored mode on a built-in harness of another
-  // kind (a built-in harness's id is its kind).
+  // The harness lookup only resolves the default mode text; a failed lookup
+  // falls back to the built-in-id heuristic. It is skipped when a stored mode
+  // needs no default on a built-in harness (a built-in harness's id is its
+  // kind).
   const builtinCtx = profileHarnessContext(task.agent, null);
-  const needsLookup = task.mode == null || builtinCtx.kind == null || builtinCtx.kind === "opencode";
+  const needsLookup = task.mode == null || builtinCtx.kind == null;
   const harnessCtx = needsLookup
     ? profileHarnessContext(task.agent, await client.listHarnesses().catch(() => null))
     : builtinCtx;
@@ -42,10 +42,6 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${task.agent}${agentNote}` +
       `   ${label("model")} ${escapeControlChars(task.model ?? "-")}   ${label("mode")} ${escapeControlChars(modeText)}`,
   );
-  // The parent of a pipeline never runs an agent, so its server option means nothing.
-  if (harnessCtx.kind === "opencode" && !task.pipelineId) {
-    out(`  ${label("opencode server")} ${opencodeServerText(task.opencodeServer ?? "shared", harnessCtx)}`);
-  }
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
   if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);
   // Last-seen worktree checkout (recorded at run start/settle, terminal open,

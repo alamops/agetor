@@ -1,6 +1,14 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
-import { effectiveOpencodeServer, opencodeMajor, opencodeModelArgs } from "../shared/opencode.ts";
+import {
+  effectiveOpencodeServer,
+  opencodeMajor,
+  opencodeModelArgs,
+  opencodeResumeFailedStatusLine,
+  opencodeTransportFor,
+  type OpencodeTransport,
+} from "../shared/opencode.ts";
 import { compactionStatusLine } from "../shared/compaction.ts";
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { HANDOFF_TAG } from "../shared/pipeline.ts";
@@ -29,6 +37,7 @@ import {
   type OpencodeSubagentNotice,
 } from "./opencode-tmux.ts";
 import { refreshOpencodeSubagents, registerOpencodeSubagent } from "./opencode-subagents.ts";
+import { attachOpencodeServerLinger, attachOpencodeServerTurn, spawnOpencodeServerTurn, type OpencodeServerTurn } from "./opencode-driver.ts";
 import { copilotHome } from "./copilot-home.ts";
 import { fakeCopilotScript, playFakeCopilotTurn } from "./copilot-fake.ts";
 import { copilotUsagePath, spawnCopilotViaTmux, type CopilotSubagentSink } from "./copilot-tmux.ts";
@@ -909,8 +918,12 @@ export function buildCommand(
   }
 
   if (harness.kind === "opencode") {
-    // opencode — hosted in tmux via opencode-tmux.ts, one-shot `opencode run`
-    // per turn (D-1/D-3, spike A10). The prompt is NOT an argv element: a
+    // opencode `run` argv — the legacy transport (OpenCode 1.x, the
+    // `AGETOR_OPENCODE_TRANSPORT=run` kill switch, the in-process fake):
+    // hosted in tmux via opencode-tmux.ts, one-shot `opencode run` per turn
+    // (D-1/D-3, spike A10). OpenCode 2.x turns normally never use this argv:
+    // `spawnAgent` sends them to the agetor-owned server over HTTP
+    // (`spawnOpencodeServerAgent`, opencode-driver.ts). The prompt is NOT an argv element: a
     // positional prompt gets wrapped in literal quotes by OpenCode, so the
     // driver feeds the prompt file on stdin (`"$@" < '<prompt>'`) and no user
     // text touches argv or the shell wrapper — which also means there is no
@@ -1145,6 +1158,39 @@ export function opencodeEffectiveServerFor(
     harnessHome: harness.home,
     major: opencodeMajor(cliVersion),
   });
+}
+
+/**
+ * How an OpenCode turn is carried (plan D3/D10): the agetor-owned HTTP server
+ * (`"server"`, OpenCode 2.x) or one-shot `opencode run` in tmux (`"run"`: OpenCode
+ * 1.x, the `AGETOR_OPENCODE_TRANSPORT=run` kill switch, and the in-process fake
+ * driver, which replays `opencode run` NDJSON). The one place this is decided:
+ * `spawnAgent`, the turn breadcrumb and the Ask-mode status line all read it.
+ */
+export function opencodeTransportOfTurn(cliVersion: string | null | undefined): OpencodeTransport {
+  if (process.env.AGETOR_OPENCODE_DRIVER === "fake") return "run";
+  return opencodeTransportFor({ version: cliVersion, transportEnv: process.env.AGETOR_OPENCODE_TRANSPORT });
+}
+
+/**
+ * Status line for an OpenCode turn that runs through `opencode run` in Ask mode:
+ * `run` has no approval channel, so OpenCode rejects every ask (deny over allow;
+ * plan D4). Shown instead of silently running a mode the turn cannot honour.
+ */
+export const OPENCODE_ASK_NEEDS_V2_STATUS =
+  "Ask mode needs OpenCode 2 — on this OpenCode every tool request that needs approval is denied";
+
+/** The same, for OpenCode 2 with the server driver switched off (`AGETOR_OPENCODE_TRANSPORT=run`): only the driver can show approval cards. */
+export const OPENCODE_ASK_DRIVER_OFF_STATUS =
+  "Ask mode needs the OpenCode server driver, which is switched off — every tool request that needs approval is denied";
+
+/** What `spawnAgent` returns for a server-transport OpenCode turn: the generic handle plus the driver's turn (its `steer` is async). */
+export type SpawnedOpencodeServerAgent = SpawnedAgent & { opencodeServerTurn: OpencodeServerTurn };
+
+/** The driver's turn behind a spawned handle, or null for every other agent. */
+export function opencodeServerTurnOf(agent: SpawnedAgent): OpencodeServerTurn | null {
+  const t = (agent as Partial<SpawnedOpencodeServerAgent>).opencodeServerTurn;
+  return t ?? null;
 }
 
 /**
@@ -3516,11 +3562,6 @@ export function fakeOpencodeChildSessionId(taskId: string): string {
   return `ses_fakechild${fakeOpencodeIdPart(taskId)}`;
 }
 
-/** The D-9 status line a failed resume posts before the fresh session. */
-export function opencodeResumeFailedStatusLine(sessionId: string): string {
-  return `couldn't resume OpenCode session ${sessionId.slice(0, 8)}… — starting a fresh session`;
-}
-
 /** Makes every fake turn's part ids unique, so two turns of one task never
  *  share a `line_uuid`. */
 let fakeOpencodeTurnCounter = 0;
@@ -3737,6 +3778,19 @@ export interface SpawnAgentArgs {
    * this sink so it shows up as a subagent tab. Other kinds ignore it.
    */
   copilotSubagents?: CopilotSubagentSink;
+  /**
+   * opencode-only, required for a server-transport turn (OpenCode 2.x): what the
+   * orchestrator lends the driver. `isBusy` says whether a turn or an open card
+   * is using this harness's server (the server restart gate); `onReplace`
+   * overwrites an already persisted event by line uuid (a tool call whose name
+   * the mapper learned late). Ignored by every other kind and by `opencode run`.
+   */
+  opencodeTurnHooks?: {
+    isBusy: () => boolean;
+    onReplace: (lineUuid: string, data: string) => void;
+    /** Another client (not agetor) interrupted the root turn: called once, before `done` resolves 130. */
+    onUserStop: () => void;
+  };
   opts?: AgentRunOptions;
 }
 
@@ -3768,6 +3822,119 @@ export function buildFxLaunchOptions(args: SpawnAgentArgs, built: AgentCommand):
     onSessionId,
     onSteerDropped,
   };
+}
+
+/** The Ask/Auto/Plan mode the server driver understands; an unknown id reads as Ask (a card per request, never a silent allow). */
+function opencodeServerMode(mode: string | null | undefined): "auto" | "ask" | "plan" {
+  const m = mode ?? defaultModeFor("opencode");
+  return m === "auto" || m === "plan" ? m : "ask";
+}
+
+/** What `spawnOpencodeServerAgent` and `attachOpencodeServerAgent` share: the server spec parts and the turn's settings. */
+interface OpencodeServerAgentBase {
+  taskId: string;
+  runId: string;
+  harness: Harness;
+  cwd: string;
+  mode: string | null | undefined;
+  model: string | null | undefined;
+  effort: string | null | undefined;
+  onChunk: ChunkHandler;
+  onSessionId?: (sessionId: string) => void;
+  hooks: NonNullable<SpawnAgentArgs["opencodeTurnHooks"]>;
+}
+
+function opencodeServerBaseArgs(a: OpencodeServerAgentBase) {
+  const env = harnessEnv(a.harness);
+  env.OPENCODE_DISABLE_AUTOUPDATE ??= "1";
+  return {
+    taskId: a.taskId,
+    runId: a.runId,
+    harnessId: a.harness.id,
+    bin: resolveBin(a.harness),
+    env,
+    serverCwd: a.harness.home ?? homedir(),
+    cwd: a.cwd,
+    mode: opencodeServerMode(a.mode),
+    model: a.model ?? null,
+    effort: a.effort ?? null,
+    isBusy: a.hooks.isBusy,
+    onChunk: a.onChunk,
+    onReplace: a.hooks.onReplace,
+    onUserStop: a.hooks.onUserStop,
+    onSessionId: (sessionId: string) => a.onSessionId?.(sessionId),
+  };
+}
+
+/**
+ * The generic handle for a driver turn. `steer` is deliberately absent: the
+ * driver's is async, so the orchestrator reaches it through `opencodeServerTurn`
+ * (`opencodeServerTurnOf`).
+ */
+function opencodeServerHandle(turn: OpencodeServerTurn): SpawnedOpencodeServerAgent {
+  return { kill: () => turn.kill(), writeInput: () => false, done: turn.done, opencodeServerTurn: turn };
+}
+
+/**
+ * A server-transport OpenCode turn (OpenCode 2.x): the driver talks HTTP to the
+ * harness's agetor-owned `opencode serve` (plan D1/D2). Returns at once: the
+ * server, session and prompt are set up in the background, and a failure there
+ * settles the turn (`done` resolves non-zero with a status line) rather than
+ * throwing here.
+ */
+function spawnOpencodeServerAgent(args: SpawnAgentArgs, harness: Harness): SpawnedAgent {
+  const { taskId, runId, prompt, cwd, onChunk, onSessionId, opts = {}, opencodeTurnHooks } = args;
+  if (!opencodeTurnHooks) throw new Error("opencode server turn needs opencodeTurnHooks (isBusy, onReplace)");
+  return opencodeServerHandle(
+    spawnOpencodeServerTurn({
+      ...opencodeServerBaseArgs({ taskId, runId, harness, cwd, mode: opts.mode, model: opts.model, effort: opts.effort, onChunk, onSessionId, hooks: opencodeTurnHooks }),
+      prompt,
+      title: opts.title ?? null,
+      resumeSessionId: opts.resumeSessionId ?? null,
+    }),
+  );
+}
+
+/**
+ * A handle that only listens for the background subagents of an OpenCode
+ * session whose last turn is over (a held task after a restart or a hand-over):
+ * its `done` resolves 0 at once and it lingers child-only, answering and
+ * settling the children. Not a run: the orchestrator holds it per task.
+ */
+export function lingerOpencodeServerAgent(
+  a: Omit<OpencodeServerAgentBase, "mode" | "model" | "effort"> & {
+    task: { mode: string | null; model: string | null; effort: string | null };
+    sessionId: string;
+  },
+): OpencodeServerTurn {
+  return attachOpencodeServerLinger({
+    ...opencodeServerBaseArgs({ ...a, mode: a.task.mode, model: a.task.model ?? DEFAULT_MODEL.opencode, effort: a.task.effort }),
+    sessionId: a.sessionId,
+  });
+}
+
+/**
+ * Join an OpenCode turn that is already running on the harness's server: after
+ * an agetor restart (`reason: "reattach"`, `sinceMs` = the run's start) or for
+ * an execution the server started on its own (`"wake"`, `sinceMs` = the
+ * `execution.started` envelope's time). Returns at once like the spawn.
+ */
+export function attachOpencodeServerAgent(
+  a: Omit<OpencodeServerAgentBase, "mode" | "model" | "effort"> & {
+    task: { mode: string | null; model: string | null; effort: string | null };
+    sessionId: string;
+    sinceMs: number;
+    reason: "reattach" | "wake";
+  },
+): SpawnedAgent {
+  return opencodeServerHandle(
+    attachOpencodeServerTurn({
+      ...opencodeServerBaseArgs({ ...a, mode: a.task.mode, model: a.task.model ?? DEFAULT_MODEL.opencode, effort: a.task.effort }),
+      sessionId: a.sessionId,
+      sinceMs: a.sinceMs,
+      reason: a.reason,
+    }),
+  );
 }
 
 /**
@@ -4013,7 +4180,11 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
   }
 
   if (harness.kind === "opencode") {
-    // opencode — hosted in a per-task tmux session via opencode-tmux.ts (so a
+    // opencode — two transports (`opencodeTransportOfTurn`). OpenCode 2.x runs
+    // on the harness's agetor-owned `opencode serve` over HTTP
+    // (opencode-driver.ts): steering, permission and question cards, restart
+    // survival. OpenCode 1.x, the kill switch and the fake driver use the
+    // legacy path below: a per-task tmux session via opencode-tmux.ts (so a
     // mid-turn run survives an agetor restart and is reattachable), one-shot
     // `opencode run --format json` per turn with the prompt on stdin,
     // streaming structured events by tailing its NDJSON log. The session id
@@ -4021,6 +4192,9 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     const major = opencodeMajor(opts.cliVersion);
     const server = opencodeEffectiveServerFor(harness, { opencodeServer: opts.opencodeServer }, opts.cliVersion ?? null);
     const hooks = opencodeDriverHooks({ taskId, runId, harness, cwd, major, standalone: server === "standalone" });
+    if (opencodeTransportOfTurn(opts.cliVersion) === "server") {
+      return spawnOpencodeServerAgent(args, harness);
+    }
     if (process.env.AGETOR_OPENCODE_DRIVER === "fake") {
       // Build the command anyway so the fake exercises the same argv
       // assembly the real path does; the fake's behaviour doesn't depend on

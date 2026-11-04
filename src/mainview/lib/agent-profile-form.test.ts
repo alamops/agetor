@@ -103,7 +103,6 @@ describe("trackLaunchInteractions", () => {
       effort: null as string | null,
       speed: "off" as "off" | "fast" | "ultrafast",
       maxMode: false,
-      opencodeServer: "shared" as "shared" | "standalone",
       kind: "opencode",
       switchAgent: (v: string) => void calls.push(["switchAgent", v]),
       setMode: (v: string) => void calls.push(["setMode", v]),
@@ -111,25 +110,20 @@ describe("trackLaunchInteractions", () => {
       setEffort: (v: string | null) => void calls.push(["setEffort", v]),
       setSpeed: (v: "off" | "fast" | "ultrafast") => void calls.push(["setSpeed", v]),
       setMaxMode: (v: boolean) => void calls.push(["setMaxMode", v]),
-      setOpencodeServer: (v: "shared" | "standalone") => void calls.push(["setOpencodeServer", v]),
     };
     return { launch, calls };
   }
 
-  test("an OpenCode server pick that changes the value is an interaction", () => {
-    const { launch, calls } = fakeLaunch();
-    let touched = 0;
-    trackLaunchInteractions(launch, () => touched++).setOpencodeServer("standalone");
-    expect(touched).toBe(1);
-    expect(calls).toEqual([["setOpencodeServer", "standalone"]]);
+  test("the retired OpenCode server setter is no longer tracked", () => {
+    expect(Object.keys(LAUNCH_INTERACTION_SETTERS)).not.toContain("setOpencodeServer");
   });
 
-  test("re-picking the current OpenCode server is not an interaction, but still forwards", () => {
+  test("re-picking the current value is not an interaction, but still forwards", () => {
     const { launch, calls } = fakeLaunch();
     let touched = 0;
-    trackLaunchInteractions(launch, () => touched++).setOpencodeServer("shared");
+    trackLaunchInteractions(launch, () => touched++).setMaxMode(false);
     expect(touched).toBe(0);
-    expect(calls).toEqual([["setOpencodeServer", "shared"]]);
+    expect(calls).toEqual([["setMaxMode", false]]);
   });
 
   test("every launch setter counts a changed value and ignores an unchanged one", () => {
@@ -140,7 +134,6 @@ describe("trackLaunchInteractions", () => {
       setEffort: "auto",
       setSpeed: "fast",
       setMaxMode: true,
-      setOpencodeServer: "standalone",
     };
     for (const setter of Object.keys(LAUNCH_INTERACTION_SETTERS) as (keyof typeof LAUNCH_INTERACTION_SETTERS)[]) {
       const { launch } = fakeLaunch();
@@ -165,13 +158,13 @@ describe("trackLaunchInteractions", () => {
 
   test("wrapping never calls onTouch and leaves the original and other fields alone", () => {
     const { launch, calls } = fakeLaunch();
-    const original = launch.setOpencodeServer;
+    const original = launch.setMaxMode;
     let touched = 0;
     const tracked = trackLaunchInteractions(launch, () => touched++);
     expect(touched).toBe(0);
     expect(calls).toEqual([]);
-    expect(launch.setOpencodeServer).toBe(original);
+    expect(launch.setMaxMode).toBe(original);
     expect(tracked.kind).toBe("opencode");
-    expect(tracked.opencodeServer).toBe("shared");
+    expect(tracked.maxMode).toBe(false);
   });
 });

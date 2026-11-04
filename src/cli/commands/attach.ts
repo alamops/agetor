@@ -2,6 +2,7 @@ import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
 import { usageError } from "../usage.ts";
+import type { AgetorClient } from "../api-client.ts";
 
 /**
  * Mirrors `tmuxSocketName()`/`tmuxSocketArgs()` from `../../bun/tmux-resolution.ts`
@@ -22,16 +23,53 @@ function cliTmuxSocketArgs(): string[] {
   return name ? ["-L", name] : [];
 }
 
+/** The harness's kind, from the harness list (a custom account's id differs from its kind), else the id itself (every built-in is seeded under its kind); null when neither resolves. */
+async function harnessKindOf(client: AgetorClient, harnessId: string): Promise<string | null> {
+  try {
+    const { harnesses } = await client.listHarnesses();
+    const row = harnesses.find((h) => h.id === harnessId);
+    if (row) return row.kind;
+  } catch { /* the id fallback below */ }
+  return harnessId;
+}
+
+/**
+ * The text of the error `agetor attach` gives when an OpenCode 2.x turn has
+ * no tmux session because it runs on the agetor-managed OpenCode server (one
+ * `opencode serve` per harness in its own tmux session, outliving the core and
+ * shared by every turn — not one session per turn), or
+ * null when `latest` (the task's newest run) is not such a turn. A server turn
+ * is stamped with no tmux session; an OpenCode 1.x (or `opencode run`) turn
+ * always has one. Only the follow commands that exist are named: `agetor logs`
+ * streams the run's events and `agetor show` prints its state.
+ */
+export function opencodeServerTurnAttachError(
+  taskId: string,
+  harnessKind: string | null,
+  latest: { tmuxSession: string | null } | undefined,
+): string | null {
+  if (harnessKind !== "opencode" || !latest || latest.tmuxSession) return null;
+  const id = taskId.slice(0, 8);
+  return (
+    "no tmux session — this OpenCode turn runs on the agetor-managed OpenCode server, which has no " +
+    "terminal to attach to. Follow it in the app, with 'agetor logs " + id + "' " +
+    "(add --no-follow for a snapshot) or 'agetor show " + id + "'"
+  );
+}
+
 /**
  * Attach the current terminal to a task's live tmux session — the
  * in-terminal equivalent of the app's "Open in tmux". Every tmux-hosted
- * agent kind runs in a per-task tmux session (fx alone is a plain child
- * process with none): claude-code's lives for the whole task, while for the
- * turn-only kinds — codex, cursor, gemini, antigravity and opencode — it
- * exists only while a turn is in flight (each turn is a fresh one-shot
- * session). Agetor creates sessions on tmux's default socket
- * (no -L/-S) in production, named `agetor-<id>`, so a plain `tmux attach`
- * finds them; under an active non-default socket (test isolation)
+ * agent kind runs in a per-task tmux session: claude-code's lives for the
+ * whole task, while for the turn-only kinds — codex, gemini, antigravity and
+ * copilot — it exists only while a turn is in flight (each turn is a fresh
+ * one-shot session). The
+ * kinds without one: fx and cursor (child processes speaking ACP), and an
+ * OpenCode 2.x turn, which runs on the agetor-managed OpenCode server
+ * ({@link opencodeServerTurnAttachError}); an OpenCode 1.x (`opencode run`)
+ * turn is tmux-hosted like codex. Agetor creates sessions on tmux's default
+ * socket (no -L/-S) in production, named `agetor-<id>`, so a plain `tmux
+ * attach` finds them; under an active non-default socket (test isolation)
  * `cliTmuxSocketArgs()` threads the matching `-L <name>` through. Detach
  * with Ctrl-b d.
  */
@@ -43,11 +81,13 @@ export async function cmdAttach(args: string[], flags: Flags): Promise<void> {
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const runs = await client.getRuns(task.id);
+  const serverTurn = opencodeServerTurnAttachError(task.id, await harnessKindOf(client, task.agent), runs[0]);
+  if (serverTurn) throw new Error(serverTurn);
   const session = runs.find((r) => r.tmuxSession)?.tmuxSession ?? null;
   if (!session) {
     throw new Error(
       "no tmux session — attach needs a task that has run (try 'agetor start' first); " +
-        "for codex, cursor, gemini, antigravity and opencode it only exists while a turn is in flight",
+        "for codex, gemini, antigravity, copilot and an OpenCode 1.x turn it only exists while a turn is in flight",
     );
   }
 

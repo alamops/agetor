@@ -1,0 +1,8 @@
+{"type":"session.execution.started","data":{"sessionID":"ses_fixture0030"}}
+{"type":"session.step.started","data":{"sessionID":"ses_fixture0030","agent":"build","model":{"id":"deepseek-v4.1-flash","providerID":"opencode-go","variant":"max"},"assistantMessageID":"msg_fixture0031","started":1}}
+{"type":"session.retry.scheduled","data":{"sessionID":"ses_fixture0030","assistantMessageID":"msg_fixture0031","attempt":1,"at":2,"error":{"type":"provider.rate-limit","message":"Rate limited by the provider","status":429,"retryAfterMs":5000}}}
+{"type":"session.retry.scheduled","data":{"sessionID":"ses_fixture0030","assistantMessageID":"msg_fixture0031","attempt":2,"at":3,"error":{"type":"provider.rate-limit","message":"Rate limited by the provider","status":429,"retryAfterMs":5000}}}
+{"type":"session.text.started","data":{"sessionID":"ses_fixture0030","assistantMessageID":"msg_fixture0031","ordinal":0}}
+{"type":"session.text.ended","data":{"sessionID":"ses_fixture0030","assistantMessageID":"msg_fixture0031","ordinal":0,"text":"Done."}}
+{"type":"session.step.ended","data":{"sessionID":"ses_fixture0030","assistantMessageID":"msg_fixture0031","finish":"stop","cost":0.001,"tokens":{"input":157,"output":38,"reasoning":0,"cache":{"read":5440,"write":0}}}}
+{"type":"session.execution.succeeded","data":{"sessionID":"ses_fixture0030"}}
