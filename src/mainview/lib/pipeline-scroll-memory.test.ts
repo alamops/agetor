@@ -247,3 +247,27 @@ describe("Pipelines list offset", () => {
     expect(pipelinesListScrollTop()).toBe(512);
   });
 });
+
+describe("human gates in the panel signature", () => {
+  test("a new gate seq changes the signature", () => {
+    const before = makeRun({ status: "review", humanSteps: [{ stepId: "h", seq: 2, startedAt: 1, arrivals: [] }] });
+    const after = makeRun({ status: "review", humanSteps: [{ stepId: "h", seq: 4, startedAt: 2, arrivals: [] }] });
+    expect(pipelineRunPanelSignature(before, makeSteps())).not.toBe(pipelineRunPanelSignature(after, makeSteps()));
+  });
+
+  test("a human decision changes the signature", () => {
+    const before = makeRun({
+      history: [
+        record(1),
+        { ...record(2, "h"), taskId: null, outcome: null, human: null },
+      ],
+    });
+    const after = makeRun({
+      history: [
+        record(1),
+        { ...record(2, "h"), taskId: null, outcome: "succeeded", human: { decision: "accept", comment: null } },
+      ],
+    });
+    expect(pipelineRunPanelSignature(before, makeSteps())).not.toBe(pipelineRunPanelSignature(after, makeSteps()));
+  });
+});

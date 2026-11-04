@@ -371,6 +371,7 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/tasks/:id/unarchive": { POST: CLI },
   "/tasks/:id/pipeline": { GET: CLI },
   "/tasks/:id/pipeline/advance": { POST: CLI },
+  "/tasks/:id/pipeline/review": { POST: CLI },
   "/tasks/:id/pipeline/retry": { POST: CLI },
   "/tasks/:id/pipeline/cancel": { POST: CLI },
   "/tasks/:id/pipeline/restart": { POST: CLI },

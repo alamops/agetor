@@ -55,7 +55,7 @@ import {
   requestRetentionPass,
   runArchivedHistoryRetentionPass,
 } from "./retention.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, reviewHumanStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import {
@@ -1114,6 +1114,10 @@ function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
     snapshot: run.snapshot ? { ...run.snapshot, profiles: {} } : null,
     history: run.history.map((h) => ({ ...h, handoff: null })),
     joins,
+    humanSteps: (run.humanSteps ?? []).map((g) => ({
+      ...g,
+      arrivals: g.arrivals.map((a) => ({ ...a, handoff: null })),
+    })),
   };
 }
 
@@ -6052,6 +6056,70 @@ export function startApiServer(
           }
 
           const result = await advancePipeline(req.params.id, { nextStepIds, handoff, fromTaskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // The human gate's decision route (docs/architecture/pipelines.md):
+      // Accept continues through the gate's outgoing edges (comment
+      // optional), Return re-runs the gate's sole incoming source (comment
+      // required). `stepId` + `seq` identify the gate, making a double
+      // submit a 409 rather than a second launch.
+      "/tasks/:id/pipeline/review": {
+        POST: authed(async (req) => {
+          // Accept/Return can launch (or resume) a step, which can
+          // (re-)materialize a worktree — same rationale as advance/retry.
+          server.timeout(req, 0);
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          if (typeof body.stepId !== "string" || body.stepId.length === 0) {
+            return json({ error: "stepId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.seq !== "number" || !Number.isSafeInteger(body.seq) || body.seq < 1) {
+            return json({ error: "seq must be a positive integer" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.decision !== "accept" && body.decision !== "return") {
+            return json({ error: "decision must be \"accept\" or \"return\"" }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          let comment: string | null | undefined;
+          if (body.comment !== undefined) {
+            if (body.comment !== null && typeof body.comment !== "string") {
+              return json({ error: "comment must be a string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            comment = body.comment as string | null;
+          }
+
+          let nextStepIds: string[] | undefined;
+          if (body.nextStepIds !== undefined) {
+            if (!Array.isArray(body.nextStepIds) || body.nextStepIds.some((s) => typeof s !== "string")) {
+              return json({ error: "nextStepIds must be an array of step ids" }, { status: 400, headers: corsHeaders(req) });
+            }
+            nextStepIds = body.nextStepIds as string[];
+          }
+
+          let mode: "fresh" | "resume" | undefined;
+          if (body.mode !== undefined) {
+            if (body.mode !== "fresh" && body.mode !== "resume") {
+              return json({ error: "mode must be \"fresh\" or \"resume\"" }, { status: 400, headers: corsHeaders(req) });
+            }
+            mode = body.mode;
+          }
+
+          const result = await reviewHumanStep(req.params.id, {
+            stepId: body.stepId,
+            seq: body.seq,
+            decision: body.decision,
+            comment,
+            nextStepIds,
+            mode,
+          });
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });

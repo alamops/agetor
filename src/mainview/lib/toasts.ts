@@ -171,6 +171,13 @@ export function toastPending(args: ToastArgs): void {
   showBlockingToast({ method: toast.warning, heading: "Waiting on you", kind: "blocked" }, args);
 }
 
+/** The human-gate alert: a pipeline paused at a review gate. Blocking (stays
+ *  until decided/dismissed) and lands on the run view with the gate focused,
+ *  exactly like a pending question does for a step. */
+export function toastPipelineReview(args: ToastArgs): void {
+  showBlockingToast({ method: toast.warning, heading: "Pipeline needs your review", kind: "blocked" }, args);
+}
+
 /** Variant of `toastPending` for the `blocked → api-error` transition.
  *  The heading/copy reads as a transient failure to retry rather than
  *  "the agent is waiting on your answer." */

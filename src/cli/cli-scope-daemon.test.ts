@@ -376,6 +376,12 @@ const ROWS: Record<ClientMethod, Row> = {
     why: "nothing to advance on an idle run",
     call: () => client.advancePipeline(fx.pipelineTaskId, { nextStepIds: null }),
   },
+  reviewPipeline: {
+    expect: [409],
+    why: "no pending human review on an idle run",
+    call: () =>
+      client.reviewPipeline(fx.pipelineTaskId, { stepId: "no-such-step", seq: 1, decision: "accept" }),
+  },
   restartPipeline: {
     expect: [200],
     why: "fresh run of the idle pipeline task (isolation:none, so no worktree to prepare)",

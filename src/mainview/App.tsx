@@ -23,6 +23,7 @@ import {
   Square,
   TimerOff,
   Trash2,
+  UserCheck,
   Workflow,
   X,
   type LucideIcon,
@@ -46,6 +47,7 @@ import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortc
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { useAgentProfiles } from "@/lib/agent-profiles";
+import { newHumanGateSeqs } from "../shared/pipeline.ts";
 import { pipelineAttentionStepTask, usePipelines } from "@/lib/pipelines";
 import { discardBoardDeparture, recordBoardDeparture, restoreBoardScroll, saveBoardScroll } from "@/lib/board-scroll";
 import { PipelineEditor, PipelinesPage, PipelineRunView } from "@/components/pipelines";
@@ -64,7 +66,7 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
+import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { OwedPipelineAlerts } from "@/lib/owed-pipeline-alerts";
 import { findTaskById } from "@/lib/notification-open";
@@ -180,6 +182,7 @@ const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
 const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   open: FolderOpen,
   "open-pipeline": Workflow,
+  "review-pipeline": UserCheck,
   start: Play,
   stop: Square,
   "resume-recovery": PlayCircle,
@@ -211,7 +214,7 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
 type AppView =
   | { kind: "board" }
   | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
-  | { kind: "pipeline-run"; taskId: string };
+  | { kind: "pipeline-run"; taskId: string; gateStepId?: string };
 
 /** The `key` a view's page mounts under in the AnimatePresence below: two
  *  views with the same key render the same page instance, so switching
@@ -492,13 +495,22 @@ function AppInner() {
    *  so the first return to the board can reveal it (`lib/board-scroll.ts`).
    *  Every other caller stays flag-less, which is what lets a non-card hop
    *  while away keep the original card's record (D8). */
-  const openPipelineRun = useCallback((taskId: string, opts?: { fromBoardCard?: boolean }) => {
-    navigate({ kind: "pipeline-run", taskId }, () => {
+  const openPipelineRun = useCallback((taskId: string, opts?: { fromBoardCard?: boolean; gateStepId?: string }) => {
+    navigate({ kind: "pipeline-run", taskId, ...(opts?.gateStepId ? { gateStepId: opts.gateStepId } : {}) }, () => {
       if (opts?.fromBoardCard) recordBoardDeparture(taskId);
       setFocusSubagent(null);
       setSelected(null);
     });
   }, [navigate]);
+  /** Open a pipeline run's human review gate: the run view plus the human
+   *  panel focused on `gateStepId` (the card's Review button, the context
+   *  menu's "Review pipeline", the review toast). */
+  const openPipelineReview = useCallback((taskId: string, gateStepId?: string, opts?: { fromBoardCard?: boolean }) => {
+    openPipelineRun(taskId, {
+      ...(gateStepId ? { gateStepId } : {}),
+      ...(opts?.fromBoardCard ? { fromBoardCard: true } : {}),
+    });
+  }, [openPipelineRun]);
   /** The "attention" landing for a pipeline PARENT — its card's amber
    *  Answer/Review button, the "Waiting on you" / "Pipeline needs you"
    *  toasts and the OS-notification click: the run view PLUS the run panel
@@ -596,6 +608,12 @@ function AppInner() {
     }
     openTask(t);
   }, [openPipelineAttention, openTask]);
+  /** The card's Review button / context menu's "Review pipeline": the run
+   *  view plus the pending human gate, focused. Stable identity — passed to
+   *  the memoized `Column`/`TaskCard`. */
+  const reviewPipelineFromBoard = useCallback((t: Task) => {
+    openPipelineReview(t.id, t.pipelineRun?.humanSteps?.[0]?.stepId, { fromBoardCard: true });
+  }, [openPipelineReview]);
   /** The board's `.kanban-scroll` element while it is mounted (`null` while
    *  another page is shown), for the fast-return guard below. */
   const boardScrollerElRef = useRef<HTMLDivElement | null>(null);
@@ -1159,6 +1177,27 @@ function AppInner() {
     });
   }, [openPipelineAttention]);
 
+  /** The human-gate alert: one per (run generation, gate seq). Lands on the
+   *  run view with the gate focused. */
+  const raisePipelineReview = useCallback((parentId: string, gateSeq: number) => {
+    const parent = tasksRef.current.find((t) => t.id === parentId);
+    toastPipelineReview({
+      taskId: parentId,
+      title: parent?.title || `Pipeline ${parentId.slice(0, 7)}`,
+      subtitle: "Pipeline needs your review",
+      isSelected:
+        parentId === selectedIdRef.current
+        || (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === parentId),
+      isFocused: document.hasFocus(),
+      onOpen: () => {
+        const live = tasksRef.current.find((t) => t.id === parentId);
+        const stepId = live?.pipelineRun?.humanSteps?.find((g) => g.seq === gateSeq)?.stepId ?? null;
+        openPipelineReview(parentId, stepId ?? undefined);
+        void api.focusWindow();
+      },
+    });
+  }, [openPipelineReview]);
+
   // "Pipeline needs you" alerts a step's retargeted "Waiting on you" toast
   // suppressed or displaced (see OwedPipelineAlerts). Once no question is left
   // and no reason toast holds the parent's slot, the alert is raised if the
@@ -1392,6 +1431,9 @@ function AppInner() {
   // broadcasts on every run-state mutation, and a manual Advance that lands
   // on an already-`done` run must not re-toast.
   const pipelineStatusRef = useRef(new Map<string, string>());
+  // Last human gates announced per parent — the "needs your review" toast
+  // fires once per (run generation, gate seq), including two gates on one run.
+  const pipelineGateRef = useRef(new Map<string, { runStartedAt: number | null; seqs: number[] }>());
   useEffect(() => {
     /** Refetch just one pipeline parent and merge the three fields the
      *  board's `PipelineBadge`, the card's column and the "needs input"
@@ -1669,14 +1711,34 @@ function AppInner() {
       if (ev.kind === "pipeline") {
         const prevStatus = pipelineStatusRef.current.get(ev.taskId) ?? task?.pipelineRun?.status ?? null;
         pipelineStatusRef.current.set(ev.taskId, ev.status);
-        if (ev.status !== "blocked") {
+        if (ev.status !== "blocked" && ev.status !== "review") {
           // No block left on the run — a retargeted step "Waiting on you"
           // toast (and its tracker entry) is stale now. This, not the step's
           // own run-status, is what clears them: the next block on any step
-          // of this pipeline should alert afresh.
+          // of this pipeline should alert afresh. A `review` transition keeps
+          // a sibling's pending question/owed alert: the run still needs you.
           dismissPending(ev.taskId);
           pendingInputRef.current.clearTask(ev.taskId);
           owedPipelineAlertsRef.current.forget(ev.taskId);
+        }
+        if (ev.status === "review") {
+          // One "needs your review" alert per (run generation, gate seq) —
+          // a repeat persist announces nothing, a new gate announces once.
+          const previous = pipelineGateRef.current.get(ev.taskId) ?? null;
+          const fresh = newHumanGateSeqs(previous, ev.runStartedAt ?? null, ev.humanStepSeqs ?? []);
+          if (fresh.length > 0) {
+            const sameGeneration = previous !== null && previous.runStartedAt === (ev.runStartedAt ?? null);
+            pipelineGateRef.current.set(ev.taskId, {
+              runStartedAt: ev.runStartedAt ?? null,
+              seqs: [...(sameGeneration ? previous.seqs : []), ...fresh],
+            });
+            if (pipelineGateRef.current.size > 500) {
+              const oldest = pipelineGateRef.current.keys().next().value;
+              if (oldest !== undefined) pipelineGateRef.current.delete(oldest);
+            }
+            const gateSeq = fresh[0]!;
+            raisePipelineReview(ev.taskId, gateSeq);
+          }
         }
         // ONE "finished" toast + OS notification per run, on the transition
         // into `done` (M-A3) — the outcome someone waiting on a long
@@ -1750,7 +1812,7 @@ function AppInner() {
     // directly — see `viewRef`'s doc comment above) — listing them doesn't
     // cause a resubscribe, it just keeps this effect honest about what it
     // closes over.
-  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields, raisePipelineNeedsYou, settleOwedPipelineAlert]);
+  }, [openTask, openPipelineStep, openPipelineAttention, mergeTaskFields, raisePipelineNeedsYou, raisePipelineReview, settleOwedPipelineAlert]);
 
   // Hidden pipeline STEP tasks never count toward anything user-facing (D11,
   // `docs/plans/pipelines.md`) — the header's "N of M tasks" count and the
@@ -2271,6 +2333,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       case "open-pipeline":
         openPipelineRun(t.id, { fromBoardCard: true });
         break;
+      case "review-pipeline":
+        reviewPipelineFromBoard(t);
+        break;
       case "start":
         void start(t);
         break;
@@ -2342,7 +2407,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         return exhaustive;
       }
     }
-  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del, openPipelineRun]);
+  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, viewIssue, markRead, markUnread, copyToClipboard, del, openPipelineRun, reviewPipelineFromBoard]);
 
   // Maps `buildTaskContextMenu`'s pure entries onto the primitive's
   // `ContextMenuItem[]`, inserting a separator whenever the group changes
@@ -2652,6 +2717,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             onDelete={del}
                             onOpen={openTaskFromBoard}
                             onOpenAttention={openAttention}
+                            onReviewPipeline={reviewPipelineFromBoard}
                             onDiff={setDiffTask}
                             onMarkDone={markDone}
                             onArchive={archive}
@@ -2760,6 +2826,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               >
                 <PipelineRunView
                   taskId={view.taskId}
+                  focusGateStepId={view.gateStepId ?? null}
                   onMarkDone={markDone}
                   onOpenTask={(t, opts) => {
                     setFocusSubagent(opts?.subagentId ? { taskId: t.id, id: opts.subagentId, nonce: Date.now(), consumed: false } : null);

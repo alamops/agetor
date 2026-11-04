@@ -62,8 +62,21 @@ export function StepPanel({
 
   const outgoing = outgoingSteps(graph, step.id);
   const isStart = graph.startStepId === step.id;
+  const human = step.type === "human";
 
   const capUnlimited = step.subagents.cap == null;
+
+  /** Switch this step between an agent step and a human review gate. A
+   *  human step has no agent/subagents and `join: "any"` (exactly one
+   *  incoming edge makes join moot), so switching clears them; switching
+   *  back leaves the step agent-less until an Agent is picked. */
+  const setType = (type: "agent" | "human") => {
+    if (type === "human") {
+      onChange({ ...step, type, agentProfileId: null, subagents: { profileIds: [], cap: null }, join: "any" });
+    } else {
+      onChange({ ...step, type: "agent" });
+    }
+  };
 
   const handleDelete = async () => {
     const ok = await confirm({
@@ -77,6 +90,24 @@ export function StepPanel({
 
   return (
     <div data-testid="pipeline-step-panel" className={cn("flex h-full flex-col gap-4 overflow-y-auto p-4", className)}>
+      <div>
+        <span className="text-xs font-medium text-muted-foreground">Step type</span>
+        <div data-testid="pipeline-step-type" role="radiogroup" className="mt-1 flex flex-col gap-1.5">
+          <RadioRow
+            testId="pipeline-step-type-agent"
+            checked={!human}
+            onSelect={() => setType("agent")}
+            label="Agent — runs an agent profile"
+          />
+          <RadioRow
+            testId="pipeline-step-type-human"
+            checked={human}
+            onSelect={() => setType("human")}
+            label="Human — pauses for your review"
+          />
+        </div>
+      </div>
+
       <div>
         <label className="text-xs font-medium text-muted-foreground" htmlFor="pipeline-step-name-input">
           Step name
@@ -93,7 +124,7 @@ export function StepPanel({
 
       <div>
         <label className="text-xs font-medium text-muted-foreground" htmlFor="pipeline-step-instructions-input">
-          Instructions
+          {human ? "What to check" : "Instructions"}
         </label>
         <Textarea
           id="pipeline-step-instructions-input"
@@ -102,82 +133,86 @@ export function StepPanel({
           maxLength={PIPELINE_LIMITS.instructions}
           onChange={(e) => onChange({ ...step, instructions: e.target.value })}
           className="mt-1 min-h-[120px]"
-          placeholder="What should this step do?"
+          placeholder={human ? "What should the reviewer check before accepting?" : "What should this step do?"}
         />
       </div>
 
-      <div>
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-muted-foreground">Agent</span>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            data-testid="pipeline-step-new-agent"
-            className="h-6 gap-1 px-1.5 text-xs"
-            onClick={() => setNewAgentOpen(true)}
-          >
-            <Plus className="size-3" aria-hidden />
-            New agent…
-          </Button>
+      {!human && (
+        <div>
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-medium text-muted-foreground">Agent</span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              data-testid="pipeline-step-new-agent"
+              className="h-6 gap-1 px-1.5 text-xs"
+              onClick={() => setNewAgentOpen(true)}
+            >
+              <Plus className="size-3" aria-hidden />
+              New agent…
+            </Button>
+          </div>
+          <AgentProfilePicker
+            value={step.agentProfileId}
+            onChange={(id) => onChange({ ...step, agentProfileId: id })}
+            profiles={profiles}
+            harnesses={harnesses}
+            className="mt-1"
+          />
+          <AgentProfileFormDialog
+            open={newAgentOpen}
+            profileId={null}
+            onClose={() => setNewAgentOpen(false)}
+            onSaved={(profile) => {
+              onProfilesChanged();
+              onChange({ ...step, agentProfileId: profile.id });
+              setNewAgentOpen(false);
+            }}
+          />
         </div>
-        <AgentProfilePicker
-          value={step.agentProfileId}
-          onChange={(id) => onChange({ ...step, agentProfileId: id })}
-          profiles={profiles}
-          harnesses={harnesses}
-          className="mt-1"
-        />
-        <AgentProfileFormDialog
-          open={newAgentOpen}
-          profileId={null}
-          onClose={() => setNewAgentOpen(false)}
-          onSaved={(profile) => {
-            onProfilesChanged();
-            onChange({ ...step, agentProfileId: profile.id });
-            setNewAgentOpen(false);
-          }}
-        />
-      </div>
+      )}
 
-      <div>
-        <span className="text-xs font-medium text-muted-foreground">Subagents this step may delegate to</span>
-        <div data-testid="pipeline-step-subagents" className="mt-1">
-          <MultiSearchSelect
-            values={step.subagents.profileIds}
-            onChange={(profileIds) => onChange({ ...step, subagents: { ...step.subagents, profileIds } })}
-            items={subagentItems}
-            emptyLabel="No subagents allowed"
-            placeholder="Search agents…"
-          />
-        </div>
-        <div className="mt-2 flex items-center gap-2">
-          <Switch
-            data-testid="pipeline-step-cap-unlimited"
-            checked={capUnlimited}
-            onCheckedChange={(checked) =>
-              onChange({ ...step, subagents: { ...step.subagents, cap: checked ? null : 1 } })
-            }
-          />
-          <span className="text-xs text-muted-foreground">No limit</span>
-          {!capUnlimited && (
-            <Input
-              type="number"
-              min={1}
-              max={PIPELINE_LIMITS.subagentCap}
-              data-testid="pipeline-step-cap"
-              value={step.subagents.cap ?? 1}
-              onChange={(e) => {
-                // Clamp into the server's own accepted range so a typed
-                // value can't make Save fail validation later.
-                const n = Math.min(PIPELINE_LIMITS.subagentCap, Math.max(1, Math.floor(Number(e.target.value) || 1)));
-                onChange({ ...step, subagents: { ...step.subagents, cap: n } });
-              }}
-              className="h-7 w-20"
+      {!human && (
+        <div>
+          <span className="text-xs font-medium text-muted-foreground">Subagents this step may delegate to</span>
+          <div data-testid="pipeline-step-subagents" className="mt-1">
+            <MultiSearchSelect
+              values={step.subagents.profileIds}
+              onChange={(profileIds) => onChange({ ...step, subagents: { ...step.subagents, profileIds } })}
+              items={subagentItems}
+              emptyLabel="No subagents allowed"
+              placeholder="Search agents…"
             />
-          )}
+          </div>
+          <div className="mt-2 flex items-center gap-2">
+            <Switch
+              data-testid="pipeline-step-cap-unlimited"
+              checked={capUnlimited}
+              onCheckedChange={(checked) =>
+                onChange({ ...step, subagents: { ...step.subagents, cap: checked ? null : 1 } })
+              }
+            />
+            <span className="text-xs text-muted-foreground">No limit</span>
+            {!capUnlimited && (
+              <Input
+                type="number"
+                min={1}
+                max={PIPELINE_LIMITS.subagentCap}
+                data-testid="pipeline-step-cap"
+                value={step.subagents.cap ?? 1}
+                onChange={(e) => {
+                  // Clamp into the server's own accepted range so a typed
+                  // value can't make Save fail validation later.
+                  const n = Math.min(PIPELINE_LIMITS.subagentCap, Math.max(1, Math.floor(Number(e.target.value) || 1)));
+                  onChange({ ...step, subagents: { ...step.subagents, cap: n } });
+                }}
+                className="h-7 w-20"
+              />
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       <div>
         <span className="text-xs font-medium text-muted-foreground">After this step</span>
@@ -186,7 +221,7 @@ export function StepPanel({
             testId="pipeline-step-transition-choose"
             checked={step.transition === "choose"}
             onSelect={() => onChange({ ...step, transition: "choose" })}
-            label="Let the agent choose one next step"
+            label={human ? "Let the reviewer choose one next step" : "Let the agent choose one next step"}
           />
           <RadioRow
             testId="pipeline-step-transition-all"
@@ -202,23 +237,25 @@ export function StepPanel({
         )}
       </div>
 
-      <div>
-        <span className="text-xs font-medium text-muted-foreground">Start when</span>
-        <div data-testid="pipeline-step-join" role="radiogroup" className="mt-1 flex flex-col gap-1.5">
-          <RadioRow
-            testId="pipeline-step-join-any"
-            checked={step.join === "any"}
-            onSelect={() => onChange({ ...step, join: "any" })}
-            label="Any incoming step finishes"
-          />
-          <RadioRow
-            testId="pipeline-step-join-all"
-            checked={step.join === "all"}
-            onSelect={() => onChange({ ...step, join: "all" })}
-            label="All incoming steps have finished"
-          />
+      {!human && (
+        <div>
+          <span className="text-xs font-medium text-muted-foreground">Start when</span>
+          <div data-testid="pipeline-step-join" role="radiogroup" className="mt-1 flex flex-col gap-1.5">
+            <RadioRow
+              testId="pipeline-step-join-any"
+              checked={step.join === "any"}
+              onSelect={() => onChange({ ...step, join: "any" })}
+              label="Any incoming step finishes"
+            />
+            <RadioRow
+              testId="pipeline-step-join-all"
+              checked={step.join === "all"}
+              onSelect={() => onChange({ ...step, join: "all" })}
+              label="All incoming steps have finished"
+            />
+          </div>
         </div>
-      </div>
+      )}
 
       <div>
         <span className="text-xs font-medium text-muted-foreground">Connect to…</span>
@@ -267,7 +304,8 @@ export function StepPanel({
           variant="outline"
           size="sm"
           data-testid="pipeline-step-set-start"
-          disabled={isStart}
+          disabled={isStart || human}
+          title={human ? "A human step can't be the start step" : undefined}
           onClick={onSetStart}
         >
           {isStart ? "Start step" : "Set as start"}

@@ -10,6 +10,7 @@ const STATUS_CLASSES: Record<PipelineRunStatus, string> = {
   blocked: "bg-warning/10 text-warning",
   done: "bg-success/10 text-success",
   cancelled: "bg-muted text-muted-foreground",
+  review: "bg-info/10 text-info",
 };
 
 interface PipelineBadgeProps {

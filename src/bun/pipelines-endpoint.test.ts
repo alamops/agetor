@@ -1423,3 +1423,124 @@ test("POST /tasks/:id/pipeline/advance: an unknown nextStepIds entry → 400, an
   expect(ended.pipelineRun?.history.at(-1)?.nextStepIds).toEqual([]);
   await waitForPipelineSettled(task.id);
 }, 20_000);
+
+// ---------------------------------------------------------------------------
+// Human gate decision route
+// ---------------------------------------------------------------------------
+
+async function waitForGate(taskId: string, attempts = 150, intervalMs = 50): Promise<{ task: Task; steps: Task[] }> {
+  for (let i = 0; i < attempts; i++) {
+    const res = await call(`/tasks/${taskId}/pipeline`);
+    if (res.status === 200) {
+      const data = (await res.json()) as { task: Task; steps: Task[] };
+      if ((data.task.pipelineRun?.humanSteps ?? []).length > 0) return data;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`timed out waiting for a human gate on ${taskId}`);
+}
+
+test("POST /tasks/:id/pipeline/review on an idle run → 409; unknown task → 404", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const task = await createTask({ pipelineId: pipeline.id });
+  const res = await call(`/tasks/${task.id}/pipeline/review`, {
+    method: "POST",
+    body: JSON.stringify({ stepId: "h", seq: 1, decision: "accept" }),
+  });
+  expect(res.status).toBe(409);
+  const missing = await call("/tasks/does-not-exist/pipeline/review", {
+    method: "POST",
+    body: JSON.stringify({ stepId: "h", seq: 1, decision: "accept" }),
+  });
+  expect(missing.status).toBe(404);
+});
+
+test("POST /tasks/:id/pipeline/review validates the body → 400", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const task = await createTask({ pipelineId: pipeline.id });
+  const post = (body: unknown) =>
+    call(`/tasks/${task.id}/pipeline/review`, { method: "POST", body: JSON.stringify(body) });
+  expect((await post({})).status).toBe(400);
+  expect((await post({ stepId: "", seq: 1, decision: "accept" })).status).toBe(400);
+  expect((await post({ stepId: "h", seq: 0, decision: "accept" })).status).toBe(400);
+  expect((await post({ stepId: "h", seq: 1, decision: "maybe" })).status).toBe(400);
+  expect((await post({ stepId: "h", seq: 1, decision: "accept", comment: 5 })).status).toBe(400);
+  expect((await post({ stepId: "h", seq: 1, decision: "accept", nextStepIds: "x" })).status).toBe(400);
+  expect((await post({ stepId: "h", seq: 1, decision: "accept", mode: "other" })).status).toBe(400);
+});
+
+test("GET /tasks trims a human gate's arrival handoff but keeps stepId/seq; the single fetch does not", async () => {
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const profile = await createProfile();
+  const aId = randomUUID();
+  const hId = randomUUID();
+  const pipeline = await createPipeline(profile.id, {
+    name: "Human gate pipeline",
+    graph: {
+      steps: [
+        { id: aId, name: "A", instructions: `Do A. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, agentProfileId: profile.id },
+        { id: hId, name: "H", type: "human" },
+      ],
+      edges: [{ id: "e", from: aId, to: hId, label: "" }],
+      startStepId: aId,
+    },
+  });
+  const task = await createTask({ pipelineId: pipeline.id });
+  const started = await call(`/tasks/${task.id}/start`, { method: "POST" });
+  expect(started.status).toBe(200);
+  const gated = await waitForGate(task.id);
+  const gate = gated.task.pipelineRun!.humanSteps![0]!;
+  expect(gate.arrivals[0]!.handoff).not.toBeNull();
+
+  const list = await call("/tasks");
+  const rows = (await list.json()) as Task[];
+  const row = rows.find((t) => t.id === task.id)!;
+  const trimmed = row.pipelineRun!.humanSteps![0]!;
+  expect(trimmed.stepId).toBe(hId);
+  expect(trimmed.seq).toBe(gate.seq);
+  expect(trimmed.arrivals[0]!.handoff).toBeNull();
+
+  const single = await call(`/tasks/${task.id}/pipeline`);
+  const data = (await single.json()) as { task: Task };
+  expect(data.task.pipelineRun!.humanSteps![0]!.arrivals[0]!.handoff).not.toBeNull();
+});
+
+test("POST /tasks/:id/pipeline/review accepts a real gate → 200 with the updated task", async () => {
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const profile = await createProfile();
+  const aId = randomUUID();
+  const hId = randomUUID();
+  const pipeline = await createPipeline(profile.id, {
+    name: "Accept pipeline",
+    graph: {
+      steps: [
+        { id: aId, name: "A", instructions: `Do A. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, agentProfileId: profile.id },
+        { id: hId, name: "H", type: "human" },
+      ],
+      edges: [{ id: "e", from: aId, to: hId, label: "" }],
+      startStepId: aId,
+    },
+  });
+  const task = await createTask({ pipelineId: pipeline.id });
+  expect((await call(`/tasks/${task.id}/start`, { method: "POST" })).status).toBe(200);
+  const gated = await waitForGate(task.id);
+  const gate = gated.task.pipelineRun!.humanSteps![0]!;
+
+  const res = await call(`/tasks/${task.id}/pipeline/review`, {
+    method: "POST",
+    body: JSON.stringify({ stepId: hId, seq: gate.seq, decision: "accept", comment: "ship it" }),
+  });
+  expect(res.status).toBe(200);
+  const updated = (await res.json()) as Task;
+  expect(updated.pipelineRun!.status).toBe("done");
+  expect(updated.pipelineRun!.humanSteps).toHaveLength(0);
+
+  // A second submit is a 409.
+  const again = await call(`/tasks/${task.id}/pipeline/review`, {
+    method: "POST",
+    body: JSON.stringify({ stepId: hId, seq: gate.seq, decision: "accept" }),
+  });
+  expect(again.status).toBe(409);
+});

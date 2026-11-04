@@ -411,3 +411,46 @@ describe("decideOwedPipelineAlert", () => {
     expect(decideOwedPipelineAlert(new Set(["s1"]), blocked([{ taskId: "s1", kind: "step-failed" }]), never)).toBe("raise");
   });
 });
+
+// ── Human gates ─────────────────────────────────────────────────────────
+
+describe("pipeline human gates", () => {
+  function harness() {
+    const posted: Array<{ title: string; body: string; taskId: string; kind?: string }> = [];
+    const handle = createHeadlessNotificationHandler({
+      lookup,
+      readTask: () => null,
+      post: (n) => { posted.push(n as (typeof posted)[number]); },
+    });
+    return { posted, handle };
+  }
+  const review = (seqs: number[], runStartedAt = 10): GlobalEvent =>
+    ({ kind: "pipeline", taskId: "p1", status: "review", activeStepIds: [], stepCount: 2, humanStepSeqs: seqs, runStartedAt, ts: 1 }) as GlobalEvent;
+
+  test("one review notification per gate seq; a repeat persist is silent; a second gate notifies once more", () => {
+    const { posted, handle } = harness();
+    handle(review([2]));
+    expect(posted).toEqual([
+      { title: "Pipeline needs your review", body: "Ship it · Pipeline needs your review", taskId: "p1", kind: "blocked" },
+    ]);
+    handle(review([2]));
+    expect(posted).toHaveLength(1);
+    handle(review([2, 4]));
+    expect(posted).toHaveLength(2);
+    handle(review([2, 4]));
+    expect(posted).toHaveLength(2);
+  });
+
+  test("a new run generation announces its gates afresh", () => {
+    const { posted, handle } = harness();
+    handle(review([2], 10));
+    handle(review([2], 20));
+    expect(posted).toHaveLength(2);
+  });
+
+  test("a stopped run (cancelled) sends nothing", () => {
+    const { posted, handle } = harness();
+    handle({ kind: "pipeline", taskId: "p1", status: "cancelled", activeStepIds: [], stepCount: 1, humanStepSeqs: [], runStartedAt: 10, ts: 1 } as GlobalEvent);
+    expect(posted).toHaveLength(0);
+  });
+});

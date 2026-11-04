@@ -128,6 +128,8 @@ function makeRunState(pipeline: Pipeline, overrides: Partial<PipelineRunState> =
     joins: { "step-2": { arrivals: [{ fromStepId: "step-1", seq: 1, handoff: null }] } },
     blocked: [],
     history: [],
+    humanSteps: [],
+    seqCounter: 1,
     stepCount: 1,
     startedAt: Date.now(),
     endedAt: null,
@@ -643,6 +645,8 @@ test("parsePipelineRunState: minimal valid input fills every default", () => {
     joins: {},
     blocked: [],
     history: [],
+    humanSteps: [],
+    seqCounter: 0,
     stepCount: 0,
     startedAt: null,
     endedAt: null,
@@ -654,7 +658,7 @@ test("parsePipelineRunState: an unknown status value falls back to idle", () => 
   const parsed = parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status: "not-a-real-status" }));
   expect(parsed?.status).toBe("idle");
 
-  const statuses: PipelineRunState["status"][] = ["idle", "running", "blocked", "done", "cancelled"];
+  const statuses: PipelineRunState["status"][] = ["idle", "running", "blocked", "done", "cancelled", "review"];
   for (const status of statuses) {
     const p = parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", status }));
     expect(p?.status).toBe(status);
@@ -740,12 +744,14 @@ test("parsePipelineRunState: junk entries are dropped from active/blocked/histor
   expect(parsed?.history[0]).toEqual({
     seq: 1, stepId: "s1", taskId: "t1", startedAt: 100, endedAt: 200,
     outcome: "succeeded", handoff: { schemaVersion: 1, purpose: "p" }, nextStepIds: ["s2", "s3"],
+    human: null, returnToStepId: null,
     responseKind: null, reminder: null,
     handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null, stoppedAt: null, stoppedRunId: null,
   } as unknown as PipelineStepRecord);
   expect(parsed?.history[1]).toEqual({
     seq: 3, stepId: "s3", taskId: "t3", startedAt: 300, endedAt: null,
     outcome: null, handoff: null, nextStepIds: [],
+    human: null, returnToStepId: null,
     responseKind: null, reminder: null,
     handoffRunId: null, handoffFromOtherRun: false, attemptStartedAt: null, stoppedAt: null, stoppedRunId: null,
   });
@@ -1081,4 +1087,67 @@ test("pipelines.insert/update reject a name carrying control characters (L-S1)",
   const p = pipelines.insert({ name: "Fine Name", graph: makeGraph() });
   expect(() => pipelines.update(p.id, { name: "Also\u0000Bad" })).toThrow("control characters");
   expect(pipelines.get(p.id)?.name).toBe("Fine Name");
+});
+
+// ── Human steps in a stored run ─────────────────────────────────────────
+
+test("parsePipelineRunState: a human gate, seqCounter, a null-taskId record, returned outcome and comments round-trip", () => {
+  const raw = {
+    pipelineId: "pipe-1",
+    status: "review",
+    humanSteps: [
+      {
+        stepId: "h", seq: 2, startedAt: 50,
+        arrivals: [{ fromStepId: "a", seq: 1, handoff: null, comment: "please check" }],
+      },
+      { stepId: "", seq: 3, startedAt: 1 }, // dropped: empty step id
+      { stepId: "h2", seq: "x", startedAt: 1 }, // dropped: bad seq
+      "junk",
+    ],
+    seqCounter: 7,
+    history: [
+      {
+        seq: 2, stepId: "h", taskId: null, startedAt: 50, endedAt: 60, outcome: "returned",
+        human: { decision: "return", comment: "redo it", mode: "resume", returnToStepId: "a" },
+        returnToStepId: "h",
+        nextStepIds: [],
+      },
+      {
+        seq: 3, stepId: "h", taskId: null, startedAt: 60, endedAt: 61, outcome: "succeeded",
+        human: { decision: "accept", comment: null }, nextStepIds: ["b"],
+      },
+    ],
+  };
+  const parsed = parsePipelineRunState(JSON.stringify(raw));
+  expect(parsed?.status).toBe("review");
+  expect(parsed?.seqCounter).toBe(7);
+  expect(parsed?.humanSteps).toEqual([
+    {
+      stepId: "h", seq: 2, startedAt: 50,
+      arrivals: [{ fromStepId: "a", seq: 1, handoff: null, comment: "please check" }],
+    },
+  ]);
+  expect(parsed?.history[0]).toMatchObject({
+    taskId: null, outcome: "returned", returnToStepId: "h",
+    human: { decision: "return", comment: "redo it", mode: "resume", returnToStepId: "a" },
+  });
+  expect(parsed?.history[1]?.human).toEqual({ decision: "accept", comment: null, returnToStepId: null });
+});
+
+test("parsePipelineRunState: an old row reads humanSteps [] and a derived seqCounter", () => {
+  const parsed = parsePipelineRunState(JSON.stringify({
+    pipelineId: "pipe-1",
+    history: [{ seq: 4, stepId: "a", taskId: "t", startedAt: 1, endedAt: 2, outcome: "succeeded" }],
+  }));
+  expect(parsed?.humanSteps).toEqual([]);
+  expect(parsed?.seqCounter).toBe(4);
+});
+
+test("parsePipelineRunState: a junk human record collapses to null without dropping the history entry", () => {
+  const parsed = parsePipelineRunState(JSON.stringify({
+    pipelineId: "pipe-1",
+    history: [{ seq: 1, stepId: "h", taskId: null, startedAt: 1, human: { decision: "maybe" } }],
+  }));
+  expect(parsed?.history).toHaveLength(1);
+  expect(parsed?.history[0]?.human).toBeNull();
 });

@@ -26,6 +26,7 @@ import { subscribeGlobal } from "./orchestrator.ts";
 import type { ApiNative } from "./server.ts";
 import { createTaskNotifier, type TaskNotification } from "./task-notifier.ts";
 import type { TaskNotificationRemoval } from "../shared/os-notification.ts";
+import { newHumanGateSeqs } from "../shared/pipeline.ts";
 import type { GlobalEvent, PipelineRunState, PipelineRunStatus } from "../shared/types.ts";
 
 /** What the installer hands to the core's notifier; the same shape `startApiServer` takes. */
@@ -312,6 +313,10 @@ export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): (e
   // with the step tasks whose questions were answered since. Mirrors the
   // webview's OwedPipelineAlerts.
   const owed = new Map<string, Set<string>>();
+  // Human gates already announced per parent, keyed by run generation — one
+  // "Pipeline needs your review" per (runStartedAt, gate.seq), including two
+  // gates on one run.
+  const announcedGates = new Map<string, { runStartedAt: number | null; seqs: number[] }>();
 
   const hasPending = (target: string): boolean => (pendingByTarget.get(target)?.size ?? 0) > 0;
   const owe = (parentId: string): void => {
@@ -331,6 +336,7 @@ export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): (e
     const stepParentId = stepParentIdOf(ev);
     const target = stepParentId ?? ("taskId" in ev ? ev.taskId : "");
     let prevPipelineStatus: PipelineRunStatus | null = null;
+    let reviewParentId: string | null = null;
 
     if (ev.kind === "interaction") {
       let set = pendingByTarget.get(target);
@@ -377,10 +383,36 @@ export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): (e
       } else {
         settleOwed(ev.taskId);
       }
+      if (ev.status === "review") {
+        const previous = announcedGates.get(ev.taskId) ?? null;
+        const runStartedAt = ev.runStartedAt ?? null;
+        const fresh = newHumanGateSeqs(previous, runStartedAt, ev.humanStepSeqs ?? []);
+        if (fresh.length > 0) {
+          const sameGeneration = previous !== null && previous.runStartedAt === runStartedAt;
+          announcedGates.set(ev.taskId, {
+            runStartedAt,
+            seqs: [...(sameGeneration ? previous.seqs : []), ...fresh],
+          });
+          if (announcedGates.size > PIPELINE_STATUS_CAP) {
+            const oldest = announcedGates.keys().next().value;
+            if (oldest !== undefined) announcedGates.delete(oldest);
+          }
+          reviewParentId = ev.taskId;
+        }
+      }
     }
 
     const n = headlessNotificationFor(ev, lookupTask, { prevPipelineStatus, hasPendingQuestion: hasPending(target) });
     if (n) notifier.post(n);
+    if (reviewParentId !== null) {
+      const title = lookupTask(reviewParentId)?.title || `Pipeline ${reviewParentId.slice(0, 7)}`;
+      notifier.post({
+        title: "Pipeline needs your review",
+        body: `${title} · Pipeline needs your review`,
+        taskId: reviewParentId,
+        kind: "blocked",
+      });
+    }
   };
 
   return handle;

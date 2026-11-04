@@ -71,6 +71,8 @@ const {
   pipelineStatusLines,
   parseAdvanceFlags,
   parseRetryFlags,
+  parseReviewFlags,
+  resolveHumanGateRef,
   resolveStepRef,
   resolveActiveStepRef,
   colorRunStatus,
@@ -1389,4 +1391,78 @@ test("pipelineStatusLines: a step id missing from the snapshot prints escaped", 
   const text = pipelineStatusLines(t, []).join("\n");
   expect(text).not.toContain("\u009b");
   expect(text).toContain("gone\\u009b");
+});
+
+// ── Human gate: flags, gate resolution, rendering ───────────────────────
+
+test("parseReviewFlags: accept/return, comment, next, step, mode", () => {
+  expect(parseReviewFlags(["--accept", "--comment", "ok"])).toEqual({ accept: true, returnBack: false, next: [], comment: "ok" });
+  expect(parseReviewFlags(["--return", "--comment", "redo", "--mode", "resume"])).toEqual({
+    accept: false, returnBack: true, next: [], comment: "redo", mode: "resume",
+  });
+  expect(parseReviewFlags(["--accept", "--next", "Fix", "--next", "Verify", "--step", "H"])).toEqual({
+    accept: true, returnBack: false, next: ["Fix", "Verify"], step: "H",
+  });
+  expect(() => parseReviewFlags(["--mode", "other"])).toThrow();
+  expect(() => parseReviewFlags(["--bogus"])).toThrow();
+});
+
+test("resolveHumanGateRef: the sole gate, --step by name/id/seq, and a clear error for several", () => {
+  const run = pipelineRun({
+    status: "review",
+    active: [],
+    blocked: [],
+    humanSteps: [
+      { stepId: "s1", seq: 4, startedAt: 1, arrivals: [] },
+      { stepId: "s2", seq: 5, startedAt: 2, arrivals: [] },
+    ],
+  });
+  expect(() => resolveHumanGateRef(run, undefined)).toThrow(/several reviews are pending/);
+  expect(resolveHumanGateRef(pipelineRun({ humanSteps: [run.humanSteps![0]!] }), undefined)).toMatchObject({ seq: 4 });
+  expect(resolveHumanGateRef(run, "Fix")).toMatchObject({ seq: 5 });
+  expect(resolveHumanGateRef(run, "s1")).toMatchObject({ seq: 4 });
+  expect(resolveHumanGateRef(run, "5")).toMatchObject({ seq: 5 });
+  expect(() => resolveHumanGateRef(pipelineRun({ humanSteps: [] }), undefined)).toThrow(/no pending human review/);
+});
+
+test("pipelineShowLines marks a human step and prints no profile for it", () => {
+  const p: Pipeline = {
+    id: "p1",
+    name: "P",
+    description: "",
+    maxSteps: 25,
+    graph: {
+      steps: [
+        { id: "a", name: "A", type: "agent", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+        { id: "h", name: "H", type: "human", instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any" },
+      ],
+      edges: [{ id: "e", from: "a", to: "h", label: "" }],
+      startStepId: "a",
+    },
+    createdAt: 0,
+    updatedAt: 0,
+  };
+  const text = pipelineShowLines(p, null).join("\n");
+  expect(text).toContain("human");
+  expect(text).toContain("none (human review)");
+});
+
+test("pipelineStatusLines prints pending gates and (human) for a null taskId", () => {
+  const t = task({
+    pipelineRun: pipelineRun({
+      status: "review",
+      active: [],
+      blocked: [],
+      humanSteps: [{ stepId: "s2", seq: 3, startedAt: 1, arrivals: [{ fromStepId: "s1", seq: 1, handoff: null }] }],
+      history: [
+        { seq: 1, stepId: "s1", taskId: "step-task-1", startedAt: 1, endedAt: 2, outcome: "succeeded", handoff: null, nextStepIds: ["s2"] },
+        { seq: 2, stepId: "s2", taskId: null, startedAt: 2, endedAt: 3, outcome: "returned", handoff: null, nextStepIds: [], human: { decision: "return", comment: "redo" } },
+      ],
+    }),
+  });
+  const text = pipelineStatusLines(t, []).join("\n");
+  expect(text).toContain("review pending");
+  expect(text).toContain("seq 3");
+  expect(text).toContain("(human)");
+  expect(colorRunStatus("review")).toBe("review");
 });

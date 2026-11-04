@@ -76,7 +76,7 @@ import {
   parseFxAutoResumePrefs,
   parseFxRecoveryPayload,
 } from "../shared/fx-recovery.ts";
-import { resolveStartStep } from "../shared/pipeline.ts";
+import { resolveStartStep, validatePipelineGraph } from "../shared/pipeline.ts";
 import {
   cascadePipelineArchive,
   cascadePipelineDelete,
@@ -8496,9 +8496,18 @@ export async function createTask(
     }
     pipeline = pipelines.get(requestedPipelineId);
     if (!pipeline) return { error: "unknown pipeline" };
+    // Validate the stored graph here too (the table's read path returns a
+    // hand-edited/corrupted graph unmodified when it is only shape-safe) —
+    // this is the acceptance point for "a human step has no agent and is
+    // never the start step".
+    const validatedGraph = validatePipelineGraph(pipeline.graph);
+    if (!validatedGraph.ok) return { error: `pipeline graph is invalid: ${validatedGraph.error}` };
+    pipeline = { ...pipeline, graph: validatedGraph.graph };
     const start = resolveStartStep(pipeline.graph);
     if (!start) return { error: "pipeline has no resolvable start step" };
     for (const step of pipeline.graph.steps) {
+      // A human gate legitimately has no agent; it spawns nothing.
+      if (step.type === "human") continue;
       if (!step.agentProfileId) return { error: `step "${step.name}" has no agent` };
       if (!agentProfiles.get(step.agentProfileId)) {
         return { error: `agent for step "${step.name}" no longer exists` };

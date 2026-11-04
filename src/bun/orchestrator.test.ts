@@ -500,3 +500,87 @@ test("startTask auto-unarchives an archived task before running it", async () =>
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
 });
+
+// ── Human steps at create time ──────────────────────────────────────────
+
+test("createTask accepts a pipeline with a human step (no agent) and rejects a human step carrying an agent or a human start", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { db, agentProfiles, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+
+  const profile = agentProfiles.insert({
+    name: `orch-human-${randomUUID()}`,
+    harness: "claude-code",
+    model: "fake-model",
+    effort: null,
+    mode: null,
+    speed: "off",
+    maxMode: false,
+    instructions: "",
+    skills: [],
+  });
+  const A = newStep({ name: "A", agentProfileId: profile.id });
+  const H = newStep({ name: "H", type: "human" });
+  const okPipeline = pipelines.insert({
+    name: `orch-human-ok-${randomUUID()}`,
+    graph: { steps: [A, H], edges: [{ id: "e", from: A.id, to: H.id, label: "" }], startStepId: A.id },
+    maxSteps: 25,
+  });
+  const created = await createTask({
+    title: "human ok",
+    prompt: "goal",
+    workdir: process.cwd(),
+    isolation: "none",
+    pipelineId: okPipeline.id,
+  });
+  try {
+    expect("error" in created).toBe(false);
+    if ("error" in created) throw new Error(created.error);
+    expect(created.task.pipelineId).toBe(okPipeline.id);
+  } finally {
+    if (!("error" in created)) db.run(`DELETE FROM tasks WHERE id = ?`, [created.task.id]);
+    pipelines.delete(okPipeline.id);
+  }
+
+  // A human step carrying an agent is refused by the validator. The
+  // pipelines table validates on insert, so write the invalid graph the way
+  // a hand-edited/corrupted row would arrive.
+  const badGraph = {
+    steps: [
+      { ...A, id: "a2", name: "A2" },
+      { ...H, id: "h2", name: "H2", agentProfileId: profile.id },
+    ],
+    edges: [{ id: "e2", from: "a2", to: "h2", label: "" }],
+    startStepId: "a2",
+  };
+  const badPipeline = pipelines.insert({ name: `orch-human-bad-${randomUUID()}`, graph: { steps: [A], edges: [], startStepId: A.id }, maxSteps: 25 });
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(badGraph), badPipeline.id]);
+  const bad = await createTask({
+    title: "human bad",
+    prompt: "goal",
+    workdir: process.cwd(),
+    isolation: "none",
+    pipelineId: badPipeline.id,
+  });
+  expect("error" in bad).toBe(true);
+  pipelines.delete(badPipeline.id);
+
+  // A human start step is refused.
+  const startGraph = {
+    steps: [{ ...H, id: "h3", name: "H3" }],
+    edges: [],
+    startStepId: "h3",
+  };
+  const startPipeline = pipelines.insert({ name: `orch-human-start-${randomUUID()}`, graph: { steps: [A], edges: [], startStepId: A.id }, maxSteps: 25 });
+  db.run(`UPDATE pipelines SET graph = ? WHERE id = ?`, [JSON.stringify(startGraph), startPipeline.id]);
+  const start = await createTask({
+    title: "human start",
+    prompt: "goal",
+    workdir: process.cwd(),
+    isolation: "none",
+    pipelineId: startPipeline.id,
+  });
+  expect("error" in start).toBe(true);
+  pipelines.delete(startPipeline.id);
+  agentProfiles.delete(profile.id);
+});

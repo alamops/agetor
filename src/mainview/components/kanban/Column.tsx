@@ -18,6 +18,10 @@ interface Props {
    *  callback — see `TaskCard`'s own doc for why it's separate from
    *  `onOpen`. Must be `useCallback`-stable (compared below). */
   onOpenAttention: (t: Task) => void;
+  /** Pipeline parent in Review with a pending gate — open the run view with
+   *  the gate focused (`TaskCard`'s Review button). Must be
+   *  `useCallback`-stable (compared below). */
+  onReviewPipeline: (t: Task) => void;
   onDiff: (t: Task) => void;
   onMarkDone: (t: Task) => void;
   onArchive: (t: Task) => void;
@@ -50,7 +54,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onReviewPipeline, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -80,6 +84,7 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
             onDelete={onDelete}
             onOpen={onOpen}
             onOpenAttention={onOpenAttention}
+            onReviewPipeline={onReviewPipeline}
             onDiff={onDiff}
             onMarkDone={onMarkDone}
             onArchive={onArchive}
@@ -116,6 +121,7 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.onDelete === next.onDelete &&
   prev.onOpen === next.onOpen &&
   prev.onOpenAttention === next.onOpenAttention &&
+  prev.onReviewPipeline === next.onReviewPipeline &&
   prev.onDiff === next.onDiff &&
   prev.onMarkDone === next.onMarkDone &&
   prev.onArchive === next.onArchive &&

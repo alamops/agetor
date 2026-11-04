@@ -34,7 +34,14 @@ import { isSpeed, speedFromFast } from "./speed.ts";
 import type { AgentProfile, Harness, OpencodeServerMode, Pipeline, PipelineEdge, PipelineGraph, Speed } from "./types.ts";
 
 export const BUNDLE_FORMAT = "agetor-bundle";
-export const BUNDLE_VERSION = 1;
+/** Highest bundle version this build reads and writes. Version 1 is the
+ *  original (human-free) format; version 2 is required only when the file
+ *  carries a human step, so a human-free export stays byte-identical to a
+ *  v1 export. */
+export const BUNDLE_VERSION = 2;
+/** The version a human-free bundle is written as — old readers keep
+ *  importing it. */
+export const BUNDLE_VERSION_BASE = 1;
 export const BUNDLE_FILE_EXT = ".agetor.json";
 /** Largest import text accepted, in UTF-8 bytes. */
 export const BUNDLE_MAX_BYTES = 2 * 1024 * 1024;
@@ -95,6 +102,9 @@ export interface BundleAgent {
 export interface BundleStep {
   id: string;
   name: string;
+  /** Present only for a human gate step (`"human"`); absent is an agent
+   *  step, so a human-free bundle is byte-identical to version 1. */
+  type?: "agent" | "human";
   instructions: string;
   /** An `agents[].key`, or null for a step with no Agent. */
   agent: string | null;
@@ -113,7 +123,7 @@ export interface BundlePipeline {
 
 export interface BundleFile {
   format: typeof BUNDLE_FORMAT;
-  version: 1;
+  version: 1 | 2;
   exportedAt: string;
   agetorVersion: string;
   agents: BundleAgent[];
@@ -905,6 +915,7 @@ export function buildBundle(input: {
       return {
         id: step.id,
         name: stepNames[stepIndex]!,
+        ...(step.type === "human" ? { type: "human" as const } : {}),
         instructions: exportText(step.instructions, { multiline: true }, "step instructions", changes),
         agent,
         position: { x: step.position.x, y: step.position.y },
@@ -1000,7 +1011,12 @@ export function buildBundle(input: {
 
   const bundle: BundleFile = {
     format: BUNDLE_FORMAT,
-    version: BUNDLE_VERSION,
+    // Conditional v2: a human-free bundle keeps version 1 (and no `type`
+    // key anywhere), so an old reader imports it unchanged. Only a file
+    // that actually carries a human step bumps to 2.
+    version: bundlePipelines.some((p) => p.graph.steps.some((s) => s.type === "human"))
+      ? BUNDLE_VERSION
+      : BUNDLE_VERSION_BASE,
     exportedAt: input.now.toISOString(),
     agetorVersion: input.agetorVersion,
     agents,
@@ -1276,7 +1292,7 @@ function checkGraphText(graph: PipelineGraph, label: string): void {
   }
 }
 
-function parseBundlePipeline(raw: unknown, index: number, keys: Set<string>): ParsedBundlePipeline {
+function parseBundlePipeline(raw: unknown, index: number, keys: Set<string>, version: number): ParsedBundlePipeline {
   const at = `pipelines[${index}]`;
   if (!isPlainObject(raw)) return invalid(`${at} must be an object`);
   const name = lineField(raw.name, `${at} name`, PIPELINE_LIMITS.name);
@@ -1301,6 +1317,17 @@ function parseBundlePipeline(raw: unknown, index: number, keys: Set<string>): Pa
     // An empty key names no Agent, and the graph validator would drop it
     // without a word: refuse it like any other malformed key.
     if (step.agent === "") invalid(`${where}: agent must be an Agent key or null`);
+    // A human step exists only from bundle version 2 on; a v1 file carrying
+    // one would be run agent-lessly by an old reader, so refuse it rather
+    // than import a step that reader can't honor.
+    if (step.type !== undefined) {
+      if (step.type !== "agent" && step.type !== "human") {
+        invalid(`${where}: type must be "agent" or "human"`);
+      }
+      if (step.type === "human" && version < 2) {
+        invalid(`${where}: a human step needs bundle version 2 — update agetor to import this file`);
+      }
+    }
     if (
       sub.agents !== undefined &&
       (!Array.isArray(sub.agents) || sub.agents.some((k) => typeof k !== "string" || k === ""))
@@ -1569,7 +1596,7 @@ function parseBundleTextUnsafe(text: string): ParseResult {
 
     const keys = new Set<string>();
     const agents = rawAgents.map((raw, i) => parseAgent(raw, i, keys));
-    const pipelines = rawPipelines.map((raw, i) => parseBundlePipeline(raw, i, keys));
+    const pipelines = rawPipelines.map((raw, i) => parseBundlePipeline(raw, i, keys, version));
     return {
       ok: true,
       bundle: {
