@@ -217,13 +217,29 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
       }
     });
 
+    test("the tmux session name is scoped to this instance's server directory", () => {
+      const id = "opencode";
+      const here = __forTest.sessionNameFor(id);
+      expect(here).toMatch(/^agetor-ocsrv-[0-9a-f]{8}-opencode$/);
+      const prev = __forTest.serverDir();
+      const other = mkdtempSync(path.join(tmpdir(), "agetor-ocsrv-other-"));
+      try {
+        __forTest.setServerDir(other);
+        expect(__forTest.sessionNameFor(id)).not.toBe(here);
+      } finally {
+        __forTest.setServerDir(prev);
+        rmSync(other, { recursive: true, force: true });
+      }
+      expect(__forTest.sessionNameFor(id)).toBe(here);
+    });
+
     test("starts a server, health-checks it, and keeps state private", async () => {
       const id = newId();
       const h = await ensureOpencodeServer(spec(id));
       expect(h.harnessId).toBe(id);
       expect(h.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
       expect(h.version).toBe("2.1.3-stub");
-      expect(h.tmuxSession).toBe(host === "tmux" ? `agetor-ocsrv-${id}` : null);
+      expect(h.tmuxSession).toBe(host === "tmux" ? __forTest.sessionNameFor(id) : null);
       expect(Buffer.from(h.password, "base64url").length).toBe(32);
       expect(getOpencodeServer(id)).toBe(h);
       expect(await checkOpencodeServerHealth(h)).toBe(true);
@@ -282,7 +298,7 @@ function suite(host: "direct" | "tmux", skip: boolean): void {
         const h = await ensureOpencodeServer(spec(id, { STUB_EXTRA: "api-key-value" }));
         const seen = readFileSync(record, "utf8");
         expect(seen).toContain("new-session");
-        expect(seen).toContain(`agetor-ocsrv-${id}`);
+        expect(seen).toContain(__forTest.sessionNameFor(id));
         expect(seen).not.toContain(h.password);
         expect(seen).not.toContain("OPENCODE_PASSWORD");
         expect(seen).not.toContain("api-key-value"); // the whole server env stays out of argv

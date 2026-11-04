@@ -235,7 +235,17 @@ function serverDir(): string {
 const statePath = (id: string): string => path.join(serverDir(), `${safeId(id)}.json`);
 const logPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.log`);
 const envPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.env`);
-const sessionNameFor = (id: string): string => `agetor-ocsrv-${safeId(id)}`;
+/**
+ * The server's tmux session name. Production cores share tmux's default socket,
+ * so the name carries a tag of this instance's server directory: the release
+ * app (`~/.agetor`) and a dev build (`~/.agetor-dev`) each see only their own
+ * server, and a start never kills or adopts another instance's session as its
+ * "leftover" (both would otherwise be `agetor-ocsrv-opencode`).
+ */
+const sessionNameFor = (id: string): string => {
+  const tag = createHash("sha256").update(path.resolve(serverDir())).digest("hex").slice(0, 8);
+  return `agetor-ocsrv-${tag}-${safeId(id)}`;
+};
 
 interface FileId {
   dev: number;
