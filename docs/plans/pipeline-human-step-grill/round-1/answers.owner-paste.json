@@ -1,0 +1,31 @@
+{
+  "formId": "pipeline-human-step-grill-r1",
+  "round": 1,
+  "submittedAt": "2026-11-04T19:22:30.358Z",
+  "answeredBy": "Alamo",
+  "generalNotes": null,
+  "answers": {
+    "card-action": { "status": "answered", "value": "review-open" },
+    "run-status": { "status": "answered", "value": "new-review" },
+    "fanout": { "status": "answered", "value": "immediate-review" },
+    "accept-targets": { "status": "answered", "value": "reuse-transition" },
+    "return-mechanics": { "status": "answered", "value": "either" },
+    "return-sticky": { "status": "answered", "value": "forced-return" },
+    "incoming-edges": { "status": "answered", "value": "single-in" },
+    "panel-form": { "status": "answered", "value": "modal" },
+    "panel-content": { "status": "answered", "value": ["goal", "instructions", "last-handoff", "history", "transcripts", "prior-rounds", "diff"] },
+    "pending-actions": { "status": "answered", "value": "restart-stop" },
+    "cli-parity": { "status": "answered", "value": "full" },
+    "bundle-compat": { "status": "answered", "value": "conditional-v2" },
+    "graph-rules": { "status": "answered", "value": "All enforced in `validatePipelineGraph` and the editor; a human step saves with `agentProfileId: null`, empty subagents, and no start/Set-as-start affordance." },
+    "comment-rules": { "status": "answered", "value": "As stated; blank/whitespace Return is rejected by the route and disabled in the UI; Accept with a blank comment is allowed." },
+    "feedback-trust": { "status": "answered", "value": "Yes — a dedicated trusted section, stored on the human history record and carried on the pending launch/arrival, never folded into a `Handoff` that `composeStepPrompt` fences." },
+    "step-cap": { "status": "answered", "value": "They are recorded in `history` and shown in progress, but do not increment `stepCount`; entering a gate is never blocked by the step cap." },
+    "visual": { "status": "answered", "value": "As stated; the pending gate uses the same info highlight on the canvas and in the panel header; the run status chip reads \"Review\"." },
+    "editor-add": { "status": "answered", "value": "As stated; switching an agent step to human clears its agent/subagents; switching back to agent starts unbound; `deleteStep` never promotes a human step to start." },
+    "no-third-action": { "status": "answered", "value": "Accept follows the outgoing edges and only finishes when there are none; Return loops with a required comment; abandoning the run stays Restart/archive/delete." },
+    "manual-advance": { "status": "answered", "value": "As stated; the panel shows \"no handoff\" for that arrival; the gate is otherwise identical." },
+    "notify": { "status": "answered", "value": "As stated; the notification is deduped per run+gate seq; clicking it opens the run view with the gate selected; the status chip still reads \"Review\"." },
+    "mock": { "status": "unanswered" }
+  }
+}
