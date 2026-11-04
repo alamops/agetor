@@ -242,10 +242,12 @@ const statePath = (id: string): string => path.join(serverDir(), `${safeId(id)}.
 const logPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.log`);
 const envPath = (id: string): string => path.join(serverDir(), `${safeId(id)}.env`);
 /**
- * The server's tmux session name. Production cores share tmux's default socket,
- * so the name carries a tag of this instance's server directory: the release
- * app (`~/.agetor`) and a dev build (`~/.agetor-dev`) each see only their own
- * server, and a start never kills or adopts another instance's session as its
+ * The server's tmux session name. The tmux socket is per instance, but it is
+ * named after the data dir's basename only (`deriveTmuxSocketName`), so two
+ * data dirs with the same name (`~/.agetor` and `/Volumes/x/.agetor`), or two
+ * cores pointed at one socket by `AGETOR_TMUX_SOCKET`, share it. The tag of
+ * this instance's server directory keeps each core to its own session there:
+ * a start never kills or adopts another instance's live server as its
  * "leftover" (both would otherwise be `agetor-ocsrv-opencode`).
  */
 const sessionNameFor = (id: string): string => {
