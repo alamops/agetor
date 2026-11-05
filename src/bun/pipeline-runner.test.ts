@@ -6226,6 +6226,74 @@ test("M1/R6: an Accept into an incomplete join carries its comment when a siblin
   await waitUntilIdle(parentId);
 });
 
+test("a pending human gate keeps a partial join open: C arrives first, A's gate completes it, Accept launches the join once", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER, FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER } = await import("./agents.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+
+  const claude = await makeProfile("join-gate-pending");
+  const S = newStep({ name: "S", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, transition: "all" });
+  // A holds its turn open behind a fake subagent so C's arrival lands at the
+  // join well before A settles into the gate — the run then has a pending
+  // gate and a partial join with no `active` execution left.
+  const A = newStep({
+    name: "A",
+    agentProfileId: claude.id,
+    instructions: `Do A. ${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}:1200 ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+  });
+  const C = newStep({ name: "C", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const H = newStep({ name: "H", type: "human" });
+  const D = newStep({ name: "D", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, join: "all" });
+  const pipeline = pipelines.insert({
+    name: uniqueName("join-gate-pending-pipeline"),
+    graph: {
+      steps: [S, A, C, H, D],
+      edges: [
+        { id: "e1", from: S.id, to: A.id, label: "" },
+        { id: "e2", from: S.id, to: C.id, label: "" },
+        { id: "e3", from: A.id, to: H.id, label: "" },
+        { id: "e4", from: H.id, to: D.id, label: "" },
+        { id: "e5", from: C.id, to: D.id, label: "" },
+      ],
+      startStepId: S.id,
+    },
+    maxSteps: 25,
+  });
+  const created = await createTask({ title: "join gate pending run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  // C's arrival is recorded while A is still running; then A settles into
+  // the gate, leaving no active execution and a still-partial join.
+  await waitFor(() => (tasks.get(parentId)?.pipelineRun?.joins[D.id]?.arrivals.length ?? 0) === 1, 10_000);
+  const gate = await waitFor(() => tasks.get(parentId)?.pipelineRun?.humanSteps?.[0], 10_000);
+  const gated = tasks.get(parentId)!.pipelineRun!;
+  expect(gated.active).toHaveLength(0);
+  expect(gated.status).toBe("review");
+  // The pending gate can still deliver the join's missing arrival, so the
+  // scan must not declare the join incomplete.
+  expect(gated.blocked.filter((b) => b.kind === "join-incomplete")).toHaveLength(0);
+
+  const res = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+  if ("error" in res) throw new Error(res.error);
+  expect(tasks.get(parentId)!.pipelineRun!.blocked).toHaveLength(0);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  }, 10_000);
+  expect(tasks.stepsForParent(parentId).filter((s) => s.pipelineStepId === D.id)).toHaveLength(1);
+  expect(finished.pipelineRun!.blocked).toHaveLength(0);
+  expect(finished.pipelineRun!.joins[D.id]).toBeUndefined();
+  await waitUntilIdle(parentId);
+});
+
 test("R7: Accept target rules — choose requires a valid pick; single-edge/all reject nextStepIds", async () => {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { tasks, pipelines } = await import("./db.ts");

@@ -80,6 +80,7 @@ import {
   nextRunSeq,
   normalizeHandoff,
   outgoingSteps,
+  pendingHumanSteps,
   renderHandoffFile,
   resolveNextSteps,
   resolveStartStep,
@@ -235,9 +236,16 @@ function addJoinArrival(existing: PipelineJoinArrival[], entry: PipelineJoinArri
 /** After every settle/advance, decide whether any `join: "all"` step is
  *  stuck forever: no execution is left active, but a partial arrival set is
  *  still sitting in `run.joins`. Idempotent — never adds a second entry for
- *  the same join step. */
+ *  the same join step.
+ *
+ *  A pending human gate counts as outstanding work even though it is not in
+ *  `run.active`: its later Accept hands the gate's own arrival to the join,
+ *  so a scan that fired while it was pending would record a `join-incomplete`
+ *  block for an arrival that is still on its way. Waiting is safe — the block
+ *  is only recorded once nothing (agent or gate) can still deliver, and the
+ *  accept path re-runs this check. */
 function checkJoinIncomplete(run: PipelineRunState): void {
-  if (run.active.length > 0 || !run.snapshot) return;
+  if (run.active.length > 0 || pendingHumanSteps(run).length > 0 || !run.snapshot) return;
   const graph = run.snapshot.graph;
   for (const [stepId, joinState] of Object.entries(run.joins)) {
     if (joinState.arrivals.length === 0) continue;

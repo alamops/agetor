@@ -206,6 +206,11 @@ interface PipelineRunViewProps {
   /** Open the human review panel for this gate step on mount/change — the
    *  board card's Review action and the review toast pass it. */
   focusGateStepId?: string | null;
+  /** Bumped by the caller on every focus request. `focusGateStepId` alone
+   *  can't distinguish "asked again for the same gate" from "already
+   *  handled", so a second Review click after closing the panel would do
+   *  nothing; the nonce makes each request distinct. */
+  focusGateNonce?: number | null;
 }
 
 function formatClockTime(ts: number): string {
@@ -284,7 +289,7 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * re-render (and therefore `<StoreUpdater>`'s own `setEdges`/`setNodes`
  * sync) entirely when a poll turns up nothing new to paint.
  */
-export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone, homeDir = null, focusGateStepId = null }: PipelineRunViewProps) {
+export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone, homeDir = null, focusGateStepId = null, focusGateNonce = null }: PipelineRunViewProps) {
   const { resolved } = useTheme();
   const { profiles: liveProfiles, loaded: liveProfilesLoaded } = useAgentProfiles();
   const confirm = useConfirm();
@@ -484,19 +489,22 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   // `focusGateStepId` (the board card's Review action, the review toast):
   // open the panel once per request. A ref keeps it one-shot — otherwise the
   // 2s poll (which re-runs this effect) would reopen a panel the user just
-  // closed while the gate is still pending.
+  // closed while the gate is still pending. The request is keyed by the
+  // caller's nonce as well as the step: pressing Review again for the same
+  // gate IS a new request and must reopen the panel.
   const focusHandledRef = useRef<string | null>(null);
   useEffect(() => {
     if (!focusGateStepId) {
       focusHandledRef.current = null;
       return;
     }
-    if (focusHandledRef.current === focusGateStepId) return;
+    const requestKey = `${focusGateStepId}:${focusGateNonce ?? 0}`;
+    if (focusHandledRef.current === requestKey) return;
     const focused = (run?.humanSteps ?? []).find((g) => g.stepId === focusGateStepId);
     if (!focused) return;
-    focusHandledRef.current = focusGateStepId;
+    focusHandledRef.current = requestKey;
     setHumanPanelGateKey(`${focused.stepId}:${focused.seq}`);
-  }, [focusGateStepId, run?.humanSteps]);
+  }, [focusGateStepId, focusGateNonce, run?.humanSteps]);
 
   // Before the first Run, `run.snapshot` is null — fall back to the live
   // pipeline's own graph so the canvas still has something to render.

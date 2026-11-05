@@ -67,7 +67,7 @@ Display: a reminder is an ordinary `user` event whose first line is the marker, 
 UI: the run view's history rows grow a `pipeline-run-response-kind` chip (`responseKindLabel` in `src/mainview/lib/pipelines.ts`, tone-mapped success/warning/danger/muted) and, when a reminder was sent, a `pipeline-run-reminder` chip reading "Reminder sent"/"Reminder failed" (`data-delivered`, tone warning/danger) with its timestamp; the still-active step node shows a small spinning-arrow glyph (`pipeline-step-reminded`, via `stepReminded`) while its current execution has been reminded and hasn't settled since.
 CLI: `agetor pipeline status <ref>` appends a dim `[<responseKind>]` tag and, when reminded, a yellow `(reminder sent)` or red `(reminder failed)` tag to each history line.
 `resolveNextSteps` decides what runs next: a step's `transition:"all"` always fans out to every outgoing target (deduplicated), ignoring `next` entirely; `transition:"choose"` (default) with zero outgoing edges is terminal, exactly one edge is taken unconditionally (`next` ignored), and with several edges `next` (trimmed, case-insensitive) is matched against a target step's name, then its id (exact), then the connecting edge's label — no `next` given is `"ambiguous"`, a `next` matching nothing is `"unknown"`, both surfacing as `handoff-invalid` blocks naming the candidates.
-A step's `join:"any"` (default) starts a **fresh execution on every arrival** — how cycles work, the same step can run many times, each a new `history` entry (`PipelineStepRecord.nextStepIds: string[]` records what actually got launched off it — empty for a terminal/failed/cancelled/still-pending execution), bounded by the run's *effective* step cap → blocked kind `step-cap`; `join:"all"` instead accumulates `{fromStepId, seq, handoff}` arrivals per step id in `run.joins` and only launches once every distinct incoming step (per the frozen graph's edges) has arrived this generation — a run with nothing left `active` but a still-partial join blocks run-level (`taskId:null`) as `join-incomplete`, naming the missing sources, resolvable only via Retry or manual advance (which launches the join step immediately with whatever handoffs did arrive).
+A step's `join:"any"` (default) starts a **fresh execution on every arrival** — how cycles work, the same step can run many times, each a new `history` entry (`PipelineStepRecord.nextStepIds: string[]` records what actually got launched off it — empty for a terminal/failed/cancelled/still-pending execution), bounded by the run's *effective* step cap → blocked kind `step-cap`; `join:"all"` instead accumulates `{fromStepId, seq, handoff}` arrivals per step id in `run.joins` and only launches once every distinct incoming step (per the frozen graph's edges) has arrived this generation — a run with nothing left `active` and no pending human gate (whose Accept can still deliver an arrival) but a still-partial join blocks run-level (`taskId:null`) as `join-incomplete`, naming the missing sources, resolvable only via Retry or manual advance (which launches the join step immediately with whatever handoffs did arrive).
 
 **Step cap and its extension** (M2): `effectiveStepCap(run)` (`src/shared/pipeline.ts`) is `snapshot.maxSteps` (default 25; an integer in 1..200 or REJECTED — 400 at the route, a thrown error from `resolveMaxSteps` at the db layer — never clamped; round-4 review fix, the two layers used to disagree) scaled by `1 + (run.capExtensions ?? 0)` — additive, not multiplicative (one extension is 2x `maxSteps`, two is 3x, not 4x) — rather than the block being a dead end.
 A single Retry call increments `run.capExtensions` **at most once** even if the run somehow queued more than one pending `step-cap` block (Minor 10, round-2 review fix) — the formula doesn't change, but one Retry click must not silently apply several extensions at once.
@@ -312,10 +312,12 @@ owner feedback to the next step, rendered by `composeStepPrompt` as a
 a `Handoff` never carries it.
 
 **Status.** `PipelineRunStatus` gains non-terminal `"review"`: a pending gate
-maps to the board's Review column. `deriveRunStatus` precedence is
-`cancelled (stopped) > review (gate pending) > blocked > running > done`; a
-gate with a live sibling stays Review, and Review outranks a blocked sibling.
-The step cap is checked only on agent launches, before a gate.
+maps to the board's Review column. With a pending gate, `deriveRunStatus`
+returns `cancelled` when the whole run was deliberately stopped and otherwise
+`review`; with no pending gate, `blocked` outranks a stopped run
+(`cancelled`), which in turn outranks `running`, then `done`. A gate with a
+live sibling stays Review, and Review outranks a blocked sibling. The step
+cap is checked only on agent launches, before a gate.
 
 **Decisions.** `reviewHumanStep` (behind `POST /tasks/:id/pipeline/review`) is
 the only mutator, run under `runExclusive(parentId)`. It removes the gate and

@@ -3127,8 +3127,22 @@ describe("human steps — model and validator", () => {
 
   test("rejects an unknown type, an agent/subagents on a human step, a human start, a non-single incoming and human→human", () => {
     expect(validatePipelineGraph({ steps: [{ ...makeStep({ id: "a" }), type: "robot" }], edges: [], startStepId: null }).ok).toBe(false);
-    expect(validatePipelineGraph({ ...humanGraph({ steps: [makeStep({ id: "a" }), makeStep({ id: "h", name: "H", type: "human", agentProfileId: "p1" })] }) }).ok).toBe(false);
-    expect(validatePipelineGraph({ ...humanGraph({ steps: [makeStep({ id: "a" }), makeStep({ id: "h", name: "H", type: "human", subagents: { profileIds: ["p2"], cap: null } })] }) }).ok).toBe(false);
+    // Valid edges (a → h) so the only failure is the rule under test, not a
+    // dangling edge from a step the override dropped.
+    const humanWithAgent = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "h", name: "H", type: "human", agentProfileId: "p1" })],
+      edges: [{ id: "e1", from: "a", to: "h", label: "" }],
+      startStepId: "a",
+    });
+    expect(humanWithAgent.ok).toBe(false);
+    if (!humanWithAgent.ok) expect(humanWithAgent.error).toContain(`step "H" is a human step and can't have an agent`);
+    const humanWithSubagents = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "h", name: "H", type: "human", subagents: { profileIds: ["p2"], cap: null } })],
+      edges: [{ id: "e1", from: "a", to: "h", label: "" }],
+      startStepId: "a",
+    });
+    expect(humanWithSubagents.ok).toBe(false);
+    if (!humanWithSubagents.ok) expect(humanWithSubagents.error).toContain(`step "H" is a human step and can't have subagents`);
     expect(validatePipelineGraph(humanGraph({ startStepId: "h" })).ok).toBe(false);
     // 0 incoming
     expect(validatePipelineGraph({ steps: [makeStep({ id: "a" }), makeStep({ id: "h", name: "H", type: "human" })], edges: [], startStepId: "a" }).ok).toBe(false);

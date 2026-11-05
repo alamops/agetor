@@ -214,7 +214,16 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
 type AppView =
   | { kind: "board" }
   | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
-  | { kind: "pipeline-run"; taskId: string; gateStepId?: string };
+  | {
+      kind: "pipeline-run";
+      taskId: string;
+      gateStepId?: string;
+      /** Bumped on every request that names a gate, so asking for the SAME
+       *  gate again while already on its run view is a new request: the run
+       *  view keys its one-shot panel focus on this, not on `gateStepId`
+       *  alone (which wouldn't change, so a closed panel would stay closed). */
+      gateFocusNonce?: number;
+    };
 
 /** The `key` a view's page mounts under in the AnimatePresence below: two
  *  views with the same key render the same page instance, so switching
@@ -393,6 +402,10 @@ function AppInner() {
   useEffect(() => { viewRef.current = view; }, [view]);
   const pipelineEditorDirtyRef = useRef(pipelineEditorDirty);
   useEffect(() => { pipelineEditorDirtyRef.current = pipelineEditorDirty; }, [pipelineEditorDirty]);
+  // Monotonic id for each "open this gate" request (see `AppView`'s
+  // `gateFocusNonce`). A ref, not state: it only ever rides along inside the
+  // next `view`, and bumping it must not re-render on its own.
+  const gateFocusNonceRef = useRef(0);
   /** The view switch behind `navigate`, past the leave guards (below): the
    *  pipeline editor's own guard, then the switch. Reads refs, so it's
    *  stable like `navigate`. `onNavigated` runs right after the switch
@@ -496,7 +509,13 @@ function AppInner() {
    *  Every other caller stays flag-less, which is what lets a non-card hop
    *  while away keep the original card's record (D8). */
   const openPipelineRun = useCallback((taskId: string, opts?: { fromBoardCard?: boolean; gateStepId?: string }) => {
-    navigate({ kind: "pipeline-run", taskId, ...(opts?.gateStepId ? { gateStepId: opts.gateStepId } : {}) }, () => {
+    const gateFocusNonce = opts?.gateStepId ? ++gateFocusNonceRef.current : undefined;
+    navigate({
+      kind: "pipeline-run",
+      taskId,
+      ...(opts?.gateStepId ? { gateStepId: opts.gateStepId } : {}),
+      ...(gateFocusNonce !== undefined ? { gateFocusNonce } : {}),
+    }, () => {
       if (opts?.fromBoardCard) recordBoardDeparture(taskId);
       setFocusSubagent(null);
       setSelected(null);
@@ -2832,6 +2851,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 <PipelineRunView
                   taskId={view.taskId}
                   focusGateStepId={view.gateStepId ?? null}
+                  focusGateNonce={view.gateFocusNonce ?? null}
                   onMarkDone={markDone}
                   onOpenTask={(t, opts) => {
                     setFocusSubagent(opts?.subagentId ? { taskId: t.id, id: opts.subagentId, nonce: Date.now(), consumed: false } : null);
