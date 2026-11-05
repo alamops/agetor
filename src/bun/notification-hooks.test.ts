@@ -44,6 +44,15 @@ const column = (
   ...(pipelineParentId ? { pipelineParentId } : {}),
 });
 
+const pipeline = (taskId: string, status: "review" | "running" | "done" | "blocked" | "cancelled"): GlobalEvent => ({
+  kind: "pipeline",
+  taskId,
+  status,
+  activeStepIds: [],
+  stepCount: 1,
+  ts: Date.now(),
+});
+
 describe("removalForEvent", () => {
   test("an answered question with nothing else pending removes the waiting entry", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
@@ -82,6 +91,15 @@ describe("removalForEvent", () => {
   test("a step's own column event never removes", async () => {
     const { removalForEvent } = await import("./notification-hooks.ts");
     expect(removalForEvent(column("step-1", "blocked", "review", "parent-1"))).toBeNull();
+  });
+
+  test("a decided human gate removes the review notification as the run leaves review", async () => {
+    const { removalForEvent } = await import("./notification-hooks.ts");
+    expect(removalForEvent(pipeline("t1", "review"))).toBeNull();
+    expect(removalForEvent(pipeline("t1", "blocked"))).toBeNull();
+    expect(removalForEvent(pipeline("t1", "running"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
+    expect(removalForEvent(pipeline("t1", "done"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
+    expect(removalForEvent(pipeline("t1", "cancelled"))).toEqual({ taskId: "t1", ifKinds: ["blocked"] });
   });
 
   test("other column moves, pending questions and other kinds remove nothing", async () => {

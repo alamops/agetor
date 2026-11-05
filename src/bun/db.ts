@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type ImportedOpencodeSession, type OpencodeServerMode, OPENCODE_SERVER_MODES, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type ImportedOpencodeSession, type OpencodeServerMode, OPENCODE_SERVER_MODES, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelinePendingLaunch, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
@@ -529,7 +529,13 @@ const sanitizeJoinArrival = (raw: unknown): PipelineJoinArrival | null => {
   const { fromStepId, seq } = raw as Record<string, unknown>;
   if (typeof fromStepId !== "string" || !fromStepId) return null;
   if (!isFiniteNumber(seq)) return null;
-  const comment = typeof raw.comment === "string" && raw.comment.length > 0 ? raw.comment : null;
+  // Same `handoffField` cap the writer applies (and `sanitizeBlockPending`
+  // applies to `humanFeedback`): a hand-edited or pre-cap row must not put an
+  // unbounded owner comment into a join/pending arrival, the board poll and
+  // the next prompt (R-N2).
+  const comment = typeof raw.comment === "string" && raw.comment.length > 0
+    ? raw.comment.slice(0, PIPELINE_LIMITS.handoffField)
+    : null;
   return {
     fromStepId,
     seq,
@@ -556,8 +562,9 @@ const sanitizeJoins = (raw: unknown): PipelineRunState["joins"] => {
  *  retry, or a join-incomplete launch) Retry would re-attempt. Dropped
  *  wholesale (never persisted as a half-valid shape) when `stepId` is
  *  missing/empty; `arrivals` reuses `sanitizeJoinArrival`, same as
- *  `sanitizeJoins` above, silently dropping any junk entry. */
-const sanitizeBlockPending = (raw: unknown): { stepId: string; arrivals: PipelineJoinArrival[] } | null => {
+ *  `sanitizeJoins` above, silently dropping any junk entry. The Return-only
+ *  fields are carried through so a hold cannot lose a human decision. */
+const sanitizeBlockPending = (raw: unknown): PipelinePendingLaunch | null => {
   if (!isPlainObject(raw)) return null;
   const rec = raw as Record<string, unknown>;
   const stepId = rec.stepId;
@@ -565,7 +572,19 @@ const sanitizeBlockPending = (raw: unknown): { stepId: string; arrivals: Pipelin
   const arrivals = Array.isArray(rec.arrivals)
     ? rec.arrivals.map(sanitizeJoinArrival).filter((a): a is PipelineJoinArrival => a !== null)
     : [];
-  return { stepId, arrivals };
+  const returnToStepId = typeof rec.returnToStepId === "string" && rec.returnToStepId.length > 0
+    ? rec.returnToStepId
+    : undefined;
+  const humanFeedback = typeof rec.humanFeedback === "string" && rec.humanFeedback.length > 0
+    ? rec.humanFeedback.slice(0, PIPELINE_LIMITS.handoffField)
+    : undefined;
+  return {
+    stepId,
+    arrivals,
+    ...(returnToStepId !== undefined ? { returnToStepId } : {}),
+    ...(rec.returned === true ? { returned: true } : {}),
+    ...(humanFeedback !== undefined ? { humanFeedback } : {}),
+  };
 };
 
 const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
@@ -590,7 +609,12 @@ const sanitizeHumanDecision = (raw: unknown): PipelineStepRecord["human"] => {
   const rec = raw as Record<string, unknown>;
   const decision = rec.decision;
   if (decision !== "accept" && decision !== "return") return null;
-  const comment = typeof rec.comment === "string" && rec.comment.length > 0 ? rec.comment : null;
+  // Same `handoffField` cap the decision route enforces (R-N2): a hand-edited
+  // or pre-cap row must not put an unbounded owner comment into the history,
+  // prior-rounds list and the next prompt.
+  const comment = typeof rec.comment === "string" && rec.comment.length > 0
+    ? rec.comment.slice(0, PIPELINE_LIMITS.handoffField)
+    : null;
   const mode = rec.mode === "fresh" || rec.mode === "resume" ? rec.mode : undefined;
   const returnToStepId = typeof rec.returnToStepId === "string" && rec.returnToStepId.length > 0 ? rec.returnToStepId : null;
   return { decision, comment, ...(mode ? { mode } : {}), returnToStepId };

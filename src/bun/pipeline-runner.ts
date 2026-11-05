@@ -100,6 +100,7 @@ import type {
   PipelineBlock,
   PipelineGraph,
   PipelineJoinArrival,
+  PipelinePendingLaunch,
   PipelineRunSnapshot,
   PipelineRunState,
   PipelineRunStatus,
@@ -262,6 +263,18 @@ function checkJoinIncomplete(run: PipelineRunState): void {
 }
 
 /**
+ * The board column a run status mirrors. `undefined` (idle) has no column —
+ * a never-started run leaves the card wherever the owner put it.
+ */
+const COLUMN_FOR_RUN_STATUS: Partial<Record<PipelineRunStatus, ColumnId>> = {
+  running: "running",
+  blocked: "blocked",
+  done: "review",
+  review: "review",
+  cancelled: "ready",
+};
+
+/**
  * Persist `run` onto the parent task row, recompute its `status` (unless
  * `preserveStatus` — see `deriveRunStatus`'s doc for why a "cancelled, but
  * kept `active` for retry" state can't be re-derived), mirror the parent's
@@ -295,14 +308,7 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   tasks.setPipelineRun(parentId, run);
   const parent = tasks.get(parentId);
   if (parent?.archivedAt != null) return; // m8
-  const columnFor: Partial<Record<PipelineRunStatus, ColumnId>> = {
-    running: "running",
-    blocked: "blocked",
-    done: "review",
-    review: "review",
-    cancelled: "ready",
-  };
-  const nextColumn = columnFor[run.status];
+  const nextColumn = COLUMN_FOR_RUN_STATUS[run.status];
   if (nextColumn && parent && parent.column !== nextColumn && previousStatus !== run.status) {
     pipelineUpdateColumn(parentId, null, nextColumn);
   }
@@ -316,6 +322,24 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
     runStartedAt: run.startedAt,
     ts: Date.now(),
   } satisfies GlobalEvent);
+}
+
+/**
+ * Re-derive a pipeline parent's board column for a PENDING GATE after an
+ * unarchive. `persist` skips the column mirror while the parent is archived
+ * (m8), so a gate reached mid-archive leaves the run correct but the card on
+ * whatever column it held before archiving. Only `review` is forced: the
+ * owner must see the gate to act on it, while every other status may have
+ * been parked deliberately (a finished pipeline left in Done, L-R4) and must
+ * keep the owner's column. A no-op while still archived, for a non-pipeline
+ * parent, or when the card already reads Review.
+ */
+export function restorePipelineGateColumn(taskId: string): void {
+  const task = tasks.get(taskId);
+  const run = task?.pipelineRun;
+  if (!task || !run || task.archivedAt != null) return;
+  if (run.status !== "review" || task.column === "review") return;
+  pipelineUpdateColumn(taskId, null, "review");
 }
 
 /**
@@ -372,8 +396,9 @@ function isDeliberateWholeRunStop(run: PipelineRunState, excludeTaskId: string):
 /** The active executions other than `excludeTaskId`'s that the pipeline is
  *  still working on: a run of them is live, or the runner itself still has a
  *  decision pending for them ({@link hasPendingStepDecision} — a release
- *  grace, a wait or busy recheck, a reminder mid-send). A Stop on one step
- *  must not end the run out from under such a sibling (M5). */
+ *  grace, a wait or busy recheck, a reminder mid-send, a Resume Return's send
+ *  mid-flight). A Stop on one step must not end the run out from under such a
+ *  sibling (M5). */
 function workingSiblings(run: PipelineRunState, excludeTaskId: string): PipelineActiveStep[] {
   return run.active.filter(
     (a) => a.taskId !== excludeTaskId && (isAnyRunOfTaskLive(a.taskId) || hasPendingStepDecision(a.taskId)),
@@ -772,15 +797,17 @@ function scheduleWaitRecheck(taskId: string): void {
 const WAIT_RECHECK_DELAYS_MS = [25, 100, 400, 1_500, 5_500];
 
 /** Whether the runner itself still has a pending decision for `taskId` with
- *  no run of it live: a release-grace timer, a wait or busy recheck, or a
- *  reminder mid-send. The pipeline is still working on such a step, so Stop
- *  must be able to stop it. */
+ *  no run of it live: a release-grace timer, a wait or busy recheck, a
+ *  reminder mid-send, or a Resume Return's `sendInput` mid-flight. The
+ *  pipeline is still working on such a step, so Stop must be able to stop
+ *  it. */
 function hasPendingStepDecision(taskId: string): boolean {
   return (
     releaseGraceTimers.has(taskId) ||
     waitRechecks.has(taskId) ||
     busyRecheckTimers.has(taskId) ||
-    remindersInFlight.has(taskId)
+    remindersInFlight.has(taskId) ||
+    reviewResumeSendsInFlight.has(taskId)
   );
 }
 
@@ -1016,6 +1043,53 @@ type LaunchResult = { ok: true; runId: string | null; pending?: true } | { ok: f
  *  Accept (trusted feedback rendered by `composeStepPrompt`). */
 type PreviousArrival = { stepId: string; seq: number; handoff: Handoff | null; comment?: string | null };
 
+/** Options that shape ONE launch beyond its arrivals: fan-out sibling
+ *  bookkeeping, a caller-already-refreshed worktree, and a human Return's
+ *  forced edge + trusted feedback. Persisted inside a run-level hold's
+ *  `pending` so a Retry re-applies the same launch. */
+type LaunchOptions = {
+  batchSiblingStepIds?: string[];
+  skipWorktreeRefresh?: boolean;
+  returnToStepId?: string;
+  returned?: boolean;
+  humanFeedback?: string | null;
+};
+
+/** `PreviousArrival` → the persisted join/pending-block shape, keeping the
+ *  human comment (M1: every conversion in both directions must preserve it,
+ *  or an Accept's feedback is silently dropped on a join/hold/retry). */
+function previousToJoinArrival(p: PreviousArrival): PipelineJoinArrival {
+  return {
+    fromStepId: p.stepId,
+    seq: p.seq,
+    handoff: p.handoff,
+    ...(p.comment ? { comment: p.comment } : {}),
+  };
+}
+
+/** Inverse of {@link previousToJoinArrival} — same comment-preserving rule. */
+function joinArrivalToPrevious(a: PipelineJoinArrival): PreviousArrival {
+  return {
+    stepId: a.fromStepId,
+    seq: a.seq,
+    handoff: a.handoff,
+    ...(a.comment ? { comment: a.comment } : {}),
+  };
+}
+
+/** Build a run-level hold's `pending` launch from the exact arrivals/options
+ *  the original launch was given, so Retry re-attempts the same execution
+ *  (including a human Return's forced edge and comment). */
+function pendingLaunch(stepId: string, previous: PreviousArrival[], opts?: LaunchOptions): PipelinePendingLaunch {
+  return {
+    stepId,
+    arrivals: previous.map(previousToJoinArrival),
+    ...(opts?.returnToStepId ? { returnToStepId: opts.returnToStepId } : {}),
+    ...(opts?.returned ? { returned: true } : {}),
+    ...(opts?.humanFeedback ? { humanFeedback: opts.humanFeedback } : {}),
+  };
+}
+
 /** Record a retryable run-level hold for `step` instead of launching it —
  *  used whenever the pipeline's parent task turns out to be archived (Major
  *  2): the settle/advance that would otherwise launch this step still has
@@ -1030,16 +1104,14 @@ function holdForArchivedParent(
   run: PipelineRunState,
   step: PipelineStep,
   previous: PreviousArrival[],
+  opts?: LaunchOptions,
 ): void {
   upsertBlocked(run, {
     taskId: null,
     stepId: step.id,
     kind: "step-failed",
     message: `step "${step.name}" is ready to launch, but the pipeline task is archived — unarchive it and retry`,
-    pending: {
-      stepId: step.id,
-      arrivals: previous.map((p) => ({ fromStepId: p.stepId, seq: p.seq, handoff: p.handoff })),
-    },
+    pending: pendingLaunch(step.id, previous, opts),
   });
 }
 
@@ -1109,7 +1181,7 @@ async function launchStep(
   run: PipelineRunState,
   step: PipelineStep,
   previous: PreviousArrival[],
-  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean; returnToStepId?: string; returned?: boolean; humanFeedback?: string | null },
+  opts?: LaunchOptions,
 ): Promise<LaunchResult> {
   const snapshot = run.snapshot;
   if (!snapshot) {
@@ -1118,12 +1190,7 @@ async function launchStep(
     return { ok: false };
   }
 
-  const pendingArrivals: PipelineJoinArrival[] = previous.map((p) => ({
-    fromStepId: p.stepId,
-    seq: p.seq,
-    handoff: p.handoff,
-    ...(p.comment ? { comment: p.comment } : {}),
-  }));
+  const pendingArrivals: PipelineJoinArrival[] = previous.map(previousToJoinArrival);
 
   // Minor 7 / Major 2: check the parent still exists, isn't mid-delete, and
   // isn't archived BEFORE touching its worktree at all — a delete cascade or
@@ -1141,7 +1208,7 @@ async function launchStep(
     return enterHumanGate(parent.id, run, step, pendingArrivals);
   }
   if (currentParent.archivedAt != null) {
-    holdForArchivedParent(run, step, previous);
+    holdForArchivedParent(run, step, previous, opts);
     persist(parent.id, run);
     return { ok: false };
   }
@@ -1158,7 +1225,7 @@ async function launchStep(
         stepId: step.id,
         kind: "step-failed",
         message: `could not prepare the pipeline's worktree: ${prepared.error}`,
-        pending: { stepId: step.id, arrivals: pendingArrivals },
+        pending: pendingLaunch(step.id, previous, opts),
       });
       persist(parent.id, run);
       return { ok: false };
@@ -1172,7 +1239,7 @@ async function launchStep(
       stepId: step.id,
       kind: "step-cap",
       message: `reached the ${effectiveStepCap(run)}-step cap for this run — retry to keep going, or stop here`,
-      pending: { stepId: step.id, arrivals: pendingArrivals },
+      pending: pendingLaunch(step.id, previous, opts),
     });
     persist(parent.id, run);
     return { ok: false };
@@ -1184,7 +1251,7 @@ async function launchStep(
       stepId: step.id,
       kind: "profile-missing",
       message: `step "${step.name}" has no agent`,
-      pending: { stepId: step.id, arrivals: pendingArrivals },
+      pending: pendingLaunch(step.id, previous, opts),
     });
     persist(parent.id, run);
     return { ok: false };
@@ -1388,7 +1455,7 @@ async function launchTarget(
   run: PipelineRunState,
   step: PipelineStep,
   previous: PreviousArrival[],
-  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean; returnToStepId?: string; returned?: boolean; humanFeedback?: string | null },
+  opts?: LaunchOptions,
 ): Promise<LaunchResult> {
   const activeIdsBefore = new Set(run.active.map((a) => a.taskId));
   const stepCountBefore = run.stepCount;
@@ -1411,10 +1478,7 @@ async function launchTarget(
         stepId: step.id,
         kind: "step-failed",
         message: `step "${step.name}" failed to launch: ${message}`,
-        pending: {
-          stepId: step.id,
-          arrivals: previous.map((p) => ({ fromStepId: p.stepId, seq: p.seq, handoff: p.handoff })),
-        },
+        pending: pendingLaunch(step.id, previous, opts),
       });
     }
     return { ok: false };
@@ -1546,13 +1610,21 @@ async function retryPendingBlocks(
       });
       continue;
     }
-    const previous = pending.arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
+    const previous = pending.arrivals.map(joinArrivalToPrevious);
+    // M2: re-apply the exact launch the hold was created for. A fresh Return
+    // held by the step cap (or a worktree/launch failure) must still carry its
+    // forced edge and feedback, or the Retry would settle through the graph
+    // and could bypass the gate entirely.
+    const launchOpts: LaunchOptions = { skipWorktreeRefresh: true };
+    if (pending.returnToStepId) launchOpts.returnToStepId = pending.returnToStepId;
+    if (pending.returned) launchOpts.returned = true;
+    if (pending.humanFeedback) launchOpts.humanFeedback = pending.humanFeedback;
     // Minor 15: `parent` here was already freshly refreshed once by this
     // call's sole caller, `performPipelineRetry` — skip `launchStep`'s own
     // redundant per-call refresh. Minor 7: go through `launchTarget`, not
     // `launchStep` directly, so a throw here is caught into a retryable
     // block instead of aborting the rest of this pending-block sweep.
-    const launched = await launchTarget(parent, run, step, previous, { skipWorktreeRefresh: true });
+    const launched = await launchTarget(parent, run, step, previous, launchOpts);
     if (launched.ok && launched.runId && !first) first = { runId: launched.runId, ...(launched.pending ? { pending: true as const } : {}) };
   }
   return first;
@@ -1947,7 +2019,7 @@ export async function advancePipeline(
         const targetStep = graph.steps.find((s) => s.id === nid);
         if (!targetStep) continue;
         const previous = nid === joinStepId
-          ? arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }))
+          ? arrivals.map(joinArrivalToPrevious)
           : [];
         // Minor 14/15: `launchTarget` catches a per-target throw into a
         // retryable block instead of aborting the rest of the batch;
@@ -2029,7 +2101,7 @@ export async function advancePipeline(
             parentRow,
             run,
             targetStep,
-            arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff })),
+            arrivals.map(joinArrivalToPrevious),
             { batchSiblingStepIds: nextStepIds, skipWorktreeRefresh: true },
           );
         } else {
@@ -2082,9 +2154,10 @@ export async function retryPipelineStep(
  * cancels every active execution and returns the parent to ready … active
  * set kept so Run retries them"). Also stops an execution the runner itself
  * is still deciding with no run of it live — a release grace, a wait or busy
- * recheck, a reminder mid-send ({@link hasPendingStepDecision}): its timers
- * are cancelled and it is recorded `cancelled`, so Retry re-runs it. 409 when
- * there is nothing of either kind (M5 — `isAnyRunOfTaskLive`, not `column`).
+ * recheck, a reminder mid-send, a Resume Return's send mid-flight
+ * ({@link hasPendingStepDecision}): its timers are cancelled and it is
+ * recorded `cancelled`, so Retry re-runs it. 409 when there is nothing of
+ * either kind (M5 — `isAnyRunOfTaskLive`, not `column`).
  *
  * Records `run.stopRequestedAt` BEFORE cancelling anything, so every settle
  * the cancels set off — and every re-settle a timer or a displaced run would
@@ -2186,6 +2259,55 @@ function normalizeHumanComment(raw: unknown): { value: string | null } | { error
 }
 
 /**
+ * What the locked half of {@link reviewHumanStep} hands back when a Resume
+ * Return needs its `sendInput` delivered outside the per-parent lock (L-R7):
+ * the re-arm record is already persisted, so the settle cannot miss it.
+ */
+interface ResumeDispatch {
+  parentId: string;
+  taskId: string;
+  runId: string;
+  message: string;
+  seq: number;
+  gate: NonNullable<PipelineRunState["humanSteps"]>[number];
+}
+
+type ReviewHumanStepResult =
+  | { task: Task }
+  | { error: string; status: 400 | 404 | 409 }
+  | { resume: ResumeDispatch };
+
+/**
+ * Step task id → how many Resume Return sends for it are mid-flight outside
+ * the per-parent lock. The re-armed `active` entry is neither live nor a
+ * timer, so without this marker `cancelPipelineRun` would read the run as
+ * "not running" and 409 while the card plainly shows Running and offers
+ * Stop. While a send is in flight this makes the entry a
+ * {@link hasPendingStepDecision} decision, so Stop wins: the cancel marks the
+ * execution cancelled, and the post-send confirm (or the refused-send
+ * rollback) re-acquires the lock, sees `stopRequestedAt`, and cancels the
+ * turn the send just started. A count (not a set) because two gates could
+ * theoretically address the same source task and must not clear each other's
+ * marker.
+ */
+const reviewResumeSendsInFlight = new Map<string, number>();
+
+function beginReviewResumeSend(taskId: string): void {
+  reviewResumeSendsInFlight.set(taskId, (reviewResumeSendsInFlight.get(taskId) ?? 0) + 1);
+}
+
+function endReviewResumeSend(taskId: string): void {
+  const remaining = (reviewResumeSendsInFlight.get(taskId) ?? 0) - 1;
+  if (remaining > 0) reviewResumeSendsInFlight.set(taskId, remaining);
+  else reviewResumeSendsInFlight.delete(taskId);
+}
+
+/** Test seam (`__forTest.setReviewResumeSend`): stubs the Resume Return's
+ *  out-of-lock `sendInput`, so a test can hold the send open and observe the
+ *  lock staying free (and a Stop winning) while it is in flight. */
+let reviewResumeSend: typeof sendInput | null = null;
+
+/**
  * Decide a pending human gate — the one mutator behind
  * `POST /tasks/:id/pipeline/review`. Under the per-parent lock it removes the
  * gate and records the decision in the same critical section (so a second
@@ -2194,6 +2316,16 @@ function normalizeHumanComment(raw: unknown): { value: string | null } | { error
  * incoming source (fresh, or resumed on its existing task). Every path that
  * surfaces a run id (a fresh start, a retry) can never reach a human gate, so
  * the route's returned shape is unchanged.
+ *
+ * A Resume Return's `sendInput` is the one send deliberately made OUTSIDE the
+ * lock (L-R7, same rationale as `deliverHandoffReminder`): the re-arm record
+ * is persisted first, the lock is released, and a refused send re-acquires it
+ * to roll the re-arm back and restore the gate. The re-armed execution is
+ * marked as a pending runner decision for the duration of the send, so a Stop
+ * still wins while no run of it is live yet.
+ * Holding the lock across a
+ * claude paste / one-shot spawn would stall every other settle and route
+ * mutation for the same parent for seconds.
  */
 export async function reviewHumanStep(
   parentId: string,
@@ -2206,7 +2338,7 @@ export async function reviewHumanStep(
     mode?: "fresh" | "resume";
   },
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
-  return runExclusive(parentId, async () => {
+  const outcome = await runExclusive(parentId, async (): Promise<ReviewHumanStepResult> => {
     if (launchesFrozen()) return { error: LAUNCHES_FROZEN_REASON, status: 409 as const };
     const parent = tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
@@ -2254,8 +2386,17 @@ export async function reviewHumanStep(
       return { error: "mode must be \"fresh\" or \"resume\"", status: 400 as const };
     }
 
-    // Accept target resolution — the graph's own transition rules.
+    // Accept target resolution — the graph's own transition rules. A
+    // supplied `nextStepIds` may only narrow a `choose` gate with several
+    // outgoing edges; on a single-edge or `all` gate it cannot be honored, so
+    // reject it rather than silently launching every outgoing step (S3).
     const outgoing = outgoingSteps(graph, step.id);
+    if (input.nextStepIds !== undefined && !(step.transition === "choose" && outgoing.length > 1)) {
+      return {
+        error: "nextStepIds is only valid for a gate with several outgoing choices",
+        status: 400 as const,
+      };
+    }
     let targetIds: string[] = [];
     if (input.decision === "accept") {
       if (outgoing.length === 0) {
@@ -2312,9 +2453,7 @@ export async function reviewHumanStep(
         if ("error" in refreshed) return { error: refreshed.error, status: 409 as const };
         const batchParent = refreshed.parent;
         const previous: PreviousArrival[] = gate.arrivals.map((a) => ({
-          stepId: a.fromStepId,
-          seq: a.seq,
-          handoff: a.handoff,
+          ...joinArrivalToPrevious(a),
           ...(comment ? { comment } : {}),
         }));
         for (const nid of targetIds) {
@@ -2322,9 +2461,19 @@ export async function reviewHumanStep(
           if (!target) continue;
           if (target.join === "all") {
             let arrivals = run.joins[nid]?.arrivals ?? [];
-            for (const a of gate.arrivals) {
-              arrivals = addJoinArrival(arrivals, { ...a, ...(comment ? { comment } : {}) });
-            }
+            // The join is waiting for the GATE as an incoming source, so the
+            // arrival must be keyed by the gate's own step id — the gate's
+            // incoming arrival belongs to the source step it reviewed and
+            // would never satisfy `incoming.every(...)`. Carry the reviewed
+            // handoff forward on the gate's arrival so the join target still
+            // sees what the owner just reviewed.
+            const gateArrival: PipelineJoinArrival = {
+              fromStepId: step.id,
+              seq: gate.seq,
+              handoff: gate.arrivals[gate.arrivals.length - 1]?.handoff ?? null,
+              ...(comment ? { comment } : {}),
+            };
+            arrivals = addJoinArrival(arrivals, gateArrival);
             const incoming = incomingSteps(graph, nid);
             const arrivedIds = new Set(arrivals.map((a) => a.fromStepId));
             if (incoming.every((i) => arrivedIds.has(i.step.id))) {
@@ -2333,12 +2482,7 @@ export async function reviewHumanStep(
                 batchParent,
                 run,
                 target,
-                arrivals.map((a) => ({
-                  stepId: a.fromStepId,
-                  seq: a.seq,
-                  handoff: a.handoff,
-                  ...(a.comment ? { comment: a.comment } : {}),
-                })),
+                arrivals.map(joinArrivalToPrevious),
                 { batchSiblingStepIds: targetIds, skipWorktreeRefresh: true },
               );
             } else {
@@ -2395,6 +2539,12 @@ export async function reviewHumanStep(
     if (isAnyRunOfTaskLive(previousTaskId)) {
       return { error: "the previous step is still running — wait, or run it fresh", status: 409 as const };
     }
+    // Two gates can name the same source step (a fan-out to two gates), and a
+    // resume send runs outside the lock: without this, both would re-arm the
+    // same task and race two sends at it.
+    if (reviewResumeSendsInFlight.has(previousTaskId)) {
+      return { error: "the previous step is already resuming — wait", status: 409 as const };
+    }
     const previousTask = tasks.get(previousTaskId);
     if (!previousTask) {
       return { error: "resume is unavailable for this step — run it fresh instead", status: 409 as const };
@@ -2427,28 +2577,93 @@ export async function reviewHumanStep(
       outgoing: outgoingSteps(graph, returnTarget.id).map((o) => ({ name: o.step.name, label: o.edge.label })),
       transition: returnTarget.transition,
     });
-    let sent: { delivered: boolean; reason?: string };
-    try {
-      sent = await sendInput(currentRunId, message, { onlyIfIdle: true });
-    } catch (err) {
-      sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
+    // L-R7: deliver the send OUTSIDE the per-parent lock. The re-arm record
+    // is already persisted above, so the settle has something to land on.
+    // Mark the send in flight under the lock: until it returns, the re-armed
+    // entry is neither live nor a timer, and Stop must still be able to win
+    // (`hasPendingStepDecision`).
+    beginReviewResumeSend(previousTaskId);
+    return {
+      resume: {
+        parentId,
+        taskId: previousTaskId,
+        runId: currentRunId,
+        message,
+        seq,
+        gate,
+      },
+    };
+  });
+
+  if (!("resume" in outcome)) return outcome;
+
+  const { parentId: lockedId, taskId, runId, message, seq, gate } = outcome.resume;
+  let sent: { delivered: boolean; reason?: string; runId?: string };
+  try {
+    sent = await (reviewResumeSend ?? sendInput)(runId, message, { onlyIfIdle: true });
+  } catch (err) {
+    sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+  try {
+    if (sent.delivered) {
+      // Confirm under the lock: a Stop that raced the send owns the run now.
+      // Cancel the turn this send just started and report the stop rather than
+      // reviving a cancelled run.
+      return await runExclusive(lockedId, async () => {
+        const task = tasks.get(lockedId);
+        if (!task) return { error: "pipeline task no longer exists", status: 404 as const };
+        const run = task.pipelineRun;
+        if (run && (run.stopRequestedAt != null || run.status === "cancelled")) {
+          // This turn is the runner's own resume, not a user turn: name it as
+          // the run the Stop applied to, so a late `running` event can never
+          // read it as "the user resumed the stopped step" (isTurnSinceStop).
+          const execution = run.history.find((h) => h.taskId === taskId && h.seq === seq);
+          if (execution && sent.runId) {
+            execution.stoppedRunId = sent.runId;
+            persist(lockedId, run);
+          }
+          await cancelLiveRunOfTask(taskId).catch(() => {});
+          return { error: "the pipeline run was stopped while the review was resuming", status: 409 as const };
+        }
+        return { task };
+      });
     }
-    if (!sent.delivered) {
-      // A refused send rolls the re-arm back so the gate stays pending.
-      run.active = run.active.filter((a) => !(a.taskId === previousTaskId && a.seq === seq));
-      run.history = run.history.filter((h) => !(h.taskId === previousTaskId && h.seq === seq));
-      run.humanSteps = [...(run.humanSteps ?? []), gate].sort((a, b) => a.seq - b.seq);
+
+    // A refused send rolls the re-arm back so the gate stays pending. Re-acquire
+    // the lock and only undo the record if it is still ours: a Stop, a settle or
+    // another decision that raced the send owns the run now and must win.
+    await runExclusive(lockedId, async () => {
+      const run = tasks.get(lockedId)?.pipelineRun;
+      if (!run || run.stopRequestedAt != null || run.status === "cancelled") return;
+      if (!run.active.some((a) => a.taskId === taskId && a.seq === seq)) return;
+      const record = run.history.find((h) => h.taskId === taskId && h.seq === seq);
+      if (record && record.outcome !== null) return;
+      run.active = run.active.filter((a) => !(a.taskId === taskId && a.seq === seq));
+      run.history = run.history.filter((h) => !(h.taskId === taskId && h.seq === seq));
+      if (!(run.humanSteps ?? []).some((g) => g.stepId === gate.stepId && g.seq === gate.seq)) {
+        run.humanSteps = [...(run.humanSteps ?? []), gate].sort((a, b) => a.seq - b.seq);
+      }
+      const humanRecord = run.history.find(
+        (h) => h.taskId === null && h.stepId === gate.stepId && h.seq === gate.seq,
+      );
       if (humanRecord) {
         humanRecord.endedAt = null;
         humanRecord.outcome = null;
         humanRecord.human = null;
         humanRecord.nextStepIds = [];
       }
-      persist(parentId, run);
-      return { error: `couldn't resume the previous step: ${sent.reason ?? "the agent refused the message"}`, status: 409 as const };
-    }
-    return { task: tasks.get(parentId)! };
-  });
+      persist(lockedId, run);
+    });
+    return {
+      error: `couldn't resume the previous step: ${sent.reason ?? "the agent refused the message"}`,
+      status: 409 as const,
+    };
+  } finally {
+    // The send is over: the re-armed entry is live now (delivered), gone
+    // (rolled back), or the run was stopped. Either way Stop no longer needs
+    // the marker to see it.
+    endReviewResumeSend(taskId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3142,10 +3357,7 @@ function holdForStoppedRun(
     stepId: step.id,
     kind: "step-failed",
     message: `step "${step.name}" is ready to launch, but the pipeline run was stopped — retry to continue`,
-    pending: {
-      stepId: step.id,
-      arrivals: previous.map((p) => ({ fromStepId: p.stepId, seq: p.seq, handoff: p.handoff })),
-    },
+    pending: pendingLaunch(step.id, previous),
   });
 }
 
@@ -3218,7 +3430,7 @@ async function advanceOnHandoff(input: {
         const arrivedIds = new Set(arrivals.map((a) => a.fromStepId));
         if (incoming.every((i) => arrivedIds.has(i.step.id))) {
           delete run.joins[nid];
-          holdForStoppedRun(run, targetStep, arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff })));
+          holdForStoppedRun(run, targetStep, arrivals.map(joinArrivalToPrevious));
         } else {
           run.joins[nid] = { arrivals };
         }
@@ -3275,7 +3487,7 @@ async function advanceOnHandoff(input: {
       const complete = incoming.every((i) => arrivedIds.has(i.step.id));
       if (complete) {
         delete run.joins[nid];
-        const previousArr = arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
+        const previousArr = arrivals.map(joinArrivalToPrevious);
         if (parentArchived) {
           holdForArchivedParent(run, targetStep, previousArr);
         } else {
@@ -3292,7 +3504,11 @@ async function advanceOnHandoff(input: {
       }
     } else {
       const previousArr = [{ stepId: activeEntry.stepId, seq: activeEntry.seq, handoff }];
-      if (parentArchived) {
+      // A human gate spawns nothing, so it must still be RECORDED on an
+      // archived parent (R21) — `launchStep`'s human branch runs before its
+      // own archived guard and `persist` skips the column/event. Only a real
+      // agent launch is held.
+      if (parentArchived && !isHumanStep(targetStep)) {
         holdForArchivedParent(run, targetStep, previousArr);
       } else {
         await launchTarget(batchParent, run, targetStep, previousArr, {
@@ -3789,6 +4005,10 @@ async function handleColumnChange(
           // flagged cancelled, even if a row still reads `running`. Nothing
           // here resumes anything.
           if (isTaskRunCancelling(taskId)) return;
+          // A Resume Return's own out-of-lock send may have started this
+          // turn: the runner owns it, not the user. The post-send confirm
+          // sees the Stop and cancels it; this event must never resume.
+          if (reviewResumeSendsInFlight.has(taskId)) return;
           const latest = currentRunRow(taskId);
           // No turn started since the Stop: the card moved without a new run
           // — the orchestrator's `pullBackParkedTask` pulls a `review` card
@@ -4141,6 +4361,8 @@ export function initPipelineRunner(): void {
  *  `setReleaseGraceMs` shrinks the release grace (returns the previous
  *  value). `setBusyRecheckDelaysMs` shortens the busy-refusal backstop
  *  (`null` restores it). `setReminderSend` stubs the reminder's `sendInput`;
+ *  `setReviewResumeSend` stubs the Resume Return's (so a test can hold it
+ *  open and prove the per-parent lock is free meanwhile);
  *  `parsedRunResponse` reads the cached parse of a run's final response.
  *  `handleDisplacedRunSettle` / `resettleCurrentRun` drive the
  *  displaced-run report and the "decide again" body directly.
@@ -4170,6 +4392,11 @@ export const __forTest = {
   },
   setReminderSend(fn: typeof sendInput | null): void {
     reminderSend = fn;
+  },
+  /** Stubs the Resume Return's out-of-lock `sendInput` (`reviewHumanStep`).
+   *  `null` restores the real one. */
+  setReviewResumeSend(fn: typeof sendInput | null): void {
+    reviewResumeSend = fn;
   },
   parsedRunResponse,
   setBusyRecheckDelaysMs(delays: readonly number[] | null): void {

@@ -1134,6 +1134,71 @@ test("parsePipelineRunState: a human gate, seqCounter, a null-taskId record, ret
   expect(parsed?.history[1]?.human).toEqual({ decision: "accept", comment: null, returnToStepId: null });
 });
 
+test("parsePipelineRunState: a pending launch keeps a Return's forced edge/feedback across a hold", () => {
+  const parsed = parsePipelineRunState(JSON.stringify({
+    pipelineId: "pipe-2",
+    blocked: [
+      {
+        taskId: null,
+        stepId: "a",
+        kind: "step-cap",
+        message: "cap",
+        pending: {
+          stepId: "a",
+          arrivals: [{ fromStepId: "h", seq: 2, handoff: null, comment: "keep this" }],
+          returnToStepId: "h",
+          returned: true,
+          humanFeedback: "redo the header",
+        },
+      },
+      {
+        taskId: null,
+        stepId: "b",
+        kind: "step-cap",
+        message: "cap",
+        pending: { stepId: "b", returned: "yes", returnToStepId: "", humanFeedback: 42 },
+      },
+    ],
+  }));
+  expect(parsed?.blocked[0]?.pending).toEqual({
+    stepId: "a",
+    arrivals: [{ fromStepId: "h", seq: 2, handoff: null, comment: "keep this" }],
+    returnToStepId: "h",
+    returned: true,
+    humanFeedback: "redo the header",
+  });
+  // Malformed/empty optional values are dropped, never persisted as junk.
+  expect(parsed?.blocked[1]?.pending).toEqual({ stepId: "b", arrivals: [] });
+});
+
+test("parsePipelineRunState: an owner comment is capped at handoffField everywhere it can live (R-N2)", () => {
+  const long = "x".repeat(PIPELINE_LIMITS.handoffField + 500);
+  const parsed = parsePipelineRunState(JSON.stringify({
+    pipelineId: "pipe-3",
+    joins: { b: { arrivals: [{ fromStepId: "a", seq: 1, handoff: null, comment: long }] } },
+    humanSteps: [
+      { stepId: "h", seq: 2, startedAt: 1, arrivals: [{ fromStepId: "a", seq: 1, handoff: null, comment: long }] },
+    ],
+    history: [
+      {
+        seq: 3, stepId: "h", taskId: null, startedAt: 1, endedAt: 2, outcome: "returned",
+        human: { decision: "return", comment: long }, nextStepIds: [],
+      },
+    ],
+    blocked: [
+      {
+        taskId: null, stepId: "b", kind: "step-cap", message: "cap",
+        pending: { stepId: "b", arrivals: [{ fromStepId: "h", seq: 2, handoff: null, comment: long }] },
+      },
+    ],
+  }));
+  const capped = "x".repeat(PIPELINE_LIMITS.handoffField);
+  expect(parsed?.joins.b?.arrivals[0]?.comment).toBe(capped);
+  expect(parsed?.humanSteps?.[0]?.arrivals[0]?.comment).toBe(capped);
+  expect(parsed?.history[0]?.human?.comment).toBe(capped);
+  expect(parsed?.blocked[0]?.pending?.arrivals[0]?.comment).toBe(capped);
+});
+
 test("parsePipelineRunState: an old row reads humanSteps [] and a derived seqCounter", () => {
   const parsed = parsePipelineRunState(JSON.stringify({
     pipelineId: "pipe-1",

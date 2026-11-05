@@ -43,6 +43,7 @@ import {
   validatePipelineGraph,
   composeReviewReturnMessage,
   isHumanStep,
+  humanReviewSubtitle,
   newHumanGateSeqs,
   nextRunSeq,
   pendingHumanSteps,
@@ -3233,6 +3234,12 @@ describe("human steps — status, progress and helpers", () => {
     expect(newHumanGateSeqs({ runStartedAt: 10, seqs: [1] }, 10, [1, 2])).toEqual([2]);
     expect(newHumanGateSeqs({ runStartedAt: 10, seqs: [1, 2] }, 10, [1, 2])).toEqual([]);
     expect(newHumanGateSeqs({ runStartedAt: 10, seqs: [1] }, 20, [1])).toEqual([1]);
+  });
+
+  test("humanReviewSubtitle names the gate count so one alert covers several gates", () => {
+    expect(humanReviewSubtitle(1)).toBe("Pipeline needs your review");
+    expect(humanReviewSubtitle(2)).toBe("Pipeline needs your review (2 gates)");
+    expect(humanReviewSubtitle(7)).toBe("Pipeline needs your review (7 gates)");
   });
 });
 

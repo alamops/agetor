@@ -10,7 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DEFAULT_MODEL, type AgentProfile, type Pipeline } from "../shared/types.ts";
-import { BUNDLE_MAX_BYTES, parseBundleText } from "../shared/bundle.ts";
+import { BUNDLE_MAX_BYTES, BUNDLE_VERSION, parseBundleText } from "../shared/bundle.ts";
 import type { BundleImportPlan } from "../shared/bundle-import.ts";
 import { rmTestDataDir } from "./test-data-dir.ts";
 import { makeTestNative } from "./test-native.ts";
@@ -576,7 +576,12 @@ describe("POST /bundle/import/preview", () => {
     const bad = await call("/bundle/import/preview", { text: "{nope" });
     expect(bad.status).toBe(400);
     expect(((await bad.json()) as { code: string }).code).toBe("invalid-json");
-    const newer = await call("/bundle/import/preview", { text: JSON.stringify({ format: "agetor-bundle", version: 2 }) });
+    // This build supports bundle v2 (human steps); only a NEWER version is
+    // refused before parsing. `BUNDLE_VERSION + 1` keeps that honest when the
+    // supported version rises again.
+    const newer = await call("/bundle/import/preview", {
+      text: JSON.stringify({ format: "agetor-bundle", version: BUNDLE_VERSION + 1 }),
+    });
     expect(((await newer.json()) as { code: string }).code).toBe("unsupported-version");
     expect((await call("/bundle/import/preview", { notText: 1 })).status).toBe(400);
     expect((await call("/bundle/import/preview", { text: "{}", options: { harnessMap: [1] } })).status).toBe(400);

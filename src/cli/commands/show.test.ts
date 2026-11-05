@@ -182,6 +182,42 @@ test("show prints an imported OpenCode session, with the error of a failed impor
   expect(outputs).toContain("    ⚠ export timed out");
 });
 
+// ── human review gates (docs/architecture/pipelines.md §11) ─────────────
+
+test("show prints pending human reviews and the decide command", async () => {
+  const run = {
+    pipelineId: "pl-1",
+    pipelineName: "P",
+    snapshot: {
+      graph: {
+        steps: [
+          { id: "a", name: "A", type: "agent", instructions: "", agentProfileId: null, transition: "choose", join: "any", subagents: { profileIds: [], cap: null }, position: { x: 0, y: 0 } },
+          { id: "h", name: "H", type: "human", instructions: "", agentProfileId: null, transition: "choose", join: "any", subagents: { profileIds: [], cap: null }, position: { x: 0, y: 0 } },
+        ],
+        edges: [{ id: "e", from: "a", to: "h", label: "" }],
+        startStepId: "a",
+      },
+      profiles: {},
+      maxSteps: 25,
+      capturedAt: 1,
+    },
+    status: "review",
+    active: [],
+    joins: {},
+    blocked: [],
+    history: [],
+    humanSteps: [{ stepId: "h", seq: 3, startedAt: 1, arrivals: [{ fromStepId: "a", seq: 2, handoff: null }] }],
+    stepCount: 1,
+    startedAt: 1,
+    endedAt: null,
+  } as unknown as NonNullable<Task["pipelineRun"]>;
+  currentClient = fakeClient(makeTask({ pipelineId: "pl-1", pipelineRun: run }));
+  await cmdShow(["abcdefgh"], flags);
+  expect(outputs.some((l) => l.includes("1 pending human review"))).toBe(true);
+  expect(outputs.some((l) => l.includes("H  seq 3  from A"))).toBe(true);
+  expect(outputs.some((l) => l.includes("agetor pipeline review abcdefgh"))).toBe(true);
+});
+
 // ── `agetor harness ls` notices (pure helpers in harness.ts) ─────────────
 
 test("harnessNoticeLines: one escaped line per notice, none when absent", async () => {

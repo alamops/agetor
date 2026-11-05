@@ -351,6 +351,35 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
             <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
               <FolderOpen className="size-3" /> Open
             </Button>
+          ) : gatePending ? (
+            // A pending human gate is a decision, not a failure: Review is the
+            // primary action, Open browses the run, and Stop stays available
+            // as a single, visually secondary danger action (owner decisions:
+            // grill round-1 "Open + Review", round-2 "Review primary, danger
+            // Stop secondary"). No icon Stop here — one Stop is enough.
+            <>
+              <Button size="sm" variant="secondary" onClick={() => onOpen(task)} title="Open the pipeline run">
+                <FolderOpen className="size-3" /> Open
+              </Button>
+              <Button
+                size="sm"
+                data-testid="task-card-pipeline-review"
+                onClick={() => onReviewPipeline(task)}
+                title="Open the human review gate"
+              >
+                <UserCheck className="mr-1 size-3" /> Review
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="task-card-pipeline-stop"
+                className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                onClick={stopTask}
+                title="Stop"
+              >
+                <Square className="size-3" /> Stop
+              </Button>
+            </>
           ) : awaiting ? (
             <Button
               size="sm"
@@ -375,20 +404,9 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
               <Play className="size-3" /> Run
             </Button>
           )}
-          {!archived && (awaiting || gatePending) && stoppable && (
+          {!archived && awaiting && !gatePending && stoppable && (
             <Button size="icon" variant="ghost" onClick={stopTask} title="Stop">
               <Square className="size-3" />
-            </Button>
-          )}
-          {!archived && gatePending && (
-            <Button
-              size="sm"
-              variant="outline"
-              data-testid="task-card-pipeline-review"
-              onClick={() => onReviewPipeline(task)}
-              title="Open the human review gate"
-            >
-              <UserCheck className="mr-1 size-3" /> Review
             </Button>
           )}
           {!archived && task.column === "review" && !gatePending

@@ -5,7 +5,7 @@
 | Date | 2026-11-04 |
 | Plan | `docs/plans/pipeline-human-step.md` (T0, §8 open question 1) |
 | Test | `src/bun/pipeline-human-step-resume-spike.test.ts` |
-| Verdict | **GO** — resume is deterministic on the fake claude driver and uses only the production seam |
+| Verdict | **GO** — resume is deterministic on the fake claude (persistent session) and fake codex (one-shot) drivers, using only the production seam |
 
 ## Question
 
@@ -20,13 +20,16 @@ shipping `resume` at all.
 
 The test drives the exact production path the route/CLI call:
 `reviewHumanStep(parentId, { decision: "return", mode: "resume" })` against a
-real runner (`initPipelineRunner`) and the fake claude driver, on
-`A → H → B` where A's handoff names **B**.
+real runner (`initPipelineRunner`) and the fake drivers — once on the
+persistent-session harness (claude-code) and once on a one-shot harness
+(codex) — on `A → H → B` where A's handoff names **B**.
 
 1. A settles and the gate opens (`run.humanSteps[0]`).
 2. Resume creates a new `seq`/`run.active`/history record **under the parent
-   lock**, then calls `sendInput(currentRunId, message, { onlyIfIdle: true })`
-   on A's existing task.
+   lock**, persists it, releases the lock, then calls
+   `sendInput(currentRunId, message, { onlyIfIdle: true })` on A's existing
+   task (L-R7: the send is outside the lock; a refusal re-acquires it to roll
+   back).
 3. A **new run row** appears on the same task (`runs.listForTask` grows by
    one); **no second step task row** is inserted.
 4. The new run settles: its history record ends `succeeded`, carries
@@ -53,19 +56,20 @@ real runner (`initPipelineRunner`) and the fake claude driver, on
 
 ## Harness coverage
 
-The fake claude driver is a persistent-session harness. One-shot harnesses
-(codex/gemini/antigravity) resume through the same `sendInput` entry point;
-their per-kind dispatch is unchanged by this feature, and the one-shot
-refusal case is covered by the route's 409 (`resume unavailable`), not by a
-second process harness.
+Both halves of `sendInput`'s dispatch are exercised: the persistent-session
+fake claude driver and the one-shot fake codex driver. Gemini/antigravity are
+not separately exercised; their per-kind dispatch is unchanged by this
+feature, while the shared re-arm/forced-edge seam is the same code proven
+here. The route's `resume unavailable` 409 still covers a missing/archived
+source task.
 
 ## Failing evidence
 
-None — the test passes:
+None — both tests pass:
 
 ```
 bun test src/bun/pipeline-human-step-resume-spike.test.ts
- 1 pass / 0 fail
+  2 pass / 0 fail
 ```
 
 The plan's stop condition (record the failing command and return to the

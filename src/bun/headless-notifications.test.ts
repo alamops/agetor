@@ -377,6 +377,30 @@ describe("stateful handler: \"Pipeline needs you\" for a block with no step ques
     expect(posted.map((p) => p.body)).toEqual(["Ship it · Review", "Ship it · Pipeline needs you"]);
   });
 
+  test("a review transition keeps a sibling's pending question and its owed alert (R-S4)", () => {
+    const { posted, handle } = harness({
+      p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: "s1", stepId: "a", kind: "step-failed", message: "x" }] } },
+    });
+    handle(ask("pending", "i1"));
+    expect(posted.map((p) => p.body)).toEqual(["Ship it · Review"]);
+    // A human gate opens on the same run: the review banner is added, but the
+    // question is still pending. Like the webview, `review` must not forget it.
+    handle({ kind: "pipeline", taskId: "p1", status: "review", activeStepIds: [], stepCount: 2, humanStepSeqs: [2], runStartedAt: 10, ts: 2 } as GlobalEvent);
+    expect(posted.map((p) => p.body)).toEqual(["Ship it · Review", "Ship it · Pipeline needs your review"]);
+    // The run later blocks on something else while the question is unanswered:
+    // the question still holds the parent's single notification (no generic cue).
+    handle(blockedCol());
+    expect(posted).toHaveLength(2);
+    // Answering it then raises the owed "Pipeline needs you" — the bookkeeping
+    // survived the review transition instead of being dropped with it.
+    handle(ask("resolved", "i1"));
+    expect(posted.map((p) => p.body)).toEqual([
+      "Ship it · Review",
+      "Ship it · Pipeline needs your review",
+      "Ship it · Pipeline needs you",
+    ]);
+  });
+
   test("a step running again ends the answered-question exemption for its block", () => {
     const { posted, handle } = harness({ p1: { column: "blocked", pipelineRun: { status: "blocked", blocked: [{ taskId: "s1", stepId: "a", kind: "step-blocked", message: "waiting" }] } } });
     handle(ask("pending", "i1"));
@@ -427,7 +451,7 @@ describe("pipeline human gates", () => {
   const review = (seqs: number[], runStartedAt = 10): GlobalEvent =>
     ({ kind: "pipeline", taskId: "p1", status: "review", activeStepIds: [], stepCount: 2, humanStepSeqs: seqs, runStartedAt, ts: 1 }) as GlobalEvent;
 
-  test("one review notification per gate seq; a repeat persist is silent; a second gate notifies once more", () => {
+  test("one review notification per gate announcement; a repeat persist is silent; a later gate notifies once more", () => {
     const { posted, handle } = harness();
     handle(review([2]));
     expect(posted).toEqual([
@@ -436,9 +460,33 @@ describe("pipeline human gates", () => {
     handle(review([2]));
     expect(posted).toHaveLength(1);
     handle(review([2, 4]));
-    expect(posted).toHaveLength(2);
+    expect(posted.map((p) => p.body)).toEqual([
+      "Ship it · Pipeline needs your review",
+      "Ship it · Pipeline needs your review (2 gates)",
+    ]);
     handle(review([2, 4]));
     expect(posted).toHaveLength(2);
+  });
+
+  test("two gates opened by one persist raise ONE alert naming both (R-S2)", () => {
+    const { posted, handle } = harness();
+    handle(review([2, 4]));
+    expect(posted).toEqual([
+      { title: "Pipeline needs your review", body: "Ship it · Pipeline needs your review (2 gates)", taskId: "p1", kind: "blocked" },
+    ]);
+    // Both seqs were marked announced by the single alert: a repeat is silent.
+    handle(review([2, 4]));
+    expect(posted).toHaveLength(1);
+  });
+
+  test("a third gate opening while two are pending re-alerts, naming all three", () => {
+    const { posted, handle } = harness();
+    handle(review([2, 4]));
+    handle(review([2, 4, 6]));
+    expect(posted.map((p) => p.body)).toEqual([
+      "Ship it · Pipeline needs your review (2 gates)",
+      "Ship it · Pipeline needs your review (3 gates)",
+    ]);
   });
 
   test("a new run generation announces its gates afresh", () => {

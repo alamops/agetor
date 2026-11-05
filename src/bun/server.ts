@@ -252,6 +252,8 @@ import type {
   Handoff,
   Pipeline,
   PipelineInput,
+  PipelineJoinArrival,
+  PipelinePendingLaunch,
   PipelineRunState,
   RunEvent,
   OpencodeServerMode,
@@ -1096,27 +1098,54 @@ function parsePipelineDescription(body: Record<string, unknown>): { value: strin
 
 /**
  * The trimmed `Task.pipelineRun` variant `GET /tasks` ships (M-S3, see the
- * field's doc in `shared/types.ts`): every persisted handoff (history and
- * partial-join arrivals) is nulled and the frozen profile snapshots dropped,
- * since the board/TUI/`agetor ls` only read `snapshot.graph`, `status`,
- * `active`, `blocked`, history outcomes and `stepCount` — and the 2s poll
- * was otherwise shipping every handoff of every pipeline task on every
- * tick. `GET /tasks/:id` and `GET /tasks/:id/pipeline` still return the
- * full state; the server's own `tasks.list()`/`get()` reads are untouched.
+ * field's doc in `shared/types.ts`): every persisted handoff (history,
+ * partial-join arrivals, human-gate arrivals and a held launch's arrivals),
+ * owner comment and the frozen profile snapshots are dropped, since the
+ * board/TUI/`agetor ls` only read `snapshot.graph`, `status`, `active`,
+ * `blocked`, history outcomes and `stepCount` — and the 2s poll was otherwise
+ * shipping every handoff of every pipeline task on every tick. `GET /tasks/:id`
+ * and `GET /tasks/:id/pipeline` still return the full state; the server's own
+ * `tasks.list()`/`get()` reads are untouched.
  */
 function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
+  // Owner-authored comments (a gate's Accept feedback, a join arrival) can be
+  // as large as a handoff field — the board poll only needs gate identity, so
+  // trim them alongside the handoffs. The single-run routes keep them.
+  const trimArrival = (a: PipelineJoinArrival): PipelineJoinArrival => ({
+    fromStepId: a.fromStepId,
+    seq: a.seq,
+    handoff: null,
+    comment: null,
+  });
   const joins: PipelineRunState["joins"] = {};
   for (const [stepId, join] of Object.entries(run.joins)) {
-    joins[stepId] = { arrivals: join.arrivals.map((a) => ({ ...a, handoff: null })) };
+    joins[stepId] = { arrivals: join.arrivals.map(trimArrival) };
   }
+  // A held launch can carry the same reviewed handoff + comments (R6/R17: a
+  // Return's forced edge/feedback and an Accept's comment survive a hold), so
+  // it must be trimmed with everything else or the 2s poll ships them for
+  // every blocked parent. The rule id/booleans stay: they are tiny and the
+  // board's block banner does not read them, but keeping the shape exact
+  // costs nothing. Retry reads the single-run routes (untrimmed).
+  const trimPending = (p: PipelinePendingLaunch): PipelinePendingLaunch => ({
+    stepId: p.stepId,
+    arrivals: p.arrivals.map(trimArrival),
+    ...(p.returnToStepId !== undefined ? { returnToStepId: p.returnToStepId } : {}),
+    ...(p.returned === true ? { returned: true } : {}),
+  });
   return {
     ...run,
     snapshot: run.snapshot ? { ...run.snapshot, profiles: {} } : null,
-    history: run.history.map((h) => ({ ...h, handoff: null })),
+    history: run.history.map((h) => ({
+      ...h,
+      handoff: null,
+      ...(h.human ? { human: { ...h.human, comment: null } } : {}),
+    })),
     joins,
+    blocked: run.blocked.map((b) => (b.pending ? { ...b, pending: trimPending(b.pending) } : b)),
     humanSteps: (run.humanSteps ?? []).map((g) => ({
       ...g,
-      arrivals: g.arrivals.map((a) => ({ ...a, handoff: null })),
+      arrivals: g.arrivals.map(trimArrival),
     })),
   };
 }

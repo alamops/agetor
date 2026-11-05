@@ -59,7 +59,10 @@ test("pause + accept: card Review/no Done, panel contents, Accept carries the co
 
   const card = page.locator(`[data-task-id="${task.id}"]`);
   await expect(card).toBeVisible();
+  await expect(card.getByRole("button", { name: "Open" })).toBeVisible();
   await expect(card.getByTestId("task-card-pipeline-review")).toBeVisible();
+  await expect(card.getByTestId("task-card-pipeline-stop")).toHaveCount(1);
+  await expect(card.locator('button[title="Stop"]')).toHaveCount(1);
   await expect(card.getByRole("button", { name: "Done" })).toHaveCount(0);
 
   await card.getByTestId("task-card-pipeline-review").click();
@@ -123,7 +126,7 @@ test("stop at a gate: card moves to Ready, the gate section is gone, history kep
   await startTaskRest(backend, task.id);
   await gateRow(backend, task.id);
 
-  await page.locator(`[data-task-id="${task.id}"]`).locator('button[title="Stop"]').click();
+  await page.locator(`[data-task-id="${task.id}"]`).getByTestId("task-card-pipeline-stop").click();
   const dialog = page.getByRole("dialog").last();
   await dialog.getByRole("button", { name: "Stop" }).click();
 
@@ -132,6 +135,99 @@ test("stop at a gate: card moves to Ready, the gate section is gone, history kep
   const gates = (stopped.pipelineRun as unknown as { humanSteps?: unknown[] }).humanSteps ?? [];
   expect(gates).toHaveLength(0);
   expect(stopped.pipelineRun?.history.length).toBeGreaterThanOrEqual(2);
+});
+
+test("multi-gate: each Open review opens its own gate's panel", async ({ page, freshBackend: backend }) => {
+  const profileId = await createProfileRest(backend, `human-${randomUUID().slice(0, 6)}`);
+  const S = {
+    ...makeStep({ id: randomUUID(), name: "S", agentProfileId: profileId, instructions: `Do S. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` }),
+    transition: "all" as const,
+  };
+  const B = makeStep({ id: randomUUID(), name: "B", agentProfileId: profileId, instructions: `Do B. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const C = makeStep({ id: randomUUID(), name: "C", agentProfileId: profileId, instructions: `Do C. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const H1 = makeStep({ id: randomUUID(), name: "H1", agentProfileId: null, type: H, instructions: "check gate one" });
+  const H2 = makeStep({ id: randomUUID(), name: "H2", agentProfileId: null, type: H, instructions: "check gate two" });
+  const pipelineId = await createPipelineRest(backend, `human-multi-${randomUUID().slice(0, 6)}`, [S, B, C, H1, H2], [
+    { from: S.id, to: B.id },
+    { from: S.id, to: C.id },
+    { from: B.id, to: H1.id },
+    { from: C.id, to: H2.id },
+  ]);
+  const task = await createPipelineTaskRest(backend, `Human multi ${randomUUID().slice(0, 6)}`, pipelineId, "goal");
+
+  await gotoApp(page, backend.bootBase);
+  await startTaskRest(backend, task.id);
+  const gated = await waitForPipelineRest(backend, task.id, (t) => {
+    const gates = (t.pipelineRun as unknown as { humanSteps?: unknown[] } | null)?.humanSteps ?? [];
+    return gates.length === 2;
+  });
+  const gates = (gated.pipelineRun as unknown as { humanSteps: { stepId: string; seq: number }[] }).humanSteps;
+  const second = [...gates].sort((a, b) => a.seq - b.seq)[1]!;
+  const secondIndex = gates.findIndex((g) => g.stepId === second.stepId);
+
+  // R-S2 webview half: the second gate's event carries every pending seq, so
+  // the one per-task alert names the count. Without that, the second gate is
+  // marked announced and never gets a cue of its own (the task notifier keeps
+  // one entry per task, so a second banner would replace the first).
+  const toaster = page.locator("[data-sonner-toaster]");
+  const multiGateToast = toaster
+    .locator("[data-sonner-toast]")
+    .filter({ hasText: "Pipeline needs your review (2 gates)" });
+  await expect(multiGateToast).toBeVisible({ timeout: 15_000 });
+
+  // The alert's Open lands on the announced gate's panel, not merely the
+  // board or the run view with no gate focused (C6). Which of the two gates
+  // the event announced is timing-dependent; either is a gate-focused panel.
+  const card = page.locator(`[data-task-id="${task.id}"]`);
+  await expect(card.getByTestId("task-card-pipeline-review")).toBeVisible();
+  await multiGateToast.getByRole("button", { name: "Open" }).click();
+  await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+  const toastFocusedPanel = page.getByTestId("pipeline-human-panel");
+  await expect(toastFocusedPanel).toBeVisible();
+  const gateSeqs = gates.map((g) => String(g.seq));
+  await expect(toastFocusedPanel).toHaveAttribute("data-gate-seq", new RegExp(`^(${gateSeqs.join("|")})$`));
+  await toastFocusedPanel.getByTitle("Close").click();
+  await expect(toastFocusedPanel).toBeHidden();
+  await page.getByTestId("pipeline-run-back").click();
+  await expect(page.getByTestId("pipeline-run-view")).toHaveCount(0);
+
+  await card.click();
+  await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+  const section = page.getByTestId("pipeline-run-human-review");
+  await expect(section).toBeVisible();
+  const opens = section.getByTestId("pipeline-run-open-review");
+  await expect(opens).toHaveCount(2);
+
+  // Opening the SECOND gate must show the second gate's own panel (N1).
+  await opens.nth(secondIndex).click();
+  const panel = page.getByTestId("pipeline-human-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel).toHaveAttribute("data-gate-seq", String(second.seq));
+  await expect(panel.getByTestId("pipeline-human-check")).toContainText(
+    second.stepId === H1.id ? "check gate one" : "check gate two",
+  );
+
+  // Closing a non-primary gate and reopening it must keep the half-typed
+  // comment: the panel stays mounted on THAT gate while closed, instead of
+  // snapping back to the primary gate and remounting a fresh draft (R-N1).
+  await panel.getByTestId("pipeline-human-comment").fill("draft for the second gate");
+  await panel.getByTitle("Close").click();
+  await expect(panel).toBeHidden();
+  await opens.nth(secondIndex).click();
+  await expect(page.getByTestId("pipeline-human-panel").getByTestId("pipeline-human-comment"))
+    .toHaveValue("draft for the second gate");
+  await expect(page.getByTestId("pipeline-human-panel")).toHaveAttribute("data-gate-seq", String(second.seq));
+
+  // Switching to the other gate remounts on its own key, so the draft belongs
+  // to the gate it was typed on and the new gate starts blank (T9 P4).
+  const reopenedPanel = page.getByTestId("pipeline-human-panel");
+  await reopenedPanel.getByTitle("Close").click();
+  await expect(reopenedPanel).toBeHidden();
+  const otherIndex = secondIndex === 0 ? 1 : 0;
+  await opens.nth(otherIndex).click();
+  const switched = page.getByTestId("pipeline-human-panel");
+  await expect(switched).toHaveAttribute("data-gate-seq", String(gates[otherIndex]!.seq));
+  await expect(switched.getByTestId("pipeline-human-comment")).toHaveValue("");
 });
 
 test("context menu: Review pipeline present, Mark done absent while a gate is pending", async ({ page, freshBackend: backend }) => {

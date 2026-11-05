@@ -1117,7 +1117,22 @@ test("GET /tasks ships a trimmed pipelineRun (no handoffs, no profile snapshots)
     status: "blocked",
     active: [{ stepId, taskId: "step-task-1", seq: 1 }],
     joins: { [stepId]: { arrivals: [{ fromStepId: stepId, seq: 1, handoff }] } },
-    blocked: [{ taskId: "step-task-1", stepId, kind: "handoff-invalid", message: "bad" }],
+    blocked: [
+      { taskId: "step-task-1", stepId, kind: "handoff-invalid", message: "bad" },
+      {
+        taskId: null,
+        stepId,
+        kind: "step-cap",
+        message: "cap",
+        pending: {
+          stepId,
+          arrivals: [{ fromStepId: stepId, seq: 1, handoff, comment: "owner accept note" }],
+          returnToStepId: stepId,
+          returned: true,
+          humanFeedback: "return note",
+        },
+      },
+    ],
     history: [
       { seq: 1, stepId, taskId: "step-task-1", startedAt: 1, endedAt: 2, outcome: "succeeded", handoff, nextStepIds: [] },
     ],
@@ -1139,14 +1154,27 @@ test("GET /tasks ships a trimmed pipelineRun (no handoffs, no profile snapshots)
   expect(trimmed.snapshot!.graph).toEqual(pipeline.graph);
   expect(trimmed.status).toBe("blocked");
   expect(trimmed.active).toEqual([{ stepId, taskId: "step-task-1", seq: 1 }]);
-  expect(trimmed.blocked).toHaveLength(1);
+  expect(trimmed.blocked).toHaveLength(2);
   expect(trimmed.history[0]!.outcome).toBe("succeeded");
   expect(trimmed.stepCount).toBe(1);
+  // A held launch carries the reviewed handoff, an Accept comment and the
+  // Return feedback, so it is trimmed like every other polled payload (R-S1):
+  // identity and the tiny Return flags stay, the owner/agent text does not.
+  const held = trimmed.blocked[1]!.pending!;
+  expect(held.stepId).toBe(stepId);
+  expect(held.returnToStepId).toBe(stepId);
+  expect(held.returned).toBe(true);
+  expect(held.arrivals[0]).toEqual({ fromStepId: stepId, seq: 1, handoff: null, comment: null });
+  expect(held.humanFeedback).toBeUndefined();
 
   const single = (await (await call(`/tasks/${parent.id}`)).json()) as Task;
   expect(single.pipelineRun!.history[0]!.handoff).toEqual(handoff);
   expect(single.pipelineRun!.joins[stepId]!.arrivals[0]!.handoff).toEqual(handoff);
   expect(single.pipelineRun!.snapshot!.profiles).toEqual(snapshotProfiles);
+  // The single-run route still ships the whole held launch for Retry.
+  expect(single.pipelineRun!.blocked[1]!.pending!.arrivals[0]!.handoff).toEqual(handoff);
+  expect(single.pipelineRun!.blocked[1]!.pending!.arrivals[0]!.comment).toBe("owner accept note");
+  expect(single.pipelineRun!.blocked[1]!.pending!.humanFeedback).toBe("return note");
 
   const viaPipeline = (await (await call(`/tasks/${parent.id}/pipeline`)).json()) as { task: Task };
   expect(viaPipeline.task.pipelineRun!.history[0]!.handoff).toEqual(handoff);

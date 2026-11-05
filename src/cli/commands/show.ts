@@ -82,6 +82,19 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     for (const b of task.pipelineRun.blocked) {
       out(c.yellow(`    ⚠ ${escapeFreeText(b.message)}`));
     }
+    // Pending human gates (same shape `pipeline status` prints) — the run is
+    // parked in Review until one is decided.
+    const gates = task.pipelineRun.humanSteps ?? [];
+    if (gates.length > 0) {
+      const graph = task.pipelineRun.snapshot?.graph ?? null;
+      const nameOf = (id: string) => escapeControlChars(graph ? stepNameById(graph, id) : id);
+      out(c.cyan(`    ◆ ${gates.length} pending human review${gates.length === 1 ? "" : "s"}:`));
+      for (const g of gates) {
+        const from = g.arrivals.map((a) => nameOf(a.fromStepId)).join(", ") || "(manual)";
+        out(`      ${nameOf(g.stepId)}  ${c.dim(`seq ${g.seq}`)}  ${c.dim(`from ${from}`)}`);
+      }
+      out(c.dim(`      decide with: agetor pipeline review ${task.id.slice(0, 8)}`));
+    }
   }
   if (task.pipelineParentId) {
     const stepOf = await pipelineStepOfText(client, task);

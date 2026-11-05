@@ -681,6 +681,23 @@ export interface PipelineHumanStep {
   arrivals: PipelineJoinArrival[];
 }
 
+/** The exact launch a run-level {@link PipelineBlock} is waiting to retry —
+ *  everything `launchStep` needs to re-materialize the same execution,
+ *  including a human Return's forced edge and trusted feedback. Persisted so
+ *  a Retry after a hold cannot silently drop the decision (R6/R17). */
+export interface PipelinePendingLaunch {
+  stepId: string;
+  arrivals: PipelineJoinArrival[];
+  /** Return only: the gate the re-run is forced back to even when its own
+   *  handoff names a different step (the fresh Return's `returnToStepId`). */
+  returnToStepId?: string;
+  /** Return only: render the returned-execution copy in the prompt. */
+  returned?: boolean;
+  /** Return only: the owner's comment, rendered as trusted
+   *  `## Human review feedback`. */
+  humanFeedback?: string | null;
+}
+
 /** A single blocked pipeline execution (or a run-level block whose
  *  `taskId`/`stepId` are null) awaiting either a fix (e.g. re-sending the
  *  step so it emits a valid handoff) or a manual advance. */
@@ -696,8 +713,9 @@ export interface PipelineBlock {
    *  launch instead of re-deriving it. `stepId` on the block itself is
    *  always set for these blocks (the step the pending launch targets, same
    *  value as `pending.stepId` here); `arrivals` is the join state (if any)
-   *  it would launch with. */
-  pending?: { stepId: string; arrivals: PipelineJoinArrival[] };
+   *  it would launch with, and the Return fields preserve a human decision
+   *  across the hold. */
+  pending?: PipelinePendingLaunch;
 }
 
 /**
@@ -878,7 +896,11 @@ export interface PipelineRunState {
    *  its history `seq` from here so human and agent entries never collide.
    *  Absent on an old row (derived from the highest known `seq`). */
   seqCounter?: number;
-  /** Total executions started this run — what `maxSteps` caps. */
+  /** Total agent executions started this run — what `maxSteps` caps. A human
+   *  gate never increments it. A resumed Return re-arms an existing step task
+   *  as a new run row + history record but deliberately does NOT increment
+   *  this, so a Return→Resume loop is not bounded by `maxSteps`; a fresh
+   *  Return does increment it (it launches a new execution). */
   stepCount: number;
   startedAt: number | null;
   endedAt: number | null;
@@ -1704,8 +1726,10 @@ export interface Task {
    * a task that isn't a pipeline task (`pipelineId` null).
    *
    * **`GET /tasks` (the board's 2s poll) ships a TRIMMED variant** of this
-   * state: every `history[].handoff` and `joins[].arrivals[].handoff` is
-   * `null` and `snapshot.profiles` is `{}` — the board/TUI/`agetor ls` only
+   * state: every `history[].handoff`, `joins[].arrivals[].handoff`,
+   * `humanSteps[].arrivals[].handoff` and `blocked[].pending` (a held
+   * launch's arrivals + `humanFeedback`) has its handoff/comment nulled and
+   * `snapshot.profiles` is `{}` — the board/TUI/`agetor ls` only
    * need `snapshot.graph`, `status`, `active`, `blocked`, the history
    * outcomes and `stepCount` (step progress, blocked banner, history
    * length), and shipping every persisted handoff for every pipeline task

@@ -323,27 +323,43 @@ records the decision in one critical section, so `stepId`+`seq` is idempotent
 (a second submit 409s). Body: `{stepId, seq, decision:"accept"|"return",
 comment?, nextStepIds?, mode?}`; 400 for a bad body / blank Return comment /
 over-cap comment / bad next target / `mode` on Accept / `nextStepIds` on
-Return; 409 for not-a-pipeline, never-run, archived, no pending gate, stale
-seq, already decided, resume unavailable, or launches frozen.
+Return / `nextStepIds` on a single-edge or `all` gate; 409 for not-a-pipeline,
+never-run, archived, no pending gate, stale seq, already decided, resume
+unavailable, or launches frozen.
 
 - **Accept** reuses the gate's `transition`: 0 outgoing finishes the run;
   `all` launches every outgoing; `choose` with one launches it; `choose` with
   several requires `nextStepIds` naming outgoing targets. The comment is
   optional and rides the launch as `PipelineJoinArrival.comment` (through
   joins and pending-launch holds, so a Retry after a step-cap/launch failure
-  keeps it).
+  keeps it; `PipelineBlock.pending` persists a Return's `returnToStepId`/
+  `returned`/`humanFeedback` too, so a held Return re-applies its forced edge
+  on Retry instead of resolving through the graph).
 - **Return** targets the gate's sole incoming source (or the step a manual
   Advance entered from). The comment is required, trimmed, capped at
   `PIPELINE_LIMITS.handoffField` (8,000), control characters other than
   `\n`/`\t` refused, `\r\n` normalized. `mode` is `"fresh"` (default; a new
   task/session/seq via `launchStep`) or `"resume"` (a `sendInput` turn on the
   previous step's existing task, re-armed as a new execution under the lock
-  first; a refused send rolls the re-arm back and 409s, leaving the gate).
+  first; the send itself runs OUTSIDE the lock — L-R7 — and the lock is
+  re-acquired afterward: a refused send rolls the re-arm back and 409s
+  (leaving the gate), and a Stop that raced the send cancels the turn it just
+  started rather than reviving a cancelled run). While that send is in flight
+  the re-armed execution counts as a pending runner decision even though no
+  run of it is live yet, so the card's Stop still wins instead of 409ing
+  "pipeline is not running"; the stop marks the execution cancelled and the
+  post-send confirm cancels the turn the send just started. That turn is never
+  read as the user resuming a stopped step: while the send is in flight the
+  runner owns it, and the confirm records its run as the one the Stop applied
+  to, so a late `running` event cannot revive the run. A second gate naming the
+  same source step is refused while its resume send is in flight (409), so two
+  sends can never race at one task.
   Either path records `returnToStepId` on the new execution, and
   `settleStepRun` resolves that edge unconditionally — the handoff's `next`
   and the graph's transition are ignored, and a missing/invalid handoff still
   returns to the gate (with a `null` handoff). See
-  `docs/plans/pipeline-human-step-resume-spike.md` for the resume proof.
+  `docs/plans/pipeline-human-step-resume-spike.md` for the resume proof (fake
+  claude and fake codex).
 
 **Stop / Restart / reconcile.** `cancelPipelineRun` accepts a gate-only run:
 it records `stopRequestedAt`, dismisses every gate (`cancelled` history
@@ -355,16 +371,23 @@ plain Run on a `review` run refuses ("accept or return it first"); Restart
 
 **Archived parents.** A gate reached while the parent is archived is recorded
 on the run (no column write, no event); the review route refuses the archived
-parent with 409, and the gate is reviewable after unarchive.
+parent with 409, and the gate is reviewable after unarchive. Because `persist`
+skips the column mirror while archived, `unarchiveTask` forces the card back to
+Review when a gate is still pending (other statuses keep the column the owner
+parked, e.g. a finished run left in Done).
 
 **Surfaces.** The run view's `HumanStepPanel` (opened from the human node, the
 run-view "Human review" section, the card's Review button, or the review
 toast) shows the goal, the gate's "What to check", the last handoff, run
 history with transcript links, prior rounds and a worktree diff. The board
-card stays in Review, offers **Review** (no **Done**), and its Stop confirms.
+card stays in Review and offers **Open** + a primary **Review** button, no
+**Done**, and a single secondary danger **Stop** (never two Stop buttons).
 The context menu offers **Review pipeline** and no **Mark done**. The CLI has
 `agetor pipeline review <ref> --accept|--return` (`--comment`, `--next`,
-`--step`, `--mode`), and `status`/`show` print pending gates and `(human)` for
-a null task id. A `pipeline` GlobalEvent carries `humanStepSeqs` and
+`--step`, `--mode`), `status`/`show` print pending gates and `(human)` for
+a null task id, and `ls` flags a parent row with `pipeline review · N gates`.
+A `pipeline` GlobalEvent carries `humanStepSeqs` and
 `runStartedAt`; the webview and headless notifier each raise one "Pipeline
-needs your review" alert per `(runStartedAt, gate.seq)`.
+needs your review" alert per event that first announces a gate (both keep one
+notification per task, so an event opening several gates names the count
+instead of silently announcing only the first).

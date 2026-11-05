@@ -8,7 +8,8 @@
  * when the step's own handoff names a different next step.
  *
  * It runs the real runner path (`reviewHumanStep` with `mode: "resume"`) over
- * the fake claude driver, so it is the same code the route/CLI call.
+ * the fake claude driver (persistent session) AND the fake codex driver (the
+ * one-shot case), so it is the same code the route/CLI call in both modes.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
@@ -22,9 +23,12 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_CLAUDE_ARGS = "";
+process.env.AGETOR_CODEX_DRIVER = "fake";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
 beforeAll(async () => {
+  const { harnesses } = await import("./db.ts");
+  harnesses.setEnabled("codex", true);
   const { initPipelineRunner } = await import("./pipeline-runner.ts");
   initPipelineRunner();
 });
@@ -51,16 +55,21 @@ async function waitFor<T>(fn: () => T | null | undefined, timeoutMs = 5000, inte
   }
 }
 
-test("resume: a settled execution is re-armed on the same task, settles into a new record, and is forced back to its gate", async () => {
-  const { agentProfiles, pipelines, tasks } = await import("./db.ts");
+/**
+ * One harness's T0 proof. `codex` is the one-shot case: every turn is a fresh
+ * process spawned on the same task, while `claude-code` is the persistent
+ * session. Both go through `sendInput`'s own per-kind dispatch.
+ */
+async function proveResume(harness: "claude-code" | "codex"): Promise<void> {
+  const { agentProfiles, pipelines, tasks, runs } = await import("./db.ts");
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { newStep } = await import("../shared/pipeline.ts");
   const { reviewHumanStep } = await import("./pipeline-runner.ts");
   const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
 
   const profile = agentProfiles.insert({
-    name: `spike-${randomUUID()}`,
-    harness: "claude-code",
+    name: `spike-${harness}-${randomUUID()}`,
+    harness,
     model: "fake-model",
     effort: null,
     mode: null,
@@ -79,7 +88,7 @@ test("resume: a settled execution is re-armed on the same task, settles into a n
   const H = newStep({ name: "H", type: "human" });
   const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `Do B. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
   const pipeline = pipelines.insert({
-    name: `spike-${randomUUID()}`,
+    name: `spike-${harness}-${randomUUID()}`,
     graph: {
       steps: [A, H, B],
       edges: [
@@ -92,7 +101,7 @@ test("resume: a settled execution is re-armed on the same task, settles into a n
   });
 
   const created = await createTask({
-    title: "resume spike",
+    title: `resume spike ${harness}`,
     prompt: "goal",
     workdir: mkdtempSync(path.join(tmpdir(), "agetor-human-resume-wd-")),
     isolation: "none",
@@ -112,7 +121,7 @@ test("resume: a settled execution is re-armed on the same task, settles into a n
     const aTaskId = aRecord.taskId!;
     const taskRowsBefore = tasks.stepsForParent(parentId).length;
     const stepCountBefore = runBefore.stepCount;
-    const runIdsBefore = (await import("./db.ts")).runs.listForTask(aTaskId).map((r) => r.id);
+    const runIdsBefore = runs.listForTask(aTaskId).map((r) => r.id);
 
     // The production resume seam.
     const res = await reviewHumanStep(parentId, {
@@ -135,7 +144,7 @@ test("resume: a settled execution is re-armed on the same task, settles into a n
     expect(tasks.stepsForParent(parentId).length).toBe(taskRowsBefore);
     expect(tasks.stepsForParent(parentId).filter((s) => s.pipelineStepId === A.id)).toHaveLength(1);
     // A new run row on the same task.
-    const runIdsAfter = (await import("./db.ts")).runs.listForTask(aTaskId).map((r) => r.id);
+    const runIdsAfter = runs.listForTask(aTaskId).map((r) => r.id);
     expect(runIdsAfter.length).toBe(runIdsBefore.length + 1);
     // A new history record, settled, forced back to the gate.
     const returned = run.history.filter((h) => h.stepId === A.id && h.taskId === aTaskId);
@@ -153,4 +162,12 @@ test("resume: a settled execution is re-armed on the same task, settles into a n
     const { deleteTask } = await import("./orchestrator.ts");
     await deleteTask(parentId).catch(() => {});
   }
+}
+
+test("resume (persistent session): a settled execution is re-armed on the same task, settles into a new record, and is forced back to its gate", async () => {
+  await proveResume("claude-code");
+});
+
+test("resume (one-shot harness): the same re-arm/forced-edge seam works on the fake codex driver", async () => {
+  await proveResume("codex");
 });

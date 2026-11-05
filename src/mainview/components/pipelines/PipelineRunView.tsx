@@ -304,7 +304,12 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const [detailsNodeId, setDetailsNodeId] = useState<string | null>(null);
   // The human review panel: never auto-opens on arrival — only a node/section
   // click, the card's Review action, or `focusGateStepId` opens it.
-  const [humanPanelOpen, setHumanPanelOpen] = useState(false);
+  const [humanPanelGateKey, setHumanPanelGateKey] = useState<string | null>(null);
+  // The gate the panel last bound to, kept while it is closed: a half-typed
+  // comment lives in the mounted panel, so closing gate #2 and snapping back
+  // to the primary gate would remount it and lose the draft (R-N1). A
+  // remembered gate that is no longer pending falls back to the primary.
+  const lastPanelGateKeyRef = useRef<string | null>(null);
   // Subagents observed on each step task (`GET /tasks/:id/subagents`), keyed
   // by step TASK id. Refreshed for every currently-active execution on each
   // poll; entries for executions that have since settled are kept as last
@@ -464,6 +469,17 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const hasRun = run != null;
   const pendingGates = run?.humanSteps ?? [];
   const primaryGate = pendingGates[0] ?? null;
+  const gateKey = (g: NonNullable<typeof primaryGate>) => `${g.stepId}:${g.seq}`;
+  // The panel stays mounted on the gate it was last opened on while closed
+  // (so a half-typed comment survives closing), and switches to whichever
+  // gate the user newly opens. Binding every "Open review" to one shared
+  // boolean showed gate #1's panel for gate #2 with two gates pending (N1).
+  if (humanPanelGateKey !== null) lastPanelGateKeyRef.current = humanPanelGateKey;
+  const boundGateKey = humanPanelGateKey ?? lastPanelGateKeyRef.current;
+  const openGate = boundGateKey
+    ? (pendingGates.find((g) => gateKey(g) === boundGateKey) ?? null)
+    : null;
+  const panelGate = openGate ?? primaryGate;
 
   // `focusGateStepId` (the board card's Review action, the review toast):
   // open the panel once per request. A ref keeps it one-shot — otherwise the
@@ -476,9 +492,10 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       return;
     }
     if (focusHandledRef.current === focusGateStepId) return;
-    if (!(run?.humanSteps ?? []).some((g) => g.stepId === focusGateStepId)) return;
+    const focused = (run?.humanSteps ?? []).find((g) => g.stepId === focusGateStepId);
+    if (!focused) return;
     focusHandledRef.current = focusGateStepId;
-    setHumanPanelOpen(true);
+    setHumanPanelGateKey(`${focused.stepId}:${focused.seq}`);
   }, [focusGateStepId, run?.humanSteps]);
 
   // Before the first Run, `run.snapshot` is null — fall back to the live
@@ -730,8 +747,9 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       }
       if (node.data.step.type === "human") {
         setNotStartedStepName(null);
-        if ((run?.humanSteps ?? []).some((g) => g.stepId === node.id)) {
-          setHumanPanelOpen(true);
+        const gate = (run?.humanSteps ?? []).find((g) => g.stepId === node.id);
+        if (gate) {
+          setHumanPanelGateKey(`${gate.stepId}:${gate.seq}`);
         } else {
           setNotStartedStepName(node.data.step.name);
         }
@@ -779,7 +797,9 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const handleStop = useCallback(async () => {
     const ok = await confirm({
       title: "Stop this run?",
-      description: "Live steps will be cancelled and the pending review dismissed. History is kept.",
+      description: pendingGates.length > 0
+        ? "Live steps will be cancelled and the pending review dismissed. History is kept."
+        : "Live steps will be cancelled. History is kept.",
       confirmLabel: "Stop",
       variant: "destructive",
     });
@@ -794,7 +814,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     } finally {
       setActionBusy(false);
     }
-  }, [taskId, load, confirm]);
+  }, [taskId, load, confirm, pendingGates.length]);
 
   const handleRetry = useCallback(async (stepTaskId?: string) => {
     setActionBusy(true);
@@ -1119,7 +1139,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                           size="sm"
                           data-testid="pipeline-run-open-review"
                           className="h-7 text-xs"
-                          onClick={() => setHumanPanelOpen(true)}
+                          onClick={() => setHumanPanelGateKey(`${g.stepId}:${g.seq}`)}
                         >
                           Open review
                         </Button>
@@ -1264,17 +1284,17 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         </div>
       </div>
 
-      {primaryGate && effectiveGraph && (
+      {panelGate && effectiveGraph && (
         <HumanStepPanel
-          key={`human-gate:${primaryGate.stepId}:${primaryGate.seq}`}
+          key={`human-gate:${panelGate.stepId}:${panelGate.seq}`}
           task={task}
           run={run}
           graph={effectiveGraph}
-          gate={primaryGate}
+          gate={panelGate}
           steps={steps}
           homeDir={homeDir}
-          open={humanPanelOpen}
-          onClose={() => setHumanPanelOpen(false)}
+          open={humanPanelGateKey !== null && openGate !== null}
+          onClose={() => setHumanPanelGateKey(null)}
           onOpenTask={onOpenTask}
           onDecided={load}
         />

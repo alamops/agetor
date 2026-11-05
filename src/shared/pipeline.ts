@@ -1489,6 +1489,18 @@ export function newHumanGateSeqs(
   return unique.filter((s) => !seen.has(s));
 }
 
+/**
+ * The "…needs your review" line shared by the webview toast and the headless
+ * notifier. Both surfaces keep ONE alert per pipeline parent (the task notifier
+ * holds one entry per task), so a single event that opens several gates must
+ * name the count rather than silently announcing only the first — otherwise
+ * the later gates are marked announced and never alert at all. A lone gate
+ * keeps the original copy.
+ */
+export function humanReviewSubtitle(gateCount: number): string {
+  return gateCount > 1 ? `Pipeline needs your review (${gateCount} gates)` : "Pipeline needs your review";
+}
+
 /** Prefix {@link parseHandoff} puts on every JSON-parse-failure `error`
  *  string. Stripped by {@link formatReminderDetail}'s caller before the
  *  detail is re-quoted inline in {@link composeHandoffReminder}'s own

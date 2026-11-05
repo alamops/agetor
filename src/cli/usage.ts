@@ -297,18 +297,20 @@ export const USAGE: Record<string, string> = {
   original agent is unchanged.
   Edit the copy afterwards with 'agetor profile edit'.`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | review <task> (--accept | --return --comment <text>) [--comment <text>] [--next <step>…] [--step <step>] [--mode fresh|resume] | restart <task> | status <task>>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them
   around) — and control a pipeline TASK's run.
     ls / show / rm / export / import   take a pipeline <ref> (id, or its
                                         unique case-insensitive name)
-    retry / advance / restart / status take a pipeline TASK <ref> (id or
-                                        short-id prefix, like every other
-                                        task-targeting command; a hidden
-                                        step task's id is refused — target
-                                        its pipeline task instead)
+    retry / advance / review / restart / status take a pipeline TASK <ref>
+                                        (id or short-id prefix, like every
+                                        other task-targeting command; a
+                                        hidden step task's id is refused —
+                                        target its pipeline task instead)
+    review decides a pending human gate (accept, or return to the previous
+                                        step with a required comment).
   Launch a pipeline with 'agetor add --pipeline <id|name>'.`,
 
   "pipeline export": `usage: agetor pipeline export <ref> [--out <file|->] [--force]
@@ -347,14 +349,27 @@ export const USAGE: Record<string, string> = {
   specific blocked/awaiting execution when more than one is in play (e.g. a
   fan-out); omitted, the sole such execution is used.`,
 
+  "pipeline review": `usage: agetor pipeline review <task-id> (--accept | --return) [--comment <text>] [--next <step> …] [--step <step>] [--mode fresh|resume]
+
+  Decide the pipeline run's pending human review (a human step). --accept
+  continues through the gate's outgoing edges; its comment is optional and is
+  carried to the next step as trusted review feedback. --return re-runs the
+  gate's previous step and requires --comment explaining what to change;
+  --mode fresh (default) starts a new execution, resume re-arms the existing
+  step task. --next picks the target(s) for a gate with several outgoing
+  choices (required when the gate is 'choose' with more than one edge; not
+  valid on a single-edge or 'all' gate). --step names the gate when several
+  are pending. 'agetor pipeline status <task-id>' lists pending gates.`,
+
   "pipeline restart": `usage: agetor pipeline restart <task-id>
 
   Restart the pipeline run from its start step, discarding current progress.`,
 
   "pipeline status": `usage: agetor pipeline status <task-id>
 
-  Print the pipeline task's run status, blocked entries, active step
-  executions, and full step history.`,
+  Print the pipeline task's run status, blocked entries, pending human
+  reviews (gates), active step executions, and full step history. Decide a
+  pending gate with 'agetor pipeline review <task-id>'.`,
 
   daemon: `usage: agetor daemon <status | start | stop | background [status | off]>
 

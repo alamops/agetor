@@ -6,7 +6,7 @@
 | Source | `docs/specs/pipeline-human-step.md` (owner task text) + `docs/plans/pipeline-human-step-investigation.md` + `docs/plans/pipeline-human-step-grill.md` + `docs/plans/pipeline-human-step-grill/round-{1,2}/` |
 | Flags | none |
 | Gates | grilled + approved by owner: all 21 required round-1 questions answered, 4 overrides (`fanout`, `return-mechanics`, `pending-actions`, `bundle-compat`), 3 round-2 consequence answers. One unratified gate remains: the resume spike (`T0`) is a go/no-go — see §8. |
-| Status | implemented (waves 0–7, all targeted suites green; see §11) |
+| Status | implemented (waves 0–7; typecheck, full `bun test`, and the pipeline e2e specs green — see §11) |
 | Branch | `feature/agetor-pipeline-human-step` |
 | Base SHA | `e4cc58e5` |
 
@@ -49,7 +49,7 @@ The investigation (`docs/plans/pipeline-human-step-investigation.md`) is the ful
 - **Resolve / settle.** `advanceOnHandoff` removes the active entry, records `succeeded`, moves the step task to `done`, then resolves/joins/launches — `src/bun/pipeline-runner.ts:2757-2903`. `settleStepRun` is the single settle body and calls `resolveNextSteps` at `:3140`. `resolveNextSteps` is `src/shared/pipeline.ts:1068-1108`.
 - **Manual advance / retry / stop / restart / reconcile.** `advancePipeline` — `src/bun/pipeline-runner.ts:1752-1953`; `performPipelineRetry` / `retryPendingBlocks` — `:1356-1567`; `startPipelineRun` — `:1568-1734`; `cancelPipelineRun` — `:1993-2047`; `reconcilePipelineRuns` — `:3517-3544`. Every mutation is serialized by `runExclusive` — `:147-178`.
 - **Persistence.** `PIPELINE_RUN_STATUSES` — `src/bun/db.ts:503`; `STEP_RECORD_OUTCOMES` — `:577`; `sanitizeStepRecord` — `:632-666`; `parsePipelineRunState` — `:761-825`. The graph is JSON in `pipelines.graph` and the run is JSON in `tasks.pipeline_run`; **no SQL migration**.
-- **Server.** `trimPipelineRunForList` nulls history/join handoffs — `src/bun/server.ts:1107-1118`, applied at `:5406`. The pipeline column guard (only `done → done`) — `:5574-5581`. The advance route (body validation, `server.timeout(req, 0)`) — `:6007-6058`; retry/restart — `:6061-6120`. `GET /tasks/:id/pipeline` returns the full parent + step rows — `:5984-5999`.
+- **Server.** `trimPipelineRunForList` nulls history/join/gate/pending-launch handoffs and comments — `src/bun/server.ts:1110-1152`, applied at `:5439`. The pipeline column guard (only `done → done`) — `:5574-5581`. The advance route (body validation, `server.timeout(req, 0)`) — `:6007-6058`; retry/restart — `:6061-6120`. `GET /tasks/:id/pipeline` returns the full parent + step rows — `:5984-5999`.
 - **Route policy.** Every route needs an entry; pipeline control routes are `app+cli` — `src/bun/route-policy.ts:319-330`, `:372-376`.
 - **Card.** `TaskCard` renders Done for any `column === "review"` — `src/mainview/components/kanban/TaskCard.tsx:353-357`; Stop is gated on `pipelineRun.status === "running"` — `:92-97`; the context menu's Mark done — `src/mainview/lib/task-context-menu.ts:121-123`; `Column`'s memo comparator — `src/mainview/components/kanban/Column.tsx:105-121`.
 - **Run view.** Status maps / terminal / restartable — `src/mainview/components/pipelines/PipelineRunView.tsx:133-164`; `nodeVisualSignature` — `:532-545`; node click / "hasn't started" — `:694-709`; header buttons — `:860-950`; side panel blocked + `reviewActive` + history — `:1023-1184`; `HistoryRow` — `:1257-1405`.
@@ -99,7 +99,7 @@ POST /tasks/:id/pipeline/review
 
 `stepId` + `seq` identify the gate (idempotency); `nextStepIds` is Accept-only and must name outgoing targets; `mode` is Return-only and defaults to `fresh`.
 
-**Notifications.** One "Pipeline needs your review" toast/OS notification per `(run.startedAt, gate.seq)`; clicking opens the run view with the gate focused. "Pipeline finished" only on the transition to `done`.
+**Notifications.** A "Pipeline needs your review" toast/OS notification on the event that first announces a gate, deduped per run generation + gate seq; both surfaces keep one notification per task, so an event opening several gates names the count rather than replacing itself. Clicking opens the run view with the gate focused. "Pipeline finished" only on the transition to `done`.
 
 **Bundle.** Conditional v2: human-free → version 1, no `type` key, byte-identical; any human step → version 2 with `type: "human"` on that step only. The parser accepts 1 and 2, rejects `type:"human"` in a v1 file, and rejects version 3+ with the existing "update agetor" copy.
 
@@ -197,7 +197,7 @@ Every task owns the files it creates or edits, including its module's tests. No 
 | **T9** | Run view + the human panel modal + the webview review client. | `src/mainview/components/pipelines/PipelineRunView.tsx`, `src/mainview/components/pipelines/HumanStepPanel.tsx` (new), `src/mainview/lib/pipeline-scroll-memory.ts`, `src/mainview/lib/pipeline-scroll-memory.test.ts`, `src/mainview/lib/api.ts` | T1, T4, T5, T7 | See §4.1 T9 P1–P12. `api.reviewPipeline` posts the documented body with `retry:false`. | `state`, `tests` | `App` view `{kind:"pipeline-run"}` → `PipelineRunView` → `api.reviewPipeline` → the route |
 | **T10** | Board card, context menu, App wiring, badge, review toast/alert dedupe. | `src/mainview/App.tsx`, `src/mainview/components/kanban/TaskCard.tsx`, `src/mainview/components/kanban/Column.tsx`, `src/mainview/lib/task-context-menu.ts`, `src/mainview/lib/task-context-menu.test.ts`, `src/mainview/components/pipelines/PipelineBadge.tsx`, `src/mainview/lib/toasts.ts` | T1, T7 | See §4.1 T10 C1–C8. | `state`, `tests` | Board render + the `pipeline` GlobalEvent handler |
 | **T11** | CLI client + full CLI/TUI parity. | `src/cli/api-client.ts`, `src/cli/commands/pipeline.ts`, `src/cli/commands/pipeline.test.ts`, `src/cli/commands/show.ts`, `src/cli/commands/show.test.ts`, `src/cli/commands/ls.ts`, `src/cli/ls.test.ts`, `src/cli/tui/Dashboard.tsx` | T5 | `AgetorClient.reviewPipeline` posts the documented body with `START_TIMEOUT_MS`; `agetor pipeline review <ref> --accept\|--return` works; `--return` without a comment is a usage error before the network; `--next` resolves a step; `--step` selects among several pending gates; `--mode resume`; `--json`; `status` prints pending gates and `(human)` for a null taskId; `show` prints `human`; `show`/`ls`/TUI color `review`. | `tests` | CLI binary → `AgetorClient` → the route |
-| **T12** | Headless review notifications. | `src/bun/headless-notifications.ts`, `src/bun/headless-notifications.test.ts` | T1, T4 | One "Pipeline needs your review" notification per `(runStartedAt, gate.seq)`, including two gates on one run; a repeat persist sends nothing; `done` still sends "Pipeline finished" once; a stopped run sends nothing. | `state` | `persist` → GlobalEvent → the headless handler |
+| **T12** | Headless review notifications. | `src/bun/headless-notifications.ts`, `src/bun/headless-notifications.test.ts` | T1, T4 | One "Pipeline needs your review" notification per event that first announces a gate (deduped per run generation + seq), naming the pending-gate count when an event opens several; a repeat persist sends nothing; `done` still sends "Pipeline finished" once; a stopped run sends nothing; a review transition keeps a sibling's pending-question/owed bookkeeping. | `state` | `persist` → GlobalEvent → the headless handler |
 | **T13** | End-to-end human-step flow. | `e2e/pipelines-human-step.spec.ts` (new) | T1–T12 | See §5.3. | `tests` | Playwright against the real backend |
 | **T14** | Docs. | `docs/architecture/pipelines.md`, `docs/plans/pipelines.md`, `README.md`, `docs/architecture/bundle.md`, `docs/architecture/notifications.md`, `docs/architecture/task-context-menu.md` | T1–T13 | The subsystem docs describe the shipped behavior: `review` status, gate state, accept/return both modes, forced return, stop/restart, route, CLI, bundle v2, panel, notifications; `README` has the `pipeline review` row; `docs/plans/pipelines.md` gains D15. | `tests` | Docs only |
 | **T15** | Final verification + plan/PR refresh. | `docs/plans/pipeline-human-step.md` | T13, T14 | `bun run typecheck` clean; the targeted suites in §5.4 green; the e2e specs green; the PR body's claims match the code; this plan's `Status` updated; no TODO/placeholder left in owned files. | `tests` | Verification only — drives the production entry points end to end (board → run view → route → runner → settle), then refreshes the plan/PR. |
@@ -265,7 +265,7 @@ Every task owns the files it creates or edits, including its module's tests. No 
 3. **C3** The context menu shows **Review pipeline** and no **Mark done** while a gate is pending; no **Mark done** for any non-`done` pipeline parent.
 4. **C4** The card Stop is visible when `status === "running"` **or** a gate is pending; it confirms first (`confirm` from `@/components/ui/confirm`).
 5. **C5** Drag-to-Done still refuses a non-`done` pipeline with the existing toast.
-6. **C6** A `pipeline` event with `status:"review"` and a new gate seq fires exactly one "Pipeline needs your review" toast; a repeat persist fires none; a second gate seq fires one more; the toast's click opens the run view with the gate focused.
+6. **C6** A `pipeline` event with `status:"review"` that first announces a gate fires exactly one "Pipeline needs your review" toast; a repeat persist fires none; an event opening several gates fires one alert naming the count; the toast's click opens the run view with the gate focused.
 7. **C7** The review transition does not clear a sibling's pending-question toast or owed alert (review still "needs you"); a `running`/`done`/`cancelled` transition still clears them as today.
 8. **C8** `PipelineBadge` renders `review` as `bg-info/10 text-info` and its label shows the gate name.
 
@@ -324,10 +324,14 @@ Applies: yes — the feature has a user-visible flow crossing UI → API → SQL
 
 ```bash
 bun install --frozen-lockfile                 # once per worktree
-bunx playwright test e2e/pipelines-human-step.spec.ts
-bunx playwright test e2e/pipelines-editor.spec.ts
-bunx playwright test e2e/pipelines-run.spec.ts   # regression
+bun --bun x playwright test e2e/pipelines-human-step.spec.ts
+bun --bun x playwright test e2e/pipelines-editor.spec.ts
+bun --bun x playwright test e2e/pipelines-run.spec.ts   # regression
 ```
+
+- Use `bun --bun x` (or `bun --bun run`), never plain `bunx`/`npx`: the specs
+  import `bun:sqlite` through `e2e/fixtures.ts`, and the default Node ESM
+  loader refuses `bun:` URLs.
 
 - `playwright.config.ts` starts the Vite server and one headless Bun backend per worker; `freshBackend` gives each test an isolated `AGETOR_DATA_DIR`, port and token.
 - The fake Claude driver is wired by `e2e/fixtures.ts` (`AGETOR_CLAUDE_DRIVER=fake`); pipeline scenarios use `AGETOR_FAKE_CLAUDE_HANDOFF_PROMPT_MARKER` and a widened `AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS`.
@@ -346,7 +350,9 @@ bun test src/bun/pipelines.test.ts src/bun/pipeline-runner.test.ts src/bun/pipel
 bun test src/mainview/lib/pipelines.test.ts src/mainview/lib/task-context-menu.test.ts src/mainview/lib/pipeline-scroll-memory.test.ts
 bun test src/cli/commands/pipeline.test.ts src/cli/commands/show.test.ts src/cli/ls.test.ts
 bun test src/bun/headless-notifications.test.ts
-bunx playwright test e2e/pipelines-human-step.spec.ts e2e/pipelines-editor.spec.ts e2e/pipelines-run.spec.ts
+# `bun --bun x`, not plain `bunx`/`npx`: the specs import `bun:sqlite`, which
+# the default Node ESM loader refuses ("Received protocol 'bun:'").
+bun --bun x playwright test e2e/pipelines-human-step.spec.ts e2e/pipelines-editor.spec.ts e2e/pipelines-run.spec.ts
 ```
 
 ---
@@ -408,7 +414,7 @@ Wave 4 pairs **T5** (the route) with **T9** (the panel and its client). They sha
 
 - **Every `PipelineRunStatus` exhaustive map** (`pipeline-runner.ts:290`, `PipelineRunView.tsx:137/145`, `PipelineBadge.tsx:7`, `colorRunStatus` in the CLI) + `isTerminalRunStatus`, `hasLiveExecution`, `RESTARTABLE_STATUSES`, `cancelPipelineRun`, `reconcilePipelineRuns`, `reviewActive`, `pipelineStepProgress`, notifications.
 - **Every `PipelineStepRecord.taskId` reader** (`stepTaskFor`/`stepNodeTaskFor`, `stepAttention`, `pipelineAttentionStepTask`, `HistoryRow`, CLI `status`).
-- **The board poll** (`trimPipelineRunForList`) — human arrival handoffs must be nulled like history/joins or every 2s poll ships them.
+- **The board poll** (`trimPipelineRunForList`) — human arrival handoffs, join/pending-launch comments and a held launch (`blocked[].pending`, including `humanFeedback`) must be nulled like history/joins or every 2s poll ships them.
 - **`startPipelineRun`** — a plain Run on `review` must refuse, Restart must clear the gate.
 - **Create validation** — `createTask` and `buildSnapshot` must stop requiring an agent for human steps.
 - **Bundle** — v2 is a one-way compatibility door for old readers; v1 stays byte-identical.
@@ -432,11 +438,12 @@ None. All work is in this repo; the fake drivers are local test seams.
 4. **`type` handling.** Missing `type` = `"agent"`; `"agent"`/`"human"` accepted; any other value rejected. A v1 bundle containing `type:"human"` is rejected with "bundle version 2". Both are inferences from the conditional-v2 decision.
 5. **Human `join` is normalized to `"any"`.** Exactly one incoming makes join moot; normalizing avoids a second validation error for hand-edited graphs.
 6. **`seqCounter` and progress.** Human entries get a unique seq but do not consume `stepCount`; `pipelineStepProgress.completed` counts an accepted human record but not a returned one. `returned` is a loop decision, not work completed. The label can exceed `total` on cycles, as it already can today.
-7. **Multiple pending gates.** The card Review opens the oldest (`seq` ascending); the CLI requires `--step` when more than one is pending; the notification dedupe is per gate seq. The exact "oldest first" choice is a presentation detail.
+7. **Multiple pending gates.** The card Review opens the oldest (`seq` ascending); the CLI requires `--step` when more than one is pending; the notification dedupe is per run generation + gate seq, but both notifiers keep one entry per task, so an event that opens several gates raises one alert naming the count instead of a second banner that would replace the first. The exact "oldest first" choice is a presentation detail.
 8. **The panel mock was not supplied.** The layout follows the record's seven items and the existing run-view visual language (info-tinted, not amber); a later mock can refine it.
 9. **No human-step task row or transcript.** The human history record *is* the decision transcript; transcript links cover prior agent steps only.
 10. **Terminal Accept with a comment.** The comment is stored on the history record and shown in prior rounds; it is not sent anywhere because there is no next step.
-11. **Comment cap** is `PIPELINE_LIMITS.handoffField` (8,000). Control chars other than `\n`/`\t` are rejected; `\r\n` is normalized to `\n`.
+11. **One alert for several gates.** Both notifiers keep one notification entry per task, so an event that opens N gates raises a single alert naming N rather than N banners that replace each other. This is the bounded realization of the owner's "one notification per gate" answer; revisit if the notifier ever supports several entries per task.
+12. **Comment cap** is `PIPELINE_LIMITS.handoffField` (8,000). Control chars other than `\n`/`\t` are rejected; `\r\n` is normalized to `\n`.
 
 ---
 
@@ -489,17 +496,20 @@ None. All work is in this repo; the fake drivers are local test seams.
 The resume spike (T0) **passed** — see `docs/plans/pipeline-human-step-resume-spike.md`;
 `mode: "resume"` ships. All waves landed in one build.
 
-Verification at this commit:
+Verification at this commit (final test-loop run):
 
 ```
-bun run typecheck                                   ✅
-bun test src/shared/pipeline.test.ts ...           ✅ 1005 pass (15 files)
-bun test src/bun/pipeline-runner.test.ts \
-         src/bun/pipeline-human-step-resume-spike.test.ts  ✅ 123 pass
+bun run typecheck                                   ✅ clean
+bun test                                            ✅ 11,732 pass / 30 skip / 0 fail
+                                                       (11,762 tests, 458 files, ~17.7 min)
 bun --bun x playwright test e2e/pipelines-human-step.spec.ts \
          e2e/pipelines-editor.spec.ts e2e/pipelines-run.spec.ts
-                                                    ✅ 4 + 14 + 28 passed
+                                                    ✅ 5 + 14 + 28 = 47 passed
 ```
+
+The 30 skips are the suite's platform/conditional gates (`skipIf(!darwin)`
+on an Intel/darwin host, tmux-dependent cases when no tmux, the real-claude
+transcript fixture when absent) — none cover the human-step paths.
 
 Inferences recorded in §8 that shipped as planned: default Return mode
 `fresh`; Stop with a gate drops `run.blocked` so the card reaches Ready;

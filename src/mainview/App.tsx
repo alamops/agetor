@@ -47,7 +47,7 @@ import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortc
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { useAgentProfiles } from "@/lib/agent-profiles";
-import { newHumanGateSeqs } from "../shared/pipeline.ts";
+import { humanReviewSubtitle, newHumanGateSeqs } from "../shared/pipeline.ts";
 import { pipelineAttentionStepTask, usePipelines } from "@/lib/pipelines";
 import { discardBoardDeparture, recordBoardDeparture, restoreBoardScroll, saveBoardScroll } from "@/lib/board-scroll";
 import { PipelineEditor, PipelinesPage, PipelineRunView } from "@/components/pipelines";
@@ -1177,14 +1177,14 @@ function AppInner() {
     });
   }, [openPipelineAttention]);
 
-  /** The human-gate alert: one per (run generation, gate seq). Lands on the
-   *  run view with the gate focused. */
-  const raisePipelineReview = useCallback((parentId: string, gateSeq: number) => {
+  /** The human-gate alert: one per event that first announces a gate, naming
+   *  how many gates are pending. Lands on the run view with the gate focused. */
+  const raisePipelineReview = useCallback((parentId: string, gateSeq: number, pendingGates = 1) => {
     const parent = tasksRef.current.find((t) => t.id === parentId);
     toastPipelineReview({
       taskId: parentId,
       title: parent?.title || `Pipeline ${parentId.slice(0, 7)}`,
-      subtitle: "Pipeline needs your review",
+      subtitle: humanReviewSubtitle(pendingGates),
       isSelected:
         parentId === selectedIdRef.current
         || (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === parentId),
@@ -1432,7 +1432,8 @@ function AppInner() {
   // on an already-`done` run must not re-toast.
   const pipelineStatusRef = useRef(new Map<string, string>());
   // Last human gates announced per parent — the "needs your review" toast
-  // fires once per (run generation, gate seq), including two gates on one run.
+  // fires once per event that first announces a gate (deduped per run
+  // generation + gate seq), naming the pending count when several open at once.
   const pipelineGateRef = useRef(new Map<string, { runStartedAt: number | null; seqs: number[] }>());
   useEffect(() => {
     /** Refetch just one pipeline parent and merge the three fields the
@@ -1722,8 +1723,12 @@ function AppInner() {
           owedPipelineAlertsRef.current.forget(ev.taskId);
         }
         if (ev.status === "review") {
-          // One "needs your review" alert per (run generation, gate seq) —
-          // a repeat persist announces nothing, a new gate announces once.
+          // One "needs your review" alert per event that first announces a
+          // gate — a repeat persist announces nothing. Every fresh seq is
+          // marked announced together, so a single event that opens two gates
+          // must carry both in its copy: the task notifier holds one entry per
+          // task, and raising the second as a separate banner would replace
+          // the first (R-S2).
           const previous = pipelineGateRef.current.get(ev.taskId) ?? null;
           const fresh = newHumanGateSeqs(previous, ev.runStartedAt ?? null, ev.humanStepSeqs ?? []);
           if (fresh.length > 0) {
@@ -1737,7 +1742,7 @@ function AppInner() {
               if (oldest !== undefined) pipelineGateRef.current.delete(oldest);
             }
             const gateSeq = fresh[0]!;
-            raisePipelineReview(ev.taskId, gateSeq);
+            raisePipelineReview(ev.taskId, gateSeq, new Set(ev.humanStepSeqs ?? []).size || 1);
           }
         }
         // ONE "finished" toast + OS notification per run, on the transition
