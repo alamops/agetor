@@ -125,11 +125,24 @@ describe("toastPipelineReview", () => {
     expect(description(calls[1])).toBe("Fix the header · Pipeline needs your review (3 gates)");
   });
 
-  test("a selected task suppresses every cue", () => {
-    toastPipelineReview(args({ taskId: "pipeline-parent-3", isSelected: true }));
+  test("a selected run view suppresses the toast but still alerts an unfocused window", () => {
+    toastPipelineReview(args({ taskId: "pipeline-parent-3", isSelected: true, isFocused: false }));
 
     expect(calls).toHaveLength(0);
     expect(cleared).toEqual([]);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({
+      title: "Pipeline needs your review",
+      taskId: "pipeline-parent-3",
+      kind: "blocked",
+    });
+  });
+
+  test("a selected run view in a focused window suppresses the toast and clears the OS entry", () => {
+    toastPipelineReview(args({ taskId: "pipeline-parent-4", isSelected: true, isFocused: true }));
+
+    expect(calls).toHaveLength(0);
     expect(posted).toEqual([]);
+    expect(cleared).toEqual(["pipeline-parent-4"]);
   });
 });
