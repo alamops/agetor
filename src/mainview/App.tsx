@@ -218,6 +218,12 @@ type AppView =
       kind: "pipeline-run";
       taskId: string;
       gateStepId?: string;
+      /** The exact pending gate to focus (a run-wide unique history `seq`).
+       *  Preferred over `gateStepId` when present: the run view resolves it
+       *  against the run it has actually loaded, so a toast that fired before
+       *  the board polled the gate in still lands on the right one, and two
+       *  gates on one step are distinguishable. */
+      gateSeq?: number;
       /** Bumped on every request that names a gate, so asking for the SAME
        *  gate again while already on its run view is a new request: the run
        *  view keys its one-shot panel focus on this, not on `gateStepId`
@@ -508,12 +514,14 @@ function AppInner() {
    *  so the first return to the board can reveal it (`lib/board-scroll.ts`).
    *  Every other caller stays flag-less, which is what lets a non-card hop
    *  while away keep the original card's record (D8). */
-  const openPipelineRun = useCallback((taskId: string, opts?: { fromBoardCard?: boolean; gateStepId?: string }) => {
-    const gateFocusNonce = opts?.gateStepId ? ++gateFocusNonceRef.current : undefined;
+  const openPipelineRun = useCallback((taskId: string, opts?: { fromBoardCard?: boolean; gateStepId?: string; gateSeq?: number }) => {
+    const gateRequested = opts?.gateStepId != null || opts?.gateSeq != null;
+    const gateFocusNonce = gateRequested ? ++gateFocusNonceRef.current : undefined;
     navigate({
       kind: "pipeline-run",
       taskId,
       ...(opts?.gateStepId ? { gateStepId: opts.gateStepId } : {}),
+      ...(opts?.gateSeq != null ? { gateSeq: opts.gateSeq } : {}),
       ...(gateFocusNonce !== undefined ? { gateFocusNonce } : {}),
     }, () => {
       if (opts?.fromBoardCard) recordBoardDeparture(taskId);
@@ -522,11 +530,17 @@ function AppInner() {
     });
   }, [navigate]);
   /** Open a pipeline run's human review gate: the run view plus the human
-   *  panel focused on `gateStepId` (the card's Review button, the context
-   *  menu's "Review pipeline", the review toast). */
-  const openPipelineReview = useCallback((taskId: string, gateStepId?: string, opts?: { fromBoardCard?: boolean }) => {
+   *  panel focused on the requested gate (the card's Review button, the
+   *  context menu's "Review pipeline", the review toast). `gate.seq` is the
+   *  precise identity — the review toast passes only that, because it can
+   *  fire before the board's poll carries the gate, so resolving a `stepId`
+   *  from `tasksRef` there would miss it (or pick the wrong gate on a step
+   *  with more than one). `gate.stepId` remains for callers that hold the
+   *  gate's step but not its seq. */
+  const openPipelineReview = useCallback((taskId: string, gate?: { stepId?: string; seq?: number } | null, opts?: { fromBoardCard?: boolean }) => {
     openPipelineRun(taskId, {
-      ...(gateStepId ? { gateStepId } : {}),
+      ...(gate?.stepId ? { gateStepId: gate.stepId } : {}),
+      ...(gate?.seq != null ? { gateSeq: gate.seq } : {}),
       ...(opts?.fromBoardCard ? { fromBoardCard: true } : {}),
     });
   }, [openPipelineRun]);
@@ -631,7 +645,8 @@ function AppInner() {
    *  view plus the pending human gate, focused. Stable identity — passed to
    *  the memoized `Column`/`TaskCard`. */
   const reviewPipelineFromBoard = useCallback((t: Task) => {
-    openPipelineReview(t.id, t.pipelineRun?.humanSteps?.[0]?.stepId, { fromBoardCard: true });
+    const gate = t.pipelineRun?.humanSteps?.[0];
+    openPipelineReview(t.id, gate ? { stepId: gate.stepId, seq: gate.seq } : null, { fromBoardCard: true });
   }, [openPipelineReview]);
   /** The board's `.kanban-scroll` element while it is mounted (`null` while
    *  another page is shown), for the fast-return guard below. */
@@ -1209,9 +1224,10 @@ function AppInner() {
         || (viewRef.current.kind === "pipeline-run" && viewRef.current.taskId === parentId),
       isFocused: document.hasFocus(),
       onOpen: () => {
-        const live = tasksRef.current.find((t) => t.id === parentId);
-        const stepId = live?.pipelineRun?.humanSteps?.find((g) => g.seq === gateSeq)?.stepId ?? null;
-        openPipelineReview(parentId, stepId ?? undefined);
+        // Hand the gate's seq to the run view, which resolves it against the
+        // run it loads: `tasksRef` can lag the persist that opened the gate,
+        // so resolving a stepId from it here would land nowhere.
+        openPipelineReview(parentId, { seq: gateSeq });
         void api.focusWindow();
       },
     });
@@ -2851,6 +2867,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 <PipelineRunView
                   taskId={view.taskId}
                   focusGateStepId={view.gateStepId ?? null}
+                  focusGateSeq={view.gateSeq ?? null}
                   focusGateNonce={view.gateFocusNonce ?? null}
                   onMarkDone={markDone}
                   onOpenTask={(t, opts) => {

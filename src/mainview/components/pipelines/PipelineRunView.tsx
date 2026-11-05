@@ -206,6 +206,11 @@ interface PipelineRunViewProps {
   /** Open the human review panel for this gate step on mount/change — the
    *  board card's Review action and the review toast pass it. */
   focusGateStepId?: string | null;
+  /** The exact pending gate (`humanSteps[].seq`) to open, resolved against
+   *  the run this view loads. Takes precedence over `focusGateStepId`: a
+   *  request can arrive before the gate has been polled in, and two gates can
+   *  share a step id. */
+  focusGateSeq?: number | null;
   /** Bumped by the caller on every focus request. `focusGateStepId` alone
    *  can't distinguish "asked again for the same gate" from "already
    *  handled", so a second Review click after closing the panel would do
@@ -289,7 +294,7 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * re-render (and therefore `<StoreUpdater>`'s own `setEdges`/`setNodes`
  * sync) entirely when a poll turns up nothing new to paint.
  */
-export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone, homeDir = null, focusGateStepId = null, focusGateNonce = null }: PipelineRunViewProps) {
+export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone, homeDir = null, focusGateStepId = null, focusGateSeq = null, focusGateNonce = null }: PipelineRunViewProps) {
   const { resolved } = useTheme();
   const { profiles: liveProfiles, loaded: liveProfilesLoaded } = useAgentProfiles();
   const confirm = useConfirm();
@@ -486,25 +491,30 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     : null;
   const panelGate = openGate ?? primaryGate;
 
-  // `focusGateStepId` (the board card's Review action, the review toast):
-  // open the panel once per request. A ref keeps it one-shot — otherwise the
-  // 2s poll (which re-runs this effect) would reopen a panel the user just
-  // closed while the gate is still pending. The request is keyed by the
-  // caller's nonce as well as the step: pressing Review again for the same
-  // gate IS a new request and must reopen the panel.
+  // `focusGateStepId`/`focusGateSeq` (the board card's Review action, the
+  // review toast): open the panel once per request. A ref keeps it one-shot —
+  // otherwise the 2s poll (which re-runs this effect) would reopen a panel the
+  // user just closed while the gate is still pending. The request is keyed by
+  // the caller's nonce as well as the gate: pressing Review again for the same
+  // gate IS a new request and must reopen the panel. A request by `seq` is
+  // resolved against THIS run's loaded gates, so a toast that fired before the
+  // board polled the gate in still opens it once the run here has it.
   const focusHandledRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!focusGateStepId) {
+    if (focusGateSeq == null && !focusGateStepId) {
       focusHandledRef.current = null;
       return;
     }
-    const requestKey = `${focusGateStepId}:${focusGateNonce ?? 0}`;
+    const requestKey = `${focusGateSeq ?? ""}:${focusGateStepId ?? ""}:${focusGateNonce ?? 0}`;
     if (focusHandledRef.current === requestKey) return;
-    const focused = (run?.humanSteps ?? []).find((g) => g.stepId === focusGateStepId);
+    const gates = run?.humanSteps ?? [];
+    const focused = focusGateSeq != null
+      ? gates.find((g) => g.seq === focusGateSeq)
+      : gates.find((g) => g.stepId === focusGateStepId);
     if (!focused) return;
     focusHandledRef.current = requestKey;
     setHumanPanelGateKey(`${focused.stepId}:${focused.seq}`);
-  }, [focusGateStepId, focusGateNonce, run?.humanSteps]);
+  }, [focusGateStepId, focusGateSeq, focusGateNonce, run?.humanSteps]);
 
   // Before the first Run, `run.snapshot` is null — fall back to the live
   // pipeline's own graph so the canvas still has something to render.
