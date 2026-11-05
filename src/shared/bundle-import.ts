@@ -95,6 +95,8 @@ export interface PlannedAgent {
 export interface PlannedStep {
   id: string;
   name: string;
+  /** `"human"` for a human gate; absent/`"agent"` otherwise. */
+  type?: "agent" | "human";
   instructions: string;
   agentKey: string | null;
   agentName: string | null;
@@ -556,6 +558,7 @@ export function planBundleImport(
           steps.push({
             id: step.id,
             name: step.name,
+            type: step.type,
             instructions: step.instructions,
             agentKey: null,
             // A step stored without an Agent imports without one, whatever
@@ -580,6 +583,7 @@ export function planBundleImport(
         return {
           id: step.id,
           name: step.name,
+          type: step.type,
           instructions: step.instructions,
           agentKey: step.agentProfileId,
           agentName: agent?.name ?? null,
@@ -589,6 +593,8 @@ export function planBundleImport(
     }
 
     for (const step of steps) {
+      // A human gate legitimately has no Agent — never warn about it.
+      if (step.type === "human") continue;
       if (step.agentKey === null && step.legacy === null) {
         warnings.push(issue("step-without-agent", `${who}, step "${step.name}" has no Agent — assign one before running it`));
       }

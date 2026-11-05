@@ -743,6 +743,26 @@ export class AgetorClient {
       START_TIMEOUT_MS,
     );
   }
+  /** `POST /tasks/:id/pipeline/review` — decide a pending human gate:
+   *  `accept` continues through its outgoing edges (comment optional),
+   *  `return` re-runs the gate's sole incoming source (comment required;
+   *  `mode` fresh by default). `stepId` + `seq` identify the gate. 400 bad
+   *  body, 404 unknown parent, 409 wrong run state — all thrown. */
+  reviewPipeline(
+    taskId: string,
+    body: {
+      stepId: string;
+      seq: number;
+      decision: "accept" | "return";
+      comment?: string;
+      nextStepIds?: string[];
+      mode?: "fresh" | "resume";
+    },
+  ): Promise<Task> {
+    // `START_TIMEOUT_MS` like advance/retry: Accept/Return launches (or
+    // resumes) a step, refreshing the shared worktree first.
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/review`, body, START_TIMEOUT_MS);
+  }
   /** `POST /tasks/:id/pipeline/cancel` — stop every active step execution
    *  and return the pipeline task to `ready`. */
   cancelPipeline(taskId: string): Promise<Task> {

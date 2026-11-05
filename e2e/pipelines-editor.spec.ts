@@ -997,3 +997,49 @@ async function findAgentProfileIdByName(backend: E2EBackend, name: string): Prom
   expect(found, `no agent profile named "${name}"`).toBeTruthy();
   return found!.id;
 }
+
+test.describe("pipelines editor — human steps", () => {
+  test("add a human step, see its distinct node/panel, switch it back to an agent, save; Set as start is disabled", async ({
+    page,
+    backend,
+  }) => {
+    test.setTimeout(60_000);
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await gotoApp(page, backend.bootBase);
+    await pipelinesButton(page).click();
+    await page.getByTestId("pipelines-new").click();
+    const editor = page.getByTestId("pipeline-editor");
+    await expect(editor).toBeVisible();
+
+    await editor.getByTestId("pipeline-add-human-step").click();
+    await expect(editor.locator('[data-testid="pipeline-step-node"]')).toHaveCount(2);
+    const humanNode = editor.locator('[data-testid="pipeline-step-node"][data-human="true"]');
+    await expect(humanNode).toHaveCount(1);
+    await expect(humanNode.getByTestId("pipeline-step-human-badge")).toBeVisible();
+    await expect(humanNode.getByText("No agent")).toHaveCount(0);
+
+    // A human step needs exactly one incoming edge — connect the default
+    // agent step to it before saving.
+    const agentNode = editor.locator('[data-testid="pipeline-step-node"]:not([data-human="true"])').first();
+    const agentPanel = await openStepPanel(editor, agentNode);
+    await openConnectAndPick(agentPanel, "New step 2");
+    await page.keyboard.press("Escape");
+
+    await humanNode.click();
+    const panel = editor.getByTestId("pipeline-step-panel");
+    await expect(panel).toHaveCount(1);
+    await expect(panel.getByText("What to check")).toBeVisible();
+    await expect(panel.getByTestId("pipeline-step-subagents")).toHaveCount(0);
+    await expect(panel.getByTestId("pipeline-step-join")).toHaveCount(0);
+    await expect(panel.getByTestId("pipeline-step-set-start")).toBeDisabled();
+
+    await panel.getByTestId("pipeline-step-type-agent").click();
+    await expect(panel.getByTestId("pipeline-step-subagents")).toBeVisible();
+    await panel.getByTestId("pipeline-step-type-human").click();
+    await expect(panel.getByTestId("pipeline-step-subagents")).toHaveCount(0);
+
+    await editor.getByTestId("pipeline-name").fill(`Human editor ${randomUUID().slice(0, 6)}`);
+    await editor.getByTestId("pipeline-save").click();
+    await expect(page.getByTestId("pipelines-back")).toBeVisible();
+  });
+});

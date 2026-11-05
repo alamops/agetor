@@ -1,6 +1,6 @@
 import { memo } from "react";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Merge, MessageCircleQuestion, Play, Plus, RefreshCw, Split } from "lucide-react";
+import { Merge, MessageCircleQuestion, Play, Plus, RefreshCw, Split, UserCheck } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AWAITING_RING_CLASS } from "@/lib/awaiting";
 import type { StepAttention, StepVisualState } from "@/lib/pipelines";
@@ -35,6 +35,9 @@ export type StepNodeData = Record<string, unknown> & {
    *  carries `data-attention`; `visual`/`data-visual` keep describing the
    *  lifecycle state underneath. The editor never sets it. */
   attention?: StepAttention | null;
+  /** Run view only: a human gate at this step is pending — the node carries
+   *  `data-gate-pending` and opens the human panel. */
+  gatePending?: boolean;
   /** Appends a new step connected to this one's output — omit (or pair
    *  with `readOnly: true`) to hide the "+" button entirely. */
   onAppend?: (stepId: string) => void;
@@ -56,23 +59,29 @@ const VISUAL_CLASSES: Record<StepVisualState, string> = {
 };
 
 function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
-  const { step, visual = "idle", readOnly, reminded, attention, onAppend } = data;
+  const { step, visual = "idle", readOnly, reminded, attention, gatePending, onAppend } = data;
   const { startStepId, resolveProfile } = usePipelineCanvasContext();
   const { profile, profileDeleted } = resolveProfile(step.agentProfileId ?? null);
   const isStart = startStepId === step.id;
-  const parallelWarning = step.transition === "all";
+  const human = step.type === "human";
+  const parallelWarning = step.transition === "all" && !human;
 
   return (
     <div
       data-testid="pipeline-step-node"
       data-step-id={step.id}
       data-visual={visual}
+      data-human={human ? "true" : undefined}
+      data-gate-pending={gatePending ? "true" : undefined}
       data-attention={attention?.kind}
       className={cn(
         "relative w-[240px] rounded-lg border bg-card p-3 text-card-foreground shadow-sm transition-colors",
         // Attention wins over the lifecycle look — a step asking mid-turn
         // is still `active`, but reads amber like the board card, not blue.
         attention ? cn("border-warning", AWAITING_RING_CLASS) : VISUAL_CLASSES[visual],
+        // A human gate is never a plain agent card: info-tinted border and
+        // background even when idle, so a pause is obvious on the canvas.
+        human && !attention && "border-info bg-info/5",
         selected && "ring-2 ring-primary",
       )}
     >
@@ -95,6 +104,16 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
           >
             <Play className="size-2.5" aria-hidden />
             Start
+          </span>
+        )}
+        {human && (
+          <span
+            title="Human review gate — the pipeline pauses here for you"
+            data-testid="pipeline-step-human-badge"
+            className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info"
+          >
+            <UserCheck className="size-2.5" aria-hidden />
+            Human
           </span>
         )}
         {step.transition === "all" && (
@@ -128,7 +147,11 @@ function StepNodeImpl({ data, selected }: NodeProps<StepFlowNodeType>) {
       </div>
 
       <div className="mt-1.5 min-w-0">
-        {profile ? (
+        {human ? (
+          <span data-testid="pipeline-step-human-hint" className="text-xs text-info">
+            Pauses for your review
+          </span>
+        ) : profile ? (
           <AgentProfileCard profile={profile} variant="chip" deleted={profileDeleted} className="max-w-full" />
         ) : profileDeleted ? (
           <span data-testid="pipeline-step-profile-deleted" className="text-xs text-danger">

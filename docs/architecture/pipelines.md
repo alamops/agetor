@@ -67,7 +67,7 @@ Display: a reminder is an ordinary `user` event whose first line is the marker, 
 UI: the run view's history rows grow a `pipeline-run-response-kind` chip (`responseKindLabel` in `src/mainview/lib/pipelines.ts`, tone-mapped success/warning/danger/muted) and, when a reminder was sent, a `pipeline-run-reminder` chip reading "Reminder sent"/"Reminder failed" (`data-delivered`, tone warning/danger) with its timestamp; the still-active step node shows a small spinning-arrow glyph (`pipeline-step-reminded`, via `stepReminded`) while its current execution has been reminded and hasn't settled since.
 CLI: `agetor pipeline status <ref>` appends a dim `[<responseKind>]` tag and, when reminded, a yellow `(reminder sent)` or red `(reminder failed)` tag to each history line.
 `resolveNextSteps` decides what runs next: a step's `transition:"all"` always fans out to every outgoing target (deduplicated), ignoring `next` entirely; `transition:"choose"` (default) with zero outgoing edges is terminal, exactly one edge is taken unconditionally (`next` ignored), and with several edges `next` (trimmed, case-insensitive) is matched against a target step's name, then its id (exact), then the connecting edge's label — no `next` given is `"ambiguous"`, a `next` matching nothing is `"unknown"`, both surfacing as `handoff-invalid` blocks naming the candidates.
-A step's `join:"any"` (default) starts a **fresh execution on every arrival** — how cycles work, the same step can run many times, each a new `history` entry (`PipelineStepRecord.nextStepIds: string[]` records what actually got launched off it — empty for a terminal/failed/cancelled/still-pending execution), bounded by the run's *effective* step cap → blocked kind `step-cap`; `join:"all"` instead accumulates `{fromStepId, seq, handoff}` arrivals per step id in `run.joins` and only launches once every distinct incoming step (per the frozen graph's edges) has arrived this generation — a run with nothing left `active` but a still-partial join blocks run-level (`taskId:null`) as `join-incomplete`, naming the missing sources, resolvable only via Retry or manual advance (which launches the join step immediately with whatever handoffs did arrive).
+A step's `join:"any"` (default) starts a **fresh execution on every arrival** — how cycles work, the same step can run many times, each a new `history` entry (`PipelineStepRecord.nextStepIds: string[]` records what actually got launched off it — empty for a terminal/failed/cancelled/still-pending execution), bounded by the run's *effective* step cap → blocked kind `step-cap`; `join:"all"` instead accumulates `{fromStepId, seq, handoff}` arrivals per step id in `run.joins` and only launches once every distinct incoming step (per the frozen graph's edges) has arrived this generation — a run with nothing left `active` and no pending human gate (whose Accept can still deliver an arrival) but a still-partial join blocks run-level (`taskId:null`) as `join-incomplete`, naming the missing sources, resolvable only via Retry or manual advance (which launches the join step immediately with whatever handoffs did arrive).
 
 **Step cap and its extension** (M2): `effectiveStepCap(run)` (`src/shared/pipeline.ts`) is `snapshot.maxSteps` (default 25; an integer in 1..200 or REJECTED — 400 at the route, a thrown error from `resolveMaxSteps` at the db layer — never clamped; round-4 review fix, the two layers used to disagree) scaled by `1 + (run.capExtensions ?? 0)` — additive, not multiplicative (one extension is 2x `maxSteps`, two is 3x, not 4x) — rather than the block being a dead end.
 A single Retry call increments `run.capExtensions` **at most once** even if the run somehow queued more than one pending `step-cap` block (Minor 10, round-2 review fix) — the formula doesn't change, but one Retry click must not silently apply several extensions at once.
@@ -286,3 +286,110 @@ RunPanel's strip shows "pipeline task no longer exists" on a 404 and disables "O
 CLI/TUI: `pipeline retry --from` is documented; `advance --next` matches name → id → edge label; the four task-scoped subcommands refuse a step task id by naming its parent; `export`/`import` now write and read the [agetor bundle](bundle.md) — the pre-bundle `profileName`-hint writer is gone, while a legacy hinted file still imports through the shared reader (an unresolved profile id is remapped by unique name, else warned about in the preview), `show` marks `(missing)` profiles;
 `logs <parent>` prints the hint and returns unless `--notify`; retry/advance parse flags before any network call; `add --start` reports a failed start; `ls --steps` marks steps `↳ … step of <parent>` and parents `»`; the TUI's `p` expands a selected parent's step rows (`dashboardRows`), `s`/`x` on a parent route to `retryPipeline`/`cancelPipeline`, and a parent's detail pane shows a hint instead of a silent stream;
 `retryPipeline`/`advancePipeline` use `START_TIMEOUT_MS`; `src/cli/test-fixtures.ts`'s `makeTask()` replaces the `as unknown as Task` fixture casts.
+
+## 11. Human steps (pause / review gates)
+
+A pipeline step may be a **human gate**: `PipelineStep.type: "human"` (missing
+means `"agent"`). A gate spawns nothing — no task row, no worktree, no agent —
+and exists to pause the run for an owner decision. Rules enforced by
+`validatePipelineGraph` (`src/shared/pipeline.ts`):
+
+- never the start step (`startStepId` and the unique-root fallback both
+  refuse it);
+- exactly one incoming edge (0 or 2+ is an error), so it is never a root; no
+  human→human edges;
+- no `agentProfileId`, no `subagents`, `join` normalized to `"any"`;
+- `transition: "choose" | "all"` still applies to Accept; it may be terminal
+  (0 outgoing) or have several outgoing edges.
+
+**Run state.** A pending gate lives in `PipelineRunState.humanSteps`
+(`{stepId, seq, startedAt, arrivals}`) and gets its own `history` record with
+`taskId: null`. `seq` comes from the run-wide monotonic `seqCounter`;
+`stepCount` stays agent-execution-only (what `maxSteps` caps), so a gate never
+consumes the step cap. `PipelineJoinArrival.comment` carries trusted
+owner feedback to the next step, rendered by `composeStepPrompt` as a
+`## Human review feedback` section **outside** the untrusted-handoff markers;
+a `Handoff` never carries it.
+
+**Status.** `PipelineRunStatus` gains non-terminal `"review"`: a pending gate
+maps to the board's Review column. With a pending gate, `deriveRunStatus`
+returns `cancelled` when the whole run was deliberately stopped and otherwise
+`review`; with no pending gate, `blocked` outranks a stopped run
+(`cancelled`), which in turn outranks `running`, then `done`. A gate with a
+live sibling stays Review, and Review outranks a blocked sibling. The step
+cap is checked only on agent launches, before a gate.
+
+**Decisions.** `reviewHumanStep` (behind `POST /tasks/:id/pipeline/review`) is
+the only mutator, run under `runExclusive(parentId)`. It removes the gate and
+records the decision in one critical section, so `stepId`+`seq` is idempotent
+(a second submit 409s). Body: `{stepId, seq, decision:"accept"|"return",
+comment?, nextStepIds?, mode?}`; 400 for a bad body / blank Return comment /
+over-cap comment / bad next target / `mode` on Accept / `nextStepIds` on
+Return / `nextStepIds` on a single-edge or `all` gate; 409 for not-a-pipeline,
+never-run, archived, no pending gate, stale seq, already decided, resume
+unavailable, or launches frozen.
+
+- **Accept** reuses the gate's `transition`: 0 outgoing finishes the run;
+  `all` launches every outgoing; `choose` with one launches it; `choose` with
+  several requires `nextStepIds` naming outgoing targets. The comment is
+  optional and rides the launch as `PipelineJoinArrival.comment` (through
+  joins and pending-launch holds, so a Retry after a step-cap/launch failure
+  keeps it; `PipelineBlock.pending` persists a Return's `returnToStepId`/
+  `returned`/`humanFeedback` too, so a held Return re-applies its forced edge
+  on Retry instead of resolving through the graph).
+- **Return** targets the gate's sole incoming source (or the step a manual
+  Advance entered from). The comment is required, trimmed, capped at
+  `PIPELINE_LIMITS.handoffField` (8,000), control characters other than
+  `\n`/`\t` refused, `\r\n` normalized. `mode` is `"fresh"` (default; a new
+  task/session/seq via `launchStep`) or `"resume"` (a `sendInput` turn on the
+  previous step's existing task, re-armed as a new execution under the lock
+  first; the send itself runs OUTSIDE the lock — L-R7 — and the lock is
+  re-acquired afterward: a refused send rolls the re-arm back and 409s
+  (leaving the gate), and a Stop that raced the send cancels the turn it just
+  started rather than reviving a cancelled run). While that send is in flight
+  the re-armed execution counts as a pending runner decision even though no
+  run of it is live yet, so the card's Stop still wins instead of 409ing
+  "pipeline is not running"; the stop marks the execution cancelled and the
+  post-send confirm cancels the turn the send just started. That turn is never
+  read as the user resuming a stopped step: while the send is in flight the
+  runner owns it, and the confirm records its run as the one the Stop applied
+  to, so a late `running` event cannot revive the run. A second gate naming the
+  same source step is refused while its resume send is in flight (409), so two
+  sends can never race at one task.
+  Either path records `returnToStepId` on the new execution, and
+  `settleStepRun` resolves that edge unconditionally — the handoff's `next`
+  and the graph's transition are ignored, and a missing/invalid handoff still
+  returns to the gate (with a `null` handoff). See
+  `docs/plans/pipeline-human-step-resume-spike.md` for the resume proof (fake
+  claude and fake codex).
+
+**Stop / Restart / reconcile.** `cancelPipelineRun` accepts a gate-only run:
+it records `stopRequestedAt`, dismisses every gate (`cancelled` history
+records), drops `run.blocked` so the card reaches Ready, and keeps history. A
+plain Run on a `review` run refuses ("accept or return it first"); Restart
+(`startPipelineRun({restart:true})`) clears all human state and starts fresh.
+`reconcilePipelineRuns` sweeps a review run only when it still has live
+`active` executions; a gate-only run is never flipped to done.
+
+**Archived parents.** A gate reached while the parent is archived is recorded
+on the run (no column write, no event); the review route refuses the archived
+parent with 409, and the gate is reviewable after unarchive. Because `persist`
+skips the column mirror while archived, `unarchiveTask` forces the card back to
+Review when a gate is still pending (other statuses keep the column the owner
+parked, e.g. a finished run left in Done).
+
+**Surfaces.** The run view's `HumanStepPanel` (opened from the human node, the
+run-view "Human review" section, the card's Review button, or the review
+toast) shows the goal, the gate's "What to check", the last handoff, run
+history with transcript links, prior rounds and a worktree diff. The board
+card stays in Review and offers **Open** + a primary **Review** button, no
+**Done**, and a single secondary danger **Stop** (never two Stop buttons).
+The context menu offers **Review pipeline** and no **Mark done**. The CLI has
+`agetor pipeline review <ref> --accept|--return` (`--comment`, `--next`,
+`--step`, `--mode`), `status`/`show` print pending gates and `(human)` for
+a null task id, and `ls` flags a parent row with `pipeline review · N gates`.
+A `pipeline` GlobalEvent carries `humanStepSeqs` and
+`runStartedAt`; the webview and headless notifier each raise one "Pipeline
+needs your review" alert per event that first announces a gate (both keep one
+notification per task, so an event opening several gates names the count
+instead of silently announcing only the first).

@@ -144,7 +144,9 @@ export function toastError(args: ToastArgs & { reason?: string }): void {
  *    • mirror the heading to the OS notification when the app is unfocused.
  *  Only the sonner severity (warning vs error), the heading and the kind differ
  *  — keep those at the call site so adding another variant is a two-line
- *  change. */
+ *  change. `notifyWhenSelected` opts a variant out of the "selected means the
+ *  user already sees it" rule for the OS half only (`toastPipelineReview`: a
+ *  gate in an open-but-backgrounded run view can't repaint). */
 function showBlockingToast(
   variant: {
     method: typeof toast.warning | typeof toast.error;
@@ -152,9 +154,13 @@ function showBlockingToast(
     kind: NotificationKind;
   },
   args: ToastArgs,
+  opts?: { notifyWhenSelected?: boolean },
 ): void {
-  if (args.isSelected) return;
   const detail = describe(args);
+  if (args.isSelected) {
+    if (opts?.notifyWhenSelected) maybeNotifyOS(args, variant.kind, variant.heading, detail);
+    return;
+  }
   showTaskToast(args.taskId, variant.kind, args.onOpen, ({ release, openAction }) =>
     variant.method(variant.heading, {
       description: detail,
@@ -169,6 +175,21 @@ function showBlockingToast(
 
 export function toastPending(args: ToastArgs): void {
   showBlockingToast({ method: toast.warning, heading: "Waiting on you", kind: "blocked" }, args);
+}
+
+/** The human-gate alert: a pipeline paused at a review gate. Blocking (stays
+ *  until decided/dismissed) and lands on the run view with the gate focused,
+ *  exactly like a pending question does for a step. Like `notifyWaitingInput`,
+ *  the OS half fires even when the run view is the selected one: an open but
+ *  backgrounded window can't repaint the gate panel, and this event is the
+ *  only thing that pulls the owner back. The in-app toast stays suppressed for
+ *  the open run view. */
+export function toastPipelineReview(args: ToastArgs): void {
+  showBlockingToast(
+    { method: toast.warning, heading: "Pipeline needs your review", kind: "blocked" },
+    args,
+    { notifyWhenSelected: true },
+  );
 }
 
 /** Variant of `toastPending` for the `blocked → api-error` transition.

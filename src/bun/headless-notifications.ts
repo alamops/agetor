@@ -26,6 +26,7 @@ import { subscribeGlobal } from "./orchestrator.ts";
 import type { ApiNative } from "./server.ts";
 import { createTaskNotifier, type TaskNotification } from "./task-notifier.ts";
 import type { TaskNotificationRemoval } from "../shared/os-notification.ts";
+import { humanReviewSubtitle, newHumanGateSeqs } from "../shared/pipeline.ts";
 import type { GlobalEvent, PipelineRunState, PipelineRunStatus } from "../shared/types.ts";
 
 /** What the installer hands to the core's notifier; the same shape `startApiServer` takes. */
@@ -312,6 +313,12 @@ export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): (e
   // with the step tasks whose questions were answered since. Mirrors the
   // webview's OwedPipelineAlerts.
   const owed = new Map<string, Set<string>>();
+  // Human gates already announced per parent, keyed by run generation — one
+  // "Pipeline needs your review" per event that first announces a gate,
+  // naming how many gates are pending. A single event can open two gates
+  // (R-S2); the task notifier keeps one entry per task, so the alert names the
+  // count instead of announcing only the first and losing the second.
+  const announcedGates = new Map<string, { runStartedAt: number | null; seqs: number[] }>();
 
   const hasPending = (target: string): boolean => (pendingByTarget.get(target)?.size ?? 0) > 0;
   const owe = (parentId: string): void => {
@@ -331,6 +338,7 @@ export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): (e
     const stepParentId = stepParentIdOf(ev);
     const target = stepParentId ?? ("taskId" in ev ? ev.taskId : "");
     let prevPipelineStatus: PipelineRunStatus | null = null;
+    let reviewAlert: { parentId: string; gateCount: number } | null = null;
 
     if (ev.kind === "interaction") {
       let set = pendingByTarget.get(target);
@@ -371,16 +379,46 @@ export function createHeadlessNotificationHandler(deps: HeadlessHandlerDeps): (e
         const oldest = pipelineStatus.keys().next().value;
         if (oldest !== undefined) pipelineStatus.delete(oldest);
       }
-      if (ev.status !== "blocked") {
+      if (ev.status === "blocked") {
+        settleOwed(ev.taskId);
+      } else if (ev.status !== "review") {
+        // A `review` transition keeps a sibling's pending question/owed alert:
+        // the run still needs the owner, exactly as the webview's
+        // `OwedPipelineAlerts` does (R-S4). Every other non-blocked status
+        // clears them.
         pendingByTarget.delete(ev.taskId);
         owed.delete(ev.taskId);
-      } else {
-        settleOwed(ev.taskId);
+      }
+      if (ev.status === "review") {
+        const previous = announcedGates.get(ev.taskId) ?? null;
+        const runStartedAt = ev.runStartedAt ?? null;
+        const fresh = newHumanGateSeqs(previous, runStartedAt, ev.humanStepSeqs ?? []);
+        if (fresh.length > 0) {
+          const sameGeneration = previous !== null && previous.runStartedAt === runStartedAt;
+          announcedGates.set(ev.taskId, {
+            runStartedAt,
+            seqs: [...(sameGeneration ? previous.seqs : []), ...fresh],
+          });
+          if (announcedGates.size > PIPELINE_STATUS_CAP) {
+            const oldest = announcedGates.keys().next().value;
+            if (oldest !== undefined) announcedGates.delete(oldest);
+          }
+          reviewAlert = { parentId: ev.taskId, gateCount: new Set(ev.humanStepSeqs ?? []).size || 1 };
+        }
       }
     }
 
     const n = headlessNotificationFor(ev, lookupTask, { prevPipelineStatus, hasPendingQuestion: hasPending(target) });
     if (n) notifier.post(n);
+    if (reviewAlert) {
+      const title = lookupTask(reviewAlert.parentId)?.title || `Pipeline ${reviewAlert.parentId.slice(0, 7)}`;
+      notifier.post({
+        title: "Pipeline needs your review",
+        body: `${title} · ${humanReviewSubtitle(reviewAlert.gateCount)}`,
+        taskId: reviewAlert.parentId,
+        kind: "blocked",
+      });
+    }
   };
 
   return handle;

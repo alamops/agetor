@@ -1104,6 +1104,97 @@ describe("buildBundle: every export imports", () => {
   });
 });
 
+describe("human steps in bundles", () => {
+  const worker = profile("p1", "Worker");
+
+  test("a human-free export stays version 1 with no type key (byte-identical shape)", () => {
+    const a = step("a", "A");
+    const b = step("b", "B", { type: "agent" });
+    const p = pipeline("pl", "P", [a, b], {
+      graph: {
+        steps: [a, b],
+        edges: [{ id: "e", from: "a", to: "b", label: "" }],
+        startStepId: "a",
+      },
+    });
+    const r = mustBuild({ pipelineIds: ["pl"] }, [worker], [p]);
+    expect(r.bundle.version).toBe(1);
+    const parsed = JSON.parse(r.text) as { version: number; pipelines: Array<{ graph: { steps: Array<Record<string, unknown>> } }> };
+    expect(parsed.version).toBe(1);
+    expect(parsed.pipelines[0]!.graph.steps.every((s) => !("type" in s))).toBe(true);
+    expect(parseBundleText(r.text).ok).toBe(true);
+  });
+
+  test("a pipeline with a human step exports version 2 and writes type only on that step", () => {
+    const a = step("a", "A");
+    const h = step("h", "H", { type: "human", agentProfileId: null });
+    const b = step("b", "B");
+    const p = pipeline("pl", "P", [a, h, b], {
+      graph: {
+        steps: [a, h, b],
+        edges: [
+          { id: "e1", from: "a", to: "h", label: "" },
+          { id: "e2", from: "h", to: "b", label: "" },
+        ],
+        startStepId: "a",
+      },
+    });
+    const r = mustBuild({ pipelineIds: ["pl"] }, [worker], [p]);
+    expect(r.bundle.version).toBe(2);
+    const parsed = JSON.parse(r.text) as { pipelines: Array<{ graph: { steps: Array<Record<string, unknown>> } }> };
+    const steps = parsed.pipelines[0]!.graph.steps;
+    expect(steps.find((s) => s.id === "h")?.type).toBe("human");
+    expect("type" in steps.find((s) => s.id === "a")!).toBe(false);
+    const back = parseBundleText(r.text);
+    if (!back.ok) throw new Error(back.error);
+    expect(back.bundle.pipelines[0]!.graph.steps.find((s) => s.id === "h")?.type).toBe("human");
+  });
+
+  test("a version 1 file carrying a human step is refused", () => {
+    expectError(
+      bundleJson({
+        version: 1,
+        pipelines: [
+          {
+            name: "P",
+            description: "",
+            maxSteps: 25,
+            graph: {
+              steps: [stepJson({ type: "human", agent: null })],
+              edges: [],
+              startStepId: null,
+            },
+          },
+        ],
+      }),
+      "invalid",
+      "bundle version 2",
+    );
+  });
+
+  test("a version 2 file imports a human step", () => {
+    const r = parseObj(
+      bundleJson({
+        version: 2,
+        pipelines: [
+          {
+            name: "P",
+            description: "",
+            maxSteps: 25,
+            graph: {
+              steps: [stepJson({ id: "a", name: "A" }), stepJson({ id: "h", name: "H", type: "human", agent: null })],
+              edges: [{ id: "e", from: "a", to: "h", label: "" }],
+              startStepId: "a",
+            },
+          },
+        ],
+      }),
+    );
+    if (!r.ok) throw new Error(r.error);
+    expect(r.bundle.pipelines[0]!.graph.steps.find((s) => s.id === "h")?.type).toBe("human");
+  });
+});
+
 describe("numberedFileName", () => {
   test("numbers before the bundle extension", () => {
     expect(numberedFileName("x.agetor.json", 1)).toBe("x.agetor.json");
@@ -1570,7 +1661,7 @@ describe("parseBundleText", () => {
     expectError(bundleJson({ version: "1" }), "invalid", "version");
     expectError(bundleJson({ version: 1.5 }), "invalid", "version");
     expectError(bundleJson({ version: 0 }), "invalid", "version");
-    expectError(bundleJson({ version: 2 }), "unsupported-version", "update agetor to import this file");
+    expectError(bundleJson({ version: 3 }), "unsupported-version", "update agetor to import this file");
   });
 
   test("rejects empty files and over-count files", () => {

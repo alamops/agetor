@@ -138,6 +138,10 @@ export function stepVisualState(
 ): StepVisualState {
   if (!run) return "idle";
 
+  // A pending human gate reads `active` (the info look) — it is what the
+  // owner must act on, and it has no task row to consult.
+  if ((run.humanSteps ?? []).some((g) => g.stepId === stepId)) return "active";
+
   const activeEntry = run.active.find((a) => a.stepId === stepId);
   if (activeEntry) {
     const blockedForStep = run.blocked.some(
@@ -157,6 +161,7 @@ export function stepVisualState(
   switch (latest.outcome) {
     case "succeeded":
     case "advanced-manually":
+    case "returned":
       return "done";
     case "failed":
       return "failed";
@@ -266,12 +271,16 @@ export function stepAttention(
 ): StepAttention | null {
   if (!run) return null;
 
+  // A human gate is not an amber "waiting on you" step — it is the info-tinted
+  // review the owner decides at, surfaced by the run view's own panel.
+  if (run.snapshot?.graph.steps.find((s) => s.id === stepId)?.type === "human") return null;
+
   const activeTaskIds = run.active.filter((a) => a.stepId === stepId).map((a) => a.taskId);
   // A Set: an execution that's still active also has its (open) history
   // record, and must not be counted twice.
   const candidateIds = new Set(activeTaskIds);
   for (const record of run.history) {
-    if (record.stepId === stepId) candidateIds.add(record.taskId);
+    if (record.stepId === stepId && record.taskId !== null) candidateIds.add(record.taskId);
   }
 
   let pending = 0;
@@ -363,7 +372,9 @@ export function pipelineAttentionStepTask(
     if (row && row.pendingInteractionCount > 0) return row;
   }
   for (let i = run.history.length - 1; i >= 0; i -= 1) {
-    const row = byId.get(run.history[i]!.taskId);
+    const taskId = run.history[i]!.taskId;
+    if (taskId === null) continue;
+    const row = byId.get(taskId);
     if (row && row.pendingInteractionCount > 0) return row;
   }
 
@@ -941,7 +952,7 @@ export function stepNodeTaskFor(
   }
   for (let i = run.history.length - 1; i >= 0; i -= 1) {
     const record = run.history[i]!;
-    if (record.stepId !== stepId) continue;
+    if (record.stepId !== stepId || record.taskId === null) continue;
     const row = byId.get(record.taskId);
     if (row && row.pendingInteractionCount > 0) return row;
   }

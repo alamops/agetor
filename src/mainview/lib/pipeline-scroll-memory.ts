@@ -81,6 +81,11 @@ export function pipelineRunPanelSignature(
     run.history.length,
     run.blocked.map((b) => [b.kind, b.stepId, b.taskId]),
     run.active.map((a) => [a.stepId, a.taskId, steps.find((s) => s.id === a.taskId)?.column === "review"]),
+    // Pending human gates and every human decision: a new gate or a decided
+    // one changes the panel's content, so it must repaint the saved offset
+    // decision rather than restore a stale position.
+    (run.humanSteps ?? []).map((g) => [g.stepId, g.seq]),
+    run.history.filter((h) => h.human != null).map((h) => [h.seq, h.human!.decision, h.outcome]),
   ]);
 }
 

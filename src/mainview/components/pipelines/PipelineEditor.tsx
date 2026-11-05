@@ -14,7 +14,7 @@ import {
   type NodeChange,
 } from "@xyflow/react";
 import { AnimatePresence, motion } from "motion/react";
-import { ArrowLeft, LayoutGrid, Maximize2, Plus, Save } from "lucide-react";
+import { ArrowLeft, LayoutGrid, Maximize2, Plus, Save, UserCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useConfirm } from "@/components/ui/confirm";
@@ -322,6 +322,22 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange, onOpe
     setSelectedStepId(id);
   }, [setNodes, appendStep]);
 
+  /** Add a human review gate. A human step is never the start step, so it
+   *  never claims an empty `startStepId` (the first agent step still does). */
+  const addHumanStep = useCallback(() => {
+    if (nodesRef.current.length >= PIPELINE_LIMITS.steps) return;
+    const id = crypto.randomUUID();
+    const maxX = nodesRef.current.reduce((m, n) => Math.max(m, n.position.x), -300);
+    const step = newStep({
+      id,
+      type: "human",
+      position: { x: maxX + 300, y: 0 },
+      name: uniqueStepName(nodesRef.current.map((n) => n.data.step)),
+    });
+    setNodes((ns) => [...ns, { id, type: "step", position: step.position, data: { step, onAppend: appendStep } }]);
+    setSelectedStepId(id);
+  }, [setNodes, appendStep]);
+
   const updateStep = useCallback(
     (updated: PipelineStep) => {
       setNodes((ns) => ns.map((n) => (n.id === updated.id ? { ...n, data: { ...n.data, step: updated } } : n)));
@@ -333,7 +349,11 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange, onOpe
     (stepId: string) => {
       setNodes((ns) => ns.filter((n) => n.id !== stepId));
       setEdges((es) => es.filter((e) => e.source !== stepId && e.target !== stepId));
-      setStartStepId((s) => (s === stepId ? (nodesRef.current.find((n) => n.id !== stepId)?.id ?? null) : s));
+      setStartStepId((s) =>
+        s === stepId
+          ? (nodesRef.current.find((n) => n.id !== stepId && n.data.step.type !== "human")?.id ?? null)
+          : s,
+      );
       setSelectedStepId((id) => (id === stepId ? null : id));
     },
     [setNodes, setEdges],
@@ -765,6 +785,17 @@ function PipelineEditorInner({ pipelineId, onBack, onSaved, onDirtyChange, onOpe
         <Button type="button" variant="outline" size="sm" data-testid="pipeline-add-step" onClick={addStep} className="gap-1.5">
           <Plus className="size-4" aria-hidden />
           Add step
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          data-testid="pipeline-add-human-step"
+          onClick={addHumanStep}
+          className="gap-1.5"
+        >
+          <UserCheck className="size-4" aria-hidden />
+          Add human step
         </Button>
         <Button
           type="button"

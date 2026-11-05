@@ -5881,3 +5881,948 @@ test("R5-3: a running event for the run the Stop applied to never resumes the st
   }
   if (s) await waitUntilIdle(s.parentId);
 });
+
+// ---------------------------------------------------------------------------
+// Human steps
+// ---------------------------------------------------------------------------
+
+/** Build a `A → H → B` pipeline (H human, terminal Accept when B omitted). */
+async function makeHumanPipeline(label: string, opts: { withB?: boolean; aNext?: string; aTransition?: "choose" | "all"; maxSteps?: number } = {}) {
+  const { agentProfiles, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const profile = agentProfiles.insert({
+    name: uniqueName(label),
+    harness: "claude-code",
+    model: "fake-model",
+    effort: null,
+    mode: null,
+    speed: "off",
+    maxMode: false,
+    instructions: "",
+    skills: [],
+  });
+  const A = newStep({
+    name: "A",
+    agentProfileId: profile.id,
+    instructions: `Do A. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${opts.aNext ?? "done"}`,
+    transition: opts.aTransition ?? "choose",
+  });
+  const H = newStep({ name: "H", type: "human", instructions: "check the header" });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `Do B. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const steps = opts.withB ? [A, H, B] : [A, H];
+  const edges = opts.withB
+    ? [
+        { id: "e1", from: A.id, to: H.id, label: "" },
+        { id: "e2", from: H.id, to: B.id, label: "" },
+      ]
+    : [{ id: "e1", from: A.id, to: H.id, label: "" }];
+  const pipeline = pipelines.insert({
+    name: uniqueName(`${label}-pipeline`),
+    graph: { steps, edges, startStepId: A.id },
+    maxSteps: opts.maxSteps ?? 25,
+  });
+  return { pipeline, A, H, B, profile };
+}
+
+async function startHumanRun(label: string, opts: { withB?: boolean; aNext?: string; aTransition?: "choose" | "all"; maxSteps?: number } = {}) {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const made = await makeHumanPipeline(label, opts);
+  const created = await createTask({
+    title: `${label} run`,
+    prompt: "the overall goal text",
+    workdir: freshWorkdir(),
+    isolation: "none",
+    pipelineId: made.pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  const gated = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.humanSteps?.length ? t : undefined;
+  });
+  return { ...made, parentId, gated };
+}
+
+test("human gate entry: A→H pauses in review with a gate, no task row and no step-cap increment", async () => {
+  const { tasks } = await import("./db.ts");
+  const { parentId, A, H } = await startHumanRun("gate-entry");
+  const run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.status).toBe("review");
+  expect(tasks.get(parentId)!.column).toBe("review");
+  expect(run.humanSteps).toHaveLength(1);
+  const gate = run.humanSteps![0]!;
+  expect(gate.stepId).toBe(H.id);
+  expect(gate.arrivals).toHaveLength(1);
+  expect(gate.arrivals[0]!.fromStepId).toBe(A.id);
+  expect(gate.arrivals[0]!.handoff).not.toBeNull();
+  expect(run.stepCount).toBe(1);
+  expect(run.history.find((h) => h.taskId === null)?.stepId).toBe(H.id);
+  expect(run.history.find((h) => h.taskId === null)?.outcome).toBeNull();
+  expect(tasks.stepsForParent(parentId).some((s) => s.pipelineStepId === H.id)).toBe(false);
+  expect(run.endedAt).toBeNull();
+  await waitUntilIdle(parentId);
+});
+
+test("accept on a terminal gate finishes the run; the comment is stored, not sent anywhere", async () => {
+  const { tasks } = await import("./db.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, H } = await startHumanRun("accept-terminal");
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const res = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept", comment: "looks good" });
+  if ("error" in res) throw new Error(res.error);
+  const run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.status).toBe("done");
+  expect(tasks.get(parentId)!.column).toBe("review");
+  expect(run.humanSteps).toHaveLength(0);
+  const record = run.history.find((h) => h.taskId === null && h.seq === gate.seq)!;
+  expect(record.outcome).toBe("succeeded");
+  expect(record.human).toMatchObject({ decision: "accept", comment: "looks good" });
+  expect(record.nextStepIds).toEqual([]);
+  await waitUntilIdle(parentId);
+});
+
+test("accept continues to the next step and carries the comment as trusted feedback", async () => {
+  const { tasks } = await import("./db.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, H, B } = await startHumanRun("accept-next", { withB: true });
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const res = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept", comment: "please tighten X" });
+  if ("error" in res) throw new Error(res.error);
+  await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done");
+  const run = tasks.get(parentId)!.pipelineRun!;
+  const record = run.history.find((h) => h.taskId === null && h.seq === gate.seq)!;
+  expect(record.nextStepIds).toEqual([B.id]);
+  const stepB = tasks.stepsForParent(parentId).find((s) => s.pipelineStepId === B.id)!;
+  expect(stepB.prompt).toContain("## Human review feedback");
+  expect(stepB.prompt).toContain("please tighten X");
+  // The human gate never consumes a step ordinal: B is agent execution 2.
+  expect(stepB.prompt).toContain("step 2 of");
+  await waitUntilIdle(parentId);
+});
+
+test("return (fresh) re-runs the previous step, re-enters the gate, and can then be accepted", async () => {
+  const { tasks } = await import("./db.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, A, H } = await startHumanRun("return-fresh");
+  const firstGate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const res = await reviewHumanStep(parentId, {
+    stepId: H.id, seq: firstGate.seq, decision: "return", comment: "redo the header",
+  });
+  if ("error" in res) throw new Error(res.error);
+  // A second A execution lands, and the gate re-opens with a new seq.
+  const secondGate = await waitFor(() => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    const g = run?.humanSteps?.[0];
+    return g && g.seq !== firstGate.seq ? g : undefined;
+  });
+  const run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.stepCount).toBe(2);
+  const aRuns = run.history.filter((h) => h.stepId === A.id && h.taskId !== null);
+  expect(aRuns).toHaveLength(2);
+  const firstRecord = run.history.find((h) => h.taskId === null && h.seq === firstGate.seq)!;
+  expect(firstRecord.outcome).toBe("returned");
+  expect(firstRecord.human).toMatchObject({ decision: "return", comment: "redo the header", mode: "fresh" });
+  const newA = tasks.stepsForParent(parentId).find((s) => s.pipelineStepId === A.id && s.id === aRuns[1]!.taskId)!;
+  expect(newA.prompt).toContain("redo the header");
+
+  const accepted = await reviewHumanStep(parentId, { stepId: H.id, seq: secondGate.seq, decision: "accept" });
+  if ("error" in accepted) throw new Error(accepted.error);
+  expect(tasks.get(parentId)!.pipelineRun!.status).toBe("done");
+  await waitUntilIdle(parentId);
+});
+
+test("a return without a comment is a 400; a double submit is a 409", async () => {
+  const { tasks } = await import("./db.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, H } = await startHumanRun("return-validation");
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const blank = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "return", comment: "   " });
+  expect("error" in blank && blank.status).toBe(400);
+  const accepted = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+  expect("error" in accepted).toBe(false);
+  const again = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+  expect("error" in again && again.status).toBe(409);
+  await waitUntilIdle(parentId);
+});
+
+test("stop works with only a gate pending: cancelled, Ready, gate dismissed, history kept", async () => {
+  const { tasks } = await import("./db.ts");
+  const { cancelPipelineRun } = await import("./pipeline-runner.ts");
+  const { parentId, H } = await startHumanRun("stop-gate");
+  const res = await cancelPipelineRun(parentId);
+  if ("error" in res) throw new Error(res.error);
+  const run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.status).toBe("cancelled");
+  expect(tasks.get(parentId)!.column).toBe("ready");
+  expect(run.humanSteps).toHaveLength(0);
+  expect(run.history.length).toBe(2);
+  expect(run.history.find((h) => h.taskId === null)?.outcome).toBe("cancelled");
+  expect(run.history.find((h) => h.stepId === H.id)).toBeDefined();
+  await waitUntilIdle(parentId);
+});
+
+test("restart clears the human state and starts a fresh run", async () => {
+  const { tasks } = await import("./db.ts");
+  const { startPipelineRun } = await import("./pipeline-runner.ts");
+  const { parentId } = await startHumanRun("restart-gate");
+  const res = await startPipelineRun(tasks.get(parentId)!, { restart: true });
+  if ("error" in res) throw new Error(res.error);
+  const run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.humanSteps).toHaveLength(0);
+  expect(run.stepCount).toBe(1);
+  expect(run.seqCounter).toBe(1);
+  await waitFor(() => tasks.get(parentId)?.pipelineRun?.humanSteps?.length === 1);
+  await waitUntilIdle(parentId);
+});
+
+test("a returned execution is forced back to its gate even when its handoff names another step", async () => {
+  const { tasks } = await import("./db.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+  // A's handoff says "B", but the forced return edge must win.
+  const { parentId, H } = await startHumanRun("forced-return", { withB: true, aNext: "B" });
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const res = await reviewHumanStep(parentId, {
+    stepId: H.id, seq: gate.seq, decision: "return", comment: "go back",
+  });
+  if ("error" in res) throw new Error(res.error);
+  const secondGate = await waitFor(() => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    const g = run?.humanSteps?.[0];
+    return g && g.seq !== gate.seq ? g : undefined;
+  });
+  const run = tasks.get(parentId)!.pipelineRun!;
+  expect(secondGate.stepId).toBe(H.id);
+  // The returned A's handoff named B, but only the gate was launched.
+  const returned = run.history.find((h) => h.stepId !== H.id && h.seq === secondGate.seq - 1);
+  expect(returned?.nextStepIds).toEqual([H.id]);
+  expect(run.active.some((a) => a.stepId === H.id)).toBe(false);
+  await waitUntilIdle(parentId);
+});
+
+test("M1/R6: an Accept held by the step cap carries its comment into the retried launch", async () => {
+  const { tasks } = await import("./db.ts");
+  const { retryPipelineStep, reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, A, H, B } = await startHumanRun("accept-cap-comment", { withB: true, maxSteps: 1 });
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+
+  const res = await reviewHumanStep(parentId, {
+    stepId: H.id, seq: gate.seq, decision: "accept", comment: "please tighten X",
+  });
+  if ("error" in res) throw new Error(res.error);
+
+  // A used the only allowed execution, so B's launch is held at the cap.
+  const held = tasks.get(parentId)!.pipelineRun!;
+  expect(held.status).toBe("blocked");
+  const block = held.blocked.find((b) => b.kind === "step-cap")!;
+  expect(block.pending?.stepId).toBe(B.id);
+  expect(block.pending?.arrivals[0]).toMatchObject({ fromStepId: A.id, comment: "please tighten X" });
+
+  const retried = await retryPipelineStep(parentId);
+  if ("error" in retried) throw new Error(retried.error);
+  const stepB = await waitFor(() =>
+    tasks.stepsForParent(parentId).find((s) => s.pipelineStepId === B.id),
+  );
+  expect(stepB.prompt).toContain("## Human review feedback");
+  expect(stepB.prompt).toContain("please tighten X");
+  await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done");
+  await waitUntilIdle(parentId);
+});
+
+test("M2/R6: a fresh Return held by the step cap keeps its forced gate + comment through Retry", async () => {
+  const { tasks } = await import("./db.ts");
+  const { retryPipelineStep, reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, A, H } = await startHumanRun("return-cap-forced", { maxSteps: 1 });
+  const firstGate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+
+  const res = await reviewHumanStep(parentId, {
+    stepId: H.id, seq: firstGate.seq, decision: "return", comment: "redo the header",
+  });
+  if ("error" in res) throw new Error(res.error);
+
+  // The re-run hit the cap; the hold must remember it is a forced Return.
+  const held = tasks.get(parentId)!.pipelineRun!;
+  const block = held.blocked.find((b) => b.kind === "step-cap")!;
+  expect(block.pending).toMatchObject({
+    stepId: A.id,
+    returnToStepId: H.id,
+    returned: true,
+    humanFeedback: "redo the header",
+  });
+  expect(block.pending!.arrivals).toEqual([]);
+
+  const retried = await retryPipelineStep(parentId);
+  if ("error" in retried) throw new Error(retried.error);
+  const secondGate = await waitFor(() => {
+    const g = tasks.get(parentId)?.pipelineRun?.humanSteps?.[0];
+    return g && g.seq !== firstGate.seq ? g : undefined;
+  });
+  expect(secondGate.stepId).toBe(H.id);
+  expect(tasks.get(parentId)!.pipelineRun!.stepCount).toBe(2);
+  await waitUntilIdle(parentId);
+});
+
+test("M1/R6: an Accept into an incomplete join carries its comment when a sibling completes it", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER, FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER } = await import("./agents.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+
+  const claude = await makeProfile("join-sibling");
+  const S = newStep({ name: "S", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, transition: "all" });
+  const A = newStep({ name: "A", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  // C holds its turn open behind a fake subagent, so A can settle, the gate
+  // can open and the owner can accept while C is still the live sibling.
+  const C = newStep({
+    name: "C",
+    agentProfileId: claude.id,
+    instructions: `Do C. ${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}:1200 ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+  });
+  const H = newStep({ name: "H", type: "human" });
+  const D = newStep({ name: "D", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, join: "all" });
+  const pipeline = pipelines.insert({
+    name: uniqueName("join-sibling-pipeline"),
+    graph: {
+      steps: [S, A, C, H, D],
+      edges: [
+        { id: "e1", from: S.id, to: A.id, label: "" },
+        { id: "e2", from: S.id, to: C.id, label: "" },
+        { id: "e3", from: A.id, to: H.id, label: "" },
+        { id: "e4", from: H.id, to: D.id, label: "" },
+        { id: "e5", from: C.id, to: D.id, label: "" },
+      ],
+      startStepId: S.id,
+    },
+    maxSteps: 25,
+  });
+  const created = await createTask({ title: "join sibling run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  const gate = await waitFor(() => tasks.get(parentId)?.pipelineRun?.humanSteps?.[0]);
+  expect(tasks.get(parentId)!.pipelineRun!.joins[D.id]?.arrivals ?? []).toHaveLength(0);
+
+  const res = await reviewHumanStep(parentId, {
+    stepId: H.id, seq: gate.seq, decision: "accept", comment: "tighten the header",
+  });
+  if ("error" in res) throw new Error(res.error);
+  expect(tasks.get(parentId)!.pipelineRun!.joins[D.id]?.arrivals[0]?.comment).toBe("tighten the header");
+
+  const stepD = await waitFor(
+    () => tasks.stepsForParent(parentId).find((s) => s.pipelineStepId === D.id),
+    10_000,
+  );
+  expect(stepD.prompt).toContain("## Human review feedback");
+  expect(stepD.prompt).toContain("tighten the header");
+  await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done", 10_000);
+  await waitUntilIdle(parentId);
+});
+
+test("a pending human gate keeps a partial join open: C arrives first, A's gate completes it, Accept launches the join once", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER, FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER } = await import("./agents.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+
+  const claude = await makeProfile("join-gate-pending");
+  const S = newStep({ name: "S", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, transition: "all" });
+  // A holds its turn open behind a fake subagent so C's arrival lands at the
+  // join well before A settles into the gate — the run then has a pending
+  // gate and a partial join with no `active` execution left.
+  const A = newStep({
+    name: "A",
+    agentProfileId: claude.id,
+    instructions: `Do A. ${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}:1200 ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+  });
+  const C = newStep({ name: "C", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const H = newStep({ name: "H", type: "human" });
+  const D = newStep({ name: "D", agentProfileId: claude.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, join: "all" });
+  const pipeline = pipelines.insert({
+    name: uniqueName("join-gate-pending-pipeline"),
+    graph: {
+      steps: [S, A, C, H, D],
+      edges: [
+        { id: "e1", from: S.id, to: A.id, label: "" },
+        { id: "e2", from: S.id, to: C.id, label: "" },
+        { id: "e3", from: A.id, to: H.id, label: "" },
+        { id: "e4", from: H.id, to: D.id, label: "" },
+        { id: "e5", from: C.id, to: D.id, label: "" },
+      ],
+      startStepId: S.id,
+    },
+    maxSteps: 25,
+  });
+  const created = await createTask({ title: "join gate pending run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  // C's arrival is recorded while A is still running; then A settles into
+  // the gate, leaving no active execution and a still-partial join.
+  await waitFor(() => (tasks.get(parentId)?.pipelineRun?.joins[D.id]?.arrivals.length ?? 0) === 1, 10_000);
+  const gate = await waitFor(() => tasks.get(parentId)?.pipelineRun?.humanSteps?.[0], 10_000);
+  const gated = tasks.get(parentId)!.pipelineRun!;
+  expect(gated.active).toHaveLength(0);
+  expect(gated.status).toBe("review");
+  // The pending gate can still deliver the join's missing arrival, so the
+  // scan must not declare the join incomplete.
+  expect(gated.blocked.filter((b) => b.kind === "join-incomplete")).toHaveLength(0);
+
+  const res = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+  if ("error" in res) throw new Error(res.error);
+  expect(tasks.get(parentId)!.pipelineRun!.blocked).toHaveLength(0);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  }, 10_000);
+  expect(tasks.stepsForParent(parentId).filter((s) => s.pipelineStepId === D.id)).toHaveLength(1);
+  expect(finished.pipelineRun!.blocked).toHaveLength(0);
+  expect(finished.pipelineRun!.joins[D.id]).toBeUndefined();
+  await waitUntilIdle(parentId);
+});
+
+test("R7: Accept target rules — choose requires a valid pick; single-edge/all reject nextStepIds", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("accept-targets");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const H = newStep({ name: "H", type: "human" });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const C = newStep({ name: "C", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const pipeline = pipelines.insert({
+    name: uniqueName("accept-targets-pipeline"),
+    graph: {
+      steps: [A, H, B, C],
+      edges: [
+        { id: "e1", from: A.id, to: H.id, label: "" },
+        { id: "e2", from: H.id, to: B.id, label: "" },
+        { id: "e3", from: H.id, to: C.id, label: "" },
+      ],
+      startStepId: A.id,
+    },
+    maxSteps: 25,
+  });
+  const created = await createTask({ title: "accept targets run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  const gate = await waitFor(() => tasks.get(parentId)?.pipelineRun?.humanSteps?.[0]);
+
+  const noPick = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+  expect("error" in noPick && noPick.status).toBe(400);
+  const badPick = await reviewHumanStep(parentId, {
+    stepId: H.id, seq: gate.seq, decision: "accept", nextStepIds: ["not-an-outgoing-step"],
+  });
+  expect("error" in badPick && badPick.status).toBe(400);
+  const picked = await reviewHumanStep(parentId, {
+    stepId: H.id, seq: gate.seq, decision: "accept", nextStepIds: [B.id],
+  });
+  if ("error" in picked) throw new Error(picked.error);
+  await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done");
+  const rows = tasks.stepsForParent(parentId);
+  expect(rows.some((s) => s.pipelineStepId === B.id)).toBe(true);
+  expect(rows.some((s) => s.pipelineStepId === C.id)).toBe(false);
+  await waitUntilIdle(parentId);
+
+  // A single-outgoing gate is unconditional: supplying a target is refused.
+  const single = await startHumanRun("accept-single-edge", { withB: true });
+  const singleGate = tasks.get(single.parentId)!.pipelineRun!.humanSteps![0]!;
+  const refused = await reviewHumanStep(single.parentId, {
+    stepId: single.H.id, seq: singleGate.seq, decision: "accept", nextStepIds: [single.B.id],
+  });
+  expect("error" in refused && refused.status).toBe(400);
+  expect((await reviewHumanStep(single.parentId, {
+    stepId: single.H.id, seq: singleGate.seq, decision: "accept",
+  }))).toHaveProperty("task");
+  await waitUntilIdle(single.parentId);
+
+  // `all` launches every outgoing edge; a supplied subset is refused rather
+  // than silently ignored.
+  const A2 = newStep({ name: "A2", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const H2 = newStep({ name: "H2", type: "human", transition: "all" });
+  const B2 = newStep({ name: "B2", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const C2 = newStep({ name: "C2", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const allPipeline = pipelines.insert({
+    name: uniqueName("accept-all-pipeline"),
+    graph: {
+      steps: [A2, H2, B2, C2],
+      edges: [
+        { id: "a1", from: A2.id, to: H2.id, label: "" },
+        { id: "a2", from: H2.id, to: B2.id, label: "" },
+        { id: "a3", from: H2.id, to: C2.id, label: "" },
+      ],
+      startStepId: A2.id,
+    },
+    maxSteps: 25,
+  });
+  const allCreated = await createTask({ title: "accept all run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: allPipeline.id });
+  if ("error" in allCreated) throw new Error(allCreated.error);
+  const allParentId = allCreated.task.id;
+  liveParentIds.push(allParentId);
+  const allStarted = await startTask(allParentId);
+  if ("error" in allStarted) throw new Error(allStarted.error);
+  const allGate = await waitFor(() => tasks.get(allParentId)?.pipelineRun?.humanSteps?.[0]);
+  const allRefused = await reviewHumanStep(allParentId, {
+    stepId: H2.id, seq: allGate.seq, decision: "accept", nextStepIds: [B2.id],
+  });
+  expect("error" in allRefused && allRefused.status).toBe(400);
+  const allAccepted = await reviewHumanStep(allParentId, { stepId: H2.id, seq: allGate.seq, decision: "accept" });
+  if ("error" in allAccepted) throw new Error(allAccepted.error);
+  await waitFor(() => tasks.get(allParentId)?.pipelineRun?.status === "done");
+  const allRows = tasks.stepsForParent(allParentId);
+  expect(allRows.some((s) => s.pipelineStepId === B2.id)).toBe(true);
+  expect(allRows.some((s) => s.pipelineStepId === C2.id)).toBe(true);
+  await waitUntilIdle(allParentId);
+});
+
+test("R17: a human gate never consumes the step cap; the agent launch after it does", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("cap-loop");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const H = newStep({ name: "H", type: "human" });
+  const pipeline = pipelines.insert({
+    name: uniqueName("cap-loop-pipeline"),
+    graph: {
+      steps: [A, H],
+      edges: [
+        { id: "e1", from: A.id, to: H.id, label: "" },
+        { id: "e2", from: H.id, to: A.id, label: "" },
+      ],
+      startStepId: A.id,
+    },
+    maxSteps: 2,
+  });
+  const created = await createTask({ title: "cap loop run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const firstGate = await waitFor(() => tasks.get(parentId)?.pipelineRun?.humanSteps?.[0]);
+  let res = await reviewHumanStep(parentId, { stepId: H.id, seq: firstGate.seq, decision: "accept" });
+  if ("error" in res) throw new Error(res.error);
+  const secondGate = await waitFor(() => {
+    const g = tasks.get(parentId)?.pipelineRun?.humanSteps?.[0];
+    return g && g.seq !== firstGate.seq ? g : undefined;
+  });
+  res = await reviewHumanStep(parentId, { stepId: H.id, seq: secondGate.seq, decision: "accept" });
+  if ("error" in res) throw new Error(res.error);
+
+  const run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.stepCount).toBe(2);
+  expect(run.humanSteps).toHaveLength(0);
+  expect(run.blocked.some((b) => b.kind === "step-cap" && b.pending?.stepId === A.id)).toBe(true);
+  await waitUntilIdle(parentId);
+});
+
+test("R2/R3: a gate with a live or blocked sibling stays Review (review outranks blocked)", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER, FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER } = await import("./agents.ts");
+
+  const profile = await makeProfile("review-siblings");
+  const S = newStep({ name: "S", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, transition: "all" });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  // C stays running behind a subagent, then ends with no handoff twice and
+  // blocks — while the gate is already pending.
+  const C = newStep({
+    name: "C",
+    agentProfileId: profile.id,
+    instructions: `Do C. ${FAKE_CLAUDE_SUBAGENT_PROMPT_MARKER}:800 ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:missing`,
+  });
+  const H = newStep({ name: "H", type: "human" });
+  const pipeline = pipelines.insert({
+    name: uniqueName("review-siblings-pipeline"),
+    graph: {
+      steps: [S, B, C, H],
+      edges: [
+        { id: "e1", from: S.id, to: B.id, label: "" },
+        { id: "e2", from: S.id, to: C.id, label: "" },
+        { id: "e3", from: B.id, to: H.id, label: "" },
+      ],
+      startStepId: S.id,
+    },
+    maxSteps: 25,
+  });
+  const created = await createTask({ title: "review siblings run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const gate = await waitFor(() => tasks.get(parentId)?.pipelineRun?.humanSteps?.[0]);
+  expect(gate.stepId).toBe(H.id);
+  // R2: the sibling is still live, but the run is Review, not running.
+  let run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.status).toBe("review");
+  expect(tasks.get(parentId)!.column).toBe("review");
+  expect(run.active.some((a) => a.stepId === C.id)).toBe(true);
+
+  // R3: the sibling blocks; Review still wins and keeps the block visible.
+  const block = await waitFor(
+    () => tasks.get(parentId)?.pipelineRun?.blocked.find((b) => b.kind === "handoff-missing"),
+    10_000,
+  );
+  run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.status).toBe("review");
+  expect(run.humanSteps?.map((g) => g.seq)).toEqual([gate.seq]);
+  expect(run.blocked.some((b) => b.kind === "handoff-missing" && b.taskId === block.taskId)).toBe(true);
+  await waitUntilIdle(parentId);
+});
+
+test("R11: a refused resume send rolls the re-arm back and leaves the gate pending", async () => {
+  const { tasks } = await import("./db.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, A, H } = await startHumanRun("resume-rollback", { withB: true });
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const aRecord = tasks.get(parentId)!.pipelineRun!.history.find((h) => h.stepId === A.id && h.taskId !== null)!;
+  const aTaskId = aRecord.taskId!;
+  const originalRunId = tasks.get(aTaskId)!.runId;
+  // `sendInput` refuses a run id that does not exist, exactly like a vanished
+  // execution — the route's own "resume unavailable" path.
+  tasks.update(aTaskId, { runId: "missing-run-for-rollback" });
+
+  const res = await reviewHumanStep(parentId, {
+    stepId: H.id, seq: gate.seq, decision: "return", comment: "try again", mode: "resume",
+  });
+  expect("error" in res && res.status).toBe(409);
+
+  const run = tasks.get(parentId)!.pipelineRun!;
+  expect(run.status).toBe("review");
+  expect(run.humanSteps?.map((g) => g.seq)).toEqual([gate.seq]);
+  expect(run.active.some((a) => a.taskId === aTaskId)).toBe(false);
+  expect(run.history.some((h) => h.taskId === aTaskId && h.seq > gate.seq)).toBe(false);
+  const humanRecord = run.history.find((h) => h.taskId === null && h.seq === gate.seq)!;
+  expect(humanRecord.outcome).toBeNull();
+  expect(humanRecord.human).toBeNull();
+
+  tasks.update(aTaskId, { runId: originalRunId });
+  const accepted = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+  expect("error" in accepted).toBe(false);
+  await waitUntilIdle(parentId);
+});
+
+test("S6/S7: a Stop during a resume Return's out-of-lock send wins (no 409) and the lock stays free", async () => {
+  const { tasks, runs } = await import("./db.ts");
+  const { reviewHumanStep, cancelPipelineRun, __forTest } = await import("./pipeline-runner.ts");
+  const { parentId, A, H } = await startHumanRun("resume-stop", { withB: true });
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const aTaskId = tasks.get(parentId)!.pipelineRun!.history
+    .find((h) => h.stepId === A.id && h.taskId !== null)!.taskId!;
+
+  let releaseSend!: () => void;
+  const sendGate = new Promise<void>((r) => { releaseSend = r; });
+  let startedSend!: () => void;
+  const sendStarted = new Promise<void>((r) => { startedSend = r; });
+  let sends = 0;
+  // The resumed turn's run, minted below after the Stop — exactly what a real
+  // harness does inside `sendInput` (claude's idle mint, codex's turn spawn).
+  // The stub returns it as the delivered run id, so the post-send confirm must
+  // name it as the run the Stop applied to.
+  let resumedRunId: string | null = null;
+  __forTest.setReviewResumeSend(async (runId) => {
+    sends++;
+    startedSend();
+    await sendGate;
+    return { delivered: true, runId: resumedRunId ?? runId };
+  });
+  try {
+    const reviewing = reviewHumanStep(parentId, {
+      stepId: H.id, seq: gate.seq, decision: "return", comment: "try again", mode: "resume",
+    });
+    await sendStarted;
+
+    // The re-armed entry is neither live nor a timer, yet the run reads
+    // Running exactly as the card does.
+    expect(tasks.get(parentId)!.pipelineRun!.status).toBe("running");
+
+    // The per-parent lock is FREE while the send is in flight: this Stop
+    // would otherwise queue behind the send and only run after it returns.
+    const stopped = await Promise.race([
+      cancelPipelineRun(parentId),
+      new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 1_000)),
+    ]);
+    if (stopped === "timeout") throw new Error("Stop queued behind the resume send");
+    if ("error" in stopped) throw new Error(stopped.error);
+    const stoppedRun = tasks.get(parentId)!.pipelineRun!;
+    expect(stoppedRun.stopRequestedAt).not.toBeNull();
+    expect(stoppedRun.status).toBe("cancelled");
+    expect(tasks.get(parentId)!.column).toBe("ready");
+
+    // The send's harness mints the resumed turn's run AFTER the racing Stop:
+    // now the task's current run is a new id the Stop never saw. A `running`
+    // event for it while the send is in flight is the runner's own turn,
+    // never "the user resumed the stopped step" — only the in-flight marker
+    // keeps it from reviving the cancelled run here.
+    resumedRunId = randomUUID();
+    runs.insert({
+      id: resumedRunId, taskId: aTaskId, agent: tasks.get(aTaskId)!.agent, status: "running", startedAt: Date.now(),
+      endedAt: null, exitCode: null, tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+      cursorSessionId: null, geminiSessionId: null, fxSessionId: null, antigravitySessionId: null,
+    });
+    tasks.update(aTaskId, { runId: resumedRunId });
+    await __forTest.handleColumnChange(aTaskId, "running", undefined);
+    expect(tasks.get(parentId)!.pipelineRun!.stopRequestedAt).not.toBeNull();
+    expect(tasks.get(parentId)!.pipelineRun!.status).toBe("cancelled");
+
+    // The delivered send's confirm sees the Stop, records the run it started
+    // as the one the Stop applied to, and refuses to revive it.
+    releaseSend();
+    const res = await reviewing;
+    expect("error" in res && res.status).toBe(409);
+    expect(sends).toBe(1);
+    const confirmed = tasks.get(parentId)!.pipelineRun!;
+    expect(confirmed.status).toBe("cancelled");
+    expect(confirmed.humanSteps).toHaveLength(0);
+    const execution = confirmed.history
+      .filter((h) => h.taskId === aTaskId)
+      .sort((a, b) => b.seq - a.seq)[0];
+    expect(execution?.stoppedRunId).toBe(resumedRunId);
+
+    // A late `running` event after the marker is gone still keeps the stop:
+    // the confirm named this turn as the run the Stop applied to.
+    await __forTest.handleColumnChange(aTaskId, "running", undefined);
+    expect(tasks.get(parentId)!.pipelineRun!.stopRequestedAt).not.toBeNull();
+    expect(tasks.get(parentId)!.pipelineRun!.status).toBe("cancelled");
+  } finally {
+    __forTest.setReviewResumeSend(null);
+  }
+  await waitUntilIdle(parentId);
+});
+
+test("S7: a second gate cannot re-arm the same source step while its resume send is in flight", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { reviewHumanStep, __forTest } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("resume-two-gates");
+  const A = newStep({
+    name: "A", agentProfileId: profile.id,
+    instructions: `Do A. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`, transition: "all",
+  });
+  const H1 = newStep({ name: "H1", type: "human" });
+  const H2 = newStep({ name: "H2", type: "human" });
+  const pipeline = pipelines.insert({
+    name: uniqueName("two-gate-resume"),
+    graph: {
+      steps: [A, H1, H2],
+      edges: [
+        { id: "e1", from: A.id, to: H1.id, label: "" },
+        { id: "e2", from: A.id, to: H2.id, label: "" },
+      ],
+      startStepId: A.id,
+    },
+    maxSteps: 25,
+  });
+  const created = await createTask({
+    title: "two gate resume", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  const gates = await waitFor(() => {
+    const list = tasks.get(parentId)?.pipelineRun?.humanSteps;
+    return list && list.length === 2 ? list : undefined;
+  });
+  const first = gates.find((g) => g.stepId === H1.id)!;
+  const second = gates.find((g) => g.stepId === H2.id)!;
+
+  let releaseSend!: () => void;
+  const sendGate = new Promise<void>((r) => { releaseSend = r; });
+  let startedSend!: () => void;
+  const sendStarted = new Promise<void>((r) => { startedSend = r; });
+  __forTest.setReviewResumeSend(async (runId) => {
+    startedSend();
+    await sendGate;
+    return { delivered: true, runId };
+  });
+  try {
+    const reviewing = reviewHumanStep(parentId, {
+      stepId: first.stepId, seq: first.seq, decision: "return", comment: "try again", mode: "resume",
+    });
+    await sendStarted;
+    const blocked = await reviewHumanStep(parentId, {
+      stepId: second.stepId, seq: second.seq, decision: "return", comment: "me too", mode: "resume",
+    });
+    expect("error" in blocked && blocked.status).toBe(409);
+    expect("error" in blocked && blocked.error).toContain("already resuming");
+    releaseSend();
+    const settled = await reviewing;
+    if ("error" in settled) throw new Error(settled.error);
+  } finally {
+    __forTest.setReviewResumeSend(null);
+  }
+  await waitUntilIdle(parentId);
+});
+
+test("S7: a refused resume send that raced a Stop leaves the Stop's state alone (no rollback)", async () => {
+  const { tasks } = await import("./db.ts");
+  const { reviewHumanStep, cancelPipelineRun, __forTest } = await import("./pipeline-runner.ts");
+  const { parentId, A, H } = await startHumanRun("resume-refused", { withB: true });
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const aTaskId = tasks.get(parentId)!.pipelineRun!.history
+    .find((h) => h.stepId === A.id && h.taskId !== null)!.taskId!;
+
+  let releaseSend!: () => void;
+  const sendGate = new Promise<void>((r) => { releaseSend = r; });
+  let startedSend!: () => void;
+  const sendStarted = new Promise<void>((r) => { startedSend = r; });
+  __forTest.setReviewResumeSend(async () => {
+    startedSend();
+    await sendGate;
+    return { delivered: false, reason: "the session vanished" };
+  });
+  try {
+    const reviewing = reviewHumanStep(parentId, {
+      stepId: H.id, seq: gate.seq, decision: "return", comment: "try again", mode: "resume",
+    });
+    await sendStarted;
+    const stopped = await cancelPipelineRun(parentId);
+    if ("error" in stopped) throw new Error(stopped.error);
+
+    releaseSend();
+    const res = await reviewing;
+    expect("error" in res && res.status).toBe(409);
+
+    // The rollback must NOT undo the Stop: the gate stays dismissed, the
+    // human record stays cancelled, and the execution stays in `active` so
+    // Retry can re-run it.
+    const run = tasks.get(parentId)!.pipelineRun!;
+    expect(run.status).toBe("cancelled");
+    expect(run.stopRequestedAt).not.toBeNull();
+    expect(run.humanSteps).toHaveLength(0);
+    expect(run.active.some((a) => a.taskId === aTaskId)).toBe(true);
+    // The re-armed execution was what the Stop cancelled; the decision record
+    // keeps the Return (a rollback would have reset both).
+    const execution = run.history.find((h) => h.taskId === aTaskId && h.seq > gate.seq)!;
+    expect(execution.outcome).toBe("cancelled");
+    const humanRecord = run.history.find((h) => h.taskId === null && h.seq === gate.seq)!;
+    expect(humanRecord.outcome).toBe("returned");
+    expect(humanRecord.human).toMatchObject({ decision: "return", comment: "try again", mode: "resume" });
+  } finally {
+    __forTest.setReviewResumeSend(null);
+  }
+  await waitUntilIdle(parentId);
+});
+
+test("R20: a review run with no active executions survives reconcile and reloads as review", async () => {
+  const { tasks } = await import("./db.ts");
+  const { reconcilePipelineRuns } = await import("./pipeline-runner.ts");
+  const { parentId } = await startHumanRun("reconcile-review");
+  const before = tasks.get(parentId)!.pipelineRun!;
+  expect(before.status).toBe("review");
+  expect(before.active).toHaveLength(0);
+
+  await reconcilePipelineRuns();
+
+  const after = tasks.get(parentId)!.pipelineRun!;
+  expect(after.status).toBe("review");
+  expect(after.humanSteps?.map((g) => g.stepId)).toEqual(before.humanSteps!.map((g) => g.stepId));
+  await waitUntilIdle(parentId);
+});
+
+test("unarchive keeps a parked Done pipeline card in Done (only a pending gate forces Review)", async () => {
+  const { tasks } = await import("./db.ts");
+  const { archiveTask, unarchiveTask } = await import("./orchestrator.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, H } = await startHumanRun("unarchive-done");
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const accepted = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+  if ("error" in accepted) throw new Error(accepted.error);
+  await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done");
+  // The owner parks the finished card in Done (the one column the server
+  // allows a Done run to be moved to).
+  tasks.update(parentId, { column: "done" });
+
+  const archived = await archiveTask(parentId, { force: true });
+  if ("error" in archived) throw new Error(archived.error);
+  const unarchived = await unarchiveTask(parentId);
+  if ("error" in unarchived) throw new Error(unarchived.error);
+
+  expect(tasks.get(parentId)!.column).toBe("done");
+  expect(tasks.get(parentId)!.pipelineRun!.status).toBe("done");
+  await waitUntilIdle(parentId);
+});
+
+test("R21: a gate reached while the parent is archived is recorded, refused until unarchive, and unarchive restores Review", async () => {
+  const { createTask, startTask, unarchiveTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { reviewHumanStep } = await import("./pipeline-runner.ts");
+  const { parentId, H } = await (async () => {
+    const made = await makeHumanPipeline("archived-gate");
+    const created = await createTask({
+      title: "archived gate run",
+      prompt: "goal",
+      workdir: freshWorkdir(),
+      isolation: "none",
+      pipelineId: made.pipeline.id,
+    });
+    if ("error" in created) throw new Error(created.error);
+    liveParentIds.push(created.task.id);
+    return { parentId: created.task.id, H: made.H };
+  })();
+
+  const previousDelay = process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "250";
+  try {
+    const started = await startTask(parentId);
+    if ("error" in started) throw new Error(started.error);
+    // Archive while A is still running; the gate's own launch takes the human
+    // branch before any archived/column handling.
+    tasks.update(parentId, { archivedAt: Date.now() });
+    const gate = await waitFor(() => tasks.get(parentId)?.pipelineRun?.humanSteps?.[0]);
+    const run = tasks.get(parentId)!.pipelineRun!;
+    expect(run.humanSteps).toHaveLength(1);
+    expect(run.blocked).toHaveLength(0);
+
+    const refused = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+    expect("error" in refused && refused.status).toBe(409);
+    // The gate landed while archived, so `persist` skipped the column mirror
+    // (m8): the card is still on the column it held when archived.
+    expect(tasks.get(parentId)!.column).not.toBe("review");
+  } finally {
+    if (previousDelay === undefined) delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+    else process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = previousDelay;
+  }
+
+  const unarchived = await unarchiveTask(parentId);
+  if ("error" in unarchived) throw new Error(unarchived.error);
+  // Unarchive re-derives the column from the stored run: a pending gate comes
+  // back to Review, not to whatever column it had before archiving.
+  expect(tasks.get(parentId)!.column).toBe("review");
+  const gate = tasks.get(parentId)!.pipelineRun!.humanSteps![0]!;
+  const accepted = await reviewHumanStep(parentId, { stepId: H.id, seq: gate.seq, decision: "accept" });
+  expect("error" in accepted).toBe(false);
+  await waitUntilIdle(parentId);
+});

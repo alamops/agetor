@@ -1297,11 +1297,15 @@ function PipelineRow({
           <li key={step.id} className="rounded-md bg-muted/30 px-2 py-1">
             <div className="flex flex-wrap items-center gap-x-1.5 text-[11px]">
               <span className="font-medium">{step.name}</span>
-              <span className="text-muted-foreground">
-                →{" "}
-                {step.agentName ?? (step.legacy === "dangling" ? "missing Agent" : "no Agent")}
-                {step.legacy === "remapped" ? " (matched by name)" : ""}
-              </span>
+              {step.type === "human" ? (
+                <span className="text-info">→ Human review</span>
+              ) : (
+                <span className="text-muted-foreground">
+                  →{" "}
+                  {step.agentName ?? (step.legacy === "dangling" ? "missing Agent" : "no Agent")}
+                  {step.legacy === "remapped" ? " (matched by name)" : ""}
+                </span>
+              )}
             </div>
             <Collapsed label="Step instructions" text={step.instructions} />
           </li>

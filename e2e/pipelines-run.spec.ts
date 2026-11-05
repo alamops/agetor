@@ -1021,6 +1021,9 @@ test.describe("pipelines run: executing a run", () => {
     await expect(stepNode(page, A.id)).toHaveAttribute("data-visual", "active", { timeout: CONVERGE_TIMEOUT });
 
     await page.getByTestId("pipeline-run-stop").click();
+    const stopDialog = page.getByRole("dialog").filter({ hasText: "Stop this run?" });
+    await expect(stopDialog).toBeVisible();
+    await stopDialog.getByRole("button", { name: "Stop", exact: true }).click();
     await expect(page.getByTestId("pipeline-run-status")).toHaveText("Cancelled", { timeout: CONVERGE_TIMEOUT });
     await waitForColumn(backend, task.id, "ready");
 

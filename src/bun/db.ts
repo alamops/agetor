@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type ImportedOpencodeSession, type OpencodeServerMode, OPENCODE_SERVER_MODES, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
+import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type ImportedOpencodeSession, type OpencodeServerMode, OPENCODE_SERVER_MODES, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelinePendingLaunch, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
@@ -500,7 +500,7 @@ const isFiniteNumber = (x: unknown): x is number => typeof x === "number" && Num
 const isPlainObject = (x: unknown): x is Record<string, unknown> =>
   typeof x === "object" && x !== null && !Array.isArray(x);
 
-const PIPELINE_RUN_STATUSES = new Set<string>(["idle", "running", "blocked", "done", "cancelled"]);
+const PIPELINE_RUN_STATUSES = new Set<string>(["idle", "running", "blocked", "done", "cancelled", "review"]);
 const PIPELINE_BLOCK_KINDS = new Set<string>([
   "step-failed", "step-blocked", "handoff-missing", "handoff-invalid", "step-cap", "profile-missing", "join-incomplete",
 ]);
@@ -529,7 +529,19 @@ const sanitizeJoinArrival = (raw: unknown): PipelineJoinArrival | null => {
   const { fromStepId, seq } = raw as Record<string, unknown>;
   if (typeof fromStepId !== "string" || !fromStepId) return null;
   if (!isFiniteNumber(seq)) return null;
-  return { fromStepId, seq, handoff: sanitizeStoredHandoff((raw as Record<string, unknown>).handoff) };
+  // Same `handoffField` cap the writer applies (and `sanitizeBlockPending`
+  // applies to `humanFeedback`): a hand-edited or pre-cap row must not put an
+  // unbounded owner comment into a join/pending arrival, the board poll and
+  // the next prompt (R-N2).
+  const comment = typeof raw.comment === "string" && raw.comment.length > 0
+    ? raw.comment.slice(0, PIPELINE_LIMITS.handoffField)
+    : null;
+  return {
+    fromStepId,
+    seq,
+    handoff: sanitizeStoredHandoff((raw as Record<string, unknown>).handoff),
+    ...(comment !== null ? { comment } : {}),
+  };
 };
 
 const sanitizeJoins = (raw: unknown): PipelineRunState["joins"] => {
@@ -550,8 +562,9 @@ const sanitizeJoins = (raw: unknown): PipelineRunState["joins"] => {
  *  retry, or a join-incomplete launch) Retry would re-attempt. Dropped
  *  wholesale (never persisted as a half-valid shape) when `stepId` is
  *  missing/empty; `arrivals` reuses `sanitizeJoinArrival`, same as
- *  `sanitizeJoins` above, silently dropping any junk entry. */
-const sanitizeBlockPending = (raw: unknown): { stepId: string; arrivals: PipelineJoinArrival[] } | null => {
+ *  `sanitizeJoins` above, silently dropping any junk entry. The Return-only
+ *  fields are carried through so a hold cannot lose a human decision. */
+const sanitizeBlockPending = (raw: unknown): PipelinePendingLaunch | null => {
   if (!isPlainObject(raw)) return null;
   const rec = raw as Record<string, unknown>;
   const stepId = rec.stepId;
@@ -559,7 +572,19 @@ const sanitizeBlockPending = (raw: unknown): { stepId: string; arrivals: Pipelin
   const arrivals = Array.isArray(rec.arrivals)
     ? rec.arrivals.map(sanitizeJoinArrival).filter((a): a is PipelineJoinArrival => a !== null)
     : [];
-  return { stepId, arrivals };
+  const returnToStepId = typeof rec.returnToStepId === "string" && rec.returnToStepId.length > 0
+    ? rec.returnToStepId
+    : undefined;
+  const humanFeedback = typeof rec.humanFeedback === "string" && rec.humanFeedback.length > 0
+    ? rec.humanFeedback.slice(0, PIPELINE_LIMITS.handoffField)
+    : undefined;
+  return {
+    stepId,
+    arrivals,
+    ...(returnToStepId !== undefined ? { returnToStepId } : {}),
+    ...(rec.returned === true ? { returned: true } : {}),
+    ...(humanFeedback !== undefined ? { humanFeedback } : {}),
+  };
 };
 
 const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
@@ -574,7 +599,26 @@ const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
   return { taskId, stepId, kind: kind as PipelineBlockKind, message, ...(pending ? { pending } : {}) };
 };
 
-const STEP_RECORD_OUTCOMES = new Set<string>(["succeeded", "failed", "cancelled", "advanced-manually"]);
+const STEP_RECORD_OUTCOMES = new Set<string>(["succeeded", "failed", "cancelled", "advanced-manually", "returned"]);
+
+/** {@link PipelineStepRecord.human} — a human gate's decision. Dropped to
+ *  `null` when malformed (the history record itself still stands; the
+ *  decision is a label for prior rounds). */
+const sanitizeHumanDecision = (raw: unknown): PipelineStepRecord["human"] => {
+  if (!isPlainObject(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  const decision = rec.decision;
+  if (decision !== "accept" && decision !== "return") return null;
+  // Same `handoffField` cap the decision route enforces (R-N2): a hand-edited
+  // or pre-cap row must not put an unbounded owner comment into the history,
+  // prior-rounds list and the next prompt.
+  const comment = typeof rec.comment === "string" && rec.comment.length > 0
+    ? rec.comment.slice(0, PIPELINE_LIMITS.handoffField)
+    : null;
+  const mode = rec.mode === "fresh" || rec.mode === "resume" ? rec.mode : undefined;
+  const returnToStepId = typeof rec.returnToStepId === "string" && rec.returnToStepId.length > 0 ? rec.returnToStepId : null;
+  return { decision, comment, ...(mode ? { mode } : {}), returnToStepId };
+};
 
 /** {@link PipelineStepRecord.responseKind}'s value set — see {@link
  *  StepResponseKind} in `src/shared/types.ts`. */
@@ -637,7 +681,8 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
   const seq = rec.seq;
   const startedAt = rec.startedAt;
   if (typeof stepId !== "string" || !stepId) return null;
-  if (typeof taskId !== "string" || !taskId) return null;
+  // A human gate's record has no task row — `null` is its valid value.
+  if (taskId !== null && (typeof taskId !== "string" || !taskId)) return null;
   if (!isFiniteNumber(seq)) return null;
   if (!isFiniteNumber(startedAt)) return null;
 
@@ -650,9 +695,11 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
     : [];
 
   return {
-    seq, stepId, taskId, startedAt, endedAt, outcome,
+    seq, stepId, taskId: taskId as string | null, startedAt, endedAt, outcome,
     handoff: sanitizeStoredHandoff(rec.handoff),
     nextStepIds,
+    human: sanitizeHumanDecision(rec.human),
+    returnToStepId: typeof rec.returnToStepId === "string" && rec.returnToStepId.length > 0 ? rec.returnToStepId : null,
     responseKind: sanitizeResponseKind(rec.responseKind),
     reminder: sanitizeStepReminder(rec.reminder),
     // Always emitted (like responseKind/reminder above) so the read shape is
@@ -685,6 +732,28 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
  *  just index into `.steps`/`.edges` arrays: a `graph` that isn't even an
  *  object with array `steps`/`edges` collapses the whole snapshot to `null`
  *  (an un-runnable snapshot is as good as none) exactly like before. */
+/** `PipelineRunState.humanSteps` — pending human gates. Entries without a
+ *  usable `stepId`/`seq`/`startedAt` are dropped; arrivals reuse
+ *  `sanitizeJoinArrival`. */
+const sanitizeHumanSteps = (raw: unknown): NonNullable<PipelineRunState["humanSteps"]> => {
+  if (!Array.isArray(raw)) return [];
+  const out: NonNullable<PipelineRunState["humanSteps"]> = [];
+  for (const value of raw) {
+    if (!isPlainObject(value)) continue;
+    const rec = value as Record<string, unknown>;
+    const stepId = rec.stepId;
+    const seq = rec.seq;
+    const startedAt = rec.startedAt;
+    if (typeof stepId !== "string" || !stepId) continue;
+    if (!isFiniteNumber(seq) || !isFiniteNumber(startedAt)) continue;
+    const arrivals = Array.isArray(rec.arrivals)
+      ? rec.arrivals.map(sanitizeJoinArrival).filter((a): a is PipelineJoinArrival => a !== null)
+      : [];
+    out.push({ stepId, seq, startedAt, arrivals });
+  }
+  return out;
+};
+
 /** Minimal shape check for one `PipelineGraph.steps` entry — a plain object
  *  with a string `id` and a `position` that's a plain object with numeric
  *  `x`/`y`. Anything else (a bare string, `null`, a step missing `position`,
@@ -786,6 +855,7 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
   const history = Array.isArray(rec.history)
     ? rec.history.map(sanitizeStepRecord).filter((h): h is PipelineStepRecord => h !== null)
     : [];
+  const humanSteps = sanitizeHumanSteps(rec.humanSteps);
 
   // L-S4: both counters are (safe) integers by construction — the runner
   // only ever increments them by one — so a fractional, negative, or
@@ -793,6 +863,18 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
   // `PIPELINE_LIMITS.capExtensionsMax` so `effectiveStepCap` can never scale
   // a run's allowance by an absurd factor off a hand-edited row.
   const stepCount = Number.isSafeInteger(rec.stepCount) && (rec.stepCount as number) >= 0 ? (rec.stepCount as number) : 0;
+  // An old row has no run-wide seq counter: derive it from the highest seq
+  // already used, so the next human gate or agent execution can't collide.
+  let seqCounter = Number.isSafeInteger(rec.seqCounter) && (rec.seqCounter as number) >= 0
+    ? (rec.seqCounter as number)
+    : undefined;
+  if (seqCounter === undefined) {
+    let max = 0;
+    for (const h of history) if (h.seq > max) max = h.seq;
+    for (const g of humanSteps) if (g.seq > max) max = g.seq;
+    for (const a of active) if (a.seq > max) max = a.seq;
+    seqCounter = max;
+  }
   const startedAt = isFiniteNumber(rec.startedAt) ? rec.startedAt : null;
   const endedAt = isFiniteNumber(rec.endedAt) ? rec.endedAt : null;
 
@@ -805,6 +887,8 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
     joins: sanitizeJoins(rec.joins),
     blocked,
     history,
+    humanSteps,
+    seqCounter,
     stepCount,
     startedAt,
     endedAt,

@@ -440,6 +440,32 @@ describe("planBundleImport — pipelines", () => {
     expect(p.legacy).toBe(false);
   });
 
+  test("a human step previews as Human and raises no step-without-agent warning", () => {
+    const p = plan(
+      parse({
+        format: "agetor-bundle",
+        version: 2,
+        agents: [agent("worker")],
+        pipelines: [{
+          name: "P",
+          description: "",
+          maxSteps: 25,
+          graph: {
+            steps: [stepJson("a", "worker"), stepJson("h", null, { type: "human" })],
+            edges: [{ id: "e", from: "a", to: "h", label: "" }],
+            startStepId: "a",
+          },
+        }],
+      }),
+      localState({ agentNames: ["Worker"] }),
+    );
+    const pp = p.pipelines[0]!;
+    expect(pp.steps.map((s) => s.type)).toEqual(["agent", "human"]);
+    expect(pp.graph.steps[1]!.type).toBe("human");
+    expect(pp.graph.steps[1]!.agentProfileId).toBeNull();
+    expect(pp.warnings).toEqual([]);
+  });
+
   test("legacy files: kept, remapped, ambiguous and dangling references", () => {
     const parsed = parse({
       name: "Old",

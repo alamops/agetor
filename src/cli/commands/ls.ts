@@ -166,6 +166,12 @@ function needsCell(t: Task): string {
   if (t.pipelineId && t.pipelineRun?.status === "blocked") {
     parts.push(c.yellow(`pipeline blocked · ${escapeControlChars(pipelineStepProgress(t.pipelineRun).label)}`));
   }
+  // A pending human gate parks the run in Review — the row's next action is
+  // a decision, not a rerun.
+  if (t.pipelineId && t.pipelineRun?.status === "review" && (t.pipelineRun.humanSteps ?? []).length > 0) {
+    const gates = (t.pipelineRun.humanSteps ?? []).length;
+    parts.push(c.cyan(`pipeline review · ${gates} gate${gates === 1 ? "" : "s"}`));
+  }
   // A step task (listed only under `--steps`) names its parent here so the
   // row is actionable — `agetor pipeline status <parent>` / `agetor show`.
   if (t.pipelineParentId) parts.push(c.dim(`step of ${t.pipelineParentId.slice(0, 8)}`));

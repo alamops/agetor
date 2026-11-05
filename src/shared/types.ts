@@ -509,6 +509,14 @@ export interface AgentProfileSnapshot {
 export interface PipelineStep {
   id: string;
   name: string;
+  /** What kind of step this is: `"agent"` (default when absent — every
+   *  graph written before human steps existed) runs an agent profile's
+   *  task, `"human"` is a pause/review gate the owner decides at. A human
+   *  step has no `agentProfileId`/`subagents`, exactly one incoming edge,
+   *  is never the start step, and its `join` is normalized to `"any"`. See
+   *  `docs/architecture/pipelines.md`. Optional/additive so an old stored
+   *  graph reads as agent-only. */
+  type?: "agent" | "human";
   /** Step-specific prompt text, composed into the launch prompt by
    *  `composeStepPrompt` alongside the pipeline goal and prior handoffs. */
   instructions: string;
@@ -619,7 +627,7 @@ export interface Handoff {
 
 /** Lifecycle state of a {@link PipelineRunState}, mirrored by the parent
  *  pipeline task's board column. */
-export type PipelineRunStatus = "idle" | "running" | "blocked" | "done" | "cancelled";
+export type PipelineRunStatus = "idle" | "running" | "blocked" | "done" | "cancelled" | "review";
 
 /** Why a pipeline execution is Blocked — surfaced per-entry in
  *  {@link PipelineRunState.blocked} and as the parent task's `column`
@@ -651,6 +659,43 @@ export interface PipelineJoinArrival {
   fromStepId: string;
   seq: number;
   handoff: Handoff | null;
+  /** Owner-authored feedback carried by a human gate's Accept — trusted,
+   *  rendered as `## Human review feedback` in the next step's prompt, never
+   *  folded into {@link handoff} (which is agent output and fenced as
+   *  untrusted). Absent/null when the human accepted without a comment. */
+  comment?: string | null;
+}
+
+/** One pending human gate on a {@link PipelineRunState}: the run has reached
+ *  a `type:"human"` step and is waiting for the owner's decision. A gate has
+ *  no task row (nothing is spawned) and lives in
+ *  {@link PipelineRunState.humanSteps}. `seq` is the run-wide monotonic
+ *  history sequence the decision is recorded under (and the idempotency key
+ *  of a decision, paired with the run's `startedAt`). `arrivals` is the
+ *  handoff(s) the gate was entered with — one for a normal edge, several
+ *  after a manual advance. */
+export interface PipelineHumanStep {
+  stepId: string;
+  seq: number;
+  startedAt: number;
+  arrivals: PipelineJoinArrival[];
+}
+
+/** The exact launch a run-level {@link PipelineBlock} is waiting to retry —
+ *  everything `launchStep` needs to re-materialize the same execution,
+ *  including a human Return's forced edge and trusted feedback. Persisted so
+ *  a Retry after a hold cannot silently drop the decision (R6/R17). */
+export interface PipelinePendingLaunch {
+  stepId: string;
+  arrivals: PipelineJoinArrival[];
+  /** Return only: the gate the re-run is forced back to even when its own
+   *  handoff names a different step (the fresh Return's `returnToStepId`). */
+  returnToStepId?: string;
+  /** Return only: render the returned-execution copy in the prompt. */
+  returned?: boolean;
+  /** Return only: the owner's comment, rendered as trusted
+   *  `## Human review feedback`. */
+  humanFeedback?: string | null;
 }
 
 /** A single blocked pipeline execution (or a run-level block whose
@@ -668,8 +713,9 @@ export interface PipelineBlock {
    *  launch instead of re-deriving it. `stepId` on the block itself is
    *  always set for these blocks (the step the pending launch targets, same
    *  value as `pending.stepId` here); `arrivals` is the join state (if any)
-   *  it would launch with. */
-  pending?: { stepId: string; arrivals: PipelineJoinArrival[] };
+   *  it would launch with, and the Return fields preserve a human decision
+   *  across the hold. */
+  pending?: PipelinePendingLaunch;
 }
 
 /**
@@ -731,6 +777,23 @@ export interface PipelineStepReminder {
 }
 
 /**
+ * The owner's decision at a human gate, recorded on the gate's
+ * {@link PipelineStepRecord.human}. `accept` continues through the gate's
+ * outgoing edges (comment optional); `return` re-runs the gate's sole
+ * incoming source (`fresh` — the default — or `resume`), and requires a
+ * comment.
+ */
+export interface PipelineHumanDecision {
+  decision: "accept" | "return";
+  comment: string | null;
+  /** `return` only. */
+  mode?: "fresh" | "resume";
+  /** `return` only: the step re-run (the gate's sole incoming source, or
+   *  the step a manual Advance entered the gate from). */
+  returnToStepId?: string | null;
+}
+
+/**
  * One completed (or cancelled) step execution, appended to {@link
  * PipelineRunState.history} once its task settles. `nextStepIds` records
  * what `resolveNextSteps` actually started from this execution's handoff —
@@ -740,12 +803,22 @@ export interface PipelineStepReminder {
 export interface PipelineStepRecord {
   seq: number;
   stepId: string;
-  taskId: string;
+  /** The hidden step task this execution ran, or `null` for a human gate
+   *  (which spawns nothing — its history record is the decision
+   *  transcript). */
+  taskId: string | null;
   startedAt: number;
   endedAt: number | null;
-  outcome: "succeeded" | "failed" | "cancelled" | "advanced-manually" | null;
+  outcome: "succeeded" | "failed" | "cancelled" | "advanced-manually" | "returned" | null;
   handoff: Handoff | null;
   nextStepIds: string[];
+  /** Human gates only: the decision this record recorded, its (trimmed)
+   *  comment, the Return mode, and the step the Return re-runs. */
+  human?: PipelineHumanDecision | null;
+  /** The gate a returned execution is forced back to — set when this
+   *  execution was launched/resumed by a human Return; `settleStepRun`
+   *  resolves this edge unconditionally instead of the handoff's `next`. */
+  returnToStepId?: string | null;
   /** How this execution's final response classified — see {@link
    *  StepResponseKind}. Optional/additive: absent on a record written before
    *  this field existed, and never set for an execution still awaiting
@@ -814,7 +887,20 @@ export interface PipelineRunState {
   joins: Record<string, { arrivals: PipelineJoinArrival[] }>;
   blocked: PipelineBlock[];
   history: PipelineStepRecord[];
-  /** Total executions started this run — what `maxSteps` caps. */
+  /** Pending human gates (no task row — a gate spawns nothing). A pending
+   *  gate makes the run `review` and the board card sit in Review. Absent
+   *  on a row written before human steps existed (read as `[]`). */
+  humanSteps?: PipelineHumanStep[];
+  /** The run-wide monotonic history sequence allocator. `stepCount` stays
+   *  agent-execution-only (it is what `maxSteps` caps); a human gate takes
+   *  its history `seq` from here so human and agent entries never collide.
+   *  Absent on an old row (derived from the highest known `seq`). */
+  seqCounter?: number;
+  /** Total agent executions started this run — what `maxSteps` caps. A human
+   *  gate never increments it. A resumed Return re-arms an existing step task
+   *  as a new run row + history record but deliberately does NOT increment
+   *  this, so a Return→Resume loop is not bounded by `maxSteps`; a fresh
+   *  Return does increment it (it launches a new execution). */
   stepCount: number;
   startedAt: number | null;
   endedAt: number | null;
@@ -1640,8 +1726,10 @@ export interface Task {
    * a task that isn't a pipeline task (`pipelineId` null).
    *
    * **`GET /tasks` (the board's 2s poll) ships a TRIMMED variant** of this
-   * state: every `history[].handoff` and `joins[].arrivals[].handoff` is
-   * `null` and `snapshot.profiles` is `{}` — the board/TUI/`agetor ls` only
+   * state: every `history[].handoff`, `joins[].arrivals[].handoff`,
+   * `humanSteps[].arrivals[].handoff` and `blocked[].pending` (a held
+   * launch's arrivals + `humanFeedback`) has its handoff/comment nulled and
+   * `snapshot.profiles` is `{}` — the board/TUI/`agetor ls` only
    * need `snapshot.graph`, `status`, `active`, `blocked`, the history
    * outcomes and `stepCount` (step progress, blocked banner, history
    * length), and shipping every persisted handoff for every pipeline task
@@ -5597,6 +5685,15 @@ export type GlobalEvent =
       activeStepIds: string[];
       stepCount: number;
       ts: number;
+      /** The `seq` of every pending human gate at the moment this fired —
+       *  the notification dedupe key, paired with `runStartedAt`. Optional/
+       *  additive (absent on an event from an older core, and on a run with
+       *  no human steps). */
+      humanStepSeqs?: number[];
+      /** The run's `startedAt` (null before the first run) — a Restart
+       *  starts a new generation, so its gates notify afresh. Optional/
+       *  additive. */
+      runStartedAt?: number | null;
     }
   | {
       /**

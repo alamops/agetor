@@ -1,0 +1,796 @@
+{
+  "version": 1,
+  "id": "pipeline-human-step-grill-r1",
+  "title": "Grill — Pipeline Human Step",
+  "skill": "grill",
+  "slug": "pipeline-human-step",
+  "round": 1,
+  "flags": [],
+  "summary": "Before Planning: **12 decisions** that change the shape of the build, plus a **confirm list** of defaults (one click each). The first four decide what the user sees and how the run state machine behaves; the next three decide what Return actually does; then the panel, escape hatches, CLI and the bundle contract.\n\nThe investigation found **no existing human-step code** and all baseline suites green. The load-bearing gaps are: the Review card's Done button 409s for a non-done pipeline; there is no `review` run status; the previous step can walk away from the gate after a return; and a human gate has no task row, so the run view and attention resolver cannot see it.\n\nSource: the pipeline step task text (no PRD in the repo), grounded in `docs/plans/pipeline-human-step-investigation.md`.",
+  "proven": [
+    {
+      "text": "**No human-step code exists today, and the pipeline baseline is green.** `bun test` on the five pipeline suites: 239 + 184 + 114 + 73 + 208 pass, 0 fail; `bun run typecheck` clean. Everything below is additive.",
+      "evidence": [
+        { "label": "baseline run", "path": "docs/plans/pipeline-human-step-investigation.md", "line": 133 }
+      ]
+    },
+    {
+      "text": "**The graph validator strips an unknown `type` and currently accepts an agent-less start step.** A read-only probe of a one-step `{type:\"human\"}` graph returned `ok:true`; `newStep()` emits no `type` field.",
+      "evidence": [
+        {
+          "label": "newStep emits no type",
+          "path": "src/shared/pipeline.ts",
+          "line": 350,
+          "lang": "ts",
+          "code": "export function newStep(partial?: Partial<PipelineStep>): PipelineStep {\n  return {\n    id: crypto.randomUUID(),\n    name: \"New step\",\n    instructions: \"\",\n    agentProfileId: null,\n    ...\n    ...partial,\n  };\n}"
+        },
+        { "label": "probe result", "path": "docs/plans/pipeline-human-step-investigation.md", "line": 134 }
+      ]
+    },
+    {
+      "text": "**`createTask`, `buildSnapshot` and `launchStep` all reject a step with no agent.** A human step must be exempted in all three, or it can never be created, snapshotted or launched.",
+      "evidence": [
+        {
+          "label": "createTask rejects a no-agent step",
+          "path": "src/bun/orchestrator.ts",
+          "line": 8501,
+          "lang": "ts",
+          "code": "for (const step of pipeline.graph.steps) {\n  if (!step.agentProfileId) return { error: `step \"${step.name}\" has no agent` };\n  ...\n}"
+        },
+        {
+          "label": "buildSnapshot rejects a no-agent step",
+          "path": "src/bun/pipeline-runner.ts",
+          "line": 884,
+          "lang": "ts",
+          "code": "const neededIds = new Set<string>();\nfor (const step of graph.steps) {\n  if (!step.agentProfileId) return { error: `step \"${step.name}\" has no agent` };\n  neededIds.add(step.agentProfileId);\n  ...\n}"
+        },
+        {
+          "label": "launchStep blocks with profile-missing",
+          "path": "src/bun/pipeline-runner.ts",
+          "line": 1118,
+          "lang": "ts",
+          "code": "const profile = step.agentProfileId ? snapshot.profiles[step.agentProfileId] : undefined;\nif (!profile) {\n  upsertBlocked(run, { taskId: null, stepId: step.id, kind: \"profile-missing\", message: `step \"${step.name}\" has no agent`, ... });\n  ...\n}"
+        }
+      ]
+    },
+    {
+      "text": "**A Review-column pipeline parent's Done button 409s today.** The card renders Done for any `column === \"review\"`, but the server only allows `column:\"done\"` when `pipelineRun.status === \"done\"`.",
+      "evidence": [
+        {
+          "label": "card renders Done for any Review card",
+          "path": "src/mainview/components/kanban/TaskCard.tsx",
+          "line": 353,
+          "lang": "tsx",
+          "code": "{!archived && task.column === \"review\" && (\n  <Button size=\"sm\" variant=\"outline\" onClick={() => onMarkDone(task)} title=\"Mark this task as done\">\n    <CheckCircle2 className=\"mr-1 size-3\" /> Done\n  </Button>\n)}"
+        },
+        {
+          "label": "server only allows done → Done",
+          "path": "src/bun/server.ts",
+          "line": 5574,
+          "lang": "ts",
+          "code": "if (before.pipelineId != null && \"column\" in patch && patch.column !== before.column) {\n  const parkingFinished = before.pipelineRun?.status === \"done\" && patch.column === \"done\";\n  if (!parkingFinished) {\n    return json({ error: \"pipeline task's column is managed by its run\" }, { status: 409, ... });\n  }\n}"
+        }
+      ]
+    },
+    {
+      "text": "**A human gate has no task row, so today's run view and attention resolver cannot see it.** `reviewActive` only walks `run.active` and looks up a step task; `pipelineAttentionStepTask` also resolves step tasks only. The human panel must key off the new run state.",
+      "evidence": [
+        {
+          "label": "reviewActive only sees task-backed executions",
+          "path": "src/mainview/components/pipelines/PipelineRunView.tsx",
+          "line": 872,
+          "lang": "tsx",
+          "code": "const reviewActive = run.active.flatMap((active) => {\n  const stepTask = steps.find((t) => t.id === active.taskId);\n  if (!stepTask || stepTask.column !== \"review\") return [];\n  ...\n});"
+        }
+      ]
+    },
+    {
+      "text": "**A plain Run on a `review` run would silently restart it.** `startPipelineRun` only special-cases `blocked`/`cancelled` (retry) and `done` (refuse); every other status falls through to the fresh-run path, discarding history and the gate.",
+      "evidence": [
+        {
+          "label": "no guard for a new status",
+          "path": "src/bun/pipeline-runner.ts",
+          "line": 1614,
+          "lang": "ts",
+          "code": "if (!opts?.restart) {\n  if (run.status === \"blocked\" || run.status === \"cancelled\") {\n    return performPipelineRetry(fresh, run);\n  } else if (run.status === \"done\") {\n    return { error: \"pipeline already finished — restart it explicitly\" };\n  }\n}\n// Fresh run ..."
+        }
+      ]
+    },
+    {
+      "text": "**No SQL migration is needed.** `pipelines.graph` and `tasks.pipeline_run` are JSON columns; old steps default to agent and old runs default to no human gates.",
+      "evidence": [
+        { "label": "run state is JSON on the task", "path": "src/shared/types.ts", "line": 808 },
+        { "label": "run-state sanitizer", "path": "src/bun/db.ts", "line": 761 }
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "run",
+      "title": "Run state & the card",
+      "intro": "These decide what the owner sees when the pipeline reaches the gate, and how the run's status machine changes.",
+      "questions": [
+        {
+          "id": "card-action",
+          "type": "single",
+          "title": "When a human step is pending in the Review column, what should the board card offer?",
+          "impact": "blocking",
+          "why": "Sets the card's primary/secondary actions, the context menu, and the server's column guard. The wrong choice leaves a Done button that 409s or makes the gate amber, contradicting \"same as Review\".",
+          "context": "Today every `column:\"review\"` card renders **Done**, but the server only accepts `column:\"done\"` when `pipelineRun.status === \"done\"`; a pipeline parent's column is otherwise managed by its run. The card shows **Open** once `pipelineRun.history.length > 0`. So a human gate in Review would show a Done button that 409s unless the card, the menu and the guard change.",
+          "evidence": [
+            {
+              "label": "card renders Done for any review card",
+              "path": "src/mainview/components/kanban/TaskCard.tsx",
+              "line": 353,
+              "lang": "tsx",
+              "code": "{!archived && task.column === \"review\" && (\n  <Button size=\"sm\" variant=\"outline\" onClick={() => onMarkDone(task)} title=\"Mark this task as done\">\n    <CheckCircle2 className=\"mr-1 size-3\" /> Done\n  </Button>\n)}"
+            },
+            {
+              "label": "server guard",
+              "path": "src/bun/server.ts",
+              "line": 5574,
+              "lang": "ts",
+              "code": "const parkingFinished = before.pipelineRun?.status === \"done\" && patch.column === \"done\";\nif (!parkingFinished) return json({ error: \"pipeline task's column is managed by its run\" }, { status: 409, ... });"
+            },
+            {
+              "label": "Open once any step has run",
+              "path": "src/mainview/components/kanban/TaskCard.tsx",
+              "line": 90,
+              "lang": "ts",
+              "code": "const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;\nconst openable = task.hasOpenableRun || hasOpenablePipelineRun;"
+            }
+          ],
+          "options": [
+            {
+              "id": "review-open",
+              "label": "Open + Review (Done suppressed)",
+              "description": "The card reads like Review: neutral Open, plus a neutral **Review** button that opens the human panel. Done is hidden until the gate is accepted and the run is done.",
+              "consequence": "TaskCard + context menu + the PATCH guard all change; the card matches Review without an amber ring."
+            },
+            {
+              "id": "review-only",
+              "label": "Review only (Done suppressed)",
+              "description": "Review is the primary action; Open stays reachable from inside the panel/run view.",
+              "consequence": "Fewer buttons, but the user loses the direct transcript entry point on the card."
+            },
+            {
+              "id": "open-only",
+              "label": "Open only (the panel lives inside the run view)",
+              "description": "No new card action; the user opens the run view and clicks the highlighted gate node.",
+              "consequence": "Least card wiring, but the gate is one click deeper and easier to miss."
+            },
+            {
+              "id": "done-accept",
+              "label": "Keep Done, repurposed as terminal Accept",
+              "description": "Done only on a gate with no outgoing edge; it accepts and finishes. Hidden when there is a next step.",
+              "consequence": "Overloads Done and drops Return from the card; the server/Done plumbing gets more special cases."
+            }
+          ],
+          "recommendation": {
+            "value": "review-open",
+            "reason": "Keeps the card visually identical to Review while making the gate one click away; Done is only valid after a terminal Accept makes the run done."
+          }
+        },
+        {
+          "id": "run-status",
+          "type": "single",
+          "title": "Represent the pause as a new `review` run status, or reuse `blocked` / `running`?",
+          "impact": "blocking",
+          "why": "Every exhaustive status map, `deriveRunStatus`, the sanitizer, the board column mapping, the CLI/TUI and the notifications depend on this.",
+          "context": "`PipelineRunStatus` is `idle | running | blocked | done | cancelled`. `persist` maps `done → review`, so Review is currently a terminal-only column. `deriveRunStatus` is blocked > cancelled > running > done. A `review` status is non-terminal: no `endedAt`, no Done button, no \"Pipeline finished\" toast.",
+          "evidence": [
+            {
+              "label": "the status union",
+              "path": "src/shared/types.ts",
+              "line": 622,
+              "lang": "ts",
+              "code": "export type PipelineRunStatus = \"idle\" | \"running\" | \"blocked\" | \"done\" | \"cancelled\";"
+            },
+            {
+              "label": "column mapping",
+              "path": "src/bun/pipeline-runner.ts",
+              "line": 290,
+              "lang": "ts",
+              "code": "const columnFor: Partial<Record<PipelineRunStatus, ColumnId>> = {\n  running: \"running\",\n  blocked: \"blocked\",\n  done: \"review\",\n  cancelled: \"ready\",\n};"
+            },
+            {
+              "label": "status derivation",
+              "path": "src/shared/pipeline.ts",
+              "line": 1120,
+              "lang": "ts",
+              "code": "export function deriveRunStatus(run: PipelineRunState): PipelineRunStatus {\n  if (run.blocked.length > 0) return \"blocked\";\n  if (run.stopRequestedAt != null) return \"cancelled\";\n  if (run.active.length > 0) { ... return allStopped ? \"cancelled\" : \"running\"; }\n  if (run.status === \"cancelled\" || run.status === \"idle\") return run.status;\n  return \"done\";\n}"
+            }
+          ],
+          "options": [
+            {
+              "id": "new-review",
+              "label": "New `review` status mapped to the Review column",
+              "description": "Non-terminal pause; `persist` maps `review → review`; `deriveRunStatus` returns `review` when a gate is pending and nothing is active/blocked.",
+              "consequence": "Touches every `Record<PipelineRunStatus, …>` (compiler catches), the sanitizer whitelist, CLI/TUI labels and the card's Done guard; gives the exact Review card with no amber."
+            },
+            {
+              "id": "blocked-kind",
+              "label": "A new `human-step` block kind under `blocked`",
+              "description": "Reuse the block machinery and Retry/Advance UI.",
+              "consequence": "Card is amber and labelled Blocked, which contradicts \"same as Review\"; the block/retry state machine grows a kind that is not a failure."
+            },
+            {
+              "id": "running-paused",
+              "label": "Keep `running` with a paused flag",
+              "description": "No new status; `humanSteps` on the run state says it is waiting.",
+              "consequence": "Card stays Running with Stop visible; Review-column behavior would have to be special-cased in the card; every status consumer sees a lying \"running\"."
+            }
+          ],
+          "recommendation": {
+            "value": "new-review",
+            "reason": "It is the only representation that makes the card's Review behavior and the non-terminal pause true at the same time."
+          }
+        },
+        {
+          "id": "fanout",
+          "type": "single",
+          "title": "If one branch reaches a human step while other branches are still running, what pauses?",
+          "impact": "blocking",
+          "why": "Decides whether the run status flips to Review immediately, waits for siblings, or holds all further launches. It also decides whether a gate can be acted on while siblings run.",
+          "context": "`transition:\"all\"` fans out; `run.active` holds several executions. `deriveRunStatus` returns `running` whenever `run.active` is non-empty. A gate has no step task and no agent. The goal says the pipeline \"pauses\" at the gate; with fan-out, \"the pipeline\" and \"that branch\" differ.",
+          "evidence": [
+            {
+              "label": "active executions drive the status",
+              "path": "src/shared/pipeline.ts",
+              "line": 1125,
+              "lang": "ts",
+              "code": "if (run.active.length > 0) {\n  const allStopped = run.active.every(...);\n  return allStopped ? \"cancelled\" : \"running\";\n}"
+            },
+            { "label": "fan-out union", "path": "src/shared/types.ts", "line": 648 }
+          ],
+          "options": [
+            {
+              "id": "branch",
+              "label": "Pause only that branch",
+              "description": "The gate is actionable as soon as it arrives. Other branches keep running and may launch further steps. The run stays `running` until every live execution settles, then `review` if a gate is still pending. Multiple gates may be pending; each is independent.",
+              "consequence": "Smallest change; matches the existing `run.active`/`deriveRunStatus` model. The card is Running (Stop visible) while siblings work, and Review once they settle; the gate is opened from the run view in the meantime."
+            },
+            {
+              "id": "whole-hold",
+              "label": "Hold the whole pipeline",
+              "description": "Once any gate is pending, no branch launches another step; agents already running finish (they cannot be paused), then the run becomes `review`. The gate is actionable immediately.",
+              "consequence": "A true breaker, but needs a run-level hold for every pending launch (like the stopped-run holds), plus tests for joins/retries; materially larger."
+            },
+            {
+              "id": "immediate-review",
+              "label": "Flip the run to `review` immediately, siblings keep running",
+              "description": "The moment a gate arrives the status/column is review; live siblings continue in the background.",
+              "consequence": "Card says Review while agents are still writing to the worktree; the human may accept/return into live work; `deriveRunStatus` and every \"review means idle\" assumption change."
+            }
+          ],
+          "recommendation": {
+            "value": "branch",
+            "reason": "The runner cannot pause a live agent anyway; branch-only reuses `run.active` and `deriveRunStatus` without inventing a run-level hold."
+          }
+        },
+        {
+          "id": "accept-targets",
+          "type": "single",
+          "title": "When the human accepts and the gate has more than one outgoing edge, how is the next step chosen?",
+          "impact": "shape",
+          "why": "Decides whether the panel needs a target picker and whether `transition` remains meaningful on a human step.",
+          "context": "`resolveNextSteps` already implements the agent rules: `transition:\"all\"` launches every outgoing step; otherwise zero outgoing is terminal, one is taken, and several are matched against the handoff's `next`. A human emits no handoff with a `next` field unless the panel asks.",
+          "evidence": [
+            {
+              "label": "the existing resolver",
+              "path": "src/shared/pipeline.ts",
+              "line": 1068,
+              "lang": "ts",
+              "code": "export function resolveNextSteps(g, fromStepId, handoff) {\n  const outgoing = outgoingSteps(g, fromStepId);\n  if (outgoing.length === 0) return { kind: \"terminal\" };\n  const transition = fromStep?.transition ?? \"choose\";\n  if (transition === \"all\") return { kind: \"steps\", stepIds: dedupeStrings(outgoing.map((o) => o.step.id)) };\n  if (outgoing.length === 1) return { kind: \"steps\", stepIds: [outgoing[0]!.step.id] };\n  ...\n}"
+            }
+          ],
+          "options": [
+            {
+              "id": "reuse-transition",
+              "label": "Reuse the step's `transition`",
+              "description": "`choose` → the panel lists the outgoing steps and the human picks one; `all` → Accept launches every outgoing step; zero outgoing → Accept finishes the run.",
+              "consequence": "One resolver for agents and humans; the editor keeps `transition`; the panel's target picker is conditional."
+            },
+            {
+              "id": "always-choose",
+              "label": "Always make the human pick one",
+              "description": "Ignore `transition`; Accept requires selecting exactly one outgoing step (or finishing when there are none).",
+              "consequence": "Simpler panel, but `transition` becomes a dead field on human steps and a fan-out gate cannot accept all at once."
+            },
+            {
+              "id": "always-all",
+              "label": "Always launch every outgoing step",
+              "description": "No target picker; Accept fans out to all outgoing steps, or finishes when there are none.",
+              "consequence": "Simplest runtime, but a gate with two alternative paths cannot choose one."
+            }
+          ],
+          "recommendation": {
+            "value": "reuse-transition",
+            "reason": "The resolver, editor field and tests already exist; only the panel's picker is new."
+          }
+        }
+      ]
+    },
+    {
+      "id": "return",
+      "title": "Return mechanics",
+      "intro": "These decide what \"send it back to the previous step\" actually does, and how the loop is guaranteed to come back to the same gate.",
+      "questions": [
+        {
+          "id": "return-mechanics",
+          "type": "single",
+          "title": "What does \"return to the previous step\" do mechanically?",
+          "impact": "blocking",
+          "why": "The two implementations touch different subsystems and have different context/risk profiles.",
+          "context": "The previous step's task is already `done`. (a) A fresh execution reuses `launchStep` (new hidden task, new `seq`, new session, the step's normal handoff contract) and can carry the human comment + its prior handoff in `composeStepPrompt`. (b) `sendInput` into the existing task session preserves the conversation but needs the execution re-armed in `run.active`, a settle path for the new turn, and a handoff-contract reminder; the runner's settle/lookback/held logic is the most intricate part of this subsystem.",
+          "evidence": [
+            {
+              "label": "the prompt composer already takes prior handoffs",
+              "path": "src/shared/pipeline.ts",
+              "line": 1215,
+              "lang": "ts",
+              "code": "export function composeStepPrompt(input: {\n  pipelineName: string; step: PipelineStep; ...\n  previous: { stepName: string; handoff: Handoff | null; filePath: string | null }[];\n  ...\n}): string"
+            },
+            { "label": "launchStep is the existing launch path", "path": "src/bun/pipeline-runner.ts", "line": 1060 }
+          ],
+          "options": [
+            {
+              "id": "fresh",
+              "label": "Fresh execution of the previous step",
+              "description": "New step task/session, new `seq`, same frozen profile and shared worktree; the prompt contains the human comment (trusted) and the handoff the human reviewed (untrusted).",
+              "consequence": "Reuses `launchStep`/`composeStepPrompt`; the agent loses its session memory but keeps the transcript in history; lowest risk."
+            },
+            {
+              "id": "resume",
+              "label": "Send the comment into the previous step's existing session",
+              "description": "Re-arm the settled execution, send the comment as a follow-up turn, remind it of the handoff contract.",
+              "consequence": "Preserves context, but touches `sendInput`, the settle/lookback window, held/background-agent state and re-open semantics; needs a spike first."
+            },
+            {
+              "id": "either",
+              "label": "Offer both, per gate",
+              "description": "A toggle in the panel: fresh run vs continue the old session.",
+              "consequence": "Two paths to build, test and document; the CLI needs the same toggle."
+            }
+          ],
+          "recommendation": {
+            "value": "fresh",
+            "reason": "It is the only option that reuses the existing launch path end to end and guarantees the step ends with a handoff; resume is a separate feature."
+          }
+        },
+        {
+          "id": "return-sticky",
+          "type": "single",
+          "title": "After a Return, must the same agent step always come back to this gate, even if its normal handoff rules would send it elsewhere?",
+          "impact": "blocking",
+          "why": "Without an answer, a returned step with several outgoing edges can choose a different branch and the human never sees the fix. This is the review loop's core guarantee.",
+          "context": "When any execution settles, `advanceOnHandoff` calls `resolveNextSteps` on the step's outgoing edges. For `transition:\"choose\"` with several edges, the agent's new `<handoff>.next` decides the target; nothing forces it back to the gate. The human comment could be followed by the agent answering a different branch.",
+          "evidence": [
+            {
+              "label": "settle resolves the step's outgoing edges",
+              "path": "src/bun/pipeline-runner.ts",
+              "line": 2757,
+              "lang": "ts",
+              "code": "async function advanceOnHandoff(input: { ...; handoff: Handoff; resolved: { kind: \"terminal\" } | { kind: \"steps\"; stepIds: string[] }; }) { ... }"
+            },
+            {
+              "label": "next is chosen by the handoff",
+              "path": "src/shared/pipeline.ts",
+              "line": 1096,
+              "lang": "ts",
+              "code": "const candidates = outgoing.map((o) => o.step.name);\nconst next = handoff?.next?.trim();\nif (!next) return { kind: \"ambiguous\", candidates };\nconst nextKey = stepNameKey(next);"
+            }
+          ],
+          "options": [
+            {
+              "id": "forced-return",
+              "label": "Record the return target on the execution and force that edge on settle",
+              "description": "The returned execution remembers `returnToStepId`; when it settles, the resolver takes that edge regardless of `transition`/`next`. Other outgoing edges of that execution are not launched.",
+              "consequence": "Guarantees the loop; adds one optional field to the history record and a branch in `advanceOnHandoff`; a fan-out step's other branches are not re-run by this execution."
+            },
+            {
+              "id": "prompt-only",
+              "label": "Only tell the agent in the prompt to choose the reviewing step",
+              "description": "Add \"end by handing off to <gate>\" to the prompt; enforcement stays with the model.",
+              "consequence": "No runtime change, but a model can ignore it and the gate is silently skipped; the e2e cannot assert the guarantee."
+            },
+            {
+              "id": "single-outgoing",
+              "label": "Require the returned-to step's only outgoing edge to be the gate",
+              "description": "Validate that an agent step feeding a human step has exactly one outgoing edge.",
+              "consequence": "Structural guarantee, but forbids a gate after a fan-out step and rejects graphs the editor can draw today."
+            }
+          ],
+          "recommendation": {
+            "value": "forced-return",
+            "reason": "It is the only option that makes the review loop deterministic without restricting the graph."
+          }
+        },
+        {
+          "id": "incoming-edges",
+          "type": "single",
+          "title": "May a human step have more than one incoming edge?",
+          "impact": "blocking",
+          "why": "Multiple incoming turns the gate into a join: wait for every source, show several handoffs, and Return needs a target. Single incoming makes Return unambiguous and removes a whole join/arrival path.",
+          "context": "The goal says the gate is added \"between two steps, and at the end\". The existing model supports `join:\"all\"` fan-in with `run.joins` and `PipelineJoinArrival {fromStepId, seq, handoff}`. A human gate has no task; its pending state must hold arrivals itself. Even with one incoming, an Accept to a join step still needs the human comment carried with the arrival, so the arrival contract changes either way.",
+          "evidence": [
+            {
+              "label": "the arrival shape",
+              "path": "src/shared/types.ts",
+              "line": 650,
+              "lang": "ts",
+              "code": "export interface PipelineJoinArrival {\n  fromStepId: string;\n  seq: number;\n  handoff: Handoff | null;\n}"
+            },
+            {
+              "label": "join state on the run",
+              "path": "src/shared/types.ts",
+              "line": 814,
+              "lang": "ts",
+              "code": "joins: Record<string, { arrivals: PipelineJoinArrival[] }>;"
+            }
+          ],
+          "options": [
+            {
+              "id": "single-in",
+              "label": "Exactly one incoming edge",
+              "description": "The gate is inserted on one edge (or at the end). Return always targets that source; no join wait; no arrival picker. A branch that needs its own review gets its own gate.",
+              "consequence": "Validation + editor reject >1 incoming; simplest state and UI; a fan-in gate is not possible in v1."
+            },
+            {
+              "id": "multi-join",
+              "label": "Multiple incoming, forced `join:\"all\"`",
+              "description": "Wait for every distinct source, show every arrival's handoff, and require a Return target when there are several (default latest).",
+              "consequence": "Reuses `run.joins` but adds human arrivals, a return-target picker and more e2e; supports fan-in review."
+            }
+          ],
+          "recommendation": {
+            "value": "single-in",
+            "reason": "The request describes an edge insertion (\"between two steps\"), and one incoming removes the join/return-target branch from both the runner and the panel."
+          }
+        }
+      ]
+    },
+    {
+      "id": "panel",
+      "title": "Control panel",
+      "intro": "These decide what the owner sees and can press while the gate is pending.",
+      "questions": [
+        {
+          "id": "panel-form",
+          "type": "single",
+          "title": "What form does the human control panel take, and where is it opened?",
+          "impact": "shape",
+          "why": "Decides component placement, navigation and whether the panel can coexist with the run view's existing side panel.",
+          "context": "`PipelineRunView` already has a right-hand side panel with Goal, blocked entries, `reviewActive` and history. A human gate would be a new section or a separate overlay. Entry points available: the human node on the canvas, a run-view Review button, and the board card's Review action (Q1). The app's view union is `board | pipelines | pipeline-run`.",
+          "evidence": [
+            {
+              "label": "existing side panel",
+              "path": "src/mainview/components/pipelines/PipelineRunView.tsx",
+              "line": 1023,
+              "lang": "tsx",
+              "code": "// Side panel renders Goal, blocked entries (with Retry/Advance),\n// reviewActive (with AdvanceForm), and history rows (HistoryRow)\n// whose handoffs render as HandoffCard."
+            },
+            { "label": "the view union", "path": "src/mainview/App.tsx", "line": 214 }
+          ],
+          "options": [
+            {
+              "id": "modal",
+              "label": "A modal/drawer over the run view",
+              "description": "Opened from the human node, a run-view **Review** button, and the card's Review action. No auto-open on arrival; the node highlights and a notification fires. Closing keeps the gate pending; a half-typed comment stays while the run view is open.",
+              "consequence": "New component + modal state; room for history + form; the existing side panel is untouched."
+            },
+            {
+              "id": "inline",
+              "label": "A section in the existing run-view side panel",
+              "description": "Clicking the human node selects it and the side panel shows the gate form instead of/in addition to the history.",
+              "consequence": "No overlay, but cramped with history + handoff + comment; the card action has to open the run view and select the node."
+            },
+            {
+              "id": "page",
+              "label": "A full-page review route",
+              "description": "A dedicated `pipeline-review` view.",
+              "consequence": "Most room, but a new view/navigation path and overkill for a single form."
+            }
+          ],
+          "recommendation": {
+            "value": "modal",
+            "reason": "The panel must show a handoff, history and a form; the run view's side panel is already dense, and a modal can be opened from both the canvas and the card."
+          }
+        },
+        {
+          "id": "panel-content",
+          "type": "multi",
+          "title": "What must the human panel show?",
+          "impact": "shape",
+          "why": "Each item is UI + data wiring; the diff in particular adds a call and a dialog.",
+          "context": "The run has `run.history` (outcomes, handoffs), the gate's arrival handoff (the last handoff), the frozen graph (goal/step instructions), the parent task (worktree) and step tasks (transcripts). `DiffDialog` already exists at App level and is opened with a `Task`; the run view does not currently receive an `onShowDiff`.",
+          "evidence": [
+            {
+              "label": "the dialog already exists",
+              "path": "src/mainview/App.tsx",
+              "line": 2809,
+              "lang": "tsx",
+              "code": "<DiffDialog\n  open={!!diffTask}\n  task={diffTask ? (tasks.find((t) => t.id === diffTask.id) ?? diffTask) : null}\n  onClose={() => setDiffTask(null)}\n/>"
+            },
+            {
+              "label": "history entries carry handoffs",
+              "path": "src/shared/types.ts",
+              "line": 740,
+              "lang": "ts",
+              "code": "export interface PipelineStepRecord {\n  seq: number; stepId: string; taskId: string;\n  outcome: ...; handoff: Handoff | null; nextStepIds: string[];\n  ...\n}"
+            }
+          ],
+          "options": [
+            { "id": "goal", "label": "Pipeline goal", "description": "The frozen goal text." },
+            { "id": "instructions", "label": "The human step's \"What to check\" instructions", "description": "The step's `instructions` field, read-only; never sent to an agent." },
+            { "id": "last-handoff", "label": "The last handoff (the arrival from the previous step)", "description": "Rendered with the existing `HandoffCard`." },
+            { "id": "history", "label": "The run's history", "description": "Every step's name, outcome and handoff, including prior human decisions." },
+            { "id": "transcripts", "label": "Links to each completed step's transcript", "description": "Opens the step task/transcript." },
+            { "id": "prior-rounds", "label": "Prior human decisions on this gate", "description": "The comments and Accept/Return outcomes from earlier rounds, so the reviewer sees what they asked for last time." },
+            { "id": "diff", "label": "A \"View changes\" button for the shared worktree diff", "description": "Reuses the App-level `DiffDialog` against the parent task." }
+          ],
+          "min": 2,
+          "recommendation": {
+            "value": ["goal", "instructions", "last-handoff", "history", "transcripts", "prior-rounds", "diff"],
+            "reason": "The gate's purpose is to judge the work; the diff and prior rounds are the two things the old side panel cannot show."
+          }
+        },
+        {
+          "id": "pending-actions",
+          "type": "single",
+          "title": "Which run-level actions stay available while a human gate is pending?",
+          "impact": "shape",
+          "why": "The run is not `running`, so Stop currently 409s; Restart isn't offered for `review` yet. Leaving no escape hatch strands the run.",
+          "context": "`cancelPipelineRun` only acts when something is live or a runner decision is pending. `RESTARTABLE_STATUSES` is `done|cancelled|blocked`. Retry/Advance/Done are meaningless for a gate with no task. Archive/delete already exist.",
+          "evidence": [
+            { "label": "restart gate", "path": "src/mainview/components/pipelines/PipelineRunView.tsx", "line": 164, "lang": "ts", "code": "const RESTARTABLE_STATUSES: PipelineRunStatus[] = [\"done\", \"cancelled\", \"blocked\"];" },
+            { "label": "cancel only acts on live work", "path": "src/bun/pipeline-runner.ts", "line": 1993 }
+          ],
+          "options": [
+            {
+              "id": "restart",
+              "label": "Restart only (confirm clears history)",
+              "description": "The run view's Restart button becomes available for `review`; Stop/Retry/Advance/Done are hidden. Archive/delete remain.",
+              "consequence": "One escape hatch; no new cancel path; restarting discards the review state and history after the existing confirm."
+            },
+            {
+              "id": "restart-stop",
+              "label": "Restart + Stop (cancel the run, keep history)",
+              "description": "Stop cancels the run, dismisses the gate and moves the card to Ready, preserving the audit trail.",
+              "consequence": "New no-live cancel path + tests; gives \"abandon without restarting\"."
+            },
+            {
+              "id": "none",
+              "label": "No run-level action",
+              "description": "Only archive/delete.",
+              "consequence": "Abandoning the run removes it from the board; a wrong gate cannot be cancelled in place."
+            }
+          ],
+          "recommendation": {
+            "value": "restart",
+            "reason": "Restart is the existing escape hatch and already confirms history loss; adding a no-live cancel path is extra lifecycle for an action Return/archive already cover."
+          }
+        }
+      ]
+    },
+    {
+      "id": "contracts",
+      "title": "CLI & bundle contract",
+      "intro": "The two surfaces outside the webview that need an explicit decision.",
+      "questions": [
+        {
+          "id": "cli-parity",
+          "type": "single",
+          "title": "How much CLI support does the human step need?",
+          "impact": "shape",
+          "why": "Decides a route + client method + command + tests, and whether a headless user can clear a gate.",
+          "context": "Pipeline run-control routes are `app+cli`; the CLI already has `show`, `status`, `advance`, `retry`, `restart`. `pipeline status` currently does `h.taskId.slice(0, 8)` and would crash on a human history record with `taskId: null`, so `show`/`status` need a fix regardless.",
+          "evidence": [
+            {
+              "label": "the crash",
+              "path": "src/cli/commands/pipeline.ts",
+              "line": 494,
+              "lang": "ts",
+              "code": "lines.push(\n  `    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}...  ${c.dim(h.taskId.slice(0, 8))}`,\n);"
+            },
+            { "label": "pipeline routes are app+cli", "path": "src/bun/route-policy.ts", "line": 319 }
+          ],
+          "options": [
+            {
+              "id": "full",
+              "label": "Full parity: `agetor pipeline review <ref> --accept|--return --comment …`",
+              "description": "Plus `--next <step>` for choose, and human-step display in `show`/`status`; tests.",
+              "consequence": "Matches the repo's convention and lets a headless user clear a gate; more surface."
+            },
+            {
+              "id": "read-only",
+              "label": "Read-only: show/status display the gate, decisions only in the UI",
+              "description": "Fix the nullable `taskId` crash and print the pending gate.",
+              "consequence": "Smaller; a headless user cannot accept/return."
+            },
+            {
+              "id": "none",
+              "label": "UI only",
+              "description": "Only fix the crash; no gate display.",
+              "consequence": "CLI shows a paused run with no explanation; worst parity."
+            }
+          ],
+          "recommendation": {
+            "value": "full",
+            "reason": "Every other pipeline action is available from both the app and the CLI; a gate that only the webview can clear breaks that contract."
+          }
+        },
+        {
+          "id": "bundle-compat",
+          "type": "single",
+          "title": "How should a human step travel in an exported bundle?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "The bundle is a versioned file format shared between app versions; old readers drop unknown step fields.",
+          "context": "`BundleStep` is `{id,name,instructions,agent,position,subagents,transition,join}`; export builds those fields explicitly, import maps `agent`→`agentProfileId` and spreads `...rest` before validation. `BUNDLE_VERSION` is 1 and readers refuse `version > 1`. The documented convention is that additive fields keep version 1 and old exports stay byte-identical. An old reader that drops `type` sees an agent step with `agent: null`; `createTask` then refuses to run it (\"step has no agent\").",
+          "evidence": [
+            {
+              "label": "the step shape",
+              "path": "src/shared/bundle.ts",
+              "line": 95,
+              "lang": "ts",
+              "code": "export interface BundleStep {\n  id: string; name: string; instructions: string;\n  /** An `agents[].key`, or null for a step with no Agent. */\n  agent: string | null;\n  position: { x: number; y: number };\n  subagents: { agents: string[]; cap: number | null };\n  transition: \"choose\" | \"all\";\n  join: \"any\" | \"all\";\n}"
+            },
+            {
+              "label": "readers reject a newer version",
+              "path": "src/shared/bundle.ts",
+              "line": 1548,
+              "lang": "ts",
+              "code": "if (version > BUNDLE_VERSION) {\n  return { ok: false, code: \"unsupported-version\", error: `this file uses bundle version ${version}, newer than this agetor supports (${BUNDLE_VERSION}) — update agetor to import this file` };\n}"
+            },
+            {
+              "label": "additive fields keep version 1",
+              "path": "docs/architecture/bundle.md",
+              "line": 8,
+              "lang": "md",
+              "code": "`speed` is written as `speed !== \"off\"` so an older agetor still imports the Agent ... and the format stays version 1"
+            }
+          ],
+          "options": [
+            {
+              "id": "additive-v1",
+              "label": "Keep version 1, add `type:\"human\"` only for human steps",
+              "description": "Agent steps write no `type`, so old exports stay byte-identical.",
+              "consequence": "Old readers import a pipeline with a broken step (recoverable in the editor) instead of refusing the file; no version logic."
+            },
+            {
+              "id": "conditional-v2",
+              "label": "Write version 2 only when the bundle contains a human step",
+              "description": "Human-free bundles stay v1; the parser accepts 1 and 2.",
+              "consequence": "Old readers refuse the file with \"update agetor\"; more version-selection + parser tests; departs from the additive-v1 convention."
+            },
+            {
+              "id": "always-v2",
+              "label": "Bump every export to version 2",
+              "description": "The parser accepts 1 and 2.",
+              "consequence": "Safest for old readers but every new bundle is rejected by every old app, even human-free ones."
+            }
+          ],
+          "recommendation": {
+            "value": "additive-v1",
+            "reason": "The bundle doc explicitly keeps version 1 for additive fields; the old reader fails at run time with a clear \"step has no agent\" and the new import preview can show the human step."
+          }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Low-stakes defaults I would bet on. One click each; override only if you disagree.",
+      "questions": [
+        {
+          "id": "graph-rules",
+          "type": "confirm",
+          "title": "Human-step graph rules: never the start step; at least one incoming (exactly one per Q7); no agent or subagents; no human→human edges; allowed at the end (terminal Accept finishes).",
+          "impact": "shape",
+          "recommendation": {
+            "value": "All enforced in `validatePipelineGraph` and the editor; a human step saves with `agentProfileId: null`, empty subagents, and no start/Set-as-start affordance.",
+            "reason": "These keep `resolveStartStep`, `createTask`/`buildSnapshot` and the runner's agent requirement intact."
+          }
+        },
+        {
+          "id": "comment-rules",
+          "type": "confirm",
+          "title": "Comments: trimmed; a non-blank comment is required for Return; optional for Accept; max 8,000 characters (`PIPELINE_LIMITS.handoffField`); a terminal Accept needs none.",
+          "impact": "shape",
+          "recommendation": {
+            "value": "As stated; blank/whitespace Return is rejected by the route and disabled in the UI; Accept with a blank comment is allowed.",
+            "reason": "Reuses the existing handoff-field cap and matches the request's \"necessary/optional\" wording."
+          }
+        },
+        {
+          "id": "feedback-trust",
+          "type": "confirm",
+          "title": "Human comments are trusted: rendered as a separate `## Human review feedback` section outside the untrusted-handoff markers; agent handoffs stay fenced; the comment must survive a blocked/retried Accept/Return.",
+          "impact": "blocking",
+          "recommendation": {
+            "value": "Yes — a dedicated trusted section, stored on the human history record and carried on the pending launch/arrival, never folded into a `Handoff` that `composeStepPrompt` fences.",
+            "reason": "The trust model says agent handoffs are untrusted and owner comments are trusted; fencing a comment would mislabel it, and prompt-only storage would lose it on Retry."
+          }
+        },
+        {
+          "id": "step-cap",
+          "type": "confirm",
+          "title": "Human gate entries do **not** count toward `maxSteps`.",
+          "impact": "shape",
+          "recommendation": {
+            "value": "They are recorded in `history` and shown in progress, but do not increment `stepCount`; entering a gate is never blocked by the step cap.",
+            "reason": "A gate spends no agent budget, and a run that cannot reach its reviewer because of a cap is a dead end; the Return re-run of the previous agent step still counts and bounds the loop."
+          }
+        },
+        {
+          "id": "visual",
+          "type": "confirm",
+          "title": "Human step visual: an info-tinted border + a \"Human\" chip + a user-check icon; no \"No agent\" warning; no amber attention ring.",
+          "impact": "minor",
+          "recommendation": {
+            "value": "As stated; the pending gate uses the same info highlight on the canvas and in the panel header; the run status chip reads \"Review\".",
+            "reason": "It must read as a different element without borrowing the warning color that means \"Blocked\"."
+          }
+        },
+        {
+          "id": "editor-add",
+          "type": "confirm",
+          "title": "Editor: add a \"Human step\" choice to Add step and a type switch in the step panel; insertion between two steps uses the existing Add step + Connect to… flow (no new one-click edge split); a human step cannot be Set as start.",
+          "impact": "minor",
+          "recommendation": {
+            "value": "As stated; switching an agent step to human clears its agent/subagents; switching back to agent starts unbound; `deleteStep` never promotes a human step to start.",
+            "reason": "Keeps the editor change small; the graph constraints make a human start invalid anyway."
+          }
+        },
+        {
+          "id": "no-third-action",
+          "type": "confirm",
+          "title": "The panel has exactly two decisions — Return and Accept; no separate Reject/Stop/Escalate.",
+          "impact": "minor",
+          "recommendation": {
+            "value": "Accept follows the outgoing edges and only finishes when there are none; Return loops with a required comment; abandoning the run stays Restart/archive/delete.",
+            "reason": "Matches the request exactly; a third action would need its own state and prompt semantics."
+          }
+        },
+        {
+          "id": "manual-advance",
+          "type": "confirm",
+          "title": "Manual Advance may target a human step; it enters the gate with `handoff: null`, and Return targets the step it was advanced from.",
+          "impact": "minor",
+          "recommendation": {
+            "value": "As stated; the panel shows \"no handoff\" for that arrival; the gate is otherwise identical.",
+            "reason": "The existing Advance form lists every step; silently excluding human steps would be a surprising hole."
+          }
+        },
+        {
+          "id": "notify",
+          "type": "confirm",
+          "title": "On entering a human gate: one \"Pipeline needs your review\" toast/OS notification per gate; no \"Pipeline finished\" until a terminal Accept.",
+          "impact": "shape",
+          "recommendation": {
+            "value": "As stated; the notification is deduped per run+gate seq; clicking it opens the run view with the gate selected; the status chip still reads \"Review\".",
+            "reason": "A headless-core user must learn the run is waiting; \"Pipeline finished\" would be a lie while a gate is pending."
+          }
+        }
+      ]
+    },
+    {
+      "id": "material",
+      "title": "Material from you",
+      "questions": [
+        {
+          "id": "mock",
+          "type": "upload",
+          "title": "Do you have a mock, screenshot, PRD or ticket for the panel or the human node that is not in the repo?",
+          "impact": "minor",
+          "why": "Matching your intended panel layout or node treatment saves a round of rework.",
+          "accept": ".png,.jpg,.jpeg,.webp,.pdf,.md,.txt,.json",
+          "multiple": true,
+          "maxSizeMB": 10,
+          "required": false
+        }
+      ]
+    }
+  ]
+}

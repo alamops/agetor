@@ -41,6 +41,12 @@ import {
   mapTextOutsideHandoffSpans,
   stepNameById,
   validatePipelineGraph,
+  composeReviewReturnMessage,
+  isHumanStep,
+  humanReviewSubtitle,
+  newHumanGateSeqs,
+  nextRunSeq,
+  pendingHumanSteps,
 } from "./pipeline.ts";
 import type {
   AgentProfileSnapshot,
@@ -3082,5 +3088,232 @@ describe("mapTextOutsideHandoffSpans", () => {
   test("an unrecognized span (wrong END nonce) is ordinary text and gets mapped", () => {
     const fake = span("(handoff saved to /root/runs/h.json)").replace(`END untrusted handoff ${NONCE}`, "END untrusted handoff deadbeef");
     expect(mapTextOutsideHandoffSpans(fake, upper)).toBe(fake.toUpperCase());
+  });
+});
+
+// ── Human steps ──────────────────────────────────────────────────────────
+
+function humanGraph(overrides: { startStepId?: string | null; edges?: PipelineEdge[]; steps?: PipelineStep[] } = {}): PipelineGraph {
+  const a = makeStep({ id: "a", name: "A", agentProfileId: "p1" });
+  const h = makeStep({ id: "h", name: "H", type: "human" });
+  const b = makeStep({ id: "b", name: "B", agentProfileId: "p1" });
+  return {
+    steps: overrides.steps ?? [a, h, b],
+    edges: overrides.edges ?? [
+      { id: "e1", from: "a", to: "h", label: "" },
+      { id: "e2", from: "h", to: "b", label: "" },
+    ],
+    startStepId: overrides.startStepId === undefined ? "a" : overrides.startStepId,
+  };
+}
+
+describe("human steps — model and validator", () => {
+  test("newStep defaults to agent; newStep({type:'human'}) clears agent/subagents and normalizes join", () => {
+    expect(newStep().type).toBe("agent");
+    const h = newStep({ type: "human", agentProfileId: "p1", subagents: { profileIds: ["p2"], cap: 3 }, join: "all" });
+    expect(h.type).toBe("human");
+    expect(h.agentProfileId).toBeNull();
+    expect(h.subagents).toEqual({ profileIds: [], cap: null });
+    expect(h.join).toBe("any");
+    expect(isHumanStep(h)).toBe(true);
+    expect(isHumanStep(newStep())).toBe(false);
+  });
+
+  test("a step missing type normalizes to agent", () => {
+    const r = validatePipelineGraph({ steps: [makeStep({ id: "a", name: "A" })], edges: [], startStepId: "a" });
+    if (!r.ok) throw new Error(r.error);
+    expect(r.graph.steps[0]!.type).toBe("agent");
+  });
+
+  test("rejects an unknown type, an agent/subagents on a human step, a human start, a non-single incoming and human→human", () => {
+    expect(validatePipelineGraph({ steps: [{ ...makeStep({ id: "a" }), type: "robot" }], edges: [], startStepId: null }).ok).toBe(false);
+    // Valid edges (a → h) so the only failure is the rule under test, not a
+    // dangling edge from a step the override dropped.
+    const humanWithAgent = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "h", name: "H", type: "human", agentProfileId: "p1" })],
+      edges: [{ id: "e1", from: "a", to: "h", label: "" }],
+      startStepId: "a",
+    });
+    expect(humanWithAgent.ok).toBe(false);
+    if (!humanWithAgent.ok) expect(humanWithAgent.error).toContain(`step "H" is a human step and can't have an agent`);
+    const humanWithSubagents = validatePipelineGraph({
+      steps: [makeStep({ id: "a" }), makeStep({ id: "h", name: "H", type: "human", subagents: { profileIds: ["p2"], cap: null } })],
+      edges: [{ id: "e1", from: "a", to: "h", label: "" }],
+      startStepId: "a",
+    });
+    expect(humanWithSubagents.ok).toBe(false);
+    if (!humanWithSubagents.ok) expect(humanWithSubagents.error).toContain(`step "H" is a human step and can't have subagents`);
+    expect(validatePipelineGraph(humanGraph({ startStepId: "h" })).ok).toBe(false);
+    // 0 incoming
+    expect(validatePipelineGraph({ steps: [makeStep({ id: "a" }), makeStep({ id: "h", name: "H", type: "human" })], edges: [], startStepId: "a" }).ok).toBe(false);
+    // 2 incoming
+    expect(
+      validatePipelineGraph({
+        steps: [makeStep({ id: "a" }), makeStep({ id: "b", name: "B" }), makeStep({ id: "h", name: "H", type: "human" })],
+        edges: [
+          { id: "e1", from: "a", to: "h", label: "" },
+          { id: "e2", from: "b", to: "h", label: "" },
+        ],
+        startStepId: "a",
+      }).ok,
+    ).toBe(false);
+    // human → human
+    expect(
+      validatePipelineGraph({
+        steps: [makeStep({ id: "a" }), makeStep({ id: "h1", name: "H1", type: "human" }), makeStep({ id: "h2", name: "H2", type: "human" })],
+        edges: [
+          { id: "e1", from: "a", to: "h1", label: "" },
+          { id: "e2", from: "h1", to: "h2", label: "" },
+        ],
+        startStepId: "a",
+      }).ok,
+    ).toBe(false);
+  });
+
+  test("a terminal human step and a fan-out human step are valid", () => {
+    const a = makeStep({ id: "a", name: "A" });
+    const h = makeStep({ id: "h", name: "H", type: "human" });
+    expect(validatePipelineGraph({ steps: [a, h], edges: [{ id: "e", from: "a", to: "h", label: "" }], startStepId: "a" }).ok).toBe(true);
+    const b = makeStep({ id: "b", name: "B" });
+    const c = makeStep({ id: "c", name: "C" });
+    const fan = validatePipelineGraph({
+      steps: [{ ...a }, { ...h, transition: "all" }, b, c],
+      edges: [
+        { id: "e1", from: "a", to: "h", label: "" },
+        { id: "e2", from: "h", to: "b", label: "" },
+        { id: "e3", from: "h", to: "c", label: "" },
+      ],
+      startStepId: "a",
+    });
+    expect(fan.ok).toBe(true);
+  });
+});
+
+describe("human steps — status, progress and helpers", () => {
+  function run(overrides: Partial<PipelineRunState> = {}): PipelineRunState {
+    return {
+      pipelineId: "pl",
+      pipelineName: "P",
+      snapshot: null,
+      status: "running",
+      active: [],
+      joins: {},
+      blocked: [],
+      history: [],
+      humanSteps: [],
+      seqCounter: 0,
+      stepCount: 0,
+      startedAt: 1,
+      endedAt: null,
+      stopRequestedAt: null,
+      ...overrides,
+    };
+  }
+
+  test("status precedence: a gate is review, a stopped gate is cancelled, review beats blocked", () => {
+    const gate = { stepId: "h", seq: 2, startedAt: 1, arrivals: [] };
+    expect(deriveRunStatus(run({ humanSteps: [gate] }))).toBe("review");
+    expect(deriveRunStatus(run({ humanSteps: [gate], stopRequestedAt: 2 }))).toBe("cancelled");
+    expect(deriveRunStatus(run({ humanSteps: [gate], blocked: [{ taskId: "t", stepId: "a", kind: "step-failed", message: "x" }] }))).toBe("review");
+    expect(deriveRunStatus(run({ humanSteps: [gate], active: [{ stepId: "c", taskId: "t", seq: 1 }] }))).toBe("review");
+    expect(deriveRunStatus(run({ blocked: [{ taskId: "t", stepId: "a", kind: "step-failed", message: "x" }] }))).toBe("blocked");
+  });
+
+  test("progress counts an accepted gate, not a returned one, and labels the pending gate", () => {
+    const graph = humanGraph();
+    const r = run({
+      snapshot: { graph, maxSteps: 25, profiles: {}, capturedAt: 1 },
+      history: [
+        { seq: 1, stepId: "a", taskId: "t", startedAt: 1, endedAt: 2, outcome: "succeeded", handoff: null, nextStepIds: ["h"] },
+        { seq: 2, stepId: "h", taskId: null, startedAt: 2, endedAt: 3, outcome: "returned", handoff: null, nextStepIds: [], human: { decision: "return", comment: "redo" } },
+      ],
+      humanSteps: [{ stepId: "h", seq: 3, startedAt: 3, arrivals: [] }],
+    });
+    const p = pipelineStepProgress(r);
+    expect(p.completed).toBe(1);
+    expect(p.total).toBe(3);
+    expect(p.label).toContain("H");
+    expect(pendingHumanSteps(r)).toHaveLength(1);
+  });
+
+  test("nextRunSeq never collides with a history seq or a gate, and an old run derives it", () => {
+    const r = run({ history: [{ seq: 4, stepId: "a", taskId: "t", startedAt: 1, endedAt: 2, outcome: "succeeded", handoff: null, nextStepIds: [] }] });
+    expect(nextRunSeq(r)).toBe(5);
+    r.seqCounter = 9;
+    expect(nextRunSeq(r)).toBe(10);
+  });
+
+  test("newHumanGateSeqs announces a gate once per run generation", () => {
+    expect(newHumanGateSeqs(null, 10, [1, 2])).toEqual([1, 2]);
+    expect(newHumanGateSeqs({ runStartedAt: 10, seqs: [1] }, 10, [1, 2])).toEqual([2]);
+    expect(newHumanGateSeqs({ runStartedAt: 10, seqs: [1, 2] }, 10, [1, 2])).toEqual([]);
+    expect(newHumanGateSeqs({ runStartedAt: 10, seqs: [1] }, 20, [1])).toEqual([1]);
+  });
+
+  test("humanReviewSubtitle names the gate count so one alert covers several gates", () => {
+    expect(humanReviewSubtitle(1)).toBe("Pipeline needs your review");
+    expect(humanReviewSubtitle(2)).toBe("Pipeline needs your review (2 gates)");
+    expect(humanReviewSubtitle(7)).toBe("Pipeline needs your review (7 gates)");
+  });
+});
+
+describe("human steps — prompt", () => {
+  const step = makeStep({ id: "h", name: "H", type: "human", instructions: "check the header" });
+
+  test("human feedback renders as a trusted section outside the untrusted markers and names no product", () => {
+    const prompt = composeStepPrompt({
+      pipelineName: "P",
+      step,
+      stepIndex: 2,
+      stepCap: 25,
+      goal: "goal",
+      previous: [],
+      outgoing: [],
+      transition: "choose",
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+      nonce: "deadbeef",
+      humanFeedback: "please tighten X",
+    });
+    expect(prompt).toContain("## Human review feedback");
+    expect(prompt).toContain("please tighten X");
+    expect(prompt).not.toContain("BEGIN untrusted handoff");
+    expect(prompt.toLowerCase()).not.toContain("agetor");
+  });
+
+  test("no feedback keeps an agent prompt byte-identical; returned replaces the first-step copy", () => {
+    const args = {
+      pipelineName: "P",
+      step: makeStep({ id: "a", name: "A", instructions: "do a" }),
+      stepIndex: 1,
+      stepCap: 25,
+      goal: "goal",
+      previous: [],
+      outgoing: [],
+      transition: "choose" as const,
+      subagentProfiles: [],
+      subagentCap: null,
+      inlineHandoff: true,
+      parallelSiblings: [],
+      nonce: "deadbeef",
+    };
+    const plain = composeStepPrompt(args);
+    expect(plain).toContain("This is the first step — there is no prior handoff.");
+    expect(composeStepPrompt({ ...args, humanFeedback: null, returned: false })).toBe(plain);
+    expect(composeStepPrompt({ ...args, returned: true })).toContain("re-running this step at the owner's request");
+  });
+
+  test("the return message contains the comment and the handoff contract, and names no product", () => {
+    const msg = composeReviewReturnMessage({
+      stepName: "A",
+      comment: "redo the header",
+      outgoing: [{ name: "B", label: "" }],
+      transition: "choose",
+    });
+    expect(msg).toContain("redo the header");
+    expect(msg).toContain(`<${HANDOFF_TAG}>`);
+    expect(msg.toLowerCase()).not.toContain("agetor");
   });
 });

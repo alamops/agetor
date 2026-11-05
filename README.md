@@ -225,10 +225,13 @@ A step ends its turn with a block like this. The last block in the turn wins. A 
 | **Run** | Starts the pipeline. On a blocked or cancelled pipeline, it resumes where it stopped and never starts over. | `agetor start <id>` for the first run; `agetor pipeline retry <ref>` to resume |
 | **Retry** | Re-runs the blocked or cancelled step. When the step cap was hit, each Retry adds another full allowance. | `agetor pipeline retry <ref> [--from <step-task>]` |
 | **Advance** | Skips the stuck step: you pick the next step, or finish the run. | `agetor pipeline advance <ref> --next <step> \| --finish` |
+| **Review** | Decides a Human Step's gate: **Accept** continues to the next step (comment optional), **Return** sends the work back to the previous step (comment required). | `agetor pipeline review <ref> --accept\|--return [--comment <text>] [--next <step>] [--mode fresh\|resume]` |
 | **Stop** | From the run view header, stops the whole pipeline. From a single step, stops only that branch. | `agetor cancel <id>` |
 | **Restart** | Cancels anything still running and starts over from the first step, discarding the previous run. | `agetor pipeline restart <ref>` |
 
 A step can also list other Agents it's allowed to delegate to as subagents, with an optional cap. Agetor passes this to the step as guidance in its prompt; it doesn't enforce the cap. Deleting or archiving a pipeline task also deletes or archives its steps.
+
+A **Human Step** is a pause between two steps (or at the end, never first): the card moves to Review, you see the work so far and the last handoff in a review panel, then you either **Accept** (continue, comment optional) or **Return** the work to the previous step (comment required, re-run fresh or resumed).
 
 On your own machine, a step points at the Agent itself, not at its name, so renaming an Agent doesn't break a pipeline. Two Agents can't share a name. An exported file carries the Agents themselves, so names only matter when you import a pipeline file from an older version of Agetor: those files list each step's Agent by name only, and import uses the local Agent with that name.
 

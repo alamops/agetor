@@ -759,6 +759,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }, { retry: false }),
+  /** Decide a pending human gate — `accept` continues through its outgoing
+   *  edges (comment optional), `return` re-runs the gate's sole incoming
+   *  source (comment required, `mode` fresh by default). `stepId` + `seq`
+   *  identify the gate. `retry: false` — a replay would double-launch. */
+  reviewPipeline: (
+    taskId: string,
+    body: {
+      stepId: string;
+      seq: number;
+      decision: "accept" | "return";
+      comment?: string;
+      nextStepIds?: string[];
+      mode?: "fresh" | "resume";
+    },
+  ) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/review`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { retry: false }),
   /** Retry the pipeline's current blocked/cancelled execution. `taskId`
    *  disambiguates which blocked step task to retry when several are
    *  blocked at once; omit to retry the run's only/most-recent block.

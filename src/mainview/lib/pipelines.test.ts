@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { pipelineStepProgress } from "../../shared/pipeline.ts";
 import {
   autoLayout,
   blockedSummary,
@@ -1631,4 +1632,66 @@ describe("step attention — card, node glow and node click agree", () => {
       expect(stepNodeTaskFor(tasks, run, landedStep!)?.id).toBe(landed!.id);
     });
   }
+});
+
+// ── Human steps ──────────────────────────────────────────────────────────
+
+function humanGraph(): PipelineGraph {
+  const a = makeStep({ id: "a", name: "A" });
+  const h = makeStep({ id: "h", name: "H", type: "human", agentProfileId: null });
+  return makeGraph([a, h], [makeEdge({ id: "e", from: "a", to: "h" })], "a");
+}
+
+describe("human steps in run-view helpers", () => {
+  test("a pending gate reads active; an accepted/returned record reads done; an untouched gate reads idle", () => {
+    const run = makeRun({
+      snapshot: { graph: humanGraph(), maxSteps: 25, profiles: {}, capturedAt: 1 },
+      humanSteps: [{ stepId: "h", seq: 2, startedAt: 2, arrivals: [] }],
+    });
+    expect(stepVisualState(run, "h", [])).toBe("active");
+    expect(stepVisualState(run, "a", [])).toBe("idle");
+
+    const accepted = makeRun({
+      snapshot: { graph: humanGraph(), maxSteps: 25, profiles: {}, capturedAt: 1 },
+      history: [makeRecord({ seq: 2, stepId: "h", taskId: null, outcome: "succeeded" })],
+    });
+    expect(stepVisualState(accepted, "h", [])).toBe("done");
+
+    const returned = makeRun({
+      snapshot: { graph: humanGraph(), maxSteps: 25, profiles: {}, capturedAt: 1 },
+      history: [makeRecord({ seq: 2, stepId: "h", taskId: null, outcome: "returned" })],
+    });
+    expect(stepVisualState(returned, "h", [])).toBe("done");
+  });
+
+  test("stepAttention never glows for a human step", () => {
+    const run = makeRun({
+      snapshot: { graph: humanGraph(), maxSteps: 25, profiles: {}, capturedAt: 1 },
+      humanSteps: [{ stepId: "h", seq: 2, startedAt: 2, arrivals: [] }],
+      blocked: [{ taskId: null, stepId: "h", kind: "step-failed", message: "x" }],
+    });
+    expect(stepAttention(run, "h", [])).toBeNull();
+  });
+
+  test("task lookups skip a null-taskId record and never crash", () => {
+    const run = makeRun({
+      snapshot: { graph: humanGraph(), maxSteps: 25, profiles: {}, capturedAt: 1 },
+      history: [
+        makeRecord({ seq: 1, stepId: "a", taskId: "task-a", outcome: "succeeded" }),
+        makeRecord({ seq: 2, stepId: "h", taskId: null, outcome: "succeeded" }),
+      ],
+    });
+    const tasks = [makeTask({ id: "task-a" })];
+    expect(stepTaskFor(tasks, run, "h")).toBeNull();
+    expect(stepNodeTaskFor(tasks, run, "h")).toBeNull();
+    expect(stepTaskFor(tasks, run, "a")?.id).toBe("task-a");
+  });
+
+  test("the progress label uses the pending gate when no agent is active", () => {
+    const run = makeRun({
+      snapshot: { graph: humanGraph(), maxSteps: 25, profiles: {}, capturedAt: 1 },
+      humanSteps: [{ stepId: "h", seq: 2, startedAt: 2, arrivals: [] }],
+    });
+    expect(pipelineStepProgress(run).label).toContain("H");
+  });
 });

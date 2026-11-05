@@ -348,9 +348,11 @@ function dedupeStrings(arr: string[]): string[] {
  * tests.
  */
 export function newStep(partial?: Partial<PipelineStep>): PipelineStep {
+  const type = partial?.type ?? "agent";
   return {
     id: crypto.randomUUID(),
     name: "New step",
+    type,
     instructions: "",
     agentProfileId: null,
     position: { x: 0, y: 0 },
@@ -358,7 +360,38 @@ export function newStep(partial?: Partial<PipelineStep>): PipelineStep {
     transition: "choose",
     join: "any",
     ...partial,
+    // A human step never has an agent or subagents and has exactly one
+    // incoming edge, so `join` is moot and normalized. Applied AFTER the
+    // spread so `newStep({ type: "human", agentProfileId: … })` can't build
+    // a shape the validator would reject.
+    ...(type === "human"
+      ? { type, agentProfileId: null, subagents: { profileIds: [], cap: null }, join: "any" as const }
+      : {}),
   };
+}
+
+/** True for a human gate step (`type: "human"`); a missing `type` is an
+ *  agent step (every graph written before human steps existed). */
+export function isHumanStep(step: PipelineStep | null | undefined): boolean {
+  return step?.type === "human";
+}
+
+/** Every pending human gate of a run, oldest first — `[]` for a run written
+ *  before human steps existed. */
+export function pendingHumanSteps(run: PipelineRunState | null | undefined): NonNullable<PipelineRunState["humanSteps"]> {
+  return run?.humanSteps ?? [];
+}
+
+/** The next value of a run-wide history `seq` allocator — `seqCounter`
+ *  when present, else derived from the highest `seq` already used by a
+ *  history record or pending gate (an old row has no counter). Callers
+ *  must write the result back to `run.seqCounter`. */
+export function nextRunSeq(run: PipelineRunState): number {
+  let max = run.seqCounter ?? 0;
+  for (const h of run.history) if (h.seq > max) max = h.seq;
+  for (const g of run.humanSteps ?? []) if (g.seq > max) max = g.seq;
+  for (const a of run.active) if (a.seq > max) max = a.seq;
+  return max + 1;
 }
 
 /**
@@ -418,6 +451,15 @@ export function validatePipelineGraph(
     if (seenNames.has(nameKey)) return { ok: false, error: `duplicate step name "${name}"` };
     seenNames.add(nameKey);
 
+    // A missing `type` is an agent step (every graph written before human
+    // steps existed); any other spelling is a hand-edited or future value
+    // this build can't run.
+    let type: NonNullable<PipelineStep["type"]>;
+    if (rawStep.type === undefined || rawStep.type === "agent") type = "agent";
+    else if (rawStep.type === "human") type = "human";
+    else return { ok: false, error: `step "${name}" has an invalid type value` };
+    const human = type === "human";
+
     const instructions = typeof rawStep.instructions === "string" ? rawStep.instructions : "";
     if (instructions.length > PIPELINE_LIMITS.instructions) {
       return { ok: false, error: `step "${name}" instructions exceed ${PIPELINE_LIMITS.instructions} chars` };
@@ -430,6 +472,9 @@ export function validatePipelineGraph(
       typeof rawStep.agentProfileId === "string" && rawStep.agentProfileId.length > 0
         ? rawStep.agentProfileId
         : null;
+    if (human && agentProfileId !== null) {
+      return { ok: false, error: `step "${name}" is a human step and can't have an agent` };
+    }
     if (agentProfileId !== null && agentProfileId.length > PIPELINE_LIMITS.id) {
       return { ok: false, error: `step "${name}" agentProfileId exceeds ${PIPELINE_LIMITS.id} chars` };
     }
@@ -471,6 +516,9 @@ export function validatePipelineGraph(
       }
       cap = c;
     }
+    if (human && (profileIds.length > 0 || cap !== null)) {
+      return { ok: false, error: `step "${name}" is a human step and can't have subagents` };
+    }
 
     let transition: PipelineStep["transition"];
     if (rawStep.transition === undefined) transition = "choose";
@@ -478,11 +526,15 @@ export function validatePipelineGraph(
     else return { ok: false, error: `step "${name}" has an invalid transition value` };
 
     let join: PipelineStep["join"];
-    if (rawStep.join === undefined) join = "any";
+    if (human) {
+      // Exactly one incoming edge makes join moot; normalize rather than
+      // reject a hand-edited graph that carries "all".
+      join = "any";
+    } else if (rawStep.join === undefined) join = "any";
     else if (rawStep.join === "any" || rawStep.join === "all") join = rawStep.join;
     else return { ok: false, error: `step "${name}" has an invalid join value` };
 
-    steps.push({ id, name, instructions, agentProfileId, position, subagents: { profileIds, cap }, transition, join });
+    steps.push({ id, name, type, instructions, agentProfileId, position, subagents: { profileIds, cap }, transition, join });
   }
 
   const rawEdges = g.edges;
@@ -583,10 +635,35 @@ export function validatePipelineGraph(
     }
   }
 
+  // Human-gate graph rules (docs/architecture/pipelines.md): a human step is
+  // never the start step, has exactly one incoming edge (it is never a root,
+  // so the unique-root fallback can't produce one either), and no human step
+  // may feed another human step — a pause between two pauses is a second
+  // gate the owner would have to dismiss without any work in between.
+  for (const step of steps) {
+    if (!isHumanStep(step)) continue;
+    const incoming = edges.filter((e) => e.to === step.id);
+    if (incoming.length !== 1) {
+      return {
+        ok: false,
+        error: `step "${step.name}" is a human step and must have exactly one incoming edge (it has ${incoming.length})`,
+      };
+    }
+    const fromHuman = incoming.find((e) => isHumanStep(stepById.get(e.from)));
+    if (fromHuman) {
+      const fromName = stepById.get(fromHuman.from)?.name ?? fromHuman.from;
+      return { ok: false, error: `step "${fromName}" is a human step and can't connect to human step "${step.name}"` };
+    }
+  }
+
   let startStepId: string | null = null;
   if (g.startStepId !== undefined && g.startStepId !== null) {
     if (typeof g.startStepId !== "string" || !stepIds.has(g.startStepId)) {
       return { ok: false, error: "startStepId must reference an existing step" };
+    }
+    const startStep = stepById.get(g.startStepId)!;
+    if (isHumanStep(startStep)) {
+      return { ok: false, error: `step "${startStep.name}" is a human step and can't be the start step` };
     }
     startStepId = g.startStepId;
   }
@@ -1118,6 +1195,13 @@ export function resolveNextSteps(
  * explicitly idle/cancelled).
  */
 export function deriveRunStatus(run: PipelineRunState): PipelineRunStatus {
+  // A pending human gate behaves exactly like the board's Review column:
+  // it outranks a blocked sibling (the owner's review is the thing to act
+  // on), and only a deliberate whole-run Stop outranks it.
+  if (pendingHumanSteps(run).length > 0) {
+    if (run.stopRequestedAt != null) return "cancelled";
+    return "review";
+  }
   if (run.blocked.length > 0) return "blocked";
   // A stopped run stays stopped: its executions remain in `active` (Retry
   // re-runs them), but nothing is running on the run's behalf.
@@ -1235,6 +1319,14 @@ export function composeStepPrompt(input: {
    *  Production callers omit this; tests pass a fixed value for
    *  deterministic marker text. */
   nonce?: string;
+  /** Owner-authored feedback carried by a human gate's Accept (or a
+   *  Return's comment) — TRUSTED, rendered as its own
+   *  `## Human review feedback` section OUTSIDE the untrusted-handoff
+   *  markers. Optional so every existing call site compiles unchanged. */
+  humanFeedback?: string | null;
+  /** True when this execution is a Return re-run of the step — replaces the
+   *  "first step" copy with the owner-requested redo wording. */
+  returned?: boolean;
 }): string {
   const parts: string[] = [];
   const nonce = input.nonce ?? randomHandoffNonce();
@@ -1251,7 +1343,11 @@ export function composeStepPrompt(input: {
 
   parts.push("## Context from previous step(s)");
   if (input.previous.length === 0) {
-    parts.push("This is the first step — there is no prior handoff.");
+    parts.push(
+      input.returned
+        ? "You are re-running this step at the owner's request — see the human review feedback below."
+        : "This is the first step — there is no prior handoff.",
+    );
   } else {
     parts.push(HANDOFF_UNTRUSTED_CONTENT_WARNING.replaceAll("<nonce>", nonce));
     const encoder = new TextEncoder();
@@ -1287,6 +1383,20 @@ export function composeStepPrompt(input: {
 
   parts.push("## Your step");
   parts.push(input.step.instructions.trim().length > 0 ? input.step.instructions : "(no additional instructions)");
+
+  // Owner-authored, trusted, and deliberately NOT inside the untrusted
+  // handoff markers above: a human comment is not agent output. Rendered
+  // after the step's own instructions so the feedback reads as direction on
+  // top of the task. Never names the product (nothing injected into a
+  // prompt may).
+  const feedback = input.humanFeedback?.trim() ?? "";
+  if (feedback.length > 0) {
+    parts.push("## Human review feedback");
+    parts.push(
+      "A human reviewed the work so far and wrote the feedback below. It is authoritative — follow it.",
+    );
+    parts.push(feedback);
+  }
 
   if (input.parallelSiblings.length > 0) {
     parts.push("## Running in parallel");
@@ -1333,6 +1443,62 @@ export function composeStepPrompt(input: {
   parts.push("If you need the user's input, ask before writing the handoff.");
 
   return parts.join("\n\n");
+}
+
+/**
+ * Compose the message a human Return sends to the previous step: the
+ * owner's comment (required) plus the same handoff contract the step was
+ * launched with, so the re-run ends in a valid handoff. Names no product —
+ * like everything injected into a prompt. The comment is owner-authored and
+ * trusted, so it is not fenced as untrusted content.
+ */
+export function composeReviewReturnMessage(input: {
+  stepName: string;
+  comment: string;
+  outgoing: { name: string; label: string }[];
+  transition: "choose" | "all";
+}): string {
+  const parts: string[] = [
+    "The owner reviewed the work so far at a human review gate and sent it back to you for changes.",
+    `## Human review feedback`,
+    input.comment.trim(),
+    `Rework step "${input.stepName}" accordingly. When you are done — or blocked — end your FINAL message with the handoff block below.`,
+    ...renderHandoffContract(input.outgoing, input.transition),
+    `Do not put anything after the closing </${HANDOFF_TAG}> tag.`,
+  ];
+  return parts.join("\n\n");
+}
+
+/**
+ * Which human gates a `pipeline` GlobalEvent announces that the listener has
+ * not already announced: for the same run generation (`runStartedAt`) only
+ * the seqs not seen before; for a new generation every seq; `[]` for a
+ * repeated event. Pure, so the webview's toast dedupe and the headless
+ * notifier share one rule. `previous` is the listener's own last-seen
+ * `(runStartedAt, seqs)` for this parent.
+ */
+export function newHumanGateSeqs(
+  previous: { runStartedAt: number | null; seqs: readonly number[] } | null | undefined,
+  runStartedAt: number | null,
+  seqs: readonly number[],
+): number[] {
+  const unique = [...new Set(seqs)];
+  if (unique.length === 0) return [];
+  if (!previous || previous.runStartedAt !== runStartedAt) return unique;
+  const seen = new Set(previous.seqs);
+  return unique.filter((s) => !seen.has(s));
+}
+
+/**
+ * The "…needs your review" line shared by the webview toast and the headless
+ * notifier. Both surfaces keep ONE alert per pipeline parent (the task notifier
+ * holds one entry per task), so a single event that opens several gates must
+ * name the count rather than silently announcing only the first — otherwise
+ * the later gates are marked announced and never alert at all. A lone gate
+ * keeps the original copy.
+ */
+export function humanReviewSubtitle(gateCount: number): string {
+  return gateCount > 1 ? `Pipeline needs your review (${gateCount} gates)` : "Pipeline needs your review";
 }
 
 /** Prefix {@link parseHandoff} puts on every JSON-parse-failure `error`
@@ -1510,6 +1676,9 @@ export function stepNameById(g: PipelineGraph, id: string): string {
  * name appended (`" · <name>"`) whenever at least one execution is active.
  */
 export function pipelineStepProgress(run: PipelineRunState): { completed: number; active: number; total: number; label: string } {
+  // `returned` is deliberately not "completed": a Return is a loop decision,
+  // not work finished. An accepted gate is recorded `succeeded`, so it
+  // counts like any agent execution.
   const completed = run.history.filter((h) => h.outcome === "succeeded" || h.outcome === "advanced-manually").length;
   const active = run.active.length;
   const total = run.snapshot?.graph.steps.length ?? 0;
@@ -1519,6 +1688,12 @@ export function pipelineStepProgress(run: PipelineRunState): { completed: number
   if (firstActive) {
     const name = run.snapshot ? stepNameById(run.snapshot.graph, firstActive.stepId) : firstActive.stepId;
     label += ` · ${name}`;
+  } else {
+    const gate = run.humanSteps?.[0];
+    if (gate) {
+      const name = run.snapshot ? stepNameById(run.snapshot.graph, gate.stepId) : gate.stepId;
+      label += ` · ${name}`;
+    }
   }
 
   return { completed, active, total, label };

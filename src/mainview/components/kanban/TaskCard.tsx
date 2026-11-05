@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2, UserCheck } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { AwaitingGlow } from "@/components/ui/awaiting-glow";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-auto-resume";
+import { useConfirm } from "@/components/ui/confirm";
 import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
@@ -32,6 +33,10 @@ interface Props {
    *  (App.tsx's `openAttention`). For any other task App routes both to the
    *  same `openTask`. */
   onOpenAttention: (t: Task) => void;
+  /** A pipeline parent in Review with a pending human gate: open the run
+   *  view with the gate focused. Separate from `onOpen` so the card can
+   *  offer both Open (browse) and Review (decide). */
+  onReviewPipeline: (t: Task) => void;
   onDiff: (t: Task) => void;
   onMarkDone: (t: Task) => void;
   onArchive: (t: Task) => void;
@@ -47,7 +52,7 @@ interface Props {
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
+function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onReviewPipeline, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
   // Last-seen worktree checkout (server-recorded; no git spawn on the 2 s
   // poll) vs the branch agetor created. Drift is tolerated — just shown.
@@ -66,6 +71,24 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
     // the user has to take the explicit unarchive action first.
     disabled: archived,
   });
+  const confirm = useConfirm();
+  /** Stop, with a confirmation for a pipeline parent (its Stop cancels live
+   *  steps and dismisses a pending review — worth confirming). Every other
+   *  task keeps the existing one-click Stop. */
+  const stopTask = () => {
+    if (!task.pipelineId) {
+      onCancel(task);
+      return;
+    }
+    void confirm({
+      title: "Stop this pipeline?",
+      description: "Live steps will be cancelled and the pending review dismissed. History is kept.",
+      confirmLabel: "Stop",
+      variant: "destructive",
+    }).then((ok) => {
+      if (ok) onCancel(task);
+    });
+  };
 
   const style = transform
     ? { transform: CSS.Translate.toString(transform) }
@@ -87,14 +110,21 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
   // execution has landed in `pipelineRun.history`, there's something worth
   // opening the run view for; Retry/Restart live there, not on the card
   // (M15, docs/plans/pipelines.md review). Mirrored in `buildTaskContextMenu`.
-  const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
+  const hasOpenablePipelineRun = !!task.pipelineRun
+    && (task.pipelineRun.history.length > 0 || (task.pipelineRun.humanSteps ?? []).length > 0);
   const openable = task.hasOpenableRun || hasOpenablePipelineRun;
+  // A pending human gate parks the card in Review and needs a decision —
+  // Offer both Open (browse the run) and Review (decide).
+  const gatePending = !!task.pipelineId && (task.pipelineRun?.humanSteps ?? []).length > 0;
   // Stop is only honoured server-side for a pipeline PARENT while its run
   // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
   // otherwise — e.g. a `blocked` run with nothing live), so the card's Stop
-  // gates on `pipelineRun.status`, not the column (L-A1). Mirrored in
-  // `buildTaskContextMenu`. Every other task keeps the column-based rule.
-  const stoppable = task.pipelineId ? task.pipelineRun?.status === "running" : active;
+  // gates on `pipelineRun.status`, not the column (L-A1). A pending gate is
+  // stoppable too: Stop dismisses it and moves the card to Ready. Mirrored
+  // in `buildTaskContextMenu`. Every other task keeps the column-based rule.
+  const stoppable = task.pipelineId
+    ? task.pipelineRun?.status === "running" || gatePending
+    : active;
   // Combine structured interactions with codex's narrative `blocked` signal.
   // The latter has no answerable payload — the user resolves it from the run
   // panel — but it represents the same "waiting on you" state to the user.
@@ -321,6 +351,35 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
             <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
               <FolderOpen className="size-3" /> Open
             </Button>
+          ) : gatePending ? (
+            // A pending human gate is a decision, not a failure: Review is the
+            // primary action, Open browses the run, and Stop stays available
+            // as a single, visually secondary danger action (owner decisions:
+            // grill round-1 "Open + Review", round-2 "Review primary, danger
+            // Stop secondary"). No icon Stop here — one Stop is enough.
+            <>
+              <Button size="sm" variant="secondary" onClick={() => onOpen(task)} title="Open the pipeline run">
+                <FolderOpen className="size-3" /> Open
+              </Button>
+              <Button
+                size="sm"
+                data-testid="task-card-pipeline-review"
+                onClick={() => onReviewPipeline(task)}
+                title="Open the human review gate"
+              >
+                <UserCheck className="mr-1 size-3" /> Review
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="task-card-pipeline-stop"
+                className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                onClick={stopTask}
+                title="Stop"
+              >
+                <Square className="size-3" /> Stop
+              </Button>
+            </>
           ) : awaiting ? (
             <Button
               size="sm"
@@ -333,7 +392,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
               <ArrowRight className="size-3" />
             </Button>
           ) : stoppable ? (
-            <Button size="sm" variant="destructive" onClick={() => onCancel(task)}>
+            <Button size="sm" variant="destructive" onClick={stopTask}>
               <Square className="size-3" /> Stop
             </Button>
           ) : openable || importedSessionOf(task) ? (
@@ -345,12 +404,13 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
               <Play className="size-3" /> Run
             </Button>
           )}
-          {!archived && awaiting && stoppable && (
-            <Button size="icon" variant="ghost" onClick={() => onCancel(task)} title="Stop">
+          {!archived && awaiting && !gatePending && stoppable && (
+            <Button size="icon" variant="ghost" onClick={stopTask} title="Stop">
               <Square className="size-3" />
             </Button>
           )}
-          {!archived && task.column === "review" && (
+          {!archived && task.column === "review" && !gatePending
+            && !(task.pipelineId && task.pipelineRun?.status !== "done") && (
             <Button size="sm" variant="outline" onClick={() => onMarkDone(task)} title="Mark this task as done">
               <CheckCircle2 className="mr-1 size-3" /> Done
             </Button>

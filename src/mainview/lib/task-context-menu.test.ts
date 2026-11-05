@@ -47,6 +47,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   open: "primary",
   "open-pipeline": "primary",
+  "review-pipeline": "primary",
   start: "primary",
   stop: "primary",
   "resume-recovery": "primary",
@@ -526,6 +527,23 @@ describe("buildTaskContextMenu", () => {
 
       expect(actions(entries)).toEqual(["open-pipeline", "diff", "open-in-finder", "delete"]);
       expect(actions(entries)).not.toContain("start");
+    });
+
+    test("a pending human gate offers Review pipeline and suppresses Mark done", () => {
+      const task = makeTask({
+        pipelineId: "pipe-1",
+        column: "review",
+        pipelineRun: pipelineRun({
+          status: "review",
+          humanSteps: [{ stepId: "h", seq: 2, startedAt: 1, arrivals: [] }],
+        }),
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+      expect(actions(entries)).toContain("review-pipeline");
+      expect(actions(entries)).not.toContain("mark-done");
+      expect(entries.find((e) => e.action === "review-pipeline")?.label).toBe("Review pipeline");
+      // A pending gate is stoppable.
+      expect(actions(entries)).toContain("stop");
     });
 
     test("M15: an idle pipeline parent (pipelineRun set, empty history) still shows 'start'", () => {

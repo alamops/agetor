@@ -55,7 +55,7 @@ import {
   requestRetentionPass,
   runArchivedHistoryRetentionPass,
 } from "./retention.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, reviewHumanStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import {
@@ -252,6 +252,8 @@ import type {
   Handoff,
   Pipeline,
   PipelineInput,
+  PipelineJoinArrival,
+  PipelinePendingLaunch,
   PipelineRunState,
   RunEvent,
   OpencodeServerMode,
@@ -1096,24 +1098,55 @@ function parsePipelineDescription(body: Record<string, unknown>): { value: strin
 
 /**
  * The trimmed `Task.pipelineRun` variant `GET /tasks` ships (M-S3, see the
- * field's doc in `shared/types.ts`): every persisted handoff (history and
- * partial-join arrivals) is nulled and the frozen profile snapshots dropped,
- * since the board/TUI/`agetor ls` only read `snapshot.graph`, `status`,
- * `active`, `blocked`, history outcomes and `stepCount` — and the 2s poll
- * was otherwise shipping every handoff of every pipeline task on every
- * tick. `GET /tasks/:id` and `GET /tasks/:id/pipeline` still return the
- * full state; the server's own `tasks.list()`/`get()` reads are untouched.
+ * field's doc in `shared/types.ts`): every persisted handoff (history,
+ * partial-join arrivals, human-gate arrivals and a held launch's arrivals),
+ * owner comment and the frozen profile snapshots are dropped, since the
+ * board/TUI/`agetor ls` only read `snapshot.graph`, `status`, `active`,
+ * `blocked`, history outcomes and `stepCount` — and the 2s poll was otherwise
+ * shipping every handoff of every pipeline task on every tick. `GET /tasks/:id`
+ * and `GET /tasks/:id/pipeline` still return the full state; the server's own
+ * `tasks.list()`/`get()` reads are untouched.
  */
 function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
+  // Owner-authored comments (a gate's Accept feedback, a join arrival) can be
+  // as large as a handoff field — the board poll only needs gate identity, so
+  // trim them alongside the handoffs. The single-run routes keep them.
+  const trimArrival = (a: PipelineJoinArrival): PipelineJoinArrival => ({
+    fromStepId: a.fromStepId,
+    seq: a.seq,
+    handoff: null,
+    comment: null,
+  });
   const joins: PipelineRunState["joins"] = {};
   for (const [stepId, join] of Object.entries(run.joins)) {
-    joins[stepId] = { arrivals: join.arrivals.map((a) => ({ ...a, handoff: null })) };
+    joins[stepId] = { arrivals: join.arrivals.map(trimArrival) };
   }
+  // A held launch can carry the same reviewed handoff + comments (R6/R17: a
+  // Return's forced edge/feedback and an Accept's comment survive a hold), so
+  // it must be trimmed with everything else or the 2s poll ships them for
+  // every blocked parent. The rule id/booleans stay: they are tiny and the
+  // board's block banner does not read them, but keeping the shape exact
+  // costs nothing. Retry reads the single-run routes (untrimmed).
+  const trimPending = (p: PipelinePendingLaunch): PipelinePendingLaunch => ({
+    stepId: p.stepId,
+    arrivals: p.arrivals.map(trimArrival),
+    ...(p.returnToStepId !== undefined ? { returnToStepId: p.returnToStepId } : {}),
+    ...(p.returned === true ? { returned: true } : {}),
+  });
   return {
     ...run,
     snapshot: run.snapshot ? { ...run.snapshot, profiles: {} } : null,
-    history: run.history.map((h) => ({ ...h, handoff: null })),
+    history: run.history.map((h) => ({
+      ...h,
+      handoff: null,
+      ...(h.human ? { human: { ...h.human, comment: null } } : {}),
+    })),
     joins,
+    blocked: run.blocked.map((b) => (b.pending ? { ...b, pending: trimPending(b.pending) } : b)),
+    humanSteps: (run.humanSteps ?? []).map((g) => ({
+      ...g,
+      arrivals: g.arrivals.map(trimArrival),
+    })),
   };
 }
 
@@ -6052,6 +6085,70 @@ export function startApiServer(
           }
 
           const result = await advancePipeline(req.params.id, { nextStepIds, handoff, fromTaskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // The human gate's decision route (docs/architecture/pipelines.md):
+      // Accept continues through the gate's outgoing edges (comment
+      // optional), Return re-runs the gate's sole incoming source (comment
+      // required). `stepId` + `seq` identify the gate, making a double
+      // submit a 409 rather than a second launch.
+      "/tasks/:id/pipeline/review": {
+        POST: authed(async (req) => {
+          // Accept/Return can launch (or resume) a step, which can
+          // (re-)materialize a worktree — same rationale as advance/retry.
+          server.timeout(req, 0);
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+
+          if (typeof body.stepId !== "string" || body.stepId.length === 0) {
+            return json({ error: "stepId must be a non-empty string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.seq !== "number" || !Number.isSafeInteger(body.seq) || body.seq < 1) {
+            return json({ error: "seq must be a positive integer" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.decision !== "accept" && body.decision !== "return") {
+            return json({ error: "decision must be \"accept\" or \"return\"" }, { status: 400, headers: corsHeaders(req) });
+          }
+
+          let comment: string | null | undefined;
+          if (body.comment !== undefined) {
+            if (body.comment !== null && typeof body.comment !== "string") {
+              return json({ error: "comment must be a string" }, { status: 400, headers: corsHeaders(req) });
+            }
+            comment = body.comment as string | null;
+          }
+
+          let nextStepIds: string[] | undefined;
+          if (body.nextStepIds !== undefined) {
+            if (!Array.isArray(body.nextStepIds) || body.nextStepIds.some((s) => typeof s !== "string")) {
+              return json({ error: "nextStepIds must be an array of step ids" }, { status: 400, headers: corsHeaders(req) });
+            }
+            nextStepIds = body.nextStepIds as string[];
+          }
+
+          let mode: "fresh" | "resume" | undefined;
+          if (body.mode !== undefined) {
+            if (body.mode !== "fresh" && body.mode !== "resume") {
+              return json({ error: "mode must be \"fresh\" or \"resume\"" }, { status: 400, headers: corsHeaders(req) });
+            }
+            mode = body.mode;
+          }
+
+          const result = await reviewHumanStep(req.params.id, {
+            stepId: body.stepId,
+            seq: body.seq,
+            decision: body.decision,
+            comment,
+            nextStepIds,
+            mode,
+          });
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });

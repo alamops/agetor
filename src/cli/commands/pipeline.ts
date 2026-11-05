@@ -128,6 +128,53 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       return;
     }
 
+    case "review": {
+      const ref = args[1];
+      if (!ref) throw usageError("pipeline review");
+      // Flags are parsed BEFORE the task lookup so a bad invocation fails
+      // fast without a network round-trip (L-CLI7).
+      const f = parseReviewFlags(args.slice(2));
+      if (f.accept === f.returnBack) throw usageError("pipeline review");
+      if (f.returnBack && (f.comment === undefined || f.comment.trim().length === 0)) {
+        throw usageError("pipeline review");
+      }
+      if (f.accept && f.mode !== undefined) throw new Error("--mode is only valid with --return");
+      if (f.returnBack && f.next.length > 0) throw new Error("--next is only valid with --accept");
+      const task = await resolvePipelineTask(client, ref);
+      if (!task.pipelineRun) throw new Error("pipeline has never run — nothing to review");
+      const graph = task.pipelineRun.snapshot?.graph ?? null;
+      const gate = resolveHumanGateRef(task.pipelineRun, f.step);
+
+      let nextStepIds: string[] | undefined;
+      if (f.accept && f.next.length > 0) {
+        if (!graph) throw new Error("pipeline has no run snapshot yet — nothing to accept");
+        nextStepIds = [...new Set(f.next.map((name) => resolveStepRef(graph, name)))];
+      } else if (f.accept && graph) {
+        // The server refuses a `choose` gate with several outgoing edges and
+        // no pick; say so before the round-trip.
+        const step = graph.steps.find((s) => s.id === gate.stepId);
+        const outgoing = step ? outgoingSteps(graph, step.id) : [];
+        if (step && step.transition === "choose" && outgoing.length > 1) {
+          throw new Error("this review has several next steps — pick one with --next");
+        }
+      }
+
+      const updated = await client.reviewPipeline(task.id, {
+        stepId: gate.stepId,
+        seq: gate.seq,
+        decision: f.accept ? "accept" : "return",
+        ...(f.comment !== undefined ? { comment: f.comment } : {}),
+        ...(nextStepIds ? { nextStepIds } : {}),
+        ...(f.mode ? { mode: f.mode } : {}),
+      });
+      if (flags.json) return printJson(updated);
+      out(
+        `${f.accept ? c.green("✓") : c.cyan("↩")} ${f.accept ? "accepted" : "returned"} the review for ` +
+          `${c.dim(task.id.slice(0, 8))}`,
+      );
+      return;
+    }
+
     case "restart": {
       const ref = args[1];
       if (!ref) throw usageError("pipeline restart");
@@ -162,7 +209,7 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       throw new Error(
         "unknown pipeline subcommand: " +
           sub +
-          " (use ls | show | rm | export | import | retry | advance | restart | status)",
+          " (use ls | show | rm | export | import | retry | advance | review | restart | status)",
       );
   }
 }
@@ -364,8 +411,79 @@ function label(s: string): string {
   return c.dim(s + ":");
 }
 
+interface ReviewFlags {
+  accept: boolean;
+  returnBack: boolean;
+  comment?: string;
+  /** `--next <step>` (repeatable) — Accept target(s), resolved against the
+   *  snapshot graph by `resolveStepRef`. */
+  next: string[];
+  /** `--step <step>` — which pending gate to decide when several are open. */
+  step?: string;
+  /** `--mode fresh|resume` — Return only; default fresh. */
+  mode?: "fresh" | "resume";
+}
+
+/** Pure flag parser for `agetor pipeline review` — `--accept`/`--return`,
+ *  `--comment <text>`, `--next <step>` (repeatable), `--step <step>`,
+ *  `--mode fresh|resume`. Exclusivity and "a Return needs a comment" are
+ *  checked by the caller before the network round-trip (L-CLI7). */
+export function parseReviewFlags(args: string[]): ReviewFlags {
+  const f: ReviewFlags = { accept: false, returnBack: false, next: [] };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--accept") f.accept = true;
+    else if (a === "--return") f.returnBack = true;
+    else if (a === "--comment") f.comment = flagValue(args, ++i, a);
+    else if (a === "--next") f.next.push(flagValue(args, ++i, a));
+    else if (a === "--step") f.step = flagValue(args, ++i, a);
+    else if (a === "--mode") {
+      const v = flagValue(args, ++i, a);
+      if (v !== "fresh" && v !== "resume") throw new Error("--mode must be fresh or resume");
+      f.mode = v;
+    } else throw usageError("pipeline review");
+  }
+  return f;
+}
+
 /**
- * Pure line-by-line renderer for `agetor pipeline show <ref>` — name/id,
+ * Resolve `--step` (or the sole pending gate) against a run's pending human
+ * gates. A step name/id resolves through the snapshot graph; an exact gate
+ * seq also works. Throws with the pending gate list when several are open
+ * and none was named.
+ */
+export function resolveHumanGateRef(run: PipelineRunState, ref: string | undefined): NonNullable<PipelineRunState["humanSteps"]>[number] {
+  const gates = run.humanSteps ?? [];
+  if (gates.length === 0) throw new Error("no pending human review on this pipeline");
+  const graph = run.snapshot?.graph ?? null;
+  if (ref === undefined) {
+    if (gates.length === 1) return gates[0]!;
+    const list = gates.map((g) => `${g.seq} (${graph ? stepLabel(graph, g.stepId) : safe(g.stepId)})`).join(", ");
+    throw new Error(`several reviews are pending — pick one with --step: ${list}`);
+  }
+  const trimmed = ref.trim();
+  if (!trimmed) throw new Error("--step requires a non-empty step reference");
+  if (/^\d+$/.test(trimmed)) {
+    const bySeq = gates.find((g) => g.seq === Number(trimmed));
+    if (bySeq) return bySeq;
+  }
+  if (graph) {
+    let stepId: string | null = null;
+    try {
+      stepId = resolveStepRef(graph, trimmed);
+    } catch {
+      stepId = null;
+    }
+    if (stepId) {
+      const byStep = gates.find((g) => g.stepId === stepId);
+      if (byStep) return byStep;
+    }
+  }
+  const list = gates.map((g) => `${g.seq} (${graph ? stepLabel(graph, g.stepId) : safe(g.stepId)})`).join(", ");
+  throw new Error(`no pending review matches "${trimmed}" — pending: ${list}`);
+}
+
+/** Pure line-by-line renderer for `agetor pipeline show <ref>` — name/id,
  * description, max steps + start step + used-by count, then one block per
  * step (name/id, bound agent profile, transition/join mode, allowed
  * subagent profiles when any, and its outgoing edges by target step name,
@@ -403,8 +521,17 @@ export function pipelineShowLines(p: Pipeline, profiles: AgentProfile[] | null =
   }
   p.graph.steps.forEach((step, i) => {
     const startMarker = start?.id === step.id ? c.cyan(" (start)") : "";
-    lines.push(`  ${i + 1}. ${c.bold(safe(step.name))}  ${c.dim(safe(step.id))}${startMarker}`);
-    lines.push(`     ${label("profile")} ${step.agentProfileId ? profileText(step.agentProfileId, profiles) : c.dim("none")}`);
+    const humanMarker = step.type === "human" ? `  ${c.cyan("human")}` : "";
+    lines.push(`  ${i + 1}. ${c.bold(safe(step.name))}  ${c.dim(safe(step.id))}${startMarker}${humanMarker}`);
+    lines.push(
+      `     ${label("profile")} ${
+        step.type === "human"
+          ? c.dim("none (human review)")
+          : step.agentProfileId
+            ? profileText(step.agentProfileId, profiles)
+            : c.dim("none")
+      }`,
+    );
     lines.push(`     ${label("transition")} ${step.transition}   ${label("join")} ${step.join}`);
     if (step.subagents.profileIds.length > 0) {
       const cap = step.subagents.cap === null ? "no cap" : `cap ${step.subagents.cap}`;
@@ -464,6 +591,16 @@ export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
     }
   }
 
+  if (run.humanSteps && run.humanSteps.length > 0) {
+    lines.push("");
+    lines.push(`  ${c.cyan("review pending")}:`);
+    for (const g of run.humanSteps) {
+      const stepName = runStepLabel(run, g.stepId);
+      const from = g.arrivals.map((a) => runStepLabel(run, a.fromStepId)).join(", ") || "(manual)";
+      lines.push(`    ${c.cyan("◆")} ${stepName}  ${c.dim(`seq ${g.seq}`)}  ${c.dim(`from ${from}`)}`);
+    }
+  }
+
   if (run.active.length > 0) {
     lines.push("");
     lines.push(`  ${c.cyan("active")}:`);
@@ -491,7 +628,9 @@ export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
           ? `  ${c.dim(`(handoff from run ${h.handoffRunId.slice(0, 8)})`)}`
           : "";
       lines.push(
-        `    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}${kindNote}${remindedNote}${handoffNote}  ${c.dim(h.taskId.slice(0, 8))}`,
+        `    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}${kindNote}${remindedNote}${handoffNote}  ${c.dim(
+          h.taskId ? h.taskId.slice(0, 8) : "(human)",
+        )}`,
       );
     }
   }
@@ -518,6 +657,7 @@ export function colorRunStatus(status: string): string {
   if (status === "blocked") return c.yellow(status);
   if (status === "done") return c.green(status);
   if (status === "cancelled") return c.yellow(status);
+  if (status === "review") return c.cyan(status);
   return status;
 }
 
@@ -525,5 +665,6 @@ function historyGlyph(outcome: string | null): string {
   if (outcome === "succeeded" || outcome === "advanced-manually") return c.green(outcome);
   if (outcome === "failed") return c.red("failed");
   if (outcome === "cancelled") return c.yellow("cancelled");
+  if (outcome === "returned") return c.cyan("returned");
   return c.dim("pending");
 }

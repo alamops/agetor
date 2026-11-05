@@ -458,3 +458,21 @@ Running per-file totals as of `6048296` (same `\b(test|it)\(` convention as the 
 ### Review round 4 (whole-feature review after the `main` merge, 2026-09-23)
 
 A fifth pass over the entire branch (88 files, fanned out over runner / shared+db+routes / canvas / app integration / CLI) found 4 high, 23 medium and ~50 low items; every one was applied in one wave. The four highs, each re-verified before fixing: **(1)** a step spawn that failed or was Stopped past the 1.5 s bounded-spawn window never produced a `run-status` event, so the execution sat in `run.active` with no block and the pipeline read `running` until the next boot — the continuation, `spawnAgentOrFail` and `consumePendingCancel` now emit it (gated on the run still being the task's current run) and `handleColumnChange` gained `ready`/`review` branches into an idempotent shared `settleStepRun`; **(2)** `parseHandoff`'s regex was quadratic in unclosed `<handoff>` opens (2.3 s of synchronous main-process time for 222 KB of agent-controlled text) — replaced by the linear `findLastHandoffBlock` over a 256 KB tail, pinned by a < 100 ms test; **(3)** React Flow's document-level `deleteKeyCode` removed the selected step when Backspace/Delete was pressed inside any dialog — the editor now owns Delete/Backspace and bails on open layers and text-entry targets; **(4)** a pipeline parent advertised its steps' pending interactions but the pending route filtered on the exact id, so `agetor answer <parent>` / TUI `g` found nothing — the route now unions `stepsForParent`. The medium/low fixes are catalogued in CLAUDE.md item 19 ("Round-4 review fixes") and the fleet KB review note; the cross-cutting contracts introduced are `GlobalEvent.pipelineParentId` (stamped centrally in `emitGlobal`), the `src/mainview/lib/pipeline-events.ts` store (one EventSource for the run view), the trimmed `pipelineRun` on `GET /tasks`, migration `059_task_pipeline_id_index.sql`, and `PIPELINE_LIMITS.handoffTotalBytes` / `.handoffScanTailBytes` / `.capExtensionsMax`. Behavioural note flagged by the runner fix: a `succeeded` settle that lands after a whole-run Stop now holds its successors as run-level `pending` blocks, so such a run reads `blocked` (blocked-wins) rather than `cancelled` until Retry picks the holds up.
+
+## D15 — Human steps (pause/review gates)
+
+Added after the original design (`docs/plans/pipeline-human-step.md`). A step
+may be `type: "human"`: no agent, no subagents, exactly one incoming edge,
+never the start step, no human→human edge. It spawns no task and consumes no
+step cap. A pending gate lives in `PipelineRunState.humanSteps` and makes the
+run `review` (mapped to the Review column), with precedence
+`cancelled > review > blocked > running > done`. `POST
+/tasks/:id/pipeline/review` decides it idempotently by `stepId`+`seq`:
+**Accept** continues through the gate's transition (comment optional, carried
+as trusted `PipelineJoinArrival.comment` into `composeStepPrompt`'s
+`## Human review feedback`), **Return** re-runs the gate's sole incoming
+source (comment required; `fresh` by default or `resume` on the existing
+task) and forces the new execution back to the gate with `returnToStepId`.
+A plain Run on a review run refuses; Restart clears human state; Stop with a
+gate dismisses it and moves the card to Ready. See
+`docs/architecture/pipelines.md` §11.

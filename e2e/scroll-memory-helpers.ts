@@ -87,11 +87,19 @@ export async function createProfileRest(backend: E2EBackend, name: string): Prom
   return ((await res.json()) as { id: string }).id;
 }
 
-/** Builds one pipeline step for `createPipelineRest` (choose/any defaults, no delegation). */
-export function makeStep(input: { id: string; name: string; agentProfileId: string; instructions?: string }) {
+/** Builds one pipeline step for `createPipelineRest` (choose/any defaults, no delegation).
+ *  `type: "human"` builds a human gate: no agent, no subagents. */
+export function makeStep(input: {
+  id: string;
+  name: string;
+  agentProfileId: string | null;
+  instructions?: string;
+  type?: "agent" | "human";
+}) {
   return {
     id: input.id,
     name: input.name,
+    ...(input.type === "human" ? { type: "human" as const } : {}),
     instructions: input.instructions ?? "",
     agentProfileId: input.agentProfileId,
     position: { x: 0, y: 0 },
@@ -187,6 +195,20 @@ export async function retryPipelineRest(backend: E2EBackend, id: string): Promis
     body: JSON.stringify({}),
   });
   await expectOk(res, `POST /tasks/${id}/pipeline/retry`);
+}
+
+/** `POST /tasks/:id/pipeline/review` (accept or return a pending human gate). */
+export async function reviewPipelineRest(
+  backend: E2EBackend,
+  id: string,
+  body: { stepId: string; seq: number; decision: "accept" | "return"; comment?: string; mode?: "fresh" | "resume" },
+): Promise<void> {
+  const res = await fetch(`${backend.apiBase}/tasks/${id}/pipeline/review`, {
+    method: "POST",
+    headers: auth(backend),
+    body: JSON.stringify(body),
+  });
+  await expectOk(res, `POST /tasks/${id}/pipeline/review`);
 }
 
 /** `POST /tasks/:id/pipeline/restart` (fresh run; clears history). */

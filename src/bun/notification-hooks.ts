@@ -75,6 +75,14 @@ export function removalForEvent(
   if (ev.kind === "column" && ev.prev === "blocked" && ev.column !== "blocked" && !ev.pipelineParentId) {
     return { taskId: ev.taskId, ifKinds: UNBLOCKED_REMOVAL_KINDS };
   }
+  // A decided human gate: the "Pipeline needs your review" entry is posted as
+  // `blocked` (it needs the user), but the run leaves `review` → `running`/
+  // `done` without ever passing through the `blocked` column, so the
+  // column-leaving-blocked rule above never fires. A run still `review` (or
+  // `blocked` on a sibling) keeps its banner.
+  if (ev.kind === "pipeline" && ev.status !== "review" && ev.status !== "blocked") {
+    return { taskId: ev.taskId, ifKinds: ["blocked"] };
+  }
   return null;
 }
 

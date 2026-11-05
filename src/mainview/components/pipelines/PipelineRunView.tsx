@@ -68,6 +68,7 @@ import { HandoffCard } from "@/components/handoff/HandoffCard";
 import { HandoffViewContext, stepNameFor, type HandoffViewValue } from "@/components/handoff/handoff-context";
 import { MdImageScopeContext, type MdImageScope } from "@/components/kanban/md-components";
 import { PipelineCanvasContext, type PipelineCanvasContextValue, type StepProfileResolution } from "./pipeline-canvas-context";
+import { HumanStepPanel } from "./HumanStepPanel";
 import { StepEdge } from "./StepEdge";
 import { StepNode } from "./StepNode";
 import { SubagentDetailsDialog } from "./SubagentDetailsDialog";
@@ -140,6 +141,7 @@ const STATUS_LABEL: Record<PipelineRunStatus, string> = {
   blocked: "Blocked",
   done: "Done",
   cancelled: "Cancelled",
+  review: "Review",
 };
 
 const STATUS_CLASSES: Record<PipelineRunStatus, string> = {
@@ -148,6 +150,7 @@ const STATUS_CLASSES: Record<PipelineRunStatus, string> = {
   blocked: "bg-warning/10 text-warning",
   done: "bg-success/10 text-success",
   cancelled: "bg-muted text-muted-foreground",
+  review: "bg-info/10 text-info",
 };
 
 /** Background/foreground pair for a {@link responseKindLabel}/reminder chip,
@@ -161,7 +164,7 @@ const TONE_CLASSES: Record<ResponseKindTone, string> = {
 
 /** Statuses from which a run can be restarted from its start step,
  *  discarding the prior history — mirrors the server's own gate. */
-const RESTARTABLE_STATUSES: PipelineRunStatus[] = ["done", "cancelled", "blocked"];
+const RESTARTABLE_STATUSES: PipelineRunStatus[] = ["done", "cancelled", "blocked", "review"];
 
 /** Block kinds Retry can re-attempt — everything except a missing/invalid
  *  handoff, which Retry can't fix (re-running the same step reproduces the
@@ -200,6 +203,19 @@ interface PipelineRunViewProps {
   onMarkDone?: (task: Task) => Promise<void> | void;
   /** The user's home directory, for `~/` artifacts in a history handoff card. */
   homeDir?: string | null;
+  /** Open the human review panel for this gate step on mount/change — the
+   *  board card's Review action and the review toast pass it. */
+  focusGateStepId?: string | null;
+  /** The exact pending gate (`humanSteps[].seq`) to open, resolved against
+   *  the run this view loads. Takes precedence over `focusGateStepId`: a
+   *  request can arrive before the gate has been polled in, and two gates can
+   *  share a step id. */
+  focusGateSeq?: number | null;
+  /** Bumped by the caller on every focus request. `focusGateStepId` alone
+   *  can't distinguish "asked again for the same gate" from "already
+   *  handled", so a second Review click after closing the panel would do
+   *  nothing; the nonce makes each request distinct. */
+  focusGateNonce?: number | null;
 }
 
 function formatClockTime(ts: number): string {
@@ -278,7 +294,7 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * re-render (and therefore `<StoreUpdater>`'s own `setEdges`/`setNodes`
  * sync) entirely when a poll turns up nothing new to paint.
  */
-export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone, homeDir = null }: PipelineRunViewProps) {
+export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onMarkDone, homeDir = null, focusGateStepId = null, focusGateSeq = null, focusGateNonce = null }: PipelineRunViewProps) {
   const { resolved } = useTheme();
   const { profiles: liveProfiles, loaded: liveProfilesLoaded } = useAgentProfiles();
   const confirm = useConfirm();
@@ -296,6 +312,14 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   // against the freshly-derived satellites every render, so the dialog
   // tracks working → done live while it's up).
   const [detailsNodeId, setDetailsNodeId] = useState<string | null>(null);
+  // The human review panel: never auto-opens on arrival — only a node/section
+  // click, the card's Review action, or `focusGateStepId` opens it.
+  const [humanPanelGateKey, setHumanPanelGateKey] = useState<string | null>(null);
+  // The gate the panel last bound to, kept while it is closed: a half-typed
+  // comment lives in the mounted panel, so closing gate #2 and snapping back
+  // to the primary gate would remount it and lose the draft (R-N1). A
+  // remembered gate that is no longer pending falls back to the primary.
+  const lastPanelGateKeyRef = useRef<string | null>(null);
   // Subagents observed on each step task (`GET /tasks/:id/subagents`), keyed
   // by step TASK id. Refreshed for every currently-active execution on each
   // poll; entries for executions that have since settled are kept as last
@@ -453,6 +477,44 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const runPipelineId = run?.pipelineId ?? null;
   const snapshotCapturedAt = run?.snapshot?.capturedAt ?? null;
   const hasRun = run != null;
+  const pendingGates = run?.humanSteps ?? [];
+  const primaryGate = pendingGates[0] ?? null;
+  const gateKey = (g: NonNullable<typeof primaryGate>) => `${g.stepId}:${g.seq}`;
+  // The panel stays mounted on the gate it was last opened on while closed
+  // (so a half-typed comment survives closing), and switches to whichever
+  // gate the user newly opens. Binding every "Open review" to one shared
+  // boolean showed gate #1's panel for gate #2 with two gates pending (N1).
+  if (humanPanelGateKey !== null) lastPanelGateKeyRef.current = humanPanelGateKey;
+  const boundGateKey = humanPanelGateKey ?? lastPanelGateKeyRef.current;
+  const openGate = boundGateKey
+    ? (pendingGates.find((g) => gateKey(g) === boundGateKey) ?? null)
+    : null;
+  const panelGate = openGate ?? primaryGate;
+
+  // `focusGateStepId`/`focusGateSeq` (the board card's Review action, the
+  // review toast): open the panel once per request. A ref keeps it one-shot —
+  // otherwise the 2s poll (which re-runs this effect) would reopen a panel the
+  // user just closed while the gate is still pending. The request is keyed by
+  // the caller's nonce as well as the gate: pressing Review again for the same
+  // gate IS a new request and must reopen the panel. A request by `seq` is
+  // resolved against THIS run's loaded gates, so a toast that fired before the
+  // board polled the gate in still opens it once the run here has it.
+  const focusHandledRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (focusGateSeq == null && !focusGateStepId) {
+      focusHandledRef.current = null;
+      return;
+    }
+    const requestKey = `${focusGateSeq ?? ""}:${focusGateStepId ?? ""}:${focusGateNonce ?? 0}`;
+    if (focusHandledRef.current === requestKey) return;
+    const gates = run?.humanSteps ?? [];
+    const focused = focusGateSeq != null
+      ? gates.find((g) => g.seq === focusGateSeq)
+      : gates.find((g) => g.stepId === focusGateStepId);
+    if (!focused) return;
+    focusHandledRef.current = requestKey;
+    setHumanPanelGateKey(`${focused.stepId}:${focused.seq}`);
+  }, [focusGateStepId, focusGateSeq, focusGateNonce, run?.humanSteps]);
 
   // Before the first Run, `run.snapshot` is null — fall back to the live
   // pipeline's own graph so the canvas still has something to render.
@@ -542,7 +604,8 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
       .map((h) => `${h.stepId}:${h.taskId}:${h.outcome ?? ""}:${h.reminder ? h.reminder.at : ""}:${h.handoffRunId ?? ""}:${h.handoffFromOtherRun ? 1 : 0}`)
       .join(",");
     const columns = steps.map((t) => `${t.id}:${t.column}:${t.pendingInteractionCount}`).join(",");
-    return `${active}|${blocked}|${history}|${columns}`;
+    const gates = (run.humanSteps ?? []).map((g) => `${g.stepId}:${g.seq}`).join(",");
+    return `${active}|${blocked}|${history}|${columns}|${gates}`;
   }, [run, steps]);
 
   const edgeVisualSignature = useMemo(() => {
@@ -576,15 +639,17 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         const visual: StepVisualState = stepVisualState(r, n.id, s);
         const reminded = stepReminded(r, n.id);
         const attention = stepAttention(r, n.id, s);
+        const gatePending = (r?.humanSteps ?? []).some((g) => g.stepId === n.id);
         if (
           n.data.visual === visual
           && n.data.reminded === reminded
+          && n.data.gatePending === gatePending
           && sameStepAttention(n.data.attention as StepAttention | null | undefined, attention)
         ) {
           return n;
         }
         changed = true;
-        return { ...n, data: { ...n.data, visual, reminded, attention } };
+        return { ...n, data: { ...n.data, visual, reminded, attention, gatePending } };
       });
       return changed ? next : ns;
     });
@@ -698,6 +763,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         setDetailsNodeId(node.id);
         return;
       }
+      if (node.data.step.type === "human") {
+        setNotStartedStepName(null);
+        const gate = (run?.humanSteps ?? []).find((g) => g.stepId === node.id);
+        if (gate) {
+          setHumanPanelGateKey(`${gate.stepId}:${gate.seq}`);
+        } else {
+          setNotStartedStepName(node.data.step.name);
+        }
+        return;
+      }
       const stepTask = stepNodeTaskFor(steps, run, node.id);
       if (stepTask) {
         setNotStartedStepName(null);
@@ -738,6 +813,15 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const detailsProfile = detailsSatellite?.profileId ? resolveProfile(detailsSatellite.profileId) : { profile: null, profileDeleted: false };
 
   const handleStop = useCallback(async () => {
+    const ok = await confirm({
+      title: "Stop this run?",
+      description: pendingGates.length > 0
+        ? "Live steps will be cancelled and the pending review dismissed. History is kept."
+        : "Live steps will be cancelled. History is kept.",
+      confirmLabel: "Stop",
+      variant: "destructive",
+    });
+    if (!ok) return;
     setActionBusy(true);
     setActionError(null);
     try {
@@ -748,7 +832,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     } finally {
       setActionBusy(false);
     }
-  }, [taskId, load]);
+  }, [taskId, load, confirm, pendingGates.length]);
 
   const handleRetry = useCallback(async (stepTaskId?: string) => {
     setActionBusy(true);
@@ -858,7 +942,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   }
 
   const candidates = (effectiveGraph?.steps ?? []).map((s) => ({ value: s.id, label: s.name }));
-  const showStop = hasLiveExecution(steps, run);
+  const showStop = hasLiveExecution(steps, run) || pendingGates.length > 0;
   const showRestart = RESTARTABLE_STATUSES.includes(run.status);
   const showMarkDone = run.status === "done" && task.column !== "done" && task.archivedAt == null;
   // An active execution whose step task already finished (board column
@@ -1047,6 +1131,44 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
             )}
           </div>
 
+          {pendingGates.length > 0 && (
+            <div data-testid="pipeline-run-human-review" className="mb-3 flex flex-col gap-2">
+              <p className="text-xs font-medium text-muted-foreground">Human review</p>
+              <AnimatePresence initial={false}>
+                {pendingGates.map((g) => {
+                  const name = effectiveGraph ? stepNameById(effectiveGraph, g.stepId) : g.stepId;
+                  const from = g.arrivals.map((a) => (effectiveGraph ? stepNameById(effectiveGraph, a.fromStepId) : a.fromStepId));
+                  return (
+                    <motion.div
+                      key={`gate:${g.stepId}:${g.seq}`}
+                      initial={{ opacity: 0, y: -4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0 }}
+                      className="rounded-md border border-info/40 bg-info/10 p-2.5"
+                    >
+                      <p className="text-xs font-medium text-info">{name} — waiting for your review</p>
+                      {from.length > 0 && (
+                        <p className="mt-0.5 text-xs text-muted-foreground">from {from.join(", ")}</p>
+                      )}
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          data-testid="pipeline-run-open-review"
+                          className="h-7 text-xs"
+                          onClick={() => setHumanPanelGateKey(`${g.stepId}:${g.seq}`)}
+                        >
+                          Open review
+                        </Button>
+                      </div>
+                    </motion.div>
+                  );
+                })}
+              </AnimatePresence>
+            </div>
+          )}
+
           {run.blocked.length > 0 && (
             <div data-testid="pipeline-run-blocked" className="mb-3 flex flex-col gap-2">
               <AnimatePresence initial={false}>
@@ -1179,6 +1301,22 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
           </div>
         </div>
       </div>
+
+      {panelGate && effectiveGraph && (
+        <HumanStepPanel
+          key={`human-gate:${panelGate.stepId}:${panelGate.seq}`}
+          task={task}
+          run={run}
+          graph={effectiveGraph}
+          gate={panelGate}
+          steps={steps}
+          homeDir={homeDir}
+          open={humanPanelGateKey !== null && openGate !== null}
+          onClose={() => setHumanPanelGateKey(null)}
+          onOpenTask={onOpenTask}
+          onDecided={load}
+        />
+      )}
     </div>
   );
 }
@@ -1309,7 +1447,7 @@ function HistoryRow({
   const handoffView = useMemo<HandoffViewValue>(
     () => ({
       enabled: true,
-      taskId: record.taskId,
+      taskId: record.taskId ?? parentTask.id,
       parentId: parentTask.id,
       roots: [worktreePath, workdir],
       homeDir,
@@ -1323,8 +1461,8 @@ function HistoryRow({
     [record, parentTask.id, worktreePath, workdir, homeDir, graph, run],
   );
   const mdImageScope = useMemo<MdImageScope>(
-    () => ({ taskId: record.taskId, roots: [worktreePath, workdir], allowLocal: true }),
-    [record.taskId, worktreePath, workdir],
+    () => ({ taskId: record.taskId ?? parentTask.id, roots: [worktreePath, workdir], allowLocal: true }),
+    [record.taskId, parentTask.id, worktreePath, workdir],
   );
 
   return (

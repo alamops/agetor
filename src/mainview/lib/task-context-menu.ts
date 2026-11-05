@@ -11,6 +11,7 @@ import { importedSessionOf } from "../../shared/imported-session.ts";
 export type TaskMenuAction =
   | "open"
   | "open-pipeline"
+  | "review-pipeline"
   | "start"
   | "stop"
   | "resume-recovery"
@@ -76,8 +77,10 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   // equivalent: once any step execution has landed in history, there's
   // something worth opening the run view for, and Retry/Restart live there
   // instead of the card (M15, docs/plans/pipelines.md review).
-  const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
+  const hasOpenablePipelineRun = !!task.pipelineRun
+    && (task.pipelineRun.history.length > 0 || (task.pipelineRun.humanSteps ?? []).length > 0);
   const openable = task.hasOpenableRun || hasOpenablePipelineRun;
+  const gatePending = task.pipelineId != null && (task.pipelineRun?.humanSteps ?? []).length > 0;
   // A pipeline PARENT task (`pipelineId` set) opens the full-page run view
   // instead of the run panel — "Open pipeline" replaces "Open details" as
   // the first entry (App.tsx maps it to `openPipelineRun`). A hidden STEP
@@ -91,13 +94,16 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
   // otherwise — e.g. a `blocked` run with nothing live), so the entry gates
   // on `pipelineRun.status`, not the column (L-A1). Mirrors `TaskCard`.
-  const stoppable = isPipelineParent ? task.pipelineRun?.status === "running" : active;
+  const stoppable = isPipelineParent ? task.pipelineRun?.status === "running" || gatePending : active;
 
   const entries: TaskMenuEntry[] = [];
 
   // primary
   if (isPipelineParent) {
     entries.push({ action: "open-pipeline", label: "Open pipeline", group: "primary" });
+    if (gatePending && !archived) {
+      entries.push({ action: "review-pipeline", label: "Review pipeline", group: "primary" });
+    }
   } else {
     entries.push({ action: "open", label: "Open details", group: "primary" });
   }
@@ -118,7 +124,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
       entries.push({ action: "cancel-auto-resume", label: "Cancel auto-resume", group: "primary" });
     }
   }
-  if (task.column === "review" && !archived) {
+  if (task.column === "review" && !archived && !gatePending && !(isPipelineParent && task.pipelineRun?.status !== "done")) {
     entries.push({ action: "mark-done", label: "Mark done", group: "primary" });
   }
   if (!archived && !isStepTask && (task.column === "done" || active)) {
