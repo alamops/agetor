@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "formId": "messages-backlog-collapse-grill-r2",
+  "title": "Grill — collapse / expand the task messages backlog (round 2)",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "f5e51c076716531e01800a6a04306078ce0d0ff60540a5e2e1e720af138991c3",
+  "submittedAt": "2026-11-06T16:33:45.718Z",
+  "receivedAt": "2026-11-06T16:33:45.723Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 1,
+    "answered": 1,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 1,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "empty-tray-state": {
+      "n": 1,
+      "title": "When the last draft is removed and a later draft is saved, should the tray stay collapsed or reopen expanded?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "reset-on-empty",
+      "display": "Accept the reset — the next draft opens expanded",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

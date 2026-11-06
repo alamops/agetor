@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "formId": "messages-backlog-collapse-grill-r1",
+  "title": "Grill — collapse / expand the task messages backlog",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "2113c448536738d06935a5b58781a69ffa23f7d029e05e4173c9b216cdca479d",
+  "submittedAt": "2026-11-06T16:32:14.460Z",
+  "receivedAt": "2026-11-06T16:32:14.467Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 15,
+    "answered": 13,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 1,
+    "notApplicable": 1,
+    "acceptedRecommendations": 12,
+    "overrodeRecommendations": [
+      "persistence"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "surface": {
+      "n": 1,
+      "title": "Which “backlog” should collapse?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "tray",
+      "display": "The saved-drafts tray above the composer",
+      "acceptedRecommendation": true
+    },
+    "default-state": {
+      "n": 2,
+      "title": "What state should the tray open in?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "expanded",
+      "display": "Expanded, always",
+      "acceptedRecommendation": true
+    },
+    "auto-threshold": {
+      "n": 3,
+      "title": "At how many saved messages should the tray auto-collapse?",
+      "type": "number",
+      "status": "not_applicable",
+      "impact": "shape"
+    },
+    "persistence": {
+      "n": 4,
+      "title": "How long should your collapse choice be remembered?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "session",
+      "display": "Not persisted — session only",
+      "acceptedRecommendation": false,
+      "recommended": "global"
+    },
+    "edit-conflict": {
+      "n": 5,
+      "title": "What happens if you collapse while a saved message is being edited inline?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "disable",
+      "display": "Block collapse while editing",
+      "acceptedRecommendation": true
+    },
+    "save-while-collapsed": {
+      "n": 6,
+      "title": "When a new draft is saved while the tray is collapsed, should it expand?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "never",
+      "display": "Stay collapsed; update the count",
+      "acceptedRecommendation": true
+    },
+    "collapsed-header": {
+      "n": 7,
+      "title": "What should the collapsed header show?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "hint-swap",
+      "display": "Keep it, but swap the hint when collapsed",
+      "acceptedRecommendation": true
+    },
+    "expanded-height": {
+      "n": 8,
+      "title": "Does “expand” mean the current capped list, or show more?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "keep",
+      "display": "Keep 160 px / 288 px while editing",
+      "acceptedRecommendation": true
+    },
+    "interaction": {
+      "n": 9,
+      "title": "Interaction and accessibility",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Whole header is one full-width `<button>` with a leading chevron; `aria-expanded` + `aria-controls`; `data-testid` hooks (`backlog-tray`, `backlog-toggle`, `backlog-list`) and `data-state`; no height animation, only the chevron rotates.",
+      "acceptedRecommendation": true
+    },
+    "always-visible": {
+      "n": 10,
+      "title": "Show the collapse toggle for every non-empty tray, even with one draft",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Yes — always show it when the tray renders.",
+      "acceptedRecommendation": true
+    },
+    "archived": {
+      "n": 11,
+      "title": "Same toggle on archived (read-only) tasks",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Yes — collapse is pure view state; drafts stay visible when expanded and the read-only hint remains.",
+      "acceptedRecommendation": true
+    },
+    "lifecycle": {
+      "n": 12,
+      "title": "Lifecycle edges",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Subagent tabs still hide the tray entirely; an empty backlog still hides it; after the last draft is sent or deleted, a later draft follows the stored choice (collapsed if you last collapsed).",
+      "acceptedRecommendation": true
+    },
+    "non-goals": {
+      "n": 13,
+      "title": "Out of scope",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Per-message collapse, expand-all/collapse-all, virtualization for huge lists, backend/preference sync, a Settings toggle, and a new keyboard shortcut.",
+      "acceptedRecommendation": true
+    },
+    "acceptance": {
+      "n": 14,
+      "title": "Tests and docs",
+      "type": "confirm",
+      "status": "answered",
+      "value": "One new Playwright spec (default visibility, toggle + `aria-expanded`, list hidden, count visible, transcript grows) plus an update to `docs/architecture/messages-backlog.md`; add `CLAUDE.md:175` only if a new localStorage key is introduced. The existing task-switch spec changes only if the chosen default hides its seeded draft.",
+      "acceptedRecommendation": true
+    },
+    "other-constraints": {
+      "n": 15,
+      "title": "Any other behavior, copy or constraint this must respect?",
+      "type": "text",
+      "status": "unanswered",
+      "optional": true,
+      "impact": "minor"
+    }
+  },
+  "generalNotes": null
+}
