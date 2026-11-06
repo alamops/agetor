@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "id": "pipeline-picker-git-modals-grill-r2",
+  "title": "Grill — Pipeline picker in the Git-integration launch modals (round 2)",
+  "skill": "grill",
+  "slug": "pipeline-picker-git-modals",
+  "round": 2,
+  "flags": [],
+  "mode": "structured question tool, follow-up to the round-1 override on the manage row",
+  "source": "round-1 answer: manage = \"Add manage row\"",
+  "questions": [
+    {
+      "id": "manage-dirty",
+      "header": "Manage navigation",
+      "question": "You chose to add \"Manage pipelines…\". In these dialogs that action must close the PipelinePicker, the issue/PR task dialog, and GitHubDialog before navigating to the Pipelines page — the page is a full `view` swap and would otherwise render underneath the still-open Git dialog. Closing those dialogs unmounts the task dialog, so the prompt, references, task type, worktree picks, and selected pipeline are discarded. How should the manage row handle that?",
+      "options": [
+        { "label": "Confirm only when dirty (Recommended)", "description": "If the user has typed a prompt, attached references, changed task type/worktree, or selected a pipeline, show a discard confirm (\"Discard this task draft and open Pipelines?\"); otherwise close both dialogs and navigate immediately. Safer against accidental clicks." },
+        { "label": "Close and navigate immediately", "description": "Close the picker, the issue/PR task dialog, and GitHubDialog, then navigate to the Pipelines list. No confirmation; an accidental click loses the in-progress prompt and attachments." },
+        { "label": "Omit manage row after all", "description": "Revert to no manage row in these two dialogs; users manage pipelines from the header Pipelines button and New Task's picker. Avoids draft loss and the callback/navigation wiring entirely." },
+        { "label": "Navigate behind open dialog", "description": "Navigate to the Pipelines page without closing the Git dialog and try to restore it on return. Not recommended: the full-page view would render underneath the stacked dialog, and preserving the draft is much larger than this change." }
+      ],
+      "answer": "Confirm only when dirty (Recommended)"
+    }
+  ]
+}
