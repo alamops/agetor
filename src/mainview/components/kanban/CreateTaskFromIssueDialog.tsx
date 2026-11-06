@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, AlertTriangle, Bot, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { useConfirm } from "@/components/ui/confirm";
 import { api } from "@/lib/api";
 import { DEFAULT_TASK_TYPE, type GitHubIssueThreadResult, type TaskReference, type TaskType } from "../../../shared/types.ts";
 import {
@@ -32,6 +33,9 @@ interface Props {
   onClose: () => void;
   context: IssueTaskContext | null;
   onCreated?: (taskId: string) => void;
+  /** Closes this dialog (after any draft confirmation) and navigates to the
+   *  Pipelines page. Optional so other mounts render no manage row. */
+  onManagePipelines?: () => void;
 }
 
 /**
@@ -50,8 +54,9 @@ interface Props {
  * embedded (inline in the prompt, and in full as a referenced snapshot
  * file).
  */
-export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }: Props) {
-  const launch = useTaskLaunch(open);
+export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, onManagePipelines }: Props) {
+  const launch = useTaskLaunch(open, { withPipelines: true });
+  const confirm = useConfirm();
 
   const [thread, setThread] = useState<GitHubIssueThreadResult | null>(null);
   const [threadLoading, setThreadLoading] = useState(false);
@@ -106,6 +111,8 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   // reset are here for the same reason as `setPromptDirty(false)`: a
   // previous issue's branch-name edits, isolate-toggle choice, attached
   // references, or manually-picked Type must not leak into the next open.
+  // The pipeline selection clears here too (owner D5: no "last used
+  // pipeline") — on every open AND on a context change.
   useEffect(() => {
     setPromptDirty(false);
     setSubmitError(null);
@@ -115,6 +122,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     setReferences([]);
     setTaskType(DEFAULT_TASK_TYPE);
     setTypeDirty(false);
+    launch.setPipelineId(null);
     if (!open || !context) return;
     setThreadLoading(true);
     let cancelled = false;
@@ -154,21 +162,56 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
   const loading = launch.loading || threadLoading;
   const error = launch.loadError ?? threadError;
 
-  const overage = promptByteOverage(launch.effectiveKind, composeLaunchPrompt(launch.selectedProfile, prompt));
-  // Names the harness a launch will ACTUALLY run under — the selected
-  // profile's harness when one is picked, else the manually-picked one
-  // (finding F2-3; `launch.agent`/`selectedStatus` stay pinned to the
-  // manual picker and go stale once a profile hides that block).
-  const selectedHarnessLabel = launch.harnesses.find((h) => h.id === launch.effectiveAgent)?.label ?? launch.effectiveAgent;
+  const overage = launch.overageKind === null
+    ? null
+    : promptByteOverage(
+        launch.overageKind,
+        // A pipeline task's prompt is wrapped by `composeStepPrompt` (a strict
+        // upper bound on bytes), so the raw prompt is the honest lower-bound
+        // pre-check — New Task parity. A profile's instructions preamble DOES
+        // ride the same one-shot launch, so it's included there.
+        launch.pipelineId ? prompt : composeLaunchPrompt(launch.selectedProfile, prompt),
+      );
 
   const canSubmit =
     !!context &&
     !!thread &&
     prompt.trim().length > 0 &&
     !!launch.effectiveStatus?.available &&
+    launch.pipelineReady &&
     !submitting &&
     overage == null &&
     wt.valid;
+
+  // Anything the user changed since the dialog opened: the prompt, attached
+  // references, the Type picker, a worktree option, or a selected pipeline.
+  const draftDirty =
+    promptDirty ||
+    references.length > 0 ||
+    typeDirty ||
+    !wt.isolate ||
+    wt.baseRefDirty ||
+    wt.branchDirty ||
+    launch.pipelineId !== null;
+
+  /** "Manage pipelines…": confirm before discarding a dirty draft, then close
+   *  this dialog (the inner one) so the Git dialog beneath can be closed by
+   *  the App callback without leaving a stacked overlay above the Pipelines
+   *  page. Cancel keeps everything open. */
+  const managePipelines = async () => {
+    if (submitting) return;
+    if (draftDirty) {
+      const ok = await confirm({
+        title: "Discard this task draft and open Pipelines?",
+        description: "Your prompt edits, references and selections will be lost.",
+        confirmLabel: "Discard draft",
+        variant: "destructive",
+      });
+      if (!ok) return;
+    }
+    onClose();
+    onManagePipelines?.();
+  };
 
   const submit = async () => {
     if (!context || !thread || !canSubmit) return;
@@ -178,7 +221,10 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
       const created = await createAndStartTask({
         title: issueTaskTitle(thread.item),
         prompt: prompt.trim(),
-        agent: launch.agent,
+        // A pipeline's launch identity is its start-step profile's harness (the
+        // server overrides this from the pipeline anyway); a selected profile's
+        // own harness otherwise; else the manual pick (finding F2-3).
+        agent: launch.effectiveAgent,
         workdir: context.path,
         ...wt.payload(),
         mode: launch.mode,
@@ -186,8 +232,11 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
         effort: launch.effort,
         speed: launch.speed,
         maxMode: launch.maxMode,
-        // Omit entirely when no profile is selected (finding F2-1) — see
-        // NewTaskForm.submit's matching comment.
+        // Omit entirely when no profile/pipeline is selected (finding F2-1) —
+        // see NewTaskForm.submit's matching comment. The two are mutually
+        // exclusive by construction (each setter clears the other), so the
+        // body never carries both.
+        ...(launch.pipelineId ? { pipelineId: launch.pipelineId } : {}),
         ...(launch.agentProfileId ? { agentProfileId: launch.agentProfileId } : {}),
         column: "ready",
         references,
@@ -319,7 +368,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                 rows={12}
                 footer={overage && (
                   <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                    This prompt is {Math.ceil(overage.bytes / 1024)} KB — {selectedHarnessLabel}'s one-shot
+                    This prompt is {Math.ceil(overage.bytes / 1024)} KB — {launch.overageLabel}'s one-shot
                     launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
                     trim the prompt.
                   </div>
@@ -328,7 +377,11 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
 
               <WorktreeOptions state={wt} />
 
-              <TaskLaunchPickers launch={launch} />
+              <TaskLaunchPickers
+                launch={launch}
+                onManagePipelines={() => { void managePipelines(); }}
+                disabled={submitting}
+              />
 
               {submitError && (
                 <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">

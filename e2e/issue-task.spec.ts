@@ -330,18 +330,35 @@ async function openGitDialog(page: Page): Promise<Locator> {
  *  are stacked (`GitHubDialog` underneath), so every subsequent locator in a
  *  test should be rooted at the returned `issueTaskDialog`, not `page`. */
 async function openIssueTaskDialog(page: Page): Promise<Locator> {
-  const dialog = await openGitDialog(page);
+  await page.getByRole("button", { name: "Git", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toBeVisible();
 
-  const row = dialog.getByRole("button", { name: `#${ISSUE_NUMBER} ${ISSUE_TITLE}` });
-  await expect(row).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-  await row.click();
-
-  // Detail subpage loaded — its header renders the issue's plain-text title
-  // (GitHubDialog.tsx's `expandedItem.title` line).
-  await expect(dialog.getByText(ISSUE_TITLE, { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-
+  // The Git dialog keeps its last detail view across a close/reopen by design
+  // (`GitHubDialog`'s view state survives a generic close), so a manage-row
+  // test that navigates to Pipelines and back reopens straight onto the issue
+  // detail — no Project combobox to drive. Wait for EITHER the list view's
+  // combobox or the detail's "Work with Agetor" button, then navigate only in
+  // the list case.
+  const projectSelect = dialog.getByRole("combobox", { name: "Project" });
   const workButton = dialog.getByTestId("issue-work-with-agetor");
-  await expect(workButton).toBeVisible();
+  await expect(projectSelect.or(workButton).first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+  if (await projectSelect.isVisible()) {
+    if ((await projectSelect.inputValue()) !== projectDir) {
+      await projectSelect.selectOption({ value: projectDir });
+    }
+    const issuesTab = dialog.getByRole("button", { name: "Issues", exact: true });
+    await issuesTab.click();
+    const row = dialog.getByRole("button", { name: `#${ISSUE_NUMBER} ${ISSUE_TITLE}` });
+    await expect(row).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await row.click();
+    // Detail subpage loaded — its header renders the issue's plain-text title
+    // (GitHubDialog.tsx's `expandedItem.title` line).
+    await expect(dialog.getByText(ISSUE_TITLE, { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  }
+
+  await expect(workButton).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await workButton.click();
 
   const issueTaskDialog = page.getByTestId("issue-task-dialog");
@@ -380,6 +397,26 @@ test.afterAll(async ({ backend }) => {
       headers: { authorization: `Bearer ${backend.apiToken}` },
     }).catch(() => { /* best-effort cleanup */ });
   }
+  // Pipeline fixtures: pipeline first (profiles/harnesses may be in use by a
+  // running step otherwise), then profiles, then the throwaway harness.
+  for (const fixture of pipelineFixtures.splice(0)) {
+    await fetch(`${backend.apiBase}/pipelines/${fixture.pipelineId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${backend.apiToken}` },
+    }).catch(() => { /* best-effort cleanup */ });
+    for (const profileId of fixture.profileIds) {
+      await fetch(`${backend.apiBase}/agent-profiles/${profileId}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${backend.apiToken}` },
+      }).catch(() => { /* best-effort cleanup */ });
+    }
+    for (const harnessId of fixture.harnessIds) {
+      await fetch(`${backend.apiBase}/harnesses/${harnessId}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${backend.apiToken}` },
+      }).catch(() => { /* best-effort cleanup */ });
+    }
+  }
   await stub.close();
   await rm(projectDir, { recursive: true, force: true });
 });
@@ -408,6 +445,9 @@ async function findTaskByTitle(
   worktreePath: string | null;
   branchSource: "created" | "existing";
   taskType: "task" | "bug" | "spike";
+  pipelineId: string | null;
+  agentProfileId: string | null;
+  pipelineRun: { status: string } | null;
 } | null> {
   const res = await request.get(`${backend.apiBase}/tasks`, {
     headers: { authorization: `Bearer ${backend.apiToken}` },
@@ -425,8 +465,18 @@ async function findTaskByTitle(
     taskType: "task" | "bug" | "spike";
     worktreePath: string | null;
     branchSource: "created" | "existing";
+    pipelineId?: string | null;
+    agentProfileId?: string | null;
+    pipelineRun?: { status: string } | null;
   }>;
-  return rows.find((r) => r.title === title) ?? null;
+  const row = rows.find((r) => r.title === title);
+  if (!row) return null;
+  return {
+    ...row,
+    pipelineId: row.pipelineId ?? null,
+    agentProfileId: row.agentProfileId ?? null,
+    pipelineRun: row.pipelineRun ?? null,
+  };
 }
 
 /** Polls `GET /tasks` until a task with `title` shows up, registers it for
@@ -443,6 +493,124 @@ async function awaitCreatedTask(
   }).toPass({ timeout: CONVERGE_TIMEOUT });
   createdTaskIds.push(task!.id);
   return task!;
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline fixtures (REST)
+//
+// Copied in shape from `e2e/pipelines-run.spec.ts`'s own helpers rather than
+// imported — this repo's specs deliberately don't cross-import (see
+// `resolve-conflicts.spec.ts`'s file header). Every fixture this spec creates
+// is tracked and best-effort-deleted in `afterAll` (the worker-shared backend
+// outlives the spec file).
+// ---------------------------------------------------------------------------
+
+interface PipelineFixture {
+  pipelineId: string;
+  profileIds: string[];
+  harnessIds: string[];
+}
+
+const pipelineFixtures: PipelineFixture[] = [];
+
+function trackPipelineFixture(pipelineId: string, profileIds: string[] = [], harnessIds: string[] = []): void {
+  pipelineFixtures.push({ pipelineId, profileIds, harnessIds });
+}
+
+function authHeaders(backend: E2EBackend): { authorization: string; "content-type": string } {
+  return { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+}
+
+async function createProfileRest(
+  backend: E2EBackend,
+  name: string,
+  harness: string = "claude-code",
+): Promise<string> {
+  const res = await fetch(`${backend.apiBase}/agent-profiles`, {
+    method: "POST",
+    headers: authHeaders(backend),
+    body: JSON.stringify({ name, harness, model: "opus-5", instructions: "", skills: [] }),
+  });
+  if (!res.ok) throw new Error(`POST /agent-profiles -> ${res.status}: ${await res.text()}`);
+  return ((await res.json()) as { id: string }).id;
+}
+
+/** A non-builtin harness whose `bin` points at a path that cannot exist —
+ *  deterministically `available: false` regardless of what the machine
+ *  running the suite has installed (helper mirrored from
+ *  `agent-profiles-dialogs.spec.ts`). */
+async function createUnavailableHarnessRest(backend: E2EBackend): Promise<string> {
+  const id = `e2e-issue-task-unavailable-${Date.now()}`;
+  const res = await fetch(`${backend.apiBase}/harnesses`, {
+    method: "POST",
+    headers: authHeaders(backend),
+    body: JSON.stringify({
+      id,
+      kind: "claude-code",
+      label: "Deliberately Unavailable Harness",
+      bin: "/nonexistent/agetor-e2e-issue-task/no-such-binary",
+    }),
+  });
+  if (!res.ok) throw new Error(`POST /harnesses -> ${res.status}: ${await res.text()}`);
+  return ((await res.json()) as { id: string }).id;
+}
+
+function makeStep(input: { id: string; name: string; agentProfileId: string | null }) {
+  return {
+    id: input.id,
+    name: input.name,
+    instructions: "",
+    agentProfileId: input.agentProfileId,
+    position: { x: 0, y: 0 },
+    subagents: { profileIds: [], cap: null },
+    transition: "choose" as const,
+    join: "any" as const,
+  };
+}
+
+async function createPipelineRest(
+  backend: E2EBackend,
+  name: string,
+  steps: ReturnType<typeof makeStep>[],
+  edges: { from: string; to: string }[] = [],
+): Promise<string> {
+  const res = await fetch(`${backend.apiBase}/pipelines`, {
+    method: "POST",
+    headers: authHeaders(backend),
+    body: JSON.stringify({
+      name,
+      description: "",
+      graph: {
+        steps,
+        edges: edges.map((e, i) => ({ id: `edge-${i}-${steps[0]?.id ?? "none"}`, from: e.from, to: e.to, label: "" })),
+        startStepId: steps[0]?.id ?? null,
+      },
+    }),
+  });
+  if (!res.ok) throw new Error(`POST /pipelines -> ${res.status}: ${await res.text()}`);
+  return ((await res.json()) as { id: string }).id;
+}
+
+/** Selects `pipelineId` in the dialog's Pipeline picker. */
+async function pickPipeline(dialog: Locator, pipelineId: string): Promise<void> {
+  const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
+  await picker.getByTestId("pipeline-picker-trigger").click();
+  const popover = picker.getByTestId("pipeline-picker-popover");
+  await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  await popover.locator(`[data-testid="pipeline-picker-row"][data-pipeline-id="${pipelineId}"]`).click();
+  await expect(popover).toBeHidden();
+}
+
+/** Opens the Pipeline picker's popover so its "Manage pipelines…" row is
+ *  clickable. */
+async function openPipelineManageRow(dialog: Locator): Promise<Locator> {
+  const picker = dialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker");
+  await picker.getByTestId("pipeline-picker-trigger").click();
+  const popover = picker.getByTestId("pipeline-picker-popover");
+  await expect(popover).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  const manage = popover.getByTestId("pipeline-picker-manage");
+  await expect(manage).toBeVisible();
+  return manage;
 }
 
 test.describe("task from a Git issue", () => {
@@ -887,5 +1055,194 @@ test.describe("task from a Git issue", () => {
 
     await deleteTask(request, backend, task.id);
     createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Pipeline picker (docs/plans/pipeline-picker-git-modals.md)
+  // -------------------------------------------------------------------------
+
+  test("pipeline picker: summary, one selection, create & start as a pipeline parent, task-count refresh", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(120_000);
+    const suffix = Date.now();
+    const pipelineName = `E2E issue pipeline ${suffix}`;
+    const profileId = await createProfileRest(backend, `E2E issue pipeline profile ${suffix}`);
+    const pipelineId = await createPipelineRest(backend, pipelineName, [
+      makeStep({ id: `step-${suffix}`, name: "Plan", agentProfileId: profileId }),
+    ]);
+    trackPipelineFixture(pipelineId, [profileId]);
+
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+
+    // Baseline: the Agent picker is visible and there's no pipeline summary.
+    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(issueTaskDialog.getByTestId("launch-pipeline-summary")).toHaveCount(0);
+    await expect(issueTaskDialog.getByTestId("launch-pipeline-picker")).toBeVisible();
+
+    // One-selection: picking a profile first, then a pipeline, drops the
+    // profile card (the Agent block disappears entirely behind the summary).
+    const agentPicker = issueTaskDialog.getByTestId("agent-profile-picker");
+    await agentPicker.getByTestId("agent-profile-picker-trigger").click();
+    await agentPicker.locator(`[data-testid="agent-profile-picker-row"][data-profile-id="${profileId}"]`).click();
+    // The picker's own trigger renders a chip with the same test id, so the
+    // selected card is the last one.
+    await expect(issueTaskDialog.getByTestId("agent-profile-card").last()).toBeVisible();
+
+    await pickPipeline(issueTaskDialog, pipelineId);
+
+    const summary = issueTaskDialog.getByTestId("launch-pipeline-summary");
+    await expect(summary).toBeVisible();
+    await expect(summary).toContainText(pipelineName);
+    await expect(summary).toContainText("1 step");
+    await expect(summary).toContainText("starts with");
+    await expect(issueTaskDialog.getByTestId("agent-profile-card")).toHaveCount(0);
+    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toHaveCount(0);
+    await expect(issueTaskDialog.getByTestId("launch-pipeline-problem")).toHaveCount(0);
+
+    // Change clears the selection and restores the Agent block.
+    await summary.getByTestId("launch-pipeline-change").click();
+    await expect(issueTaskDialog.getByTestId("launch-pipeline-summary")).toHaveCount(0);
+    await expect(issueTaskDialog.getByText("Agent", { exact: true })).toBeVisible();
+    await expect(
+      issueTaskDialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker-trigger"),
+    ).toContainText("No pipeline");
+
+    // Re-pick and submit.
+    await pickPipeline(issueTaskDialog, pipelineId);
+    const submit = issueTaskDialog.getByTestId("issue-task-submit");
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+    await submit.click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+    const task = await awaitCreatedTask(request, backend, CARD_TITLE);
+    await expect(async () => {
+      const row = await findTaskByTitle(request, backend, CARD_TITLE);
+      expect(row?.pipelineId).toBe(pipelineId);
+      // The body never carries both ids; the server records no profile on a
+      // pipeline parent.
+      expect(row?.agentProfileId ?? null).toBeNull();
+      expect(row?.pipelineRun ?? null).not.toBeNull();
+      // The issue metadata rides along unchanged.
+      expect(row?.issueUrl).toBe(ISSUE_HTML_URL);
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    // `createAndStartTask` fires `refreshPipelines()` after a pipeline
+    // create, so the Pipelines page's server-derived task count is current.
+    // Dispatch instead of click: the parent run legitimately raises a sticky
+    // "Pipeline needs you" toast in the header's top-right corner, which sits
+    // over both the dialog's Close button and the header Pipelines button.
+    const gitDialog = page.getByRole("dialog");
+    await gitDialog.getByRole("button", { name: "Close", exact: true }).dispatchEvent("click");
+    await expect(gitDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await page.getByTestId("pipelines-button").dispatchEvent("click");
+    await expect(page.getByTestId("pipelines-page")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    const pipelineRow = page.locator(`[data-testid="pipelines-row"][data-pipeline-id="${pipelineId}"]`);
+    await expect(async () => {
+      await expect(pipelineRow).toContainText("Used by 1 task");
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    await deleteTask(request, backend, task.id);
+    createdTaskIds.splice(createdTaskIds.indexOf(task.id), 1);
+  });
+
+  test("pipeline picker: an unrunnable pipeline is listed but blocks Create & start", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    const suffix = Date.now();
+    const pipelineName = `E2E unrunnable pipeline ${suffix}`;
+    // A saved graph may have a step with no profile (an editor draft) — the
+    // server rejects it at task-create, and the dialog must block first.
+    const pipelineId = await createPipelineRest(backend, pipelineName, [
+      makeStep({ id: `step-${suffix}`, name: "Plan", agentProfileId: null }),
+    ]);
+    trackPipelineFixture(pipelineId);
+
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+    await pickPipeline(issueTaskDialog, pipelineId);
+
+    const problem = issueTaskDialog.getByTestId("launch-pipeline-problem");
+    await expect(problem).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(problem).toContainText('step "Plan" has no agent');
+    await expect(issueTaskDialog.getByTestId("issue-task-submit")).toBeDisabled();
+
+    // Clearing the pipeline restores a normal single-agent launch.
+    await issueTaskDialog.getByTestId("launch-pipeline-change").click();
+    await expect(problem).toHaveCount(0);
+    await expect(issueTaskDialog.getByTestId("issue-task-submit")).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+  });
+
+  test("pipeline picker: the start-step harness — not the manual picker — decides availability", async ({
+    page,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+    const suffix = Date.now();
+    const harnessId = await createUnavailableHarnessRest(backend);
+    const profileId = await createProfileRest(backend, `E2E unavailable harness profile ${suffix}`, harnessId);
+    const pipelineName = `E2E unavailable harness pipeline ${suffix}`;
+    const pipelineId = await createPipelineRest(backend, pipelineName, [
+      makeStep({ id: `step-${suffix}`, name: "Plan", agentProfileId: profileId }),
+    ]);
+    trackPipelineFixture(pipelineId, [profileId], [harnessId]);
+
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+
+    // The manual picker (claude-code, available in the fixture env) would
+    // pass — the pipeline's own start-step harness must still block it.
+    await pickPipeline(issueTaskDialog, pipelineId);
+    const problem = issueTaskDialog.getByTestId("launch-pipeline-problem");
+    await expect(problem).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(problem).toContainText("Deliberately Unavailable Harness is not available");
+    await expect(issueTaskDialog.getByTestId("issue-task-submit")).toBeDisabled();
+
+    // Change restores the manual launch, which stays enabled in the same
+    // dialog — proving the effective identity is the start-step profile's.
+    await issueTaskDialog.getByTestId("launch-pipeline-change").click();
+    await expect(problem).toHaveCount(0);
+    await expect(issueTaskDialog.getByTestId("issue-task-submit")).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+  });
+
+  test("pipeline picker: Manage pipelines closes both dialogs, confirming a dirty draft first", async ({ page, backend }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+
+    // Dirty: a typed prompt asks before discarding.
+    let issueTaskDialog = await openIssueTaskDialog(page);
+    await issueTaskDialog.getByTestId("prompt-textarea").fill("draft that must not be lost silently");
+    let manage = await openPipelineManageRow(issueTaskDialog);
+    await manage.click();
+
+    const confirmTitle = page.getByText("Discard this task draft and open Pipelines?");
+    const confirmDialog = page
+      .locator('[role="dialog"]')
+      .filter({ has: page.getByText("Discard this task draft and open Pipelines?") });
+    await expect(confirmTitle).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await confirmDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(confirmTitle).toBeHidden();
+    await expect(issueTaskDialog).toBeVisible();
+    await expect(page.getByTestId("pipelines-page")).toHaveCount(0);
+
+    // Confirming navigates and closes both stacked dialogs first.
+    manage = await openPipelineManageRow(issueTaskDialog);
+    await manage.click();
+    await expect(confirmTitle).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await confirmDialog.getByRole("button", { name: "Discard draft", exact: true }).click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipelines-page")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+
+    // Clean: a fresh dialog goes straight through, no confirm.
+    await page.getByTestId("pipelines-back").click();
+    await expect(page.getByTestId("pipelines-page")).toHaveCount(0, { timeout: CONVERGE_TIMEOUT });
+    issueTaskDialog = await openIssueTaskDialog(page);
+    manage = await openPipelineManageRow(issueTaskDialog);
+    await manage.click();
+    await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(page.getByTestId("pipelines-page")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
 });

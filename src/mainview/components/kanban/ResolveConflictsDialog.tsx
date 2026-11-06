@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertCircle, GitMerge, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { useConfirm } from "@/components/ui/confirm";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import type { TaskReference } from "../../../shared/types.ts";
 import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
@@ -24,6 +25,9 @@ interface Props {
   onClose: () => void;
   context: ResolveConflictsContext | null;
   onCreated?: (taskId: string) => void;
+  /** Closes this dialog (after any draft confirmation) and navigates to the
+   *  Pipelines page. Optional so other mounts render no manage row. */
+  onManagePipelines?: () => void;
 }
 
 /**
@@ -36,8 +40,9 @@ interface Props {
  * References picker) `CreateTaskFromIssueDialog` uses, rather than a bare
  * `Textarea`.
  */
-export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Props) {
-  const launch = useTaskLaunch(open);
+export function ResolveConflictsDialog({ open, onClose, context, onCreated, onManagePipelines }: Props) {
+  const launch = useTaskLaunch(open, { withPipelines: true });
+  const confirm = useConfirm();
 
   const [prompt, setPrompt] = useState("");
   const [promptDirty, setPromptDirty] = useState(false);
@@ -56,15 +61,20 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
     [open, context?.path, context?.headRef],
   );
 
-  // Reset per-open transient state (prompt dirtiness, errors, references) so
-  // a previous PR's edits don't leak into the next one. Harness/model/prefs
-  // fetching is owned by useTaskLaunch.
+  // Reset per-open transient state (prompt dirtiness, errors, references,
+  // pipeline selection) so a previous PR's edits don't leak into the next
+  // one — on open AND when the PR identity changes while open. Keyed on the
+  // context's primitive fields: `PullActions` rebuilds `resolveContext` on
+  // every board poll, and an equal-valued but new-identity object must not
+  // wipe the draft. Harness/model/prefs fetching is owned by useTaskLaunch.
   useEffect(() => {
     if (!open) return;
     setPromptDirty(false);
     setSubmitError(null);
     setReferences([]);
-  }, [open]);
+    launch.setPipelineId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, context?.path, context?.number, context?.headRef]);
 
   // Seed (and re-seed) the prompt from the context, but only while the user
   // hasn't started editing it — matches the composer's usual "don't clobber
@@ -75,15 +85,44 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, context, promptDirty]);
 
-  const overage = promptByteOverage(launch.effectiveKind, composeLaunchPrompt(launch.selectedProfile, prompt));
-  // Names the harness a launch will ACTUALLY run under — the selected
-  // profile's harness when one is picked, else the manually-picked one
-  // (finding F2-3; `launch.agent`/`selectedStatus` stay pinned to the
-  // manual picker and go stale once a profile hides that block).
-  const selectedHarnessLabel = launch.harnesses.find((h) => h.id === launch.effectiveAgent)?.label ?? launch.effectiveAgent;
+  const overage = launch.overageKind === null
+    ? null
+    : promptByteOverage(
+        launch.overageKind,
+        // Raw prompt for a pipeline task (the step prompt wraps it — New Task
+        // parity); the profile's instructions preamble otherwise.
+        launch.pipelineId ? prompt : composeLaunchPrompt(launch.selectedProfile, prompt),
+      );
 
   const canSubmit =
-    !!context && prompt.trim().length > 0 && !!launch.effectiveStatus?.available && !submitting && overage == null;
+    !!context &&
+    prompt.trim().length > 0 &&
+    !!launch.effectiveStatus?.available &&
+    launch.pipelineReady &&
+    !submitting &&
+    overage == null;
+
+  // Changed since the dialog opened: the prompt, attached references, or a
+  // selected pipeline (the worktree row is locked to the PR head).
+  const draftDirty = promptDirty || references.length > 0 || launch.pipelineId !== null;
+
+  /** "Manage pipelines…": confirm before discarding a dirty draft, then close
+   *  this dialog (the inner one) so the App callback can close the Git dialog
+   *  beneath without leaving a stacked overlay above the Pipelines page. */
+  const managePipelines = async () => {
+    if (submitting) return;
+    if (draftDirty) {
+      const ok = await confirm({
+        title: "Discard this task draft and open Pipelines?",
+        description: "Your prompt edits, references and selections will be lost.",
+        confirmLabel: "Discard draft",
+        variant: "destructive",
+      });
+      if (!ok) return;
+    }
+    onClose();
+    onManagePipelines?.();
+  };
 
   const submit = async () => {
     if (!context || !canSubmit) return;
@@ -93,7 +132,9 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
       const created = await createAndStartTask({
         title: `Resolve conflicts: PR #${context.number} — ${context.title}`,
         prompt: prompt.trim(),
-        agent: launch.agent,
+        // Start-step profile's harness for a pipeline; the selected profile's
+        // otherwise; else the manual pick (finding F2-3).
+        agent: launch.effectiveAgent,
         workdir: context.path,
         isolation: "worktree" as const,
         existingBranch: context.headRef,
@@ -103,8 +144,10 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
         effort: launch.effort,
         speed: launch.speed,
         maxMode: launch.maxMode,
-        // Omit entirely when no profile is selected (finding F2-1) — see
-        // NewTaskForm.submit's matching comment.
+        // Omit entirely when no profile/pipeline is selected (finding F2-1) —
+        // see NewTaskForm.submit's matching comment. Mutually exclusive by
+        // construction, so the body never carries both.
+        ...(launch.pipelineId ? { pipelineId: launch.pipelineId } : {}),
         ...(launch.agentProfileId ? { agentProfileId: launch.agentProfileId } : {}),
         column: "ready" as const,
       });
@@ -199,7 +242,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                 rows={8}
                 footer={overage && (
                   <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                    This prompt is {Math.ceil(overage.bytes / 1024)} KB — {selectedHarnessLabel}'s one-shot
+                    This prompt is {Math.ceil(overage.bytes / 1024)} KB — {launch.overageLabel}'s one-shot
                     launch caps prompts at {Math.floor(overage.limit / 1024)} KB. Pick another harness or
                     trim the prompt.
                   </div>
@@ -208,7 +251,11 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
 
               <WorktreeOptions locked={{ branch: context.headRef }} />
 
-              <TaskLaunchPickers launch={launch} />
+              <TaskLaunchPickers
+                launch={launch}
+                onManagePipelines={() => { void managePipelines(); }}
+                disabled={submitting}
+              />
 
               {submitError && (
                 <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
