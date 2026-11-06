@@ -150,7 +150,7 @@ test.describe("messages backlog collapse", () => {
     await expect(list).toHaveAttribute("id", (await toggle.getAttribute("aria-controls")) ?? "missing-aria-controls");
     await expect(list).toContainText(firstDraft);
     await expect(count).toBeVisible();
-    const chevron = toggle.locator("svg").first();
+    const chevron = toggle.getByTestId("backlog-chevron");
     await expect(chevron).toHaveClass(/rotate-90/);
 
     const transcript = panel.getByTestId("transcript-log");
@@ -161,9 +161,11 @@ test.describe("messages backlog collapse", () => {
 
     await toggle.click();
 
-    // Collapsed: the list is unmounted (not just hidden), the count survives.
+    // Collapsed: the list is unmounted (not just hidden), the count survives,
+    // and `aria-controls` no longer dangles at an unmounted id.
     await expect(tray).toHaveAttribute("data-state", "collapsed");
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).not.toHaveAttribute("aria-controls");
     await expect(list).toHaveCount(0);
     await expect(count).toBeVisible();
     await expect(toggle).toContainText("saved messages — expand to review");
@@ -342,5 +344,74 @@ test.describe("messages backlog collapse", () => {
     await expect(tray).toHaveAttribute("data-state", "expanded");
     await expect(tray).toContainText("saved messages — unarchive the task to edit or send");
     await expect(list).toContainText(draft);
+  });
+
+  test("archiving mid-edit → collapsing → unarchiving leaves the tray expandable", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    // Regression: the collapse guard used to key off a bare `editingId`, so a
+    // task archived while a row was inline-editing kept a stale editor id.
+    // Collapsing was allowed (read-only rows render no editor), but unarchiving
+    // then re-armed the guard while the list was unmounted — stranding the tray
+    // collapsed with no way to widen it.
+    test.setTimeout(90_000);
+    const title = `backlog-archive-collapse-${randomUUID()}`;
+    const taskId = await createTask(request, backend, title);
+    await seedDraft(request, backend, taskId, "first saved draft");
+    await seedDraft(request, backend, taskId, "second saved draft");
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    const tray = panel.getByTestId("backlog-tray");
+    const toggle = tray.getByTestId("backlog-toggle");
+    const list = tray.getByTestId("backlog-list");
+    const editor = panel.locator('textarea:not([data-testid="send-textarea"])');
+
+    await tray.getByRole("button", { name: "Edit", exact: true }).first().click();
+    await expect(editor).toBeVisible();
+    await editor.fill("unsaved edit the archive will drop");
+
+    // Archive out from under the open editor. The 2s board poll flips the tray
+    // read-only: the editor unmounts and the hint becomes the archived one.
+    const done = await request.patch(`${backend.apiBase}/tasks/${taskId}`, {
+      headers: authHeaders(backend),
+      data: { column: "done" },
+    });
+    expect(done.ok(), `PATCH column=done -> ${done.status()}: ${await done.text()}`).toBeTruthy();
+    const archived = await request.post(`${backend.apiBase}/tasks/${taskId}/archive`, {
+      headers: authHeaders(backend),
+    });
+    expect(archived.ok(), `POST archive -> ${archived.status()}: ${await archived.text()}`).toBeTruthy();
+    await expect(tray).toContainText("saved messages — unarchive the task to edit or send", {
+      timeout: 15_000,
+    });
+    await expect(editor).toHaveCount(0);
+    await expect(toggle).not.toHaveAttribute("aria-disabled", "true");
+
+    // With no live editor left to protect, the tray may collapse.
+    await toggle.click();
+    await expect(tray).toHaveAttribute("data-state", "collapsed");
+    await expect(list).toHaveCount(0);
+
+    // Unarchive while collapsed. The composer replaces the static archived
+    // footer, and the toggle must stay usable despite the stale editor id.
+    const restored = await request.post(`${backend.apiBase}/tasks/${taskId}/unarchive`, {
+      headers: authHeaders(backend),
+    });
+    expect(restored.ok(), `POST unarchive -> ${restored.status()}: ${await restored.text()}`).toBeTruthy();
+    await expect(panel.getByTestId("send-textarea")).toBeVisible({ timeout: 15_000 });
+    await expect(tray).toHaveAttribute("data-state", "collapsed");
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).not.toHaveAttribute("aria-disabled", "true");
+
+    await toggle.click();
+    await expect(tray).toHaveAttribute("data-state", "expanded");
+    await expect(list).toBeVisible();
+    await expect(list).toContainText("first saved draft");
+    // The archived transition dropped the unsaved edit; unarchiving must not
+    // resurrect an editor seeded from stale state.
+    await expect(editor).toHaveCount(0);
   });
 });

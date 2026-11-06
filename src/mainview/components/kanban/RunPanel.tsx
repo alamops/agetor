@@ -5009,11 +5009,28 @@ function BacklogTray({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const listId = useId();
-  // Block collapse only while a live editor exists. `readOnly` mirrors
-  // BacklogItemRow's own `editing && !readOnly` gate, so a task archived
-  // mid-edit (stale `editingId`) renders the row read-only and must not strand
-  // the toggle.
-  const collapseBlocked = editingId !== null && !readOnly;
+  // Block collapse only while a live editor is actually on screen: the tray is
+  // expanded, the task isn't read-only (BacklogItemRow's own `editing &&
+  // !readOnly` gate), and the edited draft still exists. A bare
+  // `editingId !== null` is not enough: a stale editor id — archived mid-edit,
+  // or a draft deleted from under it — must never arm this guard, or a
+  // collapsed tray could be left with the only control that could widen it
+  // disabled.
+  const editorVisible =
+    !collapsed
+    && !readOnly
+    && editingId !== null
+    && items.some((item) => item.id === editingId);
+  const collapseBlocked = editorVisible;
+  // Forget an editor id that can no longer render an editor — archived task,
+  // or draft deleted from under it. Beyond keeping the guard honest, this
+  // stops a later unarchive from silently reopening an editor whose unsaved
+  // text was already dropped when the row went read-only.
+  useEffect(() => {
+    if (editingId === null) return;
+    if (!readOnly && items.some((item) => item.id === editingId)) return;
+    setEditingId(null);
+  }, [editingId, items, readOnly]);
   return (
     <div
       data-testid="backlog-tray"
@@ -5027,15 +5044,23 @@ function BacklogTray({
           if (!collapseBlocked) setCollapsed((c) => !c);
         }}
         aria-expanded={!collapsed}
-        aria-controls={listId}
+        // Only when the list is actually rendered: an `aria-controls` pointing
+        // at an unmounted id is a dangling reference (same rule as
+        // `info-tip.tsx`). The disclosure relationship is meaningless while
+        // collapsed anyway — the list is unmounted, not hidden.
+        aria-controls={collapsed ? undefined : listId}
         aria-disabled={collapseBlocked || undefined}
         title={collapseBlocked ? "Save or cancel your edit first" : collapsed ? "Expand backlog" : "Collapse backlog"}
         className={cn(
-          "flex w-full items-center gap-1.5 px-3 pb-1 pt-2 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
+          "flex w-full items-center gap-1.5 px-3 pb-1 pt-2 text-left text-[11px] font-medium text-muted-foreground transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
+          // No hover affordance while blocked: the header is intentionally
+          // inert, so a hover highlight would advertise a click that no-ops.
+          !collapseBlocked && "hover:bg-muted/40",
           collapseBlocked && "cursor-not-allowed opacity-60",
         )}
       >
         <ChevronRight
+          data-testid="backlog-chevron"
           className={cn("size-3.5 shrink-0 transition-transform", !collapsed && "rotate-90")}
           aria-hidden
         />
@@ -5062,7 +5087,7 @@ function BacklogTray({
           data-testid="backlog-list"
           className={cn(
             "space-y-1 overflow-y-auto px-2 pb-2",
-            editingId !== null ? "max-h-72" : "max-h-40",
+            editorVisible ? "max-h-72" : "max-h-40",
           )}
         >
           {items.map((item, i) => (
@@ -5074,7 +5099,7 @@ function BacklogTray({
               canSend={canSend}
               busy={busy}
               readOnly={readOnly}
-              editing={editingId === item.id}
+              editing={editorVisible && editingId === item.id}
               fileScope={fileScope}
               startingFolder={startingFolder}
               onStartEdit={() => setEditingId(item.id)}
