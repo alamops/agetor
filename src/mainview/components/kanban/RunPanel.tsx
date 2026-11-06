@@ -1,9 +1,9 @@
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ComponentType } from "react";
+import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ComponentType } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
@@ -4961,8 +4961,16 @@ const BACKLOG_ICON_BTN =
 /**
  * The messages-backlog tray: a list of saved, not-yet-sent drafts shown just
  * above the composer. Purely presentational — all mutations are handed back to
- * RunPanelBody, which owns the optimistic state and the API calls. Manages only
- * which item is currently in inline-edit mode.
+ * RunPanelBody, which owns the optimistic state and the API calls. Manages
+ * which item is currently in inline-edit mode, plus the collapsed/expanded view
+ * state of the tray itself (view state only — the same kind of local UI state as
+ * `editingId`, so the tray stays presentational).
+ *
+ * The whole header is one disclosure `<button>`: a large saved-drafts backlog
+ * can otherwise eat the transcript's height, so collapsing just the list hands
+ * it back. Default expanded and session-only (no persistence), matching the
+ * house collapse idiom (`CompactionSummaryBlock`). Collapse is blocked while a
+ * row is inline-editing so an unsaved edit can never be discarded.
  */
 function BacklogTray({
   fileScope,
@@ -4999,52 +5007,89 @@ function BacklogTray({
   onMove: (itemId: string, dir: -1 | 1) => void;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
+  const listId = useId();
+  // Block collapse only while a live editor exists. `readOnly` mirrors
+  // BacklogItemRow's own `editing && !readOnly` gate, so a task archived
+  // mid-edit (stale `editingId`) renders the row read-only and must not strand
+  // the toggle.
+  const collapseBlocked = editingId !== null && !readOnly;
   return (
-    <div className="shrink-0 border-t border-border/60">
-      <div className="flex items-center gap-1.5 px-3 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
-        <ClipboardList className="size-3.5" />
-        <span>Backlog</span>
-        <span className="rounded bg-muted px-1 text-[10px]">{items.length}</span>
-        <span className="ml-1 font-normal text-muted-foreground/70">
-          {readOnly
-            ? "saved messages — unarchive the task to edit or send"
-            : "saved messages — send when you're ready"}
-        </span>
-      </div>
-      {/* Grow the window while a row is being edited: the inline editor is
-          ~140px tall, so under the resting max-h-40 (160px) its Save/Cancel row
-          would be clipped below the fold whenever another draft sits above it —
-          which reads as "there is no save button". */}
-      <div
+    <div
+      data-testid="backlog-tray"
+      data-state={collapsed ? "collapsed" : "expanded"}
+      className="shrink-0 border-t border-border/60"
+    >
+      <button
+        type="button"
+        data-testid="backlog-toggle"
+        onClick={() => {
+          if (!collapseBlocked) setCollapsed((c) => !c);
+        }}
+        aria-expanded={!collapsed}
+        aria-controls={listId}
+        aria-disabled={collapseBlocked || undefined}
+        title={collapseBlocked ? "Save or cancel your edit first" : collapsed ? "Expand backlog" : "Collapse backlog"}
         className={cn(
-          "space-y-1 overflow-y-auto px-2 pb-2",
-          editingId !== null ? "max-h-72" : "max-h-40",
+          "flex w-full items-center gap-1.5 px-3 pb-1 pt-2 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
+          collapseBlocked && "cursor-not-allowed opacity-60",
         )}
       >
-        {items.map((item, i) => (
-          <BacklogItemRow
-            key={item.id}
-            item={item}
-            index={i}
-            total={items.length}
-            canSend={canSend}
-            busy={busy}
-            readOnly={readOnly}
-            editing={editingId === item.id}
-            fileScope={fileScope}
-            startingFolder={startingFolder}
-            onStartEdit={() => setEditingId(item.id)}
-            onCancelEdit={() => setEditingId(null)}
-            onSaveEdit={async (patch) => {
-              await onEdit(item.id, patch);
-              setEditingId(null);
-            }}
-            onSend={() => onSend(item)}
-            onDelete={() => onDelete(item.id)}
-            onMove={(dir) => onMove(item.id, dir)}
-          />
-        ))}
-      </div>
+        <ChevronRight
+          className={cn("size-3.5 shrink-0 transition-transform", !collapsed && "rotate-90")}
+          aria-hidden
+        />
+        <ClipboardList className="size-3.5 shrink-0" />
+        <span className="shrink-0">Backlog</span>
+        <span className="shrink-0 rounded bg-muted px-1 text-[10px]">{items.length}</span>
+        <span className="ml-1 min-w-0 truncate font-normal text-muted-foreground/70">
+          {collapseBlocked
+            ? "save or cancel your edit first"
+            : collapsed
+              ? "saved messages — expand to review"
+              : readOnly
+                ? "saved messages — unarchive the task to edit or send"
+                : "saved messages — send when you're ready"}
+        </span>
+      </button>
+      {!collapsed && (
+        // Grow the window while a row is being edited: the inline editor is
+        // ~140px tall, so under the resting max-h-40 (160px) its Save/Cancel row
+        // would be clipped below the fold whenever another draft sits above it —
+        // which reads as "there is no save button".
+        <div
+          id={listId}
+          data-testid="backlog-list"
+          className={cn(
+            "space-y-1 overflow-y-auto px-2 pb-2",
+            editingId !== null ? "max-h-72" : "max-h-40",
+          )}
+        >
+          {items.map((item, i) => (
+            <BacklogItemRow
+              key={item.id}
+              item={item}
+              index={i}
+              total={items.length}
+              canSend={canSend}
+              busy={busy}
+              readOnly={readOnly}
+              editing={editingId === item.id}
+              fileScope={fileScope}
+              startingFolder={startingFolder}
+              onStartEdit={() => setEditingId(item.id)}
+              onCancelEdit={() => setEditingId(null)}
+              onSaveEdit={async (patch) => {
+                await onEdit(item.id, patch);
+                setEditingId(null);
+              }}
+              onSend={() => onSend(item)}
+              onDelete={() => onDelete(item.id)}
+              onMove={(dir) => onMove(item.id, dir)}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
