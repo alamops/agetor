@@ -6,7 +6,7 @@
 | Source | Agetor task `df38cb35-4ba1-4073-8449-c6db9673d014`; requirement quoted verbatim at `docs/plans/messages-backlog-collapse-investigation.md:12-14`; investigation `docs/plans/messages-backlog-collapse-investigation.md`; decisions `docs/plans/messages-backlog-collapse-grill.md` + `docs/plans/messages-backlog-collapse-grill/round-{1,2}/answers.json` |
 | Flags | none |
 | Gates | grilled + approved by owner (round 1: 12 accepted recommendations + 1 override, 1 `not_applicable`, 1 optional blank; round 2: 1/1; no one-way doors). Pipeline hands off to Implementing. |
-| Status | implemented — I1 (`9090f18c`) + T1 (`ce9be918`); bug-fix round after code review (stale-editor guard + conditional `aria-controls`); typecheck and the full `e2e/backlog-collapse.spec.ts` (5/5, with red proof for the archive→collapse→unarchive case) green |
+| Status | implemented — I1 (`9090f18c`) + T1 (`ce9be918`); bug-fix round after code review (stale-editor guard + conditional `aria-controls`); test-writer round added decision-6 (save while collapsed) and the panel-close / draft-deleted lifecycle cases; typecheck and the full `e2e/backlog-collapse.spec.ts` (8/8, with red proof for every behavior) green |
 | Branch | `feature/agetor-collapse-expand-messages-backlog` (current worktree) |
 | Base SHA | `46dbe0f4` (planning HEAD; `RunPanel.tsx` is identical to `a5593d16`) |
 
@@ -18,11 +18,11 @@ The saved-drafts **Messages backlog** tray above the composer currently spends a
 | --- | --- | --- | --- |
 | C1 | A task with saved drafts opens the tray **expanded**: list visible, header button `aria-expanded="true"`, tray `data-state="expanded"`. | Card click → `App.tsx` selects the task → `RunPanel` → `RunPanelBody` renders `BacklogTray` at `RunPanel.tsx:4583-4604`; `BacklogTray`'s `useState(false)` (`RunPanel.tsx:4967`). | T1 test 1 |
 | C2 | Clicking the header **collapses**: the list is unmounted (not merely hidden), `aria-expanded="false"` (and `aria-controls` dropped, since its target no longer exists), `data-state="collapsed"`; the icon, "Backlog", count and chevron stay visible; the hint becomes `saved messages — expand to review`. | `BacklogTray` header `<button>` + `{!collapsed && <div data-testid="backlog-list">…}` (I1). | T1 test 1 |
-| C3 | Clicking again **expands** and restores the drafts; the resting/editing height caps stay `max-h-40` (160 px) / `max-h-72` (288 px). | Same conditional render; the list's existing class expression at `RunPanel.tsx:5018-5022` is unchanged (I1). | T1 tests 1–2; I1 acceptance 3 |
+| C3 | Clicking again **expands** and restores the drafts; the resting/editing height caps stay `max-h-40` (160 px) / `max-h-72` (288 px). | Same conditional render; the caps are unchanged, with the `max-h-72` branch now keyed on `editorVisible` rather than the bare `editingId` (bug-fix round). | T1 tests 1–2; I1 acceptance 3 |
 | C4 | Collapsing hands the freed height to the transcript: `transcript-log`'s bounding box grows by roughly the tray's shrink. | `aside` is a full-height flex column (`RunPanel.tsx:571-576`); transcript is `flex-1` (`:4465`); tray is `shrink-0` (`:5003`); list unmount removes its 160 px (I1). | T1 test 1 (box measurements) |
-| C5 | Collapse is **blocked while a live inline editor is on screen** — expanded, editable (`!readOnly`) and the edited draft still present: the toggle is `aria-disabled`, the hint says `save or cancel your edit first`, clicking it leaves the list mounted and the unsaved editor text intact. Cancelling clears the block. A stale editor id (archived mid-edit, or draft deleted) can never block a collapsed tray from expanding. | `editorVisible` predicate (`!collapsed && !readOnly && editingId !== null && items.some(...)`) + a reset effect in `BacklogTray`; `editingId` is existing tray state (`RunPanel.tsx:5001`). | T1 tests 2, 5 |
+| C5 | Collapse is **blocked while a live inline editor is on screen** — expanded, editable (`!readOnly`) and the edited draft still present: the toggle is `aria-disabled`, the hint says `save or cancel your edit first`, clicking it leaves the list mounted and the unsaved editor text intact. Cancelling clears the block. A stale editor id (archived mid-edit, or draft deleted) can never block a collapsed tray from expanding. | `editorVisible` predicate (`!collapsed && !readOnly && editingId !== null && items.some(...)`) + a reset effect in `BacklogTray`; `editingId` is existing tray state (`RunPanel.tsx:5001`). | T1 tests 2, 5, 8 |
 | C6 | Every non-empty tray has the toggle, including a one-item tray and an archived (read-only) task; archived keeps the read-only expanded hint (`saved messages — unarchive the task to edit or send`), while collapsed still shows the expand hint. | Header button is rendered unconditionally by `BacklogTray`; `readOnly` only affects row actions and the expanded hint (I1). | T1 tests 3–4 |
-| C7 | The choice is **session-only**: default-expanded on mount; reset on task switch, subagent tab, panel close, and after the tray empties (the next draft opens expanded). | `useState(false)` inside `BacklogTray`, whose key is `backlog-${task.id}` (`RunPanel.tsx:4584-4593`) and so remounts it per task; empty backlog unmounts the whole tray (`:4583`). No persistence code (I1). | T1 test 3 |
+| C7 | The choice is **session-only**: default-expanded on mount; reset on task switch, subagent tab, panel close, and after the tray empties (the next draft opens expanded). | `useState(false)` inside `BacklogTray`, whose key is `backlog-${task.id}` (`RunPanel.tsx:4584-4593`) and so remounts it per task; a panel close unmounts the tray with the body; empty backlog unmounts the whole tray (`:4583`). No persistence code (I1). | T1 tests 3, 7 |
 | C8 | Existing backlog behavior is intact: send/edit/delete/reorder, optimistic state, archived freeze, hidden on subagent tabs and empty, 160/288 px heights, no React sibling-key collision. | The diff is confined to `BacklogTray`'s header/list wrapper; all handlers, `BacklogItemRow`, and the render gate stay untouched (I1). | `bun run typecheck`, `bun test`, targeted `e2e/task-switch-during-restore.spec.ts` regression, T1 tests 1–2 |
 
 ## 2. Context & constraints
@@ -43,7 +43,7 @@ Quoted verbatim at `docs/plans/messages-backlog-collapse-investigation.md:12-14`
 - Current header is a non-interactive `div`: `ClipboardList`, "Backlog", count, and a hint (`RunPanel.tsx:5004-5013`). The list wrapper is `cn("space-y-1 overflow-y-auto px-2 pb-2", editingId !== null ? "max-h-72" : "max-h-40")` (`:5018-5022`). The 160/288 px heights are deliberate and must survive (`docs/plans/fix-backlog-edit-save-button-clipped.md:23-36`).
 - `BacklogTray` owns only `editingId` today (`RunPanel.tsx:5001`); it is purposely presentational, with all mutations handed back to `RunPanelBody` (`:4961-4966`). `backlogItems` is seeded/resynced at `:2846-2854`; mutations are `saveForLater` `:3416`, `sendBacklogItem` `:3455`, `editBacklogItem` `:3522`, `removeBacklogItem` `:3542`, `moveBacklogItem` `:3565`.
 - The tray is a keyed child: its key is `backlog-${task.id}` (`RunPanel.tsx:4584-4593`). `RunPanelBody` is one long-lived instance across task switches (`docs/architecture/run-panel.md:5-9`), so the key is what resets tray-local state. Any collapse state inside `BacklogTray` resets on task switch, subagent-tab switch (tray unmounts), and panel close (body unmounts after the exit animation).
-- The 2 s task poll rebuilds `task.backlog` into fresh objects every tick. Do not add an effect keyed on the array identity; the existing edit effect deliberately depends only on `[editing]` (`RunPanel.tsx:5097-5114`). The collapse feature needs no effect at all.
+- The 2 s task poll rebuilds `task.backlog` into fresh objects every tick. Do not drive collapse off the array identity; the collapse feature adds exactly one effect, the stale-`editingId` reset (archived mid-edit, or the edited draft deleted). It reads `items` (a fresh array every poll) only to test whether the edited id still exists and is an idempotent no-op otherwise; it never writes `collapsed`.
 
 ### House rules that apply
 
@@ -71,15 +71,29 @@ One desktop webview (Electrobun/WKWebView) talking to a local Bun core. The tray
 
 **Chosen shape:** local `collapsed` state in `BacklogTray`; the entire header becomes a single full-width `<button>`; the list unmounts when collapsed; collapse is blocked while a row is editing; default expanded; no persistence; the hint swaps only while collapsed. This is the smallest shape that satisfies every owner decision and adds no new state owner, API, storage key, or component primitive.
 
-**Pinned contract (I1 must match this exactly):**
+**Pinned contract (as shipped after the bug-fix round; I1 must keep matching this):**
 
 ```tsx
 const [collapsed, setCollapsed] = useState(false);   // default expanded
 const listId = useId();                             // aria-controls target
-// Block only while a live editor exists. `readOnly` mirrors BacklogItemRow's
-// own `editing && !readOnly` gate, so a task archived mid-edit (stale
-// `editingId`) renders the row read-only and must not strand the toggle.
-const collapseBlocked = editingId !== null && !readOnly;
+// Block only while a live editor is actually on screen: expanded, editable
+// (`!readOnly` mirrors BacklogItemRow's own `editing && !readOnly` gate) and
+// the edited draft still present. A bare `editingId` is not enough — a stale
+// id (archived mid-edit, or draft deleted) must never arm the guard.
+const editorVisible =
+  !collapsed
+  && !readOnly
+  && editingId !== null
+  && items.some((item) => item.id === editingId);
+const collapseBlocked = editorVisible;
+// Clear an editor id that can no longer render an editor (archived mid-edit,
+// or draft deleted); otherwise a later unarchive would re-arm the guard while
+// the list is unmounted.
+useEffect(() => {
+  if (editingId === null) return;
+  if (!readOnly && items.some((item) => item.id === editingId)) return;
+  setEditingId(null);
+}, [editingId, items, readOnly]);
 
 <div
   data-testid="backlog-tray"
@@ -91,15 +105,19 @@ const collapseBlocked = editingId !== null && !readOnly;
     data-testid="backlog-toggle"
     onClick={() => { if (!collapseBlocked) setCollapsed((c) => !c); }}
     aria-expanded={!collapsed}
-    aria-controls={listId}
+    // Only while the list is mounted: `aria-controls` must not point at an
+    // unmounted id (`info-tip.tsx` follows the same rule).
+    aria-controls={collapsed ? undefined : listId}
     aria-disabled={collapseBlocked || undefined}
     title={collapseBlocked ? "Save or cancel your edit first" : collapsed ? "Expand backlog" : "Collapse backlog"}
     className={cn(
-      "flex w-full items-center gap-1.5 px-3 pb-1 pt-2 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
+      "flex w-full items-center gap-1.5 px-3 pb-1 pt-2 text-left text-[11px] font-medium text-muted-foreground transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
+      !collapseBlocked && "hover:bg-muted/40",
       collapseBlocked && "cursor-not-allowed opacity-60",
     )}
   >
     <ChevronRight
+      data-testid="backlog-chevron"
       className={cn("size-3.5 shrink-0 transition-transform", !collapsed && "rotate-90")}
       aria-hidden
     />
@@ -123,7 +141,7 @@ const collapseBlocked = editingId !== null && !readOnly;
       data-testid="backlog-list"
       className={cn(
         "space-y-1 overflow-y-auto px-2 pb-2",
-        editingId !== null ? "max-h-72" : "max-h-40",
+        editorVisible ? "max-h-72" : "max-h-40",
       )}
     >
       {items.map(/* existing BacklogItemRow tree, untouched */)}
@@ -138,7 +156,7 @@ Add `useId` to the React import and `ChevronRight` to the lucide-react import in
 
 - **D1 — Session-only local state** (owner round-1 `#persistence`, overriding the recommendation). Rejected: global `localStorage` via `panel-collapse.ts` (would add a key, require a `CLAUDE.md:175` update, and contradict the owner); per-task keys (unbounded cleanup). The accepted cost is that the tray resets on task switch/panel close; round-2 `#empty-tray-state` accepts the empty-tray reset too.
 - **D2 — Unmount the list when collapsed** (owner grill assumption). Rejected: keep it mounted with `hidden`. Because collapse is blocked while a live editor exists, there is no row-local draft to preserve, and unmounting avoids both the render cost and the hidden-`@`-popover `data-popover-open` Escape trap (`RunPanel.tsx:544,2258`; `AtFileAutocomplete.tsx:369`).
-- **D3 — Block collapse while editing** (owner round-1 `#edit-conflict`). Rejected: close/discard the editor (silent data loss); keep it mounted-hidden (D2's trap). Enforcement is one guard on the only writer of `collapsed`, `editingId !== null && !readOnly`: `readOnly` is excluded because a stale `editingId` after an external archive has no live editor — `BacklogItemRow` already renders `editing && !readOnly` as view-mode (`RunPanel.tsx:5116-5119`), so blocking on the stale id would strand the toggle forever.
+- **D3 — Block collapse while editing** (owner round-1 `#edit-conflict`). Rejected: close/discard the editor (silent data loss); keep it mounted-hidden (D2's trap). Enforcement is one guard on the only writer of `collapsed`: `editorVisible` (`!collapsed && !readOnly && editingId !== null && items.some(...)`) plus a reset effect that clears an id which can no longer render an editor. `readOnly` and the item-membership check are both required: a stale `editingId` after an external archive or a draft deletion has no live editor — `BacklogItemRow` already renders `editing && !readOnly` as view-mode (`RunPanel.tsx:5116-5119`) — so blocking on the bare id would strand the toggle forever.
 - **D4 — Whole header is one `<button>`** (owner round-1 `#interaction`), with the chevron leading, `aria-expanded` + `aria-controls`, and `data-testid`s. Rejected: a tiny chevron-only button (small hit target); a clickable `div` (invalid semantics); nesting a button inside the header (invalid HTML).
 - **D5 — `aria-disabled` rather than native `disabled` while editing.** The control stays focusable and the `title`/hint can explain why; the handler is the real guard. Native `disabled` would remove it from the tab order and suppress hover help. This is an implementation detail inside D3, not a product change.
 - **D6 — Hint precedence: blocked > collapsed > readOnly > normal.** A collapsed archived tray shows the expand hint (there is something hidden to reveal); expanding restores the archived read-only hint, matching decisions 7 and 11.
@@ -158,7 +176,7 @@ Evidence vs reasoning: C1–C7 and D1–D7 rest on the owner's grill answers; th
 1. Open a task with ≥1 saved draft. `backlog-tray` has `data-state="expanded"`, `backlog-toggle` has `aria-expanded="true"` and an `aria-controls` equal to `backlog-list`'s `id`, `backlog-list` is present, the draft text is visible, and the count equals `items.length`.
 2. Click the toggle. `data-state="collapsed"`, `aria-expanded="false"`, `backlog-list` is absent from the DOM, the icon/label/count are still visible, the hint is exactly `saved messages — expand to review`, and the chevron points right. Click again: the list and drafts return; `max-h-40` is the resting class.
 3. Click a row's Edit button. The header shows `save or cancel your edit first`, the toggle has `aria-disabled="true"`, and clicking it does not unmount the list; the editor keeps its typed value. Cancel: the toggle is no longer `aria-disabled`; it collapses again. The editing list still uses `max-h-72`.
-4. On an archived task (`readOnly`), the toggle is still rendered; expanded shows `saved messages — unarchive the task to edit or send`; collapsed shows the expand hint. No Edit/Delete/Send/Move buttons are added. If the task is archived while a row is editing, the row falls back to read-only and the toggle is not blocked (`collapseBlocked` excludes `readOnly`).
+4. On an archived task (`readOnly`), the toggle is still rendered; expanded shows `saved messages — unarchive the task to edit or send`; collapsed shows the expand hint. No Edit/Delete/Send/Move buttons are added. If the task is archived while a row is editing, the row falls back to read-only, the reset effect clears `editingId`, and the toggle is not blocked (`editorVisible` excludes `readOnly` and requires the edited draft to still exist).
 5. A one-item tray still shows the toggle. A subagent tab and an empty backlog still hide the whole tray (existing gate, untouched).
 6. Switching tasks or closing/reopening the panel returns the tray to expanded; removing the last draft and saving a new one returns it to expanded. (No persistence code anywhere.)
 7. `grep` the diff: no `localStorage`, no `panel-collapse.ts`, no `task.backlog`/API/DB/type changes, no new `RunPanelBody` state, no key change to `backlog-${task.id}`.
@@ -182,6 +200,9 @@ The doc edit appends a paragraph to `docs/architecture/messages-backlog.md` afte
 | 3 | Session-only lifecycle + one-item toggle | Two tasks, one draft each. Open A: expanded; collapse. Use the context-menu "Open details" path (`[data-testid="task-context-menu-open"]`, copied from `e2e/task-switch-during-restore.spec.ts:205-210`) to switch to B while the panel stays open: B is expanded. Switch back to A: A is expanded (the collapse did not survive the keyed remount). Collapse A again; delete A's only draft via `DELETE /tasks/:id/backlog/:itemId`; wait for `backlog-tray` count `0`; `POST` a new draft; wait for the tray; assert `data-state="expanded"`. The one-item tray had a visible toggle throughout. |
 | 4 | Archived read-only task | Create a task, seed one draft, `PATCH /tasks/:id {column:"done"}`, `POST /tasks/:id/archive`. `gotoApp`, `page.getByTitle("Filter by archive state").selectOption("archived")` (`KanbanFilters.tsx:175-184`), open the card (wait for the panel's `translate-x-0`, not a textarea — the archived footer replaces the composer). Assert the tray is visible, the expanded hint is `saved messages — unarchive the task to edit or send`, no `Edit`/`Delete` buttons exist inside the tray, the toggle is visible, clicking it collapses to the expand hint and unmounts the list, and expanding restores the read-only hint + draft. |
 | 5 | Archive mid-edit → collapse → unarchive (regression) | Seed 2 drafts, open the first row's editor and type. `PATCH {column:"done"}` + `POST /tasks/:id/archive`; wait for the read-only hint and the editor to unmount, assert the toggle is not `aria-disabled`, collapse. `POST /tasks/:id/unarchive`; wait for `send-textarea` (the static archived footer is gone), assert the tray is still collapsed but the toggle is **not** `aria-disabled`, then expand successfully with the drafts visible and no resurrected editor. |
+| 6 | Save a draft while collapsed (decision 6) | Seed 1 draft, collapse, type into `send-textarea`, click the composer's `Save for later`. Assert the composer clears, the tray is still `data-state="collapsed"` with no `aria-controls` and the list unmounted, the count badge goes 1 → 2, and a `GET /tasks/:id` shows the new draft persisted (newest first). Expanding reveals it under `max-h-40`. |
+| 7 | Panel close → reopen resets to expanded (decision 4) | Seed 1 draft, collapse, close via `Close task details`, wait for the panel (and keyed tray) to unmount after the 250 ms exit animation, reopen the same card. Assert `data-state="expanded"`, `aria-expanded="true"`, and the draft visible — the state died with the panel, not just with a task key change. |
+| 8 | Draft deleted under an open editor (stale-id half 2) | Seed the survivor first, then the edited draft (newest on top); open the first row's editor and type. `DELETE /tasks/:id/backlog/:itemId` for the edited draft; wait for the 2 s poll to unmount the editor, assert the toggle is not `aria-disabled`, the survivor is visible, collapse works, and no editor is resurrected on expand. |
 
 **Red proof (required before T1 is called done).** Every test must be shown failing on the assertion that targets its behavior, not on an import/compile error:
 
@@ -192,6 +213,9 @@ The doc edit appends a paragraph to `docs/architecture/messages-backlog.md` afte
    - Remove the tray key (`backlog-${task.id}`) from the render site → test 3 fails because A stays collapsed after switching back.
    - Wrap the header button in `!readOnly` → test 4 fails because the archived toggle is absent.
    - Restore the old bare guard (`editingId !== null && !readOnly`, no reset effect) → test 5 fails with the collapsed toggle still `aria-disabled` after unarchive.
+   - Expand the tray whenever `items.length` changes → test 6 fails at `data-state="collapsed"` after the save (the decision-6 violation).
+   - Persist `collapsed` in module state across mounts → test 7 fails at `data-state="expanded"` on reopen.
+   - Drop both stale-id protections (`items.some` from `editorVisible` **and** the reset effect) → test 8 fails at the toggle's `aria-disabled` after the draft is deleted.
 3. Restore every mutation; final `git status` must show only the intended I1/T1 files.
 
 **E2e applicability:** applies — this is a user-visible disclosure and a height-reclaim behavior in the RunPanel; unit tests cannot observe the button/`aria-expanded`, the unmounted list, the archived variant, or the transcript growing. No new harness is needed.
@@ -262,13 +286,14 @@ No unratified one-way-door decisions: the grill's "One-way doors awaiting a huma
 | `aria-expanded`, `aria-controls` (only while expanded), `data-testid`s (`backlog-tray`/`backlog-toggle`/`backlog-list`/`backlog-chevron`), `data-state` | In this run | I1 (decision 9); bug-fix round made `aria-controls` conditional on the mounted list |
 | List unmounted while collapsed | In this run | I1 (decision 5 + grill assumption) |
 | Hint swap while collapsed (`saved messages — expand to review`) | In this run | I1 (decision 7) |
-| Block collapse while a live editor exists (`editorVisible`) + explanatory hint; clear stale editor ids on archive/delete | In this run | I1 (decision 5); guard hardened in the bug-fix round (test 5) |
+| Block collapse while a live editor exists (`editorVisible`) + explanatory hint; clear stale editor ids on archive/delete | In this run | I1 (decision 5); guard hardened in the bug-fix round (tests 5, 8) |
 | Keep `max-h-40` / `max-h-72` heights | In this run | I1 (decision 8; existing expression unchanged) |
 | Count always visible, including collapsed | In this run | I1 (decision 7) |
 | Toggle on every non-empty tray, including one item | In this run | I1 (decision 10); T1 test 3 |
 | Toggle on archived read-only tasks; read-only hint when expanded | In this run | I1 (decision 11); T1 test 4 |
-| Session-only lifecycle reset (task switch / subagent / panel close) | In this run | I1 (decision 4); T1 test 3 |
+| Session-only lifecycle reset (task switch / subagent / panel close) | In this run | I1 (decision 4); T1 tests 3, 7 |
 | Empty-tray reset — next draft opens expanded | In this run | I1 (round-2 decision); T1 test 3, second half |
+| Save while collapsed — stay collapsed, count +1 | In this run | I1 (decision 6); T1 test 6 |
 | New Playwright spec | In this run | T1 (decision 14) |
 | `docs/architecture/messages-backlog.md` update | In this run | I1 (decision 14) |
 | Existing `e2e/task-switch-during-restore.spec.ts` default-expanded expectation | No change; must stay green | Existing behavior preserved; targeted run in T1 |

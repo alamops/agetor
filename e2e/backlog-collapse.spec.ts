@@ -414,4 +414,149 @@ test.describe("messages backlog collapse", () => {
     // resurrect an editor seeded from stale state.
     await expect(editor).toHaveCount(0);
   });
+
+  test("saving a new draft while collapsed stays collapsed and bumps the count", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    // Owner decision 6: a manual save must never steal the transcript space
+    // back. The count badge is the only confirmation; the tray stays
+    // collapsed until the user asks to review it.
+    test.setTimeout(60_000);
+    const title = `backlog-save-collapsed-${randomUUID()}`;
+    const taskId = await createTask(request, backend, title);
+    const seeded = "draft already saved";
+    await seedDraft(request, backend, taskId, seeded);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    const tray = panel.getByTestId("backlog-tray");
+    const toggle = tray.getByTestId("backlog-toggle");
+    const list = tray.getByTestId("backlog-list");
+    const composer = panel.getByTestId("send-textarea");
+
+    await expect(tray).toHaveAttribute("data-state", "expanded");
+    await expect(tray.getByText("1", { exact: true })).toBeVisible();
+    await toggle.click();
+    await expect(tray).toHaveAttribute("data-state", "collapsed");
+    await expect(list).toHaveCount(0);
+
+    // The task has no run, so it cannot send — exactly the state where the
+    // composer stays typable and "Save for later" is the only exit.
+    await composer.fill("draft saved while collapsed");
+    await panel.getByRole("button", { name: "Save for later", exact: true }).click();
+
+    // Consumed like a send: composer clears, tray stays collapsed, count +1.
+    await expect(composer).toHaveValue("");
+    await expect(tray).toHaveAttribute("data-state", "collapsed");
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).not.toHaveAttribute("aria-controls");
+    await expect(list).toHaveCount(0);
+    await expect(tray.getByText("2", { exact: true })).toBeVisible();
+
+    // The badge reflects persisted server state, not just an optimistic count.
+    const fetched = await request.get(`${backend.apiBase}/tasks/${taskId}`, {
+      headers: authHeaders(backend),
+    });
+    expect(fetched.ok(), `GET /tasks/${taskId} -> ${fetched.status()}: ${await fetched.text()}`).toBeTruthy();
+    const fresh = (await fetched.json()) as TaskRow;
+    // Newest draft on top (`db.ts` backlog.add), so the tray's first row is
+    // the one saved while collapsed.
+    expect(fresh.backlog.map((i) => i.text)).toEqual(["draft saved while collapsed", seeded]);
+
+    // Expanding reveals the draft saved while the tray was shut — at the same
+    // resting height cap, not an all-items view.
+    await toggle.click();
+    await expect(tray).toHaveAttribute("data-state", "expanded");
+    await expect(list).toBeVisible();
+    await expect(list).toContainText("draft saved while collapsed");
+    await expect(list).toHaveClass(/max-h-40/);
+  });
+
+  test("closing and reopening the panel returns the collapsed tray to expanded", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    // Session-only lifecycle (decision 4): the tray's state dies with the
+    // panel, not just with the task key. Reopening the same task must show
+    // the drafts again without an extra click.
+    test.setTimeout(60_000);
+    const title = `backlog-reopen-${randomUUID()}`;
+    const taskId = await createTask(request, backend, title);
+    const draft = "draft that outlives the panel close";
+    await seedDraft(request, backend, taskId, draft);
+
+    await gotoApp(page, backend.bootBase);
+    const firstPanel = await openTask(page, title);
+    const firstTray = firstPanel.getByTestId("backlog-tray");
+    await expect(firstTray).toHaveAttribute("data-state", "expanded");
+    await firstTray.getByTestId("backlog-toggle").click();
+    await expect(firstTray).toHaveAttribute("data-state", "collapsed");
+
+    await firstPanel.getByRole("button", { name: "Close task details" }).click();
+    // The panel unmounts only after its 250 ms exit animation, which is also
+    // when the keyed tray dies. Wait for that unmount before reopening —
+    // reopening inside the window would legitimately reuse the same state.
+    await expect(page.getByRole("button", { name: "Close task panel" })).toHaveCount(0, {
+      timeout: 10_000,
+    });
+
+    const reopened = await openTask(page, title);
+    const tray = reopened.getByTestId("backlog-tray");
+    await expect(tray).toHaveAttribute("data-state", "expanded");
+    await expect(tray.getByTestId("backlog-toggle")).toHaveAttribute("aria-expanded", "true");
+    await expect(tray.getByTestId("backlog-list")).toContainText(draft);
+  });
+
+  test("deleting the draft being edited tears down its editor and lets the tray collapse", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    // The other half of the stale-editor contract: archive mid-edit is test 5,
+    // a draft deleted from under the open editor is this one. Once the row is
+    // gone the guard must disarm (the edited draft no longer exists), even
+    // though `editingId` still names it until the reset effect clears it.
+    test.setTimeout(60_000);
+    const title = `backlog-delete-edited-${randomUUID()}`;
+    const taskId = await createTask(request, backend, title);
+    // Seed the survivor first: `backlog.add` puts the newest draft on top, so
+    // the second seed is row 1 — the row this test opens the editor on and
+    // then deletes out from under itself.
+    await seedDraft(request, backend, taskId, "draft left alone");
+    const editedId = await seedDraft(request, backend, taskId, "draft being edited");
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+    const tray = panel.getByTestId("backlog-tray");
+    const toggle = tray.getByTestId("backlog-toggle");
+    const list = tray.getByTestId("backlog-list");
+    const editor = panel.locator('textarea:not([data-testid="send-textarea"])');
+
+    await tray.getByRole("button", { name: "Edit", exact: true }).first().click();
+    await expect(editor).toBeVisible();
+    await editor.fill("unsaved text on the draft about to vanish");
+    await expect(toggle).toHaveAttribute("aria-disabled", "true");
+
+    // Delete that draft out from under the editor through the API (the same
+    // mechanism another window would use); the 2 s task poll delivers it here.
+    const deleted = await request.delete(`${backend.apiBase}/tasks/${taskId}/backlog/${editedId}`, {
+      headers: authHeaders(backend),
+    });
+    expect(deleted.ok(), `DELETE backlog item -> ${deleted.status()}: ${await deleted.text()}`).toBeTruthy();
+
+    await expect(editor).toHaveCount(0, { timeout: 15_000 });
+    await expect(list.getByText("draft left alone", { exact: true })).toBeVisible();
+    await expect(toggle).not.toHaveAttribute("aria-disabled", "true");
+
+    await toggle.click();
+    await expect(tray).toHaveAttribute("data-state", "collapsed");
+    await expect(list).toHaveCount(0);
+    await toggle.click();
+    await expect(tray).toHaveAttribute("data-state", "expanded");
+    await expect(list).toContainText("draft left alone");
+    await expect(editor).toHaveCount(0);
+  });
 });
