@@ -314,8 +314,14 @@ async function createProfileRest(backend: E2EBackend, name: string, harness: str
 }
 
 /** Non-builtin harness whose `bin` cannot exist — always `available: false`
- *  (mirrored from `agent-profiles-dialogs.spec.ts`). */
-async function createUnavailableHarnessRest(backend: E2EBackend): Promise<string> {
+ *  (mirrored from `agent-profiles-dialogs.spec.ts`). `label` is caller-supplied
+ *  so more than one test in this spec can register one without making a role
+ *  locator ambiguous (the fixtures outlive their test; cleanup is in
+ *  `afterAll`). */
+async function createUnavailableHarnessRest(
+  backend: E2EBackend,
+  label = "Deliberately Unavailable Harness",
+): Promise<string> {
   const id = `e2e-resolve-conflicts-unavailable-${Date.now()}`;
   const res = await fetch(`${backend.apiBase}/harnesses`, {
     method: "POST",
@@ -323,7 +329,7 @@ async function createUnavailableHarnessRest(backend: E2EBackend): Promise<string
     body: JSON.stringify({
       id,
       kind: "claude-code",
-      label: "Deliberately Unavailable Harness",
+      label,
       bin: "/nonexistent/agetor-e2e-resolve-conflicts/no-such-binary",
     }),
   });
@@ -586,6 +592,9 @@ test.describe("Resolve with Agetor dialog", () => {
     await summary.getByTestId("launch-pipeline-change").click();
     await expect(dlg.getByTestId("launch-pipeline-summary")).toHaveCount(0);
     await expect(dlg.getByText("Agent", { exact: true })).toBeVisible();
+    // The profile picked before the pipeline stays cleared — Change restores
+    // the manual block, not the profile it replaced (New Task parity).
+    await expect(dlg.getByTestId("agent-profile-card")).toHaveCount(0);
 
     await pickPipeline(dlg, pipelineId);
     const submit = dlg.getByTestId("resolve-conflicts-submit");
@@ -669,6 +678,46 @@ test.describe("Resolve with Agetor dialog", () => {
     await dlg.getByTestId("launch-pipeline-change").click();
     await expect(problem).toHaveCount(0);
     await expect(dlg.getByTestId("resolve-conflicts-submit")).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+  });
+
+  test("pipeline picker: an available start-step harness overrides an unavailable manual pick", async ({
+    page,
+    backend,
+  }) => {
+    // Mirror of the test above, and the case that fails if the PR dialog's
+    // launch identity regresses to the hidden manual picker: the pipeline is
+    // runnable while the manually-picked harness is not, so only the
+    // start-step profile can make submit enabled.
+    test.setTimeout(90_000);
+    const suffix = Date.now();
+    const manualHarnessLabel = `Deliberately Unavailable Manual Harness ${suffix}`;
+    const harnessId = await createUnavailableHarnessRest(backend, manualHarnessLabel);
+    const profileId = await createProfileRest(backend, `E2E PR available start profile ${suffix}`);
+    const pipelineName = `E2E PR available start pipeline ${suffix}`;
+    const pipelineId = await createPipelineRest(backend, pipelineName, [
+      makeStep({ id: `step-${suffix}`, name: "Plan", agentProfileId: profileId }),
+    ]);
+    trackPipelineFixture(pipelineId, [profileId], [harnessId]);
+
+    await gotoApp(page, backend.bootBase);
+    const dlg = await openResolveConflictsDialog(page);
+
+    // A plain single-agent launch on the unavailable harness is blocked.
+    await dlg.getByRole("button", { name: manualHarnessLabel }).click();
+    const hint = dlg.getByTestId("launch-agent-unavailable-hint");
+    await expect(hint).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(hint).toContainText("not found on PATH");
+    const submit = dlg.getByTestId("resolve-conflicts-submit");
+    await expect(submit).toBeDisabled();
+
+    // The pipeline's available start-step harness is the effective identity.
+    await pickPipeline(dlg, pipelineId);
+    await expect(dlg.getByTestId("launch-pipeline-problem")).toHaveCount(0);
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    // Change returns to the still-unavailable manual harness — blocked again.
+    await dlg.getByTestId("launch-pipeline-change").click();
+    await expect(submit).toBeDisabled();
   });
 
   test("pipeline picker: Manage pipelines closes both dialogs, confirming a dirty draft first", async ({ page, backend }) => {

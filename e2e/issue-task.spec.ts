@@ -538,8 +538,13 @@ async function createProfileRest(
 /** A non-builtin harness whose `bin` points at a path that cannot exist —
  *  deterministically `available: false` regardless of what the machine
  *  running the suite has installed (helper mirrored from
- *  `agent-profiles-dialogs.spec.ts`). */
-async function createUnavailableHarnessRest(backend: E2EBackend): Promise<string> {
+ *  `agent-profiles-dialogs.spec.ts`). `label` is caller-supplied so more than
+ *  one test in this spec can register one without making a role locator
+ *  ambiguous (the fixtures outlive their test; cleanup is in `afterAll`). */
+async function createUnavailableHarnessRest(
+  backend: E2EBackend,
+  label = "Deliberately Unavailable Harness",
+): Promise<string> {
   const id = `e2e-issue-task-unavailable-${Date.now()}`;
   const res = await fetch(`${backend.apiBase}/harnesses`, {
     method: "POST",
@@ -547,7 +552,7 @@ async function createUnavailableHarnessRest(backend: E2EBackend): Promise<string
     body: JSON.stringify({
       id,
       kind: "claude-code",
-      label: "Deliberately Unavailable Harness",
+      label,
       bin: "/nonexistent/agetor-e2e-issue-task/no-such-binary",
     }),
   });
@@ -1107,6 +1112,9 @@ test.describe("task from a Git issue", () => {
     await summary.getByTestId("launch-pipeline-change").click();
     await expect(issueTaskDialog.getByTestId("launch-pipeline-summary")).toHaveCount(0);
     await expect(issueTaskDialog.getByText("Agent", { exact: true })).toBeVisible();
+    // The profile picked before the pipeline stays cleared — Change restores
+    // the manual block, not the profile it replaced (New Task parity).
+    await expect(issueTaskDialog.getByTestId("agent-profile-card")).toHaveCount(0);
     await expect(
       issueTaskDialog.getByTestId("launch-pipeline-picker").getByTestId("pipeline-picker-trigger"),
     ).toContainText("No pipeline");
@@ -1207,6 +1215,56 @@ test.describe("task from a Git issue", () => {
     await expect(issueTaskDialog.getByTestId("issue-task-submit")).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
   });
 
+  test("pipeline picker: an available start-step harness overrides an unavailable manual pick", async ({
+    page,
+    backend,
+  }) => {
+    // The mirror image of the test above, and the one that can actually fail
+    // if the launch identity regresses to the hidden manual picker: the
+    // PREFLIGHT alone would still block the unavailable-pipeline case, so
+    // only a pipeline that is runnable while the manual pick is not proves
+    // `effectiveStatus`/`canSubmit` read the start-step profile.
+    test.setTimeout(90_000);
+    const suffix = Date.now();
+    const manualHarnessLabel = `Deliberately Unavailable Manual Harness ${suffix}`;
+    const harnessId = await createUnavailableHarnessRest(backend, manualHarnessLabel);
+    // The pipeline's start profile uses the available built-in claude-code
+    // harness (the fixture env runs the fake claude driver).
+    const profileId = await createProfileRest(backend, `E2E available start profile ${suffix}`);
+    const pipelineName = `E2E available start pipeline ${suffix}`;
+    const pipelineId = await createPipelineRest(backend, pipelineName, [
+      makeStep({ id: `step-${suffix}`, name: "Plan", agentProfileId: profileId }),
+    ]);
+    trackPipelineFixture(pipelineId, [profileId], [harnessId]);
+
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+
+    // Manually pick the deterministically unavailable harness: a plain
+    // single-agent launch must be blocked by it.
+    await issueTaskDialog.getByRole("button", { name: manualHarnessLabel }).click();
+    const hint = issueTaskDialog.getByTestId("launch-agent-unavailable-hint");
+    await expect(hint).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(hint).toContainText("not found on PATH");
+    const submit = issueTaskDialog.getByTestId("issue-task-submit");
+    await expect(submit).toBeDisabled();
+
+    // Picking a pipeline whose start profile uses an AVAILABLE harness must
+    // clear that block: the pipeline's start-step profile is the effective
+    // launch identity, so the hidden manual pick's unavailable harness is
+    // irrelevant. A regression that kept gating on `selectedStatus` (or on
+    // the manual `agent`) would leave submit disabled here.
+    await pickPipeline(issueTaskDialog, pipelineId);
+    await expect(issueTaskDialog.getByTestId("launch-pipeline-problem")).toHaveCount(0);
+    await expect(submit).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    // Change drops the pipeline and returns to the still-unavailable manual
+    // harness — submit is blocked again, so the enabled state above really
+    // came from the pipeline, not from a stale enabled button.
+    await issueTaskDialog.getByTestId("launch-pipeline-change").click();
+    await expect(submit).toBeDisabled();
+  });
+
   test("pipeline picker: Manage pipelines closes both dialogs, confirming a dirty draft first", async ({ page, backend }) => {
     test.setTimeout(90_000);
     await gotoApp(page, backend.bootBase);
@@ -1240,6 +1298,13 @@ test.describe("task from a Git issue", () => {
     await page.getByTestId("pipelines-back").click();
     await expect(page.getByTestId("pipelines-page")).toHaveCount(0, { timeout: CONVERGE_TIMEOUT });
     issueTaskDialog = await openIssueTaskDialog(page);
+    // Wait for BranchPicker's automatic "preselect the current branch" seed
+    // (`main`) to land BEFORE opening Manage: that seed must not count as a
+    // user edit, or a pristine draft would ask "Discard…?" here (execution
+    // note 1: `baseRefDirty` split from the auto-selected `baseRef`).
+    await expect(
+      issueTaskDialog.getByTestId("worktree-options").getByTitle(BRANCH_PICKER_TITLE),
+    ).toContainText("main", { timeout: CONVERGE_TIMEOUT });
     manage = await openPipelineManageRow(issueTaskDialog);
     await manage.click();
     await expect(issueTaskDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });

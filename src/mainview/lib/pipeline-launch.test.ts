@@ -265,6 +265,27 @@ describe("resolvePipelineLaunch profile rules", () => {
     );
   });
 
+  test("a blocked resolution still returns the start step/profile/harness/status", () => {
+    // A later step is broken, but the start step itself is fully resolvable —
+    // the summary card can still show which step/profile the pipeline would
+    // have started with, so the helper must not drop that identity when it
+    // reports `blocked`.
+    const graph = makeGraph({
+      steps: [
+        makeStep({ id: "a", name: "Plan" }),
+        makeStep({ id: "b", name: "Build", agentProfileId: null }),
+      ],
+      edges: [{ id: "e1", from: "a", to: "b", label: "" }],
+      startStepId: "a",
+    });
+    const resolution = resolvePipelineLaunch(readyInput(graph));
+    expectBlocked(resolution, 'step "Build" has no agent');
+    expect(resolution.startStep).toMatchObject({ id: "a", name: "Plan" });
+    expect(resolution.startProfile).toEqual(makeProfile());
+    expect(resolution.startHarness).toEqual(makeHarness());
+    expect(resolution.startStatus).toEqual(makeStatus());
+  });
+
   test("the same missing later profile is only checking while the list has never loaded", () => {
     const graph = makeGraph({
       steps: [
