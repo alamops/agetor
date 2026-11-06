@@ -146,6 +146,10 @@ test.describe("messages backlog collapse", () => {
     await expect(tray).toBeVisible();
     await expect(tray).toHaveAttribute("data-state", "expanded");
     await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    // The name is the action, not the whole header text; the hint is only the
+    // description (a "Cancel" in the name would collide with the editor's own
+    // Cancel button for role-based lookups — see the blocked case below).
+    await expect(toggle).toHaveAccessibleName("Collapse backlog, 8 saved messages");
     await expect(list).toBeVisible();
     await expect(list).toHaveAttribute("id", (await toggle.getAttribute("aria-controls")) ?? "missing-aria-controls");
     await expect(list).toContainText(firstDraft);
@@ -165,6 +169,7 @@ test.describe("messages backlog collapse", () => {
     // and `aria-controls` no longer dangles at an unmounted id.
     await expect(tray).toHaveAttribute("data-state", "collapsed");
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(toggle).toHaveAccessibleName("Expand backlog, 8 saved messages");
     await expect(toggle).not.toHaveAttribute("aria-controls");
     await expect(list).toHaveCount(0);
     await expect(count).toBeVisible();
@@ -221,6 +226,10 @@ test.describe("messages backlog collapse", () => {
     // editor's own height (unchanged 288 px cap).
     await expect(toggle).toHaveAttribute("aria-disabled", "true");
     await expect(toggle).toContainText("save or cancel your edit first");
+    // The blocked copy lives in the description, never the name: a role-based
+    // "Cancel" query in the panel must keep resolving only the editor's button.
+    await expect(toggle).toHaveAccessibleName("Collapse backlog, 2 saved messages");
+    await expect(toggle).toHaveAccessibleDescription("save or cancel your edit first");
     await expect(list).toHaveClass(/max-h-72/);
 
     // A real pointer click still lands (that's the point of `aria-disabled`
@@ -263,6 +272,8 @@ test.describe("messages backlog collapse", () => {
     const toggle = tray.getByTestId("backlog-toggle");
     await expect(tray).toContainText(draftA);
     await expect(toggle).toBeVisible();
+    // Singular count: the one-item tray still names its action and count.
+    await expect(toggle).toHaveAccessibleName("Collapse backlog, 1 saved message");
     await expect(tray).toHaveAttribute("data-state", "expanded");
     await toggle.click();
     await expect(tray).toHaveAttribute("data-state", "collapsed");

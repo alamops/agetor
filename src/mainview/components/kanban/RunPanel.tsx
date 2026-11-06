@@ -5009,6 +5009,7 @@ function BacklogTray({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const listId = useId();
+  const hintId = useId();
   // Block collapse only while a live editor is actually on screen: the tray is
   // expanded, the task isn't read-only (BacklogItemRow's own `editing &&
   // !readOnly` gate), and the edited draft still exists. A bare
@@ -5044,6 +5045,14 @@ function BacklogTray({
           if (!collapseBlocked) setCollapsed((c) => !c);
         }}
         aria-expanded={!collapsed}
+        // A stable action name plus the count. Without `aria-label` the
+        // accessible name is the whole text content (icon, "Backlog", count,
+        // hint), so the blocked hint "save or cancel your edit first" would
+        // make every role-based "Cancel" lookup in the panel ambiguous. The
+        // hint stays exposed as the description below, and the count is part
+        // of the name so screen readers still hear how many drafts are saved.
+        aria-label={`${collapsed ? "Expand" : "Collapse"} backlog, ${items.length} ${items.length === 1 ? "saved message" : "saved messages"}`}
+        aria-describedby={hintId}
         // Only when the list is actually rendered: an `aria-controls` pointing
         // at an unmounted id is a dangling reference (same rule as
         // `info-tip.tsx`). The disclosure relationship is meaningless while
@@ -5067,7 +5076,7 @@ function BacklogTray({
         <ClipboardList className="size-3.5 shrink-0" />
         <span className="shrink-0">Backlog</span>
         <span className="shrink-0 rounded bg-muted px-1 text-[10px]">{items.length}</span>
-        <span className="ml-1 min-w-0 truncate font-normal text-muted-foreground/70">
+        <span id={hintId} className="ml-1 min-w-0 truncate font-normal text-muted-foreground/70">
           {collapseBlocked
             ? "save or cancel your edit first"
             : collapsed

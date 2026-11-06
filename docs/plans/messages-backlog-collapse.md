@@ -6,7 +6,7 @@
 | Source | Agetor task `df38cb35-4ba1-4073-8449-c6db9673d014`; requirement quoted verbatim at `docs/plans/messages-backlog-collapse-investigation.md:12-14`; investigation `docs/plans/messages-backlog-collapse-investigation.md`; decisions `docs/plans/messages-backlog-collapse-grill.md` + `docs/plans/messages-backlog-collapse-grill/round-{1,2}/answers.json` |
 | Flags | none |
 | Gates | grilled + approved by owner (round 1: 12 accepted recommendations + 1 override, 1 `not_applicable`, 1 optional blank; round 2: 1/1; no one-way doors). Pipeline hands off to Implementing. |
-| Status | implemented — I1 (`9090f18c`) + T1 (`ce9be918`); bug-fix round after code review (stale-editor guard + conditional `aria-controls`); test-writer round added decision-6 (save while collapsed) and the panel-close / draft-deleted lifecycle cases; typecheck and the full `e2e/backlog-collapse.spec.ts` (8/8, with red proof for every behavior) green |
+| Status | implemented — I1 (`9090f18c`) + T1 (`ce9be918`); bug-fix round after code review (stale-editor guard + conditional `aria-controls`); test-writer round added decision-6 (save while collapsed) and the panel-close / draft-deleted lifecycle cases; test-loop round gave the toggle a stable accessible name (`aria-label` action + count, hint as `aria-describedby`) so the blocked hint can no longer collide with the editor's "Cancel" in role-based lookups, and corrected the run recipe. Final gates: `bun run typecheck` green; `bun test` 11,734 pass / 30 skip / 0 fail (458 files); full Playwright suite 426/427 pass, 0 skipped — the one failure is the pre-existing `bundle-export-import` version-check test, reproduced unchanged at base `a5593d16` |
 | Branch | `feature/agetor-collapse-expand-messages-backlog` (current worktree) |
 | Base SHA | `46dbe0f4` (planning HEAD; `RunPanel.tsx` is identical to `a5593d16`) |
 
@@ -76,6 +76,7 @@ One desktop webview (Electrobun/WKWebView) talking to a local Bun core. The tray
 ```tsx
 const [collapsed, setCollapsed] = useState(false);   // default expanded
 const listId = useId();                             // aria-controls target
+const hintId = useId();                             // aria-describedby target
 // Block only while a live editor is actually on screen: expanded, editable
 // (`!readOnly` mirrors BacklogItemRow's own `editing && !readOnly` gate) and
 // the edited draft still present. A bare `editingId` is not enough — a stale
@@ -105,6 +106,12 @@ useEffect(() => {
     data-testid="backlog-toggle"
     onClick={() => { if (!collapseBlocked) setCollapsed((c) => !c); }}
     aria-expanded={!collapsed}
+    // A stable action name: without `aria-label` the accessible name is the
+    // whole text content (icon, "Backlog", count, hint), so the blocked hint
+    // "save or cancel your edit first" would make every role-based "Cancel"
+    // lookup in the panel ambiguous. The hint stays exposed as the description.
+    aria-label={`${collapsed ? "Expand" : "Collapse"} backlog, ${items.length} ${items.length === 1 ? "saved message" : "saved messages"}`}
+    aria-describedby={hintId}
     // Only while the list is mounted: `aria-controls` must not point at an
     // unmounted id (`info-tip.tsx` follows the same rule).
     aria-controls={collapsed ? undefined : listId}
@@ -124,7 +131,7 @@ useEffect(() => {
     <ClipboardList className="size-3.5 shrink-0" />
     <span className="shrink-0">Backlog</span>
     <span className="shrink-0 rounded bg-muted px-1 text-[10px]">{items.length}</span>
-    <span className="ml-1 min-w-0 truncate font-normal text-muted-foreground/70">
+    <span id={hintId} className="ml-1 min-w-0 truncate font-normal text-muted-foreground/70">
       {collapseBlocked
         ? "save or cancel your edit first"
         : collapsed
@@ -162,6 +169,7 @@ Add `useId` to the React import and `ChevronRight` to the lucide-react import in
 - **D6 — Hint precedence: blocked > collapsed > readOnly > normal.** A collapsed archived tray shows the expand hint (there is something hidden to reveal); expanding restores the archived read-only hint, matching decisions 7 and 11.
 - **D7 — No height animation**, per owner round-1 `#interaction`; only the chevron rotates.
 - **D8 — No new primitive, no config, no backend.** The repo has no Collapsible primitive and the house pattern is hand-rolled (`docs/plans/pr-diff-collapsible-sticky-headers.md:28,34`). Collapse is chrome, so it stays out of the preferences API and out of `task.backlog`.
+- **D9 — Stable accessible name (action + count), hint as the description.** The toggle carries `aria-label={collapsed ? "Expand" : "Collapse"} backlog, N saved message(s)` and `aria-describedby` points at the hint span. Without the label the button's name would be its whole text content, and the blocked hint `save or cancel your edit first` would make `getByRole("button", { name: "Cancel" })` in the same panel ambiguous (a real strict-mode collision in `e2e/at-file-autocomplete.spec.ts` during the test-loop round). The count stays in the name so a screen reader still hears how many drafts are saved; name and description stay separate and the visible copy is unchanged.
 
 Evidence vs reasoning: C1–C7 and D1–D7 rest on the owner's grill answers; the layout claims (C4, D2) rest on the verified flex structure at `RunPanel.tsx:4465,5003,571-576`; the test-layer claim rests on `bunfig.toml` and the absence of a DOM harness.
 
@@ -230,8 +238,12 @@ bunx playwright install chromium
 bun run typecheck
 bun test
 
-bunx playwright test e2e/backlog-collapse.spec.ts
-bunx playwright test e2e/task-switch-during-restore.spec.ts -g "saved backlog draft"
+# `bunx playwright` resolves the CLI's node shebang to plain Node, which cannot
+# import `bun:sqlite` (e2e/fixtures.ts) and dies with "Only URLs with a scheme in:
+# file, data, and node are supported … Received protocol 'bun:'". Run the CLI
+# through Bun explicitly:
+bun node_modules/playwright/cli.js test e2e/backlog-collapse.spec.ts
+bun node_modules/playwright/cli.js test e2e/task-switch-during-restore.spec.ts -g "saved backlog draft"
 ```
 
 Playwright starts the shared Vite server itself (`playwright.config.ts`'s `webServer`); each worker gets its own headless Bun backend + data dir (`e2e/fixtures.ts`), so no manual `dev` server is needed. For manual UI checks: `bun run dev:hmr` (Vite + Electrobun; API :4318, data dir `~/.agetor-dev`); save several drafts, then verify collapse/expand, the edit block, task switch, empty reset, archived mode, and the 420 px minimum width. `e2e/at-file-autocomplete.spec.ts` is serial and heavy; its tray-editor scenario is not required locally, but it must stay green in CI (the diff does not touch `BacklogItemRow`).
@@ -239,7 +251,7 @@ Playwright starts the shared Vite server itself (`playwright.config.ts`'s `webSe
 ## 6. Execution waves
 
 - **Wave 1 — I1** (implementation + doc). Single agent. Barrier: `bun run typecheck` green and `bun test` green; commit a checkpoint. This wave is green without the new e2e spec because no existing behavior changes.
-- **Wave 2 — T1** (new spec). Depends on I1. Barrier: the red-proof sequence done, then `bunx playwright test e2e/backlog-collapse.spec.ts` green and the targeted `task-switch-during-restore` scenario green; commit a checkpoint.
+- **Wave 2 — T1** (new spec). Depends on I1. Barrier: the red-proof sequence done, then `bun node_modules/playwright/cli.js test e2e/backlog-collapse.spec.ts` green and the targeted `task-switch-during-restore` scenario green; commit a checkpoint.
 - **Delivery slice:** one PR. The change is well under the ~1,500-line review threshold (one component + one doc paragraph + one spec), so no stacked PRs. The current branch `feature/agetor-collapse-expand-messages-backlog` at `46dbe0f4` is the base; `implement`/`execute-plan` may create its own branch from that SHA.
 
 No two tasks in a wave own the same file: wave 1 owns `RunPanel.tsx` + the architecture doc; wave 2 owns only the new spec.
