@@ -253,7 +253,10 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
 
               <TaskLaunchPickers
                 launch={launch}
-                onManagePipelines={() => { void managePipelines(); }}
+                // `onManagePipelines` is optional (see the prop comment): a
+                // mount without it must render no manage row, not one that
+                // closes this dialog and goes nowhere.
+                onManagePipelines={onManagePipelines ? () => { void managePipelines(); } : undefined}
                 disabled={submitting}
               />
 

@@ -6,7 +6,7 @@
 | Source | Pipeline step task text ("Add the Pipeline picker on the Work on this with Agetor button's modal…") + `docs/plans/pipeline-picker-git-modals-investigation.md` + `docs/plans/pipeline-picker-git-modals-grill.md` (rounds 1–2 under `docs/plans/pipeline-picker-git-modals-grill/`) |
 | Flags | none |
 | Gates | grilled + owner-settled (12 decisions, no open owner questions); plan approved for execution by this pipeline step |
-| Status | implemented — typecheck + focused/guard e2e green; `bun test` 11754 pass / 2 pre-existing unrelated failures (`daemon-handoff`, `orchestrator-opencode-server`) |
+| Status | implemented — test-loop green: `bun run typecheck`, full `bun test` (11757 pass / 30 environment-gated skips / 0 fail across 459 files), focused e2e (17) and guard e2e (52) all pass; review fix applied to T5's optional `onManagePipelines` contract |
 | Branch | `feature/agetor-run-pipeline-from-git-integration` |
 | Base SHA | `a5593d16` |
 
@@ -299,4 +299,5 @@ Plan-level assumptions (all from the grill or code evidence; none blocks executi
 
 1. **`WorktreeOptions`/`BranchPicker` gained explicit base-ref dirty tracking** (`baseRefDirty` + an optional `onAutoSelect` prop). Reason: §8 assumption 4 claimed `resetForOpen()` restores `baseRef: ""`, so a non-empty ref meant "user changed it" — but `BranchPicker` auto-selects the repo's current branch as soon as the branch list loads, which made every freshly opened issue dialog read dirty and always ask before "Manage pipelines…". The new flag marks only a user pick (and `resetForOpen`/`resetAfterSubmit` clear it), keeping the planned dirty definition accurate. Both changes are additive and default-inert for `NewTaskForm` (same values, no behavior change).
 2. **`e2e` helpers tolerate `GitHubDialog`'s surviving detail view.** Reason: the dialog deliberately keeps its last detail view across a close/reopen, which the manage-row tests hit after navigating to Pipelines and back; the helpers wait for either the list-view Project combobox or the detail's launch button instead of assuming a fresh list. Test-only.
+3. **`onManagePipelines` is forwarded to `TaskLaunchPickers` only when the caller supplies it** (both Git launch dialogs). Reason: the prop's own doc comment and T5's acceptance promise that a mount without it renders no manage row; the first implementation always passed a handler, so such a mount would have shown a row that closed the draft dialog and went nowhere. Inert in production (`App.tsx` always supplies `onOpenPipelines`), and not e2e-coverable because the only mount is `GitHubDialog` via `App`; found during the test-loop review and re-validated by typecheck + the focused/guard suites.
 
