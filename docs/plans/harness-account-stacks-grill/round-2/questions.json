@@ -1,0 +1,561 @@
+{
+  "version": 1,
+  "id": "harness-account-stacks-grill-r2",
+  "title": "Grill — Harness account stacks (round 2: push-back + remaining shape)",
+  "skill": "grill",
+  "slug": "harness-account-stacks",
+  "round": 2,
+  "summary": "Round 1 settled the stack model, the v1 kinds (Claude + Codex), the limit signals, mid-turn continuation, exact session transfer and the all-exhausted behavior. Four answers went against the evidence and need a second look before they can go into the plan:\n\n- **Copy credential files** — this makes the backup authenticate as the primary account, so it shares the primary's quota and does not provide failover.\n- **Mirror everything, including settings and hooks** — hooks execute shell code and `settings.json` `env` can carry API keys.\n- **Claude + Codex only** — but the acceptance default you confirmed still mentions an OpenCode adapter.\n- **No maximum stack size** — fine for the data, but the UI cannot assume a short list.\n\nThere are also **7 remaining shape decisions** (after-swap direction, HOME-override git/ssh, swap notice, orphaned work, lifecycle, manual switches, synthetic prompt) and **5 defaults** at the end.",
+  "proven": [
+    "Round 1 settled: an **implicit chain attached to each account**; **same-kind only**; **Claude Code + Codex** for v1; **preempt Claude's auto-continue** and swap immediately; limits are **quota + 429 + 402/credits** only; mid-turn uses **exact continuation**; history means the **exact provider session**; all-exhausted is **auto-retry at the earliest reset, cap 3**; name is **harness stack**; no maximum size; the task stays running with a suppressed failure toast; the swap intent is persisted and boot-reconciled.",
+    "The acceptance answer carries a note: tests do **not** need a real Claude account. The repo already has fake drivers (`AGETOR_CLAUDE_DRIVER=fake`, `AGETOR_CODEX_DRIVER=fake`) and `AGETOR_FAKE_CLAUDE_API_ERROR`; the plan will use those, not live credentials."
+  ],
+  "sections": [
+    {
+      "id": "pushback",
+      "title": "Push-back on round-1 overrides",
+      "intro": "These are the answers that conflict with the investigation or with each other. Each one changes the plan's security or scope, so I would rather re-ask than silently build it.",
+      "questions": [
+        {
+          "id": "credentials-recheck",
+          "type": "single",
+          "title": "Copying the primary's credential files makes the backup the same provider account. Do you still want that?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "A provider token identifies an account, not a machine. If the backup uses the primary's token, it consumes the primary's quota and hits the same limit, so the train has no extra capacity. The token also lands in an agent-writable home, and copying it may violate provider terms.",
+          "context": "In round 1 you chose **Copy credential files between homes** over each member using its own login. The investigation's security assumption is the opposite: never copy `.credentials.json`, `auth.json`, `cli-config.json`, OpenCode's credential tables or any token blob. The practical contradiction: a backup account is supposed to be a *different account* with its own quota. If it authenticates with the primary's token, the provider sees one account and the 5-hour/weekly limit is shared. That is useful for a second CLI install of the same login, but it is not failover.",
+          "evidence": [
+            {
+              "label": "the investigation's credential boundary",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 152,
+              "lang": "md",
+              "code": "2. **Each member is already logged in and configured for itself.** Agetor must never copy `.credentials.json`, `auth.json`, `cli-config.json`, the OpenCode account/credential tables or any token blob between accounts. If a member is logged out, it is skipped (or the swap fails with a clear message), not repaired by copying another account's auth."
+            },
+            {
+              "label": "only the master token is scrubbed today",
+              "path": "src/bun/core-spawn.ts",
+              "line": 36,
+              "lang": "ts",
+              "code": "export const SCRUBBED_ENV_KEYS: readonly string[] = [\"AGETOR_API_TOKEN\"];"
+            },
+            {
+              "label": "alias credentials are a plain file in an agent-writable home",
+              "path": "src/bun/usage/creds.ts",
+              "line": 44,
+              "lang": "ts",
+              "code": "export function claudeCredentialsPath(harness: Harness): string | null {\n  if (!harness.home) return null;\n  const fresh = path.join(harness.home, \".credentials.json\");\n  if (existsSync(fresh)) return fresh;"
+            }
+          ],
+          "options": [
+            {
+              "id": "own-login",
+              "label": "Each member uses its own login",
+              "description": "Revert to the recommendation: never copy tokens; a logged-out member is skipped with a clear message and the existing harness login flow sets it up.",
+              "consequence": "The backup is a genuinely different account with its own quota. This is the only option that makes the train add capacity."
+            },
+            {
+              "id": "copy-same-account",
+              "label": "Keep copying, but accept it is the same account",
+              "description": "Copy the primary's credential files into the backup's home. The backup authenticates as the primary, shares its quota, and is useful only as a second CLI installation of the same login.",
+              "consequence": "Needs a security review, an explicit warning in the UI, and a name that does not promise failover. The train cannot survive the primary's limit because the backup is the primary."
+            },
+            {
+              "id": "copy-user-provided",
+              "label": "Let the user paste the backup's own token",
+              "description": "The backup's token is obtained from that account separately and stored in its own home; Agetor never reads the primary's credential file.",
+              "consequence": "Still a token in an agent-writable home, but it is a different account and the quota is separate. More manual setup than the existing login flow."
+            },
+            {
+              "id": "keychain-ref",
+              "label": "Share a keychain item by reference",
+              "description": "Point the backup at the primary's keychain item.",
+              "consequence": "Same-account quota problem, and only works for the built-in Claude account; not portable to alias homes or Codex."
+            }
+          ],
+          "recommendation": {
+            "value": "own-login",
+            "reason": "A backup that uses the primary's token is the same account to the provider, so it cannot provide the extra quota the feature exists for; the token-in-an-agent-writable-home problem is a second reason."
+          }
+        },
+        {
+          "id": "mirror-scope",
+          "type": "single",
+          "title": "\"Mirror everything\" includes hooks and permissions, which execute code. What exactly should be mirrored?",
+          "impact": "blocking",
+          "why": "Hooks run arbitrary shell commands on every tool call; permissions change what the agent may do without asking; `settings.json` `env` can carry API keys. Mirroring them into another account's home is a security boundary, not a convenience setting.",
+          "context": "In round 1 you chose **Mirror everything, including settings and hooks** over copying the safe subset. That is a bigger change than it sounds: Claude's `settings.json` can contain `hooks`, `permissions`, `env` and `mcpServers`; Codex's `config.toml` can contain model/provider settings and MCP servers. A mirror that copies `env` could copy a key; a mirror that copies hooks makes the backup execute the primary's code. The investigation's safe-subset option excluded credentials, OAuth tokens, hooks and permissions.",
+          "evidence": [
+            {
+              "label": "what Agetor already discovers per kind",
+              "path": "src/bun/commands.ts",
+              "line": 425,
+              "lang": "ts",
+              "code": "function userSelectors(opts: DiscoveryOpts): DiscoverySelector[] {\n  switch (opts.agent) {\n    case \"claude-code\": {\n      const cfg = claudeConfigDir(opts);\n      return [\n        markdownTree(path.join(cfg, \"commands\")),\n        skillsDir(path.join(cfg, \"skills\")),\n        singleFile(path.join(cfg, \"settings.json\")),\n        singleFile(path.join(cfg, \"plugins\", \"installed_plugins.json\")),\n      ];\n    }"
+            },
+            {
+              "label": "the safe-subset recommendation",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 400,
+              "lang": "md",
+              "code": "- **Inject per kind (larger v1):** Claude `--mcp-config` (merged JSON) + a generated/copied skills/plugin dir; cursor/fx ACP `mcpServers` + skill dir copy; OpenCode share the config dir only (not the data/auth dir); codex config merge; copilot `mcp-config.json`/skills copy; gemini/antigravity selective settings/skills. All must exclude credential files."
+            }
+          ],
+          "options": [
+            {
+              "id": "mirror-safe",
+              "label": "Mirror the safe subset only",
+              "description": "MCP server definitions, skills, commands and plugins; non-executable settings. Exclude hooks, permission rules, `env`, credentials and OAuth tokens.",
+              "consequence": "The backup can use the same tools and skills without inheriting code that runs on every tool call. A backup-local hook/permission set stays the user's choice.",
+              "preview": "MIRROR:  mcpServers, skills/, commands/, plugins/installed_plugins.json\nKEEP LOCAL: hooks, permissions, env, .credentials.json, auth.json"
+            },
+            {
+              "id": "mirror-hooks",
+              "label": "Include hooks and permissions, exclude credentials",
+              "description": "Mirror the full `settings.json`/`config.toml` except credential and token fields.",
+              "consequence": "The backup behaves exactly like the primary, including its hooks and permission posture. Needs a security review, a visible warning, and a per-kind allowlist that strips `env`/token fields."
+            },
+            {
+              "id": "mirror-everything",
+              "label": "Mirror the whole file, including `env`",
+              "description": "Copy `settings.json`/`config.toml` as-is, excluding only the known credential files.",
+              "consequence": "Highest fidelity and highest risk: an `env` block can carry an API key into another account's home. Needs a credential scan and a security review."
+            },
+            {
+              "id": "mirror-safe-manual",
+              "label": "Safe subset, but only on a manual Sync",
+              "description": "Same allowlist as the safe subset, but nothing is copied until the user presses \"Sync from primary\" in Settings.",
+              "consequence": "Most predictable; the user sees exactly when a config moved. A new MCP server does not reach the backup until the user syncs."
+            }
+          ],
+          "recommendation": {
+            "value": "mirror-safe",
+            "reason": "It delivers the tools and skills the backup needs without copying code that executes on every tool call or an `env` block that can carry a key."
+          }
+        },
+        {
+          "id": "v1-kinds-recheck",
+          "type": "single",
+          "title": "You chose Claude + Codex only, but the acceptance default you confirmed mentions an OpenCode adapter. Which is the v1 scope?",
+          "impact": "blocking",
+          "why": "The plan's task list, adapter work and test matrix depend on the exact kind set. An acceptance criterion that names a kind outside the scope will fail the build or silently drop a promised test.",
+          "context": "In round 1 you answered **Claude Code and Codex for now** (overriding the recommended Claude + Codex + OpenCode). Separately, you accepted the acceptance default that says **per-kind adapter tests for Codex and OpenCode**. OpenCode's transfer is proven (S3), but it is the only one of the three that is a *move* rather than a copy, so its adapter is the most expensive. Pick the scope that the plan and the acceptance bar will both use.",
+          "evidence": [
+            {
+              "label": "S3: OpenCode transfer is proven but is a move",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 139
+            },
+            {
+              "label": "your round-1 kind answer",
+              "path": "docs/plans/harness-account-stacks-grill/round-1/answers.json",
+              "line": 54
+            }
+          ],
+          "options": [
+            {
+              "id": "claude-codex",
+              "label": "Claude + Codex only",
+              "description": "Keep your round-1 scope. Drop the OpenCode adapter from v1; the acceptance bar becomes a Claude e2e plus a Codex adapter test.",
+              "consequence": "Smallest v1 and the fastest path. OpenCode users see \"stacks are not supported for this kind yet\"."
+            },
+            {
+              "id": "claude-codex-opencode",
+              "label": "Add OpenCode back",
+              "description": "Use the original recommendation: Claude + Codex + OpenCode, with the acceptance bar as written.",
+              "consequence": "One more adapter and its move-not-merge edge cases; the acceptance bar needs no change."
+            },
+            {
+              "id": "claude-only",
+              "label": "Claude only",
+              "description": "Narrow further to the best-supported kind.",
+              "consequence": "Fastest, but Codex users are excluded even though their transfer is proven."
+            }
+          ],
+          "recommendation": {
+            "value": "claude-codex",
+            "reason": "It respects your explicit scope answer; the acceptance bar should be edited to match rather than quietly keeping a test for a kind that is not in v1."
+          }
+        }
+      ]
+    },
+    {
+      "id": "shape",
+      "title": "Remaining shape decisions",
+      "intro": "These are the lifecycle and UX decisions round 1 did not cover. They change the plan's task list but not the core model.",
+      "questions": [
+        {
+          "id": "after-swap",
+          "type": "single",
+          "title": "After a swap, where does the task run next?",
+          "impact": "shape",
+          "why": "\"Train\" can mean forward-only, wrap-around, or return-to-primary. It decides whether the plan needs reset timers on the task and how much churn a long task sees.",
+          "context": "A stack is ordered. The simplest model: a task moves forward when the current member limits, and a new task starts at the head (skipping cooling members). A reset-aware return adds timers and can bounce a long task between accounts, transferring the session each time. The all-exhausted answer already adds a reset timer for the end of the train.",
+          "options": [
+            {
+              "id": "forward",
+              "label": "Forward only within a task",
+              "description": "Stay on the current member until it limits, then move forward. A new task starts at the head, skipping cooling members.",
+              "consequence": "Predictable, no mid-task bounce. The primary is retried naturally on the next task, not in the middle of the current one."
+            },
+            {
+              "id": "wrap",
+              "label": "Wrap to the first reset member",
+              "description": "After the last member, wrap to the first one whose quota has reset.",
+              "consequence": "Keeps a very long task running, but can bounce between accounts and repeat session transfers."
+            },
+            {
+              "id": "return-primary",
+              "label": "Return to the primary when it resets",
+              "description": "As soon as the primary's quota resets, move the task back to it, even mid-task.",
+              "consequence": "Most \"primary-first\", but the most churn and the most timers. A task could transfer twice in one turn."
+            }
+          ],
+          "recommendation": {
+            "value": "forward",
+            "reason": "A new task already retries the primary; bouncing a live task mid-turn adds transfers and side-effect risk for no quota benefit."
+          }
+        },
+        {
+          "id": "home-tools",
+          "type": "single",
+          "title": "Codex aliases override HOME, so the backup loses `~/.gitconfig`, `~/.ssh`, `~/.config/gh` and `~/.npmrc`. What should v1 do?",
+          "impact": "shape",
+          "why": "Codex is in your v1 set. A swap from the built-in Codex account to an alias can turn a working commit or push into a failure without any provider limit. This is the most visible \"seamless\" gap for the chosen kinds.",
+          "context": "`harnessEnv` sets `HOME=<home>` for Codex (and cursor/fx/antigravity/opencode). Claude, Gemini and Copilot keep the real HOME and only redirect their own config var. A HOME overlay would symlink or copy the standard dotfiles while keeping the CLI's own state dirs separate; the investigation calls it a separate, broad feature. Restricting stacks to accounts with the same HOME profile would prevent the main built-in + alias Codex case.",
+          "evidence": [
+            {
+              "label": "codex re-homes the whole process",
+              "path": "src/bun/agents.ts",
+              "line": 449,
+              "lang": "ts",
+              "code": "} else if (harness.kind === \"codex\") {\n      env.HOME = harness.home;\n      env.CODEX_HOME = path.join(harness.home, \".codex\");"
+            },
+            {
+              "label": "the investigation's options",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 221,
+              "lang": "md",
+              "code": "21. **For kinds that override `HOME` (codex, cursor, fx, antigravity, opencode), must the backup keep the user's git/ssh/gh/npm config?**\n    Why: a full `HOME` override hides `~/.gitconfig`, `~/.ssh`, `~/.config/gh`, etc. A stack moving from the built-in to such an account can no longer commit/sign/push the same way. Options: HOME overlay, restrict stacks to accounts with the same HOME profile, or document the limitation."
+            }
+          ],
+          "options": [
+            {
+              "id": "document-warn",
+              "label": "Document it and warn at stack creation",
+              "description": "No overlay in v1. The stack editor and the first swap show a clear warning that a HOME-override account does not see the main home's git/ssh/gh/npm config.",
+              "consequence": "Smallest scope; the limitation is honest. A Codex backup can still edit files but may fail to commit, sign or push."
+            },
+            {
+              "id": "overlay",
+              "label": "Build a HOME overlay for the five kinds",
+              "description": "Give each alias home a shared overlay that symlinks the standard dotfiles (`~/.gitconfig`, `~/.ssh`, `~/.config/gh`, `~/.npmrc`) while keeping the CLI's own state dirs separate.",
+              "consequence": "Closest to seamless and the best fit for Codex, but it is a broad, security-sensitive feature: symlinks into `.ssh` and `.config/gh`, per-account setup, and tests for every HOME-override kind."
+            },
+            {
+              "id": "restrict",
+              "label": "Only stack accounts with the same HOME profile",
+              "description": "A built-in Codex account cannot be stacked with a HOME-override alias.",
+              "consequence": "No broken git/ssh, but it blocks the main built-in + backup Codex case, which is the reason to build the feature."
+            }
+          ],
+          "recommendation": {
+            "value": "document-warn",
+            "reason": "The overlay is a separate, broad feature; v1 should not silently promise it. The warning is cheap and keeps the limitation visible at the moment the stack is created."
+          }
+        },
+        {
+          "id": "swap-notice",
+          "type": "single",
+          "title": "What should the in-transcript swap message look like?",
+          "impact": "shape",
+          "why": "The notice is the user's only proof the swap happened. The existing `status` stream is persisted and already rendered by the RunPanel, the CLI and the TUI; a dedicated card needs a new event shape and three renderers.",
+          "context": "RunPanel renders `status` events as a muted `StatusDivider`; `isInternalStatusSentinel` suppresses internal sentinel lines, so a visible swap line must not use one of those prefixes. The status stream is also what `agetor logs` and the TUI render. A structured payload (from/to/reason/position/reset) can still be a divider and give all three surfaces the data for free.",
+          "evidence": [
+            {
+              "label": "the existing divider",
+              "path": "src/mainview/components/kanban/RunPanel.tsx",
+              "line": 6854,
+              "lang": "tsx",
+              "code": "const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {\n  const content = useMemo(() => renderLinkified(text), [text]);\n  return (\n    <div className=\"flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground\">"
+            },
+            {
+              "label": "status is the persisted transcript channel",
+              "path": "src/shared/types.ts",
+              "line": 5255,
+              "lang": "ts",
+              "code": "export type RunEventStream =\n  | \"stdout\"\n  | \"stderr\"\n  | \"status\"\n  | \"interaction\"\n  | \"interaction_resolved\"\n  | \"user\"\n  | \"assistant\"\n  | \"thinking\"\n  | \"tool_use\"\n  | \"tool_result\"\n  | \"subagent\"\n  | \"compaction_summary\";"
+            },
+            {
+              "label": "internal sentinels are suppressed",
+              "path": "src/shared/types.ts",
+              "line": 239,
+              "lang": "ts",
+              "code": "export function isInternalStatusSentinel(data: string): boolean {\n  return (\n    data.startsWith(PERMISSION_MODE_STATUS_PREFIX) ||\n    data.startsWith(FX_USAGE_STATUS_PREFIX) ||\n    data.startsWith(FX_PROVIDER_STATUS_PREFIX) ||\n    data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX) ||\n    data.startsWith(FX_RECOVERY_STATUS_PREFIX)\n  );\n}"
+            }
+          ],
+          "options": [
+            {
+              "id": "divider",
+              "label": "A status divider with structured text",
+              "description": "e.g. `Switched to Codex — Work · limit reached · 2/3`. Persisted on the `status` stream; rendered by the RunPanel, CLI and TUI.",
+              "consequence": "Cheapest and consistent with existing status lines. No new event type; the CLI/TUI get it for free."
+            },
+            {
+              "id": "card",
+              "label": "A dedicated card",
+              "description": "A richer block with from/to, reason, reset time and actions (switch back, pin to this account).",
+              "consequence": "Nicer in the RunPanel, but a new event shape and three renderers; the CLI/TUI need a fallback."
+            },
+            {
+              "id": "both",
+              "label": "Divider in the transcript, card in the run panel",
+              "description": "The divider is the durable record; the card is the interactive surface.",
+              "consequence": "Most complete, but both implementations and a rule for when each appears."
+            }
+          ],
+          "recommendation": {
+            "value": "divider",
+            "reason": "The user asked for a message in the middle of the task messages; the status stream already gives that on every surface, and a structured payload leaves room for a card later."
+          }
+        },
+        {
+          "id": "orphans",
+          "type": "single",
+          "title": "What happens to pending permission/question cards, running background agents, and queued follow-ups when the account swaps?",
+          "impact": "shape",
+          "why": "They belong to the old session and cannot move with the transcript. Dropping a user's typed follow-up loses work; carrying a permission card to a different process is impossible; waiting for a background agent can delay the failover forever.",
+          "context": "`dropSession` orphans subagents; `reconcileTaskSession` currently drops every queued follow-up on a harness change but does not call `cancelPendingForTask`. The swap path must be more careful than the manual switch: cancel the old session's cards, keep the user's typed follow-ups, and name any abandoned background agents in a status line.",
+          "evidence": [
+            {
+              "label": "the existing drain order",
+              "path": "src/bun/orchestrator.ts",
+              "line": 3488,
+              "lang": "ts",
+              "code": "async function drainFollowUpQueues(taskId: string, runId: string, wasCancelled: boolean): Promise<void> {"
+            },
+            {
+              "label": "a manual harness change drops the queue today",
+              "path": "src/bun/orchestrator.ts",
+              "line": 3637,
+              "lang": "ts",
+              "code": "if (before.agent !== after.agent) {\n    // Any queued codex/cursor/gemini/antigravity/opencode/copilot/fx follow-ups\n    // belong to the old agent — drop them so a later drain doesn't spawn\n    // them against the new harness."
+            }
+          ],
+          "options": [
+            {
+              "id": "keep-queue",
+              "label": "Cancel cards, keep follow-ups, name abandoned agents",
+              "description": "Cancel pending permission/question cards on the old account; keep the user's queued follow-ups and drain them after the new run settles; abandon background agents with a status line naming them.",
+              "consequence": "The user's typed text is not lost, and the swap is not blocked by a subagent that may never finish. The abandoned agent's work is visible, not silent."
+            },
+            {
+              "id": "stash",
+              "label": "Move follow-ups to the backlog tray",
+              "description": "Cancel cards and put queued follow-ups back in the task's backlog so the user decides when to send them.",
+              "consequence": "Safest for intent, but the user has to re-send; the task does not continue seamlessly."
+            },
+            {
+              "id": "cancel-all",
+              "label": "Cancel cards and drop the queue",
+              "description": "The current manual-switch behavior.",
+              "consequence": "Simple, but loses the user's typed text at the worst moment."
+            },
+            {
+              "id": "wait",
+              "label": "Wait for background agents first",
+              "description": "Delay the swap until running subagents finish (or a timeout).",
+              "consequence": "Avoids abandoning work, but the failover can be delayed indefinitely and the old account is already limited."
+            }
+          ],
+          "recommendation": {
+            "value": "keep-queue",
+            "reason": "It preserves the user's text and the task's momentum while being honest about the background work that cannot move."
+          }
+        },
+        {
+          "id": "lifecycle",
+          "type": "single",
+          "title": "When a stack is created or a member is disabled, deleted, reordered or removed, when do tasks pick up the change?",
+          "impact": "shape",
+          "why": "Under the implicit model a stack is a property of the account, so adding a backup silently changes every existing task on that account. This decides whether that is immediate, next-turn, or only for new tasks.",
+          "context": "A running turn is on a live process; a new turn resolves `Task.agent` again. Disabling a harness skips it for new runs but leaves in-flight runs alone. Deleting a harness is already refused if any task or profile references the row (`harnesses.delete`). Removing a member that no task currently uses is safe; removing the active member of a running task is not.",
+          "evidence": [
+            {
+              "label": "delete refuses while tasks/profiles reference the row",
+              "path": "src/bun/db.ts",
+              "line": 2219,
+              "lang": "ts",
+              "code": "delete(id: string): void {\n    const current = this.get(id);\n    if (!current) return;\n    if (current.isBuiltin) throw new HarnessBuiltinError(\"delete\");\n    const inUse = db\n      .query<{ id: string }, [string]>(\n        `SELECT id FROM tasks WHERE agent = ?`,\n      )\n      .all(id);"
+            },
+            {
+              "label": "a disabled harness refuses new runs only",
+              "path": "src/shared/types.ts",
+              "line": 392,
+              "lang": "ts",
+              "code": "/** Soft-delete flag. Disabled harnesses are hidden from the New Task\n   *  picker, the default-harness selector, and the window topbar, but the\n   *  row stays in the DB so historical `tasks.agent = <id>` references\n   *  keep resolving. The orchestrator refuses to start new runs on a\n   *  disabled harness; in-flight runs are unaffected."
+            }
+          ],
+          "options": [
+            {
+              "id": "next-turn",
+              "label": "At the next turn",
+              "description": "Existing tasks use the new stack/membership at their next turn; the in-flight turn finishes on the current account. Disabling skips the member; removing it from the stack applies to the next selection; deleting it removes the membership (the existing delete check still protects a row a task is on).",
+              "consequence": "No killed turns and no surprise mid-turn moves. A task already running on a member that was just disabled finishes its current turn, then moves on."
+            },
+            {
+              "id": "new-tasks-only",
+              "label": "Only tasks created after the change",
+              "description": "Existing tasks keep a snapshot of the stack as it was when they were created.",
+              "consequence": "Predictable for existing work, but needs a per-task snapshot and makes the account's stack membership inconsistent across tasks."
+            },
+            {
+              "id": "immediate",
+              "label": "Repoint in-flight tasks immediately",
+              "description": "Kill the current turn and move it to the next member.",
+              "consequence": "Not seamless; can duplicate or lose work. Only makes sense for a manual \"switch now\" action."
+            },
+            {
+              "id": "refuse",
+              "label": "Refuse membership changes while tasks reference the member",
+              "description": "Deleting/disabling/reordering a member is blocked until every task on it is idle or moved.",
+              "consequence": "Safest for live work, but makes stack cleanup painful and blocks a user who just wants to remove a backup."
+            }
+          ],
+          "recommendation": {
+            "value": "next-turn",
+            "reason": "It matches the existing disabled-harness semantics and never kills a live turn; the delete check already protects a row a task is actually on."
+          }
+        },
+        {
+          "id": "manual-switch",
+          "type": "single",
+          "title": "When the user manually switches a task to another member of the same stack, should the conversation be preserved?",
+          "impact": "shape",
+          "why": "Today any harness-id change kills the session and drops queued follow-ups. If a manual switch inside a stack behaves differently from an automatic swap, the stack's promise becomes inconsistent.",
+          "context": "`reconcileTaskSession` treats any harness-id change as a session-killing event, including a same-kind alias swap, and drops every queued follow-up. A manual switch inside the stack could use the same transfer path as an automatic swap; a switch outside the stack should keep today's reset behavior.",
+          "evidence": [
+            {
+              "label": "any harness change kills the session",
+              "path": "src/bun/orchestrator.ts",
+              "line": 3634,
+              "lang": "ts",
+              "code": "// Treat any harness id change as a session-killing event for claude — the\n  // alias's HOME/env block changes, so the on-disk JSONL & login differ. Even\n  // same-kind alias swaps (claude-work → claude-personal) need a fresh tmux.\n  if (before.agent !== after.agent) {"
+            }
+          ],
+          "options": [
+            {
+              "id": "preserve",
+              "label": "Preserve within the stack, reset outside",
+              "description": "A manual switch to a member of the same stack uses the transfer path and keeps the queue; a switch to an account outside the stack keeps today's reset behavior.",
+              "consequence": "Consistent with automatic swaps and with the stack's promise. Needs the manual path to distinguish \"same stack\" from \"different account\"."
+            },
+            {
+              "id": "reset",
+              "label": "Keep today's reset behavior",
+              "description": "Only automatic swaps preserve the conversation; any manual switch starts fresh.",
+              "consequence": "Simpler and matches the current rule, but a user who manually picks the backup loses the context the stack just promised."
+            }
+          ],
+          "recommendation": {
+            "value": "preserve",
+            "reason": "A manual switch between members of the same stack is the same move as an automatic swap; making it reset would be the surprising behavior."
+          }
+        },
+        {
+          "id": "synthetic-prompt",
+          "type": "single",
+          "title": "Should the synthetic \"continue\" prompt be visible in the transcript?",
+          "impact": "shape",
+          "why": "Agetor's rule is that it never adds its own text to a user message. A continuation prompt is a new exception, and a later JSONL rebuild must be able to tell it apart from a real user message.",
+          "context": "The only machine-added text today is the references heading, the agent-instructions wrapper, the issue warning, the pipeline step prompt and the handoff reminder. A hidden prompt needs a tag (e.g. `harness_swap`) in `user-message.ts` or a run-level synthetic flag. The swap notice is the visible record either way.",
+          "evidence": [
+            {
+              "label": "the no-added-text rule",
+              "path": "CLAUDE.md",
+              "line": 92,
+              "lang": "md",
+              "code": "- **Agetor never adds its own text to a message, and nothing it puts in a prompt names the product**, for any harness. The only machine-added text around a prompt is the references block heading, the `<agent_instructions_defined_by_the_user>` wrapper, the issue-thread untrusted-content warning, and the pipeline step prompt and handoff reminder."
+            }
+          ],
+          "options": [
+            {
+              "id": "hidden-tagged",
+              "label": "Hidden from the transcript, tagged in storage",
+              "description": "The continuation prompt is stored as a synthetic user message with a `harness_swap` tag; the visible record is the swap notice.",
+              "consequence": "Clean transcript, and a rebuild can distinguish it. Needs the tag in the shared user-message parser and a renderer rule."
+            },
+            {
+              "id": "visible-system",
+              "label": "Visible as a system block",
+              "description": "Render a small system block: \"Agetor asked the backup to continue from the transferred session.\"",
+              "consequence": "Transparent, but adds noise to every swap and needs a new renderer in the RunPanel/CLI/TUI."
+            },
+            {
+              "id": "no-prompt",
+              "label": "No synthetic prompt",
+              "description": "Resume the session without any added text.",
+              "consequence": "Some providers will not continue a turn without a user message; the backup may sit idle or repeat the last turn."
+            }
+          ],
+          "recommendation": {
+            "value": "hidden-tagged",
+            "reason": "The swap notice is the user-facing record; the continuation prompt is machinery, and tagging it keeps the no-added-text rule honest."
+          }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Defaults that follow from round 1. One click each, or override with what it should be.",
+      "questions": [
+        {
+          "id": "proactive-reactive",
+          "type": "confirm",
+          "title": "How is the next member chosen?",
+          "recommendation": {
+            "value": "Both: skip a member whose cached quota clearly says exhausted, and react to a failure as the backstop. A stale or missing snapshot never blocks a run on its own.",
+            "reason": "Only three kinds have quota and the poll is 10 minutes old; proactive is an optimization, reactive is the guarantee."
+          }
+        },
+        {
+          "id": "exhaustion-scope",
+          "type": "confirm",
+          "title": "Is exhaustion account-global or per task?",
+          "recommendation": {
+            "value": "Account-global: a new `harness_limit_state` table (no FK, like `harness_usage`) with `exhausted_until_ms`, reason, source and message. Selection skips a cooling account in every task; it clears on a successful turn or on expiry. No concurrency reservation in v1.",
+            "reason": "Quota is account-global; a per-task cooldown would make N tasks each discover the same limit and swap to the same backup."
+          }
+        },
+        {
+          "id": "max-size-followup",
+          "type": "confirm",
+          "title": "What follows from \"no maximum\" stack size?",
+          "recommendation": {
+            "value": "No hard cap. The stack editor virtualizes long lists and shows a warning above 10 members; the swap UI shows position/count; selection stays O(n) per turn.",
+            "reason": "No maximum is fine for the data, but the picker, the editor and the topbar must not assume a short list."
+          }
+        },
+        {
+          "id": "rollout",
+          "type": "confirm",
+          "title": "What is the rollout gate?",
+          "recommendation": {
+            "value": "No global feature flag. Stacks are opt-in by creating one, so an existing user sees no behavior change until they build a stack.",
+            "reason": "The feature is inert without a stack; a flag would add a second code path for no safety benefit."
+          }
+        },
+        {
+          "id": "per-task-opt-out",
+          "type": "confirm",
+          "title": "Can a single task opt out of failover?",
+          "recommendation": {
+            "value": "No per-task opt-out in v1. A task that must stay on one account uses an account that is not in a stack.",
+            "reason": "The implicit model makes the stack a property of the account; a per-task flag adds a column and a UI control for a rare case."
+          }
+        }
+      ]
+    }
+  ]
+}

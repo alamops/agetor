@@ -1,0 +1,300 @@
+{
+  "version": 1,
+  "id": "harness-account-stacks-grill-r3",
+  "title": "Grill — Harness account stacks (round 3: boundaries + parity)",
+  "skill": "grill",
+  "slug": "harness-account-stacks",
+  "round": 3,
+  "summary": "Round 2 resolved the security door: **each member keeps its own login**, and the harness account/limits stay separate. Two answers added scope that needs a precise boundary before Planning:\n\n- **Mirror the whole config file** — but your note says *tool* auth (MCP/plugin OAuth) should travel while the *harness* login must not. `settings.json` `env` can contain `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`, which is harness auth, so the mirror needs a key-level rule.\n- **Build a HOME overlay** — v1 only stacks Claude + Codex, so I need to know whether to build it for Codex now or all five HOME-override kinds, and whether it symlinks or copies.\n\nThere are also **2 behavior checks** (the circular train cap, and the CLI/indicator/parity defaults) and **11 one-click defaults** at the end.",
+  "proven": [
+    "Round 2 settled: **own login per member**, never copy harness credentials; **Claude + Codex only** (OpenCode out of v1); **forward within a task, circular wrap at the end, one full lap cap**; **status divider** for the swap notice; **keep queued follow-ups, cancel cards, name abandoned agents**; **next-turn lifecycle**; **preserve the conversation on a manual stack-internal switch**; **hidden-tagged continuation prompt** with no product name; **proactive + reactive selection**; **account-global cooldown**; **no hard stack cap but a virtualized UI and a warning above 10**; **opt-in by creating a stack**; **no per-task opt-out**."
+  ],
+  "sections": [
+    {
+      "id": "boundaries",
+      "title": "Boundaries for the two new scope items",
+      "intro": "These pin what \"mirror everything\" and the HOME overlay actually mean, so the plan does not guess.",
+      "questions": [
+        {
+          "id": "mirror-env-keys",
+          "type": "single",
+          "title": "`mirror-everything` copies `settings.json` `env`, which can contain harness API keys. Should the mirror strip harness-auth keys?",
+          "impact": "blocking",
+          "why": "Your round-2 note says the harness login/account must stay separate so each account has its own limits. A copied `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` makes the backup use the primary's account and share its quota, which is exactly the separation you asked for. MCP/plugin OAuth tokens are different: they authenticate a tool, not the harness.",
+          "context": "`settings.json` is already one of the user-level files Agetor discovers. Its `env` block is a common place to put provider keys. The mirror can copy the file but filter the `env` keys: strip the known harness-auth keys, keep MCP/plugin tokens and ordinary env vars. The alternative is to copy `env` verbatim, which reintroduces the same-account problem at the config layer.",
+          "evidence": [
+            {
+              "label": "settings.json is a user-level capability file",
+              "path": "src/bun/commands.ts",
+              "line": 432,
+              "lang": "ts",
+              "code": "singleFile(path.join(cfg, \"settings.json\")),"
+            },
+            {
+              "label": "provider keys in the process env already leak into every harness",
+              "path": "src/bun/core-spawn.ts",
+              "line": 36,
+              "lang": "ts",
+              "code": "export const SCRUBBED_ENV_KEYS: readonly string[] = [\"AGETOR_API_TOKEN\"];"
+            },
+            {
+              "label": "the investigation's warning",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 109,
+              "lang": "md",
+              "code": "Provider env vars (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, …) set in Agetor's own process environment are **inherited by every harness** unless the harness's env overrides them. This can silently make every account use one API key — a cross-account auth leak to account for when defining \"auth tokens preserved\"."
+            }
+          ],
+          "options": [
+            {
+              "id": "strip-harness-keys",
+              "label": "Strip harness-auth keys, keep tool auth and other env",
+              "description": "Copy `env` but remove the known harness-auth keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `CURSOR_API_KEY`, …). Keep MCP/plugin OAuth and ordinary env vars.",
+              "consequence": "Honors \"tool auth travels, harness login does not\". Needs a maintained key list and a test that the backup never inherits a harness key."
+            },
+            {
+              "id": "copy-env-verbatim",
+              "label": "Copy `env` as-is",
+              "description": "The backup inherits every env var in the primary's settings, including any harness API key.",
+              "consequence": "Simplest, but the backup may silently use the primary's key and share its quota — the same-account problem you just ruled out for credentials."
+            },
+            {
+              "id": "exclude-env",
+              "label": "Do not copy `env` at all",
+              "description": "The backup keeps its own env; only the rest of the settings file is mirrored.",
+              "consequence": "Safest for auth, but tooling that relies on non-auth env vars loses them."
+            }
+          ],
+          "recommendation": {
+            "value": "strip-harness-keys",
+            "reason": "It is the only option that matches your note: MCP/plugin auth travels, the harness account does not."
+          }
+        },
+        {
+          "id": "mirror-when",
+          "type": "single",
+          "title": "When should the mirror run?",
+          "impact": "shape",
+          "why": "A one-time copy at stack creation is stale; a live merge on every spawn can overwrite backup-local changes without review; a manual Sync is predictable but easy to forget before a swap.",
+          "context": "The owner chose `mirror-everything`, so the question is cadence and conflict resolution, not whether. The backup is about to run at swap time; that is when it needs the primary's current MCP servers, skills and tool auth. A merge that keeps backup-only entries and lets the primary win on shared keys is the least surprising.",
+          "options": [
+            {
+              "id": "create-and-swap",
+              "label": "At stack creation and before each swap",
+              "description": "Mirror when the stack is created and re-sync immediately before a swap. The primary wins for entries it defines; entries that exist only on the backup are kept.",
+              "consequence": "The backup is current at the moment it is needed, and a backup-local extra is not deleted. A swap takes a little longer while the mirror runs."
+            },
+            {
+              "id": "manual",
+              "label": "Only on a manual \"Sync from primary\"",
+              "description": "Nothing is copied until the user presses the button in Settings.",
+              "consequence": "Most predictable, but a stale backup can miss a newly added MCP server at the worst moment."
+            },
+            {
+              "id": "live",
+              "label": "Merge on every spawn",
+              "description": "Every turn reads the primary's config and merges it into the backup's launch.",
+              "consequence": "Always current, but a primary change takes effect with no review and can overwrite a backup-local customization mid-task."
+            }
+          ],
+          "recommendation": {
+            "value": "create-and-swap",
+            "reason": "It keeps the backup current at the only moment that matters (the swap) while keeping the sync observable and repeatable."
+          }
+        },
+        {
+          "id": "home-overlay-scope",
+          "type": "single",
+          "title": "What should the HOME overlay share, and for which kinds?",
+          "impact": "blocking",
+          "why": "The overlay is a new, security-sensitive subsystem: it puts links to the user's `.ssh`, `.gitconfig`, `gh` and npm config inside an agent-writable home. v1 only stacks Claude + Codex, so building and testing all five HOME-override kinds now is scope the feature cannot exercise yet.",
+          "context": "The owner chose the overlay in round 2. Codex is the only v1 kind that overrides HOME; cursor, fx, antigravity and opencode are out of v1. The overlay must not merge the CLI's own state dirs (`CODEX_HOME`, `~/.cursor`, `~/.fx`, the OpenCode XDG dirs) — those stay per-account. A fixed allowlist is predictable and testable; a full-home symlink is closer to \"same environment\" but hard to enumerate and easy to get wrong.",
+          "evidence": [
+            {
+              "label": "codex re-homes HOME",
+              "path": "src/bun/agents.ts",
+              "line": 449,
+              "lang": "ts",
+              "code": "} else if (harness.kind === \"codex\") {\n      env.HOME = harness.home;\n      env.CODEX_HOME = path.join(harness.home, \".codex\");"
+            },
+            {
+              "label": "the investigation calls the overlay a separate, broad feature",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 401,
+              "lang": "md",
+              "code": "- **HOME overlay for HOME-override kinds:** a per-account HOME that symlinks/copies standard dotfiles (`~/.gitconfig`, `~/.ssh`, `~/.config/gh`, …) but keeps the CLI's own state dirs separate. This is a separate, broad feature; without it, mixing built-in and alias accounts changes the tool environment."
+            }
+          ],
+          "options": [
+            {
+              "id": "codex-allowlist",
+              "label": "Codex only, fixed allowlist, symlinked",
+              "description": "Implement the overlay for Codex in v1: symlink `~/.gitconfig`, `~/.gitignore_global`, `~/.ssh`, `~/.config/gh`, `~/.npmrc` and `~/.netrc` into the account's home; keep `CODEX_HOME` per-account. Apply it only to accounts that are stack members, so existing aliases keep today's behavior.",
+              "consequence": "The v1 kind gets working git/ssh/gh without changing any other account. A generic module can add the other four when they join a stack."
+            },
+            {
+              "id": "all-five-allowlist",
+              "label": "All five HOME-override kinds now",
+              "description": "Same allowlist, applied to Codex, Cursor, fx, Antigravity and OpenCode.",
+              "consequence": "Fixes the limitation everywhere, but four of the five have no v1 stack support and cannot be exercised end-to-end. Larger test matrix."
+            },
+            {
+              "id": "copy-allowlist",
+              "label": "Codex only, copy instead of symlink",
+              "description": "Copy the allowlisted files into each account home.",
+              "consequence": "No live links, but the copies go stale and a copied `.ssh` key or `gh` token sits in another home."
+            },
+            {
+              "id": "full-home",
+              "label": "Symlink the whole home except the CLI state dirs",
+              "description": "Closest to the real environment; everything not owned by the CLI is visible.",
+              "consequence": "Most faithful and the hardest to secure: enumerating what to exclude is error-prone, and a missed exclusion can merge CLI state or credentials between accounts."
+            }
+          ],
+          "recommendation": {
+            "value": "codex-allowlist",
+            "reason": "It delivers the overlay for the only v1 kind that needs it, with a small, testable allowlist and no behavior change for existing aliases."
+          }
+        },
+        {
+          "id": "after-swap-lap",
+          "type": "single",
+          "title": "Confirm the circular train: forward, wrap to the head at the end, and stop after one full lap?",
+          "impact": "shape",
+          "why": "Your round-2 note adds a wrap that the original \"forward only\" option did not describe. The exact algorithm decides whether a run can loop forever and when the all-exhausted pause starts.",
+          "context": "Your note: \"it must return to the primary only if the last stack account reaches the limit, then a natural swap to the beginning of the stack happens, ie. going to the primary. We just need to make sure that if all accounts are tried in a run, to avoid running the train in loop, we must pause, as a cap.\" The algorithm below implements exactly that: move forward on each limit; when the last member limits, wrap to the head if it is available; track the members tried in this run; once every member has been tried without a successful turn, stop and use the all-exhausted behavior (auto-retry at the earliest reset, cap 3).",
+          "options": [
+            {
+              "id": "circular-lap",
+              "label": "Circular with a one-lap cap",
+              "description": "Forward on each limit; wrap to the head when the last member limits; stop after every member has been tried once in this run and fall into the all-exhausted pause.",
+              "consequence": "Matches your note and cannot loop. Needs a per-run `triedMembers` set and a clear \"one full lap\" status line."
+            },
+            {
+              "id": "forward-block",
+              "label": "Forward only, block at the end",
+              "description": "No wrap; when the last member limits, go straight to the all-exhausted pause.",
+              "consequence": "Simpler, but does not return to the primary when its quota has reset."
+            },
+            {
+              "id": "reset-aware",
+              "label": "Return to the primary only after its reset",
+              "description": "Wait for the primary's `resetsAtMs` and return then, rather than wrapping when the last member limits.",
+              "consequence": "Most primary-first, but adds a mid-task timer and can leave the task idle while a healthy backup is available."
+            }
+          ],
+          "recommendation": {
+            "value": "circular-lap",
+            "reason": "It is the literal reading of your note, and the one-lap cap is the loop guard you asked for."
+          }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Parity and integration defaults. One click each, or override with what it should be.",
+      "questions": [
+        {
+          "id": "cli-bundle",
+          "type": "confirm",
+          "title": "CLI and bundle parity in v1",
+          "recommendation": {
+            "value": "`agetor harness stack` create/list/edit/remove, and `ls`/`show`/`logs` show the active member and the swap line; the TUI shows the active member/position. Stacks are machine-local and not exported in bundles; a profile still binds an account and the stack follows implicitly.",
+            "reason": "CLI users need CRUD and visibility; a bundle cannot carry credentials or homes, so exporting a stack would be a false promise."
+          }
+        },
+        {
+          "id": "indicators",
+          "type": "confirm",
+          "title": "Where the active account is visible",
+          "recommendation": {
+            "value": "Run panel shows `account · position/count`; the task card shows a small stack badge; a toast/OS notification fires on a swap when the window is unfocused; the topbar keeps one usage chip per account in v1 (no grouping).",
+            "reason": "The run panel is where the task is watched, the toast covers the unfocused case, and grouping the topbar is a separate layout change."
+          }
+        },
+        {
+          "id": "order",
+          "type": "confirm",
+          "title": "Stack order",
+          "recommendation": {
+            "value": "User drag order in the stack editor; a new member appends at the end; selection starts at the first enabled, logged-in member and follows the order.",
+            "reason": "Predictable and inspectable; the drag order is the only thing the user has to reason about."
+          }
+        },
+        {
+          "id": "validation",
+          "type": "confirm",
+          "title": "Stack validation",
+          "recommendation": {
+            "value": "At creation and before each swap: hard-block on a different kind or the same effective home; warn on not installed, not logged in, or the task's model not offered. A hard block is only for conditions that make failover meaningless.",
+            "reason": "The hard blocks are permanent; the warnings are transient and should not prevent saving a stack."
+          }
+        },
+        {
+          "id": "force-run",
+          "type": "confirm",
+          "title": "Manual Run on a cooling account",
+          "recommendation": {
+            "value": "A manual Run or message on a cooling-down account forces it; automatic selection skips it.",
+            "reason": "The user's explicit action wins; the cooldown is advisory."
+          }
+        },
+        {
+          "id": "new-run",
+          "type": "confirm",
+          "title": "Run-row semantics of a swap",
+          "recommendation": {
+            "value": "A swap is a new run row on the same task with the new member in `runs.agent`; Agetor's `run_events` transcript stays canonical; the old run is marked failed with a swap reason and its failure toast is suppressed.",
+            "reason": "Preserves the one-in-flight-run invariant and makes the swap auditable in history."
+          }
+        },
+        {
+          "id": "pipeline",
+          "type": "confirm",
+          "title": "Pipelines",
+          "recommendation": {
+            "value": "Pipeline step tasks inherit failover automatically; the implicit model needs no pipeline format change.",
+            "reason": "Each step already has its own task and agent profile, so the stack follows the step's account."
+          }
+        },
+        {
+          "id": "process-keys",
+          "type": "confirm",
+          "title": "Process-level provider keys",
+          "recommendation": {
+            "value": "Warn at stack creation when process-level provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) would be inherited by every member; do not scrub them in v1.",
+            "reason": "The leak is real, but changing env inheritance could break users who rely on it; the mirror's `env` filter is the v1 protection."
+          }
+        },
+        {
+          "id": "swap-wording",
+          "type": "confirm",
+          "title": "Exact swap notice text",
+          "recommendation": {
+            "value": "`Switched to <account> — <reason>. Continuing from the transferred conversation.` No product name in the text.",
+            "reason": "Names the account (never an email or token), the reason, and what happens next; matches your note \"just don't mention Agetor\"."
+          }
+        },
+        {
+          "id": "source-of-truth",
+          "type": "confirm",
+          "title": "Binding spec",
+          "recommendation": {
+            "value": "`docs/plans/harness-account-stacks.md` (written from this record) is the binding spec; no separate PRD. The investigation brief stays as evidence.",
+            "reason": "The requirement lives outside the repo; the plan is the path a reviewer can open."
+          }
+        },
+        {
+          "id": "acceptance-overlay",
+          "type": "confirm",
+          "title": "Acceptance additions from round 2",
+          "recommendation": {
+            "value": "Add a Codex HOME-overlay test (git config visible in the backup) and a mirror test (MCP/plugin auth copied, harness login never copied, harness-auth env keys stripped). OpenCode is out of v1, so its adapter test is dropped.",
+            "reason": "The two round-2 scope additions need their own proof, and the v1 kind set is now fixed."
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "id": "harness-account-stacks-grill-r4",
+  "title": "Grill — Harness account stacks (round 4: the Codex HOME premise)",
+  "skill": "grill",
+  "slug": "harness-account-stacks",
+  "round": 4,
+  "summary": "Your note on the overlay asks: *\"why do we need the same home for different codex accounts (even stacked)?\"*\n\nShort answer: **we don't, and the overlay does not make them share a home.** Each Codex account keeps its own `CODEX_HOME` (login, sessions, config). The problem is the *other* half of the override: Agetor also sets `HOME=<account home>`, which hides the user's `~/.gitconfig`, `~/.ssh`, `~/.config/gh` and `~/.npmrc` from `git`, `ssh`, `gh` and `npm` inside that account. The overlay was one fix; there may be a much smaller one.\n\nThe code says `CODEX_HOME` is what actually controls Codex's login and history, and the `HOME` override is a \"belt-and-braces\" measure. If that is true, Agetor can stop overriding `HOME` for Codex, keep only `CODEX_HOME`, and the backup keeps the real home's git/ssh/gh config with **no overlay at all**.\n\nThis round is one question: should the plan test that cheaper path first, or build the overlay as answered?",
+  "proven": [
+    "Round 3 settled: strip harness-auth keys from mirrored `env`; mirror at stack creation and before each swap; circular train with a one-lap cap; CLI/indicator/order/validation/force-run/new-run/pipeline/process-key/wording/spec/acceptance defaults all confirmed.",
+    "The overlay is **not** about sharing a home between accounts. Each account's `CODEX_HOME` stays separate; the overlay only exposes the user's generic dev dotfiles."
+  ],
+  "sections": [
+    {
+      "id": "codex-home",
+      "title": "The Codex HOME premise",
+      "intro": "One question, because it decides whether the overlay is a subsystem or a one-line env change.",
+      "questions": [
+        {
+          "id": "codex-home-premise",
+          "type": "single",
+          "title": "Should the plan first test dropping the Codex HOME override (keeping only CODEX_HOME), instead of building the overlay?",
+          "impact": "blocking",
+          "why": "If CODEX_HOME alone isolates the account's login/history, dropping the HOME override is a one-line change that fixes git/ssh/gh for every Codex account and removes the need for an overlay. If Codex still writes account state to `$HOME`, the overlay (or the HOME override) is needed.",
+          "context": "Agetor sets both `HOME=<home>` and `CODEX_HOME=<home>/.codex` for a Codex alias. The comment in `harnessEnv` says `CODEX_HOME` is what actually controls login and history, and the `HOME` half is belt-and-braces. The `HOME` half is also what hides `~/.gitconfig`, `~/.ssh`, `~/.config/gh` and `~/.npmrc` from the tools the agent runs. The overlay option would keep the HOME override and symlink those dotfiles into each account home. The cheaper option is to stop overriding HOME for Codex and see whether the alias still keeps its own login, sessions and config. This needs a small real-binary spike (codex 0.166.0 is installed on this machine); it is not something to assume.",
+          "evidence": [
+            {
+              "label": "both vars are set; CODEX_HOME is the real one",
+              "path": "src/bun/agents.ts",
+              "line": 438,
+              "lang": "ts",
+              "code": "// Codex goes through its own CODEX_HOME override and doesn't touch the\n    // macOS keychain, so re-homing it is harmless — but CODEX_HOME is what\n    // actually controls its login & history, so we set both as a belt-and-\n    // braces measure."
+            },
+            {
+              "label": "the actual env block",
+              "path": "src/bun/agents.ts",
+              "line": 449,
+              "lang": "ts",
+              "code": "} else if (harness.kind === \"codex\") {\n      env.HOME = harness.home;\n      env.CODEX_HOME = path.join(harness.home, \".codex\");"
+            },
+            {
+              "label": "the existing limitation",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 38,
+              "lang": "md",
+              "code": "Five kinds override the whole `HOME` for an additional account (`codex`, `cursor`, `fx`, `antigravity`, `opencode`). That means `~/.gitconfig`, `~/.ssh`, `~/.config/gh`, `~/.npmrc` and every other user-level tool config are **not** visible to that account."
+            }
+          ],
+          "options": [
+            {
+              "id": "spike-drop-home",
+              "label": "Test dropping HOME for Codex first",
+              "description": "Add a small real-binary spike to the plan: run Codex with only `CODEX_HOME=<account>/.codex` and the real `HOME`, then verify login, session/resume, config and MCP isolation, and check where it writes. If isolation holds, drop the HOME override for Codex; if not, fall back to the allowlist overlay.",
+              "consequence": "Smallest possible fix if it works: one env change, no overlay, no symlinks into `.ssh`/`.config/gh`. The spike is cheap and the fallback is the overlay you already chose.",
+              "preview": "today:   HOME=<account>  CODEX_HOME=<account>/.codex\nproposed: HOME=<real>     CODEX_HOME=<account>/.codex\n\nverify:  login, resume, config, MCP, and where codex writes"
+            },
+            {
+              "id": "keep-overlay",
+              "label": "Keep the HOME override and build the overlay",
+              "description": "Do not test dropping HOME; build the Codex allowlist overlay as answered in round 3.",
+              "consequence": "Known path, but a new security-sensitive subsystem and a larger test matrix. The account still has its own home; only the generic dotfiles are linked."
+            },
+            {
+              "id": "document-warn",
+              "label": "Keep the HOME override and only warn",
+              "description": "No overlay and no env change; document that a Codex alias does not see the main home's git/ssh/gh/npm config.",
+              "consequence": "Smallest scope, but a Codex backup can fail to commit or push mid-task."
+            }
+          ],
+          "recommendation": {
+            "value": "spike-drop-home",
+            "reason": "Your question is right: the accounts should not share a home. If CODEX_HOME alone isolates them, the overlay is unnecessary; the spike is the cheapest way to know."
+          }
+        }
+      ]
+    }
+  ]
+}

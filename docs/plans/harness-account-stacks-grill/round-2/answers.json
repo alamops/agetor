@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "formId": "harness-account-stacks-grill-r2",
+  "title": "Grill — Harness account stacks (round 2: push-back + remaining shape)",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "ac93dd417605e05e8e6d59cb9d34c0f74c8a44f9666886673a210524b1f21859",
+  "submittedAt": "2026-11-06T21:54:34.618Z",
+  "receivedAt": "2026-11-06T21:54:34.642Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 15,
+    "answered": 15,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 13,
+    "overrodeRecommendations": [
+      "mirror-scope",
+      "home-tools"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "mirror-scope",
+      "after-swap",
+      "synthetic-prompt"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "credentials-recheck": {
+      "n": 1,
+      "title": "Copying the primary's credential files makes the backup the same provider account. Do you still want that?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "own-login",
+      "display": "Each member uses its own login",
+      "acceptedRecommendation": true
+    },
+    "mirror-scope": {
+      "n": 2,
+      "title": "\"Mirror everything\" includes hooks and permissions, which execute code. What exactly should be mirrored?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "mirror-everything",
+      "display": "Mirror the whole file, including `env`",
+      "acceptedRecommendation": false,
+      "recommended": "mirror-safe",
+      "note": "when I say tokens, I mean the authenticated oauth for mcp, plugins,etc. but the harness login/account should be separated, so it works correcly each account with its own limits"
+    },
+    "v1-kinds-recheck": {
+      "n": 3,
+      "title": "You chose Claude + Codex only, but the acceptance default you confirmed mentions an OpenCode adapter. Which is the v1 scope?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "claude-codex",
+      "display": "Claude + Codex only",
+      "acceptedRecommendation": true
+    },
+    "after-swap": {
+      "n": 4,
+      "title": "After a swap, where does the task run next?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "forward",
+      "display": "Forward only within a task",
+      "acceptedRecommendation": true,
+      "note": "it must return to the primary only if the last stack account reaches the limit, then a natural swap to the beginning of the stack happens, ie. going to the primary. We just need to make sure that if all accounts are tried in a run, to avoid running the train in loop, we must pause, as a cap."
+    },
+    "home-tools": {
+      "n": 5,
+      "title": "Codex aliases override HOME, so the backup loses `~/.gitconfig`, `~/.ssh`, `~/.config/gh` and `~/.npmrc`. What should v1 do?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "overlay",
+      "display": "Build a HOME overlay for the five kinds",
+      "acceptedRecommendation": false,
+      "recommended": "document-warn"
+    },
+    "swap-notice": {
+      "n": 6,
+      "title": "What should the in-transcript swap message look like?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "divider",
+      "display": "A status divider with structured text",
+      "acceptedRecommendation": true
+    },
+    "orphans": {
+      "n": 7,
+      "title": "What happens to pending permission/question cards, running background agents, and queued follow-ups when the account swaps?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "keep-queue",
+      "display": "Cancel cards, keep follow-ups, name abandoned agents",
+      "acceptedRecommendation": true
+    },
+    "lifecycle": {
+      "n": 8,
+      "title": "When a stack is created or a member is disabled, deleted, reordered or removed, when do tasks pick up the change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "next-turn",
+      "display": "At the next turn",
+      "acceptedRecommendation": true
+    },
+    "manual-switch": {
+      "n": 9,
+      "title": "When the user manually switches a task to another member of the same stack, should the conversation be preserved?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "preserve",
+      "display": "Preserve within the stack, reset outside",
+      "acceptedRecommendation": true
+    },
+    "synthetic-prompt": {
+      "n": 10,
+      "title": "Should the synthetic \"continue\" prompt be visible in the transcript?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "hidden-tagged",
+      "display": "Hidden from the transcript, tagged in storage",
+      "acceptedRecommendation": true,
+      "note": "Just don't mention `Agetor`"
+    },
+    "proactive-reactive": {
+      "n": 11,
+      "title": "How is the next member chosen?",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Both: skip a member whose cached quota clearly says exhausted, and react to a failure as the backstop. A stale or missing snapshot never blocks a run on its own.",
+      "acceptedRecommendation": true
+    },
+    "exhaustion-scope": {
+      "n": 12,
+      "title": "Is exhaustion account-global or per task?",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Account-global: a new `harness_limit_state` table (no FK, like `harness_usage`) with `exhausted_until_ms`, reason, source and message. Selection skips a cooling account in every task; it clears on a successful turn or on expiry. No concurrency reservation in v1.",
+      "acceptedRecommendation": true
+    },
+    "max-size-followup": {
+      "n": 13,
+      "title": "What follows from \"no maximum\" stack size?",
+      "type": "confirm",
+      "status": "answered",
+      "value": "No hard cap. The stack editor virtualizes long lists and shows a warning above 10 members; the swap UI shows position/count; selection stays O(n) per turn.",
+      "acceptedRecommendation": true
+    },
+    "rollout": {
+      "n": 14,
+      "title": "What is the rollout gate?",
+      "type": "confirm",
+      "status": "answered",
+      "value": "No global feature flag. Stacks are opt-in by creating one, so an existing user sees no behavior change until they build a stack.",
+      "acceptedRecommendation": true
+    },
+    "per-task-opt-out": {
+      "n": 15,
+      "title": "Can a single task opt out of failover?",
+      "type": "confirm",
+      "status": "answered",
+      "value": "No per-task opt-out in v1. A task that must stay on one account uses an account that is not in a stack.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}
