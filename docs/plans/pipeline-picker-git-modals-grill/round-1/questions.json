@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "id": "pipeline-picker-git-modals-grill-r1",
+  "title": "Grill — Pipeline picker in the Git-integration launch modals",
+  "skill": "grill",
+  "slug": "pipeline-picker-git-modals",
+  "round": 1,
+  "flags": [],
+  "mode": "structured question tool (the Agetor pipeline exposes the question tool; the browser decision form was not used)",
+  "source": "pipeline step task text + docs/plans/pipeline-picker-git-modals-investigation.md",
+  "questions": [
+    {
+      "id": "scope",
+      "header": "Scope: clone dialog",
+      "question": "Exactly two Git-integration dialogs create tasks: CreateTaskFromIssueDialog (issue, \"Work on this with Agetor\") and ResolveConflictsDialog (PR, \"Resolve with Agetor\"). The Clone repository dialog uses the same TaskLaunchPickers for its ELI5 explainer, but it is opened from Projects and POST /projects/clone currently drops any pipelineId (server.ts:1178-1237, :1787-1795), so adding pipelines there needs server validation/pre-clone work. Is the Clone repository dialog in scope?",
+      "options": [
+        { "label": "Two dialogs only (Recommended)", "description": "Ship only the issue and PR-conflict dialogs. UI-only change; CloneProjectDialog stays agent/manual. This matches the two surfaces the task names." },
+        { "label": "Include clone dialog", "description": "Also add pipeline selection to the clone ELI5 explainer. Requires server work: validate the pipeline before cloning, pass pipelineId through POST /projects/clone, and settle how a pipeline parent runs with isolation:\"none\" in a just-cloned repo." },
+        { "label": "Issue dialog only", "description": "Ship only \"Work on this with Agetor\"; leave the PR conflict dialog unchanged. Smaller change but the PR modal then lacks the parity the task asks for." }
+      ],
+      "answer": "Two dialogs only (Recommended)"
+    },
+    {
+      "id": "ux",
+      "header": "One-selection UX",
+      "question": "Confirm the picker uses New Task parity. New Task renders a Pipeline picker above the Agent picker; choosing a pipeline clears the selected agent profile and replaces the Agent/harness/mode/model/effort/speed/maxMode block with a summary card (\"N steps · starts with <profile>\" + Change); choosing an Agent clears the pipeline (NewTaskForm.tsx:840-898). The server rejects pipelineId + agentProfileId together (orchestrator.ts:8494-8497).",
+      "options": [
+        { "label": "Exact New Task parity (Recommended)", "description": "Pipeline section above Agent, mutual exclusion, same summary card, same \"Change\" text. The dialog's picker gets a dialog-specific wrapper test id so e2e can scope it." },
+        { "label": "Parity, below Agent", "description": "Same mutual exclusion and summary, but Pipeline sits below the Agent picker. Slightly less discoverable; no technical difference." },
+        { "label": "Keep Agent visible, pipeline wins", "description": "Render both and let a selected pipeline take precedence. Contradicts the server's mutual-exclusion rule and hides which launch identity is real — not recommended." }
+      ],
+      "answer": "Exact New Task parity (Recommended)"
+    },
+    {
+      "id": "unrunnable",
+      "header": "Unrunnable pipelines",
+      "question": "What should the modal do when a selected pipeline cannot actually run? createTask rejects an invalid stored graph, a missing/ambiguous start step, and a non-human step with a missing or deleted profile (orchestrator.ts:8498-8515); startPipelineRun also refuses a human start step (pipeline-runner.ts:1826-1831), and the start harness can be disabled/logged out. createAndStartTask deletes the parent if start fails (TaskLaunchPickers.tsx:700-713).",
+      "options": [
+        { "label": "Preflight all, disable submit (Recommended)", "description": "List every pipeline, but when the selected one has an invalid graph, no start step, a human start, a missing/deleted step profile, or an unavailable/logged-out start harness, show the reason in the summary and disable Create & start." },
+        { "label": "Filter picker to runnable only", "description": "Hide unrunnable pipelines entirely. Cleaner list, but a pipeline that exists becomes invisible with no explanation, and a selection can silently disappear." },
+        { "label": "Structural preflight only", "description": "Block on invalid graph/missing profiles/human start; let a disabled or logged-out start harness submit and surface the server/start error inline. Minimal gating, but can cost a rolled-back task." },
+        { "label": "No preflight; server errors", "description": "Allow submit for anything and show the create/start failure inline. Simplest code, worst UX; the rollback path is real." }
+      ],
+      "answer": "Preflight all, disable submit (Recommended)"
+    },
+    {
+      "id": "login",
+      "header": "Logged-out gating",
+      "question": "Today both dialogs gate Create & start on effectiveStatus.available only, not loggedIn (CreateTaskFromIssueDialog.tsx:164-171; ResolveConflictsDialog.tsx:85-86). CloneProjectDialog already requires loggedIn !== false because a failure there costs a completed clone (CloneProjectDialog.tsx:171-182). For a pipeline, a logged-out start harness would create the parent and then roll it back. Should the login gate be pipeline-only or apply to every launch in these dialogs?",
+      "options": [
+        { "label": "Pipeline-only login gate (Recommended)", "description": "When a pipeline is selected, require its start harness to be available && loggedIn !== false. Leave existing agent-profile/manual launches exactly as they are, so unrelated behavior and e2e expectations don't change." },
+        { "label": "Gate all launches on login", "description": "Also require loggedIn !== false for profile/manual launches in both dialogs. Fixes the same rollback risk broadly, but changes existing behavior and existing e2e expectations." },
+        { "label": "Availability only for pipeline", "description": "Only require available for the pipeline start harness; a logged-out harness reaches submit and surfaces the error/rollback. Simplest, least safe." }
+      ],
+      "answer": "Pipeline-only login gate (Recommended)"
+    },
+    {
+      "id": "lifetime",
+      "header": "Selection lifetime",
+      "question": "How long should a chosen pipeline live? Today a selected Agent profile survives closing and reopening these dialogs (useTaskLaunch never clears it; the issue dialog resets prompt/type/worktree/references but not launch picks), while New Task clears both profile and pipeline after submit. The Clone dialog explicitly clears its profile on every open (CloneProjectDialog.tsx:126-138).",
+      "options": [
+        { "label": "Reset pipeline each open (Recommended)", "description": "Every open starts at \"No pipeline\", so a pipeline picked for one issue/PR never silently applies to the next. Leaves existing Agent-profile persistence untouched." },
+        { "label": "Persist like Agent profile", "description": "Keep the pipeline selected across reopens until a successful create clears it. Consistent with the Agent picker, but can silently apply a pipeline to a later issue/PR." },
+        { "label": "Reset pipeline and Agent each open", "description": "Clear both selections on every open for a clean slate. Also changes existing Agent-profile behavior; matches CloneProjectDialog's approach." }
+      ],
+      "answer": "Reset pipeline each open (Recommended)"
+    },
+    {
+      "id": "manage",
+      "header": "Manage row",
+      "question": "Should the modal's pipeline popover include a \"Manage pipelines…\" footer row? New Task's picker has one (NewTaskForm.tsx:850), but neither Git dialog passes a manage callback to its AgentProfilePicker today, so there is no \"Manage agents…\" row in these dialogs. Adding one needs a callback threaded App -> GitHubDialog -> IssueActions/PullActions -> the dialog, and both stacked dialogs must close before navigating or the pipelines page opens underneath.",
+      "options": [
+        { "label": "Omit manage row (Recommended)", "description": "Match these dialogs' existing Agent picker (no manage footer). Users can still manage pipelines from the header Pipelines button. No callback threading and no stacked-overlay problem." },
+        { "label": "Add manage row", "description": "Thread a manage callback through the Git dialog and close both dialogs before navigating. More discoverable, but more wiring and a new navigation edge." },
+        { "label": "Add a plain link below picker", "description": "Show \"Manage pipelines\" as a small text link outside the popover. Less hidden than the footer, still needs the same callback/navigation wiring." }
+      ],
+      "answer": "Add manage row"
+    },
+    {
+      "id": "after-create",
+      "header": "After create",
+      "question": "When Create & start succeeds with a pipeline selected, what should happen? Today issue/PR creates close the dialog and set a 5s \"Task created and started\" chip (GitHubDialog.tsx:7451-7454 and :8155+); App has openPipelineRun but it is not wired into these inner dialogs.",
+      "options": [
+        { "label": "Stay put + existing chip (Recommended)", "description": "Close the dialog, show the existing success chip, stay in the Git view. Matches today's single-agent behavior and New Task; no new navigation wiring." },
+        { "label": "Auto-open the run view", "description": "Close the Git dialog and navigate to the new pipeline run so progress is visible immediately. Needs a new callback through GitHubDialog; changes the established post-create flow." },
+        { "label": "Chip with View run action", "description": "Stay put, but make the success chip clickable to open the run view. Adds navigation wiring without auto-navigation." }
+      ],
+      "answer": "Stay put + existing chip (Recommended)"
+    },
+    {
+      "id": "pr-branch",
+      "header": "PR head branch",
+      "question": "For \"Resolve with Agetor\", confirm a pipeline may run on the PR's head branch. createTask resolves existingBranch before pipeline binding, and pipeline-runner materializes one shared worktree that every step's task copies (orchestrator.ts:8429-8470; pipeline-runner.ts:1731+). Consequence: every step receives the conflict-resolution goal and its commits land on the PR head branch, same as a single-agent conflict task today.",
+      "options": [
+        { "label": "Allow all pipelines (Recommended)", "description": "List every pipeline in the conflict modal; no filtering. Multi-step sequencing (e.g. Plan -> Fix -> Review) is the point, and the mechanics are unchanged." },
+        { "label": "Allow, warn on multi-step", "description": "Allow all, but show an inline note when the chosen pipeline has more than one step that each step receives the same conflict-resolution goal and commits to the PR branch. Adds a warning without restricting." },
+        { "label": "Restrict to designated pipelines", "description": "Only offer pipelines explicitly marked safe for conflict resolution. Needs new pipeline metadata/UX not in scope; prevents misuse but expands the change." },
+        { "label": "No pipeline in conflict modal", "description": "Keep the PR dialog single-agent; add the picker only to the issue dialog. Removes the risk and also removes the PR parity the task asks for." }
+      ],
+      "answer": "Allow all pipelines (Recommended)"
+    },
+    {
+      "id": "visibility",
+      "header": "Visibility & load",
+      "question": "Should the Pipeline section always render in these two dialogs? New Task always shows it (an empty list reads \"No pipelines yet.\"), which means every issue/PR modal gains a \"Pipeline: No pipeline\" row even for users who never create pipelines. The pipeline list is module-cached and usually already loaded, but it can still fail.",
+      "options": [
+        { "label": "Always show, tolerate failure (Recommended)", "description": "Always render, matching New Task. Empty list shows \"No pipelines yet.\"; on list-load failure show a short inline \"Couldn't load pipelines\" message, disable the picker, and still allow a normal single-agent launch." },
+        { "label": "Hide when no pipelines exist", "description": "Render the section only when at least one pipeline exists; hide it while loading or on error. Less clutter, but the feature is undiscoverable until the user already has a pipeline and the dialog layout shifts." },
+        { "label": "Always show, block on failure", "description": "Render always and treat a pipeline-list failure like the harness-load failure (error state, no create). Safest data-wise, but a pipeline-list outage would block unrelated single-agent launches." }
+      ],
+      "answer": "Always show, tolerate failure (Recommended)"
+    },
+    {
+      "id": "acceptance",
+      "header": "Acceptance bar",
+      "question": "What verification is expected? There is no React component-test harness; UI changes are normally proven by Playwright e2e (bunfig.toml scopes bun test to src/; package.json has no jsdom/testing-library). This worktree currently has no node_modules, so the implementation step must run bun install first.",
+      "options": [
+        { "label": "E2E both + typecheck + bun test (Recommended)", "description": "Extend e2e/issue-task.spec.ts and e2e/resolve-conflicts.spec.ts: picker mutual exclusion, summary card, payload sends pipelineId and no agentProfileId, unrunnable pipeline blocks submit, and one create-and-start pipeline case per dialog. Then run bun run typecheck and bun test." },
+        { "label": "E2E issue dialog only", "description": "Cover the shared picker once in issue-task.spec.ts and add a lighter PR assertion (picker renders / selection clears agent). Faster suite, less confidence the PR's existingBranch path works." },
+        { "label": "No new e2e; typecheck + manual QA", "description": "Rely on existing suites plus manual clicking. Fastest, but the repo convention is e2e for UI changes and this cross-dialog wiring has several failure modes." }
+      ],
+      "answer": "E2E both + typecheck + bun test (Recommended)"
+    },
+    {
+      "id": "inventory",
+      "header": "Anything missed?",
+      "question": "The surface inventory is: CreateTaskFromIssueDialog (in), ResolveConflictsDialog (in), CloneProjectDialog (question 1), AgentProfileFormDialog (profile editor; must stay unchanged), RunPanel's \"Resolve Conflicts\" (sends a message to an existing task, not a new task), GitHubDialog's New PR/New issue composers (no task creation), and the CLI's `agetor add --issue --pipeline` (already supported). Is any other surface or behavior part of this change?",
+      "options": [
+        { "label": "No — inventory complete (Recommended)", "description": "Proceed with the surfaces settled above. The plan will record each out-of-scope item with its reason." },
+        { "label": "Yes — include another surface", "description": "Name it in your own answer; the plan must add that surface and any server/UI work it needs." }
+      ],
+      "answer": "No — inventory complete (Recommended)"
+    }
+  ]
+}

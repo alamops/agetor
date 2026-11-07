@@ -2488,6 +2488,15 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
     setGithubItemDetailPrefill(null);
   }, []);
 
+  /** GitHubDialog's task-launch dialogs' "Manage pipelines…" row: the inner
+   *  issue/PR dialog has already closed itself, so this closes the Git dialog
+   *  beneath and only THEN navigates — otherwise the full-page Pipelines view
+   *  would render under a still-open Git overlay (owner D6). */
+  const openPipelinesFromGit = useCallback(() => {
+    closeGithubDialog();
+    openPipelinesPage();
+  }, [closeGithubDialog, openPipelinesPage]);
+
   return (
     <div className="flex h-screen w-screen flex-col bg-background text-foreground">
       {/* Top app bar sits on the same row as the macOS traffic lights (see
@@ -2940,6 +2949,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           closeGithubDialog();
           setSettingsOpen(true);
         }}
+        onOpenPipelines={openPipelinesFromGit}
       />
       <QuitConfirmDialog request={quitRequest} onClose={() => setQuitRequest(null)} />
       <ImportSessionsDialog

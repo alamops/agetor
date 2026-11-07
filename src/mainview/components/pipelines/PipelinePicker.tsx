@@ -226,11 +226,12 @@ export function PipelinePicker({ value, onChange, pipelines, onManage, disabled,
               <button
                 type="button"
                 data-testid="pipeline-picker-manage"
+                disabled={disabled}
                 onClick={() => {
                   setOpen(false);
                   onManage();
                 }}
-                className="w-full px-3 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+                className="w-full px-3 py-1.5 text-left text-xs text-muted-foreground hover:bg-accent/40 hover:text-foreground disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-muted-foreground"
               >
                 Manage pipelines…
               </button>

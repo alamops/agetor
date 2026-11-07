@@ -1,0 +1,22 @@
+{
+  "formId": "pipeline-picker-git-modals-grill-r1",
+  "round": 1,
+  "submittedAt": "2026-11-06T08:19:00Z",
+  "answeredBy": "owner",
+  "mode": "structured question tool (the Agetor pipeline exposes the question tool; the browser decision form was not used)",
+  "generalNotes": null,
+  "answers": {
+    "scope": { "status": "answered", "value": "Two dialogs only (Recommended)" },
+    "ux": { "status": "answered", "value": "Exact New Task parity (Recommended)" },
+    "unrunnable": { "status": "answered", "value": "Preflight all, disable submit (Recommended)" },
+    "login": { "status": "answered", "value": "Pipeline-only login gate (Recommended)" },
+    "lifetime": { "status": "answered", "value": "Reset pipeline each open (Recommended)" },
+    "manage": { "status": "answered", "value": "Add manage row" },
+    "after-create": { "status": "answered", "value": "Stay put + existing chip (Recommended)" },
+    "pr-branch": { "status": "answered", "value": "Allow all pipelines (Recommended)" },
+    "visibility": { "status": "answered", "value": "Always show, tolerate failure (Recommended)" },
+    "acceptance": { "status": "answered", "value": "E2E both + typecheck + bun test (Recommended)" },
+    "inventory": { "status": "answered", "value": "No — inventory complete (Recommended)" }
+  },
+  "summary": { "complete": true, "needsAnswer": [], "note": "Round 1 complete. One answer (manage) overrode the recommendation; round 2 settles its navigation/draft consequences." }
+}

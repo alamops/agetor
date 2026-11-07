@@ -49,7 +49,15 @@ export interface WorktreeOptionsState {
   isolate: boolean;
   setIsolate: Dispatch<SetStateAction<boolean>>;
   baseRef: string;
-  setBaseRef: Dispatch<SetStateAction<string>>;
+  setBaseRef: (next: string) => void;
+  /** The current branch was pre-selected by `BranchPicker` when the branch
+   *  list arrived — not a user change. `resetForOpen()` clears it. */
+  setBaseRefAuto: (next: string) => void;
+  /** `true` once the user has picked a base ref themselves (any non-empty
+   *  pick). The dialogs' "discard this draft?" check uses this rather than
+   *  `baseRef !== ""`, because `BranchPicker` legitimately auto-selects the
+   *  current branch on load. */
+  baseRefDirty: boolean;
   branchConfig: BranchNamingConfig;
   branchOverride: string;
   setBranchOverride: Dispatch<SetStateAction<string>>;
@@ -94,7 +102,17 @@ export interface WorktreeOptionsState {
  */
 export function useWorktreeOptions({ workdir, title, taskType, enabled = true }: { workdir: string; title: string; taskType: TaskType; enabled?: boolean }): WorktreeOptionsState {
   const [isolate, setIsolate] = useState(true);
-  const [baseRef, setBaseRef] = useState("");
+  const [baseRef, setBaseRefState] = useState("");
+  // The user's own base-ref pick, distinct from `BranchPicker`'s automatic
+  // "preselect the current branch" seed — see `baseRefDirty`'s doc comment.
+  const [baseRefDirty, setBaseRefDirty] = useState(false);
+  const setBaseRef = (next: string) => {
+    setBaseRefState(next);
+    setBaseRefDirty(next.trim().length > 0);
+  };
+  const setBaseRefAuto = (next: string) => {
+    setBaseRefState(next);
+  };
   // Branch nomenclature for the selected project (loaded from the server;
   // falls back to the built-in defaults). While clean (`!branchDirty`), the
   // field DERIVES its display from the tag-visible PATTERN (e.g.
@@ -190,6 +208,8 @@ export function useWorktreeOptions({ workdir, title, taskType, enabled = true }:
     setIsolate,
     baseRef,
     setBaseRef,
+    setBaseRefAuto,
+    baseRefDirty,
     branchConfig,
     branchOverride,
     setBranchOverride,
@@ -260,6 +280,7 @@ export function WorktreeOptions(props: Props) {
     setIsolate,
     baseRef,
     setBaseRef,
+    setBaseRefAuto,
     workdir,
     taskType,
     branchOverride,
@@ -280,6 +301,7 @@ export function WorktreeOptions(props: Props) {
         workdir={workdir}
         value={baseRef}
         onChange={setBaseRef}
+        onAutoSelect={setBaseRefAuto}
         placement="bottom"
         title={
           isolate

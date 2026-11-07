@@ -1,0 +1,12 @@
+{
+  "formId": "pipeline-picker-git-modals-grill-r2",
+  "round": 2,
+  "submittedAt": "2026-11-06T08:19:00Z",
+  "answeredBy": "owner",
+  "mode": "structured question tool (follow-up to the round-1 manage-row override)",
+  "generalNotes": null,
+  "answers": {
+    "manage-dirty": { "status": "answered", "value": "Confirm only when dirty (Recommended)" }
+  },
+  "summary": { "complete": true, "needsAnswer": [] }
+}
