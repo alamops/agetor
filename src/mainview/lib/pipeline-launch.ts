@@ -53,6 +53,11 @@ export interface PipelineLaunchInput {
    *  profile missing from a not-yet-`loaded` list must never read as
    *  "deleted" (it becomes `checking` instead). */
   profilesLoaded: boolean;
+  /** The last failed agent-profile fetch, if any. When the list has never
+   *  loaded AND this is set, an unresolvable profile is a fetch failure to
+   *  report (`blocked`) rather than an indeterminate `checking` state that
+   *  would leave the picker spinning with no reason. */
+  profilesError: string | null;
   harnesses: Harness[];
   agents: AgentStatus[];
 }
@@ -69,10 +74,13 @@ export interface PipelineLaunchInput {
  *  4. human start step → `a human step can't be the pipeline's start step`
  *     (defense in depth — the validator normally rejects it first)
  *  5. profiles not loaded and the start step's profile can't be resolved
- *     from the warm cache → `checking`
+ *     from the warm cache → `checking` (or `blocked` with the fetch error
+ *     when the profile fetch itself failed, so the picker never spins
+ *     without a reason)
  *  6. any non-human step with no `agentProfileId` → `step "<name>" has no agent`
  *  7. any non-human step whose profile is missing → `agent for step "<name>"
- *     no longer exists` (or `checking` while the list has never loaded)
+ *     no longer exists` (or `checking`/fetch-error `blocked` while the list
+ *     has never loaded)
  *  8. start harness missing/disabled → `<label> is disabled — re-enable it in
  *     Settings to start new runs.`
  *  9. start harness unavailable (or no status) → `<label> is not available —
@@ -86,7 +94,7 @@ export interface PipelineLaunchInput {
  * New Task form. `createTask` still validates every non-human step's profile.
  */
 export function resolvePipelineLaunch(input: PipelineLaunchInput): PipelineLaunchResolution {
-  const { graph, profiles, profilesLoaded, harnesses, agents } = input;
+  const { graph, profiles, profilesLoaded, profilesError, harnesses, agents } = input;
 
   if (graph === null) {
     return {
@@ -139,16 +147,26 @@ export function resolvePipelineLaunch(input: PipelineLaunchInput): PipelineLaunc
     reason: string | null,
   ): PipelineLaunchResolution => ({ state, reason, startStep, startProfile, startHarness, startStatus });
 
+  // The only missing fact in these branches is the profile list. A failed
+  // fetch must say so (blocked) instead of staying `checking` forever; a
+  // still-in-flight first fetch stays `checking` (no error yet). Graph
+  // problems below still win — they don't need the list to be reported.
+  const unresolvedProfiles = (): PipelineLaunchResolution =>
+    !profilesLoaded && profilesError !== null
+      ? resolved("blocked", `Couldn't load agent profiles — ${profilesError}`)
+      : resolved("checking", null);
+
   if (isHumanStep(startStep)) {
     return resolved("blocked", "a human step can't be the pipeline's start step");
   }
 
   // The start step's own profile could not be resolved: while the list has
-  // never loaded, that is unknown — not "deleted" — so report `checking`. A
-  // loaded list falls through to the per-step loop below, whose message is
-  // the server's own ("agent for step … no longer exists").
+  // never loaded, that is unknown — not "deleted" — so report `checking`
+  // (or the fetch failure). A loaded list falls through to the per-step
+  // loop below, whose message is the server's own ("agent for step … no
+  // longer exists").
   if (startStep.agentProfileId !== null && startProfile === null && !profilesLoaded) {
-    return resolved("checking", null);
+    return unresolvedProfiles();
   }
 
   for (const step of normalized.steps) {
@@ -158,7 +176,7 @@ export function resolvePipelineLaunch(input: PipelineLaunchInput): PipelineLaunc
     }
     if (!profiles.some((p) => p.id === step.agentProfileId)) {
       // Only a successfully-loaded list can prove a profile is gone.
-      if (!profilesLoaded) return resolved("checking", null);
+      if (!profilesLoaded) return unresolvedProfiles();
       return resolved("blocked", `agent for step "${step.name}" no longer exists`);
     }
   }

@@ -93,6 +93,7 @@ function readyInput(graph: PipelineGraph) {
     graph,
     profiles: [makeProfile()],
     profilesLoaded: true,
+    profilesError: null,
     harnesses: [makeHarness()],
     agents: [makeStatus()],
   };
@@ -135,6 +136,7 @@ describe("resolvePipelineLaunch", () => {
       graph,
       profiles: [profile],
       profilesLoaded: true,
+      profilesError: null,
       harnesses: [harness],
       agents: [status],
     });
@@ -323,6 +325,56 @@ describe("resolvePipelineLaunch profile rules", () => {
     expect(resolution.reason).toBeNull();
     expect(resolution.startStep).not.toBeNull();
     expect(resolution.startProfile).toBeNull();
+  });
+
+  test("a failed profile fetch blocks an unresolvable start profile with its reason", () => {
+    const resolution = resolvePipelineLaunch({
+      ...readyInput(oneStep()),
+      profiles: [],
+      profilesLoaded: false,
+      profilesError: "GET /agent-profiles failed",
+    });
+    expectBlocked(resolution, "Couldn't load agent profiles — GET /agent-profiles failed");
+    expect(resolution.startStep).not.toBeNull();
+    expect(resolution.startProfile).toBeNull();
+  });
+
+  test("a failed profile fetch blocks an unresolvable later step with its reason", () => {
+    const graph = makeGraph({
+      steps: [
+        makeStep({ id: "a", name: "Plan" }),
+        makeStep({ id: "b", name: "Build", agentProfileId: "profile-gone" }),
+      ],
+      edges: [{ id: "e1", from: "a", to: "b", label: "" }],
+      startStepId: "a",
+    });
+    expectBlocked(
+      resolvePipelineLaunch({ ...readyInput(graph), profilesLoaded: false, profilesError: "boom" }),
+      "Couldn't load agent profiles — boom",
+    );
+  });
+
+  test("a graph problem still wins over a failed profile fetch", () => {
+    const graph = makeGraph({
+      steps: [makeStep({ id: "a", name: "Plan", agentProfileId: null })],
+      startStepId: "a",
+    });
+    expectBlocked(
+      resolvePipelineLaunch({
+        ...readyInput(graph),
+        profiles: [],
+        profilesLoaded: false,
+        profilesError: "boom",
+      }),
+      'step "Plan" has no agent',
+    );
+  });
+
+  test("a failed refetch after a successful load still reports a deleted profile", () => {
+    expectBlocked(
+      resolvePipelineLaunch({ ...readyInput(oneStep()), profiles: [], profilesError: "boom" }),
+      'agent for step "Plan" no longer exists',
+    );
   });
 
   test("a start step with no agent blocks even while the list is not loaded", () => {

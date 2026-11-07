@@ -298,6 +298,7 @@ export function useTaskLaunch(
   const {
     profiles: fetchedProfiles,
     loaded: profilesLoaded,
+    error: profilesError,
     refresh: refreshProfiles,
   } = useAgentProfiles({ enabled: open && (withProfiles || withPipelines) });
   const profiles = withProfiles ? fetchedProfiles : [];
@@ -340,10 +341,11 @@ export function useTaskLaunch(
         graph: selectedPipeline?.graph ?? null,
         profiles: fetchedProfiles,
         profilesLoaded,
+        profilesError,
         harnesses,
         agents,
       }),
-    [selectedPipeline, fetchedProfiles, profilesLoaded, harnesses, agents],
+    [selectedPipeline, fetchedProfiles, profilesLoaded, profilesError, harnesses, agents],
   );
 
   // Self-fetch harness data on open — mirrors NewTaskForm/App.tsx's own
