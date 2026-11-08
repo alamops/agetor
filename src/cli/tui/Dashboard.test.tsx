@@ -1,6 +1,6 @@
 import { test, expect, mock, afterAll } from "bun:test";
 import { render } from "ink-testing-library";
-import { Dashboard, buildSentFilesLines, buildFxRecoveryLines, buildHandoffLines, dashboardRows } from "./Dashboard.tsx";
+import { Dashboard, activeAccountLine, buildSentFilesLines, buildFxRecoveryLines, buildHandoffLines, dashboardRows } from "./Dashboard.tsx";
 import type { PipelineRunState } from "../../shared/types.ts";
 import { eventKey } from "./useCoalescedStream.ts";
 import { TASK_STREAM_GAP_NOTICE } from "../../shared/task-stream-resume.ts";
@@ -10,6 +10,7 @@ import {
   commitPushPrompt,
   FX_RECOVERY_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
+  HARNESS_SWAP_STATUS_PREFIX,
   PERMISSION_MODE_STATUS_PREFIX,
 } from "../../shared/types.ts";
 
@@ -89,6 +90,41 @@ test("Dashboard mounts the header, empty state, and the new key hints", async ()
   // fix-fx-harness-rate-limit.md §3.5/T6) — present in the default (nav)
   // mode's footer legend regardless of whether anything is actually resumable.
   expect(frame).toContain("r resume");
+  unmount();
+});
+
+const STACKS_FIXTURE = [{
+  id: "stack-1",
+  label: "train",
+  kind: "claude-code",
+  mirrorMode: "safe",
+  members: [
+    { harnessId: "work", position: 0, label: "Work", kind: "claude-code", enabled: true },
+    { harnessId: "personal", position: 1, label: "Personal", kind: "claude-code", enabled: true },
+  ],
+  createdAt: 0,
+  updatedAt: 0,
+  warnings: [],
+}] as const;
+
+test("activeAccountLine renders the account label and 1-based position, or null outside a stack", () => {
+  const stacks = STACKS_FIXTURE as unknown as import("../../shared/types.ts").HarnessStack[];
+  expect(activeAccountLine({ agent: "personal" }, stacks)).toBe("Personal · 2/2");
+  expect(activeAccountLine({ agent: "work" }, stacks)).toBe("Work · 1/2");
+  expect(activeAccountLine({ agent: "outside" }, stacks)).toBeNull();
+});
+
+test("the detail header shows the active account and stack position", async () => {
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A", agent: "personal" });
+  const client = {
+    listTasks: async () => [taskA],
+    listHarnessStacks: async () => ({ stacks: STACKS_FIXTURE, limitStates: [] }),
+  } as unknown as AgetorClient;
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(flatten(lastFrame() ?? "")).toContain("running · Personal · 2/2");
   unmount();
 });
 
@@ -211,8 +247,72 @@ test("event stream: an fx_permission interaction renders generically, sentinel s
   unmount();
 });
 
-test("event stream: a snapshot replay_meta replaces the visible lines with the dim notice plus the fresh rows", async () => {
+test("event stream: a harness-swap notice renders as a formatted divider, malformed payloads are suppressed", async () => {
   onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+
+  const base = { runId: "runA", taskId: "taskA" };
+  const notice = {
+    from: "primary",
+    fromLabel: "Claude work",
+    to: "backup",
+    toLabel: "Claude backup",
+    reason: "rate_limit" as const,
+    position: 1,
+    count: 2,
+    resetsAtMs: null,
+    at: 1,
+  };
+  const push = onTaskEvents!;
+  push({ ...base, stream: "status", data: `${HARNESS_SWAP_STATUS_PREFIX}${JSON.stringify(notice)}`, ts: 1 });
+  push({ ...base, stream: "status", data: `${HARNESS_SWAP_STATUS_PREFIX}{not-json`, ts: 2 });
+  await wait(80);
+
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("⇄ Switched to Claude backup");
+  expect(frame).toContain("rate limit");
+  expect(frame).toContain("Continuing from the");
+  // A malformed swap payload is plumbing, never raw JSON in the transcript.
+  expect(frame).not.toContain(HARNESS_SWAP_STATUS_PREFIX);
+  expect(frame).not.toContain("not-json");
+  unmount();
+});
+
+test("event stream: a harness label in a generic status line is escaped, never printed raw (R7-S1)", async () => {
+  onTaskEvents = null;
+  const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
+  const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;
+
+  const { lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  expect(onTaskEvents).not.toBeNull();
+  onTaskEvents!({
+    runId: "runA",
+    taskId: "taskA",
+    stream: "status",
+    data: "continuing the transferred conversation on \u001b[31mred\u001b[0m",
+    ts: 1,
+  });
+  await wait(80);
+
+  const frame = flatten(lastFrame() ?? "");
+  expect(frame).not.toContain("\u001b");
+  // The detail pane truncates at its width, so only the escaped prefix is
+  // guaranteed to survive — the point is that the ESC itself never does.
+  expect(frame).toContain("continuing the transferred conversation on \\u001b[31mred");
+  unmount();
+});
+
+test("event stream: a snapshot replay_meta replaces the visible lines with the dim notice plus the fresh rows", async () => {  onTaskEvents = null;
   onTaskNamed = undefined;
   const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A" });
   const client = { listTasks: async () => [taskA] } as unknown as AgetorClient;

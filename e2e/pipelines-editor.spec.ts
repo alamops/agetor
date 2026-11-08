@@ -962,7 +962,7 @@ test.describe("pipelines editor", () => {
     // Dirty + Cancel → closes at once, no confirm.
     await dialog.getByTestId("agent-profile-name").fill(`Cancelled Agent ${randomUUID()}`);
     await dialog.getByTestId("agent-profile-cancel").click();
-    await expect(dialog).toBeHidden();
+    await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
     await expect(discardConfirm(page)).toHaveCount(0);
 
     // Clean form: Escape.
@@ -970,21 +970,21 @@ test.describe("pipelines editor", () => {
     await panel.getByTestId("pipeline-step-new-agent").click();
     await expect(dialog.getByTestId("agent-profile-form-dialog")).toBeVisible();
     await page.keyboard.press("Escape");
-    await expect(dialog).toBeHidden();
+    await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
     await expect(discardConfirm(page)).toHaveCount(0);
 
     // Clean form: header X.
     await panel.getByTestId("pipeline-step-new-agent").click();
     await expect(dialog.getByTestId("agent-profile-form-dialog")).toBeVisible();
     await dialog.getByRole("button", { name: "Close", exact: true }).click();
-    await expect(dialog).toBeHidden();
+    await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
     await expect(discardConfirm(page)).toHaveCount(0);
 
     // Clean form: backdrop.
     await panel.getByTestId("pipeline-step-new-agent").click();
     await expect(dialog.getByTestId("agent-profile-form-dialog")).toBeVisible();
     await clickBackdrop(dialog);
-    await expect(dialog).toBeHidden();
+    await expect(dialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
     await expect(discardConfirm(page)).toHaveCount(0);
   });
 });

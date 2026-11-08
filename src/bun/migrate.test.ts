@@ -2012,7 +2012,7 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
     INSERT INTO subagents (id, task_id, parent_kind, source_path, status, started_at, ended_at)
       VALUES ('opencode-ses_1', 't1', 'opencode_subagent', 'opencode-session:ses_1', 'orphaned', 1, 2);
   `);
-  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones"]);
+  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks"]);
   expect(columnNames(db, "opencode_stopped_children")).toEqual(["child_session_id", "task_id", "stopped_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_stopped_children)`).all()).toEqual([]);
   // A note for a task id that doesn't exist (or no longer does) is accepted.
@@ -2025,20 +2025,20 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
   db.close();
 });
 
-test("083 (opencode watch tombstones) is the last registered migration, after 082 (opencode child bookkeeping)", () => {
-  const at = migrations.findIndex((m) => m.id === "083_opencode_watch_tombstones");
+test("084 (harness stacks) is the last registered migration, after 083 (opencode watch tombstones)", () => {
+  const at = migrations.findIndex((m) => m.id === "084_harness_stacks");
   expect(at).toBe(migrations.length - 1);
-  expect(migrations[at - 1]?.id).toBe("082_opencode_child_bookkeeping");
-  expect(migrations[at]?.aliases).toBeUndefined();
-  expect(migrations[at]?.sql).toContain("CREATE TABLE opencode_watch_tombstones");
-  expect(migrations[at]?.sql).toContain("CREATE INDEX opencode_watch_tombstones_expires_idx");
+  expect(migrations[at - 1]?.id).toBe("083_opencode_watch_tombstones");
+  expect(migrations[at]?.sql).toContain("CREATE TABLE harness_stacks");
+  expect(migrations[at]?.sql).toContain("CREATE TABLE harness_session_handoffs");
+  expect(migrations[at]?.sql).toContain("ALTER TABLE tasks ADD COLUMN harness_state");
 });
 
 test("083 adds opencode_watch_tombstones (no foreign key, session id primary key, expiry index) on an 082 DB", () => {
   const db = new Database(":memory:");
   migrateThrough(db, "082_opencode_child_bookkeeping");
   db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'opencode', '/w', 1, 1)`);
-  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones"]);
+  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks"]);
   expect(columnNames(db, "opencode_watch_tombstones")).toEqual(["session_id", "harness_id", "task_id", "expires_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_watch_tombstones)`).all()).toEqual([]);
   // A tombstone outlives its task: a task id that doesn't exist is accepted.
@@ -2094,6 +2094,7 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
     "081_cursor_asks",
     "082_opencode_child_bookkeeping",
     "083_opencode_watch_tombstones",
+    "084_harness_stacks",
   ]);
   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 

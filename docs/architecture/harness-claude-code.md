@@ -118,3 +118,17 @@ Evidence + rationale: `docs/plans/model-effort-local-command-turns.md` (§10 for
   The detached tmux sessions stay alive in the background and are picked up by the next launch via the reattach path above — or, with "Keep Agetor running in the background" on, by the background core that takes over within ~1 s of the quit (the event carries `backgroundArmed`; the dialog then says "They'll keep running in the background" and offers "Quit completely", which also stops the background core until next login; see [always-on-host.md](always-on-host.md)).
 
   **fx carve-out**: fx has no tmux session to leave alive in the first place — `fx-acp.ts` reaps every live `fx acp` child on process `exit` and on SIGINT/SIGTERM/SIGHUP (always installed, always reaping; only the sole listener for a given signal also calls `process.exit` itself — see [harness-fx.md](harness-fx.md)), so quitting kills the fx child outright rather than orphaning it in the background; an fx child that somehow survived would be an unreachable zombie, not a resumable session, since fx has no reattach path at all.
+
+## Usage-limit signal (harness stacks)
+
+The pane scraper recognizes Claude's live usage-limit AUTO-CONTINUE notice
+(`MODAL_NOTICE_RE` plus the classifier's quota table), emits exactly one
+`harness-limit:` status for the turn (a per-turn latch; the notice stays on
+screen), and resolves the turn. The synthetic `api error:` path remains the
+backstop for 429/402 — the orchestrator classifies only that sentinel, never
+arbitrary status prose, so a compaction/background summary that mentions a
+limit cannot fake one. Neither registers a card. A harness-stack task then
+settles into a swap; a lone account only records the cooldown. The transcript
+and sidecars are copied under `CLAUDE_CONFIG_DIR/projects/<encoded>/` for the
+destination account, with the `harness_session_handoffs` row as the cleanup
+allowlist. See [harness-stacks.md](harness-stacks.md).

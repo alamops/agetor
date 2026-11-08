@@ -51,12 +51,20 @@ const AUTH_JSON_MAX_BYTES = 1024 * 1024;
 const ROLLOUT_TAIL_BYTES = 8 * 1024 * 1024;
 
 /**
- * `<home>/.codex` for an aliased harness, else `~/.codex` for the main
- * account — mirrors `harnessEnv`'s `CODEX_HOME = path.join(home, ".codex")`
- * (src/bun/agents.ts:231); `home=null` inherits the real home dir.
+ * `<home>/.codex` for an aliased harness, else the process `CODEX_HOME` for a
+ * home-less built-in, else `~/.codex` — mirrors `harnessEnv`'s
+ * `CODEX_HOME = path.join(home, ".codex")` (src/bun/agents.ts:231) and the
+ * built-in inheriting Agetor's own env. The harness env map's explicit
+ * `CODEX_HOME` wins over the home-derived default, exactly as it does at
+ * spawn time.
  */
 export function codexHome(harness: Harness): string {
-  return harness.home ? path.join(harness.home, ".codex") : path.join(homedir(), ".codex");
+  const fromEnv = harness.env?.CODEX_HOME;
+  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
+  if (harness.home) return path.join(harness.home, ".codex");
+  const fromProcess = process.env.CODEX_HOME;
+  if (fromProcess && fromProcess.trim() !== "") return fromProcess;
+  return path.join(homedir(), ".codex");
 }
 
 /**

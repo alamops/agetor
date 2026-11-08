@@ -42,6 +42,34 @@ describe("claudeCredentialsPath", () => {
     expect(claudeCredentialsPath(mkHarness(null))).toBeNull();
   });
 
+  test("a harness env CLAUDE_CONFIG_DIR is the account root, not home", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-creds-home-"));
+    const envDir = mkdtempSync(path.join(tmpdir(), "agetor-creds-env-"));
+    const harness: Harness = { ...mkHarness(home), env: { CLAUDE_CONFIG_DIR: envDir } };
+    expect(claudeDotJsonPath(harness)).toBe(path.join(envDir, ".claude.json"));
+    expect(claudeCredentialsPath(harness)).toBe(path.join(envDir, ".credentials.json"));
+  });
+
+  test("a home-less built-in honors the process-level CLAUDE_CONFIG_DIR", async () => {
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    const envDir = mkdtempSync(path.join(tmpdir(), "agetor-creds-proc-"));
+    process.env.CLAUDE_CONFIG_DIR = envDir;
+    try {
+      const harness = mkHarness(null);
+      expect(claudeDotJsonPath(harness)).toBe(path.join(envDir, ".claude.json"));
+      expect(claudeCredentialsPath(harness)).toBe(path.join(envDir, ".credentials.json"));
+      // The process override is a pinned account: never the main keychain.
+      writeFileSync(
+        path.join(envDir, ".credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-oat-env-account", scopes: [] } }),
+      );
+      expect((await readClaudeToken(harness)).token).toBe("sk-ant-oat-env-account");
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+  });
+
   test("alias prefers <home>/.credentials.json, falls back to legacy <home>/.claude/.credentials.json", () => {
     const home = mkdtempSync(path.join(tmpdir(), "agetor-creds-"));
     // Neither exists: defaults to the fresh path.

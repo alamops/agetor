@@ -30,3 +30,17 @@ The read-only (`ask`) sandbox is never escalated.
 Wherever agetor decides which efforts a model supports (the four pickers, `agetor add`, `createTask`'s default effort, the PATCH null-clear guard, model-change cascades), a model's discovered effort set wins over the curated `MODEL_EFFORT_SUPPORT` table when the CLI reported one; the curated table is only the fallback when discovery is empty.
 The PATCH guard stays null-clear-only and never rejects a non-null effort id, because Codex's own catalog understates what the API accepts (`ultra` ran live on Luna despite not being offered there, and `none` ran live on GPT-5.6 Sol and Luna, GPT-6 Luna and GPT-6.1 Terra although the catalog omits it; GPT-6.1 Sol is the exception that answers `none` with a 400, above) — rejecting on the catalog would block values that actually run.
 A catalog change that only alters efforts (not ids) still republishes `agent_models_changed`.
+
+## `CODEX_HOME` isolation and harness stacks
+
+`CODEX_HOME` alone owns login (`auth.json`), config, sessions, MCP servers and
+every write; `HOME` is not overridden. The account's own env map may pin
+`CODEX_HOME` itself, which wins over the home-derived `<home>/.codex` (the
+mirror and rollout transfer use that same root). A harness-stack failover
+copies the rollout to the same relative path under the destination `CODEX_HOME`, runs
+`codex migrate-rollouts --apply` when a `thread_history_*.sqlite` already
+exists (30 s timeout, best-effort), and resumes with `exec resume <threadId>`.
+A failed resume blocks the swap visibly rather than starting a fresh session.
+MCP OAuth tokens are not copied (no stable standalone file in `auto`/`file`
+mode); the swap warns that sign-in may need repeating. Full behaviour:
+[harness-stacks.md](harness-stacks.md).

@@ -7,6 +7,7 @@ import {
   startOpencodeServerDriver,
   stopIdleOpencodeServersOnRealStop,
   stopOpencodeServerDriver,
+  reconcileHarnessFailover,
   reconcileOrphans,
   rearmFxAutoResumes,
   reapIdleSessions,
@@ -385,6 +386,8 @@ export async function runDaemon(): Promise<void> {
     if (rearmedFxAutoResumeCount > 0) {
       daemonLog(`re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
     }
+    // Harness-stack failover boot reconcile — same as index.ts's desktop path.
+    await reconcileHarnessFailover();
   } catch (err) {
     daemonLog(`boot restore failed: ${(err as Error)?.stack ?? String(err)}`);
     shutdown("boot restore failed", 1);

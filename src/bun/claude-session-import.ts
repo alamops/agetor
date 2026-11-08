@@ -136,7 +136,7 @@ function scanOptions(opts: ImportClaudeSessionsOptions | undefined): ScanClaudeS
   const homeDir = opts?.homeDir ?? (process.env.HOME || homedir());
   const listed = opts?.harnesses ?? harnesses.list()
     .filter((h) => h.kind === "claude-code")
-    .map((h) => ({ id: h.id, kind: h.kind, home: h.home, bin: h.bin }));
+    .map((h) => ({ id: h.id, kind: h.kind, home: h.home, env: h.env, bin: h.bin }));
   return {
     homeDir,
     env: opts?.env ?? process.env,

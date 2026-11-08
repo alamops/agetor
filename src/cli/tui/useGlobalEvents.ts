@@ -62,14 +62,31 @@ export function toastFor(e: GlobalEvent, hiddenTaskIds?: ReadonlySet<string>): T
   const hidden = (taskId: string) => eventPipelineParentId(e) !== null || hiddenTaskIds?.has(taskId) === true;
   if (e.kind === "run-status") {
     if (hidden(e.taskId)) return null;
+    // A failover's old run is recorded failed while the task keeps running;
+    // the `harness-swap` event carries the good news, and the blocked-column
+    // toast owns the all-exhausted case. Never paint "failed" for either.
+    if (e.reason === "harness-swap" || e.reason === "harness-exhausted") return null;
     if (e.status === "succeeded") return { text: `✓ ${short(e.taskId)} succeeded`, color: "green" };
     if (e.status === "failed") return { text: `✗ ${short(e.taskId)} failed`, color: "red" };
     if (e.status === "orphaned") return { text: `… ${short(e.taskId)} orphaned`, color: "yellow" };
     return null; // cancelled — no toast (the user did it)
   }
+  if (e.kind === "harness-swap") {
+    if (hidden(e.taskId)) return null;
+    return {
+      text: `⇄ ${short(e.taskId)} switched to ${e.toLabel} (${e.position}/${e.count})`,
+      color: "cyan",
+    };
+  }
   if (e.kind === "column" && e.column === "blocked") {
     if (hidden(e.taskId)) return null;
-    const why = e.reason === "api-error" ? " (API error)" : "";
+    const why = e.reason === "api-error"
+      ? " (API error)"
+      : e.reason === "harness-exhausted"
+        ? " (stack out of quota)"
+        : e.reason === "harness-swap-failed"
+          ? " (no usable backup)"
+          : "";
     return { text: `! ${short(e.taskId)} needs you${why}`, color: "yellow" };
   }
   // A send the app answered `pending: true` (session still launching) failed

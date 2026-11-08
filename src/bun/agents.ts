@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
+import path from "node:path";import { cursorModelArg, DEFAULT_MODEL, defaultModeFor, FX_PROVIDER_STATUS_PREFIX, FX_RECOVERY_STATUS_PREFIX, FX_SESSION_TITLE_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, HARNESS_LIMIT_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type FxRecoveryPayload, type Harness, type OpencodeServerMode, type Speed } from "../shared/types.ts";
+import { classifyHarnessLimitSignal } from "../shared/harness-limits.ts";
 import {
   effectiveOpencodeServer,
   opencodeMajor,
@@ -17,6 +18,7 @@ import { attachSubagentWatcher, settleSubagentById, type SubagentWatcherHandle }
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
+  encodeProjectPath,
   openContinuationRun,
   spawnClaudeViaTmux,
   toClaudeModeString,
@@ -204,6 +206,13 @@ export interface AgentRunOptions {
    * missing or unparseable version reads as v2. Every other kind ignores it.
    */
   cliVersion?: string | null;
+  /**
+   * claude-code-only: true when the task is on a harness stack with at least
+   * one backup. Gates the pane usage-limit notice → failover signal so a lone
+   * account keeps claude's own auto-continue (plan §2.2) instead of settling
+   * the turn. Every other kind ignores it.
+   */
+  harnessFailover?: boolean;
   /**
    * opencode-only: the task's stored server mode (`task.opencodeServer`,
    * D-4). Resolved through `effectiveOpencodeServer` — a harness with a
@@ -418,6 +427,28 @@ function warnUnknownHarnessKind(kind: string): void {
   console.warn(`[agetor] harness kind "${kind}" is not supported by this build; no home env var is set for it`);
 }
 
+/** The harness-pinned Claude config dir (`CLAUDE_CONFIG_DIR`), or null when
+ *  the built-in account falls back to the process env / `~/.claude`. Mirrors
+ *  {@link harnessEnv}'s precedence exactly: the env map wins over `home`. */
+export function claudeConfigDirOverrideFor(
+  harness: { home: string | null; env?: Record<string, string> | null },
+): string | null {
+  const fromEnv = harness.env?.CLAUDE_CONFIG_DIR;
+  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
+  return harness.home;
+}
+
+/** The harness-pinned Codex state root (`CODEX_HOME`), or null when the
+ *  built-in account falls back to the process env / `~/.codex`. Mirrors
+ *  {@link harnessEnv}: the env map wins over `<home>/.codex`. */
+export function codexHomeOverrideFor(
+  harness: { home: string | null; env?: Record<string, string> | null },
+): string | null {
+  const fromEnv = harness.env?.CODEX_HOME;
+  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
+  return harness.home ? path.join(harness.home, ".codex") : null;
+}
+
 /**
  * Build the env block the harness contributes to a spawn: home-derived
  * vars (HOME + the CLI-specific config-dir) layered under the harness's
@@ -435,10 +466,9 @@ export function harnessEnv(harness: Harness): Record<string, string> {
     // HOME, so re-homing the spawn lands on a non-existent keychain and the
     // CLI reports "Not logged in" even when a valid token is present.
     //
-    // Codex goes through its own CODEX_HOME override and doesn't touch the
-    // macOS keychain, so re-homing it is harmless — but CODEX_HOME is what
-    // actually controls its login & history, so we set both as a belt-and-
-    // braces measure.
+    // Codex goes through its own CODEX_HOME override: login, config, sessions
+    // and MCP all live there, so HOME is deliberately left as the user's real
+    // home (the T00 harness-stack spike proved the isolation).
     //
     // Cursor has no documented dedicated config-dir env var, so isolating an
     // additional account means a true HOME override (like codex's HOME half,
@@ -447,7 +477,15 @@ export function harnessEnv(harness: Harness): Record<string, string> {
     if (harness.kind === "claude-code") {
       env.CLAUDE_CONFIG_DIR = harness.home;
     } else if (harness.kind === "codex") {
-      env.HOME = harness.home;
+      // CODEX_HOME alone owns codex's login (`auth.json`), config, sessions,
+      // MCP servers and every write. The T00 spike for harness stacks verified
+      // it with `env -i HOME=<fresh> CODEX_HOME=<fresh>` on codex-cli 0.166.0:
+      // `codex login status` reports "Not logged in", `codex mcp list` starts
+      // empty, and `--version` writes only under CODEX_HOME. Leaving HOME
+      // alone keeps the user's own `~/.gitconfig`/`~/.ssh`/`gh` available to a
+      // backup account — and, importantly, makes a stack backup's HOME equal
+      // the primary's, so no second, invisible home has to be maintained.
+      // Docs: docs/architecture/harness-stacks.md, harness-codex.md.
       env.CODEX_HOME = path.join(harness.home, ".codex");
     } else if (harness.kind === "cursor") {
       env.HOME = harness.home;
@@ -535,7 +573,7 @@ export function isValidEnvKey(key: string): boolean {
  *
  *   - default Claude Code      → `claude`
  *   - a config-dir alias       → `CLAUDE_CONFIG_DIR=… claude`
- *   - a codex alias            → `HOME=… CODEX_HOME=… codex`
+ *   - a codex alias            → `CODEX_HOME=… codex`
  *
  * Pure and deterministic — no spawning — so the escaping is unit-testable in
  * isolation (see agents.test.ts). The caller wraps the result with
@@ -1268,6 +1306,99 @@ export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined 
  * instead of duplicating it.
  */
 export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
+
+/**
+ * Harness-stack failover seams. The fake Claude driver's first turn emits a
+ * tool call and then a `harness-limit:` signal, and every later turn succeeds
+ * — enough to drive the transfer branch of a swap end to end. The `_clean_`
+ * marker (or `AGETOR_FAKE_CLAUDE_LIMIT_CLEAN=1`) omits the tool call so the
+ * clean-retry branch (no transfer, original prompt resent) is exercised too.
+ *
+ * When `AGETOR_FAKE_CLAUDE_TRANSCRIPT=1` (or a limit marker is present) the
+ * fake also writes a minimal session JSONL at the harness's
+ * `CLAUDE_CONFIG_DIR` path plus one sidecar dir, so the transfer copies real
+ * files. It never writes to the real `~/.claude`: a harness with no alias home
+ * gets no transcript seam (the transfer then reports `no-session`).
+ */
+export const FAKE_CLAUDE_LIMIT_PROMPT_MARKER = "__agetor_fake_claude_limit__";
+export const FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER = "__agetor_fake_claude_limit_clean__";
+/** The pane-sourced variant: the same failover turn, but the emitted signal
+ *  says `source: "claude-pane"` so a settlement's passthrough branch (a stack
+ *  deleted mid-turn) exercises the paused-REPL session drop. */
+export const FAKE_CLAUDE_LIMIT_PANE_PROMPT_MARKER = "__agetor_fake_claude_limit_pane__";
+/** The API-error variant: turn 1 emits the synthetic `api error:` sentinel
+ *  (HTTP 429) instead of the structured limit signal, exactly like the real
+ *  driver's `isApiErrorMessage` path. Exercises the case where the api-error
+ *  column flip must NOT pre-empt a stacked swap. */
+export const FAKE_CLAUDE_API_LIMIT_PROMPT_MARKER = "__agetor_fake_claude_api_limit__";
+export const FAKE_CODEX_LIMIT_PROMPT_MARKER = "__agetor_fake_codex_limit__";
+
+/** Per-task turn counter for the fake failover scenario. Stamped so a
+ *  long-lived test process can prune entries for tasks no longer in play — the
+ *  scenario is one-shot per task, so an old entry has no future use. */
+const fakeLimitTurnCounts = new Map<string, { turn: number; at: number }>();
+const FAKE_LIMIT_COUNTER_IDLE_MS = 60 * 60_000;
+
+/** True when this fake spawn should play the failover scenario. */
+function fakeLimitScenario(kind: AgentKind, prompt: string): boolean {
+  if (kind === "codex") {
+    return (
+      process.env.AGETOR_FAKE_CODEX_LIMIT === "1"
+      || prompt.includes(FAKE_CODEX_LIMIT_PROMPT_MARKER)
+    );
+  }
+  return (
+    process.env.AGETOR_FAKE_CLAUDE_LIMIT === "1"
+    || process.env.AGETOR_FAKE_CLAUDE_LIMIT_CLEAN === "1"
+    || process.env.AGETOR_FAKE_CLAUDE_LIMIT_PANE === "1"
+    || prompt.includes(FAKE_CLAUDE_LIMIT_PROMPT_MARKER)
+    || prompt.includes(FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER)
+    || prompt.includes(FAKE_CLAUDE_LIMIT_PANE_PROMPT_MARKER)
+    || prompt.includes(FAKE_CLAUDE_API_LIMIT_PROMPT_MARKER)
+  );
+}
+
+function bumpFakeLimitTurn(taskId: string): number {
+  const now = Date.now();
+  if (fakeLimitTurnCounts.size > 32) {
+    for (const [id, entry] of fakeLimitTurnCounts) {
+      if (now - entry.at > FAKE_LIMIT_COUNTER_IDLE_MS) fakeLimitTurnCounts.delete(id);
+    }
+  }
+  const next = (fakeLimitTurnCounts.get(taskId)?.turn ?? 0) + 1;
+  fakeLimitTurnCounts.set(taskId, { turn: next, at: now });
+  return next;
+}
+
+/**
+ * Write a minimal, valid session transcript for the fake failover turn at the
+ * exact path a real Claude session would use under `configDir`. Never writes
+ * to the real `~/.claude` — a built-in harness (no alias home) has no
+ * `configDir`, and the transfer then reports `no-session`.
+ */
+function writeFakeSwapTranscript(args: {
+  cwd: string;
+  configDir: string | null;
+  sessionId: string;
+  prompt: string;
+}): void {
+  if (!args.configDir) return;
+  const dir = path.join(args.configDir, "projects", encodeProjectPath(args.cwd));
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const jsonl = path.join(dir, `${args.sessionId}.jsonl`);
+  const lines = [
+    { type: "user", uuid: `${args.sessionId}-u1`, message: { role: "user", content: [{ type: "text", text: args.prompt }] } },
+    { type: "assistant", uuid: `${args.sessionId}-a1`, message: { role: "assistant", content: [{ type: "text", text: "Working on it." }] } },
+  ];
+  writeFileSync(jsonl, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`, { mode: 0o600 });
+  const sidecar = path.join(dir, args.sessionId, "subagents");
+  mkdirSync(sidecar, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(sidecar, "agent-fake.jsonl"),
+    `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "sidecar" }] } })}\n`,
+    { mode: 0o600 },
+  );
+}
 
 /**
  * Prompt-marker trigger for the pipeline-handoff fake-driver scenario (see
@@ -2363,8 +2494,15 @@ function makeFakeAgent(
     model?: string;
     speed?: Speed | null;
     onSteerDropped?: (text: string) => boolean;
+    /** claude-code only: the account's CLAUDE_CONFIG_DIR, for the fake
+     *  transcript seam. Null means "built-in / no alias home" — no transcript
+     *  is written (the real `~/.claude` is never touched by a fake). */
+    configDir?: string | null;
+    onSessionId?: (id: string) => void;
+    resumeSessionId?: string | null;
   } = {},
-): SpawnedAgent {  const record: string[] = [`spawn:${prompt}`];
+): SpawnedAgent {
+  const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   let rejectDone!: (err: Error) => void;
   const done = new Promise<number>((res, rej) => { resolveDone = res; rejectDone = rej; });
@@ -2406,7 +2544,70 @@ function makeFakeAgent(
   // makeChunkHandler pattern-matches on. Resolves the turn with code 0
   // because that's what popEndOfTurn does — the orchestrator distinguishes
   // it from a real success via the handle.apiError flag, not exit code.
-  if (process.env.AGETOR_FAKE_CLAUDE_API_ERROR === "1") {
+  const fakeLimitTurn = fakeLimitScenario(fakeOpts.kind ?? "claude-code", prompt)
+    ? bumpFakeLimitTurn(taskId)
+    : 0;
+  if (fakeLimitTurn === 1) {
+    // Harness-stack failover scenario: turn 1 writes a real transcript (when
+    // the harness has an alias home) and, unless the clean-retry variant is
+    // selected, one harmless tool call — then the structured limit signal.
+    // Every later turn succeeds, so the swap run completes the task.
+    const clean =
+      process.env.AGETOR_FAKE_CLAUDE_LIMIT_CLEAN === "1"
+      || prompt.includes(FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER);
+    const sessionId = fakeOpts.resumeSessionId ?? `fake-swap-${taskId}`;
+    if (fakeOpts.kind !== "codex") {
+      try {
+        writeFakeSwapTranscript({
+          cwd: fakeOpts.cwd ?? process.cwd(),
+          configDir: fakeOpts.configDir ?? null,
+          sessionId,
+          prompt,
+        });
+        fakeOpts.onSessionId?.(sessionId);
+      } catch {
+        // The transcript seam is best-effort; the signal below still fires.
+      }
+    } else {
+      fakeOpts.onSessionId?.(sessionId);
+    }
+    after(5, () => {
+      onChunk("assistant", "Working on the task.");
+      if (!clean) {
+        onChunk(
+          "tool_use",
+          JSON.stringify({ id: "fake-swap-tool-1", name: "Bash", input: { command: "true" }, serverSide: false }),
+          "fake-swap-tool-1",
+        );
+      }
+    });
+    after(10, () => {
+      // The API-error variant emits the real synthetic sentinel instead of the
+      // structured limit signal. The orchestrator classifies the 429 in that
+      // sentinel as a limit, so this is the exact path where a stacked task
+      // must keep `running` rather than flipping to `blocked` first.
+      if (fakeOpts.kind !== "codex" && prompt.includes(FAKE_CLAUDE_API_LIMIT_PROMPT_MARKER)) {
+        onChunk("assistant", "API Error: 429 Too Many Requests");
+        onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}HTTP 429 Too Many Requests`);
+        resolveDone(0);
+        return;
+      }
+      const signal = classifyHarnessLimitSignal(fakeOpts.kind ?? "claude-code", {
+        text: fakeOpts.kind === "codex" ? "usage_limit_exceeded" : "Usage limit reached · continuing automatically when it resets",
+      }) ?? { reason: "quota" as const, resetAtMs: null, message: "usage limit reached", source: "claude-pane" as const };
+      // The classifier labels a Claude text signal `claude-api-error`; the
+      // pane marker/env selects the REPL-paused variant so a settlement's
+      // passthrough branch can be tested for dropping the paused session.
+      const paneLimit = fakeOpts.kind !== "codex"
+        && (prompt.includes(FAKE_CLAUDE_LIMIT_PANE_PROMPT_MARKER) || process.env.AGETOR_FAKE_CLAUDE_LIMIT_PANE === "1");
+      onChunk(
+        "status",
+        `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify({ ...signal, source: paneLimit ? "claude-pane" : signal.source })}`,
+      );
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+  } else if (process.env.AGETOR_FAKE_CLAUDE_API_ERROR === "1") {
     // Emit the chunks promptly (this is what flips the column to `blocked`
     // in the live path), but allow an optional resolve delay so
     // cancellation-precedence tests have a window to fire `cancelRun`
@@ -3982,6 +4183,9 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
         mode: opts.mode ?? defaultModeFor(harness.kind),
         cwd,
         kind: "claude-code",
+        configDir: claudeConfigDirOverrideFor(harness),
+        onSessionId,
+        resumeSessionId: opts.resumeSessionId ?? null,
       });
     }
     // Pre-generate a session uuid when we're not resuming. The driver will
@@ -4000,9 +4204,10 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       cwd,
       onChunk,
       sessionId,
-      configDir: harness.home,
+      configDir: claudeConfigDirOverrideFor(harness),
       mode: opts.mode ?? null,
       deferredPrompt: built.deferredPrompt,
+      harnessFailover: opts.harnessFailover === true,
     });
   }
 

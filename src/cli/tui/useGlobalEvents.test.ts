@@ -54,3 +54,34 @@ test("toastFor: hiddenTaskIds doesn't affect other tasks' toasts", () => {
     "green",
   );
 });
+
+test("toastFor: a harness swap is a quiet informational line and respects pipeline hiding", () => {
+  const ev = {
+    kind: "harness-swap", taskId: ID, from: "a", to: "b", fromLabel: "Work", toLabel: "Backup",
+    reason: "quota", position: 2, count: 3, ts: 1,
+  } as unknown as GlobalEvent;
+  expect(toastFor(ev)?.color).toBe("cyan");
+  expect(toastFor(ev)?.text).toContain("Backup");
+  expect(toastFor(ev, new Set([ID]))).toBeNull();
+});
+
+test("toastFor: stack blocked reasons get a specific hint", () => {
+  const ev = {
+    kind: "column", taskId: ID, runId: "r", column: "blocked", prev: "running", ts: 1,
+    reason: "harness-exhausted",
+  } as unknown as GlobalEvent;
+  expect(toastFor(ev)?.text).toContain("stack out of quota");
+});
+
+test("toastFor: the old run's failover/exhausted failure never paints a failed toast", () => {
+  for (const reason of ["harness-swap", "harness-exhausted"] as const) {
+    const ev = {
+      kind: "run-status", taskId: ID, runId: "r", status: "failed", reason, ts: 1,
+    } as unknown as GlobalEvent;
+    expect(toastFor(ev), reason).toBeNull();
+  }
+  // A genuine failure still does.
+  expect(toastFor({
+    kind: "run-status", taskId: ID, runId: "r", status: "failed", ts: 1,
+  } as unknown as GlobalEvent)?.color).toBe("red");
+});

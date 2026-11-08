@@ -2,7 +2,7 @@ import { memo } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import type { ColumnId, Task } from "../../../shared/types.ts";
+import type { ColumnId, HarnessLimitState, HarnessStack, Task } from "../../../shared/types.ts";
 import { TaskCard } from "./TaskCard";
 
 interface Props {
@@ -10,6 +10,13 @@ interface Props {
   label: string;
   tasks: Task[];
   homeDir: string;
+  /** Machine-local stacks, so a not-yet-run task still shows its `1/2` badge
+   *  from the account's membership (T15) instead of only after its first
+   *  failover state exists. */
+  stacks?: HarnessStack[];
+  /** Account-global cooldowns, forwarded so a card can mark a cooling current
+   *  account before the task itself blocks. */
+  limitStates?: HarnessLimitState[];
   onStart: (t: Task) => void;
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
@@ -54,7 +61,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onReviewPipeline, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, stacks = [], limitStates = [], onStart, onCancel, onDelete, onOpen, onOpenAttention, onReviewPipeline, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -79,6 +86,8 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
             key={t.id}
             task={t}
             homeDir={homeDir}
+            stacks={stacks}
+            limitStates={limitStates}
             onStart={onStart}
             onCancel={onCancel}
             onDelete={onDelete}
@@ -116,6 +125,8 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.id === next.id &&
   prev.label === next.label &&
   prev.homeDir === next.homeDir &&
+  prev.stacks === next.stacks &&
+  prev.limitStates === next.limitStates &&
   prev.onStart === next.onStart &&
   prev.onCancel === next.onCancel &&
   prev.onDelete === next.onDelete &&

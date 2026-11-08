@@ -212,6 +212,9 @@ afterAll(() => {
 /** `POST /daemon/shutdown` requests the in-process core received. */
 const shutdownRequests: ("stop" | "handoff")[] = [];
 
+/** The stack created by the row below, for the patch/delete rows. */
+let scopeStackId = "";
+
 /** An id no row will ever find. */
 const MISSING = "00000000-0000-4000-8000-000000000000";
 
@@ -435,6 +438,34 @@ const ROWS: Record<ClientMethod, Row> = {
     expect: [200],
     why: "label patch on the harness just created",
     call: () => client.patchHarness("scope-claude", { label: "Scope Claude 2" }),
+  },
+  listHarnessStacks: { expect: [200], why: "stacks + limit states", call: () => client.listHarnessStacks() },
+  createHarnessStack: {
+    // `statusOf` maps a resolved call to 200; the route's real 201 is not visible here.
+    expect: [200],
+    why: "a one-member stack is allowed and inert",
+    call: async () => {
+      const result = await client.createHarnessStack({ label: "Scope stack", kind: "claude-code", members: ["scope-claude"] });
+      scopeStackId = result.stack.id;
+      return result;
+    },
+  },
+  getHarnessStack: {
+    expect: [200],
+    why: "stack just created",
+    call: async () => {
+      return client.getHarnessStack(scopeStackId);
+    },
+  },
+  patchHarnessStack: {
+    expect: [200],
+    why: "label patch on the stack just created",
+    call: () => client.patchHarnessStack(scopeStackId, { label: "Scope stack 2" }),
+  },
+  deleteHarnessStack: {
+    expect: [200],
+    why: "delete is unconditional",
+    call: () => client.deleteHarnessStack(scopeStackId),
   },
   harnessUsage: { expect: [200], why: "task counts for the harness", call: () => client.harnessUsage("scope-claude") },
   harnessShellEnv: {

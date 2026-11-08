@@ -557,6 +557,42 @@ test("a plugin disabled via enabledPlugins contributes nothing", async () => {
   expect(extensions.some((e) => e.name === "off" || e.name.startsWith("off:"))).toBe(false);
 });
 
+test("an env-pinned CLAUDE_CONFIG_DIR account reads enabledPlugins from that root, not home (R7-S2)", async () => {
+  // The spawned claude resolves its config dir as env.CLAUDE_CONFIG_DIR → home
+  // → process env → ~/.claude. The plugins install records already used that
+  // resolver; the enabledPlugins map must agree, or an env-pinned account
+  // reads a different settings.json than the one its CLI actually loads.
+  const envRoot = mkdtempSync(path.join(tmpRoot, "plug-envroot-"));
+  const harnessHome = mkdtempSync(path.join(tmpRoot, "plug-envhome-"));
+  installPlugin(envRoot, "env-off@mp", {
+    commands: { "go.md": "do it" },
+    manifest: { name: "env-off", description: "disabled in the env root" },
+    enabled: false,
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-env-proj-"));
+  const opts = {
+    agent: "claude-code" as const,
+    workdir: project,
+    harnessHome,
+    harnessEnv: { CLAUDE_CONFIG_DIR: envRoot },
+  };
+  const { commands, extensions } = await listAgentCapabilities(opts);
+  expect(commands.some((c) => c.name === "/env-off:go")).toBe(false);
+  expect(extensions.some((e) => e.name === "env-off" || e.name.startsWith("env-off:"))).toBe(false);
+
+  // The same plugin enabled in an env root is visible — proof the read follows
+  // the env root rather than merely dropping the map. A fresh root keeps the
+  // stat-keyed JSON cache out of the assertion.
+  const envRootOn = mkdtempSync(path.join(tmpRoot, "plug-envroot-on-"));
+  installPlugin(envRootOn, "env-off@mp", {
+    commands: { "go.md": "do it" },
+    manifest: { name: "env-off", description: "enabled in the env root" },
+    enabled: true,
+  });
+  const on = await listAgentCapabilities({ ...opts, harnessEnv: { CLAUDE_CONFIG_DIR: envRootOn } });
+  expect(on.commands.some((c) => c.name === "/env-off:go")).toBe(true);
+});
+
 test("two plugins sharing a bare name collapse to one /name:cmd but both self-rows show", async () => {
   const harness = mkdtempSync(path.join(tmpRoot, "plug-dupcmd-"));
   installPlugin(harness, "dup@mp-one", {

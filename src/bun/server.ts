@@ -41,7 +41,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { activeRunCount, appendRunStatusLine, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { activeRunCount, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -58,6 +58,10 @@ import {
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, reviewHumanStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { harnessStacks, StackInputError } from "./harness-stacks.ts";
+import { cancelAutoRetry } from "./harness-failover.ts";
+import { mirrorStack } from "./harness-mirror.ts";
+import { collectHarnessSessionCopies, removeHarnessSessionCopies } from "./harness-session-transfer.ts";
 import {
   applyHarnessAutoEnable,
   flushPendingHarnessAutoEnableNotice,
@@ -75,6 +79,7 @@ import {
   buildHarnessTerminalCommand,
   harnessEnv,
   isValidEnvKey,
+  claudeConfigDirOverrideFor,
   resolveBin,
   toTerminalAppleScript,
 } from "./agents.ts";
@@ -611,6 +616,59 @@ const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
  *  request ever reaches `addGitHubReaction` (which re-validates independently,
  *  same defense-in-depth as the other GitHub POST routes). */
 const REACTION_CONTENTS = new Set<string>(["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"]);
+
+/**
+ * Parse a `/harness-stacks` body into a create/edit input. `partial` keeps the
+ * PATCH semantics (an omitted field means "leave it alone"); a create requires
+ * label, kind and members. Validation of the *values* stays in
+ * `harness-stacks.ts` so the CLI shares one rulebook.
+ */
+type StackInput = { label: string; kind: "claude-code" | "codex"; members: string[]; mirrorMode?: "full" | "safe" };
+
+async function parseStackBody(
+  req: Request,
+  opts: { partial?: boolean } = {},
+): Promise<{ input: StackInput | Partial<StackInput> } | { error: string }> {
+  const raw = await req.json().catch(() => null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: "invalid JSON body" };
+  const body = raw as Record<string, unknown>;
+  const label = body.label;
+  const kind = body.kind;
+  const members = body.members;
+  const mirrorMode = body.mirrorMode;
+  if (!opts.partial) {
+    if (typeof label !== "string" || !label.trim()) return { error: "label required" };
+    if (kind !== "claude-code" && kind !== "codex") return { error: "kind must be 'claude-code' or 'codex'" };
+    if (!Array.isArray(members) || !members.every((m) => typeof m === "string")) {
+      return { error: "members must be an array of harness ids" };
+    }
+  } else {
+    if (label !== undefined && (typeof label !== "string" || !label.trim())) return { error: "label must be a non-empty string" };
+    if (kind !== undefined && kind !== "claude-code" && kind !== "codex") return { error: "kind must be 'claude-code' or 'codex'" };
+    if (members !== undefined && (!Array.isArray(members) || !members.every((m) => typeof m === "string"))) {
+      return { error: "members must be an array of harness ids" };
+    }
+  }
+  if (mirrorMode !== undefined && mirrorMode !== "full" && mirrorMode !== "safe") {
+    return { error: "mirrorMode must be 'full' or 'safe'" };
+  }
+  if (opts.partial) {
+    const patch: Partial<StackInput> = {};
+    if (typeof label === "string") patch.label = label;
+    if (kind === "claude-code" || kind === "codex") patch.kind = kind;
+    if (Array.isArray(members)) patch.members = members as string[];
+    if (mirrorMode === "safe" || mirrorMode === "full") patch.mirrorMode = mirrorMode;
+    return { input: patch };
+  }
+  return {
+    input: {
+      label: typeof label === "string" ? label : "",
+      kind: kind === "codex" ? "codex" : "claude-code",
+      members: Array.isArray(members) ? (members as string[]) : [],
+      ...(mirrorMode === "safe" || mirrorMode === "full" ? { mirrorMode } : {}),
+    },
+  };
+}
 
 function filterPatch(raw: unknown): { patch: Partial<Task> } | { error: string } {
   if (!raw || typeof raw !== "object") return { patch: {} };
@@ -4272,7 +4330,7 @@ export function startApiServer(
           // response below either way.
           noteHarnessStatuses(statuses);
           return json(
-            { harnesses: harnesses.list(), statuses },
+            { harnesses: harnesses.list(), statuses, stacks: harnessStacks.list(), limitStates: harnessStacks.listLimitStates() },
             { headers: corsHeaders(req) },
           );
         }),
@@ -4372,6 +4430,94 @@ export function startApiServer(
         }),
       },
 
+      // Harness account stacks (docs/architecture/harness-stacks.md): ordered
+      // same-kind accounts whose first member is the primary. Machine-local —
+      // no bundle export, no global flag; deleting the stack makes failover
+      // inert at the task's next selection.
+      "/harness-stacks": {
+        GET: authed((req) =>
+          json(
+            { stacks: harnessStacks.list(), limitStates: harnessStacks.listLimitStates() },
+            { headers: corsHeaders(req) },
+          )),
+        POST: authed(async (req) => {
+          const body = await parseStackBody(req);
+          if ("error" in body) return json({ error: body.error }, { status: 400, headers: corsHeaders(req) });
+          try {
+            const stack = harnessStacks.create(body.input as StackInput);
+            // The mirror copies the primary's whole config tree (plugins alone
+            // can be thousands of files). Keep the request alive so a slow
+            // volume cannot trip Bun's 255 s idle cap after the stack is saved.
+            server.timeout(req, 0);
+            const mirror = await mirrorStack(stack, {});
+            return json(
+              { stack: harnessStacks.get(stack.id) ?? stack, warnings: stack.warnings, mirror },
+              { status: 201, headers: corsHeaders(req) },
+            );
+          } catch (err) {
+            if (err instanceof StackInputError) {
+              return json({ error: err.message, blockers: err.blockers }, { status: 400, headers: corsHeaders(req) });
+            }
+            return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      "/harness-stacks/:id": {
+        GET: authed((req) => {
+          const stack = harnessStacks.get(req.params.id);
+          return stack
+            ? json({ stack, limitStates: harnessStacks.listLimitStates() }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = harnessStacks.get(req.params.id);
+          if (!current) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          const body = await parseStackBody(req, { partial: true });
+          if ("error" in body) return json({ error: body.error }, { status: 400, headers: corsHeaders(req) });
+          try {
+            const stack = harnessStacks.update(req.params.id, body.input);
+            // A label-only rename changes nothing the mirror reads. Re-running
+            // the full config copy (hundreds of files, possibly hooks) for a
+            // cosmetic edit is wasted work and a needless write window.
+            const mirrorRelevant =
+              body.input.members !== undefined
+              || body.input.kind !== undefined
+              || body.input.mirrorMode !== undefined;
+            if (mirrorRelevant) server.timeout(req, 0);
+            const mirror = mirrorRelevant
+              ? await mirrorStack(stack, {})
+              : { copied: [], warnings: [] };
+            return json(
+              { stack: harnessStacks.get(stack.id) ?? stack, warnings: stack.warnings, mirror },
+              { headers: corsHeaders(req) },
+            );
+          } catch (err) {
+            if (err instanceof StackInputError) {
+              return json({ error: err.message, blockers: err.blockers }, { status: 400, headers: corsHeaders(req) });
+            }
+            return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          const stack = harnessStacks.get(req.params.id);
+          if (!stack) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // `harnessStacks.delete` clears every task's recorded failover state;
+          // its armed all-exhausted timer is process memory, so collect the
+          // affected ids first and cancel each handle too. Otherwise a deleted
+          // stack leaves a dangling timer for up to 24 h (review nit).
+          const affected = tasks
+            .list()
+            .filter((task) => task.harnessState?.stackId === stack.id)
+            .map((task) => task.id);
+          harnessStacks.delete(stack.id);
+          for (const taskId of affected) cancelAutoRetry(taskId);
+          return json({ removed: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // Existing Claude config dirs (`~/.claude*` + CLAUDE_CONFIG_DIR) with a
       // logged-in account that no registered harness points at yet — the
       // Add-harness picker renders these as one-click "use existing account"
@@ -4380,7 +4526,7 @@ export function startApiServer(
         GET: authed((req) => {
           const registeredHomes = harnesses.list()
             .filter((h) => h.kind === "claude-code")
-            .map((h) => h.home);
+            .map((h) => claudeConfigDirOverrideFor(h));
           return json(
             { accounts: discoverClaudeAccounts(registeredHomes) },
             { headers: corsHeaders(req) },
@@ -4490,9 +4636,16 @@ export function startApiServer(
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
         }),
-        DELETE: authed((req) => {
+        DELETE: authed(async (req) => {
           try {
+            // Capture the handoff copies BEFORE the delete (the root resolves
+            // only while the row exists) but unlink them only AFTER it
+            // succeeded. `harnesses.delete` re-checks in-use atomically with
+            // the row delete, so a task assigned in this window still gets a
+            // 409 with its conversation untouched (review R13-S2).
+            const copies = collectHarnessSessionCopies(req.params.id);
             harnesses.delete(req.params.id);
+            removeHarnessSessionCopies(copies);
             // Prunes the deleted harness out of the per-harness discovery
             // cache and its transition-detector bookkeeping, then publishes
             // once — cheaper than a full `refreshAllModels()` sweep (which
@@ -5166,7 +5319,7 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const configDir = effectiveClaudeConfigDir(h.home);
+          const configDir = claudeConfigDirOverrideFor(h) ?? effectiveClaudeConfigDir(null);
           return json(
             { configDir, days: accountUsageDays(configDir) },
             { headers: corsHeaders(req) },
@@ -5660,6 +5813,25 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
+          // A manual switch BETWEEN accounts of the same stack preserves the
+          // conversation, so it must not kill a live run under the user — ask
+          // them to stop first. A switch outside the stack keeps today's
+          // kill-and-reset behavior and its existing guards.
+          const beforeStack = typeof patch.agent === "string" && patch.agent !== before.agent
+            ? harnessStacks.getByMember(before.agent)
+            : null;
+          const afterStack = beforeStack && typeof patch.agent === "string"
+            ? harnessStacks.getByMember(patch.agent)
+            : null;
+          const sameStackAccountSwitch = Boolean(
+            beforeStack && afterStack && beforeStack.id === afterStack.id,
+          );
+          if (sameStackAccountSwitch && runs.hasRunning(before.id)) {
+            return json(
+              { error: "stop the run before switching accounts" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
           // Enforce the "model is always set, effort is set unless the
           // model declines it" invariant at the PATCH boundary so direct
           // API callers can't reintroduce nulls that `buildCommand` would
@@ -5716,32 +5888,75 @@ export function startApiServer(
               }
             }
           }
-          const updated = tasks.update(req.params.id, patch);
-          if (!updated) {
-            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          // A same-stack account switch copies the transcript and then drops
+          // the old session. Claim the task for the whole operation so a Run
+          // or a message that lands mid-copy is refused (or, for Run, told the
+          // task is starting) instead of being pasted into the old account's
+          // still-live REPL / minting a session the handoff then displaces
+          // (review S3). The claim is released in the `finally` below.
+          if (sameStackAccountSwitch && !claimTaskForAccountSwitch(before.id)) {
+            return json(
+              { error: "task is busy starting a turn — try again in a moment" },
+              { status: 409, headers: corsHeaders(req) },
+            );
           }
-          // A manual move (drag, `agetor move`) emits no global `column` event,
-          // so the notification hooks never see a card leave `blocked` this
-          // way. Its reason-family OS entry goes with the block.
-          if (before.column === "blocked" && updated.column !== "blocked") {
-            removeTaskNotification(req.params.id, UNBLOCKED_REMOVAL_KINDS);
+          // Persist the switch intent BEFORE the row changes accounts, so a
+          // crash between `tasks.update` and the transcript copy is completed
+          // (or visibly reported) by the boot reconcile instead of silently
+          // starting a fresh conversation on the backup (review R15-S3). The
+          // automatic swap already persists its own `pendingSwap`.
+          if (sameStackAccountSwitch && typeof patch.agent === "string") {
+            beginManualAccountSwitch(before.id, before.agent, patch.agent);
           }
-          // Mirror behavioural changes onto a live claude session via slash
-          // commands so the conversation context survives a model/mode/effort
-          // change. Agent changes wipe the session — different harness entirely.
-          // Fire-and-forget: the mode-change path now verifies via the JSONL
-          // event before resolving, which can take up to 4.5s on the
-          // exhaust-retries path. The PATCH response payload only carries the
-          // updated Task row (already in hand); the verify outcome reaches
-          // the user through the `status` SSE events that
-          // `emitModeChangeStatus` writes. Blocking the response would add
-          // unbounded latency for no benefit. `.catch` keeps an unexpected
-          // throw from becoming an unhandledRejection — every failure mode
-          // the function knows about already surfaces via SSE.
-          reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
-            console.error("reconcileTaskSession failed:", err);
-          });
-          return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
+          try {
+            const updated = tasks.update(req.params.id, patch);
+            if (!updated) {
+              clearManualAccountSwitch(before.id);
+              return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+            }
+            // A manual move (drag, `agetor move`) emits no global `column` event,
+            // so the notification hooks never see a card leave `blocked` this
+            // way. Its reason-family OS entry goes with the block.
+            if (before.column === "blocked" && updated.column !== "blocked") {
+              removeTaskNotification(req.params.id, UNBLOCKED_REMOVAL_KINDS);
+            }
+            // Mirror behavioural changes onto a live claude session via slash
+            // commands so the conversation context survives a model/mode/effort
+            // change. Agent changes wipe the session — different harness entirely.
+            //
+            // A same-stack account switch is AWAITED: its transcript copy must
+            // finish before the response lets the user Run again, and the
+            // caller's claim above is what keeps the window closed. Every other
+            // reconcile is fire-and-forget: the mode-change path verifies via
+            // the JSONL event before resolving, which can take up to 4.5s on the
+            // exhaust-retries path. The PATCH response payload only carries the
+            // updated Task row (already in hand); the verify outcome reaches the
+            // user through the `status` SSE events that `emitModeChangeStatus`
+            // writes. `.catch` keeps an unexpected throw from becoming an
+            // unhandledRejection — every failure mode the function knows about
+            // already surfaces via SSE.
+            if (sameStackAccountSwitch) {
+              try {
+                await reconcileTaskSession(req.params.id, before, updated);
+              } catch (err) {
+                console.error("reconcileTaskSession failed:", err);
+              }
+            } else {
+              reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
+                console.error("reconcileTaskSession failed:", err);
+              });
+            }
+            // The awaited switch wrote `harnessState` (the manual-switch note)
+            // after `tasks.update`, so return the fresh row rather than the
+            // pre-reconcile snapshot — otherwise the header would flash
+            // "no move" until the next fetch.
+            const responseTask = sameStackAccountSwitch
+              ? tasks.get(req.params.id) ?? updated
+              : updated;
+            return json(withRunningSubagents(responseTask), { headers: corsHeaders(req) });
+          } finally {
+            if (sameStackAccountSwitch) releaseTaskAccountSwitch(before.id);
+          }
         }),
         DELETE: authed(async (req) => {
           // A pipeline step task can't be deleted on its own — the parent
@@ -7995,7 +8210,11 @@ export function startApiServer(
           // (multi-account); built-ins resolve to `~/.claude/projects/…` via
           // the `configDir: null` branch inside jsonlPathFor.
           const harness = harnesses.getByIdOrKind(task.agent);
-          const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
+          const jsonlPath = jsonlPathFor(
+            cwd,
+            run.claudeSessionId,
+            harness ? claudeConfigDirOverrideFor(harness) : null,
+          );
           if (!existsSync(jsonlPath)) {
             return json(
               { events: [], reason: `JSONL not found at ${jsonlPath}`, ...(hasLimit ? { hasMore: false } : {}) },

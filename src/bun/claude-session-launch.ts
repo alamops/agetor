@@ -54,7 +54,7 @@ export function claudeSessionScanOptions(): ScanClaudeSessionsOptions {
     homeDir,
     harnesses: harnesses.list()
       .filter((h) => h.kind === "claude-code")
-      .map((h) => ({ id: h.id, kind: h.kind, home: h.home, bin: h.bin })),
+      .map((h) => ({ id: h.id, kind: h.kind, home: h.home, env: h.env, bin: h.bin })),
     worktreeRoots: discoverAgetorWorktreeRoots(homeDir),
     ownedSessionIds: hiddenClaudeSessionIds(),
   };

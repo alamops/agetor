@@ -1097,8 +1097,12 @@ test.describe("fx recovery", () => {
     const steerText = `fx-steer-absorbed-followup ${randomUUID()}`;
     await sendFromComposer(panel, steerText);
     await expect(panel.getByText(steerText, { exact: true })).toBeVisible();
-    // Still mid-turn when the steer went in — the turn hasn't settled yet.
-    expect((await getRuns(request, backend, task.id)).map((r) => r.status)).toEqual(["running"]);
+    // The steer joined the live turn (the fake's `:absorbed` only takes a
+    // steer mid-turn — asserted by the response below), so it must not have
+    // started a second run. The run's STATUS is deliberately not asserted
+    // here: on a fast/loaded machine the turn legitimately settles between
+    // the send and this read, which made an exact `["running"]` check racy.
+    expect((await getRuns(request, backend, task.id)).length).toBe(1);
 
     await expect(panel.getByText(`fake fx took your steer: ${steerText}`, { exact: true })).toBeVisible({
       timeout: PAUSE_TIMEOUT,

@@ -613,7 +613,7 @@ test.describe("@ file references", () => {
     await expect(panel.getByText("and @src/app.ts").first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   });
 
-  test("Run-settle refresh: a file created after the listing loaded appears without blur/refocus", async ({ page, backend }) => {
+  test("Run-settle refresh: a file created after the listing loaded appears without blur/refocus", async ({ page, request, backend }) => {
     test.setTimeout(60_000);
     expect(startedTaskId, "the prior 'Start' scenario must have run first").toBeTruthy();
 
@@ -622,6 +622,16 @@ test.describe("@ file references", () => {
     const panel = runPanel(page);
     const textarea = panel.getByTestId("send-textarea");
     await expect(textarea).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // The previous scenario sent a follow-up; wait until that run has settled
+    // before writing the file. A column transition refreshes the listing, so
+    // a settle landing between the write and "@fres" would surface the new
+    // file and make the "popover must not know it yet" assertion racy (it
+    // failed that way under a fully loaded suite, not in isolation).
+    await expect(async () => {
+      const t = await getTaskById(request, backend, startedTaskId!);
+      expect(t?.column, "the prior follow-up run has settled").not.toBe("running");
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
 
     // Load the listing (focus-refetch) and prove it's live BEFORE the new
     // file exists.

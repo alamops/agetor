@@ -61,7 +61,8 @@ Commands:
   daemon <sub>        start | stop | status | background of the Agetor core
                       (background status|off: keep Agetor running in the background)
   remote <sub>        status | off — remote access (preview; only the app turns it on)
-  harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
+  harness <sub>       list | add | edit | enable | disable | rm | stack | shell agent harnesses
+                      (stack: an ordered same-kind account train with failover)
   profile <sub>       list | show | add | edit | duplicate | rm | export | import reusable agent profiles
   pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
                       advance | restart | status control a pipeline task's run

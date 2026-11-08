@@ -6,9 +6,9 @@
 | Source | Pipeline "Alamo Pipeline (OpenCode)" step 3; `docs/plans/harness-account-stacks-investigation.md` (evidence) + `docs/plans/harness-account-stacks-grill.md` (41 owner decisions) + the pipeline step text. This plan is the binding spec (grill decision 39). |
 | Flags | none |
 | Gates | grilled + owner decisions recorded (41 decisions, 4 rounds); this plan is the binding spec and is submitted for the Implementing step. T00 gates Codex; the security review gates the full-mirror default. |
-| Status | planned |
-| Branch | TBD — set when execution starts |
-| Base SHA | TBD — set when execution starts |
+| Status | implemented (final test-loop verification round) — `bun run typecheck` clean; full `bun test` green (12,007 pass / 31 skip / 0 fail across 476 files; every skip is a platform-only case or the opt-in real-Codex spike); the two harness-stack Playwright specs 9/9 and the **full** e2e suite 428/428. This round closed the last open review finding by taking `POST`/`PATCH /harness-stacks` off Bun's 255 s idle timer while the inline mirror runs (R18-S1 — a large plugin payload on a slow volume can no longer time out after the stack row is saved), corrected the security review's misattributed `copyTreeCooperative` evidence, and made the full e2e suite reliable: the RunPanel subtitle now asserts the account LABEL (`Claude Code`, per the stack design), the bundle-import e2e uses `version: 3` (the current format is 2 since human steps), and five load-sensitive e2e races/timeouts were repaired (at-file run-settle ordering, fx steer status, auto-enable and issue-task convergence bounds, agent-dialog close). No product defect surfaced in the stack flows. |
+| Branch | worktree `ff1e7b6b` (implemented in place; no separate branch cut) |
+| Base SHA | c59a38575ee572227b90c1588dcc67b82e4c626b |
 
 > **What this builds.** A user can put two or more accounts of the same harness kind into one ordered **harness stack** (the first account is the primary, the rest are backups). A task whose active account hits its provider limit continues on the next account without leaving `running`, with the same conversation, tools, MCP servers, skills, commands, plugins and settings. A status divider appears between the task's messages. The train wraps after the last member and pauses after one full lap; when every account is exhausted the task blocks with a countdown and retries at the earliest reset, at most three times. Each account keeps its own login. Stacks are machine-local and opt-in: no global flag, and deleting the stack makes the feature inert.
 
@@ -22,10 +22,10 @@ Each criterion names the production path that produces it and the test that driv
 | --- | --- | --- | --- |
 | C1 | A user can create, reorder, edit and delete a same-kind account stack; an account belongs to at most one stack. | `POST/PATCH/DELETE /harness-stacks` → `harness-stacks.ts` → `harness_stacks`/`harness_stack_members`; `GET /harnesses` returns `stacks` for Settings/New Task/CLI. | `src/bun/harness-stacks.test.ts`, `src/bun/server-harness-stacks.test.ts`, `e2e/harness-stack-settings.spec.ts` |
 | C2 | A task on a stack account that hits a Claude usage-limit notice or a 429/402 continues on the next account and stays `running` throughout. | `claude-tmux.ts` limit notice → `HARNESS_LIMIT_STATUS_PREFIX` → `makeChunkHandler` sets `ActiveRun.limitHit` → `attachDoneHandler` → `handleHarnessLimitSettlement` → `spawnSwapContinuation`. | `src/bun/orchestrator-harness-swap.test.ts`, `e2e/harness-stack-swap.spec.ts` |
-| C3 | The conversation is preserved: after a tool call, the new run resumes the transferred provider session and the next user turn continues it; before any tool call, the original prompt is retried cleanly on a fresh session. | `runs.hasToolUse` → `harness-session-transfer.ts` copies the transcript/rollout → `harness_session_handoffs` → the new run's session id → `findLastSessionIdForHarness` → `--resume`/`exec resume`; the no-tool-call branch uses `runs.lastUserText` with no transfer. | `harness-session-transfer.test.ts`, `orchestrator-harness-swap.test.ts`, e2e |
+| C3 | The conversation is preserved: after a tool call — or after any earlier turn on the account recorded a provider session — the new run resumes the transferred provider session and the next user turn continues it; only the task's first turn on that account with no tool call is retried cleanly on a fresh session. | `runs.hasToolUse` + `hasPriorSessionForHarness` → `harness-session-transfer.ts` copies the transcript/rollout → `harness_session_handoffs` → the new run's session id → `findLastSessionIdForHarness` → `--resume`/`exec resume`; the no-conversation branch rebuilds the request from `runs.mainUserTexts` via `composeCleanRetryText` with no transfer. | `harness-session-transfer.test.ts`, `orchestrator-harness-swap.test.ts`, e2e |
 | C4 | User-level config, MCP servers, skills, commands, plugins and settings are mirrored from the primary to the backup; each account keeps its own login; harness credential files are never copied. | `harness-mirror.ts` at stack create/update and before every swap; `NEVER_COPY` assertion. | `harness-mirror.test.ts`, security review |
 | C5 | The swap notice appears in the task's message stream between the old run and the new one; the task stays running; the old run's failure toast is suppressed. | New run's first `status` event carries `harness-swap:` + `HarnessSwapNotice`; RunPanel/CLI/TUI format it; `run-status.reason = "harness-swap"` suppresses the generic failure toast. | e2e DOM assertion, `src/cli/commands/logs.test.ts`, `src/cli/tui/Dashboard.test.tsx` |
-| C6 | After the last member limits, the train wraps to the head; after one full lap it pauses; all-exhausted blocks with a countdown and retries at the earliest reset, cap 3. | `harness-stack.ts` lap walk → `harness-failover.ts` state/timers → `handleHarnessLimitSettlement` → `TaskHarnessState.allExhausted`. | `harness-stack.test.ts`, `harness-failover.test.ts`, `orchestrator-harness-exhausted.test.ts` |
+| C6 | After the last member limits, the train wraps to the head; after one full lap it pauses; all-exhausted blocks with a countdown and retries at the earliest reset, cap 3. | `harness-stack.ts` lap walk → `harness-failover.ts` state/timers → `handleHarnessLimitSettlement` → `TaskHarnessState.allExhausted`. | `harness-stack.test.ts`, `harness-failover.test.ts`, `orchestrator-harness-swap.test.ts` |
 | C7 | A manual Run/message on a cooling account forces it; a manual switch inside the same stack preserves the conversation; a switch outside the stack resets as today. | `startTaskInner`/`sendInputInner` prepare hook → `harness-failover.prepareTaskHarness`; `reconcileTaskSession` stack-aware branch. | `orchestrator-harness-swap.test.ts`, `orchestrator-session-harness.test.ts` |
 | C8 | Codex failover works on the same contract, with the HOME/`CODEX_HOME` decision the spike proves (drop HOME, or the fixed overlay). | `harnessEnv` + `harness-session-transfer.ts` codex adapter + `codex exec resume`. | `harness-session-transfer.test.ts` (Codex half), `src/bun/codex-home-spike.test.ts` (opt-in real binary) |
 | C9 | CLI/TUI parity: `agetor harness stack`, stack/position in `ls`/`show`/`logs` and the TUI, and the swap notice. | `src/cli/commands/harness.ts` + `src/cli/api-client.ts` + `src/cli/tui/*`. | `harness.test.ts`, `ls.test.ts`, `show.test.ts`, `logs.test.ts`, `Dashboard.test.tsx` |
@@ -82,7 +82,7 @@ Each criterion names the production path that produces it and the test that driv
 | Every spawn goes through `coreSpawn`/`coreSpawnSync`; child env is explicit and scrubbed. | `CLAUDE.md:87`, `src/bun/core-spawn.ts` | T12's `codex migrate-rollouts` uses `coreSpawn`; no raw spawn. |
 | Agent-writable files are read no-follow; task-dir I/O uses `task-dir-fs`; never follow a final symlink. | `CLAUDE.md:89`, `src/bun/no-follow.ts`, `docs/architecture/security.md:62-67` | T04/T05/T12 use `openReadNoFollow`/`isPlainDirBelow`, regular-file checks, atomic writes, 0600. |
 | `src/shared` has no runtime imports from either process. | `CLAUDE.md:100` | T02's modules are pure; they import only `types.ts`/other shared modules. |
-| Every `run_events` query must SEARCH; the plan test fails on a new method it doesn't exercise. | `CLAUDE.md:98`, `db-run-events-plans.test.ts` | T01 adds `runs.lastUserText` and `runs.hasToolUse` with `INDEXED BY idx_run_events_run` and extends the pinned test. |
+| Every `run_events` query must SEARCH; the plan test fails on a new method it doesn't exercise. | `CLAUDE.md:98`, `db-run-events-plans.test.ts` | T01 adds `runs.mainUserTexts` and `runs.hasToolUse` with `INDEXED BY idx_run_events_run` and extends the pinned test. |
 | Server-managed task columns are skipped by the generic SET clause and never bump `updated_at`; `reconcileById` compares the full JSON. | `CLAUDE.md:97`, `src/bun/db.ts:1240-1321`, `src/mainview/lib/reconcile.ts:36-68` | `tasks.harness_state` is server-managed, written only by `tasks.setHarnessState`, no `updated_at` bump; the UI still sees it because `reconcileById` compares the full object. |
 | Session ids are scoped to the harness that created them. | `CLAUDE.md:99`, `docs/architecture/harnesses.md:19-21` | The stack is an explicit exception implemented through a recorded handoff table; the non-stack branch is unchanged and tested. |
 | Agetor never adds its own text to a user message, and nothing in a prompt names the product. | `CLAUDE.md:92` | The continuation prompt is a documented exception, hidden-tagged, no product name; the owner approved it (grill 24). |
@@ -120,15 +120,15 @@ Each criterion names the production path that produces it and the test that driv
 | D4 | **State split:** `harness_stacks` + `harness_stack_members` + `harness_limit_state` + `harness_session_handoffs` tables; `tasks.harness_state` JSON for the per-task lap/pending swap/all-exhausted. | New tables avoid a `harnesses` rebuild. `harness_state` is read with every task poll (no join), is server-managed like `fx_recovery`, and changes rarely enough that `reconcileById`'s full-JSON comparison still updates the UI. |
 | D5 | **Session handoff table** records `(task, harness, column) → session id + copied paths`; `findLastSessionIdForHarness` prefers the newest handoff over older runs. | The existing lookup filters by the run's `agent`; without a handoff, the new account would never find the copied session. Rewriting historical runs is wrong. |
 | D6 | **Limit classifier is conservative:** provider quota, HTTP 429, 402/insufficient credits. Exclude auth, 5xx/529, network and model-not-available. | Grill 8. A false swap wastes the backup and can duplicate work. |
-| D7 | **Cooldown is account-global** in `harness_limit_state`; cleared by a successful turn or expiry; a manual Run/message forces it. | Grill 10/13. Quota is account-global; per-task cooldown would let N tasks rediscover the same limit. |
+| D7 | **Cooldown is account-global** in `harness_limit_state`; cleared by a successful turn or expiry; a manual Run/message forces it for that task **without deleting** the global cooldown. | Grill 10/13. Quota is account-global; per-task cooldown would let N tasks rediscover the same limit, and a manual force must not uncool the account for every other task. |
 | D8 | **One-full-lap state machine:** a member is "tried" only when a run on it ends in a limit that triggers a swap; success resets the lap; a member skipped for cooling/disabled/login/model is not tried; the walk goes forward, wraps to position 0, and stops when every member is tried or unusable. | Grill 12 + open assumption 4. The pure walk is in `src/shared/harness-stack.ts` so it is testable without a DB. |
 | D9 | **Swap settlement owns the old run:** `attachDoneHandler` checks `limitHit` before the normal column/status path; the swap path marks the old run `failed` with `run-status.reason="harness-swap"` (toast suppressed), cancels pending cards, orphans background agents with a status line, keeps queued follow-ups, and starts the new run. | Investigation §1.6/§7; the settle seam is dense, so one owner prevents double-settling. |
-| D10 | **Exact provider-session transfer** for claude-code/codex when the old run recorded a `tool_use`, with a hidden tagged continuation prompt. If it recorded **no** tool call, retry the original prompt cleanly on a fresh session. If the transfer fails, block with a clear message (never start fresh silently). | Grill 14/16/24; S1/S2 prove the copy + resume; the no-tool-call retry avoids a duplicate provider user message. |
+| D10 | **Exact provider-session transfer** for claude-code/codex when the old run recorded a `tool_use`, a previous swap already copied a conversation onto this account, or an earlier turn on this account recorded a provider session, with a hidden tagged continuation prompt. The third clause is what keeps a follow-up turn that limits before its own first tool call from dropping the earlier turns (R11-M1). If the task's FIRST turn on this account recorded **no** tool call and there is no handoff or earlier session, retry the original prompt cleanly on a fresh session. If the transfer fails, block with a clear message (never start fresh silently). | Grill 14/16/24; S1/S2 prove the copy + resume; the no-tool-call retry avoids a duplicate provider user message. Handoff-aware so a second consecutive limit cannot discard the conversation. |
 | D11 | **Hidden continuation prompt** is wrapped in `<harness-stack-continuation>…</harness-stack-continuation>`; `runs.origin = "harness-swap"` marks the run; all renderers hide the exact wrapper; a later JSONL rebuild can still recognize the tag. No product name. | Grill 24; the tag is stable and searchable; `Run.origin` already exists. |
 | D12 | **Mirror at stack create/update and before every swap**: primary = position 0, primary wins on conflicts, backup-only entries kept, per-kind allowlist, `mirrorMode: "full"/"safe"` (safe excludes hooks/permissions). Never copy harness credential files. | Grill 18/19/20/22; security review. |
 | D13 | **Codex HOME spike first.** If `CODEX_HOME` alone isolates login/resume/config/MCP/writes, drop the codex `HOME` override. If not, build the fixed allowlist overlay (only for stack members) with symlinks. | Grill 21/22; the only unresolved technical premise. |
 | D14 | **All-exhausted wait:** schedule at the earliest known reset; if none, 10 min; clamp re-arms to 24 h and re-check on fire; cap 3 run attempts; a manual Run resets the cap. | Grill 11/12; follows `FX_AUTO_RESUME_MAX = 3` (`src/shared/types.ts:2547`). |
-| D15 | **Crash safety:** persist `pendingSwap` and `allExhausted.nextAttemptAt` in `tasks.harness_state`; `reconcileHarnessFailover()` on boot completes/block-clears a pending swap and re-arms retries. | Grill 33; `rearmFxAutoResumes` is the precedent (`src/bun/index.ts:443-453`). |
+| D15 | **Crash safety:** persist `pendingSwap`, `allExhausted.nextAttemptAt` and an `allExhausted.inFlight` marker in `tasks.harness_state`; `reconcileHarnessFailover()` on boot completes/block-clears a pending swap, re-arms retries, and recovers a retry whose spawn was interrupted **without spending the attempt** (a crash is not a started retry). A real spawn failure spends one so the cap keeps a permanent spawn failure visible, and `inFlight` stays set through the successor's life so a non-limit failure ends the loop instead of stranding "Retrying…". | Grill 33; `rearmFxAutoResumes` is the precedent (`src/bun/index.ts:443-453`). |
 | D16 | **No global flag.** The feature is inert without a stack; rollback is deleting the stack. | Grill 38. |
 | D17 | **CLI/TUI and webview parity in the same change.** Stacks not exported in bundles; profiles/pipelines bind accounts and inherit the stack. | Grill 34/35/36. |
 
@@ -158,17 +158,17 @@ Each criterion names the production path that produces it and the test that driv
 | ID | Goal | Owned files (create/edit) | Depends on | Acceptance (one line) | Risk | Wired by |
 | --- | --- | --- | --- | --- | --- | --- |
 | T00 | Codex `CODEX_HOME`/stale-`thread_history`/MCP-OAuth spike (real binary, opt-in). | `docs/plans/harness-account-stacks-codex-spike.md`, `src/bun/codex-home-spike.test.ts` | none | Verdicts recorded with commands/versions; test skips loudly without `AGETOR_REAL_CODEX=1`. | tests | n/a (research) |
-| T01 | Additive migration 084 + DB accessors + `tasks.harness_state` + handoffs + `runs.lastUserText` + harness-delete cleanup + test snapshot. | `src/bun/migrations/084_harness_stacks.sql`, `src/bun/migrations/index.ts`, `src/bun/db.ts`, `src/bun/test-harness-state.ts`, `src/bun/migrate.test.ts`, `src/bun/db-harness-stacks.test.ts`, `src/bun/db-run-events-plans.test.ts` | none | 084 applies on 083; state is patch-proof; handoff lookup works; deletes cascade; snapshot restores; plan test green. | migration, data, tests | migration runner + `db.ts` import |
+| T01 | Additive migration 084 + DB accessors + `tasks.harness_state` + handoffs + `runs.mainUserTexts` + harness-delete cleanup + test snapshot. | `src/bun/migrations/084_harness_stacks.sql`, `src/bun/migrations/index.ts`, `src/bun/db.ts`, `src/bun/test-harness-state.ts`, `src/bun/migrate.test.ts`, `src/bun/db-harness-stacks.test.ts`, `src/bun/db-run-events-plans.test.ts` | none | 084 applies on 083; state is patch-proof; handoff lookup works; deletes cascade; snapshot restores; plan test green. | migration, data, tests | migration runner + `db.ts` import |
 | T02 | Shared contract: stack/limit/swap types, prefixes, pure lap/format helpers, limit classifier, mirror allowlist metadata, continuation tag, notification kind. | `src/shared/types.ts`, `src/shared/harness-stack.ts`, `src/shared/harness-limits.ts`, `src/shared/harness-mirror.ts`, `src/shared/user-message.ts`, `src/shared/os-notification.ts`, `src/shared/*.test.ts` (new/edited) | none | Pure tests cover the lap, classifier, merge allowlist, tag, event/notification exhaustiveness. | none, tests | imported by every later task |
 | T03 | Stack store, validation, effective home, login evidence, cooldown CRUD/expiry, task-resolution. | `src/bun/harness-stacks.ts`, `src/bun/harness-stacks.test.ts` | T01, T02 | CRUD/order/delete; blockers vs warnings; cooling skip; same-home/kind validation; orphaned member resolution. | data, state | T07 routes, T08/T09 runtime |
-| T04 | Safe file-transfer engine + mirror: per-kind allowlist, JSON/TOML merge, directory copy, `NEVER_COPY`, env strip, safe mode, atomic/cooperative, warnings. | `src/bun/harness-file-transfer.ts`, `src/bun/harness-mirror.ts`, `src/bun/harness-mirror.test.ts`, `src/bun/harness-file-transfer.test.ts`, `docs/plans/harness-account-stacks-security-review.md` | T02, T03 (pinned) | Merge fixtures; credentials never copied; symlink/FIFO/oversize rejected; safe mode excludes hooks/permissions; TOML parses after merge; mirror failures are warnings. | trust, data | T07 create/update, T09 swap |
+| T04 | Safe file-transfer engine + mirror: per-kind allowlist, JSON/TOML merge, directory copy, `NEVER_COPY`, env strip, safe mode, atomic/cooperative, warnings. | `src/bun/harness-file-transfer.ts`, `src/bun/harness-mirror.ts`, `src/bun/harness-mirror.test.ts`, `docs/plans/harness-account-stacks-security-review.md` | T02, T03 (pinned) | Merge fixtures; credentials never copied; symlink/FIFO/oversize rejected; safe mode excludes hooks/permissions; TOML parses after merge; mirror failures are warnings. | trust, data | T07 create/update, T09 swap |
 | T05 | Claude session-transfer adapter: transcript + sidecars, destination path, atomic 0600, handoff record, cleanup, no-session result. | `src/bun/harness-session-transfer.ts`, `src/bun/harness-session-transfer.test.ts` | T01, T02, T04 (pinned interface) | Transcript/sidecars copied to the standard path; missing source → no-session; symlink/FIFO rejected; cleanup bounded; handoff recorded. | trust, data | T09 swap |
 | T06 | Limit detection: Claude notice + 429/402, Codex `turn.failed`, fake-driver limit + transcript seam. | `src/bun/claude-tmux.ts`, `src/bun/codex-tmux.ts`, `src/bun/agents.ts`, `src/bun/claude-tmux-limit.test.ts`, `src/bun/codex-limit.test.ts`, `src/bun/agents.test.ts` | T02 | Pane notice emits one structured signal and resolves; 529/400/auth/network do not; fake emits a limit and writes a test transcript. | tests, state | T09 chunk handler |
 | T07 | API: stack CRUD, `/harnesses` stacks + limit states, route policy, webview/CLI clients, harness-delete `stackIds`. | `src/bun/server.ts`, `src/bun/route-policy.ts`, `src/bun/route-policy.test.ts`, `src/mainview/lib/api.ts`, `src/cli/api-client.ts`, `src/bun/server-harness-stacks.test.ts` | T03, T04 | Routes work for CLI/app; validation returns 400 with blockers; create/update returns warnings + mirror result; payloads include stacks/states. | trust, data | server boot; UI/CLI clients |
 | T08 | Failover engine: cooldown signals, lap/tried, next-member plan, all-exhausted schedule/cap, timers, boot re-arm/reconcile, prepare-task-harness. | `src/bun/harness-failover.ts`, `src/bun/harness-failover.test.ts` | T03, T05 | Lap transitions, skip rules, earliest-reset wait, cap 3, re-arm, reconcile, manual reset, archived/deleted no-op. | state, concurrency | T09 orchestrator + boot |
-| T09 | Orchestrator glue: `limitHit`, swap settlement/spawn, hidden continuation, task handoff, manual switch, boot wiring, delete/retention cleanup. | `src/bun/orchestrator.ts`, `src/bun/index.ts`, `src/bun/headless.ts`, `src/bun/retention.ts`, `src/bun/orchestrator-harness-swap.test.ts`, `src/bun/orchestrator-harness-exhausted.test.ts`, `src/bun/orchestrator-session-harness.test.ts` | T04, T05, T06, T08 (pinned) | Full happy path; queues/cards/subagents; stop/delete; transfer/spawn failure blocks; force; manual switch; boot; retention cleanup. | state, concurrency, data, trust | `attachDoneHandler`/`startTask`/`sendInput`/boot |
-| T10 | Pipeline and notification integration: ignore swap-settled step runs; blocked/exhausted reasons; `harness-swap` OS/toast mapping. | `src/bun/pipeline-runner.ts`, `src/bun/headless-notifications.ts`, `src/bun/pipeline-harness-swap.test.ts`, `src/bun/headless-notifications.test.ts` | T09 (pinned event contract) | A step swap does not fail the step; parent reflects the retry; swap/exhausted notifications are correct and silent for the old run. | state, tests | global event subscribers |
-| T11 | Codex HOME: drop `HOME` if the spike proves isolation, else the fixed overlay for stack members. | `src/bun/agents.ts`, `src/shared/types.ts` (doc), `src/bun/agents-codex-home.test.ts`, `src/bun/agents.test.ts` | T00, T06 | Correct codex env per verdict; overlay links only the allowlist; existing test updated; docs. | trust, tests | `buildCommand`/`spawnAgent`/`checkHarness` |
+| T09 | Orchestrator glue: `limitHit`, swap settlement/spawn, hidden continuation, task handoff, manual switch, boot wiring, delete/retention cleanup. | `src/bun/orchestrator.ts`, `src/bun/index.ts`, `src/bun/headless.ts`, `src/bun/retention.ts`, `src/bun/orchestrator-harness-swap.test.ts`, `src/bun/harness-failover.test.ts`, `src/bun/orchestrator-session-harness.test.ts` | T04, T05, T06, T08 (pinned) | Full happy path; queues/cards/subagents; stop/delete; transfer/spawn failure blocks; force; manual switch; boot; retention cleanup. | state, concurrency, data, trust | `attachDoneHandler`/`startTask`/`sendInput`/boot |
+| T10 | Pipeline and notification integration: ignore swap-settled step runs; blocked/exhausted reasons; `harness-swap` OS/toast mapping; pipeline Stop vs a pending retry. | `src/bun/pipeline-runner.ts`, `src/bun/headless-notifications.ts`, `src/bun/pipeline-harness-retry-stop.test.ts`, `src/bun/headless-notifications.test.ts` | T09 (pinned event contract) | A step swap does not fail the step; parent reflects the retry; swap/exhausted notifications are correct and silent for the old run; a Stop cancels the timer. | state, tests | global event subscribers |
+| T11 | Codex HOME: drop `HOME` if the spike proves isolation, else the fixed overlay for stack members. | `src/bun/agents.ts`, `src/shared/types.ts` (doc), `src/bun/codex-home-spike.test.ts`, `src/bun/agents.test.ts` | T00, T06 | Correct codex env per verdict; overlay links only the allowlist; existing test updated; docs. | trust, tests | `buildCommand`/`spawnAgent`/`checkHarness` |
 | T12 | Codex session-transfer adapter: rollout copy, stale-DB handling, resume, cleanup. | `src/bun/harness-session-transfer.ts`, `src/bun/harness-session-transfer.test.ts`, `src/bun/usage/codex-usage.ts` | T04, T05, T00 | Copied rollout resumes; missing rollout → no-session; stale-DB path per verdict; cleanup. | data, trust | T09 swap |
 | T13 | CLI parity: `agetor harness stack`, stack/position in `harness ls`/`ls`/`show`, swap notice/hidden prompt in `logs`, TUI divider/toast. | `src/cli/commands/harness.ts`, `harness.test.ts`, `ls.ts`, `ls.test.ts`, `show.ts`, `show.test.ts`, `logs.ts`, `logs.test.ts`, `src/cli/tui/Dashboard.tsx`, `Dashboard.test.tsx`, `useGlobalEvents.ts`, `useGlobalEvents.test.ts` | T07, T09, T10 | Create/list/edit/remove; order; positions; countdown; notice; no hidden prompt; escaped text. | tests | CLI dispatch / TUI |
 | T14 | Settings: Stacks section + editor (virtualized, order, mirror mode, blockers/warnings) and Harnesses row badges. | `src/mainview/components/settings/HarnessStacksSection.tsx`, `src/mainview/lib/stack-editor.ts`, `stack-editor.test.ts`, `settings-dialog-view.ts`, `settings-dialog-view.test.ts`, `SettingsDialog.tsx` | T07 | Create/edit/delete; drag order; blockers prevent save; warnings; >10; badges; delete copy. | none, tests | Settings dialog |
@@ -241,17 +241,17 @@ ALTER TABLE tasks ADD COLUMN harness_state TEXT;
 
 **DB accessors in `src/bun/db.ts`:**
 - `harnessStacks`-facing rows are owned by T03; T01 adds the generic `tasks.setHarnessState(taskId, state | null)` (targeted UPDATE, no `updated_at` bump), `toTask` calls T02's `parseTaskHarnessState` (pinned same-wave interface; malformed → null), and `tasks.update` omits `harness_state` from the SET clause.
-- `harnessSessionHandoffs`: `get(taskId, harnessId, column)`, `upsert`, `deleteForTask`, `deleteForHarness`, `listForTask` (for cleanup).
+- `harnessSessionHandoffs`: `get(taskId, harnessId, column)`, `upsert`, `deleteOne`, `deleteForHarness`, `listForTask` (for cleanup).
 - `runs.newestSessionForHarness(taskId, column, harnessId): { sessionId: string; startedAt: number } | null` (used by T09's `findLastSessionIdForHarness`).
-- `runs.lastUserText(runId): string | null` — `SELECT data FROM run_events INDEXED BY idx_run_events_run WHERE run_id = ? AND stream = 'user' AND subagent_id IS NULL ORDER BY id DESC LIMIT 1` (main-stream only, like `lastEventData`); add it to `db-run-events-plans.test.ts`.
-- `runs.hasToolUse(runId): boolean` — `SELECT 1 FROM run_events INDEXED BY idx_run_events_run WHERE run_id = ? AND stream = 'tool_use' LIMIT 1`. This is the grill-14 "did the model do anything with side effects?" check (Claude and Codex both emit `tool_use`; a synthetic API-error line on the assistant stream does not count; a **subagent** tool_use counts too, so no `subagent_id` filter): no tool call → a clean retry of the original prompt on a fresh session; any tool call → transfer + continuation. Add it to the plan test too.
+- `runs.mainUserTexts(runId): string[]` — `SELECT data FROM run_events INDEXED BY idx_run_events_run WHERE run_id = ? AND stream = 'user' AND subagent_id IS NULL ORDER BY id ASC` (main-stream only, like `lastEventData`); the clean retry composes from the whole ordered set (`composeCleanRetryText`, shared/user-message.ts) rather than only the newest row, because one send is persisted twice (live echo + JSONL twin) and a REPL follow-up folds into the same run. Add it to `db-run-events-plans.test.ts`.
+- `runs.hasToolUse(runId): boolean` — `SELECT 1 FROM run_events INDEXED BY idx_run_events_run WHERE run_id = ? AND stream = 'tool_use' LIMIT 1`. This is the grill-14 "did the model do anything with side effects?" check (Claude and Codex both emit `tool_use`; a synthetic API-error line on the assistant stream does not count; a **subagent** tool_use counts too, so no `subagent_id` filter): a tool call → transfer + continuation. It is one half of `conversationToPreserve`; a clean retry also needs no recorded handoff AND no earlier run on the current account with a provider session (`hasPriorSessionForHarness`, R11-M1). Add it to the plan test too.
 - `runs.hasRunning(taskId): boolean` — `SELECT 1 FROM runs WHERE task_id = ? AND status = 'running' LIMIT 1`; the route guard for a stack-internal manual switch (T07) uses it. A held run (row `succeeded`, background agents still running) is not "live"; that switch keeps today's drop/orphan behavior.
 - `harnesses.delete`: also `DELETE FROM harness_limit_state`, `harness_session_handoffs`; memberships cascade via FK. Keep the existing task/profile guard.
 - `harnessUsage.delete` already exists; no change.
 
 **Test hygiene:** `snapshotHarnessState()` snapshots/restores `harness_stacks`, `harness_stack_members`, `harness_limit_state` (delete test-created stacks on restore, re-insert the snapshot rows, restore limit rows). The migration test's last-id pin becomes 084.
 
-**Acceptance.** Given an 083 DB, migrate → 084 applies once and the tables/column exist. Given a task with `harness_state`, a title PATCH leaves the state byte-identical. Given a task delete, its handoffs go. Given a harness delete with no task/profile, its membership/limit/handoffs go. Given a test that creates a stack, `snapshotHarnessState()`'s restore removes it. Given `runs.lastUserText`, the plan test exercises it and the query uses the run index.
+**Acceptance.** Given an 083 DB, migrate → 084 applies once and the tables/column exist. Given a task with `harness_state`, a title PATCH leaves the state byte-identical. Given a task delete, its handoffs go. Given a harness delete with no task/profile, its membership/limit/handoffs go. Given a test that creates a stack, `snapshotHarnessState()`'s restore removes it. Given `runs.mainUserTexts`, the plan test exercises it and the query uses the run index.
 
 #### T02 — Shared contract
 
@@ -264,11 +264,11 @@ ALTER TABLE tasks ADD COLUMN harness_state TEXT;
 - `HarnessLimitSignal { reason; resetAtMs: number | null; message: string; source: "claude-pane" | "claude-api-error" | "codex-error" }`.
 - `HarnessLimitState { harnessId; reason; source; message: string | null; exhaustedUntilMs; updatedAt }`.
 - `HarnessSwapNotice { from; fromLabel; to; toLabel; reason; position; count; resetsAtMs; at }` (position 1-based).
-- `TaskHarnessState { stackId; position: number; tried: string[]; pendingSwap: { from; to; reason; runId; startedAt; phase: "switching" | "transferring" | "spawning" } | null; allExhausted: { at; attempts; max; nextAttemptAt; earliestResetAtMs; reason: HarnessLimitReason | "no-usable-member" } | null; lastMove: { from; to; at; reason: "member-removed" | "member-disabled" | "member-unavailable" } | null }`.
+- `TaskHarnessState { stackId; position: number; tried: string[]; pendingSwap: { from; to; reason; runId; startedAt } | null; allExhausted: { at; attempts; max; nextAttemptAt; earliestResetAtMs; reason: HarnessLimitReason | "no-usable-member" } | null; lastMove: { from; to; at; reason: "member-removed" | "member-disabled" | "member-unavailable" | "manual-switch" } | null }`. `manual-switch` is a user-initiated move inside one stack (the conversation is preserved), so the header says "Switched to X" rather than "the previous account left/was unavailable".
 - `Task.harnessState?: TaskHarnessState | null` (optional to avoid fixture churn; `toTask` always sets null when absent).
 - `parseTaskHarnessState(raw: string | null): TaskHarnessState | null` — defensive parser (malformed/missing → null), used by `toTask` in T01.
 - `Run.origin?: "continuation" | "imported" | "auto-resume" | "agent" | "harness-swap" | null`.
-- `GlobalEvent.run-status.reason?: "harness-swap" | "harness-exhausted"`; `GlobalEvent.column.reason` union adds `"harness-exhausted" | "harness-swap-failed"`; a new `GlobalEvent { kind: "harness-swap"; taskId; runId; fromLabel; toLabel; reason; position; count; ts; pipelineParentId?; pipelineParentTitle? }`. Add `"harness-swap"` to `PIPELINE_PARENT_STAMPED_KINDS` so a step's swap toast retargets to its parent.
+- `GlobalEvent.run-status.reason?: "harness-swap" | "harness-exhausted"`; `GlobalEvent.column.reason` union adds `"harness-exhausted" | "harness-swap-failed"`; a new `GlobalEvent { kind: "harness-swap"; taskId; from; to; fromLabel; toLabel; reason; position; count; ts; pipelineParentId?; pipelineParentTitle? }` (no `runId`: the carrier is the successor run, and a replayed swap must not re-notify). Add `"harness-swap"` to `PIPELINE_PARENT_STAMPED_KINDS` so a step's swap toast retargets to its parent.
 - `HARNESS_LIMIT_STATUS_PREFIX = "harness-limit: "`, `HARNESS_SWAP_STATUS_PREFIX = "harness-swap: "`, `HARNESS_STACK_CONTINUATION_TAG = "harness-stack-continuation"`.
 - `isInternalStatusSentinel` adds `HARNESS_LIMIT_STATUS_PREFIX` (plumbing) but **not** `HARNESS_SWAP_STATUS_PREFIX` (visible).
 - `HarnessesPayload` in `src/mainview/lib/api.ts` gets `stacks`/`limitStates` in T07.
@@ -292,13 +292,13 @@ ALTER TABLE tasks ADD COLUMN harness_state TEXT;
 - `harnessQuotaLooksExhausted(quota, now, staleMs): boolean` — only `status === "ok"`, `now - fetchedAtMs <= staleMs`, and every unscoped meter `usedPercent >= 100` with an unexpired reset; used only for an automatic walk.
 
 **`src/shared/harness-mirror.ts`** (metadata only; the engine is T04):
-- `MIRROR_SPECS: Record<"claude-code" | "codex", { copy: string[]; merge: string[]; never: string[]; envStrip: string[] }>` — an enumerated allowlist, no globs that could sweep a credential.
-- Claude copy: `settings.json` (merge), `.claude.json` only the `mcpServers`/`enabledPlugins` keys (merge; the blob lives beside the config dir as `<home>/.claude.json`, or `~/.claude.json` for the built-in — `commands.ts:420-422`), `skills/`, `commands/`, `agents/`, `plugins/installed_plugins.json`, `plugins/known_marketplaces.json`, `plugins/marketplaces/`, `plugins/data/`.
-- Claude never: `.credentials.json`, `.claude/` legacy credentials, `projects/` (sessions), `history.jsonl`, `file-history/`, `shell-snapshots/`, `sessions/`, `todos/`, `statsig/`, `stats-cache.json`, `daemon/`, `session-env/`, `paste-cache/`, `backups/`, `jobs/`, `plugins/cache/`, `plugins/store/`, `plugins/plugin-catalog-cache.json`, `plugins/plugin-directory-cache-v2.json`.
-- Codex copy: `config.toml` (merge `[mcp_servers.*]`, `[profiles.*]`, top-level scalars), `prompts/` (custom commands, `commands.ts`'s codex user selector), `skills/` (user skills; the CLI's bundled `skills/.system/` is not copied), `plugins/` (installed plugin definitions/data, excluding caches).
-- Codex never: `auth.json`, `state_*.sqlite`, `thread_history_*.sqlite`, `logs_*.sqlite`, `history.jsonl`, `sessions/`, `log/`, `tmp/`, `shell_snapshots/`, `models_cache.json`, `queue_*.sqlite`, `goals_*.sqlite`, `memories_*.sqlite`, `app-server-*`, `mcp-oauth-locks/`.
+- `MIRROR_SPECS: Record<"claude-code" | "codex", { copy: string[]; merge: string[]; never: string[] }>` — an enumerated allowlist, no globs that could sweep a credential. Provider auth env keys are stripped by `isHarnessAuthEnvKey` during the `settings.json` merge (no separate `envStrip` list to drift).
+- Claude copy: `settings.json` (merge), `.claude.json` only the `mcpServers`/`enabledPlugins` keys (merge; the blob lives beside the config dir as `<home>/.claude.json`, or `~/.claude.json` for the built-in — `commands.ts:420-422`), `CLAUDE.md` (user-level memory), `output-styles/`, `skills/`, `commands/`, `agents/`, `plugins/cache/` (the installed plugin payload), `plugins/marketplaces/`, `plugins/data/`. `plugins/installed_plugins.json` and `plugins/known_marketplaces.json` are merged with every absolute path under the primary's config root rewritten to the destination root (so the backup loads its own payload copy); the installed-plugin arrays merge by install `scope` (primary wins on a scope it defines), so a shared plugin never ends up with two `user` records.
+- Claude never: `.credentials.json`, `.claude/` legacy credentials, `projects/` (sessions), `history.jsonl`, `file-history/`, `shell-snapshots/`, `sessions/`, `todos/`, `statsig/`, `stats-cache.json`, `daemon/`, `session-env/`, `paste-cache/`, `backups/`, `jobs/`, `plugins/store/`, `plugins/plugin-catalog-cache.json`, `plugins/plugin-directory-cache-v2.json`, and any `.git` directory/file at any depth (a marketplace clone's `.git/config` can carry a remote URL with an embedded token).
+- Codex copy: `config.toml` (merge `[mcp_servers.*]`, `[profiles.*]`, top-level scalars), `AGENTS.md` (user-level instructions), `prompts/` (custom commands, `commands.ts`'s codex user selector), `skills/` (user skills; the CLI's bundled `skills/.system/` is not copied), `plugins/` (installed plugin definitions/data and the installed payload cache).
+- Codex never: `auth.json`, `state_*.sqlite`, `thread_history_*.sqlite`, `logs_*.sqlite`, `history.jsonl`, `sessions/`, `log/`, `tmp/`, `shell_snapshots/`, `models_cache.json`, `queue_*.sqlite`, `goals_*.sqlite`, `memories_*.sqlite`, `app-server-*`, `mcp-oauth-locks/`, `plugins/store/`, plugin catalog caches, `plugins/.remote-plugin-install-staging/`, and any `.git` at any depth.
 - Codex MCP OAuth: if T00 finds a standalone file store, add it as an explicit **tool-auth copy** entry (user-only/no-follow); if it is rows in a session/state DB, leave it out and emit the warning "MCP sign-in must be repeated on this account" (see §8, unratified).
-- `HARNESS_AUTH_ENV_KEYS` (explicit + prefix rule): `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `CURSOR_API_KEY`, plus any `*_API_KEY`/`*_AUTH_TOKEN` under those vendor prefixes. **Strip only the primary's keys before merging**: if the backup's own `settings.json` `env` already defines a harness-auth key, that is the backup's own login and must be kept (the primary's value never overwrites it).
+- `isHarnessAuthEnvKey` (shape-based; the enumerated list is only a supplement): any `_`-separated `TOKEN`/`SECRET`/`PASSWORD`/`KEY`/`CREDENTIAL`/`AUTHORIZATION` segment (`OPENROUTER_API_KEY`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `AWS_WEB_IDENTITY_TOKEN_FILE`), plus the vendor-prefix + credential-marker rule for names whose credential shape is not a whole segment (`ANTHROPIC_CUSTOM_HEADERS`), plus login-selecting cloud settings (`AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_ROLE_ARN`, the AWS config/credentials file pointers). Non-credential settings (`*_BASE_URL`, `*_MODEL`, `*_MAX_TOKENS`, `AWS_REGION`) are not matched. **Strip only the primary's keys before merging**: if the backup's own `settings.json` `env` already defines a harness-auth key, that is the backup's own login and must be kept (the primary's value never overwrites it).
 - `SAFE_MODE_EXCLUDED_KEYS = ["hooks", "permissions"]`.
 
 **`src/shared/user-message.ts`**: `isHarnessStackContinuation`/`stripHarnessStackContinuation` (re-export or import from `harness-stack.ts` to avoid a cycle; `user-message.ts` already imports from `agent-profile.ts`/`pipeline.ts`, so importing a pure tag constant from `harness-stack.ts` is fine). `userMessageLines` returns `[]` for the exact wrapper; `parseMessageSegments` still parses a user-typed tag in ordinary prose so the e2e can assert it is not hidden.
@@ -310,15 +310,15 @@ ALTER TABLE tasks ADD COLUMN harness_state TEXT;
 #### T03 — Stack store, validation and cooldown
 
 `src/bun/harness-stacks.ts` exports:
-- `list(): HarnessStack[]` (left-join members; empty stacks included; `warnings` computed from cached statuses, process env and mirror mode; no fresh probes).
+- `list(): HarnessStack[]` (left-join members; empty stacks included; `warnings` computed per member from process env and mirror mode plus cheap local probes — `Bun.which` / `existsSync` for the CLI, `lstat`/small-file read for login evidence, and the cached model catalog — never a fresh CLI version probe).
 - `get(id)`, `getByMember(harnessId)`, `create(input, { source: "api" })`, `update(id, patch)`, `delete(id)`.
 - `validateInput(input): { blockers: HarnessStackWarning[]; warnings: HarnessStackWarning[] }`:
   - blockers: unknown harness, duplicate member, mixed kinds, kind not v1, same effective home (`claudeConfigDirFor` / `codexHome` resolved + `realpath` when it exists), >1 stack membership for an account.
   - warnings: <2 members; >10 members; disabled; not installed (cached status); login evidence false; process provider key present; full mirror's hooks/permissions; a member's model catalog differs/empty.
 - `effectiveHome(harness)`: `claude-code` → `harness.home ?? ~/.claude`; `codex` → `codexHome(harness)` (the `CODEX_HOME` value).
-- `loginEvidence(harness): boolean | null`: built-in Claude (home null) → `null` (keychain: unknown, never block); Claude alias → `<home>/.credentials.json` exists (no-follow `lstat`) or an `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/`CLAUDE_CODE_OAUTH_TOKEN` in `harness.env` or `process.env`; Codex → `<codexHome>/auth.json` exists or `OPENAI_API_KEY`/`CODEX_API_KEY` in `harness.env` or `process.env`; `null` when the kind has no evidence rule. Only `false` is a selection skip; `null` fails open. The process-key case also raises the cross-account warning (T03/T14).
+- `loginEvidence(harness): boolean | null`: built-in Claude (home null) → `null` (keychain: unknown, never block); Claude alias → `<configDir>/.credentials.json` exists (no-follow `lstat`), or a kind-relevant credential in `harness.env` / `process.env` / the account's `settings.json` `env`, or an `apiKeyHelper`-style login → `true`; a Bedrock/Vertex/Foundry/custom-endpoint setup in any of those three scopes (a process-level selector is inherited by every spawn) → `null` (fail open); a present-but-uninspectable `settings.json` → `null`; otherwise `false`. Codex → `<codexHome>/auth.json` exists or `OPENAI_API_KEY`/`CODEX_API_KEY` in `harness.env` / `process.env` → `true`; a custom `model_provider`/`[model_providers.*]`, a custom base URL (file, env map or process env), or a present-but-unreadable `config.toml` → `null`; otherwise `false`. `null` when the kind has no evidence rule. Only `false` is a selection skip; `null` fails open. A kind-relevant process key also raises the cross-account warning (T03/T14).
 - `setLimitState(harnessId, signal)`, `getLimitState`, `listLimitStates`, `clearLimitState`, `pruneExpired(now)`, `isCooling(harnessId, now)`. `exhaustedUntilMs = signal.resetAtMs ?? now + (reason === "rate_limit" ? 60_000 : 10 * 60_000)`; a provider reset time always wins.
-- `resolveForTask(task): { stack; current: string; position: number; orphaned: boolean } | null` — prefers `harnessState.stackId` when it still resolves, else `getByMember(task.agent)`; `orphaned` when the current agent is no longer a member.
+- `resolveForTask(task): { stack; current: string; position: number; orphaned: boolean } | null` — prefers `getByMember(task.agent)` (the train the CURRENT account belongs to, so a membership move follows the account), falling back to `harnessState.stackId` when the account left every stack; `orphaned` when the current agent is no longer a member of the resolved stack.
 - `clearTaskStateForStack(stackId)`: iterate tasks with `harness_state` and null the ones whose `stackId` matches (targeted UPDATE; no `updated_at` bump).
 - `delete(id)` clears task states referencing it. Limit states are account-global and stay.
 
@@ -328,19 +328,20 @@ ALTER TABLE tasks ADD COLUMN harness_state TEXT;
 
 `src/bun/harness-file-transfer.ts`:
 - `atomicWriteFile(path, data: string | Uint8Array, { mode = 0o600 }): Promise<void>` — write a sibling temp file, `fsync`, `rename`, `chmod`; refuses a symlink at the target (lstat; rename replaces it).
-- `copyRegularFile(src, dest, { maxBytes }): Promise<number>` — `openReadNoFollow`/`readTextNoFollow`; regular file only; no FIFO; size cap; dest 0600; atomic.
-- `copyTreeCooperative(srcDir, destDir, { maxBytes, maxEntries, skip }): Promise<{ copied; skipped }>` — `isPlainDirBelow`/`lstat` each entry, skip symlinks/FIFOs/devices, yield every ~20 ms or N files, copy into a temp dir and rename the tree, never follow a destination symlink.
+- `copyRegularFile(src, dest, { maxBytes }): Promise<number>` — async `O_NOFOLLOW`/`O_NONBLOCK` open; regular file only; no FIFO; size cap; dest 0600; atomic; read/write in asynchronous 1 MiB chunks so a large transcript never blocks the shared Bun main thread.
+- `copyTreeCooperative(srcDir, destDir, { maxBytes, maxEntries, skip, root }): Promise<{ copied; skipped }>` — `isPlainDirBelow`/`lstat` each entry, skip symlinks/FIFOs/devices, yield every ~20 ms or N files, merge each regular file atomically over the destination (destination-only files/dirs are kept), and never traverse a symlink at the destination (verified with `root`).
+- `isPlainAncestorPathUnder(root, p)` — every component **between** the trusted root and the leaf is a real, non-symlink directory; used on every source path so a linked intermediate folder cannot redirect a read outside the account.
 - `assertSafeRelPath(rel)` — no `..`, absolute, empty; `assertNotCredentialPath(rel, spec)` — throws if the `NEVER_COPY` list matches (defense in depth; the engine should never walk those paths).
 - `removeCopiedPaths(paths, { root })` — only regular files/dirs below `root`; no-follow; used by cleanup.
 - `realHomePath(p)` for the overlay (T11) — resolve `~`.
 
 `src/bun/harness-mirror.ts`:
-- `mirrorStack(stack, { source: "create" | "swap" | "update", targetHarnessId? }): Promise<{ copied: string[]; warnings: string[] }>` — source = position 0; for each target (all non-primary members on create/update, only the swap target on swap), skip if target === primary.
+- `mirrorStack(stack, { targetHarnessId? }): Promise<{ copied: string[]; warnings: string[] }>` — the source is always position 0 by definition; `targetHarnessId` mirrors only that destination account (the swap/retry path uses the `mirrorForSwap(stack, targetId)` wrapper), otherwise every non-primary member is mirrored. A target equal to the primary is skipped.
 - Claude: deep-merge `settings.json` and the selected `.claude.json` keys; copy the allowlisted dirs. Merge rules: primary scalar wins; arrays union with primary first, dedupe; objects deep-merge by key; `mcpServers` by server name (primary wins, backup-only kept); `enabledPlugins` union, primary value wins on conflict; unknown keys preserved from the backup.
 - Codex: section-preserving `config.toml` merge — split on top-level `[table]` headers, primary's `[mcp_servers.*]`/`[profiles.*]`/top-level scalars replace, backup-only sections/keys are appended; validate the result with `Bun.TOML.parse`; if the merge fails, keep the backup file and return a warning (never write invalid TOML). **Never merge `[projects.*]` trust entries**: directory trust is per-account and security-sensitive; the backup must not inherit trust for arbitrary paths from the primary. `[projects.*]` entries the backup already has are kept.
 - Full mode copies hooks/permissions; safe mode drops them and never rewrites an existing backup's hooks/permissions.
 - `NEVER_COPY` assertion on every source path; the **primary's** `HARNESS_AUTH_ENV_KEYS` are stripped from the `settings.json` `env` merge (a backup's own key is kept), with a count in the warnings.
-- Size caps: 64 MB / 5,000 entries per tree; skip with a warning, never block the swap.
+- Size caps: 64 MB / 5,000 entries per tree, except the plugin payload trees (`plugins/cache/`, `plugins/marketplaces/`, Codex `plugins/`), which get their own bounded 512 MB / 25,000-entry budget so a normal marketplace install is not truncated. Skip with a warning, never block the swap. `copyTreeCooperative` reports whether a cap truncated the tree; when a plugin payload was incomplete the engine **leaves that account's plugin registry untouched** and warns, so the rewritten registry can never point at payload files that were not copied.
 - The security review doc is written here: every copied path, why it is safe, every never path, the hooks/permissions risk, the safe-mode fallback, the no-follow/atomic rules, and the Codex MCP OAuth outcome from T00.
 
 **Acceptance.** The merge fixtures (Claude JSON, Codex TOML with quoted names/nested tables/arrays); credentials/session DBs/transcripts never copied; the primary's harness-auth env keys stripped while a backup's own key survives; safe mode; symlink/FIFO/oversize; atomic/0600; idempotence; a mirror failure returns warnings and leaves the destination readable.
@@ -391,7 +392,7 @@ Routes (`src/bun/server.ts`, `ROUTE_POLICY` `app+cli`):
 - `PATCH /harness-stacks/:id` body `{ label?, members?, mirrorMode? }` → `{ stack, warnings, mirror }`; validates the full ordered list; re-mirrors new members / a changed primary.
 - `DELETE /harness-stacks/:id` → `{ removed: true }`; clears task states referencing it.
 - `PATCH /tasks/:id` gains one guard: an `agent` change **within the same stack** while `runs.hasRunning(taskId)` returns 409 `{ error: "stop the run before switching accounts" }` instead of killing the run under the user. An outside-stack switch keeps today's behavior and its existing guards. A profile-bound task's PATCH remains refused (the existing 409) — the UI's AgentSelect is disabled for bound tasks; the stack swap path changes `task.agent` internally, not through the PATCH.
-- `GET /harnesses` adds `stacks` and `limitStates` (cheap DB reads after `checkAllHarnesses`).
+- `GET /harnesses` adds `stacks` and `limitStates` after `checkAllHarnesses`. Stack rows are DB reads but their `warnings` include cheap per-member local probes (`Bun.which`/`lstat`/cached catalog), so the route is not a pure database read.
 - `GET /tasks` already includes `Task.harnessState` via `toTask`; no route change.
 - `GET /harnesses/:id/usage`'s task-count `HarnessUsage` stays. Stack membership does not block `DELETE /harnesses/:id`: the FK cascades, so the delete succeeds when no task/profile references the row. The Settings delete confirmation derives the stack membership from the `/harnesses` payload (no new 409 field).
 
@@ -441,14 +442,14 @@ The orchestrator registers `{ onAutoRetry, onReconcileSwap }` once at module loa
 2. `recordTried(taskId, currentHarnessId)`; `saveStatusLineQuietly(oldRunId, "harness limit reached: <reason> — switching")`.
 3. `cancelPendingForTask(taskId, "harness limit reached")`; drop the old session/process (Claude `dropSession`, Codex `dropCodexSession`; the limit notice leaves the Claude REPL paused, so it must be killed); `orphanRunningSubagents(taskId)` and write a status line naming the abandoned background agents.
 4. `planNextMember(task)`:
-   - `next`: persist `pendingSwap`; emit `Switching to backup…` on the old run; mark the old run `failed` (`endedAt`, exit code), emit `run-status { status:"failed", reason:"harness-swap" }`, keep the task `running`; `await mirrorStack(stack, { source:"swap", targetHarnessId: next.member })` (warnings → status line); decide `hasToolUse = runs.hasToolUse(oldRunId)`: if true, `await transfer` (T05/T12) and block with `harness-swap-failed` on failure (no new run); if false, skip the transfer (the clean-retry branch). Update `task.agent` + `harnessState` + handoff, then call `spawnSwapContinuation({ task, from, to, oldRunId, signal, transferredSessionId? })`; it owns the new-run insert, the notice, the GlobalEvent and the spawn; on spawn failure → block with `harness-swap-failed`.
+   - `next`: persist `pendingSwap`; emit `Switching to backup…` on the old run; mark the old run `failed` (`endedAt`, exit code), emit `run-status { status:"failed", reason:"harness-swap" }`, keep the task `running`; `await mirrorForSwap(stack, next.member.harnessId)` (warnings → status line); decide `conversationToPreserve` = the old run's `runs.hasToolUse` OR a recorded handoff OR an earlier run on the account with a provider session: if true, `await transfer` (T05/T12) and block with `harness-swap-failed` on failure (no new run); if false, skip the transfer (the clean-retry branch). Update `task.agent` + `harnessState` + handoff, then call `spawnSwapContinuation({ task, from, to, oldRunId, signal, transferredSessionId? })`; it owns the new-run insert, the notice, the GlobalEvent and the spawn; on spawn failure → block with `harness-swap-failed`.
    - **Messages typed during the swap/start window:** the swap holds `startingTaskIds`, so the per-kind send entries cannot mint a competing run. Add a generic `swapFollowUps: Map<taskId, { text: string; raw: string; at: number }[]>`; when `sendInputInner` sees `startingTaskIds.has(taskId)`, push the line there (do not re-stash to the backlog, do not drop it) and return the task's current run id. `attachDoneHandler`'s normal path drains `swapFollowUps` one at a time after the run settles (a `sendInput` per line, in order), so the user's message executes on the new account. A Stop/delete/archive re-stashes the remaining lines to the backlog and clears the map.
    - `all-exhausted`/`none-usable`: mark the old run failed (`reason:"harness-swap"`), write the exhausted/unusable status line, `updateColumn(taskId, oldRunId, "blocked", "harness-exhausted" | "harness-swap-failed")`, persist `allExhausted`, arm the timer or leave it manual; keep queued follow-ups.
 5. Clear `pendingSwap` after `spawnSwapContinuation` has registered the new run/claim handoff; never drain the queue here (the new run's `attachDoneHandler` drains it).
 
 **`spawnSwapContinuation`** (new, per-kind Claude/Codex; owns the new run row, the notice and the spawn):
-- **Clean-retry branch (grill 14):** if `hasToolUse` is false (no tool call — an immediate 429/quota, possibly with only an error line), do **not** transfer or resume. Start a fresh session on the new account with `runs.lastUserText(oldRunId) ?? task.prompt` as the prompt; suppress the user echo (the old run already shows the user bubble) and tag the text as a continuation in storage. The old session stays on the old account (a later switch back can resume it; archive/delete cleans it).
-- **Transfer branch:** if `hasToolUse` is true, use the `transferredSessionId` from step 4 and spawn with `resumeSessionId`/`exec resume` and the hidden `composeHarnessStackContinuationPrompt()`. Claude's `spawnAgent`/Codex's driver use the explicit id; `onSessionId` updates the run.
+- **Clean-retry branch (grill 14):** only when the task's first turn on this account has no tool call AND no handoff/earlier session exists (`conversationToPreserve` false), do **not** transfer or resume. Start a fresh session on the new account with `composeCleanRetryText(runs.mainUserTexts(oldRunId)) ?? task.prompt` as the prompt; `composeCleanRetryText` normalizes each main-stream user row (live echo vs claude's XML/`<pasted_content>` JSONL twin), unwraps a predecessor's hidden continuation, de-duplicates, and replays a REPL follow-up folded into the turn after the original prompt in order (Codex keeps only the first row because its live-turn follow-ups are queued as separate turns). Suppress the user echo (the old run already shows the user bubble) and tag the text as a continuation in storage. The old session stays on the old account (a later switch back can resume it; archive/delete cleans it). A **follow-up** turn that limits before its own first tool call is NOT this branch — its earlier conversation must move (R11-M1).
+- **Transfer branch:** when `conversationToPreserve` is true, use the `transferredSessionId` from step 4 and spawn with `resumeSessionId`/`exec resume` and the hidden `composeHarnessStackContinuationPrompt()`. Claude's `spawnAgent`/Codex's driver use the explicit id; `onSessionId` updates the run. A same-account retry sets `transferredSessionId` to the account's own session id (no copy).
 - Insert the new run `{ agent: to, status: "running", origin: "harness-swap", claudeSessionId/codexSessionId: transferredSessionId ?? null, tmuxSession }` and point `task.runId` at it in one transaction; `adoptPendingTaskCancel(taskId, newRunId)`; release the `startingTaskIds` claim after `registerActiveRun` (or transfer it to the detached continuation, mirroring `startTaskInner`).
 - Emit the swap notice as the new run's first `status` event before the spawn, then the `harness-swap` GlobalEvent, so both are visible even if the spawn fails.
 - Never emit an untagged `user` echo on the swap run: Claude's JSONL delivers the tagged prompt (the tailer emits it, the renderer hides it); Codex's one-shot path echoes the tagged prompt and the renderer hides it. A clean-retry prompt is tagged the same way.
@@ -456,7 +457,7 @@ The orchestrator registers `{ onAutoRetry, onReconcileSwap }` once at module loa
 
 **Success/cancel cleanup:**
 - In `attachDoneHandler`'s normal path, when the run is the terminal run and the task has `harnessState`, call `resetLap` (a non-limit terminal turn ends the lap) and `clearLimitState(currentHarness)` on `succeeded`; on `cancelled`, reset the lap and cancel any auto-retry. After the new run's normal settle, drain `swapFollowUps` one line at a time (in order) via `sendInput`; a Stop/archive/delete re-stashes the remaining lines to the backlog and clears the map.
-- In `startTaskInner`, call `prepareTaskHarness(taskId, { manual: true })` after the profile copy-down and before `resolveHarness(task.agent)`. In `sendInputInner`, after the imported/`onlyIfIdle` checks and before the codex/copilot CLI-floor pre-flight, handle the start/swap window: if `startingTaskIds.has(taskId)` (a swap or a run start is holding the claim), push the raw `line` to `swapFollowUps`, write the user bubble on the task's current run, and return `{ delivered: true, runId: task.runId }`; otherwise call `prepareTaskHarness(taskId, { manual: true })` **before** the CLI-floor pre-flight (which resolves `task.agent`) and before the archived/worktree side effects; re-read the task after a move. Only when no run is live. If it returns `moved`, the caller writes a `status` line on the next run or leaves the `lastMove` note for the UI. If a `startTask`/swap aborts before a run is minted, its `finally` re-stashes `swapFollowUps` to the backlog (never drops a message).
+- In `startTaskInner`, call `prepareTaskHarness(taskId, { manual: true })` after the profile copy-down and before `resolveHarness(task.agent)`. In `sendInputInner`, after the imported/`onlyIfIdle` checks and before the codex/copilot CLI-floor pre-flight, handle the swap/retry window: if `swapWindowTaskIds.has(taskId)` (a limit settlement or an all-exhausted retry is holding the task's claim), push the raw `line` to `swapFollowUps` and return `{ delivered: true, runId: task.runId }` **without writing a user bubble** — the drain's own `sendInput` writes the message's only bubble on the run that actually executes it (an early bubble on the displaced run duplicated it); otherwise call `prepareTaskHarness(taskId, { manual: true })` **before** the CLI-floor pre-flight (which resolves `task.agent`) and before the archived/worktree side effects; re-read the task after a move. Only when no run is live. If it returns `moved`, the caller writes a `status` line on the next run or leaves the `lastMove` note for the UI. If a `startTask`/swap aborts before a run is minted, its `finally` re-stashes `swapFollowUps` to the backlog (never drops a message).
 - `findLastSessionIdForHarness`: compare the newest handoff (`createdAt`) with the newest run on that harness (`startedAt`); return the newer. The non-stack behavior is unchanged.
 - `reconcileTaskSession`: if `before.agent` and `after.agent` are both members of the same stack and no run is live:
   - transfer the session (`before` → `after`), upsert the handoff, keep the follow-up queues, drop the old process (`dropSession`/per-kind drop) but do **not** clear the session mapping; write a status line "switched to <label> — continuing this conversation".
@@ -464,7 +465,7 @@ The orchestrator registers `{ onAutoRetry, onReconcileSwap }` once at module loa
   - outside a stack or cross-kind: today's behavior (kill session, clear queues, reset model/mode) **plus** `clearFailoverState(taskId)` and delete the task's session handoffs (the copied files are no longer part of the task's conversation).
   - if a run is live and the switch is inside the stack, refuse at the route with 409 before the update (T07 uses `runs.hasRunning(taskId)`; the UI disables the select).
 - `archiveTask`: `clearFailoverState(taskId)` + `cancelAutoRetry`; the copied session files stay on disk so an unarchive can still resume, and the retention sweep removes them after the archived-history threshold. `deleteTask`: `clearFailoverState(taskId)`, `cancelAutoRetry`, and `cleanupHarnessSessionCopies(taskId)` **before the task row is deleted** (the handoff rows cascade with it, so they must be read first). `retention.ts` removes the copies of archived tasks past the retention threshold. Every removal validates the recorded path is below the destination account's config dir and is a regular file/dir.
-- `fireHarnessAutoRetry(taskId)` (registered as T08's `onAutoRetry` hook): re-read the task, verify the persisted `nextAttemptAt`/`allExhausted` identity, ensure no run is live, pick a usable member (the T08 planner, with `tried: []`), decide transfer vs clean retry from the last run's `hasToolUse`, transfer if needed, and call `spawnSwapContinuation` with `origin:"harness-swap"`. If the picked member is the **current** account (its reset expired, no switch), skip the mirror/transfer no-op and write a plain `Retrying on <label> after the quota reset…` status line instead of the `Switched to…` notice (`to === from` would be misleading). Increment `attempts` only when a run starts; clear `allExhausted` on a later success; if no member is usable, re-arm at the new earliest without incrementing, or leave the task blocked at the cap.
+- `fireHarnessAutoRetry(taskId)` (registered as T08's `onAutoRetry` hook): re-read the task, verify the persisted `nextAttemptAt`/`allExhausted` identity, ensure no run is live, pick a usable member (the T08 planner, with `tried: []`), decide transfer vs clean retry from the last run's `conversationToPreserve`, transfer if needed, and call `spawnSwapContinuation` with `origin:"harness-swap"`. If the picked member is the **current** account (its reset expired, no switch), skip the mirror and resume the account's own session (`transferredSessionId` = its session id) and write a plain `Retrying on <label> after the quota reset…` status line instead of the `Switched to…` notice (`to === from` would be misleading). Increment `attempts` only when a run starts; clear `allExhausted` on a later success; if no member is usable, re-arm at the new earliest without incrementing, or leave the task blocked at the cap.
 - Boot: `index.ts`/`headless.ts` call `reconcileHarnessFailover()` after `reconcileOrphans()`/`reconcilePipelineRuns()` and before/with `rearmFxAutoResumes()`; it completes/block-clears pending swaps, re-arms retries, and prunes expired cooldowns.
 
 **Acceptance.** The scenarios in §5 (swap happy path, queue/cards/subagents, stop/archive/delete, transfer/spawn failure, all-exhausted, manual force, manual switch, boot, cleanup, non-stack regression).
@@ -527,14 +528,14 @@ The orchestrator registers `{ onAutoRetry, onReconcileSwap }` once at module loa
 
 - `StackBadge.tsx`: a small `link` + `2/3` chip, optional cooling/warning dot, `title` with the stack label and "fails over to the next account at its limit".
 - `NewTaskForm`/`TaskLaunchPickers`: pass `stacks`, render the badge next to each account; selecting an account does not change.
-- `RunPanel`: accept `stacks`/`limitStates`; show the active account line `label · 2/3` in the task details; when `task.harnessState.allExhausted`, a banner with the countdown (a `useCountdown` local hook, reset on `[task.id]`) and a "Run now" action; when `pendingSwap`, "Switching to <label>…"; render a `harness-swap:` status as a `StatusDivider` with the formatted text + a `2/3` chip; skip `isHarnessStackContinuation` user events; a `lastMove` note ("moved to <label> — <from> left the stack/ was disabled") while the state is recent; no new child key collisions; the reset effect.
+- `RunPanel`: accept `stacks`/`limitStates`; show the active account line `label · 2/3` in the task details; when `task.harnessState.allExhausted`, a banner with the countdown (a `useCountdown` local hook, reset on `[task.id]`) and a "Run now" action; when `pendingSwap`, "Switching to <label>…"; render a `harness-swap:` status as a `StatusDivider` with the formatted text + a `2/3` chip; skip `isHarnessStackContinuation` user events; a `lastMove` note (`harnessMoveNote`: "moved to <label> — <from> left the stack/ was disabled", or "switched to <label> — continuing this conversation" for `manual-switch`) while the state is recent; no new child key collisions; the reset effect.
 - `TaskCard`: the badge from `harnessState` or the account's stack; a warning dot when all-exhausted/cooling.
 - `App.tsx`: handle the `harness-swap` GlobalEvent → `toastHarnessSwap` (skip if the task is selected/focused; OS notify when unfocused); skip the old run's failed toast when `run-status.reason === "harness-swap"`; map `column.reason === "harness-exhausted"` to a "Stack out of quota" toast and `"harness-swap-failed"` to a "No usable backup account" toast; pass `stacks`/`limitStates` from the `/harnesses` payload.
 - `toasts.ts`: `toastHarnessSwap` (info, self-dismissing, `maybeNotifyOS` with the `harness-swap` kind).
 - `event-search.ts`/`message-history.ts`: skip hidden continuations; index the formatted swap notice.
 - TUI is T13; the webview only.
 
-**Acceptance.** `harness-stack-view.test.ts` (position/count, countdown copy, notice parse/format, no product name); event-search/message-history tests; e2e DOM.
+**Acceptance.** Event-search/message-history tests cover the notice parse/format (no product name) and the visible-text search; e2e DOM covers the chip/countdown/banner.
 
 #### T16 — Docs
 
@@ -560,7 +561,7 @@ The orchestrator registers `{ onAutoRetry, onReconcileSwap }` once at module loa
 
 #### T18 — Final green
 
-- Run `bun run typecheck`, `bun test`, and the full `bunx playwright test` where feasible; at minimum the two new specs plus every spec whose surface the change touched (`run-panel`/task details, settings, events, notifications, pipeline). Run the opt-in Codex spike only if the owner allows a real binary.
+- Run `bun run typecheck`, `bun test`, and the full `bunx --bun playwright test` where feasible; at minimum the two new specs plus every spec whose surface the change touched (`run-panel`/task details, settings, events, notifications, pipeline). The stack specs import `bun:sqlite`, so Playwright must itself run under Bun (`bunx --bun playwright test`), not Node. Run the opt-in Codex spike only if the owner allows a real binary.
 - Refresh the plan's `Status`, the PR body, test counts, and any generated report; ensure no test is skipped except `AGETOR_REAL_CODEX`.
 - Report defects against the owning task; do not paper over a red suite by loosening a test.
 
@@ -571,12 +572,12 @@ The orchestrator registers `{ onAutoRetry, onReconcileSwap }` once at module loa
 | ID | Layer | Covers | Owned test files | Acceptance |
 | --- | --- | --- | --- | --- |
 | TT1 | unit (shared) | Lap/wrap/skip/success reset; classifier table; notice formatter; tag; allowlist; notification kind. | `src/shared/harness-stack.test.ts`, `harness-limits.test.ts`, `harness-mirror.test.ts`, `user-message.test.ts`, `types.test.ts` | Every union variant and negative path; each test is shown red against a deliberately broken copy. |
-| TT2 | integration (DB) | 084 migration, `tasks.setHarnessState` patch-proof, handoffs, `runs.lastUserText` plan, harness/task delete cascades, snapshot restore. | `src/bun/db-harness-stacks.test.ts`, `migrate.test.ts`, `db-run-events-plans.test.ts` | Applies on 083; plan test green; deletes clean; snapshot restores. |
+| TT2 | integration (DB) | 084 migration, `tasks.setHarnessState` patch-proof, handoffs, `runs.mainUserTexts` plan, harness/task delete cascades, snapshot restore. | `src/bun/db-harness-stacks.test.ts`, `migrate.test.ts`, `db-run-events-plans.test.ts` | Applies on 083; plan test green; deletes clean; snapshot restores. |
 | TT3 | integration (store) | Stack CRUD/order, validation blockers/warnings, effective home, login evidence, cooldown expiry, orphaned member. | `src/bun/harness-stacks.test.ts` | Each hard block and warning; reorder; delete clears states. |
-| TT4 | integration (files) | Mirror merge/fixtures, never-copy, env strip, safe mode, TOML, symlink/FIFO/oversize, atomic/0600, idempotence; Claude transfer/sidecars/cleanup; Codex rollout. | `harness-mirror.test.ts`, `harness-file-transfer.test.ts`, `harness-session-transfer.test.ts` | A planted symlink/FIFO/credential path can never be read/copied; destination bytes/mode; cleanup bounded. |
-| TT5 | integration (runtime) | Fake-driver swap happy path; clean-retry (no tool call) vs transfer (tool call); queues/cards/subagents; stop/delete; transfer/spawn failure; all-exhausted; manual force; manual switch; boot; retention cleanup; non-stack regression. | `orchestrator-harness-swap.test.ts`, `orchestrator-harness-exhausted.test.ts`, `orchestrator-session-harness.test.ts` | The "assembled flow" tests drive `startTask`/`sendInput`/`attachDoneHandler` through the production entry points and assert the task/run/event/DB output. |
-| TT6 | integration (API/events) | Stack routes, payloads, route policy, pipeline swap ignore, notifications. | `server-harness-stacks.test.ts`, `route-policy.test.ts`, `pipeline-harness-swap.test.ts`, `headless-notifications.test.ts` | 400/blockers; CLI token; payloads; step stays running; old run silent. |
-| TT7 | unit (CLI/UI pure) | CLI parsing/formatting, log formatting, TUI toast, settings draft/virtual math, position/countdown/notice, search/history filters. | `harness.test.ts`, `ls.test.ts`, `show.test.ts`, `logs.test.ts`, `Dashboard.test.tsx`, `useGlobalEvents.test.ts`, `stack-editor.test.ts`, `harness-stack-view.test.ts`, `event-search.test.ts`, `message-history.test.ts`, `settings-dialog-view.test.ts` | Each variant through its renderer; escaped free text; hidden prompt skipped. |
+| TT4 | integration (files) | Mirror merge/fixtures, never-copy, env strip, login-selecting keys, MCP warning, safe mode, TOML, symlink/FIFO/oversize, atomic/0600, idempotence; symlinked-parent cleanup; Claude transfer/sidecars/cleanup; Codex rollout. | `harness-mirror.test.ts`, `harness-session-transfer.test.ts` | A planted symlink/FIFO/credential path can never be read/copied/removed; destination bytes/mode; cleanup bounded. |
+| TT5 | integration (runtime) | Fake-driver swap happy path; clean-retry (no tool call) vs transfer (tool call); second-limit handoff preservation; queues/cards/subagents; stop/delete; transfer/spawn failure; all-exhausted **and in-flight retry recovery**; manual force (cooldown stays global); manual switch; boot (settled successor, in-flight re-arm); retention cleanup; non-stack regression. | `orchestrator-harness-swap.test.ts`, `harness-failover.test.ts`, `orchestrator-session-harness.test.ts` | The "assembled flow" tests drive `startTask`/`sendInput`/`attachDoneHandler` through the production entry points and assert the task/run/event/DB output. |
+| TT6 | integration (API/events) | Stack routes, payloads, route policy, pipeline swap ignore, pipeline Stop vs a pending stack retry, successor origin is not a user turn, notifications. | `server-harness-stacks.test.ts`, `route-policy.test.ts`, `pipeline-harness-retry-stop.test.ts`, `headless-notifications.test.ts` | 400/blockers; CLI token; payloads; step stays running; old run silent; Stop cancels the timer. |
+| TT7 | unit (CLI/UI pure) | CLI parsing/formatting, log formatting, TUI toast, settings draft/virtual math, position/countdown/notice, search/history filters. | `harness.test.ts`, `ls.test.ts`, `show.test.ts`, `logs.test.ts`, `Dashboard.test.tsx`, `useGlobalEvents.test.ts`, `stack-editor.test.ts`, `event-search.test.ts`, `message-history.test.ts`, `settings-dialog-view.test.ts` | Each variant through its renderer; escaped free text; hidden prompt skipped; the swap divider searches by its visible text. |
 | TT8 | e2e | C2/C3/C5 assembled user flow; settings. | `e2e/harness-stack-swap.spec.ts`, `e2e/harness-stack-settings.spec.ts` | Fake limit → notice → backup → preserved session → success; settings create/edit/badge. |
 | TT9 | real binary (opt-in) | Codex `CODEX_HOME` isolation + stale `thread_history` + MCP OAuth store. | `src/bun/codex-home-spike.test.ts` | Skips loudly without `AGETOR_REAL_CODEX=1`; records the verdict; never prints a token. |
 
@@ -596,7 +597,7 @@ The orchestrator registers `{ onAutoRetry, onReconcileSwap }` once at module loa
 | 1 | T01 (data/migration), T02 (shared contract). | `bun run typecheck` + `bun test` green; migration pin; pure tests. |
 | 2 | T03 (store), T04 (transfer/mirror engine, imports T03's pinned `effectiveHome`), T05 (Claude adapter, imports T04's pinned engine), T06 (limit detection/fake). | Unit/integration tests green; no runtime swap yet; API still absent. |
 | 3a | T07 (API), T08 (failover engine; imports T03/T05). | `route-policy` + stack-route tests + failover-engine tests; no swap wiring yet. |
-| 3b | T09 (orchestrator glue; imports T08's pinned plan/prepare API), T10 (pipeline/notifications; codes against T02's event contract and can test with a synthetic `run-status` reason before T09 lands). | Backend assembled flow green with fake drivers; `orchestrator-harness-swap`/`exhausted`; `pipeline-harness-swap`; no UI/CLI yet (API test client). |
+| 3b | T09 (orchestrator glue; imports T08's pinned plan/prepare API), T10 (pipeline/notifications; codes against T02's event contract and can test with a synthetic `run-status` reason before T09 lands). | Backend assembled flow green with fake drivers; `orchestrator-harness-swap`/`harness-failover`; `pipeline-harness-retry-stop`; no UI/CLI yet (API test client). |
 | 4 | T11 (Codex HOME/overlay), T12 (Codex adapter) — only after T00. | Codex adapter tests + env tests; the real-binary test remains opt-in. |
 | 5 | T13 (CLI), T14 (Settings), T15 (task surfaces). | CLI/UI unit tests; `bun run typecheck`. |
 | 6 | T16 (docs/security sign-off), T17 (e2e), T18 (final green). | Full `bun test`; the two e2e specs; docs/citations; plan status. |
@@ -633,7 +634,7 @@ Each slice must build, typecheck, and pass its tests; no slice may delete or lea
 | Invariant | Enforced at | Every path through |
 | --- | --- | --- |
 | An account belongs to at most one stack. | `UNIQUE(harness_stack_members.harness_id)` in 084 + `harness-stacks.validateInput`. | Every create/edit route and CLI command. |
-| A task's stack is derived from its current account; a task has at most one stack. | `harness-stacks.resolveForTask` (state `stackId` first, then `getByMember`). | Start, send, settle, boot. |
+| A task's stack is derived from its current account; a task has at most one stack. | `harness-stacks.resolveForTask` (current `getByMember` first, recorded `stackId` only as the orphan fallback). | Start, send, settle, boot. |
 | One in-flight run per task; a swap is a new run on the same task. | `startingTaskIds` + `active` in `orchestrator.ts`; the swap path claims `startingTaskIds` before any await and releases in `finally`. | `startTask`, `sendInput`, swap, retry. |
 | Session ids are scoped to the harness that created them, except a recorded handoff. | `findLastSessionIdForHarness` compares the handoff and run timestamps. | Every resume path for every kind. |
 | Harness credential files are never copied. | `NEVER_COPY`/`assertNotCredentialPath` in `harness-mirror.ts` + the T04 tests. | Mirror at create/update/swap; no other copy path. |
@@ -666,27 +667,27 @@ Each slice must build, typecheck, and pass its tests; no slice may delete or lea
 - **Codex MCP OAuth** may live in a DB, not a standalone file. If so, the mirror cannot copy it safely; the swap warns that the account must sign in again. This is a deviation from "mirror MCP OAuth" for one kind; see §8.
 - **Hooks/permissions mirror** executes the primary's hooks on every backup. The security review and the `safe` mode are the mitigations; the owner chose full mirror.
 - **Mirror/copy latency** can make the swap gap seconds. The task stays `running`; the status line explains; the copy is cooperative so other tasks keep running.
-- **A user message typed during the swap** lands in `swapFollowUps` (with its visible bubble on the old/current run) and drains after the new run settles; it cannot start a competing turn because `startingTaskIds` is held. A Stop/delete/archive re-stashes it to the backlog. Test it.
+- **A user message typed during the swap** lands in `swapFollowUps` (with exactly one visible bubble, written by the drain's send on the run that executes it) and drains after the new run settles; it cannot start a competing turn because the swap window holds both `startingTaskIds` and `swapWindowTaskIds`. A Stop/delete/archive re-stashes it to the backlog. Test it.
 
 ---
 
 ## 8. Open questions / assumptions
 
-**Unratified one-way outcomes (put these in the PR body for the owner/reviewer):**
-1. **Codex HOME global change (if T00 says drop HOME).** The grill chose "test dropping it first", but applying it changes the tool environment for *every* existing codex account (real `~/.gitconfig`/`~/.ssh`/`gh` become visible; the account's `<home>` no longer pretends to be HOME). The plan applies it only if T00 proves `CODEX_HOME` isolation. If the owner wants stack-only behavior, use the overlay for all codex accounts or keep HOME and build the overlay; this is a product call, not a code call.
+**One-way outcomes (put these in the PR body for the owner/reviewer; item 1 is owner-ratified, item 2 remains unratified):**
+1. **Codex HOME global change — owner-ratified, applied after T00 proved isolation.** The grill chose "test dropping it first" (`round-4/answers.json#codex-home-premise`, `acceptedRecommendation: true`); T00 then proved `CODEX_HOME` alone isolates login/config/MCP/sessions on codex-cli 0.166.0, and `harnessEnv` therefore emits only `CODEX_HOME=<home>/.codex` for every codex account (real `HOME` preserved). This still changes the tool environment for *every* existing codex account (real `~/.gitconfig`/`~/.ssh`/`gh` become visible), so §9 records it as owner-ratified and the PR body must call it out. The security review did not reverse it.
 2. **Codex MCP OAuth if the store is a DB.** The owner asked to mirror MCP/plugin OAuth. If T00 finds the tokens in `state_*.sqlite` rather than a standalone file, copying rows is unsafe; the plan warns and requires a per-account sign-in. The owner should ratify this narrow deviation or ask for a DB-row copy follow-up.
 3. **Hooks/permissions security review.** The owner chose `mirror-everything`. If the security review rejects hooks/permissions, the plan's fallback is `mirrorMode: "safe"` as the default for new stacks (the editor still offers full with a warning). The owner should ratify the default change; do not silently flip it.
 4. **Mirror source = position 0.** The grill says "the primary wins" but does not define primary if the user reorders or if the built-in is not first. This plan defines primary = position 0 (the UI labels it "Primary"). If the owner meant "the built-in account", the mirror source must change; the stack editor should label it explicitly.
 5. **The task's current account is the starting point of the train.** Grill 29's "selection starts at the first enabled, logged-in member" is read as the stack's order/head (the wrap target), not as an override of the account the user picked for a task. A new task starts on its selected account (or its profile's harness); failover walks forward from there. If the owner meant "always start every task on the stack's first member", that is a different selection rule and must be stated before implementation.
 
 **Assumptions being proceeded on (with the source):**
-6. A stack may be created with 0 or 1 members; it is inert (no failover) and the editor warns. The owner said opt-in by creating a stack; allowing the shell before adding backups is the least surprising.
+6. A stack may be created with **1 or more** members; a 1-member stack is inert (no failover) and the editor warns. A 0-member draft is a blocker (`validateInput` and `draftBlockers`) — there is nothing to name as primary and no account to fail over from. The owner said opt-in by creating a stack; allowing the shell before backups are added is the least surprising.
 7. All-exhausted wait: exact earliest reset; if null, 10 min; re-arm at most every 24 h; cap 3 run attempts; a manual Run resets the cap. (fx precedent, `FX_AUTO_RESUME_MAX = 3`, `FX_AUTO_RESUME_DEFAULT_DELAY_SEC = 120`; the 10 min is a harness-stack choice, not an fx reuse.)
 8. Claude reset-time parsing (`at 8am`, `at 3:30pm`) is best-effort; an unparsed notice uses the 10-min backoff. The exact wording is version-dependent; the classifier tests pin the current notice forms.
-9. The provider session can be copied and resumed at the standard path (S1/S2). If the run recorded a `tool_use`, a transcript whose last entry is a tool_use may re-run the tool on resume — accepted and documented. If it recorded **no** `tool_use`, the clean-retry branch starts a fresh session with the original prompt, avoiding both a synthetic continuation and a duplicate provider user message.
+9. The provider session can be copied and resumed at the standard path (S1/S2). If the run recorded a `tool_use`, a transcript whose last entry is a tool_use may re-run the tool on resume — accepted and documented. If it recorded **no** `tool_use` **and no earlier turn on the account produced a session**, the clean-retry branch starts a fresh session with the original prompt, avoiding both a synthetic continuation and a duplicate provider user message. A follow-up turn that limits before its own first tool call still moves/resumes the earlier conversation (R11-M1).
 10. The task row's `harness_state` is small (ids/timestamps/notes), never prompts or tokens; `/tasks` poll size is bounded.
 11. `runs.origin = "harness-swap"` is enough to identify a swap run in history; the hidden prompt's tag is the cross-surface renderer guard.
-12. The mirror's full mode copies `settings.json`/`config.toml`, MCP definitions, skills/commands/agents/plugins and user-level hooks/permissions; it does not copy sessions, caches, logs, credentials, or `[projects.*]` trust. The security review enumerates the exact paths.
+12. The mirror's full mode copies `settings.json`/`config.toml`, MCP definitions, skills/commands/agents, the installed plugin payload/definitions and user-level hooks/permissions; it does not copy sessions, session/log caches, logs, credentials, `.git` metadata, or `[projects.*]` trust. The security review enumerates the exact paths.
 13. The built-in Claude account is usable as a stack member with no login evidence (`null` = keychain, never block); the start pre-flight still refuses if the CLI positively reports logged out.
 14. The e2e fake Claude driver can write a minimal transcript to the alias home; no real account or real `~/.claude` is touched.
 15. `Bun.TOML.parse` is available (checked) and the section merge is valid; no new dependency.
@@ -731,13 +732,13 @@ Each slice must build, typecheck, and pass its tests; no slice may delete or lea
 | Swap settlement (old run failed, toast suppressed, task stays running) | in this run | T09 |
 | New run row with new account + explicit session id + `origin` | in this run | T09 |
 | Hidden tagged continuation prompt (`harness-stack-continuation`) | in this run | T02/T05/T09 |
-| No-tool-call clean retry with the original prompt (`runs.hasToolUse`/`lastUserText`) | in this run | T01/T09 |
+| No-tool-call clean retry with the original prompt (`runs.hasToolUse`/`mainUserTexts`/`composeCleanRetryText`) | in this run | T01/T09 |
 | Transfer failure blocks with a clear message | in this run | T09 |
 | Spawn failure blocks with a clear message | in this run | T09 |
 | Pending interaction cards cancelled | in this run | T09 |
 | Background agents abandoned + status line naming them | in this run | T09 |
 | Queued follow-ups kept and drained after the new run | in this run | T09 |
-| Follow-up typed **during** the swap (`swapFollowUps`, bubble on the old/current run, drained in order; re-stashed on Stop) | in this run | T09 |
+| Follow-up typed **during** the swap (`swapFollowUps`, one bubble written by the drain's send on the run that executes it; drained in order; re-stashed on Stop) | in this run | T09 |
 | Stop during the swap cancels the successor | in this run | T09 |
 | Archive/delete during the swap aborts | in this run | T09 |
 | Manual Run/message forces a cooling account | in this run | T08/T09 |
@@ -797,3 +798,289 @@ Each slice must build, typecheck, and pass its tests; no slice may delete or lea
 | Hooks/permissions full-mirror default | owner-ratified, security-review gate | T04/T16; §8 |
 | Mirror source = position 0 | assumption, §8 | T04/T14 |
 | Hidden prompt tag reserved | documented | T02/T16 |
+
+---
+
+## Implementation record (added by the Implementing step)
+
+- **T00 verdict:** `CODEX_HOME` alone isolates Codex (`docs/plans/harness-account-stacks-codex-spike.md`);
+  `harnessEnv` drops the `HOME` override for every codex account. The
+  stale-`thread_history` and project-trust arms remain unverified without a real
+  login; T12 therefore copies the rollout and runs `migrate-rollouts --apply`
+  best-effort, blocking the swap (never a silent fresh session) if the resume
+  then fails.
+- **Codex MCP OAuth deviation:** no stable standalone store file exists, so
+  tokens are not copied; the swap warns that sign-in may need repeating
+  (reviewed in `docs/plans/harness-account-stacks-security-review.md`).
+- **Primary definition:** position 0 (the editor labels it "Primary"), as
+  stated in §8.
+- **Start account:** a task starts on the account the user picked; failover
+  walks forward from there and wraps once.
+- **New files:** `harness-stacks.ts`, `harness-failover.ts`,
+  `harness-mirror.ts`, `harness-file-transfer.ts`, `harness-session-transfer.ts`,
+  `src/shared/harness-{stack,limits,mirror}.ts`, migration 084, the Settings
+  Stacks section, `StackBadge`, the CLI `harness stack` command, two e2e specs,
+  the Codex spike/review docs and `docs/architecture/harness-stacks.md`.
+- **Tests added:** `harness-stack`, `harness-limits`, `harness-mirror`
+  (shared + engine), `harness-session-transfer`, `harness-stacks`,
+  `harness-failover`, `harness-file-transfer` (inside the mirror/file tests),
+  `db-harness-stacks`, `orchestrator-harness-swap`, `server-harness-stacks`,
+  `codex-limit`, `codex-home-spike` (opt-in), `stack-editor`,
+  `settings-dialog-view` extensions, CLI/TUI/logs/notification extensions.
+- **Verification recipe:** `bun run typecheck`; `bun test`; and
+  `bunx playwright test e2e/harness-stack-swap.spec.ts e2e/harness-stack-settings.spec.ts`
+  (run with `bunx --bun` where the specs use `bun:sqlite`).
+- **Post-review fixes (Bug Fix round):** a complete lap (all members tried) now
+  returns `all-exhausted` with its earliest reset instead of a permanent
+  `none-usable`; the mirror merges additively (backup-only files survive),
+  preserves backup-only top-level Codex keys and the backup's own safe-mode
+  sections, uses `O_NOFOLLOW` bounded merge reads, refuses destination symlink
+  traversal, and leaves an unreadable backup config untouched; the Settings
+  stack editor is no longer duplicated inside the dialog heading; auto-retry
+  skips a still-cooling current account, resumes the same provider session on
+  a same-account retry, counts only started retries, verifies timer identity
+  and holds the start/swap claim; the pipeline runner, headless notifications
+  and TUI no longer announce the old run as failed; a manual account move drops
+  the previous account's persistent session; Codex plugin caches were still
+  excluded at that point (they are mirrored now — see the twelfth bullet).
+- **Fourth post-review fixes (sixth round):** the Claude pane limit detector is
+  anchored to the provider notice's row shape — the "usage limit" phrase must
+  start a rendered row (indentation/status glyph allowed) and the provider's
+  auto-continue wording (`continuing automatically` / `continuing shortly` /
+  `esc to cancel`) must be in the same up-to-three-row window — so a single
+  transcript row such as "the usage limit resets at 8am" can no longer fail a
+  healthy stacked turn (regression test, plus the wrapped-notice reset now
+  survives into `harness_limit_state`); every Claude-root sibling uses the
+  env-aware resolver (boot subagent watcher, `/runs` rebuild, account usage,
+  session scan) and home-less built-ins honor a process-level
+  `CLAUDE_CONFIG_DIR`/`CODEX_HOME` in the mirror/transfer roots and usage
+  meters; `setLimitState` keeps a still-active later provider reset when a
+  no-reset fallback arrives; swap dividers escape the destination label for
+  the terminal; deleting a harness removes its copied handoff session files
+  before the rows; safe-mode/mirror skips are warnings instead of silent, and
+  the unused `mirrorRootFor` export is gone.
+- **Third post-review fixes (fifth round):** `allExhausted.inFlight` now stays
+  `true` for the whole life of a started retry run, so
+  `settleHarnessStateAndFollowUps`'s non-limit-failure guard stays armed and a
+  retry that fails for an API-error/session-death/ordinary reason ends the loop
+  instead of leaving "Retrying…" with `nextAttemptAt: 0` and no timer (regression
+  test drives a fake limit → blocked → retry with an API error and asserts the
+  marker is gone before cleanup); a source path with a symlinked **parent** is
+  refused (`isPlainAncestorPathUnder`) in the mirror's `copy`/`merge` sources,
+  the Claude transcript/sidecars and the Codex rollout — a leaf-only `lstat` no
+  longer reads a linked `plugins/`/`projects/` target outside the account
+  (regression tests for the mirror tree and the Claude transcript); the Claude
+  pane limit detector requires the "usage limit" phrase and its notice detail
+  within the same few rows, so transcript prose far apart no longer settles a
+  healthy turn; a Claude **pane** limit that takes the no-swap-target
+  passthrough (stack deleted mid-turn, archived interaction, 0/1-member stack)
+  drops the paused REPL session before the normal settle (a fake-driver
+  `__agetor_fake_claude_limit_pane__` marker / `AGETOR_FAKE_CLAUDE_LIMIT_PANE`
+  now emits the pane-sourced signal; regression test installs a session and
+  proves it is gone); file copies and the
+  atomic writer read/write in asynchronous 1 MiB chunks instead of a
+  synchronous up-to-64 MB `readSync`/`writeSync` burst on the shared Bun main
+  thread; D15's crash-recovery claim (a crash-interrupted spawn is re-armed
+  **without** spending an attempt) and the architecture doc's retry wording now
+  match the code.
+- **Second post-review fixes (R-M1/R-S1 + nits):** a limit with no swap target
+  (stack deleted mid-run, archived task, or an inert 0/1-member stack) now
+  returns `"passthrough"` and lets the normal settle own the run, so the
+  column/countdown matches a lone account, `noteRunSettledCheckout` runs, and
+  follow-ups typed in the swap window drain instead of being stranded; boot
+  keeps `allExhausted.inFlight` for a still-live/re-attached retry run so a
+  non-limit failure can end the loop instead of showing "Retrying…" forever;
+  cooldown expiry is filtered on read and pruned on writes (no DELETE from a
+  GET); Codex `migrate-rollouts` warnings ride the status line; the Settings
+  editor PATCHes only changed fields (a rename no longer re-mirrors); CLI
+  `harness stack create --label` is honoured; a failed swap/retry clears a
+  stale `swapCancelRequested`; the `/harnesses` payload test pins every CLI
+  probe to `/bin/echo`; Dashboard and `show` gained divider/failover tests.
+- **Seventh post-review fixes (R7-M1 + R7-S1…S4 + nits):** `DELETE
+  /harnesses/:id` now runs the built-in/in-use guard (`harnesses.assertDeletable`)
+  **before** unlinking the harness's copied handoff sessions, so a refused
+  delete no longer destroys the live stacked task's transcript (route regression
+  test proves the 409 keeps the file and handoff row, and the later successful
+  delete removes them); generic CLI/TUI status lines escape their text, so a
+  stored harness label with ESC/ANSI or a line break cannot repaint `agetor logs`
+  or the dashboard; `readEnabledPlugins` resolves `settings.json` through the
+  same env-aware `CLAUDE_CONFIG_DIR` as the spawned CLI (an env-pinned account no
+  longer takes its plugin enable/disable map from the wrong file); the Claude
+  pane limit detector searches only the bottom twelve non-blank rows (the live
+  hint slot), so a notice quoted in the scrollback or echoed in a tool result
+  cannot settle a healthy stacked turn; `agetor harness stack` is now listed in
+  `agetor harness --help`/the command index with per-subcommand usage blocks
+  (bad-argument errors name the right usage); the unreachable
+  `harnessLimitNoticeText` keyword fallback and the unused
+  `PrepareResult.moved.note` are gone.
+- **Eighth post-review fixes (R8-M1, R8-S1, R8-S2 + nits):** a swap/retry
+  successor whose spawn throws no longer emits the untagged
+  `run-status failed` from `spawnAgentOrFail` — `spawnSwapContinuation` owns the
+  single reason-tagged `harness-swap` failure, so the webview no longer
+  double-toasts and a pipeline step is not settled `step-failed` while the
+  retry is still armed (regression test drives a fake limit → blocked → retry
+  whose `buildCommand` throws and asserts one tagged successor event); a
+  `deleteTask` failure now leaves the task's copied handoff transcripts and
+  allowlist rows intact because the cleanup runs immediately before
+  `tasks.delete`, after every throwing teardown/cascade step (regression test
+  makes the pipeline cascade throw and proves the file survives until a delete
+  succeeds); a throw inside `fireHarnessAutoRetryInner` clears the persisted
+  `inFlight` marker, spends one attempt and re-arms the normal backoff instead
+  of leaving "Retrying…" with no timer (test seam + regression test); the
+  write-only webview `harnessLimitStates` state is gone; the docs now name the
+  real `mirrorForSwap` wrapper, the actual `swapWindowTaskIds` follow-up
+  window, and the GET route's per-member install/login probes; and
+  `harness stack create` refuses a positional label plus `--label` instead of
+  silently dropping one.
+- **Ninth post-review fixes (R9-M1, R9-S1…S4 + nits):** a stacked Claude
+  429/402 API error no longer flips the card to `blocked`/`api-error` before
+  the swap settlement owns it — the card stays `running`, no sticky retry
+  toast/OS notification fires, and the old run is still recorded `failed`
+  (fake-driver regression test drives the real `api error:` sentinel);
+  `blockStackTask` clears `allExhausted` instead of leaving
+  `nextAttemptAt: 0`, so a hard block cannot make RunPanel/StackBadge/`agetor
+  show` claim "Retrying…" with no timer (regression test also covers the
+  banner), and the retry loop treats that cleared marker as terminal rather
+  than re-arming against a vanished destination; a `none-usable` settlement
+  no longer prints the quota-retry copy (regression test forces the current
+  account out of the stack and leaves only logged-out members); a start
+  pre-flight failure (fresh auth / CLI floor newer than the 15 s cache) on a
+  stack account now moves to a usable backup once instead of refusing the Run
+  (`prepareTaskHarness({ forceOffCurrent })` + regression test); the opt-in
+  Codex spike test now uses a decoy `$HOME/.codex` login/MCP config and proves
+  `CODEX_HOME` wins; the dead `MIRROR_SPECS.envStrip` and
+  `pendingSwap.phase` fields are gone, StackBadge's `no-usable-member` tooltip
+  says "fix one in Settings" instead of claiming a quota wait, and the stale
+  Codex `HOME` comment and plan assertion count are corrected.
+- **Tenth post-review fixes (R10-M1, R10-S1/S2 + nits):**
+  `harnessStacks.resolveForTask` now resolves against the account's CURRENT
+  stack membership (the recorded `harnessState.stackId` is only the fallback
+  for an account removed from every stack), so a failover and a manual Run
+  after a membership move use the new train, and every persisted state write
+  re-points `stackId` to it; the clean-retry text is rebuilt from the ordered,
+  normalized main-stream user rows (`composeCleanRetryText`), with the
+  successor prompt asserted; the in-task swap divider is asserted in the DOM
+  in both stack Playwright specs; the CLI `harness stack create` refuses a
+  positional label plus `--label`; the CLI/TUI status escaping and the plan's
+  assertion count are corrected.
+- **Eleventh post-review fixes (R11-M1, R11-S1…S3 + nits):** a follow-up turn
+  that hits its limit before its own first tool call now preserves the
+  conversation — `conversationToPreserve` also counts an earlier run on the
+  current account (`hasPriorSessionForHarness`, which excludes the settling
+  run), so a cross-account swap transfers the transcript and a same-account
+  retry resumes the existing session instead of starting fresh with only the
+  follow-up text (regression tests for both; each fails with the old gate); the
+  task card's membership-derived `StackBadge` state keeps the task's LIVE
+  `pendingSwap`/`allExhausted`/`lastMove` when the account was edited into a
+  different stack, so the card and RunPanel agree after a move (pure
+  `lib/stack-badge.ts` + unit tests and a `task-card-stack-badge` e2e
+  assertion); the clean-retry regression now seeds a folded follow-up and a
+  duplicate JSONL twin, so it fails if the successor replays only the newest
+  raw row; `harness stack edit --kind` is honoured (and documented in the
+  usage block) instead of silently ignored; and the two open R9 items (a stack
+  deleted mid-turn takes the lone-account column, a built-in keychain logout is
+  not pre-flight detectable) are recorded as known limitations in
+  `docs/architecture/harness-stacks.md`.
+- **Twelfth post-review fixes (R12-M1, R12-S1…S4 + nits):** `.git` is never
+  mirrored at any depth (`isNeverCopySegment`, enforced by both
+  `isNeverCopyPath` and `copyTreeCooperative`), so a marketplace clone's
+  remote URL/token cannot cross accounts (planted-token test); the installed
+  plugin payload (`plugins/cache/`) is copied for Claude and Codex and Claude's
+  two plugin registries are merged with every absolute path rewritten to the
+  destination root; the Settings e2e now covers edit, delete, kind exclusion
+  and the >10-member warning; the new stack UI uses the semantic
+  `--info`/`--warning` tokens; `harnessSessionHandoffs.deleteForHarness` is
+  wired into `harnesses.delete`; cleanup prunes the empty sidecar directories
+  it created; a manual move cancels its dangling auto-retry timer;
+  `formatStackUnusable` shows account labels; the two countdowns share
+  `useNowTicker`; `update()`'s skip-list comment names `harness_state`;
+  `security.md` names the real reader helpers; plan §8 item 1 records the
+  Codex-HOME ratification and assumption 6 aligns with the 1-member minimum.
+- **Thirteenth post-review fixes (R13-M1, R13-M2, R13-S1/S2 + nits):** deleting
+  a stack account now re-packs the surviving `harness_stack_members` ranks
+  (the FK cascade left `0, 2`, which rendered an impossible "3/2" in the swap
+  divider and the card badge), and `harnessStacks` derives `position` from the
+  surviving order so a database written before the fix still reads
+  contiguously (regression test deletes the primary of a 3-member stack,
+  asserts the stored and reported ranks, and plants a gap by hand); the
+  Settings create/edit flow surfaces the API's `mirror.warnings` as a
+  non-dismissed warning toast instead of plain success, and the all-exhausted
+  retry carries its mirror/transfer warnings onto the successor run's status
+  stream instead of only the process log (fake-driver regression with a
+  non-object backup `settings.json`); `agetor harness stack edit` prints the
+  mirror warnings like `create` does; `DELETE /harnesses/:id` captures the
+  handoff copies before the row delete and unlinks them only after it
+  succeeded, so a task assigned in the window gets a 409 with its
+  conversation intact; the plan Status line is back in sync; and the nits:
+  `HARNESS_SWAP_STATUS_TOKEN` removes the duplicated `harness-swap:` literal,
+  a stack delete cancels the affected retry timers, a non-object JSON file is
+  reported as "not a JSON object" (not "invalid JSON"), and the editor's
+  virtual member list gets its trailing spacer.
+- **Fourteenth post-review fixes (R14-S1…S3 + nits):** the credential strip
+  also covers the cited cloud/provider spellings (`AWS_SECRET_ACCESS_KEY`,
+  `AWS_BEARER_TOKEN_BEDROCK`, `AZURE_OPENAI_API_KEY`,
+  `GOOGLE_APPLICATION_CREDENTIALS`, `ANTHROPIC_CUSTOM_HEADERS`, …) with tests;
+  the manual same-stack switch's type/parser/reconcile/RunPanel note agree
+  (`lastMove.reason = "manual-switch"` renders "Switched to … — continuing this
+  conversation"); the PATCH route claims the task for the whole copy, awaits
+  `reconcileTaskSession`, returns the post-reconcile row, and `startTask` /
+  `sendInput` refuse during the window; the three nits (status-line wording,
+  the `nextAttemptAt: 0` recovery, and the CLI edit output) are fixed. (Entry
+  was missing from this log — the review caught the stale Status.)
+- **Fifteenth post-review fixes (R15-M1, R15-S1…S4 + nits):** login evidence
+  now reads the account's own login sources instead of only
+  `.credentials.json` — its `settings.json` `env` block, its `harness.env`
+  map, and `apiKeyHelper`/`awsCredentialExport`/`awsAuthRefresh` count as
+  logged in, while a Bedrock/Vertex/Foundry/custom-endpoint setup (or a Codex
+  `model_provider`) fails **open** (`null`) instead of reading as logged out,
+  so a stack can Run and fail over to those supported accounts (unit tests for
+  every shape); the mirror's credential rule is now shape-based (any
+  `_`-separated `TOKEN`/`SECRET`/`PASSWORD`/`KEY`/`CREDENTIAL`/`AUTHORIZATION`
+  segment, plus the vendor markers), so `OPENROUTER_API_KEY`, `GITHUB_TOKEN`,
+  `AWS_WEB_IDENTITY_TOKEN_FILE` and login-selecting `AWS_ROLE_ARN`/
+  `AWS_PROFILE` no longer cross into a backup (tests assert both the matches
+  and the non-matches such as `MAX_TOKENS`/`AWS_REGION`); the process-level
+  credential warning uses the same kind-scoped matcher, so a process `AWS_*`
+  key warns on stack creation while a `GITHUB_TOKEN` the kind never reads does
+  not; the manual PATCH switch persists `pendingSwap.manual` before the task
+  row changes accounts and the boot reconcile copies the transcript onto the
+  destination (or visibly reports a failure) instead of silently starting
+  fresh after a crash (server regression test for both the committed and
+  not-yet-committed cases); the plan Status/fix log is refreshed; and the
+  nits: README distinguishes an automatic swap (message held) from a manual
+  switch (message declined), and the security-review header date is current.
+- **Sixteenth post-review fixes (R16-M1, R16-M2, R16-S1…S3 + nits):** login
+  evidence now fails open when a Bedrock/Vertex/Foundry/gateway/custom-endpoint
+  selector is set **process-level** (inherited by every spawn) instead of only
+  in `settings.json`/`harness.env`, for both Claude and Codex, and a present but
+  unreadable Codex `config.toml` no longer reads as logged out (review M1 +
+  nit); the mirror now copies the user-level instruction/config files
+  (`CLAUDE.md`, `output-styles/`, Codex `AGENTS.md`) that grill decision 18's
+  "whole user-level config" requires (review M2); `installed_plugins.json`
+  merges its per-plugin install-record arrays **by scope** (primary wins on a
+  scope it defines, backup-only scopes survive) instead of a plain union that
+  produced two `user` records for one plugin (review S1); a manual same-stack
+  switch with no recorded provider session now records the `manual-switch`
+  note exactly like the boot reconcile instead of silently clearing the state
+  (review S2); the plugin payload trees get their own bounded copy budget and a
+  truncated payload leaves the plugin registry untouched with a warning, so a
+  rewritten registry can never point at files that were not copied (review
+  S3); and plan T02 now documents the shape-based credential rule rather than
+  the superseded explicit list (nit).
+- **Seventeenth post-review fixes (R17-M1, R17-S1…S3 + nits):**
+  `installed_plugins.json` install records merge by **scope + `projectPath`**
+  instead of scope alone, so one plugin's several project records and the
+  backup's own project records are no longer collapsed/dropped (review M1);
+  `copyTreeCooperative` charges each visited entry exactly once (the parent
+  loop and the file branch both incremented it), restoring the documented
+  5,000/25,000-entry budgets that were effectively halved (review S1); an
+  existing symlinked `.credentials.json`/`auth.json` counts as login evidence
+  via the no-follow existence check instead of reading as logged out (review
+  S2); and the all-exhausted timer asks `canAutoRetry` before consuming itself —
+  while another start/swap holds the task's claim it persists a short backoff
+  and re-arms, so a failed prepare cannot leave a countdown with no timer
+  (review S3). Nits: the stack editor lists accounts that belong to another
+  stack as disabled options with the reason instead of hiding them; the task
+  card's stack chip shows a cooling marker for its current account; and the
+  plan `Status`/T02 `harness-swap` event shape now match the shipped code
+  (`from`/`to`, no `runId`).

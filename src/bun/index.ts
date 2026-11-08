@@ -16,6 +16,7 @@ import {
   stopOpencodeServersOnQuit,
   stopOpencodeServerDriver,
   launchesInFlight,
+  reconcileHarnessFailover,
   reconcileOrphans,
   rearmFxAutoResumes,
   sweepArchivedTeardowns,
@@ -451,6 +452,11 @@ try {
   if (rearmedFxAutoResumeCount > 0) {
     console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
   }
+
+  // Harness-stack failover: re-arm all-exhausted retries, complete or visibly
+  // block swaps interrupted by the restart, and prune expired cooldowns
+  // (docs/architecture/harness-stacks.md).
+  await reconcileHarnessFailover();
 } catch (err) {
   failBoot(err);
 }

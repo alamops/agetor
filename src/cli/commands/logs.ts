@@ -13,7 +13,8 @@ import {
   parseReplayMeta,
 } from "../../shared/task-stream-resume.ts";
 import type { RunEvent, GlobalEvent, Task } from "../../shared/types.ts";
-import { FX_RECOVERY_STATUS_PREFIX, isInternalStatusSentinel, retentionTrimNote } from "../../shared/types.ts";
+import { FX_RECOVERY_STATUS_PREFIX, HARNESS_SWAP_STATUS_PREFIX, isInternalStatusSentinel, retentionTrimNote } from "../../shared/types.ts";
+import { formatHarnessSwapNotice, parseHarnessSwapNotice } from "../../shared/harness-stack.ts";
 import { fxRecoveryNoticeText, parseFxRecoveryPayload } from "../../shared/fx-recovery.ts";
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
 import { userMessageLines, type PlainLine } from "../../shared/user-message.ts";
@@ -210,6 +211,10 @@ function createLineRenderer(
 ): (e: RunEvent) => string | null {
   return (e: RunEvent): string | null => {
     if (json) return JSON.stringify(e);
+    if (e.stream === "status" && e.data.startsWith(HARNESS_SWAP_STATUS_PREFIX)) {
+      const notice = parseHarnessSwapNotice(e.data);
+      return notice ? c.cyan(formatHarnessSwapNotice(notice)) : null;
+    }
     if (e.stream === "status" && e.data.startsWith(FX_RECOVERY_STATUS_PREFIX)) {
       const payload = parseFxRecoveryPayload(e.data.slice(FX_RECOVERY_STATUS_PREFIX.length));
       return payload && payload.state === "active" && !payload.replayed
@@ -292,7 +297,11 @@ function createEventFormatter(
       case "thinking":
         return c.dim(e.data);
       case "status":
-        return c.dim(`• ${e.data}`);
+        // Status lines are internally generated but may interpolate a stored
+        // harness label (a stack switch/continue line). The route stores a
+        // label as typed, so escape it here before it reaches the terminal —
+        // otherwise ESC/ANSI or a line break in a label can repaint the log.
+        return c.dim(`• ${escapeFreeText(e.data)}`);
       case "stderr":
         return c.red(e.data);
       case "stdout":

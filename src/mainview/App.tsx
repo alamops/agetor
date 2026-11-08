@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessLimitState, type HarnessQuota, type HarnessStack, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -66,7 +66,7 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
+import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastHarnessExhausted, toastHarnessSwap, toastHarnessUnusable, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { OwedPipelineAlerts } from "@/lib/owed-pipeline-alerts";
 import { findTaskById } from "@/lib/notification-open";
@@ -256,6 +256,11 @@ function AppInner() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
+  const [harnessStacks, setHarnessStacks] = useState<HarnessStack[]>([]);
+  // Account-global cooldowns for the board's stack chips. Reconciled by
+  // `harnessId` so an unchanged poll keeps the same array reference and the
+  // memoized columns/cards bail out.
+  const [harnessLimitStates, setHarnessLimitStates] = useState<HarnessLimitState[]>([]);
   // True once `/harnesses` has resolved at least once — lets onboarding's
   // harness step tell "not loaded yet" (skip the disabled/enabled
   // distinction) apart from "loaded, and it happens to be empty".
@@ -788,6 +793,14 @@ function AppInner() {
     try {
       const payload = await api.listHarnesses();
       setHarnesses((prev) => reconcileById(prev, payload.harnesses, (h) => h.id));
+      // Reconcile by id like tasks/harnesses: TaskCard's memo and every
+      // Column's stack prop depend on an unchanged array staying
+      // reference-equal across polls.
+      setHarnessStacks((prev) => reconcileById(prev, payload.stacks ?? [], (s) => s.id));
+      // The board's stack chip marks a cooling current account, so the
+      // account-global cooldowns are kept here too (reconciled by harness id
+      // so an unchanged poll keeps the array reference).
+      setHarnessLimitStates((prev) => reconcileById(prev, payload.limitStates ?? [], (s) => s.harnessId));
       setAgents((prev) => reconcileById(prev, payload.statuses, (a) => a.harnessId));
       // Harness rows (carries `enabled`) are already fetched here for the
       // header's status dots — onboarding's harness step reuses this same
@@ -1577,6 +1590,19 @@ function AppInner() {
             };
           })()
         : { taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen };
+      if (ev.kind === "harness-swap") {
+        // The task kept running — this is informational, not a block. Keyed on
+        // the retargeted (parent) task for a hidden step, like every other
+        // per-task event.
+        toastHarnessSwap({
+          ...target,
+          fromLabel: ev.fromLabel,
+          toLabel: ev.toLabel,
+          position: ev.position,
+          count: ev.count,
+        });
+        return;
+      }
       if (ev.kind === "interaction") {
         // A question / permission prompt opened or closed. The tracker raises
         // the alert only on the first prompt for a task and clears it only when
@@ -1666,7 +1692,14 @@ function AppInner() {
         if (!stepParentId) {
           if (ev.status === "succeeded") {
             toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
-          } else if (ev.status === "failed" || ev.status === "orphaned") {
+          } else if (
+            (ev.status === "failed" || ev.status === "orphaned")
+            && ev.reason !== "harness-swap"
+            && ev.reason !== "harness-exhausted"
+          ) {
+            // A harness-stack failover records the old run failed while the
+            // task keeps running; the blocked-column toast owns the
+            // exhausted case. Neither should read as "Task failed".
             toastError({
               taskId: ev.taskId,
               title,
@@ -1816,6 +1849,10 @@ function AppInner() {
           toastSessionEnded({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.reason === "unknown-command") {
           toastUnknownCommand({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "harness-exhausted") {
+          toastHarnessExhausted({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "harness-swap-failed") {
+          toastHarnessUnusable({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.reason === "pipeline") {
           // Suppressed while a step's RETARGETED "Waiting on you" toast is
           // already live for this parent (M-A3) — that toast already names
@@ -2625,6 +2662,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       </header>
       <div className="flex min-h-0 flex-1">
         <NewTaskForm
+        stacks={harnessStacks}
           agents={agents}
           harnesses={harnesses}
           profiles={profiles}
@@ -2752,6 +2790,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             label={c.label}
                             tasks={visibleTasks.filter((t) => t.column === c.id)}
                             homeDir={homeDir}
+                            stacks={harnessStacks}
+                            limitStates={harnessLimitStates}
                             onStart={start}
                             onCancel={cancel}
                             onDelete={del}
@@ -2888,6 +2928,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         stickyUserMessages={stickyUserMessages}
         agents={agents}
         harnesses={harnesses}
+        stacks={harnessStacks}
+        onRunTask={start}
         profiles={profilesLoaded ? profiles : null}
         onOpenSettingsAgents={openSettingsAgents}
         agentModels={agentModels}

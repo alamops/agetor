@@ -190,11 +190,13 @@ export const USAGE: Record<string, string> = {
                        otherwise writes ELI5.md at the clone's root
   Ctrl+C cancels an in-flight clone (the partial checkout is removed).`,
 
-  harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id> | shell <id>>
+  harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id> | stack <sub> | shell <id>>
 
   Manage agent harnesses (aliases / parallel accounts).
   Run 'agetor harness add --help' / 'edit --help' for their flags;
-  'agetor harness shell <id>' opens a shell with the harness env for login.`,
+  'agetor harness stack --help' manages an ordered account train (automatic
+  failover at a provider limit); 'agetor harness shell <id>' opens a shell
+  with the harness env for login.`,
 
   profile: `usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | duplicate <ref> [--name <name>] [--with-tasks] | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […]>
 
@@ -273,6 +275,35 @@ export const USAGE: Record<string, string> = {
   Open your shell with the harness's env applied (CLAUDE_CONFIG_DIR / HOME, custom
   env, bin on PATH). Run 'claude /login' (or 'codex login', 'opencode auth login')
   here to authenticate a parallel account against its own config. Ctrl-D to exit.`,
+
+  "harness stack": `usage: agetor harness stack <ls | create <label> … | show <id> | edit <id> … | rm <id>>
+
+  Stack same-kind accounts into an ordered train: position 1 is the primary,
+  the rest are backups. A turn that hits the primary's provider limit settles
+  and continues automatically on the next usable account with the conversation,
+  config, MCP servers and skills preserved. Each member keeps its own login.
+  Run 'agetor harness stack create --help' / 'edit --help' for their flags.`,
+
+  "harness stack create": `usage: agetor harness stack create <label> --kind <claude-code|codex> --member <id> --member <id> [--mirror full|safe]   (--label <label> instead of the positional label is also accepted; pass one or the other, not both)
+
+  Members are ordered: the first --member is the primary, the rest are the
+  train's backups. --kind defaults to claude-code. --mirror (default full)
+  copies the primary's config tree to the backups: full mirrors everything
+  eligible, safe skips hooks and other executable sections.`,
+
+  "harness stack show": `usage: agetor harness stack show <id>
+
+  Show one stack's members, their order, any cooling state and its warnings.`,
+
+  "harness stack edit": `usage: agetor harness stack edit <id> [--label <label>] [--kind claude-code|codex] [--member <id> ...] [--mirror full|safe]
+
+  Replace the member list when --member is given (first = primary), rename the
+  stack with --label, change the harness kind with --kind, and/or change the
+  mirror mode.`,
+
+  "harness stack rm": `usage: agetor harness stack rm <id>
+
+  Remove a stack. The accounts themselves are kept.`,
 
   "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
 

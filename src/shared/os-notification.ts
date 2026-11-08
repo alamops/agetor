@@ -28,6 +28,7 @@ export const NOTIFICATION_KINDS = [
   "succeeded",
   "files-sent",
   "pipeline-finished",
+  "harness-swap",
 ] as const;
 
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];

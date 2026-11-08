@@ -231,3 +231,14 @@ test("osNotify: direct helper posts are serialized per process (the second waits
   exits[1]!(0);
   await second;
 });
+
+test("notifyFor: a harness swap is quiet, and the old run's failed settle is silent", () => {
+  const swap = notifyFor({
+    kind: "harness-swap", taskId: T, from: "a", to: "b", fromLabel: "Work", toLabel: "Backup",
+    reason: "quota", position: 2, count: 3, ts: 1,
+  }, T);
+  expect(swap?.title).toContain("account switched");
+  expect(swap?.kind).toBe("harness-swap");
+  expect(notifyFor({ kind: "run-status", taskId: T, runId: "r", status: "failed", reason: "harness-swap", ts: 1 }, T)).toBeNull();
+  expect(notifyFor({ kind: "run-status", taskId: T, runId: "r", status: "failed", reason: "harness-exhausted", ts: 1 }, T)).toBeNull();
+});

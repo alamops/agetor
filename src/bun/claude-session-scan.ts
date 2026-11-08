@@ -69,9 +69,21 @@ export interface ClaudeHarnessRef {
   id: string;
   kind: string;
   home: string | null;
+  /** The harness's own env map. A `CLAUDE_CONFIG_DIR` there pins the root the
+   *  same way `home` does (it wins, mirroring `harnessEnv`). */
+  env?: Record<string, string> | null;
   /** The harness's own binary. The `claude agents --json` probe of its
    *  config dir runs this, same precedence as `resolveBin` in agents.ts. */
   bin?: string | null;
+}
+
+/** The config dir a claude-code harness actually reads, with the harness env
+ *  map winning over `home` (same precedence as `harnessEnv` in agents.ts).
+ *  The built-in falls through to the process env / `~/.claude`. */
+function harnessConfigDir(harness: ClaudeHarnessRef, discovery: { homeDir?: string; env?: Record<string, string | undefined> }): string {
+  const fromEnv = harness.env?.CLAUDE_CONFIG_DIR;
+  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
+  return effectiveClaudeConfigDir(harness.home, discovery);
 }
 
 export interface ScanClaudeSessionsOptions {
@@ -240,7 +252,7 @@ export function claudeConfigDirsToScan(opts: ScanClaudeSessionsOptions): string[
   const found: string[] = [];
   for (const harness of opts.harnesses ?? []) {
     if (harness.kind !== "claude-code") continue;
-    found.push(effectiveClaudeConfigDir(harness.home, discovery));
+    found.push(harnessConfigDir(harness, discovery));
   }
   found.push(effectiveClaudeConfigDir(null, discovery));
   try {
@@ -270,7 +282,7 @@ function harnessIdFor(configDir: string, harnesses: readonly ClaudeHarnessRef[],
   const discovery = { homeDir: opts.homeDir, env: envOf(opts) };
   for (const harness of harnesses) {
     if (harness.kind !== "claude-code") continue;
-    const effective = effectiveClaudeConfigDir(harness.home, discovery);
+    const effective = harnessConfigDir(harness, discovery);
     if (safeRealpath(effective) === real) return harness.id;
   }
   return null;
@@ -369,7 +381,7 @@ function harnessBinFor(
   const real = safeRealpath(configDir);
   for (const harness of harnesses) {
     if (harness.kind !== "claude-code" || !harness.bin) continue;
-    const effective = effectiveClaudeConfigDir(harness.home, { homeDir: discovery.homeDir, env: discovery.env ?? process.env });
+    const effective = harnessConfigDir(harness, { homeDir: discovery.homeDir, env: discovery.env ?? process.env });
     if (safeRealpath(effective) === real) return harness.bin;
   }
   return null;

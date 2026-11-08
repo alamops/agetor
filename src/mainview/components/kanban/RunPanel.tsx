@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
-  Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
+  Play, Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
@@ -47,7 +47,7 @@ import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
 import { fxUsageChipText, fxUsageTitle, mergeFxUsage, parseFxUsage } from "@/lib/fx-usage";
-import { useCountdown } from "@/lib/fx-auto-resume";
+import { useCountdown, useNowTicker } from "@/lib/fx-auto-resume";
 import { renderLinkified } from "@/lib/linkify";
 import { subscribePipelineGlobalEvents } from "@/lib/pipeline-events";
 import {
@@ -70,6 +70,13 @@ import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
+import {
+  formatHarnessSwapNotice,
+  harnessMoveNote,
+  harnessStackBannerMode,
+  isHarnessStackContinuation,
+  parseHarnessSwapNotice,
+} from "../../../shared/harness-stack.ts";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
@@ -83,6 +90,7 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
+  HARNESS_SWAP_STATUS_PREFIX,
   isInternalStatusSentinel,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsMaxMode,
@@ -94,6 +102,7 @@ import {
   type AgentProfile,
   type AgentStatus,
   type Harness,
+  type HarnessStack,
   type BacklogMessage,
   type FxRecoveryPayload,
   type AgentProfileSnapshot,
@@ -244,6 +253,12 @@ interface Props {
   /** Registered harnesses — needed so the panel's agent dropdown can list
    *  every known harness (built-ins + aliases). */
   harnesses: Harness[];
+  /** Harness account stacks, for the active-account line and switch notice. */
+  stacks?: HarnessStack[];
+  /** Start a Run for this task. Backs the all-exhausted banner's "Run now"
+   *  action (a manual run forces a cooling account and resets the attempt
+   *  cap). Omitted in standalone/test renders. */
+  onRunTask?: (task: Task) => void;
   /** Saved agent profiles — resolves the header chip (`resolveTaskProfileDisplay`)
    *  and, in Task details, whether the agent/mode/model/effort(/fast/max)
    *  controls are locked (`task.agentProfileId != null`). `null` means the
@@ -395,7 +410,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, stacks = [], profiles, onOpenSettingsAgents, onRunTask, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -605,6 +620,8 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
           stickyUserMessages={stickyUserMessages}
           agents={agents}
           harnesses={harnesses}
+          stacks={stacks}
+          onRunTask={onRunTask}
           profiles={profiles}
           onOpenSettingsAgents={onOpenSettingsAgents}
           agentModels={agentModels}
@@ -639,6 +656,8 @@ function RunPanelBody({
   stickyUserMessages,
   agents,
   harnesses,
+  stacks,
+  onRunTask,
   profiles,
   onOpenSettingsAgents,
   agentModels,
@@ -663,6 +682,8 @@ function RunPanelBody({
   stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
+  stacks: HarnessStack[];
+  onRunTask?: (task: Task) => void;
   profiles: AgentProfile[] | null;
   onOpenSettingsAgents: (profileId?: string) => void;
   agentModels: AgentModelMap;
@@ -4121,6 +4142,7 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        <HarnessStackBanner task={task} stacks={stacks} onRunTask={onRunTask} />
         {importedSession && (
           <div
             className="mt-1 space-y-1 text-xs"
@@ -4177,7 +4199,14 @@ function RunPanelBody({
         )}
         <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
           <span className="truncate">
-            {task.agent} · {task.column}
+            {harnesses.find((h) => h.id === task.agent)?.label ?? task.agent}
+            {(() => {
+              const stack = stacks.find((st) => st.members.some((m) => m.harnessId === task.agent));
+              if (!stack) return null;
+              const index = stack.members.findIndex((m) => m.harnessId === task.agent);
+              return <span className="text-info"> · {index + 1}/{stack.members.length}</span>;
+            })()}
+            {" · "}{task.column}
             {task.branch && !branchDrift.drifted && <> · <span className="font-mono">{task.branch}</span></>}
             {branchDrift.drifted && (
               <>
@@ -6007,6 +6036,11 @@ function RunEventList({
     const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
+          // A harness-stack continuation prompt is Agetor's own hidden send,
+          // not the user's words. Normalize first: claude's JSONL twin of the
+          // pasted prompt is `<pasted_content>`-wrapped, so only an exact raw
+          // check would leak the hidden prompt as a visible bubble.
+          if (isHarnessStackContinuation(normalizeDeliveredUserText(e.data))) return [];
           return [
             wrap(
               key,
@@ -6084,6 +6118,20 @@ function RunEventList({
           // "Untitled session" placeholder). Single shared predicate so a
           // new sentinel can't leak into one surface while another
           // suppresses it.
+          if (e.data.startsWith(HARNESS_SWAP_STATUS_PREFIX)) {
+            const notice = parseHarnessSwapNotice(e.data);
+            if (!notice) return [];
+            return [
+              wrap(
+                key,
+                evid,
+                <StatusDivider
+                  testId="harness-swap-divider"
+                  text={`${formatHarnessSwapNotice(notice)} (${notice.position}/${notice.count})`}
+                />,
+              ),
+            ];
+          }
           if (isInternalStatusSentinel(e.data)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
@@ -6851,10 +6899,100 @@ const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
 // fx recovery/auto-resume line) still renders it as a clickable
 // `ExternalLink`, and a no-URL line still renders the identical text node
 // across rerenders.
-const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
+/**
+ * Harness-stack state in the task header: a pending swap, or an
+ * all-exhausted countdown with a manual "Run now". Reset per task id so the
+ * countdown of a previously selected task never paints on the next one.
+ */
+function HarnessStackBanner({
+  task,
+  stacks,
+  onRunTask,
+}: {
+  task: Task;
+  stacks: HarnessStack[];
+  onRunTask?: (task: Task) => void;
+}) {
+  const state = task.harnessState;
+  const target = state?.allExhausted?.nextAttemptAt ?? null;
+  // One shared ticking clock (also used by the fx countdown); reset per task
+  // and per target so a previous task's time never paints on the next one.
+  const now = useNowTicker(target != null && target > 0, `${task.id}:${target ?? ""}`);
+
+  const mode = harnessStackBannerMode(state, now);
+  if (mode === "pending" && state?.pendingSwap) {
+    const to = stacks
+      .flatMap((s) => s.members)
+      .find((m) => m.harnessId === state.pendingSwap?.to);
+    return (
+      <div className="mt-1 text-xs text-info" data-testid="harness-swap-pending">
+        Switching to {to?.label ?? state.pendingSwap.to}…
+      </div>
+    );
+  }
+  // The mode helper ranks `allExhausted` above a recent `lastMove`: a move
+  // that happened before the accounts ran dry must not hide the countdown and
+  // "Run now" for 24 hours.
+  const ex = mode === "exhausted" ? state?.allExhausted : null;
+  if (!ex) {
+    if (mode === "moved" && state?.lastMove) {
+      const to = stacks.flatMap((s) => s.members).find((m) => m.harnessId === state.lastMove?.to);
+      return (
+        <div className="mt-1 text-xs text-muted-foreground" data-testid="harness-stack-moved">
+          {harnessMoveNote(state.lastMove, to?.label ?? state.lastMove.to)}
+        </div>
+      );
+    }
+    return null;
+  }
+  const targetAt = target ?? 0;
+  const secondsLeft = targetAt > 0 ? Math.max(0, Math.ceil((targetAt - now) / 1000)) : null;
+  // A retry that already started keeps the persisted attempt count but has no
+  // next timer (nextAttemptAt 0). That is "in progress", not "nothing usable".
+  const retrying = targetAt <= 0 && ex.reason !== "no-usable-member" && ex.attempts < ex.max;
+  const text = ex.attempts >= ex.max
+    ? "Every account in this stack is out of quota — run the task manually after a reset."
+    : targetAt > 0
+      ? `Every account in this stack is out of quota — retrying in ${formatCountdown(secondsLeft ?? 0)} (attempt ${ex.attempts + 1}/${ex.max}).`
+      : retrying
+        ? `Retrying on the next available account (attempt ${ex.attempts + 1}/${ex.max})…`
+        : "No account in this stack can run this task — fix one in Settings → Stacks.";
+  return (
+    <div
+      className="mt-1 flex flex-wrap items-center gap-2 text-xs text-warning"
+      data-testid="harness-stack-exhausted"
+    >
+      <span>{text}</span>
+      {onRunTask && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-6 border-warning/40 px-2 text-[11px] text-warning hover:bg-warning/10"
+          data-testid="harness-stack-run-now"
+          title="Run now on a cooling account and reset the retry cap"
+          onClick={() => onRunTask(task)}
+        >
+          <Play className="mr-1 size-3" /> Run now
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function formatCountdown(totalSeconds: number): string {
+  const s = Math.max(0, totalSeconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+const StatusDivider = memo(function StatusDivider({ text, testId }: { text: string; testId?: string }) {
   const content = useMemo(() => renderLinkified(text), [text]);
   return (
-    <div className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+    <div data-testid={testId} className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
       <span className="h-px flex-1 bg-border" />
       <span>{content}</span>
       <span className="h-px flex-1 bg-border" />

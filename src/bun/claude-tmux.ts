@@ -50,11 +50,13 @@ import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type
 
 import type { ContinuationTrigger, RunEventStream } from "../shared/types.ts";
 import {
+  HARNESS_LIMIT_STATUS_PREFIX,
   PERMISSION_MODE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
   TURN_STALLED_STATUS_PREFIX,
   TURN_STALL_RESUMED_STATUS_PREFIX,
 } from "../shared/types.ts";
+import { classifyHarnessLimitSignal } from "../shared/harness-limits.ts";
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
 import { compactionStatusLine, isCompactionNotice } from "../shared/compaction.ts";
@@ -438,6 +440,11 @@ export interface ClaudeLaunchOptions {
    * buffer machinery `sendTurn` uses for live-session follow-ups.
    */
   deferredPrompt?: string;
+  /** True when the task is on a harness stack with at least one backup, so a
+   *  usage-limit pane notice settles the turn for a swap. False (the default)
+   *  keeps the pre-stack behavior: the notice is not carded and claude's own
+   *  auto-continue keeps the turn in flight. See `SessionState.harnessFailover`. */
+  harnessFailover?: boolean;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -2885,6 +2892,15 @@ interface SessionState {
    *  `UNPARSABLE_STABILITY_TICKS` before the scraper presses Escape to
    *  return to the conversation (`returnFromBackgroundSessionsView`). */
   scrapeBackgroundViewStreak: number;
+  /** True when this task is on a harness stack with at least one backup, so a
+   *  usage-limit notice means "settle the turn for a swap" rather than the
+   *  pre-stack behavior of letting claude auto-continue. Supplied by the
+   *  orchestrator at spawn/reattach/sendTurn; false everywhere else. */
+  harnessFailover: boolean;
+  /** One-shot latch for the usage-limit notice: the pane keeps the notice up
+   *  for the rest of the turn, so the scrape may see it on every tick after
+   *  the first. Reset when a new turn enters the queue. */
+  limitSignaledThisTurn: boolean;
   /** `Date.now()` stamp of the most recent successful JSONL append the
    *  flusher dispatched. The scraper consults it to (a) suppress
    *  matches that happened while claude was actively writing (the
@@ -3298,6 +3314,8 @@ interface MakeSessionStateOpts {
   /** See `SessionState.launchEffort`. Only `spawnClaudeViaTmux` has a launch
    *  env to read this off; every other construction site leaves it null. */
   launchEffort?: string | null;
+  /** See `SessionState.harnessFailover`. */
+  harnessFailover?: boolean;
 }
 
 function makeSessionState(o: MakeSessionStateOpts): SessionState {
@@ -3336,6 +3354,8 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     agentRosterSignature: null,
     agentRosterChangedAt: 0,
     scrapeBackgroundViewStreak: 0,
+    harnessFailover: o.harnessFailover ?? false,
+    limitSignaledThisTurn: false,
     lastJsonlAppendAt: 0,
     stallFloorAt: Date.now(),
     stallFired: false,
@@ -4452,6 +4472,7 @@ function maybeAdoptContinuation(
     adopted.resolve = resolve;
     adopted.reject = reject;
   });
+  state.limitSignaledThisTurn = false;
   state.turnQueue.push(adopted);
   // Register the run with the orchestrator BEFORE the triggering line
   // dispatches below — the caller must be able to observe "running" before
@@ -7211,6 +7232,15 @@ function normalizePaneForActivity(tail: string): string {
     .join("\n");
 }
 
+/**
+ * Test seam: how `scrapeOnce` reads the plain pane. Production captures the
+ * tmux pane tail; the unit suite swaps in a synthetic pane so the limit
+ * notice (and the rest of the scrape path) can be driven without a real
+ * claude session or tmux server. Mirrors `captureConfirmPane`/`captureModePane`.
+ */
+let captureScrapePane: (state: SessionState) => Promise<RunResult> =
+  (state) => tmux(["capture-pane", "-p", "-t", state.sessionName]);
+
 /** Run a single scrape tick. Idempotent: registers at most one new
  *  TmuxPromptRequest per call, auto-cancels any pending one whose
  *  fingerprint no longer matches the pane. */
@@ -7239,7 +7269,7 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   if (tick.stampIdle) state.lastIdleScrapeAt = now;
   if (!tick.run) return;
 
-  const cap = await tmux(["capture-pane", "-p", "-t", state.sessionName]);
+  const cap = await captureScrapePane(state);
   if (!cap.ok) {
     // Session vanished — let `disposeSessionState` clean us up the next
     // time the orchestrator notices. Don't churn here.
@@ -7371,6 +7401,21 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // Claude's background-sessions view (Left on an empty composer) is
   // navigation, not a prompt — never a card. See the return net below.
   const backgroundView = paneShowsBackgroundSessionsView(tail);
+  // Claude's usage-limit notice. On a harness-stack task the orchestrator
+  // turns it into a swap (the turn is over for this account). On a lone
+  // account it must stay inert: claude's own auto-continue keeps the turn in
+  // flight, exactly as before stacks existed (plan §2.2). Checked before
+  // `pickScrapeMatch` because the notice must never become a card.
+  if (shouldSignalHarnessLimit({
+    harnessFailover: state.harnessFailover,
+    turnInFlight: turnInFlight(state),
+    limitSignaledThisTurn: state.limitSignaledThisTurn,
+    claudeIsWriting,
+    paneShowsNotice: paneShowsHarnessLimitNotice(tail),
+  })) {
+    signalHarnessLimit(state, tail);
+  }
+
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable) || backgroundView)
     ? null
     : pickScrapeMatch(tail, {
@@ -7909,6 +7954,150 @@ function signalIdleSettle(state: SessionState): void {
   popEndOfTurn(state);
 }
 
+/**
+ * A rendered row that can be the LIVE provider notice, rather than transcript
+ * prose that merely mentions a limit. The notice is drawn as its own row
+ * (inline notice / hint slot), so the phrase has to start that row after only
+ * indentation and an optional leading status glyph (`⚠`, `●`, `⏺`, a bullet).
+ * Anchoring here is what keeps `Usage limit resets at 8am` — a perfectly
+ * ordinary sentence in an assistant reply — from being read as the notice:
+ * with a bare substring test it matched the old `resets at` detail and settled
+ * a healthy stacked turn (review R-M1).
+ *
+ * `\p{L}`/`\p{N}` keep the optional glyph from swallowing a real word, so
+ * `"Usage limit …"` still matches (a quoted sentence can be prose) but the
+ * detail below has to be present as well.
+ */
+const PANE_LIMIT_NOTICE_LINE_RE = /^[\s\u00a0]*(?:[^\p{L}\p{N}\s]{1,3}\s*)?usage\s+limit\b/iu;
+/**
+ * The words the provider's auto-continue notice actually carries (evidence in
+ * `MODAL_NOTICE_RE`'s doc: `Usage limit reached · continuing automatically at
+ * <t> · esc to cancel`, `… continuing shortly · esc to cancel`, `… continuing
+ * automatically when it resets · esc to cancel`). Requiring one of these —
+ * instead of the old loose `reached` / `resets at` — is what tells the live
+ * notice apart from prose that repeats the phrase.
+ */
+const PANE_LIMIT_NOTICE_DETAIL_RE = /continuing\s+(?:automatically|shortly)|esc\s+to\s+cancel/i;
+/** The notice is one line that may wrap onto at most two more rows. */
+const PANE_LIMIT_WINDOW_LINES = 3;
+/**
+ * How many trailing NON-BLANK pane rows can hold the live notice. The notice
+ * renders in the hint slot of the bottom chrome, directly above the input box
+ * — never in the scrollback transcript. Scanning the whole 40-row tail let a
+ * pasted or quoted notice row (the user pasting the text, a tool result, an
+ * earlier turn's scrollback) settle a perfectly healthy stacked turn and burn
+ * a backup. 12 mirrors `matchUnknownCommand`'s "a stale sighting further up
+ * the pane" window and comfortably covers the observed chrome stack (wrapped
+ * notice, input box, status bar and the background-agent roster).
+ */
+const PANE_LIMIT_SEARCH_NONBLANK = 12;
+
+/**
+ * The joined text of the live notice, or null. One implementation shared by
+ * the boolean gate and the persisted message, so what we detect and what we
+ * store can never disagree (and a wrapped row keeps its reset time:
+ * `Usage limit reached · continuing` / `automatically at 8am`).
+ *
+ * Only the bottom {@link PANE_LIMIT_SEARCH_NONBLANK} non-blank rows are
+ * searched; the raw indices are kept so a notice's wrapped continuation rows
+ * are still sliced contiguously even when blank rows separate them.
+ */
+function paneHarnessLimitNoticeWindow(tail: string): string | null {
+  const all = tail.split("\n");
+  const nonBlank: number[] = [];
+  for (let i = 0; i < all.length; i++) {
+    if (all[i]!.trim().length > 0) nonBlank.push(i);
+  }
+  if (nonBlank.length === 0) return null;
+  const start = nonBlank[Math.max(0, nonBlank.length - PANE_LIMIT_SEARCH_NONBLANK)]!;
+  const lines = all.slice(start);
+  for (let i = 0; i < lines.length; i++) {
+    if (!PANE_LIMIT_NOTICE_LINE_RE.test(lines[i]!)) continue;
+    const window = lines
+      .slice(i, i + PANE_LIMIT_WINDOW_LINES)
+      .map((line) => line.trim())
+      .filter((line) => line !== "");
+    const joined = window.join(" ");
+    if (PANE_LIMIT_NOTICE_DETAIL_RE.test(joined)) return joined;
+  }
+  return null;
+}
+
+/**
+ * The pane's live usage-limit auto-continue notice (`Usage limit reached ·
+ * continuing automatically at 8am · esc to cancel`). Deliberately narrower
+ * than a bare "usage limit" substring: the transcript above the notice
+ * legitimately mentions limits, and only the live notice is a signal.
+ *
+ * Both halves must be in the same notice window (the anchored row plus up to
+ * two wrapped rows). Matching the phrase anywhere in a whole pane tail let
+ * ordinary transcript prose through — a line saying "we hit the usage limit"
+ * plus, ten rows later, "the docs say it resets at 8am" settled a healthy turn
+ * and burned a backup.
+ */
+export function paneShowsHarnessLimitNotice(tail: string): boolean {
+  return paneHarnessLimitNoticeWindow(tail) !== null;
+}
+
+/**
+ * Gate for turning the pane notice into a failover signal. A lone account is
+ * inert: claude keeps auto-continuing on its own notice and the turn stays in
+ * flight (plan §2.2); only a stack with a real backup settles the turn. Pure
+ * so the scrape path and its tests share one decision.
+ */
+export function shouldSignalHarnessLimit(args: {
+  harnessFailover: boolean;
+  turnInFlight: boolean;
+  limitSignaledThisTurn: boolean;
+  claudeIsWriting: boolean;
+  paneShowsNotice: boolean;
+}): boolean {
+  return args.harnessFailover
+    && args.turnInFlight
+    && !args.limitSignaledThisTurn
+    && !args.claudeIsWriting
+    && args.paneShowsNotice;
+}
+
+/**
+ * Only the notice lines themselves, never the whole pane tail: the classified
+ * `message` is persisted in `harness_limit_state` and shown in the UI, so
+ * storing the surrounding transcript would leak unrelated output into a
+ * small, user-visible record. The detection window is returned verbatim, so a
+ * reset time that wrapped onto the next row survives into the parsed signal
+ * (the old keyword filter dropped a row that carried only `automatically at
+ * 8am`). Returns "" when no live notice is on-pane; the only production
+ * caller, `signalHarnessLimit`, runs behind `paneShowsHarnessLimitNotice`
+ * (same window function), so a non-empty result is guaranteed there — a
+ * keyword fallback could never execute and is deliberately gone.
+ */
+export function harnessLimitNoticeText(tail: string): string {
+  return paneHarnessLimitNoticeWindow(tail)?.slice(0, 300) ?? "";
+}
+
+/**
+ * A harness-stack failover signal from Claude's pane notice. Emits one
+ * structured `harness-limit:` status (the orchestrator records the account
+ * cooldown and, on a stack task, settles into a swap) and resolves the turn.
+ * The notice stays on the pane for the rest of the turn, hence the one-shot
+ * latch. Deliberately does not register a card: the turn is over, not waiting
+ * on the user.
+ */
+function signalHarnessLimit(state: SessionState, tail: string): void {
+  const signal = classifyHarnessLimitSignal("claude-code", { text: harnessLimitNoticeText(tail) });
+  if (!signal) return;
+  state.limitSignaledThisTurn = true;
+  state.pendingEndTurn = null;
+  state.holdUntilIdle = false;
+  state.pendingSlashToken = null;
+  clearContinuationWatchdog(state);
+  const slot = state.turnQueue[0];
+  const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  onChunk("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify({ ...signal, source: "claude-pane" })}`);
+  onChunk("status", "turn complete");
+  popEndOfTurn(state);
+}
+
 /** Whether a turn is currently in flight on this session — a live head slot
  *  (fresh-spawn / live-stream path) or a pending reattach `onEndOfTurn`. Only
  *  then is there a "running" run to protect from a dead session. */
@@ -8358,6 +8547,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     // (--dangerously-skip-permissions) — that's what puts
     // `bypassPermissions` into the Shift+Tab cycle.
     bypassEnabled: opts.mode === "bypass",
+    harnessFailover: opts.harnessFailover === true,
     // The effort this process is actually pinned to. `ClaudeLaunchOptions` has
     // no `effort` field — `agents.ts`'s `buildCommand` translates the task's
     // effort id into the `CLAUDE_CODE_EFFORT_LEVEL` env var (dropping ids
@@ -8395,6 +8585,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     initialSlot.resolve = resolve;
     initialSlot.reject = reject;
   });
+  state.limitSignaledThisTurn = false;
   state.turnQueue.push(initialSlot);
   // Brand-new session has no prior turn to inherit metadata from, but
   // seed `lastChunk` so any metadata claude writes before its first
@@ -8860,6 +9051,9 @@ export interface ReattachOptions {
    *  (polled) instead of reported as `null` — a session spawned just before the
    *  previous process exited has not written it yet. Omitted = no wait. */
   jsonlWaitUntil?: number;
+  /** See `SessionState.harnessFailover` — true only for a stack task with a
+   *  backup, so the pane usage-limit notice can settle the turn. */
+  harnessFailover?: boolean;
 }
 
 /** Poll cadence while waiting for a fresh session's JSONL (`jsonlWaitUntil`). */
@@ -8952,6 +9146,7 @@ async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent 
     // change that guard's semantics on a reattach where the true live mode
     // might differ from the task's last-saved mode.
     lastAnnouncedPermissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
+    harnessFailover: opts.harnessFailover === true,
   });
   // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
   // reattach (or other code path) already left a SessionState in the map
@@ -9029,7 +9224,12 @@ export async function sendTurn(
   taskId: string,
   prompt: string,
   onChunk: ChunkHandler,
-  opts?: { onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void },
+  opts?: {
+    onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void;
+    /** See `SessionState.harnessFailover`; keeps the pane limit signal aligned
+     *  with the task's current stack membership on a follow-up turn. */
+    harnessFailover?: boolean;
+  },
 ): Promise<SpawnedAgent> {
   const state = sessions.get(taskId);
   if (!state) {
@@ -9037,6 +9237,10 @@ export async function sendTurn(
     onChunk("stderr", err.message);
     return rejectedAgent(taskId, err);
   }
+  // Keep the pane limit gate aligned with the task's current stack
+  // membership: a follow-up turn may start after a stack was created (or
+  // deleted) since the session was spawned.
+  state.harnessFailover = opts?.harnessFailover === true;
   // A turn starting is a life signal — reset the idle clock and snap the
   // backstop poll back to full rate immediately (relevant when this session
   // had backed off to POLL_SLOW_MS while idle).
@@ -9068,6 +9272,7 @@ export async function sendTurn(
     slot.resolve = resolve;
     slot.reject = reject;
   });
+  state.limitSignaledThisTurn = false;
   state.turnQueue.push(slot);
   // Claude's TUI input buffer accepts keystrokes even mid-response —
   // anything we paste while the agent is thinking gets queued there and
@@ -10383,6 +10588,7 @@ export const __forTest = {
       // slashCommand: null — this generic test helper drives non-slash-turn
       // scenarios; a dedicated local-command test constructs its own slot
       // (or extends this) rather than overloading this shared helper.
+      state.limitSignaledThisTurn = false;
       state.turnQueue.push({ onChunk, resolve, reject, slashCommand: null });
     });
   },
@@ -10691,6 +10897,24 @@ export const __forTest = {
     captureStyledTail = fn;
     return prev;
   },
+  /** Override `scrapeOnce`'s plain-pane capture (production runs
+   *  `tmux capture-pane -p`). Returns the previous reader so a test can
+   *  restore it in `afterEach`. */
+  setCaptureScrapePane(
+    fn: (state: SessionState) => Promise<RunResult>,
+  ): (state: SessionState) => Promise<RunResult> {
+    const prev = captureScrapePane;
+    captureScrapePane = fn;
+    return prev;
+  },
+  /** Pane usage-limit signal: the detector, the stack-only gate, the bounded
+   *  notice-text extractor and the signal itself (which settles the turn) —
+   *  all pure/fixture-driven so a lone account staying inert and a stacked
+   *  account fanning out to `harness-limit:` are both unit-testable. */
+  paneShowsHarnessLimitNotice,
+  shouldSignalHarnessLimit,
+  harnessLimitNoticeText,
+  signalHarnessLimit,
   /** The flickering right-hand `● <effort> · /effort` status-bar hint regex,
    *  plus the pure helper that strips it off a matched `STATUS_BAR_RE` row —
    *  exposed so the "narrower than the whole line" truth table (finding #8,

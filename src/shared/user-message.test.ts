@@ -3,6 +3,7 @@ import {
   AGETOR_PASTE_LEAD_IN,
   AGETOR_PASTE_LEAD_INS,
   canonicalizeUserText,
+  composeCleanRetryText,
   forkedSkillLabel,
   hasTagSegments,
   humanizeTagName,
@@ -1453,5 +1454,60 @@ describe("normalizeDeliveredUserText — fixpoint (review follow-up)", () => {
     expect(userMessageLines(`${AGETOR_PASTE_LEAD_IN}\r\nshort msg`)).toEqual([
       { label: "you›", text: "short msg", tone: "user" },
     ]);
+  });
+});
+
+describe("harness-stack continuation wrapper", () => {
+  test("the exact wrapper renders nothing", () => {
+    const wrapped = "<harness-stack-continuation>\ncontinue the task\n</harness-stack-continuation>";
+    expect(userMessageLines(wrapped)).toEqual([]);
+  });
+  test("claude's <pasted_content> JSONL twin of the wrapper also renders nothing", () => {
+    // Agetor sends the hidden prompt by paste, so claude's JSONL stores the
+    // wrapper INSIDE a `<pasted_content>` block. The exact-value check has to
+    // run after unwrapping or the prompt leaks into the CLI/TUI transcript.
+    const pasted =
+      `<pasted_content id="ab12">\n<harness-stack-continuation>\ncontinue the task\n</harness-stack-continuation>\n</pasted_content id="ab12">\n`;
+    expect(userMessageLines(pasted)).toEqual([]);
+  });
+
+  test("ordinary prose that mentions the tag still renders", () => {
+    const prose = "explain <harness-stack-continuation> to me";
+    expect(userMessageLines(prose).length).toBeGreaterThan(0);
+  });
+});
+
+describe("composeCleanRetryText", () => {
+  test("collapses a send's live echo and JSONL twin, unwrapping the paste", () => {
+    const body = "please fix the flaky test";
+    expect(composeCleanRetryText([body, wrapPastedContent("ab12", body)])).toBe(body);
+  });
+
+  test("normalizes CRLF and drops rows that are blank after unwrapping", () => {
+    expect(composeCleanRetryText(["first\r\nline", wrapPastedContent("bc23", "   ")])).toBe("first\nline");
+  });
+
+  test("replays a folded follow-up after the original prompt, in order", () => {
+    expect(composeCleanRetryText(["fix the bug", "also update the docs"]))
+      .toBe("fix the bug\n\nalso update the docs");
+  });
+
+  test("canonicalizes a slash-command twin so it dedupes with the live echo", () => {
+    const xml = "<command-message>implement</command-message><command-name>/implement</command-name><command-args>do the thing</command-args>";
+    expect(composeCleanRetryText(["/implement do the thing", xml])).toBe("/implement do the thing");
+  });
+
+  test("firstOnly keeps only the turn's first text (sequential-turn harnesses)", () => {
+    expect(composeCleanRetryText(["original", "queued follow-up"], { firstOnly: true })).toBe("original");
+  });
+
+  test("unwraps a predecessor's hidden continuation so re-wrapping cannot nest", () => {
+    const wrapped = "<harness-stack-continuation>\nalready retried body\n</harness-stack-continuation>";
+    expect(composeCleanRetryText([wrapPastedContent("cd34", wrapped)])).toBe("already retried body");
+  });
+
+  test("returns null when there is no user text to replay", () => {
+    expect(composeCleanRetryText([])).toBeNull();
+    expect(composeCleanRetryText(["", "   "])).toBeNull();
   });
 });

@@ -44,9 +44,11 @@ import {
   appendRunStatusLine,
   archiveTask,
   cancelFxAutoResume,
+  cancelHarnessRetryForTask,
   cancelLiveRunOfTask,
   defaultEffortFor,
   deleteTask,
+  hasPendingHarnessRetry,
   isAnyRunOfTaskLive,
   isHeldByBackgroundAgents,
   isTaskRunCancelling,
@@ -903,6 +905,10 @@ function reasonMessage(reason: string | undefined, stepName: string): string {
       return `step "${stepName}" session ended unexpectedly`;
     case "unknown-command":
       return `step "${stepName}" hit an unknown command error`;
+    case "harness-exhausted":
+      return `step "${stepName}" is waiting for a stacked account's quota to reset`;
+    case "harness-swap-failed":
+      return `step "${stepName}" has no usable backup account`;
     default:
       return `step "${stepName}" is blocked`;
   }
@@ -2182,7 +2188,8 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
     // runner waits on it (D5) the pipeline is running, and Stop must stop it.
     const runningTargets = run.active.filter((a) => isAnyRunOfTaskLive(a.taskId));
     const decidingTargets = run.active.filter(
-      (a) => !isAnyRunOfTaskLive(a.taskId) && hasPendingStepDecision(a.taskId),
+      (a) => !isAnyRunOfTaskLive(a.taskId)
+        && (hasPendingStepDecision(a.taskId) || hasPendingHarnessRetry(a.taskId)),
     );
     // A pending human gate is something to stop too: there is no live work,
     // but the run is parked in Review waiting for the owner.
@@ -2221,6 +2228,10 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
       // a pending auto-resume timer. Nothing may run on a stopped run's
       // behalf, so drop it (a no-op for every other step).
       cancelFxAutoResume(a.taskId, "stopped");
+      // Same for a harness-stack retry: nothing may spawn on a stopped run's
+      // behalf. `cancelLiveRunOfTask` above already stops an in-flight retry
+      // spawn; this clears the armed timer and the exhausted state.
+      cancelHarnessRetryForTask(a.taskId);
     }
     for (const a of decidingTargets) {
       const historyEntry = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);
@@ -4227,13 +4238,19 @@ function isTurnSinceStop(latest: Run, historyEntry: PipelineStepRecord | undefin
  * no `origin` that is not this execution's automatic handoff reminder — or a
  * continuation run Claude opened for text typed in the attached terminal
  * (its opening status line, `CONTINUATION_STATUS_TEXT.user`). A continuation
- * after a background task, Claude continuing on its own, or an fx
- * auto-resume (`origin: "auto-resume"`) is not.
+ * after a background task, Claude continuing on its own, an fx
+ * auto-resume (`origin: "auto-resume"`), or a harness-stack successor
+ * (`origin: "harness-swap"`) is not.
  * An OpenCode server wake (`origin: "agent"`) is not either.
  */
 function turnStartedByUser(taskId: string, latest: Run, historyEntry: PipelineStepRecord | undefined): boolean {
   if (remindersInFlight.has(taskId) || historyEntry?.reminder?.runId === latest.id) return false;
   if (latest.origin === "auto-resume") return false;
+  // A harness-stack successor (or its all-exhausted retry) is the SAME
+  // execution continuing on another account, never a user resuming a stopped
+  // step. If it arrives after Stop it must be stopped again, not read as a
+  // fresh user turn that silently clears the stop.
+  if (latest.origin === "harness-swap") return false;
   // OpenCode started this execution by itself (a background subagent finished):
   // nobody asked for it, so on a stopped step it is stopped again like Claude's
   // own continuation. A wake on a step that already handed off is inert here
@@ -4350,6 +4367,12 @@ export function initPipelineRunner(): void {
   subscribeGlobal((e: GlobalEvent) => {
     if (!listenerEnabled) return;
     if (e.kind === "run-status") {
+      // A harness-stack failover marks the OLD run failed while the task keeps
+      // running on the backup, or blocks with a retry timer when the whole
+      // train is exhausted. Neither is the step's outcome — the successor's
+      // terminal status is. Treating them as failure would fail the step and
+      // strand the pipeline before the automatic retry can continue it.
+      if (e.reason === "harness-swap" || e.reason === "harness-exhausted") return;
       void handleRunStatus(e.taskId, e.runId, e.status);
     } else if (e.kind === "column") {
       void handleColumnChange(e.taskId, e.column, e.reason);

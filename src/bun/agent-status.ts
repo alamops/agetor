@@ -3,7 +3,7 @@ import { isAbsolute } from "node:path";
 import { TMUX_MISSING_REASON, type AgentKind, type ClaudeAccount, type Harness, type HarnessStatus } from "../shared/types.ts";
 import { opencodeMajor } from "../shared/opencode.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
-import { resolveBin, harnessEnv } from "./agents.ts";
+import { resolveBin, harnessEnv, claudeConfigDirOverrideFor } from "./agents.ts";
 import { accountUsageSummary } from "./account-usage.ts";
 import { harnesses } from "./db.ts";
 import { effectiveClaudeConfigDir, readClaudeAccount } from "./harness-discovery.ts";
@@ -692,7 +692,7 @@ const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian
  */
 function claudeAccountFields(harness: Harness): { account: ClaudeAccount | null; usage: HarnessStatus["usage"] } {
   if (harness.kind !== "claude-code") return { account: null, usage: null };
-  const configDir = effectiveClaudeConfigDir(harness.home);
+  const configDir = claudeConfigDirOverrideFor(harness) ?? effectiveClaudeConfigDir(null);
   return { account: readClaudeAccount(configDir), usage: accountUsageSummary(configDir) };
 }
 

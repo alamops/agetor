@@ -393,3 +393,14 @@ A `pipeline` GlobalEvent carries `humanStepSeqs` and
 needs your review" alert per event that first announces a gate (both keep one
 notification per task, so an event opening several gates names the count
 instead of silently announcing only the first).
+
+## Harness stacks
+
+Steps inherit their parent's account and profile, hence the stack. A step
+run's `run-status` carrying `reason: "harness-swap"` is **non-terminal** for
+the runner: the old run is recorded failed only so history is honest, and the
+successor run's settle is the step's real outcome. A stack block surfaces as
+`harness-exhausted` ("waiting for a stacked account's quota to reset") or
+`harness-swap-failed` ("no usable backup account") in the step's block
+message. A manual Switch inside the same stack is refused at the route while
+a run is live. See [harness-stacks.md](harness-stacks.md).

@@ -46,6 +46,8 @@ const {
   buildFxLaunchOptions,
   resolveBin,
   harnessEnv,
+  claudeConfigDirOverrideFor,
+  codexHomeOverrideFor,
   opencodeEffectiveServerFor,
   OPENCODE_TITLE_MAX_CHARS,
   FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER,
@@ -178,13 +180,13 @@ test("aliased claude-code with a config-dir override emits CLAUDE_CONFIG_DIR (no
   expect(result.env?.HOME).toBeUndefined();
 });
 
-test("aliased codex with HOME override emits HOME + CODEX_HOME", () => {
+test("aliased codex with a home override emits CODEX_HOME only (HOME is preserved)", () => {
   const result = buildCommand(
     alias("codex", { home: "/tmp/agetor-test/codex-2" }),
     "p",
     { ...codexDefaults },
   );
-  expect(result.env?.HOME).toBe("/tmp/agetor-test/codex-2");
+  expect(result.env?.HOME).toBeUndefined();
   expect(result.env?.CODEX_HOME).toBe("/tmp/agetor-test/codex-2/.codex");
 });
 
@@ -215,8 +217,22 @@ test("aliased codex env CODEX_HOME overrides the home-derived default", () => {
     "p",
     { ...codexDefaults },
   );
-  expect(result.env?.HOME).toBe("/tmp/agetor-test");
+  expect(result.env?.HOME).toBeUndefined();
   expect(result.env?.CODEX_HOME).toBe("/custom/path/.codex");
+});
+
+test("the config-dir override helpers follow harnessEnv's precedence (env wins over home)", () => {
+  // These are the roots the driver/mirror/transfer resolve; they must agree
+  // with the env `harnessEnv` actually hands the CLI.
+  expect(claudeConfigDirOverrideFor({ home: "/h", env: { CLAUDE_CONFIG_DIR: "/c" } })).toBe("/c");
+  expect(claudeConfigDirOverrideFor({ home: "/h", env: {} })).toBe("/h");
+  expect(claudeConfigDirOverrideFor({ home: "/h", env: { CLAUDE_CONFIG_DIR: "  " } })).toBe("/h");
+  expect(claudeConfigDirOverrideFor({ home: null, env: {} })).toBeNull();
+
+  expect(codexHomeOverrideFor({ home: "/h", env: { CODEX_HOME: "/c" } })).toBe("/c");
+  expect(codexHomeOverrideFor({ home: "/h", env: {} })).toBe(path.join("/h", ".codex"));
+  expect(codexHomeOverrideFor({ home: "/h", env: { CODEX_HOME: "  " } })).toBe(path.join("/h", ".codex"));
+  expect(codexHomeOverrideFor({ home: null, env: {} })).toBeNull();
 });
 
 test("aliased cursor with HOME override emits HOME only (no CODEX_HOME)", () => {
@@ -2726,9 +2742,9 @@ test("a config-dir alias launches with CLAUDE_CONFIG_DIR inline and never HOME (
   expect(cmd).not.toContain("HOME=");
 });
 
-test("a codex alias re-homes inline via HOME + CODEX_HOME", () => {
+test("a codex alias re-homes inline via CODEX_HOME only", () => {
   expect(buildHarnessTerminalCommand(alias("codex", { home: "/cfg" }))).toBe(
-    "HOME='/cfg' CODEX_HOME='/cfg/.codex' codex",
+    "CODEX_HOME='/cfg/.codex' codex",
   );
 });
 

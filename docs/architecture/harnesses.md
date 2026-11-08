@@ -63,3 +63,14 @@ Walk this list (derived from the copilot change; `git diff c5cf1a2 --stat` shows
 11. **Webview** — `AgentIcon.tsx`, `SettingsDialog.tsx` (`isExperimentalKind`, `HARNESS_HOME_COPY`, the add-harness kind list), `OnboardingChecklist.tsx` (`LOGIN_COMMAND`), the `AgentModelMap` literals in `App.tsx`, `TaskLaunchPickers.tsx` and `lib/api.ts`, `NewTaskForm.tsx` (per-kind seed and the Plan-button title), RunPanel / PlanDialog gating for usage chips (the usage-chip scan in `RunPanel.tsx`) and plan cards, and `e2e/fixtures.ts` (stub binary + env).
 12. **Tests and docs** — a driver unit test (mapper table, shell wrapper, settle/cancel/reattach through the tmux test seam), an `agents-<kind>.test.ts` (argv per mode × effort × resume, env, exhaustive throws), status/discovery and orchestrator integration tests (fake driver, `mkdtemp` data dir, `rmTestDataDir`), an e2e spec behind an opt-in stub in `e2e/fixtures.ts` (so existing specs keep seeing the kind as not installed), and an opt-in real-binary test;
     `src/bun/agents.test.ts`'s placeholder-model guard forbids the bare model id `"default"`, a kind that mutates harness rows in tests must restore them (`snapshotHarnessState()`, see [persistence.md](persistence.md)), and any hand-built `Task`/`AgentProfile` fixture needs the new field when a required one is added; then a new `docs/architecture/harness-<kind>.md` with its row in the [Topic map](../../CLAUDE.md#topic-map), the kind's row in the table and the env-override and fake-driver list of [CLAUDE.md § Agent kinds at a glance](../../CLAUDE.md#agent-kinds-at-a-glance), and `README.md` (harness table, mermaid diagram, env table, "Adding a harness").
+
+## Codex `CODEX_HOME` and HOME
+
+A Codex account is isolated by `CODEX_HOME` alone (`harnessEnv` emits
+`CODEX_HOME=<home>/.codex`; the harness's own env map may pin `CODEX_HOME`
+instead and wins, exactly as the spawned CLI sees it). `HOME` is deliberately
+**not** overridden: the
+T00 harness-stack spike proved on codex-cli 0.166.0 that a fresh `CODEX_HOME`
+reports "Not logged in", lists no MCP servers and writes only there, so the
+account keeps the user's real `~/.gitconfig` / `~/.ssh` / `gh`. See
+[harness-stacks.md](harness-stacks.md).

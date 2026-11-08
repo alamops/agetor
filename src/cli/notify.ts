@@ -40,7 +40,16 @@ export function notifyFor(
   // suppression, no caller lookup needed (see `eventPipelineParentId`).
   if (eventPipelineParentId(e) !== null) return null;
   const short = taskId.slice(0, 8);
+  if (e.kind === "harness-swap" && e.taskId === taskId) {
+    return {
+      title: "Agetor — account switched",
+      body: `${short} · ${e.fromLabel} → ${e.toLabel} (${e.position}/${e.count})`,
+      kind: "harness-swap",
+    };
+  }
   if (e.kind === "run-status" && e.taskId === taskId) {
+    // A failover's old run is recorded failed while the task keeps running.
+    if (e.reason === "harness-swap" || e.reason === "harness-exhausted") return null;
     if (e.status === "succeeded") return { title: "Agetor — succeeded", body: short, kind: "succeeded" };
     if (e.status === "failed") return { title: "Agetor — failed", body: short, kind: "failed" };
     if (e.status === "orphaned") return { title: "Agetor — orphaned", body: short, kind: "failed" };

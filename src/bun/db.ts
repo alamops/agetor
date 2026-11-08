@@ -6,6 +6,7 @@ import path from "node:path";
 import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type ImportedOpencodeSession, type OpencodeServerMode, OPENCODE_SERVER_MODES, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelinePendingLaunch, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
+import { parseTaskHarnessState, type TaskHarnessState } from "../shared/types.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -129,6 +130,11 @@ type TaskRow = {
   pipeline_run: string | null;
   pipeline_parent_id: string | null;
   pipeline_step_id: string | null;
+  // Per-task harness-stack failover state (migration 084), `TaskHarnessState`
+  // JSON. Written exclusively by `tasks.setHarnessState`'s targeted UPDATE —
+  // never the generic `insert`/`update` paths below (same rationale as
+  // `fx_recovery`: an unrelated PATCH must not clobber a pending swap).
+  harness_state: string | null;
   // The branch agetor last observed checked out in the task's worktree
   // (migration 063; NULL = never observed, or detached HEAD at the last
   // observation). Written exclusively by `tasks.insert` (create time) and
@@ -1032,6 +1038,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   pipelineRun: parsePipelineRunState(r.pipeline_run),
   pipelineParentId: r.pipeline_parent_id ?? null,
   pipelineStepId: r.pipeline_step_id ?? null,
+  harnessState: parseTaskHarnessState(r.harness_state),
   checkoutBranch: r.checkout_branch ?? null,
   importedClaude: parseImportedClaude(r.imported_claude),
   importedOpencode: parseImportedOpencode(r.imported_opencode),
@@ -1293,6 +1300,11 @@ export const tasks = {
     // join the same skip list on the same rationale: both are written only
     // by `tasks.setImportedOpencode` below. `opencode_server` (also 078) is
     // NOT skipped — it is an ordinary patchable launch field like `speed`.
+    // `harness_state` (migration 084) joins the same skip list: it is written
+    // only by `tasks.setHarnessState` below (and the failover engine through
+    // it). A generic PATCH must never clobber a pending swap, the retry
+    // countdown or the lap's `tried` set, and that write never bumps
+    // `updated_at`.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -1447,6 +1459,19 @@ export const tasks = {
       `UPDATE tasks SET fx_recovery = ? WHERE id = ?`,
       [value ? JSON.stringify(value) : null, taskId],
     );
+  },
+  /**
+   * Write (or clear) a task's harness-stack failover state in one targeted
+   * UPDATE. Server-managed exactly like `setFxRecovery`: no `updated_at`
+   * bump, and the generic `update` SET clause skips `harness_state`, so this
+   * is the only writer. A missing task id matches zero rows.
+   */
+  setHarnessState(taskId: string, value: TaskHarnessState | null): Task | null {
+    db.run(
+      `UPDATE tasks SET harness_state = ? WHERE id = ?`,
+      [value ? JSON.stringify(value) : null, taskId],
+    );
+    return this.get(taskId);
   },
   /**
    * Write (or clear) a task's imported-Claude provenance in one targeted
@@ -2095,6 +2120,30 @@ export interface HarnessPatch {
   profileMcpServers?: boolean;
 }
 
+/**
+ * Re-pack a stack's stored ranks to `0..n-1` in their current order. The
+ * `harnesses.delete` FK cascade removes one membership row and leaves a gap;
+ * `UNIQUE(stack_id, position)` forbids renumbering in place, so the surviving
+ * rows are rewritten inside the caller's transaction. A stack with no rows
+ * left is a no-op (nothing to rank).
+ */
+function renumberStackPositions(stackId: string): void {
+  const survivors = db
+    .query<{ harness_id: string }, [string]>(
+      `SELECT harness_id FROM harness_stack_members WHERE stack_id = ? ORDER BY position ASC`,
+    )
+    .all(stackId)
+    .map((row) => row.harness_id);
+  if (survivors.length === 0) return;
+  db.run(`DELETE FROM harness_stack_members WHERE stack_id = ?`, [stackId]);
+  survivors.forEach((harnessId, position) => {
+    db.run(
+      `INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES (?, ?, ?)`,
+      [stackId, harnessId, position],
+    );
+  });
+}
+
 export const harnesses = {
   list(): Harness[] {
     return db
@@ -2216,7 +2265,15 @@ export const harnesses = {
     );
     return this.get(id) as Harness;
   },
-  delete(id: string): void {
+  /**
+   * Refuse a delete with the same two guards `delete` enforces, WITHOUT
+   * touching a row or a file. Route handlers that must remove on-disk state
+   * owned by the harness (its copied handoff sessions) call this first: a
+   * refused delete must leave that state intact. Keeping one implementation
+   * here means the pre-check and the real delete can never disagree.
+   * A missing row is a no-op, matching `delete`.
+   */
+  assertDeletable(id: string): void {
     const current = this.get(id);
     if (!current) return;
     if (current.isBuiltin) throw new HarnessBuiltinError("delete");
@@ -2233,10 +2290,34 @@ export const harnesses = {
     if (inUse.length > 0 || inUseByProfiles.length > 0) {
       throw new HarnessInUseError(inUse.map((r) => r.id), inUseByProfiles.map((r) => r.id));
     }
-    db.run(`DELETE FROM harnesses WHERE id = ?`, [id]);
-    // Drop any cached usage snapshot so a deleted alias doesn't leave an
-    // orphaned harness_usage row (the table has no FK cascade by design).
-    db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [id]);
+  },
+  delete(id: string): void {
+    const current = this.get(id);
+    if (!current) return;
+    this.assertDeletable(id);
+    // Remember the stack before the membership row cascades away, so the
+    // surviving ranks can be made contiguous again. A gap (`0, 2`) would make
+    // the stored position an impossible "3/2" in the swap divider and the card
+    // badge (review R13-M1); the reader also re-ranks defensively, but the DB
+    // must not claim a rank that does not exist.
+    const membership = db
+      .query<{ stack_id: string }, [string]>(
+        `SELECT stack_id FROM harness_stack_members WHERE harness_id = ?`,
+      )
+      .get(id);
+    db.transaction(() => {
+      db.run(`DELETE FROM harnesses WHERE id = ?`, [id]);
+      // Drop any cached usage snapshot so a deleted alias doesn't leave an
+      // orphaned harness_usage row (the table has no FK cascade by design).
+      db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [id]);
+      // Stack membership cascades via the FK on `harness_stack_members`. The
+      // cooldown is account-global and keyed by harness id with no FK, and the
+      // handoff table deliberately names a destination account without an FK
+      // (a historical handoff is not ownership), so both are deleted here.
+      db.run(`DELETE FROM harness_limit_state WHERE harness_id = ?`, [id]);
+      harnessSessionHandoffs.deleteForHarness(id);
+      if (membership) renumberStackPositions(membership.stack_id);
+    })();
   },
   /**
    * Soft delete / re-enable. Carve-out from `HarnessBuiltinError` — toggling
@@ -2275,12 +2356,111 @@ export const harnesses = {
   },
 };
 
+/** A provider session copied from one stack account onto another. */
+export interface HarnessSessionHandoff {
+  taskId: string;
+  harnessId: string;
+  columnName: SessionIdColumn;
+  sessionId: string;
+  /** Absolute paths the transfer wrote, used as the cleanup allowlist. */
+  copiedPaths: string[];
+  createdAt: number;
+}
+
+type HandoffRow = {
+  task_id: string;
+  harness_id: string;
+  column_name: string;
+  session_id: string;
+  copied_paths_json: string;
+  created_at: number;
+};
+
+const toHandoff = (r: HandoffRow): HarnessSessionHandoff => ({
+  taskId: r.task_id,
+  harnessId: r.harness_id,
+  columnName: r.column_name as SessionIdColumn,
+  sessionId: r.session_id,
+  copiedPaths: (() => {
+    try {
+      const parsed = JSON.parse(r.copied_paths_json);
+      return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : [];
+    } catch {
+      return [];
+    }
+  })(),
+  createdAt: r.created_at,
+});
+
+/**
+ * The recorded provider-session handoffs (migration 084). A row is the one
+ * exception to "session ids are scoped to the harness that created them": it
+ * says `sessionId` was COPIED onto `harnessId` for `taskId`, so the resume
+ * lookup may use it there. `copiedPaths` is the cleanup allowlist — a path
+ * not recorded here is never removed.
+ */
+export const harnessSessionHandoffs = {
+  get(taskId: string, harnessId: string, column: SessionIdColumn): HarnessSessionHandoff | null {
+    const row = db
+      .query<HandoffRow, [string, string, string]>(
+        `SELECT * FROM harness_session_handoffs
+          WHERE task_id = ? AND harness_id = ? AND column_name = ?`,
+      )
+      .get(taskId, harnessId, column);
+    return row ? toHandoff(row) : null;
+  },
+  upsert(handoff: HarnessSessionHandoff): void {
+    db.run(
+      `INSERT INTO harness_session_handoffs
+         (task_id, harness_id, column_name, session_id, copied_paths_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(task_id, harness_id, column_name) DO UPDATE SET
+         session_id = excluded.session_id,
+         copied_paths_json = excluded.copied_paths_json,
+         created_at = excluded.created_at`,
+      [
+        handoff.taskId,
+        handoff.harnessId,
+        handoff.columnName,
+        handoff.sessionId,
+        JSON.stringify(handoff.copiedPaths),
+        handoff.createdAt,
+      ],
+    );
+  },
+  deleteForHarness(harnessId: string): void {
+    db.run(`DELETE FROM harness_session_handoffs WHERE harness_id = ?`, [harnessId]);
+  },
+  deleteOne(taskId: string, harnessId: string, column: SessionIdColumn): void {
+    db.run(
+      `DELETE FROM harness_session_handoffs WHERE task_id = ? AND harness_id = ? AND column_name = ?`,
+      [taskId, harnessId, column],
+    );
+  },
+  listForTask(taskId: string): HarnessSessionHandoff[] {
+    return db
+      .query<HandoffRow, [string]>(
+        `SELECT * FROM harness_session_handoffs WHERE task_id = ? ORDER BY created_at ASC`,
+      )
+      .all(taskId)
+      .map(toHandoff);
+  },
+  /** Every handoff whose destination is this account (harness delete). */
+  listForHarness(harnessId: string): HarnessSessionHandoff[] {
+    return db
+      .query<HandoffRow, [string]>(
+        `SELECT * FROM harness_session_handoffs WHERE harness_id = ? ORDER BY created_at ASC`,
+      )
+      .all(harnessId)
+      .map(toHandoff);
+  },
+};
+
 type HarnessUsageRow = {
   harness_id: string;
   snapshot_json: string;
   updated_at: number;
 };
-
 /**
  * Latest per-harness usage/quota snapshot for the topbar usage tracker
  * (docs/plans/harness-usage-tracker.md). Standalone table, deliberately not
@@ -3216,6 +3396,81 @@ export const runs = {
     return row ? row.data : null;
   },
   /**
+   * The newest session id `harnessId` ever recorded for a task in `column`,
+   * with the run's start time so a caller can compare it against a session
+   * handoff. Mirrors `sessionIdsForTask`'s ordering but scoped to one harness
+   * in SQL (the existing helper intentionally resolves aliases in JS).
+   *
+   * A legacy row storing a bare kind is matched through `resolveHarness` by
+   * `findLastSessionIdForHarness`; this is the handoff-comparison half, where
+   * only exact harness ids matter because a handoff is always written with
+   * the destination's real id.
+   */
+  newestSessionForHarness(
+    taskId: string,
+    column: SessionIdColumn,
+    harnessId: string,
+  ): { sessionId: string; startedAt: number } | null {
+    const col = SESSION_ID_COLUMNS.find((c) => c === column);
+    if (!col) return null;
+    const row = db
+      .query<{ sessionId: string | null; startedAt: number }, [string, string]>(
+        `SELECT ${col} AS sessionId, started_at AS startedAt
+           FROM runs
+          WHERE task_id = ? AND agent = ? AND ${col} IS NOT NULL
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT 1`,
+      )
+      .get(taskId, harnessId);
+    return row?.sessionId ? { sessionId: row.sessionId, startedAt: row.startedAt } : null;
+  },
+  /**
+   * Every MAIN-stream `user` event for a run, oldest first
+   * (`subagent_id IS NULL`, like `lastEventData`). Used by a harness-stack
+   * clean retry: when the old account hit its limit before any tool call, the
+   * successor rebuilds the unanswered request from the whole ordered set —
+   * not just the newest row — because a send can be recorded twice (the live
+   * echo + the CLI's JSONL twin) and a REPL follow-up folds into the same run.
+   * `composeCleanRetryText` (shared/user-message.ts) does the normalization
+   * and de-duplication.
+   */
+  mainUserTexts(runId: string): string[] {
+    return db
+      .query<{ data: string }, [string]>(
+        `SELECT data FROM run_events INDEXED BY idx_run_events_run
+         WHERE run_id = ? AND stream = 'user' AND subagent_id IS NULL ORDER BY id ASC`,
+      )
+      .all(runId)
+      .map((row) => row.data);
+  },
+  /**
+   * Whether a run recorded ANY tool call (main stream or a subagent's — a
+   * subagent's side effects are real too). This is the "did the model do
+   * anything with side effects?" gate: no tool call → a clean retry of the
+   * original prompt on a fresh session; any tool call → transfer + resume.
+   */
+  hasToolUse(runId: string): boolean {
+    return (
+      db
+        .query<{ n: number }, [string]>(
+          `SELECT 1 AS n FROM run_events INDEXED BY idx_run_events_run
+           WHERE run_id = ? AND stream = 'tool_use' LIMIT 1`,
+        )
+        .get(runId) !== null
+    );
+  },
+  /** Whether a task has a genuinely `running` run row. A held run (row
+   *  `succeeded`, background agents still live) is not "live". */
+  hasRunning(taskId: string): boolean {
+    return (
+      db
+        .query<{ n: number }, [string]>(
+          `SELECT 1 AS n FROM runs WHERE task_id = ? AND status = 'running' LIMIT 1`,
+        )
+        .get(taskId) !== null
+    );
+  },
+  /**
    * Find a run's persisted `tool_use` event by its `id` (claude-tmux's
    * `{ id, name, input, serverSide }` shape — see the `case "tool_use"`
    * branch in `claude-tmux.ts`). Backs the sent-files map-miss fallback in
@@ -3752,9 +4007,26 @@ export const runs = {
    * account's session. `column` is a closed whitelist (it is interpolated
    * into the SQL); anything outside {@link SESSION_ID_COLUMNS} throws.
    * Reads `runs` only — never `run_events`.
+   *
+   * `opts.excludeRunId` drops that run's row. The harness-stack
+   * "did a conversation exist BEFORE this turn?" check uses it so a limit in
+   * the task's very first turn stays a clean retry, while a follow-up turn
+   * that already has an earlier session keeps its history (R11-M1).
    */
-  sessionIdsForTask(taskId: string, column: SessionIdColumn): { sessionId: string; agent: string }[] {
+  sessionIdsForTask(
+    taskId: string,
+    column: SessionIdColumn,
+    opts: { excludeRunId?: string } = {},
+  ): { sessionId: string; agent: string }[] {
     if (!SESSION_ID_COLUMNS.includes(column)) throw new Error(`unknown session id column: ${String(column)}`);
+    const excludeRunId = opts.excludeRunId;
+    if (excludeRunId) {
+      return db.query<{ sessionId: string; agent: string }, [string, string]>(
+        `SELECT ${column} AS sessionId, agent FROM runs
+           WHERE task_id = ? AND id <> ? AND ${column} IS NOT NULL
+           ORDER BY started_at DESC, rowid DESC`,
+      ).all(taskId, excludeRunId);
+    }
     return db.query<{ sessionId: string; agent: string }, [string]>(
       `SELECT ${column} AS sessionId, agent FROM runs
          WHERE task_id = ? AND ${column} IS NOT NULL

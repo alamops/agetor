@@ -10,7 +10,8 @@
 // RunPanel.tsx), but a positional index scoped to "whatever's currently
 // displayed" is always available, and it's exactly what the log's
 // `data-evid` DOM attribute is keyed on too.
-import { isInternalStatusSentinel, type RunEventStream } from "../../shared/types.ts";
+import { formatHarnessSwapNotice, isHarnessStackContinuation, parseHarnessSwapNotice } from "../../shared/harness-stack.ts";
+import { HARNESS_SWAP_STATUS_PREFIX, isInternalStatusSentinel, type RunEventStream } from "../../shared/types.ts";
 import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
 import { normalizeDeliveredUserText } from "../../shared/user-message.ts";
 import { isHiddenToolEvent } from "../../shared/tool-visibility.ts";
@@ -100,6 +101,15 @@ export function searchableEventText(
       return textOf(parsed.content);
     }
     case "status":
+      // A harness-stack divider is rendered as the formatted notice, never as
+      // the raw `harness-swap: {json}` payload. Match what the user sees, so
+      // "Switched to …" finds the node and the JSON is not a phantom hit.
+      if (data.startsWith(HARNESS_SWAP_STATUS_PREFIX)) {
+        const notice = parseHarnessSwapNotice(data);
+        // RunPanel appends the `position/count` chip to the same notice;
+        // search must index what is actually rendered, not just the sentence.
+        return notice ? `${formatHarnessSwapNotice(notice)} (${notice.position}/${notice.count})` : null;
+      }
       // Claude's synthetic "[Image: source: <path>]" breadcrumbs are
       // suppressed by the log renderer (`renderEvent` in RunPanel returns no
       // block for them — the attachment shows as a thumbnail chip on the user
@@ -122,6 +132,11 @@ export function searchableEventText(
       // bubble uses; same string back when there is nothing to strip.
       {
         const normalized = normalizeDeliveredUserText(data.replace(/\r\n?/g, "\n"));
+        // A harness-stack continuation prompt is Agetor's own hidden send: its
+        // JSONL twin is `<pasted_content>`-wrapped, so the check must run on
+        // the unwrapped value — RunPanel renders no bubble for it, and a match
+        // here would navigate to nothing.
+        if (isHarnessStackContinuation(normalized)) return null;
         return opts?.handoffCards ? withHandoffSpanValues(normalized) : normalized;
       }
     // Claude's compaction summary renders (when expanded) as its own block —

@@ -1,8 +1,9 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
-import type { Task, RunEvent } from "../../shared/types.ts";
-import { FX_RECOVERY_STATUS_PREFIX, commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
+import type { Task, RunEvent, HarnessStack } from "../../shared/types.ts";
+import { FX_RECOVERY_STATUS_PREFIX, HARNESS_SWAP_STATUS_PREFIX, commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
+import { formatHarnessSwapNotice, parseHarnessSwapNotice } from "../../shared/harness-stack.ts";
 import {
   fxAutoResumeCountdownText,
   fxRecoveryNoticeText,
@@ -24,6 +25,7 @@ import {
   type SentFilesResult,
 } from "../../shared/sent-files.ts";
 import { useTasks } from "./useTasks.ts";
+import { useHarnessStacks } from "./useHarnessStacks.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
 import { useGlobalEvents, type Toast } from "./useGlobalEvents.ts";
@@ -82,6 +84,23 @@ export function dashboardRows(tasks: Task[], expandedParents: ReadonlySet<string
   return rows;
 }
 
+/**
+ * The task header's active-account line (`<label> · 2/3`), or null when the
+ * account is in no stack. Mirrors the webview RunPanel's line and the CLI's
+ * `· 2/3` suffix. Labels are caller-escaped before rendering.
+ */
+export function activeAccountLine(
+  task: Pick<Task, "agent">,
+  stacks: readonly HarnessStack[],
+): string | null {
+  const stack = stacks.find((st) => st.members.some((m) => m.harnessId === task.agent));
+  if (!stack) return null;
+  const index = stack.members.findIndex((m) => m.harnessId === task.agent);
+  if (index < 0) return null;
+  const member = stack.members[index]!;
+  return `${member.label} · ${index + 1}/${stack.members.length}`;
+}
+
 export function Dashboard({
   client,
   core,
@@ -93,6 +112,7 @@ export function Dashboard({
 }) {
   const { exit } = useApp();
   const tasks = useTasks(client);
+  const stacks = useHarnessStacks(client);
   // Pipeline parents whose step rows are currently shown inline (`p`
   // toggles) — hidden by default, same as the board and `agetor ls`, since
   // steps are an implementation detail of the parent (D11); expanding one
@@ -518,6 +538,7 @@ export function Dashboard({
               events={visible}
               now={now}
               expanded={expandedParents.has(selected.id)}
+              stacks={stacks}
             />
           ) : (
             <Box flexDirection="column">
@@ -662,12 +683,15 @@ function Detail({
   events,
   now,
   expanded,
+  stacks,
 }: {
   task: Task;
   events: RunEvent[];
   now: number;
   /** Whether this (pipeline parent) task's step rows are currently shown. */
   expanded: boolean;
+  /** Harness-account stacks for the active-account line (`label · 2/3`). */
+  stacks: readonly HarnessStack[];
 }) {
   // One pass over the visible window pairs every `SendUserFile` tool_use
   // with its (possibly not-yet-arrived) tool_result and formats the result
@@ -707,11 +731,13 @@ function Detail({
   // protecting.
   const showResumeHint = isTaskFxPaused(task);
   const autoResume = task.fxRecovery?.autoResume;
+  const account = activeAccountLine(task, stacks);
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">
         <Text bold>{escapeFreeText(task.title)}</Text> <Text dimColor>{task.id.slice(0, 8)}</Text>{" "}
         <Text color={columnColor(task.column)}>{task.column}</Text>
+        {account ? <Text dimColor> · {escapeControlChars(account)}</Text> : null}
         {task.pendingInteractionCount > 0 ? (
           <Text color="yellow"> · ! press g to answer</Text>
         ) : null}
@@ -1014,10 +1040,21 @@ const EventLine = memo(function EventLine({
       // chip, …) are UI-plumbing, not transcript content — see
       // `isInternalStatusSentinel` in shared/types.ts, the one predicate every
       // raw-status renderer must consult. Skip rendering them.
+      if (e.data.startsWith(HARNESS_SWAP_STATUS_PREFIX)) {
+        const notice = parseHarnessSwapNotice(e.data);
+        if (notice) {
+          return (
+            <Text color="cyan" wrap="truncate-end">
+              ⇄ {formatHarnessSwapNotice(notice)}
+            </Text>
+          );
+        }
+        return null;
+      }
       if (isInternalStatusSentinel(e.data)) return null;
       return (
         <Text dimColor wrap="truncate-end">
-          • {e.data}
+          • {escapeFreeText(e.data)}
         </Text>
       );
     }

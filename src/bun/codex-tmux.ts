@@ -14,7 +14,8 @@ import path from "node:path";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
-import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { SESSION_DIED_STATUS_PREFIX, HARNESS_LIMIT_STATUS_PREFIX } from "../shared/types.ts";
+import { classifyHarnessLimitSignal } from "../shared/harness-limits.ts";
 import {
   DEATH_JSONL_QUIET_MS,
   DEATH_MISS_THRESHOLD,
@@ -101,6 +102,15 @@ export interface CodexMapResult {
   threadId?: string;
 }
 
+/** Emit a structured limit signal when Codex's error classifies. Conservative:
+ *  `server_overloaded`, `model_not_found`, 5xx and auth/network produce
+ *  nothing (the classifier's negative table). */
+function emitCodexLimitSignal(message: string, onChunk: ChunkHandler, key: string): void {
+  const signal = classifyHarnessLimitSignal("codex", { text: message });
+  if (!signal) return;
+  onChunk("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`, `${key}:limit`);
+}
+
 function errMessage(e: CodexEvent["error"]): string {
   if (!e) return "codex turn failed";
   if (typeof e === "string") return e;
@@ -138,15 +148,23 @@ export function mapCodexEvent(
     case "turn.completed":
       return { done: 0 };
 
-    case "turn.failed":
-      onChunk("stderr", errMessage(evt.error), `turn.failed:${seq.n++}`);
+    case "turn.failed": {
+      const message = errMessage(evt.error);
+      const key = `turn.failed:${seq.n++}`;
+      emitCodexLimitSignal(message, onChunk, key);
+      onChunk("stderr", message, key);
       return { done: 1 };
+    }
 
-    case "error":
+    case "error": {
       // Top-level transport/model error (no item). A `turn.failed` usually
       // follows and carries the terminal `done`; surface the message here.
-      onChunk("stderr", errMessage(evt.error ?? evt.message), `error:${seq.n++}`);
+      const message = errMessage(evt.error ?? evt.message);
+      const key = `error:${seq.n++}`;
+      emitCodexLimitSignal(message, onChunk, key);
+      onChunk("stderr", message, key);
       return {};
+    }
 
     case "item.started":
       // Wait for `item.completed` to emit — codex restates the item with its

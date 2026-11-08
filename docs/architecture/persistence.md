@@ -60,3 +60,16 @@ Routes: `GET /db/stats` (`DbStats`), `POST /db/compact`, `POST /db/retention/run
 A new `run_events` method that isn't exercised by that test fails it by name.
 
 **Adding a migration** (numbered `.sql` files, the `migrations/index.ts` entry, never editing an applied one, and why the SQL is inlined at bundle time) is described once, in [CLAUDE.md § Persistence, in brief](../../CLAUDE.md#persistence-in-brief).
+
+## Harness stack tables (migration 084)
+
+`harness_stacks`, `harness_stack_members`, `harness_limit_state` and
+`harness_session_handoffs` are additive; `tasks.harness_state` is another
+server-managed column (targeted UPDATE only, no `updated_at`, skipped by the
+generic PATCH clause — same rule as `fx_recovery`). `UNIQUE(harness_stack_members.harness_id)`
+is the "one stack per account" invariant and `UNIQUE(stack_id, position)` the
+order. `harness_limit_state` has no FK on purpose: it is account-global and
+survives a stack delete. `harness_session_handoffs` cascades with the task; its
+`copied_paths_json` is the only allowlist cleanup may remove. Snapshot/restore
+for tests covers all three (`test-harness-state.ts`). Model:
+[harness-stacks.md](harness-stacks.md).

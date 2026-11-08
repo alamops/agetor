@@ -11,6 +11,10 @@ import type {
   DbStats,
   DiscoveredAccount,
   GlobalEvent,
+  HarnessLimitState,
+  HarnessStack,
+  HarnessStackInput,
+  HarnessStackWarning,
   RetentionPassResult,
   GitHubIssueThreadResult,
   GitHubItemKind,
@@ -519,7 +523,20 @@ export interface SentMessageItem {
   agent: string;
 }
 
-export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
+export interface HarnessesPayload {
+  harnesses: Harness[];
+  statuses: HarnessStatus[];
+  /** Harness account stacks (empty unless the user made one). */
+  stacks?: HarnessStack[];
+  /** Account-global limit cooldowns currently in force. */
+  limitStates?: HarnessLimitState[];
+}
+export interface HarnessStacksPayload { stacks: HarnessStack[]; limitStates: HarnessLimitState[] }
+export interface HarnessStackResult {
+  stack: HarnessStack;
+  warnings: HarnessStackWarning[];
+  mirror: { copied: string[]; warnings: string[] };
+}
 /** One day × model row of an account's local token rollup. */
 export interface AccountUsageDay {
   day: string;
@@ -618,6 +635,18 @@ export const api = {
   applyUpdate: () => j<{ ok: true }>("/updates/apply", { method: "POST" }),
   listAgents: () => j<AgentStatus[]>("/agents"),
   listHarnesses: () => j<HarnessesPayload>("/harnesses"),
+  listHarnessStacks: () => j<HarnessStacksPayload>("/harness-stacks"),
+  getHarnessStack: (id: string) =>
+    j<{ stack: HarnessStack; limitStates: HarnessLimitState[] }>(`/harness-stacks/${encodeURIComponent(id)}`),
+  createHarnessStack: (input: HarnessStackInput) =>
+    j<HarnessStackResult>("/harness-stacks", { method: "POST", body: JSON.stringify(input) }),
+  patchHarnessStack: (id: string, patch: Partial<HarnessStackInput>) =>
+    j<HarnessStackResult>(`/harness-stacks/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteHarnessStack: (id: string) =>
+    j<{ removed: true }>(`/harness-stacks/${encodeURIComponent(id)}`, { method: "DELETE" }),
   createHarness: (input: HarnessInput) =>
     j<Harness>("/harnesses", { method: "POST", body: JSON.stringify(input) }),
   updateHarness: (id: string, patch: Partial<Omit<HarnessInput, "id" | "kind">>) =>

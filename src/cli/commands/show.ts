@@ -30,6 +30,9 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const harnessCtx = needsLookup
     ? profileHarnessContext(task.agent, await client.listHarnesses().catch(() => null))
     : builtinCtx;
+  const stacksPayload = typeof client.listHarnessStacks === "function"
+    ? await client.listHarnessStacks().catch(() => null)
+    : null;
   const modeText = resolveModeText(harnessCtx, task.mode);
 
   // A step task's title is `<pipeline> · <step>`, both locally written names.
@@ -42,6 +45,23 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${task.agent}${agentNote}` +
       `   ${label("model")} ${escapeControlChars(task.model ?? "-")}   ${label("mode")} ${escapeControlChars(modeText)}`,
   );
+  const stack = (stacksPayload?.stacks ?? []).find((st) => st.members.some((m) => m.harnessId === task.agent));
+  if (stack) {
+    const index = stack.members.findIndex((m) => m.harnessId === task.agent);
+    out(`  ${label("stack")} ${escapeFreeText(stack.label)} (${index + 1}/${stack.members.length})`);
+  }
+  if (task.harnessState?.allExhausted) {
+    const ex = task.harnessState.allExhausted;
+    const retrying = ex.nextAttemptAt <= 0 && ex.reason !== "no-usable-member" && ex.attempts < ex.max;
+    const text = ex.attempts >= ex.max
+      ? "every account is out of quota — run the task manually after a reset"
+      : ex.nextAttemptAt > 0
+        ? `waiting until ${new Date(ex.nextAttemptAt).toLocaleString()} (attempt ${Math.min(ex.attempts + 1, ex.max)}/${ex.max})`
+        : retrying
+          ? `retrying on the next available account (attempt ${ex.attempts + 1}/${ex.max})`
+          : "no usable account — fix one in Settings";
+    out(`  ${label("failover")} ${c.yellow(escapeFreeText(text))}`);
+  }
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
   if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);
   // Last-seen worktree checkout (recorded at run start/settle, terminal open,

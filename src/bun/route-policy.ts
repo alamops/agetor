@@ -293,6 +293,16 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
     POST: cli({ pathParams: BODY_HOME_BIN }),
   },
   "/harness-discovery": { GET: CLI },
+  // Harness account stacks (machine-local; the CLI manages them too).
+  "/harness-stacks": {
+    GET: CLI,
+    POST: CLI,
+  },
+  "/harness-stacks/:id": {
+    GET: CLI,
+    PATCH: CLI,
+    DELETE: CLI,
+  },
   "/harnesses/:id": {
     GET: CLI,
     PATCH: cli({ pathParams: BODY_HOME_BIN }),

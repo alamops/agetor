@@ -11,6 +11,7 @@ const {
   claudeSessionLivenessCheckedAt,
   clearClaudeSessionLivenessCache,
   clearClaudeSessionMetaCache,
+  claudeConfigDirsToScan,
   findClaudeSession,
   refreshClaudeSessionLiveness,
   scanClaudeSessions,
@@ -63,6 +64,32 @@ function userLine(cwd: string, text: string, extra: Record<string, unknown> = {}
 }
 
 const harnessFor = (configDir: string) => [{ id: "claude-code", kind: "claude-code", home: configDir }];
+
+test("a harness env CLAUDE_CONFIG_DIR is the scanned root, not its home", () => {
+  const root = home();
+  const cwd = path.join(root, "repo-env");
+  mkdirSync(cwd, { recursive: true });
+  const config = plant({
+    home: root,
+    configName: ".claude-env-account",
+    dirName: plainEncodedProjectPath(cwd),
+    sessionId: "env-one",
+    cwd,
+    lines: [userLine(cwd, "env account")],
+  });
+  const dirs = claudeConfigDirsToScan({
+    homeDir: root,
+    env: {},
+    harnesses: [{
+      id: "env-claude",
+      kind: "claude-code",
+      home: path.join(root, "not-this-home"),
+      env: { CLAUDE_CONFIG_DIR: config },
+    }],
+  });
+  expect(dirs).toContain(config);
+  expect(dirs).not.toContain(path.join(root, "not-this-home"));
+});
 
 test("scan hides owned, worktree, agetor tmux, temp agetor, and empty transcripts", async () => {
   const root = home();

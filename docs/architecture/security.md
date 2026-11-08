@@ -89,3 +89,40 @@ A Reject with no reason is relayed with a one-space `message`, because OpenCode 
 
 Residual (D20): "Open terminal" runs the harness `bin` in Terminal.app under Terminal's identity; the user triggers it from the app and sees the command.
 See `docs/plans/stop-agetor-tcc-appdata-spam.md` for the original agent-only change and `docs/qa/master-token-agent-read-qa.md` for the manual pass.
+
+## Harness-stack mirror and session transfer
+
+Every source is an agent-writable harness home, so mirror/transfer reads open
+with `openReadNoFollow` (`O_NOFOLLOW | O_NONBLOCK`, regular file only, never a
+FIFO) — the mirror's merge readers wrap it in their local `readTextIfRegular`,
+and the copy path uses `copyRegularFile` with the same `READ_NOFOLLOW` flags —
+and every write is a sibling temp file, fsync, rename, 0600 (0700 dirs).
+Directory walks `lstat` each entry and skip symlinks/FIFOs/devices; copies
+merge additively into the destination (a backup's own files survive) without
+traversing a destination symlink; caps are 64 MB and 5,000 entries per tree,
+and a config merge reads at most 8 MB.
+
+Harness credential files are **never** copied: `.credentials.json`,
+`auth.json`, session stores/transcripts, Codex `thread_history_*.sqlite`,
+`state_*.sqlite`, session/log caches and `mcp-oauth-locks/`. **`.git` is never copied
+anywhere in a mirrored tree**: a marketplace clone keeps its remote URL (and
+any embedded access token) in `.git/config`, so the payload is mirrored without
+the repository metadata. Each harness's installed plugin payload
+(`plugins/cache/`) *is* copied so a backup can load its plugins from its own
+home; Claude's two plugin registries (`installed_plugins.json`,
+`known_marketplaces.json`) are merged with every absolute path rewritten from
+the primary's config root to the destination's, never copied raw. The primary's
+provider **and cloud** login env keys are stripped from a mirrored
+`settings.json` by shape (any credential segment — `API_KEY`/`TOKEN`/
+`SECRET`/`PASSWORD`/`KEY`/`CREDENTIAL` — whatever the vendor, plus
+login-selecting cloud settings such as `AWS_ROLE_ARN`/`AWS_PROFILE`); a
+backup's own key survives and the process environment is not modified. The
+Codex `[projects.*]` trust entries are never inherited. Codex MCP OAuth tokens
+are not copied (no stable standalone store file) and the swap warns that
+sign-in may need repeating. `safe` mirror mode skips hooks/permissions.
+
+Copied session files are recorded in `harness_session_handoffs`; cleanup
+removes only a recorded path below the destination account's config root and
+only when it is a regular file or plain directory, then prunes the now-empty
+plain parent directories it created (stopping at the first non-empty one, never
+removing the root). Full behaviour: [harness-stacks.md](harness-stacks.md).

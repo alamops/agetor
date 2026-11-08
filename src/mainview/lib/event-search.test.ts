@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  HARNESS_SWAP_STATUS_PREFIX,
   FX_PROVIDER_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
@@ -17,6 +18,7 @@ import {
   stepMatchIndex,
 } from "./event-search.ts";
 import { AGETOR_PASTE_LEAD_IN } from "../../shared/user-message.ts";
+import { composeHarnessStackContinuationPrompt } from "../../shared/harness-stack.ts";
 
 type Ev = { stream: RunEventStream; data: string };
 
@@ -55,6 +57,32 @@ test("searchableEventText: suppressed internal status sentinels are never search
   expect(searchableEventText("status", `${FX_SESSION_TITLE_STATUS_PREFIX}Refactor the login flow`)).toBeNull();
   // Ordinary status text is unaffected.
   expect(searchableEventText("status", "session ended: tmux session gone")).toBe("session ended: tmux session gone");
+});
+
+test("searchableEventText: a harness-swap divider matches its formatted notice, not the raw payload", () => {
+  const notice = {
+    from: "a",
+    fromLabel: "alpha",
+    to: "b",
+    toLabel: "beta",
+    reason: "quota" as const,
+    position: 2,
+    count: 3,
+    resetsAtMs: null,
+    at: 1,
+  };
+  const data = `${HARNESS_SWAP_STATUS_PREFIX}${JSON.stringify(notice)}`;
+  const text = searchableEventText("status", data);
+  expect(text).toContain("Switched to beta");
+  // RunPanel renders the position/count chip next to the notice; search must
+  // index that suffix too so "2/3" finds the node the user sees.
+  expect(text).toContain("(2/3)");
+  expect(text).not.toContain("harness-swap");
+  // Malformed payloads are never rendered, so they never match.
+  expect(searchableEventText("status", `${HARNESS_SWAP_STATUS_PREFIX}{`)).toBeNull();
+  // The visible text is what search should match.
+  expect(findMatchingEventIds([ev("status", data)], "switched to beta")).toEqual([0]);
+  expect(findMatchingEventIds([ev("status", data)], "harness-swap")).toEqual(NO_MATCHES);
 });
 
 test("searchableEventText: passthrough streams pass an empty string through unchanged", () => {
@@ -463,6 +491,19 @@ test("findMatchingEventIds: wrapper markup and the lead-in never match; the body
 test("findMatchingEventIds: only the USER stream is normalized — an assistant quoting the wrapper still matches", () => {
   const events = [ev("assistant", "claude wraps pastes in <pasted_content id=\"0a7d\"> tags")];
   expect(findMatchingEventIds(events, "pasted_content")).toEqual([0]);
+});
+
+test("searchableEventText: a wrapped harness-stack continuation twin is hidden, not indexed", () => {
+  // The hidden prompt is sent by paste, so its JSONL twin is wrapped; the
+  // renderer shows no bubble for it and search must not navigate to nothing.
+  const wrapped =
+    `<pasted_content id="ab12">\n${composeHarnessStackContinuationPrompt()}\n</pasted_content id="ab12">\n`;
+  expect(searchableEventText("user", wrapped)).toBeNull();
+  expect(findMatchingEventIds([ev("user", wrapped)], "harness-stack-continuation")).toBe(NO_MATCHES);
+  // A user who merely mentions the tag in prose is still indexed.
+  expect(searchableEventText("user", "what does <harness-stack-continuation> do?")).toBe(
+    "what does <harness-stack-continuation> do?",
+  );
 });
 
 test("searchableEventText: a compaction_summary event is searchable by its body text", () => {

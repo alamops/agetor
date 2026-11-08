@@ -12,6 +12,25 @@ import { fxAutoResumeCountdownText } from "../../shared/fx-recovery.ts";
 import { FX_AUTO_RESUME_MAX, type TaskFxRecovery } from "../../shared/types.ts";
 
 /**
+ * The one ticking clock behind every countdown in the webview: returns the
+ * current epoch-ms, re-rendering once a second while `active`, and resets to
+ * "now" whenever `resetKey` changes (a new task or a new target). The interval
+ * is armed only while active and is cleared on unmount, so a panel with no
+ * pending timer never runs one. Shared by `useCountdown` and the harness-stack
+ * banner so the two cannot drift into duplicate interval implementations.
+ */
+export function useNowTicker(active: boolean, resetKey?: unknown): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    if (!active) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [active, resetKey]);
+  return now;
+}
+
+/**
  * Live `m:ss` (or `"now"`) countdown to an auto-resume firing at `at` (ms
  * epoch), ticking once a second — or `null` when there's nothing pending
  * (`at` is `null`/`undefined`). The interval is armed only while `at` is
@@ -20,14 +39,9 @@ import { FX_AUTO_RESUME_MAX, type TaskFxRecovery } from "../../shared/types.ts";
  * notice with no pending auto-resume never runs a timer.
  */
 export function useCountdown(at: number | null | undefined): string | null {
-  const [, forceTick] = useState(0);
-  useEffect(() => {
-    if (at == null) return;
-    const id = setInterval(() => forceTick((n) => n + 1), 1000);
-    return () => clearInterval(id);
-  }, [at]);
+  const now = useNowTicker(at != null, at);
   if (at == null) return null;
-  return fxAutoResumeCountdownText(at, Date.now());
+  return fxAutoResumeCountdownText(at, now);
 }
 
 /**

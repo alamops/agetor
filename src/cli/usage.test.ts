@@ -60,9 +60,24 @@ test("helpFor resolves command, subcommand, alias, and falls back", () => {
   expect(helpFor("mv", undefined)).toBe(USAGE["move"]); // alias
   expect(helpFor("harness", "add")).toBe(USAGE["harness add"]); // subcommand
   expect(helpFor("harness", "rm")).toBe(USAGE["harness"]); // unknown sub → command block
+  expect(helpFor("harness", "stack")).toBe(USAGE["harness stack"]); // R7-S4
   expect(helpFor("projects", "add")).toBe(USAGE["projects add"]);
   expect(helpFor(undefined, undefined)).toBeUndefined();
   expect(helpFor("frobnicate", undefined)).toBeUndefined();
+});
+
+test("harness stack: the command index and every subcommand expose a usage line (R7-S4)", () => {
+  // 'stack' used to be executable but absent from help, and its bad-argument
+  // errors fell back to "unknown command" because they passed a whole usage
+  // string instead of a USAGE key.
+  expect(USAGE["harness"]!.split("\n", 1)[0]).toContain("stack <sub>");
+  expect(USAGE["harness"]!.split("\n", 1)[0]).toContain("shell <id>");
+  for (const sub of ["create", "show", "edit", "rm"]) {
+    const key = `harness stack ${sub}`;
+    expect(USAGE[key]).toBeDefined();
+    expect(USAGE[key]!.split("\n", 1)[0]!.startsWith(`usage: agetor ${key}`)).toBe(true);
+    expect(usageError(key).message).toBe(USAGE[key]!.split("\n", 1)[0]!);
+  }
 });
 
 // T7 (CLI parity for pipelines, docs/plans/pipelines.md §3/D14): 'pipeline' /

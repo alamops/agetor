@@ -11,6 +11,10 @@ import type {
   Harness,
   HarnessStatus,
   HarnessUsage,
+  HarnessLimitState,
+  HarnessStack,
+  HarnessStackInput,
+  HarnessStackWarning,
   AgentKind,
   AgentProfile,
   BranchInfo,
@@ -552,8 +556,23 @@ export class AgetorClient {
   }
 
   // ── harnesses ──────────────────────────────────────────────────────────────
-  listHarnesses(): Promise<{ harnesses: Harness[]; statuses: HarnessStatus[] }> {
+  listHarnesses(): Promise<{ harnesses: Harness[]; statuses: HarnessStatus[]; stacks?: HarnessStack[]; limitStates?: HarnessLimitState[] }> {
     return this.req("GET", "/harnesses");
+  }
+  listHarnessStacks(): Promise<{ stacks: HarnessStack[]; limitStates: HarnessLimitState[] }> {
+    return this.req("GET", "/harness-stacks");
+  }
+  getHarnessStack(id: string): Promise<{ stack: HarnessStack; limitStates: HarnessLimitState[] }> {
+    return this.req("GET", `/harness-stacks/${id}`);
+  }
+  createHarnessStack(input: HarnessStackInput): Promise<{ stack: HarnessStack; warnings: HarnessStackWarning[]; mirror: { copied: string[]; warnings: string[] } }> {
+    return this.req("POST", "/harness-stacks", input);
+  }
+  patchHarnessStack(id: string, patch: Partial<HarnessStackInput>): Promise<{ stack: HarnessStack; warnings: HarnessStackWarning[]; mirror: { copied: string[]; warnings: string[] } }> {
+    return this.req("PATCH", `/harness-stacks/${id}`, patch);
+  }
+  deleteHarnessStack(id: string): Promise<{ removed: true }> {
+    return this.req("DELETE", `/harness-stacks/${id}`);
   }
   createHarness(input: CreateHarnessInput): Promise<Harness> {
     return this.req("POST", "/harnesses", input);

@@ -86,6 +86,14 @@ A **harness** is the agent CLI Agetor drives. Agetor launches the real binary on
 
 Claude Code, Antigravity and GitHub Copilot are enabled out of the box. Codex, Cursor, Gemini CLI, fx and OpenCode turn on by themselves, once, the first time Agetor finds their CLI installed, and a toast tells you which ones it turned on. If you turn one off in **Settings → Harnesses**, it stays off, even though the CLI is still installed. Extra-account harnesses you add are never touched. Settings and the onboarding checklist show whether each CLI is installed and logged in, and give an install hint if it isn't.
 
+### Harness stacks (backup accounts)
+
+You can stack two or more accounts of the **same** harness — for example two Claude Code accounts — into one ordered train in **Settings → Stacks** (first is the primary, the rest are backups). When the account a task is running on hits its usage limit or is rate-limited, the task continues on the next account **with the same conversation, tools, MCP servers, skills, commands, plugins and settings**. A divider appears between the task's messages ("Switched to … — usage limit reached. Continuing from the transferred conversation.") and the run keeps going; the card never leaves *running*. After the last account the train wraps to the first and pauses for one lap; when every account is out of quota the card blocks with a countdown and retries at the earliest reset (at most three times). Run manually to force a cooling account or reset the cap.
+
+Each account keeps its **own login**: harness credential files are never copied. The primary's user-level config is mirrored onto the backups (hooks and permissions are skipped by the *Safe* mirror mode). The installed plugin payload is mirrored too; a marketplace's `.git` metadata is never copied because it can carry an access token. A message typed while an automatic swap is happening is held and sent on the new account in order; a manual account switch (dragging the card to another account of the stack, or `PATCH /tasks/:id`) declines messages for the moment it copies the conversation, so nothing is pasted into the old account. Stacks are machine-local, are not exported in bundles, and the feature is inert without one; deleting the stack stops failover. The CLI mirrors the UI: `agetor harness stack ls|create|show|edit|rm`.
+
+Codex accounts are isolated by `CODEX_HOME`; the newer stack behaviour copies the Codex rollout so `exec resume` continues the thread (a `thread_history` DB already in the destination is migrated best-effort). Codex MCP sign-in may need repeating on the backup.
+
 Each harness offers the permission modes its CLI actually supports. They range from hands-off modes (*Auto*, *Full access*) to *Ask*, *Plan only* and *Read-only*.
 
 Where the model offers one, pickers also show a **Speed** control: *Off*, *Fast* or *Ultrafast*. Cursor's Fast comes from its fast model variants, and fx's Fast and Ultrafast come from the AI Gateway lanes your account's catalog lists for that model. Ultrafast costs more per token than Fast. On the CLI, use `--speed off|fast|ultrafast` (`--fast` and `--no-fast` still work).
@@ -342,7 +350,7 @@ The architecture, rules and gotchas are summarized in [`CLAUDE.md`](./CLAUDE.md)
 
 ## Configuration
 
-Most settings live in the app under **Settings**: General, Harnesses, Agents, Pipelines, Git Integration and Saved Prompts. All state is stored under `~/.agetor/`:
+Most settings live in the app under **Settings**: General, Harnesses, Stacks, Agents, Pipelines, Git Integration and Saved Prompts. All state is stored under `~/.agetor/`:
 
 ```
 ~/.agetor/

@@ -30,6 +30,7 @@ Code comments cite these docs by path (`docs/architecture/<doc>.md`); `src/bun/c
 | item 22, Always-on host | [always-on-host.md](always-on-host.md) |
 | "Importing Claude Code / OpenCode sessions started outside Agetor" | [session-import.md](session-import.md) |
 | "Agent command shape": intro, auto-enable, session-id scoping, defaults, speed tiers, `AGENT_OPTIONS` | [harnesses.md](harnesses.md) |
+| Harness account stacks (backup accounts, automatic failover) | [harness-stacks.md](harness-stacks.md) |
 | "Agent command shape": the env overrides, test stubs and fake drivers | [CLAUDE.md § Agent kinds at a glance](../../CLAUDE.md#agent-kinds-at-a-glance) |
 | "Agent command shape": the bullet for one kind (the "fx bullet", …) | `harness-<kind>.md`: [claude-code](harness-claude-code.md), [codex](harness-codex.md), [cursor](harness-cursor.md), [gemini](harness-gemini.md), [fx](harness-fx.md), [antigravity](harness-antigravity.md), [copilot](harness-copilot.md), [opencode](harness-opencode.md) |
 | "To add a new agent kind" checklist | [harnesses.md § Adding a new agent kind](harnesses.md#adding-a-new-agent-kind) |

@@ -10,7 +10,7 @@
  * behind for a sibling file that counts rows.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -888,5 +888,47 @@ describe("dbStats / compactDatabase", () => {
     expect(trimmedCount(live.runIds)).toBe(0);
     expect(dbm.runs.appendEvent(old.runIds[0]!, "status", "after compact")).not.toBeNull();
     expect(dbm.tasks.get(old.taskId)?.id).toBe(old.taskId);
+  });
+
+  test("an archived-old task's copied harness session is removed with its history", async () => {
+    const log = silenceLog();
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-retention-harness-"));
+    const harnessId = `ret-harness-${randomUUID()}`;
+    dbm.harnesses.insert({ id: harnessId, kind: "claude-code", label: harnessId, home, env: {} } as never);
+    const now = Date.now();
+    const old = seedTask(now - 40 * DAY, { runs: 1 });
+    const recent = seedTask(now - 5 * DAY, { runs: 1 });
+    const copied = (taskId: string): string => {
+      const p = path.join(home, "projects", "proj", `${taskId}.jsonl`);
+      mkdirSync(path.dirname(p), { recursive: true });
+      writeFileSync(p, "{}\n");
+      return p;
+    };
+    const oldCopy = copied(old.taskId);
+    const recentCopy = copied(recent.taskId);
+    for (const [taskId, copy] of [[old.taskId, oldCopy], [recent.taskId, recentCopy]] as const) {
+      dbm.harnessSessionHandoffs.upsert({
+        taskId,
+        harnessId,
+        columnName: "claude_session_id",
+        sessionId: taskId,
+        copiedPaths: [copy],
+        createdAt: now,
+      });
+    }
+    try {
+      await ret.runArchivedHistoryRetentionPass({ now, days: 30 });
+      // Past the threshold: the copy and its handoff row are gone.
+      expect(existsSync(oldCopy)).toBe(false);
+      expect(dbm.harnessSessionHandoffs.get(old.taskId, harnessId, "claude_session_id")).toBeNull();
+      // Before the threshold: an unarchive can still resume the conversation.
+      expect(existsSync(recentCopy)).toBe(true);
+      expect(dbm.harnessSessionHandoffs.get(recent.taskId, harnessId, "claude_session_id")).not.toBeNull();
+    } finally {
+      dbm.harnessSessionHandoffs.deleteForHarness(harnessId);
+      dbm.db.run(`DELETE FROM harnesses WHERE id = ?`, [harnessId]);
+      rmSync(home, { recursive: true, force: true });
+      log.mockRestore();
+    }
   });
 });
