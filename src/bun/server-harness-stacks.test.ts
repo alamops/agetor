@@ -3,7 +3,7 @@
 // is set before db/server import.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Task } from "../shared/types.ts";
@@ -495,7 +495,7 @@ describe("harness account roots and the CLI path gate", () => {
     rmSync(lockedParent, { recursive: true, force: true });
   });
 
-  test("POST/PATCH /harnesses refuse a `..` segment in home, bin and a config-root env value, and store normalized paths", async () => {
+  test("POST/PATCH /harnesses refuse a `..` segment in home, bin and a config-root env value, and store paths exactly as given", async () => {
     const id = `api-norm-${randomUUID().slice(0, 8)}`;
     const home = path.join(DATA_DIR, "homes", id);
     const dotted = await call("POST", "/harnesses", { id, kind: "claude-code", label: id, home: `${home}/zz/..` });
@@ -513,29 +513,103 @@ describe("harness account roots and the CLI path gate", () => {
     expect(dottedEnv.status).toBe(400);
     expect(dottedEnv.body.error).toContain("CODEX_HOME");
 
+    // The stored spelling is the `CLAUDE_CONFIG_DIR` string Claude hashes into
+    // its keychain service name, so a trailing `/`, `//` or `.` is kept as
+    // given (R-S7): rewriting it would log the account out.
     const created = await call("POST", "/harnesses", {
       id,
       kind: "claude-code",
       label: id,
       home: `${home}//./acct/`,
-      env: { CLAUDE_CONFIG_DIR: ` ${home}/cfg/./ `, OTHER: "/keep/./as/given" },
+      env: { CLAUDE_CONFIG_DIR: `${home}/cfg/./`, OTHER: "/keep/./as/given" },
     });
     expect(created.status).toBe(200);
     try {
-      expect(created.body.home).toBe(path.join(home, "acct"));
-      expect(created.body.env.CLAUDE_CONFIG_DIR).toBe(path.join(home, "cfg"));
-      // Only config-root keys are rewritten.
+      expect(created.body.home).toBe(`${home}//./acct/`);
+      expect(created.body.env.CLAUDE_CONFIG_DIR).toBe(`${home}/cfg/./`);
       expect(created.body.env.OTHER).toBe("/keep/./as/given");
 
       const patched = await call("PATCH", `/harnesses/${id}`, { home: `${home}/a/../b` });
       expect(patched.status).toBe(400);
       const patchedEnv = await call("PATCH", `/harnesses/${id}`, { env: { HOME: "~/../other" } });
       expect(patchedEnv.status).toBe(400);
-      expect(db.harnesses.get(id)?.home).toBe(path.join(home, "acct"));
+      expect(db.harnesses.get(id)?.home).toBe(`${home}//./acct/`);
+      // A label rename that re-sends the same home and env leaves both
+      // byte-identical.
+      const relabel = await call("PATCH", `/harnesses/${id}`, {
+        label: "renamed",
+        home: `${home}//./acct/`,
+        env: { CLAUDE_CONFIG_DIR: `${home}/cfg/./`, OTHER: "/keep/./as/given" },
+      });
+      expect(relabel.status).toBe(200);
+      expect(db.harnesses.get(id)?.home).toBe(`${home}//./acct/`);
+      expect(db.harnesses.get(id)?.env.CLAUDE_CONFIG_DIR).toBe(`${home}/cfg/./`);
       const ok = await call("PATCH", `/harnesses/${id}`, { home: `${home}/b/` });
       expect(ok.status).toBe(200);
-      expect(db.harnesses.get(id)?.home).toBe(path.join(home, "b"));
+      expect(db.harnesses.get(id)?.home).toBe(`${home}/b/`);
     } finally {
+      db.harnesses.delete(id);
+    }
+  }, 60_000);
+
+  test("POST/PATCH /harnesses refuse a relative or `~` config-root env value for every caller; a blank one stays allowed (R-M2)", async () => {
+    const id = `api-relenv-${randomUUID().slice(0, 8)}`;
+    const bad = ["relative/acct", "./acct", "~", "~/acct", " /leading/space"];
+    for (const key of ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME"]) {
+      for (const value of bad) {
+        for (const bearer of [token, cliToken]) {
+          const res = await call("POST", "/harnesses", { id, kind: "claude-code", label: id, env: { [key]: value } }, bearer);
+          expect(res.status).toBe(400);
+          expect(String(res.body.error)).toContain(key);
+          expect(String(res.body.error)).toContain("absolute");
+        }
+      }
+    }
+    expect(db.harnesses.get(id)).toBeNull();
+
+    // A blank root value counts as unset everywhere and is stored as given;
+    // a non-root key is never checked.
+    const created = await call(
+      "POST",
+      "/harnesses",
+      { id, kind: "codex", label: id, env: { CODEX_HOME: "  ", OTHER: "relative/ok" } },
+      cliToken,
+    );
+    expect(created.status).toBe(200);
+    try {
+      expect(created.body.env).toEqual({ CODEX_HOME: "  ", OTHER: "relative/ok" });
+      for (const key of ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME"]) {
+        for (const value of bad) {
+          for (const bearer of [token, cliToken]) {
+            const res = await call("PATCH", `/harnesses/${id}`, { env: { [key]: value } }, bearer);
+            expect(res.status).toBe(400);
+            expect(String(res.body.error)).toContain(key);
+          }
+        }
+      }
+      expect(db.harnesses.get(id)?.env).toEqual({ CODEX_HOME: "  ", OTHER: "relative/ok" });
+    } finally {
+      db.harnesses.delete(id);
+    }
+  }, 60_000);
+
+  test.skipIf(IS_ROOT)("a CLI-token relative env root under a protected folder no longer slips past the gate (R-M2 repro)", async () => {
+    const id = `api-relgate-${randomUUID().slice(0, 8)}`;
+    db.harnesses.insert({ id, kind: "claude-code", label: id, home: path.join(DATA_DIR, "homes", id), env: {} } as never);
+    const prevCwd = process.cwd();
+    // The core's cwd sits next to the protected folder, so `locked/acct`
+    // resolves under it for every consumer, while no absolute path names it.
+    process.chdir(lockedParent);
+    try {
+      const rel = await call("PATCH", `/harnesses/${id}`, { env: { CLAUDE_CONFIG_DIR: "locked/acct" } }, cliToken);
+      expect(rel.status).toBe(400);
+      expect(db.harnesses.get(id)?.env).toEqual({});
+      // The absolute spelling of the same folder is the gate's 403.
+      const abs = await call("PATCH", `/harnesses/${id}`, { env: { CLAUDE_CONFIG_DIR: path.join(locked, "acct") } }, cliToken);
+      expect(abs.status).toBe(403);
+      expect(abs.body.code).toBe("path-not-accessible");
+    } finally {
+      process.chdir(prevCwd);
       db.harnesses.delete(id);
     }
   }, 60_000);
@@ -813,6 +887,148 @@ describe("rebuild-events anchor", () => {
     } finally {
       db.runs.update(runId, { status: "failed" });
       db.tasks.delete(taskId);
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// N3 / CR5: the same-stack switch through PATCH /tasks/:id refuses a task held
+// by background agents, and for the CLI token re-gates both members' roots
+// (a root re-pointed into a protected folder after the stack save).
+// ---------------------------------------------------------------------------
+
+describe("same-stack switch guards on PATCH /tasks/:id", () => {
+  test("a task held by running background agents refuses the switch (N3)", async () => {
+    const created = await call("POST", "/harness-stacks", { label: "held", kind: "claude-code", members: ["api-a", "api-b"] });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    const runId = randomUUID();
+    const taskId = seedTaskRow({ column: "running", runId });
+    db.runs.insert({
+      id: runId, taskId, agent: "api-a", status: "succeeded",
+      startedAt: Date.now(), endedAt: Date.now(), exitCode: 0,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+    const subagentId = `held-${randomUUID().slice(0, 8)}`;
+    db.subagents.insertIfAbsent({
+      id: subagentId, taskId, runId, parentKind: "subagent", agentType: "Explore", description: "bg",
+      spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`), status: "running", startedAt: Date.now(), endedAt: null,
+    });
+    try {
+      const refused = await call("PATCH", `/tasks/${taskId}`, { agent: "api-b" });
+      expect(refused.status).toBe(409);
+      expect(refused.body.error).toBe("stop the background agents before switching accounts");
+      expect(db.tasks.get(taskId)?.agent).toBe("api-a");
+      expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
+    } finally {
+      db.subagents.setStatus(subagentId, "completed", Date.now());
+      db.tasks.delete(taskId);
+      await call("DELETE", `/harness-stacks/${stackId}`);
+    }
+  }, 60_000);
+
+  test.skipIf(IS_ROOT)("a CLI-token switch re-gates both members' roots: a root re-pointed into a protected folder after the save is refused (CR5)", async () => {
+    const cliToken = (await import("./api-config.ts")).CLI_TOKEN;
+    const ids = ["a", "b"].map((x) => `api-cr5-${x}-${randomUUID().slice(0, 6)}`);
+    const homes = ids.map((id) => path.join(DATA_DIR, "homes", id));
+    for (const [i, id] of ids.entries()) {
+      mkdirSync(homes[i]!, { recursive: true });
+      writeFileSync(path.join(homes[i]!, ".credentials.json"), "{}");
+      writeFileSync(path.join(homes[i]!, "settings.json"), JSON.stringify({ theme: "dark" }));
+      db.harnesses.insert({ id, kind: "claude-code", label: id, home: homes[i]!, env: {} } as never);
+    }
+    // Saved through the CLI token while both roots were readable.
+    const created = await call("POST", "/harness-stacks", { label: "cr5", kind: "claude-code", members: ids, mirrorMode: "safe" }, cliToken);
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    // Then the backup's root is swapped for a symlink into a folder the
+    // disclaimed probe cannot read (the stand-in for a TCC-protected one).
+    const lockedParent = mkdtempSync(path.join(tmpdir(), "agetor-cr5-"));
+    const target = path.join(lockedParent, "acct");
+    mkdirSync(target);
+    chmodSync(target, 0o300);
+    rmSync(homes[1]!, { recursive: true, force: true });
+    symlinkSync(target, homes[1]!);
+    const taskId = seedTaskRow({ agent: ids[0]! });
+    try {
+      const into = await call("PATCH", `/tasks/${taskId}`, { agent: ids[1] }, cliToken);
+      expect(into.status).toBe(403);
+      expect(into.body.code).toBe("path-not-accessible");
+      expect(db.tasks.get(taskId)?.agent).toBe(ids[0]);
+      expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
+
+      // The CURRENT member's root is gated too: switching out of it is refused.
+      db.tasks.update(taskId, { agent: ids[1]! });
+      const outOf = await call("PATCH", `/tasks/${taskId}`, { agent: ids[0] }, cliToken);
+      expect(outOf.status).toBe(403);
+      expect(outOf.body.code).toBe("path-not-accessible");
+      expect(db.tasks.get(taskId)?.agent).toBe(ids[1]);
+
+      chmodSync(target, 0o700);
+      // Nothing was mirrored into the protected target.
+      expect(readdirSync(target)).toEqual([]);
+
+      // Readable roots on both sides: the CLI switch goes through.
+      const ok = await call("PATCH", `/tasks/${taskId}`, { agent: ids[0] }, cliToken);
+      expect(ok.status).toBe(200);
+      expect(db.tasks.get(taskId)?.agent).toBe(ids[0]);
+    } finally {
+      chmodSync(target, 0o700);
+      db.tasks.delete(taskId);
+      await call("DELETE", `/harness-stacks/${stackId}`);
+      for (const id of ids) db.harnesses.delete(id);
+      rmSync(lockedParent, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// CR1: server routes that READ an account's claude files use the directory
+// claude actually reads (claudeConfigDirFor), which for an account whose only
+// root setting is an env-map HOME is `<HOME>/.claude`, not the spawn pin.
+// ---------------------------------------------------------------------------
+
+describe("claude file readers follow claudeConfigDirFor", () => {
+  test("account-usage and rebuild-events read `<HOME>/.claude` for an env-map-HOME-only account", async () => {
+    const prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    const id = `api-envhome-${randomUUID().slice(0, 8)}`;
+    const envHome = path.join(DATA_DIR, "envhomes", id);
+    mkdirSync(envHome, { recursive: true });
+    db.harnesses.insert({ id, kind: "claude-code", label: id, home: null, env: { HOME: envHome } } as never);
+    const { encodeProjectPath } = await import("./claude-tmux.ts");
+    const cwd = path.join(DATA_DIR, `envhome-cwd-${randomUUID().slice(0, 8)}`);
+    const sessionId = randomUUID();
+    const taskId = seedTaskRow({ workdir: cwd, agent: id });
+    const runId = randomUUID();
+    db.runs.insert({
+      id: runId, taskId, agent: id, status: "succeeded",
+      startedAt: Date.now(), endedAt: Date.now() + 1, exitCode: 0,
+      tmuxSession: null, claudeSessionId: sessionId, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+    const projectDir = path.join(envHome, ".claude", "projects", encodeProjectPath(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(
+      path.join(projectDir, `${sessionId}.jsonl`),
+      `${JSON.stringify({ type: "user", uuid: randomUUID(), message: { content: "hello from the env-home account" } })}\n`,
+    );
+    try {
+      const usage = await call("GET", `/harnesses/${id}/account-usage`);
+      expect(usage.status).toBe(200);
+      expect(usage.body.configDir).toBe(path.join(envHome, ".claude"));
+
+      const rebuilt = await call("GET", `/runs/${runId}/rebuild-events`);
+      expect(rebuilt.status).toBe(200);
+      expect(rebuilt.body.reason).toBeUndefined();
+      expect((rebuilt.body.events as Array<{ stream: string; data: string }>).some(
+        (e) => e.stream === "user" && e.data === "hello from the env-home account",
+      )).toBe(true);
+    } finally {
+      if (prevConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prevConfigDir;
+      db.runs.update(runId, { status: "failed" });
+      db.tasks.delete(taskId);
+      db.harnesses.delete(id);
     }
   }, 30_000);
 });

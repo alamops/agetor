@@ -57,6 +57,7 @@ import {
   TURN_STALL_RESUMED_STATUS_PREFIX,
 } from "../shared/types.ts";
 import { classifyHarnessLimitSignal } from "../shared/harness-limits.ts";
+import { nonBlankRootValue } from "../shared/harness-config-root.ts";
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
 import { compactionStatusLine, isCompactionNotice } from "../shared/compaction.ts";
@@ -416,11 +417,13 @@ export interface ClaudeLaunchOptions {
    */
   sessionId: string;
   /**
-   * Per-harness config-dir override (passed to claude as CLAUDE_CONFIG_DIR).
-   * When set, claude writes its JSONL under `<configDir>/projects/…` — the
-   * path itself replaces `~/.claude/`. NULL falls back to
-   * `~/.claude/projects/…`. This is how multi-account harnesses keep their
-   * login & history separate. Sourced from `Harness.home` at the call site.
+   * The harness's config-dir PIN (`claudeConfigDirOverrideFor`: its env
+   * map's `CLAUDE_CONFIG_DIR`, else its `home`), passed to claude as
+   * CLAUDE_CONFIG_DIR. When set, claude writes its JSONL under
+   * `<configDir>/projects/…` — the path itself replaces `~/.claude/`. NULL
+   * pins nothing (see `pinClaudeConfigDir`); the tailer then reads where the
+   * launch env sends claude (`claudeReadRootsForLaunch`). This is how
+   * multi-account harnesses keep their login & history separate.
    */
   configDir: string | null;
   /**
@@ -577,19 +580,23 @@ export function buildClaudeSessionEnv(callerEnv: Record<string, string>): Record
 }
 
 /**
- * Make a session's config dir the one `jsonlPathFor` will tail. A harness
- * with a home already passes `CLAUDE_CONFIG_DIR` (`harnessEnv`, agents.ts).
- * Without one, claude would inherit whatever the long-lived tmux server
- * captured when it started — possibly another process's env (the desktop
- * app and a CLI daemon share the socket) — while the tailer reads this
- * process's `CLAUDE_CONFIG_DIR` (`effectiveClaudeConfigDir(null)`). So pin
- * this process's value, or unset it so claude falls back to `~/.claude`.
- * Setting it to `~/.claude` explicitly is not equivalent: claude then reads
- * `.claude.json` inside that dir instead of `~/.claude.json`. With a home,
- * `configDir` always wins: a harness `env` map that names a different
- * `CLAUDE_CONFIG_DIR` would send claude to a folder the tailer, the
- * session scan and the liveness probe never read. Without a home, a caller
- * env that already names a config dir (a harness `env` map) is left alone.
+ * Make a session's config dir the one the tailer reads. `configDir` is the
+ * harness's own pin (`claudeConfigDirOverrideFor`: its env map's
+ * `CLAUDE_CONFIG_DIR`, else its `home`). Without one, claude would inherit
+ * whatever the long-lived tmux server captured when it started — possibly
+ * another process's env (the desktop app and a CLI daemon share the socket)
+ * — while the readers (`claudeConfigDirFor`) assume this process's
+ * `CLAUDE_CONFIG_DIR`. So pin this process's value, or unset it so claude
+ * falls back to `<HOME>/.claude` (HOME being the env map's, if it sets one).
+ * Setting it to `<HOME>/.claude` explicitly is not equivalent: claude then
+ * reads `.claude.json` inside that dir instead of `<HOME>/.claude.json`, and
+ * hashes the value into a different macOS keychain service, which logs the
+ * account out (review R-M1). With a pin, `configDir` always wins: a harness
+ * `env` map that names a different `CLAUDE_CONFIG_DIR` would send claude to
+ * a folder the tailer, the session scan and the liveness probe never read.
+ * Without a pin, a caller env that already names a config dir is left alone.
+ * A blank value anywhere counts as unset, like the resolvers in
+ * harness-config-root.ts.
  */
 export function pinClaudeConfigDir(
   argv: readonly string[],
@@ -597,12 +604,33 @@ export function pinClaudeConfigDir(
   configDir: string | null,
   processEnv: Record<string, string | undefined> = process.env,
 ): { argv: string[]; env: Record<string, string> } {
-  if (configDir) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: configDir } };
-  if (env.CLAUDE_CONFIG_DIR) return { argv: [...argv], env };
+  if (nonBlankRootValue(configDir)) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: configDir } };
+  if (nonBlankRootValue(env.CLAUDE_CONFIG_DIR)) return { argv: [...argv], env };
   const own = processEnv.CLAUDE_CONFIG_DIR;
-  if (own) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: own } };
+  const { CLAUDE_CONFIG_DIR: _blank, ...rest } = env;
+  if (nonBlankRootValue(own)) return { argv: [...argv], env: { ...rest, CLAUDE_CONFIG_DIR: own } };
   // `env` execs claude in place, so the pane's pid is still claude's.
-  return { argv: ["/usr/bin/env", "-u", "CLAUDE_CONFIG_DIR", ...argv], env };
+  return { argv: ["/usr/bin/env", "-u", "CLAUDE_CONFIG_DIR", ...argv], env: rest };
+}
+
+/**
+ * The directories a claude launched with `launch` (the output of
+ * `pinClaudeConfigDir`) reads, modelled on the CLI itself: the config dir is
+ * `CLAUDE_CONFIG_DIR`, else `<HOME>/.claude`; `.claude.json` sits in
+ * `CLAUDE_CONFIG_DIR`, else in `<HOME>`. HOME is the launch env's, else
+ * `realHome` (the tmux server's, which is Agetor's own). The tailer reads the
+ * session JSONL from `configDir`, and the parity test pins these to
+ * `claudeConfigDirFor` / `claudeJsonDirFor` for every account shape.
+ */
+export function claudeReadRootsForLaunch(
+  launch: { argv: readonly string[]; env: Record<string, string> },
+  realHome: string = homedir(),
+): { configDir: string; claudeJsonDir: string } {
+  const unset = launch.argv[0] === "/usr/bin/env" && launch.argv[1] === "-u" && launch.argv[2] === "CLAUDE_CONFIG_DIR";
+  const pinned = unset ? undefined : launch.env.CLAUDE_CONFIG_DIR;
+  const home = nonBlankRootValue(launch.env.HOME) ? launch.env.HOME : realHome;
+  if (nonBlankRootValue(pinned)) return { configDir: pinned, claudeJsonDir: pinned };
+  return { configDir: path.join(home, ".claude"), claudeJsonDir: home };
 }
 
 interface ContentBlock {
@@ -7998,6 +8026,30 @@ const INPUT_BOX_BORDER_RE = /^[\s ]*─{8,}/;
 /** A transcript/tool gutter row: walking up from the box stops there, so the
  *  hint slot never reaches into the transcript above it. */
 const TRANSCRIPT_GUTTER_RE = /^[\s ]*(?:⎿|│|\||>|⏺|●|❯)/u;
+/** Claude's working spinner row (`✻ Thinking… (esc to interrupt)`,
+ *  `✶ Composing…`): a spinner glyph, a word, an ellipsis. It sits between the
+ *  transcript and the hint slot, so the walk up from the box stops there
+ *  (review R-S8). */
+const SPINNER_ROW_RE = /^[\s ]*[✻✶✳✢✽·*∗][\s ]+\S[^\n]*…/u;
+
+/**
+ * Whether the non-blank row at `index` continues a transcript entry: the
+ * contiguous run of non-blank rows above it (no blank row in between)
+ * reaches a gutter row (`⏺` message, `⎿` tool result, …). Claude draws a
+ * wrapped assistant line or a multi-line tool result as indented rows with no
+ * glyph of their own directly under that gutter row, so such a row is
+ * transcript even though it starts with only spaces (review R-S8). The hint
+ * slot is separated from the transcript by a blank row or the spinner row.
+ */
+function continuesTranscriptEntry(lines: string[], index: number): boolean {
+  for (let j = index - 1; j >= 0; j--) {
+    const row = lines[j]!;
+    if (row.trim().length === 0) return false;
+    if (SPINNER_ROW_RE.test(row) || INPUT_BOX_BORDER_RE.test(row)) return false;
+    if (TRANSCRIPT_GUTTER_RE.test(row)) return true;
+  }
+  return false;
+}
 
 type PaneLimitNoticeKind = "auto-continue" | "stopped" | "wrap-up";
 
@@ -8063,7 +8115,8 @@ function noticeFrom(rows: string[], start: number): PaneLimitNotice | null {
  *
  * Two places count, both chrome anchored to the input box: the hint slot (up
  * to {@link PANE_LIMIT_HINT_ROWS} non-blank rows directly above the box's top
- * border, stopping at the first transcript/tool-gutter row) and the footer
+ * border, stopping at the first transcript/tool-gutter row, at the spinner
+ * row, and at an indented row that continues a transcript entry) and the footer
  * (below the box's bottom border, where a notification can share the status
  * bar's row after a run of spaces).
  */
@@ -8076,7 +8129,8 @@ function paneHarnessLimitNotice(tail: string): PaneLimitNotice | null {
   for (let i = box.top - 1; i >= 0 && hint.length < PANE_LIMIT_HINT_ROWS; i--) {
     const row = lines[i]!;
     if (row.trim().length === 0) continue;
-    if (TRANSCRIPT_GUTTER_RE.test(row) || INPUT_BOX_BORDER_RE.test(row)) break;
+    if (TRANSCRIPT_GUTTER_RE.test(row) || INPUT_BOX_BORDER_RE.test(row) || SPINNER_ROW_RE.test(row)) break;
+    if (continuesTranscriptEntry(lines, i)) break;
     hint.unshift(row);
   }
   for (let i = 0; i < hint.length; i++) {
@@ -8589,10 +8643,10 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // The JSONL path is deterministic from cwd + session uuid (we passed
   // `--session-id <uuid>` for new sessions, and `--resume <id>` reopens an
   // existing file at the same path). No mtime poll, no freshest-file pick.
-  // Tail the dir claude was actually launched with: a home-less harness
-  // whose `env` map names a `CLAUDE_CONFIG_DIR` writes there, not to this
-  // process's dir.
-  const sessionConfigDir = opts.configDir ?? fullEnv.CLAUDE_CONFIG_DIR ?? null;
+  // Tail the dir claude was actually launched with: the pin, else the
+  // process value it was handed, else `<HOME>/.claude` with the launch env's
+  // HOME (an account whose env map sets only `HOME` writes there).
+  const sessionConfigDir = claudeReadRootsForLaunch(launchCommand).configDir;
   const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, sessionConfigDir);
 
   // When the JSONL already exists at spawn time, we're resuming a prior
@@ -9103,8 +9157,11 @@ export interface ReattachOptions {
   taskId: string;
   cwd: string;
   sessionId: string;
-  /** Per-harness CLAUDE_CONFIG_DIR (sourced from `Harness.home`). See
-   *  `SpawnOptions.configDir` for the full semantics. */
+  /** The directory the session's claude reads and writes sessions in:
+   *  `claudeConfigDirFor(harness)` (harness-config-root.ts), NOT the spawn
+   *  pin `claudeConfigDirOverrideFor`, which is null for an account whose env
+   *  map sets only `HOME`. Null means this process's default (its
+   *  `CLAUDE_CONFIG_DIR`, else `~/.claude`). */
   configDir: string | null;
   /** Per-run chunk handler that persists to run_events + broadcasts on SSE.
    *  Built by the orchestrator the same way it does for fresh runs. */

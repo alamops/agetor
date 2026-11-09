@@ -29,7 +29,7 @@ import {
 } from "../shared/types.ts";
 import { isHarnessAuthEnvKey, isLoginBearingSettingsKey } from "../shared/harness-mirror.ts";
 import { resolveBin } from "./agents.ts";
-import { childEnv, coreSpawnSync } from "./core-spawn.ts";
+import { childEnv, coreSpawn } from "./core-spawn.ts";
 import {
   claudeConfigDirEnvFor,
   claudeConfigDirFor,
@@ -193,64 +193,152 @@ function readJsonObject(p: string): Record<string, unknown> | null {
 }
 
 /** Outcome of an existence-only keychain lookup: found, not found, or
- *  unknown (any error, a timeout, a locked keychain). */
-export type KeychainProbe = (service: string) => boolean | null;
+ *  unknown (any error, a timeout, a locked keychain). A probe may answer
+ *  synchronously (test fixtures) or with a promise (the real `security`
+ *  lookup, which never runs on the main thread's critical path). */
+export type KeychainProbe = (service: string) => boolean | null | Promise<boolean | null>;
+
+/** Runs `argv` and reports how it ended: its exit code, or null when it was
+ *  killed (the timeout) or could not start. The real one is `coreSpawn`. */
+export type SecurityRunner = (argv: string[], timeoutMs: number) => Promise<number | null>;
 
 const KEYCHAIN_PROBE_TIMEOUT_MS = 2_000;
 const KEYCHAIN_PROBE_CACHE_MS = 60_000;
 /** `security` exits 44 (errSecItemNotFound) when no item has the service. */
 const SECURITY_ITEM_NOT_FOUND = 44;
+const SECURITY_BIN = "/usr/bin/security";
+
+/** The real runner: `coreSpawn` (disclaimed, scrubbed env), all output
+ *  discarded, killed after `timeoutMs`. Never throws. Exported for its own
+ *  test only (it runs any argv; production passes it nothing but
+ *  `/usr/bin/security`). */
+export async function runSecurity(argv: string[], timeoutMs: number): Promise<number | null> {
+  let proc: ReturnType<typeof coreSpawn>;
+  try {
+    proc = coreSpawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: childEnv() });
+  } catch {
+    return null;
+  }
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { proc.kill(); } catch { /* already gone */ }
+  }, timeoutMs);
+  try {
+    const code = await proc.exited;
+    if (timedOut || proc.signalCode) return null;
+    return typeof code === "number" ? code : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * Ask the macOS keychain whether a generic-password item with this service
  * exists. Existence only: no `-w`/`-g`, so the secret is never read (and no
  * keychain ACL prompt can appear), and all output is discarded. The absolute
  * `/usr/bin/security` keeps a binary an agent planted on PATH out of it.
+ * Exit 0 = found, 44 (errSecItemNotFound) = not found, anything else
+ * (a locked keychain, a timeout, a spawn failure) = unknown.
  */
-function securityItemExists(service: string): boolean | null {
+export async function securityItemExists(
+  service: string,
+  run: SecurityRunner = runSecurity,
+): Promise<boolean | null> {
   try {
-    const result = coreSpawnSync("/usr/bin/security", ["find-generic-password", "-s", service], {
-      stdio: ["ignore", "ignore", "ignore"],
-      env: childEnv(),
-      timeout: KEYCHAIN_PROBE_TIMEOUT_MS,
-    });
-    if (result.error || result.signal) return null;
-    if (result.status === 0) return true;
-    if (result.status === SECURITY_ITEM_NOT_FOUND) return false;
+    const code = await run([SECURITY_BIN, "find-generic-password", "-s", service], KEYCHAIN_PROBE_TIMEOUT_MS);
+    if (code === 0) return true;
+    if (code === SECURITY_ITEM_NOT_FOUND) return false;
     return null;
   } catch {
     return null;
   }
 }
 
+let loginEvidencePlatform: NodeJS.Platform | null = null;
+let securityRunner: SecurityRunner | null = null;
+
 /** Under `bun test` the real keychain is never consulted: a test that does
- *  not inject a probe sees "no item", which keeps a credential-less fixture
- *  account logged out exactly as on Linux. */
-function defaultKeychainProbe(service: string): boolean | null {
+ *  not inject a probe (or a runner) sees "no item", which keeps a
+ *  credential-less fixture account logged out exactly as on Linux. An
+ *  injected runner exercises the real argv and exit-code mapping. */
+function defaultKeychainProbe(service: string): boolean | null | Promise<boolean | null> {
+  if (securityRunner) return securityItemExists(service, securityRunner);
   if (process.env.NODE_ENV === "test") return false;
   return securityItemExists(service);
 }
 
-let loginEvidencePlatform: NodeJS.Platform | null = null;
 let keychainProbe: KeychainProbe = defaultKeychainProbe;
 const keychainProbeCache = new Map<string, { value: boolean | null; at: number }>();
+/** One lookup in flight per service (single-flight). */
+const keychainProbeInFlight = new Map<string, Promise<void>>();
+/** Bumped by the test seam so a lookup started under an old seam can never
+ *  write into the fresh cache. */
+let keychainProbeGeneration = 0;
 
-/** Test seam: pin the platform and/or the keychain probe (null restores the
- *  defaults). Always clears the probe cache. */
+/** Test seam: pin the platform, the keychain probe and/or the `security`
+ *  runner (null restores the defaults). Always clears the probe cache and
+ *  forgets in-flight lookups. */
 export function setLoginEvidenceDepsForTests(
-  deps: { platform?: NodeJS.Platform; keychainProbe?: KeychainProbe } | null,
+  deps: { platform?: NodeJS.Platform; keychainProbe?: KeychainProbe; securityRunner?: SecurityRunner } | null,
 ): void {
   loginEvidencePlatform = deps?.platform ?? null;
   keychainProbe = deps?.keychainProbe ?? defaultKeychainProbe;
+  securityRunner = deps?.securityRunner ?? null;
   keychainProbeCache.clear();
+  keychainProbeInFlight.clear();
+  keychainProbeGeneration++;
 }
 
+/** Test seam: resolves once every keychain lookup in flight has landed in
+ *  the cache. */
+export async function settleKeychainProbesForTests(): Promise<void> {
+  while (keychainProbeInFlight.size > 0) {
+    await Promise.all([...keychainProbeInFlight.values()]);
+  }
+}
+
+/** Start a background lookup for `service` unless one is already running. */
+function refreshKeychainProbe(service: string, result: Promise<boolean | null>): void {
+  const generation = keychainProbeGeneration;
+  const flight = result
+    .catch(() => null)
+    .then((value) => {
+      if (generation !== keychainProbeGeneration) return;
+      keychainProbeCache.set(service, { value, at: Date.now() });
+    })
+    .finally(() => {
+      if (keychainProbeInFlight.get(service) === flight) keychainProbeInFlight.delete(service);
+    });
+  keychainProbeInFlight.set(service, flight);
+}
+
+/**
+ * The keychain answer for `service` without ever blocking the caller: a fresh
+ * cached answer is returned as is. Otherwise a lookup is started in the
+ * background (one per service at a time) and the caller gets the stale
+ * cached answer, or null (unknown, which never skips an account) when there
+ * is none. A probe that answers synchronously (a test fixture) is cached and
+ * returned at once.
+ */
 function cachedKeychainProbe(service: string, now = Date.now()): boolean | null {
   const hit = keychainProbeCache.get(service);
   if (hit && now - hit.at < KEYCHAIN_PROBE_CACHE_MS) return hit.value;
-  const value = keychainProbe(service);
-  keychainProbeCache.set(service, { value, at: now });
-  return value;
+  if (keychainProbeInFlight.has(service)) return hit?.value ?? null;
+  let answer: boolean | null | Promise<boolean | null>;
+  try {
+    answer = keychainProbe(service);
+  } catch {
+    answer = null;
+  }
+  if (answer instanceof Promise) {
+    refreshKeychainProbe(service, answer);
+    return hit?.value ?? null;
+  }
+  keychainProbeCache.set(service, { value: answer, at: now });
+  return answer;
 }
 
 /**
@@ -277,10 +365,14 @@ export function claudeKeychainServiceFor(harness: HarnessRootSource, configDir: 
  *  root). Only an explicit `false` skips a member.
  *
  *  On macOS a pinned Claude config dir with no `.credentials.json` is decided
- *  by an existence-only keychain lookup (`claudeKeychainEvidence`), cached for
- *  a minute per service; the CLI keeps such a login there and writes no file.
- *  It runs only off the runtime hot path: stack list/create/update warnings
- *  and the failover planner's member check.
+ *  by an existence-only keychain lookup (`claudeKeychainEvidence`); the CLI
+ *  keeps such a login there and writes no file. The lookup is an async
+ *  `security` spawn that never blocks this call: the answer is read from a
+ *  per-service cache (fresh for a minute), and a miss or a stale entry starts
+ *  one background refresh per service and returns the stale answer, or null
+ *  (unknown, which never skips an account) until the first lookup lands. Its
+ *  readers are the stack list/create/update warnings (`GET /harnesses`) and
+ *  the failover planner's member check.
  *
  *  The account's own `settings.json` `env` block, its `harness.env` map and
  *  Agetor's process env are login sources exactly like `.credentials.json`: a
@@ -319,8 +411,9 @@ export function loginEvidence(harness: Harness): boolean | null {
     if (settings) {
       const settingsEnv = isPlainObject(settings.env) ? settings.env : {};
       if (hasKindAuthKey(settingsEnv, "claude-code")) return true;
-      // `apiKeyHelper` / `awsCredentialExport` / `awsAuthRefresh` produce or
-      // select a credential at run time — a login the file check cannot see.
+      // `apiKeyHelper` / `forceLoginOrgUUID` / `awsCredentialExport` /
+      // `awsAuthRefresh` / `gcpAuthRefresh` produce or select a credential at
+      // run time — a login the file check cannot see.
       if (isLoginBearingSettingsKeyIn(settings)) return true;
       if (hasUninspectableLogin({ ...settingsEnv, ...harnessEnv, ...processEnv }, "claude-code")) return null;
     } else if (pathExistsNoFollow(settingsPath)) {
@@ -481,7 +574,7 @@ function stackWarnings(members: HarnessStackMember[], mirrorMode: HarnessMirrorM
   if (mirrorMode === "full") {
     warnings.push({
       code: "full-mirror-hooks",
-      message: "Full mirror copies user-level hooks and permissions onto every backup; use Safe mirror to skip them.",
+      message: "Full mirror copies settings hooks, permissions, status line and helper commands (Codex: notify) onto every backup.",
     });
   }
   for (const member of members) {

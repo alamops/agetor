@@ -41,7 +41,7 @@ import {
 import { refreshOpencodeSubagents, registerOpencodeSubagent } from "./opencode-subagents.ts";
 import { attachOpencodeServerLinger, attachOpencodeServerTurn, spawnOpencodeServerTurn, type OpencodeServerTurn } from "./opencode-driver.ts";
 import { copilotHome } from "./copilot-home.ts";
-import { claudeConfigDirOverrideFor, ROOT_ENV_KEYS } from "./harness-config-root.ts";
+import { claudeConfigDirFor, claudeConfigDirOverrideFor, claudeRootFor, ROOT_ENV_KEYS } from "./harness-config-root.ts";
 import { fakeCopilotScript, playFakeCopilotTurn } from "./copilot-fake.ts";
 import { copilotUsagePath, spawnCopilotViaTmux, type CopilotSubagentSink } from "./copilot-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
@@ -431,7 +431,9 @@ function warnUnknownHarnessKind(kind: string): void {
 // The config-root resolvers live in a db-free module so the usage tracker can
 // import them; re-exported here for the spawn paths and existing importers.
 // They mirror `harnessEnv` below exactly (docs/architecture/harness-stacks.md).
-export { claudeConfigDirOverrideFor };
+// `claudeConfigDirOverrideFor` is the spawn PIN only (env map, else home);
+// every file reader uses `claudeConfigDirFor` (CR1, review R-M1).
+export { claudeConfigDirFor, claudeConfigDirOverrideFor };
 export { codexHomeOverrideFor } from "./harness-config-root.ts";
 
 /**
@@ -1360,6 +1362,19 @@ function bumpFakeLimitTurn(taskId: string): number {
   const next = (fakeLimitTurnCounts.get(taskId)?.turn ?? 0) + 1;
   fakeLimitTurnCounts.set(taskId, { turn: next, at: now });
   return next;
+}
+
+/**
+ * Where the fake claude driver writes its swap transcript: the directory a
+ * real spawn of this harness would write sessions to (`claudeConfigDirFor`),
+ * but only when the account names its own root (an env-map
+ * `CLAUDE_CONFIG_DIR`, a `home`, or an env-map `HOME`). The built-in account
+ * would write into the user's real `~/.claude` (or Agetor's own
+ * `CLAUDE_CONFIG_DIR`), so it gets null and no transcript.
+ */
+export function fakeTranscriptDirFor(harness: Pick<Harness, "home" | "env">): string | null {
+  const root = claudeRootFor(harness);
+  return root.source === "default" || root.source === "process" ? null : root.configDir;
 }
 
 /**
@@ -2547,6 +2562,8 @@ function makeFakeAgent(
     const clean =
       process.env.AGETOR_FAKE_CLAUDE_LIMIT_CLEAN === "1"
       || prompt.includes(FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER);
+    // Codex already reported its thread id at spawn (the codex branch of
+    // `spawnAgent`), so only Claude reports the swap transcript's session here.
     const sessionId = fakeOpts.resumeSessionId ?? `fake-swap-${taskId}`;
     if (fakeOpts.kind !== "codex") {
       try {
@@ -2560,8 +2577,6 @@ function makeFakeAgent(
       } catch {
         // The transcript seam is best-effort; the signal below still fires.
       }
-    } else {
-      fakeOpts.onSessionId?.(sessionId);
     }
     after(5, () => {
       onChunk("assistant", "Working on the task.");
@@ -2584,11 +2599,19 @@ function makeFakeAgent(
         resolveDone(0);
         return;
       }
+      // The real CLI prose, classified by the real classifier: no fallback, so
+      // a classifier regression fails the swap tests instead of being masked
+      // (review R-S15).
       const signal = classifyHarnessLimitSignal(fakeOpts.kind ?? "claude-code", {
         text: fakeOpts.kind === "codex"
           ? "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:00 PM."
           : "Usage limit reached · continuing automatically when it resets",
-      }) ?? { reason: "quota" as const, resetAtMs: null, message: "usage limit reached", source: "claude-pane" as const };
+      });
+      if (!signal) {
+        onChunk("stderr", "fake limit text did not classify as a harness limit");
+        resolveDone(1);
+        return;
+      }
       // The classifier labels a Claude text signal `claude-api-error`; the
       // pane marker/env selects the REPL-paused variant so a settlement's
       // passthrough branch can be tested for dropping the paused session.
@@ -4180,7 +4203,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
         mode: opts.mode ?? defaultModeFor(harness.kind),
         cwd,
         kind: "claude-code",
-        configDir: claudeConfigDirOverrideFor(harness),
+        configDir: fakeTranscriptDirFor(harness),
         onSessionId,
         resumeSessionId: opts.resumeSessionId ?? null,
       });
@@ -4433,8 +4456,10 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       buildCommand(harness, prompt, opts);
       // Hand the orchestrator a thread id so it persists `codex_session_id` and
       // can route follow-ups through `codex exec resume` — mirrors what a real
-      // `thread.started` event would deliver.
-      onSessionId?.(`fake-codex-thread-${taskId}`);
+      // `thread.started` event would deliver. A resumed turn reports the thread
+      // it resumed (`codex exec resume <id>` keeps the id), so a test can tell
+      // whether a successor really resumed a transferred thread (review R-S15).
+      onSessionId?.(opts.resumeSessionId ?? `fake-codex-thread-${taskId}`);
       // `kind` is what arms the fake's codex-only resolve delay
       // (`AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS`).
       return makeFakeAgent(taskId, prompt, onChunk, {
@@ -4442,6 +4467,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
         mode: opts.mode ?? defaultModeFor(harness.kind),
         cwd,
         kind: harness.kind,
+        resumeSessionId: opts.resumeSessionId ?? null,
       });
     }
     // Resolve git dirs outside the cwd (the source repo's `.git` for a linked

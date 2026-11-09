@@ -36,6 +36,7 @@ import {
 import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
 import { resolveTemplateInitialHome } from "@/lib/harness-template";
 import { harnessEditorDirty } from "@/lib/harness-editor-dirty";
+import { stackPositionFor } from "@/lib/stack-badge";
 import {
   SETTINGS_SECTIONS,
   activeSection,
@@ -1512,12 +1513,10 @@ function HarnessesSection({
   // Local to this section: the table fetches on expand, and the scan behind
   // it stats every transcript file — never fetched with the list.
   const [usageOpenFor, setUsageOpenFor] = useState<string | null>(null);
-  const stackByHarness = new Map<string, { stackId: string; position: number; count: number }>();
-  for (const stack of payload.stacks ?? []) {
-    // A one-account stack cannot fail over: no `1/1` chip promising it does.
-    if (stack.members.length < 2) continue;
-    stack.members.forEach((m, i) => stackByHarness.set(m.harnessId, { stackId: stack.id, position: i + 1, count: stack.members.length }));
-  }
+  // The `n/m` chip per account. `stackPositionFor` owns the "fewer than two
+  // members → no chip" rule (via the shared `stackPositionText`): a
+  // one-account stack cannot fail over, so it gets no `1/1` chip.
+  const stacks = payload.stacks ?? [];
   const coolingByHarness = new Map((payload.limitStates ?? []).map((s) => [s.harnessId, s] as const));
   return (
     <div className="space-y-4 pt-3 text-sm">
@@ -1538,6 +1537,7 @@ function HarnessesSection({
           {payload.harnesses.map((h) => {
             const status = statusByHarness.get(h.id);
             const available = status?.available ?? false;
+            const stackAt = stackPositionFor(stacks, h.id);
             return (
               <div
                 key={h.id}
@@ -1574,13 +1574,13 @@ function HarnessesSection({
                         not logged in
                       </span>
                     )}
-                    {stackByHarness.has(h.id) && (
+                    {stackAt && (
                       <span
                         data-testid="harness-stack-chip"
                         className="rounded border border-info/40 px-1.5 py-0.5 text-[10px] font-medium text-info"
                         title="Harness account stack — fails over to the next account at its limit"
                       >
-                        {stackByHarness.get(h.id)!.position}/{stackByHarness.get(h.id)!.count}
+                        {stackAt.text}
                       </span>
                     )}
                     {coolingByHarness.has(h.id) && (

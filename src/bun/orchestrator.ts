@@ -22,11 +22,13 @@ import {
 } from "./db.ts";
 import { isHiddenContinuationUserText as dbIsHiddenContinuationUserText } from "./db.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
+// File READERS (JSONL paths, tailers, watchers) resolve the account's config
+// dir through `claudeConfigDirFor`; only the spawn pins the override (CR1).
+import { claudeConfigDirFor } from "./harness-config-root.ts";
 import {
   spawnAgent,
   toClaudeModelArg,
   claudeModelPickerFamily,
-  claudeConfigDirOverrideFor,
   opencodeDriverHooks,
   opencodeEffectiveServerFor,
   opencodeTransportOfTurn,
@@ -87,6 +89,7 @@ import {
   formatStackExhausted,
   formatStackUnusable,
   isHarnessStackContinuation,
+  neutralizeHarnessStackContinuationTags,
   stripHarnessStackContinuation,
   wrapHarnessStackContinuation,
 } from "../shared/harness-stack.ts";
@@ -1217,7 +1220,11 @@ export async function reconcileOrphans(): Promise<number> {
               taskId: row.task_id,
               cwd,
               sessionId: row.claude_session_id as string,
-              configDir: harness ? claudeConfigDirOverrideFor(harness) : null,
+              // Reattach only TAILS the JSONL (no spawn, no pin), so it reads
+              // where the live claude actually writes: an env-map-HOME-only
+              // account writes under `<HOME>/.claude`, which the spawn-pin
+              // value (null there) would miss (CR1).
+              configDir: harness ? claudeConfigDirFor(harness) : null,
               onChunk,
               seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
               mode: task.mode,
@@ -1456,7 +1463,7 @@ export async function reconcileOrphans(): Promise<number> {
         await attachSubagentWatcher({
           taskId: heldId,
           runId: run.id,
-          jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness ? claudeConfigDirOverrideFor(harness) : null),
+          jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness ? claudeConfigDirFor(harness) : null),
         }).ready;
         reArmed++;
       } else {
@@ -1490,7 +1497,7 @@ export async function reconcileOrphans(): Promise<number> {
       await attachSubagentWatcher({
         taskId: heldId,
         runId: run.id,
-        jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness ? claudeConfigDirOverrideFor(harness) : null),
+        jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness ? claudeConfigDirFor(harness) : null),
       }).ready;
       reArmed++;
     } else {
@@ -3069,12 +3076,42 @@ export function isRawTextLimitChunk(
  * heuristic had no signal to match. `mode` is retained on the signature for
  * symmetry with the claude path and possible future use.
  */
+/** A run's chunk handler, as the driver receives it. */
+type RunChunkHandler = (stream: RunEvent["stream"], data: string, lineUuid?: string) => void;
+
+/**
+ * Test seam: observe every per-run chunk handler as it is created, so an
+ * orchestrator-level test can feed a live fake run a chunk its driver has no
+ * marker for (e.g. a Codex limit signal on a turn that then completes) and
+ * exercise the real chunk handler and done handler together.
+ */
+type ChunkHandlerTap = (runId: string, taskId: string, handler: RunChunkHandler) => void;
+let chunkHandlerTap: ChunkHandlerTap | null = null;
+
+/** Test-only: install/clear {@link chunkHandlerTap}. Returns the previous tap. */
+export function __setChunkHandlerTapForTest(tap: ChunkHandlerTap | null): ChunkHandlerTap | null {
+  const prev = chunkHandlerTap;
+  chunkHandlerTap = tap;
+  return prev;
+}
+
 function makeChunkHandler(
   runId: string,
   taskId: string,
   kind: AgentKind,
+  mode: Task["mode"],
+): RunChunkHandler {
+  const handler = makeChunkHandlerInner(runId, taskId, kind, mode);
+  chunkHandlerTap?.(runId, taskId, handler);
+  return handler;
+}
+
+function makeChunkHandlerInner(
+  runId: string,
+  taskId: string,
+  kind: AgentKind,
   _mode: Task["mode"],
-) {
+): RunChunkHandler {
   return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
     let eventId: number | null;
     try {
@@ -3545,7 +3582,20 @@ async function noteRunSettledCheckout(taskId: string): Promise<void> {
  * replayed (in order) once the new run settles. Never dropped: a Stop,
  * archive or delete re-stashes it to the task's backlog.
  */
-const swapFollowUps = new Map<string, Array<{ text: string; at: number }>>();
+const swapFollowUps = new Map<string, HeldFollowUp[]>();
+
+/**
+ * One message held during a start/swap window. `hidden` marks agetor's own
+ * clean-retry remainder (review N2: the folded follow-ups that ride after a
+ * slash command sent alone); its `text` is the user's own words, wrapped in
+ * the hidden continuation only when it is delivered, so a stash puts the
+ * plain words back in the tray (a wrapper there would be refused on resend).
+ */
+interface HeldFollowUp {
+  text: string;
+  at: number;
+  hidden?: boolean;
+}
 
 /**
  * A Stop pressed while a swap has failed the old run but not yet spawned the
@@ -3582,6 +3632,10 @@ const accountSwitchTaskIds = new Set<string>();
  */
 export function claimTaskForAccountSwitch(taskId: string): boolean {
   if (startingTaskIds.has(taskId)) return false;
+  // A held task's REPL is still hosting background agents: the switch would
+  // drop it and abandon them (review N3). The PATCH route refuses with its
+  // own 409 first; this keeps every other caller out too.
+  if (isHeldByBackgroundAgents(taskId)) return false;
   startingTaskIds.add(taskId);
   accountSwitchTaskIds.add(taskId);
   return true;
@@ -3644,10 +3698,12 @@ const harnessRetriesInFlight = new Set<string>();
  * fires on the no-swap-target passthrough branches), `"after-transfer"` runs
  * after the mirror/transfer awaits and before the spawn decision, and
  * `"before-block"` runs just before the all-exhausted branch writes its
- * blocked column / arms a retry. The hook receives the task and old run id,
+ * blocked column / arms a retry. `"retry-before-commit"` runs inside the
+ * all-exhausted retry's `beforeCommit`, after its mirror/transfer and before
+ * the move is committed. The hook receives the task and old run id,
  * so a test can Stop or archive at exactly that point.
  */
-type HarnessSwapSettlePhase = "settle" | "after-transfer" | "before-block";
+type HarnessSwapSettlePhase = "settle" | "after-transfer" | "before-block" | "retry-before-commit";
 let harnessSwapSettleHook:
   | ((taskId: string, runId: string, phase: HarnessSwapSettlePhase) => void | Promise<void>)
   | null = null;
@@ -3721,13 +3777,30 @@ export function __setHarnessSwapPromptHookForTest(
   return prev;
 }
 
-function pushSwapFollowUp(taskId: string, text: string): void {
+function pushSwapFollowUp(taskId: string, text: string, hidden = false): void {
   const q = swapFollowUps.get(taskId) ?? [];
-  q.push({ text, at: Date.now() });
+  q.push({ text, at: Date.now(), ...(hidden ? { hidden: true } : {}) });
   swapFollowUps.set(taskId, q);
 }
 
-/** Deliver the follow-ups held during a start/swap, one turn at a time. */
+/** Send one held message on `runId` through the normal follow-up path (fold
+ *  into a live Claude turn, queue behind a live Codex turn, …). A `hidden`
+ *  item goes out as the hidden continuation, which only agetor may send. */
+function sendHeldFollowUp(runId: string, item: HeldFollowUp, bypassSwapHold: boolean): Promise<SendInputResult> {
+  if (item.hidden) {
+    return sendInputWith(
+      runId,
+      wrapHarnessStackContinuation(neutralizeHarnessStackContinuationTags(item.text)),
+      {},
+      { allowHiddenContinuation: true, bypassSwapHold },
+    );
+  }
+  return sendInputWith(runId, item.text, {}, { bypassSwapHold });
+}
+
+/** Deliver the follow-ups held during a start/swap, one turn at a time. The
+ *  settle-time fallback: {@link deliverHeldFollowUpsToSuccessor} normally
+ *  hands them to the live successor long before this runs. */
 async function drainSwapFollowUps(taskId: string): Promise<void> {
   const q = swapFollowUps.get(taskId);
   if (!q || q.length === 0) return;
@@ -3739,9 +3812,50 @@ async function drainSwapFollowUps(taskId: string): Promise<void> {
       for (const rest of q.slice(i)) restashPasteWithheldText(taskId, rest.text);
       return;
     }
-    const result = await sendInput(task.runId, item.text, {});
+    const result = await sendHeldFollowUp(task.runId, item, false);
     if (!result.delivered) {
       for (const rest of q.slice(i)) restashPasteWithheldText(taskId, rest.text);
+      return;
+    }
+  }
+}
+
+/**
+ * Hand the messages held during a swap/retry window to the successor the
+ * moment it is registered (review R-S13), in the order they were typed,
+ * through the same path a mid-turn message takes: Claude folds them into the
+ * live turn, Codex queues them behind it. Waiting for the successor's whole
+ * turn to settle inverted their order against a message typed after the
+ * window closed, and a crash in that turn lost text the sender was told was
+ * delivered.
+ *
+ * Runs while the window is still open (the caller holds the claim), so a
+ * message typed meanwhile is held and delivered by the next iteration rather
+ * than racing ahead. Delivery bypasses the hold (`bypassSwapHold`) — sending
+ * through `sendInput` would only put it back in the queue. When the successor
+ * is no longer live the rest stay queued for the settle-time drain or the
+ * window-close stash (the existing fallback); a refused send puts the rest in
+ * the backlog tray.
+ */
+async function deliverHeldFollowUpsToSuccessor(taskId: string, runId: string): Promise<void> {
+  for (;;) {
+    const q = swapFollowUps.get(taskId);
+    if (!q || q.length === 0) {
+      swapFollowUps.delete(taskId);
+      return;
+    }
+    // An archive in between must not be undone by a send (`sendInput`
+    // un-archives); the window-close stash puts the rest in the tray.
+    const current = tasks.get(taskId);
+    if (!active.has(runId) || current?.runId !== runId || current.archivedAt != null || launchesFrozenFlag) return;
+    const item = q.shift()!;
+    if (q.length === 0) swapFollowUps.delete(taskId);
+    const result = await sendHeldFollowUp(runId, item, true);
+    if (!result.delivered) {
+      // Back at the head, then everything goes to the tray in typed order.
+      const rest = swapFollowUps.get(taskId) ?? [];
+      swapFollowUps.set(taskId, [item, ...rest]);
+      stashSwapFollowUps(taskId);
       return;
     }
   }
@@ -3811,9 +3925,35 @@ function undeliveredMidTurnFollowUps(runId: string): string[] {
       counts.set(key, seen - 2);
       continue;
     }
-    out.push(text);
+    // A hidden clean-retry remainder (N2) carries the user's own words inside
+    // the wrapper; hand on (or stash) the words, never the wrapper.
+    out.push(isHarnessStackContinuation(text) ? stripHarnessStackContinuation(text) : text);
   }
   return out;
+}
+
+/**
+ * Put the mid-turn follow-ups of `runId` that Claude never read into the
+ * task's backlog tray, then forget them (review R-S12). Called whenever a
+ * limit settlement ends without a successor that carries them — a block (all
+ * exhausted, transfer failed, the destination vanished), a Stop, a superseded
+ * or frozen swap, a successor that never started, a paused REPL dropped on the
+ * passthrough branch. Without it the REPL that held them in its input box was
+ * dropped and the text was gone although the sender saw it as sent.
+ */
+function stashUndeliveredMidTurnFollowUps(taskId: string, runId: string): void {
+  const texts = undeliveredMidTurnFollowUps(runId);
+  midTurnFollowUps.delete(runId);
+  if (texts.length === 0) return;
+  // `backlog.add` PREPENDS: restash newest first so the tray reads in send order.
+  let saved = 0;
+  for (const text of [...texts].reverse()) if (restashPasteWithheldText(taskId, text)) saved++;
+  if (saved === 0) return;
+  saveStatusLineQuietly(
+    runId,
+    taskId,
+    `${saved === 1 ? "a message claude had not read yet" : `${saved} messages claude had not read yet`} — saved to your backlog, resend from the tray`,
+  );
 }
 
 /** Why a user text is refused when it would become a hidden prompt. */
@@ -3931,6 +4071,8 @@ async function dropPausedLimitedSession(
   } catch (err) {
     console.warn(`[agetor] dropping the paused limited session for ${taskId} failed:`, err);
   }
+  // Whatever sat in the dropped REPL's input box is gone with it (R-S12).
+  stashUndeliveredMidTurnFollowUps(taskId, runId);
 }
 
 /**
@@ -3986,9 +4128,12 @@ async function handleHarnessLimitSettlement(args: {
     releaseStartingClaim(taskId);
     // A passthrough hands the held messages to the normal settle's drain;
     // every handled ending without a live successor stashes them now (M6).
+    // Mid-turn follow-ups Claude never read go to the tray too unless the
+    // successor carried them (it then already forgot them) — R-S12. They
+    // were typed before the held ones, so they are stashed first.
     if (outcome === "handled") {
+      stashUndeliveredMidTurnFollowUps(taskId, runId);
       stashHeldFollowUpsUnlessLive(taskId);
-      midTurnFollowUps.delete(runId);
     }
   }
 }
@@ -4165,10 +4310,21 @@ async function settleHarnessLimitInClaim(
       });
     if (copy) saveStatusLineQuietly(runId, taskId, copy);
   }
+  // Mid-turn follow-ups Claude never read: a clean retry re-sends every
+  // user text of this run (they are its persisted bubbles), so it carries
+  // them; a transfer retry resumes the copied transcript, which does not
+  // hold them, and no retry at all leaves them nowhere. Only the first case
+  // may skip the tray (the settlement's `finally` stashes the rest, R-S12).
+  const retryArmed = (persisted?.allExhausted?.nextAttemptAt ?? 0) > 0;
+  const retryCarriesThem = retryArmed
+    && fromKind === "claude-code"
+    && !conversationToPreserve(taskId, runId, current, harnessSessionColumnFor(fromKind) ?? "claude_session_id");
+  if (retryCarriesThem) midTurnFollowUps.delete(runId);
   // Messages typed during the swap are put back in the tray now, timer or
   // not: a retry can be hours away and the in-memory hold would die with the
   // process while the sender was told `delivered` (review M6). They then run
   // as normal messages once the user acts.
+  stashUndeliveredMidTurnFollowUps(taskId, runId);
   stashSwapFollowUps(taskId);
   return "handled";
 }
@@ -4344,12 +4500,13 @@ async function executeStackSwap(args: {
   saveStatusLineQuietly(runId, taskId, `switched from ${fromLabel} to ${toLabel}`);
   emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
 
-  const cleanRetryText = composeCleanRetryText(runs.mainUserTexts(runId), {
+  const cleanRetryParts = cleanRetryPartsOf(runs.mainUserTexts(runId), {
     // Codex queues a follow-up typed during a live turn as its own later
     // run; only Claude folds it into this one. Replaying a queued Codex
     // row here would duplicate it.
     firstOnly: fromKind !== "claude-code",
-  }) ?? fetched.prompt;
+  });
+  const cleanRetryText = cleanRetryParts.length > 0 ? cleanRetryParts.join("\n\n") : fetched.prompt;
   const transferredSessionId = moved.transferredSessionId;
   const hasToolUse = preserveConversation && transferredSessionId !== null;
   const spawned = await spawnSwapContinuation({
@@ -4364,11 +4521,17 @@ async function executeStackSwap(args: {
     transferredSessionId,
     hasToolUse,
     cleanRetryText,
+    cleanRetryParts,
     // Follow-ups Claude never wrote to the copied transcript (review S16).
     undelivered: hasToolUse && fromKind === "claude-code" ? undeliveredMidTurnFollowUps(runId) : [],
     position: member.position + 1,
     count,
   });
+  // A started successor carried this run's unread mid-turn follow-ups (the
+  // transfer prompt lists them, a clean retry re-sends every user text), so
+  // the settlement must not also stash them (R-S12). Any other outcome leaves
+  // them for the settlement's stash.
+  if (spawned === "started") midTurnFollowUps.delete(runId);
   if (spawned === "failed" && carried) {
     // The carried retry marker has no retry behind it here (only the
     // all-exhausted handler re-arms after a failed spawn): the blocked card
@@ -4455,6 +4618,11 @@ async function spawnSwapContinuation(args: {
   transferredSessionId: string | null;
   hasToolUse: boolean;
   cleanRetryText: string;
+  /** The clean-retry text's separate user messages, in send order
+   *  ({@link cleanRetryPartsOf}); `cleanRetryText` is their join (or the task
+   *  prompt when there are none). Lets a leading slash command go out alone
+   *  (review N2). */
+  cleanRetryParts?: readonly string[];
   position: number;
   count: number;
   /** Best-effort pre-swap warnings (mirror/transfer) to persist as status
@@ -4480,16 +4648,30 @@ async function spawnSwapContinuation(args: {
   // A second consecutive clean retry re-sends text that is already the
   // wrapper. Strip before wrapping, or the nested tag stops being recognised
   // as the machine prompt and becomes a visible bubble.
-  const retryBody = stripHarnessStackContinuation(args.cleanRetryText);
-  const prompt = args.hasToolUse
-    ? composeHarnessStackContinuationPrompt(args.undelivered ?? [])
+  const retryParts = (args.cleanRetryParts && args.cleanRetryParts.length > 0 ? args.cleanRetryParts : [args.cleanRetryText])
+    .map((part) => stripHarnessStackContinuation(part));
+  const retryBody = retryParts.join("\n\n");
+  // Folded follow-ups that ride after a slash command sent alone (N2).
+  let slashRemainder: string | null = null;
+  let prompt: string;
+  if (args.hasToolUse) {
+    prompt = composeHarnessStackContinuationPrompt(args.undelivered ?? []);
+  } else if (kind === "claude-code" && retryParts[0]!.trimStart().startsWith("/")) {
     // A slash command must reach the CLI as typed: wrapped in the hidden tag
     // it is plain text Claude never runs (review Q4). It stays a visible
     // bubble; the divider already says "Restarting the request on this
-    // account."
-    : kind === "claude-code" && retryBody.trimStart().startsWith("/")
-      ? retryBody.trimStart()
-      : wrapHarnessStackContinuation(retryBody);
+    // account." It goes out ALONE: the follow-ups folded into the limited
+    // turn would otherwise become its arguments (review N2). They follow it
+    // as a queued hidden continuation — the same wrapping every other clean
+    // retry uses — once the successor is live.
+    prompt = retryParts[0]!.trimStart();
+    const rest = retryParts.slice(1).join("\n\n").trim();
+    slashRemainder = rest === "" ? null : rest;
+  } else {
+    // User text quoting the tag is defused so the value stays exactly one
+    // wrapper (review N5), as the transfer branch's prompt does.
+    prompt = wrapHarnessStackContinuation(neutralizeHarnessStackContinuationTags(retryBody));
+  }
   harnessSwapPromptHook?.(taskId, prompt);
   const newRunId = randomUUID();
   const now = Date.now();
@@ -4686,7 +4868,34 @@ async function spawnSwapContinuation(args: {
   }
   registerActiveRun(newRunId, taskId, fresh, agent);
   attachDoneHandler(newRunId, taskId, agent);
+  // The folded follow-ups of a slash command sent alone go first: they were
+  // typed before anything held during this window (N2).
+  if (slashRemainder !== null) {
+    swapFollowUps.set(taskId, [{ text: slashRemainder, at: now, hidden: true }, ...(swapFollowUps.get(taskId) ?? [])]);
+  }
+  // Messages held during the window reach the live successor now, through
+  // the ordinary mid-turn path, not when its whole turn settles (R-S13).
+  await deliverHeldFollowUpsToSuccessor(taskId, newRunId);
   return "started";
+}
+
+/**
+ * The separate user messages a clean retry re-sends, in send order: each
+ * persisted main-stream user text canonicalized exactly as
+ * {@link composeCleanRetryText} does (wrapper stripped, deduped, blanks
+ * dropped), so `parts.join("\n\n")` equals `composeCleanRetryText(raws, opts)`.
+ */
+function cleanRetryPartsOf(raws: readonly string[], opts: { firstOnly?: boolean } = {}): string[] {
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of raws) {
+    const part = composeCleanRetryText([raw]);
+    if (part === null || seen.has(part)) continue;
+    seen.add(part);
+    parts.push(part);
+    if (opts.firstOnly) break;
+  }
+  return parts;
 }
 
 function attachDoneHandler(
@@ -5166,7 +5375,23 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // here means an internal/older caller — fall through to today's behavior.
     const beforeStack = harnessStacks.getByMember(before.agent);
     const afterStack = harnessStacks.getByMember(after.agent);
-    const sameStackSwitch = Boolean(beforeStack && afterStack && beforeStack.id === afterStack.id && !runs.hasRunning(taskId));
+    const sameStack = Boolean(beforeStack && afterStack && beforeStack.id === afterStack.id);
+    if (sameStack && isHeldByBackgroundAgents(taskId)) {
+      // The REPL still hosts background agents: the switch would drop it and
+      // abandon them mid-work (review N3). The PATCH route refuses this with a
+      // 409 before writing; a direct caller that got here anyway is refused
+      // too — the row goes back to its account and the session is untouched.
+      tasks.update(taskId, { agent: before.agent });
+      clearManualAccountSwitch(taskId);
+      const fromLabel = resolveHarness(before.agent)?.label ?? before.agent;
+      saveStatusLineQuietly(
+        after.runId ?? before.runId ?? "",
+        taskId,
+        `account switch refused: background agents are still running on ${fromLabel} — switch once they finish or after Stop`,
+      );
+      return;
+    }
+    const sameStackSwitch = sameStack && !runs.hasRunning(taskId);
     // Hold the start claim + switch marker for the whole switch: the transfer,
     // the successful state write AND the fallback teardown. The route normally
     // takes it before `tasks.update`; a direct caller (tests, an older path)
@@ -6176,6 +6401,11 @@ async function fireHarnessAutoRetry(taskId: string): Promise<void> {
     recoverFailedHarnessAutoRetry(taskId);
   } finally {
     swapWindowTaskIds.delete(taskId);
+    // A Stop recorded against this retry's window (`cancelRun` saw the swap
+    // window) that nothing consumed must not outlive it: a later, unrelated
+    // limit would read it as "cancelled by user" and skip its failover
+    // (review R-S14).
+    swapCancelRequested.delete(taskId);
     harnessRetriesInFlight.delete(taskId);
     releaseStartingClaim(taskId);
     // Messages typed during the retry window drain on a live successor;
@@ -6239,6 +6469,8 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     : false;
   const sessionId = preserveConversation && column ? findLastSessionIdForHarness(taskId, column, current) : null;
   const position = stack.members.findIndex((m) => m.harnessId === toHarness.id);
+  // Set by `beforeCommit` when a Stop recorded during the move aborted it.
+  let retryStopped = false as boolean;
 
   // The retry is a swap too: the move refreshes the destination's config
   // before moving the conversation (a mirror failure is a warning, never a
@@ -6255,9 +6487,16 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     cwd: task.worktreePath ?? task.workdir,
     // A pipeline Stop, an archive or a column move during the mirror/transfer
     // awaits clears the exhausted state. Do not resurrect it: no retry may
-    // start on a stopped run's behalf. A freeze leaves the schedule to the
-    // next owner's boot re-arm.
-    beforeCommit: () => {
+    // start on a stopped run's behalf. A plain Stop in that window is
+    // recorded on the swap (`swapCancelRequested`) and must stop the account
+    // move itself, not only the successor spawned after it (R-S14). A freeze
+    // leaves the schedule to the next owner's boot re-arm.
+    beforeCommit: async () => {
+      await harnessSwapSettleHook?.(taskId, lastRun?.id ?? "", "retry-before-commit");
+      if (swapCancelRequested.delete(taskId)) {
+        retryStopped = true;
+        return false;
+      }
       const beforeSpawn = tasks.get(taskId);
       return Boolean(
         beforeSpawn
@@ -6297,6 +6536,14 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     return;
   }
   if (moved.kind === "aborted") {
+    if (retryStopped) {
+      // Settle like a user Stop on a blocked card with an armed retry: the
+      // countdown and its exhausted state end, held messages go to the tray,
+      // the card stays where it is and the task keeps its account.
+      cancelHarnessRetryForTask(taskId);
+      if (lastRun) saveStatusLineQuietly(lastRun.id, taskId, "cancelled by user during the account retry");
+      return;
+    }
     if (!launchesFrozenFlag) cancelAutoRetry(taskId);
     return;
   }
@@ -6305,6 +6552,11 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   // selected, but another task may still be probing it. It clears on a
   // successful turn or its own reset.
   const transferredSessionId = moved.transferredSessionId;
+  // See the limit settlement: Codex's live-turn follow-ups are queued as
+  // their own turns, so only the first user text belongs to this retry.
+  const retryParts = cleanRetryPartsOf(lastRun ? runs.mainUserTexts(lastRun.id) : [], {
+    firstOnly: fromKind !== "claude-code",
+  });
   const outcome = await spawnSwapContinuation({
     taskId,
     task: tasks.get(taskId) ?? task,
@@ -6322,11 +6574,8 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
     transferredSessionId,
     hasToolUse: preserveConversation && transferredSessionId !== null,
     notes: moved.warnings,
-    cleanRetryText: composeCleanRetryText(lastRun ? runs.mainUserTexts(lastRun.id) : [], {
-      // See the limit settlement: Codex's live-turn follow-ups are queued as
-      // their own turns, so only the first user text belongs to this retry.
-      firstOnly: fromKind !== "claude-code",
-    }) ?? task.prompt,
+    cleanRetryText: retryParts.length > 0 ? retryParts.join("\n\n") : task.prompt,
+    cleanRetryParts: retryParts,
     position: position + 1,
     count: stack.members.length,
     sameAccount,
@@ -6427,6 +6676,17 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // already succeeded, so the card advances to `review`.
     const taskId = runs.get(runId)?.taskId;
     if (!taskId) return false;
+    // This process is handing off (`freezeLaunches`) and the settlement
+    // already left its persisted swap for the next owner (no claim holds the
+    // task any more): nothing here would ever read a recorded Stop, and the
+    // next owner's boot would finish the swap the user just stopped. Settle
+    // the Stop now, as a Stop before the successor existed (review N1).
+    const leftSwap = tasks.get(taskId)?.harnessState?.pendingSwap;
+    if (leftSwap && !leftSwap.manual && launchesFrozenFlag && !startingTaskIds.has(taskId)) {
+      cancelPendingForTask(taskId, "cancelled by user");
+      abortSwapForUserStop(taskId, leftSwap.runId);
+      return true;
+    }
     // A swap between the old run's failure and the successor's spawn: record
     // the stop so `spawnSwapContinuation` cancels the successor instead of
     // launching it on the backup account.
@@ -6719,6 +6979,30 @@ export async function sendInput(
   line: string,
   opts: { bounded?: boolean; onlyIfIdle?: boolean } = {},
 ): Promise<SendInputResult> {
+  return sendInputWith(runId, line, opts, {});
+}
+
+/**
+ * Agetor-internal capabilities of {@link sendInputWith}, never reachable from
+ * a caller of the exported `sendInput` (the HTTP route, the CLI, the tray):
+ *  - `allowHiddenContinuation`: agetor's own clean-retry remainder (N2) goes
+ *    out as the hidden wrapper the S1 refusal keeps every user path from
+ *    sending;
+ *  - `bypassSwapHold`: delivering a held message to the live successor while
+ *    the swap window is still open (R-S13) — through the hold it would only be
+ *    queued again.
+ */
+interface SendInputInternal {
+  allowHiddenContinuation?: boolean;
+  bypassSwapHold?: boolean;
+}
+
+async function sendInputWith(
+  runId: string,
+  line: string,
+  opts: { bounded?: boolean; onlyIfIdle?: boolean },
+  internal: SendInputInternal,
+): Promise<SendInputResult> {
   const row = db.query<{ task_id: string; agent: string }, [string]>(
     `SELECT task_id, agent FROM runs WHERE id = ?`,
   ).get(runId);
@@ -6730,7 +7014,9 @@ export async function sendInput(
   // Only agetor's own swap sends may produce the hidden continuation value;
   // every follow-up path (webview, CLI, tray, ask-card answers) funnels here
   // (review S1).
-  if (isHiddenContinuationUserText(line)) return { delivered: false, reason: HIDDEN_CONTINUATION_REFUSAL };
+  if (!internal.allowHiddenContinuation && isHiddenContinuationUserText(line)) {
+    return { delivered: false, reason: HIDDEN_CONTINUATION_REFUSAL };
+  }
 
   // Everything past the two cheap lookups above — the codex floor probe, the
   // teardown wait, the worktree restore, `@`-expansion and the per-kind
@@ -6748,7 +7034,7 @@ export async function sendInput(
   // tray item was saved with, which is what the re-stash dedupes against.
   const rawLine = line;
   const sendStartedAt = Date.now();
-  const inner = sendInputInner(row, task, line, opts.onlyIfIdle === true).catch(
+  const inner = sendInputInner(row, task, line, opts.onlyIfIdle === true, internal.bypassSwapHold === true).catch(
     (err): SendInputResult => ({
       delivered: false,
       reason: err instanceof Error ? err.message : String(err),
@@ -6819,6 +7105,7 @@ async function sendInputInner(
   task: Task,
   line: string,
   onlyIfIdle: boolean,
+  bypassSwapHold = false,
 ): Promise<SendInputResult> {
   // The claim column, not the JSON blob. Migration 070 (and 078 for
   // OpenCode) leaves a duplicate's losing row with the provenance set and
@@ -6868,10 +7155,14 @@ async function sendInputInner(
   // run that will actually execute it, so exactly one user bubble exists.
   // Writing one here too (on the OLD/displaced run) duplicated the message
   // once the drain sent it on the successor.
-  if (swapWindowTaskIds.has(row.task_id)) {
+  if (swapWindowTaskIds.has(row.task_id) && !bypassSwapHold) {
     const heldRunId = tasks.get(row.task_id)?.runId ?? task.runId;
     if (!heldRunId) return { delivered: false, reason: "the task is starting" };
-    pushSwapFollowUp(row.task_id, line);
+    // Only agetor's own hidden remainder can arrive here wrapped (the S1
+    // refusal stops every user path): hold its words with the flag, so a
+    // later stash restores plain text and a delivery re-wraps it once.
+    const hidden = isHiddenContinuationUserText(line);
+    pushSwapFollowUp(row.task_id, hidden ? stripHarnessStackContinuation(line) : line, hidden);
     // The response contract still names the run the message is addressed to;
     // it only becomes the successor's own bubble when the drain sends it.
     return { delivered: true, runId: heldRunId };

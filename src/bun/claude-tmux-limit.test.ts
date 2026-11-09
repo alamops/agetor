@@ -149,6 +149,83 @@ describe("claude pane usage-limit notice", () => {
     expect(__forTest.paneShowsHarnessLimitNotice(LIMIT_PANE)).toBe(true);
   });
 
+  test("glyph-less transcript rows (tool output, assistant continuation) never enter the hint slot (R-S8)", () => {
+    const box = [
+      "─".repeat(80),
+      "❯",
+      "─".repeat(80),
+      "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt",
+    ];
+    const pane = (rows: string[]) => [...rows, ...box].join("\n");
+    const cases: Record<string, string[]> = {
+      // A multi-line tool result whose second row is the notice text, then
+      // the spinner: the rows under `⎿` are transcript.
+      multiLineToolResult: [
+        "⏺ Bash(cat fixture.txt)",
+        "  ⎿  line one",
+        "     Usage limit reached · continuing automatically at 8am · esc to cancel",
+        "     line three",
+        "",
+        "✻ Thinking… (esc to interrupt)",
+        "",
+      ],
+      // A wrapped assistant line quoting the notice, then the spinner.
+      assistantContinuation: [
+        "⏺ The notice the REPL prints when the account is out of quota is",
+        "  Usage limit reached · limit resets 3pm",
+        "  so the detector must match it.",
+        "",
+        "✻ Thinking…",
+        "",
+      ],
+      assistantBare: ["⏺ Here is the exact string:", "  Usage limit reached", "", "✶ Composing…", ""],
+      // No spinner: the tool result's continuation row sits right above the
+      // box with no blank row between it and its `⎿` row.
+      toolResultContinuationAboveBox: [
+        "⏺ Read(fixture.txt)",
+        "  ⎿  Read 3 lines",
+        "",
+        "⏺ Bash(echo test)",
+        "  ⎿  ok",
+        "     You've hit your limit · resets 3pm",
+        "",
+      ],
+      // Same, an assistant continuation directly above the box.
+      assistantContinuationAboveBox: [
+        "⏺ The notice reads",
+        "  Usage limit reached · continuing automatically at 8am · esc to cancel",
+      ],
+    };
+    for (const [name, rows] of Object.entries(cases)) {
+      expect(__forTest.paneShowsHarnessLimitNotice(pane(rows)), name).toBe(false);
+      expect(__forTest.harnessLimitNoticeText(pane(rows)), name).toBe("");
+    }
+
+    // The real hint rows still count: below the spinner while claude works…
+    const working = pane([
+      "⏺ Bash(cat fixture.txt)",
+      "  ⎿  line one",
+      "     line two",
+      "",
+      "✻ Thinking… (esc to interrupt)",
+      HINT("Usage limit reached · wrapping up · limit resets 3pm · claude.ai/settings/usage"),
+    ]);
+    expect(__forTest.paneShowsHarnessLimitNotice(working, { turnStopped: true })).toBe(true);
+    // …and separated from the transcript by a blank row when idle, after a
+    // multi-line tool result.
+    const idle = pane([
+      "⏺ Bash(cat fixture.txt)",
+      "  ⎿  line one",
+      "     line two",
+      "",
+      HINT("Usage limit reached · continuing automatically at 8am · esc to cancel"),
+    ]);
+    expect(__forTest.paneShowsHarnessLimitNotice(idle)).toBe(true);
+    expect(__forTest.harnessLimitNoticeText(idle)).toBe(
+      "Usage limit reached · continuing automatically at 8am · esc to cancel",
+    );
+  });
+
   test("a notice row above the transcript gutter or beyond the hint slot is not live", () => {
     // Walking up from the box stops at a transcript/tool row…
     expect(__forTest.paneShowsHarnessLimitNotice(livePane([

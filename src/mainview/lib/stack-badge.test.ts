@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { HarnessStack, TaskHarnessState } from "../../shared/types.ts";
 import { stackBadgeStateFor, stackPositionFor } from "./stack-badge.ts";
+import { stackPositionText } from "../../shared/harness-stack.ts";
 
 function stack(id: string, members: string[]): HarnessStack {
   return {
@@ -116,7 +117,7 @@ describe("stackBadgeStateFor", () => {
 describe("stackPositionFor (N1)", () => {
   test("a member of a multi-account stack gets its 1-based position", () => {
     const stacks = [stack("s1", ["a", "b", "c"])];
-    expect(stackPositionFor(stacks, "c")).toEqual({ stack: stacks[0]!, position: 3, count: 3 });
+    expect(stackPositionFor(stacks, "c")).toEqual({ stack: stacks[0]!, position: 3, count: 3, text: "3/3" });
     expect(stackPositionFor(stacks, "a")?.position).toBe(1);
   });
 
@@ -127,5 +128,15 @@ describe("stackPositionFor (N1)", () => {
   test("an account in no stack has no chip", () => {
     expect(stackPositionFor([stack("s1", ["a", "b"])], "z")).toBeNull();
     expect(stackPositionFor([], "a")).toBeNull();
+  });
+
+  test("one rule with the shared stackPositionText for every stack size (N9)", () => {
+    for (let size = 0; size <= 4; size++) {
+      const ids = Array.from({ length: size }, (_, i) => `m${i}`);
+      const stacks = [stack("s", ids)];
+      for (const id of [...ids, "outsider"]) {
+        expect(stackPositionFor(stacks, id)?.text ?? null).toBe(stackPositionText(stacks[0]!, id));
+      }
+    }
   });
 });

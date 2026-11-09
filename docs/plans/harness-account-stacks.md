@@ -1087,8 +1087,10 @@ Each slice must build, typecheck, and pass its tests; no slice may delete or lea
 
 ### Review fix round (after 941679f3)
 
-A whole-branch review found 2 blockers, 8 must-fix and 27 should-fix items; all
-are fixed. The architecture doc (`docs/architecture/harness-stacks.md`) is the
+A whole-branch review found 2 blockers, 8 must-fix and 27 should-fix items.
+The fix commit (d5cd469a) closed most of them; its re-review scored 8 as
+partial (M4, M7, S2, S3, S6, S16, S17, S24) and found 2 new must-fix items, and
+the second fix round below closes those. The architecture doc (`docs/architecture/harness-stacks.md`) is the
 current contract. These are the points where the shipped behaviour departs
 from the plan text above:
 
@@ -1115,10 +1117,46 @@ from the plan text above:
   completes the transfer/spawn" true. A launch freeze stops retry timers and
   leaves the swap intent for the next owner.
 - **Stopping a retry:** Stop and moving the card out of `blocked` both cancel
-  an armed retry. Messages held across a block go to the backlog at once.
+  an armed retry. Messages held across a block go to the backlog at once;
+  messages typed during a swap window are held in memory until the successor
+  registers and then delivered to it (second round).
 - **One move implementation:** every account move uses `moveTaskToMember`,
   so manual moves mirror the config too. A retry attempt keeps its attempt
   count across a swap, so the 3-retry cap holds.
 - **Hidden continuation text is refused on input:** user text that is exactly
   the wrapper is refused, because otherwise the agent would act on a message
   no transcript shows.
+
+### Second review fix round (after d5cd469a)
+
+The re-review of d5cd469a found 2 must-fix and 17 should-fix items plus 10
+nits; all are fixed. Points that change behaviour beyond the plan text:
+
+- **Env-map `HOME` Claude accounts spawn unpinned again** (as before the
+  stacks branch): the fix round had started pinning `<HOME>/.claude`, which
+  moved the keychain item (logged out) and the `.claude.json`. Spawn pins and
+  file readers now come from one pure precedence
+  (`src/shared/harness-config-root.ts`), and an unpinned Codex turn has the
+  tmux server's `CODEX_HOME` overridden or unset (`pinCodexHome`).
+- **Harness paths are stored as given.** A non-absolute config-root env value
+  (relative, `~`, leading whitespace) is refused for every caller, and no
+  `home`/`CLAUDE_CONFIG_DIR` spelling is rewritten (it is what Claude hashes
+  into its keychain item).
+- **Roots redirected after gating are refused:** mirror, transfer and cleanup
+  resolve each account root lexically and refuse one that lands in a
+  macOS-protected home folder its stored path did not name; a CLI-triggered
+  same-stack switch re-runs the CLI path gate on both members; symlinked
+  skills are resolved lexically, never with `realpath`.
+- **Mirror:** Codex profile login keys are filtered in every TOML form and the
+  backup's own survive; `forceLoginMethod`, `gcpAuthRefresh` and
+  `proxyAuthHelper` are never imported; safe mode skips every command-running
+  setting on Claude Code's own list.
+- **Detection:** the pane walk stops at the spinner and at transcript
+  continuation rows; a remembered Codex `error` is dropped by any `item.*`
+  event, and a Codex that exits with no terminal event emits it (so failover
+  works whether or not a build sends `turn.failed` after a usage-limit
+  error); the keychain probe is async and never blocks the main thread.
+- **Owner decision (S15):** when mirroring a top-level symlinked skill, an
+  existing backup **symlink** is replaced (primary wins), not only links
+  Agetor created; a real backup entry is never replaced.
+

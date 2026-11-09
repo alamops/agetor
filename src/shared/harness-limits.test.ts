@@ -309,3 +309,27 @@ describe("parseHarnessLimitSignal", () => {
     expect(parsed?.message.length).toBe(300);
   });
 });
+
+describe("classifier inputs the fake drivers rely on (CR2)", () => {
+  test("the fake drivers' real CLI prose classifies on its own, with no fallback", () => {
+    expect(classifyHarnessLimitSignal("claude-code", {
+      text: "Usage limit reached · continuing automatically when it resets",
+    })?.reason).toBe("quota");
+    const codex = classifyHarnessLimitSignal("codex", {
+      text: "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:00 PM.",
+      now: new Date(2026, 10, 1, 9, 0, 0, 0).getTime(),
+    });
+    expect(codex?.reason).toBe("quota");
+    expect(codex?.resetAtMs).toBe(new Date(2026, 10, 1, 15, 0, 0, 0).getTime());
+  });
+
+  test("`now` pins the instant a relative reset resolves against", () => {
+    const text = "You've hit your usage limit. Try again at 3:00 PM.";
+    const morning = new Date(2026, 10, 1, 9, 0, 0, 0).getTime();
+    const evening = new Date(2026, 10, 1, 18, 0, 0, 0).getTime();
+    expect(classifyHarnessLimitSignal("codex", { text, now: morning })?.resetAtMs)
+      .toBe(new Date(2026, 10, 1, 15, 0, 0, 0).getTime());
+    expect(classifyHarnessLimitSignal("codex", { text, now: evening })?.resetAtMs)
+      .toBe(new Date(2026, 10, 2, 15, 0, 0, 0).getTime());
+  });
+});

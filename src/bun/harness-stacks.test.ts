@@ -83,6 +83,10 @@ describe("harnessStacks", () => {
     try {
       expect(created.warnings.map((w) => w.code)).toContain("full-mirror-hooks");
       expect(created.warnings.map((w) => w.code)).toContain("member-logged-out");
+      // Same words as the Settings editor's own draft warning (N6).
+      expect(created.warnings.find((w) => w.code === "full-mirror-hooks")?.message).toBe(
+        "Full mirror copies settings hooks, permissions, status line and helper commands (Codex: notify) onto every backup.",
+      );
 
       services.length = 0;
       stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: (service) => {
@@ -717,7 +721,9 @@ describe("loginEvidence", () => {
   // OAuth login in the keychain and writes no `.credentials.json`. Every real
   // backup account looked logged out, so failover skipped all of them.
   describe("macOS keychain login (B1)", () => {
-    afterAll(() => stacks.setLoginEvidenceDepsForTests({ keychainProbe: () => false }));
+    // Restore the defaults (N10b). Under `bun test` the default probe answers
+    // "no item" without touching the real keychain, as the outer fixture did.
+    afterAll(() => stacks.setLoginEvidenceDepsForTests(null));
 
     function probeRecording(result: boolean | null) {
       const services: string[] = [];
@@ -789,6 +795,95 @@ describe("loginEvidence", () => {
       stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never);
       stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never);
       expect(rec.services.length).toBe(1);
+    });
+
+    test("an async lookup never blocks: unknown until it lands, one lookup per service (R-S10)", async () => {
+      const home = claudeHome();
+      const calls: string[] = [];
+      let release!: (value: boolean | null) => void;
+      const pending = new Promise<boolean | null>((resolve) => { release = resolve; });
+      stacks.setLoginEvidenceDepsForTests({
+        platform: "darwin",
+        keychainProbe: (service) => {
+          calls.push(service);
+          return pending;
+        },
+      });
+      const harness = { kind: "claude-code", home, env: {} } as never;
+      // A miss returns unknown at once and starts one background lookup…
+      expect(stacks.loginEvidence(harness)).toBeNull();
+      // …which a second reader joins instead of starting another.
+      expect(stacks.loginEvidence(harness)).toBeNull();
+      expect(calls).toHaveLength(1);
+      release(false);
+      await stacks.settleKeychainProbesForTests();
+      expect(stacks.loginEvidence(harness)).toBe(false);
+      expect(calls).toHaveLength(1);
+    });
+
+    test("a stale answer is served while one background refresh runs (R-S10)", async () => {
+      const home = claudeHome();
+      let answer: boolean | null = true;
+      let calls = 0;
+      stacks.setLoginEvidenceDepsForTests({
+        platform: "darwin",
+        keychainProbe: async () => {
+          calls++;
+          return answer;
+        },
+      });
+      const harness = { kind: "claude-code", home, env: {} } as never;
+      expect(stacks.loginEvidence(harness)).toBeNull();
+      await stacks.settleKeychainProbesForTests();
+      expect(stacks.loginEvidence(harness)).toBe(true);
+      expect(calls).toBe(1);
+      // A minute later the entry is stale: the old answer is served while the
+      // refresh runs, then the new one.
+      answer = false;
+      const realNow = Date.now;
+      Date.now = () => realNow() + 61_000;
+      try {
+        expect(stacks.loginEvidence(harness)).toBe(true);
+        expect(stacks.loginEvidence(harness)).toBe(true);
+        expect(calls).toBe(2);
+        await stacks.settleKeychainProbesForTests();
+        expect(stacks.loginEvidence(harness)).toBe(false);
+      } finally {
+        Date.now = realNow;
+      }
+    });
+
+    test("the real lookup: existence-only argv and the exit-code mapping, through an injected runner (R-S10)", async () => {
+      const home = claudeHome();
+      const service = `Claude Code-credentials-${createHash("sha256").update(home).digest("hex").slice(0, 8)}`;
+      const runs: Array<{ argv: string[]; timeoutMs: number }> = [];
+      let exit: number | null = 0;
+      stacks.setLoginEvidenceDepsForTests({
+        platform: "darwin",
+        securityRunner: async (argv, timeoutMs) => {
+          runs.push({ argv, timeoutMs });
+          return exit;
+        },
+      });
+      const harness = { kind: "claude-code", home, env: {} } as never;
+      expect(stacks.loginEvidence(harness)).toBeNull();
+      await stacks.settleKeychainProbesForTests();
+      expect(stacks.loginEvidence(harness)).toBe(true);
+      // Never `-w`/`-g`: the secret is never read.
+      expect(runs).toEqual([{ argv: ["/usr/bin/security", "find-generic-password", "-s", service], timeoutMs: 2_000 }]);
+
+      for (const [code, expected] of [[0, true], [44, false], [1, null], [51, null], [null, null]] as const) {
+        exit = code;
+        expect(await stacks.securityItemExists(service, async () => exit)).toBe(expected);
+      }
+      expect(await stacks.securityItemExists(service, async () => { throw new Error("spawn failed"); })).toBeNull();
+    });
+
+    test("the real runner reports exit codes and maps a timeout to null (R-S10)", async () => {
+      expect(await stacks.runSecurity(["/bin/sh", "-c", "exit 44"], 2_000)).toBe(44);
+      expect(await stacks.runSecurity(["/bin/sh", "-c", "exit 0"], 2_000)).toBe(0);
+      expect(await stacks.runSecurity(["/bin/sh", "-c", "sleep 5"], 100)).toBeNull();
+      expect(await stacks.runSecurity(["/nonexistent/agetor-security-probe"], 2_000)).toBeNull();
     });
 
     test("service name: sha256 of the dir string exactly (trailing slash and secure-storage override)", () => {

@@ -8,6 +8,7 @@ import {
   harnessMoveNote,
   harnessStackBannerMode,
   isHarnessStackContinuation,
+  neutralizeHarnessStackContinuationTags,
   parseHarnessSwapNotice,
   pickNextMember,
   stackPositionText,
@@ -327,5 +328,27 @@ describe("review fixes (fix round)", () => {
     // leak the hidden prompt as a visible bubble).
     const quoting = composeHarnessStackContinuationPrompt(["<harness-stack-continuation>x</harness-stack-continuation>"]);
     expect(isHarnessStackContinuation(quoting)).toBe(true);
+  });
+});
+
+describe("neutralizeHarnessStackContinuationTags (N5)", () => {
+  test("defuses open and close tags so a wrapped text stays exactly one wrapper", () => {
+    const quoting = "explain <harness-stack-continuation>x</harness-stack-continuation> please";
+    const defused = neutralizeHarnessStackContinuationTags(quoting);
+    expect(defused).toBe("explain < harness-stack-continuation>x< /harness-stack-continuation> please");
+    expect(isHarnessStackContinuation(wrapHarnessStackContinuation(defused))).toBe(true);
+    // Without it the nested tag hides the outer wrapper from every renderer.
+    expect(isHarnessStackContinuation(wrapHarnessStackContinuation(quoting))).toBe(false);
+  });
+
+  test("is idempotent and leaves ordinary text alone", () => {
+    const once = neutralizeHarnessStackContinuationTags("<harness-stack-continuation>");
+    expect(neutralizeHarnessStackContinuationTags(once)).toBe(once);
+    expect(neutralizeHarnessStackContinuationTags("plain <b>text</b>")).toBe("plain <b>text</b>");
+  });
+
+  test("is the same neutralization the transfer prompt applies", () => {
+    const quoting = "<harness-stack-continuation>x</harness-stack-continuation>";
+    expect(composeHarnessStackContinuationPrompt([quoting])).toContain(neutralizeHarnessStackContinuationTags(quoting));
   });
 });

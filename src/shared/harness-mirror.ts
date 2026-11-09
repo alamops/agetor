@@ -22,7 +22,8 @@
  *   that select a provider/login (`CLAUDE_CODE_USE_BEDROCK`,
  *   `ANTHROPIC_BASE_URL`, …), are never imported while merging
  *   `settings.json`; a backup's own value is kept. Codex's login-bearing
- *   `config.toml` keys and `[model_providers.*]` tables follow the same rule.
+ *   `config.toml` keys and `[model_providers.*]` tables follow the same rule,
+ *   as do the login-bearing and login-selecting `settings.json` keys.
  */
 import type { HarnessStackKind } from "./types.ts";
 
@@ -33,7 +34,9 @@ export interface HarnessMirrorSpec {
   /** Copy entries whose TOP-LEVEL symlinked children are re-created on the
    *  backup as an absolute symlink to the link's resolved target (a skill
    *  kept as `skills/x -> ../../.agents/skills/x`). The target's bytes are
-   *  never read, and a target inside a credential/never-copy path is refused.
+   *  never read, the target is resolved without `realpath` (no stat inside
+   *  it), and a target inside a credential/never-copy path or a macOS
+   *  TCC-protected home folder is refused.
    *  Nested symlinks are still skipped. */
   linkTopLevel: string[];
   /** Files merged with the primary's values winning. */
@@ -247,20 +250,45 @@ export function isHarnessAuthEnvKey(key: string): boolean {
 }
 
 /**
+ * The Claude `settings.json` keys whose value is a command the CLI runs —
+ * exactly Claude Code 2.1.319's own list of command settings: the
+ * credential/login helpers (`apiKeyHelper`, `awsAuthRefresh`,
+ * `awsCredentialExport`, `gcpAuthRefresh`, `proxyAuthHelper`), the telemetry
+ * header helper (`otelHeadersHelper`), the UI commands (`statusLine`,
+ * `subagentStatusLine`, `fileSuggestion`), the process wrapper every tool
+ * command runs under (`processWrapper`) and the policy helpers
+ * (`policyHelpers`). The login helpers are never imported in either mode
+ * ({@link MIRROR_NEVER_IMPORTED_SETTINGS_KEYS}); safe mode skips all of them.
+ */
+export const COMMAND_RUNNING_SETTINGS_KEYS: readonly string[] = [
+  "apiKeyHelper",
+  "awsAuthRefresh",
+  "awsCredentialExport",
+  "fileSuggestion",
+  "gcpAuthRefresh",
+  "otelHeadersHelper",
+  "policyHelpers",
+  "processWrapper",
+  "proxyAuthHelper",
+  "statusLine",
+  "subagentStatusLine",
+];
+
+/**
  * Safe mode skips everything in the primary's config that runs a command or
- * grants one: settings hooks, permissions, the status line and helper commands
- * (Claude `settings.json`), and Codex's top-level `notify` (plus its `hooks`
- * and `permissions` tables). Plugins and MCP servers are still mirrored — they
- * are the tools the feature promises. Executing the primary's commands on
- * every backup is the risk the security review calls out, and the per-stack
- * `safe` mode is the opt-out. The backup's own value of an excluded key always
- * survives.
+ * grants one: settings hooks, permissions and every command setting
+ * ({@link COMMAND_RUNNING_SETTINGS_KEYS}: status lines, file suggestion,
+ * process wrapper, policy and credential helpers) in Claude `settings.json`,
+ * and Codex's top-level `notify` (plus its `hooks` and `permissions` tables).
+ * Plugins and MCP servers are still mirrored — they are the tools the feature
+ * promises. Executing the primary's commands on every backup is the risk the
+ * security review calls out, and the per-stack `safe` mode is the opt-out. The
+ * backup's own value of an excluded key always survives.
  */
 export const SAFE_MODE_EXCLUDED_SETTINGS_KEYS: readonly string[] = [
   "hooks",
   "permissions",
-  "statusLine",
-  "otelHeadersHelper",
+  ...COMMAND_RUNNING_SETTINGS_KEYS,
 ];
 
 /** Codex `config.toml` keys/tables skipped in safe mode (see
@@ -319,24 +347,115 @@ export function isCodexLoginBearingKeyPath(segments: readonly string[]): boolean
 }
 
 /**
- * Claude `settings.json` keys that select a login rather than describe
+ * Claude `settings.json` keys that carry a login rather than describe
  * configuration: `apiKeyHelper` hands the CLI a credential-producing command,
- * `forceLoginOrgUUID` pins the account's organization, and the AWS helpers
- * export/refresh credentials. Copying the primary's value would make the
- * backup run as the primary (or overwrite the backup's own login), which
- * breaks the "each account keeps its own login" invariant. The backup's own
- * value always survives; only the primary's is dropped.
+ * `forceLoginOrgUUID` pins the account's organization, and the AWS/GCP helpers
+ * export or refresh cloud credentials (Claude Code 2.1.319). Copying the
+ * primary's value would make the backup run as the primary (or overwrite the
+ * backup's own login), which breaks the "each account keeps its own login"
+ * invariant. The backup's own value always survives; only the primary's is
+ * dropped. Login evidence (`src/bun/harness-stacks.ts`) also reads a set key
+ * from this list as "this account logs in through a helper", so only keys that
+ * really produce or pin a login belong here; the login-SELECTING keys that are
+ * no login by themselves are in {@link LOGIN_SELECTING_SETTINGS_KEYS}.
  */
 export const LOGIN_BEARING_SETTINGS_KEYS: readonly string[] = [
   "apiKeyHelper",
   "forceLoginOrgUUID",
   "awsCredentialExport",
   "awsAuthRefresh",
+  "gcpAuthRefresh",
 ];
 
-/** True when a Claude `settings.json` key carries or selects a login. */
+/**
+ * Claude `settings.json` keys that pick HOW an account authenticates without
+ * being a login themselves, so the mirror never imports them but login
+ * evidence ignores them:
+ * - `forceLoginMethod` (`claudeai` / `console`) decides which login the CLI
+ *   accepts; the primary's would lock the backup out of its own.
+ * - `proxyAuthHelper` is a command whose output is the proxy's
+ *   authentication (a credential for the network path, not the account), so
+ *   it is credential-producing and command-running: never imported in either
+ *   mode, and listed among the safe-mode command settings too.
+ */
+export const LOGIN_SELECTING_SETTINGS_KEYS: readonly string[] = [
+  "forceLoginMethod",
+  "proxyAuthHelper",
+];
+
+/** True when a Claude `settings.json` key carries a login (login evidence). */
 export function isLoginBearingSettingsKey(key: string): boolean {
   return LOGIN_BEARING_SETTINGS_KEYS.includes(key);
+}
+
+/** Every Claude `settings.json` key the mirror never imports from the primary,
+ *  in either mode: the login-bearing and the login-selecting keys. */
+export const MIRROR_NEVER_IMPORTED_SETTINGS_KEYS: readonly string[] = [
+  ...LOGIN_BEARING_SETTINGS_KEYS,
+  ...LOGIN_SELECTING_SETTINGS_KEYS,
+];
+
+/** True when the mirror must keep the backup's own value of a Claude
+ *  `settings.json` key and never import the primary's. */
+export function isMirrorNeverImportedSettingsKey(key: string): boolean {
+  return MIRROR_NEVER_IMPORTED_SETTINGS_KEYS.includes(key);
+}
+
+/**
+ * Home-relative folders macOS gates per app through TCC (privacy prompts /
+ * Full Disk Access): the user's Desktop, Documents and Downloads, iCloud Drive
+ * (`Library/Mobile Documents`), the media libraries, Mail, Messages, Safari
+ * data and other apps' sandbox containers. When the core touches a path under
+ * one of them in its own process, macOS answers with Agetor's grants (or
+ * prompts in Agetor's name), which is what the CLI path gate prevents
+ * (docs/architecture/security.md, D24). The list is deliberately the
+ * well-known set rather than every protected location: it is used to REFUSE
+ * a config root or symlink target that resolves into one of these folders
+ * after it was saved somewhere else (docs/architecture/harness-stacks.md), so
+ * a missing entry only narrows that refusal.
+ */
+export const MACOS_TCC_PROTECTED_HOME_FOLDERS: readonly string[] = [
+  "Desktop",
+  "Documents",
+  "Downloads",
+  "Library/Mobile Documents",
+  "Pictures",
+  "Movies",
+  "Music",
+  "Library/Mail",
+  "Library/Messages",
+  "Library/Safari",
+  "Library/Containers",
+  "Library/Group Containers",
+];
+
+/** `p` without trailing slashes and with repeated slashes collapsed. */
+function trimSlashes(p: string): string {
+  const collapsed = p.replace(/\/+/g, "/");
+  return collapsed.length > 1 ? collapsed.replace(/\/+$/, "") : collapsed;
+}
+
+/**
+ * The {@link MACOS_TCC_PROTECTED_HOME_FOLDERS} entry (e.g. `"Documents"`)
+ * whose folder `<home>/<entry>` the absolute, normalized path `p` is equal to
+ * or inside, or null. Every candidate home in `homes` is
+ * tried (the caller passes the home as spelled and its realpath). Compared
+ * case-insensitively: the default macOS volume is case-insensitive, so
+ * `~/documents` is `~/Documents`. Pure string work — nothing is stat'ed.
+ */
+export function tccProtectedFolderOf(p: string, homes: readonly string[]): string | null {
+  const target = trimSlashes(p);
+  const lowered = target.toLowerCase();
+  for (const home of homes) {
+    if (!home) continue;
+    const base = trimSlashes(home);
+    for (const entry of MACOS_TCC_PROTECTED_HOME_FOLDERS) {
+      const folder = `${base === "/" ? "" : base}/${entry}`;
+      const f = folder.toLowerCase();
+      if (lowered === f || lowered.startsWith(`${f}/`)) return entry;
+    }
+  }
+  return null;
 }
 
 export const MIRROR_SPECS: Record<HarnessStackKind, HarnessMirrorSpec> = {

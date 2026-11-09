@@ -78,7 +78,9 @@ Writers:
   notice, then resolves the turn. The notice is read relative to the input box
   (the last pair of `─` border rows around the `❯` row): only the hint slot —
   at most four non-blank rows directly above the box, the upward walk stopping
-  at any transcript/tool gutter row (`⎿`, `│`, `|`, `>`, `⏺`, `●`, `❯`) — or the
+  at any transcript/tool gutter row (`⎿`, `│`, `|`, `>`, `⏺`, `●`, `❯`), at
+  the spinner row (`✻ Thinking…`) and at a glyph-less row that continues a
+  transcript entry (contiguous with a `⎿`/`⏺` row, no blank line between) — or the
   footer below it counts, and the head row may start only with indentation or
   an optional `⚠`. So a notice quoted in the scrollback, echoed in a tool
   result or typed into the input box never settles a healthy turn; with no
@@ -105,8 +107,11 @@ Writers:
 - **Codex** — only a terminal `turn.failed` emits the structured signal, from
   its own message or from the classification remembered from the last
   top-level `error`. A top-level `error` alone, an `error` item and a non-JSON
-  log line never signal, and `turn.completed`/`turn.started` discard a
-  remembered one; the orchestrator never classifies raw codex text and ignores
+  log line never signal, and `turn.completed`/`turn.started` or any `item.*`
+  event discard a remembered one (so a retried 429 never attaches to a later,
+  unrelated failure). A codex that exits without `turn.completed`/`turn.failed`
+  while a limit is remembered emits that limit instead of the "ended
+  unexpectedly" sentinel; the orchestrator never classifies raw codex text and ignores
   a codex limit on a run that exited 0 (`limitSignalForSettle`). So a 429 that
   codex retried and recovered from — or an MCP tool error mentioning 429 — is
   never a limit. Codex 0.166 reports quota in prose: "You've hit your usage
@@ -175,7 +180,13 @@ stack task it hands everything to `handleHarnessLimitSettlement`
      branch resumes the existing session in place (no copy). A Claude
      follow-up pasted into the REPL mid-turn that never reached the transcript
      (a live echo with no JSONL twin) is appended to the continuation prompt,
-     so it is not lost with the dropped REPL.
+     so it is not lost with the dropped REPL. Whenever no started successor
+     carries such follow-ups — a blocked ending (all-exhausted with a transfer
+     retry or no timer, transfer failed), Stop, superseded, a frozen handoff,
+     a failed or stopped spawn, or a paused REPL dropped on the passthrough
+     branch — they go to the task's backlog tray with a status line; an
+     all-exhausted **clean** retry replays them itself. A hard crash still
+     loses them (they are in memory until the settlement ends).
    - **the task's first turn on the account with no tool call** → resend the
      request on a fresh session (the clean-retry branch), avoiding a duplicate
      provider user message. The text is rebuilt by
@@ -188,9 +199,11 @@ stack task it hands everything to `handleHarnessLimitSettlement`
      because its live-turn follow-ups are queued as separate turns. Its
      divider says "Restarting the request on this account." — it never claims
      a transferred conversation that does not exist. A Claude clean retry whose
-     text is a slash command (starts with `/`) is sent unwrapped, as typed —
-     Claude runs a command only from the start of the input, so the wrapper
-     would turn it into prose; that one visible bubble is the accepted cost.
+     text is a slash command (starts with `/`) is sent **alone** and unwrapped,
+     as typed — Claude runs a command only from the start of the input, so the
+     wrapper would turn it into prose; that one visible bubble is the accepted
+     cost. The follow-ups folded into the limited turn are never its arguments:
+     they follow as a queued hidden-continuation follow-up.
    A present-but-unreadable session is a hard block (`harness-swap-failed`), not
    a silent fresh start.
 8. The old run is recorded `failed` with `run-status.reason: "harness-swap"`
@@ -263,6 +276,13 @@ but before `pendingSwap` is persisted — is recorded on the task's swap window
 and aborts the settlement before any mirror/transfer/spawn, recording the old
 run `cancelled` (not failed; a pipeline step settles `cancelled` too); the
 blocked all-exhausted branch honours it too, so no retry is armed.
+A Stop during an all-exhausted retry's mirror/transfer aborts the account move
+and settles like a Stop on an armed retry ("cancelled by user during the
+account retry"; the card stays blocked, the account does not change), and a
+Stop recorded during a retry is cleared when that retry ends, so it can never
+cancel a later, unrelated failover. When a launch freeze already left the swap
+for the next owner, a Stop clears `pendingSwap` and records the run
+`cancelled`, so the next owner does not finish it.
 The post-transfer step also re-reads the task, so an archive/stack delete during
 the mirror/transfer can never resurrect a swap and spawn onto an archived task.
 
@@ -284,7 +304,9 @@ the text above.
 
 The clean-retry branch wraps the user's own reconstructed text in the same tag
 (the body is the user's words, not a continuation instruction; a slash command
-is the unwrapped exception above). Its source is
+is the unwrapped exception above). A literal tag inside the user's text is
+neutralized first (`neutralizeHarnessStackContinuationTags`, shared with the
+transfer prompt), so a message that quotes the tag cannot break the wrapper. Its source is
 `composeCleanRetryText(runs.mainUserTexts(oldRunId))` — normalized, de-duplicated
 and unwrapped — so a second consecutive clean retry strips the previous wrapper
 before wrapping again; nesting would stop the value being recognised and leak
@@ -338,10 +360,14 @@ transfer target the directory the CLI really reads.
   `forced_chatgpt_workspace_id`, `preferred_auth_method`,
   `cli_auth_credentials_store`, `mcp_oauth_credentials_store`,
   `mcp_enterprise_managed_auth`, `chatgpt_base_url`, `openai_base_url` (top
-  level, dotted, inside `[profiles.*]` or an inline `profiles` table) and every
+  level, dotted, inside `[profiles.*]`, as a dotted key of a `[profiles]`
+  table such as `work.model_provider`, or an inline `profiles` table) and every
   `[model_providers]`/`[model_providers.*]` table, which can carry a bearer
-  token or auth headers; the backup's own values and blocks survive and one
-  warning names what was skipped; copy `AGENTS.md` (the user-level instruction file),
+  token or auth headers. Each assignment of a primary table is judged by its
+  full key path; an inline profile table that names a login key is dropped
+  whole. The backup's own values and blocks survive — its own profile login
+  keys are carried into the merged table even when the primary's same-named
+  profile has none — and one warning names what was skipped; copy `AGENTS.md` (the user-level instruction file),
   `prompts/`, `skills/`, `plugins/` including the installed payload cache
   (never the derived `store/`/catalog caches or the transient
   `.remote-plugin-install-staging/`).
@@ -371,8 +397,13 @@ transfer target the directory the CLI really reads.
   run on the primary's cloud identity and quota. The process environment is not modified (a warning names the
   first kind-relevant credential it sees, cloud keys included).
 - **Login-selecting `settings.json` keys** (`apiKeyHelper`,
-  `forceLoginOrgUUID`, `awsCredentialExport`, `awsAuthRefresh`) are treated the
-  same way: never imported from the primary, and a backup's own value survives.
+  `forceLoginOrgUUID`, `awsCredentialExport`, `awsAuthRefresh`,
+  `gcpAuthRefresh`, `forceLoginMethod`, `proxyAuthHelper`) are treated the
+  same way, in both modes: never imported from the primary, and a backup's own
+  value survives. Only the credential-producing ones (`apiKeyHelper`,
+  `forceLoginOrgUUID`, the `aws*` pair, `gcpAuthRefresh`) count as login
+  evidence; `forceLoginMethod` and `proxyAuthHelper` select or proxy a login
+  without providing one.
 - **Codex MCP sign-in** is not copied (OAuth store, security review deviation);
   when the primary defines `[mcp_servers.*]` the mirror warns that the backup
   may need to sign in once.
@@ -388,27 +419,42 @@ transfer target the directory the CLI really reads.
   remote-session tokens) count, so Agetor started from inside a Claude Code
   session (which exports e.g. `CLAUDE_CODE_MESSAGING_TOKEN`) does not read every
   account as logged in; the mirror still strips every secret-shaped key.
-- **Safe mirror** skips settings hooks, permissions, status line and helper
-  commands (`hooks`, `permissions`, `statusLine`, `otelHeadersHelper`; Codex:
-  `notify`); plugins and MCP servers are still mirrored. It never rewrites a
-  backup's existing values.
+- **Safe mirror** skips settings hooks, permissions and every setting that
+  runs a command — Claude Code 2.1.319's own list: `apiKeyHelper`,
+  `awsAuthRefresh`, `awsCredentialExport`, `fileSuggestion`, `gcpAuthRefresh`,
+  `otelHeadersHelper`, `policyHelpers`, `processWrapper`, `proxyAuthHelper`,
+  `statusLine`, `subagentStatusLine` (Codex: `notify`); plugins and MCP
+  servers are still mirrored. The backup's own value of every skipped key
+  survives; the primary still wins the keys that are not skipped (`model`, …).
 
 All reads are no-follow/regular-file; every write is atomic and 0600; symlinks,
 FIFOs and oversize trees are skipped with a warning — except a **top-level**
 symlink in Claude `skills/`/`commands/`/`agents/` or Codex `skills/`/`prompts/`
 (a skills-manager layout links them in), which is recreated in the backup as an
-absolute link to the source link's resolved target without reading through
-it; a dangling target, a target at or above either account root, a
-never-copy/credential path or a `.git` path is refused, and a real backup
-entry is never replaced (an existing link is). Mirror copies keep the source
+absolute link to the source link's target without reading through it. The
+target is resolved **lexically** (lstat + readlink per component, never
+`realpath`; nothing below a protected folder is ever stat'ed), because an
+agent can plant such a link. A dangling target, a link loop, a target at or
+above either account root, a never-copy/credential path, a `.git` path, or a
+target that reaches a macOS-protected home folder (`Desktop`, `Documents`,
+`Downloads`, `Pictures`, `Movies`, `Music`, `Library/Mobile Documents`,
+`Library/Mail`, `Library/Messages`, `Library/Safari`, `Library/Containers`,
+`Library/Group Containers`) is refused. A real backup entry is never
+replaced; an existing backup **link** is (primary wins — owner decision). Mirror copies keep the source
 mtime, and a destination that is already a regular file of the same size and
 mtime is skipped, as is a merged file whose result equals the backup's
 current text, so a swap does not rewrite thousands of unchanged plugin files.
 `mirrorForSwap` is single-flight per destination account and all mirror work
 for one destination is serialized, so a stack save and N tasks swapping onto
-the same backup never interleave. Mirror and both transfer adapters refuse two
-accounts whose config roots are the same directory **by realpath** (a
-symlinked alias included). A **source** path is also
+the same backup never interleave. Before any other I/O, mirror, both transfer
+adapters and cleanup resolve each account root (and, for Claude, each
+`.claude.json` directory) lexically and refuse it when it lands in a
+protected home folder its stored path did not name — a root swapped for a
+symlink after it was gated (mirror: one warning, nothing written; transfer:
+`unsafe-source`; cleanup: nothing removed). A root saved under such a folder
+on purpose, and the `/tmp`/`/var` system links, are unaffected. Mirror and
+both transfer adapters also refuse two accounts whose config roots are the
+same directory **by realpath** (a symlinked alias included). A **source** path is also
 refused when any component between the trusted account root and the leaf is a
 symlink, not just the leaf: a linked intermediate folder (`plugins/` → outside
 the account) would otherwise make the target's regular file look like the
@@ -440,9 +486,19 @@ that relied on its own `HOME` for `.gitconfig`/`.ssh`/`gh` now runs shell tools
 under the user's main identity — pin `HOME` in the account's env map to keep
 the old behaviour.
 
-All config roots resolve through one module, `src/bun/harness-config-root.ts`
-(used by the spawn env, mirror, transfer, command discovery and the usage
-meters), with `harnessEnv`'s exact precedence. Codex: the env map's
+All config roots resolve through one precedence, the pure
+`src/shared/harness-config-root.ts`, which `src/bun/harness-config-root.ts`
+feeds with the process values (used by the spawn env, mirror, transfer,
+command discovery and the usage meters), matching what the spawn makes the CLI
+read. The **spawn pin** (`claudeConfigDirOverrideFor` /
+`codexHomeOverrideFor`) is only the env map's value, else `home`: an env-map
+`HOME` alone pins nothing. Such a Claude account spawns without
+`CLAUDE_CONFIG_DIR` (so on macOS it uses the unsuffixed keychain item) and
+reads `<HOME>/.claude` and `<HOME>/.claude.json`; an unpinned spawn is handed
+this process's `CLAUDE_CONFIG_DIR`/`CODEX_HOME` or has it unset
+(`pinClaudeConfigDir`, `pinCodexHome`), so the long-lived tmux server's env can
+never redirect it. Every reader uses `claudeConfigDirFor`/`claudeJsonDirFor`/
+`codexHomeFor`. Codex: the env map's
 `CODEX_HOME` → `<home>/.codex` → the process `CODEX_HOME` → `<env-map
 HOME>/.codex` → `~/.codex`. Claude: the env map's `CLAUDE_CONFIG_DIR` → `home`
 → the process `CLAUDE_CONFIG_DIR` → `<env-map HOME>/.claude` → `~/.claude`
@@ -451,7 +507,9 @@ HOME). Blank values count as unset, and `harnessEnv` drops a blank
 `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`HOME` from the env map so the spawn agrees. The rollout adapter copies the
 rollout to the same relative path under the destination `CODEX_HOME` and, when
 a `thread_history_*.sqlite` already exists, runs `codex migrate-rollouts
---apply` (30 s timeout, `coreSpawn`) once; a failure is a warning and a failed
+--apply` (30 s timeout, `coreSpawn`) once with `CODEX_HOME` set to the
+destination's resolved root for every account shape (an env-map `HOME` one
+included, so it never touches the user's own `~/.codex`); a failure is a warning and a failed
 resume blocks the swap visibly.
 
 ## Crash safety and boot
@@ -499,8 +557,10 @@ resume blocks the swap visibly.
   a handoff shape (Claude `projects/<enc>/<sid>.jsonl` or
   `…/<sid>/{subagents,tool-results,mcp-tasks}/…`; Codex
   `sessions/YYYY/MM/DD/rollout-*.jsonl`), has no symlinked component and is a
-  regular file. Nothing is removed recursively; afterwards only empty plain
-  directories inside those shapes are pruned. The unlink loop is cooperative.
+  regular file, and nothing is removed under a root that resolves into a
+  protected folder its stored path did not name. Nothing is removed
+  recursively; afterwards only empty plain directories inside those shapes are
+  pruned. The unlink loop is cooperative.
   Handoff upserts merge `copied_paths_json`, so a second copy onto the same
   account never orphans the first copy's files.
 - **Delete** clears failover state and cancels timers first, then removes the
@@ -538,14 +598,20 @@ resume blocks the swap visibly.
   message queues). The message path holds the task's start claim for the whole
   move, so an armed retry cannot mint a competing successor mid-copy.
 - `PATCH /tasks/:id` with an `agent` inside the same stack is refused while a
-  run is live (409 "stop the run before switching accounts"); an outside-stack
-  switch keeps the old kill/reset behavior.
+  run is live (409 "stop the run before switching accounts") and while the
+  task is held by running background agents (409 "stop the background agents
+  before switching accounts"); for a CLI-token caller both members' roots are
+  re-probed through the CLI path gate first (403 `path-not-accessible`). An
+  outside-stack switch keeps the old kill/reset behavior.
 - A same-stack manual switch is AWAITED by the PATCH route and holds the task's
   start claim for the whole transcript copy (`accountSwitchTaskIds` plus
   `startingTaskIds`). A Run during the copy is refused ("switching accounts —
   try again in a moment") and a message is declined for the same reason: the old
   REPL is about to be dropped and a fresh session would be displaced by the
-  handoff. The intent is persisted as `harnessState.pendingSwap.manual` **before**
+  handoff. A same-stack switch of a task held by running background agents is
+  refused at every entry (the route answers 409; `claimTaskForAccountSwitch`
+  and `reconcileTaskSession` revert a direct caller's switch with a status
+  line), so the REPL hosting them is never dropped. The intent is persisted as `harnessState.pendingSwap.manual` **before**
   the task row changes accounts, so a crash between the row update and the
   transcript copy is completed by the boot reconcile (the transcript is still on
   the source account) or visibly reported — never silently lost. The move
@@ -558,13 +624,19 @@ resume blocks the swap visibly.
   follow-ups; the boot completion of an interrupted manual switch mirrors too.
   Outside the stack the old fresh-start behavior applies (but copied files are
   kept, see Cleanup). In the RunPanel, a same-kind account switch PATCHes only
-  `{ agent }`, so the task keeps its mode, model, effort, speed and Max mode.
+  `{ agent }`, so the task keeps its mode, model, effort, speed and Max mode;
+  a refused or failed switch shows an error toast with the server's reason
+  ("may have gone through" on a dropped connection — `taskPatchFailureToast`,
+  `src/mainview/lib/task-patch-failure.ts`), while other dropdown PATCH
+  failures stay quiet.
 - A message typed during a swap window is held (`swapWindowTaskIds`) and
-  drained in order onto the run that actually executes it, after the successor
-  settles. The drain's own send is the message's only `user` bubble — the
-  window does not write one on the displaced run (that duplicated it).
-  Stop/archive/delete, a settlement that ends blocked (timer or not) and a
-  launch freeze re-stash it to the backlog at once; a message typed later,
+  delivered in order to the successor as soon as it registers, through the
+  ordinary mid-turn path (Claude folds it into the live turn, Codex queues it);
+  a settle-time drain onto the run that actually executes it remains the
+  fallback. That send is the message's only `user` bubble — the window does
+  not write one on the displaced run (that duplicated it).
+  Stop/archive/delete, a settlement that ends blocked (timer or not), a refused
+  send and a launch freeze re-stash it to the backlog at once; a message typed later,
   during an all-exhausted countdown, is a manual message and runs through
   `prepareTaskHarness` immediately.
 
@@ -582,8 +654,13 @@ resume blocks the swap visibly.
   computed only by the list, the detail `GET /harness-stacks/:id` and the
   create/edit responses; the runtime lookups (`get`, `getByMember`,
   `resolveForTask`) are plain DB reads. For a CLI-token caller, create/edit
-  first probe every member's config root through the CLI path gate (403
-  `path-not-accessible`). `PATCH /harnesses/:id` refuses re-pointing a stack
+  (and a same-stack account switch) first probe every member's config root
+  through the CLI path gate (403 `path-not-accessible`). `POST`/`PATCH
+  /harnesses` refuse (400, every caller) a non-blank `CLAUDE_CONFIG_DIR`/
+  `CODEX_HOME`/`HOME` env value that is not absolute as given (relative, `~`,
+  leading whitespace), refuse a `..` segment, and otherwise store `home` and
+  those values exactly as given — the stored `CLAUDE_CONFIG_DIR`/`home`
+  spelling is the string Claude hashes into its keychain item. `PATCH /harnesses/:id` refuses re-pointing a stack
   member onto another member's config root or another kind
   (`harnessStacks.validateMemberRoot`), and a `PATCH /tasks/:id` column move
   off `blocked` cancels an armed retry.
@@ -598,7 +675,11 @@ resume blocks the swap visibly.
   terminal renderer escapes it — a switch/continue line cannot repaint the
   log. A hidden continuation prints nothing (not even a blank line).
 - **Webview**: Settings → Stacks editor (a disabled account can be added and
-  shows the `member-disabled` warning); Harnesses chips (position + cooling);
+  shows the `member-disabled` warning; its same-config-directory blocker uses
+  the shared spawn precedence of `src/shared/harness-config-root.ts`, env-map
+  `HOME` included, lexically — the real home is `~` and a process
+  `CLAUDE_CONFIG_DIR`/`CODEX_HOME` is unknown there, so the server stays
+  authoritative); Harnesses chips (position + cooling);
   New Task/TaskCard and the task-launch pickers' badges (a not-yet-run task
   derives its `n/m` from the account's stack membership); RunPanel account
   line, countdown banner with a **Run now** action (forces a cooling account
@@ -607,7 +688,9 @@ resume blocks the swap visibly.
   n/3)." with no Run now (`src/mainview/lib/harness-stack-banner.ts`).
 - **One-account stacks**: a stack with fewer than two members is inert, so no
   surface shows an `n/m` position or "fails over" copy for it (webview, CLI,
-  TUI, notifications); the card badge shows only a live state word.
+  TUI, notifications); the card badge shows only a live state word. The rule
+  lives once in `stackPositionText` (`src/shared/harness-stack.ts`), which the
+  CLI and the webview's `stackPositionFor` both use.
 - **Notifications**: `harness-swap` is a quiet kind; `blocked` with a stack
   reason reads "Stack out of quota" / "No usable backup account" (webview,
   headless core, TUI and CLI `--notify`). The old run's failed settle is
@@ -642,15 +725,20 @@ resume blocks the swap visibly.
   evidence for a pinned account reads its own config directory
   (`~/.claude*` / `CLAUDE_CONFIG_DIR`): `.credentials.json`, the credential in
   its `settings.json` `env` or `harness.env` map, or an `apiKeyHelper`-style
-  login. On **macOS** a pinned account keeps its OAuth login in the keychain,
+  login (`apiKeyHelper`, `forceLoginOrgUUID`, `awsCredentialExport`,
+  `awsAuthRefresh`, `gcpAuthRefresh`). On **macOS** a pinned account keeps its OAuth login in the keychain,
   not in a file, so when none of those is present the core asks the keychain
   whether the item exists — existence only, never the secret:
   `/usr/bin/security find-generic-password -s "Claude
   Code-credentials-<first 8 hex of sha256(CLAUDE_CONFIG_DIR as given, NFC)>"`
-  (or of `CLAUDE_SECURESTORAGE_CONFIG_DIR` when set), without `-w`, 2 s
-  timeout, cached 60 s: found → logged in, missing (exit 44) → logged out, any
-  error → unknown. Test seam: `setLoginEvidenceDepsForTests` (under
-  `NODE_ENV=test` the default probe reports "no item"). A Codex account whose
+  (or of `CLAUDE_SECURESTORAGE_CONFIG_DIR` when set), without `-w`, run as an
+  async `coreSpawn` (2 s kill), single-flight per service, cached 60 s: found →
+  logged in, missing (exit 44) → logged out, any error → unknown. Readers never
+  block the main thread: they get the cached (or stale) value, or unknown until
+  the first lookup lands, and trigger a background refresh. Test seams:
+  `setLoginEvidenceDepsForTests` (`keychainProbe`, `securityRunner`) and
+  `settleKeychainProbesForTests` (under `NODE_ENV=test` with no seam the probe
+  reports "no item"). A Codex account whose
   `config.toml` sets `cli_auth_credentials_store = "keyring"|"auto"` and has no
   `auth.json` is "unknown" too. A Bedrock/Vertex/custom-provider setup (or a
   custom endpoint) fails **open** — it is never reported as logged out — in

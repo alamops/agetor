@@ -36,7 +36,9 @@ A catalog change that only alters efforts (not ids) still republishes `agent_mod
 `CODEX_HOME` alone owns login (`auth.json`), config, sessions, MCP servers and
 every write; `HOME` is not overridden. The account's own env map may pin
 `CODEX_HOME` itself, which wins over the home-derived `<home>/.codex` (the
-mirror and rollout transfer use that same root). A harness-stack failover
+mirror and rollout transfer use that same root). An account with neither is
+handed this process's `CODEX_HOME`, or has it unset (`pinCodexHome`), so the
+long-lived tmux server's env can never redirect it. A harness-stack failover
 copies the rollout to the same relative path under the destination `CODEX_HOME`, runs
 `codex migrate-rollouts --apply` when a `thread_history_*.sqlite` already
 exists (30 s timeout, best-effort), and resumes with `exec resume <threadId>`.
@@ -48,7 +50,9 @@ the primary's login-bearing `config.toml` keys or `[model_providers.*]` tables.
 A limit signal comes only from a terminal `turn.failed` (its own message, or
 the classification remembered from the last top-level `error`). A top-level
 `error`, an `error` item and a non-JSON log line never signal, and
-`turn.completed` discards a remembered one, so a 429 that codex retried and
+`turn.completed` or any `item.*` event discards a remembered one (a codex that
+exits with no terminal event while one is remembered emits it instead of the
+"ended unexpectedly" sentinel), so a 429 that codex retried and
 recovered from is never a limit; the orchestrator also ignores a codex limit on
 a run that exited 0. Codex 0.166 reports quota in prose — "You've hit your usage
 limit. … try again at <date> <time>" (quota, with the reset parsed) and "Quota

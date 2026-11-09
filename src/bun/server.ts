@@ -42,7 +42,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, isHeldByBackgroundAgents, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -60,6 +60,7 @@ import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineSt
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackInputError } from "./harness-stacks.ts";
+import { claudeConfigDirFor } from "./harness-config-root.ts";
 import { clearFailoverState, failoverTaskIdsForStack } from "./harness-failover.ts";
 import { mirrorStack } from "./harness-mirror.ts";
 import { collectHarnessSessionCopies, removeHarnessSessionCopies } from "./harness-session-transfer.ts";
@@ -69,7 +70,7 @@ import {
   setHarnessAutoEnableBroadcaster,
 } from "./harness-auto-enable.ts";
 import { accountUsageDays } from "./account-usage.ts";
-import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
+import { discoverClaudeAccounts } from "./harness-discovery.ts";
 import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
@@ -80,7 +81,6 @@ import {
   buildHarnessTerminalCommand,
   harnessEnv,
   isValidEnvKey,
-  claudeConfigDirOverrideFor,
   resolveBin,
   toTerminalAppleScript,
 } from "./agents.ts";
@@ -1411,37 +1411,46 @@ function hasParentSegment(p: string): boolean {
 }
 
 /**
- * Validate and normalize a harness `home`/`bin` (already known absolute). A
- * `..` component is refused: the CLI path gate probes the string the kernel
- * resolves (`/Users/u/Documents/zz/..` is a missing `zz` while `zz` does not
- * exist) while every consumer resolves it lexically to `~/Documents`, so the
- * two would disagree on which folder is touched. What is stored is the
- * `path.resolve` form (no `.`, no doubled or trailing slash), so the string
- * the gate checked is the one every consumer uses.
+ * Validate a harness `home`/`bin` (already known absolute). A `..` component
+ * is refused: the CLI path gate probes the string the kernel resolves
+ * (`/Users/u/Documents/zz/..` is a missing `zz` while `zz` does not exist)
+ * while every consumer resolves it lexically to `~/Documents`, so the two
+ * would disagree on which folder is touched. Without `..` the kernel and a
+ * lexical resolve agree, so the value is stored exactly as given: the stored
+ * `home` is the `CLAUDE_CONFIG_DIR` string Claude Code hashes into its macOS
+ * keychain service name, and rewriting its spelling (a trailing `/`, `//`,
+ * `.`) would log the account out (docs/architecture/harness-stacks.md). The
+ * gate probes that same string.
  */
-function normalizeHarnessPath(value: string, field: string): { value: string } | { error: string } {
+function validateHarnessPath(value: string, field: string): { value: string } | { error: string } {
   if (hasParentSegment(value)) return { error: `${field} must not contain ".." path segments` };
-  return { value: path.resolve(value) };
+  return { value };
 }
 
 /**
- * The same rule for a harness's `env` map: a config-root key
- * (`HARNESS_ENV_ROOT_KEYS`) whose value is absolute (after trimming) is stored
- * trimmed and `path.resolve`d, and any `..` component in it (absolute, `~` or
- * relative) is refused. Other keys are stored as given.
+ * The same rule for a harness's `env` map, which is stored exactly as given. A
+ * config-root key (`HARNESS_ENV_ROOT_KEYS`) whose value is blank
+ * (whitespace-only) counts as unset everywhere (harness-config-root.ts) and
+ * passes; any other value must be an absolute path with no `..` component.
+ * A relative value would resolve against whatever cwd the core inherited, and
+ * a `~` one is taken literally by every consumer (nothing expands it), so
+ * neither is ever meaningful — and neither could be probed by the CLI path
+ * gate as the path a consumer will touch. Refused for every caller. Other
+ * keys pass unchecked.
  */
-function normalizeHarnessEnv(env: Record<string, string>): { env: Record<string, string> } | { error: string } {
-  const out: Record<string, string> = {};
+function validateHarnessEnv(env: Record<string, string>): { env: Record<string, string> } | { error: string } {
   for (const [key, value] of Object.entries(env)) {
-    if (!HARNESS_ENV_ROOT_KEYS.has(key)) {
-      out[key] = value;
-      continue;
-    }
+    if (!HARNESS_ENV_ROOT_KEYS.has(key)) continue;
     const trimmed = value.trim();
+    if (trimmed === "") continue;
     if (hasParentSegment(trimmed)) return { error: `env ${key} must not contain ".." path segments` };
-    out[key] = path.isAbsolute(trimmed) ? path.resolve(trimmed) : value;
+    // Checked on the value as given: one with leading whitespace is absolute
+    // only after trimming, but the spawn and every consumer use it untrimmed.
+    if (!path.isAbsolute(value)) {
+      return { error: `env ${key} must be an absolute path (no leading whitespace; "~" is not expanded)` };
+    }
   }
-  return { env: out };
+  return { env: { ...env } };
 }
 
 function gateRefusalResponse(req: Request, refusal: { status: 403; error: string; code: string }): Response {
@@ -1453,15 +1462,17 @@ function gateRefusalResponse(req: Request, refusal: { status: 403; error: string
 // caller, but not the values inside its `env` map — and an env value that is an
 // absolute path (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME`…) names a directory
 // the core later tails, reads, creates or writes in-process. So the same
-// disclaimed probe runs over every absolute-path env value (D24), plus the
-// `~`-expanded form of a config-root key; the first denied one refuses the
-// request with the gate's own 403 body. The mode is `nearest-ancestor`: a root
-// that does not exist yet is created by the stack mirror under its nearest
-// existing ancestor, so that ancestor is what the core would touch. Run on the
-// NORMALIZED env (`normalizeHarnessEnv`). The app caller is never gated.
+// disclaimed probe runs over every absolute-path env value (D24); the first
+// denied one refuses the request with the gate's own 403 body. A config-root
+// key can only hold a blank or an absolute value by now (`validateHarnessEnv`
+// refuses a relative or `~` one), so the string probed is the string every
+// consumer uses. The mode is `nearest-ancestor`: a root that does not exist
+// yet is created by the stack mirror under its nearest existing ancestor, so
+// that ancestor is what the core would touch. Run after `validateHarnessEnv`.
+// The app caller is never gated.
 async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): Promise<Response | null> {
   if (callerOf(req) !== "cli") return null;
-  for (const [key, value] of Object.entries(env)) {
+  for (const value of Object.values(env)) {
     // Gate the trimmed spelling too: a consumer that trims the value would
     // otherwise act on a protected path the raw string never named.
     const trimmed = value.trim();
@@ -1469,8 +1480,6 @@ async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): P
     if (trimmed.startsWith("/")) {
       candidates.add(value);
       candidates.add(trimmed);
-    } else if (HARNESS_ENV_ROOT_KEYS.has(key) && (trimmed === "~" || trimmed.startsWith("~/"))) {
-      candidates.add(path.resolve(expandHomePath(trimmed)));
     }
     for (const p of candidates) {
       const refusal = await gateCallerPath(p, "cli", "nearest-ancestor");
@@ -1487,17 +1496,30 @@ async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): P
  * CLI-token caller each member's effective roots (the config root, and for
  * Claude the directory holding `.claude.json`) are probed through the
  * disclaimed child before anything is saved; a denied one refuses with the
- * gate's 403 `path-not-accessible`. Unknown ids are left to the stack
- * validator's own 400. The app caller is never gated.
+ * gate's 403 `path-not-accessible`. The probe follows symlinks, so a root
+ * re-pointed into a protected folder after an earlier save is caught again
+ * here. Also run before a CLI-token same-stack account switch
+ * (`PATCH /tasks/:id`), which mirrors and transfers between the two members'
+ * roots (CR5). Unknown ids are left to the stack validator's own 400. The
+ * app caller is never gated.
  */
 async function gateStackMemberRoots(req: Request, memberIds: readonly string[]): Promise<Response | null> {
   if (callerOf(req) !== "cli") return null;
   const roots = new Set<string>();
+  const addRoot = (root: string) => {
+    // The spelling consumers use: they resolve a root lexically against the
+    // core's cwd and never expand `~`. A legacy row saved before a `~` or
+    // relative env value was refused also gets its `~`-expanded form probed,
+    // since the stack validator's realpath compare expands it.
+    roots.add(path.resolve(root));
+    const expanded = expandHomePath(root);
+    if (expanded !== root) roots.add(path.resolve(expanded));
+  };
   for (const id of memberIds) {
-    const harness = harnesses.get(id);
+    const harness = harnesses.getByIdOrKind(id);
     if (!harness || (harness.kind !== "claude-code" && harness.kind !== "codex")) continue;
-    roots.add(path.resolve(expandHomePath(effectiveHome(harness))));
-    if (harness.kind === "claude-code") roots.add(path.resolve(expandHomePath(claudeJsonDirFor(harness))));
+    addRoot(effectiveHome(harness));
+    if (harness.kind === "claude-code") addRoot(claudeJsonDirFor(harness));
   }
   for (const root of roots) {
     const refusal = await gateCallerPath(root, "cli", "nearest-ancestor");
@@ -4469,13 +4491,13 @@ export function startApiServer(
           if (bin && !path.isAbsolute(bin)) {
             return json({ error: "bin must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
           }
-          // No `..` components, and store the resolved spelling (M7): the
-          // path the CLI gate probed must be the one every consumer uses.
-          const homeNorm = home ? normalizeHarnessPath(home, "home") : null;
+          // No `..` components (M7); stored as given (R-S7) — see
+          // `validateHarnessPath`.
+          const homeNorm = home ? validateHarnessPath(home, "home") : null;
           if (homeNorm && "error" in homeNorm) {
             return json({ error: homeNorm.error }, { status: 400, headers: corsHeaders(req) });
           }
-          const binNorm = bin ? normalizeHarnessPath(bin, "bin") : null;
+          const binNorm = bin ? validateHarnessPath(bin, "bin") : null;
           if (binNorm && "error" in binNorm) {
             return json({ error: binNorm.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -4492,7 +4514,7 @@ export function startApiServer(
               rawEnv[k] = v;
             }
           }
-          const envNorm = normalizeHarnessEnv(rawEnv);
+          const envNorm = validateHarnessEnv(rawEnv);
           if ("error" in envNorm) return json({ error: envNorm.error }, { status: 400, headers: corsHeaders(req) });
           const env = envNorm.env;
           const envRefusal = await gateHarnessEnvPaths(req, env);
@@ -4633,9 +4655,12 @@ export function startApiServer(
       // entries. Identity fields only; never tokens or account uuids.
       "/harness-discovery": {
         GET: authed((req) => {
+          // The directory each registered account's claude actually reads
+          // (claudeConfigDirFor), not the spawn pin: an account with only an
+          // env-map HOME pins nothing yet reads `<HOME>/.claude`.
           const registeredHomes = harnesses.list()
             .filter((h) => h.kind === "claude-code")
-            .map((h) => claudeConfigDirOverrideFor(h));
+            .map((h) => claudeConfigDirFor(h));
           return json(
             { accounts: discoverClaudeAccounts(registeredHomes) },
             { headers: corsHeaders(req) },
@@ -4704,7 +4729,7 @@ export function startApiServer(
           if ("home" in body) {
             if (body.home == null || body.home === "") patch.home = null;
             else if (typeof body.home === "string" && path.isAbsolute(body.home)) {
-              const norm = normalizeHarnessPath(body.home, "home");
+              const norm = validateHarnessPath(body.home, "home");
               if ("error" in norm) return json({ error: norm.error }, { status: 400, headers: corsHeaders(req) });
               patch.home = norm.value;
             } else return json({ error: "home must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
@@ -4712,7 +4737,7 @@ export function startApiServer(
           if ("bin" in body) {
             if (body.bin == null || body.bin === "") patch.bin = null;
             else if (typeof body.bin === "string" && path.isAbsolute(body.bin)) {
-              const norm = normalizeHarnessPath(body.bin, "bin");
+              const norm = validateHarnessPath(body.bin, "bin");
               if ("error" in norm) return json({ error: norm.error }, { status: 400, headers: corsHeaders(req) });
               patch.bin = norm.value;
             } else return json({ error: "bin must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
@@ -4729,7 +4754,7 @@ export function startApiServer(
               }
               rawEnv[k] = v;
             }
-            const envNorm = normalizeHarnessEnv(rawEnv);
+            const envNorm = validateHarnessEnv(rawEnv);
             if ("error" in envNorm) return json({ error: envNorm.error }, { status: 400, headers: corsHeaders(req) });
             const envRefusal = await gateHarnessEnvPaths(req, envNorm.env);
             if (envRefusal) return envRefusal;
@@ -5449,7 +5474,9 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const configDir = claudeConfigDirOverrideFor(h) ?? effectiveClaudeConfigDir(null);
+          // The directory this account's claude writes its JSONLs to (an
+          // env-map HOME included), which is what the rollup reads.
+          const configDir = claudeConfigDirFor(h);
           return json(
             { configDir, days: accountUsageDays(configDir) },
             { headers: corsHeaders(req) },
@@ -5970,6 +5997,25 @@ export function startApiServer(
               { error: "stop the run before switching accounts" },
               { status: 409, headers: corsHeaders(req) },
             );
+          }
+          // A held task (its turn succeeded but background agents are still
+          // running in the REPL) is live too: the switch drops the old
+          // session, which would kill the REPL hosting those agents.
+          if (sameStackAccountSwitch && isHeldByBackgroundAgents(before.id)) {
+            return json(
+              { error: "stop the background agents before switching accounts" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // The switch mirrors config into the target's root and copies the
+          // transcript between the two roots in-process. Both were gated when
+          // the stack was saved, but a root can be re-pointed (a symlink into
+          // a protected folder) afterwards, so a CLI-token switch re-gates
+          // both members' effective roots before anything moves (CR5,
+          // docs/architecture/security.md). The app caller is never gated.
+          if (sameStackAccountSwitch && typeof patch.agent === "string") {
+            const rootRefusal = await gateStackMemberRoots(req, [before.agent, patch.agent]);
+            if (rootRefusal) return rootRefusal;
           }
           // Enforce the "model is always set, effort is set unless the
           // model declines it" invariant at the PATCH boundary so direct
@@ -8358,14 +8404,16 @@ export function startApiServer(
           // Reconstruct the cwd claude was launched against. Worktree tasks
           // had cwd = worktreePath; isolation=none had cwd = workdir.
           const cwd = task.worktreePath ?? task.workdir;
-          // Resolve the harness so we read from the alias's CLAUDE_CONFIG_DIR
-          // (multi-account); built-ins resolve to `~/.claude/projects/…` via
-          // the `configDir: null` branch inside jsonlPathFor.
+          // Resolve the harness so we read from the directory its claude
+          // actually wrote the session to (claudeConfigDirFor: the alias's
+          // CLAUDE_CONFIG_DIR, or `<HOME>/.claude` for an env-map HOME, or the
+          // built-in's `~/.claude`); an unknown agent falls back to the
+          // `configDir: null` branch inside jsonlPathFor.
           const harness = harnesses.getByIdOrKind(task.agent);
           const jsonlPath = jsonlPathFor(
             cwd,
             run.claudeSessionId,
-            harness ? claudeConfigDirOverrideFor(harness) : null,
+            harness ? claudeConfigDirFor(harness) : null,
           );
           if (!existsSync(jsonlPath)) {
             return json(

@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   CODEX_LOGIN_BEARING_CONFIG_KEYS,
+  COMMAND_RUNNING_SETTINGS_KEYS,
+  LOGIN_BEARING_SETTINGS_KEYS,
   LOGIN_SELECTOR_ENV_KEYS,
+  MACOS_TCC_PROTECTED_HOME_FOLDERS,
   MIRROR_PAYLOAD_LIMITS,
   MIRROR_SPECS,
   SAFE_MODE_EXCLUDED_CODEX_KEYS,
@@ -12,9 +15,12 @@ import {
   isHandoffCopyShape,
   isHandoffPrunableDir,
   isHarnessAuthEnvKey,
+  isLoginBearingSettingsKey,
   isLoginSelectorEnvKey,
   isMirrorNeverImportedEnvKey,
+  isMirrorNeverImportedSettingsKey,
   isNeverCopyPath,
+  tccProtectedFolderOf,
 } from "./harness-mirror.ts";
 
 describe("mirror allowlist", () => {
@@ -247,15 +253,49 @@ describe("Claude Code's own session variables are not a login", () => {
 });
 
 describe("safe mode and login-bearing config keys", () => {
-  test("safe mode skips hooks, permissions, status line and helper commands; Codex notify", () => {
+  test("safe mode skips hooks, permissions and every command setting; Codex notify", () => {
+    // Claude Code 2.1.319's own list of settings whose value is a command
+    // (review R-S4): every one is skipped in safe mode.
+    const claudeCommandSettings = [
+      "apiKeyHelper",
+      "awsAuthRefresh",
+      "awsCredentialExport",
+      "fileSuggestion",
+      "gcpAuthRefresh",
+      "otelHeadersHelper",
+      "policyHelpers",
+      "processWrapper",
+      "proxyAuthHelper",
+      "statusLine",
+      "subagentStatusLine",
+    ];
+    expect([...COMMAND_RUNNING_SETTINGS_KEYS].sort()).toEqual(claudeCommandSettings);
     expect([...SAFE_MODE_EXCLUDED_SETTINGS_KEYS].sort()).toEqual(
-      ["hooks", "otelHeadersHelper", "permissions", "statusLine"],
+      ["hooks", "permissions", ...claudeCommandSettings].sort(),
     );
     expect(SAFE_MODE_EXCLUDED_CODEX_KEYS).toContain("notify");
     // Plugins and MCP servers are the feature's promise, never safe-skipped.
     for (const key of ["enabledPlugins", "mcpServers", "mcp_servers", "plugins"]) {
       expect(SAFE_MODE_EXCLUDED_SETTINGS_KEYS).not.toContain(key);
       expect(SAFE_MODE_EXCLUDED_CODEX_KEYS).not.toContain(key);
+    }
+  });
+
+  test("login-bearing and login-selecting settings are never imported; only the bearing ones are login evidence (review R-S3)", () => {
+    for (const key of ["apiKeyHelper", "forceLoginOrgUUID", "awsCredentialExport", "awsAuthRefresh", "gcpAuthRefresh"]) {
+      expect(isLoginBearingSettingsKey(key), key).toBe(true);
+      expect(isMirrorNeverImportedSettingsKey(key), key).toBe(true);
+    }
+    // `forceLoginMethod` selects which login the CLI accepts and
+    // `proxyAuthHelper` produces the proxy's credential: never imported, but
+    // neither is a login of the account, so login evidence ignores them.
+    for (const key of ["forceLoginMethod", "proxyAuthHelper"]) {
+      expect(isMirrorNeverImportedSettingsKey(key), key).toBe(true);
+      expect(isLoginBearingSettingsKey(key), key).toBe(false);
+      expect(LOGIN_BEARING_SETTINGS_KEYS).not.toContain(key);
+    }
+    for (const key of ["model", "statusLine", "hooks", "env", "enabledPlugins"]) {
+      expect(isMirrorNeverImportedSettingsKey(key), key).toBe(false);
     }
   });
 
@@ -328,5 +368,57 @@ describe("handoff copy shapes (review S4)", () => {
     expect(isHandoffPrunableDir("codex", "sessions/2026")).toBe(true);
     expect(isHandoffPrunableDir("codex", "sessions")).toBe(false);
     expect(isHandoffPrunableDir("codex", "sessions/archive")).toBe(false);
+  });
+});
+
+describe("macOS TCC-protected home folders (contract CR4, review R-S5)", () => {
+  const home = "/Users/someone";
+
+  test("a path equal to or inside a protected folder names its entry", () => {
+    expect(tccProtectedFolderOf("/Users/someone/Documents", [home])).toBe("Documents");
+    expect(tccProtectedFolderOf("/Users/someone/Documents/notes/x", [home])).toBe("Documents");
+    expect(tccProtectedFolderOf("/Users/someone/Library/Mobile Documents/com~apple~CloudDocs", [home]))
+      .toBe("Library/Mobile Documents");
+    expect(tccProtectedFolderOf("/Users/someone/Library/Group Containers/g/x", [home])).toBe("Library/Group Containers");
+    // The default macOS volume is case-insensitive.
+    expect(tccProtectedFolderOf("/Users/someone/documents/x", [home])).toBe("Documents");
+    // Trailing and doubled slashes do not matter.
+    expect(tccProtectedFolderOf("/Users/someone//Desktop/", [home + "/"])).toBe("Desktop");
+  });
+
+  test("ordinary home paths, prefixes and other homes are not protected", () => {
+    for (const p of [
+      "/Users/someone",
+      "/Users/someone/.claude",
+      "/Users/someone/DocumentsArchive",
+      "/Users/someone/Library",
+      "/Users/someone/Library/Caches",
+      "/Users/other/Documents",
+      "/private/tmp/x",
+      "/private/var/folders/x",
+    ]) {
+      expect(tccProtectedFolderOf(p, [home]), p).toBeNull();
+    }
+  });
+
+  test("every candidate home is tried", () => {
+    expect(tccProtectedFolderOf("/private/h/Downloads/x", ["/h", "/private/h"])).toBe("Downloads");
+  });
+
+  test("the list is the documented conservative set", () => {
+    expect([...MACOS_TCC_PROTECTED_HOME_FOLDERS].sort()).toEqual([
+      "Desktop",
+      "Documents",
+      "Downloads",
+      "Library/Containers",
+      "Library/Group Containers",
+      "Library/Mail",
+      "Library/Messages",
+      "Library/Mobile Documents",
+      "Library/Safari",
+      "Movies",
+      "Music",
+      "Pictures",
+    ]);
   });
 });

@@ -25,6 +25,9 @@ export interface HarnessLimitInput {
    * to the text.
    */
   code?: unknown;
+  /** The instant a relative reset ("try again at 3:00 PM") resolves against;
+   *  defaults to `Date.now()`. Tests pin it so a dated reset stays exact. */
+  now?: number;
 }
 
 interface Matcher {
@@ -184,13 +187,14 @@ export function classifyHarnessLimitSignal(
   const trimmed = typeof input.text === "string" ? input.text.trim() : "";
   const source = kind === "codex" ? "codex-error" as const : "claude-api-error" as const;
   const code = normalizeErrorCode(input.code);
+  const now = typeof input.now === "number" && Number.isFinite(input.now) ? input.now : Date.now();
   if (code !== null) {
     if (NEGATIVE_CODES.has(code)) return null;
     const reason = LIMIT_CODES[code];
     if (reason) {
       return {
         reason,
-        resetAtMs: trimmed ? parseClaudeResetNotice(trimmed, Date.now()) : null,
+        resetAtMs: trimmed ? parseClaudeResetNotice(trimmed, now) : null,
         message: sanitizeLimitMessage(trimmed || code),
         source,
       };
@@ -202,7 +206,7 @@ export function classifyHarnessLimitSignal(
     if (!matcher.re.test(trimmed)) continue;
     return {
       reason: matcher.reason,
-      resetAtMs: parseClaudeResetNotice(trimmed, Date.now()),
+      resetAtMs: parseClaudeResetNotice(trimmed, now),
       message: sanitizeLimitMessage(trimmed),
       source,
     };

@@ -33,7 +33,7 @@ A site the user happens to visit can't read either token, so even with `ACAO` se
 `/refs/resolve` for the CLI answers from those probe results directly (a denied path drops like a failing stat), agent discovery's live project tree is read through `callerProjectTree` (a disclaimed `find -L … -print0` filtered by `shouldRead`, then `tar -L --null -T -`, parsed by `src/bun/tar-read.ts`;
 a truncation at the 8 MB cap is logged) — and while the disclaim switch is on, ALL of agent discovery reads through disclaimed children for every caller, the app included (`src/bun/discovery-fs.ts`, D26: user/harness-home trees, settings, `installed_plugins.json`, plugin install dirs, codex/cursor config, and `~/.claude.json` via a disclaimed `stat`+`cat` behind a stat-keyed cache;
 each `load()` stage is one direct `find -L` per (depth, name) selector shape, run in parallel, plus one `tar`, under one 15 s budget whose timeout is logged — claude-code adds a second stage for its active plugins and the `.claude.json` child, the other kinds need one stage), and `/claude-sessions/import`, `/claude-sessions/checkout` and `/opencode-sessions/import` pass a `gateCwd` for a CLI caller;
-harness `home`/`bin` and absolute-path `env` values are gated the same way. `POST`/`PATCH /harnesses` first refuse any `..` component in `home`, `bin` and the config-root env values (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME`) with a 400 and store them `path.resolve`d, so the probe and every consumer see the same path; `home` and those env values are gated `nearest-ancestor` (a missing nested root under a protected folder is refused, since the stack mirror may create it), `bin` stays `exists`, and a `~`-prefixed root value is gated after expansion. The harness-stack routes take no path from the request but act on stored roots, so for the CLI caller `POST`/`PATCH /harness-stacks` probe every member's `effectiveHome` (and, for Claude, the `.claude.json` directory) in the handler and refuse `403 path-not-accessible` (no `pathParams` entry).
+harness `home`/`bin` and absolute-path `env` values are gated the same way. `POST`/`PATCH /harnesses` first refuse any `..` component in `home`, `bin` and the config-root env values (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME`) with a 400, refuse (400, every caller) a non-blank config-root env value that is not absolute as given (relative, `~`, leading whitespace — a consumer would resolve it against the core's cwd), and store `home` and those values exactly as given (the stored `home`/`CLAUDE_CONFIG_DIR` spelling is the string Claude hashes into its keychain item), so the probe and every consumer see the same string; `home` and those env values are gated `nearest-ancestor` (a missing nested root under a protected folder is refused, since the stack mirror may create it) and `bin` stays `exists`. The harness-stack routes take no path from the request but act on stored roots, so for the CLI caller `POST`/`PATCH /harness-stacks` probe every member's `effectiveHome` (and, for Claude, the `.claude.json` directory) in the handler and refuse `403 path-not-accessible` (no `pathParams` entry); a CLI-token same-stack account switch through `PATCH /tasks/:id` re-runs the same probe for both the current and the target member.
 The app caller is never gated and keeps today's in-process behavior.
 A route whose path field needs no gate says why with `pathParamsExempt`.
 
@@ -99,10 +99,13 @@ and the copy path uses `copyRegularFile` with the same `READ_NOFOLLOW` flags —
 and every write is a sibling temp file, fsync, rename, 0600 (0700 dirs).
 Directory walks `lstat` each entry and skip symlinks/FIFOs/devices (the one
 exception: a *top-level* symlink in Claude `skills/`/`commands/`/`agents/` or
-Codex `skills/`/`prompts/` is recreated as an absolute link to its resolved
-target — no bytes are read through it — and a dangling target, a target at or
-above either account root, a never-copy/credential path or a `.git` path is
-refused; a real backup entry is never replaced); copies
+Codex `skills/`/`prompts/` is recreated as an absolute link to its target,
+resolved lexically — lstat + readlink per component, never `realpath`, nothing
+below a macOS-protected home folder is stat'ed, no bytes are read through it —
+and a dangling or looping target, a target at or above either account root, a
+never-copy/credential path, a `.git` path or a target in a protected home folder
+(`Desktop`, `Documents`, `Downloads`, …) is refused; a real backup entry is never
+replaced); copies
 merge additively into the destination (a backup's own files survive) without
 traversing a destination symlink; caps are 64 MB and 5,000 entries per tree,
 and a config merge reads at most 8 MB.
@@ -123,7 +126,8 @@ provider **and cloud** login env keys are stripped from a mirrored
 every provider/login **selector** (`CLAUDE_CODE_USE_BEDROCK`/`VERTEX`/`FOUNDRY`/…,
 `ANTHROPIC_BASE_URL` and the per-cloud `*_BASE_URL`s, `CLAUDE_CODE_SKIP_*_AUTH`,
 `AWS_ROLE_ARN`/`AWS_PROFILE`, …) and the login-selecting settings keys
-(`apiKeyHelper`, `forceLoginOrgUUID`, …); a backup's own value survives and the
+(`apiKeyHelper`, `forceLoginOrgUUID`, `aws*`, `gcpAuthRefresh`,
+`forceLoginMethod`, `proxyAuthHelper`); a backup's own value survives and the
 process environment is not modified. On the Codex side the login-bearing
 `config.toml` keys (`model_provider`, `forced_login_method`,
 `forced_chatgpt_workspace_id`, `preferred_auth_method`,
@@ -131,14 +135,21 @@ process environment is not modified. On the Codex side the login-bearing
 `mcp_enterprise_managed_auth`, `chatgpt_base_url`, `openai_base_url`) and every
 `[model_providers.*]` table (which can carry a bearer token or auth headers)
 are never imported; the backup's own survive, including the login keys of its
-own `[profiles.*]`. The Codex `[projects.*]` trust entries are never inherited.
+own `[profiles.*]`, in any TOML form (an inline primary profile naming a login
+key is dropped whole). The Codex `[projects.*]` trust entries are never inherited.
 Codex MCP OAuth tokens are not copied (no stable standalone store file) and the
 swap warns that sign-in may need repeating. Static MCP/plugin tool
 configuration — including any token an MCP server definition carries in its
 `env`/`headers` — **is** mirrored: the owner sanctioned tool auth crossing
 accounts, never the harness's own login (`docs/plans/harness-account-stacks-grill.md`).
-`safe` mirror mode skips settings hooks, permissions, status line and helper
-commands (Codex: `notify`); plugins and MCP servers are still mirrored.
+`safe` mirror mode skips settings hooks, permissions and every setting that
+runs a command (Claude Code's own list: `apiKeyHelper`, `awsAuthRefresh`,
+`awsCredentialExport`, `fileSuggestion`, `gcpAuthRefresh`, `otelHeadersHelper`,
+`policyHelpers`, `processWrapper`, `proxyAuthHelper`, `statusLine`,
+`subagentStatusLine`; Codex: `notify`); plugins and MCP servers are still
+mirrored. Before any other I/O, mirror, transfer and cleanup resolve each
+account root lexically and refuse one that lands in a protected home folder its
+stored path did not name (a root swapped for a symlink after it was gated).
 Mirror and transfer refuse two accounts whose config roots are the same
 directory by realpath (a symlinked alias included), and `PATCH /harnesses/:id`
 refuses re-pointing a stack member onto another member's root.

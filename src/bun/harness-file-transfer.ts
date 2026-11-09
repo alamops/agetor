@@ -14,6 +14,11 @@
  * - the mirror's tree copy preserves each file's mtime and skips a destination
  *   that already has the same size and mtime, so a repeat mirror rewrites only
  *   what changed;
+ * - an account root that resolves (through a symlink planted after the
+ *   account was saved) into a macOS TCC-protected home folder its stored path
+ *   did not name is refused before anything is read or written
+ *   (`rootRedirectRefusal`, resolved with `lstat`/`readlink` only, never a
+ *   stat inside the target);
  * - cleanup unlinks only regular files whose path has a handoff shape
  *   (`isHandoffCopyShape`), never recurses, and prunes only empty folders
  *   inside that shape;
@@ -28,6 +33,7 @@ import {
   mkdirSync,
   constants,
   readdirSync,
+  readlinkSync,
   realpathSync,
   rmdirSync,
   unlinkSync,
@@ -38,6 +44,7 @@ import {
   rename,
   unlink,
 } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { READ_NOFOLLOW } from "./no-follow.ts";
@@ -46,6 +53,7 @@ import {
   isHandoffPrunableDir,
   isNeverCopyPath,
   isNeverCopySegment,
+  tccProtectedFolderOf,
 } from "../shared/harness-mirror.ts";
 import type { HarnessStackKind } from "../shared/types.ts";
 
@@ -123,9 +131,157 @@ export function canonicalRoot(p: string): string {
 /** True when two config roots are the same directory after resolving
  *  symlinks ({@link canonicalRoot}). Mirroring or transferring between them
  *  would copy an account onto itself, and cleanup would then delete the
- *  source's own files, so every caller refuses. */
+ *  source's own files, so every caller refuses. Callers run
+ *  {@link rootRedirectRefusal} first: `realpath` would otherwise stat inside a
+ *  protected folder a root was redirected into. */
 export function sameConfigRoot(a: string, b: string): boolean {
   return canonicalRoot(a) === canonicalRoot(b);
+}
+
+/** Symlinks followed by {@link resolvePathLexically} before it gives up (the
+ *  macOS kernel's own MAXSYMLINKS). */
+const MAX_LEXICAL_LINKS = 32;
+
+/** Test seam: the home whose TCC-protected folders are checked. */
+let tccHomeOverride: string | null = null;
+
+/** Point the TCC-protected-folder checks at a fake home (null restores the
+ *  real one). Tests only — `bun test` shares one process, so restore it. */
+export function setTccHomeForTests(home: string | null): void {
+  tccHomeOverride = home;
+}
+
+/** The home as spelled and its realpath (the home itself is never a protected
+ *  folder, so resolving it is safe). */
+function tccHomes(): string[] {
+  const home = tccHomeOverride ?? homedir();
+  const homes = [path.resolve(home)];
+  try {
+    const real = realpathSync(home);
+    if (!homes.includes(real)) homes.push(real);
+  } catch {
+    // A missing home has no protected folders to resolve into.
+  }
+  return homes;
+}
+
+export interface LexicalResolution {
+  /** Absolute path with every symlink the walk could see followed. */
+  path: string;
+  /** A component did not exist (or was not a directory); the remainder was
+   *  joined on lexically. */
+  missing: boolean;
+  /** The protected home-folder entry (e.g. `"Documents"`) the path reached, or
+   *  null (see `MACOS_TCC_PROTECTED_HOME_FOLDERS` in src/shared/harness-mirror.ts).
+   *  The walk stops at such a folder: nothing below it is stat'ed and
+   *  the remainder is joined on lexically. */
+  protectedFolder: string | null;
+  /** Too many links, or a component that could not be inspected. */
+  error: string | null;
+}
+
+/**
+ * Resolve `p` like `realpath`, but one component at a time with `lstat` +
+ * `readlink`, so the core never stats INSIDE a macOS TCC-protected home folder
+ * (docs/architecture/security.md, D24): the walk lstat's a protected folder's
+ * own entry in the home (allowed) and stops there, and nothing below it is
+ * touched. `..` is applied to the already-resolved prefix (POSIX semantics,
+ * as `realpath` does), links are spliced in place, and more than
+ * {@link MAX_LEXICAL_LINKS} links is an error. A missing component ends the
+ * walk with the rest joined lexically. Synchronous and bounded: at most one
+ * `lstat`/`readlink` per component and link.
+ */
+export function resolvePathLexically(p: string): LexicalResolution {
+  const homes = tccHomes();
+  // Not `path.resolve`: it would apply `..` lexically before the links that
+  // precede it are followed.
+  const absolute = path.isAbsolute(p) ? p : `${process.cwd()}${path.sep}${p}`;
+  let pending = absolute.split(path.sep).filter(Boolean);
+  let cur: string = path.sep;
+  let links = 0;
+  const finish = (resolved: string, extra: Partial<LexicalResolution>): LexicalResolution => {
+    const normalized = path.resolve(resolved);
+    return {
+      path: normalized,
+      missing: false,
+      protectedFolder: tccProtectedFolderOf(normalized, homes),
+      error: null,
+      ...extra,
+    };
+  };
+  while (pending.length > 0) {
+    const part = pending.shift()!;
+    if (part === ".") continue;
+    if (part === "..") {
+      cur = path.dirname(cur);
+      continue;
+    }
+    // Inside a protected folder: never lstat below it. The folder is reported
+    // even if the unresolved remainder's `..` would lexically climb back out:
+    // what a component inside it links to is unknown.
+    const inside = tccProtectedFolderOf(cur, homes);
+    if (inside) return finish(path.join(cur, part, ...pending), { protectedFolder: inside });
+    const next = path.join(cur, part);
+    let st;
+    try {
+      st = lstatSync(next);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT" || code === "ENOTDIR") return finish(path.join(next, ...pending), { missing: true });
+      return finish(path.join(next, ...pending), { error: `${code ?? "error"} inspecting a path component` });
+    }
+    if (!st.isSymbolicLink()) {
+      cur = next;
+      continue;
+    }
+    if (++links > MAX_LEXICAL_LINKS) {
+      return finish(path.join(next, ...pending), { error: "too many levels of symbolic links" });
+    }
+    let target: string;
+    try {
+      target = readlinkSync(next);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      return finish(path.join(next, ...pending), { error: `${code ?? "error"} reading a symbolic link` });
+    }
+    if (path.isAbsolute(target)) cur = path.sep;
+    pending = [...target.split(path.sep).filter(Boolean), ...pending];
+  }
+  return finish(cur, {});
+}
+
+/**
+ * Contract CR4 (docs/architecture/harness-stacks.md): the reason to refuse a
+ * mirror or session transfer into or out of the account root `root`, or null
+ * when it is safe. Roots are gated when an account is saved, but an agent can
+ * later replace a root (or one of its parents) with a symlink into a
+ * TCC-protected home folder, and the core would then read and write there in
+ * its own process. The root is resolved lexically ({@link resolvePathLexically},
+ * no stat inside the target) and refused when it lands in a protected folder
+ * the stored path itself did not name, or when it cannot be resolved. A root
+ * the user deliberately saved under a protected folder is unchanged (it was
+ * gated as such), and ordinary system links (`/tmp` → `/private/tmp`, `/var`
+ * → `/private/var`) never land in a protected folder.
+ */
+export function rootRedirectRefusal(root: string, what: string): string | null {
+  const homes = tccHomes();
+  const named = tccProtectedFolderOf(path.resolve(root), homes);
+  const resolved = resolvePathLexically(root);
+  if (resolved.error) return `${what} could not be resolved safely (${resolved.error})`;
+  const landed = resolved.protectedFolder;
+  if (landed && landed.toLowerCase() !== named?.toLowerCase()) {
+    return `${what} now resolves into the macOS-protected folder ~/${landed} through a symbolic link — refused`;
+  }
+  return null;
+}
+
+/** {@link rootRedirectRefusal} for several roots: the first refusal, or null. */
+export function rootsRedirectRefusal(roots: ReadonlyArray<readonly [root: string, what: string]>): string | null {
+  for (const [root, what] of roots) {
+    const reason = rootRedirectRefusal(root, what);
+    if (reason) return reason;
+  }
+  return null;
 }
 
 /** True when `p` is a regular file that is NOT a symlink. */
@@ -149,7 +305,9 @@ export function isPlainDir(p: string): boolean {
 /**
  * Create `dir` (and any missing ancestors) below `root`, refusing to walk
  * through a symlink or a non-directory. `root` itself is trusted: it is the
- * account's own config root, which a user may legitimately symlink. Every
+ * account's own config root, which a user may legitimately symlink — the
+ * mirror and session transfer first refuse a root that now resolves into a
+ * macOS-protected folder ({@link rootRedirectRefusal}, contract CR4). Every
  * component Agetor creates or descends into below it must be a real
  * directory, so an agent-writable home cannot redirect the mirror's writes
  * into a protected folder.
@@ -622,6 +780,8 @@ export function isPlainPathUnder(root: string, p: string): boolean {
  *   (`isHandoffCopyShape`): Claude `projects/<enc>/<sid>.jsonl` or a file in
  *   that session's `subagents`/`tool-results`/`mcp-tasks` folder, Codex
  *   `sessions/YYYY/MM/DD/rollout-*.jsonl`;
+ * - `root` itself does not resolve into a protected folder it was not saved
+ *   under ({@link rootRedirectRefusal}; otherwise nothing is removed);
  * - every component below `root` is a real, non-symlink path
  *   ({@link isPlainPathUnder}) and the leaf is a regular file (a directory, a
  *   symlink or a special file at a recorded path is left alone).
@@ -644,6 +804,8 @@ export async function removeCopiedPaths(
 ): Promise<string[]> {
   const resolvedRoot = path.resolve(root);
   const removed: string[] = [];
+  // Contract CR4: a root redirected into a protected folder is never touched.
+  if (rootRedirectRefusal(resolvedRoot, "the account's config directory")) return removed;
   let lastYield = Date.now();
   for (const p of paths) {
     if (Date.now() - lastYield >= YIELD_EVERY_MS) {

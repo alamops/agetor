@@ -5,6 +5,13 @@
  * Model and rules: docs/architecture/harness-stacks.md.
  */
 import type { Harness, HarnessMirrorMode, HarnessStack, HarnessStackKind } from "../../shared/types.ts";
+import {
+  joinRootPath,
+  nonBlankRootValue,
+  resolveClaudeRoot,
+  resolveCodexRoot,
+  type ProcessRootValues,
+} from "../../shared/harness-config-root.ts";
 import { ApiTransitError } from "./net-retry.ts";
 
 /**
@@ -136,22 +143,40 @@ export function draftBlockers(
 }
 
 /**
- * The config root a draft member would use, without touching the filesystem.
- * Mirrors the server's `effectiveHome`: an env override wins, then the
- * harness home (`<home>/.codex` for codex), then the process default. A
- * home-less built-in therefore collapses to one per-kind sentinel — the same
- * way every home-less built-in inherits the same `~/.claude` / `~/.codex`,
- * so adding two of them still trips the blocker.
+ * Stand-in for the core's process values, which the webview cannot see. The
+ * real home becomes `~` — the server's comparison expands a leading `~` to
+ * the real home, so `~/.claude` set explicitly still matches a home-less
+ * account here exactly as it does there. Agetor's own `CLAUDE_CONFIG_DIR` /
+ * `CODEX_HOME` are treated as unset; the server remains authoritative.
  */
-function configRootKey(harness: Harness): string {
-  const env = harness.env ?? {};
+const WEBVIEW_PROCESS_ROOTS: ProcessRootValues = { homeDir: "~", claudeConfigDir: null, codexHome: null };
+
+/**
+ * The config root a draft member would use, without touching the filesystem.
+ * It runs the SAME precedence as the server's `effectiveHome` (the shared
+ * `resolveClaudeRoot` / `resolveCodexRoot`, docs/architecture/harness-stacks.md):
+ * env-map `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, then the harness home
+ * (`<home>/.codex` for codex), then the env-map `HOME` (`<HOME>/.claude`,
+ * `<HOME>/.codex`), then the default. So two home-less accounts that differ
+ * only by their env-map `HOME` are distinct roots (review N7), while every
+ * account on the default root collapses to one key and still trips the
+ * blocker. Lexical only: no realpath, no relative-path resolution.
+ */
+export function configRootKey(harness: Pick<Harness, "kind" | "home" | "env">): string {
   if (harness.kind === "claude-code") {
-    return env.CLAUDE_CONFIG_DIR?.trim() || harness.home || "__default-claude__";
+    return comparableRootKey(resolveClaudeRoot(harness, WEBVIEW_PROCESS_ROOTS).configDir);
   }
   if (harness.kind === "codex") {
-    return env.CODEX_HOME?.trim() || (harness.home ? `${harness.home.replace(/\/+$/, "")}/.codex` : "__default-codex__");
+    return comparableRootKey(resolveCodexRoot(harness, WEBVIEW_PROCESS_ROOTS).codexHome);
   }
-  return harness.home || `__default-${harness.kind}__`;
+  return nonBlankRootValue(harness.home) ? comparableRootKey(harness.home) : `__default-${harness.kind}__`;
+}
+
+/** The lexical half of the server's `comparableHome`: collapse `.`/`..`,
+ *  repeated and trailing slashes, as `path.resolve` would. */
+function comparableRootKey(p: string): string {
+  const normalized = joinRootPath(p, "");
+  return normalized.length > 1 && normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
 }
 
 /** Non-blocking warnings shown next to a saveable draft. */

@@ -11,7 +11,10 @@
  *
  * Every source path is agent-writable, so reads are no-follow/regular-file,
  * copies are atomic and 0600, and a symlink/FIFO/oversized transcript is
- * refused rather than followed. Two accounts whose config roots resolve to the
+ * refused rather than followed. A config root that now resolves (through a
+ * symlink planted after the account was saved) into a macOS-protected home
+ * folder its stored path did not name is refused before anything touches it
+ * (contract CR4, `rootRedirectRefusal`). Two accounts whose config roots resolve to the
  * same directory (realpath) are refused, and a destination file that existed
  * BEFORE the copy (the destination account's own original after an A→B→A
  * wrap) is never recorded in `copiedPaths`, so cleanup can only delete files
@@ -32,9 +35,10 @@ import {
   isPlainDir,
   isRegularFileNoFollow,
   removeCopiedPaths,
+  rootsRedirectRefusal,
   sameConfigRoot,
 } from "./harness-file-transfer.ts";
-import { claudeConfigDirFor, codexHomeFor } from "./harness-stacks.ts";
+import { claudeConfigDirFor, codexHomeFor } from "./harness-config-root.ts";
 import { CLAUDE_SESSION_SIDECAR_DIRS, isHandoffCopyShape, isSafePathSegment } from "../shared/harness-mirror.ts";
 import type { Harness, HarnessStackKind } from "../shared/types.ts";
 import { resolveBin } from "./agents.ts";
@@ -105,6 +109,14 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
     }
     const fromRoot = claudeConfigDirFor(fromHarness);
     const toRoot = claudeConfigDirFor(toHarness);
+    // Contract CR4: refuse a root that now resolves into a macOS-protected
+    // folder it was not saved under, before anything (realpath included)
+    // touches it.
+    const redirected = rootsRedirectRefusal([
+      [fromRoot, "the source account's config directory"],
+      [toRoot, "the destination account's config directory"],
+    ]);
+    if (redirected) return unsafeReason(redirected);
     // realpath, not `path.resolve`: a later `PATCH /harnesses/:id` can point a
     // backup's root at the primary's through a symlink, and copying an account
     // onto itself then lets cleanup delete the source's own transcript.
@@ -263,16 +275,15 @@ async function migrateCodexRollouts(harness: Harness): Promise<string | null> {
 }
 
 function harnessEnvelope(harness: Harness): Record<string, string> {
-  // Match `harnessEnv` in agents.ts: CODEX_HOME alone isolates the account;
-  // HOME stays the user's real home. The harness's own env map may pin
-  // CODEX_HOME over the home-derived default (see `codexHomeFor`), and the
-  // migration must run against the same root the rollout was copied into. The
-  // full spawn env builder lives in agents.ts and importing it here would
-  // create a cycle.
-  if (harness.home || harness.env?.CODEX_HOME?.trim()) {
-    return { CODEX_HOME: codexHomeFor(harness) };
-  }
-  return {};
+  // The migration must run against exactly the root the rollout was copied
+  // into, which is `codexHomeFor` for every account shape: an env-map
+  // CODEX_HOME, a home (`<home>/.codex`), an env-map HOME alone
+  // (`<HOME>/.codex`), the process-level CODEX_HOME or the real `~/.codex`.
+  // Passing it always — not only for a home or an env CODEX_HOME — keeps an
+  // env-map-HOME account from migrating the user's real `~/.codex` instead
+  // (review R-S11). The full spawn env builder lives in agents.ts and
+  // importing it here would create a cycle.
+  return { CODEX_HOME: codexHomeFor(harness) };
 }
 
 function readdirSyncSafe(dir: string): string[] {
@@ -294,6 +305,12 @@ export const codexSessionTransfer: SessionTransferAdapter = {
     }
     const fromRoot = codexHomeFor(fromHarness);
     const toRoot = codexHomeFor(toHarness);
+    // Contract CR4, as in the Claude adapter.
+    const redirected = rootsRedirectRefusal([
+      [fromRoot, "the source account's CODEX_HOME"],
+      [toRoot, "the destination account's CODEX_HOME"],
+    ]);
+    if (redirected) return unsafeReason(redirected);
     if (sameConfigRoot(fromRoot, toRoot)) {
       return { ok: false, reason: "unsafe-source", message: "source and destination share a CODEX_HOME" };
     }

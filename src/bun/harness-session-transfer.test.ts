@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -23,12 +24,14 @@ type Db = typeof import("./db.ts");
 let dbm: Db;
 let transfer: typeof import("./harness-session-transfer.ts");
 let claudeTmux: typeof import("./claude-tmux.ts");
+let fileTransfer: typeof import("./harness-file-transfer.ts");
 let restore: () => void;
 
 beforeAll(async () => {
   dbm = await import("./db.ts");
   transfer = await import("./harness-session-transfer.ts");
   claudeTmux = await import("./claude-tmux.ts");
+  fileTransfer = await import("./harness-file-transfer.ts");
   const { snapshotHarnessState } = await import("./test-harness-state.ts");
   restore = snapshotHarnessState();
 });
@@ -370,6 +373,44 @@ describe("codex rollout projection migration (T12)", () => {
     if (!result.ok) return;
     expect(result.warnings?.[0]?.startsWith("codex migrate-rollouts could not run:")).toBe(true);
     await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("an account with only an env-map HOME migrates <HOME>/.codex, never the real ~/.codex (review R-S11)", async () => {
+    const from = alias("codex");
+    const envHome = mkdtempSync(path.join(tmpdir(), "agetor-xfer-migrate-envhome-"));
+    const codexHome = path.join(envHome, ".codex");
+    const marker = path.join(envHome, "migration.log");
+    const bin = fakeCodex(`printf '%s\\n' "$CODEX_HOME" > "${marker}"`);
+    seq++;
+    const toId = `ctx-envhome-${seq}`;
+    dbm.harnesses.insert({ id: toId, kind: "codex", label: toId, home: null, env: { HOME: envHome }, bin } as never);
+    const thread = "abababab-abab-4bab-8bab-abababababab";
+    seedRollout(from.home, thread);
+    write(path.join(codexHome, "thread_history_1.sqlite"), "sqlite");
+    // The account's root falls back to the process CODEX_HOME when one is set;
+    // clear it so the env-map HOME decides, and restore it afterwards.
+    const savedCodexHome = process.env.CODEX_HOME;
+    delete process.env.CODEX_HOME;
+    try {
+      const taskId = seedTask(`task-codex-migrate-envhome-${seq}`);
+      const result = await transfer.codexSessionTransfer.transfer({
+        taskId,
+        fromHarness: dbm.harnesses.get(from.id)!,
+        toHarness: dbm.harnesses.get(toId)!,
+        sessionId: thread,
+        cwd: "/tmp/x",
+      });
+      expect(result.ok).toBe(true);
+      expect(existsSync(path.join(codexHome, "sessions", "2026", "11", "08", `rollout-2026-11-08T00-00-00-${thread}.jsonl`)))
+        .toBe(true);
+      // Before the fix the envelope was empty for this shape, so the child saw
+      // no CODEX_HOME at all and codex migrated the user's real ~/.codex.
+      expect(readFileSync(marker, "utf8").trim()).toBe(codexHome);
+      await transfer.cleanupHarnessSessionCopies(taskId);
+    } finally {
+      if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = savedCodexHome;
+    }
   });
 
   test("a destination without a projection database runs no migration process", async () => {
@@ -754,5 +795,80 @@ describe("transfer safety (review S5, S27, contract C5)", () => {
     if (result.ok) return;
     expect(result.reason).toBe("unsafe-source");
     expect(existsSync(path.join(to.home, ".codex", "sessions", "odd"))).toBe(false);
+  });
+});
+
+describe("roots redirected into a macOS-protected folder (contract CR4, review R-S6)", () => {
+  function protectedHome() {
+    const home = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-xfer-tcc-home-")));
+    const documents = path.join(home, "Documents");
+    mkdirSync(path.join(documents, "acct2"), { recursive: true });
+    fileTransfer.setTccHomeForTests(home);
+    return { documents, lock: () => chmodSync(documents, 0o000), unlock: () => chmodSync(documents, 0o700) };
+  }
+
+  test("Claude: a destination root swapped for a link into a protected folder is unsafe-source, nothing written", async () => {
+    const { documents, lock, unlock } = protectedHome();
+    try {
+      const from = alias("claude-code");
+      const to = alias("claude-code");
+      const cwd = "/tmp/xfer-tcc";
+      const sid = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+      write(path.join(from.home, "projects", claudeTmux.encodeProjectPath(cwd), `${sid}.jsonl`), "transcript");
+      const linked = path.join(mkdtempSync(path.join(tmpdir(), "agetor-xfer-tcc-link-")), "home");
+      symlinkSync(path.join(documents, "acct2"), linked);
+      dbm.harnesses.update(to.id, { home: linked });
+      lock();
+      const taskId = seedTask(`task-tcc-claude-${seq}`);
+      const result = await transfer.claudeSessionTransfer.transfer({
+        taskId,
+        fromHarness: dbm.harnesses.get(from.id)!,
+        toHarness: dbm.harnesses.get(to.id)!,
+        sessionId: sid,
+        cwd,
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toBe("unsafe-source");
+      expect(result.message).toContain("the destination account's config directory now resolves into the macOS-protected folder ~/Documents");
+      expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeFalsy();
+      unlock();
+      expect(readdirSync(path.join(documents, "acct2"))).toEqual([]);
+    } finally {
+      unlock();
+      fileTransfer.setTccHomeForTests(null);
+    }
+  });
+
+  test("Codex: a source CODEX_HOME redirected into a protected folder is unsafe-source", async () => {
+    const { documents, lock, unlock } = protectedHome();
+    try {
+      const from = alias("codex");
+      const to = alias("codex");
+      const thread = "efefefef-efef-4fef-8fef-efefefefefef";
+      write(
+        path.join(documents, "acct2", "sessions", "2026", "11", "08", `rollout-2026-11-08T00-00-00-${thread}.jsonl`),
+        "rollout",
+      );
+      const linked = path.join(mkdtempSync(path.join(tmpdir(), "agetor-xfer-tcc-codex-")), "codex-home");
+      symlinkSync(path.join(documents, "acct2"), linked);
+      dbm.harnesses.update(from.id, { env: { CODEX_HOME: linked } });
+      lock();
+      const result = await transfer.codexSessionTransfer.transfer({
+        taskId: seedTask(`task-tcc-codex-${seq}`),
+        fromHarness: dbm.harnesses.get(from.id)!,
+        toHarness: dbm.harnesses.get(to.id)!,
+        sessionId: thread,
+        cwd: "/tmp/x",
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toBe("unsafe-source");
+      expect(result.message).toContain("the source account's CODEX_HOME now resolves into the macOS-protected folder ~/Documents");
+      expect(existsSync(path.join(to.home, ".codex", "sessions"))).toBe(false);
+    } finally {
+      unlock();
+      fileTransfer.setTccHomeForTests(null);
+    }
   });
 });

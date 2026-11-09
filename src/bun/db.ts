@@ -3182,6 +3182,24 @@ export function clampWindowByBytes(
   return rowsDesc[count - 1]!.id;
 }
 
+/** Page size for `runs.lastUserEventId`'s newest-first walk. */
+const LAST_USER_ANCHOR_PAGE = 8;
+const CONTINUATION_OPEN_TAG = `<${HARNESS_STACK_CONTINUATION_TAG}>`;
+
+/**
+ * True when a stored `user` event is a harness-stack continuation that every
+ * renderer hides: the exact wrapper, either as sent (the live echo) or after
+ * claude's `<pasted_content>` delivery wrapper is peeled (its JSONL twin).
+ * The same two checks the renderers run (`userMessageLines`,
+ * `cleanMessageText`), so the first-load anchor never lands on a row the
+ * transcript does not show.
+ */
+export function isHiddenContinuationUserText(raw: string): boolean {
+  if (!raw.includes(CONTINUATION_OPEN_TAG)) return false;
+  const text = raw.replace(/\r\n?/g, "\n");
+  return isHarnessStackContinuation(text) || isHarnessStackContinuation(normalizeDeliveredUserText(text));
+}
+
 /**
  * Decides whether a first-load window should be extended back to an anchor
  * event (the newest main-stream `user` event) — see
@@ -3210,24 +3228,6 @@ export function clampWindowByBytes(
  * tests, so "does the span fit" can't drift between the two surfaces. Pure
  * and DB-free, like `clampWindowByBytes`.
  */
-/** Page size for `runs.lastUserEventId`'s newest-first walk. */
-const LAST_USER_ANCHOR_PAGE = 8;
-const CONTINUATION_OPEN_TAG = `<${HARNESS_STACK_CONTINUATION_TAG}>`;
-
-/**
- * True when a stored `user` event is a harness-stack continuation that every
- * renderer hides: the exact wrapper, either as sent (the live echo) or after
- * claude's `<pasted_content>` delivery wrapper is peeled (its JSONL twin).
- * The same two checks the renderers run (`userMessageLines`,
- * `cleanMessageText`), so the first-load anchor never lands on a row the
- * transcript does not show.
- */
-export function isHiddenContinuationUserText(raw: string): boolean {
-  if (!raw.includes(CONTINUATION_OPEN_TAG)) return false;
-  const text = raw.replace(/\r\n?/g, "\n");
-  return isHarnessStackContinuation(text) || isHarnessStackContinuation(normalizeDeliveredUserText(text));
-}
-
 export function resolveAnchoredMinId(args: {
   minId: number;
   anchorId: number | null;

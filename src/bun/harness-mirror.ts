@@ -9,9 +9,18 @@
  * Codex login/provider keys and `[model_providers.*]` tables are never
  * imported into `config.toml` — a backup's own values survive.
  *
- * Safe mode skips settings hooks, permissions, status line and helper commands
- * (Codex: notify); plugins and MCP servers are still mirrored. Full mode copies
- * them, and the primary's `hooks`/`permissions` objects replace the backup's.
+ * Safe mode skips settings hooks, permissions and every command setting
+ * (status lines, file suggestion, process wrapper, policy and credential
+ * helpers; Codex: notify); plugins and MCP servers are still mirrored. Full
+ * mode copies them, and the primary's `hooks`/`permissions` objects replace
+ * the backup's. Login and login-selecting settings (`apiKeyHelper`,
+ * `forceLoginMethod`, the AWS/GCP/proxy auth helpers, …) never cross in either
+ * mode.
+ *
+ * Every account root is resolved lexically before the mirror touches it, and a
+ * root that now resolves into a macOS-protected home folder it was not saved
+ * under is refused (contract CR4); symlinked skills are resolved the same way
+ * and never into a protected folder.
  *
  * A mirror is idempotent and cheap to repeat: a copied file keeps the source's
  * mtime and an unchanged destination (same size + mtime) is not rewritten, a
@@ -23,7 +32,7 @@
  * Failures are warnings, never blocks: a task must still be able to fail over
  * when a mirror cannot read one directory.
  */
-import { closeSync, fstatSync, lstatSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
+import { closeSync, fstatSync, lstatSync, readdirSync, readlinkSync, readSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { openReadNoFollow } from "./no-follow.ts";
@@ -34,8 +43,8 @@ import {
   SAFE_MODE_EXCLUDED_CODEX_KEYS,
   SAFE_MODE_EXCLUDED_SETTINGS_KEYS,
   isCodexLoginBearingKeyPath,
-  isLoginBearingSettingsKey,
   isMirrorNeverImportedEnvKey,
+  isMirrorNeverImportedSettingsKey,
   isNeverCopyPath,
   isNeverCopySegment,
   type HarnessMirrorSpec,
@@ -51,6 +60,8 @@ import {
   isPlainAncestorPathUnder,
   isPlainDir,
   isRegularFileNoFollow,
+  resolvePathLexically,
+  rootsRedirectRefusal,
   sameConfigRoot,
 } from "./harness-file-transfer.ts";
 import { claudeConfigDirFor, claudeJsonDirFor, codexHomeFor } from "./harness-stacks.ts";
@@ -221,6 +232,21 @@ async function mirrorOne(
   const warnings: string[] = [];
   const fromRoot = mirrorRootFor(primary);
   const toRoot = mirrorRootFor(target);
+  // Contract CR4: a root gated when the account was saved may since have been
+  // replaced by a symlink into a macOS-protected folder. Resolve every root
+  // the mirror reads or writes lexically (no stat inside the target) before
+  // anything else touches it, including the realpath below.
+  const redirected = rootsRedirectRefusal([
+    [fromRoot, "the primary's config directory"],
+    [toRoot, "this account's config directory"],
+    ...(kind === "claude-code"
+      ? [
+        [claudeJsonDirFor(primary), "the primary's .claude.json directory"] as const,
+        [claudeJsonDirFor(target), "this account's .claude.json directory"] as const,
+      ]
+      : []),
+  ]);
+  if (redirected) return { copied, warnings: [redirected] };
   // realpath, not `path.resolve`: an account edited after the stack was saved
   // can alias another member's root through a symlink. Mirroring onto itself
   // would rewrite the primary's own files.
@@ -421,12 +447,18 @@ function isForbiddenLinkTarget(target: string, guard: LinkGuard): boolean {
 /**
  * Re-create the top-level symlinked entries of a mirrored folder (`skills/x ->
  * ../../.agents/skills/x`) on the backup as an ABSOLUTE symlink to the source
- * link's resolved target. Nothing is read through the link: `realpath` only
- * resolves the path. A dangling link, or a target inside a credential or
- * never-copy path (see {@link isForbiddenLinkTarget}), is skipped with a
- * warning. The destination entry is created when absent and replaced only
- * when it is itself a symlink (atomically, via a temp link + rename); a real
- * file or folder the backup has at that name is never replaced.
+ * link's resolved target. Nothing is read through the link, and the target is
+ * resolved LEXICALLY (`readlink` + `lstat` of each component,
+ * {@link resolvePathLexically}) rather than with `realpath`: the link is
+ * agent-plantable, and resolving `skills/x -> ~/Documents/notes` with
+ * `realpath` would stat inside a macOS-protected folder in the core's own
+ * process (review R-S5). A target that reaches a protected folder is refused
+ * without anything below that folder being touched. A dangling link, a chain
+ * that cannot be resolved, or a target inside a credential or never-copy path
+ * (see {@link isForbiddenLinkTarget}) is skipped with a warning. The
+ * destination entry is created when absent and replaced only when it is
+ * itself a symlink (atomically, via a temp link + rename); a real file or
+ * folder the backup has at that name is never replaced.
  */
 function linkTopLevelSymlinks(
   from: string,
@@ -452,13 +484,20 @@ function linkTopLevelSymlinks(
       continue;
     }
     handled.push(name);
-    let target: string;
-    try {
-      target = realpathSync(src);
-    } catch {
+    const resolved = resolvePathLexically(src);
+    if (resolved.protectedFolder) {
+      warnings.push(`${rel}/${name}: symlink points into the macOS-protected folder ~/${resolved.protectedFolder} — not linked`);
+      continue;
+    }
+    if (resolved.error) {
+      warnings.push(`${rel}/${name}: symlink target could not be resolved (${resolved.error}) — not linked`);
+      continue;
+    }
+    if (resolved.missing) {
       warnings.push(`${rel}/${name}: symlink target is missing — not linked`);
       continue;
     }
+    const target = resolved.path;
     if (isForbiddenLinkTarget(target, guard)) {
       warnings.push(`${rel}/${name}: symlink points at account login or session data — not linked`);
       continue;
@@ -568,7 +607,7 @@ async function mergeClaudeSettings(
   // one) and leaves the key absent otherwise.
   let strippedSettings = 0;
   for (const key of Object.keys(filtered)) {
-    if (!isLoginBearingSettingsKey(key)) continue;
+    if (!isMirrorNeverImportedSettingsKey(key)) continue;
     delete filtered[key];
     strippedSettings++;
   }
@@ -822,8 +861,11 @@ export function rewritePathPrefixes(value: unknown, from: string, to: string): u
  * (`CODEX_LOGIN_BEARING_CONFIG_KEYS`: `model_provider`, `forced_login_method`,
  * `cli_auth_credentials_store`, …), every `[model_providers]`/
  * `[model_providers.*]` table (bearer tokens, auth headers) and the same keys
- * inside a `[profiles.*]` table are dropped, while the backup's own keys and
- * tables survive verbatim. Safe mode also drops `notify`, `hooks` and
+ * inside a profile are dropped — whether the profile is a `[profiles.<name>]`
+ * table, dotted keys in a `[profiles]` table, or an inline profile table
+ * (dropped whole, since it cannot be split). The backup's own keys and tables
+ * survive: its login assignments are carried into a merged table even when the
+ * primary's same-named table has none. Safe mode also drops `notify`, `hooks` and
  * `permissions`. The result is validated by `Bun.TOML.parse`; invalid output is
  * discarded and the backup file left untouched.
  */
@@ -902,10 +944,11 @@ async function mergeCodexConfig(fromRoot: string, toRoot: string, safe: boolean)
       continue;
     }
     if (safeExcluded(segments)) continue;
-    let text = block.text;
-    if (segments[0] === "profiles" && segments.length === 2) {
-      text = mergeProfileLoginKeys(block.text, backupHeaders.get(block.header), segments, loginSkipped);
-    }
+    // Every assignment is judged by its FULL key path (header + key), so a
+    // `[profiles]` table written in dotted (`work.model_provider = …`) or
+    // inline (`work = { model_provider = … }`) form loses the primary's login
+    // keys exactly like a `[profiles.work]` table does (review R-S1).
+    const text = mergeBlockLoginKeys(block.text, backupHeaders.get(block.header), segments, loginSkipped);
     out.push(text.trimEnd());
     keptPrimaryHeaders.add(block.header);
   }
@@ -960,12 +1003,16 @@ function isCodexLoginAssignment(segments: readonly string[], text: string): bool
 }
 
 /**
- * A primary `[profiles.<name>]` table with its login-bearing keys removed and
- * the backup's own login keys from the same table carried over (the merged
- * table replaces the backup's, so its own `model_provider` would otherwise be
- * lost). A table with no login key is returned unchanged.
+ * A primary table block with its login-bearing assignments removed and the
+ * backup's own login assignments from the same table carried over. The merged
+ * table replaces the backup's, so the backup's `model_provider` (or any other
+ * login key) would otherwise be lost — including when the primary's table has
+ * no login key at all (review R-S2). Each assignment is judged by its full key
+ * path `[...tableSegments, ...key]`, so `[profiles]` + `work.model_provider`
+ * and `[profiles.work]` + `model_provider` are the same key. A block where
+ * neither side has a login assignment is returned unchanged.
  */
-function mergeProfileLoginKeys(
+function mergeBlockLoginKeys(
   primaryText: string,
   backupText: string | undefined,
   tableSegments: readonly string[],
@@ -973,18 +1020,16 @@ function mergeProfileLoginKeys(
 ): string {
   const [headerLine, ...body] = primaryText.split(/\r?\n/);
   const assignments = splitTopLevelAssignments(body.join("\n")).assignments;
-  const isLogin = (a: TomlAssignment) =>
-    isCodexLoginAssignment([...tableSegments, ...splitTomlKeyPath(a.key)], a.text);
+  const fullPath = (a: TomlAssignment) => [...tableSegments, ...splitTomlKeyPath(a.key)];
+  const isLogin = (a: TomlAssignment) => isCodexLoginAssignment(fullPath(a), a.text);
   const login = assignments.filter(isLogin);
-  if (login.length === 0) return primaryText;
-  for (const a of login) loginSkipped.add([...tableSegments, ...splitTomlKeyPath(a.key)].join("."));
+  const backupLogin = backupText === undefined
+    ? []
+    : splitTopLevelAssignments(backupText.split(/\r?\n/).slice(1).join("\n")).assignments.filter(isLogin);
+  if (login.length === 0 && backupLogin.length === 0) return primaryText;
+  for (const a of login) loginSkipped.add(fullPath(a).join("."));
   const kept = assignments.filter((a) => !isLogin(a)).map((a) => a.text.trimEnd());
-  if (backupText !== undefined) {
-    const [, ...backupBody] = backupText.split(/\r?\n/);
-    for (const a of splitTopLevelAssignments(backupBody.join("\n")).assignments) {
-      if (isLogin(a)) kept.push(a.text.trimEnd());
-    }
-  }
+  for (const a of backupLogin) kept.push(a.text.trimEnd());
   return [headerLine ?? "", ...kept].join("\n");
 }
 

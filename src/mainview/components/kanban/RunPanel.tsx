@@ -79,6 +79,7 @@ import { harnessStackBannerView } from "@/lib/harness-stack-banner";
 import { agentSwitchPatch } from "@/lib/agent-switch";
 import { groupStickySections, type StickyItem } from "@/lib/sticky-sections";
 import { stackPositionFor } from "@/lib/stack-badge";
+import { taskPatchFailureToast } from "@/lib/task-patch-failure";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
@@ -4206,7 +4207,7 @@ function RunPanelBody({
               // No chip for a one-account stack: it cannot fail over.
               const at = stackPositionFor(stacks, task.agent);
               if (!at) return null;
-              return <span className="text-info"> · {at.position}/{at.count}</span>;
+              return <span className="text-info"> · {at.text}</span>;
             })()}
             {" · "}{task.column}
             {task.branch && !branchDrift.drifted && <> · <span className="font-mono">{task.branch}</span></>}
@@ -7757,11 +7758,14 @@ function TaskDetails({
   const save = async (patch: Partial<Task>) => {
     try {
       await api.updateTask(task.id, patch);
-    } catch {
-      // Swallow — the parent's poll picks the row back up on the next 2s tick
-      // and the dropdown reverts on its own. We could surface this through
-      // the global error toast, but for now keeping it quiet matches the
-      // optimistic-UI pattern the rest of the panel uses.
+    } catch (e) {
+      // A dropdown PATCH stays quiet: the parent's poll picks the row back up
+      // on the next 2s tick and the dropdown reverts on its own. An account
+      // switch (`agent`) shows the server's reason instead — a refused
+      // same-stack move would otherwise look like a click that did nothing
+      // (`taskPatchFailureToast`, review N8).
+      const failure = taskPatchFailureToast(patch, e);
+      if (failure) toast.error(failure.title, { description: failure.description });
     }
   };
 

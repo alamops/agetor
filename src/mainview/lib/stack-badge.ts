@@ -1,3 +1,4 @@
+import { stackPositionText } from "../../shared/harness-stack.ts";
 import type { HarnessStack, Task, TaskHarnessState } from "../../shared/types.ts";
 
 /**
@@ -55,6 +56,8 @@ export interface StackPosition {
   /** 1-based (`1` is the primary). */
   position: number;
   count: number;
+  /** The chip text, `"n/m"`, exactly as the CLI prints it. */
+  text: string;
 }
 
 /**
@@ -63,6 +66,10 @@ export interface StackPosition {
  * so every surface (New Task chip, launch pickers, the RunPanel account line,
  * Settings → Harnesses) hides the `1/1` chip and its "fails over…" copy
  * rather than promise a failover that cannot happen.
+ *
+ * The "fewer than two members → no chip" rule lives only in the shared
+ * `stackPositionText` (src/shared/harness-stack.ts), which the CLI uses too;
+ * this helper is the webview's single entry point to it (review N9).
  */
 export function stackPositionFor(
   stacks: readonly HarnessStack[],
@@ -71,8 +78,9 @@ export function stackPositionFor(
   for (const stack of stacks) {
     const index = stack.members.findIndex((m) => m.harnessId === harnessId);
     if (index < 0) continue;
-    if (stack.members.length < 2) return null;
-    return { stack, position: index + 1, count: stack.members.length };
+    const text = stackPositionText(stack, harnessId);
+    if (text === null) return null;
+    return { stack, position: index + 1, count: stack.members.length, text };
   }
   return null;
 }

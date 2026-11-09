@@ -50,17 +50,18 @@ describe("claudeCredentialsPath", () => {
     expect(claudeCredentialsPath(harness)).toBe(path.join(envDir, ".credentials.json"));
   });
 
-  test("an env-map HOME alone pins <HOME>/.claude and <HOME>/.claude.json, never the main keychain (S17)", async () => {
+  test("an env-map HOME alone spawns unpinned: <HOME>/.claude.json, and the login claude itself uses (re-review R-M1)", () => {
     const prev = process.env.CLAUDE_CONFIG_DIR;
     delete process.env.CLAUDE_CONFIG_DIR;
     try {
       const envHome = mkdtempSync(path.join(tmpdir(), "agetor-creds-envhome-"));
       const harness: Harness = { ...mkHarness(null), id: "claude-envhome", env: { HOME: envHome } };
       expect(claudeDotJsonPath(harness)).toBe(path.join(envHome, ".claude.json"));
-      expect(claudeCredentialsPath(harness)).toBe(path.join(envHome, ".claude", ".credentials.json"));
-      // A pinned account with no credentials file gets no token rather than
-      // the main account's keychain login.
-      expect(await readClaudeToken(harness)).toEqual({ token: null, scopes: [] });
+      // No CLAUDE_CONFIG_DIR reaches the spawn, so on macOS claude reads the
+      // unsuffixed keychain item (null = keychain) and elsewhere the file
+      // under <HOME>/.claude.
+      expect(claudeCredentialsPath(harness, "darwin")).toBeNull();
+      expect(claudeCredentialsPath(harness, "linux")).toBe(path.join(envHome, ".claude", ".credentials.json"));
     } finally {
       if (prev !== undefined) process.env.CLAUDE_CONFIG_DIR = prev;
     }

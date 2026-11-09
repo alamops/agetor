@@ -127,7 +127,8 @@ reached again …`, the standalone `Continuing automatically … · Esc to cance
 `… · limit resets <t>`, the bare `Usage limit reached` and `You've hit your
 limit · resets <t>` — but only in the hint slot directly above the input box
 (at most four rows, stopping at any transcript/tool gutter row such as `⎿`,
-`│`, `⏺`) or the footer below it, so a quoted notice or a tool result can never
+`│`, `⏺`, at the spinner row, and at a glyph-less row that continues a
+transcript entry) or the footer below it, so a quoted notice or a tool result can never
 settle a turn. The grace-window `… · wrapping up` counts only once the turn has
 stopped, and the usage-credits wrap-up never counts. It emits exactly one
 `harness-limit:` status for the turn (a per-turn latch; the notice stays on

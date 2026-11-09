@@ -6,16 +6,27 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Task, TaskHarnessState } from "../shared/types.ts";
+import { HARNESS_LIMIT_STATUS_PREFIX, type Task, type TaskHarnessState } from "../shared/types.ts";
 
 // Literal copies: a static src/bun import would load db.ts before the data
 // dir below is set (the suite runs every file in one process).
 const FAKE_CLAUDE_LIMIT_PROMPT_MARKER = "__agetor_fake_claude_limit__";
 const FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER = "__agetor_fake_claude_limit_clean__";
+const FAKE_CODEX_LIMIT_PROMPT_MARKER = "__agetor_fake_codex_limit__";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-harness-fixes-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
-const ENV_KEYS = ["AGETOR_CLAUDE_DRIVER", "AGETOR_CLAUDE_BIN", "AGETOR_TMUX_BIN"] as const;
+// Every key a test here sets (some only inside one test) is restored in
+// afterAll: `bun test` runs every file in one process.
+const ENV_KEYS = [
+  "AGETOR_CLAUDE_DRIVER",
+  "AGETOR_CLAUDE_BIN",
+  "AGETOR_TMUX_BIN",
+  "AGETOR_CODEX_DRIVER",
+  "AGETOR_CODEX_BIN",
+  "AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS",
+  "AGETOR_FAKE_CLAUDE_TURN_MS",
+] as const;
 const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
@@ -54,6 +65,7 @@ afterAll(async () => {
   }
   failover.stopAllAutoRetryTimers();
   orch.__resetLaunchFreezeForTest();
+  orch.__setChunkHandlerTapForTest(null);
   restore();
   for (const key of ENV_KEYS) {
     if (savedEnv[key] === undefined) delete process.env[key];
@@ -593,4 +605,542 @@ describe("manual prepare holds the start claim (S8)", () => {
     expect(orch.isTaskRunLive(task.id)).toBe(false);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// Fix round 2 (review R-S12, R-S13, R-S14, R-S16, N1, N2, N3, N5)
+// ---------------------------------------------------------------------------
+
+/** Run `fn` with env vars set, restoring each one's previous value after. */
+async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const prev = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+/** A Codex account whose `CODEX_HOME` is `<home>/.codex`; returns that root. */
+function codexAccount(id: string): string {
+  const dir = path.join(DATA_DIR, "harnesses", id);
+  mkdirSync(path.join(dir, ".codex"), { recursive: true });
+  writeFileSync(path.join(dir, ".codex", "auth.json"), "{}");
+  if (!db.harnesses.get(id)) db.harnesses.insert({ id, kind: "codex", label: id, home: dir, env: {} } as never);
+  return path.join(dir, ".codex");
+}
+
+/** Plant a Codex rollout for `threadId` where codex lays it out. */
+function plantRollout(root: string, threadId: string): string {
+  const rel = path.join("sessions", "2026", "11", "08", `rollout-2026-11-08T00-00-00-${threadId}.jsonl`);
+  mkdirSync(path.dirname(path.join(root, rel)), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(root, rel), `${JSON.stringify({ type: "session_meta", payload: { id: threadId } })}\n`, { mode: 0o600 });
+  return rel;
+}
+
+const userRows = (runId: string) => db.runs.events(runId).filter((e) => e.stream === "user").map((e) => e.data);
+const backlogTexts = (taskId: string) => db.tasks.get(taskId)!.backlog.map((i) => i.text);
+
+describe("unread mid-turn follow-ups are never dropped (R-S12)", () => {
+  test("an all-exhausted block puts them in the tray", async () => {
+    const [a, b] = ids("midblock", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "midblock", kind: "claude-code", members: [a, b] });
+    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 120_000, message: "x", source: "claude-pane" });
+    const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
+    const prev = orch.__setHarnessLimitObservedHookForTest((hooked, runId) => {
+      if (hooked !== task.id) return;
+      // Still sitting in the REPL's input box: echo only, no JSONL twin.
+      db.runs.appendEvent(runId, "user", "please also update the docs");
+      orch.__noteMidTurnFollowUpForTest(runId, "please also update the docs");
+    });
+    try {
+      expect(await orch.startTask(task.id)).toHaveProperty("runId");
+      await waitFor(() => db.tasks.get(task.id)?.column === "blocked");
+    } finally {
+      orch.__setHarnessLimitObservedHookForTest(prev);
+      failover.cancelAutoRetry(task.id);
+      stacks.harnessStacks.clearLimitState(a);
+      stacks.harnessStacks.clearLimitState(b);
+    }
+    // The limited turn had a tool call: a retry resumes the copied
+    // transcript, which never held this message — only the tray does.
+    expect(backlogTexts(task.id)).toContain("please also update the docs");
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("an all-exhausted clean retry carries them itself, so they are not also stashed", async () => {
+    const [a, b] = ids("midclean", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "midclean", kind: "claude-code", members: [a, b] });
+    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: Date.now() + 120_000, message: "x", source: "claude-pane" });
+    const task = makeTask(a, `ask ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`);
+    const prev = orch.__setHarnessLimitObservedHookForTest((hooked, runId) => {
+      if (hooked !== task.id) return;
+      db.runs.appendEvent(runId, "user", "and the changelog");
+      orch.__noteMidTurnFollowUpForTest(runId, "and the changelog");
+    });
+    try {
+      expect(await orch.startTask(task.id)).toHaveProperty("runId");
+      await waitFor(() => db.tasks.get(task.id)?.column === "blocked");
+    } finally {
+      orch.__setHarnessLimitObservedHookForTest(prev);
+      failover.cancelAutoRetry(task.id);
+      stacks.harnessStacks.clearLimitState(a);
+      stacks.harnessStacks.clearLimitState(b);
+    }
+    expect(db.tasks.get(task.id)!.harnessState?.allExhausted?.nextAttemptAt).toBeGreaterThan(0);
+    expect(backlogTexts(task.id)).not.toContain("and the changelog");
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("a failed transfer block puts them in the tray", async () => {
+    const [a, b] = ids("midxfer", 2);
+    const homeA = alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "midxfer", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
+    const prev = orch.__setHarnessLimitObservedHookForTest((hooked, runId) => {
+      if (hooked !== task.id) return;
+      db.runs.appendEvent(runId, "user", "rename the helper too");
+      orch.__noteMidTurnFollowUpForTest(runId, "rename the helper too");
+      // The recorded conversation vanished: the transfer must fail.
+      rmSync(transcriptOn(homeA, task, `fake-swap-${task.id}`), { force: true });
+    });
+    try {
+      expect(await orch.startTask(task.id)).toHaveProperty("runId");
+      await waitFor(() => db.tasks.get(task.id)?.column === "blocked");
+    } finally {
+      orch.__setHarnessLimitObservedHookForTest(prev);
+      stacks.harnessStacks.clearLimitState(a);
+    }
+    const rows = sortedRuns(task.id);
+    expect(rows).toHaveLength(1);
+    expect(statusLines(rows[0]!.id).some((l) => l.includes("could not move the conversation"))).toBe(true);
+    expect(backlogTexts(task.id)).toContain("rename the helper too");
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});
+
+describe("unread mid-turn follow-ups on the other settlement endings (R-S12)", () => {
+  test("a launch freeze that leaves the swap to the next owner stashes them before exit", async () => {
+    const [a, b] = ids("midfreeze", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "midfreeze", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
+    const prevObserved = orch.__setHarnessLimitObservedHookForTest((hooked, runId) => {
+      if (hooked !== task.id) return;
+      db.runs.appendEvent(runId, "user", "keep the old flag");
+      orch.__noteMidTurnFollowUpForTest(runId, "keep the old flag");
+    });
+    const prevSettle = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
+      if (hooked !== task.id || phase !== "settle") return;
+      orch.__setHarnessSwapSettleHookForTest(null);
+      orch.freezeLaunches();
+    });
+    try {
+      await orch.startTask(task.id);
+      await waitFor(() => db.tasks.get(task.id)!.harnessState?.pendingSwap != null && db.runs.listForTask(task.id)[0]?.status === "failed");
+      // The next owner (another process) has no memory of the REPL's input
+      // box: the tray is the only place the text survives.
+      expect(backlogTexts(task.id)).toContain("keep the old flag");
+    } finally {
+      orch.__setHarnessLimitObservedHookForTest(prevObserved);
+      orch.__setHarnessSwapSettleHookForTest(prevSettle);
+      orch.__resetLaunchFreezeForTest();
+      db.tasks.setHarnessState(task.id, null);
+      stacks.harnessStacks.clearLimitState(a);
+    }
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("a pane limit on a lone account drops the paused REPL and stashes them", async () => {
+    const FAKE_CLAUDE_LIMIT_PANE_PROMPT_MARKER = "__agetor_fake_claude_limit_pane__";
+    const [a] = ids("midpane", 1);
+    alias(a);
+    const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PANE_PROMPT_MARKER}`);
+    const prev = orch.__setHarnessLimitObservedHookForTest((hooked, runId) => {
+      if (hooked !== task.id) return;
+      db.runs.appendEvent(runId, "user", "then run the linter");
+      orch.__noteMidTurnFollowUpForTest(runId, "then run the linter");
+    });
+    try {
+      expect(await orch.startTask(task.id)).toHaveProperty("runId");
+      await waitFor(settledRuns(task.id, 1));
+    } finally {
+      orch.__setHarnessLimitObservedHookForTest(prev);
+      stacks.harnessStacks.clearLimitState(a);
+    }
+    expect(db.runs.listForTask(task.id)[0]!.status).toBe("failed");
+    expect(backlogTexts(task.id)).toContain("then run the linter");
+  }, 20_000);
+});
+
+describe("held swap messages reach the live successor (R-S13)", () => {
+  test("a message typed during the window lands on the successor while it is still running", async () => {
+    const [a, b] = ids("heldlive", 2);
+    const rootA = codexAccount(a);
+    codexAccount(b);
+    const stack = stacks.harnessStacks.create({ label: "heldlive", kind: "codex", members: [a, b] });
+    const task = makeTask(a, `quota ${FAKE_CODEX_LIMIT_PROMPT_MARKER}`, { model: "fixture-codex-model" } as Partial<Task>);
+    plantRollout(rootA, `fake-codex-thread-${task.id}`);
+    const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, runId, phase) => {
+      if (hooked !== task.id || phase !== "after-transfer") return;
+      orch.__setHarnessSwapSettleHookForTest(null);
+      expect((await orch.sendInput(runId, "typed during the swap")).delivered).toBe(true);
+    });
+    let seenWhileLive = false;
+    try {
+      await withEnv(
+        { AGETOR_CODEX_DRIVER: "fake", AGETOR_CODEX_BIN: "/bin/echo", AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS: "1500" },
+        async () => {
+          expect(await orch.startTask(task.id)).toHaveProperty("runId");
+          await waitFor(() => {
+            const successor = sortedRuns(task.id)[1];
+            if (!successor) return false;
+            if (userRows(successor.id).includes("typed during the swap")) {
+              seenWhileLive = db.runs.get(successor.id)?.status === "running";
+              return true;
+            }
+            return successor.status !== "running";
+          }, 10_000);
+          // Let the successor and the queued turn behind it finish.
+          await waitFor(settledRuns(task.id, 3), 10_000);
+        },
+      );
+    } finally {
+      orch.__setHarnessSwapSettleHookForTest(prev);
+      stacks.harnessStacks.clearLimitState(a);
+      stacks.harnessStacks.clearLimitState(b);
+    }
+    // Delivered through the ordinary mid-turn path the moment the successor
+    // registered (Codex queues it behind the live turn), not drained after
+    // the successor's whole turn settled.
+    expect(seenWhileLive).toBe(true);
+    const rows = sortedRuns(task.id);
+    expect(rows[1]!.agent).toBe(b);
+    expect(userRows(rows[1]!.id)).toContain("typed during the swap");
+    expect(backlogTexts(task.id)).not.toContain("typed during the swap");
+    stacks.harnessStacks.delete(stack.id);
+  }, 30_000);
+});
+
+describe("a Stop during an all-exhausted retry (R-S14)", () => {
+  test("a plain Stop during the retry's move aborts the move itself", async () => {
+    const [a, b] = ids("retrystop", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "retrystop", kind: "claude-code", members: [a, b] });
+    // A is still cooling, so the retry picks B and has to move the task.
+    stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: Date.now() + 600_000, message: "x", source: "claude-pane" });
+    const task = makeTask(a, "p");
+    const lastRun = insertRun(task.id, a, { status: "failed", exitCode: -1 });
+    db.tasks.update(task.id, { runId: lastRun, column: "blocked" });
+    const at = Date.now();
+    db.tasks.setHarnessState(task.id, {
+      stackId: stack.id, position: 0, count: 2, tried: [a], pendingSwap: null, lastMove: null,
+      allExhausted: exhausted(at, { attempts: 1, nextAttemptAt: at }),
+    });
+    let stopped = null as boolean | null;
+    const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
+      if (hooked !== task.id || phase !== "retry-before-commit") return;
+      orch.__setHarnessSwapSettleHookForTest(null);
+      stopped = await orch.cancelRun(lastRun);
+    });
+    try {
+      failover.armAutoRetry(task.id, at);
+      await waitFor(() => stopped !== null && db.tasks.get(task.id)!.harnessState?.allExhausted == null);
+    } finally {
+      orch.__setHarnessSwapSettleHookForTest(prev);
+      stacks.harnessStacks.clearLimitState(a);
+    }
+    expect(stopped).toBe(true);
+    const after = db.tasks.get(task.id)!;
+    // Nothing moved and nothing ran on the stopped retry's behalf.
+    expect(after.agent).toBe(a);
+    expect(db.runs.listForTask(task.id)).toHaveLength(1);
+    expect(after.column).toBe("blocked");
+    expect(after.harnessState?.allExhausted ?? null).toBeNull();
+    expect(failover.hasArmedAutoRetry(task.id)).toBe(false);
+    expect(statusLines(lastRun).some((l) => l.includes("cancelled by user during the account retry"))).toBe(true);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("a Stop the retry never consumed does not cancel a later, unrelated failover", async () => {
+    const [a, b] = ids("stalestop", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "stalestop", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, `later ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
+    const lastRun = insertRun(task.id, a, { status: "failed", exitCode: -1 });
+    db.tasks.update(task.id, { runId: lastRun, column: "blocked" });
+    const at = Date.now();
+    db.tasks.setHarnessState(task.id, {
+      stackId: stack.id, position: 0, count: 2, tried: [a], pendingSwap: null, lastMove: null,
+      allExhausted: exhausted(at, { attempts: 0, nextAttemptAt: at }),
+    });
+    // The Stop lands in the retry window, then the retry ends on a path that
+    // never reads it (an unexpected throw before its successor exists).
+    const prev = orch.__setHarnessSwapSpawnHookForTest(async (hooked) => {
+      if (hooked !== task.id) return;
+      orch.__setHarnessSwapSpawnHookForTest(null);
+      expect(await orch.cancelRun(lastRun)).toBe(true);
+      throw new Error("synthetic retry spawn throw");
+    });
+    try {
+      failover.armAutoRetry(task.id, at);
+      await waitFor(() => (db.tasks.get(task.id)!.harnessState?.allExhausted?.attempts ?? 0) === 1);
+    } finally {
+      orch.__setHarnessSwapSpawnHookForTest(prev);
+      failover.cancelAutoRetry(task.id);
+    }
+    expect(db.runs.listForTask(task.id)).toHaveLength(1);
+    // The user takes the task back and runs it; that run hits a real limit.
+    db.tasks.setHarnessState(task.id, null);
+    db.tasks.update(task.id, { column: "ready" });
+    expect(await orch.startTask(task.id)).toHaveProperty("runId");
+    await waitFor(settledRuns(task.id, 3));
+    const rows = sortedRuns(task.id);
+    // It fails over to B instead of being read as "cancelled by user".
+    expect(rows).toHaveLength(3);
+    expect(rows[1]!.agent).toBe(a);
+    expect(statusLines(rows[1]!.id).some((l) => l.includes("cancelled by user"))).toBe(false);
+    expect(rows[2]!.agent).toBe(b);
+    expect(rows[2]!.origin).toBe("harness-swap");
+    stacks.harnessStacks.clearLimitState(a);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});
+
+describe("Codex limit settle and the retry timer at the orchestrator (R-S16)", () => {
+  test("a recovered 429 on a turn that completes settles succeeded: no swap, no cooldown", async () => {
+    const [a, b] = ids("recovered", 2);
+    codexAccount(a);
+    codexAccount(b);
+    const stack = stacks.harnessStacks.create({ label: "recovered", kind: "codex", members: [a, b] });
+    const task = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
+    // The fake has no "429 then success" scenario: feed the live run's real
+    // chunk handler the structured signal the codex driver writes for a
+    // top-level `error`, then let the turn complete (exit 0).
+    const signal = { reason: "rate_limit", resetAtMs: null, message: "429 Too Many Requests", source: "codex-error" };
+    let sawCooldown = false;
+    let cooldownAfter: unknown = "unset";
+    const prevTap = orch.__setChunkHandlerTapForTest((_runId, hooked, handler) => {
+      if (hooked !== task.id) return;
+      orch.__setChunkHandlerTapForTest(null);
+      setTimeout(() => {
+        handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
+        sawCooldown = stacks.harnessStacks.getLimitState(a) !== null;
+      }, 150);
+    });
+    try {
+      await withEnv(
+        { AGETOR_CODEX_DRIVER: "fake", AGETOR_CODEX_BIN: "/bin/echo", AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS: "800" },
+        async () => {
+          expect(await orch.startTask(task.id)).toHaveProperty("runId");
+          await waitFor(() => db.tasks.get(task.id)?.column === "review", 10_000);
+          cooldownAfter = stacks.harnessStacks.getLimitState(a);
+        },
+      );
+    } finally {
+      orch.__setChunkHandlerTapForTest(prevTap);
+      stacks.harnessStacks.clearLimitState(a);
+      stacks.harnessStacks.clearLimitState(b);
+    }
+    // The signal really reached the live run (the chunk handler recorded it)…
+    expect(sawCooldown).toBe(true);
+    // …and the completed turn still settled as a success on A.
+    const rows = sortedRuns(task.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.status).toBe("succeeded");
+    expect(rows[0]!.agent).toBe(a);
+    expect(db.tasks.get(task.id)!.agent).toBe(a);
+    expect(db.tasks.get(task.id)!.harnessState?.pendingSwap ?? null).toBeNull();
+    // No swap divider, and the successful settle cleared the cooldown.
+    expect(statusLines(rows[0]!.id).some((l) => l.includes("switching"))).toBe(false);
+    expect(cooldownAfter).toBeNull();
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("a retry timer that fires while a run is live is re-armed, not consumed", async () => {
+    const [a, b] = ids("liveretry", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "liveretry", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "a long turn");
+    try {
+      await withEnv({ AGETOR_FAKE_CLAUDE_TURN_MS: "1500" }, async () => {
+        expect(await orch.startTask(task.id)).toHaveProperty("runId");
+        // The driver is live (its first chunk landed), so the start claim is
+        // released: the ORCHESTRATOR's busy check is what the timer meets,
+        // not the failover engine's claim backoff.
+        await waitFor(() => {
+          const live = db.runs.listForTask(task.id).find((r) => r.status === "running");
+          return !!live && db.runs.events(live.id).some((e) => e.stream === "stdout");
+        });
+        await Bun.sleep(30);
+        const at = Date.now();
+        db.tasks.setHarnessState(task.id, {
+          stackId: stack.id, position: 0, count: 2, tried: [a], pendingSwap: null, lastMove: null,
+          allExhausted: exhausted(at, { attempts: 1, nextAttemptAt: at }),
+        });
+        failover.armAutoRetry(task.id, at);
+        // The timer fires (immediately) while the turn is still running.
+        await waitFor(() => (db.tasks.get(task.id)!.harnessState?.allExhausted?.nextAttemptAt ?? 0) > at);
+        expect(db.runs.listForTask(task.id).some((r) => r.status === "running")).toBe(true);
+        expect(failover.hasArmedAutoRetry(task.id)).toBe(true);
+        expect(db.tasks.get(task.id)!.harnessState?.allExhausted?.attempts).toBe(1);
+        // No second run was minted next to the live one.
+        expect(db.runs.listForTask(task.id)).toHaveLength(1);
+        await waitFor(settledRuns(task.id, 1), 10_000);
+      });
+    } finally {
+      failover.cancelAutoRetry(task.id);
+      db.tasks.setHarnessState(task.id, null);
+    }
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});
+
+describe("Stop while a frozen process left the swap for the next owner (N1)", () => {
+  test("the Stop clears the persisted swap so the next owner does not finish it", async () => {
+    const [a, b] = ids("frozenstop", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "frozenstop", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, `limit ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
+    const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
+      if (hooked !== task.id || phase !== "settle") return;
+      orch.__setHarnessSwapSettleHookForTest(null);
+      orch.freezeLaunches();
+    });
+    let oldRunId = "";
+    try {
+      await orch.startTask(task.id);
+      await waitFor(() => {
+        const rows = db.runs.listForTask(task.id);
+        return rows.length === 1 && rows[0]!.status === "failed" && db.tasks.get(task.id)!.harnessState?.pendingSwap != null;
+      });
+      oldRunId = db.runs.listForTask(task.id)[0]!.id;
+      expect(await orch.cancelRun(oldRunId)).toBe(true);
+      const stoppedTask = db.tasks.get(task.id)!;
+      expect(stoppedTask.harnessState?.pendingSwap ?? null).toBeNull();
+      expect(db.runs.get(oldRunId)?.status).toBe("cancelled");
+      expect(stoppedTask.column).toBe("ready");
+    } finally {
+      orch.__setHarnessSwapSettleHookForTest(prev);
+      orch.__resetLaunchFreezeForTest();
+    }
+    // The next owner's boot finds nothing to resume.
+    await orch.reconcileHarnessFailover();
+    expect(db.runs.listForTask(task.id)).toHaveLength(1);
+    expect(db.tasks.get(task.id)!.agent).toBe(a);
+    stacks.harnessStacks.clearLimitState(a);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});
+
+describe("clean-retry prompts (N2, N5)", () => {
+  test("a slash command goes out alone; the folded follow-ups follow it, never as its arguments", async () => {
+    const [a, b] = ids("slashrest", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "slashrest", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, `/review ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`);
+    const prompts: string[] = [];
+    const prevPrompt = orch.__setHarnessSwapPromptHookForTest((hooked, prompt) => {
+      if (hooked === task.id) prompts.push(prompt);
+    });
+    const prevObserved = orch.__setHarnessLimitObservedHookForTest((hooked, runId) => {
+      if (hooked !== task.id) return;
+      // A follow-up folded into the limited turn.
+      db.runs.appendEvent(runId, "user", "and also check the tests");
+    });
+    try {
+      expect(await orch.startTask(task.id)).toHaveProperty("runId");
+      await waitFor(settledRuns(task.id, 2));
+    } finally {
+      orch.__setHarnessSwapPromptHookForTest(prevPrompt);
+      orch.__setHarnessLimitObservedHookForTest(prevObserved);
+      stacks.harnessStacks.clearLimitState(a);
+    }
+    expect(prompts).toEqual([task.prompt]);
+    // The remainder is never lost: it reached the successor as a follow-up
+    // (a live REPL folds it), or — the fake has no REPL to fold into — it is
+    // back in the tray as the user's own words, never the hidden wrapper.
+    const successor = sortedRuns(task.id)[1]!;
+    const delivered = userRows(successor.id).some((d) => d.includes("and also check the tests"));
+    const stashed = backlogTexts(task.id).includes("and also check the tests");
+    expect(delivered || stashed).toBe(true);
+    expect(backlogTexts(task.id).some((t) => t.includes("<harness-stack-continuation>"))).toBe(false);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("a clean retry of text that quotes the tag is still exactly one hidden wrapper", async () => {
+    const [a, b] = ids("quoted", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "quoted", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, `what does <harness-stack-continuation> mean? ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`);
+    const prompts: string[] = [];
+    const prev = orch.__setHarnessSwapPromptHookForTest((hooked, prompt) => {
+      if (hooked === task.id) prompts.push(prompt);
+    });
+    try {
+      expect(await orch.startTask(task.id)).toHaveProperty("runId");
+      await waitFor(settledRuns(task.id, 2));
+    } finally {
+      orch.__setHarnessSwapPromptHookForTest(prev);
+      stacks.harnessStacks.clearLimitState(a);
+    }
+    expect(prompts).toHaveLength(1);
+    expect(shared.isHarnessStackContinuation(prompts[0]!)).toBe(true);
+    expect(shared.stripHarnessStackContinuation(prompts[0]!)).toBe(
+      `what does < harness-stack-continuation> mean? ${FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER}`,
+    );
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});
+
+describe("a same-stack switch on a held task (N3)", () => {
+  test("is refused: the claim fails and a direct reconcile puts the account back without touching the session", async () => {
+    const [a, b] = ids("heldswitch", 2);
+    alias(a);
+    alias(b);
+    const stack = stacks.harnessStacks.create({ label: "heldswitch", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "p");
+    const runId = insertRun(task.id, a, { status: "succeeded", claudeSessionId: `held-${task.id}` });
+    db.tasks.update(task.id, { runId, column: "running" });
+    const subagentId = `agent-${randomUUID()}`;
+    db.subagents.insertIfAbsent({
+      id: subagentId, taskId: task.id, runId, parentKind: "subagent", agentType: "general-purpose",
+      description: "background review", spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`),
+      status: "running", startedAt: Date.now() - 1000, endedAt: null,
+    } as never);
+    try {
+      expect(orch.isHeldByBackgroundAgents(task.id)).toBe(true);
+      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+
+      const before = db.tasks.get(task.id)!;
+      db.tasks.update(task.id, { agent: b });
+      await orch.reconcileTaskSession(task.id, before, db.tasks.get(task.id)!);
+      const after = db.tasks.get(task.id)!;
+      expect(after.agent).toBe(a);
+      expect(after.harnessState?.lastMove ?? null).toBeNull();
+      expect(statusLines(runId).some((l) => l.includes("account switch refused"))).toBe(true);
+      // The background agent was not abandoned.
+      expect(db.subagents.hasRunning(task.id)).toBe(true);
+      expect(orch.isHeldByBackgroundAgents(task.id)).toBe(true);
+    } finally {
+      db.tasks.update(task.id, { column: "review" });
+    }
+    stacks.harnessStacks.delete(stack.id);
+  }, 15_000);
 });

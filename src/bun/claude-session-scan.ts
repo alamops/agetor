@@ -12,9 +12,10 @@
  */
 import { closeSync, createReadStream, existsSync, lstatSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { effectiveClaudeConfigDir } from "./harness-discovery.ts";
+import { resolveClaudeRoot } from "../shared/harness-config-root.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import {
   createClaudeSessionMetaReader,
@@ -77,25 +78,17 @@ export interface ClaudeHarnessRef {
   bin?: string | null;
 }
 
-/** The config dir a claude-code harness actually reads, with the harness env
- *  map winning over `home` (same precedence as `harnessEnv` in agents.ts and
- *  the shared resolver in harness-config-root.ts, here against the injected
- *  discovery env). The built-in falls through to the process env, then an
- *  env-map `HOME`'s `.claude`, then `~/.claude`. */
+/** The config dir a claude-code harness actually reads: the shared
+ *  precedence (src/shared/harness-config-root.ts, the same one the spawn and
+ *  every other reader use), here against the injected discovery env. The
+ *  env map's `CLAUDE_CONFIG_DIR` wins over `home`; without either, the
+ *  process `CLAUDE_CONFIG_DIR`, then an env-map `HOME`'s `.claude`, then
+ *  `~/.claude`. */
 function harnessConfigDir(harness: ClaudeHarnessRef, discovery: { homeDir?: string; env?: Record<string, string | undefined> }): string {
-  const fromEnv = harness.env?.CLAUDE_CONFIG_DIR;
-  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
-  const processDir = (discovery.env ?? process.env).CLAUDE_CONFIG_DIR;
-  const envHome = harness.env?.HOME;
-  if (
-    !(typeof harness.home === "string" && harness.home.trim() !== "")
-    && !(typeof processDir === "string" && processDir.trim() !== "")
-    && typeof envHome === "string"
-    && envHome.trim() !== ""
-  ) {
-    return path.join(envHome, ".claude");
-  }
-  return effectiveClaudeConfigDir(harness.home, discovery);
+  return resolveClaudeRoot(harness, {
+    homeDir: discovery.homeDir ?? homedir(),
+    claudeConfigDir: (discovery.env ?? process.env).CLAUDE_CONFIG_DIR ?? null,
+  }).configDir;
 }
 
 export interface ScanClaudeSessionsOptions {

@@ -2960,18 +2960,24 @@ test("harnessEnv drops a blank config-root key from the env map so the spawn rea
   expect(harnessEnv(alias("codex", { home: "/h/x", env: { CODEX_HOME: "/pinned" } }))).toEqual({ CODEX_HOME: "/pinned" });
 });
 
-test("claudeConfigDirOverrideFor / codexHomeOverrideFor agree with harnessEnv for an env-map HOME (S17)", () => {
+test("the override helpers are the spawn PIN only: an env-map HOME alone pins nothing (CR1, R-M1)", () => {
   const prevClaude = process.env.CLAUDE_CONFIG_DIR;
   const prevCodex = process.env.CODEX_HOME;
   delete process.env.CLAUDE_CONFIG_DIR;
   delete process.env.CODEX_HOME;
   try {
-    expect(claudeConfigDirOverrideFor({ home: null, env: { HOME: "/eh" } })).toBe("/eh/.claude");
-    expect(codexHomeOverrideFor({ home: null, env: { HOME: "/eh" } })).toBe("/eh/.codex");
+    // Pinning `<HOME>/.claude` would change the CLAUDE_CONFIG_DIR claude
+    // hashes into its keychain service name and log the account out, and
+    // move `.claude.json` into that dir. The spawn stays as it was before
+    // stacks; readers use claudeConfigDirFor (`<HOME>/.claude`).
+    expect(claudeConfigDirOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();
+    expect(harnessEnv(alias("claude-code", { env: { HOME: "/eh" } }))).toEqual({ HOME: "/eh" });
+    expect(codexHomeOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();
+    expect(harnessEnv(alias("codex", { env: { HOME: "/eh" } }))).toEqual({ HOME: "/eh" });
     expect(claudeConfigDirOverrideFor({ home: null, env: {} })).toBeNull();
     expect(claudeConfigDirOverrideFor({ home: "/h", env: { CLAUDE_CONFIG_DIR: "" } })).toBe("/h");
-    // An inherited process override reaches the spawn ahead of the HOME, and
-    // the "override" readers then fall back to the process value themselves.
+    // The process value is never a pin either: pinClaudeConfigDir hands it to
+    // claude itself, and a codex spawn inherits it.
     process.env.CLAUDE_CONFIG_DIR = "/proc-claude";
     process.env.CODEX_HOME = "/proc-codex";
     expect(claudeConfigDirOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();

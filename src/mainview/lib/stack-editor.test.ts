@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   addMember,
+  configRootKey,
   draftBlockers,
   draftFromStack,
   draftPatch,
@@ -126,6 +127,56 @@ describe("stack draft", () => {
         { harnesses: [...HARNESSES, harness("y", "codex")], stackId: null, membership: new Map() },
       ).map((p) => p.code),
     ).not.toContain("same-home");
+  });
+
+  describe("configRootKey follows the shared spawn precedence (N7)", () => {
+    const homeless = (id: string, kind: Harness["kind"], env: Record<string, string>): Harness =>
+      ({ ...harness(id, kind), home: null, env });
+    const sameHomeCodes = (kind: HarnessStack["kind"], a: Harness, b: Harness) =>
+      draftBlockers(
+        { label: "L", kind, members: [a.id, b.id], mirrorMode: "full" },
+        { harnesses: [a, b], stackId: null, membership: new Map() },
+      ).map((p) => p.code);
+
+    test("home-less accounts that differ only by env-map HOME do not share a config dir", () => {
+      expect(sameHomeCodes("claude-code", homeless("h1", "claude-code", { HOME: "/u1" }), homeless("h2", "claude-code", { HOME: "/u2" })))
+        .not.toContain("same-home");
+      expect(sameHomeCodes("codex", homeless("c1", "codex", { HOME: "/u1" }), homeless("c2", "codex", { HOME: "/u2" })))
+        .not.toContain("same-home");
+      // An env-map HOME is not the default root either.
+      expect(sameHomeCodes("claude-code", homeless("h1", "claude-code", { HOME: "/u1" }), homeless("h0", "claude-code", {})))
+        .not.toContain("same-home");
+      expect(configRootKey({ kind: "claude-code", home: null, env: { HOME: "/u1" } })).toBe("/u1/.claude");
+      expect(configRootKey({ kind: "codex", home: null, env: { HOME: "/u1/" } })).toBe("/u1/.codex");
+    });
+
+    test("the same env-map CODEX_HOME / CLAUDE_CONFIG_DIR is one config dir, whatever HOME says", () => {
+      expect(sameHomeCodes(
+        "codex",
+        homeless("c1", "codex", { CODEX_HOME: "/shared/codex", HOME: "/u1" }),
+        homeless("c2", "codex", { CODEX_HOME: "/shared/codex/", HOME: "/u2" }),
+      )).toContain("same-home");
+      expect(sameHomeCodes(
+        "claude-code",
+        homeless("h1", "claude-code", { CLAUDE_CONFIG_DIR: "/shared/claude", HOME: "/u1" }),
+        homeless("h2", "claude-code", { CLAUDE_CONFIG_DIR: "/shared/claude" }),
+      )).toContain("same-home");
+    });
+
+    test("two default-root accounts still collide, and so does an explicit ~ path to that root", () => {
+      expect(sameHomeCodes("claude-code", homeless("d1", "claude-code", {}), homeless("d2", "claude-code", {})))
+        .toContain("same-home");
+      expect(sameHomeCodes("codex", homeless("d1", "codex", {}), { ...harness("d2", "codex"), home: "~" }))
+        .toContain("same-home");
+      expect(sameHomeCodes("claude-code", homeless("d1", "claude-code", {}), { ...harness("d2"), home: "~/.claude" }))
+        .toContain("same-home");
+    });
+
+    test("a blank env value is ignored, as the spawn ignores it", () => {
+      expect(configRootKey({ kind: "claude-code", home: "/a", env: { CLAUDE_CONFIG_DIR: "  " } })).toBe("/a");
+      expect(configRootKey({ kind: "codex", home: null, env: { CODEX_HOME: "", HOME: " " } }))
+        .toBe(configRootKey({ kind: "codex", home: null, env: {} }));
+    });
   });
 
   test("warnings cover <2, >10, full mirror and disabled", () => {

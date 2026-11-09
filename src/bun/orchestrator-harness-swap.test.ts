@@ -207,7 +207,7 @@ describe("harness-stack swap", () => {
     stacks.harnessStacks.delete(stack.id);
   }, 15_000);
 
-  test("a Codex quota limit (the real CLI prose) swaps and resumes the transferred rollout on the backup (S24)", async () => {
+  test("a Codex quota limit (the real CLI prose) swaps and resumes the transferred rollout on the backup (S24, R-S15)", async () => {
     const FAKE_CODEX_LIMIT_PROMPT_MARKER = "__agetor_fake_codex_limit__";
     const idA = `codex-swap-a-${seq}`;
     const idB = `codex-swap-b-${seq}`;
@@ -226,37 +226,69 @@ describe("harness-stack swap", () => {
     const prevBin = process.env.AGETOR_CODEX_BIN;
     process.env.AGETOR_CODEX_DRIVER = "fake";
     process.env.AGETOR_CODEX_BIN = "/bin/echo";
+    const prompts: string[] = [];
+    let taskId = "";
+    const prevPrompt = orch.__setHarnessSwapPromptHookForTest((hooked, prompt) => {
+      if (hooked === taskId) prompts.push(prompt);
+    });
     try {
       // No floor for this model id, so /bin/echo's non-version output never
       // blocks the pre-flight.
-      const task = makeTask(idA, `quota ${FAKE_CODEX_LIMIT_PROMPT_MARKER}`, { model: "fixture-codex-model" } as Partial<Task>);
-      // The fake codex driver reports thread `fake-codex-thread-<task>` (what a
-      // real `thread.started` would deliver); plant its rollout where codex
-      // lays it out, so the transfer copies a real file.
-      const threadId = `fake-codex-thread-${task.id}`;
+      const task = makeTask(idA, "earlier ask", { model: "fixture-codex-model" } as Partial<Task>);
+      taskId = task.id;
+      // An earlier turn on A left a thread whose id is NOT the fake's default
+      // (`fake-codex-thread-<task>`): the follow-up below resumes it, the
+      // limit transfers it, and only a successor that really resumed the
+      // transferred thread can report it back (CR2: the fake reports
+      // `resumeSessionId` when it is given one).
+      const threadId = `planted-thread-${task.id}`;
+      const prior = randomUUID();
+      db.runs.insert({
+        id: prior, taskId: task.id, agent: idA, status: "succeeded", startedAt: Date.now() - 1_000,
+        endedAt: Date.now() - 900, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: threadId,
+        cursorSessionId: null, geminiSessionId: null, fxSessionId: null, antigravitySessionId: null,
+      } as never);
+      db.tasks.update(task.id, { column: "review", runId: prior });
       const rel = path.join("sessions", "2026", "11", "08", `rollout-2026-11-08T00-00-00-${threadId}.jsonl`);
       mkdirSync(path.dirname(path.join(rootA, rel)), { recursive: true, mode: 0o700 });
       writeFileSync(path.join(rootA, rel), `${JSON.stringify({ type: "session_meta", payload: { id: threadId } })}\n`, { mode: 0o600 });
 
-      const started = await orch.startTask(task.id);
-      expect(started).toHaveProperty("runId");
-      await waitFor(() => db.runs.listForTask(task.id).length >= 2 && db.runs.listForTask(task.id).every((r) => r.status !== "running"), 10_000);
+      const sent = await orch.sendInput(prior, `quota ${FAKE_CODEX_LIMIT_PROMPT_MARKER}`);
+      expect(sent.delivered).toBe(true);
+      await waitFor(() => db.runs.listForTask(task.id).length >= 3 && db.runs.listForTask(task.id).every((r) => r.status !== "running"), 10_000);
 
       const runs = [...db.runs.listForTask(task.id)].sort((a, b) => a.startedAt - b.startedAt);
-      expect(runs).toHaveLength(2);
-      expect(runs[0]!.agent).toBe(idA);
-      expect(runs[0]!.status).toBe("failed");
-      expect(runs[1]!.agent).toBe(idB);
-      expect(runs[1]!.origin).toBe("harness-swap");
-      // The successor resumes the transferred thread on B.
-      expect(runs[1]!.codexSessionId).toBe(threadId);
+      expect(runs).toHaveLength(3);
+      const [, limited, successor] = runs;
+      expect(limited!.agent).toBe(idA);
+      expect(limited!.status).toBe("failed");
+      // The limited follow-up resumed the planted thread on A.
+      expect(limited!.codexSessionId).toBe(threadId);
+      expect(successor!.agent).toBe(idB);
+      expect(successor!.origin).toBe("harness-swap");
+      expect(successor!.status).toBe("succeeded");
+      // The successor was spawned resuming the transferred thread on B, with
+      // the hidden continuation prompt (the limited turn had a tool call).
+      expect(successor!.codexSessionId).toBe(threadId);
+      const { composeHarnessStackContinuationPrompt, parseHarnessSwapNotice } = await import("../shared/harness-stack.ts");
+      expect(prompts).toEqual([composeHarnessStackContinuationPrompt([])]);
       expect(existsSync(path.join(rootB, rel))).toBe(true);
       expect(db.harnessSessionHandoffs.get(task.id, idB, "codex_session_id")?.sessionId).toBe(threadId);
-      // The real prose classified as quota with the parsed 3 PM reset.
+      // The real prose classified as quota with its parsed 3 PM reset, which
+      // the swap notice carries.
       const cooldown = stacks.harnessStacks.getLimitState(idA);
       expect(cooldown?.reason).toBe("quota");
+      const noticeRaw = statusLines(successor!.id).find((l) => l.startsWith("harness-swap: "));
+      const resetsAtMs = parseHarnessSwapNotice(noticeRaw ?? "")?.resetsAtMs;
+      expect(typeof resetsAtMs).toBe("number");
+      expect(resetsAtMs!).toBeGreaterThan(Date.now());
+      expect(new Date(resetsAtMs!).getHours()).toBe(15);
+      expect(new Date(resetsAtMs!).getMinutes()).toBe(0);
+      // The provider-reported reset is the account's cooldown, not a fallback.
+      expect(cooldown?.exhaustedUntilMs).toBe(resetsAtMs!);
       expect(db.tasks.get(task.id)!.agent).toBe(idB);
     } finally {
+      orch.__setHarnessSwapPromptHookForTest(prevPrompt);
       stacks.harnessStacks.clearLimitState(idA);
       stacks.harnessStacks.clearLimitState(idB);
       stacks.harnessStacks.delete(stack.id);

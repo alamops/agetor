@@ -272,6 +272,22 @@ export function wrapHarnessStackContinuation(text: string): string {
   return `<${HARNESS_STACK_CONTINUATION_TAG}>\n${text.replace(/\r\n?/g, "\n")}\n</${HARNESS_STACK_CONTINUATION_TAG}>`;
 }
 
+/**
+ * Defuse every `<harness-stack-continuation>` / `</harness-stack-continuation>`
+ * tag inside user text that is about to be wrapped: a space after the `<`
+ * keeps the words readable to the model while the composed value stays
+ * exactly ONE wrapper. A nested tag would stop {@link isHarnessStackContinuation}
+ * recognising the outer value, and the hidden prompt would leak into the
+ * transcript as a visible bubble. Idempotent. Used by the transfer branch's
+ * {@link composeHarnessStackContinuationPrompt} and the clean-retry wrapper.
+ */
+export function neutralizeHarnessStackContinuationTags(text: string): string {
+  return text.replace(
+    new RegExp(`<(/?)${HARNESS_STACK_CONTINUATION_TAG}>`, "g"),
+    (_m, slash: string) => `< ${slash}${HARNESS_STACK_CONTINUATION_TAG}>`,
+  );
+}
+
 /** The fixed instruction body of the transfer branch's hidden prompt. */
 export const HARNESS_STACK_CONTINUATION_INSTRUCTION =
   "Continue the task from where it stopped. The previous account reached its usage limit; no work was lost. "
@@ -301,9 +317,8 @@ export const HARNESS_STACK_UNDELIVERED_LEAD =
  * prompt as a visible bubble).
  */
 export function composeHarnessStackContinuationPrompt(undelivered: readonly string[] = []): string {
-  const tagRe = new RegExp(`<(/?)${HARNESS_STACK_CONTINUATION_TAG}>`, "g");
   const messages = undelivered
-    .map((m) => m.replace(/\r\n?/g, "\n").trim().replace(tagRe, (_m, slash: string) => `< ${slash}${HARNESS_STACK_CONTINUATION_TAG}>`))
+    .map((m) => neutralizeHarnessStackContinuationTags(m.replace(/\r\n?/g, "\n").trim()))
     .filter((m) => m !== "");
   if (messages.length === 0) return wrapHarnessStackContinuation(HARNESS_STACK_CONTINUATION_INSTRUCTION);
   return wrapHarnessStackContinuation(

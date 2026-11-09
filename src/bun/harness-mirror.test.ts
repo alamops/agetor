@@ -1324,3 +1324,234 @@ describe("unchanged-file skip and single-flight (review S9, contract C4)", () =>
     expect(readdirSync(path.join(backup, "skills"))).toHaveLength(40);
   });
 });
+
+describe("Codex profiles in every TOML form (review R-S1, R-S2)", () => {
+  test("a [profiles] table with dotted keys loses the primary's login keys and keeps the backup's", async () => {
+    const { pRoot, bRoot, stack } = codexPair("cx-prof-dotted");
+    write(path.join(pRoot, "config.toml"), [
+      "[profiles]",
+      'work.model_provider = "corp"',
+      'work.model = "gpt-5-work"',
+      'work.forced_login_method = "chatgpt"',
+    ].join("\n"));
+    write(path.join(bRoot, "config.toml"), [
+      "[profiles]",
+      'work.model_provider = "own"',
+    ].join("\n"));
+
+    const result = await mirror.mirrorStack(stack, {});
+    const text = readFileSync(path.join(bRoot, "config.toml"), "utf8");
+    const parsed = Bun.TOML.parse(text) as Record<string, any>;
+    expect(parsed.profiles.work).toEqual({ model: "gpt-5-work", model_provider: "own" });
+    expect(text).not.toContain("corp");
+    expect(text).not.toContain("forced_login_method");
+    expect(result.warnings.some((w) => w.includes("profiles.work.model_provider") && w.includes("profiles.work.forced_login_method")))
+      .toBe(true);
+  });
+
+  test("a backup with no profile login gets none of the primary's from a [profiles] table", async () => {
+    const { pRoot, bRoot, stack } = codexPair("cx-prof-dotted-none");
+    write(path.join(pRoot, "config.toml"), '[profiles]\nwork.model_provider = "corp"\n');
+    await mirror.mirrorStack(stack, {});
+    const parsed = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, any>;
+    expect(parsed.profiles?.work?.model_provider).toBeUndefined();
+  });
+
+  test("an inline profile table naming a login key is not imported; the backup's own inline profile survives", async () => {
+    const { pRoot, bRoot, stack } = codexPair("cx-prof-inline");
+    write(path.join(pRoot, "config.toml"), [
+      "[profiles]",
+      'work = { model_provider = "corp", model = "gpt-5" }',
+      'plain = { model = "gpt-5-mini" }',
+    ].join("\n"));
+    write(path.join(bRoot, "config.toml"), [
+      "[profiles]",
+      'work = { model_provider = "own" }',
+    ].join("\n"));
+
+    await mirror.mirrorStack(stack, {});
+    const text = readFileSync(path.join(bRoot, "config.toml"), "utf8");
+    const parsed = Bun.TOML.parse(text) as Record<string, any>;
+    expect(parsed.profiles.work).toEqual({ model_provider: "own" });
+    expect(parsed.profiles.plain).toEqual({ model: "gpt-5-mini" });
+    expect(text).not.toContain("corp");
+  });
+
+  test("the backup's own [profiles.<n>] login keys survive when the primary's profile has none (R-S2)", async () => {
+    const { pRoot, bRoot, stack } = codexPair("cx-prof-keep");
+    write(path.join(pRoot, "config.toml"), '[profiles.work]\nmodel = "gpt-5"\n');
+    write(path.join(bRoot, "config.toml"), '[profiles.work]\nmodel_provider = "own"\nchatgpt_base_url = "https://own.invalid"\n');
+
+    await mirror.mirrorStack(stack, {});
+    const parsed = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, any>;
+    expect(parsed.profiles.work).toEqual({ model: "gpt-5", model_provider: "own", chatgpt_base_url: "https://own.invalid" });
+  });
+});
+
+describe("Claude login-selecting and command settings (review R-S3, R-S4)", () => {
+  const LOGIN_KEYS = ["forceLoginMethod", "gcpAuthRefresh", "proxyAuthHelper"] as const;
+  const COMMAND_KEYS = [
+    "fileSuggestion",
+    "processWrapper",
+    "policyHelpers",
+    "proxyAuthHelper",
+    "subagentStatusLine",
+    "gcpAuthRefresh",
+    "statusLine",
+    "otelHeadersHelper",
+  ] as const;
+
+  for (const mode of ["full", "safe"] as const) {
+    for (const key of LOGIN_KEYS) {
+      test(`${mode} mode never imports ${key}; the backup's own survives`, async () => {
+        const { primary, backup, stack } = claudePair(`login-${key.toLowerCase()}-${mode}`, mode);
+        write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus", [key]: `primary-${key}` }));
+        write(path.join(backup, "settings.json"), JSON.stringify({ model: "sonnet" }));
+        await mirror.mirrorStack(stack, {});
+        let merged = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+        expect(merged.model).toBe("opus");
+        expect(merged[key]).toBeUndefined();
+
+        write(path.join(backup, "settings.json"), JSON.stringify({ [key]: `backup-${key}` }));
+        await mirror.mirrorStack(stack, {});
+        merged = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+        expect(merged[key]).toBe(`backup-${key}`);
+      });
+    }
+  }
+
+  for (const key of COMMAND_KEYS) {
+    test(`safe mode skips the command setting ${key} and keeps the backup's own`, async () => {
+      const { primary, backup, stack } = claudePair(`safe-cmd-${key.toLowerCase()}`, "safe");
+      const value = { type: "command", command: `/primary/${key}.sh` };
+      write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus", [key]: value }));
+      write(path.join(backup, "settings.json"), JSON.stringify({ model: "sonnet" }));
+      await mirror.mirrorStack(stack, {});
+      let merged = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+      expect(merged.model).toBe("opus");
+      expect(merged[key]).toBeUndefined();
+
+      write(path.join(backup, "settings.json"), JSON.stringify({ [key]: "backup-own" }));
+      await mirror.mirrorStack(stack, {});
+      merged = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+      expect(merged[key]).toBe("backup-own");
+    });
+  }
+
+  test("full mode still copies the non-login command settings", async () => {
+    const { primary, backup, stack } = claudePair("full-cmd", "full");
+    write(path.join(primary, "settings.json"), JSON.stringify({
+      fileSuggestion: { type: "command", command: "/primary/fs.sh" },
+      processWrapper: "/primary/wrap.sh",
+      subagentStatusLine: { type: "command", command: "/primary/s.sh" },
+    }));
+    await mirror.mirrorStack(stack, {});
+    const merged = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(merged.fileSuggestion).toEqual({ type: "command", command: "/primary/fs.sh" });
+    expect(merged.processWrapper).toBe("/primary/wrap.sh");
+    expect(merged.subagentStatusLine).toEqual({ type: "command", command: "/primary/s.sh" });
+  });
+});
+
+describe("macOS-protected folders (review R-S5, R-S6, contract CR4)", () => {
+  /** A fake home with a `Documents` folder; while locked (mode 000) any stat
+   *  below it fails, so a clean result proves the core never looked inside. */
+  function protectedHome() {
+    const home = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-mirror-tcc-home-")));
+    const documents = path.join(home, "Documents");
+    mkdirSync(documents);
+    transfer.setTccHomeForTests(home);
+    return {
+      home,
+      documents,
+      lock: () => chmodSync(documents, 0o000),
+      unlock: () => chmodSync(documents, 0o700),
+    };
+  }
+
+  test("a skill symlinked into a protected folder (directly or through a chain) is refused without stat'ing inside it", async () => {
+    const { documents, lock, unlock } = protectedHome();
+    try {
+      mkdirSync(path.join(documents, "notes"));
+      const { primary, backup, stack } = claudePair("tcc-skill");
+      mkdirSync(path.join(primary, "skills"), { recursive: true });
+      symlinkSync(path.join(documents, "notes"), path.join(primary, "skills", "notes"));
+      const hop = mkdtempSync(path.join(tmpdir(), "agetor-mirror-tcc-hop-"));
+      symlinkSync(documents, path.join(hop, "docs"));
+      symlinkSync(path.join(hop, "docs", "notes"), path.join(primary, "skills", "chained"));
+      const shared = mkdtempSync(path.join(tmpdir(), "agetor-mirror-tcc-ok-"));
+      write(path.join(shared, "ok", "SKILL.md"), "# ok");
+      symlinkSync(path.join(shared, "ok"), path.join(primary, "skills", "ok"));
+      lock();
+
+      const result = await mirror.mirrorStack(stack, {});
+
+      for (const name of ["notes", "chained"]) {
+        expect(isLink(path.join(backup, "skills", name)), name).toBe(false);
+        expect(result.warnings.some((w) => w.includes(`skills/${name}: symlink points into the macOS-protected folder ~/Documents`)), name)
+          .toBe(true);
+      }
+      // `realpath` on a link into the locked folder would have failed and been
+      // reported as a missing target; the lexical walk never got that far.
+      expect(result.warnings.some((w) => w.includes("target is missing"))).toBe(false);
+      expect(readlinkSync(path.join(backup, "skills", "ok"))).toBe(realpathSync(path.join(shared, "ok")));
+    } finally {
+      unlock();
+      transfer.setTccHomeForTests(null);
+    }
+  });
+
+  test("a backup root swapped for a symlink into a protected folder after it was saved is refused, nothing written", async () => {
+    const { documents, lock, unlock } = protectedHome();
+    try {
+      const { primary, b, stack } = claudePair("tcc-root");
+      write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus" }));
+      write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+      // The repro from review R-S6: the member root is replaced by a link
+      // into a protected folder after the stack was saved.
+      mkdirSync(path.join(documents, "acct2"));
+      const parent = mkdtempSync(path.join(tmpdir(), "agetor-mirror-tcc-link-"));
+      const linkedHome = path.join(parent, "home");
+      symlinkSync(path.join(documents, "acct2"), linkedHome);
+      dbm.harnesses.update(b, { home: linkedHome });
+      lock();
+
+      const result = await mirror.mirrorStack(stack, {});
+
+      expect(result.copied).toEqual([]);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain("this account's config directory now resolves into the macOS-protected folder ~/Documents");
+      unlock();
+      expect(readdirSync(path.join(documents, "acct2"))).toEqual([]);
+    } finally {
+      unlock();
+      transfer.setTccHomeForTests(null);
+    }
+  });
+
+  test("a redirected primary root is refused the same way; a root saved under the folder still mirrors", async () => {
+    const { documents, unlock } = protectedHome();
+    try {
+      const { primary, backup, a, stack } = claudePair("tcc-primary");
+      write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus" }));
+      const parent = mkdtempSync(path.join(tmpdir(), "agetor-mirror-tcc-plink-"));
+      mkdirSync(path.join(documents, "primary"));
+      write(path.join(documents, "primary", "settings.json"), JSON.stringify({ model: "from-documents" }));
+      symlinkSync(path.join(documents, "primary"), path.join(parent, "home"));
+      dbm.harnesses.update(a, { home: path.join(parent, "home") });
+
+      const refused = await mirror.mirrorStack(stack, {});
+      expect(refused.warnings.some((w) => w.includes("the primary's config directory now resolves into the macOS-protected folder"))).toBe(true);
+      expect(existsSync(path.join(backup, "settings.json"))).toBe(false);
+
+      // Saved under Documents on purpose: gated as such, so not refused.
+      dbm.harnesses.update(a, { home: path.join(documents, "primary") });
+      const ok = await mirror.mirrorStack(stack, {});
+      expect(ok.warnings.some((w) => w.includes("macOS-protected"))).toBe(false);
+      expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("from-documents");
+    } finally {
+      unlock();
+      transfer.setTccHomeForTests(null);
+    }
+  });
+});
