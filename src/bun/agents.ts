@@ -41,6 +41,7 @@ import {
 import { refreshOpencodeSubagents, registerOpencodeSubagent } from "./opencode-subagents.ts";
 import { attachOpencodeServerLinger, attachOpencodeServerTurn, spawnOpencodeServerTurn, type OpencodeServerTurn } from "./opencode-driver.ts";
 import { copilotHome } from "./copilot-home.ts";
+import { claudeConfigDirOverrideFor, ROOT_ENV_KEYS } from "./harness-config-root.ts";
 import { fakeCopilotScript, playFakeCopilotTurn } from "./copilot-fake.ts";
 import { copilotUsagePath, spawnCopilotViaTmux, type CopilotSubagentSink } from "./copilot-tmux.ts";
 import { answerFxPermission, registerFxPermission } from "./interactions.ts";
@@ -427,27 +428,11 @@ function warnUnknownHarnessKind(kind: string): void {
   console.warn(`[agetor] harness kind "${kind}" is not supported by this build; no home env var is set for it`);
 }
 
-/** The harness-pinned Claude config dir (`CLAUDE_CONFIG_DIR`), or null when
- *  the built-in account falls back to the process env / `~/.claude`. Mirrors
- *  {@link harnessEnv}'s precedence exactly: the env map wins over `home`. */
-export function claudeConfigDirOverrideFor(
-  harness: { home: string | null; env?: Record<string, string> | null },
-): string | null {
-  const fromEnv = harness.env?.CLAUDE_CONFIG_DIR;
-  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
-  return harness.home;
-}
-
-/** The harness-pinned Codex state root (`CODEX_HOME`), or null when the
- *  built-in account falls back to the process env / `~/.codex`. Mirrors
- *  {@link harnessEnv}: the env map wins over `<home>/.codex`. */
-export function codexHomeOverrideFor(
-  harness: { home: string | null; env?: Record<string, string> | null },
-): string | null {
-  const fromEnv = harness.env?.CODEX_HOME;
-  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
-  return harness.home ? path.join(harness.home, ".codex") : null;
-}
+// The config-root resolvers live in a db-free module so the usage tracker can
+// import them; re-exported here for the spawn paths and existing importers.
+// They mirror `harnessEnv` below exactly (docs/architecture/harness-stacks.md).
+export { claudeConfigDirOverrideFor };
+export { codexHomeOverrideFor } from "./harness-config-root.ts";
 
 /**
  * Build the env block the harness contributes to a spawn: home-derived
@@ -535,8 +520,15 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       warnUnknownHarnessKind(harness.kind satisfies never);
     }
   }
-  // User-provided env wins over the home-derived defaults.
-  for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
+  // User-provided env wins over the home-derived defaults. A blank
+  // config-root key (`CLAUDE_CONFIG_DIR=""`, `CODEX_HOME=""`, `HOME=""`) is
+  // dropped rather than handed to the CLI as an empty (relative) root: the
+  // resolvers in harness-config-root.ts treat it as unset, and the spawn must
+  // read the same root they do.
+  for (const [k, v] of Object.entries(harness.env ?? {})) {
+    if (ROOT_ENV_KEYS.includes(k) && v.trim() === "") continue;
+    env[k] = v;
+  }
   // Copilot: resolve the home the same way every spawn does (`copilotHome`
   // expands a leading `~` and trims), so the login terminal and
   // `agetor harness shell` write the login where runs will read it. Only when
@@ -2593,7 +2585,9 @@ function makeFakeAgent(
         return;
       }
       const signal = classifyHarnessLimitSignal(fakeOpts.kind ?? "claude-code", {
-        text: fakeOpts.kind === "codex" ? "usage_limit_exceeded" : "Usage limit reached · continuing automatically when it resets",
+        text: fakeOpts.kind === "codex"
+          ? "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:00 PM."
+          : "Usage limit reached · continuing automatically when it resets",
       }) ?? { reason: "quota" as const, resetAtMs: null, message: "usage limit reached", source: "claude-pane" as const };
       // The classifier labels a Claude text signal `claude-api-error`; the
       // pane marker/env selects the REPL-paused variant so a settlement's
@@ -2605,7 +2599,10 @@ function makeFakeAgent(
         `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify({ ...signal, source: paneLimit ? "claude-pane" : signal.source })}`,
       );
       onChunk("status", "turn complete");
-      resolveDone(0);
+      // Real codex exits non-zero on `turn.failed`, and a codex limit on an
+      // exit-0 turn is ignored by the settle (it recovered). Claude's REPL
+      // resolves the paused turn cleanly, so it keeps 0.
+      resolveDone(fakeOpts.kind === "codex" ? 1 : 0);
     });
   } else if (process.env.AGETOR_FAKE_CLAUDE_API_ERROR === "1") {
     // Emit the chunks promptly (this is what flips the column to `blocked`

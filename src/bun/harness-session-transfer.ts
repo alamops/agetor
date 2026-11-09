@@ -11,7 +11,11 @@
  *
  * Every source path is agent-writable, so reads are no-follow/regular-file,
  * copies are atomic and 0600, and a symlink/FIFO/oversized transcript is
- * refused rather than followed. A missing transcript is `no-session`; the
+ * refused rather than followed. Two accounts whose config roots resolve to the
+ * same directory (realpath) are refused, and a destination file that existed
+ * BEFORE the copy (the destination account's own original after an A→B→A
+ * wrap) is never recorded in `copiedPaths`, so cleanup can only delete files
+ * the transfer created. A missing transcript is `no-session`; the
  * caller decides what that means — when it has a recorded session id the
  * conversation is gone and the swap blocks (`harness-swap-failed`) rather than
  * silently starting fresh.
@@ -22,15 +26,17 @@ import path from "node:path";
 import { encodeProjectPath } from "./claude-tmux.ts";
 import { harnesses, harnessSessionHandoffs, runs, type HarnessSessionHandoff, type SessionIdColumn } from "./db.ts";
 import {
-  copyRegularFile,
+  copyRegularFileDetailed,
   copyTreeCooperative,
   isPlainAncestorPathUnder,
   isPlainDir,
   isRegularFileNoFollow,
   removeCopiedPaths,
+  sameConfigRoot,
 } from "./harness-file-transfer.ts";
 import { claudeConfigDirFor, codexHomeFor } from "./harness-stacks.ts";
-import type { Harness } from "../shared/types.ts";
+import { CLAUDE_SESSION_SIDECAR_DIRS, isHandoffCopyShape, isSafePathSegment } from "../shared/harness-mirror.ts";
+import type { Harness, HarnessStackKind } from "../shared/types.ts";
 import { resolveBin } from "./agents.ts";
 import { childEnv, coreSpawn } from "./core-spawn.ts";
 
@@ -38,7 +44,7 @@ export const CLAUDE_SESSION_COLUMN = "claude_session_id" as const satisfies Sess
 export const CODEX_SESSION_COLUMN = "codex_session_id" as const satisfies SessionIdColumn;
 
 const MAX_SESSION_BYTES = 64 * 1024 * 1024;
-const SIDECAR_DIRS = ["subagents", "tool-results", "mcp-tasks"] as const;
+const SIDECAR_DIRS = CLAUDE_SESSION_SIDECAR_DIRS;
 
 export type TransferResult =
   | {
@@ -99,9 +105,15 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
     }
     const fromRoot = claudeConfigDirFor(fromHarness);
     const toRoot = claudeConfigDirFor(toHarness);
-    if (path.resolve(fromRoot) === path.resolve(toRoot)) {
+    // realpath, not `path.resolve`: a later `PATCH /harnesses/:id` can point a
+    // backup's root at the primary's through a symlink, and copying an account
+    // onto itself then lets cleanup delete the source's own transcript.
+    if (sameConfigRoot(fromRoot, toRoot)) {
       return { ok: false, reason: "unsafe-source", message: "source and destination share a config directory" };
     }
+    // The id becomes a file name on the destination; a separator or `..`
+    // would write outside `projects/<enc>/`.
+    if (!isSafePathSegment(sessionId)) return unsafeReason("the session id is not a plain file name");
     const source = claudeTranscriptPath(fromRoot, cwd, sessionId);
     const isFresh = existsSync(source.fresh);
     const src = isFresh ? source.fresh : source.legacy;
@@ -128,10 +140,14 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
     }
     const destDir = path.join(toRoot, "projects", source.encoded);
     const dest = path.join(destDir, `${sessionId}.jsonl`);
+    // Only files this transfer CREATED go on the cleanup allowlist. A
+    // pre-existing destination is the account's own file (e.g. its original
+    // transcript after an A→B→A wrap): the copy still updates it, but deleting
+    // it later would destroy that account's conversation (contract C5).
     const copied: string[] = [];
     try {
-      await copyRegularFile(src, dest, { maxBytes: MAX_SESSION_BYTES, root: toRoot });
-      copied.push(dest);
+      const result = await copyRegularFileDetailed(src, dest, { maxBytes: MAX_SESSION_BYTES, root: toRoot });
+      if (result.created) copied.push(dest);
     } catch (err) {
       return { ok: false, reason: "io", message: err instanceof Error ? err.message : String(err) };
     }
@@ -147,7 +163,7 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
           maxBytes: MAX_SESSION_BYTES,
           root: toRoot,
         });
-        copied.push(...result.copied.map((rel) => path.join(destDir, sessionId, dir, rel)));
+        copied.push(...result.created.map((rel) => path.join(destDir, sessionId, dir, rel)));
       } catch {
         // A sidecar that cannot be copied is not fatal: the transcript is the
         // conversation; the sidecar only carries subagent/tool scratch files.
@@ -168,7 +184,7 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
     const handoff = harnessSessionHandoffs.get(taskId, harnessId, CLAUDE_SESSION_COLUMN);
     if (!handoff) return;
     const harness = harnesses.getByIdOrKind(harnessId);
-    if (harness) removeCopiedPaths(handoff.copiedPaths, claudeConfigDirFor(harness));
+    if (harness) await removeCopiedPaths(handoff.copiedPaths, claudeConfigDirFor(harness), "claude-code");
     harnessSessionHandoffs.deleteOne(taskId, harnessId, CLAUDE_SESSION_COLUMN);
   },
 };
@@ -278,9 +294,10 @@ export const codexSessionTransfer: SessionTransferAdapter = {
     }
     const fromRoot = codexHomeFor(fromHarness);
     const toRoot = codexHomeFor(toHarness);
-    if (path.resolve(fromRoot) === path.resolve(toRoot)) {
+    if (sameConfigRoot(fromRoot, toRoot)) {
       return { ok: false, reason: "unsafe-source", message: "source and destination share a CODEX_HOME" };
     }
+    if (!isSafePathSegment(sessionId)) return unsafeReason("the thread id is not a plain file name");
     const source = await findCodexRollout(fromRoot, sessionId);
     if (!source) return { ok: false, reason: "no-session", message: "no rollout recorded yet" };
     // Defense in depth: the walk already skips symlinked entries, but the
@@ -293,9 +310,19 @@ export const codexSessionTransfer: SessionTransferAdapter = {
     }
     const rel = path.relative(fromRoot, source);
     if (rel.startsWith("..") || path.isAbsolute(rel)) return unsafeReason("rollout path escapes CODEX_HOME");
+    // Only Codex's own `sessions/YYYY/MM/DD/rollout-*.jsonl` layout is copied:
+    // it is the only shape cleanup will ever remove, so a copy of any other
+    // shape could never be cleaned up.
+    if (!isHandoffCopyShape("codex", rel.split(path.sep).join("/"))) {
+      return unsafeReason("the rollout is not in Codex's sessions/YYYY/MM/DD layout");
+    }
     const dest = path.join(toRoot, rel);
+    const copiedPaths: string[] = [];
     try {
-      await copyRegularFile(source, dest, { maxBytes: MAX_SESSION_BYTES, root: toRoot });
+      const result = await copyRegularFileDetailed(source, dest, { maxBytes: MAX_SESSION_BYTES, root: toRoot });
+      // Same rule as the Claude adapter: a rollout the destination already
+      // had is its own, never put on the cleanup allowlist (contract C5).
+      if (result.created) copiedPaths.push(dest);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return { ok: false, reason: message.includes("too large") ? "too-large" : "io", message };
@@ -308,7 +335,7 @@ export const codexSessionTransfer: SessionTransferAdapter = {
       harnessId: toHarness.id,
       columnName: CODEX_SESSION_COLUMN,
       sessionId,
-      copiedPaths: [dest],
+      copiedPaths,
       createdAt: Date.now(),
     });
     // The migration warning is surfaced through the caller's status line; the
@@ -316,7 +343,7 @@ export const codexSessionTransfer: SessionTransferAdapter = {
     return {
       ok: true,
       sessionId,
-      copiedPaths: [dest],
+      copiedPaths,
       ...(warnings.length > 0 ? { warnings } : {}),
     };
   },
@@ -324,7 +351,7 @@ export const codexSessionTransfer: SessionTransferAdapter = {
     const handoff = harnessSessionHandoffs.get(taskId, harnessId, CODEX_SESSION_COLUMN);
     if (!handoff) return;
     const harness = harnesses.getByIdOrKind(harnessId);
-    if (harness) removeCopiedPaths(handoff.copiedPaths, codexHomeFor(harness));
+    if (harness) await removeCopiedPaths(handoff.copiedPaths, codexHomeFor(harness), "codex");
     harnessSessionHandoffs.deleteOne(taskId, harnessId, CODEX_SESSION_COLUMN);
   },
 };
@@ -413,6 +440,7 @@ export function hasPriorSessionForHarness(
  * built-in) leaves a live task's conversation intact (review R13-S2).
  */
 export interface HarnessSessionCopies {
+  kind: HarnessStackKind;
   root: string;
   paths: readonly string[];
 }
@@ -422,31 +450,28 @@ export interface HarnessSessionCopies {
 export function collectHarnessSessionCopies(harnessId: string): HarnessSessionCopies[] {
   const harness = harnesses.getByIdOrKind(harnessId);
   if (!harness) return [];
-  return harnessSessionHandoffs.listForHarness(harnessId).map((handoff) => ({
-    root: handoff.columnName === CODEX_SESSION_COLUMN
-      ? codexHomeFor(harness)
-      : claudeConfigDirFor(harness),
-    paths: handoff.copiedPaths,
-  }));
+  return harnessSessionHandoffs.listForHarness(harnessId).map((handoff) => {
+    const codex = handoff.columnName === CODEX_SESSION_COLUMN;
+    return {
+      kind: codex ? "codex" : "claude-code",
+      root: codex ? codexHomeFor(harness) : claudeConfigDirFor(harness),
+      paths: handoff.copiedPaths,
+    };
+  });
 }
 
-/** Remove copies captured by {@link collectHarnessSessionCopies}. Only paths
- *  recorded in the handoff allowlist and inside `root` are touched. */
-export function removeHarnessSessionCopies(copies: readonly HarnessSessionCopies[]): void {
-  for (const copy of copies) removeCopiedPaths(copy.paths, copy.root);
-}
-
-/**
- * Remove every copied session file a harness owns as a handoff DESTINATION,
- * then drop the rows. Kept for callers that do not delete the harness row
- * itself; the DELETE route captures with {@link collectHarnessSessionCopies}
- * and removes only after the row delete succeeded. Call this while the harness
- * row still exists so the root resolves; a missing harness still drops the
- * rows (nothing to resume).
- */
-export async function cleanupHarnessSessionCopiesForHarness(harnessId: string): Promise<void> {
-  removeHarnessSessionCopies(collectHarnessSessionCopies(harnessId));
-  harnessSessionHandoffs.deleteForHarness(harnessId);
+/** Remove copies captured by {@link collectHarnessSessionCopies}. Only regular
+ *  files recorded in the handoff allowlist, inside `root` and of a handoff
+ *  shape are unlinked (`removeCopiedPaths`). Cooperative and never rejects, so
+ *  a caller may also fire it without awaiting. */
+export async function removeHarnessSessionCopies(copies: readonly HarnessSessionCopies[]): Promise<void> {
+  for (const copy of copies) {
+    try {
+      await removeCopiedPaths(copy.paths, copy.root, copy.kind);
+    } catch (err) {
+      console.warn("[harness-stacks] removing handoff copies failed:", err);
+    }
+  }
 }
 
 /**

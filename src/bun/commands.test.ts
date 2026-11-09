@@ -1416,3 +1416,57 @@ describe("opencode capability discovery", () => {
     });
   });
 });
+
+// Review S17: capability discovery reads the same account root the spawn
+// uses, through the one resolver in harness-config-root.ts. Each case below
+// read a different directory before the resolvers were unified.
+describe("config roots match harnessEnv (S17)", () => {
+  function withProcessEnv(key: string, value: string | undefined, fn: () => Promise<void>): Promise<void> {
+    const prev = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+    return fn().finally(() => {
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    });
+  }
+
+  test("codex: an inherited process CODEX_HOME beats an env-map HOME", async () => {
+    const processCodex = mkdtempSync(path.join(tmpRoot, "s17-proc-codex-"));
+    writeCmd(path.join(processCodex, "prompts"), "from-process.md", "body");
+    const envHome = mkdtempSync(path.join(tmpRoot, "s17-env-home-"));
+    writeCmd(path.join(envHome, ".codex", "prompts"), "from-env-home.md", "body");
+    const project = mkdtempSync(path.join(tmpRoot, "s17-proj-"));
+    await withProcessEnv("CODEX_HOME", processCodex, async () => {
+      const all = await listAvailableCommands({ agent: "codex", workdir: project, harnessEnv: { HOME: envHome } });
+      expect(all.some((c) => c.name === "/from-process")).toBe(true);
+      expect(all.some((c) => c.name.includes("from-env-home"))).toBe(false);
+    });
+  });
+
+  test("claude: an env-map HOME alone pins <HOME>/.claude", async () => {
+    const envHome = mkdtempSync(path.join(tmpRoot, "s17-claude-home-"));
+    writeCmd(path.join(envHome, ".claude", "commands"), "envhome-only.md", "body");
+    const project = mkdtempSync(path.join(tmpRoot, "s17-claude-proj-"));
+    await withProcessEnv("CLAUDE_CONFIG_DIR", undefined, async () => {
+      const all = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessEnv: { HOME: envHome } });
+      expect(all.some((c) => c.name === "/envhome-only")).toBe(true);
+    });
+  });
+
+  test("claude: a blank env-map CLAUDE_CONFIG_DIR is unset, so .claude.json comes from the home (N9)", async () => {
+    const harnessHome = mkdtempSync(path.join(tmpRoot, "s17-claude-json-"));
+    writeFileSync(
+      path.join(harnessHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { blankpin: { command: "npx" } } }),
+    );
+    const project = mkdtempSync(path.join(tmpRoot, "s17-claude-json-proj-"));
+    const all = await listExtensions({
+      agent: "claude-code",
+      workdir: project,
+      harnessHome,
+      harnessEnv: { CLAUDE_CONFIG_DIR: "" },
+    });
+    expect(all.some((e) => e.kind === "mcp" && e.name === "blankpin")).toBe(true);
+  });
+});

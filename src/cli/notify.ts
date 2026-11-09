@@ -43,7 +43,8 @@ export function notifyFor(
   if (e.kind === "harness-swap" && e.taskId === taskId) {
     return {
       title: "Agetor — account switched",
-      body: `${short} · ${e.fromLabel} → ${e.toLabel} (${e.position}/${e.count})`,
+      // No `(1/1)` for a one-member stack's same-account retry (review N1).
+      body: `${short} · ${e.fromLabel} → ${e.toLabel}${e.count < 2 ? "" : ` (${e.position}/${e.count})`}`,
       kind: "harness-swap",
     };
   }
@@ -56,6 +57,14 @@ export function notifyFor(
     return null; // cancelled: the user did it
   }
   if (e.kind === "column" && e.taskId === taskId && e.column === "blocked") {
+    // A harness-stack block says why, with the same headings the app, the
+    // headless core and the TUI use (docs/architecture/harness-stacks.md).
+    if (e.reason === "harness-exhausted") {
+      return { title: "Agetor — Stack out of quota", body: `${short} is waiting on you`, kind: "blocked" };
+    }
+    if (e.reason === "harness-swap-failed") {
+      return { title: "Agetor — No usable backup account", body: `${short} is waiting on you`, kind: "blocked" };
+    }
     return {
       title: "Agetor — needs you",
       body: e.reason === "api-error" ? `${short} (API error)` : `${short} is waiting on you`,

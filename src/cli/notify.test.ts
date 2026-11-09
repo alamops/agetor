@@ -239,6 +239,24 @@ test("notifyFor: a harness swap is quiet, and the old run's failed settle is sil
   }, T);
   expect(swap?.title).toContain("account switched");
   expect(swap?.kind).toBe("harness-swap");
+  expect(swap?.body).toContain("(2/3)");
+  const lone = notifyFor({
+    kind: "harness-swap", taskId: T, from: "a", to: "a", fromLabel: "Work", toLabel: "Work",
+    reason: "quota", position: 1, count: 1, ts: 1,
+  }, T);
+  expect(lone?.body).not.toContain("1/1");
   expect(notifyFor({ kind: "run-status", taskId: T, runId: "r", status: "failed", reason: "harness-swap", ts: 1 }, T)).toBeNull();
   expect(notifyFor({ kind: "run-status", taskId: T, runId: "r", status: "failed", reason: "harness-exhausted", ts: 1 }, T)).toBeNull();
+});
+
+test("notifyFor: a harness-stack block names its cause like the app and the headless core", () => {
+  const blocked = (reason: "harness-exhausted" | "harness-swap-failed") =>
+    notifyFor({ kind: "column", taskId: T, runId: "r", column: "blocked", prev: "running", ts: 1, reason }, T);
+  const exhausted = blocked("harness-exhausted");
+  expect(exhausted?.title).toBe("Agetor — Stack out of quota");
+  expect(exhausted?.kind).toBe("blocked");
+  expect(exhausted?.body).toContain(T.slice(0, 8));
+  const unusable = blocked("harness-swap-failed");
+  expect(unusable?.title).toBe("Agetor — No usable backup account");
+  expect(unusable?.kind).toBe("blocked");
 });

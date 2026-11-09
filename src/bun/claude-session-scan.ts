@@ -78,11 +78,23 @@ export interface ClaudeHarnessRef {
 }
 
 /** The config dir a claude-code harness actually reads, with the harness env
- *  map winning over `home` (same precedence as `harnessEnv` in agents.ts).
- *  The built-in falls through to the process env / `~/.claude`. */
+ *  map winning over `home` (same precedence as `harnessEnv` in agents.ts and
+ *  the shared resolver in harness-config-root.ts, here against the injected
+ *  discovery env). The built-in falls through to the process env, then an
+ *  env-map `HOME`'s `.claude`, then `~/.claude`. */
 function harnessConfigDir(harness: ClaudeHarnessRef, discovery: { homeDir?: string; env?: Record<string, string | undefined> }): string {
   const fromEnv = harness.env?.CLAUDE_CONFIG_DIR;
   if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
+  const processDir = (discovery.env ?? process.env).CLAUDE_CONFIG_DIR;
+  const envHome = harness.env?.HOME;
+  if (
+    !(typeof harness.home === "string" && harness.home.trim() !== "")
+    && !(typeof processDir === "string" && processDir.trim() !== "")
+    && typeof envHome === "string"
+    && envHome.trim() !== ""
+  ) {
+    return path.join(envHome, ".claude");
+  }
   return effectiveClaudeConfigDir(harness.home, discovery);
 }
 

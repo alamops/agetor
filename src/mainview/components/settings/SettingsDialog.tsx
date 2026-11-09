@@ -1514,6 +1514,8 @@ function HarnessesSection({
   const [usageOpenFor, setUsageOpenFor] = useState<string | null>(null);
   const stackByHarness = new Map<string, { stackId: string; position: number; count: number }>();
   for (const stack of payload.stacks ?? []) {
+    // A one-account stack cannot fail over: no `1/1` chip promising it does.
+    if (stack.members.length < 2) continue;
     stack.members.forEach((m, i) => stackByHarness.set(m.harnessId, { stackId: stack.id, position: i + 1, count: stack.members.length }));
   }
   const coolingByHarness = new Map((payload.limitStates ?? []).map((s) => [s.harnessId, s] as const));

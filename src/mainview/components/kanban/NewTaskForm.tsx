@@ -44,6 +44,7 @@ import {
   type TaskType,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
+import { StackPositionChip } from "./StackBadge";
 import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
@@ -962,12 +963,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                       >
                         <AgentIcon kind={h.kind} className="mr-1" />
                         <span className="truncate">{h.label}</span>
-                        {(() => {
-                          const stack = stacks.find((st) => st.members.some((m) => m.harnessId === h.id));
-                          if (!stack) return null;
-                          const index = stack.members.findIndex((m) => m.harnessId === h.id);
-                          return <span className="ml-1 text-[10px] text-info">{index + 1}/{stack.members.length}</span>;
-                        })()}
+                        <StackPositionChip stacks={stacks} harnessId={h.id} />
                         <span
                           className={cn(
                             "ml-auto inline-block size-1.5 rounded-full",

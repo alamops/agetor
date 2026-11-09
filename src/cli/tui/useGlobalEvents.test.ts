@@ -62,7 +62,15 @@ test("toastFor: a harness swap is a quiet informational line and respects pipeli
   } as unknown as GlobalEvent;
   expect(toastFor(ev)?.color).toBe("cyan");
   expect(toastFor(ev)?.text).toContain("Backup");
+  expect(toastFor(ev)?.text).toContain("(2/3)");
+  const lone = { ...(ev as object), position: 1, count: 1 } as unknown as GlobalEvent;
+  expect(toastFor(lone)?.text).not.toContain("1/1");
   expect(toastFor(ev, new Set([ID]))).toBeNull();
+  // A stored label with ESC / a line break cannot repaint the dashboard.
+  const hostile = { ...(ev as object), toLabel: "Bad\u001b[2Jlabel\nnext" } as unknown as GlobalEvent;
+  const text = toastFor(hostile)?.text ?? "";
+  expect(text).not.toContain("\u001b");
+  expect(text).not.toContain("\n");
 });
 
 test("toastFor: stack blocked reasons get a specific hint", () => {
@@ -71,6 +79,8 @@ test("toastFor: stack blocked reasons get a specific hint", () => {
     reason: "harness-exhausted",
   } as unknown as GlobalEvent;
   expect(toastFor(ev)?.text).toContain("stack out of quota");
+  const failed = { ...(ev as object), reason: "harness-swap-failed" } as unknown as GlobalEvent;
+  expect(toastFor(failed)?.text).toContain("no usable backup account");
 });
 
 test("toastFor: the old run's failover/exhausted failure never paints a failed toast", () => {

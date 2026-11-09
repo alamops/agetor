@@ -121,8 +121,15 @@ Evidence + rationale: `docs/plans/model-effort-local-command-turns.md` (§10 for
 
 ## Usage-limit signal (harness stacks)
 
-The pane scraper recognizes Claude's live usage-limit AUTO-CONTINUE notice
-(`MODAL_NOTICE_RE` plus the classifier's quota table), emits exactly one
+The pane scraper recognizes Claude's live usage-limit notice — the
+auto-continue rows (`Usage limit reached · continuing automatically …`, `…
+reached again …`, the standalone `Continuing automatically … · Esc to cancel`),
+`… · limit resets <t>`, the bare `Usage limit reached` and `You've hit your
+limit · resets <t>` — but only in the hint slot directly above the input box
+(at most four rows, stopping at any transcript/tool gutter row such as `⎿`,
+`│`, `⏺`) or the footer below it, so a quoted notice or a tool result can never
+settle a turn. The grace-window `… · wrapping up` counts only once the turn has
+stopped, and the usage-credits wrap-up never counts. It emits exactly one
 `harness-limit:` status for the turn (a per-turn latch; the notice stays on
 screen), and resolves the turn. The synthetic `api error:` path remains the
 backstop for 429/402 — the orchestrator classifies only that sentinel, never

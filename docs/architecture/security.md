@@ -33,7 +33,7 @@ A site the user happens to visit can't read either token, so even with `ACAO` se
 `/refs/resolve` for the CLI answers from those probe results directly (a denied path drops like a failing stat), agent discovery's live project tree is read through `callerProjectTree` (a disclaimed `find -L … -print0` filtered by `shouldRead`, then `tar -L --null -T -`, parsed by `src/bun/tar-read.ts`;
 a truncation at the 8 MB cap is logged) — and while the disclaim switch is on, ALL of agent discovery reads through disclaimed children for every caller, the app included (`src/bun/discovery-fs.ts`, D26: user/harness-home trees, settings, `installed_plugins.json`, plugin install dirs, codex/cursor config, and `~/.claude.json` via a disclaimed `stat`+`cat` behind a stat-keyed cache;
 each `load()` stage is one direct `find -L` per (depth, name) selector shape, run in parallel, plus one `tar`, under one 15 s budget whose timeout is logged — claude-code adds a second stage for its active plugins and the `.claude.json` child, the other kinds need one stage), and `/claude-sessions/import`, `/claude-sessions/checkout` and `/opencode-sessions/import` pass a `gateCwd` for a CLI caller;
-harness `home`/`bin` and absolute-path `env` values are gated the same way.
+harness `home`/`bin` and absolute-path `env` values are gated the same way. `POST`/`PATCH /harnesses` first refuse any `..` component in `home`, `bin` and the config-root env values (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME`) with a 400 and store them `path.resolve`d, so the probe and every consumer see the same path; `home` and those env values are gated `nearest-ancestor` (a missing nested root under a protected folder is refused, since the stack mirror may create it), `bin` stays `exists`, and a `~`-prefixed root value is gated after expansion. The harness-stack routes take no path from the request but act on stored roots, so for the CLI caller `POST`/`PATCH /harness-stacks` probe every member's `effectiveHome` (and, for Claude, the `.claude.json` directory) in the handler and refuse `403 path-not-accessible` (no `pathParams` entry).
 The app caller is never gated and keeps today's in-process behavior.
 A route whose path field needs no gate says why with `pathParamsExempt`.
 
@@ -97,7 +97,12 @@ with `openReadNoFollow` (`O_NOFOLLOW | O_NONBLOCK`, regular file only, never a
 FIFO) — the mirror's merge readers wrap it in their local `readTextIfRegular`,
 and the copy path uses `copyRegularFile` with the same `READ_NOFOLLOW` flags —
 and every write is a sibling temp file, fsync, rename, 0600 (0700 dirs).
-Directory walks `lstat` each entry and skip symlinks/FIFOs/devices; copies
+Directory walks `lstat` each entry and skip symlinks/FIFOs/devices (the one
+exception: a *top-level* symlink in Claude `skills/`/`commands/`/`agents/` or
+Codex `skills/`/`prompts/` is recreated as an absolute link to its resolved
+target — no bytes are read through it — and a dangling target, a target at or
+above either account root, a never-copy/credential path or a `.git` path is
+refused; a real backup entry is never replaced); copies
 merge additively into the destination (a backup's own files survive) without
 traversing a destination symlink; caps are 64 MB and 5,000 entries per tree,
 and a config merge reads at most 8 MB.
@@ -114,15 +119,36 @@ home; Claude's two plugin registries (`installed_plugins.json`,
 the primary's config root to the destination's, never copied raw. The primary's
 provider **and cloud** login env keys are stripped from a mirrored
 `settings.json` by shape (any credential segment — `API_KEY`/`TOKEN`/
-`SECRET`/`PASSWORD`/`KEY`/`CREDENTIAL` — whatever the vendor, plus
-login-selecting cloud settings such as `AWS_ROLE_ARN`/`AWS_PROFILE`); a
-backup's own key survives and the process environment is not modified. The
-Codex `[projects.*]` trust entries are never inherited. Codex MCP OAuth tokens
-are not copied (no stable standalone store file) and the swap warns that
-sign-in may need repeating. `safe` mirror mode skips hooks/permissions.
+`SECRET`/`PASSWORD`/`KEY`/`CREDENTIAL` — whatever the vendor), together with
+every provider/login **selector** (`CLAUDE_CODE_USE_BEDROCK`/`VERTEX`/`FOUNDRY`/…,
+`ANTHROPIC_BASE_URL` and the per-cloud `*_BASE_URL`s, `CLAUDE_CODE_SKIP_*_AUTH`,
+`AWS_ROLE_ARN`/`AWS_PROFILE`, …) and the login-selecting settings keys
+(`apiKeyHelper`, `forceLoginOrgUUID`, …); a backup's own value survives and the
+process environment is not modified. On the Codex side the login-bearing
+`config.toml` keys (`model_provider`, `forced_login_method`,
+`forced_chatgpt_workspace_id`, `preferred_auth_method`,
+`cli_auth_credentials_store`, `mcp_oauth_credentials_store`,
+`mcp_enterprise_managed_auth`, `chatgpt_base_url`, `openai_base_url`) and every
+`[model_providers.*]` table (which can carry a bearer token or auth headers)
+are never imported; the backup's own survive, including the login keys of its
+own `[profiles.*]`. The Codex `[projects.*]` trust entries are never inherited.
+Codex MCP OAuth tokens are not copied (no stable standalone store file) and the
+swap warns that sign-in may need repeating. Static MCP/plugin tool
+configuration — including any token an MCP server definition carries in its
+`env`/`headers` — **is** mirrored: the owner sanctioned tool auth crossing
+accounts, never the harness's own login (`docs/plans/harness-account-stacks-grill.md`).
+`safe` mirror mode skips settings hooks, permissions, status line and helper
+commands (Codex: `notify`); plugins and MCP servers are still mirrored.
+Mirror and transfer refuse two accounts whose config roots are the same
+directory by realpath (a symlinked alias included), and `PATCH /harnesses/:id`
+refuses re-pointing a stack member onto another member's root.
 
-Copied session files are recorded in `harness_session_handoffs`; cleanup
-removes only a recorded path below the destination account's config root and
-only when it is a regular file or plain directory, then prunes the now-empty
-plain parent directories it created (stopping at the first non-empty one, never
-removing the root). Full behaviour: [harness-stacks.md](harness-stacks.md).
+Copied session files are recorded in `harness_session_handoffs` — only files
+the copy created (a destination that already existed is never recorded), and
+session/thread ids must be plain file names. The database is agent-writable,
+so cleanup trusts a recorded path only when it lies below the destination
+account's config root, matches a handoff shape (Claude
+`projects/<enc>/<sid>.jsonl` or `…/<sid>/{subagents,tool-results,mcp-tasks}/…`;
+Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`), has no symlinked component and is
+a regular file; it unlinks files only (never a recursive delete) and then
+prunes only empty plain directories inside those shapes. Full behaviour: [harness-stacks.md](harness-stacks.md).

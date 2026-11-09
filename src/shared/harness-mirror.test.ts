@@ -1,5 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { MIRROR_PAYLOAD_LIMITS, MIRROR_SPECS, isHarnessAuthEnvKey, isNeverCopyPath } from "./harness-mirror.ts";
+import {
+  CODEX_LOGIN_BEARING_CONFIG_KEYS,
+  LOGIN_SELECTOR_ENV_KEYS,
+  MIRROR_PAYLOAD_LIMITS,
+  MIRROR_SPECS,
+  SAFE_MODE_EXCLUDED_CODEX_KEYS,
+  SAFE_MODE_EXCLUDED_SETTINGS_KEYS,
+  CLAUDE_CODE_LOGIN_ENV_KEYS,
+  isCodexLoginBearingKeyPath,
+  isCredentialShapedEnvKey,
+  isHandoffCopyShape,
+  isHandoffPrunableDir,
+  isHarnessAuthEnvKey,
+  isLoginSelectorEnvKey,
+  isMirrorNeverImportedEnvKey,
+  isNeverCopyPath,
+} from "./harness-mirror.ts";
 
 describe("mirror allowlist", () => {
   test("no credential or session path is ever in a copy/merge list", () => {
@@ -125,20 +141,192 @@ describe("mirror allowlist", () => {
     }
   });
 
+  test("provider/login selectors are never imported by the mirror (review S3)", () => {
+    // Not secrets (so not credential-shaped), but each one makes the account
+    // authenticate somewhere else: the primary's must never become the
+    // backup's.
+    for (const key of [
+      "CLAUDE_CODE_USE_BEDROCK",
+      "CLAUDE_CODE_USE_VERTEX",
+      "CLAUDE_CODE_USE_FOUNDRY",
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_BEDROCK_BASE_URL",
+      "ANTHROPIC_VERTEX_BASE_URL",
+      "OPENAI_BASE_URL",
+      "CODEX_BASE_URL",
+      "OPENAI_API_BASE",
+    ]) {
+      expect(isLoginSelectorEnvKey(key), key).toBe(true);
+      expect(isMirrorNeverImportedEnvKey(key), key).toBe(true);
+      // The credential predicate (used for login evidence) is unchanged.
+      expect(isHarnessAuthEnvKey(key), key).toBe(false);
+    }
+    // Credentials are never imported either.
+    expect(isMirrorNeverImportedEnvKey("ANTHROPIC_API_KEY")).toBe(true);
+  });
+
+  test("the mirror's selector list covers every login selector harness-stacks treats as uninspectable", () => {
+    // `UNINSPECTABLE_LOGIN_ENV_KEYS` in src/bun/harness-stacks.ts (not
+    // importable here: shared stays free of process imports) — pinned by value.
+    const uninspectable = {
+      "claude-code": [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+      ],
+      codex: ["OPENAI_BASE_URL", "CODEX_BASE_URL", "OPENAI_API_BASE"],
+    } as const;
+    for (const kind of ["claude-code", "codex"] as const) {
+      for (const key of uninspectable[kind]) expect(LOGIN_SELECTOR_ENV_KEYS[kind], key).toContain(key);
+    }
+  });
+
   test("non-credential provider settings survive the strip", () => {
     for (const key of [
-      "ANTHROPIC_BASE_URL",
       "ANTHROPIC_MODEL",
       "ANTHROPIC_MAX_TOKENS",
-      "OPENAI_BASE_URL",
       "OPENAI_ORGANIZATION",
       "AWS_REGION",
       "GOOGLE_CLOUD_PROJECT",
       "GOOGLE_CLOUD_REGION",
-      "CLAUDE_CODE_USE_BEDROCK",
       "GEMINI_MODEL",
     ]) {
       expect(isHarnessAuthEnvKey(key), key).toBe(false);
+      expect(isMirrorNeverImportedEnvKey(key), key).toBe(false);
     }
+  });
+});
+
+describe("Claude Code's own session variables are not a login", () => {
+  test("credential-shaped CLAUDE_CODE_* runtime vars are not harness auth; the real login vars are", () => {
+    // Set in every process a Claude Code session spawns (Agetor started from
+    // a session inherits them), or non-login integration secrets/tuning knobs.
+    for (const key of [
+      "CLAUDE_CODE_MESSAGING_TOKEN",
+      "CLAUDE_CODE_MCP_SERVE_AUTH_TOKEN",
+      "CLAUDE_CODE_MEMORY_API_TOKEN",
+      "CLAUDE_CODE_ARTIFACTS_API_TOKEN",
+      "CLAUDE_CODE_SLACK_TAG_TOKEN",
+      "CLAUDE_CODE_HFI_BEARER_TOKEN",
+      "CLAUDE_CODE_CLIENT_KEY",
+      "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+      "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+      "CLAUDE_CODE_ARG_KEY_SHAPE",
+      "CLAUDE_CODE_IDLE_TOKEN_THRESHOLD",
+      "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD",
+      "CLAUDE_CODE_ENABLE_TOKEN_USAGE_ATTACHMENT",
+      "CLAUDE_CODE_SOME_FUTURE_TOKEN",
+    ]) {
+      expect(isHarnessAuthEnvKey(key), key).toBe(false);
+    }
+    for (const key of [
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+      "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+      "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+      "CLAUDE_CODE_GATEWAY_TOKEN",
+    ]) {
+      expect(CLAUDE_CODE_LOGIN_ENV_KEYS, key).toContain(key);
+      expect(isHarnessAuthEnvKey(key), key).toBe(true);
+    }
+    // The shape rule still holds outside the CLAUDE_CODE_ namespace.
+    for (const key of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GITHUB_TOKEN", "CLAUDE_API_KEY"]) {
+      expect(isHarnessAuthEnvKey(key), key).toBe(true);
+    }
+  });
+
+  test("the mirror still strips every secret-shaped key, login or not", () => {
+    for (const key of ["CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_MEMORY_API_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]) {
+      expect(isCredentialShapedEnvKey(key), key).toBe(true);
+      expect(isMirrorNeverImportedEnvKey(key), key).toBe(true);
+    }
+  });
+});
+
+describe("safe mode and login-bearing config keys", () => {
+  test("safe mode skips hooks, permissions, status line and helper commands; Codex notify", () => {
+    expect([...SAFE_MODE_EXCLUDED_SETTINGS_KEYS].sort()).toEqual(
+      ["hooks", "otelHeadersHelper", "permissions", "statusLine"],
+    );
+    expect(SAFE_MODE_EXCLUDED_CODEX_KEYS).toContain("notify");
+    // Plugins and MCP servers are the feature's promise, never safe-skipped.
+    for (const key of ["enabledPlugins", "mcpServers", "mcp_servers", "plugins"]) {
+      expect(SAFE_MODE_EXCLUDED_SETTINGS_KEYS).not.toContain(key);
+      expect(SAFE_MODE_EXCLUDED_CODEX_KEYS).not.toContain(key);
+    }
+  });
+
+  test("Codex login-bearing key paths", () => {
+    for (const key of CODEX_LOGIN_BEARING_CONFIG_KEYS) {
+      expect(isCodexLoginBearingKeyPath([key]), key).toBe(true);
+    }
+    expect(isCodexLoginBearingKeyPath(["model_providers", "corp"])).toBe(true);
+    expect(isCodexLoginBearingKeyPath(["model_providers", "corp", "http_headers"])).toBe(true);
+    expect(isCodexLoginBearingKeyPath(["profiles", "work", "model_provider"])).toBe(true);
+    expect(isCodexLoginBearingKeyPath(["profiles", "work", "model"])).toBe(false);
+    expect(isCodexLoginBearingKeyPath(["profiles", "work"])).toBe(false);
+    for (const key of ["model", "notify", "mcp_servers", "model_reasoning_effort", "profile"]) {
+      expect(isCodexLoginBearingKeyPath([key]), key).toBe(false);
+    }
+  });
+});
+
+describe("handoff copy shapes (review S4)", () => {
+  test("Claude: a transcript or a file in a session sidecar folder", () => {
+    for (const rel of [
+      "projects/-tmp-x/11111111-1111-4111-8111-111111111111.jsonl",
+      "projects/enc/sid/subagents/agent-1.jsonl",
+      "projects/enc/sid/tool-results/a/b.txt",
+      "projects/enc/sid/mcp-tasks/t.json",
+    ]) {
+      expect(isHandoffCopyShape("claude-code", rel), rel).toBe(true);
+    }
+    for (const rel of [
+      "settings.json",
+      ".credentials.json",
+      "projects/enc",
+      "projects/enc/.jsonl",
+      "projects/enc/sid.json",
+      "projects/enc/sid/notes.txt",
+      "projects/enc/sid/other/x",
+      "projects/enc/sid/subagents",
+      "projects/../x/s.jsonl",
+      "projects/enc/../s.jsonl",
+      "skills/s/SKILL.md",
+      "sessions/2026/11/08/rollout-x.jsonl",
+    ]) {
+      expect(isHandoffCopyShape("claude-code", rel), rel).toBe(false);
+    }
+  });
+
+  test("Codex: only sessions/YYYY/MM/DD/rollout-*.jsonl", () => {
+    expect(isHandoffCopyShape("codex", "sessions/2026/11/08/rollout-2026-11-08T00-00-00-t.jsonl")).toBe(true);
+    for (const rel of [
+      "auth.json",
+      "config.toml",
+      "sessions/rollout-x.jsonl",
+      "sessions/2026/11/rollout-x.jsonl",
+      "sessions/2026/11/08/x.jsonl",
+      "sessions/26/11/08/rollout-x.jsonl",
+      "sessions/2026/11/08/sub/rollout-x.jsonl",
+      "projects/enc/s.jsonl",
+    ]) {
+      expect(isHandoffCopyShape("codex", rel), rel).toBe(false);
+    }
+  });
+
+  test("prunable folders stay inside the shape", () => {
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid")).toBe(true);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid/subagents/nested")).toBe(true);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc")).toBe(false);
+    expect(isHandoffPrunableDir("claude-code", "projects")).toBe(false);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid/other")).toBe(false);
+    expect(isHandoffPrunableDir("codex", "sessions/2026/11/08")).toBe(true);
+    expect(isHandoffPrunableDir("codex", "sessions/2026")).toBe(true);
+    expect(isHandoffPrunableDir("codex", "sessions")).toBe(false);
+    expect(isHandoffPrunableDir("codex", "sessions/archive")).toBe(false);
   });
 });

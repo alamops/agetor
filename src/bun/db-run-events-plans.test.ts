@@ -205,6 +205,12 @@ function seed(): Seed {
         ids.push(runs.appendEvent(runId, "tool_result", JSON.stringify({ toolUseId: `toolu_${i}`, content: `Task #${i} created successfully` }), `tr-${i}`)!.id);
       }
     }
+    // A hidden harness-stack continuation as the newest main-stream user row:
+    // `lastUserEventId` must skip it, which runs its by-id re-read statement
+    // so that statement's plan is checked too.
+    ids.push(
+      runs.appendEvent(runId, "user", "<harness-stack-continuation>\nContinue.\n</harness-stack-continuation>", "u-cont")!.id,
+    );
     ids.push(runs.appendEvent(runId, "status", `${API_ERROR_PREFIX}overloaded`)!.id);
     ids.push(runs.appendEvent(runId, "assistant", "subagent line", `sa-0`, subagentId)!.id);
     ids.push(runs.appendEvent(runId, "status", "monitor:x:terminal:done", "monitor:x:terminal:0", subagentId)!.id);

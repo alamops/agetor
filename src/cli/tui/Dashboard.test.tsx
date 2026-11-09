@@ -114,6 +114,14 @@ test("activeAccountLine renders the account label and 1-based position, or null 
   expect(activeAccountLine({ agent: "outside" }, stacks)).toBeNull();
 });
 
+test("activeAccountLine: a one-member stack shows the bare label, never 1/1 (review N1)", () => {
+  const lone = [{
+    ...STACKS_FIXTURE[0],
+    members: [STACKS_FIXTURE[0].members[0]],
+  }] as unknown as import("../../shared/types.ts").HarnessStack[];
+  expect(activeAccountLine({ agent: "work" }, lone)).toBe("Work");
+});
+
 test("the detail header shows the active account and stack position", async () => {
   const taskA = task({ id: "taskA", column: "running", runId: "runA", title: "A", agent: "personal" });
   const client = {

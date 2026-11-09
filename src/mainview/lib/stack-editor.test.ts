@@ -6,10 +6,15 @@ import {
   draftPatch,
   draftWarnings,
   emptyDraft,
+  memberPickerOptions,
+  MIRROR_MODE_COPY,
   moveMember,
   removeMember,
+  stackSaveFailure,
   virtualWindow,
 } from "./stack-editor.ts";
+import { ApiError } from "./api.ts";
+import { ApiTransitError } from "./net-retry.ts";
 import type { Harness, HarnessStack } from "../../shared/types.ts";
 
 const harness = (id: string, kind: Harness["kind"] = "claude-code", enabled = true): Harness => ({
@@ -156,5 +161,84 @@ describe("virtualWindow", () => {
     // must cover the whole list, or the list can never scroll to its end.
     expect(win.leading + win.count + win.trailing).toBe(100);
     expect(win.trailing).toBe(100 - win.end);
+  });
+});
+
+describe("member picker (N5)", () => {
+  const stackOf = (id: string, label: string, members: string[]): HarnessStack => ({
+    id,
+    label,
+    kind: "claude-code",
+    mirrorMode: "full",
+    members: members.map((harnessId, position) => ({ harnessId, position, label: harnessId, kind: "claude-code", enabled: true })),
+    createdAt: 1,
+    updatedAt: 1,
+    warnings: [],
+  });
+
+  test("a disabled account is selectable with a note, and the draft warns about it", () => {
+    const draft = { label: "L", kind: "claude-code" as const, members: ["a"], mirrorMode: "safe" as const };
+    const options = memberPickerOptions(draft, { harnesses: HARNESSES, stacks: [], membership: new Map() });
+    const off = options.find((o) => o.harness.id === "off");
+    expect(off).toEqual({ harness: HARNESSES[4]!, note: "disabled", selectable: true });
+    // Already-chosen and other-kind accounts are not offered.
+    expect(options.map((o) => o.harness.id)).toEqual(["b", "c", "off"]);
+    const withOff = addMember(draft, "off");
+    expect(draftBlockers(withOff, { harnesses: HARNESSES, stackId: null, membership: new Map() })).toEqual([]);
+    expect(draftWarnings(withOff, { harnesses: HARNESSES })).toContainEqual({
+      code: "member-disabled",
+      harnessId: "off",
+      message: "off is disabled.",
+    });
+  });
+
+  test("an account in another stack is listed but not selectable", () => {
+    const draft = { label: "L", kind: "claude-code" as const, members: [], mirrorMode: "full" as const };
+    const options = memberPickerOptions(draft, {
+      harnesses: HARNESSES,
+      stacks: [stackOf("s2", "Other train", ["b"])],
+      membership: new Map([["b", "s2"]]),
+    });
+    expect(options.find((o) => o.harness.id === "b")).toEqual({
+      harness: HARNESSES[1]!,
+      note: 'in stack "Other train"',
+      selectable: false,
+    });
+    expect(options.find((o) => o.harness.id === "a")?.selectable).toBe(true);
+  });
+});
+
+describe("mirror copy (S6)", () => {
+  test("safe mode states exactly what it skips and what still mirrors", () => {
+    expect(MIRROR_MODE_COPY.safe).toBe(
+      "Safe skips settings hooks, permissions, status line and helper commands (Codex: notify); plugins and MCP servers are still mirrored.",
+    );
+  });
+
+  test("the full-mirror warning names the same sections", () => {
+    const warning = draftWarnings(
+      { label: "L", kind: "claude-code", members: ["a", "b"], mirrorMode: "full" },
+      { harnesses: HARNESSES },
+    ).find((w) => w.code === "full-mirror-hooks");
+    expect(warning?.message).toBe(
+      "Full mirror copies settings hooks, permissions, status line and helper commands (Codex: notify) onto every backup.",
+    );
+  });
+});
+
+describe("stackSaveFailure (S21)", () => {
+  test("a dropped connection may have saved the stack: say so and reload", () => {
+    expect(stackSaveFailure(new ApiTransitError("request failed in transit"))).toEqual({
+      message: "The connection dropped before agetor answered — the stack may have been saved — reloading.",
+      reload: true,
+    });
+  });
+
+  test("a server refusal is shown as-is with no reload", () => {
+    expect(stackSaveFailure(new ApiError("b is already in another stack", 400, null))).toEqual({
+      message: "b is already in another stack",
+      reload: false,
+    });
+    expect(stackSaveFailure("boom")).toEqual({ message: "boom", reload: false });
   });
 });

@@ -87,7 +87,9 @@ export function dashboardRows(tasks: Task[], expandedParents: ReadonlySet<string
 /**
  * The task header's active-account line (`<label> · 2/3`), or null when the
  * account is in no stack. Mirrors the webview RunPanel's line and the CLI's
- * `· 2/3` suffix. Labels are caller-escaped before rendering.
+ * `· 2/3` suffix. A one-member stack has nothing to fail over to, so its line
+ * is the bare label with no `1/1` position (review N1). Labels are
+ * caller-escaped before rendering.
  */
 export function activeAccountLine(
   task: Pick<Task, "agent">,
@@ -98,6 +100,7 @@ export function activeAccountLine(
   const index = stack.members.findIndex((m) => m.harnessId === task.agent);
   if (index < 0) return null;
   const member = stack.members[index]!;
+  if (stack.members.length < 2) return member.label;
   return `${member.label} · ${index + 1}/${stack.members.length}`;
 }
 
@@ -966,10 +969,14 @@ const EventLine = memo(function EventLine({
     // output, a forked-skill launch, a shell escape, …) prints labeled lines
     // instead of raw `<tag>` text. Ordinary messages render one `you› ` line,
     // identical to today.
-    case "user":
+    case "user": {
+      const lines = userMessageLines(e.data);
+      // A hidden message (the harness-stack continuation) has no lines:
+      // render nothing rather than an empty box.
+      if (lines.length === 0) return null;
       return (
         <Box flexDirection="column">
-          {userMessageLines(e.data).map((line, i) => (
+          {lines.map((line, i) => (
             <UserPlainLine
               key={i}
               line={
@@ -981,6 +988,7 @@ const EventLine = memo(function EventLine({
           ))}
         </Box>
       );
+    }
     // Claude's context-compaction summary — one digest line (first line +
     // size), same as `agetor logs`, never the ~16 KB body.
     case "compaction_summary":

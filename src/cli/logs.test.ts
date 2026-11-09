@@ -1047,4 +1047,6 @@ test("logs --rebuild: a hidden harness-stack continuation renders no user bubble
   const rendered = outputs.join("\n");
   expect(rendered).not.toContain("Continue the task");
   expect(rendered).not.toContain("you›");
+  // Not even an empty row (review N3).
+  expect(outputs).toHaveLength(0);
 });

@@ -1084,3 +1084,41 @@ Each slice must build, typecheck, and pass its tests; no slice may delete or lea
   card's stack chip shows a cooling marker for its current account; and the
   plan `Status`/T02 `harness-swap` event shape now match the shipped code
   (`from`/`to`, no `runId`).
+
+### Review fix round (after 941679f3)
+
+A whole-branch review found 2 blockers, 8 must-fix and 27 should-fix items; all
+are fixed. The architecture doc (`docs/architecture/harness-stacks.md`) is the
+current contract. These are the points where the shipped behaviour departs
+from the plan text above:
+
+- **Login evidence on macOS:** a pinned Claude account keeps its login in the
+  keychain, not in `.credentials.json`. Pre-flight therefore checks that the
+  keychain item exists (existence only, never the secret); before the fix,
+  every backup read as logged out.
+- **Codex limit detection:**
+  - The classifier now matches the real Codex 0.166 prose ("You've hit your
+    usage limit…", "Quota exceeded…"), not only the enum tokens.
+  - Only a terminal `turn.failed` signals a limit, so a retried 429 never
+    swaps. This also fixes a regression for Codex tasks with no stack.
+- **Migration 085** removes 084's foreign key from `harness_stack_members` to
+  `harnesses`. Without that, the documented `harnesses` rebuild would cascade
+  every stack membership away.
+- **Switching accounts never deletes copied conversations.** After a swap,
+  the copy is the live transcript. Cleanup belongs to task delete, retention
+  and harness delete, and unlinks shape-checked regular files only.
+- **The Codex mirror never imports login settings:** login-bearing
+  `config.toml` keys, `[model_providers.*]` tables, and the Claude
+  provider-selector env keys.
+- **Boot completes interrupted swaps:** a swap with no successor run is
+  re-run at boot rather than blocked, which makes the plan's §7 "boot
+  completes the transfer/spawn" true. A launch freeze stops retry timers and
+  leaves the swap intent for the next owner.
+- **Stopping a retry:** Stop and moving the card out of `blocked` both cancel
+  an armed retry. Messages held across a block go to the backlog at once.
+- **One move implementation:** every account move uses `moveTaskToMember`,
+  so manual moves mirror the config too. A retry attempt keeps its attempt
+  count across a swap, so the 3-retry cap holds.
+- **Hidden continuation text is refused on input:** user text that is exactly
+  the wrapper is refused, because otherwise the agent would act on a message
+  no transcript shows.

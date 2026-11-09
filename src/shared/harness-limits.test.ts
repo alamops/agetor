@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   classifyHarnessLimitSignal,
+  harnessLimitTextIsNegative,
   harnessQuotaLooksExhausted,
   harnessQuotaResetAt,
   parseClaudeResetNotice,
@@ -20,6 +21,72 @@ describe("classifyHarnessLimitSignal", () => {
     expect(classifyHarnessLimitSignal("codex", { text: "usage_limit_exceeded" })?.reason).toBe("quota");
     expect(classifyHarnessLimitSignal("codex", { text: "rate_limit_exceeded" })?.reason).toBe("rate_limit");
     expect(classifyHarnessLimitSignal("codex", { text: "insufficient_quota" })?.reason).toBe("insufficient_credits");
+  });
+
+  test("Codex 0.166 prose (strings of the shipped binary) — contract C2", () => {
+    for (const text of [
+      "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:00 PM.",
+      "You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 10th, 2026 3:00 PM.",
+      "You've hit your usage limit. To get more access now, send a request to your admin or try again later.",
+      "You've hit your usage limit for gpt-5.5-codex. Switch to another model now, or try again at 4:15 PM.",
+      "You\u2019ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits",
+    ]) {
+      const signal = classifyHarnessLimitSignal("codex", { text });
+      expect(signal?.reason, text).toBe("quota");
+      expect(signal?.source).toBe("codex-error");
+    }
+    expect(classifyHarnessLimitSignal("codex", {
+      text: "Quota exceeded. Check your plan and billing details.",
+    })?.reason).toBe("insufficient_credits");
+  });
+
+  test("Codex 'try again at <time>' is parsed as the reset", () => {
+    const signal = classifyHarnessLimitSignal("codex", {
+      text: "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:00 PM.",
+    });
+    expect(signal?.resetAtMs).not.toBeNull();
+    const at = new Date(signal!.resetAtMs!);
+    expect(at.getHours()).toBe(15);
+    expect(at.getMinutes()).toBe(0);
+    expect(signal!.resetAtMs! - Date.now()).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
+    // No time → no reset (the caller uses its default backoff).
+    expect(classifyHarnessLimitSignal("codex", {
+      text: "You've hit your usage limit. To get more access now, send a request to your admin",
+    })?.resetAtMs).toBeNull();
+  });
+
+  test("a structured code decides; a non-limit code is a definitive negative", () => {
+    expect(classifyHarnessLimitSignal("codex", { code: "usage_limit_exceeded", text: "turn failed" })?.reason).toBe("quota");
+    expect(classifyHarnessLimitSignal("codex", { code: "usageLimitExceeded" })?.reason).toBe("quota");
+    expect(classifyHarnessLimitSignal("codex", { code: { usage_limit_exceeded: {} } })?.reason).toBe("quota");
+    expect(classifyHarnessLimitSignal("codex", { code: "workspace_member_credits_depleted" })?.reason).toBe("insufficient_credits");
+    expect(classifyHarnessLimitSignal("codex", { code: "rate_limit_reached" })?.reason).toBe("rate_limit");
+    expect(classifyHarnessLimitSignal("codex", {
+      code: "server_overloaded",
+      text: "You've hit your usage limit.",
+    })).toBeNull();
+    expect(classifyHarnessLimitSignal("codex", { code: { model_not_found: {} }, text: "429" })).toBeNull();
+    // An unknown code falls back to the prose.
+    expect(classifyHarnessLimitSignal("codex", {
+      code: { response_too_many_failed_attempts: { http_status_code: 429 } },
+      text: "exceeded retry limit, last status: 429 Too Many Requests",
+    })?.reason).toBe("rate_limit");
+    expect(classifyHarnessLimitSignal("codex", { code: "something_new", text: "all good" })).toBeNull();
+  });
+
+  test("Claude 2.1.319 wordings", () => {
+    expect(classifyHarnessLimitSignal("claude-code", { text: "You've hit your limit · resets 3pm" })?.reason).toBe("quota");
+    expect(classifyHarnessLimitSignal("claude-code", { text: "Continuing automatically at 8am · Esc to cancel" })?.reason).toBe("quota");
+    expect(classifyHarnessLimitSignal("claude-code", { text: "Usage limit reached again · continuing automatically at 8am · esc to cancel" })?.reason).toBe("quota");
+    // "Continuing automatically" without the cancel hint is ordinary prose.
+    expect(classifyHarnessLimitSignal("claude-code", { text: "Continuing automatically with the next file." })).toBeNull();
+  });
+
+  test("harnessLimitTextIsNegative names exactly the explicit negatives", () => {
+    expect(harnessLimitTextIsNegative("503 Service Unavailable")).toBe(true);
+    expect(harnessLimitTextIsNegative("server_overloaded")).toBe(true);
+    expect(harnessLimitTextIsNegative("codex turn failed")).toBe(false);
+    expect(harnessLimitTextIsNegative("")).toBe(false);
   });
 
   test("explicit negatives never signal", () => {
@@ -67,6 +134,79 @@ describe("parseClaudeResetNotice", () => {
   test("returns null when unsure", () => {
     expect(parseClaudeResetNotice("continuing shortly", Date.now())).toBeNull();
     expect(parseClaudeResetNotice("at 25pm", Date.now())).toBeNull();
+    // A date with no time, an impossible date, a dated reset already past.
+    const noon = new Date(2026, 10, 8, 12, 0, 0).getTime();
+    expect(parseClaudeResetNotice("resets Aug 8", noon)).toBeNull();
+    expect(parseClaudeResetNotice("resets Feb 30, 3pm", noon)).toBeNull();
+    expect(parseClaudeResetNotice("resets Nov 1, 9am", noon)).toBeNull();
+    expect(parseClaudeResetNotice("try again at Nov 7th, 2026 3:00 PM", noon)).toBeNull();
+  });
+
+  // Sunday Nov 8 2026, noon local.
+  const sundayNoon = new Date(2026, 10, 8, 12, 0, 0).getTime();
+  const local = (month: number, day: number, hour: number, minute = 0, year = 2026) =>
+    new Date(year, month, day, hour, minute, 0, 0).getTime();
+
+  test("a month/day resolves to that date, not today/tomorrow (S13)", () => {
+    expect(parseClaudeResetNotice("Usage limit reached · continuing automatically at Nov 10, 3pm", sundayNoon)).toBe(local(10, 10, 15));
+    expect(parseClaudeResetNotice("limit resets Nov 10 at 3pm", sundayNoon)).toBe(local(10, 10, 15));
+    expect(parseClaudeResetNotice("resets 3pm on Nov 12", sundayNoon)).toBe(local(10, 12, 15));
+    expect(parseClaudeResetNotice("resets Tue, Nov 10, 9:30am", sundayNoon)).toBe(local(10, 10, 9, 30));
+    // Today's own date with a time still ahead is today.
+    expect(parseClaudeResetNotice("resets Nov 8, 3pm", sundayNoon)).toBe(local(10, 8, 15));
+  });
+
+  test("Codex's dated 'try again at' wording (chrono '%b %-d<suffix>, %Y %-I:%M %p')", () => {
+    expect(parseClaudeResetNotice("or try again at Nov 10th, 2026 3:00 PM.", sundayNoon)).toBe(local(10, 10, 15));
+    expect(parseClaudeResetNotice("Try again at Nov 21st, 2026 9:05 AM.", sundayNoon)).toBe(local(10, 21, 9, 5));
+    expect(parseClaudeResetNotice("or try again at 3:00 PM.", sundayNoon)).toBe(local(10, 8, 15));
+  });
+
+  test("a December date seen across New Year is next year's", () => {
+    const dec30 = new Date(2026, 11, 30, 12, 0, 0).getTime();
+    expect(parseClaudeResetNotice("resets Jan 2, 9am", dec30)).toBe(local(0, 2, 9, 0, 2027));
+    // …but a reset implausibly far out is not believed.
+    expect(parseClaudeResetNotice("resets Jan 2, 9am", sundayNoon)).toBeNull();
+  });
+
+  test("a weekday resolves to its next occurrence", () => {
+    expect(parseClaudeResetNotice("resets Tuesday at 3pm", sundayNoon)).toBe(local(10, 10, 15));
+    expect(parseClaudeResetNotice("resets Wed 8am", sundayNoon)).toBe(local(10, 11, 8));
+    // Today's weekday: today when the time is ahead, a week out when passed.
+    expect(parseClaudeResetNotice("resets Sunday 1pm", sundayNoon)).toBe(local(10, 8, 13));
+    expect(parseClaudeResetNotice("resets Sun 11am", sundayNoon)).toBe(local(10, 15, 11));
+  });
+
+  test("other time spellings", () => {
+    expect(parseClaudeResetNotice("resets 3 p.m.", sundayNoon)).toBe(local(10, 8, 15));
+    expect(parseClaudeResetNotice("resets 15:00", sundayNoon)).toBe(local(10, 8, 15));
+    expect(parseClaudeResetNotice("Usage limit reached · limit resets 3pm (America/New_York) · claude.ai/settings/usage", sundayNoon))
+      .toBe(local(10, 8, 15));
+  });
+
+  test("a passed time rolls by a calendar day, keeping its wall-clock time across DST", () => {
+    const originalTz = process.env.TZ;
+    const systemZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    process.env.TZ = "America/New_York";
+    try {
+      // US DST ends Sun Nov 1 2026 at 2am: Nov 1 is a 25-hour day. From 8pm
+      // on Oct 31, "at 8am" is Nov 1 8:00 local — the old `+24h` landed 7:00.
+      const now = new Date(2026, 9, 31, 20, 0, 0).getTime();
+      const at = parseClaudeResetNotice("continuing automatically at 8am", now)!;
+      expect(new Date(at).getDate()).toBe(1);
+      expect(new Date(at).getHours()).toBe(8);
+      expect(at - now).toBe(13 * 60 * 60 * 1000);
+      // Spring forward (Sun Mar 14 2027, a 23-hour day): 9pm Mar 13 → "at 8am".
+      const spring = new Date(2027, 2, 13, 21, 0, 0).getTime();
+      const springAt = parseClaudeResetNotice("resets 8am", spring)!;
+      expect(new Date(springAt).getHours()).toBe(8);
+      expect(springAt - spring).toBe(10 * 60 * 60 * 1000);
+    } finally {
+      // Re-point at the system zone before dropping the override, so the
+      // rest of this process (bun test shares one) is back on local time.
+      process.env.TZ = originalTz ?? systemZone;
+      if (originalTz === undefined) delete process.env.TZ;
+    }
   });
 });
 

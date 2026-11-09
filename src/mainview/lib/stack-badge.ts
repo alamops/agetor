@@ -48,3 +48,31 @@ export function stackBadgeStateFor(
   }
   return state ?? null;
 }
+
+/** An account's place in its stack, for the small `n/m` chips. */
+export interface StackPosition {
+  stack: HarnessStack;
+  /** 1-based (`1` is the primary). */
+  position: number;
+  count: number;
+}
+
+/**
+ * Where `harnessId` sits in its stack, or null when it is in no stack **or its
+ * stack has fewer than two accounts**. A one-account stack cannot fail over,
+ * so every surface (New Task chip, launch pickers, the RunPanel account line,
+ * Settings → Harnesses) hides the `1/1` chip and its "fails over…" copy
+ * rather than promise a failover that cannot happen.
+ */
+export function stackPositionFor(
+  stacks: readonly HarnessStack[],
+  harnessId: string,
+): StackPosition | null {
+  for (const stack of stacks) {
+    const index = stack.members.findIndex((m) => m.harnessId === harnessId);
+    if (index < 0) continue;
+    if (stack.members.length < 2) return null;
+    return { stack, position: index + 1, count: stack.members.length };
+  }
+  return null;
+}

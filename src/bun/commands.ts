@@ -13,6 +13,7 @@ import {
 } from "./discovery-fs.ts";
 import { diskProjectTree, emptyProjectTree, loadRefProjectTree, type ProjectTree } from "./ref-tree.ts";
 import { copilotHome } from "./copilot-home.ts";
+import { claudeConfigDirFor, claudeJsonDirFor, codexHomeFor } from "./harness-config-root.ts";
 import { repoRoot } from "./worktree.ts";
 
 // `safeReadJsonCached` lives in discovery-fs.ts (the in-process half of the
@@ -239,15 +240,17 @@ function builtinCommands(agent: AgentKind): AvailableCommand[] {
   return builtins.map((b) => ({ name: b.name, description: b.description, source: "builtin", kind: b.kind }));
 }
 
+/** The built-in account's Codex root (process `CODEX_HOME`, else `~/.codex`). */
 function defaultCodexHome(): string {
-  return process.env.CODEX_HOME || path.join(homedir(), ".codex");
+  return codexHomeFor({ home: null, env: null });
 }
 
+/** CODEX_HOME as a spawned codex sees it — the shared resolver that mirrors
+ *  `harnessEnv` (harness-config-root.ts): the env map's CODEX_HOME, then
+ *  `<harnessHome>/.codex`, then the process CODEX_HOME, then an env-map
+ *  HOME's `.codex`, else `~/.codex`. */
 function codexHome(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
-  if (opts.harnessEnv?.CODEX_HOME) return opts.harnessEnv.CODEX_HOME;
-  if (opts.harnessHome) return path.join(opts.harnessHome, ".codex");
-  if (opts.harnessEnv?.HOME) return path.join(opts.harnessEnv.HOME, ".codex");
-  return defaultCodexHome();
+  return codexHomeFor({ home: opts.harnessHome ?? null, env: opts.harnessEnv ?? null });
 }
 
 function codexSystemSkills(home: string, reader: DiscoveryReader): AvailableCommand[] {
@@ -411,18 +414,17 @@ interface DiscoveryData {
   claudeJson: any;
 }
 
-/** CLAUDE_CONFIG_DIR as a spawned claude sees it: the harness env map's own
- *  override, then the harness home, then the process env, else `~/.claude`. */
+/** CLAUDE_CONFIG_DIR as a spawned claude sees it — the shared resolver that
+ *  mirrors `harnessEnv` (harness-config-root.ts): the env map's override, then
+ *  the harness home, then the process env, else `<HOME>/.claude` (an env-map
+ *  HOME counts). A blank value is unset. */
 function claudeConfigDir(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
-  const fromEnv = opts.harnessEnv?.CLAUDE_CONFIG_DIR;
-  if (fromEnv) return fromEnv;
-  return opts.harnessHome ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(homedir(), ".claude");
+  return claudeConfigDirFor({ home: opts.harnessHome ?? null, env: opts.harnessEnv ?? null });
 }
 
 /** The big config blob lives alongside the config dir as `.claude.json` (in HOME by default). */
 function claudeJsonPath(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
-  const pinned = opts.harnessEnv?.CLAUDE_CONFIG_DIR ?? opts.harnessHome ?? process.env.CLAUDE_CONFIG_DIR;
-  return pinned ? path.join(pinned, ".claude.json") : path.join(homedir(), ".claude.json");
+  return path.join(claudeJsonDirFor({ home: opts.harnessHome ?? null, env: opts.harnessEnv ?? null }), ".claude.json");
 }
 
 /** User-level files each kind's parsers read (everything machine-local). */

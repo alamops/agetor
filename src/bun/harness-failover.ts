@@ -3,12 +3,22 @@
  * plan T08).
  *
  * It owns the pure-ish decisions — the lap, which member to try next, when an
- * all-exhausted task should retry — plus the timers and persisted intent that
- * survive a core restart. It never spawns or settles a run itself: the
- * orchestrator registers two hooks (`onAutoRetry`, `onReconcileSwap`), which
- * is the only bridge and keeps this module import-cycle-free.
+ * all-exhausted task should retry — the timers and persisted intent that
+ * survive a core restart, the single `harness_state` write path
+ * (`updateTaskState`/`patchTaskState`) and the single account move
+ * (`moveTaskToMember`: mirror, transcript transfer, commit). It never spawns
+ * or settles a run itself: the orchestrator registers its hooks
+ * (`onAutoRetry`, `onReconcileSwap`, `canAutoRetry`, `isTaskHeld`), which are
+ * the only bridge and keep this module import-cycle-free.
  */
-import { MODEL_MIN_CLI_VERSION, type HarnessLimitSignal, type Task, type TaskHarnessState } from "../shared/types.ts";
+import {
+  MODEL_MIN_CLI_VERSION,
+  type Harness,
+  type HarnessLimitSignal,
+  type HarnessStack,
+  type Task,
+  type TaskHarnessState,
+} from "../shared/types.ts";
 import { pickNextMember, type NextMemberPlan } from "../shared/harness-stack.ts";
 import { harnessQuotaLooksExhausted, harnessQuotaResetAt } from "../shared/harness-limits.ts";
 import { getHarnessDiscoveredModels } from "./agent-discovery.ts";
@@ -17,12 +27,17 @@ import { cliVersionSatisfies } from "../shared/cli-version.ts";
 import { harnesses, harnessUsage, runs, tasks, type SessionIdColumn } from "./db.ts";
 import { harnessStacks, loginEvidence, memberInstalled } from "./harness-stacks.ts";
 import { findSessionIdForHarness, sessionTransferAdapter } from "./harness-session-transfer.ts";
+import { mirrorForSwap } from "./harness-mirror.ts";
 
 export const HARNESS_STACK_RETRY_MAX = 3;
 export const HARNESS_STACK_RETRY_BACKOFF_MS = 10 * 60_000;
 export const HARNESS_STACK_RETRY_MIN_MS = 10_000;
 export const HARNESS_STACK_RETRY_MAX_WAIT_MS = 24 * 60 * 60 * 1000;
 export const HARNESS_QUOTA_STALE_MS = 20 * 60_000;
+/** Boot stagger for overdue retries (same shape as `rearmFxAutoResumes`):
+ *  `now + BASE + i * STEP`, so N tasks never mirror into one backup at once. */
+export const HARNESS_STACK_REARM_OVERDUE_BASE_MS = 5_000;
+export const HARNESS_STACK_REARM_OVERDUE_STEP_MS = 2_000;
 export interface FailoverHooks {
   /** Re-read the task and start a retry run (all-exhausted timer fired). */
   onAutoRetry(taskId: string): Promise<void>;
@@ -33,6 +48,11 @@ export interface FailoverHooks {
    *  a start whose prepare then fails cannot leave a persisted countdown with
    *  no timer (R17-S3). Omitted ⇒ the timer always fires. */
   canAutoRetry?(taskId: string): boolean;
+  /** True while the task is held by running background agents (its terminal
+   *  run succeeded, so there is no `running` run row, but its REPL is still
+   *  live). A manual prepare must leave such a task alone exactly like a live
+   *  run (review Q6). Omitted ⇒ never held. */
+  isTaskHeld?(taskId: string): boolean;
 }
 
 let hooks: FailoverHooks | null = null;
@@ -44,12 +64,65 @@ export function setHarnessFailoverHooks(next: FailoverHooks | null): FailoverHoo
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-function updateTaskState(taskId: string, mutate: (state: TaskHarnessState | null, task: Task) => TaskHarnessState | null): TaskHarnessState | null {
+/**
+ * The one write path for `tasks.harness_state` (review S10). `mutate` gets the
+ * persisted state (or null) and returns the next one; a non-null result is
+ * re-pointed at the stack the task's CURRENT account belongs to (see
+ * {@link stateBase}), so no caller can write back a `stackId`/position the
+ * account already left — the orchestrator's settle/retry/swap writes used to
+ * spread the stale value back in and stack delete then missed the task.
+ */
+export function updateTaskState(
+  taskId: string,
+  mutate: (state: TaskHarnessState | null, task: Task) => TaskHarnessState | null,
+): TaskHarnessState | null {
   const task = tasks.get(taskId);
   if (!task) return null;
   const next = mutate(task.harnessState ?? null, task);
-  tasks.setHarnessState(taskId, next);
-  return next;
+  if (next === null) {
+    tasks.setHarnessState(taskId, null);
+    return null;
+  }
+  const repointed = stateBase(next, harnessStacks.resolveForTask({ ...task, harnessState: next }));
+  tasks.setHarnessState(taskId, repointed);
+  return repointed;
+}
+
+/**
+ * Merge `patch` into the persisted state (re-pointed like
+ * {@link updateTaskState}). A no-op returning null when the task has no state:
+ * every caller patches a field of an existing failover state, and creating one
+ * from nothing would turn a lone account into a "stacked" task.
+ */
+export function patchTaskState(
+  taskId: string,
+  patch: Partial<TaskHarnessState> | ((state: TaskHarnessState) => Partial<TaskHarnessState>),
+): TaskHarnessState | null {
+  if (!tasks.get(taskId)?.harnessState) return null;
+  return updateTaskState(taskId, (state) => {
+    if (!state) return null;
+    return { ...state, ...(typeof patch === "function" ? patch(state) : patch) };
+  });
+}
+
+/**
+ * The ids of every task whose failover state belongs to `stackId`: the
+ * recorded `stackId` OR the stack the task's account resolves to right now.
+ * A stack delete must clear both — an account edited into this stack after the
+ * task's last write still names the old train (review S10). Call BEFORE the
+ * stack row is deleted (the resolution needs the membership).
+ */
+export function failoverTaskIdsForStack(stackId: string): string[] {
+  const ids: string[] = [];
+  for (const task of tasks.list()) {
+    if (task.harnessState?.stackId === stackId) {
+      ids.push(task.id);
+      continue;
+    }
+    if (!task.harnessState && !retryTimers.has(task.id)) continue;
+    if (harnessStacks.resolveForTask(task)?.stack.id === stackId) ids.push(task.id);
+  }
+  return ids;
 }
 
 /**
@@ -98,7 +171,7 @@ export function recordTried(taskId: string, harnessId: string): void {
 
 /** A successful (or cancelled) terminal turn ends the lap. */
 export function resetLap(taskId: string): void {
-  updateTaskState(taskId, (state) => (state ? { ...state, tried: [], allExhausted: null } : state));
+  patchTaskState(taskId, { tried: [], allExhausted: null });
 }
 
 /** Clear all failover state (a non-stack switch, archive, or stack delete). */
@@ -277,18 +350,47 @@ export function planExhausted(
  * ever wakes (R17-S3). Guards against a concurrent re-arm/clear: only the
  * exact schedule that fired is moved.
  */
-function deferAutoRetry(taskId: string, firedAt: number): void {
-  const task = tasks.get(taskId);
-  const persisted = task?.harnessState?.allExhausted;
-  if (!task?.harnessState || !persisted) return;
-  if (persisted.nextAttemptAt !== firedAt || persisted.inFlight) return;
-  if (persisted.attempts >= HARNESS_STACK_RETRY_MAX) return;
+function deferAutoRetry(taskId: string, firedAt: number): boolean {
+  const persisted = tasks.get(taskId)?.harnessState?.allExhausted;
+  if (!persisted) return false;
+  if (persisted.nextAttemptAt !== firedAt || persisted.inFlight) return false;
+  if (persisted.attempts >= HARNESS_STACK_RETRY_MAX) return false;
   const at = Date.now() + HARNESS_STACK_RETRY_MIN_MS;
-  tasks.setHarnessState(taskId, {
-    ...task.harnessState,
-    allExhausted: { ...persisted, nextAttemptAt: at },
-  });
+  patchTaskState(taskId, { allExhausted: { ...persisted, nextAttemptAt: at } });
   armAutoRetry(taskId, at);
+  return true;
+}
+
+/**
+ * A retry whose handler found the task busy (a run is live, so this turn must
+ * not mint a second one): push the persisted schedule a short backoff out and
+ * re-arm it, instead of consuming the timer and leaving a countdown nothing
+ * wakes (review Q7). The live run's own settle then decides: success/cancel
+ * clears the exhausted state (and this timer), a limit re-plans it. Returns
+ * whether a timer was re-armed.
+ */
+export function deferAutoRetryNow(taskId: string): boolean {
+  const persisted = tasks.get(taskId)?.harnessState?.allExhausted;
+  if (!persisted || persisted.inFlight || persisted.nextAttemptAt <= 0) return false;
+  return deferAutoRetry(taskId, persisted.nextAttemptAt);
+}
+
+/** Stop every armed retry timer in this process (a launch freeze before a
+ *  handoff/quit, and test cleanup). The persisted schedules are untouched:
+ *  the next owner's boot re-arms them from the DB. Returns how many stopped. */
+export function stopAllAutoRetryTimers(): number {
+  let stopped = 0;
+  for (const timer of retryTimers.values()) {
+    clearTimeout(timer);
+    stopped++;
+  }
+  retryTimers.clear();
+  return stopped;
+}
+
+/** Whether a retry timer is armed in this process for `taskId`. */
+export function hasArmedAutoRetry(taskId: string): boolean {
+  return retryTimers.has(taskId);
 }
 
 /** Arm (or re-arm) the all-exhausted retry timer. Re-arming replaces the old one. */
@@ -327,9 +429,14 @@ export function cancelAutoRetry(taskId: string): void {
 }
 
 /** Boot: re-arm every persisted all-exhausted retry still in the future, and
- *  recover one that was spawning when the core stopped. */
+ *  recover one that was spawning when the core stopped. An overdue schedule
+ *  (the core was down through it) is staggered like `rearmFxAutoResumes`'s —
+ *  `now + 5 s + i × 2 s` per overdue entry, persisted so the armed timer's
+ *  identity check matches — instead of every overdue task firing in the same
+ *  tick and mirroring into one backup concurrently (review S9). */
 export function rearmAutoRetries(now = Date.now()): number {
   let armed = 0;
+  let overdue = 0;
   for (const task of tasks.list()) {
     const state = task.harnessState;
     const exhausted = state?.allExhausted;
@@ -364,35 +471,29 @@ export function rearmAutoRetries(now = Date.now()): number {
         // re-armed — that would loop on the same error — and a succeeded run
         // already proved the account works. Drop the exhausted state and let
         // the run's own visible outcome stand.
-        tasks.setHarnessState(task.id, { ...state, allExhausted: null });
+        patchTaskState(task.id, { allExhausted: null });
         continue;
       }
       if (attempts >= HARNESS_STACK_RETRY_MAX) {
-        tasks.setHarnessState(task.id, {
-          ...state,
-          allExhausted: { ...exhausted, inFlight: false, nextAttemptAt: 0 },
-        });
+        patchTaskState(task.id, { allExhausted: { ...exhausted, inFlight: false, nextAttemptAt: 0 } });
         continue;
       }
       const at = now + HARNESS_STACK_RETRY_BACKOFF_MS;
-      tasks.setHarnessState(task.id, {
-        ...state,
-        allExhausted: { ...exhausted, inFlight: false, nextAttemptAt: at },
-      });
+      patchTaskState(task.id, { allExhausted: { ...exhausted, inFlight: false, nextAttemptAt: at } });
       armAutoRetry(task.id, at);
       armed++;
       continue;
     }
     if (exhausted.attempts >= HARNESS_STACK_RETRY_MAX) continue;
     if (exhausted.nextAttemptAt <= 0) continue;
-    // Clamp a missed timer to "now" AND persist the clamped instant, so the
-    // armed timer's identity check matches the state it reads on fire.
-    const at = Math.max(now, exhausted.nextAttemptAt);
+    // A missed timer is staggered (see the doc above) AND the new instant is
+    // persisted, so the armed timer's identity check matches the state it
+    // reads on fire.
+    const at = exhausted.nextAttemptAt > now
+      ? exhausted.nextAttemptAt
+      : now + HARNESS_STACK_REARM_OVERDUE_BASE_MS + overdue++ * HARNESS_STACK_REARM_OVERDUE_STEP_MS;
     if (at !== exhausted.nextAttemptAt) {
-      tasks.setHarnessState(task.id, {
-        ...state,
-        allExhausted: { ...exhausted, nextAttemptAt: at },
-      });
+      patchTaskState(task.id, { allExhausted: { ...exhausted, nextAttemptAt: at } });
     }
     armAutoRetry(task.id, at);
     armed++;
@@ -417,10 +518,15 @@ export async function reconcilePendingSwaps(): Promise<number> {
   return reconciled;
 }
 
+
 export interface PrepareResult {
   ok: boolean;
   moved?: { from: string; to: string };
   error?: string;
+  /** Non-fatal mirror/transfer warnings of a move, already prefixed
+   *  (`config mirror: …`, `session transfer: …`). The caller writes them as
+   *  status lines so a partially mirrored backup is visible (review S11). */
+  warnings?: string[];
 }
 
 /**
@@ -437,12 +543,124 @@ function latestSessionForAccount(
   return findSessionIdForHarness(task.id, column, harnessId);
 }
 
+/** What {@link moveTaskToMember} did. */
+export type MoveTaskToMemberResult =
+  /** Mirrored/transferred and committed (agent + state written). */
+  | { kind: "moved"; transferredSessionId: string | null; warnings: string[] }
+  /** `beforeCommit` declined after the mirror/transfer: nothing committed. */
+  | { kind: "aborted"; transferredSessionId: string | null; warnings: string[] }
+  /** A recorded conversation could not be moved: nothing committed. The
+   *  caller's failure policy decides (block, refuse, or start fresh). */
+  | { kind: "transfer-failed"; message: string; warnings: string[] };
+
+export interface MoveTaskToMemberArgs {
+  taskId: string;
+  /** The stack both accounts belong to (the mirror's source is its primary). */
+  stack: HarnessStack;
+  /** The account the conversation lives on (the run's own account). */
+  from: string;
+  /** The destination account. Equal to `from` for a same-account retry:
+   *  no mirror and no copy, the existing session is resumed in place. */
+  to: string;
+  /** The provider session on `from` to carry, or null when there is nothing
+   *  worth moving (a clean first turn). */
+  sessionId: string | null;
+  /** The task's cwd (the transcript's project key). */
+  cwd: string;
+  /** Refresh `to`'s config from the primary first (contract C4). Default
+   *  true; never for a same-account retry. */
+  mirror?: boolean;
+  /** Re-check after the mirror/transfer awaits and before the commit. Return
+   *  false when the move is no longer wanted (a Stop, an archive, a freeze):
+   *  the result is `aborted` and nothing is written. */
+  beforeCommit?: () => boolean | Promise<boolean>;
+  /** Write `tasks.agent = to` on commit (default true; skipped when the row
+   *  already names `to`, e.g. a PATCH that switched it). */
+  writeAgent?: boolean;
+  /** The failover state written with the commit, through
+   *  {@link updateTaskState} (re-pointed at the current stack). */
+  state?: (current: TaskHarnessState | null, task: Task) => TaskHarnessState | null;
+}
+
+/** How many mirror warnings a status line carries (the rest are logged). */
+const MIRROR_WARNINGS_SHOWN = 3;
+
+/**
+ * Move a task's conversation from one stack member to another — the single
+ * implementation every account move uses (review S11): the automatic swap, the
+ * all-exhausted retry, the manual prepare move, the same-stack PATCH switch and
+ * the boot completion of an interrupted manual switch. It owns, in order:
+ *
+ *  1. the config mirror onto `to` (contract C4; a failure is a warning);
+ *  2. the provider-session transfer (Claude transcript + sidecars, or the
+ *     Codex rollout) when `sessionId` is set;
+ *  3. the caller's `beforeCommit` re-check;
+ *  4. the commit: `tasks.agent = to` and the failover state.
+ *
+ * Warnings come back prefixed for status lines. The failure policy stays with
+ * the caller: a transfer failure commits nothing, and NEVER touches the source
+ * account's files — the transfer only reads them.
+ */
+export async function moveTaskToMember(args: MoveTaskToMemberArgs): Promise<MoveTaskToMemberResult> {
+  const { taskId, stack, from, to, sessionId, cwd } = args;
+  const warnings: string[] = [];
+  const sameAccount = from === to;
+  if (!sameAccount && args.mirror !== false) {
+    try {
+      const mirror = await mirrorForSwap(stack, to);
+      if (mirror.warnings.length > 0) {
+        warnings.push(`config mirror: ${mirror.warnings.slice(0, MIRROR_WARNINGS_SHOWN).join("; ")}`);
+        if (mirror.warnings.length > MIRROR_WARNINGS_SHOWN) {
+          console.warn(`[agetor] harness mirror warnings for task ${taskId}:`, mirror.warnings);
+        }
+      }
+    } catch (err) {
+      warnings.push(`config mirror skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  let transferredSessionId: string | null = null;
+  if (sessionId) {
+    if (sameAccount) {
+      // The transcript never moved: resume the existing provider session.
+      transferredSessionId = sessionId;
+    } else {
+      const fromHarness = harnesses.getByIdOrKind(from);
+      const toHarness = harnesses.getByIdOrKind(to);
+      if (!fromHarness || !toHarness) {
+        return { kind: "transfer-failed", message: "the account no longer exists", warnings };
+      }
+      const adapter = sessionTransferAdapter(fromHarness.kind);
+      if (!adapter) {
+        return { kind: "transfer-failed", message: "this harness kind cannot transfer a conversation", warnings };
+      }
+      const result = await adapter.transfer({ taskId, fromHarness, toHarness, sessionId, cwd });
+      if (!result.ok) return { kind: "transfer-failed", message: result.message, warnings };
+      transferredSessionId = result.sessionId;
+      for (const warning of result.warnings ?? []) warnings.push(`session transfer: ${warning}`);
+    }
+  }
+
+  if (args.beforeCommit && !(await args.beforeCommit())) {
+    return { kind: "aborted", transferredSessionId, warnings };
+  }
+  if (args.writeAgent !== false && tasks.get(taskId)?.agent !== to) tasks.update(taskId, { agent: to });
+  if (args.state) updateTaskState(taskId, args.state);
+  return { kind: "moved", transferredSessionId, warnings };
+}
+
 /**
  * Prepare a task before a user-initiated Run/message. A no-op unless the task
  * is in a stack and its current account cannot serve the turn; then it moves
- * to the next usable member, transferring the conversation. A live run is left
- * alone (the message queues behind it). `manual: true` forces a cooling
- * account, and resets the lap.
+ * to the next usable member, mirroring its config and transferring the
+ * conversation ({@link moveTaskToMember}). A live run — or a task held by
+ * running background agents, whose REPL is still live — is left alone (the
+ * message queues behind it). `manual: true` forces a cooling account, and
+ * resets the lap.
+ *
+ * The caller holds the task's start claim for the whole call (the move awaits
+ * a mirror and a transcript copy; an all-exhausted retry timer firing in that
+ * window must not mint a successor the move then overwrites — review S8).
  *
  * `forceOffCurrent` is for a start pre-flight that failed on the current
  * account even though the cached member snapshot looked usable (a fresh-auth
@@ -458,7 +676,7 @@ export async function prepareTaskHarness(
   if (!task) return { ok: false, error: "task not found" };
   const resolved = harnessStacks.resolveForTask(task);
   if (!resolved) return { ok: true };
-  if (runs.hasRunning(taskId)) return { ok: true };
+  if (runs.hasRunning(taskId) || hooks?.isTaskHeld?.(taskId)) return { ok: true };
   const { stack, current } = resolved;
   const member = stack.members.find((m) => m.harnessId === current);
   const unusable = opts.forceOffCurrent
@@ -506,48 +724,40 @@ export async function prepareTaskHarness(
   const toHarness = harnesses.getByIdOrKind(to);
   if (!fromHarness || !toHarness) return { ok: false, error: "account no longer exists" };
 
-  const sessionId = latestSessionForAccount(task, fromHarness.kind, current);
-  if (sessionId) {
-    const adapter = sessionTransferAdapter(fromHarness.kind);
-    if (!adapter) return { ok: false, error: "this harness kind cannot transfer a conversation" };
-    const result = await adapter.transfer({
-      taskId,
-      fromHarness,
-      toHarness,
-      sessionId,
-      cwd: task.worktreePath ?? task.workdir,
-    });
-    if (!result.ok) {
-      // A conversation is recorded for this account, so a missing/unreadable
-      // transcript is not "nothing to lose": refuse the move instead of
-      // silently starting a fresh session on the backup. The automatic swap
-      // blocks on the same condition.
-      return { ok: false, error: `could not move the conversation to ${toHarness.label}: ${result.message}` };
-    }
-    for (const warning of result.warnings ?? []) {
-      console.warn(`[agetor] harness session transfer warning for task ${taskId}:`, warning);
-    }
+  const reason: NonNullable<TaskHarnessState["lastMove"]>["reason"] = unusable.includes("disabled")
+    ? "member-disabled"
+    : member ? "member-unavailable" : "member-removed";
+  const moved = await moveTaskToMember({
+    taskId,
+    stack,
+    from: current,
+    to,
+    sessionId: latestSessionForAccount(task, fromHarness.kind, current),
+    cwd: task.worktreePath ?? task.workdir,
+    state: () => ({
+      stackId: stack.id,
+      position: plan.member.position,
+      count: stack.members.length,
+      tried: [],
+      pendingSwap: null,
+      allExhausted: null,
+      lastMove: { from: current, to, at: Date.now(), reason },
+    }),
+  });
+  if (moved.kind === "transfer-failed") {
+    // A conversation is recorded for this account, so a missing/unreadable
+    // transcript is not "nothing to lose": refuse the move instead of
+    // silently starting a fresh session on the backup. The automatic swap
+    // blocks on the same condition.
+    return { ok: false, error: `could not move the conversation to ${toHarness.label}: ${moved.message}` };
   }
-
-  tasks.update(taskId, { agent: to });
-  updateTaskState(taskId, () => ({
-    stackId: stack.id,
-    position: plan.member.position,
-    count: stack.members.length,
-    tried: [],
-    pendingSwap: null,
-    allExhausted: null,
-    lastMove: {
-      from: current,
-      to,
-      at: Date.now(),
-      reason: unusable.includes("disabled") ? "member-disabled" : member ? "member-unavailable" : "member-removed",
-    },
-  }));
   // A manual move supersedes any armed all-exhausted retry. The timer callback
   // would no-op on the cleared state, but leaving the handle in the map keeps
   // a dangling timer for up to 24 h; cancel it like the no-move branch does.
   cancelAutoRetry(taskId);
-  return { ok: true, moved: { from: current, to } };
+  return {
+    ok: true,
+    moved: { from: current, to },
+    ...(moved.warnings.length > 0 ? { warnings: moved.warnings } : {}),
+  };
 }
-

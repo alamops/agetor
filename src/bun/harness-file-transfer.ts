@@ -11,6 +11,12 @@
  *   linked intermediate directory cannot redirect a read outside the account;
  * - writes go to a sibling temp file, are fsynced, then renamed — so a reader
  *   never sees a half-written credential or session;
+ * - the mirror's tree copy preserves each file's mtime and skips a destination
+ *   that already has the same size and mtime, so a repeat mirror rewrites only
+ *   what changed;
+ * - cleanup unlinks only regular files whose path has a handoff shape
+ *   (`isHandoffCopyShape`), never recurses, and prunes only empty folders
+ *   inside that shape;
  * - every file is created 0600, every directory 0700;
  * - sizes and entry counts are capped, and both the walk and each individual
  *   read/write are chunked and asynchronous so a large copy cannot freeze the
@@ -22,6 +28,7 @@ import {
   mkdirSync,
   constants,
   readdirSync,
+  realpathSync,
   rmdirSync,
   unlinkSync,
 } from "node:fs";
@@ -34,7 +41,12 @@ import {
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { READ_NOFOLLOW } from "./no-follow.ts";
-import { isNeverCopyPath, isNeverCopySegment } from "../shared/harness-mirror.ts";
+import {
+  isHandoffCopyShape,
+  isHandoffPrunableDir,
+  isNeverCopyPath,
+  isNeverCopySegment,
+} from "../shared/harness-mirror.ts";
 import type { HarnessStackKind } from "../shared/types.ts";
 
 /** 64 MB per file/tree and 5,000 entries per tree (plan T04 size caps). */
@@ -50,7 +62,16 @@ export interface TransferLimits {
 }
 
 export interface TreeCopyResult {
+  /** Files written by this copy (relative to the source dir). */
   copied: string[];
+  /** The subset of `copied` whose destination did not exist before the copy.
+   *  A session handoff records only these for cleanup, so a file the
+   *  destination account already had (e.g. its own original after an A→B→A
+   *  wrap) is never put on the delete allowlist (contract C5). */
+  created: string[];
+  /** Files left alone because the destination already matched (size + mtime;
+   *  only with `skipUnchanged`). */
+  unchanged: string[];
   skipped: string[];
   /** True when a byte or entry budget stopped the walk before every regular
    *  file was copied (or an individual file was larger than the remaining
@@ -73,6 +94,38 @@ export function assertSafeRelPath(rel: string): void {
 export function assertNotCredentialPath(rel: string, kind: HarnessStackKind): void {
   assertSafeRelPath(rel);
   if (isNeverCopyPath(kind, rel)) throw new Error(`refusing to copy a credential/session path: ${rel}`);
+}
+
+/**
+ * The canonical form of a config root: `realpath` of the path, or — when it does
+ * not exist yet — `realpath` of its nearest existing ancestor joined with the
+ * missing tail. Falls back to `path.resolve` when nothing resolves. Two
+ * accounts whose roots alias each other through a symlink (`/a/link -> /b`)
+ * compare equal here, which `path.resolve` alone cannot see.
+ */
+export function canonicalRoot(p: string): string {
+  const resolved = path.resolve(p);
+  let cur = resolved;
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(cur);
+      return tail.length > 0 ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return resolved;
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/** True when two config roots are the same directory after resolving
+ *  symlinks ({@link canonicalRoot}). Mirroring or transferring between them
+ *  would copy an account onto itself, and cleanup would then delete the
+ *  source's own files, so every caller refuses. */
+export function sameConfigRoot(a: string, b: string): boolean {
+  return canonicalRoot(a) === canonicalRoot(b);
 }
 
 /** True when `p` is a regular file that is NOT a symlink. */
@@ -186,6 +239,31 @@ export async function atomicWriteFile(
   }
 }
 
+export interface CopyFileOptions {
+  maxBytes?: number;
+  root?: string;
+  /** Mirror mode: preserve the source's mtime on the copy, and leave a
+   *  destination alone when it is already a regular file (not a symlink) with
+   *  the source's size and mtime. Because every mirror write preserves the
+   *  mtime, an unchanged file matches on the next mirror; a file the backup's
+   *  CLI (or the user) edited gets a new mtime and is copied again. */
+  skipUnchanged?: boolean;
+}
+
+export interface CopyFileResult {
+  bytes: number;
+  /** The destination did not exist (lstat ENOENT) before this copy. */
+  created: boolean;
+  /** `skipUnchanged` matched: nothing was written. */
+  unchanged: boolean;
+}
+
+/** mtimes compared to the millisecond: `utimes` takes float seconds, so the
+ *  stored value can differ from the source's by a rounding of under 1 ms. */
+function sameMtime(a: number, b: number): boolean {
+  return Math.abs(a - b) < 1;
+}
+
 /**
  * Copy one regular file, refusing a symlink/FIFO at the source and a size
  * over `maxBytes`. Writes atomically and 0600. The source is read in
@@ -196,8 +274,18 @@ export async function atomicWriteFile(
 export async function copyRegularFile(
   src: string,
   dest: string,
-  opts: { maxBytes?: number; root?: string } = {},
+  opts: CopyFileOptions = {},
 ): Promise<number> {
+  return (await copyRegularFileDetailed(src, dest, opts)).bytes;
+}
+
+/** {@link copyRegularFile} that also reports whether the destination was new
+ *  and whether an unchanged destination was skipped. */
+export async function copyRegularFileDetailed(
+  src: string,
+  dest: string,
+  opts: CopyFileOptions = {},
+): Promise<CopyFileResult> {
   const maxBytes = opts.maxBytes ?? TRANSFER_MAX_BYTES;
   // `lstat` only gives an early, friendly error; the authoritative type and
   // size come from the already-open, no-follow descriptor so a file swapped
@@ -213,6 +301,22 @@ export async function copyRegularFile(
     const dir = path.dirname(dest);
     if (opts.root) ensurePlainDirUnder(opts.root, dir);
     else mkdirSync(dir, { recursive: true, mode: 0o700 });
+    let created = false;
+    try {
+      const existing = lstatSync(dest);
+      if (
+        opts.skipUnchanged
+        && existing.isFile()
+        && existing.size === st.size
+        && sameMtime(existing.mtimeMs, st.mtimeMs)
+      ) {
+        return { bytes: st.size, created: false, unchanged: true };
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") created = true;
+      else throw err;
+    }
     const tmp = path.join(dir, `.agetor-tmp-${randomUUID()}`);
     const chunk = Buffer.allocUnsafe(Math.min(IO_CHUNK_BYTES, Math.max(1, st.size)));
     let total = 0;
@@ -231,6 +335,9 @@ export async function copyRegularFile(
           }
           total += bytesRead;
         }
+        // The rename below keeps the inode's times, so the mirror's
+        // unchanged-file check sees the source's mtime on the next run.
+        if (opts.skipUnchanged) await target.utimes(st.atime, st.mtime);
         await target.sync();
       } finally {
         await target.close();
@@ -245,7 +352,7 @@ export async function copyRegularFile(
       }
       throw err;
     }
-    return total;
+    return { bytes: total, created, unchanged: false };
   } finally {
     await source.close();
   }
@@ -266,9 +373,11 @@ export async function copyRegularFile(
  * The walk skips anything that is not a regular file or a plain directory,
  * any `.git` entry at any depth (a clone's config can carry a remote token),
  * entries for which `skip` returns true, and — with `root` — any destination
- * path that would traverse a symlink. Returns the relative paths copied and
- * skipped, plus whether a size/entry cap truncated the tree (the mirror uses
- * the flag to keep a plugin registry from pointing at a partial copy).
+ * path that would traverse a symlink. Returns the relative paths copied (and
+ * which of those were new at the destination), left unchanged (with
+ * `skipUnchanged`) and skipped, plus whether a size/entry cap truncated the
+ * tree (the mirror uses the flag to keep a plugin registry from pointing at a
+ * partial copy).
  */
 export async function copyTreeCooperative(
   srcDir: string,
@@ -277,14 +386,18 @@ export async function copyTreeCooperative(
     skip?: (rel: string, entry: "file" | "dir") => boolean;
     /** Trusted destination root; every path below it must be a real dir. */
     root?: string;
+    /** See {@link CopyFileOptions.skipUnchanged}. */
+    skipUnchanged?: boolean;
   } = {},
 ): Promise<TreeCopyResult> {
   const maxBytes = opts.maxBytes ?? TRANSFER_MAX_BYTES;
   const maxEntries = opts.maxEntries ?? TRANSFER_MAX_ENTRIES;
   const copied: string[] = [];
+  const created: string[] = [];
+  const unchanged: string[] = [];
   const skipped: string[] = [];
   let truncated = false;
-  if (!isPlainDir(srcDir)) return { copied, skipped, truncated };
+  if (!isPlainDir(srcDir)) return { copied, created, unchanged, skipped, truncated };
 
   const ensureDestDir = (target: string): boolean => {
     try {
@@ -384,11 +497,17 @@ export async function copyTreeCooperative(
       return;
     }
     const target = path.join(destDir, rel);
+    let result: CopyFileResult;
     try {
-      bytes += await copyRegularFile(abs, target, {
+      result = await copyRegularFileDetailed(abs, target, {
         maxBytes: Math.max(1, maxBytes - bytes),
         root: opts.root,
+        skipUnchanged: opts.skipUnchanged,
       });
+      // An unchanged file still counts toward the budget: the budget bounds
+      // the payload's size, and `truncated` must mean the same thing on every
+      // run.
+      bytes += result.bytes;
     } catch (err) {
       // Skip the per-file refusals (a vanished/rotated file, a symlink or FIFO
       // the walk could not see through, an oversized file) so the rest of the
@@ -406,11 +525,16 @@ export async function copyTreeCooperative(
       skipped.push(rel);
       return;
     }
+    if (result.unchanged) {
+      unchanged.push(rel);
+      return;
+    }
     copied.push(rel);
+    if (result.created) created.push(rel);
   };
 
   await walk("");
-  return { copied, skipped, truncated };
+  return { copied, created, unchanged, skipped, truncated };
 }
 
 function requireSortedNames(dir: string): string[] {
@@ -491,46 +615,72 @@ export function isPlainPathUnder(root: string, p: string): boolean {
 }
 
 /**
- * Remove a copied path only when it is a regular file/plain directory below
- * `root`; never follows a symlink (including a symlinked parent) and never
- * throws on a missing path.
+ * Remove recorded handoff copies. A path is unlinked only when ALL of these
+ * hold, and nothing is ever removed recursively:
+ * - it resolves strictly inside `root`;
+ * - its root-relative shape is one a session handoff writes for `kind`
+ *   (`isHandoffCopyShape`): Claude `projects/<enc>/<sid>.jsonl` or a file in
+ *   that session's `subagents`/`tool-results`/`mcp-tasks` folder, Codex
+ *   `sessions/YYYY/MM/DD/rollout-*.jsonl`;
+ * - every component below `root` is a real, non-symlink path
+ *   ({@link isPlainPathUnder}) and the leaf is a regular file (a directory, a
+ *   symlink or a special file at a recorded path is left alone).
+ * The paths come from SQLite, which an agent can write, so the shape rule is
+ * what keeps a planted row from deleting anything else in the account.
  *
- * After a removal the now-empty parent directories are pruned up to (but never
- * including) `root`: a session transfer creates `projects/<encoded>/<session>/
- * <sidecar>/…`, and leaving those empty shells behind after cleanup is both
- * noise and a weak hint that another account's conversation was there. Only
- * plain, empty directories are removed, so a directory still holding the
- * backup's own files is untouched.
+ * After each unlink the now-empty folders inside the shape are pruned
+ * (`isHandoffPrunableDir`): a Claude session folder and its sidecar folders, or
+ * Codex's date folders. Only plain, empty directories are removed, so a folder
+ * still holding the backup's own files stays, and `projects/<enc>`,
+ * `projects` and `sessions` are never pruned.
+ *
+ * Cooperative: it yields to the shared event loop every ~20 ms, because a
+ * handoff with large sidecars can record thousands of files. Never throws.
  */
-export function removeCopiedPaths(paths: readonly string[], root: string): string[] {
+export async function removeCopiedPaths(
+  paths: readonly string[],
+  root: string,
+  kind: HarnessStackKind,
+): Promise<string[]> {
   const resolvedRoot = path.resolve(root);
   const removed: string[] = [];
+  let lastYield = Date.now();
   for (const p of paths) {
-    if (typeof p !== "string" || !p) continue;
+    if (Date.now() - lastYield >= YIELD_EVERY_MS) {
+      await Bun.sleep(0);
+      lastYield = Date.now();
+    }
+    if (typeof p !== "string" || !p || p.includes("\0")) continue;
     const resolved = path.resolve(p);
     const rel = path.relative(resolvedRoot, resolved);
     if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
+    if (!isHandoffCopyShape(kind, rel.split(path.sep).join("/"))) continue;
     // A symlinked directory anywhere between the root and the recorded file
     // resolves outside the root. `path.resolve` cannot see that, so walk and
     // `lstat` every component before touching the target.
     if (!isPlainPathUnder(resolvedRoot, resolved)) continue;
-    if (removeTreePlain(resolved)) {
-      removed.push(resolved);
-      pruneEmptyDirsUpTo(resolvedRoot, path.dirname(resolved));
+    try {
+      if (!lstatSync(resolved).isFile()) continue;
+      unlinkSync(resolved);
+    } catch {
+      continue;
     }
+    removed.push(resolved);
+    pruneEmptyShapeDirs(resolvedRoot, path.dirname(resolved), kind);
   }
   return removed;
 }
 
-/** Remove empty plain directories from `start` up to (excluding) `root`.
- *  Stops at the first non-empty, non-directory or symlinked component, so a
- *  backup's own content is never pruned. */
-function pruneEmptyDirsUpTo(root: string, start: string): void {
-  const resolvedRoot = path.resolve(root);
+/** Remove empty plain directories from `start` upwards while they are inside
+ *  a handoff shape (`isHandoffPrunableDir`). Stops at the first non-empty,
+ *  non-directory, symlinked or out-of-shape component, so a backup's own
+ *  content and the account's own folders are never pruned. */
+function pruneEmptyShapeDirs(root: string, start: string, kind: HarnessStackKind): void {
   let cur = path.resolve(start);
   for (;;) {
-    const rel = path.relative(resolvedRoot, cur);
+    const rel = path.relative(root, cur);
     if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return;
+    if (!isHandoffPrunableDir(kind, rel.split(path.sep).join("/"))) return;
     let st;
     try {
       st = lstatSync(cur);
@@ -553,31 +703,3 @@ function pruneEmptyDirsUpTo(root: string, start: string): void {
     cur = path.dirname(cur);
   }
 }
-
-/** Remove a file or a tree of plain files/dirs; symlinks are unlinked, never
- *  traversed. Returns whether anything was removed. */
-export function removeTreePlain(p: string): boolean {
-  let st;
-  try {
-    st = lstatSync(p);
-  } catch {
-    return false;
-  }
-  if (st.isSymbolicLink() || st.isFile()) {
-    try {
-      unlinkSync(p);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  if (!st.isDirectory()) return false;
-  for (const name of readdirSync(p)) removeTreePlain(path.join(p, name));
-  try {
-    rmdirSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-

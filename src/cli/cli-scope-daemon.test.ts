@@ -56,10 +56,10 @@ import { CLI_TOKEN } from "../bun/api-config.ts";
 import { writeCoreCreds } from "../bun/core-creds.ts";
 import type { AgentProfile, PipelineGraph, Task } from "../shared/types.ts";
 
-/** Methods on the prototype that are not API calls: the constructor and the two
- *  `private` request helpers (`req`, `bundleReq`). Listed explicitly — and
+/** Methods on the prototype that are not API calls: the constructor and the three
+ *  `private` request helpers (`req`, `bundleReq`, `stackWrite`). Listed explicitly — and
  *  asserted below — so a new public method can't hide behind this set. */
-const NOT_API_CALLS = ["constructor", "req", "bundleReq"] as const;
+const NOT_API_CALLS = ["constructor", "req", "bundleReq", "stackWrite"] as const;
 
 type ClientMethod = Exclude<
   {

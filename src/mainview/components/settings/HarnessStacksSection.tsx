@@ -14,8 +14,11 @@ import {
   draftPatch,
   draftWarnings,
   emptyDraft,
+  memberPickerOptions,
+  MIRROR_MODE_COPY,
   moveMember,
   removeMember,
+  stackSaveFailure,
   virtualWindow,
   type StackDraft,
 } from "@/lib/stack-editor";
@@ -208,20 +211,10 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
   const warnings = draftWarnings(draft, { harnesses });
   const sameKind = harnesses.filter((h) => h.kind === draft.kind);
   // An account already in another stack cannot join this one, but hiding it
-  // made the picker look like the account did not exist. List it disabled with
-  // the reason instead (review nit).
-  const available = sameKind
-    .filter((h) => !draft.members.includes(h.id))
-    .map((h) => {
-      const otherStackId = membership.get(h.id);
-      const otherStack = otherStackId ? stacks.find((s) => s.id === otherStackId) : null;
-      const reason = otherStack
-        ? `in stack "${otherStack.label}"`
-        : h.enabled
-          ? null
-          : "disabled";
-      return { harness: h, reason };
-    });
+  // made the picker look like the account did not exist: it is listed, not
+  // selectable, with the reason. A disabled account IS selectable, with the
+  // `member-disabled` warning below (`memberPickerOptions`).
+  const available = memberPickerOptions(draft, { harnesses, stacks, membership });
   const coolingByHarness = useMemo(
     () => new Map(limitStates.map((s) => [s.harnessId, s] as const)),
     [limitStates],
@@ -282,9 +275,17 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
       onChange?.();
       onSaved?.();
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      setError(message);
-      toast.error("Couldn't save the stack", { description: message, duration: Infinity });
+      // A dropped connection after the request left may still have saved the
+      // stack (it mirrors inline and is never re-sent): say so and reload
+      // rather than invite a second save into "already in another stack".
+      const failure = stackSaveFailure(e);
+      setError(failure.message);
+      if (failure.reload) {
+        toast.warning("The stack may have been saved", { description: failure.message, duration: Infinity });
+        onChange?.();
+      } else {
+        toast.error("Couldn't save the stack", { description: failure.message, duration: Infinity });
+      }
     } finally {
       setSaving(false);
     }
@@ -411,9 +412,9 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
               onChange={(e) => setPicker(e.target.value)}
             >
               <option value="">Choose an account…</option>
-              {available.map(({ harness: h, reason }) => (
-                <option key={h.id} value={h.id} disabled={reason !== null}>
-                  {h.label}{reason ? ` — ${reason}` : ""}
+              {available.map(({ harness: h, note, selectable }) => (
+                <option key={h.id} value={h.id} disabled={!selectable}>
+                  {h.label}{note ? ` — ${note}` : ""}
                 </option>
               ))}
             </select>
@@ -452,9 +453,7 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
           ))}
         </div>
         <p className="text-xs text-muted-foreground">
-          {draft.mirrorMode === "full"
-            ? "Copies user-level hooks and permissions too."
-            : "Skips hooks and permissions; everything else still mirrors."}
+          {MIRROR_MODE_COPY[draft.mirrorMode]}
         </p>
       </div>
 

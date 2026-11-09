@@ -315,3 +315,49 @@ test("harness stack create/list/show/edit/rm drive the client and escape labels"
   await cmdHarness(["stack", "rm", "stack-1"], flags);
   expect(calls.at(-1)).toBe("rm:stack-1");
 });
+
+test("harness stack show escapes a member's harness id (review N12)", async () => {
+  const stack = {
+    id: "stack-1",
+    label: "Train",
+    kind: "claude-code" as const,
+    mirrorMode: "full" as const,
+    members: [{ harnessId: "h1\u001b[2Jx", position: 0, label: "A", kind: "claude-code" as const, enabled: true }],
+    createdAt: 1,
+    updatedAt: 1,
+    warnings: [],
+  };
+  currentClient = {
+    getHarnessStack: async () => ({ stack, limitStates: [] }),
+  } as unknown as AgetorClient;
+  await cmdHarness(["stack", "show", "stack-1"], flags);
+  const rendered = outputs.join("\n");
+  expect(rendered).not.toContain("\u001b");
+  expect(rendered).toContain("h1");
+});
+
+test("harness ls: a one-member stack reads 'primary' with no 1/1 position (review N1)", async () => {
+  currentClient = {
+    listHarnesses: async () => ({
+      harnesses: [harness({ id: "h1" }), harness({ id: "h2", label: "H2" })],
+      statuses: [],
+      stacks: [
+        {
+          id: "solo",
+          label: "Solo",
+          kind: "claude-code",
+          mirrorMode: "full",
+          members: [{ harnessId: "h1", position: 0, label: "H1", kind: "claude-code", enabled: true }],
+          createdAt: 1,
+          updatedAt: 1,
+          warnings: [],
+        },
+      ],
+      limitStates: [],
+    }),
+  } as unknown as AgetorClient;
+  await cmdHarness(["ls"], flags);
+  const h1Row = outputs.join("\n").split("\n").find((l) => /\bh1\b/.test(l)) ?? "";
+  expect(h1Row).toContain("primary");
+  expect(h1Row).not.toContain("1/1");
+});

@@ -2,7 +2,18 @@
 // rollout, handoff recording, cleanup and unsafe-source refusal.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -438,8 +449,8 @@ describe("hasPriorSessionForHarness", () => {
   });
 });
 
-describe("cleanupHarnessSessionCopiesForHarness", () => {
-  test("collect is read-only and remove runs only after a successful delete (R13-S2)", () => {
+describe("collectHarnessSessionCopies / removeHarnessSessionCopies (harness delete)", () => {
+  test("collect is read-only and remove runs only after a successful delete (R13-S2)", async () => {
     const to = alias("claude-code");
     const taskId = seedTask(`task-collect-${seq}`);
     const inside = path.join(to.home, "projects", "p", "collect.jsonl");
@@ -456,39 +467,292 @@ describe("cleanupHarnessSessionCopiesForHarness", () => {
     const copies = transfer.collectHarnessSessionCopies(to.id);
     expect(copies).toHaveLength(1);
     expect(copies[0]!.root).toBe(to.home);
+    expect(copies[0]!.kind).toBe("claude-code");
     // Capturing must not touch disk or the allowlist: a refused harness delete
     // (409/built-in) leaves a live task's conversation resumable.
     expect(existsSync(inside)).toBe(true);
     expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).not.toBeNull();
 
-    transfer.removeHarnessSessionCopies(copies);
+    await transfer.removeHarnessSessionCopies(copies);
     expect(existsSync(inside)).toBe(false);
     // Removal is the caller's separate step; the row is dropped by the row
-    // delete (or by `cleanupHarnessSessionCopiesForHarness`).
+    // delete.
     expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).not.toBeNull();
     dbm.harnessSessionHandoffs.deleteForHarness(to.id);
   });
 
-  test("deletes copied files for the destination account, inside its root only", async () => {
+  test("deletes copied files for the destination account, inside its root and handoff shape only", async () => {
     const to = alias("claude-code");
+    const codexTo = alias("codex");
     const taskId = seedTask(`task-harness-delete-${seq}`);
     const inside = path.join(to.home, "projects", "p", "s.jsonl");
     write(inside, "{}\n");
     const outsideDir = mkdtempSync(path.join(tmpdir(), "agetor-outside-"));
     const outside = path.join(outsideDir, "keep.jsonl");
     write(outside, "keep\n");
+    // A planted row naming the account's own config is not a handoff shape.
+    const settings = path.join(to.home, "settings.json");
+    write(settings, "{}");
     dbm.harnessSessionHandoffs.upsert({
       taskId,
       harnessId: to.id,
       columnName: "claude_session_id",
       sessionId: "s",
-      copiedPaths: [inside, outside],
+      copiedPaths: [inside, outside, settings],
       createdAt: Date.now(),
     });
-    await transfer.cleanupHarnessSessionCopiesForHarness(to.id);
+    const rollout = path.join(codexTo.home, ".codex", "sessions", "2026", "11", "08", "rollout-x-t.jsonl");
+    const codexAuth = path.join(codexTo.home, ".codex", "auth.json");
+    write(rollout, "rollout");
+    write(codexAuth, "auth");
+    dbm.harnessSessionHandoffs.upsert({
+      taskId,
+      harnessId: codexTo.id,
+      columnName: "codex_session_id",
+      sessionId: "t",
+      copiedPaths: [rollout, codexAuth],
+      createdAt: Date.now(),
+    });
+
+    await transfer.removeHarnessSessionCopies(transfer.collectHarnessSessionCopies(to.id));
+    await transfer.removeHarnessSessionCopies(transfer.collectHarnessSessionCopies(codexTo.id));
+    dbm.harnessSessionHandoffs.deleteForHarness(to.id);
+    dbm.harnessSessionHandoffs.deleteForHarness(codexTo.id);
+
     expect(existsSync(inside)).toBe(false);
-    // A path outside the destination root is never removed.
+    expect(existsSync(rollout)).toBe(false);
+    // A path outside the destination root is never removed…
     expect(existsSync(outside)).toBe(true);
+    // …nor one inside it that a handoff never writes.
+    expect(existsSync(settings)).toBe(true);
+    expect(existsSync(codexAuth)).toBe(true);
     expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+  });
+});
+
+describe("transfer safety (review S5, S27, contract C5)", () => {
+  test("an A→B→A wrap never records A's own original transcript for cleanup", async () => {
+    const a = alias("claude-code");
+    const b = alias("claude-code");
+    const cwd = "/tmp/agetor-wrap";
+    const enc = claudeTmux.encodeProjectPath(cwd);
+    const sessionId = "abababab-abab-4bab-8bab-abababababab";
+    const aTranscript = path.join(a.home, "projects", enc, `${sessionId}.jsonl`);
+    const aSidecar = path.join(a.home, "projects", enc, sessionId, "subagents", "agent.jsonl");
+    write(aTranscript, "turn 1 on A\n");
+    write(aSidecar, "A's subagent\n");
+    const taskId = seedTask(`task-wrap-${seq}`);
+
+    const toB = await transfer.claudeSessionTransfer.transfer({
+      taskId,
+      fromHarness: dbm.harnesses.get(a.id)!,
+      toHarness: dbm.harnesses.get(b.id)!,
+      sessionId,
+      cwd,
+    });
+    expect(toB.ok).toBe(true);
+    if (!toB.ok) return;
+    const bTranscript = path.join(b.home, "projects", enc, `${sessionId}.jsonl`);
+    // B did not have these files: both are B's to clean up.
+    expect(toB.copiedPaths.sort()).toEqual(
+      [bTranscript, path.join(b.home, "projects", enc, sessionId, "subagents", "agent.jsonl")].sort(),
+    );
+
+    // B continues the conversation (and a new sidecar file), then wraps back.
+    writeFileSync(bTranscript, "turn 1 on A\nturn 2 on B\n");
+    write(path.join(b.home, "projects", enc, sessionId, "tool-results", "r.txt"), "B's result");
+    const toA = await transfer.claudeSessionTransfer.transfer({
+      taskId,
+      fromHarness: dbm.harnesses.get(b.id)!,
+      toHarness: dbm.harnesses.get(a.id)!,
+      sessionId,
+      cwd,
+    });
+    expect(toA.ok).toBe(true);
+    if (!toA.ok) return;
+    // A's transcript was updated with B's turn…
+    expect(readFileSync(aTranscript, "utf8")).toBe("turn 1 on A\nturn 2 on B\n");
+    // …but A's original transcript and sidecar existed before the copy, so
+    // they are not on A's cleanup allowlist; only the new sidecar file is.
+    const aResult = path.join(a.home, "projects", enc, sessionId, "tool-results", "r.txt");
+    expect(toA.copiedPaths).toEqual([aResult]);
+    const handoffA = dbm.harnessSessionHandoffs.get(taskId, a.id, "claude_session_id");
+    expect(handoffA?.copiedPaths).not.toContain(aTranscript);
+    expect(handoffA?.copiedPaths).not.toContain(aSidecar);
+
+    // Cleanup of the task removes copies, never A's own conversation.
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(readFileSync(aTranscript, "utf8")).toBe("turn 1 on A\nturn 2 on B\n");
+    expect(existsSync(aSidecar)).toBe(true);
+    expect(existsSync(aResult)).toBe(false);
+    expect(existsSync(bTranscript)).toBe(false);
+  });
+
+  test("Codex: a rollout the destination already had is not recorded", async () => {
+    const from = alias("codex");
+    const to = alias("codex");
+    const thread = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+    const rel = path.join("sessions", "2026", "11", "08", `rollout-2026-11-08T00-00-00-${thread}.jsonl`);
+    write(path.join(from.home, ".codex", rel), "from");
+    write(path.join(to.home, ".codex", rel), "to's own");
+    const taskId = seedTask(`task-codex-pre-${seq}`);
+    const result = await transfer.codexSessionTransfer.transfer({
+      taskId,
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId: thread,
+      cwd: "/tmp/x",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.copiedPaths).toEqual([]);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(readFileSync(path.join(to.home, ".codex", rel), "utf8")).toBe("from");
+  });
+
+  test("roots that alias each other through a symlink are refused by both adapters", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const cwd = "/tmp/agetor-alias";
+    const enc = claudeTmux.encodeProjectPath(cwd);
+    const sessionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    write(path.join(from.home, "projects", enc, `${sessionId}.jsonl`), "mine");
+    const linkParent = mkdtempSync(path.join(tmpdir(), "agetor-xfer-alias-"));
+    symlinkSync(from.home, path.join(linkParent, "home"));
+    dbm.harnesses.update(to.id, { home: path.join(linkParent, "home") });
+    const claude = await transfer.claudeSessionTransfer.transfer({
+      taskId: seedTask(`task-alias-${seq}`),
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId,
+      cwd,
+    });
+    expect(claude.ok).toBe(false);
+    if (claude.ok) return;
+    expect(claude.reason).toBe("unsafe-source");
+    expect(claude.message).toContain("share a config directory");
+
+    const cfrom = alias("codex");
+    const cto = alias("codex");
+    const thread = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    write(path.join(cfrom.home, ".codex", "sessions", "2026", "11", "08", `rollout-x-${thread}.jsonl`), "r");
+    const codexLinkParent = mkdtempSync(path.join(tmpdir(), "agetor-xfer-alias-codex-"));
+    symlinkSync(path.join(cfrom.home, ".codex"), path.join(codexLinkParent, "codex-home"));
+    dbm.harnesses.update(cto.id, { env: { CODEX_HOME: path.join(codexLinkParent, "codex-home") } });
+    const codex = await transfer.codexSessionTransfer.transfer({
+      taskId: seedTask(`task-alias-codex-${seq}`),
+      fromHarness: dbm.harnesses.get(cfrom.id)!,
+      toHarness: dbm.harnesses.get(cto.id)!,
+      sessionId: thread,
+      cwd: "/tmp/x",
+    });
+    expect(codex.ok).toBe(false);
+    if (codex.ok) return;
+    expect(codex.message).toContain("share a CODEX_HOME");
+  });
+
+  test("symlinks inside the session sidecars are never copied or followed", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const cwd = "/tmp/agetor-sidecar-links";
+    const enc = claudeTmux.encodeProjectPath(cwd);
+    const sessionId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    write(path.join(from.home, "projects", enc, `${sessionId}.jsonl`), "t");
+    const outside = mkdtempSync(path.join(tmpdir(), "agetor-sidecar-outside-"));
+    write(path.join(outside, "secret.txt"), "OUTSIDE-SECRET");
+    write(path.join(outside, "dir", "inner.txt"), "OUTSIDE-DIR");
+    const sub = path.join(from.home, "projects", enc, sessionId, "subagents");
+    write(path.join(sub, "real.jsonl"), "real");
+    symlinkSync(path.join(outside, "secret.txt"), path.join(sub, "file-link.jsonl"));
+    symlinkSync(path.join(outside, "dir"), path.join(sub, "dir-link"));
+    // A whole sidecar folder that is a symlink is refused too.
+    symlinkSync(path.join(outside, "dir"), path.join(from.home, "projects", enc, sessionId, "tool-results"));
+
+    const result = await transfer.claudeSessionTransfer.transfer({
+      taskId: seedTask(`task-sidecar-links-${seq}`),
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId,
+      cwd,
+    });
+    expect(result.ok).toBe(true);
+    const destSession = path.join(to.home, "projects", enc, sessionId);
+    expect(readFileSync(path.join(destSession, "subagents", "real.jsonl"), "utf8")).toBe("real");
+    expect(readdirSync(path.join(destSession, "subagents"))).toEqual(["real.jsonl"]);
+    expect(existsSync(path.join(destSession, "tool-results"))).toBe(false);
+    const leaked: string[] = [];
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir)) {
+        const abs = path.join(dir, name);
+        const st = lstatSync(abs);
+        if (st.isSymbolicLink()) leaked.push(abs);
+        else if (st.isDirectory()) walk(abs);
+        else if (/OUTSIDE-/.test(readFileSync(abs, "utf8"))) leaked.push(abs);
+      }
+    };
+    walk(to.home);
+    expect(leaked).toEqual([]);
+  });
+
+  test("a symlinked destination projects folder is never written through", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const cwd = "/tmp/agetor-dest-projects-link";
+    const enc = claudeTmux.encodeProjectPath(cwd);
+    const sessionId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    write(path.join(from.home, "projects", enc, `${sessionId}.jsonl`), "t");
+    write(path.join(from.home, "projects", enc, sessionId, "subagents", "a.jsonl"), "a");
+    const outside = mkdtempSync(path.join(tmpdir(), "agetor-dest-projects-outside-"));
+    symlinkSync(outside, path.join(to.home, "projects"));
+    const taskId = seedTask(`task-dest-link-${seq}`);
+
+    const result = await transfer.claudeSessionTransfer.transfer({
+      taskId,
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId,
+      cwd,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("io");
+    expect(readdirSync(outside)).toEqual([]);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+  });
+
+  test("a session id that is not a plain file name is refused", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const cwd = "/tmp/agetor-bad-id";
+    const enc = claudeTmux.encodeProjectPath(cwd);
+    write(path.join(from.home, "projects", "x.jsonl"), "t");
+    const result = await transfer.claudeSessionTransfer.transfer({
+      taskId: seedTask(`task-bad-id-${seq}`),
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId: `../../${enc}/x`,
+      cwd,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("unsafe-source");
+  });
+
+  test("a Codex rollout outside the sessions/YYYY/MM/DD layout is refused (it could never be cleaned up)", async () => {
+    const from = alias("codex");
+    const to = alias("codex");
+    const thread = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    write(path.join(from.home, ".codex", "sessions", "odd", `rollout-x-${thread}.jsonl`), "r");
+    const result = await transfer.codexSessionTransfer.transfer({
+      taskId: seedTask(`task-codex-odd-${seq}`),
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId: thread,
+      cwd: "/tmp/x",
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("unsafe-source");
+    expect(existsSync(path.join(to.home, ".codex", "sessions", "odd"))).toBe(false);
   });
 });

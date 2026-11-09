@@ -50,6 +50,29 @@ describe("claudeCredentialsPath", () => {
     expect(claudeCredentialsPath(harness)).toBe(path.join(envDir, ".credentials.json"));
   });
 
+  test("an env-map HOME alone pins <HOME>/.claude and <HOME>/.claude.json, never the main keychain (S17)", async () => {
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    try {
+      const envHome = mkdtempSync(path.join(tmpdir(), "agetor-creds-envhome-"));
+      const harness: Harness = { ...mkHarness(null), id: "claude-envhome", env: { HOME: envHome } };
+      expect(claudeDotJsonPath(harness)).toBe(path.join(envHome, ".claude.json"));
+      expect(claudeCredentialsPath(harness)).toBe(path.join(envHome, ".claude", ".credentials.json"));
+      // A pinned account with no credentials file gets no token rather than
+      // the main account's keychain login.
+      expect(await readClaudeToken(harness)).toEqual({ token: null, scopes: [] });
+    } finally {
+      if (prev !== undefined) process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+  });
+
+  test("a blank env-map CLAUDE_CONFIG_DIR is unset: the home is the root (S17/N9)", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-creds-blank-"));
+    const harness: Harness = { ...mkHarness(home), env: { CLAUDE_CONFIG_DIR: "  " } };
+    expect(claudeDotJsonPath(harness)).toBe(path.join(home, ".claude.json"));
+    expect(claudeCredentialsPath(harness)).toBe(path.join(home, ".credentials.json"));
+  });
+
   test("a home-less built-in honors the process-level CLAUDE_CONFIG_DIR", async () => {
     const prev = process.env.CLAUDE_CONFIG_DIR;
     const envDir = mkdtempSync(path.join(tmpdir(), "agetor-creds-proc-"));

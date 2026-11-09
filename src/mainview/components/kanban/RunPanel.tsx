@@ -72,11 +72,13 @@ import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   formatHarnessSwapNotice,
-  harnessMoveNote,
-  harnessStackBannerMode,
   isHarnessStackContinuation,
   parseHarnessSwapNotice,
 } from "../../../shared/harness-stack.ts";
+import { harnessStackBannerView } from "@/lib/harness-stack-banner";
+import { agentSwitchPatch } from "@/lib/agent-switch";
+import { groupStickySections, type StickyItem } from "@/lib/sticky-sections";
+import { stackPositionFor } from "@/lib/stack-badge";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
@@ -4142,7 +4144,7 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
-        <HarnessStackBanner task={task} stacks={stacks} onRunTask={onRunTask} />
+        <HarnessStackBanner task={task} stacks={stacks} harnesses={harnesses} onRunTask={onRunTask} />
         {importedSession && (
           <div
             className="mt-1 space-y-1 text-xs"
@@ -4201,10 +4203,10 @@ function RunPanelBody({
           <span className="truncate">
             {harnesses.find((h) => h.id === task.agent)?.label ?? task.agent}
             {(() => {
-              const stack = stacks.find((st) => st.members.some((m) => m.harnessId === task.agent));
-              if (!stack) return null;
-              const index = stack.members.findIndex((m) => m.harnessId === task.agent);
-              return <span className="text-info"> · {index + 1}/{stack.members.length}</span>;
+              // No chip for a one-account stack: it cannot fail over.
+              const at = stackPositionFor(stacks, task.agent);
+              if (!at) return null;
+              return <span className="text-info"> · {at.position}/{at.count}</span>;
             })()}
             {" · "}{task.column}
             {task.branch && !branchDrift.drifted && <> · <span className="font-mono">{task.branch}</span></>}
@@ -6170,29 +6172,24 @@ function RunEventList({
     };
 
     if (stickyUserMessages) {
-      const sections: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
-      // Preamble events before the first user message share an initial
-      // headerless section. Each subsequent user message starts a new turn;
-      // its sticky lifetime naturally ends at that section's boundary.
-      let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = {
-        key: "",
-        header: null,
-        body: [],
-      };
+      // Grouping rules (incl. skipping a hidden continuation prompt, which
+      // renders nothing and must not open a headerless section) live in
+      // `groupStickySections`.
+      const items: StickyItem<React.ReactNode>[] = [];
       for (let i = 0; i < normalised.length; i++) {
         const e = normalised[i]!;
         const key = `${e.ts}-${i}`;
         const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
         if (e.stream === "user") {
-          if (current.header !== null || current.body.length > 0) sections.push(current);
-          current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
+          items.push({ kind: "turn", key, header: renderEvent(e, key, i)[0] ?? null, before });
         } else {
-          if (current.key === "") current.key = key;
-          current.body.push(...before, ...renderEvent(e, key, i));
+          items.push({ kind: "body", key, nodes: [...before, ...renderEvent(e, key, i)] });
         }
       }
-      current.body.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
-      if (current.header !== null || current.body.length > 0) sections.push(current);
+      const sections = groupStickySections(
+        items,
+        (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction),
+      );
       return sections.map((section, index) => (
         <section key={section.key || `section-${index}`} className="flex flex-col gap-4">
           {section.header}
@@ -6889,81 +6886,62 @@ const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
   );
 });
 
-// `text` stays a plain `string` prop (not the `renderLinkified` output)
-// specifically so `memo`'s default shallow comparator actually catches a
-// same-text rerender: `renderLinkified` returns a freshly allocated array
-// whenever it finds a link, so passing its result as the prop would hand
-// this component a new-identity node on every parent render and defeat the
-// memo outright. Linkifying happens INSIDE the component instead, via
-// `useMemo` keyed on `text`, so a status line carrying a bare URL (e.g. an
-// fx recovery/auto-resume line) still renders it as a clickable
-// `ExternalLink`, and a no-URL line still renders the identical text node
-// across rerenders.
 /**
- * Harness-stack state in the task header: a pending swap, or an
- * all-exhausted countdown with a manual "Run now". Reset per task id so the
- * countdown of a previously selected task never paints on the next one.
+ * Harness-stack state in the task header: a pending swap, a recent move, a
+ * live retry run, or an all-exhausted countdown with a manual "Run now". The
+ * copy comes from `harnessStackBannerView` (lib/harness-stack-banner.ts).
+ * Reset per task id so the countdown of a previously selected task never
+ * paints on the next one.
  */
 function HarnessStackBanner({
   task,
   stacks,
+  harnesses,
   onRunTask,
 }: {
   task: Task;
   stacks: HarnessStack[];
+  harnesses: Harness[];
   onRunTask?: (task: Task) => void;
 }) {
-  const state = task.harnessState;
-  const target = state?.allExhausted?.nextAttemptAt ?? null;
+  const target = task.harnessState?.allExhausted?.nextAttemptAt ?? null;
   // One shared ticking clock (also used by the fx countdown); reset per task
   // and per target so a previous task's time never paints on the next one.
   const now = useNowTicker(target != null && target > 0, `${task.id}:${target ?? ""}`);
-
-  const mode = harnessStackBannerMode(state, now);
-  if (mode === "pending" && state?.pendingSwap) {
-    const to = stacks
-      .flatMap((s) => s.members)
-      .find((m) => m.harnessId === state.pendingSwap?.to);
+  const labelOf = (id: string) =>
+    stacks.flatMap((s) => s.members).find((m) => m.harnessId === id)?.label
+      ?? harnesses.find((h) => h.id === id)?.label
+      ?? id;
+  const view = harnessStackBannerView(task, labelOf, now);
+  if (!view) return null;
+  if (view.kind === "pending") {
     return (
       <div className="mt-1 text-xs text-info" data-testid="harness-swap-pending">
-        Switching to {to?.label ?? state.pendingSwap.to}…
+        {view.text}
       </div>
     );
   }
-  // The mode helper ranks `allExhausted` above a recent `lastMove`: a move
-  // that happened before the accounts ran dry must not hide the countdown and
-  // "Run now" for 24 hours.
-  const ex = mode === "exhausted" ? state?.allExhausted : null;
-  if (!ex) {
-    if (mode === "moved" && state?.lastMove) {
-      const to = stacks.flatMap((s) => s.members).find((m) => m.harnessId === state.lastMove?.to);
-      return (
-        <div className="mt-1 text-xs text-muted-foreground" data-testid="harness-stack-moved">
-          {harnessMoveNote(state.lastMove, to?.label ?? state.lastMove.to)}
-        </div>
-      );
-    }
-    return null;
+  if (view.kind === "moved") {
+    return (
+      <div className="mt-1 text-xs text-muted-foreground" data-testid="harness-stack-moved">
+        {view.text}
+      </div>
+    );
   }
-  const targetAt = target ?? 0;
-  const secondsLeft = targetAt > 0 ? Math.max(0, Math.ceil((targetAt - now) / 1000)) : null;
-  // A retry that already started keeps the persisted attempt count but has no
-  // next timer (nextAttemptAt 0). That is "in progress", not "nothing usable".
-  const retrying = targetAt <= 0 && ex.reason !== "no-usable-member" && ex.attempts < ex.max;
-  const text = ex.attempts >= ex.max
-    ? "Every account in this stack is out of quota — run the task manually after a reset."
-    : targetAt > 0
-      ? `Every account in this stack is out of quota — retrying in ${formatCountdown(secondsLeft ?? 0)} (attempt ${ex.attempts + 1}/${ex.max}).`
-      : retrying
-        ? `Retrying on the next available account (attempt ${ex.attempts + 1}/${ex.max})…`
-        : "No account in this stack can run this task — fix one in Settings → Stacks.";
+  if (view.kind === "retry-running") {
+    return (
+      <div className="mt-1 text-xs text-info" data-testid="harness-stack-retry-running">
+        {view.text}
+      </div>
+    );
+  }
   return (
     <div
       className="mt-1 flex flex-wrap items-center gap-2 text-xs text-warning"
       data-testid="harness-stack-exhausted"
     >
-      <span>{text}</span>
-      {onRunTask && (
+      <span>{view.text}</span>
+      {onRunTask && view.runNow && (
         <Button
           size="sm"
           variant="outline"
@@ -6979,16 +6957,16 @@ function HarnessStackBanner({
   );
 }
 
-function formatCountdown(totalSeconds: number): string {
-  const s = Math.max(0, totalSeconds);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${sec}s`;
-  return `${sec}s`;
-}
-
+// `text` stays a plain `string` prop (not the `renderLinkified` output)
+// specifically so `memo`'s default shallow comparator actually catches a
+// same-text rerender: `renderLinkified` returns a freshly allocated array
+// whenever it finds a link, so passing its result as the prop would hand
+// this component a new-identity node on every parent render and defeat the
+// memo outright. Linkifying happens INSIDE the component instead, via
+// `useMemo` keyed on `text`, so a status line carrying a bare URL (e.g. an
+// fx recovery/auto-resume line) still renders it as a clickable
+// `ExternalLink`, and a no-URL line still renders the identical text node
+// across rerenders.
 const StatusDivider = memo(function StatusDivider({ text, testId }: { text: string; testId?: string }) {
   const content = useMemo(() => renderLinkified(text), [text]);
   return (
@@ -7927,11 +7905,22 @@ function TaskDetails({
 
   const onAgentChange = (nextId: string) => {
     if (nextId === task.agent) return;
-    // Switching harness wipes the current mode / model / effort context —
-    // those ids belong to the old harness's kind option set. Reset to the
-    // new harness's kind defaults (DEFAULT_MODEL + DEFAULT_EFFORT) and let
-    // the user re-pick if they want something specific. Sent as one PATCH
+    // Switching to another KIND wipes the current mode / model / effort
+    // context — those ids belong to the old harness's kind option set. Reset
+    // to the new harness's kind defaults (DEFAULT_MODEL + DEFAULT_EFFORT) and
+    // let the user re-pick if they want something specific. A same-kind
+    // switch sends only `{ agent }` (`agentSwitchPatch`). Sent as one PATCH
     // so the server-side reconcile only fires once.
+    const nextHarness = harnesses.find((h) => h.id === nextId);
+    void save(agentSwitchPatch({
+      nextId,
+      currentKind: harnessKnown ? kind : null,
+      nextKind: nextHarness?.kind ?? null,
+      kindDefaults: () => kindDefaultsFor(nextId),
+    }));
+  };
+
+  const kindDefaultsFor = (nextId: string) => {
     const nextKind = harnessKindOf(nextId, harnesses);
     const nextMode = defaultModeFor(nextKind);
     const nextModel = DEFAULT_MODEL[nextKind];
@@ -7950,7 +7939,7 @@ function TaskDetails({
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
         ? DEFAULT_EFFORT[nextKind]
         : nextEfforts[0]!.id;
-    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, speed: "off", maxMode: false });
+    return { mode: nextMode, model: nextModel, effort: nextEffort, speed: "off" as const, maxMode: false };
   };
 
   const onModelChange = (model: string) => {

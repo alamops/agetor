@@ -9,6 +9,31 @@ import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/t
 import { colorRunStatus } from "./pipeline.ts";
 import { profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
 
+/**
+ * The `failover` line for a task with a recorded all-exhausted state.
+ *
+ * While the retry successor is alive (`inFlight` stays true for its whole life)
+ * or the task is running, the retry is not "retrying…" any more: it is a real
+ * run on the destination account (review S20). `attempts` is only incremented
+ * when that run itself returns to exhausted, so the live attempt is
+ * `attempts + 1`. `accountLabel` is the member's label (the caller resolves it
+ * from the stack); the task's raw harness id stands in when it can't.
+ */
+export function failoverText(
+  task: Pick<Task, "agent" | "column" | "harnessState">,
+  accountLabel: string | null,
+): string {
+  const ex = task.harnessState!.allExhausted!;
+  const attempt = `attempt ${Math.min(ex.attempts + 1, ex.max)}/${ex.max}`;
+  if (ex.inFlight === true || task.column === "running") {
+    return `running on ${accountLabel ?? task.agent} after a quota reset (${attempt})`;
+  }
+  if (ex.attempts >= ex.max) return "every account is out of quota — run the task manually after a reset";
+  if (ex.nextAttemptAt > 0) return `waiting until ${new Date(ex.nextAttemptAt).toLocaleString()} (${attempt})`;
+  if (ex.reason !== "no-usable-member") return `retrying on the next available account (${attempt})`;
+  return "no usable account — fix one in Settings";
+}
+
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
   if (!ref) throw usageError("show");
@@ -48,18 +73,12 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const stack = (stacksPayload?.stacks ?? []).find((st) => st.members.some((m) => m.harnessId === task.agent));
   if (stack) {
     const index = stack.members.findIndex((m) => m.harnessId === task.agent);
-    out(`  ${label("stack")} ${escapeFreeText(stack.label)} (${index + 1}/${stack.members.length})`);
+    // A one-member stack has nothing to fail over to: no `(1/1)` position.
+    const position = stack.members.length < 2 ? "" : ` (${index + 1}/${stack.members.length})`;
+    out(`  ${label("stack")} ${escapeFreeText(stack.label)}${position}`);
   }
   if (task.harnessState?.allExhausted) {
-    const ex = task.harnessState.allExhausted;
-    const retrying = ex.nextAttemptAt <= 0 && ex.reason !== "no-usable-member" && ex.attempts < ex.max;
-    const text = ex.attempts >= ex.max
-      ? "every account is out of quota — run the task manually after a reset"
-      : ex.nextAttemptAt > 0
-        ? `waiting until ${new Date(ex.nextAttemptAt).toLocaleString()} (attempt ${Math.min(ex.attempts + 1, ex.max)}/${ex.max})`
-        : retrying
-          ? `retrying on the next available account (attempt ${ex.attempts + 1}/${ex.max})`
-          : "no usable account — fix one in Settings";
+    const text = failoverText(task, stack?.members.find((m) => m.harnessId === task.agent)?.label ?? null);
     out(`  ${label("failover")} ${c.yellow(escapeFreeText(text))}`);
   }
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);

@@ -1,4 +1,6 @@
 import { cn } from "@/lib/utils";
+import { stackPositionFor } from "@/lib/stack-badge";
+import type { HarnessStack } from "../../../shared/types.ts";
 
 /**
  * The display slice of `TaskHarnessState` this chip needs. Kept structural so
@@ -15,6 +17,7 @@ export interface StackBadgeState {
     reason: string;
     attempts: number;
     max: number;
+    inFlight?: boolean;
   } | null;
 }
 
@@ -22,8 +25,13 @@ export interface StackBadgeState {
  * A small chip naming a task's position in its harness account stack
  * (`2/3`). Position 1 is the primary. An all-exhausted state and a cooling
  * current account use the `--warning` token (the latter adds an hourglass
- * marker); a pending swap keeps `--info`. `title` explains the failover in
- * one sentence.
+ * marker); a pending swap and a live retry keep `--info`. `title` explains
+ * the state in one sentence.
+ *
+ * A stack with fewer than two accounts cannot fail over, so the chip never
+ * shows `1/1` or the "fails over…" copy for it: it renders nothing unless
+ * something live (a swap, a retry, an exhausted wait, a cooling account) is
+ * worth showing, and then names that state instead of a position.
  */
 export function StackBadge({
   state,
@@ -31,37 +39,69 @@ export function StackBadge({
    *  The card used to hide a cooling account until the task itself blocked;
    *  the badge now marks it (review nit). A past instant reads as not cooling. */
   coolingUntilMs,
+  /** The task is running right now (`task.column === "running"`). With an
+   *  `allExhausted` marker that is the retry run itself, not a wait. */
+  running,
   className,
 }: {
   state: StackBadgeState | null | undefined;
   coolingUntilMs?: number | null;
+  running?: boolean;
   className?: string;
 }) {
   if (!state) return null;
   const position = state.position + 1;
   const count = state.count ?? position;
+  const single = count < 2;
   const pending = state.pendingSwap != null;
   const ex = state.allExhausted;
+  // The retry run is live: the marker keeps its attempt count (and
+  // `inFlight`) for the successor's whole life, so a running task with the
+  // marker is "running after a quota reset", never "retrying…" (review S20).
+  const liveRetry = ex != null && (ex.inFlight === true || running === true);
   // A started retry keeps `allExhausted` for its attempt count but clears the
   // timer; that is cyan "in flight", not amber "out of quota".
-  const retrying = ex != null && ex.nextAttemptAt <= 0 && ex.reason !== "no-usable-member" && ex.attempts < ex.max;
+  const retrying = liveRetry
+    || (ex != null && ex.nextAttemptAt <= 0 && ex.reason !== "no-usable-member" && ex.attempts < ex.max);
   // "No usable member" is a manual fix (disabled/logged-out/missing CLI), not
   // a quota wait — the amber tooltip must not claim the stack is out of quota.
   const noUsable = ex != null && !retrying && ex.reason === "no-usable-member";
   const exhausted = ex != null && !retrying;
   const cooling = coolingUntilMs != null && coolingUntilMs > Date.now();
+  if (single && !pending && ex == null && !cooling) return null;
+  const attempt = ex ? `attempt ${Math.min(ex.attempts + 1, ex.max)}/${ex.max}` : "";
   const coolingDetail = cooling
-    ? `Account ${position} of ${count} — its current account is cooling until ${new Date(coolingUntilMs).toLocaleString()}`
+    ? single
+      ? `Its account is cooling until ${new Date(coolingUntilMs).toLocaleString()}`
+      : `Account ${position} of ${count} — its current account is cooling until ${new Date(coolingUntilMs).toLocaleString()}`
     : null;
-  const title = retrying
-    ? "Retrying on the next available account…"
-    : noUsable
-      ? "No account in this stack can run this task — fix one in Settings"
-      : exhausted
-        ? "Every account in this stack is out of quota"
-        : pending
-          ? "Switching to the next account…"
-          : coolingDetail ?? `Account ${position} of ${count} — fails over to the next account at its limit`;
+  const title = liveRetry
+    ? ex!.reason === "no-usable-member"
+      ? `Running (${attempt})`
+      : `Running after a quota reset (${attempt})`
+    : retrying
+      ? "Retrying on the next available account…"
+      : noUsable
+        ? "No account in this stack can run this task — fix one in Settings"
+        : exhausted
+          ? "Every account in this stack is out of quota"
+          : pending
+            ? "Switching to the next account…"
+            : coolingDetail ?? `Account ${position} of ${count} — fails over to the next account at its limit`;
+  // A one-account stack has no meaningful position: name the state instead.
+  const label = !single
+    ? `${position}/${count}`
+    : liveRetry
+      ? "running"
+      : retrying
+        ? "retrying"
+        : noUsable
+          ? "no account"
+          : exhausted
+            ? "out of quota"
+            : pending
+              ? "switching"
+              : "cooling";
   return (
     <span
       data-testid="task-card-stack-badge"
@@ -76,7 +116,34 @@ export function StackBadge({
     >
       {pending || retrying ? "⇄ " : ""}
       {cooling ? "⏳ " : ""}
-      {position}/{count}
+      {label}
+    </span>
+  );
+}
+
+/**
+ * The plain `n/m` position chip next to an account name (New Task harness
+ * grid, the launch pickers). Nothing for an account in no stack or in a
+ * one-account stack ({@link stackPositionFor}).
+ */
+export function StackPositionChip({
+  stacks,
+  harnessId,
+  className,
+}: {
+  stacks: readonly HarnessStack[];
+  harnessId: string;
+  className?: string;
+}) {
+  const at = stackPositionFor(stacks, harnessId);
+  if (!at) return null;
+  return (
+    <span
+      data-testid="stack-position-chip"
+      title={`Account ${at.position} of ${at.count} in stack "${at.stack.label}" — fails over to the next account at its limit`}
+      className={cn("ml-1 text-[10px] text-info", className)}
+    >
+      {at.position}/{at.count}
     </span>
   );
 }

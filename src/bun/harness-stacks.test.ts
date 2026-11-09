@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 process.env.AGETOR_DATA_DIR ??= mkdtempSync(path.join(tmpdir(), "agetor-harness-stacks-"));
 
@@ -15,7 +15,20 @@ let dbm: Db;
 let restore: () => void;
 const homes: string[] = [];
 
+// Ambient credentials in the runner's env (a CI secret, or the
+// `CLAUDE_CODE_*_TOKEN` a Claude Code session exports) are login evidence and
+// a `process-provider-key` warning for every account. Strip every key the
+// evidence check would count for the whole file, then restore it.
+const ambientAuth = new Map<string, string | undefined>();
+
 beforeAll(async () => {
+  const { isHarnessAuthEnvKey } = await import("../shared/harness-mirror.ts");
+  for (const key of Object.keys(process.env)) {
+    if (isHarnessAuthEnvKey(key)) {
+      ambientAuth.set(key, process.env[key]);
+      delete process.env[key];
+    }
+  }
   dbm = await import("./db.ts");
   stacks = await import("./harness-stacks.ts");
   const { snapshotHarnessState } = await import("./test-harness-state.ts");
@@ -32,7 +45,13 @@ beforeAll(async () => {
   }
 });
 
-afterAll(() => restore());
+afterAll(() => {
+  restore();
+  for (const [key, value] of ambientAuth) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 function input(members: string[], extra: Partial<{ label: string; mirrorMode: "full" | "safe" }> = {}) {
   return { label: extra.label ?? "train", kind: "claude-code" as const, members, mirrorMode: extra.mirrorMode };
@@ -46,6 +65,82 @@ describe("harnessStacks", () => {
     expect(() => stacks.harnessStacks.create(input(["stack-b", "stack-c"]))).toThrow();
     stacks.harnessStacks.delete(stack.id);
     expect(stacks.harnessStacks.get(stack.id)).toBeNull();
+  });
+
+  test("runtime reads skip member warnings; list and create/update compute them (C6)", () => {
+    // The hot path (`get`/`getByMember`/`resolveForTask`, read on every swap,
+    // retry, start and send) must not run install probes, login evidence (a
+    // keychain lookup on macOS) or the catalog.
+    const services: string[] = [];
+    stacks.setLoginEvidenceDepsForTests({
+      platform: "darwin",
+      keychainProbe: (service) => {
+        services.push(service);
+        return false;
+      },
+    });
+    const created = stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
+    try {
+      expect(created.warnings.map((w) => w.code)).toContain("full-mirror-hooks");
+      expect(created.warnings.map((w) => w.code)).toContain("member-logged-out");
+
+      services.length = 0;
+      stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: (service) => {
+        services.push(service);
+        return false;
+      } });
+      expect(stacks.harnessStacks.get(created.id)!.warnings).toEqual([]);
+      expect(stacks.harnessStacks.getByMember("stack-b")!.warnings).toEqual([]);
+      expect(stacks.harnessStacks.resolveForTask({ id: "t", agent: "stack-a", harnessState: null } as never)!.stack.warnings)
+        .toEqual([]);
+      expect(services).toEqual([]);
+
+      const listed = stacks.harnessStacks.list().find((s) => s.id === created.id)!;
+      expect(listed.warnings.map((w) => w.code)).toContain("member-logged-out");
+      expect(services.length).toBeGreaterThan(0);
+      expect(stacks.harnessStacks.get(created.id, { warnings: true })!.warnings.map((w) => w.code))
+        .toContain("full-mirror-hooks");
+
+      const updated = stacks.harnessStacks.update(created.id, { mirrorMode: "safe" });
+      expect(updated.warnings.map((w) => w.code)).not.toContain("full-mirror-hooks");
+      expect(updated.warnings.map((w) => w.code)).toContain("member-logged-out");
+    } finally {
+      stacks.harnessStacks.delete(created.id);
+      stacks.setLoginEvidenceDepsForTests(null);
+    }
+  });
+
+  test("validateMemberRoot refuses an edit that aliases another member's root (C9)", () => {
+    const stack = stacks.harnessStacks.create(input(["stack-a", "stack-b"]));
+    try {
+      // Not a member of any stack: nothing to check.
+      expect(stacks.harnessStacks.validateMemberRoot("stack-c", { kind: "claude-code", home: homes[0]!, env: {} }))
+        .toBeNull();
+      // A fresh, distinct root is fine.
+      const fresh = mkdtempSync(path.join(tmpdir(), "agetor-member-root-"));
+      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: fresh, env: {} }))
+        .toBeNull();
+      // Its own current root is fine (it is not compared with itself).
+      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: homes[1]!, env: {} }))
+        .toBeNull();
+      // The primary's root, directly, through a symlink, or via the env map.
+      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: homes[0]!, env: {} }))
+        .toContain("stack-a");
+      const link = path.join(mkdtempSync(path.join(tmpdir(), "agetor-member-link-")), "alias");
+      symlinkSync(homes[0]!, link);
+      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "claude-code", home: link, env: {} }))
+        .toContain("share its config directory");
+      expect(stacks.harnessStacks.validateMemberRoot("stack-b", {
+        kind: "claude-code",
+        home: fresh,
+        env: { CLAUDE_CONFIG_DIR: homes[0]! },
+      })).toContain("stack-a");
+      // A kind change would leave the stack's kind.
+      expect(stacks.harnessStacks.validateMemberRoot("stack-b", { kind: "codex", home: fresh, env: {} }))
+        .toContain("remove it from the stack");
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
   });
 
   test("update reorders and can remove a member", () => {
@@ -265,11 +360,13 @@ describe("harnessStacks", () => {
   });
 
   test("deleting a stack member re-packs the surviving ranks (R13-M1)", () => {
-    // The `harnesses.delete` FK cascade used to leave a gap in the stored
+    // Deleting a member account used to drop its row through the (since
+    // removed, migration 085) FK cascade and leave a gap in the stored
     // position (0, 2). The swap divider then rendered an impossible "3/2" and
-    // the reader trusted the stale rank. The delete renumbers and `toStack`
-    // derives from the array index, so both a fresh delete and pre-fix data
-    // read back contiguously.
+    // the reader trusted the stale rank. `harnesses.delete` now deletes the
+    // membership explicitly and renumbers, and `toStack` derives from the
+    // array index, so both a fresh delete and pre-fix data read back
+    // contiguously.
     const ids = ["ren-a", "ren-b", "ren-c"];
     for (const id of ids) {
       dbm.harnesses.insert({
@@ -283,7 +380,7 @@ describe("harnessStacks", () => {
     const stack = stacks.harnessStacks.create(input(ids));
     expect(stack.members.map((m) => m.position)).toEqual([0, 1, 2]);
 
-    // Delete the PRIMARY through the harness row — the cascade path.
+    // Delete the PRIMARY through the harness row (`harnesses.delete`).
     dbm.harnesses.delete("ren-a");
     const after = stacks.harnessStacks.get(stack.id)!;
     expect(after.members.map((m) => m.harnessId)).toEqual(["ren-b", "ren-c"]);
@@ -417,6 +514,7 @@ describe("harnessStacks", () => {
 describe("loginEvidence", () => {
   const cleared = [
     "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
@@ -443,8 +541,12 @@ describe("loginEvidence", () => {
       saved.set(key, process.env[key]);
       delete process.env[key];
     }
+    // The cases below predate the macOS keychain lookup: a fixture account
+    // with no credential file has no keychain item either.
+    stacks.setLoginEvidenceDepsForTests({ keychainProbe: () => false });
   });
   afterAll(() => {
+    stacks.setLoginEvidenceDepsForTests(null);
     for (const [key, value] of saved) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -609,6 +711,119 @@ describe("loginEvidence", () => {
         else process.env[key] = value;
       }
     }
+  });
+
+  // Review B1: on macOS, Claude Code keeps a CLAUDE_CONFIG_DIR account's
+  // OAuth login in the keychain and writes no `.credentials.json`. Every real
+  // backup account looked logged out, so failover skipped all of them.
+  describe("macOS keychain login (B1)", () => {
+    afterAll(() => stacks.setLoginEvidenceDepsForTests({ keychainProbe: () => false }));
+
+    function probeRecording(result: boolean | null) {
+      const services: string[] = [];
+      const probe = (service: string) => {
+        services.push(service);
+        return result;
+      };
+      return { services, probe };
+    }
+
+    test("darwin + pinned dir + no credentials file: the keychain item decides", () => {
+      const home = claudeHome();
+      const expected = `Claude Code-credentials-${createHash("sha256").update(home).digest("hex").slice(0, 8)}`;
+
+      const found = probeRecording(true);
+      stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: found.probe });
+      expect(stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never)).toBe(true);
+      expect(found.services).toEqual([expected]);
+
+      const missing = probeRecording(false);
+      stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: missing.probe });
+      expect(stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never)).toBe(false);
+
+      // A failed lookup (timeout, locked keychain, no `security`) is unknown,
+      // never a logout.
+      const broken = probeRecording(null);
+      stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: broken.probe });
+      expect(stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never)).toBeNull();
+    });
+
+    test("the env map's CLAUDE_CONFIG_DIR is the hashed value, as given", () => {
+      const home = claudeHome();
+      const pinned = claudeHome();
+      const rec = probeRecording(true);
+      stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: rec.probe });
+      expect(stacks.loginEvidence({ kind: "claude-code", home, env: { CLAUDE_CONFIG_DIR: pinned } } as never)).toBe(true);
+      expect(rec.services).toEqual([
+        `Claude Code-credentials-${createHash("sha256").update(pinned).digest("hex").slice(0, 8)}`,
+      ]);
+    });
+
+    test("a credentials file still wins without a lookup", () => {
+      const home = claudeHome({ ".credentials.json": "{}" });
+      const rec = probeRecording(false);
+      stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: rec.probe });
+      expect(stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never)).toBe(true);
+      expect(rec.services).toEqual([]);
+    });
+
+    test("non-darwin is unchanged: no file means logged out, no lookup", () => {
+      const home = claudeHome();
+      const rec = probeRecording(true);
+      stacks.setLoginEvidenceDepsForTests({ platform: "linux", keychainProbe: rec.probe });
+      expect(stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never)).toBe(false);
+      expect(rec.services).toEqual([]);
+    });
+
+    test("the built-in account (no config dir) stays unknown without a lookup", () => {
+      const rec = probeRecording(false);
+      stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: rec.probe });
+      expect(stacks.loginEvidence({ kind: "claude-code", home: null, env: {} } as never)).toBeNull();
+      expect(rec.services).toEqual([]);
+    });
+
+    test("the lookup is cached per service", () => {
+      const home = claudeHome();
+      const rec = probeRecording(true);
+      stacks.setLoginEvidenceDepsForTests({ platform: "darwin", keychainProbe: rec.probe });
+      stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never);
+      stacks.loginEvidence({ kind: "claude-code", home, env: {} } as never);
+      expect(rec.services.length).toBe(1);
+    });
+
+    test("service name: sha256 of the dir string exactly (trailing slash and secure-storage override)", () => {
+      expect(stacks.claudeKeychainServiceFor({ home: null }, "/Users/alice/.agetor/harnesses/claude-backup"))
+        .toBe("Claude Code-credentials-111767e8");
+      expect(stacks.claudeKeychainServiceFor({ home: null }, "/Users/alice/.agetor/harnesses/claude-backup/"))
+        .toBe("Claude Code-credentials-c70e3e00");
+      expect(stacks.claudeKeychainServiceFor(
+        { home: null, env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: "/srv/secure-store" } },
+        "/ignored",
+      )).toBe("Claude Code-credentials-523ed66e");
+      // Set but empty selects the unsuffixed shared item: unattributable.
+      expect(stacks.claudeKeychainServiceFor({ home: null, env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: "" } }, "/x"))
+        .toBeNull();
+    });
+  });
+
+  test("Codex: a keyring/auto credential store with no auth.json is unknown, not logged out (S19)", () => {
+    for (const store of ["keyring", "auto"]) {
+      const home = mkdtempSync(path.join(tmpdir(), "agetor-login-codex-keyring-"));
+      mkdirSync(path.join(home, ".codex"), { recursive: true });
+      writeFileSync(path.join(home, ".codex", "config.toml"), `cli_auth_credentials_store = "${store}"\n`);
+      expect(stacks.loginEvidence({ kind: "codex", home, env: {} } as never)).toBeNull();
+    }
+    const fileStore = mkdtempSync(path.join(tmpdir(), "agetor-login-codex-filestore-"));
+    mkdirSync(path.join(fileStore, ".codex"), { recursive: true });
+    writeFileSync(path.join(fileStore, ".codex", "config.toml"), `cli_auth_credentials_store = "file"\n`);
+    expect(stacks.loginEvidence({ kind: "codex", home: fileStore, env: {} } as never)).toBe(false);
+  });
+
+  test("Codex: an env-map HOME with no CODEX_HOME reads <HOME>/.codex (S17)", () => {
+    const realHome = mkdtempSync(path.join(tmpdir(), "agetor-login-codex-envhome-"));
+    mkdirSync(path.join(realHome, ".codex"), { recursive: true });
+    writeFileSync(path.join(realHome, ".codex", "auth.json"), "{}");
+    expect(stacks.loginEvidence({ kind: "codex", home: null, env: { HOME: realHome } } as never)).toBe(true);
   });
 
   test("a process-level cloud credential warns on stack creation (R15-S2)", () => {

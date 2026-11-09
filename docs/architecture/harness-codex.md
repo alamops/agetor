@@ -42,5 +42,18 @@ copies the rollout to the same relative path under the destination `CODEX_HOME`,
 exists (30 s timeout, best-effort), and resumes with `exec resume <threadId>`.
 A failed resume blocks the swap visibly rather than starting a fresh session.
 MCP OAuth tokens are not copied (no stable standalone file in `auto`/`file`
-mode); the swap warns that sign-in may need repeating. Full behaviour:
+mode); the swap warns that sign-in may need repeating. The mirror never imports
+the primary's login-bearing `config.toml` keys or `[model_providers.*]` tables.
+
+A limit signal comes only from a terminal `turn.failed` (its own message, or
+the classification remembered from the last top-level `error`). A top-level
+`error`, an `error` item and a non-JSON log line never signal, and
+`turn.completed` discards a remembered one, so a 429 that codex retried and
+recovered from is never a limit; the orchestrator also ignores a codex limit on
+a run that exited 0. Codex 0.166 reports quota in prose — "You've hit your usage
+limit. … try again at <date> <time>" (quota, with the reset parsed) and "Quota
+exceeded. Check your plan and billing details." (out of credits) — and the
+classifier matches that prose plus the snake_case codes (`usage_limit_reached`,
+`rate_limit_exceeded`, …) and honours a structured `codex_error_info` /
+`error.code` / `error.type` when one is present. Full behaviour:
 [harness-stacks.md](harness-stacks.md).

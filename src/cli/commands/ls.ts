@@ -107,6 +107,8 @@ export async function cmdLs(
     : null);
   const stackPositionByHarness = new Map<string, string>();
   for (const stack of harnessPayload?.stacks ?? []) {
+    // A one-member stack has nothing to fail over to: no `· 1/1` suffix.
+    if (stack.members.length < 2) continue;
     stack.members.forEach((m, i) => {
       stackPositionByHarness.set(m.harnessId, `${i + 1}/${stack.members.length}`);
     });
@@ -135,7 +137,7 @@ function titleCell(t: Task): string {
 /** Agent column: the raw harness id — always, regardless of whether the task
  *  is bound to an agent profile. The `--agent` filter above matches on the
  *  same `t.agent` field this renders; `· 2/3` is the account's position in
- *  its stack. */
+ *  its stack (only for a stack of two or more accounts). */
 function agentCell(t: Task, stackPositionByHarness: Map<string, string>): string {
   const raw = t.agent ?? "";
   const position = stackPositionByHarness.get(raw);

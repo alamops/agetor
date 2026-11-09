@@ -318,6 +318,7 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
           <StackBadge
             state={stackBadgeStateFor(task, stacks)}
             coolingUntilMs={limitStates.find((s) => s.harnessId === task.agent)?.exhaustedUntilMs ?? null}
+            running={task.column === "running"}
             className="shrink-0"
           />
         </div>

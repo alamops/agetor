@@ -12,7 +12,7 @@
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   HARNESS_STACK_KINDS,
   type Harness,
@@ -28,7 +28,14 @@ import {
   type Task,
 } from "../shared/types.ts";
 import { isHarnessAuthEnvKey, isLoginBearingSettingsKey } from "../shared/harness-mirror.ts";
-import { claudeConfigDirOverrideFor, codexHomeOverrideFor, resolveBin } from "./agents.ts";
+import { resolveBin } from "./agents.ts";
+import { childEnv, coreSpawnSync } from "./core-spawn.ts";
+import {
+  claudeConfigDirEnvFor,
+  claudeConfigDirFor,
+  codexHomeFor,
+  type HarnessRootSource,
+} from "./harness-config-root.ts";
 import { getHarnessDiscoveredModels } from "./agent-discovery.ts";
 import { readAccountFileText } from "./no-follow.ts";
 import { db, harnesses, tasks } from "./db.ts";
@@ -66,61 +73,15 @@ function resolveHarness(id: string): Harness | null {
  * The sub-fields of a harness that determine its on-disk config root. `env`
  * is optional so a caller may pass a `{ home }`-only fixture.
  */
-export interface HarnessHomeSource {
-  home: string | null;
-  env?: Record<string, string> | null;
-}
+export type HarnessHomeSource = HarnessRootSource;
 
-/**
- * The Claude config root for a harness (`CLAUDE_CONFIG_DIR` equivalent).
- *
- * The harness's own env map is authoritative when it pins
- * `CLAUDE_CONFIG_DIR`: `harnessEnv` (agents.ts) layers that map over the
- * home-derived value, so the CLI really reads there. Ignoring it here made the
- * mirror and the transcript transfer target the home-derived directory while
- * claude wrote to the env-pinned one (a swap then blocked on `no-session`).
- *
- * A home-less built-in inherits Agetor's own process env (`harnessEnv` writes
- * nothing for it), so a process-level `CLAUDE_CONFIG_DIR` is the account's
- * real root too. Resolve it here or mirror/transfer would read and write
- * `~/.claude` while the CLI uses the override (review R-S2).
- */
-export function claudeConfigDirFor(harness: HarnessHomeSource): string {
-  const pinned = claudeConfigDirOverrideFor(harness);
-  if (pinned) return pinned;
-  const fromProcess = process.env.CLAUDE_CONFIG_DIR;
-  if (fromProcess && fromProcess.trim() !== "") return fromProcess;
-  return path.join(homedir(), ".claude");
-}
-
-/**
- * The Codex state root for a harness (`CODEX_HOME`). Same precedence as
- * {@link claudeConfigDirFor}: the env map's own `CODEX_HOME` wins over the
- * home-derived `<home>/.codex`, and a home-less built-in falls back to the
- * process-level `CODEX_HOME` before `~/.codex` (review R-S2).
- */
-export function codexHomeFor(harness: HarnessHomeSource): string {
-  const pinned = codexHomeOverrideFor(harness);
-  if (pinned) return pinned;
-  const fromProcess = process.env.CODEX_HOME;
-  if (fromProcess && fromProcess.trim() !== "") return fromProcess;
-  return path.join(homedir(), ".codex");
-}
-
-/** The directory holding Claude's `.claude.json` blob. It lives directly in
- *  the account's config root when the harness pins one (`home`, an env
- *  `CLAUDE_CONFIG_DIR`, or the process-level override the built-in inherits);
- *  a built-in account keeps it in the real home, NOT in `~/.claude`. */
-export function claudeJsonDirFor(harness: HarnessHomeSource): string {
-  return claudeConfigDirOverrideFor(harness)
-    ?? (process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.trim() !== ""
-      ? process.env.CLAUDE_CONFIG_DIR
-      : null)
-    ?? homedir();
-}
+// One resolver per kind, shared with the spawn (`harnessEnv`), capability
+// discovery and the usage tracker: harness-config-root.ts. Re-exported here
+// for the mirror and transcript-transfer importers.
+export { claudeConfigDirFor, claudeJsonDirFor, codexHomeFor } from "./harness-config-root.ts";
 
 /** The per-kind config root a mirror/session copy reads and writes. */
-export function effectiveHome(harness: Harness): string {
+export function effectiveHome(harness: Pick<Harness, "kind" | "home" | "env">): string {
   return harness.kind === "claude-code" ? claudeConfigDirFor(harness) : codexHomeFor(harness);
 }
 
@@ -231,10 +192,95 @@ function readJsonObject(p: string): Record<string, unknown> | null {
   }
 }
 
+/** Outcome of an existence-only keychain lookup: found, not found, or
+ *  unknown (any error, a timeout, a locked keychain). */
+export type KeychainProbe = (service: string) => boolean | null;
+
+const KEYCHAIN_PROBE_TIMEOUT_MS = 2_000;
+const KEYCHAIN_PROBE_CACHE_MS = 60_000;
+/** `security` exits 44 (errSecItemNotFound) when no item has the service. */
+const SECURITY_ITEM_NOT_FOUND = 44;
+
+/**
+ * Ask the macOS keychain whether a generic-password item with this service
+ * exists. Existence only: no `-w`/`-g`, so the secret is never read (and no
+ * keychain ACL prompt can appear), and all output is discarded. The absolute
+ * `/usr/bin/security` keeps a binary an agent planted on PATH out of it.
+ */
+function securityItemExists(service: string): boolean | null {
+  try {
+    const result = coreSpawnSync("/usr/bin/security", ["find-generic-password", "-s", service], {
+      stdio: ["ignore", "ignore", "ignore"],
+      env: childEnv(),
+      timeout: KEYCHAIN_PROBE_TIMEOUT_MS,
+    });
+    if (result.error || result.signal) return null;
+    if (result.status === 0) return true;
+    if (result.status === SECURITY_ITEM_NOT_FOUND) return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Under `bun test` the real keychain is never consulted: a test that does
+ *  not inject a probe sees "no item", which keeps a credential-less fixture
+ *  account logged out exactly as on Linux. */
+function defaultKeychainProbe(service: string): boolean | null {
+  if (process.env.NODE_ENV === "test") return false;
+  return securityItemExists(service);
+}
+
+let loginEvidencePlatform: NodeJS.Platform | null = null;
+let keychainProbe: KeychainProbe = defaultKeychainProbe;
+const keychainProbeCache = new Map<string, { value: boolean | null; at: number }>();
+
+/** Test seam: pin the platform and/or the keychain probe (null restores the
+ *  defaults). Always clears the probe cache. */
+export function setLoginEvidenceDepsForTests(
+  deps: { platform?: NodeJS.Platform; keychainProbe?: KeychainProbe } | null,
+): void {
+  loginEvidencePlatform = deps?.platform ?? null;
+  keychainProbe = deps?.keychainProbe ?? defaultKeychainProbe;
+  keychainProbeCache.clear();
+}
+
+function cachedKeychainProbe(service: string, now = Date.now()): boolean | null {
+  const hit = keychainProbeCache.get(service);
+  if (hit && now - hit.at < KEYCHAIN_PROBE_CACHE_MS) return hit.value;
+  const value = keychainProbe(service);
+  keychainProbeCache.set(service, { value, at: now });
+  return value;
+}
+
+/**
+ * The macOS keychain service Claude Code stores a `CLAUDE_CONFIG_DIR`
+ * account's OAuth login under: `Claude Code-credentials-<first 8 hex of
+ * sha256(dir)>`, hashing the env value exactly as the CLI receives it (NFC,
+ * no resolve, a trailing slash changes it; verified against claude 2.1.319).
+ * A `CLAUDE_SECURESTORAGE_CONFIG_DIR` the spawn sees replaces the hashed dir;
+ * set but empty, it selects the unsuffixed default item, which cannot be
+ * attributed to this account, so the result is null (unknown).
+ */
+export function claudeKeychainServiceFor(harness: HarnessRootSource, configDir: string): string | null {
+  const secure = harness.env?.CLAUDE_SECURESTORAGE_CONFIG_DIR ?? process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+  const source = secure !== undefined ? secure : configDir;
+  if (!source) return null;
+  const hash = createHash("sha256").update(source.normalize("NFC")).digest("hex").slice(0, 8);
+  return `Claude Code-credentials-${hash}`;
+}
+
 /** Login evidence for a member: `true`/`false` when the kind has a check,
- *  `null` when it can't be known cheaply (the built-in Claude keychain, or a
- *  Bedrock/Vertex/custom-provider setup whose credential source is not a file
- *  under the account's config root). Only an explicit `false` skips a member.
+ *  `null` when it can't be known (the built-in Claude keychain item, a failed
+ *  keychain lookup, a Codex keyring login, or a Bedrock/Vertex/custom-provider
+ *  setup whose credential source is not a file under the account's config
+ *  root). Only an explicit `false` skips a member.
+ *
+ *  On macOS a pinned Claude config dir with no `.credentials.json` is decided
+ *  by an existence-only keychain lookup (`claudeKeychainEvidence`), cached for
+ *  a minute per service; the CLI keeps such a login there and writes no file.
+ *  It runs only off the runtime hot path: stack list/create/update warnings
+ *  and the failover planner's member check.
  *
  *  The account's own `settings.json` `env` block, its `harness.env` map and
  *  Agetor's process env are login sources exactly like `.credentials.json`: a
@@ -251,14 +297,12 @@ export function loginEvidence(harness: Harness): boolean | null {
   // (review M1). Ignoring it read a working cloud account as logged out.
   const processEnv = process.env as Record<string, unknown>;
   if (harness.kind === "claude-code") {
-    // The built-in account uses the macOS keychain, so there is no file to
-    // inspect. A home, an env `CLAUDE_CONFIG_DIR`, or a process-level
-    // `CLAUDE_CONFIG_DIR` (which the built-in inherits) pins a file-based
-    // config root — the same one the CLI reads (see `claudeConfigDirFor`).
-    const configDir = claudeConfigDirOverrideFor(harness)
-      ?? (process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.trim() !== ""
-        ? process.env.CLAUDE_CONFIG_DIR
-        : null);
+    // With no `CLAUDE_CONFIG_DIR` (the built-in account, or an env-map `HOME`
+    // alone) the login is the unsuffixed keychain item shared with the user's
+    // own claude, so it cannot be attributed: unknown. A home, an env
+    // `CLAUDE_CONFIG_DIR`, or a process-level one (which the built-in
+    // inherits) pins the config root the CLI reads (see `claudeConfigDirFor`).
+    const configDir = claudeConfigDirEnvFor(harness);
     if (!configDir) return null;
     // Presence, not regular-file-ness: a user may legitimately symlink the
     // credential file (a shared keychain file, a dotfiles manager). Counting
@@ -287,7 +331,7 @@ export function loginEvidence(harness: Harness): boolean | null {
     } else if (hasUninspectableLogin({ ...harnessEnv, ...processEnv }, "claude-code")) {
       return null;
     }
-    return false;
+    return claudeKeychainEvidence(harness, configDir);
   }
   if (harness.kind === "codex") {
     const configPath = path.join(codexHomeFor(harness), "config.toml");
@@ -304,6 +348,12 @@ export function loginEvidence(harness: Harness): boolean | null {
         // authenticate through its own env key, helper or cloud login; there
         // is no auth file to inspect, so fail open.
         if (parsed.model_provider !== undefined || isPlainObject(parsed.model_providers)) return null;
+        // `keyring` keeps the login in the OS keychain instead of `auth.json`,
+        // and `auto` does whenever a keychain is available. Its item is keyed
+        // by an account Agetor cannot attribute reliably, so the login is
+        // unknown, never "logged out" (review S19).
+        const store = parsed.cli_auth_credentials_store;
+        if (store === "keyring" || store === "auto") return null;
       } catch {
         // An unparseable config is not proof of a missing login.
         return null;
@@ -320,6 +370,21 @@ export function loginEvidence(harness: Harness): boolean | null {
     return false;
   }
   return null;
+}
+
+/**
+ * The last word on a pinned Claude config dir with no file/env/settings
+ * login: on macOS, Claude Code keeps a `CLAUDE_CONFIG_DIR` account's OAuth
+ * login in the keychain and writes no `.credentials.json` at all (review B1),
+ * so the item's existence decides. Elsewhere the credential file is the
+ * login, and its absence means logged out.
+ */
+function claudeKeychainEvidence(harness: Harness, configDir: string): boolean | null {
+  const platform = loginEvidencePlatform ?? process.platform;
+  if (platform !== "darwin") return false;
+  const service = claudeKeychainServiceFor(harness, configDir);
+  if (!service) return null;
+  return cachedKeychainProbe(service);
 }
 
 function isLoginBearingSettingsKeyIn(settings: Record<string, unknown>): boolean {
@@ -378,8 +443,9 @@ function memberRows(stackId?: string): MemberRow[] {
 /**
  * Map a stored membership row to its API shape. `position` is the caller's
  * contiguous rank, NOT the stored `harness_stack_members.position`: deleting
- * an account cascades its row away and leaves a gap in the stored ranks
- * (`0, 2`), which used to surface as an impossible "3/2" in the swap divider
+ * an account used to drop its row through a foreign-key cascade and leave a
+ * gap in the stored ranks (`0, 2`; `harnesses.delete` now deletes and
+ * renumbers explicitly, migration 085), which used to surface as an impossible "3/2" in the swap divider
  * and the card badge (review R13-M1). Deriving it from the surviving order
  * keeps every reader correct even against a database written before the
  * renumber-on-delete fix.
@@ -438,11 +504,19 @@ function stackWarnings(members: HarnessStackMember[], mirrorMode: HarnessMirrorM
   return warnings;
 }
 
-function toStack(row: StackRow): HarnessStack {
+/**
+ * Map a stored stack to its API shape. `warnings` (install probe, login
+ * evidence with its keychain lookup, the model catalog) are computed only when
+ * asked for: by `list()`, `get(id, { warnings: true })` and the create/update
+ * results. The runtime readers (`get`, `getByMember`, `resolveForTask`, used
+ * on every swap, retry, start and send) get `warnings: []` and stay a plain
+ * database read (review C6).
+ */
+function toStack(row: StackRow, opts: { warnings?: boolean } = {}): HarnessStack {
   const kind = isV1Kind(row.kind) ? row.kind : "claude-code";
   const mirrorMode: HarnessMirrorMode = row.mirror_mode === "safe" ? "safe" : "full";
-  // Re-rank from the surviving order: dropping an unresolvable row (or a
-  // cascade-deleted account leaving a gap in the stored rank) must not shift
+  // Re-rank from the surviving order: dropping an unresolvable row (or a gap
+  // a pre-085 cascade delete left in the stored rank) must not shift
   // the displayed position away from the array index every consumer
   // (`pickNextMember`, the notice, the badge) reads.
   const members: HarnessStackMember[] = [];
@@ -458,7 +532,7 @@ function toStack(row: StackRow): HarnessStack {
     members,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    warnings: stackWarnings(members, mirrorMode, kind),
+    warnings: opts.warnings ? stackWarnings(members, mirrorMode, kind) : [],
   };
 }
 
@@ -565,12 +639,15 @@ function memberIdsOf(stackId: string): string[] {
 }
 
 export const harnessStacks = {
+  /** Every stack, with its warnings (the Settings/CLI listing). */
   list(): HarnessStack[] {
-    return stackRows().map(toStack);
+    return stackRows().map((row) => toStack(row, { warnings: true }));
   },
-  get(id: string): HarnessStack | null {
+  /** One stack. `warnings` stays `[]` unless `{ warnings: true }` is passed:
+   *  the runtime reads this on every swap and must not probe accounts. */
+  get(id: string, opts: { warnings?: boolean } = {}): HarnessStack | null {
     const row = db.query<StackRow, [string]>(`SELECT * FROM harness_stacks WHERE id = ?`).get(id);
-    return row ? toStack(row) : null;
+    return row ? toStack(row, opts) : null;
   },
   /** The stack an account belongs to, or null. */
   getByMember(harnessId: string): HarnessStack | null {
@@ -581,7 +658,8 @@ export const harnessStacks = {
       .get(harnessId);
     return row ? this.get(row.stack_id) : null;
   },
-  /** Create a stack and its ordered memberships in one transaction. */
+  /** Create a stack and its ordered memberships in one transaction. The
+   *  result carries the draft's warnings. */
   create(input: HarnessStackInput): HarnessStack {
     const label = normalizeLabel(input.label);
     const validation = validateInput({ ...input, label });
@@ -601,10 +679,10 @@ export const harnessStacks = {
         );
       });
     })();
-    return this.get(id) as HarnessStack;
+    return { ...(this.get(id) as HarnessStack), warnings: validation.warnings };
   },
   /**
-   * Edit a stack. `members` defines the FULL ordered list; omit it to keep
+   * Edit a stack. The result carries the edited stack's warnings. `members` defines the FULL ordered list; omit it to keep
    * membership and order. Reorders are applied inside one transaction so
    * `UNIQUE(stack_id, position)` never sees a transient duplicate.
    */
@@ -631,7 +709,41 @@ export const harnessStacks = {
         );
       });
     })();
-    return this.get(id) as HarnessStack;
+    return { ...(this.get(id) as HarnessStack), warnings: validation.warnings };
+  },
+  /**
+   * Would saving `candidate` as harness `harnessId`'s home/env make it share a
+   * config root with another member of its stack (or leave the stack's kind)?
+   * Returns a user-facing error, or null when the edit is fine or the harness
+   * is in no stack. `PATCH /harnesses/:id` calls it before saving a stack
+   * member, since the same-root check at stack save cannot see a later edit
+   * (review S5). Roots compare by realpath, falling back to `path.resolve`.
+   */
+  validateMemberRoot(
+    harnessId: string,
+    candidate: { kind: string; home: string | null; env?: Record<string, string> | null },
+  ): string | null {
+    const stack = this.getByMember(harnessId);
+    if (!stack) return null;
+    const self = resolveHarness(harnessId);
+    const selfLabel = self?.label ?? harnessId;
+    if (candidate.kind !== stack.kind) {
+      return `${selfLabel} is in the ${stack.kind} stack "${stack.label}"; remove it from the stack before changing its kind.`;
+    }
+    const root = comparableHome(effectiveHome({
+      kind: candidate.kind as Harness["kind"],
+      home: candidate.home,
+      env: candidate.env ?? {},
+    }));
+    for (const member of stack.members) {
+      if (member.harnessId === harnessId || member.harnessId === self?.id) continue;
+      const other = resolveHarness(member.harnessId);
+      if (!other) continue;
+      if (comparableHome(effectiveHome(other)) === root) {
+        return `${selfLabel} would share its config directory with ${other.label} in the stack "${stack.label}"; every account in a stack needs its own.`;
+      }
+    }
+    return null;
   },
   /** Delete a stack; its task failover state becomes inert. Cooldowns and
    *  copied session files stay account-scoped. */

@@ -6,7 +6,9 @@ import path from "node:path";
 import { AGENT_OPTIONS, PIPELINE_LIMITS, type AgentKind, type AgentProfile, type AgentProfileSnapshot, type BacklogMessage, type BranchNamingConfig, type Handoff, type Harness, type HarnessQuota, type HarnessUsage, type ImportedClaudeSession, type ImportedOpencodeSession, type OpencodeServerMode, OPENCODE_SERVER_MODES, type Pipeline, type PipelineActiveStep, type PipelineBlock, type PipelineBlockKind, type PipelineGraph, type PipelineInput, type PipelineJoinArrival, type PipelinePendingLaunch, type PipelineRunSnapshot, type PipelineRunState, type PipelineRunStatus, type PipelineStepRecord, type Project, type SavedPrompt, type SentFileEntry, type Task, type TaskDraft, type TaskFxRecovery, type TaskPlan, type TaskReference, type TaskType, type Run, type RunEventStream, type Speed, type Subagent, type SubagentStatus } from "../shared/types.ts";
 import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts";
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
-import { parseTaskHarnessState, type TaskHarnessState } from "../shared/types.ts";
+import { HARNESS_STACK_CONTINUATION_TAG, parseTaskHarnessState, type TaskHarnessState } from "../shared/types.ts";
+import { isHarnessStackContinuation } from "../shared/harness-stack.ts";
+import { normalizeDeliveredUserText } from "../shared/user-message.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -2121,8 +2123,8 @@ export interface HarnessPatch {
 }
 
 /**
- * Re-pack a stack's stored ranks to `0..n-1` in their current order. The
- * `harnesses.delete` FK cascade removes one membership row and leaves a gap;
+ * Re-pack a stack's stored ranks to `0..n-1` in their current order.
+ * `harnesses.delete` removes one membership row and leaves a gap;
  * `UNIQUE(stack_id, position)` forbids renumbering in place, so the surviving
  * rows are rewritten inside the caller's transaction. A stack with no rows
  * left is a no-op (nothing to rank).
@@ -2295,25 +2297,28 @@ export const harnesses = {
     const current = this.get(id);
     if (!current) return;
     this.assertDeletable(id);
-    // Remember the stack before the membership row cascades away, so the
-    // surviving ranks can be made contiguous again. A gap (`0, 2`) would make
-    // the stored position an impossible "3/2" in the swap divider and the card
-    // badge (review R13-M1); the reader also re-ranks defensively, but the DB
-    // must not claim a rank that does not exist.
-    const membership = db
-      .query<{ stack_id: string }, [string]>(
-        `SELECT stack_id FROM harness_stack_members WHERE harness_id = ?`,
-      )
-      .get(id);
     db.transaction(() => {
+      // Remember the stack before the membership row goes, so the surviving
+      // ranks can be made contiguous again. A gap (`0, 2`) would make the
+      // stored position an impossible "3/2" in the swap divider and the card
+      // badge (review R13-M1); the reader also re-ranks defensively, but the
+      // DB must not claim a rank that does not exist.
+      const membership = db
+        .query<{ stack_id: string }, [string]>(
+          `SELECT stack_id FROM harness_stack_members WHERE harness_id = ?`,
+        )
+        .get(id);
       db.run(`DELETE FROM harnesses WHERE id = ?`, [id]);
       // Drop any cached usage snapshot so a deleted alias doesn't leave an
       // orphaned harness_usage row (the table has no FK cascade by design).
       db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [id]);
-      // Stack membership cascades via the FK on `harness_stack_members`. The
-      // cooldown is account-global and keyed by harness id with no FK, and the
-      // handoff table deliberately names a destination account without an FK
-      // (a historical handoff is not ownership), so both are deleted here.
+      // Stack membership has no FK to harnesses (085: a cascade would wipe
+      // every membership on the next harnesses table rebuild), so the row is
+      // deleted here, before the survivors are renumbered. The cooldown is
+      // account-global and keyed by harness id with no FK, and the handoff
+      // table deliberately names a destination account without an FK (a
+      // historical handoff is not ownership), so both are deleted here too.
+      db.run(`DELETE FROM harness_stack_members WHERE harness_id = ?`, [id]);
       db.run(`DELETE FROM harness_limit_state WHERE harness_id = ?`, [id]);
       harnessSessionHandoffs.deleteForHarness(id);
       if (membership) renumberStackPositions(membership.stack_id);
@@ -2409,24 +2414,37 @@ export const harnessSessionHandoffs = {
       .get(taskId, harnessId, column);
     return row ? toHandoff(row) : null;
   },
+  /**
+   * Record (or replace) the handoff for one (task, destination, column). The
+   * session id and timestamp are replaced, but `copiedPaths` is MERGED with
+   * the existing row's list (existing order first, duplicates dropped): a file
+   * an earlier transfer copied onto this account is still on disk, and
+   * dropping it from the allowlist would leak it past task delete, retention
+   * and harness delete (docs/architecture/harness-stacks.md). Read and write
+   * share one transaction so two upserts can't lose each other's paths.
+   */
   upsert(handoff: HarnessSessionHandoff): void {
-    db.run(
-      `INSERT INTO harness_session_handoffs
-         (task_id, harness_id, column_name, session_id, copied_paths_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(task_id, harness_id, column_name) DO UPDATE SET
-         session_id = excluded.session_id,
-         copied_paths_json = excluded.copied_paths_json,
-         created_at = excluded.created_at`,
-      [
-        handoff.taskId,
-        handoff.harnessId,
-        handoff.columnName,
-        handoff.sessionId,
-        JSON.stringify(handoff.copiedPaths),
-        handoff.createdAt,
-      ],
-    );
+    db.transaction(() => {
+      const existing = this.get(handoff.taskId, handoff.harnessId, handoff.columnName);
+      const copiedPaths = [...new Set([...(existing?.copiedPaths ?? []), ...handoff.copiedPaths])];
+      db.run(
+        `INSERT INTO harness_session_handoffs
+           (task_id, harness_id, column_name, session_id, copied_paths_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(task_id, harness_id, column_name) DO UPDATE SET
+           session_id = excluded.session_id,
+           copied_paths_json = excluded.copied_paths_json,
+           created_at = excluded.created_at`,
+        [
+          handoff.taskId,
+          handoff.harnessId,
+          handoff.columnName,
+          handoff.sessionId,
+          JSON.stringify(copiedPaths),
+          handoff.createdAt,
+        ],
+      );
+    })();
   },
   deleteForHarness(harnessId: string): void {
     db.run(`DELETE FROM harness_session_handoffs WHERE harness_id = ?`, [harnessId]);
@@ -3192,6 +3210,24 @@ export function clampWindowByBytes(
  * tests, so "does the span fit" can't drift between the two surfaces. Pure
  * and DB-free, like `clampWindowByBytes`.
  */
+/** Page size for `runs.lastUserEventId`'s newest-first walk. */
+const LAST_USER_ANCHOR_PAGE = 8;
+const CONTINUATION_OPEN_TAG = `<${HARNESS_STACK_CONTINUATION_TAG}>`;
+
+/**
+ * True when a stored `user` event is a harness-stack continuation that every
+ * renderer hides: the exact wrapper, either as sent (the live echo) or after
+ * claude's `<pasted_content>` delivery wrapper is peeled (its JSONL twin).
+ * The same two checks the renderers run (`userMessageLines`,
+ * `cleanMessageText`), so the first-load anchor never lands on a row the
+ * transcript does not show.
+ */
+export function isHiddenContinuationUserText(raw: string): boolean {
+  if (!raw.includes(CONTINUATION_OPEN_TAG)) return false;
+  const text = raw.replace(/\r\n?/g, "\n");
+  return isHarnessStackContinuation(text) || isHarnessStackContinuation(normalizeDeliveredUserText(text));
+}
+
 export function resolveAnchoredMinId(args: {
   minId: number;
   anchorId: number | null;
@@ -3900,23 +3936,44 @@ export const runs = {
    * every started task has at least its prompt echo, so this is a few ms in
    * practice; a partial index on `(run_id, stream, id DESC)` would make it
    * terminate inside the task's own runs if that ever changes.
+   *
+   * A harness-stack continuation (agetor's own hidden send after an account
+   * swap, docs/architecture/harness-stacks.md) is never the anchor: every
+   * renderer hides it, so anchoring on it would cut the window just above an
+   * invisible row and drop the user's real last message out of the first
+   * load. The query reads the newest `LAST_USER_ANCHOR_PAGE` user rows with a
+   * cheap `instr` flag for the tag, re-reads the full text of a flagged row by
+   * primary key, and pages further back (same index, `id < last`) only when
+   * every row on the page is a hidden continuation, which a task only has one
+   * of per swap.
    */
   lastUserEventId(taskId: string, beforeId?: number): number | null {
-    const conditions = ["runs.task_id = ?", "run_events.stream = 'user'", "run_events.subagent_id IS NULL"];
-    const params: Array<string | number> = [taskId];
-    if (beforeId != null) {
-      conditions.push("run_events.id < ?");
-      params.push(beforeId);
+    let cursor = beforeId;
+    for (;;) {
+      const conditions = ["runs.task_id = ?", "run_events.stream = 'user'", "run_events.subagent_id IS NULL"];
+      const params: Array<string | number> = [CONTINUATION_OPEN_TAG, taskId];
+      if (cursor != null) {
+        conditions.push("run_events.id < ?");
+        params.push(cursor);
+      }
+      const rows = db.query<{ id: number; flagged: number }, Array<string | number>>(
+        `SELECT run_events.id as id, instr(run_events.data, ?) > 0 as flagged
+         FROM run_events
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY run_events.id DESC
+         LIMIT ${LAST_USER_ANCHOR_PAGE}`,
+      ).all(...params);
+      for (const row of rows) {
+        if (!row.flagged) return row.id;
+        const data = db
+          .query<{ data: string }, [number]>(`SELECT data FROM run_events WHERE id = ?`)
+          .get(row.id)?.data;
+        if (data == null || !isHiddenContinuationUserText(data)) return row.id;
+      }
+      if (rows.length < LAST_USER_ANCHOR_PAGE) return null;
+      cursor = rows[rows.length - 1]!.id;
     }
-    const row = db.query<{ id: number }, Array<string | number>>(
-      `SELECT run_events.id as id
-       FROM run_events
-       JOIN runs ON runs.id = run_events.run_id
-       WHERE ${conditions.join(" AND ")}
-       ORDER BY run_events.id DESC
-       LIMIT 1`,
-    ).get(...params);
-    return row ? row.id : null;
   },
   /**
    * Returns the stored `{ id, ts }`, or `null` when nothing was actually

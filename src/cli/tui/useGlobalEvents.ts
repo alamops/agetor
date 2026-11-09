@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { streamSse } from "../sse.ts";
 import type { GlobalEvent } from "../../shared/types.ts";
 import { eventPipelineParentId } from "../notify.ts";
+import { escapeFreeText } from "../../shared/terminal-text.ts";
 
 export interface Toast {
   text: string;
@@ -73,8 +74,10 @@ export function toastFor(e: GlobalEvent, hiddenTaskIds?: ReadonlySet<string>): T
   }
   if (e.kind === "harness-swap") {
     if (hidden(e.taskId)) return null;
+    // The label is stored as typed: escape it before it reaches the terminal.
     return {
-      text: `⇄ ${short(e.taskId)} switched to ${e.toLabel} (${e.position}/${e.count})`,
+      // No `(1/1)` for a one-member stack's same-account retry (review N1).
+      text: `⇄ ${short(e.taskId)} switched to ${escapeFreeText(e.toLabel)}${e.count < 2 ? "" : ` (${e.position}/${e.count})`}`,
       color: "cyan",
     };
   }
@@ -85,7 +88,7 @@ export function toastFor(e: GlobalEvent, hiddenTaskIds?: ReadonlySet<string>): T
       : e.reason === "harness-exhausted"
         ? " (stack out of quota)"
         : e.reason === "harness-swap-failed"
-          ? " (no usable backup)"
+          ? " (no usable backup account)"
           : "";
     return { text: `! ${short(e.taskId)} needs you${why}`, color: "yellow" };
   }

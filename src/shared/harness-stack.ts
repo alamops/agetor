@@ -42,11 +42,14 @@ export function harnessStackBannerMode(
 }
 
 /** `"2/3"` for the account's 1-based position in the stack, or null when the
- *  account is not a member. */
+ *  account is not a member — and null for a stack with fewer than two
+ *  members: a 0/1-member stack is inert (no failover), so a `1/1` chip would
+ *  promise a backup that does not exist. */
 export function stackPositionText(
   stack: Pick<HarnessStack, "members">,
   harnessId: string,
 ): string | null {
+  if (stack.members.length < 2) return null;
   const index = stack.members.findIndex((m) => m.harnessId === harnessId);
   if (index < 0) return null;
   return `${index + 1}/${stack.members.length}`;
@@ -269,16 +272,42 @@ export function wrapHarnessStackContinuation(text: string): string {
   return `<${HARNESS_STACK_CONTINUATION_TAG}>\n${text.replace(/\r\n?/g, "\n")}\n</${HARNESS_STACK_CONTINUATION_TAG}>`;
 }
 
+/** The fixed instruction body of the transfer branch's hidden prompt. */
+export const HARNESS_STACK_CONTINUATION_INSTRUCTION =
+  "Continue the task from where it stopped. The previous account reached its usage limit; no work was lost. "
+  + "Do not repeat completed steps, re-read files you already changed, or ask the user to confirm. "
+  + "Pick up the next action.";
+
+/** The line that introduces messages the user typed into the limited turn
+ *  that never reached its transcript (see
+ *  {@link composeHarnessStackContinuationPrompt}). */
+export const HARNESS_STACK_UNDELIVERED_LEAD =
+  "The user also sent these messages before the switch; they were not delivered yet:";
+
 /**
  * The transfer branch's hidden prompt. No product name and no added user-facing
  * text beyond this documented exception (owner decision, grill 24): the model
  * is told not to repeat completed work after a mid-turn resume.
+ *
+ * `undelivered` carries follow-ups the user typed into the limited turn that
+ * never reached the copied transcript (Claude queues a mid-turn paste in its
+ * input box until the turn ends, and the swap drops that REPL). They are the
+ * user's own words, appended verbatim after one neutral lead line, so the
+ * successor still acts on them; without them they were silently lost (review
+ * S16). An empty list yields exactly the documented fixed prompt. A message
+ * that quotes the tag itself gets a space after its `<`/`</` so the composed
+ * value stays exactly one wrapper (a nested tag would stop
+ * {@link isHarnessStackContinuation} recognising it and leak the hidden
+ * prompt as a visible bubble).
  */
-export function composeHarnessStackContinuationPrompt(): string {
+export function composeHarnessStackContinuationPrompt(undelivered: readonly string[] = []): string {
+  const tagRe = new RegExp(`<(/?)${HARNESS_STACK_CONTINUATION_TAG}>`, "g");
+  const messages = undelivered
+    .map((m) => m.replace(/\r\n?/g, "\n").trim().replace(tagRe, (_m, slash: string) => `< ${slash}${HARNESS_STACK_CONTINUATION_TAG}>`))
+    .filter((m) => m !== "");
+  if (messages.length === 0) return wrapHarnessStackContinuation(HARNESS_STACK_CONTINUATION_INSTRUCTION);
   return wrapHarnessStackContinuation(
-    "Continue the task from where it stopped. The previous account reached its usage limit; no work was lost. "
-      + "Do not repeat completed steps, re-read files you already changed, or ask the user to confirm. "
-      + "Pick up the next action.",
+    `${HARNESS_STACK_CONTINUATION_INSTRUCTION}\n\n${HARNESS_STACK_UNDELIVERED_LEAD}\n\n${messages.join("\n\n")}`,
   );
 }
 

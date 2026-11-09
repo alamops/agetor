@@ -1,4 +1,7 @@
 import { test, expect } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { USAGE, canonical, usageError, helpFor, parseSpeedFlag } from "./usage.ts";
 
 const COMMANDS = [
@@ -203,3 +206,45 @@ test("the answer help documents --reason and --skip", () => {
   expect(block).toContain("the action and the agent continues");
   expect(block).not.toContain("stops");
 });
+
+test("helpFor resolves a third-level block (harness stack create) and falls back level by level (review S23)", () => {
+  expect(helpFor("harness", "stack", "create")).toBe(USAGE["harness stack create"]);
+  expect(helpFor("harness", "stack", "edit")).toBe(USAGE["harness stack edit"]);
+  expect(helpFor("harness", "stack", "show")).toBe(USAGE["harness stack show"]);
+  expect(helpFor("harness", "stack", "rm")).toBe(USAGE["harness stack rm"]);
+  // A third word that names no block (a positional) keeps the two-word block.
+  expect(helpFor("harness", "stack", "frobnicate")).toBe(USAGE["harness stack"]);
+  expect(helpFor("harness", "add", "my-id")).toBe(USAGE["harness add"]);
+  expect(helpFor("harness", "rm", "my-id")).toBe(USAGE["harness"]);
+});
+
+test("safe mirror wording says exactly what is skipped and what is still mirrored (review S6)", () => {
+  const sentence = "Safe skips settings hooks, permissions, status line and helper commands (Codex: notify); plugins and MCP servers are still mirrored.";
+  const flat = (key: string) => USAGE[key]!.replace(/\s+/g, " ");
+  expect(flat("harness stack create")).toContain(sentence);
+  expect(flat("harness stack edit")).toContain(sentence);
+  expect(flat("harness stack create")).not.toContain("other executable sections");
+});
+
+test("`agetor harness stack create --help` prints the create block, not the parent block (review S23)", () => {
+  // --help returns before any core is discovered or booted; the fresh
+  // --data-dir is belt and braces so this can never reach a live core.
+  const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-help-"));
+  try {
+    const run = (...args: string[]) => {
+      const res = Bun.spawnSync(
+        [process.execPath, path.resolve(import.meta.dir, "index.ts"), "--no-daemon", "--data-dir", dataDir, ...args],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      expect(res.exitCode).toBe(0);
+      return res.stdout.toString();
+    };
+    const create = run("harness", "stack", "create", "--help");
+    expect(create).toContain("usage: agetor harness stack create");
+    expect(create).not.toContain("usage: agetor harness stack <ls");
+    expect(run("help", "harness", "stack", "edit")).toContain("usage: agetor harness stack edit");
+    expect(run("harness", "stack", "--help")).toContain("usage: agetor harness stack <ls");
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+}, 30_000);

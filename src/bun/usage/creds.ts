@@ -11,40 +11,35 @@
  */
 
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import path from "node:path";
 import type { Harness } from "../../shared/types.ts";
 import { coreSpawn } from "../core-spawn.ts";
+import { claudeConfigDirEnvFor, claudeConfigDirOverrideFor, claudeJsonDirFor } from "../harness-config-root.ts";
 import { readAccountFileText } from "../no-follow.ts";
 
 /** Upper bound on a `.credentials.json` we parse — a token blob is ~1 KB. */
 const CREDENTIALS_MAX_BYTES = 1024 * 1024;
 
-/** The Claude config root this harness actually reads: the harness env map's
- *  `CLAUDE_CONFIG_DIR` wins over `home`, and a home-less built-in inherits
- *  the process-level override (matching `harnessEnv` and `jsonlPathFor`).
+/** The Claude config root this harness pins — the shared resolver that
+ *  mirrors `harnessEnv` (harness-config-root.ts): the env map's
+ *  `CLAUDE_CONFIG_DIR` wins over `home`, a home-less built-in inherits the
+ *  process-level override, and an env-map `HOME` alone pins `<HOME>/.claude`.
  *  Null only for a built-in with no override at all (keychain + `~/.claude`). */
 function claudeConfigRoot(harness: Harness): string | null {
-  const fromEnv = harness.env?.CLAUDE_CONFIG_DIR;
-  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
-  if (harness.home) return harness.home;
-  const fromProcess = process.env.CLAUDE_CONFIG_DIR;
-  return fromProcess && fromProcess.trim() !== "" ? fromProcess : null;
+  return claudeConfigDirEnvFor(harness) ?? claudeConfigDirOverrideFor(harness);
 }
 
 /**
  * Path to the `.claude.json` claude reads/writes for this harness.
- *  - main with no override: `~/.claude.json` — HOME is untouched for this
- *    harness, so this is the CLI's real config file.
+ *  - main with no override: `~/.claude.json` (`<HOME>/.claude.json` when the
+ *    env map sets HOME) — the CLI's real config file.
  *  - any pinned config dir (`home`, an env `CLAUDE_CONFIG_DIR`, or the
  *    process-level override the built-in inherits): `<dir>/.claude.json` —
  *    claude treats `CLAUDE_CONFIG_DIR` as the `.claude/` equivalent, and
  *    `.claude.json` lives directly under it (not nested under `.claude/`).
  */
 export function claudeDotJsonPath(harness: Harness): string {
-  const root = claudeConfigRoot(harness);
-  if (root) return path.join(root, ".claude.json");
-  return path.join(homedir(), ".claude.json");
+  return path.join(claudeJsonDirFor(harness), ".claude.json");
 }
 
 /**

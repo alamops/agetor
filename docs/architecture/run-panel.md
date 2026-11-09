@@ -15,9 +15,18 @@ A dropped task stream reconnects with `Last-Event-ID` and resumes: the subscript
 
 ## Harness stacks
 
-The task header shows the active account with its position (`2/3`), a
+The task header shows the active account with its position (`2/3`; no
+position for a stack of fewer than two accounts, which is inert), a
 "Switching to …" line while `harnessState.pendingSwap` is set, and an
-all-exhausted banner with a live countdown (reset on `task.id`). A `status`
+all-exhausted banner with a live countdown (reset on `task.id`) and a **Run
+now** action. While the retry run itself is live (`allExhausted.inFlight` or
+the card is `running`) the banner reads "Running on <account> after a quota
+reset (attempt n/3)." and offers no Run now (`harnessStackBannerView`,
+`src/mainview/lib/harness-stack-banner.ts`). A same-kind account switch in the
+account picker PATCHes only `{ agent }`, so mode, model, effort, speed and Max
+mode survive; a cross-kind switch resets them to the kind defaults
+(`agentSwitchPatch`). In sticky-user-message mode the hidden continuation does
+not open a section. A `status`
 event with the `harness-swap:` prefix renders as a divider carrying the exact
 notice plus `(2/3)`; a `user` event that is exactly the hidden
 `<harness-stack-continuation>` wrapper renders nothing. The panel takes an

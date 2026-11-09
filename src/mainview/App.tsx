@@ -68,6 +68,7 @@ import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, dismissTaskToast, hasPendingToast, notifyFilesSent, notifyWaitingInput, toastApiError, toastError, toastFxAutoResumeExhausted, toastFxAutoResumeFired, toastHarnessExhausted, toastHarnessSwap, toastHarnessUnusable, toastPending, toastPipelineReview, toastSendFailed, toastSessionEnded, toastSuccess, toastUnknownCommand, type ToastArgs } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
+import { runStatusToastKind } from "@/lib/run-status-toast";
 import { OwedPipelineAlerts } from "@/lib/owed-pipeline-alerts";
 import { findTaskById } from "@/lib/notification-open";
 import { publishCloneProgress } from "@/lib/clone-progress";
@@ -1690,16 +1691,12 @@ function AppInner() {
         // would defeat the double-notify suppression below. The parent's own
         // `pipeline` status transitions own that toast's lifecycle instead.
         if (!stepParentId) {
-          if (ev.status === "succeeded") {
+          // `runStatusToastKind` keeps a harness-stack failover settle
+          // (`harness-swap` / `harness-exhausted`) from reading as "Task failed".
+          const toastKind = runStatusToastKind(ev);
+          if (toastKind === "success") {
             toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
-          } else if (
-            (ev.status === "failed" || ev.status === "orphaned")
-            && ev.reason !== "harness-swap"
-            && ev.reason !== "harness-exhausted"
-          ) {
-            // A harness-stack failover records the old run failed while the
-            // task keeps running; the blocked-column toast owns the
-            // exhausted case. Neither should read as "Task failed".
+          } else if (toastKind === "error") {
             toastError({
               taskId: ev.taskId,
               title,

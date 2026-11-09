@@ -2,7 +2,7 @@
 // account settles the old run, transfers the conversation and keeps the task
 // running on the backup. Nothing here touches a real CLI.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -18,6 +18,10 @@ const FAKE_CLAUDE_API_LIMIT_PROMPT_MARKER = "__agetor_fake_claude_api_limit__";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-harness-swap-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
+// Every other env var this file sets is restored in afterAll: `bun test` runs
+// every file in one process (review S25).
+const ENV_KEYS = ["AGETOR_CLAUDE_DRIVER", "AGETOR_CLAUDE_BIN", "AGETOR_TMUX_BIN", "AGETOR_CODEX_DRIVER", "AGETOR_CODEX_BIN"] as const;
+const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 const binDir = mkdtempSync(path.join(tmpdir(), "agetor-harness-swap-bin-"));
@@ -47,7 +51,18 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // No retry timer armed by these tests may outlive the file: clear every
+  // seeded schedule and stop the timers before restoring anything else.
+  for (const task of db.tasks.list()) {
+    if (task.harnessState?.allExhausted) db.tasks.setHarnessState(task.id, { ...task.harnessState, allExhausted: null });
+  }
+  failover.stopAllAutoRetryTimers();
   restore();
+  for (const key of ENV_KEYS) {
+    if (savedEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = savedEnv[key];
+  }
+  rmSync(binDir, { recursive: true, force: true });
   const { rmTestDataDir } = await import("./test-data-dir.ts");
   rmTestDataDir(DATA_DIR);
 });
@@ -191,6 +206,66 @@ describe("harness-stack swap", () => {
     expect(final.harnessState?.pendingSwap ?? null).toBeNull();
     stacks.harnessStacks.delete(stack.id);
   }, 15_000);
+
+  test("a Codex quota limit (the real CLI prose) swaps and resumes the transferred rollout on the backup (S24)", async () => {
+    const FAKE_CODEX_LIMIT_PROMPT_MARKER = "__agetor_fake_codex_limit__";
+    const idA = `codex-swap-a-${seq}`;
+    const idB = `codex-swap-b-${seq}`;
+    const codexHome = (id: string): string => {
+      const dir = path.join(DATA_DIR, "harnesses", id);
+      // `CODEX_HOME` = `<home>/.codex`; `auth.json` is the login evidence.
+      mkdirSync(path.join(dir, ".codex"), { recursive: true });
+      writeFileSync(path.join(dir, ".codex", "auth.json"), "{}");
+      if (!db.harnesses.get(id)) db.harnesses.insert({ id, kind: "codex", label: id, home: dir, env: {} } as never);
+      return path.join(dir, ".codex");
+    };
+    const rootA = codexHome(idA);
+    const rootB = codexHome(idB);
+    const stack = stacks.harnessStacks.create({ label: "codex-swap", kind: "codex", members: [idA, idB] });
+    const prevDriver = process.env.AGETOR_CODEX_DRIVER;
+    const prevBin = process.env.AGETOR_CODEX_BIN;
+    process.env.AGETOR_CODEX_DRIVER = "fake";
+    process.env.AGETOR_CODEX_BIN = "/bin/echo";
+    try {
+      // No floor for this model id, so /bin/echo's non-version output never
+      // blocks the pre-flight.
+      const task = makeTask(idA, `quota ${FAKE_CODEX_LIMIT_PROMPT_MARKER}`, { model: "fixture-codex-model" } as Partial<Task>);
+      // The fake codex driver reports thread `fake-codex-thread-<task>` (what a
+      // real `thread.started` would deliver); plant its rollout where codex
+      // lays it out, so the transfer copies a real file.
+      const threadId = `fake-codex-thread-${task.id}`;
+      const rel = path.join("sessions", "2026", "11", "08", `rollout-2026-11-08T00-00-00-${threadId}.jsonl`);
+      mkdirSync(path.dirname(path.join(rootA, rel)), { recursive: true, mode: 0o700 });
+      writeFileSync(path.join(rootA, rel), `${JSON.stringify({ type: "session_meta", payload: { id: threadId } })}\n`, { mode: 0o600 });
+
+      const started = await orch.startTask(task.id);
+      expect(started).toHaveProperty("runId");
+      await waitFor(() => db.runs.listForTask(task.id).length >= 2 && db.runs.listForTask(task.id).every((r) => r.status !== "running"), 10_000);
+
+      const runs = [...db.runs.listForTask(task.id)].sort((a, b) => a.startedAt - b.startedAt);
+      expect(runs).toHaveLength(2);
+      expect(runs[0]!.agent).toBe(idA);
+      expect(runs[0]!.status).toBe("failed");
+      expect(runs[1]!.agent).toBe(idB);
+      expect(runs[1]!.origin).toBe("harness-swap");
+      // The successor resumes the transferred thread on B.
+      expect(runs[1]!.codexSessionId).toBe(threadId);
+      expect(existsSync(path.join(rootB, rel))).toBe(true);
+      expect(db.harnessSessionHandoffs.get(task.id, idB, "codex_session_id")?.sessionId).toBe(threadId);
+      // The real prose classified as quota with the parsed 3 PM reset.
+      const cooldown = stacks.harnessStacks.getLimitState(idA);
+      expect(cooldown?.reason).toBe("quota");
+      expect(db.tasks.get(task.id)!.agent).toBe(idB);
+    } finally {
+      stacks.harnessStacks.clearLimitState(idA);
+      stacks.harnessStacks.clearLimitState(idB);
+      stacks.harnessStacks.delete(stack.id);
+      if (prevDriver === undefined) delete process.env.AGETOR_CODEX_DRIVER;
+      else process.env.AGETOR_CODEX_DRIVER = prevDriver;
+      if (prevBin === undefined) delete process.env.AGETOR_CODEX_BIN;
+      else process.env.AGETOR_CODEX_BIN = prevBin;
+    }
+  }, 20_000);
 
   test("a stacked Claude 429 API error swaps without ever painting a blocked api-error", async () => {
     const idA = `api-limit-a-${seq}`;
@@ -460,12 +535,17 @@ describe("harness-stack swap", () => {
       expect(observedTaskId).toBe(task.id);
       stacks.harnessStacks.update(stack.id, { members: [idB, idC] });
     });
+    // Platform-independent login evidence: on darwin a credential-less
+    // config dir would otherwise fall through to a keychain probe. Pin a
+    // platform where the missing `.credentials.json` is the whole answer.
+    stacks.setLoginEvidenceDepsForTests({ platform: "linux" });
     try {
       const started = await orch.startTask(task.id);
       expect(started).toHaveProperty("runId");
       await waitFor(() => db.tasks.get(task.id)?.column === "blocked");
     } finally {
       orch.__setHarnessLimitObservedHookForTest(prev);
+      stacks.setLoginEvidenceDepsForTests(null);
     }
 
     const after = db.tasks.get(task.id)!;
@@ -1091,6 +1171,8 @@ describe("harness-stack swap", () => {
     expect(orch.hasPendingHarnessRetry(task.id)).toBe(false);
     expect(db.tasks.get(task.id)!.harnessState!.allExhausted).toBeNull();
     expect(orch.cancelHarnessRetryForTask(task.id)).toBe(false);
+    // The handle itself is gone, not merely a state the callback would ignore.
+    expect(failover.hasArmedAutoRetry(task.id)).toBe(false);
 
     await new Promise((r) => setTimeout(r, 150));
     // The timer was cleared, not fired: no run appeared.
@@ -1123,7 +1205,10 @@ describe("harness-stack swap", () => {
 
     const runs = db.runs.listForTask(task.id);
     expect(runs).toHaveLength(1);
-    expect(runs[0]!.status).toBe("failed");
+    // The user's Stop is the outcome (review Q5): `cancelled`, so a pipeline
+    // step settles like any user Stop instead of reading the `ready` fallback
+    // as a failure.
+    expect(runs[0]!.status).toBe("cancelled");
     const after = db.tasks.get(task.id)!;
     expect(after.column).toBe("ready");
     expect(after.agent).toBe(idA);
@@ -1203,18 +1288,30 @@ describe("harness-stack swap", () => {
     // The pane notice leaves the REPL parked; model that state explicitly.
     claude.__forTest.installSession(task.id, path.join(DATA_DIR, "pane-session.jsonl"));
 
+    let observed = 0;
     const prev = orch.__setHarnessLimitObservedHookForTest((observedTaskId) => {
       orch.__setHarnessLimitObservedHookForTest(null);
       expect(observedTaskId).toBe(task.id);
+      observed++;
       // No swap target left when the settlement resolves (M1 window).
       stacks.harnessStacks.delete(stack.id);
     });
     try {
       await orch.startTask(task.id);
-      await waitFor(() => db.runs.listForTask(task.id).every((r) => r.status !== "running"));
+      await waitFor(() => {
+        const rows = db.runs.listForTask(task.id);
+        return rows.length > 0 && rows.every((r) => r.status !== "running");
+      });
     } finally {
       orch.__setHarnessLimitObservedHookForTest(prev);
     }
+
+    // The limit really reached the settlement (a run that never limited would
+    // also leave no session), and the passthrough minted no successor.
+    expect(observed).toBe(1);
+    const rows = db.runs.listForTask(task.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.status).toBe("failed");
 
     // The normal settle owns the run now; the paused session must not survive
     // to swallow the next message into a REPL waiting on a limit nobody will
@@ -1257,6 +1354,11 @@ describe("harness-stack swap", () => {
     expect(after.column).toBe("ready");
     expect(after.agent).toBe(idA);
     expect(after.harnessState ?? null).toBeNull();
+    // Neutral wording with no stack jargon: the task is no longer in one
+    // (review N2).
+    const lines = statusLines(runs[0]!.id);
+    expect(lines.some((l) => l.startsWith("account limit reached (usage limit)"))).toBe(true);
+    expect(lines.some((l) => l.includes("not in a stack"))).toBe(false);
   }, 15_000);
 
   test("a refused archive keeps an armed failover retry and its lap state", async () => {
@@ -1328,9 +1430,12 @@ describe("harness-stack swap", () => {
     expect(
       orch.isRawTextLimitChunk("claude-code", "status", "api error: HTTP 429 Too Many Requests"),
     ).toBe(true);
-    // Codex's error vocabulary is a genuine error body and remains eligible.
-    expect(orch.isRawTextLimitChunk("codex", "stderr", "rate_limit_exceeded")).toBe(true);
-    expect(orch.isRawTextLimitChunk("codex", "status", "usage_limit_exceeded")).toBe(true);
+    // Codex is never classified from raw text (contract C1): its stderr and
+    // status carry retried transport errors and MCP tool errors that mention
+    // 429 on turns that then complete. Only the structured signal counts.
+    expect(orch.isRawTextLimitChunk("codex", "stderr", "rate_limit_exceeded")).toBe(false);
+    expect(orch.isRawTextLimitChunk("codex", "status", "usage_limit_exceeded")).toBe(false);
+    expect(orch.isRawTextLimitChunk("codex", "stderr", "You've hit your usage limit. Try again at 3:00 PM.")).toBe(false);
     // A non-error Claude stream is never classified.
     expect(orch.isRawTextLimitChunk("claude-code", "assistant", "api error: HTTP 429")).toBe(false);
   });

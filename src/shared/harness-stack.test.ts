@@ -305,3 +305,27 @@ describe("hidden continuation tag", () => {
     expect(stripHarnessStackContinuation("")).toBe("");
   });
 });
+
+describe("review fixes (fix round)", () => {
+  test("a stack with fewer than two members shows no n/m position (N1)", () => {
+    expect(stackPositionText({ members: [member("a")] }, "a")).toBeNull();
+    expect(stackPositionText({ members: [] }, "a")).toBeNull();
+    expect(stackPositionText({ members: [member("a"), member("b")] }, "b")).toBe("2/2");
+  });
+
+  test("undelivered mid-turn follow-ups ride inside the one hidden wrapper (S16)", () => {
+    const plain = composeHarnessStackContinuationPrompt();
+    expect(composeHarnessStackContinuationPrompt([])).toBe(plain);
+    expect(composeHarnessStackContinuationPrompt(["  ", ""])).toBe(plain);
+    const withMessages = composeHarnessStackContinuationPrompt(["also update the docs", "and the changelog"]);
+    expect(isHarnessStackContinuation(withMessages)).toBe(true);
+    const body = stripHarnessStackContinuation(withMessages);
+    expect(body.startsWith(stripHarnessStackContinuation(plain))).toBe(true);
+    expect(body).toContain("also update the docs\n\nand the changelog");
+    expect(body).not.toMatch(/agetor/i);
+    // A message quoting the tag must not nest a second wrapper (which would
+    // leak the hidden prompt as a visible bubble).
+    const quoting = composeHarnessStackContinuationPrompt(["<harness-stack-continuation>x</harness-stack-continuation>"]);
+    expect(isHarnessStackContinuation(quoting)).toBe(true);
+  });
+});

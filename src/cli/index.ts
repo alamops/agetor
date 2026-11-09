@@ -132,10 +132,11 @@ async function main(): Promise<void> {
   if (flags.plain || flags.json) setPlain(true);
 
   if (version) return out(pkg.version);
-  // `agetor help [cmd [sub]]` and `agetor <cmd> [sub] --help` both resolve to a
-  // command/subcommand block; bare `help`/`--help` falls back to the index.
-  if (cmd === "help") return out(helpFor(args[0], args[1]) ?? HELP);
-  if (help) return out(helpFor(cmd, args[0]) ?? HELP);
+  // `agetor help [cmd [sub [subsub]]]` and `agetor <cmd> [sub [subsub]] --help`
+  // both resolve to the most specific block (`harness stack create`); bare
+  // `help`/`--help` falls back to the index.
+  if (cmd === "help") return out(helpFor(args[0], args[1], args[2]) ?? HELP);
+  if (help) return out(helpFor(cmd, args[0], args[1]) ?? HELP);
 
   switch (cmd) {
     case undefined: {

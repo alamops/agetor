@@ -15,16 +15,32 @@ let dbm: Db;
 let fo: Fo;
 let stacks: typeof import("./harness-stacks.ts");
 let restore: () => void;
+let prevHooks: import("./harness-failover.ts").FailoverHooks | null = null;
+const seededTaskIds: string[] = [];
 
 beforeAll(async () => {
   dbm = await import("./db.ts");
   fo = await import("./harness-failover.ts");
   stacks = await import("./harness-stacks.ts");
   restore = (await import("./test-harness-state.ts")).snapshotHarnessState();
+  // `rearmAutoRetries` walks every task in the shared test DB and arms real
+  // timers. No-op hooks for the whole file: a timer that fires (here or for
+  // another file's row) must never reach the orchestrator's real retry
+  // handler from this suite (review S25).
+  prevHooks = fo.setHarnessFailoverHooks({ onAutoRetry: async () => {}, onReconcileSwap: async () => {} });
 });
 
 afterAll(() => {
-  fo.cancelAutoRetry("__none__");
+  // Drop every schedule this file seeded, then every timer it armed, BEFORE
+  // the real hooks come back.
+  for (const id of seededTaskIds) {
+    const state = dbm.tasks.get(id)?.harnessState;
+    if (state?.allExhausted || state?.pendingSwap) {
+      dbm.tasks.setHarnessState(id, { ...state, allExhausted: null, pendingSwap: null });
+    }
+  }
+  fo.stopAllAutoRetryTimers();
+  fo.setHarnessFailoverHooks(prevHooks);
   restore();
 });
 
@@ -48,6 +64,7 @@ function makeTask(agent: string): string {
     opencodeServer: "shared", references: [], backlog: [], plans: [], draft: null,
     column: "ready", runId: null, createdAt: Date.now(), updatedAt: Date.now(), archivedAt: null,
   } as never);
+  seededTaskIds.push(id);
   return id;
 }
 
@@ -540,7 +557,7 @@ describe("cooldown and boot recovery", () => {
     stacks.harnessStacks.delete(stack.id);
   });
 
-  test("boot clamps a missed retry instant to now and persists it so the armed timer matches", () => {
+  test("boot staggers a missed retry instant and persists it so the armed timer matches (S9)", () => {
     const a = account();
     const b = account();
     const stack = stacks.harnessStacks.create({ label: "missed-retry", kind: "claude-code", members: [a, b] });
@@ -570,7 +587,11 @@ describe("cooldown and boot recovery", () => {
       const armed = fo.rearmAutoRetries(now);
       expect(armed).toBeGreaterThanOrEqual(1);
       const state = dbm.tasks.get(taskId)!.harnessState!.allExhausted!;
-      expect(state.nextAttemptAt).toBe(now);
+      // Overdue retries are staggered (`now + 5 s + i × 2 s`), never all
+      // fired in the boot tick: N tasks would mirror into one backup at once.
+      expect(state.nextAttemptAt).toBeGreaterThanOrEqual(now + fo.HARNESS_STACK_REARM_OVERDUE_BASE_MS);
+      expect((state.nextAttemptAt - now - fo.HARNESS_STACK_REARM_OVERDUE_BASE_MS) % fo.HARNESS_STACK_REARM_OVERDUE_STEP_MS).toBe(0);
+      expect(fo.hasArmedAutoRetry(taskId)).toBe(true);
       // A crash/pause is not a started retry.
       expect(state.attempts).toBe(1);
     } finally {
@@ -779,6 +800,136 @@ describe("auto-retry timer claim", () => {
     } finally {
       fo.setHarnessFailoverHooks(prev);
       fo.cancelAutoRetry(taskId);
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+});
+
+describe("review fixes (fix round)", () => {
+  test("two overdue retries are staggered apart, not fired in one tick (S9)", () => {
+    const a = account();
+    const b = account();
+    const stack = stacks.harnessStacks.create({ label: "stagger", kind: "claude-code", members: [a, b] });
+    const now = Date.now();
+    const first = makeTask(a);
+    const second = makeTask(a);
+    for (const id of [first, second]) {
+      dbm.tasks.setHarnessState(id, {
+        stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, lastMove: null,
+        allExhausted: { at: now - 120_000, attempts: 0, max: 3, nextAttemptAt: now - 60_000, earliestResetAtMs: null, reason: "quota" },
+      });
+    }
+    try {
+      fo.rearmAutoRetries(now);
+      const at1 = dbm.tasks.get(first)!.harnessState!.allExhausted!.nextAttemptAt;
+      const at2 = dbm.tasks.get(second)!.harnessState!.allExhausted!.nextAttemptAt;
+      expect(at1).not.toBe(at2);
+      expect(Math.abs(at2 - at1) % fo.HARNESS_STACK_REARM_OVERDUE_STEP_MS).toBe(0);
+    } finally {
+      for (const id of [first, second]) {
+        fo.cancelAutoRetry(id);
+        dbm.tasks.setHarnessState(id, null);
+      }
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("a task held by background agents is left alone by a manual prepare (Q6)", async () => {
+    const a = account();
+    const b = account();
+    dbm.harnesses.setEnabled(a, false);
+    const stack = stacks.harnessStacks.create({ label: "held", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    const prev = fo.setHarnessFailoverHooks({
+      onAutoRetry: async () => {},
+      onReconcileSwap: async () => {},
+      isTaskHeld: (id) => id === taskId,
+    });
+    try {
+      // A is disabled, so an idle task would move to B — but a held task's
+      // REPL is still live: moving it would kill that REPL.
+      const held = await fo.prepareTaskHarness(taskId, { manual: true });
+      expect(held).toEqual({ ok: true });
+      expect(dbm.tasks.get(taskId)!.agent).toBe(a);
+    } finally {
+      fo.setHarnessFailoverHooks(prev);
+    }
+    // Once the hold is gone the same prepare does move.
+    const moved = await fo.prepareTaskHarness(taskId, { manual: true });
+    expect(moved.moved).toEqual({ from: a, to: b });
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("a manual prepare move mirrors the destination's config and returns the warnings (S11)", async () => {
+    const a = account();
+    const b = account();
+    const homeA = path.join(process.env.AGETOR_DATA_DIR!, "homes", a);
+    const homeB = path.join(process.env.AGETOR_DATA_DIR!, "homes", b);
+    // A settings object on the primary and a non-object on the backup: the
+    // mirror skips the merge with a warning, which proves the mirror ran.
+    writeFileSync(path.join(homeA, "settings.json"), "{}\n");
+    writeFileSync(path.join(homeB, "settings.json"), "[]\n");
+    dbm.harnesses.setEnabled(a, false);
+    const stack = stacks.harnessStacks.create({ label: "prepare-mirror", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    const result = await fo.prepareTaskHarness(taskId, { manual: true });
+    expect(result.moved).toEqual({ from: a, to: b });
+    expect((result.warnings ?? []).some((w) => w.startsWith("config mirror:") && w.includes("not a JSON object"))).toBe(true);
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("state writes re-point stackId, and stack delete finds tasks by resolved membership (S10)", () => {
+    const a = account();
+    const b = account();
+    const c = account();
+    const old = stacks.harnessStacks.create({ label: "s10-old", kind: "claude-code", members: [a, b] });
+    const fresh = stacks.harnessStacks.create({ label: "s10-new", kind: "claude-code", members: [c] });
+    const taskId = makeTask(a);
+    dbm.tasks.setHarnessState(taskId, {
+      stackId: old.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
+    });
+    stacks.harnessStacks.update(old.id, { members: [b] });
+    stacks.harnessStacks.update(fresh.id, { members: [c, a] });
+    // Before any write the recorded id is stale; the resolved stack still
+    // claims the task for a delete.
+    expect(fo.failoverTaskIdsForStack(fresh.id)).toContain(taskId);
+    // Any write through the engine re-points it.
+    fo.patchTaskState(taskId, { tried: [a] });
+    const state = dbm.tasks.get(taskId)!.harnessState!;
+    expect(state.stackId).toBe(fresh.id);
+    expect(state.position).toBe(1);
+    expect(fo.failoverTaskIdsForStack(old.id)).not.toContain(taskId);
+    // A task without state is never created by a patch.
+    const bare = makeTask(b);
+    expect(fo.patchTaskState(bare, { tried: [b] })).toBeNull();
+    expect(dbm.tasks.get(bare)!.harnessState ?? null).toBeNull();
+    stacks.harnessStacks.delete(old.id);
+    stacks.harnessStacks.delete(fresh.id);
+  });
+
+  test("a busy task defers its fired retry instead of consuming the timer (Q7)", () => {
+    const a = account();
+    const b = account();
+    const stack = stacks.harnessStacks.create({ label: "q7", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    const firedAt = Date.now() - 10;
+    dbm.tasks.setHarnessState(taskId, {
+      stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, lastMove: null,
+      allExhausted: { at: firedAt, attempts: 1, max: 3, nextAttemptAt: firedAt, earliestResetAtMs: null, reason: "quota" },
+    });
+    try {
+      expect(fo.deferAutoRetryNow(taskId)).toBe(true);
+      const ex = dbm.tasks.get(taskId)!.harnessState!.allExhausted!;
+      expect(ex.nextAttemptAt).toBeGreaterThan(firedAt);
+      expect(ex.attempts).toBe(1);
+      expect(fo.hasArmedAutoRetry(taskId)).toBe(true);
+      // An in-flight marker is owned by its run: never deferred.
+      dbm.tasks.setHarnessState(taskId, { ...dbm.tasks.get(taskId)!.harnessState!, allExhausted: { ...ex, inFlight: true, nextAttemptAt: 0 } });
+      fo.cancelAutoRetry(taskId);
+      expect(fo.deferAutoRetryNow(taskId)).toBe(false);
+    } finally {
+      fo.cancelAutoRetry(taskId);
+      dbm.tasks.setHarnessState(taskId, null);
       stacks.harnessStacks.delete(stack.id);
     }
   });

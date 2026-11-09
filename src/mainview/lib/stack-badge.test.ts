@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { HarnessStack, TaskHarnessState } from "../../shared/types.ts";
-import { stackBadgeStateFor } from "./stack-badge.ts";
+import { stackBadgeStateFor, stackPositionFor } from "./stack-badge.ts";
 
 function stack(id: string, members: string[]): HarnessStack {
   return {
@@ -110,5 +110,22 @@ describe("stackBadgeStateFor", () => {
     const recorded = state("gone", { position: 1 });
     expect(stackBadgeStateFor({ agent: "a", harnessState: recorded }, [stack("s1", ["b", "c"])])).toBe(recorded);
     expect(stackBadgeStateFor({ agent: "a", harnessState: null }, [stack("s1", ["b", "c"])])).toBeNull();
+  });
+});
+
+describe("stackPositionFor (N1)", () => {
+  test("a member of a multi-account stack gets its 1-based position", () => {
+    const stacks = [stack("s1", ["a", "b", "c"])];
+    expect(stackPositionFor(stacks, "c")).toEqual({ stack: stacks[0]!, position: 3, count: 3 });
+    expect(stackPositionFor(stacks, "a")?.position).toBe(1);
+  });
+
+  test("a one-account stack has no chip: it cannot fail over", () => {
+    expect(stackPositionFor([stack("solo", ["a"])], "a")).toBeNull();
+  });
+
+  test("an account in no stack has no chip", () => {
+    expect(stackPositionFor([stack("s1", ["a", "b"])], "z")).toBeNull();
+    expect(stackPositionFor([], "a")).toBeNull();
   });
 });

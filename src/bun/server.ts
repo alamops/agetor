@@ -34,6 +34,7 @@ import {
   PipelineNameError,
   dataDir,
   clampWindowByBytes,
+  isHiddenContinuationUserText,
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
@@ -41,7 +42,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { activeRunCount, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -58,8 +59,8 @@ import {
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, reviewHumanStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
-import { harnessStacks, StackInputError } from "./harness-stacks.ts";
-import { cancelAutoRetry } from "./harness-failover.ts";
+import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackInputError } from "./harness-stacks.ts";
+import { clearFailoverState, failoverTaskIdsForStack } from "./harness-failover.ts";
 import { mirrorStack } from "./harness-mirror.ts";
 import { collectHarnessSessionCopies, removeHarnessSessionCopies } from "./harness-session-transfer.ts";
 import {
@@ -1397,26 +1398,110 @@ function sessionCwdGate(req: Request): { gateCwd?: (cwd: string) => Promise<stri
   return { gateCwd: async (cwd) => (await gateCallerPath(cwd, "cli", "exists"))?.error ?? null };
 }
 
+// Env keys whose value is an account's config root: the core resolves it
+// lexically (path.join/resolve) and the stack mirror and session transfer
+// create, write and delete files under it in-process
+// (docs/architecture/harness-stacks.md). `HOME` counts because Codex reads
+// `<HOME>/.codex` when no `CODEX_HOME` is set.
+const HARNESS_ENV_ROOT_KEYS: ReadonlySet<string> = new Set(["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME"]);
+
+/** True when `p` has a `..` component (either separator). */
+function hasParentSegment(p: string): boolean {
+  return p.split(/[\\/]/).some((seg) => seg === "..");
+}
+
+/**
+ * Validate and normalize a harness `home`/`bin` (already known absolute). A
+ * `..` component is refused: the CLI path gate probes the string the kernel
+ * resolves (`/Users/u/Documents/zz/..` is a missing `zz` while `zz` does not
+ * exist) while every consumer resolves it lexically to `~/Documents`, so the
+ * two would disagree on which folder is touched. What is stored is the
+ * `path.resolve` form (no `.`, no doubled or trailing slash), so the string
+ * the gate checked is the one every consumer uses.
+ */
+function normalizeHarnessPath(value: string, field: string): { value: string } | { error: string } {
+  if (hasParentSegment(value)) return { error: `${field} must not contain ".." path segments` };
+  return { value: path.resolve(value) };
+}
+
+/**
+ * The same rule for a harness's `env` map: a config-root key
+ * (`HARNESS_ENV_ROOT_KEYS`) whose value is absolute (after trimming) is stored
+ * trimmed and `path.resolve`d, and any `..` component in it (absolute, `~` or
+ * relative) is refused. Other keys are stored as given.
+ */
+function normalizeHarnessEnv(env: Record<string, string>): { env: Record<string, string> } | { error: string } {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (!HARNESS_ENV_ROOT_KEYS.has(key)) {
+      out[key] = value;
+      continue;
+    }
+    const trimmed = value.trim();
+    if (hasParentSegment(trimmed)) return { error: `env ${key} must not contain ".." path segments` };
+    out[key] = path.isAbsolute(trimmed) ? path.resolve(trimmed) : value;
+  }
+  return { env: out };
+}
+
+function gateRefusalResponse(req: Request, refusal: { status: 403; error: string; code: string }): Response {
+  const { status, ...body } = refusal;
+  return json(body, { status, headers: corsHeaders(req) });
+}
+
 // The policy walker gates a harness's top-level `home`/`bin` for a CLI-token
 // caller, but not the values inside its `env` map — and an env value that is an
 // absolute path (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME`…) names a directory
-// the core later tails or reads in-process. So the same disclaimed probe runs
-// over every absolute-path env value (D24); the first denied one refuses the
-// request with the gate's own 403 body. The app caller is never gated.
+// the core later tails, reads, creates or writes in-process. So the same
+// disclaimed probe runs over every absolute-path env value (D24), plus the
+// `~`-expanded form of a config-root key; the first denied one refuses the
+// request with the gate's own 403 body. The mode is `nearest-ancestor`: a root
+// that does not exist yet is created by the stack mirror under its nearest
+// existing ancestor, so that ancestor is what the core would touch. Run on the
+// NORMALIZED env (`normalizeHarnessEnv`). The app caller is never gated.
 async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): Promise<Response | null> {
   if (callerOf(req) !== "cli") return null;
-  for (const value of Object.values(env)) {
+  for (const [key, value] of Object.entries(env)) {
     // Gate the trimmed spelling too: a consumer that trims the value would
     // otherwise act on a protected path the raw string never named.
     const trimmed = value.trim();
-    if (!trimmed.startsWith("/")) continue;
-    for (const p of trimmed === value ? [value] : [value, trimmed]) {
-      const refusal = await gateCallerPath(p, "cli", "exists");
-      if (refusal) {
-        const { status, ...body } = refusal;
-        return json(body, { status, headers: corsHeaders(req) });
-      }
+    const candidates = new Set<string>();
+    if (trimmed.startsWith("/")) {
+      candidates.add(value);
+      candidates.add(trimmed);
+    } else if (HARNESS_ENV_ROOT_KEYS.has(key) && (trimmed === "~" || trimmed.startsWith("~/"))) {
+      candidates.add(path.resolve(expandHomePath(trimmed)));
     }
+    for (const p of candidates) {
+      const refusal = await gateCallerPath(p, "cli", "nearest-ancestor");
+      if (refusal) return gateRefusalResponse(req, refusal);
+    }
+  }
+  return null;
+}
+
+/**
+ * CLI path gate for a stack save (D24). The stack routes name accounts, not
+ * paths, but creating or editing a stack mirrors config into every member's
+ * root, and later swaps copy transcripts there — all in-process. So for a
+ * CLI-token caller each member's effective roots (the config root, and for
+ * Claude the directory holding `.claude.json`) are probed through the
+ * disclaimed child before anything is saved; a denied one refuses with the
+ * gate's 403 `path-not-accessible`. Unknown ids are left to the stack
+ * validator's own 400. The app caller is never gated.
+ */
+async function gateStackMemberRoots(req: Request, memberIds: readonly string[]): Promise<Response | null> {
+  if (callerOf(req) !== "cli") return null;
+  const roots = new Set<string>();
+  for (const id of memberIds) {
+    const harness = harnesses.get(id);
+    if (!harness || (harness.kind !== "claude-code" && harness.kind !== "codex")) continue;
+    roots.add(path.resolve(expandHomePath(effectiveHome(harness))));
+    if (harness.kind === "claude-code") roots.add(path.resolve(expandHomePath(claudeJsonDirFor(harness))));
+  }
+  for (const root of roots) {
+    const refusal = await gateCallerPath(root, "cli", "nearest-ancestor");
+    if (refusal) return gateRefusalResponse(req, refusal);
   }
   return null;
 }
@@ -4384,7 +4469,17 @@ export function startApiServer(
           if (bin && !path.isAbsolute(bin)) {
             return json({ error: "bin must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
           }
-          const env: Record<string, string> = {};
+          // No `..` components, and store the resolved spelling (M7): the
+          // path the CLI gate probed must be the one every consumer uses.
+          const homeNorm = home ? normalizeHarnessPath(home, "home") : null;
+          if (homeNorm && "error" in homeNorm) {
+            return json({ error: homeNorm.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const binNorm = bin ? normalizeHarnessPath(bin, "bin") : null;
+          if (binNorm && "error" in binNorm) {
+            return json({ error: binNorm.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const rawEnv: Record<string, string> = {};
           if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
             for (const [k, v] of Object.entries(body.env)) {
               if (typeof v !== "string") continue;
@@ -4394,9 +4489,12 @@ export function startApiServer(
                   { status: 400, headers: corsHeaders(req) },
                 );
               }
-              env[k] = v;
+              rawEnv[k] = v;
             }
           }
+          const envNorm = normalizeHarnessEnv(rawEnv);
+          if ("error" in envNorm) return json({ error: envNorm.error }, { status: 400, headers: corsHeaders(req) });
+          const env = envNorm.env;
           const envRefusal = await gateHarnessEnvPaths(req, env);
           if (envRefusal) return envRefusal;
           // Whether fx sessions load the user's fx profile MCP servers
@@ -4413,8 +4511,8 @@ export function startApiServer(
               id: body.id.trim(),
               kind: body.kind,
               label: body.label.trim(),
-              home,
-              bin,
+              home: homeNorm ? homeNorm.value : null,
+              bin: binNorm ? binNorm.value : null,
               env,
               ...(typeof body.profileMcpServers === "boolean" ? { profileMcpServers: body.profileMcpServers } : {}),
             });
@@ -4443,6 +4541,8 @@ export function startApiServer(
         POST: authed(async (req) => {
           const body = await parseStackBody(req);
           if ("error" in body) return json({ error: body.error }, { status: 400, headers: corsHeaders(req) });
+          const rootRefusal = await gateStackMemberRoots(req, (body.input as StackInput).members);
+          if (rootRefusal) return rootRefusal;
           try {
             const stack = harnessStacks.create(body.input as StackInput);
             // The mirror copies the primary's whole config tree (plugins alone
@@ -4451,7 +4551,7 @@ export function startApiServer(
             server.timeout(req, 0);
             const mirror = await mirrorStack(stack, {});
             return json(
-              { stack: harnessStacks.get(stack.id) ?? stack, warnings: stack.warnings, mirror },
+              { stack: harnessStacks.get(stack.id, { warnings: true }) ?? stack, warnings: stack.warnings, mirror },
               { status: 201, headers: corsHeaders(req) },
             );
           } catch (err) {
@@ -4465,7 +4565,9 @@ export function startApiServer(
 
       "/harness-stacks/:id": {
         GET: authed((req) => {
-          const stack = harnessStacks.get(req.params.id);
+          // The detail read is what `agetor harness stack show` prints, so it
+          // carries the member warnings; the runtime lookups skip them.
+          const stack = harnessStacks.get(req.params.id, { warnings: true });
           return stack
             ? json({ stack, limitStates: harnessStacks.listLimitStates() }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -4475,6 +4577,13 @@ export function startApiServer(
           if (!current) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           const body = await parseStackBody(req, { partial: true });
           if ("error" in body) return json({ error: body.error }, { status: 400, headers: corsHeaders(req) });
+          // Every member the saved stack will hold: the new list, or the
+          // current one when only the label/kind/mirror mode changes.
+          const rootRefusal = await gateStackMemberRoots(
+            req,
+            body.input.members ?? current.members.map((m) => m.harnessId),
+          );
+          if (rootRefusal) return rootRefusal;
           try {
             const stack = harnessStacks.update(req.params.id, body.input);
             // A label-only rename changes nothing the mirror reads. Re-running
@@ -4489,7 +4598,7 @@ export function startApiServer(
               ? await mirrorStack(stack, {})
               : { copied: [], warnings: [] };
             return json(
-              { stack: harnessStacks.get(stack.id) ?? stack, warnings: stack.warnings, mirror },
+              { stack: harnessStacks.get(stack.id, { warnings: true }) ?? stack, warnings: stack.warnings, mirror },
               { headers: corsHeaders(req) },
             );
           } catch (err) {
@@ -4508,12 +4617,12 @@ export function startApiServer(
           // its armed all-exhausted timer is process memory, so collect the
           // affected ids first and cancel each handle too. Otherwise a deleted
           // stack leaves a dangling timer for up to 24 h (review nit).
-          const affected = tasks
-            .list()
-            .filter((task) => task.harnessState?.stackId === stack.id)
-            .map((task) => task.id);
+          // Resolved BEFORE the delete: a task whose account was edited into
+          // this stack after its last state write still names the old stack
+          // id, so the stored-id filter alone would miss it (review S10).
+          const affected = failoverTaskIdsForStack(stack.id);
           harnessStacks.delete(stack.id);
-          for (const taskId of affected) cancelAutoRetry(taskId);
+          for (const taskId of affected) clearFailoverState(taskId);
           return json({ removed: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -4594,16 +4703,22 @@ export function startApiServer(
           if (typeof body.label === "string") patch.label = body.label.trim();
           if ("home" in body) {
             if (body.home == null || body.home === "") patch.home = null;
-            else if (typeof body.home === "string" && path.isAbsolute(body.home)) patch.home = body.home;
-            else return json({ error: "home must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
+            else if (typeof body.home === "string" && path.isAbsolute(body.home)) {
+              const norm = normalizeHarnessPath(body.home, "home");
+              if ("error" in norm) return json({ error: norm.error }, { status: 400, headers: corsHeaders(req) });
+              patch.home = norm.value;
+            } else return json({ error: "home must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
           }
           if ("bin" in body) {
             if (body.bin == null || body.bin === "") patch.bin = null;
-            else if (typeof body.bin === "string" && path.isAbsolute(body.bin)) patch.bin = body.bin;
-            else return json({ error: "bin must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
+            else if (typeof body.bin === "string" && path.isAbsolute(body.bin)) {
+              const norm = normalizeHarnessPath(body.bin, "bin");
+              if ("error" in norm) return json({ error: norm.error }, { status: 400, headers: corsHeaders(req) });
+              patch.bin = norm.value;
+            } else return json({ error: "bin must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
           }
           if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
-            const env: Record<string, string> = {};
+            const rawEnv: Record<string, string> = {};
             for (const [k, v] of Object.entries(body.env)) {
               if (typeof v !== "string") continue;
               if (!isValidEnvKey(k)) {
@@ -4612,11 +4727,26 @@ export function startApiServer(
                   { status: 400, headers: corsHeaders(req) },
                 );
               }
-              env[k] = v;
+              rawEnv[k] = v;
             }
-            const envRefusal = await gateHarnessEnvPaths(req, env);
+            const envNorm = normalizeHarnessEnv(rawEnv);
+            if ("error" in envNorm) return json({ error: envNorm.error }, { status: 400, headers: corsHeaders(req) });
+            const envRefusal = await gateHarnessEnvPaths(req, envNorm.env);
             if (envRefusal) return envRefusal;
-            patch.env = env;
+            patch.env = envNorm.env;
+          }
+          // A stack member may not be re-pointed at another member's config
+          // root (realpath compare): a later swap would copy a transcript
+          // onto itself and cleanup would delete the primary's own file. The
+          // stack save checks this once; a later edit is checked here
+          // (docs/architecture/harness-stacks.md).
+          if (patch.home !== undefined || patch.env !== undefined) {
+            const rootError = harnessStacks.validateMemberRoot(req.params.id, {
+              kind: current.kind,
+              home: patch.home !== undefined ? patch.home : current.home,
+              env: patch.env ?? current.env,
+            });
+            if (rootError) return json({ error: rootError }, { status: 400, headers: corsHeaders(req) });
           }
           try {
             const updated = harnesses.update(req.params.id, patch);
@@ -4645,7 +4775,7 @@ export function startApiServer(
             // 409 with its conversation untouched (review R13-S2).
             const copies = collectHarnessSessionCopies(req.params.id);
             harnesses.delete(req.params.id);
-            removeHarnessSessionCopies(copies);
+            await removeHarnessSessionCopies(copies);
             // Prunes the deleted harness out of the per-harness discovery
             // cache and its transition-detector bookkeeping, then publishes
             // once — cheaper than a full `refreshAllModels()` sweep (which
@@ -5717,6 +5847,15 @@ export function startApiServer(
             return json({ error: filtered.error }, { status: 400, headers: corsHeaders(req) });
           }
           const { patch } = filtered;
+          // A prompt that is exactly the hidden account-switch wrapper would
+          // be sent to the agent at the next Run while no transcript shows it
+          // (review S1); `createTask`/`startTask`/`sendInput` refuse it too.
+          if (typeof patch.prompt === "string" && isHiddenContinuationUserText(patch.prompt)) {
+            return json(
+              { error: HIDDEN_CONTINUATION_REFUSAL, code: "hidden-continuation" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
           const before = tasks.get(req.params.id);
           if (!before) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -5919,6 +6058,19 @@ export function startApiServer(
             // way. Its reason-family OS entry goes with the block.
             if (before.column === "blocked" && updated.column !== "blocked") {
               removeTaskNotification(req.params.id, UNBLOCKED_REMOVAL_KINDS);
+            }
+            // Moving a card out of `blocked` (or off an all-exhausted stack)
+            // is the user taking the task back: an armed quota-reset retry
+            // must not fire later and pull it into `running` again. Cancels
+            // the timer, clears `allExhausted` and stashes held follow-ups
+            // to the backlog (docs/architecture/harness-stacks.md).
+            if (
+              "column" in patch
+              && updated.column !== before.column
+              && updated.column !== "blocked"
+              && (before.column === "blocked" || before.harnessState?.allExhausted)
+            ) {
+              cancelHarnessRetryForTask(req.params.id);
             }
             // Mirror behavioural changes onto a live claude session via slash
             // commands so the conversation context survives a model/mode/effort
@@ -8284,12 +8436,14 @@ export function startApiServer(
             // to it as long as the span `[userIdx, events.length)` fits
             // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES. All-or-nothing: either
             // `start` becomes `userIdx`, or it's left exactly as computed
-            // above.
+            // above. A hidden harness-stack continuation is skipped, as in
+            // `runs.lastUserEventId`: no renderer shows it, so it is not the
+            // user's last message.
             // (`idx`, not `i`: the outer `i` is the live counter `onChunk`
             // closes over for its synthetic `ts`, and must not be shadowed.)
             let userIdx = -1;
             for (let idx = events.length - 1; idx >= 0; idx--) {
-              if (events[idx]!.stream === "user") {
+              if (events[idx]!.stream === "user" && !isHiddenContinuationUserText(events[idx]!.data)) {
                 userIdx = idx;
                 break;
               }

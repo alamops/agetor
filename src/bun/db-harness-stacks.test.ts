@@ -28,7 +28,7 @@ afterAll(() => {
   restore();
 });
 
-function seedTask(): string {
+function seedTask(opts: { updatedAt?: number } = {}): string {
   const id = randomUUID();
   taskIds.push(id);
   dbm.tasks.insert({
@@ -57,7 +57,7 @@ function seedTask(): string {
     column: "ready",
     runId: null,
     createdAt: Date.now(),
-    updatedAt: Date.now(),
+    updatedAt: opts.updatedAt ?? Date.now(),
     archivedAt: null,
   } as never);
   return id;
@@ -95,8 +95,10 @@ describe("084 tables and tasks.harness_state", () => {
   });
 
   test("setHarnessState is patch-proof and never bumps updated_at", () => {
-    const taskId = seedTask();
-    const before = dbm.tasks.get(taskId)!;
+    // updatedAt 1 (not "now"): a write that bumped it to Date.now() would be
+    // indistinguishable from the seed if both landed in the same millisecond.
+    const taskId = seedTask({ updatedAt: 1 });
+    expect(dbm.tasks.get(taskId)!.updatedAt).toBe(1);
     dbm.tasks.setHarnessState(taskId, {
       stackId: "stack-1",
       position: 1,
@@ -107,8 +109,17 @@ describe("084 tables and tasks.harness_state", () => {
     });
     const after = dbm.tasks.get(taskId)!;
     expect(after.harnessState?.stackId).toBe("stack-1");
-    expect(after.updatedAt).toBe(before.updatedAt);
+    expect(after.updatedAt).toBe(1);
 
+    // The generic SET clause skips harness_state: a patch that carries one
+    // (a stale copy, or a caller that slipped it past the allow-list) leaves
+    // the stored value alone.
+    dbm.tasks.update(taskId, {
+      harnessState: { stackId: "clobbered", position: 0, tried: [], pendingSwap: null, allExhausted: null, lastMove: null },
+    } as never);
+    expect(dbm.tasks.get(taskId)?.harnessState?.stackId).toBe("stack-1");
+    dbm.tasks.update(taskId, { harnessState: null } as never);
+    expect(dbm.tasks.get(taskId)?.harnessState?.stackId).toBe("stack-1");
     dbm.tasks.update(taskId, { title: "renamed" });
     expect(dbm.tasks.get(taskId)?.harnessState?.stackId).toBe("stack-1");
 
@@ -140,10 +151,27 @@ describe("084 tables and tasks.harness_state", () => {
       copiedPaths: ["/tmp/y.jsonl"],
       createdAt: 20,
     });
+    // The session id is replaced but the cleanup allowlist is merged: the
+    // first transfer's file is still on disk and must stay removable.
     expect(dbm.harnessSessionHandoffs.get(taskId, "claude-b", "claude_session_id")).toMatchObject({
       sessionId: "s-2",
-      copiedPaths: ["/tmp/y.jsonl"],
+      copiedPaths: ["/tmp/x.jsonl", "/tmp/y.jsonl"],
+      createdAt: 20,
     });
+    // A repeat path is not duplicated.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId,
+      harnessId: "claude-b",
+      columnName: "claude_session_id",
+      sessionId: "s-2b",
+      copiedPaths: ["/tmp/y.jsonl", "/tmp/z.jsonl"],
+      createdAt: 25,
+    });
+    expect(dbm.harnessSessionHandoffs.get(taskId, "claude-b", "claude_session_id")?.copiedPaths).toEqual([
+      "/tmp/x.jsonl",
+      "/tmp/y.jsonl",
+      "/tmp/z.jsonl",
+    ]);
     expect(dbm.harnessSessionHandoffs.listForTask(taskId)).toHaveLength(1);
     dbm.harnessSessionHandoffs.deleteOne(taskId, "claude-b", "claude_session_id");
     expect(dbm.harnessSessionHandoffs.listForTask(taskId)).toEqual([]);
@@ -183,6 +211,42 @@ describe("084 tables and tasks.harness_state", () => {
     expect(dbm.harnessSessionHandoffs.listForHarness(harnessId)).toEqual([]);
   });
 
+  test("harnesses.delete removes the account's stack membership explicitly and renumbers the survivors (no FK cascade since 085)", () => {
+    const fks = dbm.db.query<{ table: string }, []>(`PRAGMA foreign_key_list(harness_stack_members)`).all();
+    expect(fks.map((f) => f.table)).toEqual(["harness_stacks"]);
+    const tag = randomUUID().slice(0, 8);
+    const ids = ["a", "b", "c"].map((x) => `del-member-${x}-${tag}`);
+    for (const id of ids) {
+      dbm.harnesses.insert({
+        id,
+        kind: "claude-code",
+        label: id,
+        home: mkdtempSync(path.join(tmpdir(), "agetor-del-member-")),
+        env: {},
+      } as never);
+    }
+    const stackId = `stack-del-${tag}`;
+    dbm.db.run(
+      `INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES (?, 'S', 'claude-code', 1, 1)`,
+      [stackId],
+    );
+    ids.forEach((id, position) =>
+      dbm.db.run(`INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES (?, ?, ?)`, [stackId, id, position]),
+    );
+    dbm.harnesses.delete(ids[1]!);
+    const rows = dbm.db
+      .query<{ harness_id: string; position: number }, [string]>(
+        `SELECT harness_id, position FROM harness_stack_members WHERE stack_id = ? ORDER BY position`,
+      )
+      .all(stackId);
+    expect(rows).toEqual([
+      { harness_id: ids[0]!, position: 0 },
+      { harness_id: ids[2]!, position: 1 },
+    ]);
+    dbm.db.run(`DELETE FROM harness_stacks WHERE id = ?`, [stackId]);
+    for (const id of [ids[0]!, ids[2]!]) dbm.harnesses.delete(id);
+  });
+
   test("mainUserTexts/hasToolUse read the main run stream", () => {
     const taskId = seedTask();
     const runId = seedRun(taskId);
@@ -198,6 +262,28 @@ describe("084 tables and tasks.harness_state", () => {
     expect(dbm.runs.mainUserTexts(runId)).toEqual(["hello", "follow-up"]);
     dbm.runs.appendEvent(runId, "tool_use", JSON.stringify({ id: "t1", name: "Bash" }));
     expect(dbm.runs.hasToolUse(runId)).toBe(true);
+  });
+
+  test("lastUserEventId skips a hidden harness-stack continuation (live echo and pasted_content twin) but not prose mentioning the tag", () => {
+    const taskId = seedTask();
+    const runId = seedRun(taskId);
+    const wrapped = "<harness-stack-continuation>\nContinue the task.\n</harness-stack-continuation>";
+    const real = dbm.runs.appendEvent(runId, "user", "the user's real message")!.id;
+    dbm.runs.appendEvent(runId, "assistant", "ok");
+    dbm.runs.appendEvent(runId, "user", wrapped);
+    dbm.runs.appendEvent(runId, "user", `<pasted_content id="ab12">\n${wrapped}\n</pasted_content id="ab12">`);
+    expect(dbm.isHiddenContinuationUserText(wrapped)).toBe(true);
+    expect(dbm.isHiddenContinuationUserText(`<pasted_content id="ab12">\n${wrapped}\n</pasted_content id="ab12">`)).toBe(true);
+    expect(dbm.runs.lastUserEventId(taskId)).toBe(real);
+    // More hidden rows than one page: the walk keeps paging back.
+    for (let i = 0; i < 12; i++) dbm.runs.appendEvent(runId, "user", wrapped);
+    expect(dbm.runs.lastUserEventId(taskId)).toBe(real);
+    // A user message that merely mentions the tag in prose is a real anchor.
+    const prose = dbm.runs.appendEvent(runId, "user", `what does ${wrapped} mean? and more`)!.id;
+    expect(dbm.runs.lastUserEventId(taskId)).toBe(prose);
+    // beforeId still bounds the walk.
+    expect(dbm.runs.lastUserEventId(taskId, prose)).toBe(real);
+    expect(dbm.runs.lastUserEventId(taskId, real)).toBeNull();
   });
 
   test("newestSessionForHarness and hasRunning", () => {

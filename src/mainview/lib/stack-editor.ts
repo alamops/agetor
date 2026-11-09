@@ -5,6 +5,18 @@
  * Model and rules: docs/architecture/harness-stacks.md.
  */
 import type { Harness, HarnessMirrorMode, HarnessStack, HarnessStackKind } from "../../shared/types.ts";
+import { ApiTransitError } from "./net-retry.ts";
+
+/**
+ * What each mirror mode copies, in the exact words the docs and CLI use
+ * (review S6). Safe mode skips the executable/permission-bearing settings;
+ * plugins and MCP servers are the tools the feature promises, so both modes
+ * mirror them.
+ */
+export const MIRROR_MODE_COPY: Record<HarnessMirrorMode, string> = {
+  full: "Full also mirrors settings hooks, permissions, status line and helper commands (Codex: notify), plus plugins and MCP servers.",
+  safe: "Safe skips settings hooks, permissions, status line and helper commands (Codex: notify); plugins and MCP servers are still mirrored.",
+};
 
 export interface StackDraft {
   label: string;
@@ -154,7 +166,7 @@ export function draftWarnings(draft: StackDraft, ctx: { harnesses: readonly Harn
   if (draft.mirrorMode === "full") {
     warnings.push({
       code: "full-mirror-hooks",
-      message: "Full mirror copies user-level hooks and permissions onto every backup.",
+      message: "Full mirror copies settings hooks, permissions, status line and helper commands (Codex: notify) onto every backup.",
     });
   }
   for (const id of draft.members) {
@@ -164,6 +176,60 @@ export function draftWarnings(draft: StackDraft, ctx: { harnesses: readonly Harn
     }
   }
   return warnings;
+}
+
+export interface MemberPickerOption {
+  harness: Harness;
+  /** Shown after the label (`— disabled`, `— in stack "X"`), or null. */
+  note: string | null;
+  /** False only when the account cannot join this stack at all. */
+  selectable: boolean;
+}
+
+/**
+ * The "Add account" picker rows: every same-kind account not already in the
+ * draft. An account in ANOTHER stack is listed but not selectable (the
+ * server refuses it). A DISABLED account is selectable — the server and CLI
+ * accept it with a `member-disabled` warning, which the editor shows too
+ * (`draftWarnings`); the failover walk skips it until it is enabled (review
+ * N5).
+ */
+export function memberPickerOptions(
+  draft: StackDraft,
+  ctx: {
+    harnesses: readonly Harness[];
+    stacks: readonly HarnessStack[];
+    /** account → the stack that already owns it (when not this one). */
+    membership: ReadonlyMap<string, string>;
+  },
+): MemberPickerOption[] {
+  return ctx.harnesses
+    .filter((h) => h.kind === draft.kind && !draft.members.includes(h.id))
+    .map((harness) => {
+      const otherStackId = ctx.membership.get(harness.id);
+      if (otherStackId) {
+        const otherLabel = ctx.stacks.find((s) => s.id === otherStackId)?.label ?? otherStackId;
+        return { harness, note: `in stack "${otherLabel}"`, selectable: false };
+      }
+      return { harness, note: harness.enabled ? null : "disabled", selectable: true };
+    });
+}
+
+/**
+ * How a failed save reads. Stack create/edit mirrors the primary's config
+ * inline, which can outlast the connection; the requests are sent with
+ * `retry: false` (a replay would hit "already in another stack"), so a
+ * transit failure means the save MAY have landed. The editor then says so
+ * and reloads the stacks instead of claiming it failed (review S21).
+ */
+export function stackSaveFailure(error: unknown): { message: string; reload: boolean } {
+  if (error instanceof ApiTransitError) {
+    return {
+      message: "The connection dropped before agetor answered — the stack may have been saved — reloading.",
+      reload: true,
+    };
+  }
+  return { message: error instanceof Error ? error.message : String(error), reload: false };
 }
 
 export interface VirtualWindow {

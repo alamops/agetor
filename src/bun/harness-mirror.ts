@@ -4,33 +4,54 @@
  * A stack mirrors user-level config from the primary (position 0) onto its
  * backups so a failover keeps the same skills, commands, MCP servers, plugins
  * and settings. Each account keeps its own login: harness credential files are
- * never copied, and the primary's provider env keys are stripped from a merged
- * `settings.json` while a backup's own key survives.
+ * never copied, the primary's provider credential and provider-selector env
+ * keys are never imported into a merged `settings.json`, and the primary's
+ * Codex login/provider keys and `[model_providers.*]` tables are never
+ * imported into `config.toml` — a backup's own values survive.
+ *
+ * Safe mode skips settings hooks, permissions, status line and helper commands
+ * (Codex: notify); plugins and MCP servers are still mirrored. Full mode copies
+ * them, and the primary's `hooks`/`permissions` objects replace the backup's.
+ *
+ * A mirror is idempotent and cheap to repeat: a copied file keeps the source's
+ * mtime and an unchanged destination (same size + mtime) is not rewritten, a
+ * merged file whose result equals the backup's current text is not rewritten,
+ * and `mirrorForSwap` is single-flight per destination account. Work on one
+ * destination is serialized, so a stack save and a swap never write the same
+ * account at once.
  *
  * Failures are warnings, never blocks: a task must still be able to fail over
  * when a mirror cannot read one directory.
  */
-import { closeSync, fstatSync, lstatSync, readSync } from "node:fs";
+import { closeSync, fstatSync, lstatSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { openReadNoFollow } from "./no-follow.ts";
 import {
+  FULL_MODE_REPLACED_SETTINGS_KEYS,
   MIRROR_PAYLOAD_LIMITS,
   MIRROR_SPECS,
-  SAFE_MODE_EXCLUDED_KEYS,
-  isHarnessAuthEnvKey,
+  SAFE_MODE_EXCLUDED_CODEX_KEYS,
+  SAFE_MODE_EXCLUDED_SETTINGS_KEYS,
+  isCodexLoginBearingKeyPath,
   isLoginBearingSettingsKey,
+  isMirrorNeverImportedEnvKey,
   isNeverCopyPath,
+  isNeverCopySegment,
   type HarnessMirrorSpec,
 } from "../shared/harness-mirror.ts";
 import type { Harness, HarnessStack, HarnessStackKind } from "../shared/types.ts";
 import {
   assertNotCredentialPath,
   atomicWriteFile,
-  copyRegularFile,
+  canonicalRoot,
+  copyRegularFileDetailed,
   copyTreeCooperative,
+  ensurePlainDirUnder,
   isPlainAncestorPathUnder,
   isPlainDir,
   isRegularFileNoFollow,
+  sameConfigRoot,
 } from "./harness-file-transfer.ts";
 import { claudeConfigDirFor, claudeJsonDirFor, codexHomeFor } from "./harness-stacks.ts";
 import { harnesses } from "./db.ts";
@@ -132,7 +153,8 @@ export async function mirrorStack(
     }
     if (target.id === primary.id) continue;
     try {
-      const one = await mirrorOne(primary, target, kind, spec, stack.mirrorMode === "safe", opts.copyLimits);
+      const one = await serializeForDestination(target.id, () =>
+        mirrorOne(primary, target, kind, spec, stack.mirrorMode === "safe", opts.copyLimits));
       copied.push(...one.copied.map((p) => `${target.id}:${p}`));
       warnings.push(...one.warnings.map((w) => `${target.label}: ${w}`));
     } catch (err) {
@@ -142,12 +164,49 @@ export async function mirrorStack(
   return { copied, warnings };
 }
 
-/** Mirror `targetHarnessId` from the stack's primary, if both exist. */
-export async function mirrorForSwap(
+/** The tail of the work queued for each destination account. Every mirror
+ *  write to one account runs after the previous one settled, so a stack save
+ *  and a swap (or two swaps) never interleave writes into the same files. */
+const destinationTails = new Map<string, Promise<void>>();
+
+function serializeForDestination<T>(harnessId: string, work: () => Promise<T>): Promise<T> {
+  const previous = destinationTails.get(harnessId) ?? Promise.resolve();
+  const run = previous.then(work);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  destinationTails.set(harnessId, tail);
+  void tail.then(() => {
+    if (destinationTails.get(harnessId) === tail) destinationTails.delete(harnessId);
+  });
+  return run;
+}
+
+/** In-flight `mirrorForSwap` per destination account (contract C4). */
+const swapMirrorsInFlight = new Map<string, Promise<MirrorResult>>();
+
+/**
+ * Mirror `targetHarnessId` from the stack's primary, if both exist.
+ *
+ * Single-flight per destination: every account move (automatic swap, retry,
+ * manual move, boot switch) calls this, and N tasks failing over onto one
+ * backup at once would otherwise copy the same tree N times concurrently. A
+ * caller that arrives while a mirror into the same account is running gets
+ * that same promise; a call after it settled runs a fresh mirror (which skips
+ * every unchanged file, so it is cheap).
+ */
+export function mirrorForSwap(
   stack: HarnessStack,
   targetHarnessId: string,
 ): Promise<MirrorResult> {
-  return mirrorStack(stack, { targetHarnessId });
+  const existing = swapMirrorsInFlight.get(targetHarnessId);
+  if (existing) return existing;
+  const promise: Promise<MirrorResult> = mirrorStack(stack, { targetHarnessId }).finally(() => {
+    if (swapMirrorsInFlight.get(targetHarnessId) === promise) swapMirrorsInFlight.delete(targetHarnessId);
+  });
+  swapMirrorsInFlight.set(targetHarnessId, promise);
+  return promise;
 }
 
 async function mirrorOne(
@@ -162,9 +221,20 @@ async function mirrorOne(
   const warnings: string[] = [];
   const fromRoot = mirrorRootFor(primary);
   const toRoot = mirrorRootFor(target);
-  if (path.resolve(fromRoot) === path.resolve(toRoot)) {
+  // realpath, not `path.resolve`: an account edited after the stack was saved
+  // can alias another member's root through a symlink. Mirroring onto itself
+  // would rewrite the primary's own files.
+  if (sameConfigRoot(fromRoot, toRoot)) {
     return { copied, warnings: ["source and destination share a config directory"] };
   }
+  // Roots a re-created symlink must never expose (see `linkTopLevelSymlinks`).
+  const guard: LinkGuard = {
+    kind,
+    configRoots: [canonicalRoot(fromRoot), canonicalRoot(toRoot)],
+    accountDirs: kind === "claude-code"
+      ? [canonicalRoot(claudeJsonDirFor(primary)), canonicalRoot(claudeJsonDirFor(target))]
+      : [],
+  };
 
   // 1. Copy the allowlisted dirs/files verbatim FIRST, so the registry merge
   //    below can tell whether the payload it points at was copied completely.
@@ -174,10 +244,6 @@ async function mirrorOne(
   for (const rel of spec.copy) {
     try {
       assertNotCredentialPath(rel, kind);
-      if (safe && SAFE_MODE_EXCLUDED_KEYS.some((k) => rel === k || rel.startsWith(`${k}/`))) {
-        warnings.push(`${rel}: not copied in safe mode`);
-        continue;
-      }
       const from = path.join(fromRoot, rel);
       const to = path.join(toRoot, rel);
       // A leaf `lstat` follows every parent, so a linked intermediate folder
@@ -211,19 +277,19 @@ async function mirrorOne(
           ...MIRROR_PAYLOAD_LIMITS[rel],
           ...copyLimits?.[rel],
           root: toRoot,
+          // Repeat mirrors (every swap and retry) rewrite only what changed.
+          skipUnchanged: true,
           skip: (child) => {
             // `child` is relative to `from` (e.g. "plugins"), but the
             // allowlist's never-copy entries are root-relative
             // ("plugins/store"). Check the full path or a nested store would
             // slip through.
-            const rootRel = `${rel}/${child}`;
             try {
-              assertNotCredentialPath(rootRel, kind);
+              assertNotCredentialPath(`${rel}/${child}`, kind);
             } catch {
               return true;
             }
-            return safe
-              && SAFE_MODE_EXCLUDED_KEYS.some((k) => rootRel === k || rootRel.startsWith(`${k}/`));
+            return false;
           },
         });
         copied.push(...result.copied.map((c) => `${rel}/${c}`));
@@ -231,12 +297,22 @@ async function mirrorOne(
           incompletePayloads.add(rel);
           warnings.push(`${rel}: copy hit its size/entry budget — the copy on this account is incomplete`);
         }
-        if (result.skipped.length > 0) {
+        // Top-level symlinked skills/commands/agents are re-created as links
+        // on the backup instead of being skipped (the walk never follows them).
+        const linkedNames = new Set<string>();
+        if (spec.linkTopLevel.includes(rel)) {
+          const links = linkTopLevelSymlinks(from, to, rel, toRoot, guard);
+          for (const name of links.handled) linkedNames.add(name);
+          copied.push(...links.linked);
+          warnings.push(...links.warnings);
+        }
+        const skipped = result.skipped.filter((entry) => !linkedNames.has(entry));
+        if (skipped.length > 0) {
           // Not silent: a never-copy cache, a symlink, a vanished entry or a
           // size/entry cap is exactly what a user needs to know did not move
           // (review nit).
           warnings.push(
-            `${rel}: skipped ${result.skipped.length} entr${result.skipped.length === 1 ? "y" : "ies"}`
+            `${rel}: skipped ${skipped.length} entr${skipped.length === 1 ? "y" : "ies"}`
             + " (symlink, never-copy cache, vanished entry, or size/entry cap)",
           );
         }
@@ -246,8 +322,8 @@ async function mirrorOne(
           incompletePayloads.add(rel);
           continue;
         }
-        await copyRegularFile(from, to, { root: toRoot });
-        copied.push(rel);
+        const result = await copyRegularFileDetailed(from, to, { root: toRoot, skipUnchanged: true });
+        if (!result.unchanged) copied.push(rel);
       } else {
         warnings.push(`${rel}: not a regular file or directory`);
         incompletePayloads.add(rel);
@@ -302,6 +378,130 @@ async function mirrorOne(
   return { copied, warnings };
 }
 
+interface LinkGuard {
+  kind: HarnessStackKind;
+  /** Canonical config roots of the source and destination accounts. A link
+   *  target equal to/above one of them, or at/above/inside one of its
+   *  never-copy paths, is refused. */
+  configRoots: string[];
+  /** Canonical folders that hold an account file outside its config root
+   *  (Claude's `.claude.json` dir). A target equal to or above one is
+   *  refused. */
+  accountDirs: string[];
+}
+
+/** File names that are a login wherever they sit. */
+const CREDENTIAL_BASENAMES = new Set([".credentials.json", "auth.json", ".claude.json"]);
+
+function isInsideOrEqual(child: string, parent: string): boolean {
+  const rel = path.relative(parent, child);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/** True when a resolved symlink target would hand a backup the primary's (or
+ *  its own) login or session data: the target is an account root or one of
+ *  its ancestors, a never-copy path (or a folder containing one), a `.git`
+ *  folder, or a credential file by name. */
+function isForbiddenLinkTarget(target: string, guard: LinkGuard): boolean {
+  if (target.split(path.sep).some((segment) => isNeverCopySegment(segment))) return true;
+  if (CREDENTIAL_BASENAMES.has(path.basename(target))) return true;
+  for (const dir of [...guard.configRoots, ...guard.accountDirs]) {
+    if (isInsideOrEqual(dir, target)) return true;
+  }
+  const never = MIRROR_SPECS[guard.kind].never;
+  for (const root of guard.configRoots) {
+    if (!isInsideOrEqual(target, root)) continue;
+    const rel = path.relative(root, target).split(path.sep).join("/");
+    if (isNeverCopyPath(guard.kind, rel)) return true;
+    if (never.some((entry) => entry.startsWith(`${rel}/`))) return true;
+  }
+  return false;
+}
+
+/**
+ * Re-create the top-level symlinked entries of a mirrored folder (`skills/x ->
+ * ../../.agents/skills/x`) on the backup as an ABSOLUTE symlink to the source
+ * link's resolved target. Nothing is read through the link: `realpath` only
+ * resolves the path. A dangling link, or a target inside a credential or
+ * never-copy path (see {@link isForbiddenLinkTarget}), is skipped with a
+ * warning. The destination entry is created when absent and replaced only
+ * when it is itself a symlink (atomically, via a temp link + rename); a real
+ * file or folder the backup has at that name is never replaced.
+ */
+function linkTopLevelSymlinks(
+  from: string,
+  to: string,
+  rel: string,
+  toRoot: string,
+  guard: LinkGuard,
+): { linked: string[]; handled: string[]; warnings: string[] } {
+  const linked: string[] = [];
+  const handled: string[] = [];
+  const warnings: string[] = [];
+  let names: string[];
+  try {
+    names = readdirSync(from).sort();
+  } catch {
+    return { linked, handled, warnings };
+  }
+  for (const name of names) {
+    const src = path.join(from, name);
+    try {
+      if (!lstatSync(src).isSymbolicLink()) continue;
+    } catch {
+      continue;
+    }
+    handled.push(name);
+    let target: string;
+    try {
+      target = realpathSync(src);
+    } catch {
+      warnings.push(`${rel}/${name}: symlink target is missing — not linked`);
+      continue;
+    }
+    if (isForbiddenLinkTarget(target, guard)) {
+      warnings.push(`${rel}/${name}: symlink points at account login or session data — not linked`);
+      continue;
+    }
+    const dest = path.join(to, name);
+    try {
+      ensurePlainDirUnder(toRoot, to);
+      let existing;
+      try {
+        existing = lstatSync(dest);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+      }
+      if (!existing) {
+        symlinkSync(target, dest);
+        linked.push(`${rel}/${name}`);
+        continue;
+      }
+      if (!existing.isSymbolicLink()) {
+        warnings.push(`${rel}/${name}: kept this account's own copy — not replaced by the primary's link`);
+        continue;
+      }
+      if (readlinkSync(dest) === target) continue;
+      const tmp = path.join(to, `.agetor-tmp-${randomUUID()}`);
+      symlinkSync(target, tmp);
+      try {
+        renameSync(tmp, dest);
+      } catch (err) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          // Already gone.
+        }
+        throw err;
+      }
+      linked.push(`${rel}/${name}`);
+    } catch (err) {
+      warnings.push(`${rel}/${name}: could not link — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return { linked, handled, warnings };
+}
+
 const MAX_MIRROR_FILE_BYTES = 8 * 1024 * 1024;
 
 /** Deep-merge `backup` under `primary`: primary scalars win, arrays union
@@ -332,9 +532,13 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** Merge Claude's `settings.json`, stripping the primary's provider login
- *  keys while keeping a backup's own. `safe` mode drops hooks/permissions
- *  from the primary and preserves whatever the backup already has. */
+/** Merge Claude's `settings.json`, stripping the primary's provider
+ *  credential and provider-selector env keys and login-bearing settings while
+ *  keeping a backup's own. `safe` mode drops the primary's hooks, permissions,
+ *  status line and helper commands and preserves whatever the backup already
+ *  has; full mode makes the primary's `hooks`/`permissions` replace the
+ *  backup's (no array union — an edited hook would otherwise run twice and a
+ *  revoked permission survive forever). Other arrays keep the union. */
 async function mergeClaudeSettings(
   fromRoot: string,
   toRoot: string,
@@ -358,7 +562,7 @@ async function mergeClaudeSettings(
   if (!backup) return { copied: [], warnings: ["settings.json: backup file is not a JSON object — left alone"] };
 
   const filtered: Record<string, unknown> = { ...primary };
-  if (safe) for (const key of SAFE_MODE_EXCLUDED_KEYS) delete filtered[key];
+  if (safe) for (const key of SAFE_MODE_EXCLUDED_SETTINGS_KEYS) delete filtered[key];
   // Login-selecting keys never cross accounts. Deleting them from the primary
   // side before the merge leaves the backup's own value intact (when it has
   // one) and leaves the key absent otherwise.
@@ -369,6 +573,11 @@ async function mergeClaudeSettings(
     strippedSettings++;
   }
   const merged = deepMerge(filtered, backup) as Record<string, unknown>;
+  if (!safe) {
+    for (const key of FULL_MODE_REPLACED_SETTINGS_KEYS) {
+      if (key in filtered) merged[key] = filtered[key];
+    }
+  }
 
   // Provider login keys are account-scoped. Start from the backup's own env,
   // then overwrite every non-auth key from the primary's (auth keys stripped).
@@ -377,7 +586,7 @@ async function mergeClaudeSettings(
   const env: Record<string, unknown> = { ...backupEnv };
   let stripped = 0;
   for (const [key, value] of Object.entries(primaryEnv)) {
-    if (isHarnessAuthEnvKey(key)) {
+    if (isMirrorNeverImportedEnvKey(key)) {
       stripped++;
       continue;
     }
@@ -386,7 +595,9 @@ async function mergeClaudeSettings(
   if (Object.keys(env).length > 0) merged.env = env;
   else delete merged.env;
   if (stripped > 0) {
-    warnings.push(`settings.json: stripped ${stripped} provider credential key${stripped === 1 ? "" : "s"} from the primary`);
+    warnings.push(
+      `settings.json: stripped ${stripped} provider credential or login-selector key${stripped === 1 ? "" : "s"} from the primary`,
+    );
   }
   if (strippedSettings > 0) {
     warnings.push(
@@ -394,7 +605,9 @@ async function mergeClaudeSettings(
     );
   }
 
-  await atomicWriteFile(toPath, `${JSON.stringify(merged, null, 2)}\n`, { root: toRoot });
+  const text = `${JSON.stringify(merged, null, 2)}\n`;
+  if (backupRead.ok && backupRead.text === text) return { copied: [], warnings };
+  await atomicWriteFile(toPath, text, { root: toRoot });
   return { copied: ["settings.json"], warnings };
 }
 
@@ -413,7 +626,7 @@ async function mergeClaudeJson(
   const fromPath = path.join(fromBase, ".claude.json");
   const toBase = claudeJsonDirFor(target);
   const toPath = path.join(toBase, ".claude.json");
-  if (path.resolve(fromPath) === path.resolve(toPath)) return { copied: [], warnings: [] };
+  if (canonicalRoot(fromPath) === canonicalRoot(toPath)) return { copied: [], warnings: [] };
   if (!isPlainAncestorPathUnder(fromBase, fromPath)) {
     return { copied: [], warnings: [".claude.json: symlinked parent directory refused — left alone"] };
   }
@@ -441,9 +654,9 @@ async function mergeClaudeJson(
   // This merge copies only `mcpServers`/`enabledPlugins`; it never imports the
   // primary's hooks or permissions, so safe mode must not delete the backup's
   // own copy of those keys from the rest of its blob.
-  await atomicWriteFile(toPath, `${JSON.stringify(merged, null, 2)}\n`, {
-    root: toBase,
-  });
+  const text = `${JSON.stringify(merged, null, 2)}\n`;
+  if (backupRead.ok && backupRead.text === text) return { copied: [], warnings };
+  await atomicWriteFile(toPath, text, { root: toBase });
   return { copied: [".claude.json"], warnings };
 }
 
@@ -498,7 +711,9 @@ async function mergePluginRegistry(
   const merged = rel === "plugins/installed_plugins.json"
     ? mergeInstalledPluginsJson(rewritten, backupJson)
     : (deepMerge(rewritten, backupJson) as Record<string, unknown>);
-  await atomicWriteFile(toPath, `${JSON.stringify(merged, null, 2)}\n`, { root: toRoot });
+  const text = `${JSON.stringify(merged, null, 2)}\n`;
+  if (backupRead.ok && backupRead.text === text) return { copied: [], warnings };
+  await atomicWriteFile(toPath, text, { root: toRoot });
   return { copied: [rel], warnings };
 }
 
@@ -601,8 +816,16 @@ export function rewritePathPrefixes(value: unknown, from: string, to: string): u
  * except `[projects.*]` replaces the backup block with the same header, new
  * primary blocks are appended, and backup-only blocks are kept. `[projects.*]`
  * trust entries are never inherited — directory trust is per-account and
- * security-sensitive. The result is validated by `Bun.TOML.parse`; invalid
- * output is discarded and the backup file left untouched.
+ * security-sensitive.
+ *
+ * Login never crosses accounts: the primary's login-bearing keys
+ * (`CODEX_LOGIN_BEARING_CONFIG_KEYS`: `model_provider`, `forced_login_method`,
+ * `cli_auth_credentials_store`, …), every `[model_providers]`/
+ * `[model_providers.*]` table (bearer tokens, auth headers) and the same keys
+ * inside a `[profiles.*]` table are dropped, while the backup's own keys and
+ * tables survive verbatim. Safe mode also drops `notify`, `hooks` and
+ * `permissions`. The result is validated by `Bun.TOML.parse`; invalid output is
+ * discarded and the backup file left untouched.
  */
 async function mergeCodexConfig(fromRoot: string, toRoot: string, safe: boolean): Promise<MirrorResult> {
   const warnings: string[] = [];
@@ -628,11 +851,15 @@ async function mergeCodexConfig(fromRoot: string, toRoot: string, safe: boolean)
   ).length;
   const backupHeaders = new Map(backupBlocks.map((b) => [b.header, b.text] as const));
   // Only headers the primary actually writes may replace a backup section.
-  // A primary section removed by safe mode must NOT make the backup's own
-  // same-named section disappear.
+  // A primary section removed by safe mode or the login rule must NOT make
+  // the backup's own same-named section disappear.
   const keptPrimaryHeaders = new Set<string>();
   const out: string[] = [];
   let skippedProjects = 0;
+  /** Login-bearing keys/tables of the primary that were not imported. */
+  const loginSkipped = new Set<string>();
+  const safeExcluded = (segments: readonly string[]) =>
+    safe && segments.length > 0 && SAFE_MODE_EXCLUDED_CODEX_KEYS.includes(segments[0]!);
 
   // Top-level scalars are their own merge: the primary's replace by key,
   // while a backup-only key (a model override, notify list, custom setting)
@@ -641,9 +868,14 @@ async function mergeCodexConfig(fromRoot: string, toRoot: string, safe: boolean)
   const primaryTopAssignments = splitTopLevelAssignments(
     primaryBlocks.filter((b) => b.header === "").map((b) => b.text).join("\n"),
   ).assignments;
-  const keptPrimaryTop = safe
-    ? primaryTopAssignments.filter((a) => !SAFE_MODE_EXCLUDED_KEYS.includes(a.key))
-    : primaryTopAssignments;
+  const keptPrimaryTop = primaryTopAssignments.filter((a) => {
+    const segments = splitTomlKeyPath(a.key);
+    if (isCodexLoginAssignment(segments, a.text)) {
+      loginSkipped.add(segments.join("."));
+      return false;
+    }
+    return !safeExcluded(segments);
+  });
   const primaryTopKeys = new Set(keptPrimaryTop.map((a) => a.key));
   const topParts = keptPrimaryTop.map((a) => a.text.trimEnd());
   const backupTopText = backupBlocks.filter((b) => b.header === "").map((b) => b.text).join("\n");
@@ -664,8 +896,17 @@ async function mergeCodexConfig(fromRoot: string, toRoot: string, safe: boolean)
       skippedProjects++;
       continue;
     }
-    if (safe && SAFE_MODE_EXCLUDED_KEYS.some((k) => block.header === k || block.header.startsWith(`${k}.`))) continue;
-    out.push(block.text.trimEnd());
+    const segments = splitTomlKeyPath(block.header);
+    if (isCodexLoginBearingKeyPath(segments)) {
+      loginSkipped.add(segments.join("."));
+      continue;
+    }
+    if (safeExcluded(segments)) continue;
+    let text = block.text;
+    if (segments[0] === "profiles" && segments.length === 2) {
+      text = mergeProfileLoginKeys(block.text, backupHeaders.get(block.header), segments, loginSkipped);
+    }
+    out.push(text.trimEnd());
     keptPrimaryHeaders.add(block.header);
   }
   for (const block of backupBlocks) {
@@ -693,11 +934,94 @@ async function mergeCodexConfig(fromRoot: string, toRoot: string, safe: boolean)
   if (skippedProjects > 0) {
     warnings.push("config.toml: did not copy the primary's [projects.*] trust entries");
   }
+  if (loginSkipped.size > 0) {
+    warnings.push(
+      `config.toml: kept this account's own login and provider settings; did not copy ${[...loginSkipped].sort().join(", ")} from the primary`,
+    );
+  }
   if (primaryMcpSections > 0) {
     warnings.push("config.toml: MCP sign-in may need repeating on this account — OAuth tokens are not copied");
   }
+  if (backupRead.ok && backupRead.text === merged) return { copied: [], warnings };
   await atomicWriteFile(toPath, merged, { root: toRoot });
   return { copied: ["config.toml"], warnings };
+}
+
+/** The login-key names, for spotting one inside an inline-table value. */
+const CODEX_LOGIN_KEY_IN_TEXT_RE =
+  /\b(?:model_providers?|forced_login_method|forced_chatgpt_workspace_id|preferred_auth_method|cli_auth_credentials_store|mcp_oauth_credentials_store|mcp_enterprise_managed_auth|chatgpt_base_url|openai_base_url)\b/;
+
+/** True for a primary assignment that must not be imported: a login-bearing
+ *  key path, or a `profiles`/`profiles.<name>` inline table whose value names a
+ *  login key (an inline profile can set `model_provider` too). */
+function isCodexLoginAssignment(segments: readonly string[], text: string): boolean {
+  if (isCodexLoginBearingKeyPath(segments)) return true;
+  return segments[0] === "profiles" && segments.length < 3 && CODEX_LOGIN_KEY_IN_TEXT_RE.test(text);
+}
+
+/**
+ * A primary `[profiles.<name>]` table with its login-bearing keys removed and
+ * the backup's own login keys from the same table carried over (the merged
+ * table replaces the backup's, so its own `model_provider` would otherwise be
+ * lost). A table with no login key is returned unchanged.
+ */
+function mergeProfileLoginKeys(
+  primaryText: string,
+  backupText: string | undefined,
+  tableSegments: readonly string[],
+  loginSkipped: Set<string>,
+): string {
+  const [headerLine, ...body] = primaryText.split(/\r?\n/);
+  const assignments = splitTopLevelAssignments(body.join("\n")).assignments;
+  const isLogin = (a: TomlAssignment) =>
+    isCodexLoginAssignment([...tableSegments, ...splitTomlKeyPath(a.key)], a.text);
+  const login = assignments.filter(isLogin);
+  if (login.length === 0) return primaryText;
+  for (const a of login) loginSkipped.add([...tableSegments, ...splitTomlKeyPath(a.key)].join("."));
+  const kept = assignments.filter((a) => !isLogin(a)).map((a) => a.text.trimEnd());
+  if (backupText !== undefined) {
+    const [, ...backupBody] = backupText.split(/\r?\n/);
+    for (const a of splitTopLevelAssignments(backupBody.join("\n")).assignments) {
+      if (isLogin(a)) kept.push(a.text.trimEnd());
+    }
+  }
+  return [headerLine ?? "", ...kept].join("\n");
+}
+
+/** Split a TOML key path (`a.b`, `a."b.c"`, `'x'.y`) into unquoted segments.
+ *  Whitespace outside quotes is ignored. */
+export function splitTomlKeyPath(key: string): string[] {
+  const segments: string[] = [];
+  let cur = "";
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < key.length; i++) {
+    const ch = key[i]!;
+    if (quote) {
+      if (quote === '"' && ch === "\\" && i + 1 < key.length) {
+        cur += key[++i];
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+        continue;
+      }
+      cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === ".") {
+      segments.push(cur);
+      cur = "";
+      continue;
+    }
+    if (/\s/.test(ch)) continue;
+    cur += ch;
+  }
+  segments.push(cur);
+  return segments;
 }
 
 interface TomlBlock {

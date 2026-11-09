@@ -14,8 +14,8 @@ import path from "node:path";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
-import { SESSION_DIED_STATUS_PREFIX, HARNESS_LIMIT_STATUS_PREFIX } from "../shared/types.ts";
-import { classifyHarnessLimitSignal } from "../shared/harness-limits.ts";
+import { SESSION_DIED_STATUS_PREFIX, HARNESS_LIMIT_STATUS_PREFIX, type HarnessLimitSignal } from "../shared/types.ts";
+import { classifyHarnessLimitSignal, harnessLimitTextIsNegative } from "../shared/harness-limits.ts";
 import {
   DEATH_JSONL_QUIET_MS,
   DEATH_MISS_THRESHOLD,
@@ -90,23 +90,73 @@ interface CodexEvent {
   thread_id?: string;
   item?: CodexItem;
   message?: string;
-  error?: { message?: string } | string;
+  error?: { message?: string; [k: string]: unknown } | string;
   [k: string]: unknown;
 }
 
 /** Result of mapping one event line. `done` is set when the event terminates
- *  the turn (`turn.completed` → 0, `turn.failed`/`error` → 1). `threadId` is
- *  set on `thread.started`. */
+ *  the turn (`turn.completed` → 0, `turn.failed` → 1; a top-level `error` is
+ *  not terminal on its own). `threadId` is set on `thread.started`. */
 export interface CodexMapResult {
   done?: number;
   threadId?: string;
 }
 
-/** Emit a structured limit signal when Codex's error classifies. Conservative:
- *  `server_overloaded`, `model_not_found`, 5xx and auth/network produce
- *  nothing (the classifier's negative table). */
-function emitCodexLimitSignal(message: string, onChunk: ChunkHandler, key: string): void {
-  const signal = classifyHarnessLimitSignal("codex", { text: message });
+/**
+ * Per-run mapper state, carried in the same `{ n }` box as the line-uuid
+ * counter so every caller (spawn, reattach replay, tests) threads it for free.
+ * `pendingLimit` is the classification of the most recent top-level `error`:
+ * codex prints the cause there and the terminal `turn.failed` usually repeats
+ * it, but a top-level `error` alone is NOT terminal — codex also reports
+ * errors it retries past, and a turn that then completes must never read as
+ * an account limit (docs/architecture/harness-stacks.md, contract C1).
+ */
+export interface CodexMapSeq {
+  n: number;
+  pendingLimit?: HarnessLimitSignal | null;
+}
+
+/** A structured error code, when the event carries one (`codex_error_info`
+ *  on the error or the event, else `error.code` / `error.type`). codex 0.166's
+ *  `exec --json` events carry only `message`; this reads the code a newer
+ *  CLI may add, and the classifier falls back to the prose otherwise. */
+function codexErrorCode(evt: CodexEvent): unknown {
+  const err = evt.error && typeof evt.error === "object" ? evt.error : null;
+  for (const value of [
+    err?.codex_error_info,
+    err?.codexErrorInfo,
+    evt.codex_error_info,
+    evt.codexErrorInfo,
+    err?.code,
+    err?.type,
+  ]) {
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+}
+
+/** Classify a codex error event. Conservative: `server_overloaded`,
+ *  `model_not_found`, 5xx and auth/network produce nothing (the classifier's
+ *  negative table). */
+function classifyCodexError(evt: CodexEvent, message: string): HarnessLimitSignal | null {
+  return classifyHarnessLimitSignal("codex", { text: message, code: codexErrorCode(evt) });
+}
+
+/** Emit the structured limit signal for a TERMINAL turn failure only: the
+ *  `turn.failed` message itself, else the last top-level `error`'s
+ *  classification — unless the terminal message names an explicit
+ *  non-limit cause (outage, auth, model). */
+function emitCodexTurnFailedSignal(
+  evt: CodexEvent,
+  message: string,
+  seq: CodexMapSeq,
+  onChunk: ChunkHandler,
+  key: string,
+): void {
+  const remembered = seq.pendingLimit ?? null;
+  seq.pendingLimit = null;
+  const own = classifyCodexError(evt, message);
+  const signal = own ?? (harnessLimitTextIsNegative(message) ? null : remembered);
   if (!signal) return;
   onChunk("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`, `${key}:limit`);
 }
@@ -114,7 +164,7 @@ function emitCodexLimitSignal(message: string, onChunk: ChunkHandler, key: strin
 function errMessage(e: CodexEvent["error"]): string {
   if (!e) return "codex turn failed";
   if (typeof e === "string") return e;
-  return e.message ?? "codex turn failed";
+  return typeof e.message === "string" ? e.message : "codex turn failed";
 }
 
 /**
@@ -133,7 +183,7 @@ function errMessage(e: CodexEvent["error"]): string {
 export function mapCodexEvent(
   evt: CodexEvent,
   onChunk: ChunkHandler,
-  seq: { n: number },
+  seq: CodexMapSeq,
 ): CodexMapResult {
   const type = evt.type ?? "";
   switch (type) {
@@ -143,25 +193,31 @@ export function mapCodexEvent(
     case "turn.started":
       // Silent — the per-item events carry the substance; a "turn started"
       // banner would just be noise above the first assistant/tool chunk.
+      seq.pendingLimit = null;
       return {};
 
     case "turn.completed":
+      // The turn succeeded: whatever limit-shaped error codex reported on the
+      // way (a retried 429) was not terminal, so it is forgotten, not emitted.
+      seq.pendingLimit = null;
       return { done: 0 };
 
     case "turn.failed": {
       const message = errMessage(evt.error);
       const key = `turn.failed:${seq.n++}`;
-      emitCodexLimitSignal(message, onChunk, key);
+      emitCodexTurnFailedSignal(evt, message, seq, onChunk, key);
       onChunk("stderr", message, key);
       return { done: 1 };
     }
 
     case "error": {
       // Top-level transport/model error (no item). A `turn.failed` usually
-      // follows and carries the terminal `done`; surface the message here.
+      // follows and carries the terminal `done`; surface the message here and
+      // REMEMBER its classification for that `turn.failed` — never emit a
+      // limit signal from here (contract C1: only a terminal failure does).
       const message = errMessage(evt.error ?? evt.message);
       const key = `error:${seq.n++}`;
-      emitCodexLimitSignal(message, onChunk, key);
+      seq.pendingLimit = classifyCodexError(evt, message);
       onChunk("stderr", message, key);
       return {};
     }
@@ -186,6 +242,8 @@ export function mapCodexEvent(
           break;
         }
         case "error":
+          // A non-fatal item-level error (a tool failure, a retry notice):
+          // shown, never classified as an account limit.
           onChunk("stderr", item.message ?? item.text ?? "codex error", key);
           break;
         case "command_execution": {
@@ -255,7 +313,7 @@ interface CodexSessionState {
   pollTimer: ReturnType<typeof setInterval> | null;
   deathTimer: ReturnType<typeof setInterval> | null;
   seenLineUuids: Set<string>;
-  seq: { n: number };
+  seq: CodexMapSeq;
   onChunk: ChunkHandler;
   onSessionId?: (id: string) => void;
   sessionIdSent: boolean;
@@ -317,7 +375,9 @@ function flushCodexLog(state: CodexSessionState): void {
     } catch {
       // Not JSON — codex shouldn't emit this under `--json --color never`, but
       // surface it rather than drop it (could be a launch error from the shell
-      // wrapper, e.g. "command not found").
+      // wrapper, e.g. "command not found"). Never classified as an account
+      // limit: `2>&1` also carries codex's own log lines, which can mention a
+      // retried 429 on a turn that then succeeds.
       state.onChunk("stderr", trimmed, undefined);
       continue;
     }

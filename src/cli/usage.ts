@@ -289,7 +289,8 @@ export const USAGE: Record<string, string> = {
   Members are ordered: the first --member is the primary, the rest are the
   train's backups. --kind defaults to claude-code. --mirror (default full)
   copies the primary's config tree to the backups: full mirrors everything
-  eligible, safe skips hooks and other executable sections.`,
+  eligible. Safe skips settings hooks, permissions, status line and helper
+  commands (Codex: notify); plugins and MCP servers are still mirrored.`,
 
   "harness stack show": `usage: agetor harness stack show <id>
 
@@ -299,7 +300,9 @@ export const USAGE: Record<string, string> = {
 
   Replace the member list when --member is given (first = primary), rename the
   stack with --label, change the harness kind with --kind, and/or change the
-  mirror mode.`,
+  mirror mode with --mirror. Safe skips settings hooks, permissions, status
+  line and helper commands (Codex: notify); plugins and MCP servers are still
+  mirrored.`,
 
   "harness stack rm": `usage: agetor harness stack rm <id>
 
@@ -521,11 +524,21 @@ export function parseOpencodeServerFlag(value: string): true {
   );
 }
 
-/** Resolve the help block for `agetor <cmd> [sub] --help` / `agetor help <cmd>
- *  [sub]`: a subcommand block when one exists, else the command block, else
- *  undefined (the caller falls back to the global index). */
-export function helpFor(cmd: string | undefined, sub: string | undefined): string | undefined {
+/** Resolve the help block for `agetor <cmd> [sub [subsub]] --help` /
+ *  `agetor help <cmd> [sub [subsub]]`: a third-level block when one exists
+ *  (`harness stack create`), else the subcommand block, else the command
+ *  block, else undefined (the caller falls back to the global index). */
+export function helpFor(
+  cmd: string | undefined,
+  sub: string | undefined,
+  subsub?: string | undefined,
+): string | undefined {
   if (!cmd) return undefined;
   const name = canonical(cmd);
-  return (sub ? USAGE[`${name} ${sub}`] : undefined) ?? USAGE[name];
+  // Most specific block first: `harness stack create` → `harness stack` →
+  // `harness`. A third word that names no block (a positional argument such
+  // as `harness add <id>`) falls back to the two-word block.
+  return (sub && subsub ? USAGE[`${name} ${sub} ${subsub}`] : undefined)
+    ?? (sub ? USAGE[`${name} ${sub}`] : undefined)
+    ?? USAGE[name];
 }

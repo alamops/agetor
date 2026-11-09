@@ -25,7 +25,11 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
       const byId = new Map(statuses.map((s) => [s.harnessId, s]));
       const stackPosition = new Map<string, string>();
       for (const stack of stacks) {
-        stack.members.forEach((m, i) => stackPosition.set(m.harnessId, `${i + 1}/${stack.members.length}${i === 0 ? " primary" : ""}`));
+        // A one-member stack has no backups: name the role without a `1/1`.
+        stack.members.forEach((m, i) => stackPosition.set(
+          m.harnessId,
+          stack.members.length < 2 ? "primary" : `${i + 1}/${stack.members.length}${i === 0 ? " primary" : ""}`,
+        ));
       }
       const cooling = new Map(limitStates.map((s) => [s.harnessId, s]));
       const rows = harnesses.map((h) => {
@@ -291,7 +295,7 @@ async function cmdHarnessStack(
         const cooling = limitStates.find((s) => s.harnessId === m.harnessId);
         const role = i === 0 ? c.cyan("primary") : c.dim(`backup ${i + 1}`);
         const cool = cooling ? ` — ${c.yellow(`cooling until ${new Date(cooling.exhaustedUntilMs).toLocaleString()}`)}` : "";
-        out(`  ${role} ${escapeControlChars(m.label)} ${c.gray(m.harnessId)}${cool}`);
+        out(`  ${role} ${escapeControlChars(m.label)} ${c.gray(escapeControlChars(m.harnessId))}${cool}`);
       });
       for (const w of stack.warnings) out(`  ${c.yellow("!")} ${escapeFreeText(w.message)}`);
       return;

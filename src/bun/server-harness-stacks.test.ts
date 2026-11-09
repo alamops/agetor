@@ -3,7 +3,7 @@
 // is set before db/server import.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Task } from "../shared/types.ts";
@@ -67,13 +67,52 @@ afterAll(() => {
   rmTestDataDir(DATA_DIR);
 });
 
-async function call(method: string, p: string, body?: unknown) {
+async function call(method: string, p: string, body?: unknown, bearer = token) {
   const res = await fetch(`${BASE}${p}`, {
     method,
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   return { status: res.status, body: await res.json().catch(() => null) };
+}
+
+/** A minimal task row; `patch` overrides any field. */
+function seedTaskRow(patch: Partial<Task> = {}): string {
+  const id = randomUUID();
+  db.tasks.insert({
+    id,
+    title: "server harness test",
+    prompt: "p",
+    agent: "api-a",
+    workdir: DATA_DIR,
+    isolation: "none",
+    taskType: "task",
+    branch: null,
+    branchSource: "created",
+    worktreePath: null,
+    baseRef: null,
+    prUrl: null,
+    mode: null,
+    model: null,
+    effort: null,
+    speed: "off",
+    maxMode: false,
+    opencodeServer: "shared",
+    references: [],
+    backlog: [],
+    plans: [],
+    draft: null,
+    column: "ready",
+    runId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+    ...patch,
+  } satisfies Task);
+  return id;
 }
 
 describe("harness-stacks routes", () => {
@@ -426,4 +465,354 @@ describe("harness-stacks routes", () => {
       if (db.harnesses.get(harnessId)) db.harnesses.delete(harnessId);
     }
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Account roots and the CLI path gate (review M7): `..` refused, paths stored
+// normalized, a missing root gated by its nearest existing ancestor, and a
+// stack save over a root the CLI token cannot reach refused with 403.
+// ---------------------------------------------------------------------------
+
+// A directory the probe can search but not read (`-wx`): a missing child of it
+// stats as ENOENT (so an `exists` gate passed it), while the directory itself
+// answers `denied`, which is what a `nearest-ancestor` gate must find. Root
+// ignores permission bits, so these cases are skipped when run as root.
+const IS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
+
+describe("harness account roots and the CLI path gate", () => {
+  let lockedParent = "";
+  let locked = "";
+  let cliToken = "";
+  beforeAll(async () => {
+    cliToken = (await import("./api-config.ts")).CLI_TOKEN;
+    lockedParent = mkdtempSync(path.join(tmpdir(), "agetor-locked-"));
+    locked = path.join(lockedParent, "locked");
+    mkdirSync(locked);
+    chmodSync(locked, 0o300);
+  });
+  afterAll(() => {
+    chmodSync(locked, 0o700);
+    rmSync(lockedParent, { recursive: true, force: true });
+  });
+
+  test("POST/PATCH /harnesses refuse a `..` segment in home, bin and a config-root env value, and store normalized paths", async () => {
+    const id = `api-norm-${randomUUID().slice(0, 8)}`;
+    const home = path.join(DATA_DIR, "homes", id);
+    const dotted = await call("POST", "/harnesses", { id, kind: "claude-code", label: id, home: `${home}/zz/..` });
+    expect(dotted.status).toBe(400);
+    expect(dotted.body.error).toContain('".."');
+    expect(db.harnesses.get(id)).toBeNull();
+    const dottedBin = await call("POST", "/harnesses", { id, kind: "claude-code", label: id, bin: "/usr/../bin/claude" });
+    expect(dottedBin.status).toBe(400);
+    const dottedEnv = await call("POST", "/harnesses", {
+      id,
+      kind: "codex",
+      label: id,
+      env: { CODEX_HOME: `${home}/x/../y` },
+    });
+    expect(dottedEnv.status).toBe(400);
+    expect(dottedEnv.body.error).toContain("CODEX_HOME");
+
+    const created = await call("POST", "/harnesses", {
+      id,
+      kind: "claude-code",
+      label: id,
+      home: `${home}//./acct/`,
+      env: { CLAUDE_CONFIG_DIR: ` ${home}/cfg/./ `, OTHER: "/keep/./as/given" },
+    });
+    expect(created.status).toBe(200);
+    try {
+      expect(created.body.home).toBe(path.join(home, "acct"));
+      expect(created.body.env.CLAUDE_CONFIG_DIR).toBe(path.join(home, "cfg"));
+      // Only config-root keys are rewritten.
+      expect(created.body.env.OTHER).toBe("/keep/./as/given");
+
+      const patched = await call("PATCH", `/harnesses/${id}`, { home: `${home}/a/../b` });
+      expect(patched.status).toBe(400);
+      const patchedEnv = await call("PATCH", `/harnesses/${id}`, { env: { HOME: "~/../other" } });
+      expect(patchedEnv.status).toBe(400);
+      expect(db.harnesses.get(id)?.home).toBe(path.join(home, "acct"));
+      const ok = await call("PATCH", `/harnesses/${id}`, { home: `${home}/b/` });
+      expect(ok.status).toBe(200);
+      expect(db.harnesses.get(id)?.home).toBe(path.join(home, "b"));
+    } finally {
+      db.harnesses.delete(id);
+    }
+  }, 60_000);
+
+  test.skipIf(IS_ROOT)("a missing home or env root under a protected folder is gated by its nearest ancestor for the CLI token; the app is not gated", async () => {
+    const id = `api-gate-${randomUUID().slice(0, 8)}`;
+    const missingHome = path.join(locked, "missing", "deeper");
+    const viaHome = await call("POST", "/harnesses", { id, kind: "claude-code", label: id, home: missingHome }, cliToken);
+    expect(viaHome.status).toBe(403);
+    expect(viaHome.body.code).toBe("path-not-accessible");
+    const viaEnv = await call(
+      "POST",
+      "/harnesses",
+      { id, kind: "claude-code", label: id, env: { CLAUDE_CONFIG_DIR: path.join(locked, "missing") } },
+      cliToken,
+    );
+    expect(viaEnv.status).toBe(403);
+    expect(viaEnv.body.code).toBe("path-not-accessible");
+    expect(db.harnesses.get(id)).toBeNull();
+
+    // A missing root under a readable folder still passes for the CLI token.
+    const fine = await call(
+      "POST",
+      "/harnesses",
+      { id, kind: "claude-code", label: id, home: path.join(DATA_DIR, "homes", id, "not-yet") },
+      cliToken,
+    );
+    expect(fine.status).toBe(200);
+    try {
+      const patched = await call("PATCH", `/harnesses/${id}`, { home: missingHome }, cliToken);
+      expect(patched.status).toBe(403);
+      expect(patched.body.code).toBe("path-not-accessible");
+      // The app caller (the user in the desktop UI) is never gated.
+      const app = await call("PATCH", `/harnesses/${id}`, { home: missingHome });
+      expect(app.status).toBe(200);
+      expect(db.harnesses.get(id)?.home).toBe(missingHome);
+    } finally {
+      db.harnesses.delete(id);
+    }
+  }, 60_000);
+
+  test.skipIf(IS_ROOT)("a CLI-token stack save over a member root it cannot reach is refused with 403; the app caller is unaffected", async () => {
+    const id = `api-denied-${randomUUID().slice(0, 8)}`;
+    // Stored directly (as the desktop UI may have): the stack route is what
+    // must refuse to mirror into it for the CLI token.
+    db.harnesses.insert({ id, kind: "claude-code", label: id, home: path.join(locked, id), env: {} } as never);
+    let stackId: string | null = null;
+    try {
+      const refused = await call(
+        "POST",
+        "/harness-stacks",
+        { label: "denied root", kind: "claude-code", members: ["api-a", id], mirrorMode: "safe" },
+        cliToken,
+      );
+      expect(refused.status).toBe(403);
+      expect(refused.body.code).toBe("path-not-accessible");
+      expect(db.db.query(`SELECT 1 FROM harness_stack_members WHERE harness_id = ?`).get(id)).toBeNull();
+
+      // Readable roots pass for the CLI token…
+      const cliOk = await call(
+        "POST",
+        "/harness-stacks",
+        { label: "cli ok", kind: "claude-code", members: ["api-a"], mirrorMode: "safe" },
+        cliToken,
+      );
+      expect(cliOk.status).toBe(201);
+      stackId = cliOk.body.stack.id as string;
+      // …but a PATCH adding the denied member is refused too.
+      const patchRefused = await call("PATCH", `/harness-stacks/${stackId}`, { members: ["api-a", id] }, cliToken);
+      expect(patchRefused.status).toBe(403);
+      expect(patchRefused.body.code).toBe("path-not-accessible");
+
+      // The app caller saves the same stack.
+      const app = await call("PATCH", `/harness-stacks/${stackId}`, { members: ["api-a", id] });
+      expect(app.status).toBe(200);
+      expect(app.body.stack.members.map((m: { harnessId: string }) => m.harnessId)).toEqual(["api-a", id]);
+    } finally {
+      if (stackId) await call("DELETE", `/harness-stacks/${stackId}`);
+      db.harnesses.delete(id);
+    }
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// S5 (contract C9): PATCH /harnesses/:id re-validates a stack member's root.
+// ---------------------------------------------------------------------------
+
+describe("PATCH /harnesses/:id on a stack member", () => {
+  test("refuses re-pointing a member at another member's config root (also via a symlink), allows its own new root", async () => {
+    const ids = ["a", "b"].map((x) => `api-s5-${x}-${randomUUID().slice(0, 6)}`);
+    for (const id of ids) {
+      const home = path.join(DATA_DIR, "homes", id);
+      mkdirSync(home, { recursive: true });
+      writeFileSync(path.join(home, ".credentials.json"), "{}");
+      db.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+    }
+    const created = await call("POST", "/harness-stacks", { label: "s5", kind: "claude-code", members: ids, mirrorMode: "safe" });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    const homeA = path.join(DATA_DIR, "homes", ids[0]!);
+    const homeB = path.join(DATA_DIR, "homes", ids[1]!);
+    const alias = path.join(DATA_DIR, "homes", `alias-${ids[0]}`);
+    symlinkSync(homeA, alias);
+    try {
+      const direct = await call("PATCH", `/harnesses/${ids[1]}`, { home: homeA });
+      expect(direct.status).toBe(400);
+      expect(String(direct.body.error)).toContain(ids[0]!);
+      const viaLink = await call("PATCH", `/harnesses/${ids[1]}`, { home: alias });
+      expect(viaLink.status).toBe(400);
+      const viaEnv = await call("PATCH", `/harnesses/${ids[1]}`, { env: { CLAUDE_CONFIG_DIR: homeA } });
+      expect(viaEnv.status).toBe(400);
+      expect(db.harnesses.get(ids[1]!)?.home).toBe(homeB);
+      expect(db.harnesses.get(ids[1]!)?.env).toEqual({});
+
+      const own = path.join(DATA_DIR, "homes", `${ids[1]}-moved`);
+      const moved = await call("PATCH", `/harnesses/${ids[1]}`, { home: own });
+      expect(moved.status).toBe(200);
+      expect(db.harnesses.get(ids[1]!)?.home).toBe(own);
+    } finally {
+      await call("DELETE", `/harness-stacks/${stackId}`);
+      for (const id of ids) db.harnesses.delete(id);
+    }
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// M5 server part (contract C3): moving a card out of `blocked` cancels the
+// armed all-exhausted retry.
+// ---------------------------------------------------------------------------
+
+describe("PATCH /tasks/:id column move off blocked", () => {
+  test("cancels the armed retry timer, clears allExhausted, and the timer never fires", async () => {
+    const failover = await import("./harness-failover.ts");
+    const fired: string[] = [];
+    const prev = failover.setHarnessFailoverHooks({
+      onAutoRetry: async (taskId) => {
+        fired.push(taskId);
+      },
+      onReconcileSwap: async () => {},
+    });
+    const at = Date.now() + 400;
+    const taskId = seedTaskRow({ column: "blocked" });
+    db.tasks.setHarnessState(taskId, {
+      stackId: "s-none",
+      position: 0,
+      tried: ["api-a"],
+      pendingSwap: null,
+      allExhausted: { at: Date.now(), attempts: 1, max: 3, nextAttemptAt: at, earliestResetAtMs: null, reason: "quota" },
+      lastMove: null,
+    });
+    failover.armAutoRetry(taskId, at);
+    try {
+      const moved = await call("PATCH", `/tasks/${taskId}`, { column: "ready" });
+      expect(moved.status).toBe(200);
+      expect(db.tasks.get(taskId)?.column).toBe("ready");
+      expect(db.tasks.get(taskId)?.harnessState?.allExhausted ?? null).toBeNull();
+      await new Promise((r) => setTimeout(r, 800));
+      expect(fired).toEqual([]);
+    } finally {
+      failover.cancelAutoRetry(taskId);
+      failover.setHarnessFailoverHooks(prev);
+      db.tasks.delete(taskId);
+    }
+  }, 30_000);
+
+  test("a PATCH that keeps the card in blocked leaves the armed retry alone", async () => {
+    const taskId = seedTaskRow({ column: "blocked" });
+    const exhausted = { at: Date.now(), attempts: 1, max: 3, nextAttemptAt: Date.now() + 60_000, earliestResetAtMs: null, reason: "quota" as const };
+    db.tasks.setHarnessState(taskId, { stackId: "s-none", position: 0, tried: [], pendingSwap: null, allExhausted: exhausted, lastMove: null });
+    try {
+      const renamed = await call("PATCH", `/tasks/${taskId}`, { title: "still blocked" });
+      expect(renamed.status).toBe(200);
+      expect(db.tasks.get(taskId)?.harnessState?.allExhausted).toEqual(exhausted);
+    } finally {
+      db.tasks.delete(taskId);
+    }
+  }, 30_000);
+});
+
+describe("review S1 / S10 route guards", () => {
+  test("PATCH /tasks/:id refuses a prompt that is exactly the hidden continuation wrapper", async () => {
+    const { wrapHarnessStackContinuation, isHarnessStackContinuation } = await import("../shared/harness-stack.ts");
+    const taskId = seedTaskRow();
+    try {
+      const hidden = wrapHarnessStackContinuation("do something the user cannot see");
+      expect(isHarnessStackContinuation(hidden)).toBe(true);
+      const refused = await call("PATCH", `/tasks/${taskId}`, { prompt: hidden });
+      expect(refused.status).toBe(400);
+      expect(refused.body?.code).toBe("hidden-continuation");
+      expect(db.tasks.get(taskId)?.prompt).toBe("p");
+      // Merely mentioning the tag stays allowed.
+      const mention = "explain what the <harness-stack-continuation> tag is for";
+      const ok = await call("PATCH", `/tasks/${taskId}`, { prompt: mention });
+      expect(ok.status).toBe(200);
+      expect(db.tasks.get(taskId)?.prompt).toBe(mention);
+    } finally {
+      db.tasks.delete(taskId);
+    }
+  }, 30_000);
+
+  test("DELETE /harness-stacks/:id clears a task whose account resolves to the stack even when its state names another stack id", async () => {
+    const failover = await import("./harness-failover.ts");
+    const fired: string[] = [];
+    const prev = failover.setHarnessFailoverHooks({
+      onAutoRetry: async (taskId) => {
+        fired.push(taskId);
+      },
+      onReconcileSwap: async () => {},
+    });
+    const created = await call("POST", "/harness-stacks", { label: "S10", kind: "claude-code", members: ["api-a", "api-b"] });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    const at = Date.now() + 400;
+    const taskId = seedTaskRow({ column: "blocked", agent: "api-a" });
+    // A raw write naming a stale stack id: the stored-id filter alone misses it.
+    db.tasks.setHarnessState(taskId, {
+      stackId: "an-older-stack",
+      position: 0,
+      tried: ["api-a", "api-b"],
+      pendingSwap: null,
+      allExhausted: { at: Date.now(), attempts: 1, max: 3, nextAttemptAt: at, earliestResetAtMs: null, reason: "quota" },
+      lastMove: null,
+    });
+    failover.armAutoRetry(taskId, at);
+    try {
+      const removed = await call("DELETE", `/harness-stacks/${stackId}`);
+      expect(removed.status).toBe(200);
+      expect(db.tasks.get(taskId)?.harnessState ?? null).toBeNull();
+      await new Promise((r) => setTimeout(r, 800));
+      expect(fired).toEqual([]);
+    } finally {
+      failover.cancelAutoRetry(taskId);
+      failover.setHarnessFailoverHooks(prev);
+      db.tasks.delete(taskId);
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// N13: the `?limit=` rebuild snapshot's first-load anchor skips the hidden
+// continuation agetor sends after a swap.
+// ---------------------------------------------------------------------------
+
+describe("rebuild-events anchor", () => {
+  test("anchors on the user's last real message, not a hidden harness-stack continuation", async () => {
+    const { encodeProjectPath } = await import("./claude-tmux.ts");
+    const cwd = path.join(DATA_DIR, `anchor-cwd-${randomUUID().slice(0, 8)}`);
+    const sessionId = randomUUID();
+    const taskId = seedTaskRow({ workdir: cwd });
+    const runId = randomUUID();
+    db.runs.insert({
+      id: runId, taskId, agent: "api-a", status: "succeeded",
+      startedAt: Date.now(), endedAt: Date.now() + 1, exitCode: 0,
+      tmuxSession: null, claudeSessionId: sessionId, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+    const projectDir = path.join(DATA_DIR, "homes", "api-a", "projects", encodeProjectPath(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    const user = (content: string) => JSON.stringify({ type: "user", uuid: randomUUID(), message: { content } });
+    const assistant = (text: string) =>
+      JSON.stringify({ type: "assistant", uuid: randomUUID(), message: { content: [{ type: "text", text }] } });
+    const continuation = '<pasted_content id="ab12">\n<harness-stack-continuation>\nContinue the task.\n</harness-stack-continuation>\n</pasted_content id="ab12">';
+    const lines = [
+      user("the user's real message"),
+      ...Array.from({ length: 900 }, (_, i) => assistant(`A${i}`)),
+      user(continuation),
+      ...Array.from({ length: 10 }, (_, i) => assistant(`B${i}`)),
+    ];
+    writeFileSync(path.join(projectDir, `${sessionId}.jsonl`), lines.join("\n") + "\n");
+    try {
+      const res = await call("GET", `/runs/${runId}/rebuild-events?limit=800`);
+      expect(res.status).toBe(200);
+      const events = res.body.events as Array<{ stream: string; data: string }>;
+      expect(events[0]).toMatchObject({ stream: "user", data: "the user's real message" });
+      expect(res.body.hasMore).toBe(false);
+    } finally {
+      db.runs.update(runId, { status: "failed" });
+      db.tasks.delete(taskId);
+    }
+  }, 30_000);
 });

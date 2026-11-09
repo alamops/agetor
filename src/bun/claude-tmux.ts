@@ -7405,13 +7405,15 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // turns it into a swap (the turn is over for this account). On a lone
   // account it must stay inert: claude's own auto-continue keeps the turn in
   // flight, exactly as before stacks existed (plan §2.2). Checked before
-  // `pickScrapeMatch` because the notice must never become a card.
+  // `pickScrapeMatch` because the notice must never become a card. The
+  // `wrapping up` grace notice counts only once the turn has stopped —
+  // nothing shows claude working and it sits idle at its input box.
   if (shouldSignalHarnessLimit({
     harnessFailover: state.harnessFailover,
     turnInFlight: turnInFlight(state),
     limitSignaledThisTurn: state.limitSignaledThisTurn,
     claudeIsWriting,
-    paneShowsNotice: paneShowsHarnessLimitNotice(tail),
+    paneShowsNotice: paneShowsHarnessLimitNotice(tail, { turnStopped: !paneWorking && paneIdle }),
   })) {
     signalHarnessLimit(state, tail);
   }
@@ -7955,88 +7957,164 @@ function signalIdleSettle(state: SessionState): void {
 }
 
 /**
- * A rendered row that can be the LIVE provider notice, rather than transcript
- * prose that merely mentions a limit. The notice is drawn as its own row
- * (inline notice / hint slot), so the phrase has to start that row after only
- * indentation and an optional leading status glyph (`⚠`, `●`, `⏺`, a bullet).
- * Anchoring here is what keeps `Usage limit resets at 8am` — a perfectly
- * ordinary sentence in an assistant reply — from being read as the notice:
- * with a bare substring test it matched the old `resets at` detail and settled
- * a healthy stacked turn (review R-M1).
+ * Claude's live usage-limit notices (claude 2.1.319 binary strings — the
+ * `limit-status` notification and the auto-continue rows):
+ *   `Usage limit reached · continuing automatically <when> · esc to cancel`
+ *   `Usage limit reached again · continuing automatically <when> · esc to cancel`
+ *   `Continuing automatically <when> · Esc to cancel`          (waiting row)
+ *   `Usage limit reached · limit resets <t> · <help url>`      (stopped)
+ *   `Usage limit reached · wrapping up · limit resets <t> · …` (grace window:
+ *       claude is still finishing the turn on a brief allowance)
+ *   `Usage limit reached · brief included wrap-up, then usage credits`
+ *       (usage credits cover it — the account keeps working; NOT a stop)
+ *   `You've hit your limit · resets <t>`                       (client-composed 429)
+ * plus the older wrapped form (`Usage limit · continuing` / `automatically at
+ * 8am`).
  *
- * `\p{L}`/`\p{N}` keep the optional glyph from swallowing a real word, so
- * `"Usage limit …"` still matches (a quoted sentence can be prose) but the
- * detail below has to be present as well.
+ * The notice row must START with the phrase after only indentation and an
+ * optional `⚠`. Any other leading glyph is transcript or tool gutter — `⎿`
+ * (tool result), `│`/`|` (boxed output), `>` (quote), `⏺`/`●` (message
+ * bullets), `❯` (an echoed prompt) — so a tool result printing the notice
+ * text (review S2) can never pass, nor can a sentence that merely mentions
+ * the limit.
  */
-const PANE_LIMIT_NOTICE_LINE_RE = /^[\s\u00a0]*(?:[^\p{L}\p{N}\s]{1,3}\s*)?usage\s+limit\b/iu;
-/**
- * The words the provider's auto-continue notice actually carries (evidence in
- * `MODAL_NOTICE_RE`'s doc: `Usage limit reached · continuing automatically at
- * <t> · esc to cancel`, `… continuing shortly · esc to cancel`, `… continuing
- * automatically when it resets · esc to cancel`). Requiring one of these —
- * instead of the old loose `reached` / `resets at` — is what tells the live
- * notice apart from prose that repeats the phrase.
- */
-const PANE_LIMIT_NOTICE_DETAIL_RE = /continuing\s+(?:automatically|shortly)|esc\s+to\s+cancel/i;
-/** The notice is one line that may wrap onto at most two more rows. */
+const PANE_LIMIT_NOTICE_HEAD_RE =
+  /^[\s ]*(?:⚠️?[\s ]+)?(?=usage\s+limit\b|continuing\s+automatically\b|you(?:'|’)ve\s+hit\s+your\s+(?:usage\s+)?limit\b)/iu;
+/** The notice is one row that may wrap onto at most two more rows. */
 const PANE_LIMIT_WINDOW_LINES = 3;
 /**
- * How many trailing NON-BLANK pane rows can hold the live notice. The notice
- * renders in the hint slot of the bottom chrome, directly above the input box
- * — never in the scrollback transcript. Scanning the whole 40-row tail let a
- * pasted or quoted notice row (the user pasting the text, a tool result, an
- * earlier turn's scrollback) settle a perfectly healthy stacked turn and burn
- * a backup. 12 mirrors `matchUnknownCommand`'s "a stale sighting further up
- * the pane" window and comfortably covers the observed chrome stack (wrapped
- * notice, input box, status bar and the background-agent roster).
+ * How many non-blank rows directly above the input box form the hint slot.
+ * The notice renders there (or in the footer below the box) — never in the
+ * scrollback transcript. Bounded so a pasted or quoted notice further up (the
+ * user pasting the text, an earlier turn's scrollback) can't settle a healthy
+ * stacked turn and burn a backup (review R7-S3).
  */
-const PANE_LIMIT_SEARCH_NONBLANK = 12;
+const PANE_LIMIT_HINT_ROWS = 4;
+/** How many trailing non-blank rows can hold the input box at all: the box
+ *  (≥3 rows), the status bar and the background-agent roster. */
+const PANE_LIMIT_CHROME_NONBLANK = 20;
+/** A horizontal rule row: the input box's top and bottom borders. */
+const INPUT_BOX_BORDER_RE = /^[\s ]*─{8,}/;
+/** A transcript/tool gutter row: walking up from the box stops there, so the
+ *  hint slot never reaches into the transcript above it. */
+const TRANSCRIPT_GUTTER_RE = /^[\s ]*(?:⎿|│|\||>|⏺|●|❯)/u;
+
+type PaneLimitNoticeKind = "auto-continue" | "stopped" | "wrap-up";
+
+interface PaneLimitNotice {
+  /** The notice rows as drawn (joined, trimmed) — what is classified and
+   *  stored, so a reset time on a wrapped row survives. */
+  text: string;
+  kind: PaneLimitNoticeKind;
+}
+
+/** Which notice a head row (plus its wrapped rows) is, or null for anything
+ *  that only resembles one (`Usage limit has reset · press enter to continue`
+ *  is actionable, not a limit; `Usage limit resets at 8am` is prose). */
+function paneLimitNoticeKind(text: string): PaneLimitNoticeKind | null {
+  const body = text.replace(/^⚠️?\s+/u, "");
+  if (/brief\s+included\s+wrap-up/i.test(body)) return null;
+  if (/^continuing\s+automatically\b/i.test(body)) {
+    return /\besc\s+to\s+cancel\b/i.test(body) ? "auto-continue" : null;
+  }
+  if (/^you(?:'|’)ve\s+hit\s+your\s+(?:usage\s+)?limit\b/i.test(body)) return "stopped";
+  // usage limit …
+  if (/^usage\s+limit\s+reached(?:\s+again)?\s*·\s*wrapping\s+up\b/i.test(body)) return "wrap-up";
+  if (/continuing\s+(?:automatically|shortly)|\besc\s+to\s+cancel\b/i.test(body)) return "auto-continue";
+  if (/^usage\s+limit\s+reached(?:\s+again)?\s*(?:·|$)/i.test(body)) return "stopped";
+  return null;
+}
+
+/** Raw line indices of the live input box's top and bottom borders (the last
+ *  pair of border rows in the bottom chrome with a `❯` row between them), or
+ *  null when no input box is on the pane (a modal replaced it, or the capture
+ *  is not claude's TUI) — then nothing counts as the live notice. */
+function inputBoxBorders(lines: string[]): { top: number; bottom: number } | null {
+  const nonBlank: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.trim().length > 0) nonBlank.push(i);
+  }
+  const window = nonBlank.slice(-PANE_LIMIT_CHROME_NONBLANK);
+  const borders = window.filter((i) => INPUT_BOX_BORDER_RE.test(lines[i]!));
+  for (let j = borders.length - 1; j >= 1; j--) {
+    const top = borders[j - 1]!;
+    const bottom = borders[j]!;
+    for (let i = top + 1; i < bottom; i++) {
+      if (/^[\s ]*❯/.test(lines[i]!)) return { top, bottom };
+    }
+  }
+  return null;
+}
+
+function noticeFrom(rows: string[], start: number): PaneLimitNotice | null {
+  const text = rows
+    .slice(start, start + PANE_LIMIT_WINDOW_LINES)
+    .map((row) => row.trim())
+    .filter((row) => row !== "")
+    .join(" ");
+  const kind = paneLimitNoticeKind(text);
+  return kind ? { text, kind } : null;
+}
 
 /**
- * The joined text of the live notice, or null. One implementation shared by
- * the boolean gate and the persisted message, so what we detect and what we
- * store can never disagree (and a wrapped row keeps its reset time:
- * `Usage limit reached · continuing` / `automatically at 8am`).
+ * The live notice, or null. One implementation shared by the boolean gate and
+ * the persisted message, so what we detect and what we store can never
+ * disagree.
  *
- * Only the bottom {@link PANE_LIMIT_SEARCH_NONBLANK} non-blank rows are
- * searched; the raw indices are kept so a notice's wrapped continuation rows
- * are still sliced contiguously even when blank rows separate them.
+ * Two places count, both chrome anchored to the input box: the hint slot (up
+ * to {@link PANE_LIMIT_HINT_ROWS} non-blank rows directly above the box's top
+ * border, stopping at the first transcript/tool-gutter row) and the footer
+ * (below the box's bottom border, where a notification can share the status
+ * bar's row after a run of spaces).
  */
-function paneHarnessLimitNoticeWindow(tail: string): string | null {
-  const all = tail.split("\n");
-  const nonBlank: number[] = [];
-  for (let i = 0; i < all.length; i++) {
-    if (all[i]!.trim().length > 0) nonBlank.push(i);
+function paneHarnessLimitNotice(tail: string): PaneLimitNotice | null {
+  const lines = tail.split("\n");
+  const box = inputBoxBorders(lines);
+  if (!box) return null;
+
+  const hint: string[] = [];
+  for (let i = box.top - 1; i >= 0 && hint.length < PANE_LIMIT_HINT_ROWS; i--) {
+    const row = lines[i]!;
+    if (row.trim().length === 0) continue;
+    if (TRANSCRIPT_GUTTER_RE.test(row) || INPUT_BOX_BORDER_RE.test(row)) break;
+    hint.unshift(row);
   }
-  if (nonBlank.length === 0) return null;
-  const start = nonBlank[Math.max(0, nonBlank.length - PANE_LIMIT_SEARCH_NONBLANK)]!;
-  const lines = all.slice(start);
-  for (let i = 0; i < lines.length; i++) {
-    if (!PANE_LIMIT_NOTICE_LINE_RE.test(lines[i]!)) continue;
-    const window = lines
-      .slice(i, i + PANE_LIMIT_WINDOW_LINES)
-      .map((line) => line.trim())
-      .filter((line) => line !== "");
-    const joined = window.join(" ");
-    if (PANE_LIMIT_NOTICE_DETAIL_RE.test(joined)) return joined;
+  for (let i = 0; i < hint.length; i++) {
+    if (!PANE_LIMIT_NOTICE_HEAD_RE.test(hint[i]!)) continue;
+    const notice = noticeFrom(hint, i);
+    if (notice) return notice;
+  }
+
+  const footer = lines.slice(box.bottom + 1).filter((row) => row.trim().length > 0);
+  for (let i = 0; i < footer.length; i++) {
+    // A notification may sit right of the status bar on the same row.
+    const segments = footer[i]!.split(/[\s ]{2,}/);
+    for (let s = 0; s < segments.length; s++) {
+      if (!PANE_LIMIT_NOTICE_HEAD_RE.test(segments[s]!)) continue;
+      const rows = [segments.slice(s).join("  "), ...footer.slice(i + 1)];
+      const notice = noticeFrom(rows, 0);
+      if (notice) return notice;
+    }
   }
   return null;
 }
 
 /**
- * The pane's live usage-limit auto-continue notice (`Usage limit reached ·
- * continuing automatically at 8am · esc to cancel`). Deliberately narrower
- * than a bare "usage limit" substring: the transcript above the notice
- * legitimately mentions limits, and only the live notice is a signal.
+ * Whether the pane shows a live usage-limit notice that means this account
+ * stopped. Deliberately narrower than a bare "usage limit" substring: the
+ * transcript legitimately mentions limits, and only the live notice in the
+ * input box's chrome is a signal (see {@link paneHarnessLimitNotice}).
  *
- * Both halves must be in the same notice window (the anchored row plus up to
- * two wrapped rows). Matching the phrase anywhere in a whole pane tail let
- * ordinary transcript prose through — a line saying "we hit the usage limit"
- * plus, ten rows later, "the docs say it resets at 8am" settled a healthy turn
- * and burned a backup.
+ * `Usage limit reached · wrapping up` is claude's grace window — it keeps
+ * working on a brief allowance — so it counts only once the turn has actually
+ * stopped (`turnStopped`: nothing on the pane shows claude working and it sits
+ * idle at its input box, the same reading the idle-settle net uses). Every
+ * other notice kind means the account is paused now.
  */
-export function paneShowsHarnessLimitNotice(tail: string): boolean {
-  return paneHarnessLimitNoticeWindow(tail) !== null;
+export function paneShowsHarnessLimitNotice(tail: string, opts: { turnStopped?: boolean } = {}): boolean {
+  const notice = paneHarnessLimitNotice(tail);
+  if (!notice) return false;
+  return notice.kind !== "wrap-up" || opts.turnStopped === true;
 }
 
 /**
@@ -8068,11 +8146,13 @@ export function shouldSignalHarnessLimit(args: {
  * (the old keyword filter dropped a row that carried only `automatically at
  * 8am`). Returns "" when no live notice is on-pane; the only production
  * caller, `signalHarnessLimit`, runs behind `paneShowsHarnessLimitNotice`
- * (same window function), so a non-empty result is guaranteed there — a
- * keyword fallback could never execute and is deliberately gone.
+ * (same `paneHarnessLimitNotice` detector), so a non-empty result is
+ * guaranteed there — a keyword fallback could never execute and is
+ * deliberately gone. Every notice kind it can return classifies as `quota`
+ * in `classifyHarnessLimitSignal` (shared/harness-limits.ts).
  */
 export function harnessLimitNoticeText(tail: string): string {
-  return paneHarnessLimitNoticeWindow(tail)?.slice(0, 300) ?? "";
+  return paneHarnessLimitNotice(tail)?.text.slice(0, 300) ?? "";
 }
 
 /**

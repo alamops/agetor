@@ -638,13 +638,20 @@ export const api = {
   listHarnessStacks: () => j<HarnessStacksPayload>("/harness-stacks"),
   getHarnessStack: (id: string) =>
     j<{ stack: HarnessStack; limitStates: HarnessLimitState[] }>(`/harness-stacks/${encodeURIComponent(id)}`),
+  /** `retry: false` — the core mirrors the primary's config inline before it
+   *  answers, which can outlast the connection; a replay after a lost
+   *  response would re-POST a stack that already exists ("already in another
+   *  stack"). The editor reads the resulting `ApiTransitError` as "may have
+   *  been saved" and reloads (`stackSaveFailure`). */
   createHarnessStack: (input: HarnessStackInput) =>
-    j<HarnessStackResult>("/harness-stacks", { method: "POST", body: JSON.stringify(input) }),
+    j<HarnessStackResult>("/harness-stacks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
+  /** `retry: false` for the same reason as `createHarnessStack`: a members
+   *  change re-mirrors inline. */
   patchHarnessStack: (id: string, patch: Partial<HarnessStackInput>) =>
     j<HarnessStackResult>(`/harness-stacks/${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
-    }),
+    }, { retry: false }),
   deleteHarnessStack: (id: string) =>
     j<{ removed: true }>(`/harness-stacks/${encodeURIComponent(id)}`, { method: "DELETE" }),
   createHarness: (input: HarnessInput) =>

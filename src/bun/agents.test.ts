@@ -2952,6 +2952,38 @@ test("opencode resolveBin: AGETOR_OPENCODE_BIN override, harness.bin wins over i
   expect(resolveBin(alias("opencode", { bin: "/usr/local/bin/opencode" }))).toBe("/usr/local/bin/opencode");
 });
 
+test("harnessEnv drops a blank config-root key from the env map so the spawn reads the resolver's root (S17)", () => {
+  expect(harnessEnv(alias("claude-code", { home: "/h/c", env: { CLAUDE_CONFIG_DIR: "", HOME: " ", FOO: "" } })))
+    .toEqual({ CLAUDE_CONFIG_DIR: "/h/c", FOO: "" });
+  expect(harnessEnv(alias("codex", { home: "/h/x", env: { CODEX_HOME: "  " } }))).toEqual({ CODEX_HOME: "/h/x/.codex" });
+  // A non-blank value still wins, as before.
+  expect(harnessEnv(alias("codex", { home: "/h/x", env: { CODEX_HOME: "/pinned" } }))).toEqual({ CODEX_HOME: "/pinned" });
+});
+
+test("claudeConfigDirOverrideFor / codexHomeOverrideFor agree with harnessEnv for an env-map HOME (S17)", () => {
+  const prevClaude = process.env.CLAUDE_CONFIG_DIR;
+  const prevCodex = process.env.CODEX_HOME;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CODEX_HOME;
+  try {
+    expect(claudeConfigDirOverrideFor({ home: null, env: { HOME: "/eh" } })).toBe("/eh/.claude");
+    expect(codexHomeOverrideFor({ home: null, env: { HOME: "/eh" } })).toBe("/eh/.codex");
+    expect(claudeConfigDirOverrideFor({ home: null, env: {} })).toBeNull();
+    expect(claudeConfigDirOverrideFor({ home: "/h", env: { CLAUDE_CONFIG_DIR: "" } })).toBe("/h");
+    // An inherited process override reaches the spawn ahead of the HOME, and
+    // the "override" readers then fall back to the process value themselves.
+    process.env.CLAUDE_CONFIG_DIR = "/proc-claude";
+    process.env.CODEX_HOME = "/proc-codex";
+    expect(claudeConfigDirOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();
+    expect(codexHomeOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();
+  } finally {
+    if (prevClaude === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prevClaude;
+    if (prevCodex === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodex;
+  }
+});
+
 test("opencode harnessEnv: a home pins HOME plus all four XDG dirs under it; the harness env map still wins", () => {
   expect(harnessEnv(builtin("opencode"))).toEqual({});
   expect(harnessEnv(alias("opencode", { home: "/h/oc-2", env: { XDG_CACHE_HOME: "/elsewhere" } }))).toEqual({

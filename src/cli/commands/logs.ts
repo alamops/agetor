@@ -261,13 +261,18 @@ function createEventFormatter(
       // prints labeled lines here instead of raw `<tag>` text. `--json`
       // output is unaffected: it emits the raw event, never routing through
       // this formatter.
-      case "user":
-        return userMessageLines(e.data)
+      case "user": {
+        const lines = userMessageLines(e.data);
+        // A hidden message (the harness-stack continuation) renders no lines
+        // at all; null keeps it from printing an empty row.
+        if (lines.length === 0) return null;
+        return lines
           .map((line) => {
             const text = handoffDigest && line.label === "you›" ? collapseHandoffPromptSpans(line.text) : line.text;
             return `${colorLabel(line)} ${text}`;
           })
           .join("\n");
+      }
       // Claude's context-compaction summary (~16 KB of its own markdown) —
       // one digest line (first line + size), never the whole body. The
       // digest is model-written text on one terminal line, so it goes

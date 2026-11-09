@@ -20,22 +20,46 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 // opener would miss the temp data dir (and warn). Import after it instead.
 const { __forTest } = await import("./claude-tmux.ts");
 const { HARNESS_LIMIT_STATUS_PREFIX } = await import("../shared/types.ts");
-const { parseClaudeResetNotice } = await import("../shared/harness-limits.ts");
+const { parseClaudeResetNotice, classifyHarnessLimitSignal } = await import("../shared/harness-limits.ts");
 const { rmTestDataDir } = await import("./test-data-dir.ts");
 
-const LIMIT_PANE = [
-  "● Working on the task…",
+/** Claude's input box + idle status bar: the anchor the live notice is read
+ *  relative to (its hint slot is directly above the top border). */
+const INPUT_BOX = [
+  "─".repeat(80),
+  "❯",
+  "─".repeat(80),
+  "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent",
+];
+
+/** A realistic pane: transcript, then the hint-slot rows, then the box. */
+function livePane(hint: string[], transcript: string[] = ["⏺ Working on the task…", ""]): string {
+  return [...transcript, ...hint, ...INPUT_BOX].join("\n");
+}
+
+/** The hint-slot form observed on a live pane (indented, no glyph). */
+const HINT = (text: string) => `          ${text}`;
+
+const LIMIT_PANE = livePane([HINT("Usage limit reached · continuing automatically at 8am · esc to cancel")]);
+
+const PLAIN_PANE = livePane([]);
+
+/** Mid-grace: claude still working on its brief wrap-up allowance. */
+const WRAP_UP_WORKING_PANE = [
+  "⏺ Working on the task…",
   "",
-  "  Usage limit reached · continuing automatically at 8am",
-  "",
-  "  esc to interrupt",
+  "✻ Working… (2m 52s · ↓ 12.1k tokens)",
+  HINT("Usage limit reached · wrapping up · limit resets 3pm · claude.ai/settings/usage"),
+  "─".repeat(80),
+  "❯",
+  "─".repeat(80),
+  "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt",
 ].join("\n");
 
-const PLAIN_PANE = [
-  "● Working on the task…",
-  "",
-  "  esc to interrupt",
-].join("\n");
+/** The same notice once the turn has stopped: idle at a bare input box. */
+const WRAP_UP_STOPPED_PANE = livePane([
+  HINT("Usage limit reached · wrapping up · limit resets 3pm · claude.ai/settings/usage"),
+]);
 
 type CaptureFn = Parameters<typeof __forTest.setCaptureScrapePane>[0];
 let previousCapture: CaptureFn | null = null;
@@ -81,24 +105,117 @@ describe("claude pane usage-limit notice", () => {
   test("detects the live notice without matching prose about limits", () => {
     expect(__forTest.paneShowsHarnessLimitNotice(LIMIT_PANE)).toBe(true);
     expect(__forTest.paneShowsHarnessLimitNotice("I checked the usage limit docs.")).toBe(false);
+    expect(__forTest.paneShowsHarnessLimitNotice(livePane(["  I checked the usage limit docs."]))).toBe(false);
   });
 
   test("prose that mentions limits far apart is not the live notice", () => {
-    const prose = [
-      "● Working on the task…",
-      "",
+    const prose = livePane([
       "  I checked the usage limit docs after the last run.",
       "  Nothing else to report.",
       "",
       "  The guide says the quota resets at midnight UTC.",
-      "",
-      "  esc to interrupt",
-    ].join("\n");
+    ]);
     expect(__forTest.paneShowsHarnessLimitNotice(prose)).toBe(false);
     // A genuinely wrapped notice still matches within its own rows.
     expect(__forTest.paneShowsHarnessLimitNotice(
-      ["  Usage limit · continuing", "  automatically at 8am"].join("\n"),
+      livePane(["  Usage limit · continuing", "  automatically at 8am"]),
     )).toBe(true);
+  });
+
+  test("no input box on the pane → nothing is the live notice", () => {
+    // The notice is read relative to the composer; a capture without one (a
+    // modal replaced it, or not claude's TUI) can't be anchored.
+    expect(__forTest.paneShowsHarnessLimitNotice(
+      "  Usage limit reached · continuing automatically at 8am · esc to cancel",
+    )).toBe(false);
+  });
+
+  test("a tool result or quoted row printing the notice is never the live notice (S2)", () => {
+    for (const row of [
+      "  ⎿  Usage limit reached · continuing automatically at 8am · esc to cancel",
+      "     ⎿ Usage limit reached · limit resets 3pm",
+      "  │ Usage limit reached · continuing automatically at 8am · esc to cancel",
+      "  | Usage limit reached · continuing automatically at 8am · esc to cancel",
+      "  > Usage limit reached · continuing automatically at 8am · esc to cancel",
+      "⏺ Usage limit reached · continuing automatically at 8am · esc to cancel",
+      "● You've hit your limit · resets 3pm",
+      "❯ Continuing automatically at 8am · Esc to cancel",
+    ]) {
+      // Directly above the input box — the hint slot's own position.
+      expect(__forTest.paneShowsHarnessLimitNotice(livePane([row])), row).toBe(false);
+      expect(__forTest.harnessLimitNoticeText(livePane([row])), row).toBe("");
+    }
+    // The real hint row in the same position is the signal.
+    expect(__forTest.paneShowsHarnessLimitNotice(LIMIT_PANE)).toBe(true);
+  });
+
+  test("a notice row above the transcript gutter or beyond the hint slot is not live", () => {
+    // Walking up from the box stops at a transcript/tool row…
+    expect(__forTest.paneShowsHarnessLimitNotice(livePane([
+      HINT("Usage limit reached · continuing automatically at 8am · esc to cancel"),
+      "  ⎿  (no output)",
+    ]))).toBe(false);
+    // …and covers only the few rows directly above the box.
+    expect(__forTest.paneShowsHarnessLimitNotice(livePane([
+      HINT("Usage limit reached · continuing automatically at 8am · esc to cancel"),
+      "  row a",
+      "  row b",
+      "  row c",
+      "  row d",
+    ]))).toBe(false);
+  });
+
+  test("claude 2.1.319 notice variants are each the live notice and classify as quota (S12)", () => {
+    for (const row of [
+      "Usage limit reached · continuing automatically at 8am · esc to cancel",
+      "Usage limit reached again · continuing automatically at 8am · esc to cancel",
+      "Continuing automatically at 8am · Esc to cancel",
+      "Usage limit reached · limit resets 3pm · claude.ai/settings/usage",
+      "Usage limit reached · claude.ai/settings/usage",
+      "Usage limit reached",
+      "You've hit your limit · resets 3pm",
+      "⚠ Usage limit reached · limit resets 3pm",
+    ]) {
+      const pane = livePane([HINT(row)]);
+      expect(__forTest.paneShowsHarnessLimitNotice(pane), row).toBe(true);
+      const text = __forTest.harnessLimitNoticeText(pane);
+      expect(classifyHarnessLimitSignal("claude-code", { text })?.reason, row).toBe("quota");
+    }
+  });
+
+  test("a notification sharing the footer row below the box is the live notice", () => {
+    const pane = [
+      "⏺ Working on the task…",
+      "",
+      "─".repeat(80),
+      "❯",
+      "─".repeat(80),
+      "  ⏵⏵ auto mode on (shift+tab to cycle)          Usage limit reached · limit resets 3pm",
+    ].join("\n");
+    expect(__forTest.paneShowsHarnessLimitNotice(pane)).toBe(true);
+    expect(__forTest.harnessLimitNoticeText(pane)).toBe("Usage limit reached · limit resets 3pm");
+  });
+
+  test("look-alikes that are not a stop never match", () => {
+    for (const row of [
+      // Usage credits cover the overage — the account keeps working.
+      "Usage limit reached · brief included wrap-up, then usage credits",
+      // Actionable, not a limit.
+      "Usage limit has reset · press enter to continue",
+      // Ordinary prose starting with the same words.
+      "Continuing automatically with the next file.",
+      "Usage limit resets at 8am — I'll retry afterwards",
+    ]) {
+      expect(__forTest.paneShowsHarnessLimitNotice(livePane([HINT(row)])), row).toBe(false);
+    }
+  });
+
+  test("'wrapping up' is the grace window: it counts only once the turn stopped (S12)", () => {
+    expect(__forTest.paneShowsHarnessLimitNotice(WRAP_UP_WORKING_PANE)).toBe(false);
+    expect(__forTest.paneShowsHarnessLimitNotice(WRAP_UP_WORKING_PANE, { turnStopped: false })).toBe(false);
+    // Detected all along; only the stop gate holds it back.
+    expect(__forTest.paneShowsHarnessLimitNotice(WRAP_UP_WORKING_PANE, { turnStopped: true })).toBe(true);
+    expect(__forTest.harnessLimitNoticeText(WRAP_UP_WORKING_PANE)).toContain("wrapping up");
   });
 
   test("one-line prose about the reset time is not the live notice (R-M1)", () => {
@@ -111,22 +228,22 @@ describe("claude pane usage-limit notice", () => {
       "⏺ Usage limit resets at 8am, per the plan.",
       "  I reached the usage limit yesterday.",
     ]) {
-      expect(__forTest.paneShowsHarnessLimitNotice(prose)).toBe(false);
+      expect(__forTest.paneShowsHarnessLimitNotice(livePane([prose])), prose).toBe(false);
     }
     // The provider's real notice wording still matches, including a wrapped row.
     expect(__forTest.paneShowsHarnessLimitNotice(
-      "  Usage limit reached · continuing automatically at 8am · esc to cancel",
+      livePane(["  Usage limit reached · continuing automatically at 8am · esc to cancel"]),
     )).toBe(true);
     expect(__forTest.paneShowsHarnessLimitNotice(
-      "  Usage limit reached · continuing shortly · esc to cancel",
+      livePane(["  Usage limit reached · continuing shortly · esc to cancel"]),
     )).toBe(true);
   });
 
   test("a wrapped notice keeps its reset time in the stored message", () => {
-    const wrapped = [
+    const wrapped = livePane([
       "  Usage limit reached · continuing",
       "  automatically at 8am · esc to cancel",
-    ].join("\n");
+    ]);
     const text = __forTest.harnessLimitNoticeText(wrapped);
     expect(text).toContain("continuing automatically at 8am");
     // The reset survives the wrap and is the instant the cooldown uses.
@@ -153,6 +270,9 @@ describe("claude pane usage-limit notice", () => {
       ...Array.from({ length: 20 }, (_, i) => `  tool output row ${i}`),
       "",
       "✻ Working… (2m 52s · ↓ 12.1k tokens)",
+      "─".repeat(80),
+      "❯",
+      "─".repeat(80),
       "⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent",
     ].join("\n");
     expect(__forTest.paneShowsHarnessLimitNotice(healthy)).toBe(false);
@@ -256,6 +376,61 @@ describe("claude pane usage-limit notice", () => {
       expect(isResolved()).toBe(false);
     } finally {
       __forTest.uninstallSession("t-limit-scrollback");
+    }
+  });
+
+  test("a tool result printing the notice right above the box never settles a stacked turn (S2)", async () => {
+    installPane(livePane(["  ⎿  Usage limit reached · continuing automatically at 8am · esc to cancel"]));
+    const { state, chunks, isResolved } = paneState("t-limit-tool-row", true);
+    try {
+      await __forTest.scrapeOnce(state);
+      expect(chunks.some((c) => c.stream === "status" && c.data.startsWith(HARNESS_LIMIT_STATUS_PREFIX))).toBe(false);
+      expect(state.turnQueue).toHaveLength(1);
+      expect(isResolved()).toBe(false);
+    } finally {
+      __forTest.uninstallSession("t-limit-tool-row");
+    }
+  });
+
+  test("the standalone 'Continuing automatically' row settles a stacked turn with a reset (S12)", async () => {
+    installPane(livePane([HINT("Continuing automatically at 8am · Esc to cancel")]));
+    const { state, chunks, isResolved } = paneState("t-limit-waiting", true);
+    try {
+      await __forTest.scrapeOnce(state);
+      const signal = chunks.find((c) => c.stream === "status" && c.data.startsWith(HARNESS_LIMIT_STATUS_PREFIX));
+      expect(signal).toBeTruthy();
+      const payload = JSON.parse(signal!.data.slice(HARNESS_LIMIT_STATUS_PREFIX.length));
+      expect(payload.reason).toBe("quota");
+      expect(payload.source).toBe("claude-pane");
+      expect(new Date(payload.resetAtMs).getHours()).toBe(8);
+      expect(isResolved()).toBe(true);
+    } finally {
+      __forTest.uninstallSession("t-limit-waiting");
+    }
+  });
+
+  test("'wrapping up' mid-grace never settles; once claude stops it does (S12)", async () => {
+    installPane(WRAP_UP_WORKING_PANE);
+    const working = paneState("t-limit-wrap-working", true);
+    try {
+      await __forTest.scrapeOnce(working.state);
+      expect(working.chunks.some((c) => c.data.startsWith(HARNESS_LIMIT_STATUS_PREFIX))).toBe(false);
+      expect(working.state.turnQueue).toHaveLength(1);
+      expect(working.isResolved()).toBe(false);
+    } finally {
+      __forTest.uninstallSession("t-limit-wrap-working");
+    }
+
+    installPane(WRAP_UP_STOPPED_PANE);
+    const stopped = paneState("t-limit-wrap-stopped", true);
+    try {
+      await __forTest.scrapeOnce(stopped.state);
+      const signal = stopped.chunks.find((c) => c.data.startsWith(HARNESS_LIMIT_STATUS_PREFIX));
+      expect(signal).toBeTruthy();
+      expect(JSON.parse(signal!.data.slice(HARNESS_LIMIT_STATUS_PREFIX.length)).reason).toBe("quota");
+      expect(stopped.isResolved()).toBe(true);
+    } finally {
+      __forTest.uninstallSession("t-limit-wrap-stopped");
     }
   });
 

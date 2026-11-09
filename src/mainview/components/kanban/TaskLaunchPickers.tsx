@@ -22,9 +22,11 @@ import {
   type AgentProfile,
   type AgentStatus,
   type Harness,
+  type HarnessStack,
   type Speed,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
+import { StackPositionChip } from "./StackBadge";
 import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
@@ -45,6 +47,9 @@ export interface TaskLaunch {
   loading: boolean;
   loadError: string | null;
   harnesses: Harness[];
+  /** Harness account stacks, for the `n/m` position chip next to each
+   *  account (same chip as the New Task form). */
+  stacks: HarnessStack[];
   availableHarnesses: Harness[];
   agents: AgentStatus[];
   agentModels: AgentModelMap;
@@ -181,6 +186,7 @@ export function useTaskLaunch(
   const withProfiles = opts?.withProfiles !== false;
   const initial = opts?.initial;
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
+  const [stacks, setStacks] = useState<HarnessStack[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], antigravity: [], fx: [], opencode: [], copilot: [] });
   const [harnessModels, setHarnessModels] = useState<Record<string, DiscoveredModel[]>>({});
@@ -242,6 +248,7 @@ export function useTaskLaunch(
       .then(([payload, models, harnessModelPayload, prefs]) => {
         if (cancelled) return;
         setHarnesses(payload.harnesses);
+        setStacks(payload.stacks ?? []);
         setAgents(payload.statuses);
         setAgentModels(models);
         setHarnessModels(harnessModelPayload.byHarness);
@@ -450,6 +457,7 @@ export function useTaskLaunch(
     loading,
     loadError,
     harnesses,
+    stacks,
     availableHarnesses,
     agents,
     agentModels,
@@ -508,6 +516,7 @@ export function TaskLaunchPickers({
 }) {
   const {
     harnesses,
+    stacks,
     availableHarnesses,
     agents,
     agent,
@@ -600,6 +609,7 @@ export function TaskLaunchPickers({
                   >
                     <AgentIcon kind={h.kind} className="mr-1" />
                     <span className="truncate">{h.label}</span>
+                    <StackPositionChip stacks={stacks} harnessId={h.id} />
                     <span
                       className={cn(
                         "ml-auto inline-block size-1.5 rounded-full",
