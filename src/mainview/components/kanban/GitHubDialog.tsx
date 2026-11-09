@@ -240,6 +240,11 @@ interface Props {
    *  when absent, the credential-error panel below simply omits its "Open
    *  Settings" button rather than rendering a dead one. */
   onOpenSettings?: () => void;
+  /** Wired from App.tsx: the task-launch dialogs' "Manage pipelines…" rows
+   *  close themselves, then this closes this dialog and navigates to the
+   *  Pipelines page. Optional for the same reason as `onOpenSettings` — when
+   *  absent, the pickers render no manage row. */
+  onOpenPipelines?: () => void;
 }
 
 const basename = (p: string) => {
@@ -575,7 +580,7 @@ function credentialSetupStep1(provider: GitProvider | "mixed" | null): string {
   }
 }
 
-export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, itemDetailPrefill, onClose, onOpenSettings }: Props) {
+export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, itemDetailPrefill, onClose, onOpenSettings, onOpenPipelines }: Props) {
   const [projectPath, setProjectPath] = useState("");
   // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
   const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
@@ -3831,6 +3836,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
             itemPath={expandedItemPath}
             canPush={canPush}
             viewerLogin={viewerLogin}
+            onOpenPipelines={onOpenPipelines}
             diff={expandedItem.kind === "pulls" ? diffs[itemKey(expandedItem)] : undefined}
             diffLoading={expandedItem.kind === "pulls" ? !!diffLoading[itemKey(expandedItem)] : false}
             diffError={expandedItem.kind === "pulls" ? diffErrors[itemKey(expandedItem)] : undefined}
@@ -6752,6 +6758,7 @@ function GitHubItemDetail({
   itemPath,
   canPush,
   viewerLogin,
+  onOpenPipelines,
   diff,
   diffLoading,
   diffError,
@@ -6867,6 +6874,8 @@ function GitHubItemDetail({
   itemPath: string;
   canPush: boolean;
   viewerLogin: string;
+  /** Forwarded to the task-launch dialogs' Pipeline picker manage row. */
+  onOpenPipelines?: () => void;
   diff?: TaskDiff;
   diffLoading: boolean;
   diffError?: string;
@@ -7074,6 +7083,7 @@ function GitHubItemDetail({
             refreshing={refreshing}
             canPush={canPush}
             canModifyOwn={canModifyOwn}
+            onOpenPipelines={onOpenPipelines}
           />
           <PullTriage
             caps={caps}
@@ -7161,6 +7171,7 @@ function GitHubItemDetail({
           transferConfirming={transferConfirming}
           onTransferIssue={onTransferIssue}
           onCancelTransfer={onCancelTransfer}
+          onOpenPipelines={onOpenPipelines}
         />
       )}
       <Conversation
@@ -7261,6 +7272,7 @@ function IssueActions({
   onCancelTransfer,
   canPush,
   canModifyOwn,
+  onOpenPipelines,
 }: {
   item: GitHubListItem;
   caps: ProviderCaps;
@@ -7291,6 +7303,8 @@ function IssueActions({
   // Push access OR being the issue's own author — gates close/reopen only.
   // Everything else here (triage save, lock, pin, transfer) stays push-only.
   canModifyOwn: boolean;
+  /** Forwards the Pipeline picker's manage row to the task dialog. */
+  onOpenPipelines?: () => void;
 }) {
   const isBusy = !!busy;
   const pushDisabled = isBusy || !canPush;
@@ -7452,6 +7466,7 @@ function IssueActions({
           setTaskConfirmed(true);
           setTimeout(() => setTaskConfirmed(false), 5_000);
         }}
+        onManagePipelines={onOpenPipelines}
       />
     </div>
   );
@@ -7884,6 +7899,7 @@ function PullActions({
   refreshing,
   canPush,
   canModifyOwn,
+  onOpenPipelines,
 }: {
   item: GitHubListItem;
   caps: ProviderCaps;
@@ -7919,6 +7935,8 @@ function PullActions({
   // Push access OR being the PR's own author — gates close/reopen only.
   // Merge, auto-merge, update-branch and draft-toggle stay push-only.
   canModifyOwn: boolean;
+  /** Forwards the Pipeline picker's manage row to the task dialog. */
+  onOpenPipelines?: () => void;
 }) {
   // A merged PR replaces the mergeability banner + Review/Merge/Close grid
   // below with a single positive card — there's nothing actionable left to
@@ -8156,6 +8174,7 @@ function PullActions({
           setResolveConfirmed(true);
           setTimeout(() => setResolveConfirmed(false), 5_000);
         }}
+        onManagePipelines={onOpenPipelines}
       />
     </div>
   );

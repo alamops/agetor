@@ -1,0 +1,529 @@
+{
+  "version": 1,
+  "id": "messages-backlog-collapse-grill-r1",
+  "title": "Grill — collapse / expand the task messages backlog",
+  "skill": "grill",
+  "slug": "messages-backlog-collapse",
+  "round": 1,
+  "flags": [],
+  "summary": "Before this goes to planning: **8 decisions** the build would otherwise make silently, plus six low-stakes defaults I'd bet on. Start with the **surface** and **how the tray opens** — those two change the shape of the plan. The confirm list at the end is one click each.\n\nSource: the Agetor task prompt, quoted verbatim in `docs/plans/messages-backlog-collapse-investigation.md:12-14`. Investigation: `docs/plans/messages-backlog-collapse-investigation.md`.",
+  "proven": [
+    {
+      "text": "**The surface is the saved-drafts tray, not the kanban column.** The tray is the only UI called “Backlog” that holds saved messages; the kanban `backlog` column holds task cards. `BacklogTray` is rendered at `RunPanel.tsx:4583-4605`.",
+      "evidence": [
+        {
+          "label": "the tray's header and list",
+          "path": "src/mainview/components/kanban/RunPanel.tsx",
+          "line": 5003,
+          "endLine": 5022,
+          "lang": "tsx",
+          "code": "<div className=\"shrink-0 border-t border-border/60\">\n  <div className=\"flex items-center gap-1.5 px-3 pb-1 pt-2 text-[11px] font-medium text-muted-foreground\">\n    <ClipboardList className=\"size-3.5\" />\n    <span>Backlog</span>\n    <span className=\"rounded bg-muted px-1 text-[10px]\">{items.length}</span>\n    ...\n  <div className={cn(\"space-y-1 overflow-y-auto px-2 pb-2\",\n    editingId !== null ? \"max-h-72\" : \"max-h-40\")}>"
+        },
+        {
+          "label": "the unrelated kanban column",
+          "path": "src/shared/types.ts",
+          "line": 3,
+          "lang": "ts",
+          "code": "export type ColumnId = \"backlog\" | \"ready\" | \"running\" | \"blocked\" | \"review\" | \"done\";"
+        }
+      ]
+    },
+    {
+      "text": "**Collapse reclaims ~160 px, not an unbounded list.** The tray is `shrink-0`; the transcript above it is `flex-1 overflow-y-auto`, so hidden tray height goes straight back to the message stream. The list is already capped at 160 px (288 px while editing), plus a ~28 px header.",
+      "evidence": [
+        {
+          "label": "transcript scroller",
+          "path": "src/mainview/components/kanban/RunPanel.tsx",
+          "line": 4466,
+          "lang": "tsx",
+          "code": "className=\"min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed [overflow-anchor:none]\""
+        },
+        {
+          "label": "the tray never shrinks",
+          "path": "src/mainview/components/kanban/RunPanel.tsx",
+          "line": 5003,
+          "lang": "tsx",
+          "code": "<div className=\"shrink-0 border-t border-border/60\">"
+        }
+      ]
+    },
+    {
+      "text": "**No backend, database, API or CLI change is needed.** `task.backlog` is a JSON column (`Task.backlog` at `src/shared/types.ts:1813`); collapse is pure view chrome. The existing routes all return the full updated `Task` and remain untouched."
+    },
+    {
+      "text": "**The tray is keyed per task and local state is wiped on remount.** `BacklogTray` is keyed `backlog-${task.id}`; switching task, switching to a subagent tab (the tray unmounts) or closing/reopening the panel (the body unmounts after the exit animation) resets anything held in local `useState`.",
+      "evidence": [
+        {
+          "label": "the keyed tray",
+          "path": "src/mainview/components/kanban/RunPanel.tsx",
+          "line": 4583,
+          "endLine": 4593,
+          "lang": "tsx",
+          "code": "{activeStream === \"main\" && backlogItems.length > 0 && (\n  <BacklogTray\n    key={`backlog-${task.id}`}"
+        }
+      ]
+    },
+    {
+      "text": "**Existing e2e pins today's default-expanded behavior.** The task-switch regression seeds one draft and asserts it is visible without expanding anything; default-collapsed (or an auto threshold of 1) would fail it and force a test change.",
+      "evidence": [
+        {
+          "label": "the assertion",
+          "path": "e2e/task-switch-during-restore.spec.ts",
+          "line": 435,
+          "lang": "ts",
+          "code": "await expect(panel.getByText(\"draft that mounts the backlog tray\")).toBeVisible();"
+        }
+      ]
+    },
+    {
+      "text": "**The house pattern for a disclosure is a hand-rolled full-width button with `aria-expanded` and a chevron; there is no Collapsible primitive, and layout-chrome state lives in `localStorage`.** `panel-collapse.ts` already wraps storage access and reads lazily during first render.",
+      "evidence": [
+        {
+          "label": "the existing disclosure",
+          "path": "src/mainview/components/kanban/CompactionSummaryBlock.tsx",
+          "line": 42,
+          "endLine": 57,
+          "lang": "tsx",
+          "code": "<button\n  type=\"button\"\n  onClick={() => setOpen((o) => !o)}\n  aria-expanded={open}\n  className=\"flex w-full items-center gap-1.5 px-2 py-1 text-left ...\"\n>\n  <ChevronRight className={cn(\"size-3 shrink-0 transition-transform\", open && \"rotate-90\")} aria-hidden />\n  Compaction summary"
+        },
+        {
+          "label": "guarded localStorage helper",
+          "path": "src/mainview/lib/panel-collapse.ts",
+          "line": 38,
+          "endLine": 60,
+          "lang": "ts",
+          "code": "export function readCollapsed(key, storage = defaultStorage()): boolean {\n  if (!storage) return false;\n  try { return storage.getItem(key) === COLLAPSED; } catch { return false; }\n}\nexport function writeCollapsed(key, collapsed, storage = defaultStorage()): void { ... }"
+        }
+      ]
+    },
+    {
+      "text": "**New drafts go on top.** `backlog.add` prepends, so a collapsed-header preview or an “expand to see what you saved” action would show the newest draft first.",
+      "evidence": [
+        {
+          "label": "newest first",
+          "path": "src/bun/db.ts",
+          "line": 1728,
+          "endLine": 1730,
+          "lang": "ts",
+          "code": "// Newest draft on top: the thing you just jotted is the one most likely\n// to be sent or edited next.\nreturn tasks.update(taskId, { backlog: [item, ...task.backlog] });"
+        }
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "scope-default",
+      "title": "Surface and default state",
+      "intro": "These two decide what the plan is building and what every task looks like when opened.",
+      "questions": [
+        {
+          "id": "surface",
+          "type": "single",
+          "title": "Which “backlog” should collapse?",
+          "impact": "blocking",
+          "why": "This picks the component and decides whether this is a one-component UI change or a different feature.",
+          "context": "The task details panel has one saved-messages list: the **Backlog** tray directly above the composer. The kanban board also has a column called `backlog`, but it holds task cards, not saved messages; nothing in it can be “saved for later”. The prompt's wording (“we save many messages for later”) matches the tray.",
+          "evidence": [
+            {
+              "label": "the tray",
+              "path": "src/mainview/components/kanban/RunPanel.tsx",
+              "line": 5004,
+              "endLine": 5007,
+              "lang": "tsx",
+              "code": "<div className=\"flex items-center gap-1.5 px-3 pb-1 pt-2 ...\">\n  <ClipboardList className=\"size-3.5\" />\n  <span>Backlog</span>\n  <span className=\"rounded bg-muted px-1 text-[10px]\">{items.length}</span>"
+            },
+            {
+              "label": "the kanban column of the same name",
+              "path": "src/shared/types.ts",
+              "line": 3,
+              "lang": "ts",
+              "code": "export type ColumnId = \"backlog\" | \"ready\" | \"running\" | \"blocked\" | \"review\" | \"done\";"
+            }
+          ],
+          "options": [
+            {
+              "id": "tray",
+              "label": "The saved-drafts tray above the composer",
+              "description": "`BacklogTray` in `RunPanel.tsx` — the only UI that holds saved messages.",
+              "consequence": "One component, UI-only; no API, DB or CLI change."
+            },
+            {
+              "id": "kanban",
+              "label": "The kanban `backlog` column",
+              "description": "The board column of task cards (`ColumnId = \"backlog\"`).",
+              "consequence": "A different feature: column collapse, unrelated to saved messages."
+            },
+            {
+              "id": "both",
+              "label": "Both surfaces",
+              "description": "Add collapse to the tray and the kanban column.",
+              "consequence": "Two features in one plan; the surface and test work roughly doubles."
+            }
+          ],
+          "recommendation": {
+            "value": "tray",
+            "reason": "The prompt is about saved messages, and the tray is the only UI that stores them."
+          }
+        },
+        {
+          "id": "default-state",
+          "type": "single",
+          "title": "What state should the tray open in?",
+          "impact": "blocking",
+          "why": "This decides what every task looks like on open and whether the existing regression test must change.",
+          "context": "Today the tray is always expanded: a ~28 px header plus a list capped at 160 px — roughly 190–200 px of an 800 px panel. The existing regression test opens a task with one seeded draft and expects it visible (`e2e/task-switch-during-restore.spec.ts:435`), so default-collapsed would require changing that test.",
+          "options": [
+            {
+              "id": "expanded",
+              "label": "Expanded, always",
+              "description": "Opens exactly as it does today; only your click collapses it.",
+              "consequence": "Preserves current behavior and the existing test. The big tray is still there until you collapse it once (and the choice can persist — next questions)."
+            },
+            {
+              "id": "collapsed",
+              "label": "Collapsed, always",
+              "description": "Opens as a header-only bar; you click to reveal the list.",
+              "consequence": "Maximum reading area on every open, but drafts are hidden by default and the existing e2e must expand first."
+            },
+            {
+              "id": "auto",
+              "label": "Collapsed only when it gets big",
+              "description": "Expanded for a short list, collapsed once it holds at least N drafts.",
+              "consequence": "Directly targets the complaint; needs a threshold (next question) and a precedence rule for a stored manual choice."
+            }
+          ],
+          "recommendation": {
+            "value": "expanded",
+            "reason": "The request is for an option to reclaim space, not for hiding drafts by default; this also keeps the existing regression test honest."
+          }
+        },
+        {
+          "id": "auto-threshold",
+          "type": "number",
+          "title": "At how many saved messages should the tray auto-collapse?",
+          "impact": "shape",
+          "why": "Defines “big” and the exact number the implementation and e2e use.",
+          "context": "A one-line draft row is roughly 28–32 px, so the 160 px list cap holds about five rows; five is where the tray starts taking its full ~190 px. A manual toggle (remembered per the persistence question) wins over this threshold once stored — the threshold only decides the first open when there is no stored choice.",
+          "unit": "saved messages",
+          "min": 2,
+          "max": 50,
+          "step": 1,
+          "showIf": { "question": "default-state", "in": ["auto"] },
+          "recommendation": {
+            "value": 5,
+            "reason": "Five rows is where the list reaches its 160 px cap, so it is the first count that actually costs the full slice of the panel."
+          }
+        }
+      ]
+    },
+    {
+      "id": "state-lifetime",
+      "title": "State lifetime and interference",
+      "intro": "These decide whether the choice sticks, and what happens when the tray changes while you are reading or editing.",
+      "questions": [
+        {
+          "id": "persistence",
+          "type": "single",
+          "title": "How long should your collapse choice be remembered?",
+          "impact": "blocking",
+          "why": "This decides the state owner (tray vs parent), whether a storage key is added, and how many lifecycle tests the plan needs.",
+          "context": "`BacklogTray` is keyed `backlog-${task.id}`, so local state is wiped on a task switch, a subagent-tab switch (the tray unmounts) and a panel close (the body unmounts after the exit animation) — `RunPanel.tsx:4583-4593`. Layout-chrome state is kept in `localStorage` via `panel-collapse.ts` (guarded read/write, lazy first render), not the server preferences API (`CLAUDE.md:175`).",
+          "options": [
+            {
+              "id": "session",
+              "label": "Not persisted — session only",
+              "description": "A plain `useState` in the tray; resets on task switch, subagent tab, panel close and restart.",
+              "consequence": "Least code, matches the PR-diff precedent. You re-collapse each time — likely the exact annoyance this feature is meant to remove."
+            },
+            {
+              "id": "global",
+              "label": "One global localStorage flag",
+              "description": "`agetor:backlogTrayCollapsed`; the same choice applies to every task and survives restart.",
+              "consequence": "Set once; one key; reuses `readCollapsed`/`writeCollapsed` and its tests. Any task with drafts opens as a collapsed header."
+            },
+            {
+              "id": "per-task",
+              "label": "Per-task localStorage flag",
+              "description": "The key includes the task id, so each task remembers its own state.",
+              "consequence": "Most precise per task, but unbounded keys, a cleanup story, and a key-builder helper plus tests."
+            }
+          ],
+          "recommendation": {
+            "value": "global",
+            "reason": "The complaint is recurring screen occupation; one remembered reading preference is the least code for the best payoff, and `panel-collapse.ts` already solves the storage guards and first-paint."
+          }
+        },
+        {
+          "id": "edit-conflict",
+          "type": "single",
+          "title": "What happens if you collapse while a saved message is being edited inline?",
+          "impact": "blocking",
+          "why": "The inline editor holds unsaved text in row-local state; this decides whether collapse can lose it and whether the list can be unmounted.",
+          "context": "The inline editor holds unsaved `draft`/`draftRefs` in `BacklogItemRow` local state (`RunPanel.tsx:5087-5114`); unmounting the list discards them. Keeping the list mounted but hidden preserves the text, but an open `@` popover keeps `data-popover-open` in the DOM (`AtFileAutocomplete.tsx:369`), and `RunPanel`'s Escape handlers bail on that marker (`RunPanel.tsx:544,2258`) — the panel and search can get stuck until the popover is dismissed.",
+          "evidence": [
+            {
+              "label": "the unsaved editor state",
+              "path": "src/mainview/components/kanban/RunPanel.tsx",
+              "line": 5087,
+              "endLine": 5088,
+              "lang": "tsx",
+              "code": "const [draft, setDraft] = useState(item.text);\nconst [draftRefs, setDraftRefs] = useState<TaskReference[]>(item.references);"
+            },
+            {
+              "label": "Escape yields to any popover marker",
+              "path": "src/mainview/components/kanban/RunPanel.tsx",
+              "line": 544,
+              "lang": "tsx",
+              "code": "if (document.querySelector('[role=\"dialog\"][aria-modal=\"true\"], [data-popover-open], [data-quote-open], [data-search-open]')) return;"
+            },
+            {
+              "label": "the popover marker",
+              "path": "src/mainview/components/kanban/AtFileAutocomplete.tsx",
+              "line": 369,
+              "lang": "tsx",
+              "code": "data-popover-open=\"\""
+            }
+          ],
+          "options": [
+            {
+              "id": "disable",
+              "label": "Block collapse while editing",
+              "description": "The toggle is disabled (or `aria-disabled`) with a hint such as “Save or cancel your edit first”.",
+              "consequence": "No data loss and no hidden-editor trap; because `editingId` is null, the list can safely unmount when collapsed. One click is unavailable in a rare moment."
+            },
+            {
+              "id": "hidden",
+              "label": "Allow collapse; keep the editor mounted but hidden",
+              "description": "The header shows an “editing” cue; expanding restores the unsaved text.",
+              "consequence": "Preserves the draft, but needs explicit blur/popover-close work on collapse to avoid the Escape trap; more code and a new test."
+            },
+            {
+              "id": "commit",
+              "label": "Collapse saves the edit first",
+              "description": "Clicking collapse runs the existing save path, then closes the editor and collapses on success.",
+              "consequence": "Never loses text; a validation or network failure must keep the tray expanded and show the error."
+            },
+            {
+              "id": "discard",
+              "label": "Collapse cancels the edit and discards unsaved text",
+              "description": "The tray closes and the edit is thrown away.",
+              "consequence": "Silent data loss; not recommended."
+            }
+          ],
+          "recommendation": {
+            "value": "disable",
+            "reason": "It is the only option with no data-loss path and no hidden-focus/popover trap, and the moment is rare enough that blocking one click is cheap."
+          }
+        },
+        {
+          "id": "save-while-collapsed",
+          "type": "single",
+          "title": "When a new draft is saved while the tray is collapsed, should it expand?",
+          "impact": "shape",
+          "why": "This decides whether the parent must control the state and whether there is an expand signal from three save paths.",
+          "context": "Three paths add drafts: “Save for later” / Enter in this panel (`RunPanel.tsx:3416`), DiffDialog's “Save to backlog” (`DiffDialog.tsx:637-647`), and a server re-stash after a withheld/failed send, surfaced by `send-failed` plus a toast (`App.tsx:1700-1712`). New drafts are inserted at the top (`db.ts:1728-1730`).",
+          "evidence": [
+            {
+              "label": "Save for later",
+              "path": "src/mainview/components/kanban/RunPanel.tsx",
+              "line": 3416,
+              "endLine": 3426,
+              "lang": "tsx",
+              "code": "const saveForLater = async () => {\n  const text = input.trim();\n  ...\n  const updated = await api.addBacklogItem(sentTaskId, { text, references: sendRefs });\n  if (currentTaskIdRef.current === sentTaskId) {\n    setBacklogItems(updated.backlog);"
+            },
+            {
+              "label": "DiffDialog save",
+              "path": "src/mainview/components/kanban/DiffDialog.tsx",
+              "line": 637,
+              "endLine": 645,
+              "lang": "tsx",
+              "code": "const doSave = async () => {\n  ...\n  await api.addBacklogItem(task.id, { text: composed, references: [] });\n  ...\n  setHint(\"Saved to backlog.\");"
+            }
+          ],
+          "options": [
+            {
+              "id": "never",
+              "label": "Stay collapsed; update the count",
+              "description": "The only feedback for a manual save is the count badge; the existing send-failed toast still explains a failed send.",
+              "consequence": "Reading is never interrupted; a manual save is less visually confirmed, but the count is in the header right above the composer."
+            },
+            {
+              "id": "explicit",
+              "label": "Expand on “Save for later” only",
+              "description": "DiffDialog saves and background re-stashes stay collapsed.",
+              "consequence": "Immediate confirmation of the draft you just saved; one deliberate exception to the stored preference."
+            },
+            {
+              "id": "explicit-all",
+              "label": "Expand on any save you initiate",
+              "description": "Both “Save for later” and DiffDialog's “Save to backlog”; background re-stashes stay collapsed.",
+              "consequence": "Every deliberate save is visible; two paths must feed one expand signal."
+            },
+            {
+              "id": "all",
+              "label": "Expand on every addition",
+              "description": "Including the server re-stash.",
+              "consequence": "Nothing is ever added unseen, but the tray can pop open while you are reading."
+            }
+          ],
+          "recommendation": {
+            "value": "never",
+            "reason": "Auto-expanding is the exact interruption the collapse is meant to stop; the count badge stays visible, and the failure path already has its own toast."
+          }
+        }
+      ]
+    },
+    {
+      "id": "presentation",
+      "title": "What collapsed and expanded look like",
+      "intro": "These decide how much of the header survives and what “expand” means.",
+      "questions": [
+        {
+          "id": "collapsed-header",
+          "type": "single",
+          "title": "What should the collapsed header show?",
+          "impact": "shape",
+          "why": "This decides the header markup, the copy and whether the collapsed row grows a line.",
+          "context": "The header currently holds a clipboard icon, “Backlog”, a count badge and a hint: `saved messages — send when you're ready`, or the archived variant `saved messages — unarchive the task to edit or send` (`RunPanel.tsx:5004-5012`). At the 420 px minimum panel width the row fits with room to spare; a leading chevron adds ~18 px. The newest draft is first (`db.ts:1728-1730`), so a preview would show the newest one.",
+          "options": [
+            {
+              "id": "keep",
+              "label": "Keep the current header, add a chevron",
+              "description": "Icon, label, count and the existing hint in both states.",
+              "consequence": "Smallest diff; the chevron is the only new affordance."
+            },
+            {
+              "id": "hint-swap",
+              "label": "Keep it, but swap the hint when collapsed",
+              "description": "Collapsed: `saved messages — expand to review`; expanded: the current hint.",
+              "consequence": "Tells a first-time user how to get the list back; one conditional string, no extra height."
+            },
+            {
+              "id": "compact",
+              "label": "Compact: icon, label and count only",
+              "description": "Drop the hint while collapsed.",
+              "consequence": "Least clutter; loses the explanation of what the count is."
+            },
+            {
+              "id": "preview",
+              "label": "Compact plus a one-line newest-draft preview",
+              "description": "A truncated `line-clamp-1` preview under the header.",
+              "consequence": "Keeps context while collapsed; adds ~16 px and a truncation rule at narrow widths."
+            }
+          ],
+          "recommendation": {
+            "value": "hint-swap",
+            "reason": "The chevron alone is standard but easy to miss; explicit copy costs no height and makes the return path obvious."
+          }
+        },
+        {
+          "id": "expanded-height",
+          "type": "single",
+          "title": "Does “expand” mean the current capped list, or show more?",
+          "impact": "shape",
+          "why": "“Expand” could reasonably mean “show all drafts”; that would change the height rule and the transcript reclaim.",
+          "context": "The list is capped at `max-h-40` (160 px) at rest and `max-h-72` (288 px) while editing; the taller edit cap exists so the Save/Cancel row is not clipped (`docs/plans/fix-backlog-edit-save-button-clipped.md:15-36`). The tray scrolls inside its cap, so even a 30-draft backlog only shows the first few rows today.",
+          "options": [
+            {
+              "id": "keep",
+              "label": "Keep 160 px / 288 px while editing",
+              "description": "Expanding restores exactly today's view.",
+              "consequence": "No layout risk; the transcript reclaim is the only change."
+            },
+            {
+              "id": "taller",
+              "label": "Make the expanded list taller (e.g. 50–60% of the panel)",
+              "description": "A larger fixed cap, or a viewport-relative one.",
+              "consequence": "You see more drafts at once, but it re-occupies the reading area you just reclaimed."
+            },
+            {
+              "id": "all",
+              "label": "Expand shows all drafts (no cap)",
+              "description": "The list grows to fit every item.",
+              "consequence": "Recreates the original complaint on a big backlog; the transcript shrinks instead of grows."
+            }
+          ],
+          "recommendation": {
+            "value": "keep",
+            "reason": "The ask is to give the transcript room, not to see more drafts; the 288 px edit cap is a recent fix for clipped Save/Cancel buttons."
+          }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Low-stakes defaults I'd bet on. Confirm with one click, or override with what it should be.",
+      "questions": [
+        {
+          "id": "interaction",
+          "type": "confirm",
+          "title": "Interaction and accessibility",
+          "recommendation": {
+            "value": "Whole header is one full-width `<button>` with a leading chevron; `aria-expanded` + `aria-controls`; `data-testid` hooks (`backlog-tray`, `backlog-toggle`, `backlog-list`) and `data-state`; no height animation, only the chevron rotates.",
+            "reason": "Matches the house disclosure pattern (`CompactionSummaryBlock.tsx:42-57`, `PullCommits`) and gives the e2e stable hooks."
+          }
+        },
+        {
+          "id": "always-visible",
+          "type": "confirm",
+          "title": "Show the collapse toggle for every non-empty tray, even with one draft",
+          "recommendation": {
+            "value": "Yes — always show it when the tray renders.",
+            "reason": "A control that appears only past a count is more surprising than a consistent header, and the tray already unmounts when empty."
+          }
+        },
+        {
+          "id": "archived",
+          "type": "confirm",
+          "title": "Same toggle on archived (read-only) tasks",
+          "recommendation": {
+            "value": "Yes — collapse is pure view state; drafts stay visible when expanded and the read-only hint remains.",
+            "reason": "Hiding the list does not mutate the frozen task; the server's `backlogGuard` is untouched."
+          }
+        },
+        {
+          "id": "lifecycle",
+          "type": "confirm",
+          "title": "Lifecycle edges",
+          "recommendation": {
+            "value": "Subagent tabs still hide the tray entirely; an empty backlog still hides it; after the last draft is sent or deleted, a later draft follows the stored choice (collapsed if you last collapsed).",
+            "reason": "No new mount gates; the keyed tray already resets local state, and persisted state makes the return state predictable."
+          }
+        },
+        {
+          "id": "non-goals",
+          "type": "confirm",
+          "title": "Out of scope",
+          "recommendation": {
+            "value": "Per-message collapse, expand-all/collapse-all, virtualization for huge lists, backend/preference sync, a Settings toggle, and a new keyboard shortcut.",
+            "reason": "Each is an adjacent feature; adding them would make this a different ticket."
+          }
+        },
+        {
+          "id": "acceptance",
+          "type": "confirm",
+          "title": "Tests and docs",
+          "recommendation": {
+            "value": "One new Playwright spec (default visibility, toggle + `aria-expanded`, list hidden, count visible, transcript grows) plus an update to `docs/architecture/messages-backlog.md`; add `CLAUDE.md:175` only if a new localStorage key is introduced. The existing task-switch spec changes only if the chosen default hides its seeded draft.",
+            "reason": "There is no DOM/component harness; e2e is the only layer that can see the disclosure and the reclaimed height."
+          }
+        }
+      ]
+    },
+    {
+      "id": "anything-else",
+      "title": "Anything else",
+      "questions": [
+        {
+          "id": "other-constraints",
+          "type": "text",
+          "title": "Any other behavior, copy or constraint this must respect?",
+          "impact": "minor",
+          "required": false,
+          "placeholder": "e.g. a screenshot, a specific label, or a case I missed"
+        }
+      ]
+    }
+  ]
+}

@@ -1,10 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Workflow } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { PipelinePicker } from "@/components/pipelines/PipelinePicker";
 import { cn } from "@/lib/utils";
 import { api, type AgentModelMap } from "@/lib/api";
 import { useAgentProfiles } from "@/lib/agent-profiles";
+import { refreshPipelines, usePipelines } from "@/lib/pipelines";
+import { resolvePipelineLaunch, type PipelineLaunchState } from "@/lib/pipeline-launch";
 import { discoveredEffortsFor, mergeModelOptions, type DiscoveredModel } from "../../../shared/model-options.ts";
 import { supportedSpeeds } from "../../../shared/speed.ts";
 import {
@@ -23,6 +27,7 @@ import {
   type AgentStatus,
   type Harness,
   type HarnessStack,
+  type Pipeline,
   type Speed,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
@@ -124,9 +129,51 @@ export interface TaskLaunch {
    *  auth status for whichever harness a launch will actually run under.
    *  Consumers must gate submit and render the availability/auth hint off
    *  THIS, not `selectedStatus` (which only ever reflects the manual
-   *  picker and goes stale — silently — once a profile is selected and
-   *  hides that block). */
+   *  picker and goes stale — silently — once a profile or pipeline is
+   *  selected and hides that block). */
   effectiveStatus: AgentStatus | undefined;
+  /** `true` only when the hook was created with `{ withPipelines: true }` —
+   *  every pipeline field below is inert (`[]`/`null`/`false`) otherwise, so
+   *  the Agent Settings form and `CloneProjectDialog` render exactly the same
+   *  DOM they always have. */
+  withPipelines: boolean;
+  /** Module-cached pipeline list (see `usePipelines`) — empty while not
+   *  opted in. */
+  pipelines: Pipeline[];
+  /** `true` once a pipeline fetch has succeeded at least once. */
+  pipelinesLoaded: boolean;
+  /** A pipeline fetch is in flight with no cached list to show yet. */
+  pipelinesLoading: boolean;
+  /** The last failed pipeline fetch, if any (a stale cache may still be
+   *  shown alongside it — see `usePipelines`). */
+  pipelinesError: string | null;
+  /** Selected pipeline id, or `null` for "no pipeline". Mutually exclusive
+   *  with `agentProfileId`: a non-null pick through either setter clears the
+   *  other (the hook's one-selection invariant). */
+  pipelineId: string | null;
+  setPipelineId: (id: string | null) => void;
+  /** `pipelines.find(p => p.id === pipelineId)`, or `null`. */
+  selectedPipeline: Pipeline | null;
+  /** Result of the pre-submit runnability check for the selected pipeline
+   *  (`resolvePipelineLaunch`) — `no-pipeline` when none is selected. */
+  pipelineState: PipelineLaunchState;
+  /** The user-facing reason the selected pipeline can't launch yet, mirroring
+   *  the server's own wording — `null` while ready/checking/none selected. */
+  pipelineProblem: string | null;
+  /** `true` when it's safe to submit: either no pipeline is selected, or the
+   *  selected one resolved to `ready`. Both dialogs' `canSubmit` includes
+   *  this. */
+  pipelineReady: boolean;
+  /** The selected pipeline's start-step profile (also returned while
+   *  blocked) — what the summary's "starts with" line names. */
+  pipelineStartProfile: AgentProfile | null;
+  /** The harness kind the prompt-byte overage check should key on. `null`
+   *  while a pipeline is selected but its start step's profile/harness can't
+   *  be resolved (nothing to check — the inline problem explains why). */
+  overageKind: AgentKind | null;
+  /** Display label matching {@link overageKind} — the start-step harness's
+   *  label for a pipeline, else the effective harness's label. */
+  overageLabel: string;
   /** Apply a batch of values onto the manual picker state — used by the
    *  Agents Settings edit form to seed the picker from the profile being
    *  edited. Applies `agent` first via the same reset-to-kind-defaults path
@@ -146,6 +193,15 @@ export function useTaskLaunch(
   open: boolean,
   opts?: {
     withProfiles?: boolean;
+    /**
+     * Opt into the pipeline section: loads the module-cached pipeline list,
+     * adds `pipelineId`/`setPipelineId` with the same one-selection rule as
+     * the agent profile, runs the pre-submit runnability check, and reports
+     * the start-step profile as the effective launch identity. Defaults to
+     * `false` so the Agent Settings form (`hideProfilePicker`) and
+     * `CloneProjectDialog` keep rendering exactly today's DOM.
+     */
+    withPipelines?: boolean;
     /**
      * Seed values for the manual harness/mode/model/effort/speed/maxMode
      * block, resolved by the open-effect INSTEAD OF `prefs.defaultHarness` /
@@ -184,6 +240,7 @@ export function useTaskLaunch(
   },
 ): TaskLaunch {
   const withProfiles = opts?.withProfiles !== false;
+  const withPipelines = opts?.withPipelines === true;
   const initial = opts?.initial;
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [stacks, setStacks] = useState<HarnessStack[]>([]);
@@ -229,12 +286,73 @@ export function useTaskLaunch(
   const [speed, setSpeed] = useState<Speed>(initial?.speed ?? "off");
   const [maxMode, setMaxMode] = useState(initial?.maxMode ?? false);
 
-  const [agentProfileId, setAgentProfileId] = useState<string | null>(null);
-  const { profiles: fetchedProfiles, refresh: refreshProfiles } = useAgentProfiles({
-    enabled: open && withProfiles,
-  });
+  const [agentProfileId, setAgentProfileIdState] = useState<string | null>(null);
+  // A pipeline and an agent profile are two ways to name ONE launch identity
+  // — picking either clears the other (the hook's one-selection invariant).
+  const [pipelineId, setPipelineIdState] = useState<string | null>(null);
+  const setAgentProfileId = useCallback((id: string | null) => {
+    setAgentProfileIdState(id);
+    if (id !== null) setPipelineIdState(null);
+  }, []);
+  const setPipelineId = useCallback((id: string | null) => {
+    setPipelineIdState(id);
+    if (id !== null) setAgentProfileIdState(null);
+  }, []);
+  // A pipeline's preflight needs the profile list even on a surface that
+  // hides the Agent picker (`withProfiles: false`) — otherwise the section
+  // would sit at `checking` forever.
+  const {
+    profiles: fetchedProfiles,
+    loaded: profilesLoaded,
+    error: profilesError,
+    refresh: refreshProfiles,
+  } = useAgentProfiles({ enabled: open && (withProfiles || withPipelines) });
   const profiles = withProfiles ? fetchedProfiles : [];
   const selectedProfile = agentProfileId ? (profiles.find((p) => p.id === agentProfileId) ?? null) : null;
+  // Module-cached (App mounts it at boot) — a Git dialog that opens later
+  // reads the resolved list instantly. Also reused by `createAndStartTask`
+  // via `refreshPipelines()`.
+  const {
+    pipelines,
+    loaded: pipelinesLoaded,
+    loading: pipelinesLoading,
+    error: pipelinesError,
+  } = usePipelines({ enabled: open && withPipelines });
+  const selectedPipeline = pipelineId ? (pipelines.find((p) => p.id === pipelineId) ?? null) : null;
+
+  // Every open starts with no pipeline selected — there's deliberately no
+  // "last used pipeline" preference (owner D5), matching New Task's
+  // post-submit reset.
+  useEffect(() => {
+    if (!open) return;
+    setPipelineIdState(null);
+  }, [open]);
+
+  // Stale-selection guard: clear a selected pipeline that no longer exists,
+  // but only once the list has actually loaded — never while the module
+  // cache is still empty on the very first fetch.
+  useEffect(() => {
+    if (pipelineId !== null && pipelinesLoaded && !pipelines.some((p) => p.id === pipelineId)) {
+      setPipelineIdState(null);
+    }
+  }, [pipelines, pipelineId, pipelinesLoaded]);
+
+  // Pre-submit runnability (server-authoritative, advisory here): mirrors the
+  // graph/profile/harness gates `createTask` and `startTask` would apply, so
+  // the dialog can explain a bad pipeline BEFORE `createAndStartTask` creates
+  // and rolls back a parent row.
+  const pipelineLaunch = useMemo(
+    () =>
+      resolvePipelineLaunch({
+        graph: selectedPipeline?.graph ?? null,
+        profiles: fetchedProfiles,
+        profilesLoaded,
+        profilesError,
+        harnesses,
+        agents,
+      }),
+    [selectedPipeline, fetchedProfiles, profilesLoaded, profilesError, harnesses, agents],
+  );
 
   // Self-fetch harness data on open — mirrors NewTaskForm/App.tsx's own
   // fetch, but scoped to whichever dialog mounts this hook (it's mounted
@@ -432,26 +550,44 @@ export function useTaskLaunch(
   };
 
   const rememberPicks = () => {
-    // A profile-backed launch didn't come from manually-picked values —
-    // nothing of the user's own intent to remember (see the `TaskLaunch`
-    // doc comment).
-    if (agentProfileId) return;
+    // A profile- or pipeline-backed launch didn't come from manually-picked
+    // values — nothing of the user's own intent to remember (see the
+    // `TaskLaunch` doc comment).
+    if (agentProfileId || pipelineId) return;
     void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
     void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
     if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
   };
 
-  const effectiveAgent = selectedProfile ? selectedProfile.harness : agent;
-  const effectiveKind: AgentKind = selectedProfile
-    ? (harnesses.find((h) => h.id === selectedProfile.harness)?.kind ?? "claude-code")
-    : kind;
+  // A pipeline's start-step profile is the launch identity while one is
+  // selected (New Task parity): the composer's discovery, the overage check,
+  // the availability/auth hint and the submit gate all describe the harness
+  // whose step will actually run first — not the hidden manual picker.
+  const pipelineProfile = pipelineLaunch.startProfile;
+  const effectiveAgent = pipelineProfile
+    ? pipelineProfile.harness
+    : selectedProfile ? selectedProfile.harness : agent;
+  const effectiveHarness = harnesses.find((h) => h.id === effectiveAgent) ?? null;
+  const effectiveKind: AgentKind =
+    (selectedProfile || pipelineProfile) ? (effectiveHarness?.kind ?? kind) : kind;
   // `AgentStatus` for whichever harness a launch will ACTUALLY run under —
-  // the selected profile's harness when one is picked, else the manually-
-  // picked `agent`. Callers must gate submit / render availability+auth
-  // hints off this, not the bare `selectedStatus` (which stays pinned to
-  // the manual picker and is invisible once a profile hides that block) —
-  // finding F2-3.
+  // the selected pipeline's start-step profile's harness, else the selected
+  // profile's harness, else the manually-picked `agent`. Callers must gate
+  // submit / render availability+auth hints off this, not the bare
+  // `selectedStatus` (which stays pinned to the manual picker and is
+  // invisible once a profile/pipeline hides that block) — finding F2-3.
   const effectiveStatus = agents.find((a) => a.harnessId === effectiveAgent);
+  const effectiveHarnessLabel = effectiveHarness?.label ?? effectiveAgent;
+  // For a pipeline the manual `effectiveKind` is meaningless (each step runs
+  // its own profile's harness), so the prompt-budget check keys on the START
+  // step's bound harness instead — `null` when that can't be resolved yet
+  // (the inline problem explains why).
+  const overageKind: AgentKind | null = pipelineId !== null
+    ? (pipelineLaunch.startHarness?.kind ?? null)
+    : effectiveKind;
+  const overageLabel = pipelineId !== null
+    ? (pipelineLaunch.startHarness?.label ?? pipelineProfile?.harness ?? "the start step's harness")
+    : effectiveHarnessLabel;
 
   return {
     loading,
@@ -490,6 +626,20 @@ export function useTaskLaunch(
     effectiveKind,
     effectiveAgent,
     effectiveStatus,
+    withPipelines,
+    pipelines,
+    pipelinesLoaded,
+    pipelinesLoading,
+    pipelinesError,
+    pipelineId,
+    setPipelineId,
+    selectedPipeline,
+    pipelineState: pipelineLaunch.state,
+    pipelineProblem: pipelineLaunch.reason,
+    pipelineReady: pipelineId === null || pipelineLaunch.state === "ready",
+    pipelineStartProfile: pipelineLaunch.startProfile,
+    overageKind,
+    overageLabel,
     seed,
   };
 }
@@ -504,15 +654,27 @@ export function useTaskLaunch(
  *  `hideProfilePicker` is set. Once `launch.agentProfileId` names a profile,
  *  the harness grid / mode / model / effort / speed / max-mode / OpenCode
  *  server controls are replaced by a single `<AgentProfileCard variant="selected">` — the
- *  launch form's "one selection" rule (plan D5). */
+ *  launch form's "one selection" rule (plan D5).
+ *
+ *  With `{ withPipelines: true }` on the hook, a **Pipeline** picker renders
+ *  ABOVE the Agent picker; picking one hides the Agent picker and the whole
+ *  manual block behind a summary card (name, step count, "starts with",
+ *  Change) plus any pre-submit problem. Other consumers never opt in, so
+ *  their DOM is unchanged. */
 export function TaskLaunchPickers({
   launch,
   hideProfilePicker,
   onManageProfiles,
+  onManagePipelines,
+  disabled,
 }: {
   launch: TaskLaunch;
   hideProfilePicker?: boolean;
   onManageProfiles?: () => void;
+  /** Renders the picker's "Manage pipelines…" row when supplied. */
+  onManagePipelines?: () => void;
+  /** Busy/read-only gate for the pipeline controls (a submit in flight). */
+  disabled?: boolean;
 }) {
   const {
     harnesses,
@@ -543,156 +705,242 @@ export function TaskLaunchPickers({
     profiles,
     selectedProfile,
     kind,
+    withPipelines,
+    pipelines,
+    pipelinesLoaded,
+    pipelinesLoading,
+    pipelinesError,
+    pipelineId,
+    setPipelineId,
+    selectedPipeline,
+    pipelineState,
+    pipelineProblem,
+    pipelineStartProfile,
   } = launch;
+
+  // Only a failed FIRST fetch disables the picker — a transient refetch
+  // failure keeps the stale-but-known list usable (`usePipelines`).
+  const pipelinesUnavailable = withPipelines && pipelinesError !== null && !pipelinesLoaded && pipelines.length === 0;
 
   return (
     <>
-      {!hideProfilePicker && (
-        <div className="space-y-1">
-          <label className="text-muted-foreground">Agent</label>
-          <AgentProfilePicker
-            value={agentProfileId}
-            onChange={setAgentProfileId}
-            profiles={profiles}
-            harnesses={harnesses}
-            onManage={onManageProfiles}
-          />
-        </div>
+      {withPipelines && (
+        <>
+          <div className="space-y-1">
+            <label className="text-muted-foreground">Pipeline</label>
+            <div data-testid="launch-pipeline-picker">
+              <PipelinePicker
+                value={pipelineId}
+                onChange={setPipelineId}
+                pipelines={pipelines}
+                onManage={onManagePipelines}
+                disabled={disabled || pipelinesUnavailable}
+              />
+            </div>
+          </div>
+          {pipelinesLoading && pipelines.length === 0 ? (
+            <p data-testid="launch-pipelines-loading" className="text-[11px] text-muted-foreground">
+              Loading pipelines…
+            </p>
+          ) : pipelinesUnavailable ? (
+            <p data-testid="launch-pipelines-error" className="text-[11px] text-destructive">
+              Couldn't load pipelines {pipelinesError ? `— ${pipelinesError}` : ""}
+            </p>
+          ) : pipelines.length === 0 && pipelineId === null ? (
+            <p className="text-[11px] text-muted-foreground">
+              No pipelines yet. Create one on the Pipelines page.
+            </p>
+          ) : null}
+        </>
       )}
 
-      {selectedProfile ? (
-        <>
-          <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
-          {/* Same availability/auth hint the manual branch below shows,
-           *  but keyed off `effectiveStatus` (the PROFILE's harness) — a
-           *  profile whose harness is unavailable or logged out must not
-           *  block Start with no visible reason (finding F2-3). */}
-          {effectiveStatus && !effectiveStatus.available && (
+      {selectedPipeline ? (
+        <div
+          data-testid="launch-pipeline-summary"
+          className="space-y-1 rounded-md border border-border bg-muted/30 p-2"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium">
+              <Workflow className="size-3.5 shrink-0 text-info" aria-hidden />
+              <span className="truncate">{selectedPipeline.name}</span>
+            </span>
+            <button
+              type="button"
+              data-testid="launch-pipeline-change"
+              onClick={() => setPipelineId(null)}
+              disabled={disabled}
+              className="shrink-0 text-[11px] text-muted-foreground hover:text-foreground hover:underline disabled:opacity-50"
+            >
+              Change
+            </button>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            {selectedPipeline.graph.steps.length} step{selectedPipeline.graph.steps.length === 1 ? "" : "s"}
+            {pipelineStartProfile && <> · starts with {pipelineStartProfile.name}</>}
+          </p>
+          {pipelineState === "checking" ? (
+            <p data-testid="launch-pipeline-checking" className="text-[11px] text-muted-foreground">
+              Checking the start step's agent…
+            </p>
+          ) : pipelineProblem ? (
             <div
-              data-testid="launch-agent-unavailable-hint"
+              data-testid="launch-pipeline-problem"
               className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
             >
-              <div className="font-medium">{effectiveStatus.reason}</div>
-              {effectiveStatus.installHint && (
-                <div className="mt-1 font-mono opacity-80">{effectiveStatus.installHint}</div>
-              )}
+              {pipelineProblem}
             </div>
-          )}
-          <HarnessAuthHint status={effectiveStatus} />
-        </>
+          ) : null}
+        </div>
       ) : (
         <>
-          <div className="space-y-1">
-            <label className="text-muted-foreground">Harness</label>
-            <div className="grid grid-cols-2 gap-1">
-              {availableHarnesses.map((h) => {
-                const status = agents.find((s) => s.harnessId === h.id);
-                const available = status?.available ?? false;
-                const loggedOut = available && status?.loggedIn === false;
-                return (
-                  <Button
-                    key={h.id}
-                    size="sm"
-                    variant={agent === h.id ? "default" : "outline"}
-                    onClick={() => switchAgent(h.id)}
-                    title={
-                      [
-                        status?.reason,
-                        status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
-                        status?.path,
-                        status?.version,
-                      ]
-                        .filter(Boolean)
-                        .join(" — ") || h.id
-                    }
-                    className="justify-start"
-                  >
-                    <AgentIcon kind={h.kind} className="mr-1" />
-                    <span className="truncate">{h.label}</span>
-                    <StackPositionChip stacks={stacks} harnessId={h.id} />
-                    <span
-                      className={cn(
-                        "ml-auto inline-block size-1.5 rounded-full",
-                        !available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid",
-                      )}
-                    />
-                  </Button>
-                );
-              })}
-            </div>
-            {selectedStatus && !selectedStatus.available && (
-              <div
-                data-testid="launch-agent-unavailable-hint"
-                className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
-              >
-                <div className="font-medium">{selectedStatus.reason}</div>
-                {selectedStatus.installHint && (
-                  <div className="mt-1 font-mono opacity-80">{selectedStatus.installHint}</div>
-                )}
-              </div>
-            )}
-            <HarnessAuthHint status={selectedStatus} />
-          </div>
-
-          <div className="space-y-1">
-            <label className="text-muted-foreground">Mode</label>
-            <Select value={mode} onChange={(e) => setMode(e.target.value)} className="h-8">
-              {modes.map((m) => (
-                <option key={m.id} value={m.id}>{m.label}</option>
-              ))}
-            </Select>
-          </div>
-
-          <div className="grid grid-cols-2 gap-2">
-            <div className="min-w-0 space-y-1">
-              <label className="text-muted-foreground">Model</label>
-              <Select value={model} onChange={(e) => setModel(e.target.value)} className="h-8">
-                {models.map((m) => (
-                  <option key={m.id} value={m.id}>{m.label}</option>
-                ))}
-              </Select>
-            </div>
-            <div className="min-w-0 space-y-1">
-              <label className="text-muted-foreground">Effort</label>
-              <Select
-                value={effort ?? ""}
-                onChange={(e) => setEffort(e.target.value)}
-                disabled={efforts.length === 0}
-                className="h-8"
-              >
-                {efforts.length === 0 ? (
-                  <option value="">n/a</option>
-                ) : (
-                  efforts.map((m) => (
-                    <option key={m.id} value={m.id}>{m.label}</option>
-                  ))
-                )}
-              </Select>
-            </div>
-          </div>
-
-          {showsSpeedPicker(speedOptions, speed) && (
+          {!hideProfilePicker && (
             <div className="space-y-1">
-              <label className="text-muted-foreground">Speed</label>
-              <SpeedPicker options={speedOptions} value={speed} onChange={setSpeed} testId="launch-speed" />
+              <label className="text-muted-foreground">Agent</label>
+              <AgentProfilePicker
+                value={agentProfileId}
+                onChange={setAgentProfileId}
+                profiles={profiles}
+                harnesses={harnesses}
+                onManage={onManageProfiles}
+              />
             </div>
           )}
 
-          {kind === "cursor" && (maxModeAvailable || maxMode) && (
-            <div className="grid grid-cols-2 gap-2">
-              <label
-                data-testid="launch-max-mode-toggle"
-                className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs"
-              >
-                <span>Max Mode</span>
-                <Switch
-                  checked={maxMode}
-                  onCheckedChange={setMaxMode}
-                  disabled={!maxModeAvailable}
-                  aria-label="Use Cursor Max Mode context"
-                />
-              </label>
-            </div>
+          {selectedProfile ? (
+            <>
+              <AgentProfileCard profile={selectedProfile} harnesses={harnesses} variant="selected" />
+              {/* Same availability/auth hint the manual branch below shows,
+               *  but keyed off `effectiveStatus` (the PROFILE's harness) — a
+               *  profile whose harness is unavailable or logged out must not
+               *  block Start with no visible reason (finding F2-3). */}
+              {effectiveStatus && !effectiveStatus.available && (
+                <div
+                  data-testid="launch-agent-unavailable-hint"
+                  className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
+                >
+                  <div className="font-medium">{effectiveStatus.reason}</div>
+                  {effectiveStatus.installHint && (
+                    <div className="mt-1 font-mono opacity-80">{effectiveStatus.installHint}</div>
+                  )}
+                </div>
+              )}
+              <HarnessAuthHint status={effectiveStatus} />
+            </>
+          ) : (
+            <>
+              <div className="space-y-1">
+                <label className="text-muted-foreground">Harness</label>
+                <div className="grid grid-cols-2 gap-1">
+                  {availableHarnesses.map((h) => {
+                    const status = agents.find((s) => s.harnessId === h.id);
+                    const available = status?.available ?? false;
+                    const loggedOut = available && status?.loggedIn === false;
+                    return (
+                      <Button
+                        key={h.id}
+                        size="sm"
+                        variant={agent === h.id ? "default" : "outline"}
+                        onClick={() => switchAgent(h.id)}
+                        title={
+                          [
+                            status?.reason,
+                            status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
+                            status?.path,
+                            status?.version,
+                          ]
+                            .filter(Boolean)
+                            .join(" — ") || h.id
+                        }
+                        className="justify-start"
+                      >
+                        <AgentIcon kind={h.kind} className="mr-1" />
+                        <span className="truncate">{h.label}</span>
+                        <StackPositionChip stacks={stacks} harnessId={h.id} />
+                        <span
+                          className={cn(
+                            "ml-auto inline-block size-1.5 rounded-full",
+                            !available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid",
+                          )}
+                        />
+                      </Button>
+                    );
+                  })}
+                </div>
+                {selectedStatus && !selectedStatus.available && (
+                  <div
+                    data-testid="launch-agent-unavailable-hint"
+                    className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground"
+                  >
+                    <div className="font-medium">{selectedStatus.reason}</div>
+                    {selectedStatus.installHint && (
+                      <div className="mt-1 font-mono opacity-80">{selectedStatus.installHint}</div>
+                    )}
+                  </div>
+                )}
+                <HarnessAuthHint status={selectedStatus} />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-muted-foreground">Mode</label>
+                <Select value={mode} onChange={(e) => setMode(e.target.value)} className="h-8">
+                  {modes.map((m) => (
+                    <option key={m.id} value={m.id}>{m.label}</option>
+                  ))}
+                </Select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="min-w-0 space-y-1">
+                  <label className="text-muted-foreground">Model</label>
+                  <Select value={model} onChange={(e) => setModel(e.target.value)} className="h-8">
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ))}
+                  </Select>
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <label className="text-muted-foreground">Effort</label>
+                  <Select
+                    value={effort ?? ""}
+                    onChange={(e) => setEffort(e.target.value)}
+                    disabled={efforts.length === 0}
+                    className="h-8"
+                  >
+                    {efforts.length === 0 ? (
+                      <option value="">n/a</option>
+                    ) : (
+                      efforts.map((m) => (
+                        <option key={m.id} value={m.id}>{m.label}</option>
+                      ))
+                    )}
+                  </Select>
+                </div>
+              </div>
+
+              {showsSpeedPicker(speedOptions, speed) && (
+                <div className="space-y-1">
+                  <label className="text-muted-foreground">Speed</label>
+                  <SpeedPicker options={speedOptions} value={speed} onChange={setSpeed} testId="launch-speed" />
+                </div>
+              )}
+
+              {kind === "cursor" && (maxModeAvailable || maxMode) && (
+                <div className="grid grid-cols-2 gap-2">
+                  <label
+                    data-testid="launch-max-mode-toggle"
+                    className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs"
+                  >
+                    <span>Max Mode</span>
+                    <Switch
+                      checked={maxMode}
+                      onCheckedChange={setMaxMode}
+                      disabled={!maxModeAvailable}
+                      aria-label="Use Cursor Max Mode context"
+                    />
+                  </label>
+                </div>
+              )}
+            </>
           )}
         </>
       )}
@@ -706,6 +954,10 @@ export function TaskLaunchPickers({
  * created. Mirrors `ResolveConflictsDialog`'s inline `submit()` body
  * (lines 194-207) exactly, including both error message shapes. Resolves to
  * the created task's id.
+ *
+ * A successful pipeline create fires `refreshPipelines()` (not awaited) so
+ * the module-cached list's server-derived `taskCount` ("Used by N task(s)")
+ * is current the next time a picker or the Pipelines page renders.
  */
 export async function createAndStartTask(input: Parameters<typeof api.createTask>[0]): Promise<string> {
   const created = await api.createTask(input);
@@ -720,5 +972,6 @@ export async function createAndStartTask(input: Parameters<typeof api.createTask
         : `task was created but couldn't start (${detail}) — find it on the board and start it manually`,
     );
   }
+  if (input.pipelineId) void refreshPipelines().catch(() => {});
   return created.id;
 }

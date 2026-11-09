@@ -9,6 +9,14 @@ interface Props {
   workdir: string;
   value: string;
   onChange: (next: string) => void;
+  /**
+   * Called instead of `onChange` for the automatic "pre-select the current
+   * branch" seed when branches first arrive. Lets a caller distinguish a
+   * programmatic seed from a real user pick — `WorktreeOptions` uses it so a
+   * dialog's unsaved-draft check doesn't count the auto-selected current
+   * branch as a user change. Defaults to `onChange`.
+   */
+  onAutoSelect?: (next: string) => void;
   className?: string;
   /**
    * Field label rendered above the picker. Sharing the label row with the
@@ -43,7 +51,7 @@ const formatAge = (ms: number): string => {
  * covers the "use what's checked out" intent without the extra entry. Empty
  * value still means "use HEAD" downstream so the picker can sit unselected.
  */
-export function BranchPicker({ workdir, value, onChange, className, label, title, placement, disabled }: Props) {
+export function BranchPicker({ workdir, value, onChange, onAutoSelect, className, label, title, placement, disabled }: Props) {
   // Branches are tagged with the workdir they were fetched for. Without the
   // tag, switching projects would let the auto-select effect below see the
   // previous repo's `branches` array (state updates from `setBranches([])`
@@ -174,9 +182,9 @@ export function BranchPicker({ workdir, value, onChange, className, label, title
   useEffect(() => {
     if (value) return;
     const current = branches.find((b) => b.current);
-    if (current) onChange(current.name);
-    // Intentionally not depending on onChange to avoid loops when the parent
-    // doesn't memoize it.
+    if (current) (onAutoSelect ?? onChange)(current.name);
+    // Intentionally not depending on the callbacks to avoid loops when the
+    // parent doesn't memoize them.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [branches, value]);
 

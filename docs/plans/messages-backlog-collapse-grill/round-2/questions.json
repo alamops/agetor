@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "id": "messages-backlog-collapse-grill-r2",
+  "title": "Grill — collapse / expand the task messages backlog (round 2)",
+  "skill": "grill",
+  "slug": "messages-backlog-collapse",
+  "round": 2,
+  "flags": [],
+  "summary": "One contradiction to settle before the record is written. You chose **session-only** collapse state, but also confirmed that a collapsed tray should still be collapsed after its last draft is sent or deleted. Those two cannot both hold with the state inside `BacklogTray`: the tray is only rendered while it has items, so an empty backlog unmounts it and destroys its `useState`. The next saved draft remounts it expanded. Pick which behavior wins.",
+  "sections": [
+    {
+      "id": "pushback",
+      "title": "Resolve the persistence / empty-tray conflict",
+      "questions": [
+        {
+          "id": "empty-tray-state",
+          "type": "single",
+          "title": "When the last draft is removed and a later draft is saved, should the tray stay collapsed or reopen expanded?",
+          "impact": "blocking",
+          "why": "This decides whether the collapse flag stays inside `BacklogTray` or is lifted to `RunPanelBody`, and whether the accepted lifecycle line is amended.",
+          "context": "Round 1, persistence: you chose **“Not persisted — session only”** (the option said the state resets on task switch, subagent tab, panel close and restart). Round 1, lifecycle: you confirmed **“after the last draft is sent or deleted, a later draft follows the stored choice (collapsed if you last collapsed)”**. With the flag inside `BacklogTray`, that second part cannot hold: `RunPanel.tsx:4583` renders the tray only while `backlogItems.length > 0`, so removing the last draft unmounts the tray and its `useState`; the next draft remounts it at the default. There is no stored choice to follow.",
+          "evidence": [
+            {
+              "label": "the tray unmounts when empty",
+              "path": "src/mainview/components/kanban/RunPanel.tsx",
+              "line": 4583,
+              "endLine": 4593,
+              "lang": "tsx",
+              "code": "{activeStream === \"main\" && backlogItems.length > 0 && (\n  <BacklogTray\n    key={`backlog-${task.id}`}"
+            },
+            {
+              "label": "the local flag would die with it",
+              "path": "src/mainview/components/kanban/RunPanel.tsx",
+              "line": 5001,
+              "lang": "tsx",
+              "code": "const [editingId, setEditingId] = useState<string | null>(null);"
+            }
+          ],
+          "options": [
+            {
+              "id": "reset-on-empty",
+              "label": "Accept the reset — the next draft opens expanded",
+              "description": "Keep the flag in `BacklogTray` and amend the lifecycle answer: an empty tray forgets the state, and the next saved draft appears expanded.",
+              "consequence": "Fully consistent with session-only and the current render gate; no parent prop, no reset line. The one surprise is a collapsed-then-emptied task reopening expanded — arguably good, because it shows the draft you just saved."
+            },
+            {
+              "id": "lift-to-parent",
+              "label": "Keep it session-only, but hold the flag in `RunPanelBody`",
+              "description": "The parent already survives empty→non-empty and subagent-tab switches; reset the flag on task id in the existing `[task.id]` effect.",
+              "consequence": "Survives the empty gap and subagent tabs within the same panel session; still resets on task switch (explicit reset) and on panel close/restart. Adds one prop and a reset line, and departs from the round-1 option's “resets on subagent tab” description."
+            },
+            {
+              "id": "persist-global",
+              "label": "Switch to the global localStorage flag you overrode",
+              "description": "`agetor:backlogTrayCollapsed`, one choice for every task and every restart.",
+              "consequence": "Survives empty, task switch, subagent tab and restart with no parent state; reverses the round-1 persistence answer and adds a `panel-collapse.ts` key plus `CLAUDE.md:175`."
+            },
+            {
+              "id": "persist-per-task",
+              "label": "Switch to per-task localStorage",
+              "description": "The key includes the task id, so a task remembers its own state forever.",
+              "consequence": "Survives everything for that task; unbounded keys, a cleanup story, and a key-builder helper."
+            }
+          ],
+          "recommendation": {
+            "value": "reset-on-empty",
+            "reason": "It is the only option that keeps your explicit session-only choice and the current render gate without adding parent state; the reset is an obscure edge and it re-shows the draft you just saved."
+          }
+        }
+      ]
+    }
+  ]
+}
