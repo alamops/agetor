@@ -686,6 +686,12 @@ resume blocks the swap visibly.
   and resets the attempt cap) and the swap divider. While the retry run itself
   is live the banner reads "Running on <account> after a quota reset (attempt
   n/3)." with no Run now (`src/mainview/lib/harness-stack-banner.ts`).
+- **Launch surfaces**: a launch is never refused client-side on an account
+  that is disabled, unavailable or logged out when its stack has a usable
+  backup (`stackBackupCanServe`, `src/mainview/lib/stack-launch.ts`): the Git
+  issue/PR dialogs gate submit on `effectiveLaunchable`, the pipeline
+  preflight (`resolvePipelineLaunch`) returns ready, and a hint says the run
+  starts on the next usable account — the core's `startTask` makes the move.
 - **One-account stacks**: a stack with fewer than two members is inert, so no
   surface shows an `n/m` position or "fails over" copy for it (webview, CLI,
   TUI, notifications); the card badge shows only a live state word. The rule

@@ -32,6 +32,7 @@ import {
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
 import { StackPositionChip } from "./StackBadge";
+import { stackBackupCanServe } from "@/lib/stack-launch";
 import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
@@ -132,6 +133,14 @@ export interface TaskLaunch {
    *  picker and goes stale — silently — once a profile or pipeline is
    *  selected and hides that block). */
   effectiveStatus: AgentStatus | undefined;
+  /** True when the account a launch will run under is in a stack with a
+   *  usable backup: the core moves the run there instead of refusing it, so
+   *  an unavailable, disabled or logged-out `effectiveStatus` is not a block. */
+  effectiveStackFallback: boolean;
+  /** Whether the launch identity can start right now: its CLI is available,
+   *  or a stack backup can serve it (`effectiveStackFallback`). Gate submit
+   *  on this, not on `effectiveStatus.available` alone. */
+  effectiveLaunchable: boolean;
   /** `true` only when the hook was created with `{ withPipelines: true }` —
    *  every pipeline field below is inert (`[]`/`null`/`false`) otherwise, so
    *  the Agent Settings form and `CloneProjectDialog` render exactly the same
@@ -350,8 +359,9 @@ export function useTaskLaunch(
         profilesError,
         harnesses,
         agents,
+        stacks,
       }),
-    [selectedPipeline, fetchedProfiles, profilesLoaded, profilesError, harnesses, agents],
+    [selectedPipeline, fetchedProfiles, profilesLoaded, profilesError, harnesses, agents, stacks],
   );
 
   // Self-fetch harness data on open — mirrors NewTaskForm/App.tsx's own
@@ -577,6 +587,8 @@ export function useTaskLaunch(
   // `selectedStatus` (which stays pinned to the manual picker and is
   // invisible once a profile/pipeline hides that block) — finding F2-3.
   const effectiveStatus = agents.find((a) => a.harnessId === effectiveAgent);
+  const effectiveStackFallback = stackBackupCanServe(effectiveAgent, stacks, harnesses, agents);
+  const effectiveLaunchable = !!effectiveStatus?.available || effectiveStackFallback;
   const effectiveHarnessLabel = effectiveHarness?.label ?? effectiveAgent;
   // For a pipeline the manual `effectiveKind` is meaningless (each step runs
   // its own profile's harness), so the prompt-budget check keys on the START
@@ -626,6 +638,8 @@ export function useTaskLaunch(
     effectiveKind,
     effectiveAgent,
     effectiveStatus,
+    effectiveStackFallback,
+    effectiveLaunchable,
     withPipelines,
     pipelines,
     pipelinesLoaded,
@@ -683,7 +697,9 @@ export function TaskLaunchPickers({
     agents,
     agent,
     selectedStatus,
+    effectiveAgent,
     effectiveStatus,
+    effectiveStackFallback,
     mode,
     modes,
     model,
@@ -717,6 +733,15 @@ export function TaskLaunchPickers({
     pipelineProblem,
     pipelineStartProfile,
   } = launch;
+  // The current account can't start this launch on its own, but its stack
+  // has a usable backup the core will move to (see `stackBackupCanServe`):
+  // say so, so an enabled Create & start next to a red hint isn't a puzzle.
+  const effectiveHarnessRow = harnesses.find((h) => h.id === effectiveAgent);
+  const showStackFallback =
+    effectiveStackFallback &&
+    (!effectiveHarnessRow?.enabled ||
+      !effectiveStatus?.available ||
+      effectiveStatus.loggedIn === false);
 
   // Only a failed FIRST fetch disables the picker — a transient refetch
   // failure keeps the stale-but-known list usable (`usePipelines`).
@@ -789,6 +814,10 @@ export function TaskLaunchPickers({
             >
               {pipelineProblem}
             </div>
+          ) : showStackFallback ? (
+            <p data-testid="launch-stack-fallback-hint" className="text-[11px] text-muted-foreground">
+                This account can't start right now — the run starts on the next usable account in its stack.
+              </p>
           ) : null}
         </div>
       ) : (
@@ -825,6 +854,11 @@ export function TaskLaunchPickers({
                 </div>
               )}
               <HarnessAuthHint status={effectiveStatus} />
+              {showStackFallback && (
+                <p data-testid="launch-stack-fallback-hint" className="text-[11px] text-muted-foreground">
+                This account can't start right now — the run starts on the next usable account in its stack.
+              </p>
+              )}
             </>
           ) : (
             <>
@@ -878,6 +912,11 @@ export function TaskLaunchPickers({
                   </div>
                 )}
                 <HarnessAuthHint status={selectedStatus} />
+                {showStackFallback && (
+                  <p data-testid="launch-stack-fallback-hint" className="text-[11px] text-muted-foreground">
+                This account can't start right now — the run starts on the next usable account in its stack.
+              </p>
+                )}
               </div>
 
               <div className="space-y-1">
