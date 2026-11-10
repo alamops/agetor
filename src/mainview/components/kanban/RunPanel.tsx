@@ -7052,9 +7052,13 @@ function HarnessStackBanner({
     if (!onRunTask || runBusy) return;
     const id = task.id;
     setRunningNowFor(id);
-    void Promise.resolve(onRunTask(task)).finally(() => {
-      setRunningNowFor((cur) => (cur === id ? null : cur));
-    });
+    // App's start handler reports its own failures (toast); this only clears
+    // the in-flight guard, so a rejection is swallowed here, not left unhandled.
+    void Promise.resolve(onRunTask(task))
+      .catch(() => {})
+      .finally(() => {
+        setRunningNowFor((cur) => (cur === id ? null : cur));
+      });
   };
   return (
     <div className="mt-1 space-y-1 text-xs text-warning" data-testid="harness-stack-exhausted">
