@@ -10,7 +10,12 @@ import {
   SAFE_MODE_EXCLUDED_CODEX_KEYS,
   SAFE_MODE_EXCLUDED_SETTINGS_KEYS,
   CLAUDE_CODE_LOGIN_ENV_KEYS,
+  containsUrlUserinfo,
   isCodexLoginBearingKeyPath,
+  isCodexSecretKeyPath,
+  isCommandRunningEnvKey,
+  isMirrorNeverImportedEnvEntry,
+  urlHasUserinfo,
   isCredentialShapedEnvKey,
   isHandoffCopyShape,
   isHandoffPrunableDir,
@@ -427,5 +432,57 @@ describe("macOS TCC-protected home folders (contract CR4, review R-S5)", () => {
       "Music",
       "Pictures",
     ]);
+  });
+});
+
+describe("TT-C: finding 14 predicates", () => {
+  test("every credential segment is stripped, in any case, as a whole segment only", () => {
+    for (const seg of ["APIKEY", "PASS", "PASSWD", "PAT", "AUTH", "HEADERS", "COOKIE", "COOKIES", "SESSION", "DSN", "WEBHOOK", "CONNECTION", "PASSPHRASE"]) {
+      for (const key of [`SVC_${seg}`, `${seg}_X`, `a_${seg}_b`, `svc_${seg.toLowerCase()}`, `Svc_${seg[0]}${seg.slice(1).toLowerCase()}`]) {
+        expect(isCredentialShapedEnvKey(key), key).toBe(true);
+        expect(isMirrorNeverImportedEnvKey(key), key).toBe(true);
+      }
+    }
+    // Whole-segment: look-alikes keep mirroring.
+    for (const key of ["PATH", "AWS_REGION", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "MAX_THINKING_TOKENS", "PATHEXT", "AUTHOR", "COMPASS", "PASSENGER", "SESSIONS_DIR_X", "HOME"]) {
+      expect(isMirrorNeverImportedEnvKey(key), key).toBe(false);
+    }
+  });
+
+  test("session-ish credential shapes are mirror-stripped without becoming login evidence", () => {
+    for (const key of ["TERM_SESSION_ID", "SITE_COOKIE", "OTEL_EXPORTER_OTLP_HEADERS", "SENTRY_DSN"]) {
+      expect(isMirrorNeverImportedEnvKey(key), key).toBe(true);
+      expect(isHarnessAuthEnvKey(key), key).toBe(false);
+    }
+  });
+
+  test("a URL with userinfo is a credential whatever the name; a plain URL is not", () => {
+    expect(isMirrorNeverImportedEnvEntry("HTTPS_PROXY", "http://u:p@proxy:8080")).toBe(true);
+    expect(isMirrorNeverImportedEnvEntry("ANY", "  postgres://user@db/x  ")).toBe(true);
+    expect(isMirrorNeverImportedEnvEntry("ANY", "https://host/path?a=b@c")).toBe(false);
+    expect(isMirrorNeverImportedEnvEntry("ANY", "user@example.com")).toBe(false);
+    expect(isMirrorNeverImportedEnvEntry("ANY", 5)).toBe(false);
+    expect(urlHasUserinfo("https://tok@host/x")).toBe(true);
+    expect(urlHasUserinfo("https://host/x")).toBe(false);
+    expect(containsUrlUserinfo({ a: [{ b: "git+https://t:x@h/r.git" }] })).toBe(true);
+    expect(containsUrlUserinfo({ a: [{ b: "https://h/r.git" }], n: 1, z: null })).toBe(false);
+  });
+
+  test("command-running env names, any case, including DYLD_*, *_HELPER and *_COMMAND", () => {
+    for (const key of ["CLAUDE_CODE_SHELL_PREFIX", "NODE_OPTIONS", "node_options", "BASH_ENV", "PROMPT_COMMAND", "LD_PRELOAD", "GIT_PAGER", "GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "EDITOR", "PAGER", "DYLD_INSERT_LIBRARIES", "dyld_library_path", "MY_HELPER", "x_helper", "RUN_COMMAND", "run_command"]) {
+      expect(isCommandRunningEnvKey(key), key).toBe(true);
+    }
+    for (const key of ["PATH", "AWS_REGION", "ANTHROPIC_MODEL", "HELPERS_DIR", "COMMANDS", "LANG"]) {
+      expect(isCommandRunningEnvKey(key), key).toBe(false);
+    }
+  });
+
+  test("Codex secret key paths: shell_environment_policy.set credentials and otel headers", () => {
+    expect(isCodexSecretKeyPath(["shell_environment_policy", "set", "GH_TOKEN"])).toBe(true);
+    expect(isCodexSecretKeyPath(["shell_environment_policy", "set", "db_pass"])).toBe(true);
+    expect(isCodexSecretKeyPath(["shell_environment_policy", "set", "LANG"])).toBe(false);
+    expect(isCodexSecretKeyPath(["otel", "exporter", "otlp-http", "headers"])).toBe(true);
+    expect(isCodexSecretKeyPath(["otel", "exporter", "otlp-http", "headers", "authorization"])).toBe(true);
+    expect(isCodexSecretKeyPath(["otel", "environment"])).toBe(false);
   });
 });

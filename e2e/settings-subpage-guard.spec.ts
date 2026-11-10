@@ -101,13 +101,11 @@ async function openAddHarnessEditor(page: Page): Promise<{ modal: Locator; label
   return { modal, labelInput };
 }
 
-/** The harness row's "Edit" button, found via the row's label text (rows have
- *  no test id) — the nearest bordered `rounded-md` ancestor is the row. */
+/** The harness row's edit button, found by its accessible name ("Edit <label>",
+ *  `HarnessAccountRow`). A stack card's own button is "Edit stack <label>", so
+ *  the exact match cannot hit it. */
 function harnessRowEdit(modal: Locator, label: string): Locator {
-  return modal
-    .getByText(label, { exact: true })
-    .locator("xpath=ancestor::div[contains(@class,'rounded-md') and contains(@class,'border')][1]")
-    .getByRole("button", { name: "Edit", exact: true });
+  return modal.getByRole("button", { name: `Edit ${label}`, exact: true });
 }
 
 test.describe("Settings → Harnesses editor — dirty-leave guard", () => {

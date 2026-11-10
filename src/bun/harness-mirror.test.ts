@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 process.env.AGETOR_DATA_DIR ??= mkdtempSync(path.join(tmpdir(), "agetor-mirror-"));
@@ -2050,5 +2050,683 @@ describe("fix round F-B: backup store trust, link restore, deleted originals, ac
     expect(JSON.stringify(settings.hooks)).toContain("my-hook");
     expect(JSON.stringify(settings.hooks)).not.toContain("primary-hook");
     expect(result.restored.some((r) => r.startsWith("settings.json:hooks"))).toBe(true);
+  });
+});
+
+describe("TT-C: finding 12 (JSON merge semantics)", () => {
+  test("stdio -> http: the replaced server keeps no stale command or args", async () => {
+    const { primary, backup, stack } = claudePair("ttc-stdio-http");
+    write(path.join(primary, ".claude.json"), JSON.stringify({ mcpServers: { foo: { type: "http", url: "https://mcp.example/x" } } }));
+    write(path.join(backup, ".claude.json"), JSON.stringify({ mcpServers: { foo: { command: "old-bin", args: ["--old"], env: { A: "1" } } } }));
+    await mirror.mirrorStack(stack, {});
+    const foo = JSON.parse(readFileSync(path.join(backup, ".claude.json"), "utf8")).mcpServers.foo;
+    expect(foo).toEqual({ type: "http", url: "https://mcp.example/x" });
+  });
+
+  test("an enabledPlugins entry is replaced whole, never deep-merged", async () => {
+    const { primary, backup, stack } = claudePair("ttc-enabled-plugins");
+    write(path.join(primary, "settings.json"), JSON.stringify({ enabledPlugins: { "p@m": { scope: "user" } } }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ enabledPlugins: { "p@m": { scope: "project", stale: true }, "own@m": true } }));
+    await mirror.mirrorStack(stack, {});
+    const merged = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(merged.enabledPlugins["p@m"]).toEqual({ scope: "user" });
+    expect(merged.enabledPlugins["own@m"]).toBe(true);
+  });
+
+  test("enabledMcpjsonServers and disabledMcpjsonServers are replaced, not unioned", async () => {
+    const { primary, backup, stack } = claudePair("ttc-mcpjson");
+    write(path.join(primary, "settings.json"), JSON.stringify({ enabledMcpjsonServers: ["a"], disabledMcpjsonServers: ["x"] }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ enabledMcpjsonServers: ["b", "x"], disabledMcpjsonServers: ["a", "y"] }));
+    await mirror.mirrorStack(stack, {});
+    const merged = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(merged.enabledMcpjsonServers).toEqual(["a"]);
+    expect(merged.disabledMcpjsonServers).toEqual(["x"]);
+  });
+
+  test("a per-project entry carries only mcpServers: no other project field crosses, and a project without servers adds none", async () => {
+    const { primary, backup, stack } = claudePair("ttc-projects");
+    write(path.join(primary, ".claude.json"), JSON.stringify({
+      projects: {
+        "/work/a": { mcpServers: { s: { command: "c" } }, allowedTools: ["Bash"], history: ["SENTINEL-HISTORY"], lastCost: 4, enabledMcpjsonServers: ["z"] },
+        "/work/b": { allowedTools: ["Bash"], hasTrustDialogAccepted: true },
+      },
+    }));
+    write(path.join(backup, ".claude.json"), JSON.stringify({ projects: { "/work/a": { mcpServers: { own: { command: "o" } }, history: ["mine"] } } }));
+    await mirror.mirrorStack(stack, {});
+    const text = readFileSync(path.join(backup, ".claude.json"), "utf8");
+    expect(text).not.toContain("SENTINEL-HISTORY");
+    expect(text).not.toContain("hasTrustDialogAccepted");
+    const projects = JSON.parse(text).projects;
+    expect(projects["/work/a"].mcpServers).toEqual({ own: { command: "o" }, s: { command: "c" } });
+    expect(projects["/work/a"].history).toEqual(["mine"]);
+    expect(projects["/work/a"].allowedTools).toBeUndefined();
+    expect(projects["/work/a"].lastCost).toBeUndefined();
+    expect(projects["/work/b"]?.allowedTools).toBeUndefined();
+  });
+});
+
+describe("TT-C: finding 13 (TOML block handling)", () => {
+  test("a ''' literal string holding [Rules] does not split the block", async () => {
+    const { pRoot, bRoot, stack } = codexPair("ttc-literal");
+    write(path.join(pRoot, "config.toml"), [
+      "developer_instructions = '''",
+      "[Rules]",
+      "[mcp_servers.fake]",
+      "be kind",
+      "'''",
+      "",
+      "[mcp_servers.foo]",
+      'command = "x"',
+    ].join("\n"));
+    write(path.join(bRoot, "config.toml"), 'model = "own"\n');
+    const result = await mirror.mirrorStack(stack, {});
+    const parsed = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, any>;
+    expect(parsed.developer_instructions).toContain("[Rules]");
+    expect(parsed.mcp_servers.fake).toBeUndefined();
+    expect(parsed.mcp_servers.foo.command).toBe("x");
+    expect(result.warnings.some((w) => w.includes("invalid TOML") || w.includes("would have lost"))).toBe(false);
+  });
+
+  test("the backup's own [[array-of-tables]] and comments survive, and the primary's cross intact", async () => {
+    const { pRoot, bRoot, stack } = codexPair("ttc-aot");
+    write(path.join(pRoot, "config.toml"), [
+      'model = "gpt-5"',
+      "",
+      "# the primary's server",
+      "[mcp_servers.foo]",
+      'command = "x" # inline comment',
+      "",
+      "[[hooks_list]]",
+      'name = "p1"',
+      "",
+      "[[hooks_list]]",
+      'name = "p2"',
+    ].join("\n"));
+    write(path.join(bRoot, "config.toml"), [
+      "# my own note",
+      "[[mine]]",
+      'name = "m1"',
+      "",
+      "[[mine]]",
+      'name = "m2"',
+      "",
+      "[mcp_servers.own]",
+      "# keep this comment",
+      'command = "o"',
+    ].join("\n"));
+    await mirror.mirrorStack(stack, {});
+    const text = readFileSync(path.join(bRoot, "config.toml"), "utf8");
+    const parsed = Bun.TOML.parse(text) as Record<string, any>;
+    expect(parsed.mine.map((m: any) => m.name)).toEqual(["m1", "m2"]);
+    expect(parsed.mcp_servers.own.command).toBe("o");
+    expect(parsed.mcp_servers.foo.command).toBe("x");
+    expect(parsed.hooks_list?.map((m: any) => m.name)).toEqual(["p1", "p2"]);
+    expect(text).toContain("# keep this comment");
+  });
+
+  test("an unmergeable mix of dotted and table forms is refused: the backup stays byte-identical and a warning names config.toml", async () => {
+    const { pRoot, bRoot, stack } = codexPair("ttc-backstop");
+    write(path.join(pRoot, "config.toml"), '[mcp_servers.foo]\ncommand = "x"\n[mcp_servers.foo.env]\nA = "2"\n');
+    const original = 'mcp_servers.foo.command = "own"\n';
+    write(path.join(bRoot, "config.toml"), original);
+    const result = await mirror.mirrorStack(stack, {});
+    expect(readFileSync(path.join(bRoot, "config.toml"), "utf8")).toBe(original);
+    expect(result.warnings.some((w) => w.includes("config.toml") && w.includes("backup left untouched"))).toBe(true);
+  });
+
+  test("an inline set member the filter stripped on purpose is not a lost key: LANG crosses, the userinfo URL does not", async () => {
+    const { pRoot, bRoot, stack } = codexPair("ttc-lostkey");
+    write(path.join(pRoot, "config.toml"), 'shell_environment_policy.set = { URLISH = "https://SENTINEL-u@h/x", LANG = "C" }\n');
+    write(path.join(bRoot, "config.toml"), 'shell_environment_policy.set = { GH_TOKEN = "b-own" }\n');
+    const result = await mirror.mirrorStack(stack, {});
+    expect(result.warnings.some((w) => w.includes("would have lost"))).toBe(false);
+    const text = readFileSync(path.join(bRoot, "config.toml"), "utf8");
+    const parsed = Bun.TOML.parse(text) as { shell_environment_policy: { set: Record<string, string> } };
+    expect(parsed.shell_environment_policy.set.LANG).toBe("C");
+    expect(parsed.shell_environment_policy.set.GH_TOKEN).toBe("b-own");
+    expect(parsed.shell_environment_policy.set.URLISH).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain("SENTINEL-");
+    expect(text).not.toContain("SENTINEL-");
+  });
+
+  test("mixed forms: the backup's [shell_environment_policy.set] table and the primary's inline set merge member-wise", async () => {
+    const { pRoot, bRoot, stack } = codexPair("ttc-mixed");
+    write(path.join(pRoot, "config.toml"), 'shell_environment_policy.set = { URLISH = "https://SENTINEL-u@h/x", LANG = "C" }\n');
+    write(path.join(bRoot, "config.toml"), '[shell_environment_policy.set]\nGH_TOKEN = "b-own"\nOWN = "1"\n');
+    const result = await mirror.mirrorStack(stack, {});
+    expect(result.warnings.some((w) => w.includes("would have lost") || w.includes("invalid TOML"))).toBe(false);
+    const text = readFileSync(path.join(bRoot, "config.toml"), "utf8");
+    const set = (Bun.TOML.parse(text) as { shell_environment_policy: { set: Record<string, string> } }).shell_environment_policy.set;
+    expect(set.LANG).toBe("C");
+    expect(set.GH_TOKEN).toBe("b-own");
+    // The primary's set replaces the backup's non-credential members (as inline-vs-inline does)...
+    expect(set.OWN).toBeUndefined();
+    expect(set.URLISH).toBeUndefined();
+    // ...and the file is one spelling only: TOML forbids a key defined both inline and as a table.
+    expect(text).not.toContain("[shell_environment_policy.set]");
+    expect(text).not.toContain("SENTINEL-");
+  });
+});
+
+describe("TT-C: finding 14 (credential shapes and command-running env)", () => {
+  const SHAPES = [
+    "SERPAPI_APIKEY", "DB_PASS", "GH_PAT", "NPM_AUTH", "OTEL_EXPORTER_OTLP_HEADERS", "SITE_COOKIE", "MY_SESSION",
+    "SENTRY_DSN", "SLACK_WEBHOOK", "PG_CONNECTION", "SSH_PASSPHRASE", "github_token", "Db_Pass", "my_apikey",
+  ];
+
+  test("every credential shape, in any case, is stripped from settings env while the backup's own survives", async () => {
+    const { primary, backup, stack } = claudePair("ttc-shapes");
+    const env: Record<string, string> = { KEEP_ME: "1" };
+    for (const k of SHAPES) env[k] = `SENTINEL-${k}`;
+    write(path.join(primary, "settings.json"), JSON.stringify({ env }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ env: { DB_PASS: "mine" } }));
+    await mirror.mirrorStack(stack, {});
+    const text = readFileSync(path.join(backup, "settings.json"), "utf8");
+    expect(text).not.toContain("SENTINEL-");
+    expect(JSON.parse(text).env).toEqual({ DB_PASS: "mine", KEEP_ME: "1" });
+  });
+
+  test("URL userinfo is stripped from env under any name", async () => {
+    const { primary, backup, stack } = claudePair("ttc-userinfo");
+    write(path.join(primary, "settings.json"), JSON.stringify({
+      env: { HTTP_PROXY: "http://user:SENTINEL-pw@proxy:3128", WEIRD_NAME: "https://SENTINEL-tok@host/x", FINE_URL: "https://host/x" },
+    }));
+    await mirror.mirrorStack(stack, {});
+    const text = readFileSync(path.join(backup, "settings.json"), "utf8");
+    expect(text).not.toContain("SENTINEL-");
+    expect(JSON.parse(text).env).toEqual({ FINE_URL: "https://host/x" });
+  });
+
+  test("non-credential names still mirror: PATH, AWS_REGION, *_MODEL, *_MAX_TOKENS", async () => {
+    const { primary, backup, stack } = claudePair("ttc-keep");
+    const env = { PATH: "/usr/bin", AWS_REGION: "eu-west-1", ANTHROPIC_SMALL_FAST_MODEL: "haiku", CLAUDE_CODE_MAX_OUTPUT_TOKENS: "9", MAX_THINKING_TOKENS: "5" };
+    write(path.join(primary, "settings.json"), JSON.stringify({ env }));
+    await mirror.mirrorStack(stack, {});
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env).toEqual(env);
+  });
+
+  test("safe mode skips every command-running env name and keeps the backup's own value; full mode copies them", async () => {
+    const names = ["CLAUDE_CODE_SHELL_PREFIX", "NODE_OPTIONS", "BASH_ENV", "GIT_PAGER", "GIT_SSH_COMMAND", "DYLD_INSERT_LIBRARIES", "MY_HELPER", "x_command", "PAGER"];
+    const env: Record<string, string> = { OK: "1" };
+    for (const k of names) env[k] = `primary-${k}`;
+    {
+      const { primary, backup, stack } = claudePair("ttc-cmdenv-safe", "safe");
+      write(path.join(primary, "settings.json"), JSON.stringify({ env }));
+      write(path.join(backup, "settings.json"), JSON.stringify({ env: { NODE_OPTIONS: "--own", MY_HELPER: "own-helper" } }));
+      await mirror.mirrorStack(stack, {});
+      expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env).toEqual({ NODE_OPTIONS: "--own", MY_HELPER: "own-helper", OK: "1" });
+    }
+    {
+      const { primary, backup, stack } = claudePair("ttc-cmdenv-full", "full");
+      write(path.join(primary, "settings.json"), JSON.stringify({ env }));
+      await mirror.mirrorStack(stack, {});
+      expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env.NODE_OPTIONS).toBe("primary-NODE_OPTIONS");
+    }
+  });
+
+  test("Codex: shell_environment_policy.set secrets are stripped in table, inline and dotted forms; the backup's own survive", async () => {
+    for (const form of ["table", "inline", "dotted"] as const) {
+      const { pRoot, bRoot, stack } = codexPair(`ttc-cx-shell-${form}`);
+      const primaryText = {
+        table: '[shell_environment_policy.set]\nGH_TOKEN = "SENTINEL-p"\nDB_PASS = "SENTINEL-q"\nURLISH = "https://SENTINEL-u@h/x"\nLANG = "C"\n',
+        inline: 'shell_environment_policy.set = { GH_TOKEN = "SENTINEL-p", DB_PASS = "SENTINEL-q", LANG = "C" }\n',
+        dotted: 'shell_environment_policy.set.GH_TOKEN = "SENTINEL-p"\nshell_environment_policy.set.DB_PASS = "SENTINEL-q"\nshell_environment_policy.set.URLISH = "https://SENTINEL-u@h/x"\nshell_environment_policy.set.LANG = "C"\n',
+      }[form];
+      write(path.join(pRoot, "config.toml"), primaryText);
+      write(path.join(bRoot, "config.toml"), {
+        table: '[shell_environment_policy.set]\nGH_TOKEN = "b-own"\n',
+        inline: 'shell_environment_policy.set = { GH_TOKEN = "b-own" }\n',
+        dotted: 'shell_environment_policy.set.GH_TOKEN = "b-own"\n',
+      }[form]);
+      await mirror.mirrorStack(stack, {});
+      const text = readFileSync(path.join(bRoot, "config.toml"), "utf8");
+      expect(text, form).not.toContain("SENTINEL-");
+      const set = (Bun.TOML.parse(text) as Record<string, any>).shell_environment_policy.set;
+      expect(set.GH_TOKEN, form).toBe("b-own");
+      expect(set.LANG, form).toBe("C");
+      expect(set.DB_PASS, form).toBeUndefined();
+    }
+  });
+
+  test("Codex: otel exporter headers are stripped in table and inline forms", async () => {
+    for (const form of ["table", "inline"] as const) {
+      const { pRoot, bRoot, stack } = codexPair(`ttc-cx-otel-${form}`);
+      write(path.join(pRoot, "config.toml"), form === "table"
+        ? '[otel]\nenvironment = "dev"\n\n[otel.exporter.otlp-http]\nendpoint = "https://o.example"\n\n[otel.exporter.otlp-http.headers]\nauthorization = "Bearer SENTINEL-h"\n'
+        : '[otel]\nenvironment = "dev"\nexporter = { otlp-http = { endpoint = "https://o.example", headers = { authorization = "Bearer SENTINEL-h" } } }\n');
+      write(path.join(bRoot, "config.toml"), 'model = "own"\n');
+      await mirror.mirrorStack(stack, {});
+      const text = readFileSync(path.join(bRoot, "config.toml"), "utf8");
+      expect(text, form).not.toContain("SENTINEL-h");
+      expect((Bun.TOML.parse(text) as Record<string, any>).otel.environment, form).toBe("dev");
+    }
+  });
+
+  test("a credentialed marketplace in the plugin registry is not copied; the clean one is", async () => {
+    const { primary, backup, stack } = claudePair("ttc-registry");
+    write(path.join(primary, "plugins", "known_marketplaces.json"), JSON.stringify({
+      bad: { source: { source: "git", url: "https://SENTINEL-tok:x@host/repo.git" }, installLocation: path.join(primary, "plugins", "marketplaces", "bad") },
+      good: { source: { source: "git", url: "https://host/repo.git" }, installLocation: path.join(primary, "plugins", "marketplaces", "good") },
+    }));
+    const result = await mirror.mirrorStack(stack, {});
+    const out = path.join(backup, "plugins", "known_marketplaces.json");
+    const text = existsSync(out) ? readFileSync(out, "utf8") : "";
+    expect(text).not.toContain("SENTINEL-");
+    expect(text).not.toContain('"bad"');
+    expect(JSON.stringify(result)).not.toContain("SENTINEL-");
+  });
+});
+
+describe("TT-C: finding 15 (dotfile symlinks)", () => {
+  const LOGIN_REASON = "account login or session data";
+
+  test("a dotfile-symlinked settings.json and CLAUDE.md are mirrored", async () => {
+    const { primary, backup, stack } = claudePair("ttc-dot-ok");
+    const dots = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-ttc-dots-")));
+    write(path.join(dots, "settings.json"), JSON.stringify({ model: "from-dots" }));
+    write(path.join(dots, "CLAUDE.md"), "dot rules\n");
+    symlinkSync(path.join(dots, "settings.json"), path.join(primary, "settings.json"));
+    symlinkSync(path.join(dots, "CLAUDE.md"), path.join(primary, "CLAUDE.md"));
+    await mirror.mirrorStack(stack, {});
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("from-dots");
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("dot rules\n");
+  });
+
+  test("a link to a directory is refused", async () => {
+    const { primary, backup, stack } = claudePair("ttc-dot-dir");
+    const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-ttc-dir-")));
+    mkdirSync(path.join(dir, "d.md"));
+    symlinkSync(path.join(dir, "d.md"), path.join(primary, "CLAUDE.md"));
+    const result = await mirror.mirrorStack(stack, {});
+    expect(existsSync(path.join(backup, "CLAUDE.md"))).toBe(false);
+    expect(result.warnings.some((w) => w.includes("CLAUDE.md") && w.includes("not a regular file"))).toBe(true);
+  });
+
+  test("a link whose target has the wrong extension is refused", async () => {
+    const { primary, backup, stack } = claudePair("ttc-dot-ext");
+    const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-ttc-ext-")));
+    write(path.join(dir, "settings.txt"), JSON.stringify({ model: "SENTINEL-ext" }));
+    symlinkSync(path.join(dir, "settings.txt"), path.join(primary, "settings.json"));
+    const result = await mirror.mirrorStack(stack, {});
+    expect(existsSync(path.join(backup, "settings.json"))).toBe(false);
+    expect(result.warnings.some((w) => w.includes("settings.json") && w.includes("not a .json file"))).toBe(true);
+  });
+
+  // The link guard compares the target against both spellings of the data dir (macOS
+  // /var -> /private/var, a dotfile-linked ~/.agetor).
+  test("a link into the data dir is refused as login/session data", async () => {
+    const { primary, backup, stack } = claudePair("ttc-dot-datadir");
+    write(path.join(dbm.dataDir, "ttc-dotfile.md"), "SENTINEL-datadir");
+    symlinkSync(path.join(dbm.dataDir, "ttc-dotfile.md"), path.join(primary, "CLAUDE.md"));
+    const result = await mirror.mirrorStack(stack, {});
+    expect(existsSync(path.join(backup, "CLAUDE.md"))).toBe(false);
+    expect(result.warnings.some((w) => w.includes("CLAUDE.md") && w.includes(LOGIN_REASON))).toBe(true);
+  });
+
+  // `os.homedir()` ignores a changed $HOME under Bun and the mirror has no home seam, so the real
+  // home's folders are linked to (never read: the refusal happens first; nothing is created). Only
+  // folders that exist can be exercised, so on a machine with none the test is skipped by name.
+  const SECRET_HOME_FOLDERS = [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".git-credentials", ".npmrc", ".netrc"]
+    .filter((n) => existsSync(path.join(homedir(), n)));
+  test.skipIf(SECRET_HOME_FOLDERS.length === 0)("a link at or inside a secret-bearing home folder (~/.ssh, ~/.git-credentials, ...) is refused as login data, not merely for its extension [SKIPPED when none of these folders exists on this machine]", async () => {
+    const home = homedir();
+    const present = SECRET_HOME_FOLDERS;
+    for (const name of present) {
+      const { primary, backup, stack } = claudePair("ttc-dot-home");
+      symlinkSync(path.join(home, name), path.join(primary, "CLAUDE.md"));
+      const result = await mirror.mirrorStack(stack, {});
+      expect(existsSync(path.join(backup, "CLAUDE.md")), name).toBe(false);
+      expect(result.warnings.some((w) => w.includes("CLAUDE.md") && w.includes(LOGIN_REASON)), name).toBe(true);
+    }
+  });
+
+  test("Codex: AGENTS.md linked into the data dir is refused", async () => {
+    const { pRoot, bRoot, stack } = codexPair("ttc-dot-cx");
+    write(path.join(dbm.dataDir, "ttc-agents.md"), "SENTINEL-agents");
+    mkdirSync(pRoot, { recursive: true });
+    symlinkSync(path.join(dbm.dataDir, "ttc-agents.md"), path.join(pRoot, "AGENTS.md"));
+    const result = await mirror.mirrorStack(stack, {});
+    expect(existsSync(path.join(bRoot, "AGENTS.md"))).toBe(false);
+    expect(result.warnings.some((w) => w.includes("AGENTS.md") && w.includes(LOGIN_REASON))).toBe(true);
+  });
+});
+
+describe("TT-C: provenance, preview and propagation", () => {
+  const provs = async () => (await import("./harness-mirror-provenance.ts")).mirrorProvenance;
+  const SENTINEL = "SENTINEL-SECRET-VALUE-9f3a";
+
+  test("every write records a provenance row: file, nested file, JSON key, link and TOML key", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-rows");
+    const shared = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-ttc-rows-")));
+    write(path.join(shared, "linked", "SKILL.md"), "# l");
+    write(path.join(primary, "CLAUDE.md"), "rules\n");
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    mkdirSync(path.join(primary, "skills"), { recursive: true });
+    symlinkSync(path.join(shared, "linked"), path.join(primary, "skills", "linked"));
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus", env: { FOO: "1" } }));
+    await mirror.mirrorStack(stack, {});
+    const rows = (await provs()).list(b);
+    const has = (scope: string, p: string, key = "") => rows.some((r) => r.scope === scope && r.path === p && r.key === key);
+    expect(has("file", "CLAUDE.md")).toBe(true);
+    expect(has("file", "skills/s/SKILL.md")).toBe(true);
+    expect(has("link", "skills/linked")).toBe(true);
+    expect(has("key", "settings.json", "model")).toBe(true);
+    expect(has("key", "settings.json", "env.FOO")).toBe(true);
+    expect(rows.every((r) => r.preexisted === false)).toBe(true);
+    expect(existsSync(backup)).toBe(true);
+
+    const cx = codexPair("ttc-rows-cx");
+    write(path.join(cx.pRoot, "config.toml"), 'model = "gpt-5"\n[mcp_servers.foo]\ncommand = "x"\n');
+    await mirror.mirrorStack(cx.stack, {});
+    const cxRows = (await provs()).list(cx.b);
+    expect(cxRows.some((r) => r.scope === "key" && r.path === "config.toml" && r.key === "model")).toBe(true);
+    expect(cxRows.some((r) => r.scope === "key" && r.path === "config.toml" && r.key === "mcp_servers.foo")).toBe(true);
+  });
+
+  test("the preview carries names only: no value, file content or secret appears anywhere in it", async () => {
+    const { primary, backup, a, b, stack } = claudePair("ttc-preview-names");
+    write(path.join(primary, "CLAUDE.md"), `${SENTINEL} rules\n`);
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    write(path.join(primary, "skills", "s", "SKILL.md"), `${SENTINEL} skill`);
+    write(path.join(primary, "settings.json"), JSON.stringify({
+      model: SENTINEL,
+      env: { SAFE_VAR: SENTINEL, API_TOKEN: SENTINEL },
+      mcpServers: { srv: { command: "run", args: [SENTINEL] } },
+    }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ model: `${SENTINEL}-old` }));
+    write(path.join(primary, ".claude.json"), JSON.stringify({ mcpServers: { j: { command: "c", args: [SENTINEL] } } }));
+    const preview = await mirror.previewMirror({ kind: "claude-code", members: [a, b], mirrorMode: "full" }, { stackId: stack.id });
+    expect(preview.plans.length).toBeGreaterThan(0);
+    const dumped = JSON.stringify(preview);
+    expect(dumped).not.toContain(SENTINEL);
+    expect(dumped).not.toContain("SENTINEL");
+    // ...but it does name what would change.
+    expect(preview.plans[0]!.keys.some((k) => k.key === "env.SAFE_VAR")).toBe(true);
+    // A preview writes nothing and records nothing.
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("mine\n");
+    expect((await provs()).list(b)).toEqual([]);
+  });
+
+  test("the preview equals the real run: same files and keys, then the real run writes exactly those", async () => {
+    const { primary, a, b, stack } = claudePair("ttc-preview-eq");
+    write(path.join(primary, "CLAUDE.md"), "p\n");
+    write(path.join(primary, "commands", "c.md"), "c");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "m", env: { K: "v" } }));
+    const draft = { kind: "claude-code" as const, members: [a, b], mirrorMode: "full" as const };
+    const preview = await mirror.previewMirror(draft, { stackId: stack.id });
+    await mirror.mirrorStack(stack, {});
+    const again = await mirror.previewMirror(draft, { stackId: stack.id });
+    const plan = preview.plans[0]!;
+    const rows = (await provs()).list(b);
+    const written = new Set(rows.map((r) => r.path)); // merged files record per-key rows
+    for (const f of [...plan.files.add, ...plan.files.update]) expect(written.has(f), f).toBe(true);
+    const keyRows = new Set(rows.filter((r) => r.scope === "key").map((r) => `${r.path}:${r.key}`));
+    for (const k of plan.keys.filter((x) => x.action !== "remove")) expect(keyRows.has(`${k.file}:${k.key}`), k.key).toBe(true);
+    // Once mirrored, nothing is left to do.
+    expect(again.plans[0]!.files.add).toEqual([]);
+    expect(again.plans[0]!.files.update).toEqual([]);
+    expect(again.plans[0]!.keys.filter((k) => k.action !== "remove")).toEqual([]);
+  });
+
+  test("overwrites is false for a clean first copy and true exactly when there are backups or removals", async () => {
+    const { primary, a, b, stack } = claudePair("ttc-overwrites");
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "m" }));
+    const draft = { kind: "claude-code" as const, members: [a, b], mirrorMode: "full" as const };
+    const clean = await mirror.previewMirror(draft, { stackId: stack.id });
+    expect(clean.overwrites).toBe(false);
+    expect(clean.plans[0]!.backups).toEqual([]);
+    await mirror.mirrorStack(stack, {});
+    const idle = await mirror.previewMirror(draft, { stackId: stack.id });
+    expect(idle.overwrites).toBe(false);
+    // A pure removal (unedited mirrored file gone from the primary) is an overwrite.
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(primary, "skills", "s"), { recursive: true });
+    const removal = await mirror.previewMirror(draft, { stackId: stack.id });
+    expect(removal.plans[0]!.backups).toEqual([]);
+    expect(removal.plans[0]!.files.remove).toEqual(["skills/s/SKILL.md"]);
+    expect(removal.overwrites).toBe(true);
+  });
+
+  test("deleting a mirrored JSON key on the primary removes the unedited copy and keeps an edited one with a warning", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-key-delete");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "m", env: { A: "1", B: "2" } }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ env: { OWN: "o" } }));
+    await mirror.mirrorStack(stack, {});
+    const s = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    s.env.B = "edited";
+    write(path.join(backup, "settings.json"), JSON.stringify(s));
+    write(path.join(primary, "settings.json"), JSON.stringify({}));
+    const result = await mirror.mirrorStack(stack, {});
+    const after = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(after.model).toBeUndefined();
+    expect(after.env.A).toBeUndefined();
+    expect(after.env.B).toBe("edited");
+    expect(after.env.OWN).toBe("o");
+    expect(result.warnings.some((w) => w.includes("env.B") && w.includes("edited"))).toBe(true);
+    expect((await provs()).get(b, "settings.json", "env.B")).toBeNull();
+  });
+
+  test("a planted provenance row for a settings key or a path outside the allowlist cannot remove anything", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-planted2");
+    write(path.join(primary, "CLAUDE.md"), "p\n");
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    // Under an allowlisted folder, but a never-copy shape (a clone's .git): propagation must not delete it.
+    write(path.join(backup, "skills", ".git", "config"), "[remote]");
+    write(path.join(backup, ".credentials.json"), '{"claudeAiOauth":"SENTINEL-login"}');
+    write(path.join(backup, "settings.json"), JSON.stringify({ forceLoginMethod: "console", model: "own" }));
+    const crypto = await import("node:crypto");
+    const p = await provs();
+    p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: ".credentials.json", key: "", valueHash: crypto.createHash("sha256").update('{"claudeAiOauth":"SENTINEL-login"}').digest("hex"), srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
+    p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: "skills/.git/config", key: "", valueHash: crypto.createHash("sha256").update("[remote]").digest("hex"), srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
+    p.upsert({ harnessId: b, stackId: stack.id, scope: "file", path: "../outside.md", key: "", valueHash: "x", srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null, updatedAt: 1 });
+    await mirror.mirrorStack(stack, {});
+    await mirror.restoreMirror(b);
+    expect(existsSync(path.join(backup, ".credentials.json"))).toBe(true);
+    expect(readFileSync(path.join(backup, "skills", ".git", "config"), "utf8")).toBe("[remote]");
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).forceLoginMethod).toBe("console");
+  });
+});
+
+describe("TT-C: backups and Restore", () => {
+  const provs = async () => (await import("./harness-mirror-provenance.ts")).mirrorProvenance;
+  const backupsOf = (id: string) => path.join(dbm.dataDir, "mirror-backups", id);
+
+  test("the first overwrite backs up the original; a second overwrite never re-backs-up over it", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-first-backup");
+    write(path.join(primary, "CLAUDE.md"), "p1\n");
+    write(path.join(backup, "CLAUDE.md"), "the true original\n");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "p1" }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ model: "true-original" }));
+    await mirror.mirrorStack(stack, {});
+    expect(existsSync(backupsOf(b))).toBe(true);
+    write(path.join(primary, "CLAUDE.md"), "p2 changed\n");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "p2" }));
+    const second = await mirror.mirrorStack(stack, {});
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("p2 changed\n");
+    write(path.join(primary, "CLAUDE.md"), "p3 changed again\n");
+    await mirror.mirrorStack(stack, {});
+    expect(second.warnings.some((w) => w.includes("invalid"))).toBe(false);
+    await mirror.restoreMirror(b);
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("the true original\n");
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("true-original");
+  });
+
+  test("Restore puts back a TOML key and a JSON key the primary overwrote, and an original the account deleted", async () => {
+    const cx = codexPair("ttc-restore-toml");
+    write(path.join(cx.pRoot, "config.toml"), 'model = "primary"\neffort = "hi"\n');
+    write(path.join(cx.bRoot, "config.toml"), 'model = "mine"\n');
+    await mirror.mirrorStack(cx.stack, {});
+    expect(readFileSync(path.join(cx.bRoot, "config.toml"), "utf8")).toContain("primary");
+    await mirror.restoreMirror(cx.b);
+    const parsed = Bun.TOML.parse(readFileSync(path.join(cx.bRoot, "config.toml"), "utf8")) as Record<string, any>;
+    expect(parsed.model).toBe("mine");
+    expect(parsed.effort).toBeUndefined();
+
+    const { primary, backup, b, stack } = claudePair("ttc-restore-deleted-key");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "primary" }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ model: "mine" }));
+    await mirror.mirrorStack(stack, {});
+    write(path.join(backup, "settings.json"), JSON.stringify({}));
+    const result = await mirror.restoreMirror(b);
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("mine");
+    expect(result.restored).toContain("settings.json:model");
+  });
+
+  test("Restore keeps the rows and the saved originals of a kept item; a later clean Restore removes both", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-restore-retry");
+    write(path.join(primary, "CLAUDE.md"), "p\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    await mirror.mirrorStack(stack, {});
+    writeFileSync(path.join(backup, "skills", "s", "SKILL.md"), "# edited by the account");
+    const first = await mirror.restoreMirror(b);
+    expect(first.kept).toContain("skills/s/SKILL.md");
+    expect(readFileSync(path.join(backup, "skills", "s", "SKILL.md"), "utf8")).toBe("# edited by the account");
+    expect((await provs()).get(b, "skills/s/SKILL.md")).not.toBeNull();
+    // The account's original CLAUDE.md came back; the retry still has rows, so the store stays.
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("mine\n");
+    expect(existsSync(backupsOf(b))).toBe(true);
+    // Once the item matches what the mirror wrote again, the retry clears everything.
+    writeFileSync(path.join(backup, "skills", "s", "SKILL.md"), "# s");
+    const second = await mirror.restoreMirror(b);
+    expect(second.kept).toEqual([]);
+    expect((await provs()).list(b)).toEqual([]);
+    expect(existsSync(backupsOf(b))).toBe(false);
+  });
+
+  test("a symlinked mirror-backups root is never read, restored from or removed through", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-root-link");
+    write(path.join(primary, "CLAUDE.md"), "p\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    await mirror.mirrorStack(stack, {});
+    const root = path.join(dbm.dataDir, "mirror-backups");
+    const { renameSync, rmSync } = await import("node:fs");
+    const outside = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-ttc-root-out-")));
+    write(path.join(outside, b, "files", "CLAUDE.md"), "PLANTED");
+    renameSync(root, `${root}.real`);
+    symlinkSync(outside, root);
+    try {
+      const result = await mirror.restoreMirror(b);
+      expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("p\n");
+      expect(result.restored).not.toContain("CLAUDE.md");
+      await mirror.removeMirrorBackups(b);
+      expect(readFileSync(path.join(outside, b, "files", "CLAUDE.md"), "utf8")).toBe("PLANTED");
+      expect(lstatSync(root).isSymbolicLink()).toBe(true);
+    } finally {
+      rmSync(root, { force: true });
+      renameSync(`${root}.real`, root);
+    }
+  });
+
+  test("a symlinked parent inside mirror-backups/<id>/key and link stores is never followed", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-parent-link");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "primary" }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ model: "mine" }));
+    await mirror.mirrorStack(stack, {});
+    const store = backupsOf(b);
+    const { readdirSync: ls, renameSync, rmSync } = await import("node:fs");
+    const outside = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-ttc-parent-out-")));
+    write(path.join(outside, "keep.txt"), "keep");
+    // Replace every child directory of the store with a link to the outside folder.
+    for (const name of ls(store)) {
+      const p = path.join(store, name);
+      if (!lstatSync(p).isDirectory()) continue;
+      renameSync(p, `${p}.real`);
+      symlinkSync(outside, p);
+    }
+    await mirror.restoreMirror(b);
+    // The planted bytes did not become the account's model, and nothing outside was touched.
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).not.toBe("keep");
+    expect(readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+    expect(readdirSync(outside)).toEqual(["keep.txt"]);
+    await mirror.removeMirrorBackups(b);
+    expect(readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+    rmSync(store, { recursive: true, force: true });
+  });
+
+  test("W2: a primary deletion of a preexisted key never removes it, and Restore still recovers the original", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-w2-key");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "primary" }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ model: "mine" }));
+    await mirror.mirrorStack(stack, {});
+    write(path.join(primary, "settings.json"), JSON.stringify({}));
+    await mirror.mirrorStack(stack, {});
+    // Kept (it was the account's own to begin with)...
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("primary");
+    // ...and still restorable.
+    const row = (await provs()).get(b, "settings.json", "model");
+    expect(row?.preexisted).toBe(true);
+    await mirror.restoreMirror(b);
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).model).toBe("mine");
+  });
+
+  test("W2: a primary deletion of a preexisted Codex TOML key never removes it, and Restore recovers the original", async () => {
+    const cx = codexPair("ttc-w2-toml");
+    write(path.join(cx.pRoot, "config.toml"), 'model = "primary"\nother = "x"\n');
+    write(path.join(cx.bRoot, "config.toml"), 'model = "mine"\n');
+    await mirror.mirrorStack(cx.stack, {});
+    write(path.join(cx.pRoot, "config.toml"), 'other = "x"\n');
+    await mirror.mirrorStack(cx.stack, {});
+    const kept = Bun.TOML.parse(readFileSync(path.join(cx.bRoot, "config.toml"), "utf8")) as Record<string, any>;
+    expect(kept.model).toBe("primary");
+    await mirror.restoreMirror(cx.b);
+    const back = Bun.TOML.parse(readFileSync(path.join(cx.bRoot, "config.toml"), "utf8")) as Record<string, any>;
+    expect(back.model).toBe("mine");
+    expect(back.other).toBeUndefined();
+  });
+
+  test("a planted symlink in the backup store makes the overwrite refuse to save through it; nothing lands outside", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-store-write-link");
+    write(path.join(primary, "CLAUDE.md"), "primary\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    const outside = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-ttc-store-out-")));
+    mkdirSync(backupsOf(b), { recursive: true });
+    symlinkSync(outside, path.join(backupsOf(b), "files"));
+    await mirror.mirrorStack(stack, {});
+    expect(readdirSync(outside)).toEqual([]);
+    // The account's own file is never overwritten without a saved original.
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("mine\n");
+  });
+
+  test("a backup's dotfile-symlinked settings.json is skipped, not replaced, and its target is untouched", async () => {
+    const { primary, backup, stack } = claudePair("ttc-dest-link-json");
+    const outside = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-ttc-dest-json-")));
+    write(path.join(outside, "settings.json"), JSON.stringify({ model: "dotfile" }));
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "primary" }));
+    symlinkSync(path.join(outside, "settings.json"), path.join(backup, "settings.json"));
+    const result = await mirror.mirrorStack(stack, {});
+    expect(lstatSync(path.join(backup, "settings.json")).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(readFileSync(path.join(outside, "settings.json"), "utf8")).model).toBe("dotfile");
+    expect(result.warnings.some((w) => w.includes("settings.json"))).toBe(true);
+  });
+
+  test("Restore removes an item the mirror added and leaves the account's own files and keys", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-restore-added");
+    write(path.join(primary, "skills", "new", "SKILL.md"), "# n");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "m" }));
+    write(path.join(backup, "skills", "own", "SKILL.md"), "# own");
+    write(path.join(backup, "settings.json"), JSON.stringify({ theme: "dark" }));
+    await mirror.mirrorStack(stack, {});
+    const result = await mirror.restoreMirror(b);
+    expect(existsSync(path.join(backup, "skills", "new", "SKILL.md"))).toBe(false);
+    expect(readFileSync(path.join(backup, "skills", "own", "SKILL.md"), "utf8")).toBe("# own");
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"))).toEqual({ theme: "dark" });
+    expect(result.removed).toContain("skills/new/SKILL.md");
+  });
+
+  test("deleteMirrorStateForHarness queued behind a mirror in flight leaves no rows and no backups", async () => {
+    const { primary, backup, b, stack } = claudePair("ttc-delete-queued");
+    write(path.join(primary, "CLAUDE.md"), "p\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    for (let i = 0; i < 120; i++) write(path.join(primary, "skills", `s${i}`, "SKILL.md"), `# ${i}`);
+    const running = mirror.mirrorStack(stack, {});
+    const p = await provs();
+    for (let i = 0; i < 2000 && p.list(b).length === 0; i++) await Bun.sleep(0);
+    const deleting = mirror.deleteMirrorStateForHarness(b);
+    await running;
+    await deleting;
+    expect(p.list(b)).toEqual([]);
+    expect(existsSync(backupsOf(b))).toBe(false);
   });
 });

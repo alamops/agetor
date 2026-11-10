@@ -2,21 +2,32 @@ import { describe, expect, test } from "bun:test";
 import {
   HARNESS_STACK_MOVED_TTL_MS,
   composeHarnessStackContinuationPrompt,
+  formatHarnessSwapEvent,
   formatHarnessSwapNotice,
   formatStackExhausted,
   formatStackUnusable,
   harnessMoveNote,
   harnessStackBannerMode,
   isHarnessStackContinuation,
+  memberReasonText,
+  memberStateText,
   neutralizeHarnessStackContinuationTags,
   parseHarnessSwapNotice,
   pickNextMember,
+  quotaSummary,
   stackPositionText,
   stripHarnessStackContinuation,
   wrapHarnessStackContinuation,
 } from "./harness-stack.ts";
 import { parseTaskHarnessState } from "./types.ts";
-import type { HarnessStackMember, HarnessSwapNotice, TaskHarnessState } from "./types.ts";
+import type {
+  HarnessLimitState,
+  HarnessQuota,
+  HarnessStackMember,
+  HarnessSwapEvent,
+  HarnessSwapNotice,
+  TaskHarnessState,
+} from "./types.ts";
 
 const member = (id: string, enabled = true): HarnessStackMember => ({
   harnessId: id,
@@ -364,5 +375,137 @@ describe("neutralizeHarnessStackContinuationTags (N5)", () => {
   test("is the same neutralization the transfer prompt applies", () => {
     const quoting = "<harness-stack-continuation>x</harness-stack-continuation>";
     expect(composeHarnessStackContinuationPrompt([quoting])).toContain(neutralizeHarnessStackContinuationTags(quoting));
+  });
+});
+
+describe("TT-A: findings 6, helpers and surfaces", () => {
+  test("6: a tried member whose cooldown expired makes the lap retry-now, not the far reset", () => {
+    const plan = pickNextMember({
+      members: [member("a"), member("b"), member("c")],
+      currentId: "c",
+      tried: ["a", "b", "c"],
+      now: 1000,
+      // a: expired cooldown; b: far reset; c: far reset.
+      cooling: (id) => ({ exhaustedUntilMs: id === "a" ? 500 : 9_000_000 }),
+      usable: () => null,
+    });
+    expect(plan.kind).toBe("all-exhausted");
+    if (plan.kind !== "all-exhausted") return;
+    expect(plan.earliestResetAtMs).toBe(1000);
+  });
+
+  test("6: a tried member that has become unusable does not pull the retry forward", () => {
+    const plan = pickNextMember({
+      members: [member("a"), member("b")],
+      currentId: "b",
+      tried: ["a", "b"],
+      now: 1000,
+      cooling: (id) => (id === "a" ? { exhaustedUntilMs: 500 } : { exhaustedUntilMs: 9_000_000 }),
+      usable: (m) => (m.harnessId === "a" ? "logged out" : null),
+    });
+    expect(plan.kind).toBe("all-exhausted");
+    if (plan.kind !== "all-exhausted") return;
+    expect(plan.earliestResetAtMs).toBe(9_000_000);
+  });
+
+  test("harnessMoveNote: switch-now, manual-switch and automatic wording differ", () => {
+    expect(harnessMoveNote({ at: 1, reason: "switch-now" } as never, "B"))
+      .toBe("Switched to the next account — continuing this conversation.");
+    expect(harnessMoveNote({ at: 1, reason: "manual-switch" } as never, "B")).toBe("Switched to B — continuing this conversation.");
+    expect(harnessMoveNote({ at: 1, reason: "member-removed" } as never, "B")).toContain("Moved to B");
+  });
+
+  test("stackPositionText: fewer than two members is null for member and non-member", () => {
+    expect(stackPositionText({ members: [member("a")] }, "a")).toBeNull();
+    expect(stackPositionText({ members: [member("a"), member("b")] }, "zzz")).toBeNull();
+  });
+
+  test("memberStateText names the reason, deadline, model and message of a cooldown row", () => {
+    const row: HarnessLimitState = {
+      harnessId: "a", reason: "quota", source: "text", message: "hit it", exhaustedUntilMs: 5000, updatedAt: 1, model: "gpt-5.6-codex",
+    };
+    expect(memberStateText(row)).toEqual({ reasonText: "usage limit", until: 5000, model: "gpt-5.6-codex", message: "hit it" });
+    expect(memberStateText({ ...row, reason: "rate_limit", model: undefined, message: null }))
+      .toEqual({ reasonText: "rate limit", until: 5000, model: null, message: null });
+    expect(memberStateText({ ...row, reason: "insufficient_credits" }).reasonText).toBe("out of credits");
+  });
+
+  test("memberReasonText joins label and reason", () => {
+    expect(memberReasonText({ harnessId: "a", label: "Work", reason: "logged out" })).toBe("Work: logged out");
+  });
+
+  const ev = (over: Partial<HarnessSwapEvent>): HarnessSwapEvent => ({
+    id: "e", stackId: "s", taskId: "t", taskTitle: "T", fromHarnessId: "a", fromLabel: "Alpha", toHarnessId: "b", toLabel: "Beta",
+    trigger: "limit", reason: "quota", source: "text", message: null, model: null, resetsAtMs: null, createdAt: 1,
+    ...over,
+  } as HarnessSwapEvent);
+
+  test("formatHarnessSwapEvent renders every trigger", () => {
+    expect(formatHarnessSwapEvent(ev({}))).toBe("limit: Alpha → Beta (usage limit)");
+    expect(formatHarnessSwapEvent(ev({ resetsAtMs: 1_800_000_000_000 }))).toContain(", resets ");
+    expect(formatHarnessSwapEvent(ev({ trigger: "retry" }))).toBe("retry on Beta after the reset");
+    expect(formatHarnessSwapEvent(ev({ trigger: "manual" }))).toBe("manual switch: Alpha → Beta");
+    expect(formatHarnessSwapEvent(ev({ trigger: "scheduled" }))).toBe("scheduled switch: Alpha → Beta");
+    expect(formatHarnessSwapEvent(ev({ trigger: "unavailable", reason: "member-removed" })))
+      .toBe("moved off Alpha (removed from the stack) → Beta");
+    expect(formatHarnessSwapEvent(ev({ trigger: "unavailable", reason: "member-disabled" }))).toContain("(disabled)");
+    expect(formatHarnessSwapEvent(ev({ trigger: "unavailable", reason: "member-unavailable" }))).toContain("(unavailable)");
+    expect(formatHarnessSwapEvent(ev({ trigger: "boot-resume" }))).toBe("resumed after restart: Alpha → Beta");
+    expect(formatHarnessSwapEvent(ev({ trigger: "blocked", reason: "no-usable-member" })))
+      .toBe("blocked: no account in the stack can run this task");
+    expect(formatHarnessSwapEvent(ev({ trigger: "blocked", reason: "quota" }))).toBe("blocked: every account out of quota");
+  });
+
+  test("formatHarnessSwapEvent never returns undefined for hostile rows", () => {
+    const hostile = [
+      ev({ trigger: "wat" as never }),
+      ev({ reason: "constructor" as never }),
+      ev({ trigger: "unavailable", reason: "constructor" as never }),
+      ev({ fromLabel: null, toLabel: null }),
+      ev({ trigger: "retry", fromLabel: null, toLabel: null }),
+      ev({ trigger: undefined as never, fromLabel: null, toLabel: null }),
+    ];
+    for (const e of hostile) {
+      const out = formatHarnessSwapEvent(e);
+      expect(typeof out).toBe("string");
+      expect(out.length).toBeGreaterThan(0);
+      expect(out).not.toContain("undefined");
+    }
+    expect(formatHarnessSwapEvent(ev({ reason: "constructor" as never }))).toBe("limit: Alpha → Beta (limit)");
+    expect(formatHarnessSwapEvent(ev({ trigger: "wat" as never }))).toBe("wat: Alpha → Beta");
+    expect(formatHarnessSwapEvent(ev({ fromLabel: null, toLabel: null }))).toBe("limit: an account → an account (usage limit)");
+  });
+
+  describe("quotaSummary", () => {
+    const quota = (over: Partial<HarnessQuota>): HarnessQuota => ({
+      harnessId: "a", kind: "claude-code", planType: null, status: "ok", source: "api", fetchedAtMs: 1_000_000, meters: [], reason: null, ...over,
+    });
+    test("a missing snapshot is stale with status missing", () => {
+      expect(quotaSummary(null, 5)).toEqual({ meters: [], ageMs: null, stale: true, status: "missing" });
+      expect(quotaSummary(undefined, 5).status).toBe("missing");
+    });
+    test("keeps only unscoped blocking meters in BLOCKING_METER_IDS order and reports age", () => {
+      const q = quota({
+        meters: [
+          { id: "seven_day", label: "7d", usedPercent: 40, resetsAtMs: 9 },
+          { id: "extra_usage", label: "Extra", usedPercent: 0, resetsAtMs: null },
+          { id: "five_hour", label: "5h", usedPercent: 100, resetsAtMs: 7 },
+          { id: "seven_day", label: "Opus 7d", usedPercent: 100, resetsAtMs: 8, scope: "Opus" },
+        ],
+      });
+      const s = quotaSummary(q, 1_000_000 + 60_000);
+      expect(s.meters.map((m) => m.id)).toEqual(["five_hour", "seven_day"]);
+      expect(s.meters[1]!.label).toBe("7d");
+      expect(s.ageMs).toBe(60_000);
+      expect(s.stale).toBe(false);
+      expect(s.status).toBe("ok");
+    });
+    test("older than 20 minutes is stale; a clock behind the snapshot clamps age to 0", () => {
+      expect(quotaSummary(quota({}), 1_000_000 + 20 * 60_000 + 1).stale).toBe(true);
+      expect(quotaSummary(quota({}), 1_000_000 + 20 * 60_000).stale).toBe(false);
+      expect(quotaSummary(quota({}), 10).ageMs).toBe(0);
+      expect(quotaSummary(quota({ fetchedAtMs: Number.NaN }), 10)).toMatchObject({ ageMs: null, stale: true });
+      expect(quotaSummary(quota({ status: "error" }), 1_000_001).status).toBe("error");
+    });
   });
 });

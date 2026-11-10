@@ -525,3 +525,67 @@ test("harness cooldown clear by kind alias filters leftovers by the resolved id 
   (currentClient as unknown as { listHarnesses: unknown }).listHarnesses = async () => ({ harnesses: [{ id: "b", kind: "claude-code" }], statuses: [] });
   await expect(cmdHarness(["restore", "claude-code"], flags)).rejects.toThrow(/next mirror will re-apply/);
 });
+
+// ── TT-A additions: 22d across every CLI surface, paging end, clear with nothing left ──
+
+test("22d: a one-member stack prints no n/m in `harness ls`, `stack ls`, `stack show` and switch-account", async () => {
+  const solo = stack({ members: [member("a", "A", 0)] });
+  currentClient = {
+    listHarnesses: async () => ({
+      harnesses: [{ id: "a", kind: "claude-code", label: "A", home: null, bin: null, env: {}, isBuiltin: false, createdAt: 0, enabled: true }],
+      statuses: [], stacks: [solo], limitStates: [],
+    }),
+    listHarnessStacks: async () => ({ stacks: [solo], limitStates: [] }),
+    getHarnessStack: async () => ({ stack: solo, limitStates: [] }),
+    getUsage: async () => [],
+  } as unknown as AgetorClient;
+  await cmdHarness(["ls"], flags);
+  await cmdHarness(["stack", "ls"], flags);
+  await cmdHarness(["stack", "show", "Train"], flags);
+  const text = outputs.join("\n");
+  expect(text).toContain("primary");
+  expect(text).not.toMatch(/\b1\/1\b/);
+
+  // the same rule for the multi-member control: the positions DO print
+  outputs.length = 0;
+  currentClient = {
+    listHarnesses: async () => ({
+      harnesses: [{ id: "b", kind: "claude-code", label: "B", home: null, bin: null, env: {}, isBuiltin: false, createdAt: 0, enabled: true }],
+      statuses: [], stacks: [stack()], limitStates: [],
+    }),
+    getUsage: async () => [],
+  } as unknown as AgetorClient;
+  await cmdHarness(["ls"], flags);
+  expect(outputs.join("\n")).toContain("2/3");
+
+  // switch-account landing in a one-member stack
+  outputs.length = 0;
+  currentClient = taskClient({
+    listHarnessStacks: async () => ({ stacks: [solo], limitStates: [] }),
+    switchTaskAccount: async () => ({ status: "switched", task: makeTask({ agent: "a" }) }),
+  });
+  await cmdSwitchAccount(["abcdefgh"], flags);
+  expect(outputs.join("\n")).toBe("✓ switched to A — continuing this conversation");
+});
+
+test("stack history: the last page prints no `more:` line and an empty history says so", async () => {
+  const ev = (id: string) => ({
+    id, stackId: "stk-aaaa1111", taskId: null, taskTitle: null, fromHarnessId: null, fromLabel: null, toHarnessId: null, toLabel: null,
+    trigger: "blocked" as const, reason: "no-usable-member" as const, source: null, message: null, model: null, resetsAtMs: null,
+    fromRunId: null, toRunId: null, continuation: null, at: 1,
+  });
+  currentClient = fakeClient({ getHarnessStackHistory: async () => ({ events: [ev("e1")], nextCursor: null }) }).client;
+  await cmdHarness(["stack", "history", "Train"], flags);
+  const text = outputs.join("\n");
+  expect(text).toContain("blocked: no account in the stack can run this task");
+  expect(text).not.toContain("more: --before");
+});
+
+test("harness cooldown clear: with no row left it says no cooldown remains and never claims a re-arm", async () => {
+  currentClient = { clearHarnessCooldown: async () => ({ cleared: true as const, limitStates: [] as HarnessLimitState[] }) } as unknown as AgetorClient;
+  await cmdHarness(["cooldown", "clear", "a"], flags);
+  const text = outputs.join("\n");
+  expect(text).toContain("no cooldown remains");
+  expect(text).not.toContain("still cooling");
+  expect(text).not.toContain("re-armed");
+});

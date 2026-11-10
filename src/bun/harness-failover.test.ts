@@ -2,7 +2,7 @@
 // persistence/cap. Timers are not fired here — the boot/handoff behaviour is
 // exercised by the orchestrator suite and the boot reconcile is read-only.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -995,5 +995,153 @@ describe("memberReasonsFor and the 1-member early return", () => {
     expect(dbm.tasks.get(taskId)!.harnessState).toBeNull();
     expect(fo.hasArmedAutoRetry(taskId)).toBe(false);
     stacks.harnessStacks.delete(stack.id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 6 TT-D: per-model cooldowns (D5), default-model checks (finding 9),
+// the 1-member inert rule (22a) and the `unavailable` history row (SC8)
+// ---------------------------------------------------------------------------
+
+describe("per-model cooldowns in selection (D5, W1 review S2)", () => {
+  /** The member selection lands on for `task`, or null when none is usable. */
+  const pick = (task: object, now: number): string | null => {
+    const plan = fo.planNextMember(task as never, { now });
+    return plan.kind === "next" ? plan.member.harnessId : null;
+  };
+
+  test("a per-model row for model X does not block a task on model Y; an account-wide row blocks both", () => {
+    const a = account();
+    const b = account();
+    const c = account();
+    const stack = stacks.harnessStacks.create({ label: "permodel", kind: "claude-code", members: [a, b, c] });
+    const taskId = makeTask(a);
+    const now = Date.now();
+    // The cooldown on b is for one model only.
+    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: now + 3_600_000, message: "x", source: "codex-error", model: "model-x" } as never, now);
+    const onX = { ...dbm.tasks.get(taskId)!, model: "model-x" };
+    const onY = { ...dbm.tasks.get(taskId)!, model: "model-y" };
+    expect(pick(onX, now)).toBe(c);
+    expect(pick(onY, now)).toBe(b);
+    // An account-wide row blocks every model.
+    stacks.harnessStacks.setLimitState(b, { reason: "quota", resetAtMs: now + 3_600_000, message: "all", source: "claude-pane" } as never, now);
+    expect(pick(onY, now)).toBe(c);
+    stacks.harnessStacks.clearLimitState(b);
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("model matching is case-insensitive and a default-model task resolves to DEFAULT_MODEL", async () => {
+    const { DEFAULT_MODEL } = await import("../shared/types.ts");
+    const a = account();
+    const b = account();
+    const c = account();
+    const stack = stacks.harnessStacks.create({ label: "permodel-default", kind: "claude-code", members: [a, b, c] });
+    const taskId = makeTask(a);
+    const now = Date.now();
+    const defaultModel = DEFAULT_MODEL["claude-code"];
+    stacks.harnessStacks.setLimitState(b, {
+      reason: "quota", resetAtMs: now + 3_600_000, message: "x", source: "codex-error", model: defaultModel.toLowerCase(),
+    } as never, now);
+    const nullModel = { ...dbm.tasks.get(taskId)!, model: null as never };
+    expect(fo.cooldownModelFor(nullModel, b)).toBe(defaultModel.toLowerCase());
+    // A default-model task meets the row for the default model...
+    expect(pick(nullModel, now)).toBe(c);
+    // ...and the same task pinned to another model does not.
+    expect(pick({ ...nullModel, model: "some-other-model" }, now)).toBe(b);
+    // The match is on the lower-cased id.
+    expect(fo.cooldownModelFor({ model: defaultModel.toUpperCase() } as never, b)).toBe(defaultModel.toLowerCase());
+    expect(pick({ ...nullModel, model: defaultModel.toUpperCase() }, now)).toBe(c);
+    stacks.harnessStacks.clearLimitState(b);
+    stacks.harnessStacks.delete(stack.id);
+  });
+});
+
+describe("a default-model task is checked against the backup's CLI floor (finding 9)", () => {
+  test("a backup whose cached CLI is below the default model's floor is skipped; a pinned model without a floor is not", async () => {
+    const { DEFAULT_MODEL, MODEL_MIN_CLI_VERSION } = await import("../shared/types.ts");
+    const agentStatus = await import("./agent-status.ts");
+    const floor = MODEL_MIN_CLI_VERSION.codex?.[DEFAULT_MODEL.codex];
+    expect(floor).toBeDefined();
+    const binDirLocal = mkdtempSync(path.join(tmpdir(), "agetor-failover-codexbin-"));
+    const stub = path.join(binDirLocal, "codex");
+    writeFileSync(stub, '#!/bin/sh\necho "codex-cli ${STUB_CODEX_VERSION:-9.9.9}"\n', { mode: 0o755 });
+    const prevBin = process.env.AGETOR_CODEX_BIN;
+    process.env.AGETOR_CODEX_BIN = stub;
+    const codex = (label: string, version: string) => {
+      seq++;
+      const id = `fo-codex-${label}-${seq}`;
+      const home = path.join(process.env.AGETOR_DATA_DIR!, "homes", id);
+      mkdirSync(path.join(home, ".codex"), { recursive: true });
+      writeFileSync(path.join(home, ".codex", "auth.json"), "{}");
+      dbm.harnesses.insert({ id, kind: "codex", label: id, home, env: { STUB_CODEX_VERSION: version } } as never);
+      return id;
+    };
+    try {
+      const a = codex("a", "9.9.9");
+      const b = codex("b", "0.100.0");
+      const c = codex("c", "9.9.9");
+      const stack = stacks.harnessStacks.create({ label: "floor", kind: "codex", members: [a, b, c] });
+      for (const id of [a, b, c]) await agentStatus.cachedCliVersion(dbm.harnesses.get(id)!);
+      expect(agentStatus.peekCachedCliVersion(dbm.harnesses.get(b)!)).toContain("0.100.0");
+      const task = { id: "t", agent: a, model: null as string | null, harnessState: null } as never;
+      const member = (id: string) => ({ harnessId: id, enabled: true, label: id });
+      // The default-model task cannot run on the old CLI...
+      expect(fo.memberUnusableReason(member(b), task)).toBe(`CLI older than ${floor}`);
+      expect(fo.memberUnusableReason(member(c), task)).toBeNull();
+      // ...so selection lands on the next member that can.
+      const plan = fo.planNextMember({ id: "t", agent: a, model: null, harnessState: null } as never);
+      expect(plan.kind).toBe("next");
+      if (plan.kind === "next") expect(plan.member.harnessId).toBe(c);
+      // A model without a floor is fine on the old CLI.
+      expect(fo.memberUnusableReason(member(b), { model: "fixture-codex-model" } as never)).toBeNull();
+      stacks.harnessStacks.delete(stack.id);
+    } finally {
+      if (prevBin === undefined) delete process.env.AGETOR_CODEX_BIN; else process.env.AGETOR_CODEX_BIN = prevBin;
+      rmSync(binDirLocal, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a 1-member stack is inert (22a) and prepare moves record `unavailable`", () => {
+  let harnessSwapEvents: typeof import("./harness-swap-history.ts").harnessSwapEvents;
+  beforeAll(async () => {
+    harnessSwapEvents = (await import("./harness-swap-history.ts")).harnessSwapEvents;
+  });
+  test("an unusable lone member gets the normal pre-flight: ok, no move, no state, no history", async () => {
+    const a = account();
+    const b = account();
+    const stack = stacks.harnessStacks.create({ label: "inert", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    stacks.harnessStacks.update(stack.id, { members: [a] } as never);
+    dbm.harnesses.setEnabled(a, false);
+    try {
+      const res = await fo.prepareTaskHarness(taskId, { manual: false });
+      expect(res).toEqual({ ok: true });
+      expect(dbm.tasks.get(taskId)!.agent).toBe(a);
+      expect(dbm.tasks.get(taskId)!.harnessState ?? null).toBeNull();
+      expect(harnessSwapEvents.page(stack.id, { limit: 10 }).events).toHaveLength(0);
+    } finally {
+      dbm.harnesses.setEnabled(a, true);
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("an unavailable current account moves to the backup with exactly one `unavailable` row", async () => {
+    const a = account();
+    const b = account();
+    const stack = stacks.harnessStacks.create({ label: "unavail", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    dbm.harnesses.setEnabled(a, false);
+    try {
+      const res = await fo.prepareTaskHarness(taskId, { manual: false });
+      expect(res.ok).toBe(true);
+      expect(dbm.tasks.get(taskId)!.agent).toBe(b);
+      const rows = harnessSwapEvents.page(stack.id, { limit: 10 }).events.filter((e) => e.taskId === taskId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ trigger: "unavailable", fromHarnessId: a, toHarnessId: b });
+    } finally {
+      dbm.harnesses.setEnabled(a, true);
+      stacks.harnessStacks.delete(stack.id);
+    }
   });
 });

@@ -2570,3 +2570,54 @@ test("087 keeps cooldown rows as whole-account (model ''), keys by (harness, mod
   expect(migrate(db, migrations)).toEqual([]);
   db.close();
 });
+
+test("087 N-1: several real cooldown rows survive byte-for-byte as whole-account rows, a per-model row coexists, and history references no task or harness", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "086_normalize_cursor_fable_5_2");
+  const seeded = [
+    ["cc-a", "quota", "claude-pane", "5-hour limit reached", 9_000, 100],
+    ["cc-b", "rate_limit", "claude-api-error", null, 7_500, 90],
+    ["cx-1", "insufficient_credits", "codex-error", "out of credits", 12_345, 80],
+  ] as const;
+  for (const [id, reason, source, message, until, at] of seeded) {
+    db.run(
+      `INSERT INTO harness_limit_state (harness_id, reason, source, message, exhausted_until_ms, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, reason, source, message, until, at],
+    );
+  }
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round"]);
+  const rows = db.query(`SELECT * FROM harness_limit_state ORDER BY harness_id`).all();
+  expect(rows).toEqual(
+    seeded.map(([harness_id, reason, source, message, exhausted_until_ms, updated_at]) => ({
+      harness_id, model: "", reason, source, message, exhausted_until_ms, updated_at,
+    })),
+  );
+  // The account-wide row and a per-model row of the same account coexist.
+  db.run(
+    `INSERT INTO harness_limit_state (harness_id, model, reason, source, exhausted_until_ms, updated_at) VALUES ('cc-a', 'opus', 'quota', 'codex-error', 1, 1)`,
+  );
+  expect(db.query(`SELECT model FROM harness_limit_state WHERE harness_id = 'cc-a' ORDER BY model`).all()).toEqual([
+    { model: "" },
+    { model: "opus" },
+  ]);
+
+  // History: the only foreign key is to the stack, so a task or account that
+  // is gone (or never existed) cannot take the row with it, and the stack can.
+  expect(db.query<{ table: string; on_delete: string }, []>(`PRAGMA foreign_key_list(harness_swap_events)`).all()).toEqual([
+    expect.objectContaining({ table: "harness_stacks", on_delete: "CASCADE" }),
+  ]);
+  db.exec(`PRAGMA foreign_keys = ON`);
+  db.run(`INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'S', 'claude-code', 1, 1)`);
+  db.run(
+    `INSERT INTO harness_swap_events (id, stack_id, task_id, from_harness_id, to_harness_id, trigger, at) VALUES ('e1', 's1', 'no-such-task', 'no-such-a', 'no-such-b', 'limit', 1)`,
+  );
+  db.run(`DELETE FROM harnesses WHERE id = 'cc-a'`);
+  expect(db.query(`SELECT id FROM harness_swap_events`).all()).toEqual([{ id: "e1" }]);
+  // continuation is the one CHECKed column.
+  expect(() => db.run(`INSERT INTO harness_swap_events (id, stack_id, trigger, continuation, at) VALUES ('e2', 's1', 'limit', 'bogus', 1)`)).toThrow();
+  db.run(`INSERT INTO harness_swap_events (id, stack_id, trigger, continuation, at) VALUES ('e3', 's1', 'future-trigger', 'restarted', 2)`);
+  db.run(`DELETE FROM harness_stacks WHERE id = 's1'`);
+  expect(db.query(`SELECT id FROM harness_swap_events`).all()).toEqual([]);
+  expect(db.query<{ name: string }, []>(`PRAGMA foreign_key_list(harness_mirror_provenance)`).all()).toEqual([]);
+  db.close();
+});

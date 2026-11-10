@@ -189,3 +189,47 @@ describe("per-model cooldowns (review S2)", () => {
     expect(stackPickerOptions({ task: { agent: "q", model: null }, ...base })).toBeNull();
   });
 });
+
+describe("TT-A: scheduled switch and model-aware picker", () => {
+  test("a scheduled switch survives a membership move; other live fields too", () => {
+    const stacks = [stack("s2", ["a", "b"])];
+    const out = stackBadgeStateFor(
+      { agent: "a", harnessState: state("old", { scheduledSwitch: { requestedAt: 77 } }) },
+      stacks,
+    );
+    expect(out?.stackId).toBe("s2");
+    expect(out?.scheduledSwitch).toEqual({ requestedAt: 77 });
+  });
+
+  test("a scheduled switch is kept on same-stack re-ranking", () => {
+    const stacks = [stack("s1", ["x", "a", "b"])];
+    const out = stackBadgeStateFor(
+      { agent: "a", harnessState: state("s1", { position: 0, count: 2, scheduledSwitch: { requestedAt: 5 } }) },
+      stacks,
+    );
+    expect(out).toMatchObject({ position: 1, count: 3, scheduledSwitch: { requestedAt: 5 } });
+  });
+
+  test("the picker does not mark a member cooling when the row is for another model", () => {
+    const stacks = [stack("s1", ["a", "b"])];
+    const opts = stackPickerOptions({
+      task: { agent: "a", model: "opus-x" },
+      stacks,
+      harnesses: [{ id: "a", label: "Work" }, { id: "b", label: "Personal" }] as never,
+      agents: [],
+      limitStates: [limit("b", Date.now() + 3_600_000, "sonnet")],
+      now: Date.now(),
+    });
+    expect(opts?.[1]!.label).toBe("Personal 2/2");
+    const acct = stackPickerOptions({
+      task: { agent: "a", model: "opus-x" },
+      stacks,
+      harnesses: [{ id: "a", label: "Work" }, { id: "b", label: "Personal" }] as never,
+      agents: [{ harnessId: "b", available: false }] as never,
+      limitStates: [limit("b", Date.now() + 3_600_000)],
+      now: Date.now(),
+    });
+    expect(acct?.[1]!.label).toContain("⏳ cooling until");
+    expect(acct?.[1]!.label).toContain("(unavailable)");
+  });
+});

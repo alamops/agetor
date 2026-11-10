@@ -268,6 +268,54 @@ describe("084 tables and tasks.harness_state", () => {
     expect(dbm.runs.hasToolUse(runId)).toBe(true);
   });
 
+  test("mainUserRows marks twin exactly on rows that carry a line_uuid", () => {
+    const taskId = seedTask();
+    const runId = seedRun(taskId);
+    dbm.runs.appendEvent(runId, "user", "typed, no twin");
+    dbm.runs.appendEvent(runId, "user", "from the jsonl", `uuid-${randomUUID()}`);
+    dbm.runs.appendEvent(runId, "user", "typed again");
+    dbm.runs.appendEvent(runId, "assistant", "ignored", `uuid-${randomUUID()}`);
+    expect(dbm.runs.mainUserRows(runId)).toEqual([
+      { data: "typed, no twin", twin: false },
+      { data: "from the jsonl", twin: true },
+      { data: "typed again", twin: false },
+    ]);
+  });
+
+  test("087: swap history survives a task delete and an account delete; limit and provenance rows go with the account", () => {
+    const tag = randomUUID().slice(0, 8);
+    const accountId = `hist-acct-${tag}`;
+    dbm.harnesses.insert({
+      id: accountId, kind: "claude-code", label: accountId,
+      home: mkdtempSync(path.join(tmpdir(), "agetor-hist-")), env: {},
+    } as never);
+    const stackId = `hist-stack-${tag}`;
+    dbm.db.run(`INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES (?, 'H', 'claude-code', 1, 1)`, [stackId]);
+    const taskId = seedTask();
+    dbm.db.run(
+      `INSERT INTO harness_swap_events (id, stack_id, task_id, task_title, from_harness_id, from_label, to_harness_id, to_label, trigger, at)
+       VALUES (?, ?, ?, 'Title', ?, 'From label', 'other', 'To label', 'limit', 5)`,
+      [`ev-${tag}`, stackId, taskId, accountId],
+    );
+    dbm.db.run(`INSERT INTO harness_limit_state (harness_id, model, reason, source, exhausted_until_ms, updated_at) VALUES (?, '', 'quota', 'claude-pane', 9, 1)`, [accountId]);
+    dbm.db.run(`INSERT INTO harness_limit_state (harness_id, model, reason, source, exhausted_until_ms, updated_at) VALUES (?, 'm1', 'quota', 'codex-error', 9, 1)`, [accountId]);
+    dbm.db.run(`INSERT INTO harness_mirror_provenance (harness_id, scope, path, updated_at) VALUES (?, 'file', '/p', 1)`, [accountId]);
+    const events = () =>
+      dbm.db.query<{ task_title: string; from_label: string }, [string]>(`SELECT task_title, from_label FROM harness_swap_events WHERE stack_id = ?`).all(stackId);
+
+    expect(dbm.db.query<{ foreign_keys: number }, []>(`PRAGMA foreign_keys`).get()!.foreign_keys).toBe(1);
+    dbm.db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    expect(events()).toEqual([{ task_title: "Title", from_label: "From label" }]);
+    dbm.harnesses.delete(accountId);
+    expect(events()).toEqual([{ task_title: "Title", from_label: "From label" }]);
+    for (const table of ["harness_limit_state", "harness_mirror_provenance"]) {
+      expect(dbm.db.query<{ n: number }, [string]>(`SELECT COUNT(*) AS n FROM ${table} WHERE harness_id = ?`).get(accountId)!.n).toBe(0);
+    }
+    // The cascade is on the stack only.
+    dbm.db.run(`DELETE FROM harness_stacks WHERE id = ?`, [stackId]);
+    expect(events()).toEqual([]);
+  });
+
   test("lastUserEventId skips a hidden harness-stack continuation (live echo and pasted_content twin) but not prose mentioning the tag", () => {
     const taskId = seedTask();
     const runId = seedRun(taskId);

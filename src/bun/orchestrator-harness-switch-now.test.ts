@@ -16,7 +16,7 @@ const FAKE_CLAUDE_LIMIT_CLEAN_PROMPT_MARKER = "__agetor_fake_claude_limit_clean_
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-switch-now-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
-const ENV_KEYS = ["AGETOR_CLAUDE_DRIVER", "AGETOR_CLAUDE_BIN", "AGETOR_TMUX_BIN", "AGETOR_FAKE_CLAUDE_TURN_MS"] as const;
+const ENV_KEYS = ["AGETOR_CLAUDE_DRIVER", "AGETOR_CLAUDE_BIN", "AGETOR_TMUX_BIN", "AGETOR_FAKE_CLAUDE_TURN_MS", "AGETOR_FAKE_CLAUDE_SESSION_DIED", "AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS"] as const;
 const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
@@ -500,6 +500,132 @@ describe("wave 3 review fixes", () => {
     expect(rowsAfter.length >= 2 || backlog.some((i) => i.text === "handoff reminder")).toBe(true);
     expect(db.tasks.get(task.id)!.agent).toBe(b);
     await waitFor(() => db.runs.listForTask(task.id).every((r) => r.status !== "running"));
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 6 TT-D additions (docs/plans/harness-stacks-fix-round.md D12, Phase 5
+// review decisions): the refusals and settlement paths not covered above.
+// ---------------------------------------------------------------------------
+
+describe("refusals with per-member reasons and in-memory windows (TT-D)", () => {
+  async function refusal(taskId: string): Promise<InstanceType<typeof orch.SwitchAccountRefusedError> | null> {
+    try {
+      await orch.switchTaskAccountNow(taskId);
+      return null;
+    } catch (err) {
+      return err as InstanceType<typeof orch.SwitchAccountRefusedError>;
+    }
+  }
+
+  test("no-usable-member: every other account is unusable, and the reasons name them", async () => {
+    const a = alias("nu-a");
+    const b = alias("nu-b");
+    const stack = stacks.harnessStacks.create({ label: "nu", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "work", { column: "review" });
+    db.harnesses.setEnabled(b, false);
+    try {
+      const err = await refusal(task.id);
+      expect(err).toBeInstanceOf(orch.SwitchAccountRefusedError);
+      expect(err!.body.code).toBe("no-usable-member");
+      expect(err!.body.reasons?.some((r) => r.harnessId === b && r.reason === "disabled")).toBe(true);
+      expect(err!.body.error).toContain("disabled");
+      // Refused up front: nothing scheduled, nothing moved, no history.
+      expect(db.tasks.get(task.id)!.agent).toBe(a);
+      expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+      expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    } finally {
+      db.harnesses.setEnabled(b, true);
+    }
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("busy while the limit settlement's swap window is open, and nothing is scheduled", async () => {
+    const a = alias("busyw-a");
+    const b = alias("busyw-b");
+    const stack = stacks.harnessStacks.create({ label: "busyw", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
+    let inWindow: InstanceType<typeof orch.SwitchAccountRefusedError> | null = null;
+    const prev = orch.__setHarnessSwapSettleHookForTest(async (hooked, _runId, phase) => {
+      // The earliest point of the window: no pendingSwap yet, so only the
+      // in-memory window itself can refuse (a scheduled switch here would be
+      // rewritten away by the swap's state writes).
+      if (hooked !== task.id || phase !== "settle") return;
+      orch.__setHarnessSwapSettleHookForTest(null);
+      inWindow = await refusal(task.id);
+    });
+    try {
+      expect(await orch.startTask(task.id)).toHaveProperty("runId");
+      await waitFor(() => inWindow !== null);
+      await waitFor(() => db.runs.listForTask(task.id).length >= 2 && db.runs.listForTask(task.id).every((r) => r.status !== "running"));
+    } finally {
+      orch.__setHarnessSwapSettleHookForTest(prev);
+    }
+    expect(inWindow).not.toBeNull();
+    expect((inWindow as unknown as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code).toBe("busy");
+    expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+    stacks.harnessStacks.clearLimitState(a);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("busy while the boot swap claim is held", async () => {
+    const a = alias("busyb-a");
+    const b = alias("busyb-b");
+    const stack = stacks.harnessStacks.create({ label: "busyb", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "work", { column: "running" });
+    const oldRun = insertRun(task.id, a, { status: "running", endedAt: null, exitCode: null });
+    db.tasks.update(task.id, { runId: oldRun });
+    db.tasks.setHarnessState(task.id, {
+      stackId: stack.id, position: 0, count: 2, tried: [a],
+      pendingSwap: { from: a, to: b, reason: "quota", runId: oldRun, startedAt: Date.now() },
+      allExhausted: null, lastMove: null,
+    });
+    await orch.reconcileOrphans();
+    let during: InstanceType<typeof orch.SwitchAccountRefusedError> | null = null;
+    const prev = orch.__setHarnessSwapSpawnHookForTest(async (hooked) => {
+      if (hooked !== task.id) return;
+      orch.__setHarnessSwapSpawnHookForTest(null);
+      during = await refusal(task.id);
+    });
+    try {
+      await orch.reconcilePendingHarnessSwaps();
+      await waitFor(() => db.runs.listForTask(task.id).length >= 2 && db.runs.listForTask(task.id).every((r) => r.status !== "running"));
+    } finally {
+      orch.__setHarnessSwapSpawnHookForTest(prev);
+    }
+    expect(during).not.toBeNull();
+    expect((during as unknown as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code).toBe("busy");
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});
+
+describe("a scheduled switch is performed when the turn FAILS (TT-D)", () => {
+  test("a turn that ends failed moves the task to the next account, as a `scheduled` row", async () => {
+    const a = alias("fail-a");
+    const b = alias("fail-b");
+    const stack = stacks.harnessStacks.create({ label: "fail", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "plain work");
+    process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED = "1";
+    process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "400";
+    try {
+      expect(await orch.startTask(task.id)).toHaveProperty("runId");
+      expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
+      await waitFor(() => db.tasks.get(task.id)?.agent === b);
+    } finally {
+      delete process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED;
+      delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+    }
+    const first = [...db.runs.listForTask(task.id)].sort((x, y) => x.startedAt - y.startedAt)[0]!;
+    expect(first.status).not.toBe("succeeded");
+    const after = db.tasks.get(task.id)!;
+    expect(after.agent).toBe(b);
+    expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
+    const rows = events(stack.id).filter((e) => e.taskId === task.id);
+    expect(rows.map((r) => r.trigger)).toEqual(["scheduled"]);
+    // Not a limit: no cooldown, nothing marked tried.
+    expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
+    expect(after.harnessState?.tried ?? []).toEqual([]);
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });

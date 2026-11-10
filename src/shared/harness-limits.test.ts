@@ -5,6 +5,7 @@ import {
   harnessQuotaLooksExhausted,
   harnessQuotaResetAt,
   parseClaudeResetNotice,
+  parseLimitedModel,
   parseHarnessLimitSignal,
 } from "./harness-limits.ts";
 import type { HarnessLimitSignal, HarnessQuota } from "./types.ts";
@@ -383,5 +384,78 @@ describe("fix-round limit parsing", () => {
     expect(classifyHarnessLimitSignal("codex", { text: "You've hit your usage limit for GPT-5.6-Codex. Switch." })?.model).toBe("gpt-5.6-codex");
     const wide = classifyHarnessLimitSignal("codex", { text: "You've hit your usage limit. Upgrade to Plus." });
     expect(wide?.model).toBeNull();
+  });
+});
+
+describe("TT-A: findings 7, 8, 11 gaps", () => {
+  const at = (h: number, m: number, sec = 0) => new Date(2026, 10, 9, h, m, sec).getTime(); // Mon Nov 9 2026
+  test("7: a time-only reset that passed seconds ago is null; at 17:00 it is tomorrow 15:00", () => {
+    expect(parseClaudeResetNotice("resets 3pm", at(15, 0, 30))).toBeNull();
+    expect(parseClaudeResetNotice("resets 3pm", at(15, 59))).toBeNull();
+    expect(parseClaudeResetNotice("resets 3pm", at(17, 0))).toBe(new Date(2026, 10, 10, 15, 0).getTime());
+  });
+
+  test("7: a weekday-named reset for today that just passed is null; long passed rolls a week", () => {
+    // Nov 9 2026 is a Monday.
+    expect(parseClaudeResetNotice("resets Monday 3pm", at(15, 0, 30))).toBeNull();
+    expect(parseClaudeResetNotice("resets Monday 3pm", at(17, 0))).toBe(new Date(2026, 10, 16, 15, 0).getTime());
+    expect(parseClaudeResetNotice("resets Monday 3pm", at(10, 0))).toBe(at(15, 0));
+  });
+
+  const q = (meters: HarnessQuota["meters"], over: Partial<HarnessQuota> = {}): HarnessQuota => ({
+    harnessId: "a", kind: "claude-code", planType: null, status: "ok", source: "api", fetchedAtMs: 1000, meters, reason: null, ...over,
+  });
+
+  test("8: 5h full with weekly at 40% is exhausted, with the 5h reset", () => {
+    const quota = q([
+      { id: "five_hour", label: "5h", usedPercent: 100, resetsAtMs: 9000 },
+      { id: "seven_day", label: "7d", usedPercent: 40, resetsAtMs: 50_000 },
+    ]);
+    expect(harnessQuotaLooksExhausted(quota, 2000, 5000)).toBe(true);
+    expect(harnessQuotaResetAt(quota, 2000, 5000)).toBe(9000);
+  });
+
+  test("8: weekly_all and session meters block; the latest of several full windows wins", () => {
+    const quota = q([
+      { id: "session", label: "s", usedPercent: 100, resetsAtMs: 6000 },
+      { id: "weekly_all", label: "w", usedPercent: 100, resetsAtMs: 30_000 },
+      { id: "five_hour", label: "5h", usedPercent: 100, resetsAtMs: 9000 },
+    ]);
+    expect(harnessQuotaResetAt(quota, 2000, 5000)).toBe(30_000);
+  });
+
+  test("8: an already-reset full window is ignored when picking the reset", () => {
+    const quota = q([
+      { id: "five_hour", label: "5h", usedPercent: 100, resetsAtMs: 1500 },
+      { id: "seven_day", label: "7d", usedPercent: 100, resetsAtMs: 20_000 },
+    ]);
+    expect(harnessQuotaResetAt(quota, 2000, 5000)).toBe(20_000);
+  });
+
+  test("8: a credits meter with headroom blocks exhaustion; credits at 100 does not", () => {
+    const full = { id: "five_hour", label: "5h", usedPercent: 100, resetsAtMs: 9000 };
+    expect(harnessQuotaLooksExhausted(q([full, { id: "credits", label: "c", usedPercent: 20, resetsAtMs: null }]), 2000, 5000)).toBe(false);
+    expect(harnessQuotaResetAt(q([full, { id: "credits", label: "c", usedPercent: 20, resetsAtMs: null }]), 2000, 5000)).toBeNull();
+    expect(harnessQuotaLooksExhausted(q([full, { id: "credits", label: "c", usedPercent: 100, resetsAtMs: null }]), 2000, 5000)).toBe(true);
+  });
+
+  test("8: a stale, missing or non-ok snapshot fails open for both helpers", () => {
+    const full = [{ id: "five_hour", label: "5h", usedPercent: 100, resetsAtMs: 90_000 }];
+    expect(harnessQuotaLooksExhausted(null, 2000, 5000)).toBe(false);
+    expect(harnessQuotaLooksExhausted(undefined, 2000, 5000)).toBe(false);
+    expect(harnessQuotaResetAt(null, 2000, 5000)).toBeNull();
+    expect(harnessQuotaLooksExhausted(q(full), 6001, 5000)).toBe(false);
+    expect(harnessQuotaResetAt(q(full), 6001, 5000)).toBeNull();
+    expect(harnessQuotaLooksExhausted(q(full, { fetchedAtMs: Number.NaN }), 2000, 5000)).toBe(false);
+    expect(harnessQuotaLooksExhausted(q(full, { status: "error" }), 2000, 5000)).toBe(false);
+  });
+
+  test("11: the model parses from trailing-period prose, lower-cased; plan/account prose has none", () => {
+    expect(parseLimitedModel("You've hit your usage limit for GPT-5.6-Codex.")).toBe("gpt-5.6-codex");
+    expect(parseLimitedModel("You've hit your usage limit for gpt-5.6-codex. Switch to another model now.")).toBe("gpt-5.6-codex");
+    expect(parseLimitedModel("You've hit your usage limit. Upgrade to Plus.")).toBeNull();
+    expect(parseLimitedModel("You've hit your usage limit for your plan.")).toBeNull();
+    expect(parseLimitedModel("You've hit your usage limit for Codex.")).toBeNull();
+    expect(parseLimitedModel("")).toBeNull();
   });
 });

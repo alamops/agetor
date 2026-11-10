@@ -1181,13 +1181,29 @@ function isForbiddenLinkTarget(target: string, guard: LinkGuard, ownName?: strin
     if (never.some((entry) => entry.startsWith(`${rel}/`))) return true;
   }
   // Agetor's own data dir holds the core's token file and the saved originals.
-  if (isInsideOrEqual(target, dataDir) || isInsideOrEqual(dataDir, target)) return true;
+  // Both spellings: the data dir is core-trusted, so its realpath is safe to
+  // take (macOS /var vs /private/var, a dotfile-linked ~/.agetor). The link
+  // target is never realpathed.
+  for (const data of dataDirCandidates()) {
+    if (isInsideOrEqual(target, data) || isInsideOrEqual(data, target)) return true;
+  }
   for (const home of homeCandidates()) {
     for (const sub of SENSITIVE_HOME_SUBPATHS) {
       if (isInsideOrEqual(target, path.join(home, sub))) return true;
     }
   }
   return false;
+}
+
+function dataDirCandidates(): string[] {
+  const dirs = [path.resolve(dataDir)];
+  try {
+    const real = realpathSync(dataDir);
+    if (real !== dirs[0]) dirs.push(real);
+  } catch {
+    // Not resolvable: only the spelled one applies.
+  }
+  return dirs;
 }
 
 function homeCandidates(): string[] {
@@ -2074,6 +2090,10 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
   const backupTopAssignments = splitTopLevelAssignments(backupTopText).assignments;
   const backupTopByKey = new Map(backupTopAssignments.map((a) => [a.key, a] as const));
   const keptTop: Array<{ key: string; text: string }> = [];
+  /** Backup `[table]` blocks that the primary's inline/dotted assignment of the
+   *  same key replaces (TOML forbids defining a key both ways, so the table
+   *  form cannot stay next to it). */
+  const formConflictHeaders = new Set<string>();
   for (const a of primaryTopAssignments) {
     const segments = splitTomlKeyPath(a.key);
     // Directory trust is per account: a dotted or inline `projects` key never
@@ -2093,9 +2113,34 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
       droppedPrefixes.push(segments);
       continue;
     }
+    // The backup spells the same key as a `[table]` (mixed forms): merge
+    // member-wise into one inline table, carrying the backup's credential
+    // members, so non-secret members cross and the file stays valid TOML.
+    const conflicting = backupBlocks.filter(
+      (b) => b.header !== "" && isUnder(splitTomlKeyPath(b.header), segments),
+    );
+    const isShellSet = segments.length === 2 && segments[0] === "shell_environment_policy" && segments[1] === "set";
+    if (conflicting.length > 0 && isShellSet && isPlainObject(inlineSetEntries(segments, segments, a.text))) {
+      const table = conflicting.find((b) => b.header === segments.join("."));
+      let tableEntries: Record<string, unknown> = {};
+      if (table) {
+        try {
+          const body = table.text.split(/\r?\n/).slice(1).join("\n");
+          tableEntries = Bun.TOML.parse(body) as Record<string, unknown>;
+        } catch {
+          tableEntries = {};
+        }
+      }
+      const synthetic: TomlAssignment = { key: a.key, text: `${a.key} = ${renderInlineTable(tableEntries)}` } as TomlAssignment;
+      for (const b of conflicting) formConflictHeaders.add(b.header);
+      loginSkipped.add(segments.join("."));
+      keptTop.push({ key: a.key, text: filterInlineSet(a, segments, segments, synthetic, droppedPrefixes) });
+      replacedPrefixes.push(segments);
+      continue;
+    }
     if (verdict === "filter") {
       loginSkipped.add(segments.join("."));
-      keptTop.push({ key: a.key, text: filterInlineSet(a, segments, segments, backupTopByKey.get(a.key)) });
+      keptTop.push({ key: a.key, text: filterInlineSet(a, segments, segments, backupTopByKey.get(a.key), droppedPrefixes) });
       replacedPrefixes.push(segments);
       continue;
     }
@@ -2144,7 +2189,7 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
   const oldValues = collectTomlValues(backupBlocks, backupTopAssignments);
 
   // Stale subtables of a table the primary replaces (see the doc comment).
-  const staleHeaders = new Set<string>();
+  const staleHeaders = new Set<string>(formConflictHeaders);
   for (const kept of keptBlocks) {
     const keptSegments = splitTomlKeyPath(kept.header);
     const direct = new Set(
@@ -2396,6 +2441,14 @@ function inlineSetEntries(fullPath: readonly string[], localKey: readonly string
   return cur.found && isPlainObject(cur.value) ? cur.value : null;
 }
 
+/** A flat table of primitive members as an inline TOML table. */
+function renderInlineTable(entries: Record<string, unknown>): string {
+  const rendered = Object.entries(entries)
+    .filter(([, v]) => typeof v === "string" || typeof v === "number" || typeof v === "boolean")
+    .map(([k, v]) => `${JSON.stringify(k)} = ${JSON.stringify(v)}`);
+  return `{ ${rendered.join(", ")} }`;
+}
+
 /** An inline `set` table rewritten without the primary's credential members
  *  and with the backup's own credential members carried over. */
 function filterInlineSet(
@@ -2403,12 +2456,15 @@ function filterInlineSet(
   fullPath: readonly string[],
   localKey: readonly string[],
   backupAssignment: TomlAssignment | undefined,
+  droppedPrefixes: string[][],
 ): string {
   const members: Array<[string, unknown]> = [];
   const backupEntries = backupAssignment ? inlineSetEntries(fullPath, localKey, backupAssignment.text) : null;
   for (const [k, v] of Object.entries(backupEntries ?? {})) if (isMirrorNeverImportedEnvEntry(k, v)) members.push([k, v]);
   for (const [k, v] of Object.entries(inlineSetEntries(fullPath, localKey, a.text) ?? {})) {
     if (!isMirrorNeverImportedEnvEntry(k, v)) members.push([k, v]);
+    // A member the filter stripped on purpose is not a "lost" key (backstop).
+    else droppedPrefixes.push([...fullPath, ...(fullPath.length === 1 ? ["set"] : []), k]);
   }
   const rendered = members
     .filter(([, v]) => typeof v === "string" || typeof v === "number" || typeof v === "boolean")
@@ -2453,7 +2509,7 @@ function mergeBlockLoginKeys(
     }
     loginSkipped.add(fullPath(a).join("."));
     if (v === "drop") droppedPrefixes.push(fullPath(a));
-    else kept.push(filterInlineSet(a, fullPath(a), splitTomlKeyPath(a.key), backupByKey.get(a.key)));
+    else kept.push(filterInlineSet(a, fullPath(a), splitTomlKeyPath(a.key), backupByKey.get(a.key), droppedPrefixes));
   });
   const primaryKeys = new Set(assignments.map((a) => a.key));
   backupAssignments.forEach((a, i) => {

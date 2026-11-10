@@ -4167,12 +4167,12 @@ async function drainSwapFollowUps(taskId: string): Promise<void> {
     const item = q[i]!;
     const task = tasks.get(taskId);
     if (!task?.runId) {
-      for (const rest of q.slice(i)) restashPasteWithheldText(taskId, rest.text);
+      stashFollowUpBatch(taskId, q.slice(i).map((rest) => rest.text));
       return;
     }
     const result = await sendHeldFollowUp(task.runId, item, false);
     if (!result.delivered) {
-      for (const rest of q.slice(i)) restashPasteWithheldText(taskId, rest.text);
+      stashFollowUpBatch(taskId, q.slice(i).map((rest) => rest.text));
       return;
     }
   }
@@ -4224,7 +4224,7 @@ function stashSwapFollowUps(taskId: string): void {
   const q = swapFollowUps.get(taskId);
   if (!q || q.length === 0) return;
   swapFollowUps.delete(taskId);
-  for (const item of [...q].reverse()) restashPasteWithheldText(taskId, item.text);
+  stashFollowUpBatch(taskId, [...q].reverse().map((item) => item.text));
 }
 
 /**
@@ -4321,9 +4321,8 @@ function stashCleanRetryFollowUps(taskId: string, retryOfRunId: string): void {
   const prompt = canonicalizeUserText((tasks.get(taskId)?.prompt ?? "").replace(/\r\n?/g, "\n")).trim();
   const parts = chain.length > 0 && chain[0] === prompt ? chain.slice(1) : chain;
   if (parts.length === 0) return;
-  let saved = 0;
   // `backlog.add` PREPENDS: restash newest first so the tray reads in send order.
-  for (const text of [...parts].reverse()) if (restashPasteWithheldText(taskId, text)) saved++;
+  const saved = stashFollowUpBatch(taskId, [...parts].reverse());
   if (saved === 0) return;
   saveStatusLineQuietly(
     retryOfRunId,
@@ -4539,8 +4538,7 @@ function stashUndeliveredMidTurnFollowUps(taskId: string, runId: string): void {
   midTurnFollowUps.delete(runId);
   if (texts.length === 0) return;
   // `backlog.add` PREPENDS: restash newest first so the tray reads in send order.
-  let saved = 0;
-  for (const text of [...texts].reverse()) if (restashPasteWithheldText(taskId, text)) saved++;
+  const saved = stashFollowUpBatch(taskId, [...texts].reverse());
   if (saved === 0) return;
   saveStatusLineQuietly(
     runId,
@@ -5975,9 +5973,8 @@ function stashQueuedFollowUpsOfStoppedStep(taskId: string, runId: string): void 
 function stashQueuedFollowUps(taskId: string, runId: string | null, why: string, tail = ""): void {
   const lines = takeQueuedFollowUps(taskId);
   if (lines.length === 0) return;
-  let saved = false;
   // `backlog.add` PREPENDS, so restash newest first (see `drainCodexQueue`).
-  for (const text of [...lines].reverse()) saved = restashPasteWithheldText(taskId, text) || saved;
+  const saved = stashFollowUpBatch(taskId, [...lines].reverse()) > 0;
   if (!saved || runId === null) return;
   const what = lines.length === 1 ? "queued message not sent" : `${lines.length} queued messages not sent`;
   const data = `${what} — ${why}; saved to your backlog, resend from the tray${tail ? ` ${tail}` : ""}`;
@@ -11470,6 +11467,27 @@ function restashPasteWithheldText(taskId: string, text: string): boolean {
   const alreadyStashed = task.backlog.some((item) => item.text === text);
   if (!alreadyStashed) backlog.add(taskId, { text });
   return true;
+}
+
+/**
+ * Stash a batch of follow-ups to the backlog tray, in the given ADD order
+ * (`backlog.add` prepends, so callers pass newest first). Unlike
+ * {@link restashPasteWithheldText}, two identical texts inside one batch are
+ * two separate sends and are both kept; only a text already in the tray
+ * before this batch is skipped (an overlapping stash path re-stashing the
+ * same message). Returns how many were added.
+ */
+function stashFollowUpBatch(taskId: string, textsInAddOrder: readonly string[]): number {
+  const task = tasks.get(taskId);
+  if (!task || task.archivedAt != null || textsInAddOrder.length === 0) return 0;
+  const before = new Set(task.backlog.map((item) => item.text));
+  let added = 0;
+  for (const text of textsInAddOrder) {
+    if (before.has(text)) continue;
+    backlog.add(taskId, { text });
+    added++;
+  }
+  return added;
 }
 
 /** Test hook: exercise `handlePasteWithheld` directly against a real task

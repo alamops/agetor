@@ -667,13 +667,25 @@ export class AgetorClient {
     return this.req("POST", "/harness-stacks/mirror-preview", draft, HARNESS_STACK_MIRROR_TIMEOUT_MS);
   }
   /** Put an account's mirror backups back. */
-  restoreHarnessMirror(id: string): Promise<MirrorRestoreResult> {
-    return this.req(
-      "POST",
-      `/harnesses/${encodeURIComponent(id)}/mirror-restore`,
-      undefined,
-      HARNESS_STACK_MIRROR_TIMEOUT_MS,
-    );
+  async restoreHarnessMirror(id: string): Promise<MirrorRestoreResult> {
+    try {
+      return await this.req<MirrorRestoreResult>(
+        "POST",
+        `/harnesses/${encodeURIComponent(id)}/mirror-restore`,
+        undefined,
+        HARNESS_STACK_MIRROR_TIMEOUT_MS,
+      );
+    } catch (e) {
+      // A restore whose answer never arrived may still have run on the core.
+      if (e instanceof ApiError && e.status === 0) {
+        throw new ApiError(
+          0,
+          e.body,
+          `${e.message} — the restore may have gone through; re-running it is safe (restored items are skipped)`,
+        );
+      }
+      throw e;
+    }
   }
   /** Clear an account's cooldown rows (all, or only `model`'s). */
   clearHarnessCooldown(

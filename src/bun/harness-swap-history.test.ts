@@ -97,3 +97,105 @@ describe("mirrorProvenance", () => {
     expect(mirrorProvenance.list("prov-1")).toEqual([]);
   });
 });
+
+describe("TT-B: the real page queries, validation without side effects, planted rows", () => {
+  const mkStack = (label: string) => {
+    const id = `st-${randomUUID()}`;
+    db.run(`INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES (?, ?, 'claude-code', 1, 1)`, [id, label]);
+    return id;
+  };
+
+  test("EXPLAIN of the SQL page() actually runs: first page and cursor page are SEARCHes with the row-value range", () => {
+    const sid = mkStack("plan");
+    for (let i = 0; i < 4; i++) harnessSwapEvents.insert({ ...base, stackId: sid, at: 50 + i });
+    // Capture the statements page() prepares instead of re-typing them here.
+    const seen: string[] = [];
+    const realQuery = db.query.bind(db);
+    (db as unknown as { query: unknown }).query = (sql: string) => {
+      if (sql.includes("harness_swap_events")) seen.push(sql);
+      return realQuery(sql as never);
+    };
+    let cursor: string | null;
+    try {
+      cursor = harnessSwapEvents.page(sid, { limit: 2 }).nextCursor;
+      expect(cursor).not.toBeNull();
+      harnessSwapEvents.page(sid, { limit: 2, before: cursor });
+    } finally {
+      (db as unknown as { query: unknown }).query = realQuery;
+    }
+    const selects = seen.filter((s) => /SELECT \*/.test(s));
+    expect(selects).toHaveLength(2);
+    for (const sql of selects) {
+      const stmt = db.prepare(`EXPLAIN QUERY PLAN ${sql}`);
+      try {
+        const args = sql.includes("(at, id) <") ? [sid, 1, "x", 5] : [sid, 5];
+        const plan = (stmt.all(...(args as never[])) as { detail: string }[]).map((r) => r.detail).join("\n");
+        expect(plan).toContain("SEARCH");
+        expect(plan).toContain("idx_harness_swap_events_stack");
+        expect(plan).not.toContain("SCAN");
+        expect(plan).not.toContain("TEMP B-TREE");
+        if (sql.includes("(at, id) <")) expect(plan).toMatch(/stack_id=\? AND \(at,id\)<\(\?,\?\)/);
+      } finally {
+        stmt.finalize();
+      }
+    }
+    db.run(`DELETE FROM harness_stacks WHERE id = ?`, [sid]);
+  });
+
+  test("each bad field is refused and nothing is written; null optional fields are accepted", () => {
+    const sid = mkStack("val");
+    const bad: Array<Partial<typeof base>> = [
+      { trigger: "evil" as never },
+      { reason: "bogus" as never },
+      { source: "bogus" as never },
+      { continuation: "bogus" as never },
+    ];
+    for (const patch of bad) {
+      expect(() => harnessSwapEvents.insert({ ...base, stackId: sid, ...patch })).toThrow(/invalid swap-history/);
+    }
+    expect(harnessSwapEvents.countForStack(sid)).toBe(0);
+    const ok = harnessSwapEvents.insert({ ...base, stackId: sid, reason: null, source: null, continuation: null });
+    expect(harnessSwapEvents.countForStack(sid)).toBe(1);
+    expect(harnessSwapEvents.page(sid).events[0]).toMatchObject({ id: ok.id, reason: null, source: null });
+    db.run(`DELETE FROM harness_stacks WHERE id = ?`, [sid]);
+  });
+
+  test("a planted bad row at a page boundary does not stall paging or leak; every valid row is seen once", () => {
+    const sid = mkStack("plant");
+    // 5 rows, newest first by (at,id): the invalid trigger sits at the end of page 1.
+    for (const [id, at, trigger] of [["p5", 50, "limit"], ["p4", 40, "limit"], ["p3", 30, "evil"], ["p2", 20, "manual"], ["p1", 10, "retry"]] as const) {
+      db.run(`INSERT INTO harness_swap_events (id, stack_id, trigger, at) VALUES (?, ?, ?, ?)`, [id, sid, trigger, at]);
+    }
+    db.run(`UPDATE harness_swap_events SET reason = 'not-a-reason', source = 'not-a-source' WHERE id = 'p4'`);
+    const seen: string[] = [];
+    let before: string | null = null;
+    for (let guard = 0; guard < 10; guard++) {
+      const page = harnessSwapEvents.page(sid, { limit: 3, before });
+      seen.push(...page.events.map((e) => e.id));
+      if (!page.nextCursor) break;
+      before = page.nextCursor;
+    }
+    expect(seen).toEqual(["p5", "p4", "p2", "p1"]);
+    expect(harnessSwapEvents.page(sid).events.find((e) => e.id === "p4")).toMatchObject({ reason: null, source: null });
+    // countForStack counts raw rows, the dropped one included.
+    expect(harnessSwapEvents.countForStack(sid)).toBe(5);
+    db.run(`DELETE FROM harness_stacks WHERE id = ?`, [sid]);
+  });
+
+  test("ties on the same timestamp break by id descending with no duplicate or gap across pages of one", () => {
+    const sid = mkStack("tie");
+    for (const id of ["a", "b", "c", "d", "e"]) {
+      db.run(`INSERT INTO harness_swap_events (id, stack_id, trigger, at) VALUES (?, ?, 'limit', 7)`, [id, sid]);
+    }
+    const ids: string[] = [];
+    let before: string | null = null;
+    for (let guard = 0; guard < 10; guard++) {
+      const page = harnessSwapEvents.page(sid, { limit: 1, before });
+      ids.push(...page.events.map((e) => e.id));
+      if (!page.nextCursor) break;
+      before = page.nextCursor;
+    }
+    expect(ids).toEqual(["e", "d", "c", "b", "a"]);
+    db.run(`DELETE FROM harness_stacks WHERE id = ?`, [sid]);
+  });
+});
