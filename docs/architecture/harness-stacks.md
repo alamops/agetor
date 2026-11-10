@@ -751,13 +751,20 @@ deleted. `harness_mirror_sources` (migration 089) records, per backup, the
 primary's id, its resolved folder(s) (the config root, plus the `.claude.json`
 folder for Claude) and a fingerprint of its own root settings (`home` and the
 non-blank `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`HOME` of its env map). When the same
-primary with the same settings resolves to a different folder, the run (and its
-preview) copies as usual but **removes nothing** from that backup and warns; the
-recorded folder is kept, so deletions resume when the primary resolves back. A
-changed fingerprint (the user re-pointed the account) or a different primary is
-a real change: propagation runs and the record is updated. The record is
-written only by a real run, dropped with the account (`harnesses.delete`,
-account cleanup, a Restore of a missing account).
+primary with the same settings resolves to a different folder while the
+recorded one still exists, that backup is **skipped entirely** (nothing copied,
+merged or removed; the preview shows the same `skipped:` warning): copying from
+the unexpected folder would plant its content as mirror-owned, to be removed,
+or a preexisted key stranded on its value, once the environment flips back. The
+recorded folder is kept, so mirroring resumes when the primary resolves back;
+to adopt the new folder, give the primary account its own config folder. A
+changed fingerprint (the user re-pointed the account), a different primary, or
+a recorded folder that no longer exists is a real change: the run proceeds and
+the record is updated. The record is written only by a real run whose primary
+folder exists (a run against a missing folder copies nothing and records
+nothing), and dropped with the account (`harnesses.delete`, account cleanup, a
+Restore of a missing account) and by a Restore that returns the backup to its
+own originals.
 
 A **merged file the primary deleted outright** (`settings.json`,
 `.claude.json`, `config.toml`, a plugin registry) is merged as an empty

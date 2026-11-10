@@ -599,16 +599,27 @@ async function mirrorOne(
       ? [canonicalRoot(claudeJsonDirFor(primary)), canonicalRoot(claudeJsonDirFor(target))]
       : [],
   };
-  // Deletion propagation trusts that the primary's folder is the one the last
-  // run read. The same primary, with unchanged root settings, resolving to a
-  // different folder means the core's environment changed, not the user's
-  // files: copy as usual, but remove nothing (and keep the recorded folder).
+  // The mirror trusts that the primary's folder is the one the last run read.
+  // The same primary, with unchanged root settings, resolving to a different
+  // folder means the core's environment changed, not the user's files. Copying
+  // from that folder would plant its content in the backup as mirror-owned
+  // (and later remove it, or strand a preexisted key on its value), so this
+  // backup is skipped entirely, with a warning, and the recorded folder kept.
+  // A recorded folder that no longer exists is stale and does not block.
   const source = primarySourceOf(primary, fromRoot);
   const recorded = mirrorSources.get(target.id);
-  const rootMoved = recorded !== null
+  const recordedRoot = recorded?.primaryRoot.split("\n")[0] ?? "";
+  if (
+    recorded !== null
     && recorded.primaryId === primary.id
     && recorded.primaryConfig === source.primaryConfig
-    && recorded.primaryRoot !== source.primaryRoot;
+    && recorded.primaryRoot !== source.primaryRoot
+    && isDirectory(recordedRoot)
+  ) {
+    return refuse(
+      `skipped: the primary account's config folder is now ${fromRoot}, but it was ${recordedRoot} on the last mirror and the account's settings did not change (Agetor was probably started with a different ${kind === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"}); nothing is copied to or removed from this account until it resolves back. To use the new folder, give the primary account its own config folder`,
+    );
+  }
   const ctx: MirrorCtx = {
     dry,
     harnessId: target.id,
@@ -618,19 +629,13 @@ async function mirrorOne(
     fromRoot,
     toRoot,
     guard,
-    propagate: isDirectory(fromRoot) && !rootMoved,
+    propagate: isDirectory(fromRoot),
     rows: new Map(mirrorProvenance.list(target.id).map((r) => [rowId(r.path, r.key), r] as const)),
     plan,
     copied: [],
     warnings: [],
     lastYield: Date.now(),
   };
-  if (rootMoved) {
-    warn(
-      ctx,
-      `the primary account's config folder is now ${fromRoot}, but it was ${recorded.primaryRoot.split("\n")[0]} on the last mirror and the account's settings did not change (Agetor was probably started with a different ${kind === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"}): nothing is removed from this account until it resolves back, or give the primary account its own config folder`,
-    );
-  }
 
   // 1. Copy the allowlisted dirs/files verbatim FIRST, so the registry merge
   //    below can tell whether the payload it points at was copied completely.
@@ -680,10 +685,9 @@ async function mirrorOne(
     }
   }
 
-  // Record the folder this run read, except when it was the unexpected one:
-  // the recorded folder stays the reference until the primary resolves back
-  // or its own settings change.
-  if (!dry && !rootMoved && accountAlive(ctx)) {
+  // Record the folder this run read. Only an existing folder becomes the
+  // reference: a run against a missing one copied nothing.
+  if (!dry && ctx.propagate && accountAlive(ctx)) {
     mirrorSources.set({ harnessId: target.id, ...source, updatedAt: Date.now() });
   }
 
@@ -3085,7 +3089,12 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
     }
   }
 
-  if (mirrorProvenance.list(harnessId).length === 0) await removeMirrorBackups(harnessId);
+  if (mirrorProvenance.list(harnessId).length === 0) {
+    await removeMirrorBackups(harnessId);
+    // Back to its own originals: the next mirror starts from scratch, and
+    // records the primary's folder afresh.
+    mirrorSources.deleteForHarness(harnessId);
+  }
   return result;
 }
 

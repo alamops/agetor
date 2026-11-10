@@ -1,5 +1,6 @@
 // Safe transfer engine + mirror (T04/TT4).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -2811,7 +2812,7 @@ describe("a deleted primary merged file propagates key removals", () => {
 });
 
 describe("a primary whose folder comes from the core's environment", () => {
-  test("a changed CLAUDE_CONFIG_DIR, with the account unchanged, copies but removes nothing; it propagates again once it resolves back", async () => {
+  test("a changed CLAUDE_CONFIG_DIR, with the account unchanged, skips the backup entirely; it mirrors again once it resolves back", async () => {
     const dirA = mkdtempSync(path.join(tmpdir(), "agetor-envroot-a-"));
     const dirB = mkdtempSync(path.join(tmpdir(), "agetor-envroot-b-"));
     const backup = mkdtempSync(path.join(tmpdir(), "agetor-envroot-backup-"));
@@ -2832,14 +2833,15 @@ describe("a primary whose folder comes from the core's environment", () => {
       // which has neither the key nor the skill.
       write(path.join(dirB, "settings.json"), JSON.stringify({ model: "sonnet" }));
       process.env.CLAUDE_CONFIG_DIR = dirB;
+      const before = readFileSync(path.join(backup, "settings.json"), "utf8");
       const preview = await mirror.previewMirror({ kind: "claude-code", members: [primaryId, b], mirrorMode: "full" });
       expect(preview.plans[0]!.files.remove).toEqual([]);
-      expect(preview.plans[0]!.keys.filter((k) => k.action === "remove")).toEqual([]);
+      expect(preview.plans[0]!.keys).toEqual([]);
+      expect(preview.plans[0]!.warnings.some((w) => w.startsWith("skipped: the primary account's config folder is now"))).toBe(true);
       const moved = await mirror.mirrorStack(stack, {});
-      expect(moved.warnings.some((w) => w.includes("config folder is now") && w.includes("nothing is removed"))).toBe(true);
-      const during = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
-      expect(during.env.FOO).toBe("1");
-      expect(during.model).toBe("sonnet");
+      expect(moved.warnings.some((w) => w.includes("config folder is now") && w.includes("nothing is copied to or removed"))).toBe(true);
+      // Nothing from dirB lands in the backup, and nothing is removed.
+      expect(readFileSync(path.join(backup, "settings.json"), "utf8")).toBe(before);
       expect(existsSync(path.join(backup, "skills", "a-skill", "SKILL.md"))).toBe(true);
       // Still the unexpected folder on the next run: still nothing removed.
       await mirror.mirrorStack(stack, {});
@@ -2870,6 +2872,46 @@ describe("a primary whose folder comes from the core's environment", () => {
     const result = await mirror.mirrorStack(stacks.harnessStacks.get(stack.id)!, {});
     expect(result.warnings.some((w) => w.includes("config folder is now"))).toBe(false);
     expect(existsSync(path.join(backup, "skills", "old-skill", "SKILL.md"))).toBe(false);
+  });
+
+  test("a recorded folder that no longer exists is stale; a missing folder is never recorded; a full Restore clears the record", async () => {
+    const dirA = mkdtempSync(path.join(tmpdir(), "agetor-envstale-a-"));
+    const dirB = mkdtempSync(path.join(tmpdir(), "agetor-envstale-b-"));
+    const missing = path.join(tmpdir(), `agetor-envstale-missing-${randomUUID()}`);
+    const backup = mkdtempSync(path.join(tmpdir(), "agetor-envstale-backup-"));
+    const primaryId = unique("envstale-p");
+    dbm.harnesses.insert({ id: primaryId, kind: "claude-code", label: primaryId, home: null, env: {} } as never);
+    const b = alias(unique("envstale-b"), backup);
+    const stack = stacks.harnessStacks.create({ label: "envstale", kind: "claude-code", members: [primaryId, b], mirrorMode: "full" });
+    const { mirrorSources } = await import("./harness-mirror-provenance.ts");
+    const { rmSync } = await import("node:fs");
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      // A run against a missing folder records nothing.
+      process.env.CLAUDE_CONFIG_DIR = missing;
+      await mirror.mirrorStack(stack, {});
+      expect(mirrorSources.get(b)).toBeNull();
+      // The first real folder becomes the reference.
+      write(path.join(dirA, "skills", "s", "SKILL.md"), "# s");
+      process.env.CLAUDE_CONFIG_DIR = dirA;
+      await mirror.mirrorStack(stack, {});
+      expect(mirrorSources.get(b)?.primaryRoot.split("\n")[0]).toBe(path.resolve(dirA));
+      // The reference folder is gone: it no longer blocks the new one.
+      rmSync(dirA, { recursive: true });
+      write(path.join(dirB, "skills", "t", "SKILL.md"), "# t");
+      process.env.CLAUDE_CONFIG_DIR = dirB;
+      const result = await mirror.mirrorStack(stack, {});
+      expect(result.warnings.some((w) => w.includes("config folder is now"))).toBe(false);
+      expect(existsSync(path.join(backup, "skills", "t", "SKILL.md"))).toBe(true);
+      expect(mirrorSources.get(b)?.primaryRoot.split("\n")[0]).toBe(path.resolve(dirB));
+      // A Restore back to the backup's own originals clears the record.
+      await mirror.restoreMirror(b);
+      expect(mirrorSources.get(b)).toBeNull();
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = saved;
+      stacks.harnessStacks.delete(stack.id);
+    }
   });
 
   test("account delete drops the backup's recorded source", async () => {

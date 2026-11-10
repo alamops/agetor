@@ -342,7 +342,7 @@ Phase 5 review (opus, parallel dimension and flow passes) → Phase 6 tests (TT1
   - re-keyed handoff rows and a deleted task's kept copies: migration 088 `harness_orphaned_copies`, swept at boot (with a normalization of pre-088 rows), after a transfer and after an account root edit; account delete collects them;
   - a deleted primary merged file now propagates key removals (merged as an empty document under the deletion-propagation rules);
   - the backup-removal directory-swap race: a spike showed the old walk, `/bin/rm -rf` and `find -delete` can all be redirected on macOS, while Bun's fd-relative `fs.rm` lost nothing; `removeMirrorBackups` uses it;
-  - deletion propagation no longer follows an unexpected primary folder: migration 089 records the folder each backup's primary resolved to, and a change with unchanged account settings skips deletions with a warning;
+  - the mirror no longer follows an unexpected primary folder: migration 089 records the folder each backup's primary resolved to, and a change with unchanged account settings skips that backup's run with a warning (a vanished recorded folder, a re-pointed account or a full Restore resets the reference);
   - a boot-completed switch-now keeps its `switch-now` label (`pendingSwap.switchNow`).
 - **Accepted known limitation**, documented in `harness-stacks.md`: an orphaned copy outside its account's current root waits until the root points back or the account is deleted (by design: the core never deletes outside an account's current root).
 - **Owner-deferred:** none.
