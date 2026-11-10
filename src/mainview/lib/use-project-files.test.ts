@@ -5,13 +5,15 @@
 // spying on `api.listProjectFiles` and driving the TTL with bun's
 // `setSystemTime`. Each test uses a UNIQUE `dir` because the caches are
 // module-level and `bun test` runs every file in one process.
-import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import { api } from "./api";
 import {
   SEARCH_CACHE_MAX,
   SEARCH_CACHE_TTL_MS,
   clearSearchCacheForScope,
+  resolveNamedScopePath,
   searchProjectFiles,
+  searchProjectFileScopes,
 } from "./use-project-files";
 
 let spies: Array<{ mockRestore: () => void }> = [];
@@ -118,4 +120,94 @@ test("the cache caps at SEARCH_CACHE_MAX, evicting the oldest key", async () => 
   const before = spy.mock.calls.length;
   await searchProjectFiles({ dir: "/t/evict" }, "first"); // evicted → refetch
   expect(spy.mock.calls.length).toBe(before + 1);
+});
+
+describe("multi-repository scopes", () => {
+  // Unique dirs per test: `bun test` shares one module-level search cache
+  // across the whole file, so reused scopes would serve a cached answer and
+  // never exercise the path under test.
+  const scopesFor = (tag: string) => [
+    { name: "frontend", dir: `/t/multi-${tag}-front` },
+    { name: "backend", dir: `/t/multi-${tag}-back`, ref: "main" },
+  ];
+
+  test("resolveNamedScopePath strips a known workspace prefix and preserves a trailing slash", () => {
+    const scopes = scopesFor("resolve");
+    expect(resolveNamedScopePath(scopes, "backend/src/a.ts")).toEqual({
+      scope: scopes[1]!,
+      path: "src/a.ts",
+    });
+    expect(resolveNamedScopePath(scopes, "frontend/src/")).toEqual({
+      scope: scopes[0]!,
+      path: "src/",
+    });
+    // No prefix / unknown prefix: neither can resolve inside the workspace.
+    expect(resolveNamedScopePath(scopes, "src/a.ts")).toBeNull();
+    expect(resolveNamedScopePath(scopes, "other/src/a.ts")).toBeNull();
+    expect(resolveNamedScopePath(scopes, "backend")).toBeNull();
+    expect(resolveNamedScopePath(null, "backend/src/a.ts")).toBeNull();
+  });
+
+  test("a prefixed query searches only that repository with the prefix stripped", async () => {
+    const scopes = scopesFor("prefixed");
+    const spy = stub(async ({ dir }) => ({
+      files: dir === scopes[0]!.dir ? ["src/a.ts"] : ["src/b.ts"],
+      truncated: false,
+    }));
+    const rows = await searchProjectFileScopes(scopes, "frontend/src/a", 20);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0]![0]).toEqual({ dir: scopes[0]!.dir, ref: undefined, q: "src/a", limit: 20 });
+    expect(rows).toEqual([{ path: "frontend/src/a.ts", isDirectory: false }]);
+  });
+
+  test("an unprefixed query searches every repository and re-prefixes each row", async () => {
+    const scopes = scopesFor("all");
+    const spy = stub(async ({ dir }) => ({
+      files: dir === scopes[0]!.dir ? ["src/a.ts", "src/"] : ["src/b.ts"],
+      truncated: false,
+    }));
+    const rows = await searchProjectFileScopes(scopes, "src", 20);
+    expect(spy).toHaveBeenCalledTimes(2);
+    // Round-robin across repositories, so the first repo's rows can't hide
+    // the second's entirely.
+    expect(rows).toEqual([
+      { path: "frontend/src/a.ts", isDirectory: false },
+      { path: "backend/src/b.ts", isDirectory: false },
+      { path: "frontend/src/", isDirectory: true },
+    ]);
+  });
+
+  test("a bare workspace prefix has nothing to search past the client listing", async () => {
+    const spy = stub(async () => ({ files: ["src/a.ts"], truncated: false }));
+    expect(await searchProjectFileScopes(scopesFor("bare"), "frontend/")).toEqual([]);
+    expect(spy).toHaveBeenCalledTimes(0);
+  });
+
+  test("honors the overall limit while still interleaving repositories", async () => {
+    const scopes = scopesFor("cap");
+    stub(async () => ({ files: ["a.ts", "b.ts", "c.ts"], truncated: false }));
+    const rows = await searchProjectFileScopes(scopes, "a", 3);
+    expect(rows.map((r) => r.path)).toEqual(["frontend/a.ts", "backend/a.ts", "frontend/b.ts"]);
+  });
+
+  test("null only when every targeted request failed; a partial failure keeps the successes", async () => {
+    const scopes = scopesFor("fail");
+    let frontFails = true;
+    stub(async ({ dir }) => {
+      if (dir === scopes[0]!.dir && frontFails) throw new Error("boom");
+      return { files: dir === scopes[0]!.dir ? ["src/a.ts"] : ["src/b.ts"], truncated: false };
+    });
+    const warns: unknown[][] = [];
+    spies.push(spyOn(console, "warn").mockImplementation((...a: unknown[]) => { warns.push(a); }));
+    // All fail (prefixed → a single target that fails).
+    expect(await searchProjectFileScopes(scopes, "frontend/src/a", 20)).toBeNull();
+    // Unprefixed: front fails, back succeeds → keep the backend rows only.
+    expect(await searchProjectFileScopes(scopes, "src", 20)).toEqual([
+      { path: "backend/src/b.ts", isDirectory: false },
+    ]);
+    frontFails = false;
+    expect(await searchProjectFileScopes(scopes, "frontend/src/a", 20)).toEqual([
+      { path: "frontend/src/a.ts", isDirectory: false },
+    ]);
+  });
 });

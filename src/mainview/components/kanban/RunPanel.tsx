@@ -24,7 +24,7 @@ import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
-import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { useProjectFiles, useProjectFileScopes, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { fileScopeForTask, fileScopesForTask } from "../../../shared/file-scope.ts";
 import {
   emptyOpencodeDrafts,
@@ -4777,6 +4777,7 @@ function RunPanelBody({
           // one key make React leak the earlier one on every re-render.
           key={`backlog-${task.id}`}
           fileScope={fileScope}
+          fileScopes={multiRepoScopes}
           items={backlogItems}
           canSend={canSend && !modalPending}
           busy={sending || backlogBusy}
@@ -5181,6 +5182,7 @@ const BACKLOG_ICON_BTN =
  */
 function BacklogTray({
   fileScope,
+  fileScopes,
   items,
   canSend,
   busy,
@@ -5195,6 +5197,10 @@ function BacklogTray({
    *  threaded into each row's inline editor for popover + highlight parity.
    *  Display/suggestion layer only; expansion stays server-side. */
   fileScope?: FileScope | null;
+  /** Every repository scope for a multi-repository task (issue #291) —
+   *  mirrors the send composer's merged, `<name>/…`-prefixed listing so a
+   *  saved draft's `@` editor sees the same files it will send. */
+  fileScopes?: NamedFileScope[] | null;
   items: BacklogMessage[];
   /** Whether "Send now" is available (task has a resumable run and no pending prompt). */
   canSend: boolean;
@@ -5317,6 +5323,7 @@ function BacklogTray({
               readOnly={readOnly}
               editing={editorVisible && editingId === item.id}
               fileScope={fileScope}
+              fileScopes={fileScopes}
               startingFolder={startingFolder}
               onStartEdit={() => setEditingId(item.id)}
               onCancelEdit={() => setEditingId(null)}
@@ -5339,6 +5346,7 @@ function BacklogTray({
  *  (textarea + references picker) when `editing` is true. */
 function BacklogItemRow({
   fileScope,
+  fileScopes,
   item,
   index,
   total,
@@ -5355,6 +5363,7 @@ function BacklogItemRow({
   onMove,
 }: {
   fileScope?: FileScope | null;
+  fileScopes?: NamedFileScope[] | null;
   item: BacklogMessage;
   index: number;
   total: number;
@@ -5377,9 +5386,18 @@ function BacklogItemRow({
   // `@` popover + highlight for the inline editor — scope gated on `editing`
   // so a tray full of closed rows fetches nothing (the module-level cache is
   // shared with the send composer anyway, so entering edit mode is a cache
-  // hit in practice). Expansion still happens server-side on send; this is
-  // the suggestion/validation layer only, same as every other composer.
-  const projectFiles = useProjectFiles(editing && !readOnly ? (fileScope ?? null) : null);
+  // hit in practice). Multi-repository tasks use the same merged, prefixed
+  // listing as the send composer (issue #291), so a draft's `@` editor can
+  // reference any repository instead of only the active tab's. Expansion
+  // still happens server-side on send; this is the suggestion/validation
+  // layer only, same as every other composer.
+  const multiScopes = (fileScopes?.length ?? 0) > 1 ? fileScopes : null;
+  const singleScopeFiles = useProjectFiles(editing && !readOnly ? (fileScope ?? null) : null);
+  const multiScopeFiles = useProjectFileScopes(editing && !readOnly ? multiScopes : null);
+  const projectFiles = multiScopes ? multiScopeFiles : singleScopeFiles;
+  const hasFileScope = multiScopes
+    ? multiScopes.every((s) => !!s.dir)
+    : !!fileScope?.dir;
   // Re-seed the edit form only when we *enter* edit mode. We deliberately do
   // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
   // `task.backlog` into fresh objects (new array references) on every tick, so
@@ -5410,7 +5428,7 @@ function BacklogItemRow({
             paint, see AtHighlightBackdrop's doc. Popover anchors above (the
             tray sits at the panel's bottom edge). */}
         <div className="relative">
-          {fileScope && (
+          {hasFileScope && (
             <AtHighlightBackdrop textareaRef={editorRef} value={draft} validPaths={projectFiles.validPaths} />
           )}
           <Textarea
@@ -5421,7 +5439,7 @@ function BacklogItemRow({
             autoFocus
             className="relative min-h-0 w-full resize-none text-xs"
           />
-          {fileScope && (
+          {hasFileScope && (
             <AtFileAutocomplete
               entries={projectFiles.entries}
               truncated={projectFiles.truncated}
@@ -5431,6 +5449,7 @@ function BacklogItemRow({
               textareaRef={editorRef}
               placement="above"
               fileScope={fileScope}
+              fileScopes={multiScopes}
             />
           )}
         </div>

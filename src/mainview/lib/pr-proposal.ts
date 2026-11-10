@@ -185,7 +185,10 @@ const REPO_LABEL_RE = /^\s*#{0,6}\s*[*_]{0,2}\s*repository\s*:\s*(.*?)\s*$/i;
  * (`repoNameForPath` preserves it), so stripping it unconditionally dropped
  * the proposal for a directory like `api_`. Asterisks can never appear in a
  * slug (`repoNameForPath` replaces them), so any leftover asterisks are
- * still safe to remove.
+ * still safe to remove. Agents also commonly render the name as an inline
+ * code span (`` Repository: `backend` ``), sometimes nested inside emphasis
+ * (`` **`backend`** ``), so a balanced backtick pair is stripped too — on
+ * repeat, until neither wrapper remains.
  */
 function repositoryLabelValue(raw: string): string {
   let value = raw.trim();
@@ -194,13 +197,23 @@ function repositoryLabelValue(raw: string): string {
   // contain a space, so an underscore/asterisk immediately followed by
   // whitespace is emphasis residue, not part of the name.
   value = value.replace(/^[*_]+\s+/, "").trim();
-  for (const marker of ["**", "__", "*", "_"]) {
-    if (value.length >= marker.length * 2 && value.startsWith(marker) && value.endsWith(marker)) {
-      value = value.slice(marker.length, -marker.length).trim();
-      break;
+  // Wrappers can nest (`**`backend`**`, `` `**backend**` ``); peel one layer
+  // per pass until nothing changes. Bounded so pathological input can't loop.
+  for (let pass = 0; pass < 4; pass++) {
+    const before = value;
+    for (const marker of ["**", "__", "*", "_"]) {
+      if (value.length >= marker.length * 2 && value.startsWith(marker) && value.endsWith(marker)) {
+        value = value.slice(marker.length, -marker.length).trim();
+        break;
+      }
     }
+    if (value.length >= 2 && value.startsWith("`") && value.endsWith("`")) {
+      value = value.slice(1, -1).trim();
+    }
+    value = value.replace(/^\*+|\*+$/g, "").trim();
+    if (value === before) break;
   }
-  return value.replace(/^\*+|\*+$/g, "").trim();
+  return value;
 }
 
 /**

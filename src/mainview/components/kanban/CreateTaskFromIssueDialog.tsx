@@ -17,7 +17,7 @@ import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
 import { RepositoriesDialog } from "./RepositoriesDialog";
-import { repositoryFileScopes, selectionName, type RepoSelection } from "@/lib/repo-selection";
+import { pinPrimaryRepository, repositoryFileScopes, selectionName, type RepoSelection } from "@/lib/repo-selection";
 import { PromptComposer } from "./PromptComposer";
 import { TaskTypePicker } from "./TaskTypePicker";
 
@@ -429,8 +429,11 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
                   onClose={() => setRepositoriesOpen(false)}
                   value={repos}
                   onSave={(next) => {
-                    const primary = context?.path ? [{ path: context.path, root: null }] : [];
-                    setRepos([...primary, ...next.filter((r) => r.path !== context?.path)]);
+                    if (!context) {
+                      setRepos(next);
+                      return;
+                    }
+                    setRepos((cur) => pinPrimaryRepository(context.path, next, cur));
                   }}
                 />
               </div>

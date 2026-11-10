@@ -120,3 +120,29 @@ export function collapseToProject(path: string, previous: RepoSelection[]): Repo
   const known = previous.find((e) => e.path === path);
   return [known ?? { path, root: null }];
 }
+
+/**
+ * Merge the repositories dialog's saved selection back into a selection with a
+ * fixed primary repository — the create-from-issue dialog's issue repo, which
+ * is always first and cannot be removed. A per-repository base ref the user
+ * set for it (in this dialog round or an earlier one) is preserved: rebuilding
+ * the entry from only its path silently dropped the pin, so the issue's own
+ * repository always branched from HEAD regardless of what the user picked.
+ */
+export function pinPrimaryRepository(
+  path: string,
+  next: readonly RepoSelection[],
+  previous: readonly RepoSelection[] = [],
+): RepoSelection[] {
+  const chosen = next.find((e) => e.path === path);
+  const prior = previous.find((e) => e.path === path);
+  const baseRef = chosen?.baseRef ?? prior?.baseRef;
+  return [
+    {
+      path,
+      root: chosen?.root ?? prior?.root ?? null,
+      ...(baseRef === undefined ? {} : { baseRef }),
+    },
+    ...next.filter((e) => e.path !== path),
+  ];
+}

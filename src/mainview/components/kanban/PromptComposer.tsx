@@ -15,7 +15,7 @@ import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
-import { useProjectFiles, useProjectFileScopes, searchProjectFiles, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
+import { useProjectFiles, useProjectFileScopes, searchProjectFiles, resolveNamedScopePath, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { unresolvedAtTokens, isSafeClientRelPath, isListedPath } from "@/lib/at-highlight";
 
@@ -634,13 +634,51 @@ export function PromptComposer({
   // fresh array per keystroke, but an unchanged token set must not re-arm
   // the debounce timer.
   const unlistedKey = unlistedTokens.map((t) => t.path).join("\u0000");
-  useEffect(() => {
+  // Stable identity for the repository scopes, so a fresh-but-equal array
+  // from a parent render never re-arms the effects below.
+  const multiScopesKey = (fileScopes ?? []).map((s) => `${s.name}\0${s.dir}\0${s.ref ?? ""}`).join("\0");
+  // The live scope(s) each unlisted token may exist in on disk, keyed by the
+  // token path (trailing "/" stripped) the warning layer checks. A single live
+  // scope maps plain token paths; a multi task maps each prefixed token to its
+  // own repository scope and strips the workspace prefix — `<dir>/frontend/src/a`
+  // is not a path inside any repository, so the old single-scope stat could
+  // never rescue a gitignored file in a multi-repository task. A token with no
+  // known prefix (or a ref scope, which lists exactly what the worktree will
+  // contain) is skipped, leaving the listing verdict in place.
+  const liveStatTargets = useMemo(() => {
+    if (!hasFileScope) return [];
+    if (multiScope) {
+      const targets = new Map<string, { dir: string; paths: Map<string, string> }>();
+      for (const t of unlistedTokens) {
+        const split = resolveNamedScopePath(fileScopes, t.path);
+        if (!split || (split.scope.ref ?? "").trim()) continue;
+        const local = split.path.replace(/\/+$/, "");
+        const dir = split.scope.dir.trim();
+        if (!local || !dir || !isSafeClientRelPath(local)) continue;
+        let target = targets.get(split.scope.name);
+        if (!target) {
+          target = { dir, paths: new Map() };
+          targets.set(split.scope.name, target);
+        }
+        target.paths.set(local, t.path.replace(/\/+$/, ""));
+      }
+      return [...targets.values()].filter((t) => t.paths.size > 0);
+    }
     const dir = fileScope?.dir?.trim();
-    const live = !!dir && !(fileScope?.ref ?? "").trim();
-    const candidates = live
-      ? [...new Set(unlistedTokens.map((t) => t.path.replace(/\/+$/, "")).filter(isSafeClientRelPath))]
-      : [];
-    if (candidates.length === 0) {
+    if (!dir || (fileScope?.ref ?? "").trim()) return [];
+    const paths = new Map<string, string>();
+    for (const t of unlistedTokens) {
+      const local = t.path.replace(/\/+$/, "");
+      if (local && isSafeClientRelPath(local)) paths.set(local, local);
+    }
+    return paths.size > 0 ? [{ dir, paths }] : [];
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKey/multiScopesKey stand in for the arrays
+  }, [hasFileScope, multiScope, unlistedKey, multiScopesKey, fileScope?.dir, fileScope?.ref]);
+  const liveStatKey = liveStatTargets
+    .map((t) => `${t.dir}\0${[...t.paths.keys()].join("\0")}`)
+    .join("\u0001");
+  useEffect(() => {
+    if (liveStatTargets.length === 0) {
       setExistsOnDisk((prev) => (prev.size ? EMPTY_PATH_SET : prev));
       return;
     }
@@ -649,13 +687,18 @@ export function PromptComposer({
     // unlisted tokens (rare) — this is not a per-keystroke request.
     const timer = setTimeout(async () => {
       try {
-        const refs = await api.resolveRefs(candidates.map((p) => `${dir}/${p}`));
-        if (cancelled) return;
         const found = new Set<string>();
-        for (const r of refs) {
-          if (r.path.startsWith(`${dir}/`)) found.add(r.path.slice(dir!.length + 1).replace(/\/+$/, ""));
-        }
-        setExistsOnDisk(found);
+        await Promise.all(liveStatTargets.map(async (target) => {
+          const refs = await api.resolveRefs([...target.paths.keys()].map((p) => `${target.dir}/${p}`));
+          if (cancelled) return;
+          for (const r of refs) {
+            if (!r.path.startsWith(`${target.dir}/`)) continue;
+            const local = r.path.slice(target.dir.length + 1).replace(/\/+$/, "");
+            const tokenKey = target.paths.get(local);
+            if (tokenKey) found.add(tokenKey);
+          }
+        }));
+        if (!cancelled) setExistsOnDisk(found);
       } catch {
         // Stat unavailable — keep the listing verdict. Worst case is an
         // over-warn on a gitignored path until the next successful check;
@@ -663,8 +706,8 @@ export function PromptComposer({
       }
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKey stands in for unlistedTokens (see above)
-  }, [unlistedKey, fileScope?.dir, fileScope?.ref]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- liveStatKey stands in for liveStatTargets (see above)
+  }, [liveStatKey]);
 
   // --- Truncated-scope verification: per-token server-side search ---------
   // Only relevant once `projectFiles.truncated` is true — a capped listing
@@ -702,7 +745,6 @@ export function PromptComposer({
       clear();
       return;
     }
-    const scope = fileScope!;
     // De-dupe by stripped path (a bare-typed and a slash-typed token for the
     // same path shouldn't cost two round-trips) and cap at 8 so a draft with
     // a pile of unresolved tokens can't fan out unboundedly. Deliberate
@@ -733,7 +775,26 @@ export function PromptComposer({
       const entryPaths = new Set<string>();
       const missing = new Set<string>();
       await Promise.all([...byKey.entries()].map(async ([key, token]) => {
-        const results = await searchProjectFiles(scope, key, 20);
+        // Multi-repository listing: the token must name its workspace first
+        // (`backend/src/a.ts`). Search THAT repository for the repo-local
+        // path — searching the single active repo with the prefixed path
+        // could never match, so every valid prefixed token was falsely
+        // confirmed missing. An unprefixed token can never resolve inside a
+        // multi workspace (the merged listing always prefixes), so it is
+        // confirmed missing without a round trip.
+        const named = multiScope ? resolveNamedScopePath(fileScopes, token.path) : null;
+        if (multiScope && !named) {
+          missing.add(key);
+          return;
+        }
+        const lookupPath = named ? named.path : token.path;
+        const query = lookupPath.replace(/\/+$/, "");
+        const scope = named?.scope ?? fileScope;
+        if (!scope || !query) {
+          missing.add(key);
+          return;
+        }
+        const results = await searchProjectFiles(scope, query, 20);
         if (cancelled) return;
         // `null` means the REQUEST failed (network/server error) — NOT that
         // the server looked and found nothing (see `searchProjectFiles`'s
@@ -743,12 +804,15 @@ export function PromptComposer({
         // missing" and warned on.
         if (results === null) return;
         const rowPaths = new Set(results.map((r) => r.path));
-        if (isListedPath(rowPaths, token.path, token.isDirectory)) {
+        if (isListedPath(rowPaths, lookupPath, token.isDirectory)) {
           listed.add(key);
-          // The exact entry that matched: the token's own path when it hit
-          // directly, else (only possible when the token wasn't typed as a
-          // directory) the listing's slash-suffixed form of it.
-          entryPaths.add(rowPaths.has(token.path) ? token.path : `${key}/`);
+          // The exact listing entry that matched: the token's own path when
+          // it hit directly, else (only possible when the token wasn't typed
+          // as a directory) the listing's slash-suffixed form of it. Re-add
+          // the workspace prefix so `verifiedEntryPaths` stays in the same
+          // `<name>/…` shape as `projectFiles.validPaths`.
+          const matched = rowPaths.has(lookupPath) ? lookupPath : `${query}/`;
+          entryPaths.add(named ? `${named.scope.name}/${matched}` : matched);
         } else {
           missing.add(key);
         }
@@ -759,8 +823,8 @@ export function PromptComposer({
       setCheckedMissing(missing);
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKeyForVerify stands in for unlistedTokens; fileScope read via closure, keyed by dir/ref below
-  }, [projectFiles.truncated, hasFileScope, unlistedKeyForVerify, fileScope?.dir, fileScope?.ref]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKeyForVerify/multiScopesKey stand in for the arrays; fileScope/fileScopes read via closure, keyed below
+  }, [projectFiles.truncated, hasFileScope, unlistedKeyForVerify, multiScopesKey, multiScope, fileScope?.dir, fileScope?.ref]);
 
   const unresolvedWarning = useMemo(() => {
     const seen = new Set<string>();
@@ -836,6 +900,7 @@ export function PromptComposer({
           textareaRef={ref}
           placement={placement}
           fileScope={fileScope}
+          fileScopes={multiScope ? fileScopes : null}
         />
       )}
       {inputAdornment}

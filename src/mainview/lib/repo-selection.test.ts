@@ -4,6 +4,7 @@ import {
   collapseToProject,
   dedupeSelections,
   issueProjectPath,
+  pinPrimaryRepository,
   repositoryFileScopes,
   selectionName,
   selectionNames,
@@ -137,5 +138,46 @@ describe("collapseToProject", () => {
     expect(collapseToProject("/b", prev)).toEqual([{ path: "/b", root: "/b" }]);
     expect(collapseToProject("/c", prev)).toEqual([{ path: "/c", root: null }]);
     expect(collapseToProject("", prev)).toEqual([]);
+  });
+});
+
+describe("pinPrimaryRepository", () => {
+  test("keeps the fixed primary first and appends the dialog's extras", () => {
+    expect(pinPrimaryRepository("/repos/issue", [
+      { path: "/repos/issue", root: "/repos/issue" },
+      { path: "/repos/api", root: "/repos/api" },
+    ])).toEqual([
+      { path: "/repos/issue", root: "/repos/issue" },
+      { path: "/repos/api", root: "/repos/api" },
+    ]);
+  });
+
+  test("preserves a base ref chosen for the primary in the dialog round", () => {
+    // Review S1: rebuilding the issue entry from only its path silently
+    // dropped the user's pinned base, so the issue's repo always used HEAD.
+    const next = [
+      { path: "/repos/issue", root: "/repos/issue", baseRef: "release/1.2" },
+      { path: "/repos/api", root: "/repos/api", baseRef: "main" },
+    ];
+    expect(pinPrimaryRepository("/repos/issue", next, [])).toEqual([
+      { path: "/repos/issue", root: "/repos/issue", baseRef: "release/1.2" },
+      { path: "/repos/api", root: "/repos/api", baseRef: "main" },
+    ]);
+  });
+
+  test("falls back to the previously stored base ref when the dialog omits it", () => {
+    const previous = [{ path: "/repos/issue", root: "/repos/issue", baseRef: "develop" }];
+    expect(pinPrimaryRepository("/repos/issue", [{ path: "/repos/api", root: "/repos/api" }], previous)).toEqual([
+      { path: "/repos/issue", root: "/repos/issue", baseRef: "develop" },
+      { path: "/repos/api", root: "/repos/api" },
+    ]);
+  });
+
+  test("never duplicates the primary when the dialog also returns it", () => {
+    const out = pinPrimaryRepository("/repos/issue", [
+      { path: "/repos/api", root: "/repos/api" },
+      { path: "/repos/issue", root: "/repos/issue" },
+    ]);
+    expect(out.map((e) => e.path)).toEqual(["/repos/issue", "/repos/api"]);
   });
 });

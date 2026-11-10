@@ -173,6 +173,28 @@ export interface NamedFileScope extends FileScope {
 }
 
 /**
+ * Resolve a multi-repository `@` token/query to the repository scope it names.
+ * A multi listing prefixes every entry with its workspace name
+ * (`uniqueRepoSlugs`), so the first path segment must equal one of `scopes`'
+ * names. Returns that scope plus the repo-local remainder (a trailing slash is
+ * preserved, so directory tokens keep their shape), or `null` for an
+ * unprefixed path / unknown name — neither can resolve inside the multi
+ * workspace, where only `<name>/<path>` exists.
+ */
+export function resolveNamedScopePath(
+  scopes: readonly NamedFileScope[] | null | undefined,
+  path: string,
+): { scope: NamedFileScope; path: string } | null {
+  if (!scopes || scopes.length === 0 || !path) return null;
+  const slash = path.indexOf("/");
+  if (slash <= 0) return null;
+  const name = path.slice(0, slash);
+  const scope = scopes.find((s) => s.name === name);
+  if (!scope) return null;
+  return { scope, path: path.slice(slash + 1) };
+}
+
+/**
  * Loads the union of several repository scopes for a multi-repository task's
  * `@` popover. Each scope keeps its own cache entry (so a single scope still
  * renders instantly from the shared cache); entries are prefixed with
@@ -370,4 +392,54 @@ export async function searchProjectFiles(scope: FileScope, q: string, limit = 50
     }
     return null;
   }
+}
+
+/**
+ * {@link searchProjectFiles} for a multi-repository listing. A query that
+ * starts with a known workspace name (`backend/src/ap`) searches only that
+ * repository, with the prefix stripped — the prefix is a client-side layout
+ * alias, not part of the repository's own file tree. An unprefixed query
+ * searches every repository; each result is re-prefixed with its workspace
+ * name so remote rows keep the exact shape of the merged client listing.
+ *
+ * Resolves to `null` only when EVERY targeted request failed (the caller must
+ * keep "unproven" distinct from "confirmed missing"); a partial failure keeps
+ * the answers that did succeed. A named query with nothing after the prefix
+ * resolves to `[]` — the client already has every entry under that prefix, so
+ * a full-listing search would have nothing to narrow.
+ */
+export async function searchProjectFileScopes(
+  scopes: readonly NamedFileScope[] | null | undefined,
+  q: string,
+  limit = 50,
+): Promise<FileEntry[] | null> {
+  const list = scopes ?? [];
+  if (list.length === 0) return [];
+  const named = resolveNamedScopePath(list, q);
+  const targets = named
+    ? [{ scope: named.scope, local: named.path.replace(/\/+$/, "") }]
+    : list.map((scope) => ({ scope, local: q }));
+  if (targets.length === 0 || targets.some((t) => !t.local)) return [];
+  const results = await Promise.all(
+    targets.map(async (t) => ({ ...t, rows: await searchProjectFiles(t.scope, t.local, limit) })),
+  );
+  if (results.every((r) => r.rows === null)) return null;
+  // Interleave the per-repository rankings instead of concatenating them:
+  // concatenation let the first repository's `limit` rows hide every later
+  // repository's matches entirely. Round-robin keeps the top of each
+  // repository's ranking visible while still honoring the overall cap.
+  const successes = results.filter((r) => r.rows !== null) as Array<{ scope: NamedFileScope; rows: FileEntry[] }>;
+  const out: FileEntry[] = [];
+  for (let i = 0; out.length < limit; i++) {
+    let added = false;
+    for (const r of successes) {
+      const row = r.rows[i];
+      if (!row) continue;
+      out.push({ path: `${r.scope.name}/${row.path}`, isDirectory: row.isDirectory });
+      added = true;
+      if (out.length >= limit) break;
+    }
+    if (!added) break;
+  }
+  return out;
 }

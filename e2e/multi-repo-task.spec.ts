@@ -36,6 +36,7 @@ const CONVERGE_TIMEOUT = 30_000;
 let repoA: string;
 let repoB: string;
 let taskId: string;
+let singleTaskId: string;
 
 function git(cwd: string, args: string[]): void {
   execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -73,12 +74,29 @@ test.beforeAll(async ({ backend, request }) => {
   });
   expect(res.ok()).toBe(true);
   taskId = ((await res.json()) as { id: string }).id;
+
+  // A second, single-repository task gives the per-task reset test something
+  // to switch to and back from without changing the multi row under test.
+  const single = await request.post(`${backend.apiBase}/tasks`, {
+    headers: auth,
+    data: {
+      title: "Single repository e2e",
+      prompt: "make the change",
+      agent: "claude-code",
+      workdir: repoA,
+      isolation: "worktree",
+    },
+  });
+  expect(single.ok()).toBe(true);
+  singleTaskId = ((await single.json()) as { id: string }).id;
 });
 
 test.afterAll(async ({ backend, request }) => {
   const auth = { authorization: `Bearer ${backend.apiToken}` };
-  if (taskId) {
-    await request.delete(`${backend.apiBase}/tasks/${taskId}`, { headers: auth }).catch(() => {});
+  for (const id of [taskId, singleTaskId]) {
+    if (id) {
+      await request.delete(`${backend.apiBase}/tasks/${id}`, { headers: auth }).catch(() => {});
+    }
   }
   for (const dir of [repoA, repoB]) {
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -170,6 +188,34 @@ test("the terminal section defaults to the workspace and follows the repository 
   const name = uniqueRepoSlugs([repoA, repoB])[1]!;
   await page.getByTestId(`run-repo-tab-${name}`).click();
   await expect(select).toHaveValue(name);
+});
+
+test("the selected repository tab resets on a task switch (sibling of the allPrsBusy reset)", async ({ backend, page }) => {
+  // Review S4 regression: `repoTab`/`allPrsBusy` are RunPanelBody-local state
+  // and the panel is not remounted between tasks. Without the `[task.id]`
+  // reset, task B opens on task A's tab (and could inherit A's in-flight
+  // "Creating PRs…" flag). Selecting the second tab here then switching away
+  // and back proves the selection is reset, not carried over.
+  await gotoApp(page, backend.bootBase);
+  const [firstName, secondName] = uniqueRepoSlugs([repoA, repoB]);
+  await page.getByText("Multi repository e2e", { exact: true }).first().click();
+  const firstTab = page.getByTestId(`run-repo-tab-${firstName}`);
+  const secondTab = page.getByTestId(`run-repo-tab-${secondName}`);
+  await expect(firstTab).toHaveAttribute("aria-selected", "true", { timeout: CONVERGE_TIMEOUT });
+
+  await secondTab.click();
+  await expect(secondTab).toHaveAttribute("aria-selected", "true");
+
+  // Switch tasks WITHOUT closing the panel: dispatching the card's click
+  // bypasses the panel's backdrop (which would normally intercept a board
+  // click). This is the exact path the reset protects — RunPanelBody stays
+  // mounted and receives a new `task` prop.
+  await page.getByText("Single repository e2e", { exact: true }).first().dispatchEvent("click");
+  await expect(secondTab).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+  await page.getByText("Multi repository e2e", { exact: true }).first().dispatchEvent("click");
+
+  await expect(firstTab).toHaveAttribute("aria-selected", "true", { timeout: CONVERGE_TIMEOUT });
+  await expect(secondTab).toHaveAttribute("aria-selected", "false");
 });
 
 test("archive detaches both clean worktrees and keeps the branches", async ({ backend, request }) => {

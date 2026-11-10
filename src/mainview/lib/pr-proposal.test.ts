@@ -571,6 +571,30 @@ describe("multi-repository proposals", () => {
     expect(map.get("agetor_api")?.title).toBe("API");
   });
 
+  test("inline-code-wrapped labels keep their proposal (backticks and nested emphasis)", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const block = (label: string, title: string) => [
+      label,
+      LINK,
+      "PR title:",
+      "```",
+      title,
+      "```",
+      "PR description:",
+      "````",
+      "Body.",
+      "````",
+    ].join("\n");
+    const map = parseRepositoryProposals([
+      block("Repository: `frontend`", "UI"),
+      block("**Repository: `backend`**", "API"),
+      block("Repository: **`infra`**", "Infra"),
+    ].join("\n\n"));
+    expect([...map.keys()]).toEqual(["frontend", "backend", "infra"]);
+    expect(map.get("backend")?.title).toBe("API");
+    expect(map.get("infra")?.title).toBe("Infra");
+  });
+
   test("tolerates a missing label only when exactly one proposal exists", () => {
     const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
     const events = [ev({ data: canonicalText() })];

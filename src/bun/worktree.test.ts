@@ -2452,3 +2452,49 @@ test("resolveWorktreeRef accepts direct and nested ids and refuses traversal", a
     expect(resolveWorktreeRef(bad).ok).toBe(false);
   }
 });
+
+describe("workspaceHasOnlyAgetorScratch", () => {
+  const scratch = async () => {
+    const { workspaceHasOnlyAgetorScratch } = await import("./worktree.ts");
+    return workspaceHasOnlyAgetorScratch;
+  };
+
+  test("missing, empty, and settings-only workspaces are reclaimable", async () => {
+    const hasOnlyScratch = await scratch();
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-ws-scratch-"));
+    try {
+      expect(hasOnlyScratch(path.join(dir, "missing"))).toBe(false);
+      expect(hasOnlyScratch(dir)).toBe(true);
+      mkdirSync(path.join(dir, ".claude"));
+      expect(hasOnlyScratch(dir)).toBe(true);
+      writeFileSync(path.join(dir, ".claude", "settings.local.json"), "{}\n");
+      expect(hasOnlyScratch(dir)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("any real content keeps the workspace (including inside .claude)", async () => {
+    const hasOnlyScratch = await scratch();
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-ws-content-"));
+    try {
+      writeFileSync(path.join(root, "notes.md"), "keep me\n");
+      expect(hasOnlyScratch(root)).toBe(false);
+
+      // The review nit: a `.claude` holding more than agetor's own settings
+      // file is agent/user data, so the boot sweep must not enqueue a no-op
+      // teardown for it on every boot.
+      const onlyClaude = mkdtempSync(path.join(tmpdir(), "agetor-ws-claude-"));
+      try {
+        mkdirSync(path.join(onlyClaude, ".claude"));
+        writeFileSync(path.join(onlyClaude, ".claude", "settings.local.json"), "{}\n");
+        writeFileSync(path.join(onlyClaude, ".claude", "history.jsonl"), "{}\n");
+        expect(hasOnlyScratch(onlyClaude)).toBe(false);
+      } finally {
+        rmSync(onlyClaude, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

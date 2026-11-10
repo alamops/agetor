@@ -1592,6 +1592,37 @@ function pruneWorkspaceScratch(dir: string): void {
 }
 
 /**
+ * True when a task workspace holds nothing but agetor's own scratch: no
+ * entries at all, or only a `.claude` directory containing just
+ * `settings.local.json`. `false` for any agent/user artifact (including any
+ * other file or directory inside `.claude`), a missing/unreadable root, or a
+ * `.claude` that isn't a directory.
+ *
+ * The boot sweep uses this to decide whether a teardown job would still have
+ * something to do. Checking only for the `.claude` entry itself treated a
+ * workspace left with real agent content inside `.claude` as reclaimable and
+ * re-enqueued a no-op teardown on every boot.
+ */
+export function workspaceHasOnlyAgetorScratch(dir: string): boolean {
+  let entries: string[];
+  try {
+    if (!lstatSync(dir).isDirectory()) return false;
+    entries = readdirSync(dir);
+  } catch {
+    return false; // missing or unreadable — nothing to reclaim
+  }
+  if (entries.length === 0) return true;
+  if (entries.some((entry) => entry !== ".claude")) return false;
+  try {
+    const claudeDir = path.join(dir, ".claude");
+    if (!lstatSync(claudeDir).isDirectory()) return false;
+    return readdirSync(claudeDir).every((entry) => entry === "settings.local.json");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Remove a multi-repository workspace root only when nothing else is left in
  * it (never a recursive wipe — an agent may have written notes or artifacts
  * the user still wants). Agetor's own `.claude/settings.local.json` scratch
@@ -1603,21 +1634,8 @@ function pruneWorkspaceScratch(dir: string): void {
  * after its last repository child is deleted.
  */
 export function removeWorkspaceIfEmpty(dir: string): void {
-  let entries: string[];
-  try {
-    if (!lstatSync(dir).isDirectory()) return;
-    entries = readdirSync(dir);
-  } catch {
-    return; // missing or unreadable — nothing to do
-  }
-  // Only `.claude` left: it may be entirely agetor's settings scratch, which
-  // would otherwise keep the root alive forever. Anything else means real
-  // content (a still-present repository checkout, or agent artifacts) — leave
-  // the directory and its settings alone.
-  if (entries.length > 0) {
-    if (entries.some((entry) => entry !== ".claude")) return;
-    pruneWorkspaceScratch(dir);
-  }
+  if (!workspaceHasOnlyAgetorScratch(dir)) return;
+  pruneWorkspaceScratch(dir);
   try {
     if (readdirSync(dir).length === 0) rmdirSync(dir);
   } catch {

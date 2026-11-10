@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { iconForRef } from "@/lib/file-icons";
 import { cn } from "@/lib/utils";
-import { searchProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { searchProjectFiles, searchProjectFileScopes, resolveNamedScopePath, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { findActiveAtQuery, formatAtToken, MAX_PROJECT_FILES } from "../../../shared/at-refs.ts";
 import { descendInto, filterFileEntries, fuzzyPathMatch, type FileEntry } from "../../../shared/at-file-filter.ts";
 
@@ -32,6 +32,13 @@ interface Props {
    *  rows over the capped `entries` only, with the "keep typing to narrow"
    *  footer. */
   fileScope?: FileScope | null;
+  /** Every repository scope for a multi-repository listing (issue #291). When
+   *  2+ are present the truncated-mode search runs over those scopes instead
+   *  of `fileScope`: a prefixed query (`backend/src/`) searches that
+   *  repository with the prefix stripped, and an unprefixed query searches
+   *  every repository, re-prefixing each row so the popover commits a token in
+   *  the same `<name>/…` shape as the merged client listing. */
+  fileScopes?: NamedFileScope[] | null;
   /** The base listing's failure message (`useProjectFiles().error`). When an
    *  `@` query is active and there are no entries to suggest, the popover
    *  renders this as a non-interactive notice instead of silently never
@@ -97,7 +104,7 @@ function landCaret(el: HTMLTextAreaElement, caret: number, next: string) {
  * misreports a real search as "nothing found" — while a request is in flight
  * or unavailable.
  */
-export function AtFileAutocomplete({ entries, truncated, value, onChange, textareaRef, placement = "below", fileScope, error }: Props) {
+export function AtFileAutocomplete({ entries, truncated, value, onChange, textareaRef, placement = "below", fileScope, fileScopes, error }: Props) {
   const [caret, setCaret] = useState<number>(0);
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLUListElement>(null);
@@ -144,7 +151,16 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
   // Only consulted when the base listing is `truncated` AND a scope is
   // known — otherwise this whole block is inert (no timer, no fetch) and
   // `rows` below is just `filtered`, byte-identical to before this feature.
-  const scopeKey = fileScope ? `${fileScope.dir}\0${fileScope.ref ?? ""}` : null;
+  // A multi-repository listing searches its named scopes instead (see
+  // `searchProjectFileScopes`): one scope when the query carries a workspace
+  // prefix, all of them otherwise, with every row re-prefixed so committing a
+  // remote row still inserts a valid `<name>/…` token.
+  const multiScopes = (fileScopes?.length ?? 0) > 1 ? fileScopes! : null;
+  const scopeKey = multiScopes
+    ? multiScopes.map((s) => `${s.name}\0${s.dir}\0${s.ref ?? ""}`).join("\0")
+    : fileScope
+      ? `${fileScope.dir}\0${fileScope.ref ?? ""}`
+      : null;
   const [remoteResult, setRemoteResult] = useState<{ scopeKey: string; query: string; rows: FileEntry[] } | null>(null);
   useEffect(() => {
     // A query under 2 chars (a bare `@`, or one typed char) isn't worth a
@@ -153,7 +169,7 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
     // just fine (there's rarely a meaningful narrowing at that length
     // anyway). The verification effect in `PromptComposer` is unaffected: its
     // queries are always full token paths, never this short.
-    if (!truncated || !fileScope || !slice || !scopeKey || slice.query.length < 2) {
+    if (!truncated || (!fileScope && !multiScopes) || !slice || !scopeKey || slice.query.length < 2) {
       setRemoteResult(null);
       return;
     }
@@ -163,10 +179,27 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
     // resolves — `cancelled` (below) is still the actual staleness guard;
     // these are just what gets tagged onto the eventual result.
     const scope = fileScope;
+    const scopes = multiScopes;
     const answeredScopeKey = scopeKey;
+    // A bare workspace prefix (`frontend/`) has no repo-local query to rank:
+    // the client listing already holds everything under it, and
+    // `searchProjectFileScopes` answers `[]` there — which the empty-answer
+    // rule below would wrongly treat as authoritative and blank the popover.
+    // Keep the client-filtered rows instead; the next typed character narrows
+    // the query and re-enables remote search.
+    if (scopes) {
+      const named = resolveNamedScopePath(scopes, query);
+      if (named && !named.path.replace(/\/+$/, "")) {
+        setRemoteResult(null);
+        return;
+      }
+    }
     let cancelled = false;
     const timer = setTimeout(() => {
-      searchProjectFiles(scope, query, 50).then((rows) => {
+      const search = scopes
+        ? searchProjectFileScopes(scopes, query, 50)
+        : searchProjectFiles(scope!, query, 50);
+      search.then((rows) => {
         if (cancelled) return; // superseded by a newer slice/scope — drop it
         // `null` means the REQUEST failed (see searchProjectFiles's doc), not
         // that the server found nothing — never treat it as an answer. Leave

@@ -292,6 +292,7 @@ import {
   planTeardownBranches,
   resolveDefaultBranchName,
   removeWorkspaceIfEmpty,
+  workspaceHasOnlyAgetorScratch,
   type PreparedWorkdir,
 } from "./worktree.ts";
 import { resolveRepositorySet, branchesPinnedByOtherTasks } from "./task-repos.ts";
@@ -12426,12 +12427,13 @@ export function sweepArchivedTeardowns(): number {
       // previous teardown may have removed every repository worktree but
       // failed to clear agetor's `.claude` scratch from the root. The job's
       // per-repo detach is idempotent and `removeWorkspaceIfEmpty` then
-      // reclaims the root. Anything else in the root (agent artifacts) means
-      // the workspace is intentionally retained, so skip it rather than
-      // enqueueing a no-op job every boot.
+      // reclaims the root. Anything else in the root (agent artifacts —
+      // including anything besides agetor's own settings file inside
+      // `.claude`) means the workspace is intentionally retained, so skip it
+      // rather than enqueueing a no-op job every boot.
       let onlyScratchLeft = false;
       try {
-        onlyScratchLeft = readdirSync(workspacePathFor(task)).every((entry) => entry === ".claude");
+        onlyScratchLeft = workspaceHasOnlyAgetorScratch(workspacePathFor(task));
       } catch {
         /* no workspace root */
       }
