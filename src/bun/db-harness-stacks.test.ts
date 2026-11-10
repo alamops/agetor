@@ -372,3 +372,55 @@ describe("084 tables and tasks.harness_state", () => {
     expect(older).toBeTruthy();
   });
 });
+
+describe("boot normalization re-reads the row (088 review N1)", () => {
+  test("a row re-keyed after the pass listed it is never overwritten from the stale snapshot", () => {
+    const taskId = seedTask();
+    const s1 = "aaaaaaaa-0000-4000-8000-000000000001";
+    const s2 = "aaaaaaaa-0000-4000-8000-000000000002";
+    const s3 = "aaaaaaaa-0000-4000-8000-000000000003";
+    // A pre-088 row: session s2 still listing s1's transcript.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: "claude-n1", columnName: "claude_session_id", sessionId: s2,
+      copiedPaths: [`/r/projects/e/${s1}.jsonl`, `/r/projects/e/${s2}.jsonl`], createdAt: 5,
+    });
+    const snapshot = dbm.harnessSessionHandoffs.listAll().find((r) => r.taskId === taskId)!;
+    // A transfer re-keys it before the pass reaches it.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: "claude-n1", columnName: "claude_session_id", sessionId: s3,
+      copiedPaths: [`/r/projects/e/${s3}.jsonl`], createdAt: 9,
+    });
+    expect(dbm.harnessSessionHandoffs.orphanMismatchedPaths(snapshot.taskId, snapshot.harnessId, snapshot.columnName)).toBe(0);
+    expect(dbm.harnessSessionHandoffs.get(taskId, "claude-n1", "claude_session_id")).toMatchObject({
+      sessionId: s3,
+      copiedPaths: [`/r/projects/e/${s3}.jsonl`],
+    });
+    // The re-key labelled each old path with the session it names.
+    expect(
+      dbm.harnessOrphanedCopies.list({ harnessId: "claude-n1" }).map((r) => [r.sessionId, r.path]).sort(),
+    ).toEqual([
+      [s1, `/r/projects/e/${s1}.jsonl`],
+      [s2, `/r/projects/e/${s2}.jsonl`],
+    ]);
+    dbm.harnessOrphanedCopies.deleteForHarness("claude-n1");
+  });
+
+  test("a row stamped 0 is left alone; a completed one is split atomically", () => {
+    const taskId = seedTask();
+    const s1 = "bbbbbbbb-0000-4000-8000-000000000001";
+    const s2 = "bbbbbbbb-0000-4000-8000-000000000002";
+    const mixed = [`/r/projects/e/${s1}.jsonl`, `/r/projects/e/${s2}.jsonl`];
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: "claude-n1b", columnName: "claude_session_id", sessionId: s2, copiedPaths: mixed, createdAt: 0,
+    });
+    expect(dbm.harnessSessionHandoffs.orphanMismatchedPaths(taskId, "claude-n1b", "claude_session_id")).toBe(0);
+    expect(dbm.harnessSessionHandoffs.get(taskId, "claude-n1b", "claude_session_id")?.copiedPaths).toEqual(mixed);
+    dbm.db.run(`UPDATE harness_session_handoffs SET created_at = 7 WHERE task_id = ?`, [taskId]);
+    expect(dbm.harnessSessionHandoffs.orphanMismatchedPaths(taskId, "claude-n1b", "claude_session_id")).toBe(1);
+    expect(dbm.harnessSessionHandoffs.get(taskId, "claude-n1b", "claude_session_id")?.copiedPaths).toEqual(mixed.slice(1));
+    expect(dbm.harnessOrphanedCopies.list({ harnessId: "claude-n1b" })).toEqual([
+      expect.objectContaining({ sessionId: s1, path: mixed[0] }),
+    ]);
+    dbm.harnessOrphanedCopies.deleteForHarness("claude-n1b");
+  });
+});

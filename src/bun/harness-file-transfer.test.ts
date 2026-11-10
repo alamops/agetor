@@ -265,7 +265,7 @@ describe("rootRedirectRefusal (contract CR4)", () => {
 });
 
 describe("removeCopiedPathsDetailed shouldStop", () => {
-  test("stops before the next file once asked, retaining the rest", async () => {
+  test("asked before the first file: a yes retains everything, a no removes everything", async () => {
     const { mkdtempSync, mkdirSync, writeFileSync, existsSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const path = (await import("node:path")).default;
@@ -276,11 +276,14 @@ describe("removeCopiedPathsDetailed shouldStop", () => {
     mkdirSync(dir, { recursive: true });
     const files = ["a.jsonl", "b.jsonl", "c.jsonl"].map((n) => path.join(dir, n));
     for (const f of files) writeFileSync(f, "x");
+    const stopped = await ft.removeCopiedPathsDetailed(files, root, "claude-code", sid, { shouldStop: () => true });
+    expect(stopped.removed).toEqual([]);
+    expect(stopped.retained).toEqual(files);
+    for (const f of files) expect(existsSync(f)).toBe(true);
     let calls = 0;
-    const result = await ft.removeCopiedPathsDetailed(files, root, "claude-code", sid, { shouldStop: () => ++calls > 1 });
-    expect(result.removed).toEqual(files.slice(0, 1));
-    expect(result.retained).toEqual(files.slice(1));
-    expect(existsSync(files[1]!)).toBe(true);
-    expect(existsSync(files[2]!)).toBe(true);
+    const done = await ft.removeCopiedPathsDetailed(files, root, "claude-code", sid, { shouldStop: () => (calls++, false) });
+    expect(done.removed).toEqual(files);
+    // Asked once, not per file: nothing else can run between two yields.
+    expect(calls).toBe(1);
   });
 });

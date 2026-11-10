@@ -893,8 +893,8 @@ export interface RemoveCopiesResult {
  *
  * Cooperative: it yields to the shared event loop every ~20 ms, because a
  * handoff with large sidecars can record thousands of files. `shouldStop` is
- * asked before each file; once it says yes, the rest are `retained`. Never
- * throws.
+ * asked before the first file and after every yield; once it says yes, the
+ * rest are `retained`. Never throws.
  */
 export async function removeCopiedPathsDetailed(
   paths: readonly string[],
@@ -914,18 +914,22 @@ export async function removeCopiedPathsDetailed(
     return out;
   }
   let lastYield = Date.now();
+  // Nothing else runs between two yields, so `shouldStop` is asked before the
+  // first file and again after every yield: its answer cannot change in
+  // between, and each unlink follows a check with no await in between.
+  let mustCheck = true;
   for (let i = 0; i < valid.length; i++) {
     const p = valid[i]!;
     if (Date.now() - lastYield >= YIELD_EVERY_MS) {
       await Bun.sleep(0);
       lastYield = Date.now();
+      mustCheck = true;
     }
-    // Checked in the same synchronous step as the unlink below, so nothing a
-    // caller cares about can start between the check and the removal.
-    if (opts.shouldStop?.()) {
+    if (mustCheck && opts.shouldStop?.()) {
       out.retained.push(...valid.slice(i));
       break;
     }
+    mustCheck = false;
     const resolved = path.resolve(p);
     const rel = path.relative(resolvedRoot, resolved);
     if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {

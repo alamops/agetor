@@ -967,7 +967,8 @@ source account's config root to the destination's (adapters: Claude, Codex).
 handoff row can clean up any more, each with the session it was copied for:
 
 - the old session's paths when a row is **re-keyed** to another session (the
-  same task moved onto the same account again), at the transfer's final upsert;
+  same task moved onto the same account again), at the transfer's final upsert,
+  each labelled with the session its shape names (`addLabelled`);
 - the paths a transfer onto an account with another session's row is about to
   create (*pending*, reclaimed onto the row when the copy succeeds), and
   whatever a **failed first transfer** recorded (`harnessSessionHandoffs.abandon`);
@@ -991,8 +992,9 @@ cooperative and never reject. They run:
   (`sweepOrphanedHandoffCopiesAtBoot`). It first normalizes rows written before
   088: a path on a handoff row whose shape names another session
   (`handoffCopySessionIdFromPath`, which prefers the row's own session) moves
-  to the orphan store under that session, one transaction per row; a row
-  stamped 0 (a transfer that never completed) is skipped, because its old
+  to the orphan store under that session, in one transaction per row that
+  re-reads the row first (the pass yields, and a transfer may change a row
+  meanwhile); a row stamped 0 (a transfer that never completed) is skipped, because its old
   session is still the one a resume uses;
 - after a successful transfer, for the superseded session; after a failed one,
   for the session it recorded;

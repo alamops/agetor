@@ -954,7 +954,8 @@ async function sweepOnce(
  * under that session, in one transaction per row. A row stamped 0 is skipped:
  * it is a transfer that never completed, and its OLD session is still the one
  * a resume uses, so those files must stay. Idempotent; a path whose session
- * cannot be read stays. Cooperative: yields every ~20 ms.
+ * cannot be read stays. Cooperative: yields every ~20 ms; each row is re-read
+ * inside its own transaction (`orphanMismatchedPaths`).
  */
 export async function adoptMismatchedHandoffPaths(): Promise<number> {
   let moved = 0;
@@ -964,23 +965,9 @@ export async function adoptMismatchedHandoffPaths(): Promise<number> {
       await Bun.sleep(0);
       lastYield = Date.now();
     }
-    if (row.createdAt === 0) continue;
-    const kind: HarnessStackKind = row.columnName === CODEX_SESSION_COLUMN ? "codex" : "claude-code";
-    const keep: string[] = [];
-    const bySession = new Map<string, string[]>();
-    for (const p of row.copiedPaths) {
-      const sid = handoffCopySessionIdFromPath(kind, path.resolve(p), row.sessionId);
-      if (sid !== null && sid !== row.sessionId) {
-        const list = bySession.get(sid) ?? [];
-        list.push(p);
-        bySession.set(sid, list);
-      } else {
-        keep.push(p);
-      }
-    }
-    if (bySession.size === 0) continue;
-    harnessSessionHandoffs.orphanPaths(row, bySession, keep);
-    for (const paths of bySession.values()) moved += paths.length;
+    // Re-read and rewritten atomically by the store: the listing above is a
+    // snapshot and a transfer may have changed the row while this pass yielded.
+    moved += harnessSessionHandoffs.orphanMismatchedPaths(row.taskId, row.harnessId, row.columnName);
   }
   return moved;
 }

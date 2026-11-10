@@ -2453,12 +2453,7 @@ export const harnessSessionHandoffs = {
         // never be removed from here. They move to the orphan store under
         // their own session id, where a sweep removes them.
         const incoming = new Set(handoff.copiedPaths);
-        harnessOrphanedCopies.add(
-          existing.harnessId,
-          existing.columnName,
-          existing.sessionId,
-          existing.copiedPaths.filter((p) => !incoming.has(p)),
-        );
+        harnessOrphanedCopies.addLabelled(existing, existing.copiedPaths.filter((p) => !incoming.has(p)));
         copiedPaths = [...incoming];
       } else {
         copiedPaths = [...new Set([...(existing?.copiedPaths ?? []), ...handoff.copiedPaths])];
@@ -2505,17 +2500,39 @@ export const harnessSessionHandoffs = {
       this.deleteOne(taskId, harnessId, column);
     })();
   },
-  /** Move some of a row's paths to the orphan store under the sessions they
-   *  belong to and keep the rest, atomically (the boot normalization; see
-   *  `adoptMismatchedHandoffPaths`). */
-  orphanPaths(row: HarnessSessionHandoff, bySession: ReadonlyMap<string, readonly string[]>, keep: readonly string[]): void {
-    db.transaction(() => {
-      for (const [sid, paths] of bySession) harnessOrphanedCopies.add(row.harnessId, row.columnName, sid, paths);
+  /**
+   * The boot normalization of one row (see `adoptMismatchedHandoffPaths`):
+   * paths whose shape names another session move to the orphan store under
+   * that session, the rest stay. The row is re-read inside the transaction, so
+   * a transfer that re-keyed or extended it since the caller listed it is
+   * never overwritten; a row stamped 0 (a transfer that never completed, whose
+   * old session is still the resumable one) is left alone. Returns the number
+   * of paths moved.
+   */
+  orphanMismatchedPaths(taskId: string, harnessId: string, column: SessionIdColumn): number {
+    return db.transaction(() => {
+      const row = this.get(taskId, harnessId, column);
+      if (!row || row.createdAt === 0) return 0;
+      const kind = column === "codex_session_id" ? "codex" : "claude-code";
+      const keep: string[] = [];
+      const bySession = new Map<string, string[]>();
+      for (const p of row.copiedPaths) {
+        const sid = handoffCopySessionIdFromPath(kind, path.resolve(p), row.sessionId);
+        if (sid !== null && sid !== row.sessionId) bySession.set(sid, [...(bySession.get(sid) ?? []), p]);
+        else keep.push(p);
+      }
+      if (bySession.size === 0) return 0;
+      let moved = 0;
+      for (const [sid, paths] of bySession) {
+        harnessOrphanedCopies.add(row.harnessId, row.columnName, sid, paths);
+        moved += paths.length;
+      }
       db.run(
         `UPDATE harness_session_handoffs SET copied_paths_json = ?
           WHERE task_id = ? AND harness_id = ? AND column_name = ?`,
-        [JSON.stringify([...keep]), row.taskId, row.harnessId, row.columnName],
+        [JSON.stringify(keep), taskId, harnessId, column],
       );
+      return moved;
     })();
   },
   listAll(): HarnessSessionHandoff[] {
@@ -2648,16 +2665,20 @@ export const harnessOrphanedCopies = {
   adoptFromTask(taskId: string): void {
     for (const row of harnessSessionHandoffs.listForTask(taskId)) {
       if (!harnesses.getByIdOrKind(row.harnessId)) continue;
-      // Label each path with the session it names (a pre-088 re-keyed row can
-      // still hold another session's paths); the row's own session wins.
-      const kind = row.columnName === "codex_session_id" ? "codex" : "claude-code";
-      const bySession = new Map<string, string[]>();
-      for (const p of row.copiedPaths) {
-        const sid = handoffCopySessionIdFromPath(kind, path.resolve(p), row.sessionId) ?? row.sessionId;
-        bySession.set(sid, [...(bySession.get(sid) ?? []), p]);
-      }
-      for (const [sid, paths] of bySession) this.add(row.harnessId, row.columnName, sid, paths);
+      this.addLabelled(row, row.copiedPaths);
     }
+  },
+  /** Orphan some of a handoff row's paths, each labelled with the session its
+   *  shape names (a pre-088 re-keyed row can still list another session's
+   *  paths); the row's own session wins, and is the fallback. */
+  addLabelled(row: HarnessSessionHandoff, paths: readonly string[]): void {
+    const kind = row.columnName === "codex_session_id" ? "codex" : "claude-code";
+    const bySession = new Map<string, string[]>();
+    for (const p of paths) {
+      const sid = handoffCopySessionIdFromPath(kind, path.resolve(p), row.sessionId) ?? row.sessionId;
+      bySession.set(sid, [...(bySession.get(sid) ?? []), p]);
+    }
+    for (const [sid, list] of bySession) this.add(row.harnessId, row.columnName, sid, list);
   },
 };
 
