@@ -722,6 +722,8 @@ function describeGlobalEvent(event: GlobalEvent): string {
       return `pipeline:${event.status}`;
     case "send-failed":
       return `send-failed:${event.savedToBacklog}`;
+    case "harness-swap":
+      return `harness-swap:${event.from}->${event.to}`;
     default:
       return assertNever(event);
   }

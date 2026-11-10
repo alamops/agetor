@@ -13,6 +13,7 @@ import {
 } from "./discovery-fs.ts";
 import { diskProjectTree, emptyProjectTree, loadRefProjectTree, type ProjectTree } from "./ref-tree.ts";
 import { copilotHome } from "./copilot-home.ts";
+import { claudeConfigDirFor, claudeJsonDirFor, codexHomeFor } from "./harness-config-root.ts";
 import { repoRoot } from "./worktree.ts";
 
 // `safeReadJsonCached` lives in discovery-fs.ts (the in-process half of the
@@ -239,15 +240,17 @@ function builtinCommands(agent: AgentKind): AvailableCommand[] {
   return builtins.map((b) => ({ name: b.name, description: b.description, source: "builtin", kind: b.kind }));
 }
 
+/** The built-in account's Codex root (process `CODEX_HOME`, else `~/.codex`). */
 function defaultCodexHome(): string {
-  return process.env.CODEX_HOME || path.join(homedir(), ".codex");
+  return codexHomeFor({ home: null, env: null });
 }
 
+/** CODEX_HOME as a spawned codex sees it — the shared resolver that mirrors
+ *  `harnessEnv` (harness-config-root.ts): the env map's CODEX_HOME, then
+ *  `<harnessHome>/.codex`, then the process CODEX_HOME, then an env-map
+ *  HOME's `.codex`, else `~/.codex`. */
 function codexHome(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
-  if (opts.harnessEnv?.CODEX_HOME) return opts.harnessEnv.CODEX_HOME;
-  if (opts.harnessHome) return path.join(opts.harnessHome, ".codex");
-  if (opts.harnessEnv?.HOME) return path.join(opts.harnessEnv.HOME, ".codex");
-  return defaultCodexHome();
+  return codexHomeFor({ home: opts.harnessHome ?? null, env: opts.harnessEnv ?? null });
 }
 
 function codexSystemSkills(home: string, reader: DiscoveryReader): AvailableCommand[] {
@@ -411,14 +414,17 @@ interface DiscoveryData {
   claudeJson: any;
 }
 
-/** CLAUDE_CONFIG_DIR as a spawned claude sees it: the harness home, else `~/.claude`. */
-function claudeConfigDir(opts: { harnessHome?: string | null }): string {
-  return opts.harnessHome ?? path.join(homedir(), ".claude");
+/** CLAUDE_CONFIG_DIR as a spawned claude sees it — the shared resolver that
+ *  mirrors `harnessEnv` (harness-config-root.ts): the env map's override, then
+ *  the harness home, then the process env, else `<HOME>/.claude` (an env-map
+ *  HOME counts). A blank value is unset. */
+function claudeConfigDir(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
+  return claudeConfigDirFor({ home: opts.harnessHome ?? null, env: opts.harnessEnv ?? null });
 }
 
 /** The big config blob lives alongside the config dir as `.claude.json` (in HOME by default). */
-function claudeJsonPath(opts: { harnessHome?: string | null }): string {
-  return opts.harnessHome ? path.join(opts.harnessHome, ".claude.json") : path.join(homedir(), ".claude.json");
+function claudeJsonPath(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
+  return path.join(claudeJsonDirFor({ home: opts.harnessHome ?? null, env: opts.harnessEnv ?? null }), ".claude.json");
 }
 
 /** User-level files each kind's parsers read (everything machine-local). */
@@ -570,10 +576,14 @@ async function prepareDiscovery(opts: DiscoveryOpts, want: { claudeJson: boolean
  * Project entries override user entries by name.
  *
  * `harnessHome` is the harness-level config-dir override (from `Harness.home`):
- *  - claude-code: CLAUDE_CONFIG_DIR=<harnessHome>, so user commands/skills live
- *    directly under it (no `.claude/` segment, matching what spawned claude sees).
- *  - codex: HOME=<harnessHome>, so user prompts live at <harnessHome>/.codex/prompts.
- *    CODEX_HOME in harness env wins when present, matching the spawned process.
+ *  - claude-code: the env map's `CLAUDE_CONFIG_DIR` wins over
+ *    CLAUDE_CONFIG_DIR=<harnessHome> (it wins at spawn too), so user commands/
+ *    skills live under that dir (no `.claude/` segment, matching what spawned
+ *    claude sees); `.claude.json` sits there as well. NULL falls back to the
+ *    process `CLAUDE_CONFIG_DIR`, then `~/.claude`.
+ *  - codex: CODEX_HOME=<harnessHome>/.codex (no HOME override), so user
+ *    prompts live at <harnessHome>/.codex/prompts. An env-map CODEX_HOME wins
+ *    when present, matching the spawned process.
  *  - cursor / fx: an explicit HOME in the harness env wins (it wins at spawn
  *    too — `harnessEnv` applies the env map after the home-derived HOME),
  *    else HOME=<harnessHome>, else the process home; user skills live under
@@ -918,7 +928,7 @@ interface ActivePlugin {
  * (agent/workdir/branch), so re-parsing them every call is cheap enough.
  */
 function readEnabledPlugins(
-  harnessHome: string | null,
+  opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null },
   projectTree: ProjectTree | null,
   reader: DiscoveryReader,
 ): Map<string, boolean> {
@@ -930,9 +940,11 @@ function readEnabledPlugins(
       }
     }
   };
-  // harnessHome IS the CLAUDE_CONFIG_DIR, so settings.json sits directly under
-  // it (mirroring how commands/skills live there sans `.claude/` segment).
-  const userSettingsPath = path.join(claudeConfigDir({ harnessHome }), "settings.json");
+  // Resolve the config dir EXACTLY as the spawned claude does: the harness env
+  // map (a pinned CLAUDE_CONFIG_DIR) wins over the home field. Reading
+  // `settings.json` from `harnessHome` alone made an env-pinned account take
+  // its enabled/disabled plugin map from the wrong file.
+  const userSettingsPath = path.join(claudeConfigDir(opts), "settings.json");
   apply(reader.json(userSettingsPath, { cached: true })?.enabledPlugins);
   if (projectTree) {
     apply(safeParseJson(projectTree.read(".claude/settings.json"))?.enabledPlugins);
@@ -962,7 +974,7 @@ function resolveActivePlugins(
   const installed = reader.json(path.join(configDir, "plugins", "installed_plugins.json"), { cached: true });
   const plugins = installed?.plugins;
   if (!plugins || typeof plugins !== "object") return [];
-  const enabled = readEnabledPlugins(opts.harnessHome ?? null, projectTree, reader);
+  const enabled = readEnabledPlugins(opts, projectTree, reader);
   const roots = new Set([root, opts.workdir].filter(Boolean) as string[]);
   const out: ActivePlugin[] = [];
   for (const [key, recordsRaw] of Object.entries(plugins as Record<string, unknown>)) {

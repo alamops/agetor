@@ -557,6 +557,42 @@ test("a plugin disabled via enabledPlugins contributes nothing", async () => {
   expect(extensions.some((e) => e.name === "off" || e.name.startsWith("off:"))).toBe(false);
 });
 
+test("an env-pinned CLAUDE_CONFIG_DIR account reads enabledPlugins from that root, not home (R7-S2)", async () => {
+  // The spawned claude resolves its config dir as env.CLAUDE_CONFIG_DIR → home
+  // → process env → ~/.claude. The plugins install records already used that
+  // resolver; the enabledPlugins map must agree, or an env-pinned account
+  // reads a different settings.json than the one its CLI actually loads.
+  const envRoot = mkdtempSync(path.join(tmpRoot, "plug-envroot-"));
+  const harnessHome = mkdtempSync(path.join(tmpRoot, "plug-envhome-"));
+  installPlugin(envRoot, "env-off@mp", {
+    commands: { "go.md": "do it" },
+    manifest: { name: "env-off", description: "disabled in the env root" },
+    enabled: false,
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-env-proj-"));
+  const opts = {
+    agent: "claude-code" as const,
+    workdir: project,
+    harnessHome,
+    harnessEnv: { CLAUDE_CONFIG_DIR: envRoot },
+  };
+  const { commands, extensions } = await listAgentCapabilities(opts);
+  expect(commands.some((c) => c.name === "/env-off:go")).toBe(false);
+  expect(extensions.some((e) => e.name === "env-off" || e.name.startsWith("env-off:"))).toBe(false);
+
+  // The same plugin enabled in an env root is visible — proof the read follows
+  // the env root rather than merely dropping the map. A fresh root keeps the
+  // stat-keyed JSON cache out of the assertion.
+  const envRootOn = mkdtempSync(path.join(tmpRoot, "plug-envroot-on-"));
+  installPlugin(envRootOn, "env-off@mp", {
+    commands: { "go.md": "do it" },
+    manifest: { name: "env-off", description: "enabled in the env root" },
+    enabled: true,
+  });
+  const on = await listAgentCapabilities({ ...opts, harnessEnv: { CLAUDE_CONFIG_DIR: envRootOn } });
+  expect(on.commands.some((c) => c.name === "/env-off:go")).toBe(true);
+});
+
 test("two plugins sharing a bare name collapse to one /name:cmd but both self-rows show", async () => {
   const harness = mkdtempSync(path.join(tmpRoot, "plug-dupcmd-"));
   installPlugin(harness, "dup@mp-one", {
@@ -1378,5 +1414,59 @@ describe("opencode capability discovery", () => {
       expect(find(all, "/oc-user-still-zq")).toHaveLength(1);
       expect(find(all, "/oc-on-ref")).toHaveLength(0);
     });
+  });
+});
+
+// Review S17: capability discovery reads the same account root the spawn
+// uses, through the one resolver in harness-config-root.ts. Each case below
+// read a different directory before the resolvers were unified.
+describe("config roots match harnessEnv (S17)", () => {
+  function withProcessEnv(key: string, value: string | undefined, fn: () => Promise<void>): Promise<void> {
+    const prev = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+    return fn().finally(() => {
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    });
+  }
+
+  test("codex: an inherited process CODEX_HOME beats an env-map HOME", async () => {
+    const processCodex = mkdtempSync(path.join(tmpRoot, "s17-proc-codex-"));
+    writeCmd(path.join(processCodex, "prompts"), "from-process.md", "body");
+    const envHome = mkdtempSync(path.join(tmpRoot, "s17-env-home-"));
+    writeCmd(path.join(envHome, ".codex", "prompts"), "from-env-home.md", "body");
+    const project = mkdtempSync(path.join(tmpRoot, "s17-proj-"));
+    await withProcessEnv("CODEX_HOME", processCodex, async () => {
+      const all = await listAvailableCommands({ agent: "codex", workdir: project, harnessEnv: { HOME: envHome } });
+      expect(all.some((c) => c.name === "/from-process")).toBe(true);
+      expect(all.some((c) => c.name.includes("from-env-home"))).toBe(false);
+    });
+  });
+
+  test("claude: an env-map HOME alone pins <HOME>/.claude", async () => {
+    const envHome = mkdtempSync(path.join(tmpRoot, "s17-claude-home-"));
+    writeCmd(path.join(envHome, ".claude", "commands"), "envhome-only.md", "body");
+    const project = mkdtempSync(path.join(tmpRoot, "s17-claude-proj-"));
+    await withProcessEnv("CLAUDE_CONFIG_DIR", undefined, async () => {
+      const all = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessEnv: { HOME: envHome } });
+      expect(all.some((c) => c.name === "/envhome-only")).toBe(true);
+    });
+  });
+
+  test("claude: a blank env-map CLAUDE_CONFIG_DIR is unset, so .claude.json comes from the home (N9)", async () => {
+    const harnessHome = mkdtempSync(path.join(tmpRoot, "s17-claude-json-"));
+    writeFileSync(
+      path.join(harnessHome, ".claude.json"),
+      JSON.stringify({ mcpServers: { blankpin: { command: "npx" } } }),
+    );
+    const project = mkdtempSync(path.join(tmpRoot, "s17-claude-json-proj-"));
+    const all = await listExtensions({
+      agent: "claude-code",
+      workdir: project,
+      harnessHome,
+      harnessEnv: { CLAUDE_CONFIG_DIR: "" },
+    });
+    expect(all.some((e) => e.kind === "mcp" && e.name === "blankpin")).toBe(true);
   });
 });

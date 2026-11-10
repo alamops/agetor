@@ -55,3 +55,14 @@ A `null` live list — `useAgentProfiles`'s `loaded` flag still `false`, i.e. no
 `edit --clear-skills`); `agetor add --profile <id|name>` resolves and sends `agentProfileId`, and is a usage error when combined with any of `--agent/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode` (the profile defines them) — the wizard's non-interactive and interactive (`@clack/prompts`, a "Profile" step listing profiles ahead of the harness/model/mode/effort steps, skipping those steps and their `lastModel:<kind>` pref writes when a profile is picked) paths both honor this;
 `agetor edit <ref> --detach-profile` calls the detach route (combinable with other edits — detach runs first so a same-call field edit isn't refused by the 409 guard); `agetor show` prints a `profile: <name> (<id>)` line (`(deleted)` suffix when a live lookup 404s) and `agetor ls` carries a separate `profile` column (the bound profile's name, or `-` when unbound) alongside the unchanged `agent` column, which stays the harness id.
 `agetor profile export <ref> [--out <file|->] [--force]` / `agetor profile import <file|->` are shortcuts over the [agetor bundle](bundle.md) — the exported Agent carries its harness id and the built-in kind it wraps.
+
+## Harness stacks
+
+A profile binds an **account** (harness id), not a stack. A task launched from
+a profile inherits its stack implicitly through `Task.agent`, so a failover
+moves `task.agent` while the profile's frozen snapshot keeps naming the
+original account. The UI shows the profile badge and the active-account badge
+separately; the prompt kind/model stay valid because stacks are same-kind. The
+PATCH guard that freezes a bound task's agent does not apply to the internal
+swap (it never goes through `PATCH /tasks/:id`). See
+[harness-stacks.md](harness-stacks.md).

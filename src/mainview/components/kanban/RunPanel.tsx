@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
-  Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
+  Play, Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
@@ -47,7 +47,7 @@ import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { shortenTaskPaths } from "@/lib/shorten-task-paths";
 import { fxUsageChipText, fxUsageTitle, mergeFxUsage, parseFxUsage } from "@/lib/fx-usage";
-import { useCountdown } from "@/lib/fx-auto-resume";
+import { useCountdown, useNowTicker } from "@/lib/fx-auto-resume";
 import { renderLinkified } from "@/lib/linkify";
 import { subscribePipelineGlobalEvents } from "@/lib/pipeline-events";
 import {
@@ -70,6 +70,16 @@ import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
+import {
+  formatHarnessSwapNotice,
+  isHarnessStackContinuation,
+  parseHarnessSwapNotice,
+} from "../../../shared/harness-stack.ts";
+import { harnessStackBannerView } from "@/lib/harness-stack-banner";
+import { agentSwitchPatch } from "@/lib/agent-switch";
+import { groupStickySections, type StickyItem } from "@/lib/sticky-sections";
+import { stackPositionFor } from "@/lib/stack-badge";
+import { taskPatchFailureToast } from "@/lib/task-patch-failure";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
@@ -83,6 +93,7 @@ import {
   FX_RECOVERY_STATUS_PREFIX,
   FX_SESSION_TITLE_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
+  HARNESS_SWAP_STATUS_PREFIX,
   isInternalStatusSentinel,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsMaxMode,
@@ -94,6 +105,7 @@ import {
   type AgentProfile,
   type AgentStatus,
   type Harness,
+  type HarnessStack,
   type BacklogMessage,
   type FxRecoveryPayload,
   type AgentProfileSnapshot,
@@ -244,6 +256,12 @@ interface Props {
   /** Registered harnesses — needed so the panel's agent dropdown can list
    *  every known harness (built-ins + aliases). */
   harnesses: Harness[];
+  /** Harness account stacks, for the active-account line and switch notice. */
+  stacks?: HarnessStack[];
+  /** Start a Run for this task. Backs the all-exhausted banner's "Run now"
+   *  action (a manual run forces a cooling account and resets the attempt
+   *  cap). Omitted in standalone/test renders. */
+  onRunTask?: (task: Task) => void;
   /** Saved agent profiles — resolves the header chip (`resolveTaskProfileDisplay`)
    *  and, in Task details, whether the agent/mode/model/effort(/fast/max)
    *  controls are locked (`task.agentProfileId != null`). `null` means the
@@ -395,7 +413,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles, onOpenSettingsAgents, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, stacks = [], profiles, onOpenSettingsAgents, onRunTask, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -605,6 +623,8 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, profiles
           stickyUserMessages={stickyUserMessages}
           agents={agents}
           harnesses={harnesses}
+          stacks={stacks}
+          onRunTask={onRunTask}
           profiles={profiles}
           onOpenSettingsAgents={onOpenSettingsAgents}
           agentModels={agentModels}
@@ -639,6 +659,8 @@ function RunPanelBody({
   stickyUserMessages,
   agents,
   harnesses,
+  stacks,
+  onRunTask,
   profiles,
   onOpenSettingsAgents,
   agentModels,
@@ -663,6 +685,8 @@ function RunPanelBody({
   stickyUserMessages: boolean;
   agents: AgentStatus[];
   harnesses: Harness[];
+  stacks: HarnessStack[];
+  onRunTask?: (task: Task) => void;
   profiles: AgentProfile[] | null;
   onOpenSettingsAgents: (profileId?: string) => void;
   agentModels: AgentModelMap;
@@ -4121,6 +4145,7 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        <HarnessStackBanner task={task} stacks={stacks} harnesses={harnesses} onRunTask={onRunTask} />
         {importedSession && (
           <div
             className="mt-1 space-y-1 text-xs"
@@ -4177,7 +4202,14 @@ function RunPanelBody({
         )}
         <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
           <span className="truncate">
-            {task.agent} · {task.column}
+            {harnesses.find((h) => h.id === task.agent)?.label ?? task.agent}
+            {(() => {
+              // No chip for a one-account stack: it cannot fail over.
+              const at = stackPositionFor(stacks, task.agent);
+              if (!at) return null;
+              return <span className="text-info"> · {at.text}</span>;
+            })()}
+            {" · "}{task.column}
             {task.branch && !branchDrift.drifted && <> · <span className="font-mono">{task.branch}</span></>}
             {branchDrift.drifted && (
               <>
@@ -6086,6 +6118,11 @@ function RunEventList({
     const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
+          // A harness-stack continuation prompt is Agetor's own hidden send,
+          // not the user's words. Normalize first: claude's JSONL twin of the
+          // pasted prompt is `<pasted_content>`-wrapped, so only an exact raw
+          // check would leak the hidden prompt as a visible bubble.
+          if (isHarnessStackContinuation(normalizeDeliveredUserText(e.data))) return [];
           return [
             wrap(
               key,
@@ -6163,6 +6200,20 @@ function RunEventList({
           // "Untitled session" placeholder). Single shared predicate so a
           // new sentinel can't leak into one surface while another
           // suppresses it.
+          if (e.data.startsWith(HARNESS_SWAP_STATUS_PREFIX)) {
+            const notice = parseHarnessSwapNotice(e.data);
+            if (!notice) return [];
+            return [
+              wrap(
+                key,
+                evid,
+                <StatusDivider
+                  testId="harness-swap-divider"
+                  text={`${formatHarnessSwapNotice(notice)} (${notice.position}/${notice.count})`}
+                />,
+              ),
+            ];
+          }
           if (isInternalStatusSentinel(e.data)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
@@ -6201,29 +6252,24 @@ function RunEventList({
     };
 
     if (stickyUserMessages) {
-      const sections: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
-      // Preamble events before the first user message share an initial
-      // headerless section. Each subsequent user message starts a new turn;
-      // its sticky lifetime naturally ends at that section's boundary.
-      let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = {
-        key: "",
-        header: null,
-        body: [],
-      };
+      // Grouping rules (incl. skipping a hidden continuation prompt, which
+      // renders nothing and must not open a headerless section) live in
+      // `groupStickySections`.
+      const items: StickyItem<React.ReactNode>[] = [];
       for (let i = 0; i < normalised.length; i++) {
         const e = normalised[i]!;
         const key = `${e.ts}-${i}`;
         const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
         if (e.stream === "user") {
-          if (current.header !== null || current.body.length > 0) sections.push(current);
-          current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
+          items.push({ kind: "turn", key, header: renderEvent(e, key, i)[0] ?? null, before });
         } else {
-          if (current.key === "") current.key = key;
-          current.body.push(...before, ...renderEvent(e, key, i));
+          items.push({ kind: "body", key, nodes: [...before, ...renderEvent(e, key, i)] });
         }
       }
-      current.body.push(...(interactionByIndex.get(normalised.length) ?? []).map(renderInteraction));
-      if (current.header !== null || current.body.length > 0) sections.push(current);
+      const sections = groupStickySections(
+        items,
+        (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction),
+      );
       return sections.map((section, index) => (
         <section key={section.key || `section-${index}`} className="flex flex-col gap-4">
           {section.header}
@@ -6920,6 +6966,77 @@ const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
   );
 });
 
+/**
+ * Harness-stack state in the task header: a pending swap, a recent move, a
+ * live retry run, or an all-exhausted countdown with a manual "Run now". The
+ * copy comes from `harnessStackBannerView` (lib/harness-stack-banner.ts).
+ * Reset per task id so the countdown of a previously selected task never
+ * paints on the next one.
+ */
+function HarnessStackBanner({
+  task,
+  stacks,
+  harnesses,
+  onRunTask,
+}: {
+  task: Task;
+  stacks: HarnessStack[];
+  harnesses: Harness[];
+  onRunTask?: (task: Task) => void;
+}) {
+  const target = task.harnessState?.allExhausted?.nextAttemptAt ?? null;
+  // One shared ticking clock (also used by the fx countdown); reset per task
+  // and per target so a previous task's time never paints on the next one.
+  const now = useNowTicker(target != null && target > 0, `${task.id}:${target ?? ""}`);
+  const labelOf = (id: string) =>
+    stacks.flatMap((s) => s.members).find((m) => m.harnessId === id)?.label
+      ?? harnesses.find((h) => h.id === id)?.label
+      ?? id;
+  const view = harnessStackBannerView(task, labelOf, now);
+  if (!view) return null;
+  if (view.kind === "pending") {
+    return (
+      <div className="mt-1 text-xs text-info" data-testid="harness-swap-pending">
+        {view.text}
+      </div>
+    );
+  }
+  if (view.kind === "moved") {
+    return (
+      <div className="mt-1 text-xs text-muted-foreground" data-testid="harness-stack-moved">
+        {view.text}
+      </div>
+    );
+  }
+  if (view.kind === "retry-running") {
+    return (
+      <div className="mt-1 text-xs text-info" data-testid="harness-stack-retry-running">
+        {view.text}
+      </div>
+    );
+  }
+  return (
+    <div
+      className="mt-1 flex flex-wrap items-center gap-2 text-xs text-warning"
+      data-testid="harness-stack-exhausted"
+    >
+      <span>{view.text}</span>
+      {onRunTask && view.runNow && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-6 border-warning/40 px-2 text-[11px] text-warning hover:bg-warning/10"
+          data-testid="harness-stack-run-now"
+          title="Run now on a cooling account and reset the retry cap"
+          onClick={() => onRunTask(task)}
+        >
+          <Play className="mr-1 size-3" /> Run now
+        </Button>
+      )}
+    </div>
+  );
+}
+
 // `text` stays a plain `string` prop (not the `renderLinkified` output)
 // specifically so `memo`'s default shallow comparator actually catches a
 // same-text rerender: `renderLinkified` returns a freshly allocated array
@@ -6930,10 +7047,10 @@ const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
 // fx recovery/auto-resume line) still renders it as a clickable
 // `ExternalLink`, and a no-URL line still renders the identical text node
 // across rerenders.
-const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
+const StatusDivider = memo(function StatusDivider({ text, testId }: { text: string; testId?: string }) {
   const content = useMemo(() => renderLinkified(text), [text]);
   return (
-    <div className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+    <div data-testid={testId} className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
       <span className="h-px flex-1 bg-border" />
       <span>{content}</span>
       <span className="h-px flex-1 bg-border" />
@@ -7720,11 +7837,14 @@ function TaskDetails({
   const save = async (patch: Partial<Task>) => {
     try {
       await api.updateTask(task.id, patch);
-    } catch {
-      // Swallow — the parent's poll picks the row back up on the next 2s tick
-      // and the dropdown reverts on its own. We could surface this through
-      // the global error toast, but for now keeping it quiet matches the
-      // optimistic-UI pattern the rest of the panel uses.
+    } catch (e) {
+      // A dropdown PATCH stays quiet: the parent's poll picks the row back up
+      // on the next 2s tick and the dropdown reverts on its own. An account
+      // switch (`agent`) shows the server's reason instead — a refused
+      // same-stack move would otherwise look like a click that did nothing
+      // (`taskPatchFailureToast`, review N8).
+      const failure = taskPatchFailureToast(patch, e);
+      if (failure) toast.error(failure.title, { description: failure.description });
     }
   };
 
@@ -7868,11 +7988,22 @@ function TaskDetails({
 
   const onAgentChange = (nextId: string) => {
     if (nextId === task.agent) return;
-    // Switching harness wipes the current mode / model / effort context —
-    // those ids belong to the old harness's kind option set. Reset to the
-    // new harness's kind defaults (DEFAULT_MODEL + DEFAULT_EFFORT) and let
-    // the user re-pick if they want something specific. Sent as one PATCH
+    // Switching to another KIND wipes the current mode / model / effort
+    // context — those ids belong to the old harness's kind option set. Reset
+    // to the new harness's kind defaults (DEFAULT_MODEL + DEFAULT_EFFORT) and
+    // let the user re-pick if they want something specific. A same-kind
+    // switch sends only `{ agent }` (`agentSwitchPatch`). Sent as one PATCH
     // so the server-side reconcile only fires once.
+    const nextHarness = harnesses.find((h) => h.id === nextId);
+    void save(agentSwitchPatch({
+      nextId,
+      currentKind: harnessKnown ? kind : null,
+      nextKind: nextHarness?.kind ?? null,
+      kindDefaults: () => kindDefaultsFor(nextId),
+    }));
+  };
+
+  const kindDefaultsFor = (nextId: string) => {
     const nextKind = harnessKindOf(nextId, harnesses);
     const nextMode = defaultModeFor(nextKind);
     const nextModel = DEFAULT_MODEL[nextKind];
@@ -7891,7 +8022,7 @@ function TaskDetails({
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
         ? DEFAULT_EFFORT[nextKind]
         : nextEfforts[0]!.id;
-    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, speed: "off", maxMode: false });
+    return { mode: nextMode, model: nextModel, effort: nextEffort, speed: "off" as const, maxMode: false };
   };
 
   const onModelChange = (model: string) => {

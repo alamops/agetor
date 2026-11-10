@@ -205,6 +205,12 @@ function seed(): Seed {
         ids.push(runs.appendEvent(runId, "tool_result", JSON.stringify({ toolUseId: `toolu_${i}`, content: `Task #${i} created successfully` }), `tr-${i}`)!.id);
       }
     }
+    // A hidden harness-stack continuation as the newest main-stream user row:
+    // `lastUserEventId` must skip it, which runs its by-id re-read statement
+    // so that statement's plan is checked too.
+    ids.push(
+      runs.appendEvent(runId, "user", "<harness-stack-continuation>\nContinue.\n</harness-stack-continuation>", "u-cont")!.id,
+    );
     ids.push(runs.appendEvent(runId, "status", `${API_ERROR_PREFIX}overloaded`)!.id);
     ids.push(runs.appendEvent(runId, "assistant", "subagent line", `sa-0`, subagentId)!.id);
     ids.push(runs.appendEvent(runId, "status", "monitor:x:terminal:done", "monitor:x:terminal:0", subagentId)!.id);
@@ -230,6 +236,8 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
     "runs.events": [{ label: "events(runId)", run: () => runs.events(s.runId) }],
     "runs.lastEventData": [{ label: "lastEventData(runId)", run: () => runs.lastEventData(s.runId) }],
     "runs.lastToolUseData": [{ label: "lastToolUseData(runId)", run: () => runs.lastToolUseData(s.runId) }],
+    "runs.mainUserTexts": [{ label: "mainUserTexts(runId)", run: () => runs.mainUserTexts(s.runId) }],
+    "runs.hasToolUse": [{ label: "hasToolUse(runId)", run: () => runs.hasToolUse(s.runId) }],
     "runs.findToolUseEvent": [
       { label: "findToolUseEvent(runId, id)", run: () => runs.findToolUseEvent(s.runId, "toolu_0") },
     ],

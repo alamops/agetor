@@ -27,9 +27,9 @@
  */
 
 import { closeSync, existsSync, fstatSync, readdirSync, readSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import path from "node:path";
 import type { Harness, HarnessQuota, QuotaMeter } from "../../shared/types.ts";
+import { codexHomeFor } from "../harness-config-root.ts";
 import { isPlainDirBelow, openReadNoFollow, readAccountFileText } from "../no-follow.ts";
 
 /** Fetch timeout for the live `wham/usage` call. */
@@ -51,12 +51,13 @@ const AUTH_JSON_MAX_BYTES = 1024 * 1024;
 const ROLLOUT_TAIL_BYTES = 8 * 1024 * 1024;
 
 /**
- * `<home>/.codex` for an aliased harness, else `~/.codex` for the main
- * account — mirrors `harnessEnv`'s `CODEX_HOME = path.join(home, ".codex")`
- * (src/bun/agents.ts:231); `home=null` inherits the real home dir.
+ * The CODEX_HOME this harness's codex runs with — the shared resolver that
+ * mirrors `harnessEnv` (harness-config-root.ts): the env map's `CODEX_HOME`,
+ * then `<home>/.codex`, then the process `CODEX_HOME` a home-less built-in
+ * inherits, then an env-map `HOME`'s `.codex`, else `~/.codex`.
  */
 export function codexHome(harness: Harness): string {
-  return harness.home ? path.join(harness.home, ".codex") : path.join(homedir(), ".codex");
+  return codexHomeFor(harness);
 }
 
 /**

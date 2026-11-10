@@ -104,7 +104,7 @@ const BRANCH_PICKER_TITLE =
 // involves a real worktree/branch creation against a real temp git repo, on
 // top of the usual fetch/render settling. Mirrors pr-merged-state.spec.ts's
 // CONVERGE_TIMEOUT.
-const CONVERGE_TIMEOUT = 20_000;
+const CONVERGE_TIMEOUT = 30_000;
 
 let stub: GitHubStub;
 let projectDir: string;

@@ -12,16 +12,24 @@ import { taskTypeIcon } from "@/lib/task-type-icon";
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { useCountdown, fxPausedBadgeText, fxPausedBadgeTitle } from "@/lib/fx-auto-resume";
 import { useConfirm } from "@/components/ui/confirm";
-import { taskTypeMeta, type Task } from "../../../shared/types.ts";
+import { taskTypeMeta, type HarnessLimitState, type HarnessStack, type Task } from "../../../shared/types.ts";
 import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { importedSessionOf } from "../../../shared/imported-session.ts";
 import { AgentIcon } from "./AgentIcon";
 import { PipelineBadge } from "@/components/pipelines";
+import { StackBadge } from "./StackBadge";
+import { stackBadgeStateFor } from "@/lib/stack-badge";
 
 interface Props {
   task: Task;
   homeDir: string;
+  /** Machine-local stacks: a task that has never failed over has no
+   *  `harnessState`, so its badge is derived from the account's membership. */
+  stacks?: HarnessStack[];
+  /** Account-global cooldowns, so the stack chip can mark a cooling current
+   *  account even before the task itself blocks (review nit). */
+  limitStates?: HarnessLimitState[];
   onStart: (t: Task) => void;
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
@@ -52,7 +60,7 @@ interface Props {
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOpenAttention, onReviewPipeline, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
+function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, onCancel, onDelete, onOpen, onOpenAttention, onReviewPipeline, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
   // Last-seen worktree checkout (server-recorded; no git spawn on the 2 s
   // poll) vs the branch agetor created. Drift is tolerated — just shown.
@@ -307,6 +315,12 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onOp
               {task.agent}
             </Badge>
           )}
+          <StackBadge
+            state={stackBadgeStateFor(task, stacks)}
+            coolingUntilMs={limitStates.find((s) => s.harnessId === task.agent)?.exhaustedUntilMs ?? null}
+            running={task.column === "running"}
+            className="shrink-0"
+          />
         </div>
         {(task.model || task.mode) && (
           <span className="self-end text-[10px] font-mono text-muted-foreground">

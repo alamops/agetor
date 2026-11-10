@@ -21,9 +21,11 @@ import type {
   AgentProfile,
   AgentStatus,
   Harness,
+  HarnessStack,
   PipelineGraph,
   PipelineStep,
 } from "../../shared/types.ts";
+import { stackBackupCanServe } from "./stack-launch.ts";
 
 /** `no-pipeline` — nothing selected; `checking` — the selected graph names a
  *  profile the not-yet-loaded list can't confirm (never reported as
@@ -60,6 +62,10 @@ export interface PipelineLaunchInput {
   profilesError: string | null;
   harnesses: Harness[];
   agents: AgentStatus[];
+  /** Harness account stacks. A start account that is disabled, unavailable or
+   *  logged out but sits in a stack with a usable backup is not a block: the
+   *  core moves the run to that backup (`stackBackupCanServe`). */
+  stacks?: readonly HarnessStack[];
 }
 
 /**
@@ -82,7 +88,9 @@ export interface PipelineLaunchInput {
  *     no longer exists` (or `checking`/fetch-error `blocked` while the list
  *     has never loaded)
  *  8. start harness missing/disabled → `<label> is disabled — re-enable it in
- *     Settings to start new runs.`
+ *     Settings to start new runs.` — rules 8–10 are skipped when the start
+ *     account is in a stack with a usable backup, because the core's
+ *     `startTask` moves the run to that backup instead of refusing it
  *  9. start harness unavailable (or no status) → `<label> is not available —
  *     <reason>[. Install it with: <hint>]`
  * 10. start harness positively logged out → `<label> isn't logged in —
@@ -94,7 +102,7 @@ export interface PipelineLaunchInput {
  * New Task form. `createTask` still validates every non-human step's profile.
  */
 export function resolvePipelineLaunch(input: PipelineLaunchInput): PipelineLaunchResolution {
-  const { graph, profiles, profilesLoaded, profilesError, harnesses, agents } = input;
+  const { graph, profiles, profilesLoaded, profilesError, harnesses, agents, stacks = [] } = input;
 
   if (graph === null) {
     return {
@@ -187,6 +195,9 @@ export function resolvePipelineLaunch(input: PipelineLaunchInput): PipelineLaunc
     return resolved("blocked", `step "${startStep.name}" has no agent`);
   }
 
+  if (startProfile !== null && stackBackupCanServe(startProfile.harness, stacks, harnesses, agents)) {
+    return resolved("ready", null);
+  }
   if (startHarness === null) {
     return resolved(
       "blocked",

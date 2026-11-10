@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "formId": "harness-account-stacks-grill-r3",
+  "title": "Grill — Harness account stacks (round 3: boundaries + parity)",
+  "round": 3,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "40ed6bb54eb2c7b4eb535edae94eac20e3651beece046cd4123986b61704e0e9",
+  "submittedAt": "2026-11-06T22:02:11.521Z",
+  "receivedAt": "2026-11-06T22:02:11.531Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 15,
+    "answered": 15,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 15,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "home-overlay-scope"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "mirror-env-keys": {
+      "n": 1,
+      "title": "`mirror-everything` copies `settings.json` `env`, which can contain harness API keys. Should the mirror strip harness-auth keys?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "strip-harness-keys",
+      "display": "Strip harness-auth keys, keep tool auth and other env",
+      "acceptedRecommendation": true
+    },
+    "mirror-when": {
+      "n": 2,
+      "title": "When should the mirror run?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "create-and-swap",
+      "display": "At stack creation and before each swap",
+      "acceptedRecommendation": true
+    },
+    "home-overlay-scope": {
+      "n": 3,
+      "title": "What should the HOME overlay share, and for which kinds?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "codex-allowlist",
+      "display": "Codex only, fixed allowlist, symlinked",
+      "acceptedRecommendation": true,
+      "note": "why do we need the same home for different codex accounts (even stacked)?"
+    },
+    "after-swap-lap": {
+      "n": 4,
+      "title": "Confirm the circular train: forward, wrap to the head at the end, and stop after one full lap?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "circular-lap",
+      "display": "Circular with a one-lap cap",
+      "acceptedRecommendation": true
+    },
+    "cli-bundle": {
+      "n": 5,
+      "title": "CLI and bundle parity in v1",
+      "type": "confirm",
+      "status": "answered",
+      "value": "`agetor harness stack` create/list/edit/remove, and `ls`/`show`/`logs` show the active member and the swap line; the TUI shows the active member/position. Stacks are machine-local and not exported in bundles; a profile still binds an account and the stack follows implicitly.",
+      "acceptedRecommendation": true
+    },
+    "indicators": {
+      "n": 6,
+      "title": "Where the active account is visible",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Run panel shows `account · position/count`; the task card shows a small stack badge; a toast/OS notification fires on a swap when the window is unfocused; the topbar keeps one usage chip per account in v1 (no grouping).",
+      "acceptedRecommendation": true
+    },
+    "order": {
+      "n": 7,
+      "title": "Stack order",
+      "type": "confirm",
+      "status": "answered",
+      "value": "User drag order in the stack editor; a new member appends at the end; selection starts at the first enabled, logged-in member and follows the order.",
+      "acceptedRecommendation": true
+    },
+    "validation": {
+      "n": 8,
+      "title": "Stack validation",
+      "type": "confirm",
+      "status": "answered",
+      "value": "At creation and before each swap: hard-block on a different kind or the same effective home; warn on not installed, not logged in, or the task's model not offered. A hard block is only for conditions that make failover meaningless.",
+      "acceptedRecommendation": true
+    },
+    "force-run": {
+      "n": 9,
+      "title": "Manual Run on a cooling account",
+      "type": "confirm",
+      "status": "answered",
+      "value": "A manual Run or message on a cooling-down account forces it; automatic selection skips it.",
+      "acceptedRecommendation": true
+    },
+    "new-run": {
+      "n": 10,
+      "title": "Run-row semantics of a swap",
+      "type": "confirm",
+      "status": "answered",
+      "value": "A swap is a new run row on the same task with the new member in `runs.agent`; Agetor's `run_events` transcript stays canonical; the old run is marked failed with a swap reason and its failure toast is suppressed.",
+      "acceptedRecommendation": true
+    },
+    "pipeline": {
+      "n": 11,
+      "title": "Pipelines",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Pipeline step tasks inherit failover automatically; the implicit model needs no pipeline format change.",
+      "acceptedRecommendation": true
+    },
+    "process-keys": {
+      "n": 12,
+      "title": "Process-level provider keys",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Warn at stack creation when process-level provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) would be inherited by every member; do not scrub them in v1.",
+      "acceptedRecommendation": true
+    },
+    "swap-wording": {
+      "n": 13,
+      "title": "Exact swap notice text",
+      "type": "confirm",
+      "status": "answered",
+      "value": "`Switched to <account> — <reason>. Continuing from the transferred conversation.` No product name in the text.",
+      "acceptedRecommendation": true
+    },
+    "source-of-truth": {
+      "n": 14,
+      "title": "Binding spec",
+      "type": "confirm",
+      "status": "answered",
+      "value": "`docs/plans/harness-account-stacks.md` (written from this record) is the binding spec; no separate PRD. The investigation brief stays as evidence.",
+      "acceptedRecommendation": true
+    },
+    "acceptance-overlay": {
+      "n": 15,
+      "title": "Acceptance additions from round 2",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Add a Codex HOME-overlay test (git config visible in the backup) and a mirror test (MCP/plugin auth copied, harness login never copied, harness-auth env keys stripped). OpenCode is out of v1, so its adapter test is dropped.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

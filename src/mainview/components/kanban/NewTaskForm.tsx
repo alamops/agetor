@@ -36,6 +36,7 @@ import {
   type AgentProfile,
   type AgentStatus,
   type Harness,
+  type HarnessStack,
   type Isolation,
   type Pipeline,
   type Speed,
@@ -43,6 +44,7 @@ import {
   type TaskType,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
+import { StackPositionChip } from "./StackBadge";
 import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
@@ -101,6 +103,8 @@ interface Props {
   /** Registered harnesses — built-ins plus user aliases. The agent picker
    *  renders one button per harness. */
   harnesses: Harness[];
+  /** Harness account stacks, for the account position chip. */
+  stacks?: HarnessStack[];
   /** Saved agent profiles — powers the `AgentProfilePicker` above the
    *  harness grid ("one selection": picking one hides the manual
    *  harness/mode/model/effort block). */
@@ -150,7 +154,7 @@ interface Props {
   focusNonce?: number;
 }
 
-export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSettingsAgents, pipelines, pipelinesLoaded, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
+export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles, onOpenSettingsAgents, pipelines, pipelinesLoaded, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
   // state) so a restart repaints in the state the user left it in — an async
@@ -959,6 +963,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                       >
                         <AgentIcon kind={h.kind} className="mr-1" />
                         <span className="truncate">{h.label}</span>
+                        <StackPositionChip stacks={stacks} harnessId={h.id} />
                         <span
                           className={cn(
                             "ml-auto inline-block size-1.5 rounded-full",

@@ -177,7 +177,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     !!context &&
     !!thread &&
     prompt.trim().length > 0 &&
-    !!launch.effectiveStatus?.available &&
+    launch.effectiveLaunchable &&
     launch.pipelineReady &&
     !submitting &&
     overage == null &&

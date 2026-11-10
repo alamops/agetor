@@ -103,6 +103,7 @@ import {
 import { trimToolResultData, utf8Length } from "../shared/tool-result-trim";
 import { TOOL_RESULT_TRIM_SQL, dataDir, db, preferences, retentionSweeps, runs, tasks } from "./db";
 import { beginLagLabel } from "./event-loop-lag";
+import { cleanupHarnessSessionCopies } from "./harness-session-transfer";
 
 /** Every SQL text this module itself runs against `run_events` (see the
  *  "SQL covered by the plan guard" note above for the rest). */
@@ -246,6 +247,19 @@ export async function runArchivedHistoryRetentionPass(opts: {
       const taskRunIds = runs.runIdsForTask(candidate.id);
       const key = sweepKey(candidate.id, candidate.archivedAt, maxBytes, taskRunIds);
       if (sweptTasks.get(candidate.id) === key) continue;
+      // Harness-stack copies (docs/architecture/harness-stacks.md): an
+      // archived task's transferred provider sessions are removed with the
+      // same age threshold, so an unarchive before it keeps them and one
+      // after it starts fresh. Best-effort — a failed removal leaves the
+      // handoff row and is retried on the next pass. Re-check eligibility
+      // here: the candidate list is a snapshot and the pass yields, so the
+      // user can unarchive this task between that read and this cleanup.
+      if (!stillEligible(candidate.id, cutoff)) continue;
+      try {
+        await cleanupHarnessSessionCopies(candidate.id);
+      } catch (err) {
+        console.warn(`[agetor] could not remove copied harness sessions for ${candidate.id}:`, err);
+      }
       // The stored key (if any) stays stale until this sweep runs to
       // completion, so an abort or unarchive mid-sweep is re-swept next time.
       result.scannedTasks++;

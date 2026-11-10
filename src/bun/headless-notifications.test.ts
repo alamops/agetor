@@ -502,3 +502,32 @@ describe("pipeline human gates", () => {
     expect(posted).toHaveLength(0);
   });
 });
+
+describe("harness stacks", () => {
+  test("an old run's harness-swap/exhausted failure is silent", () => {
+    expect(f({ kind: "run-status", taskId: "t1", runId: "r1", status: "failed", reason: "harness-swap", ts: 1 })).toBeNull();
+    expect(f({ kind: "run-status", taskId: "t1", runId: "r1", status: "failed", reason: "harness-exhausted", ts: 1 })).toBeNull();
+  });
+
+  test("blocked reasons read as a stack problem, not a generic wait", () => {
+    const exhausted = f({
+      kind: "column", taskId: "t1", runId: "r1", column: "blocked", prev: "running", reason: "harness-exhausted", ts: 1,
+    });
+    expect(exhausted?.title).toBe("Stack out of quota");
+    const unusable = f({
+      kind: "column", taskId: "t1", runId: "r1", column: "blocked", prev: "running", reason: "harness-swap-failed", ts: 1,
+    });
+    expect(unusable?.title).toBe("No usable backup account");
+  });
+
+  test("a swap event posts a quiet account-switched notification", () => {
+    const n = f({
+      kind: "harness-swap", taskId: "t1", from: "a", to: "b", fromLabel: "Work", toLabel: "Backup",
+      reason: "quota", position: 2, count: 3, ts: 1,
+    });
+    expect(n?.title).toBe("Account switched");
+    expect(n?.kind).toBe("harness-swap");
+    expect(n?.body).toContain("Work → Backup");
+    expect(n?.body).not.toContain("@");
+  });
+});

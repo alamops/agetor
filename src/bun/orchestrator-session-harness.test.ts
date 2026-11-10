@@ -204,6 +204,31 @@ for (const c of KINDS) {
   });
 }
 
+test("a stacked account resumes its own session, or the conversation a swap copied onto it", async () => {
+  db.harnesses.insert({ id: "stack-a", kind: "claude-code", label: "Stack A" });
+  db.harnesses.insert({ id: "stack-b", kind: "claude-code", label: "Stack B" });
+  const taskId = randomUUID();
+  db.tasks.insert(makeTask(taskId, "stack-b", null));
+  // The primary's conversation must never be resumed by the backup...
+  seedRun(taskId, "stack-a", "claudeSessionId", "sess-primary", { startedAt: 1_000 });
+  expect(orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBeNull();
+  // ...unless a swap explicitly copied one onto the backup and recorded it
+  // as a handoff (the one exception to per-account session scoping).
+  const own = seedRun(taskId, "stack-b", "claudeSessionId", "sess-backup-own", { startedAt: 2_000 });
+  expect(orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBe("sess-backup-own");
+  db.harnessSessionHandoffs.upsert({
+    taskId,
+    harnessId: "stack-b",
+    columnName: "claude_session_id",
+    sessionId: "sess-transferred",
+    copiedPaths: [],
+    createdAt: own.startedAt + 1_000,
+  });
+  expect(orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-b")).toBe("sess-transferred");
+  // The handoff is scoped to the destination account.
+  expect(orch.findLastSessionIdForHarness(taskId, "claude_session_id", "stack-a")).toBe("sess-primary");
+});
+
 test("an imported Claude task resumes its imported session (the seed run carries the importing harness id)", async () => {
   const altId = "claude-import-alt";
   db.harnesses.insert({ id: altId, kind: "claude-code", label: "Claude (import alt)" });

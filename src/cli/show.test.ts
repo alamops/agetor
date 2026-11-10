@@ -88,6 +88,7 @@ function makeClient(
   opts: {
     harnesses?: Harness[];
     listHarnesses?: AgetorClient["listHarnesses"];
+    listHarnessStacks?: AgetorClient["listHarnessStacks"];
     runs?: Run[];
     getPipelineRun?: AgetorClient["getPipelineRun"];
     pending?: Array<{ id: string; kind: string; taskId: string }>;
@@ -99,6 +100,8 @@ function makeClient(
     pendingInteractions: async () => opts.pending ?? [],
     listHarnesses: opts.listHarnesses
       ?? (async () => ({ harnesses: opts.harnesses ?? [], statuses: [] })),
+    listHarnessStacks: opts.listHarnessStacks
+      ?? (async () => ({ stacks: [], limitStates: [] })),
     getPipelineRun: opts.getPipelineRun,
   } as unknown as AgetorClient;
 }
@@ -419,4 +422,154 @@ test("show: a task with no pipelineParentId never calls getPipelineRun", async (
 
   await cmdShow([TASK_ID], flags);
   expect(called).toBe(false);
+});
+
+test("show: a stacked task prints its stack position and an awaiting-reset failover line", async () => {
+  outputs.length = 0;
+  const retryAt = Date.now() + 60_000;
+  currentClient = makeClient(
+    task({
+      agent: "claude-b",
+      harnessState: {
+        stackId: "stack-1",
+        position: 1,
+        count: 2,
+        tried: ["claude-a"],
+        pendingSwap: null,
+        allExhausted: {
+          at: Date.now(),
+          attempts: 1,
+          max: 3,
+          nextAttemptAt: retryAt,
+          earliestResetAtMs: retryAt,
+          reason: "quota",
+        },
+        lastMove: null,
+      },
+    }),
+    {
+      harnesses: [harness("claude-a", "claude-code"), harness("claude-b", "claude-code")],
+      listHarnessStacks: async () => ({
+        stacks: [{
+          id: "stack-1",
+          label: "Claude train",
+          kind: "claude-code",
+          mirrorMode: "safe",
+          members: [
+            { harnessId: "claude-a", position: 0, label: "Claude A", kind: "claude-code", enabled: true },
+            { harnessId: "claude-b", position: 1, label: "Claude B", kind: "claude-code", enabled: true },
+          ],
+          createdAt: 1,
+          updatedAt: 1,
+          warnings: [],
+        }],
+        limitStates: [],
+      }),
+    },
+  );
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("stack: Claude train (2/2)");
+  expect(rendered).toContain("failover: waiting until");
+  expect(rendered).toContain("(attempt 2/3)");
+});
+
+test("show: an in-flight retry prints the running-after-reset line, and a lone task has no stack line (review S20)", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(
+    task({
+      agent: "claude-a",
+      harnessState: {
+        stackId: "stack-1",
+        position: 0,
+        count: 2,
+        tried: ["claude-a", "claude-b"],
+        pendingSwap: null,
+        allExhausted: {
+          at: Date.now(),
+          attempts: 1,
+          max: 3,
+          nextAttemptAt: 0,
+          earliestResetAtMs: null,
+          reason: "quota",
+          inFlight: true,
+        },
+        lastMove: null,
+      },
+    }),
+    {
+      harnesses: [harness("claude-a", "claude-code")],
+      listHarnessStacks: async () => ({ stacks: [], limitStates: [] }),
+    },
+  );
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).not.toContain("stack:");
+  // The successor run is alive for as long as `inFlight` is set: it is not
+  // "retrying…" any more. No stack row → the raw harness id names the account.
+  expect(rendered).toContain("failover: running on claude-a after a quota reset (attempt 2/3)");
+  expect(rendered).not.toContain("retrying");
+});
+
+function exhaustedTask(over: { column: Task["column"]; inFlight?: boolean; nextAttemptAt?: number; attempts?: number }): Task {
+  return task({
+    agent: "claude-b",
+    column: over.column,
+    harnessState: {
+      stackId: "stack-1",
+      position: 0,
+      count: 1,
+      tried: [],
+      pendingSwap: null,
+      allExhausted: {
+        at: Date.now(),
+        attempts: over.attempts ?? 0,
+        max: 3,
+        nextAttemptAt: over.nextAttemptAt ?? 0,
+        earliestResetAtMs: null,
+        reason: "quota",
+        ...(over.inFlight !== undefined ? { inFlight: over.inFlight } : {}),
+      },
+      lastMove: null,
+    },
+  });
+}
+
+const SOLO_STACKS: AgetorClient["listHarnessStacks"] = async () => ({
+  stacks: [{
+    id: "stack-1",
+    label: "Solo train",
+    kind: "claude-code",
+    mirrorMode: "full",
+    members: [{ harnessId: "claude-b", position: 0, label: "Claude B", kind: "claude-code", enabled: true }],
+    createdAt: 1,
+    updatedAt: 1,
+    warnings: [],
+  }],
+  limitStates: [],
+});
+
+test("show: a running column with a recorded exhaust names the account label, and a one-member stack has no position (review S20/N1)", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(exhaustedTask({ column: "running", inFlight: false }), { listHarnessStacks: SOLO_STACKS });
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("failover: running on Claude B after a quota reset (attempt 1/3)");
+  expect(rendered).toContain("stack: Solo train");
+  expect(rendered).not.toContain("(1/1)");
+});
+
+test("show: not running and no timer still reads as retrying (pre-spawn window)", async () => {
+  outputs.length = 0;
+  currentClient = makeClient(exhaustedTask({ column: "blocked", inFlight: false, attempts: 1 }), { listHarnessStacks: SOLO_STACKS });
+
+  await cmdShow([TASK_ID], flags);
+
+  expect(outputs.join("\n")).toContain("failover: retrying on the next available account (attempt 2/3)");
 });

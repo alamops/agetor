@@ -2012,7 +2012,7 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
     INSERT INTO subagents (id, task_id, parent_kind, source_path, status, started_at, ended_at)
       VALUES ('opencode-ses_1', 't1', 'opencode_subagent', 'opencode-session:ses_1', 'orphaned', 1, 2);
   `);
-  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones"]);
+  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk"]);
   expect(columnNames(db, "opencode_stopped_children")).toEqual(["child_session_id", "task_id", "stopped_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_stopped_children)`).all()).toEqual([]);
   // A note for a task id that doesn't exist (or no longer does) is accepted.
@@ -2025,20 +2025,20 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
   db.close();
 });
 
-test("083 (opencode watch tombstones) is the last registered migration, after 082 (opencode child bookkeeping)", () => {
-  const at = migrations.findIndex((m) => m.id === "083_opencode_watch_tombstones");
-  expect(at).toBe(migrations.length - 1);
-  expect(migrations[at - 1]?.id).toBe("082_opencode_child_bookkeeping");
-  expect(migrations[at]?.aliases).toBeUndefined();
-  expect(migrations[at]?.sql).toContain("CREATE TABLE opencode_watch_tombstones");
-  expect(migrations[at]?.sql).toContain("CREATE INDEX opencode_watch_tombstones_expires_idx");
+test("084 (harness stacks) follows 083 (opencode watch tombstones)", () => {
+  const at = migrations.findIndex((m) => m.id === "084_harness_stacks");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("083_opencode_watch_tombstones");
+  expect(migrations[at]?.sql).toContain("CREATE TABLE harness_stacks");
+  expect(migrations[at]?.sql).toContain("CREATE TABLE harness_session_handoffs");
+  expect(migrations[at]?.sql).toContain("ALTER TABLE tasks ADD COLUMN harness_state");
 });
 
 test("083 adds opencode_watch_tombstones (no foreign key, session id primary key, expiry index) on an 082 DB", () => {
   const db = new Database(":memory:");
   migrateThrough(db, "082_opencode_child_bookkeeping");
   db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'opencode', '/w', 1, 1)`);
-  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones"]);
+  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk"]);
   expect(columnNames(db, "opencode_watch_tombstones")).toEqual(["session_id", "harness_id", "task_id", "expires_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_watch_tombstones)`).all()).toEqual([]);
   // A tombstone outlives its task: a task id that doesn't exist is accepted.
@@ -2094,6 +2094,8 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
     "081_cursor_asks",
     "082_opencode_child_bookkeeping",
     "083_opencode_watch_tombstones",
+    "084_harness_stacks",
+    "085_harness_stack_members_no_harness_fk",
   ]);
   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 
@@ -2171,5 +2173,75 @@ test("080 creates harness_auto_enabled with no foreign key, surviving a harnesse
   db.exec(`PRAGMA foreign_keys = ON`);
   db.exec(`CREATE TABLE h2 AS SELECT * FROM harnesses; DROP TABLE harnesses; ALTER TABLE h2 RENAME TO harnesses;`);
   expect(db.query<{ id: string }, []>(`SELECT harness_id AS id FROM harness_auto_enabled`).all()).toEqual([{ id: "codex" }]);
+  db.close();
+});
+
+test("085 (stack members without the harnesses FK) is the last registered migration, after 084 (harness stacks)", () => {
+  const at = migrations.findIndex((m) => m.id === "085_harness_stack_members_no_harness_fk");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("084_harness_stacks");
+  expect(migrations[at]?.aliases).toBeUndefined();
+});
+
+test("085 rebuilds harness_stack_members without the harnesses FK, keeping rows, the stack cascade, the PK and both UNIQUEs; a later harnesses rebuild with foreign keys on keeps every membership", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "084_harness_stacks");
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('cc-b', 'claude-code', 'Backup', 1, 1);
+    INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'Claude', 'claude-code', 1, 1);
+    INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'claude-code', 0), ('s1', 'cc-b', 1);
+  `);
+  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk"]);
+  expect(columnNames(db, "harness_stack_members")).toEqual(["stack_id", "harness_id", "position"]);
+  const fks = db.query<{ table: string; on_delete: string }, []>(`PRAGMA foreign_key_list(harness_stack_members)`).all();
+  expect(fks.map((f) => [f.table, f.on_delete])).toEqual([["harness_stacks", "CASCADE"]]);
+  const members = () =>
+    db.query<{ stack_id: string; harness_id: string; position: number }, []>(
+      `SELECT stack_id, harness_id, position FROM harness_stack_members ORDER BY position`,
+    ).all();
+  expect(members()).toEqual([
+    { stack_id: "s1", harness_id: "claude-code", position: 0 },
+    { stack_id: "s1", harness_id: "cc-b", position: 1 },
+  ]);
+
+  // The documented harnesses rebuild recipe (078's), inside one transaction,
+  // with foreign keys ON as db.ts runs every migration.
+  db.exec(`PRAGMA foreign_keys = ON`);
+  db.transaction(() => {
+    db.run(`CREATE TABLE harnesses_new (
+      id TEXT PRIMARY KEY, kind TEXT NOT NULL, label TEXT NOT NULL, is_builtin INTEGER NOT NULL DEFAULT 0,
+      home TEXT, bin TEXT, env_json TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1, profile_mcp_servers INTEGER NOT NULL DEFAULT 1)`);
+    db.run(`INSERT INTO harnesses_new SELECT id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers FROM harnesses`);
+    db.run(`DROP TABLE harnesses`);
+    db.run(`ALTER TABLE harnesses_new RENAME TO harnesses`);
+  })();
+  expect(members()).toHaveLength(2);
+
+  // The stack cascade, the PK and both UNIQUEs still hold.
+  expect(() => db.run(`INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'cc-c', 1)`)).toThrow();
+  db.run(`INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s2', 'Other', 'claude-code', 1, 1)`);
+  expect(() => db.run(`INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s2', 'cc-b', 0)`)).toThrow();
+  expect(() => db.run(`INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('missing', 'cc-z', 0)`)).toThrow();
+  db.run(`DELETE FROM harness_stacks WHERE id = 's1'`);
+  expect(members()).toEqual([]);
+  expect(migrate(db, migrations)).toEqual([]);
+  db.close();
+});
+
+test("084's harnesses FK on its own would wipe memberships on a harnesses rebuild (the defect 085 removes)", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "084_harness_stacks");
+  db.exec(`
+    INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'Claude', 'claude-code', 1, 1);
+    INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'claude-code', 0);
+    PRAGMA foreign_keys = ON;
+  `);
+  db.transaction(() => {
+    db.run(`CREATE TABLE harnesses_new AS SELECT * FROM harnesses`);
+    db.run(`DROP TABLE harnesses`);
+    db.run(`ALTER TABLE harnesses_new RENAME TO harnesses`);
+  })();
+  expect(db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM harness_stack_members`).get()?.n).toBe(0);
   db.close();
 });

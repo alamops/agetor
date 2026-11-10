@@ -7,6 +7,7 @@ import { isMachineEmittedMessage, normalizeDeliveredUserText, parseUserMessage, 
 import { canonicalizeAttachmentText } from "../../shared/attachments.ts";
 import { stripAgentInstructionsPreamble } from "../../shared/agent-profile.ts";
 import { isHandoffReminderMarker } from "../../shared/pipeline.ts";
+import { isHarnessStackContinuation } from "../../shared/harness-stack.ts";
 
 /**
  * Reduce a raw sent-message payload to display text: normalize CR newlines,
@@ -48,8 +49,15 @@ import { isHandoffReminderMarker } from "../../shared/pipeline.ts";
  * of two.
  */
 export function cleanMessageText(raw: string): string {
+  // A harness-stack continuation prompt is Agetor's own hidden send, never
+  // something the user could usefully resend from history.
+  if (isHarnessStackContinuation(raw)) return "";
   const withoutAttachmentDiffs = canonicalizeAttachmentText(raw.replace(/\r\n?/g, "\n"));
   const text = stripAgentInstructionsPreamble(normalizeDeliveredUserText(withoutAttachmentDiffs));
+  // The JSONL twin of that hidden send is `<pasted_content>`-wrapped, so the
+  // exact-value check above only catches the live echo — re-check the
+  // unwrapped text before it can leak into history.
+  if (isHarnessStackContinuation(text)) return "";
   // Agetor's own automatic handoff-format reminder (`composeHandoffReminder`
   // in shared/pipeline.ts) is a `user` event the RUNNER sent into a pipeline
   // step, not the user's own words — its first line is exactly the marker

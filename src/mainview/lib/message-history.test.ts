@@ -3,6 +3,7 @@ import { cleanMessageText } from "./message-history.ts";
 import { AGETOR_PASTE_LEAD_IN } from "../../shared/user-message.ts";
 import { composeLaunchPrompt } from "../../shared/agent-profile.ts";
 import { HANDOFF_REMINDER_MARKER, composeHandoffReminder } from "../../shared/pipeline.ts";
+import { composeHarnessStackContinuationPrompt } from "../../shared/harness-stack.ts";
 
 /** Build claude's own `<pasted_content>` wrapper shape (the `oKe` function in
  *  the 2.1.277 binary — see docs/plans/pasted-content-tags.md §2 and the
@@ -33,6 +34,16 @@ describe("cleanMessageText", () => {
     // A user who merely MENTIONS the marker mid-message is not a reminder.
     expect(cleanMessageText(`please resend the ${HANDOFF_REMINDER_MARKER} text`)).toBe(
       `please resend the ${HANDOFF_REMINDER_MARKER} text`,
+    );
+  });
+
+  test("a harness-stack continuation prompt is machine text — never offered for resend", () => {
+    expect(cleanMessageText(composeHarnessStackContinuationPrompt())).toBe("");
+    // Claude's JSONL wraps a pasted prompt; the wrapper still cleans to "".
+    expect(cleanMessageText(wrapPastedContent("ab12", composeHarnessStackContinuationPrompt()))).toBe("");
+    // A user who merely mentions the tag stays a real message.
+    expect(cleanMessageText("what does <harness-stack-continuation> mean?")).toBe(
+      "what does <harness-stack-continuation> mean?",
     );
   });
 

@@ -14,7 +14,9 @@ import path from "node:path";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs, spawnTmuxNewSession } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
-import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { SESSION_DIED_STATUS_PREFIX, HARNESS_LIMIT_STATUS_PREFIX, type HarnessLimitSignal } from "../shared/types.ts";
+import { classifyHarnessLimitSignal, harnessLimitTextIsNegative } from "../shared/harness-limits.ts";
+import { nonBlankRootValue } from "../shared/harness-config-root.ts";
 import {
   DEATH_JSONL_QUIET_MS,
   DEATH_MISS_THRESHOLD,
@@ -89,22 +91,99 @@ interface CodexEvent {
   thread_id?: string;
   item?: CodexItem;
   message?: string;
-  error?: { message?: string } | string;
+  error?: { message?: string; [k: string]: unknown } | string;
   [k: string]: unknown;
 }
 
 /** Result of mapping one event line. `done` is set when the event terminates
- *  the turn (`turn.completed` → 0, `turn.failed`/`error` → 1). `threadId` is
- *  set on `thread.started`. */
+ *  the turn (`turn.completed` → 0, `turn.failed` → 1; a top-level `error` is
+ *  not terminal on its own). `threadId` is set on `thread.started`. */
 export interface CodexMapResult {
   done?: number;
   threadId?: string;
 }
 
+/**
+ * Per-run mapper state, carried in the same `{ n }` box as the line-uuid
+ * counter so every caller (spawn, reattach replay, tests) threads it for free.
+ * `pendingLimit` is the classification of the most recent top-level `error`:
+ * codex prints the cause there and the terminal `turn.failed` usually repeats
+ * it, but a top-level `error` alone is NOT terminal — codex also reports
+ * errors it retries past, and a turn that then completes must never read as
+ * an account limit (docs/architecture/harness-stacks.md, contract C1). Any
+ * `item.*` event after it means codex carried on, so it forgets the error
+ * then too (review R-S9); only a terminal failure that follows the error
+ * directly inherits it. A codex that exits after the error with no terminal
+ * event at all emits it from the death watch (`codexExitLimitSignal`).
+ * `now` is a test seam for the reset-time parse (defaults to `Date.now`).
+ */
+export interface CodexMapSeq {
+  n: number;
+  pendingLimit?: HarnessLimitSignal | null;
+  now?: () => number;
+}
+
+/** A structured error code, when the event carries one (`codex_error_info`
+ *  on the error or the event, else `error.code` / `error.type`). codex 0.166's
+ *  `exec --json` events carry only `message`; this reads the code a newer
+ *  CLI may add, and the classifier falls back to the prose otherwise. */
+function codexErrorCode(evt: CodexEvent): unknown {
+  const err = evt.error && typeof evt.error === "object" ? evt.error : null;
+  for (const value of [
+    err?.codex_error_info,
+    err?.codexErrorInfo,
+    evt.codex_error_info,
+    evt.codexErrorInfo,
+    err?.code,
+    err?.type,
+  ]) {
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+}
+
+/** Classify a codex error event. Conservative: `server_overloaded`,
+ *  `model_not_found`, 5xx and auth/network produce nothing (the classifier's
+ *  negative table). */
+function classifyCodexError(evt: CodexEvent, message: string, seq: CodexMapSeq): HarnessLimitSignal | null {
+  return classifyHarnessLimitSignal("codex", { text: message, code: codexErrorCode(evt), now: seq.now?.() });
+}
+
+/**
+ * The limit a codex that exited WITHOUT a terminal `turn.completed` /
+ * `turn.failed` leaves behind: the remembered top-level `error`'s
+ * classification, consumed. Some codex builds print the usage-limit `error`
+ * and exit; the process exit is then the terminal event (CR3).
+ */
+export function codexExitLimitSignal(seq: CodexMapSeq): HarnessLimitSignal | null {
+  const remembered = seq.pendingLimit ?? null;
+  seq.pendingLimit = null;
+  return remembered;
+}
+
+/** Emit the structured limit signal for a TERMINAL turn failure only: the
+ *  `turn.failed` message itself, else the last top-level `error`'s
+ *  classification — unless the terminal message names an explicit
+ *  non-limit cause (outage, auth, model). */
+function emitCodexTurnFailedSignal(
+  evt: CodexEvent,
+  message: string,
+  seq: CodexMapSeq,
+  onChunk: ChunkHandler,
+  key: string,
+): void {
+  const remembered = seq.pendingLimit ?? null;
+  seq.pendingLimit = null;
+  const own = classifyCodexError(evt, message, seq);
+  const signal = own ?? (harnessLimitTextIsNegative(message) ? null : remembered);
+  if (!signal) return;
+  onChunk("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`, `${key}:limit`);
+}
+
 function errMessage(e: CodexEvent["error"]): string {
   if (!e) return "codex turn failed";
   if (typeof e === "string") return e;
-  return e.message ?? "codex turn failed";
+  return typeof e.message === "string" ? e.message : "codex turn failed";
 }
 
 /**
@@ -123,9 +202,12 @@ function errMessage(e: CodexEvent["error"]): string {
 export function mapCodexEvent(
   evt: CodexEvent,
   onChunk: ChunkHandler,
-  seq: { n: number },
+  seq: CodexMapSeq,
 ): CodexMapResult {
   const type = evt.type ?? "";
+  // Codex kept working after the remembered error (it retried past it), so a
+  // later, unrelated `turn.failed` must not inherit it (review R-S9).
+  if (type.startsWith("item.")) seq.pendingLimit = null;
   switch (type) {
     case "thread.started":
       return { threadId: typeof evt.thread_id === "string" ? evt.thread_id : undefined };
@@ -133,20 +215,34 @@ export function mapCodexEvent(
     case "turn.started":
       // Silent — the per-item events carry the substance; a "turn started"
       // banner would just be noise above the first assistant/tool chunk.
+      seq.pendingLimit = null;
       return {};
 
     case "turn.completed":
+      // The turn succeeded: whatever limit-shaped error codex reported on the
+      // way (a retried 429) was not terminal, so it is forgotten, not emitted.
+      seq.pendingLimit = null;
       return { done: 0 };
 
-    case "turn.failed":
-      onChunk("stderr", errMessage(evt.error), `turn.failed:${seq.n++}`);
+    case "turn.failed": {
+      const message = errMessage(evt.error);
+      const key = `turn.failed:${seq.n++}`;
+      emitCodexTurnFailedSignal(evt, message, seq, onChunk, key);
+      onChunk("stderr", message, key);
       return { done: 1 };
+    }
 
-    case "error":
+    case "error": {
       // Top-level transport/model error (no item). A `turn.failed` usually
-      // follows and carries the terminal `done`; surface the message here.
-      onChunk("stderr", errMessage(evt.error ?? evt.message), `error:${seq.n++}`);
+      // follows and carries the terminal `done`; surface the message here and
+      // REMEMBER its classification for that `turn.failed` — never emit a
+      // limit signal from here (contract C1: only a terminal failure does).
+      const message = errMessage(evt.error ?? evt.message);
+      const key = `error:${seq.n++}`;
+      seq.pendingLimit = classifyCodexError(evt, message, seq);
+      onChunk("stderr", message, key);
       return {};
+    }
 
     case "item.started":
       // Wait for `item.completed` to emit — codex restates the item with its
@@ -168,6 +264,8 @@ export function mapCodexEvent(
           break;
         }
         case "error":
+          // A non-fatal item-level error (a tool failure, a retry notice):
+          // shown, never classified as an account limit.
           onChunk("stderr", item.message ?? item.text ?? "codex error", key);
           break;
         case "command_execution": {
@@ -237,7 +335,7 @@ interface CodexSessionState {
   pollTimer: ReturnType<typeof setInterval> | null;
   deathTimer: ReturnType<typeof setInterval> | null;
   seenLineUuids: Set<string>;
-  seq: { n: number };
+  seq: CodexMapSeq;
   onChunk: ChunkHandler;
   onSessionId?: (id: string) => void;
   sessionIdSent: boolean;
@@ -299,7 +397,9 @@ function flushCodexLog(state: CodexSessionState): void {
     } catch {
       // Not JSON — codex shouldn't emit this under `--json --color never`, but
       // surface it rather than drop it (could be a launch error from the shell
-      // wrapper, e.g. "command not found").
+      // wrapper, e.g. "command not found"). Never classified as an account
+      // limit: `2>&1` also carries codex's own log lines, which can mention a
+      // retried 429 on a turn that then succeeds.
       state.onChunk("stderr", trimmed, undefined);
       continue;
     }
@@ -340,6 +440,75 @@ function resolveCodexDone(state: CodexSessionState, code: number): void {
   try { unlinkSync(codexPromptPath(state.runId)); } catch { /* already gone */ }
   try { unlinkSync(state.logPath); } catch { /* already gone */ }
   state.resolveDone(code);
+}
+
+/**
+ * The codex process is gone: read the last bytes, then resolve with whatever
+ * terminal code the log showed (default: failed — a codex exec that vanished
+ * without `turn.completed` did not succeed). If the final flush surfaced a
+ * terminal event, `resolveCodexDone` already fired — an orderly finish, not a
+ * death. Otherwise a remembered usage-limit `error` is the cause (CR3), else
+ * the "ended unexpectedly" sentinel tells the user why the run stopped.
+ */
+function settleCodexAfterExit(state: CodexSessionState): void {
+  flushCodexLog(state);
+  if (!state.resolved) {
+    const limit = codexExitLimitSignal(state.seq);
+    if (limit) {
+      // Codex printed a usage-limit `error` and exited without a terminal
+      // event: the exit is the terminal failure, so the limit is real and
+      // settles the run like `turn.failed` would. The cause is known, so no
+      // "ended unexpectedly" sentinel.
+      state.onChunk(
+        "status",
+        `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(limit)}`,
+        `exit:${state.seq.n++}:limit`,
+      );
+    } else {
+      // Emit the shared sentinel so the orchestrator flips the card to
+      // `blocked` (via makeChunkHandler) and the user sees WHY the run
+      // stopped in the stream, instead of a silent drop to `ready`.
+      state.onChunk(
+        "status",
+        `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
+      );
+    }
+  }
+  resolveCodexDone(state, state.lastCode ?? 1);
+}
+
+/**
+ * Test seam: drive the exit settlement over a codex `--json` log on disk, as
+ * the death watch does once the tmux session is gone, without tmux. Returns
+ * the code `done` resolved with.
+ */
+export function __settleCodexLogAfterExitForTest(
+  logPath: string,
+  onChunk: ChunkHandler,
+  seq: CodexMapSeq = { n: 0 },
+): Promise<number> {
+  const state: CodexSessionState = {
+    taskId: `codex-exit-test-${logPath}`,
+    runId: `codex-exit-test-${logPath}`,
+    sessionName: "codex-exit-test",
+    logPath,
+    offset: 0,
+    decoder: new StringDecoder("utf8"),
+    partial: "",
+    watcher: null,
+    pollTimer: null,
+    deathTimer: null,
+    seenLineUuids: new Set(),
+    seq,
+    onChunk,
+    sessionIdSent: true,
+    resolved: false,
+    lastCode: null,
+    resolveDone: () => {},
+  };
+  const done = new Promise<number>((resolve) => { state.resolveDone = resolve; });
+  settleCodexAfterExit(state);
+  return done;
 }
 
 /** Begin tailing the run's log + watching for session death. Shared by the
@@ -404,22 +573,7 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
         // Session gone. Give the FS a beat to surface the final bytes, flush, then
         // resolve with whatever terminal code we saw (default: failed — a codex
         // exec that vanished without `turn.completed` did not succeed).
-        setTimeout(() => {
-          flushCodexLog(state);
-          // If the final flush surfaced a terminal event (turn.completed/failed),
-          // resolveCodexDone already fired — this was an orderly finish, not a
-          // death, so don't emit the "session ended" sentinel.
-          if (!state.resolved) {
-            // Emit the shared sentinel so the orchestrator flips the card to
-            // `blocked` (via makeChunkHandler) and the user sees WHY the run
-            // stopped in the stream, instead of a silent drop to `ready`.
-            state.onChunk(
-              "status",
-              `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
-            );
-          }
-          resolveCodexDone(state, state.lastCode ?? 1);
-        }, DEATH_GRACE_MS);
+        setTimeout(() => settleCodexAfterExit(state), DEATH_GRACE_MS);
         if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
       } catch {
         /* never crash the watch */
@@ -458,6 +612,27 @@ export interface CodexLaunchOptions {
 }
 
 /**
+ * Make the `CODEX_HOME` a codex turn sees the one `codexHomeFor`
+ * (harness-config-root.ts) describes. A harness that pins one (`harnessEnv`:
+ * its env map's `CODEX_HOME`, else `<home>/.codex`) keeps it. Without a pin,
+ * codex would inherit whatever the long-lived tmux server captured when it
+ * started (the desktop app and a CLI daemon share the socket), while the
+ * readers assume this process's value: so pass this process's value, or unset
+ * it so codex falls back to `<HOME>/.codex` (HOME being the env map's, if it
+ * sets one). A blank value counts as unset, like the resolvers.
+ */
+export function pinCodexHome(
+  env: Record<string, string>,
+  processEnv: Record<string, string | undefined> = process.env,
+): { env: Record<string, string>; unset: boolean } {
+  if (nonBlankRootValue(env.CODEX_HOME)) return { env, unset: false };
+  const { CODEX_HOME: _blank, ...rest } = env;
+  const own = processEnv.CODEX_HOME;
+  if (nonBlankRootValue(own)) return { env: { ...rest, CODEX_HOME: own }, unset: false };
+  return { env: rest, unset: true };
+}
+
+/**
  * Spawn one codex turn in a detached tmux session and start tailing its
  * `--json` log. Returns a `SpawnedAgent` whose `done` resolves when the turn
  * ends (0 on `turn.completed`, 1 on failure/crash).
@@ -476,12 +651,13 @@ export async function spawnCodexViaTmux(opts: CodexLaunchOptions): Promise<Spawn
   await killSessionByName(sessionName);
 
   const tmux = resolveTmuxBin();
-  const inner = `exec ${opts.argv.map(sq).join(" ")} < ${sq(promptPath)} > ${sq(logPath)} 2>&1`;
+  const launchEnv = pinCodexHome(opts.env);
+  const inner = `${launchEnv.unset ? "unset CODEX_HOME; " : ""}exec ${opts.argv.map(sq).join(" ")} < ${sq(promptPath)} > ${sq(logPath)} 2>&1`;
   const envArgs: string[] = [];
   // Forward PATH so codex's own shell-tool invocations resolve dev binaries,
   // plus the harness env (CODEX_HOME/HOME) that controls codex's login/history.
   if (process.env.PATH) { envArgs.push("-e", `PATH=${process.env.PATH}`); }
-  for (const [k, v] of Object.entries(opts.env)) envArgs.push("-e", `${k}=${v}`);
+  for (const [k, v] of Object.entries(launchEnv.env)) envArgs.push("-e", `${k}=${v}`);
 
   const args = [
     ...tmuxSocketArgs(),

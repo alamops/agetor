@@ -386,3 +386,59 @@ test("ApiError exposes the 403 body's code and a plain message", async () => {
     server.stop(true);
   }
 });
+
+// Review S21: the stack create/edit routes mirror the primary's config inline
+// with the server's idle timeout off. The default 15 s budget aborted the CLI
+// after the stack was saved, so the client must use the long budget, and a
+// no-answer failure must say the stack may already exist.
+test("createHarnessStack / patchHarnessStack use the long mirror budget, and a transport failure says the stack may be saved", async () => {
+  const server = Bun.serve({
+    port: 0,
+    fetch: async () =>
+      new Response(JSON.stringify({ stack: { id: "s1" }, warnings: [], mirror: { copied: [], warnings: [] } }), {
+        headers: { "content-type": "application/json" },
+      }),
+  });
+  const realTimeout = AbortSignal.timeout;
+  const budgets: number[] = [];
+  AbortSignal.timeout = ((ms: number) => {
+    budgets.push(ms);
+    return realTimeout.call(AbortSignal, ms);
+  }) as typeof AbortSignal.timeout;
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    await client.createHarnessStack({ label: "T", kind: "claude-code", members: ["a", "b"] });
+    await client.patchHarnessStack("s1", { members: ["b", "a"] });
+    await client.listHarnessStacks().catch(() => null);
+    expect(budgets).toHaveLength(3);
+    expect(budgets[0]).toBe(15 * 60_000);
+    expect(budgets[1]).toBe(15 * 60_000);
+    // Plain reads keep the default budget.
+    expect(budgets[2]).toBe(15_000);
+  } finally {
+    AbortSignal.timeout = realTimeout;
+    server.stop(true);
+  }
+
+  // A core that is gone: no answer at all → status 0 with the save hint.
+  const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
+  const deadPort = dead.port!;
+  dead.stop(true);
+  const client = new AgetorClient({ port: deadPort, token: "tok" });
+  let err: unknown;
+  try {
+    await client.createHarnessStack({ label: "T", kind: "claude-code", members: ["a"] });
+  } catch (e) {
+    err = e;
+  }
+  expect(err).toBeInstanceOf(ApiError);
+  expect((err as ApiError).status).toBe(0);
+  expect((err as ApiError).message).toContain("may have been saved");
+  err = undefined;
+  try {
+    await client.patchHarnessStack("s1", { label: "U" });
+  } catch (e) {
+    err = e;
+  }
+  expect((err as ApiError).message).toContain("may have been saved");
+});

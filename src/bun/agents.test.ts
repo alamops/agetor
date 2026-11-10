@@ -46,6 +46,8 @@ const {
   buildFxLaunchOptions,
   resolveBin,
   harnessEnv,
+  claudeConfigDirOverrideFor,
+  codexHomeOverrideFor,
   opencodeEffectiveServerFor,
   OPENCODE_TITLE_MAX_CHARS,
   FAKE_OPENCODE_SUBAGENT_PROMPT_MARKER,
@@ -178,13 +180,13 @@ test("aliased claude-code with a config-dir override emits CLAUDE_CONFIG_DIR (no
   expect(result.env?.HOME).toBeUndefined();
 });
 
-test("aliased codex with HOME override emits HOME + CODEX_HOME", () => {
+test("aliased codex with a home override emits CODEX_HOME only (HOME is preserved)", () => {
   const result = buildCommand(
     alias("codex", { home: "/tmp/agetor-test/codex-2" }),
     "p",
     { ...codexDefaults },
   );
-  expect(result.env?.HOME).toBe("/tmp/agetor-test/codex-2");
+  expect(result.env?.HOME).toBeUndefined();
   expect(result.env?.CODEX_HOME).toBe("/tmp/agetor-test/codex-2/.codex");
 });
 
@@ -215,8 +217,22 @@ test("aliased codex env CODEX_HOME overrides the home-derived default", () => {
     "p",
     { ...codexDefaults },
   );
-  expect(result.env?.HOME).toBe("/tmp/agetor-test");
+  expect(result.env?.HOME).toBeUndefined();
   expect(result.env?.CODEX_HOME).toBe("/custom/path/.codex");
+});
+
+test("the config-dir override helpers follow harnessEnv's precedence (env wins over home)", () => {
+  // These are the roots the driver/mirror/transfer resolve; they must agree
+  // with the env `harnessEnv` actually hands the CLI.
+  expect(claudeConfigDirOverrideFor({ home: "/h", env: { CLAUDE_CONFIG_DIR: "/c" } })).toBe("/c");
+  expect(claudeConfigDirOverrideFor({ home: "/h", env: {} })).toBe("/h");
+  expect(claudeConfigDirOverrideFor({ home: "/h", env: { CLAUDE_CONFIG_DIR: "  " } })).toBe("/h");
+  expect(claudeConfigDirOverrideFor({ home: null, env: {} })).toBeNull();
+
+  expect(codexHomeOverrideFor({ home: "/h", env: { CODEX_HOME: "/c" } })).toBe("/c");
+  expect(codexHomeOverrideFor({ home: "/h", env: {} })).toBe(path.join("/h", ".codex"));
+  expect(codexHomeOverrideFor({ home: "/h", env: { CODEX_HOME: "  " } })).toBe(path.join("/h", ".codex"));
+  expect(codexHomeOverrideFor({ home: null, env: {} })).toBeNull();
 });
 
 test("aliased cursor with HOME override emits HOME only (no CODEX_HOME)", () => {
@@ -2726,9 +2742,9 @@ test("a config-dir alias launches with CLAUDE_CONFIG_DIR inline and never HOME (
   expect(cmd).not.toContain("HOME=");
 });
 
-test("a codex alias re-homes inline via HOME + CODEX_HOME", () => {
+test("a codex alias re-homes inline via CODEX_HOME only", () => {
   expect(buildHarnessTerminalCommand(alias("codex", { home: "/cfg" }))).toBe(
-    "HOME='/cfg' CODEX_HOME='/cfg/.codex' codex",
+    "CODEX_HOME='/cfg/.codex' codex",
   );
 });
 
@@ -2934,6 +2950,44 @@ test("opencode resolveBin: AGETOR_OPENCODE_BIN override, harness.bin wins over i
   process.env.AGETOR_OPENCODE_BIN = "/opt/oc/opencode";
   expect(resolveBin(builtin("opencode"))).toBe("/opt/oc/opencode");
   expect(resolveBin(alias("opencode", { bin: "/usr/local/bin/opencode" }))).toBe("/usr/local/bin/opencode");
+});
+
+test("harnessEnv drops a blank config-root key from the env map so the spawn reads the resolver's root (S17)", () => {
+  expect(harnessEnv(alias("claude-code", { home: "/h/c", env: { CLAUDE_CONFIG_DIR: "", HOME: " ", FOO: "" } })))
+    .toEqual({ CLAUDE_CONFIG_DIR: "/h/c", FOO: "" });
+  expect(harnessEnv(alias("codex", { home: "/h/x", env: { CODEX_HOME: "  " } }))).toEqual({ CODEX_HOME: "/h/x/.codex" });
+  // A non-blank value still wins, as before.
+  expect(harnessEnv(alias("codex", { home: "/h/x", env: { CODEX_HOME: "/pinned" } }))).toEqual({ CODEX_HOME: "/pinned" });
+});
+
+test("the override helpers are the spawn PIN only: an env-map HOME alone pins nothing (CR1, R-M1)", () => {
+  const prevClaude = process.env.CLAUDE_CONFIG_DIR;
+  const prevCodex = process.env.CODEX_HOME;
+  delete process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CODEX_HOME;
+  try {
+    // Pinning `<HOME>/.claude` would change the CLAUDE_CONFIG_DIR claude
+    // hashes into its keychain service name and log the account out, and
+    // move `.claude.json` into that dir. The spawn stays as it was before
+    // stacks; readers use claudeConfigDirFor (`<HOME>/.claude`).
+    expect(claudeConfigDirOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();
+    expect(harnessEnv(alias("claude-code", { env: { HOME: "/eh" } }))).toEqual({ HOME: "/eh" });
+    expect(codexHomeOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();
+    expect(harnessEnv(alias("codex", { env: { HOME: "/eh" } }))).toEqual({ HOME: "/eh" });
+    expect(claudeConfigDirOverrideFor({ home: null, env: {} })).toBeNull();
+    expect(claudeConfigDirOverrideFor({ home: "/h", env: { CLAUDE_CONFIG_DIR: "" } })).toBe("/h");
+    // The process value is never a pin either: pinClaudeConfigDir hands it to
+    // claude itself, and a codex spawn inherits it.
+    process.env.CLAUDE_CONFIG_DIR = "/proc-claude";
+    process.env.CODEX_HOME = "/proc-codex";
+    expect(claudeConfigDirOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();
+    expect(codexHomeOverrideFor({ home: null, env: { HOME: "/eh" } })).toBeNull();
+  } finally {
+    if (prevClaude === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prevClaude;
+    if (prevCodex === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodex;
+  }
 });
 
 test("opencode harnessEnv: a home pins HOME plus all four XDG dirs under it; the harness env map still wins", () => {

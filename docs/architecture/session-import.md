@@ -5,7 +5,7 @@
 ## Claude Code sessions
 
 `GET /claude-sessions` lists transcripts under each Claude Code harness config dir (and `~/.claude`) that Agetor did not start.
-Import creates an in-place task (`isolation: "none"`, `workdir` = the transcript's cwd) in **review**, bound to that session id, and persists the transcript onto a succeeded seed run (`origin: "imported"`).
+Import creates an in-place task (`isolation: "none"`, `workdir` = the transcript's cwd) in **review**, bound to that session id, and persists the transcript onto a succeeded seed run (`origin: "imported"`). A session that opens on the harness-stack hidden continuation wrapper (a clean retry on a backup account) uses the user's words inside the wrapper as the task prompt (`importedTaskPrompt`), falling back to the title when nothing is left.
 A live session is refused.
 Claude's `default`, missing, and unknown permission modes are stored as `ask` (resume passes `--permission-mode default`).
 A project folder whose plain encoding would exceed 200 characters stays listed with Import disabled ("Folder path is too long to import yet") until `encodeProjectPath` matches the on-disk directory name — the hash is not guessed.
@@ -17,7 +17,7 @@ Launch scan (`claudeSessions.launchScan`, default on) runs only after the deskto
 The scanner reads as little as it can: an id Agetor owns is skipped by file name, a project dir whose name starts with an encoded worktree or temp root is peeked (first 64 KB) for its cwd before a full parse, parsed metadata is cached per file by size + mtime, and `git rev-parse` (5 s timeout) runs only for the rows a list scan (`scanClaudeSessions`) shows; an import by id (`findClaudeSessions`) probes every id it matches, hidden ones included.
 Liveness is a cached `claude agents --json` per config dir, run with that harness's own `bin`; `GET /claude-sessions` returns `livenessCheckedAt` (oldest probe, null when a dir has none) and the dialog and `agetor sessions ls` re-check when it is null or older than `CLAUDE_SESSIONS_LIVENESS_STALE_MS`.
 The task panel's "Switch to X" banner sends the branch it names and hides once the task has an Agetor run.
-A home-less claude-code harness launches with this process's `CLAUDE_CONFIG_DIR` pinned, or unset via `/usr/bin/env -u` (`pinClaudeConfigDir`), so the long-lived tmux server's env can't send claude to a dir `jsonlPathFor` doesn't tail; a harness with a home always launches with that home, even when its `env` map names another `CLAUDE_CONFIG_DIR`; a home-less harness whose `env` map names one launches there, and the spawn tails that dir.
+A home-less claude-code harness launches with this process's `CLAUDE_CONFIG_DIR` pinned, or unset via `/usr/bin/env -u` (`pinClaudeConfigDir`), so the long-lived tmux server's env can't send claude to a dir `jsonlPathFor` doesn't tail (a blank process value counts as unset). The env map's `CLAUDE_CONFIG_DIR` wins over `home`, then `home`; an account whose env map sets only `HOME` launches unpinned and claude reads `<HOME>/.claude`. The spawn tails exactly the dir the launch env sends claude to (`claudeReadRootsForLaunch`).
 `agetor sessions import --json` lists requested ids that are blocked or missing in `results` with their reason, and the task panel hides Commit & push while send is refused.
 `tasks.imported_claude`/`imported_claude_session_id` are skipped by the generic `tasks.update` SET clause and written only by `tasks.setImportedClaude`, in one UPDATE.
 

@@ -72,3 +72,19 @@
    `fast` is a boolean alias of `speed`, kept for older clients: `resolveSpeedInput` (`src/shared/speed.ts`) maps `true` → `"fast"` and `false` → `"off"`, `speed` wins when both are sent, and a bad `speed` or a non-boolean `fast` is a 400 (`speed must be one of off, fast, ultrafast` / `fast must be a boolean`); `POST /tasks`, `POST`/`PATCH /agent-profiles`, `POST /agent-profiles/:id/duplicate` and `POST /projects/clone`'s launch fields take the same alias, and every Task/AgentProfile response carries `speed` plus a derived `fast` (`speed !== "off"`, never read by agetor itself).
    Worktree-derived fields (`branch`, `worktreePath`, `baseRef`), identity fields (`id`, `runId`, `createdAt`, `updatedAt`, `isolation`), and server-managed derived state (`sentFiles`, `todoProgress`, `plans`) are all server-managed too — as are the four pipeline fields (`pipelineId`, `pipelineRun`, `pipelineParentId`, `pipelineStepId`, see [pipelines.md](pipelines.md)): a step row additionally 409s a `column` patch specifically (its column is runner-owned), while every other field on a step row stays ordinarily patchable.
    The webview's edit dialog also locks the `workdir` field once `task.worktreePath !== null`, so the UI prevents the orphan scenario before the server would have to clean it up.
+
+## Harness-stack prepare and swap
+
+Before `resolveHarness(task.agent)`, a manual Run/message calls
+`prepareTaskHarness({ manual: true })`: a no-stack task is untouched; a stack
+task whose current account was removed/disabled/logged out moves to the next
+usable account and transfers the conversation (a live run is left alone; the
+message queues). A limit on a stack task settles through
+`handleHarnessLimitSettlement` instead of the normal column path — the old run
+is `failed` with `run-status.reason: "harness-swap"`, the task stays
+`running`, and a successor run (`origin: "harness-swap"`) continues on the
+next account. A message typed in that window is held and drained after the
+successor settles. Delete removes copied sessions at the end of a successful
+delete (after every throwing teardown step, so a failed delete keeps the
+conversation resumable); archive keeps them for the retention sweep. See
+[harness-stacks.md](harness-stacks.md).

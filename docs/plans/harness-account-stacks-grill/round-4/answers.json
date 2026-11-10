@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "formId": "harness-account-stacks-grill-r4",
+  "title": "Grill — Harness account stacks (round 4: the Codex HOME premise)",
+  "round": 4,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "aa5e4bb5f862b75417d505eafa6879eff7531177907cfc344b70f05d023fe722",
+  "submittedAt": "2026-11-06T22:03:52.265Z",
+  "receivedAt": "2026-11-06T22:03:52.270Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 1,
+    "answered": 1,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 1,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "codex-home-premise": {
+      "n": 1,
+      "title": "Should the plan first test dropping the Codex HOME override (keeping only CODEX_HOME), instead of building the overlay?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "spike-drop-home",
+      "display": "Test dropping HOME for Codex first",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

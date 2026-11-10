@@ -60,3 +60,24 @@ Routes: `GET /db/stats` (`DbStats`), `POST /db/compact`, `POST /db/retention/run
 A new `run_events` method that isn't exercised by that test fails it by name.
 
 **Adding a migration** (numbered `.sql` files, the `migrations/index.ts` entry, never editing an applied one, and why the SQL is inlined at bundle time) is described once, in [CLAUDE.md § Persistence, in brief](../../CLAUDE.md#persistence-in-brief).
+
+## Harness stack tables (migrations 084, 085)
+
+`harness_stacks`, `harness_stack_members`, `harness_limit_state` and
+`harness_session_handoffs` are additive; `tasks.harness_state` is another
+server-managed column (targeted UPDATE only, no `updated_at`, skipped by the
+generic PATCH clause — same rule as `fx_recovery`). `UNIQUE(harness_stack_members.harness_id)`
+is the "one stack per account" invariant and `UNIQUE(stack_id, position)` the
+order. **No table references `harnesses` by FK**: 084 shipped
+`harness_stack_members.harness_id REFERENCES harnesses(id) ON DELETE CASCADE`,
+and because `db.ts` turns `foreign_keys` on before `migrate()` (it cannot be
+turned off inside a migration's transaction), the documented `harnesses`
+rebuild (`DROP TABLE harnesses` = an implicit `DELETE`) would have cascaded
+every membership away. Migration 085 rebuilds `harness_stack_members` without
+that FK (the cascade from `harness_stacks` stays), and `harnesses.delete`
+removes the account's membership row explicitly and re-packs the ranks.
+`harness_limit_state` has no FK on purpose: it is account-global and
+survives a stack delete. `harness_session_handoffs` cascades with the task; its
+`copied_paths_json` is the only allowlist cleanup may remove. Snapshot/restore
+for tests covers all three (`test-harness-state.ts`). Model:
+[harness-stacks.md](harness-stacks.md).

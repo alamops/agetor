@@ -13,6 +13,7 @@ import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { AgentProfileForm } from "@/components/kanban/AgentProfileFormDialog";
 import { AgentProfilesSection } from "@/components/settings/AgentProfilesSection";
+import { HarnessStacksSection } from "@/components/settings/HarnessStacksSection";
 import { BackgroundSection } from "@/components/settings/BackgroundSection";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { PipelinesSection } from "@/components/settings/PipelinesSection";
@@ -35,6 +36,7 @@ import {
 import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
 import { resolveTemplateInitialHome } from "@/lib/harness-template";
 import { harnessEditorDirty } from "@/lib/harness-editor-dirty";
+import { stackPositionFor } from "@/lib/stack-badge";
 import {
   SETTINGS_SECTIONS,
   activeSection,
@@ -44,6 +46,7 @@ import {
   openAgentEditor,
   openEditor,
   openSection,
+  openStackEditor,
   openTemplates,
   resolveEscape,
   type SettingsSectionId,
@@ -449,9 +452,12 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   };
 
   const onDeleteHarness = async (h: Harness) => {
+    const stack = (payload.stacks ?? []).find((st) => st.members.some((m) => m.harnessId === h.id));
     const ok = await confirm({
       title: `Delete "${h.label}"?`,
-      description: "The alias will be removed. Tasks already using it will fail to start until reassigned.",
+      description: stack
+        ? `It is in the stack "${stack.label}"; deleting it removes it from that stack and stops its failover. Tasks already using it will fail to start until reassigned.`
+        : "The alias will be removed. Tasks already using it will fail to start until reassigned.",
       confirmLabel: "Delete",
       variant: "destructive",
     });
@@ -652,6 +658,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
             {view.kind === "templates" && "Add harness"}
             {view.kind === "editor" && (view.harnessId ? "Edit harness" : "Add harness")}
             {view.kind === "agent-editor" && (view.profileId ? "Edit agent" : view.duplicateFromId ? "Duplicate agent" : "Add agent")}
+            {view.kind === "stack-editor" && (view.stackId ? "Edit stack" : "New stack")}
           </h2>
         </div>
         <div className="flex items-center gap-2">
@@ -737,6 +744,20 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       pendingToggle={pendingToggle}
                       onToggleProfileMcp={onToggleProfileMcp}
                       pendingProfileMcp={pendingProfileMcp}
+                    />
+                  );
+                case "stacks":
+                  return (
+                    <HarnessStacksSection
+                      stacks={payload.stacks ?? []}
+                      limitStates={payload.limitStates ?? []}
+                      harnesses={payload.harnesses}
+                      onEdit={(id) => setView(openStackEditor(id))}
+                      onNew={() => setView(openStackEditor(null))}
+                      onChange={() => {
+                        void refresh();
+                        onChange?.();
+                      }}
                     />
                   );
                 case "agents":
@@ -848,6 +869,26 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 }}
               />
             </div>
+          )}
+
+          {view.kind === "stack-editor" && (
+            <HarnessStacksSection
+              mode="editor"
+              stackId={view.stackId}
+              stacks={payload.stacks ?? []}
+              limitStates={payload.limitStates ?? []}
+              harnesses={payload.harnesses}
+              onEdit={(id) => setView(openStackEditor(id))}
+              onNew={() => setView(openStackEditor(null))}
+              onChange={() => {
+                void refresh();
+                onChange?.();
+              }}
+              onSaved={() => setView(backFromSubview(viewRef.current))}
+              onDirtyChange={(dirty) => {
+                subpageDirtyRef.current = dirty;
+              }}
+            />
           )}
 
           {view.kind === "editor" && (
@@ -1472,6 +1513,11 @@ function HarnessesSection({
   // Local to this section: the table fetches on expand, and the scan behind
   // it stats every transcript file — never fetched with the list.
   const [usageOpenFor, setUsageOpenFor] = useState<string | null>(null);
+  // The `n/m` chip per account. `stackPositionFor` owns the "fewer than two
+  // members → no chip" rule (via the shared `stackPositionText`): a
+  // one-account stack cannot fail over, so it gets no `1/1` chip.
+  const stacks = payload.stacks ?? [];
+  const coolingByHarness = new Map((payload.limitStates ?? []).map((s) => [s.harnessId, s] as const));
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-2">
@@ -1491,6 +1537,7 @@ function HarnessesSection({
           {payload.harnesses.map((h) => {
             const status = statusByHarness.get(h.id);
             const available = status?.available ?? false;
+            const stackAt = stackPositionFor(stacks, h.id);
             return (
               <div
                 key={h.id}
@@ -1525,6 +1572,24 @@ function HarnessesSection({
                         title={status.authHelp ?? "Not logged in"}
                       >
                         not logged in
+                      </span>
+                    )}
+                    {stackAt && (
+                      <span
+                        data-testid="harness-stack-chip"
+                        className="rounded border border-info/40 px-1.5 py-0.5 text-[10px] font-medium text-info"
+                        title="Harness account stack — fails over to the next account at its limit"
+                      >
+                        {stackAt.text}
+                      </span>
+                    )}
+                    {coolingByHarness.has(h.id) && (
+                      <span
+                        data-testid="harness-cooling-chip"
+                        className="rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning"
+                        title={`Cooling until ${new Date(coolingByHarness.get(h.id)!.exhaustedUntilMs).toLocaleString()}`}
+                      >
+                        cooling
                       </span>
                     )}
                     <span

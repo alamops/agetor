@@ -191,6 +191,12 @@ export function headlessNotificationFor(
       return { title: "Waiting on you", body: describe, taskId, kind: "waiting" };
 
     case "run-status": {
+      // A harness-stack failover marks the old run failed while the task
+      // keeps running; the successor's settle is the real outcome. An
+      // all-exhausted settle is also non-terminal — its `column` block
+      // carries the stack-specific notification, so the generic "Task
+      // failed" must not fire first.
+      if (ev.reason === "harness-swap" || ev.reason === "harness-exhausted") return null;
       // A step's own run settling never notifies; the parent's pipeline
       // events are the user-facing signal.
       if (stepParentId) return null;
@@ -222,7 +228,22 @@ export function headlessNotificationFor(
       if (ev.reason === "pipeline") {
         return ctx.hasPendingQuestion ? null : pipelineNeedsYou(taskId, lookup);
       }
+      if (ev.reason === "harness-exhausted") {
+        return { title: "Stack out of quota", body: describe, taskId, kind: "blocked" };
+      }
+      if (ev.reason === "harness-swap-failed") {
+        return { title: "No usable backup account", body: describe, taskId, kind: "blocked" };
+      }
       return { title: "Waiting on you", body: describe, taskId, kind: "blocked" };
+    }
+
+    case "harness-swap": {
+      return {
+        title: "Account switched",
+        body: `${describe} — ${ev.fromLabel} → ${ev.toLabel} (${ev.position}/${ev.count})`,
+        taskId,
+        kind: "harness-swap",
+      };
     }
 
     case "files-sent": {

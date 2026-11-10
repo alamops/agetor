@@ -50,11 +50,14 @@ import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type
 
 import type { ContinuationTrigger, RunEventStream } from "../shared/types.ts";
 import {
+  HARNESS_LIMIT_STATUS_PREFIX,
   PERMISSION_MODE_STATUS_PREFIX,
   SESSION_DIED_STATUS_PREFIX,
   TURN_STALLED_STATUS_PREFIX,
   TURN_STALL_RESUMED_STATUS_PREFIX,
 } from "../shared/types.ts";
+import { classifyHarnessLimitSignal } from "../shared/harness-limits.ts";
+import { nonBlankRootValue } from "../shared/harness-config-root.ts";
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 import { sanitizeToolResultAttachments } from "../shared/sent-files.ts";
 import { compactionStatusLine, isCompactionNotice } from "../shared/compaction.ts";
@@ -414,11 +417,13 @@ export interface ClaudeLaunchOptions {
    */
   sessionId: string;
   /**
-   * Per-harness config-dir override (passed to claude as CLAUDE_CONFIG_DIR).
-   * When set, claude writes its JSONL under `<configDir>/projects/…` — the
-   * path itself replaces `~/.claude/`. NULL falls back to
-   * `~/.claude/projects/…`. This is how multi-account harnesses keep their
-   * login & history separate. Sourced from `Harness.home` at the call site.
+   * The harness's config-dir PIN (`claudeConfigDirOverrideFor`: its env
+   * map's `CLAUDE_CONFIG_DIR`, else its `home`), passed to claude as
+   * CLAUDE_CONFIG_DIR. When set, claude writes its JSONL under
+   * `<configDir>/projects/…` — the path itself replaces `~/.claude/`. NULL
+   * pins nothing (see `pinClaudeConfigDir`); the tailer then reads where the
+   * launch env sends claude (`claudeReadRootsForLaunch`). This is how
+   * multi-account harnesses keep their login & history separate.
    */
   configDir: string | null;
   /**
@@ -438,6 +443,11 @@ export interface ClaudeLaunchOptions {
    * buffer machinery `sendTurn` uses for live-session follow-ups.
    */
   deferredPrompt?: string;
+  /** True when the task is on a harness stack with at least one backup, so a
+   *  usage-limit pane notice settles the turn for a swap. False (the default)
+   *  keeps the pre-stack behavior: the notice is not carded and claude's own
+   *  auto-continue keeps the turn in flight. See `SessionState.harnessFailover`. */
+  harnessFailover?: boolean;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -570,19 +580,23 @@ export function buildClaudeSessionEnv(callerEnv: Record<string, string>): Record
 }
 
 /**
- * Make a session's config dir the one `jsonlPathFor` will tail. A harness
- * with a home already passes `CLAUDE_CONFIG_DIR` (`harnessEnv`, agents.ts).
- * Without one, claude would inherit whatever the long-lived tmux server
- * captured when it started — possibly another process's env (the desktop
- * app and a CLI daemon share the socket) — while the tailer reads this
- * process's `CLAUDE_CONFIG_DIR` (`effectiveClaudeConfigDir(null)`). So pin
- * this process's value, or unset it so claude falls back to `~/.claude`.
- * Setting it to `~/.claude` explicitly is not equivalent: claude then reads
- * `.claude.json` inside that dir instead of `~/.claude.json`. With a home,
- * `configDir` always wins: a harness `env` map that names a different
- * `CLAUDE_CONFIG_DIR` would send claude to a folder the tailer, the
- * session scan and the liveness probe never read. Without a home, a caller
- * env that already names a config dir (a harness `env` map) is left alone.
+ * Make a session's config dir the one the tailer reads. `configDir` is the
+ * harness's own pin (`claudeConfigDirOverrideFor`: its env map's
+ * `CLAUDE_CONFIG_DIR`, else its `home`). Without one, claude would inherit
+ * whatever the long-lived tmux server captured when it started — possibly
+ * another process's env (the desktop app and a CLI daemon share the socket)
+ * — while the readers (`claudeConfigDirFor`) assume this process's
+ * `CLAUDE_CONFIG_DIR`. So pin this process's value, or unset it so claude
+ * falls back to `<HOME>/.claude` (HOME being the env map's, if it sets one).
+ * Setting it to `<HOME>/.claude` explicitly is not equivalent: claude then
+ * reads `.claude.json` inside that dir instead of `<HOME>/.claude.json`, and
+ * hashes the value into a different macOS keychain service, which logs the
+ * account out (review R-M1). With a pin, `configDir` always wins: a harness
+ * `env` map that names a different `CLAUDE_CONFIG_DIR` would send claude to
+ * a folder the tailer, the session scan and the liveness probe never read.
+ * Without a pin, a caller env that already names a config dir is left alone.
+ * A blank value anywhere counts as unset, like the resolvers in
+ * harness-config-root.ts.
  */
 export function pinClaudeConfigDir(
   argv: readonly string[],
@@ -590,12 +604,33 @@ export function pinClaudeConfigDir(
   configDir: string | null,
   processEnv: Record<string, string | undefined> = process.env,
 ): { argv: string[]; env: Record<string, string> } {
-  if (configDir) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: configDir } };
-  if (env.CLAUDE_CONFIG_DIR) return { argv: [...argv], env };
+  if (nonBlankRootValue(configDir)) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: configDir } };
+  if (nonBlankRootValue(env.CLAUDE_CONFIG_DIR)) return { argv: [...argv], env };
   const own = processEnv.CLAUDE_CONFIG_DIR;
-  if (own) return { argv: [...argv], env: { ...env, CLAUDE_CONFIG_DIR: own } };
+  const { CLAUDE_CONFIG_DIR: _blank, ...rest } = env;
+  if (nonBlankRootValue(own)) return { argv: [...argv], env: { ...rest, CLAUDE_CONFIG_DIR: own } };
   // `env` execs claude in place, so the pane's pid is still claude's.
-  return { argv: ["/usr/bin/env", "-u", "CLAUDE_CONFIG_DIR", ...argv], env };
+  return { argv: ["/usr/bin/env", "-u", "CLAUDE_CONFIG_DIR", ...argv], env: rest };
+}
+
+/**
+ * The directories a claude launched with `launch` (the output of
+ * `pinClaudeConfigDir`) reads, modelled on the CLI itself: the config dir is
+ * `CLAUDE_CONFIG_DIR`, else `<HOME>/.claude`; `.claude.json` sits in
+ * `CLAUDE_CONFIG_DIR`, else in `<HOME>`. HOME is the launch env's, else
+ * `realHome` (the tmux server's, which is Agetor's own). The tailer reads the
+ * session JSONL from `configDir`, and the parity test pins these to
+ * `claudeConfigDirFor` / `claudeJsonDirFor` for every account shape.
+ */
+export function claudeReadRootsForLaunch(
+  launch: { argv: readonly string[]; env: Record<string, string> },
+  realHome: string = homedir(),
+): { configDir: string; claudeJsonDir: string } {
+  const unset = launch.argv[0] === "/usr/bin/env" && launch.argv[1] === "-u" && launch.argv[2] === "CLAUDE_CONFIG_DIR";
+  const pinned = unset ? undefined : launch.env.CLAUDE_CONFIG_DIR;
+  const home = nonBlankRootValue(launch.env.HOME) ? launch.env.HOME : realHome;
+  if (nonBlankRootValue(pinned)) return { configDir: pinned, claudeJsonDir: pinned };
+  return { configDir: path.join(home, ".claude"), claudeJsonDir: home };
 }
 
 interface ContentBlock {
@@ -2885,6 +2920,15 @@ interface SessionState {
    *  `UNPARSABLE_STABILITY_TICKS` before the scraper presses Escape to
    *  return to the conversation (`returnFromBackgroundSessionsView`). */
   scrapeBackgroundViewStreak: number;
+  /** True when this task is on a harness stack with at least one backup, so a
+   *  usage-limit notice means "settle the turn for a swap" rather than the
+   *  pre-stack behavior of letting claude auto-continue. Supplied by the
+   *  orchestrator at spawn/reattach/sendTurn; false everywhere else. */
+  harnessFailover: boolean;
+  /** One-shot latch for the usage-limit notice: the pane keeps the notice up
+   *  for the rest of the turn, so the scrape may see it on every tick after
+   *  the first. Reset when a new turn enters the queue. */
+  limitSignaledThisTurn: boolean;
   /** `Date.now()` stamp of the most recent successful JSONL append the
    *  flusher dispatched. The scraper consults it to (a) suppress
    *  matches that happened while claude was actively writing (the
@@ -3298,6 +3342,8 @@ interface MakeSessionStateOpts {
   /** See `SessionState.launchEffort`. Only `spawnClaudeViaTmux` has a launch
    *  env to read this off; every other construction site leaves it null. */
   launchEffort?: string | null;
+  /** See `SessionState.harnessFailover`. */
+  harnessFailover?: boolean;
 }
 
 function makeSessionState(o: MakeSessionStateOpts): SessionState {
@@ -3336,6 +3382,8 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     agentRosterSignature: null,
     agentRosterChangedAt: 0,
     scrapeBackgroundViewStreak: 0,
+    harnessFailover: o.harnessFailover ?? false,
+    limitSignaledThisTurn: false,
     lastJsonlAppendAt: 0,
     stallFloorAt: Date.now(),
     stallFired: false,
@@ -4452,6 +4500,7 @@ function maybeAdoptContinuation(
     adopted.resolve = resolve;
     adopted.reject = reject;
   });
+  state.limitSignaledThisTurn = false;
   state.turnQueue.push(adopted);
   // Register the run with the orchestrator BEFORE the triggering line
   // dispatches below — the caller must be able to observe "running" before
@@ -7211,6 +7260,15 @@ function normalizePaneForActivity(tail: string): string {
     .join("\n");
 }
 
+/**
+ * Test seam: how `scrapeOnce` reads the plain pane. Production captures the
+ * tmux pane tail; the unit suite swaps in a synthetic pane so the limit
+ * notice (and the rest of the scrape path) can be driven without a real
+ * claude session or tmux server. Mirrors `captureConfirmPane`/`captureModePane`.
+ */
+let captureScrapePane: (state: SessionState) => Promise<RunResult> =
+  (state) => tmux(["capture-pane", "-p", "-t", state.sessionName]);
+
 /** Run a single scrape tick. Idempotent: registers at most one new
  *  TmuxPromptRequest per call, auto-cancels any pending one whose
  *  fingerprint no longer matches the pane. */
@@ -7239,7 +7297,7 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   if (tick.stampIdle) state.lastIdleScrapeAt = now;
   if (!tick.run) return;
 
-  const cap = await tmux(["capture-pane", "-p", "-t", state.sessionName]);
+  const cap = await captureScrapePane(state);
   if (!cap.ok) {
     // Session vanished — let `disposeSessionState` clean us up the next
     // time the orchestrator notices. Don't churn here.
@@ -7371,6 +7429,23 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // Claude's background-sessions view (Left on an empty composer) is
   // navigation, not a prompt — never a card. See the return net below.
   const backgroundView = paneShowsBackgroundSessionsView(tail);
+  // Claude's usage-limit notice. On a harness-stack task the orchestrator
+  // turns it into a swap (the turn is over for this account). On a lone
+  // account it must stay inert: claude's own auto-continue keeps the turn in
+  // flight, exactly as before stacks existed (plan §2.2). Checked before
+  // `pickScrapeMatch` because the notice must never become a card. The
+  // `wrapping up` grace notice counts only once the turn has stopped —
+  // nothing shows claude working and it sits idle at its input box.
+  if (shouldSignalHarnessLimit({
+    harnessFailover: state.harnessFailover,
+    turnInFlight: turnInFlight(state),
+    limitSignaledThisTurn: state.limitSignaledThisTurn,
+    claudeIsWriting,
+    paneShowsNotice: paneShowsHarnessLimitNotice(tail, { turnStopped: !paneWorking && paneIdle }),
+  })) {
+    signalHarnessLimit(state, tail);
+  }
+
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable) || backgroundView)
     ? null
     : pickScrapeMatch(tail, {
@@ -7909,6 +7984,254 @@ function signalIdleSettle(state: SessionState): void {
   popEndOfTurn(state);
 }
 
+/**
+ * Claude's live usage-limit notices (claude 2.1.319 binary strings — the
+ * `limit-status` notification and the auto-continue rows):
+ *   `Usage limit reached · continuing automatically <when> · esc to cancel`
+ *   `Usage limit reached again · continuing automatically <when> · esc to cancel`
+ *   `Continuing automatically <when> · Esc to cancel`          (waiting row)
+ *   `Usage limit reached · limit resets <t> · <help url>`      (stopped)
+ *   `Usage limit reached · wrapping up · limit resets <t> · …` (grace window:
+ *       claude is still finishing the turn on a brief allowance)
+ *   `Usage limit reached · brief included wrap-up, then usage credits`
+ *       (usage credits cover it — the account keeps working; NOT a stop)
+ *   `You've hit your limit · resets <t>`                       (client-composed 429)
+ * plus the older wrapped form (`Usage limit · continuing` / `automatically at
+ * 8am`).
+ *
+ * The notice row must START with the phrase after only indentation and an
+ * optional `⚠`. Any other leading glyph is transcript or tool gutter — `⎿`
+ * (tool result), `│`/`|` (boxed output), `>` (quote), `⏺`/`●` (message
+ * bullets), `❯` (an echoed prompt) — so a tool result printing the notice
+ * text (review S2) can never pass, nor can a sentence that merely mentions
+ * the limit.
+ */
+const PANE_LIMIT_NOTICE_HEAD_RE =
+  /^[\s ]*(?:⚠️?[\s ]+)?(?=usage\s+limit\b|continuing\s+automatically\b|you(?:'|’)ve\s+hit\s+your\s+(?:usage\s+)?limit\b)/iu;
+/** The notice is one row that may wrap onto at most two more rows. */
+const PANE_LIMIT_WINDOW_LINES = 3;
+/**
+ * How many non-blank rows directly above the input box form the hint slot.
+ * The notice renders there (or in the footer below the box) — never in the
+ * scrollback transcript. Bounded so a pasted or quoted notice further up (the
+ * user pasting the text, an earlier turn's scrollback) can't settle a healthy
+ * stacked turn and burn a backup (review R7-S3).
+ */
+const PANE_LIMIT_HINT_ROWS = 4;
+/** How many trailing non-blank rows can hold the input box at all: the box
+ *  (≥3 rows), the status bar and the background-agent roster. */
+const PANE_LIMIT_CHROME_NONBLANK = 20;
+/** A horizontal rule row: the input box's top and bottom borders. */
+const INPUT_BOX_BORDER_RE = /^[\s ]*─{8,}/;
+/** A transcript/tool gutter row: walking up from the box stops there, so the
+ *  hint slot never reaches into the transcript above it. */
+const TRANSCRIPT_GUTTER_RE = /^[\s ]*(?:⎿|│|\||>|⏺|●|❯)/u;
+/** Claude's working spinner row (`✻ Thinking… (esc to interrupt)`,
+ *  `✶ Composing…`): a spinner glyph, a word, an ellipsis. It sits between the
+ *  transcript and the hint slot, so the walk up from the box stops there
+ *  (review R-S8). */
+const SPINNER_ROW_RE = /^[\s ]*[✻✶✳✢✽·*∗][\s ]+\S[^\n]*…/u;
+
+/**
+ * Whether the non-blank row at `index` continues a transcript entry: the
+ * contiguous run of non-blank rows above it (no blank row in between)
+ * reaches a gutter row (`⏺` message, `⎿` tool result, …). Claude draws a
+ * wrapped assistant line or a multi-line tool result as indented rows with no
+ * glyph of their own directly under that gutter row, so such a row is
+ * transcript even though it starts with only spaces (review R-S8). The hint
+ * slot is separated from the transcript by a blank row or the spinner row.
+ */
+function continuesTranscriptEntry(lines: string[], index: number): boolean {
+  for (let j = index - 1; j >= 0; j--) {
+    const row = lines[j]!;
+    if (row.trim().length === 0) return false;
+    if (SPINNER_ROW_RE.test(row) || INPUT_BOX_BORDER_RE.test(row)) return false;
+    if (TRANSCRIPT_GUTTER_RE.test(row)) return true;
+  }
+  return false;
+}
+
+type PaneLimitNoticeKind = "auto-continue" | "stopped" | "wrap-up";
+
+interface PaneLimitNotice {
+  /** The notice rows as drawn (joined, trimmed) — what is classified and
+   *  stored, so a reset time on a wrapped row survives. */
+  text: string;
+  kind: PaneLimitNoticeKind;
+}
+
+/** Which notice a head row (plus its wrapped rows) is, or null for anything
+ *  that only resembles one (`Usage limit has reset · press enter to continue`
+ *  is actionable, not a limit; `Usage limit resets at 8am` is prose). */
+function paneLimitNoticeKind(text: string): PaneLimitNoticeKind | null {
+  const body = text.replace(/^⚠️?\s+/u, "");
+  if (/brief\s+included\s+wrap-up/i.test(body)) return null;
+  if (/^continuing\s+automatically\b/i.test(body)) {
+    return /\besc\s+to\s+cancel\b/i.test(body) ? "auto-continue" : null;
+  }
+  if (/^you(?:'|’)ve\s+hit\s+your\s+(?:usage\s+)?limit\b/i.test(body)) return "stopped";
+  // usage limit …
+  if (/^usage\s+limit\s+reached(?:\s+again)?\s*·\s*wrapping\s+up\b/i.test(body)) return "wrap-up";
+  if (/continuing\s+(?:automatically|shortly)|\besc\s+to\s+cancel\b/i.test(body)) return "auto-continue";
+  if (/^usage\s+limit\s+reached(?:\s+again)?\s*(?:·|$)/i.test(body)) return "stopped";
+  return null;
+}
+
+/** Raw line indices of the live input box's top and bottom borders (the last
+ *  pair of border rows in the bottom chrome with a `❯` row between them), or
+ *  null when no input box is on the pane (a modal replaced it, or the capture
+ *  is not claude's TUI) — then nothing counts as the live notice. */
+function inputBoxBorders(lines: string[]): { top: number; bottom: number } | null {
+  const nonBlank: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.trim().length > 0) nonBlank.push(i);
+  }
+  const window = nonBlank.slice(-PANE_LIMIT_CHROME_NONBLANK);
+  const borders = window.filter((i) => INPUT_BOX_BORDER_RE.test(lines[i]!));
+  for (let j = borders.length - 1; j >= 1; j--) {
+    const top = borders[j - 1]!;
+    const bottom = borders[j]!;
+    for (let i = top + 1; i < bottom; i++) {
+      if (/^[\s ]*❯/.test(lines[i]!)) return { top, bottom };
+    }
+  }
+  return null;
+}
+
+function noticeFrom(rows: string[], start: number): PaneLimitNotice | null {
+  const text = rows
+    .slice(start, start + PANE_LIMIT_WINDOW_LINES)
+    .map((row) => row.trim())
+    .filter((row) => row !== "")
+    .join(" ");
+  const kind = paneLimitNoticeKind(text);
+  return kind ? { text, kind } : null;
+}
+
+/**
+ * The live notice, or null. One implementation shared by the boolean gate and
+ * the persisted message, so what we detect and what we store can never
+ * disagree.
+ *
+ * Two places count, both chrome anchored to the input box: the hint slot (up
+ * to {@link PANE_LIMIT_HINT_ROWS} non-blank rows directly above the box's top
+ * border, stopping at the first transcript/tool-gutter row, at the spinner
+ * row, and at an indented row that continues a transcript entry) and the footer
+ * (below the box's bottom border, where a notification can share the status
+ * bar's row after a run of spaces).
+ */
+function paneHarnessLimitNotice(tail: string): PaneLimitNotice | null {
+  const lines = tail.split("\n");
+  const box = inputBoxBorders(lines);
+  if (!box) return null;
+
+  const hint: string[] = [];
+  for (let i = box.top - 1; i >= 0 && hint.length < PANE_LIMIT_HINT_ROWS; i--) {
+    const row = lines[i]!;
+    if (row.trim().length === 0) continue;
+    if (TRANSCRIPT_GUTTER_RE.test(row) || INPUT_BOX_BORDER_RE.test(row) || SPINNER_ROW_RE.test(row)) break;
+    if (continuesTranscriptEntry(lines, i)) break;
+    hint.unshift(row);
+  }
+  for (let i = 0; i < hint.length; i++) {
+    if (!PANE_LIMIT_NOTICE_HEAD_RE.test(hint[i]!)) continue;
+    const notice = noticeFrom(hint, i);
+    if (notice) return notice;
+  }
+
+  const footer = lines.slice(box.bottom + 1).filter((row) => row.trim().length > 0);
+  for (let i = 0; i < footer.length; i++) {
+    // A notification may sit right of the status bar on the same row.
+    const segments = footer[i]!.split(/[\s ]{2,}/);
+    for (let s = 0; s < segments.length; s++) {
+      if (!PANE_LIMIT_NOTICE_HEAD_RE.test(segments[s]!)) continue;
+      const rows = [segments.slice(s).join("  "), ...footer.slice(i + 1)];
+      const notice = noticeFrom(rows, 0);
+      if (notice) return notice;
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether the pane shows a live usage-limit notice that means this account
+ * stopped. Deliberately narrower than a bare "usage limit" substring: the
+ * transcript legitimately mentions limits, and only the live notice in the
+ * input box's chrome is a signal (see {@link paneHarnessLimitNotice}).
+ *
+ * `Usage limit reached · wrapping up` is claude's grace window — it keeps
+ * working on a brief allowance — so it counts only once the turn has actually
+ * stopped (`turnStopped`: nothing on the pane shows claude working and it sits
+ * idle at its input box, the same reading the idle-settle net uses). Every
+ * other notice kind means the account is paused now.
+ */
+export function paneShowsHarnessLimitNotice(tail: string, opts: { turnStopped?: boolean } = {}): boolean {
+  const notice = paneHarnessLimitNotice(tail);
+  if (!notice) return false;
+  return notice.kind !== "wrap-up" || opts.turnStopped === true;
+}
+
+/**
+ * Gate for turning the pane notice into a failover signal. A lone account is
+ * inert: claude keeps auto-continuing on its own notice and the turn stays in
+ * flight (plan §2.2); only a stack with a real backup settles the turn. Pure
+ * so the scrape path and its tests share one decision.
+ */
+export function shouldSignalHarnessLimit(args: {
+  harnessFailover: boolean;
+  turnInFlight: boolean;
+  limitSignaledThisTurn: boolean;
+  claudeIsWriting: boolean;
+  paneShowsNotice: boolean;
+}): boolean {
+  return args.harnessFailover
+    && args.turnInFlight
+    && !args.limitSignaledThisTurn
+    && !args.claudeIsWriting
+    && args.paneShowsNotice;
+}
+
+/**
+ * Only the notice lines themselves, never the whole pane tail: the classified
+ * `message` is persisted in `harness_limit_state` and shown in the UI, so
+ * storing the surrounding transcript would leak unrelated output into a
+ * small, user-visible record. The detection window is returned verbatim, so a
+ * reset time that wrapped onto the next row survives into the parsed signal
+ * (the old keyword filter dropped a row that carried only `automatically at
+ * 8am`). Returns "" when no live notice is on-pane; the only production
+ * caller, `signalHarnessLimit`, runs behind `paneShowsHarnessLimitNotice`
+ * (same `paneHarnessLimitNotice` detector), so a non-empty result is
+ * guaranteed there — a keyword fallback could never execute and is
+ * deliberately gone. Every notice kind it can return classifies as `quota`
+ * in `classifyHarnessLimitSignal` (shared/harness-limits.ts).
+ */
+export function harnessLimitNoticeText(tail: string): string {
+  return paneHarnessLimitNotice(tail)?.text.slice(0, 300) ?? "";
+}
+
+/**
+ * A harness-stack failover signal from Claude's pane notice. Emits one
+ * structured `harness-limit:` status (the orchestrator records the account
+ * cooldown and, on a stack task, settles into a swap) and resolves the turn.
+ * The notice stays on the pane for the rest of the turn, hence the one-shot
+ * latch. Deliberately does not register a card: the turn is over, not waiting
+ * on the user.
+ */
+function signalHarnessLimit(state: SessionState, tail: string): void {
+  const signal = classifyHarnessLimitSignal("claude-code", { text: harnessLimitNoticeText(tail) });
+  if (!signal) return;
+  state.limitSignaledThisTurn = true;
+  state.pendingEndTurn = null;
+  state.holdUntilIdle = false;
+  state.pendingSlashToken = null;
+  clearContinuationWatchdog(state);
+  const slot = state.turnQueue[0];
+  const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  onChunk("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify({ ...signal, source: "claude-pane" })}`);
+  onChunk("status", "turn complete");
+  popEndOfTurn(state);
+}
+
 /** Whether a turn is currently in flight on this session — a live head slot
  *  (fresh-spawn / live-stream path) or a pending reattach `onEndOfTurn`. Only
  *  then is there a "running" run to protect from a dead session. */
@@ -8320,10 +8643,10 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
   // The JSONL path is deterministic from cwd + session uuid (we passed
   // `--session-id <uuid>` for new sessions, and `--resume <id>` reopens an
   // existing file at the same path). No mtime poll, no freshest-file pick.
-  // Tail the dir claude was actually launched with: a home-less harness
-  // whose `env` map names a `CLAUDE_CONFIG_DIR` writes there, not to this
-  // process's dir.
-  const sessionConfigDir = opts.configDir ?? fullEnv.CLAUDE_CONFIG_DIR ?? null;
+  // Tail the dir claude was actually launched with: the pin, else the
+  // process value it was handed, else `<HOME>/.claude` with the launch env's
+  // HOME (an account whose env map sets only `HOME` writes there).
+  const sessionConfigDir = claudeReadRootsForLaunch(launchCommand).configDir;
   const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, sessionConfigDir);
 
   // When the JSONL already exists at spawn time, we're resuming a prior
@@ -8358,6 +8681,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     // (--dangerously-skip-permissions) — that's what puts
     // `bypassPermissions` into the Shift+Tab cycle.
     bypassEnabled: opts.mode === "bypass",
+    harnessFailover: opts.harnessFailover === true,
     // The effort this process is actually pinned to. `ClaudeLaunchOptions` has
     // no `effort` field — `agents.ts`'s `buildCommand` translates the task's
     // effort id into the `CLAUDE_CODE_EFFORT_LEVEL` env var (dropping ids
@@ -8395,6 +8719,7 @@ export async function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): Promise<Spa
     initialSlot.resolve = resolve;
     initialSlot.reject = reject;
   });
+  state.limitSignaledThisTurn = false;
   state.turnQueue.push(initialSlot);
   // Brand-new session has no prior turn to inherit metadata from, but
   // seed `lastChunk` so any metadata claude writes before its first
@@ -8832,8 +9157,11 @@ export interface ReattachOptions {
   taskId: string;
   cwd: string;
   sessionId: string;
-  /** Per-harness CLAUDE_CONFIG_DIR (sourced from `Harness.home`). See
-   *  `SpawnOptions.configDir` for the full semantics. */
+  /** The directory the session's claude reads and writes sessions in:
+   *  `claudeConfigDirFor(harness)` (harness-config-root.ts), NOT the spawn
+   *  pin `claudeConfigDirOverrideFor`, which is null for an account whose env
+   *  map sets only `HOME`. Null means this process's default (its
+   *  `CLAUDE_CONFIG_DIR`, else `~/.claude`). */
   configDir: string | null;
   /** Per-run chunk handler that persists to run_events + broadcasts on SSE.
    *  Built by the orchestrator the same way it does for fresh runs. */
@@ -8860,6 +9188,9 @@ export interface ReattachOptions {
    *  (polled) instead of reported as `null` — a session spawned just before the
    *  previous process exited has not written it yet. Omitted = no wait. */
   jsonlWaitUntil?: number;
+  /** See `SessionState.harnessFailover` — true only for a stack task with a
+   *  backup, so the pane usage-limit notice can settle the turn. */
+  harnessFailover?: boolean;
 }
 
 /** Poll cadence while waiting for a fresh session's JSONL (`jsonlWaitUntil`). */
@@ -8952,6 +9283,7 @@ async function reattachSessionBody(opts: ReattachOptions): Promise<SpawnedAgent 
     // change that guard's semantics on a reattach where the true live mode
     // might differ from the task's last-saved mode.
     lastAnnouncedPermissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
+    harnessFailover: opts.harnessFailover === true,
   });
   // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
   // reattach (or other code path) already left a SessionState in the map
@@ -9029,7 +9361,12 @@ export async function sendTurn(
   taskId: string,
   prompt: string,
   onChunk: ChunkHandler,
-  opts?: { onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void },
+  opts?: {
+    onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void;
+    /** See `SessionState.harnessFailover`; keeps the pane limit signal aligned
+     *  with the task's current stack membership on a follow-up turn. */
+    harnessFailover?: boolean;
+  },
 ): Promise<SpawnedAgent> {
   const state = sessions.get(taskId);
   if (!state) {
@@ -9037,6 +9374,10 @@ export async function sendTurn(
     onChunk("stderr", err.message);
     return rejectedAgent(taskId, err);
   }
+  // Keep the pane limit gate aligned with the task's current stack
+  // membership: a follow-up turn may start after a stack was created (or
+  // deleted) since the session was spawned.
+  state.harnessFailover = opts?.harnessFailover === true;
   // A turn starting is a life signal — reset the idle clock and snap the
   // backstop poll back to full rate immediately (relevant when this session
   // had backed off to POLL_SLOW_MS while idle).
@@ -9068,6 +9409,7 @@ export async function sendTurn(
     slot.resolve = resolve;
     slot.reject = reject;
   });
+  state.limitSignaledThisTurn = false;
   state.turnQueue.push(slot);
   // Claude's TUI input buffer accepts keystrokes even mid-response —
   // anything we paste while the agent is thinking gets queued there and
@@ -10383,6 +10725,7 @@ export const __forTest = {
       // slashCommand: null — this generic test helper drives non-slash-turn
       // scenarios; a dedicated local-command test constructs its own slot
       // (or extends this) rather than overloading this shared helper.
+      state.limitSignaledThisTurn = false;
       state.turnQueue.push({ onChunk, resolve, reject, slashCommand: null });
     });
   },
@@ -10691,6 +11034,24 @@ export const __forTest = {
     captureStyledTail = fn;
     return prev;
   },
+  /** Override `scrapeOnce`'s plain-pane capture (production runs
+   *  `tmux capture-pane -p`). Returns the previous reader so a test can
+   *  restore it in `afterEach`. */
+  setCaptureScrapePane(
+    fn: (state: SessionState) => Promise<RunResult>,
+  ): (state: SessionState) => Promise<RunResult> {
+    const prev = captureScrapePane;
+    captureScrapePane = fn;
+    return prev;
+  },
+  /** Pane usage-limit signal: the detector, the stack-only gate, the bounded
+   *  notice-text extractor and the signal itself (which settles the turn) —
+   *  all pure/fixture-driven so a lone account staying inert and a stacked
+   *  account fanning out to `harness-limit:` are both unit-testable. */
+  paneShowsHarnessLimitNotice,
+  shouldSignalHarnessLimit,
+  harnessLimitNoticeText,
+  signalHarnessLimit,
   /** The flickering right-hand `● <effort> · /effort` status-bar hint regex,
    *  plus the pure helper that strips it off a matched `STATUS_BAR_RE` row —
    *  exposed so the "narrower than the whole line" truth table (finding #8,

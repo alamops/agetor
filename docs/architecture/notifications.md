@@ -28,3 +28,14 @@ The delivered list is scoped per code signature — a dev-built helper can't see
 Tests: `os-notification.test.ts`, `notifier.test.ts`, `task-notifier.test.ts`, `notification-hooks.test.ts`, `notifications.test.ts`, `toast-slots.test.ts`, `src/cli/notify.test.ts`, `e2e/one-notification-per-task.spec.ts`; `interaction-broadcast-wiring.test.ts` pins from a fresh process that the global `interaction` `resolved` event fires — `orchestrator.ts` installs the interaction bridges exactly once (a second `setResolvedBroadcaster` once replaced the global emit), the setters return the previous fn so a test restores it, and `interactions.ts` `__testing.reset()` leaves the broadcasters installed.
 
 **Pipeline human gates.** A `pipeline` GlobalEvent with `status: "review"` carries `humanStepSeqs` (the pending gates' seqs) and `runStartedAt` (the run generation). The webview raises one blocking "Pipeline needs your review" toast — and, unfocused, one OS notification (`kind: "blocked"`) — per event that first announces a gate, deduped per `(runStartedAt, gate.seq)` with `newHumanGateSeqs` (`src/shared/pipeline.ts`); a repeat persist sends nothing, a Restart (new generation) notifies afresh, and a stopped run sends nothing. Both notifiers keep one entry per task, so an event that opens several gates raises one alert naming the count (`humanReviewSubtitle`) rather than a second banner replacing the first. Clicking it opens the run view with the gate focused. `headless-notifications.ts` applies the same dedupe statefully. A review transition does not clear a sibling step's pending-question toast or owed "Pipeline needs you" alert — the run still needs the user; leaving review to `running`/`done`/`cancelled` clears them as before. "Pipeline finished" still fires only on the transition into `done`.
+
+## Harness stacks
+
+`harness-swap` is a **quiet** Notification kind: a completed failover posts one
+"Account switched" entry (`from → to, 2/3`) and never needs the user. The old
+run's settle carries `run-status.reason: "harness-swap"` and is deliberately
+silent in the webview (`runStatusToastKind`, `src/mainview/lib/run-status-toast.ts`),
+the CLI `--notify` path, the TUI and `headless-notifications.ts`; the
+successor's own settle is the real outcome. A stack blocked with
+`harness-exhausted` posts "Stack out of quota"; `harness-swap-failed` posts
+"No usable backup account" (the CLI `--notify` titles match).

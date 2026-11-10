@@ -12,3 +12,23 @@ The 2 s polls (`listRuns`, `listSubagents` in the panel; `listTasks`, `refreshAg
 `RunsList` renders nothing until `runsLoaded` (no `No runs yet for this task.` flash while the first `listRuns` is in flight).
 A dropped task stream reconnects with `Last-Event-ID` and resumes: the subscription drops frames at or below its highest accepted server id before the deduper; a `snapshotRequired` meta resets the subscription in the meta handler, before the fresh rows arrive (`buffer.discard()`, a new deduper and high-water mark, events / `loadedDbIdsRef` / `prevEventIdRef` cleared, `earliestId`/`hasMore` replaced rather than merged, the JSONL splice dropped and re-run through the `rebuildEpoch` dependency of the auto-rebuild effect, a muted `transcript-gap-notice` line)
 — `nextEventIdRef` is deliberately NOT reset, so client ids stay monotonic for `rebuilt-mask.ts`; and every `replay_meta` after the first refetches pending interactions (merged by `src/mainview/lib/interaction-refetch.ts`, so a card that lands or resolves over SSE while the request is in flight isn't lost or revived) and kicks the runs/subagents polls, because `interaction`/`subagent` lifecycle frames are live-only and a drop misses them.
+
+## Harness stacks
+
+The task header shows the active account with its position (`2/3`; no
+position for a stack of fewer than two accounts, which is inert), a
+"Switching to …" line while `harnessState.pendingSwap` is set, and an
+all-exhausted banner with a live countdown (reset on `task.id`) and a **Run
+now** action. While the retry run itself is live (`allExhausted.inFlight` or
+the card is `running`) the banner reads "Running on <account> after a quota
+reset (attempt n/3)." and offers no Run now (`harnessStackBannerView`,
+`src/mainview/lib/harness-stack-banner.ts`). A same-kind account switch in the
+account picker PATCHes only `{ agent }`, so mode, model, effort, speed and Max
+mode survive; a cross-kind switch resets them to the kind defaults
+(`agentSwitchPatch`). In sticky-user-message mode the hidden continuation does
+not open a section. A `status`
+event with the `harness-swap:` prefix renders as a divider carrying the exact
+notice plus `(2/3)`; a `user` event that is exactly the hidden
+`<harness-stack-continuation>` wrapper renders nothing. The panel takes an
+optional `stacks` prop; no extra fetch is made. See
+[harness-stacks.md](harness-stacks.md).

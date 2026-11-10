@@ -39,6 +39,8 @@ import {
   agetorModeForClaudePermission,
 } from "../shared/claude-session-meta.ts";
 import type { ImportedClaudeSession, Run, Task } from "../shared/types.ts";
+import { isHarnessStackContinuation, stripHarnessStackContinuation } from "../shared/harness-stack.ts";
+import { normalizeDeliveredUserText } from "../shared/user-message.ts";
 
 const PROMPT_CAP_BYTES = 100 * 1024;
 
@@ -132,11 +134,32 @@ function capPrompt(text: string): string {
   return text.slice(0, Math.max(0, end));
 }
 
+/**
+ * The prompt an imported session's task is created with. A session a
+ * harness-stack clean retry started opens on agetor's hidden continuation
+ * wrapper, which `createTask` refuses as a user prompt (review S1); the task
+ * gets the user's words inside it instead (review N4). Checked the way every
+ * renderer checks it: as sent, and after claude's `<pasted_content>` delivery
+ * wrapper is peeled.
+ */
+export function importedTaskPrompt(firstHumanPrompt: string | null, title: string): string {
+  let text = firstHumanPrompt ?? title;
+  const lf = text.replace(/\r\n?/g, "\n");
+  if (isHarnessStackContinuation(lf)) {
+    text = stripHarnessStackContinuation(lf);
+  } else {
+    const delivered = normalizeDeliveredUserText(lf);
+    if (isHarnessStackContinuation(delivered)) text = stripHarnessStackContinuation(delivered);
+  }
+  if (text.trim() === "") text = title;
+  return capPrompt(text);
+}
+
 function scanOptions(opts: ImportClaudeSessionsOptions | undefined): ScanClaudeSessionsOptions {
   const homeDir = opts?.homeDir ?? (process.env.HOME || homedir());
   const listed = opts?.harnesses ?? harnesses.list()
     .filter((h) => h.kind === "claude-code")
-    .map((h) => ({ id: h.id, kind: h.kind, home: h.home, bin: h.bin }));
+    .map((h) => ({ id: h.id, kind: h.kind, home: h.home, env: h.env, bin: h.bin }));
   return {
     homeDir,
     env: opts?.env ?? process.env,
@@ -629,7 +652,7 @@ async function bindImportedSession(
   record: ClaudeSessionRecord,
   opts: ImportClaudeSessionsOptions | undefined,
 ): Promise<ImportClaudeSessionResult> {
-  const prompt = capPrompt(record.firstHumanPrompt ?? record.title);
+  const prompt = importedTaskPrompt(record.firstHumanPrompt, record.title);
   const model = record.model ? claudeModelIdFromArg(record.model) : null;
   projects.upsert(record.cwd, path.basename(record.cwd) || record.cwd);
   const created = await createTask({

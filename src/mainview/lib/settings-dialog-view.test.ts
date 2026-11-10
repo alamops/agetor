@@ -5,6 +5,7 @@ import {
   initialView,
   isFormSubpage,
   openAgentEditor,
+  openStackEditor,
   openEditor,
   openSection,
   openTemplates,
@@ -29,12 +30,13 @@ function template(overrides: Partial<HarnessTemplate> = {}): HarnessTemplate {
   };
 }
 
-const SECTION_IDS: SettingsSectionId[] = ["general", "harnesses", "agents", "pipelines", "git", "prompts"];
+const SECTION_IDS: SettingsSectionId[] = ["general", "harnesses", "stacks", "agents", "pipelines", "git", "prompts"];
 
-test("SETTINGS_SECTIONS lists the six sidebar sections in order", () => {
+test("SETTINGS_SECTIONS lists the seven sidebar sections in order", () => {
   expect(SETTINGS_SECTIONS).toEqual([
     { id: "general", label: "General" },
     { id: "harnesses", label: "Harnesses" },
+    { id: "stacks", label: "Stacks" },
     { id: "agents", label: "Agents" },
     { id: "pipelines", label: "Pipelines" },
     { id: "git", label: "Git Integration" },
@@ -203,6 +205,14 @@ describe("round-trip conventions", () => {
 
   test("openSection(activeSection(v)) lands back on Agents from the agent editor", () => {
     const view: SettingsView = openAgentEditor("prof-1");
+    expect(openSection(activeSection(view))).toEqual(backFromSubview(view));
+  });
+
+  test("the stack editor is a Stacks form subpage that pops on Escape", () => {
+    const view = openStackEditor(null);
+    expect(activeSection(view)).toBe("stacks");
+    expect(isFormSubpage(view)).toBe(true);
+    expect(resolveEscape(view)).toBe("pop");
     expect(openSection(activeSection(view))).toEqual(backFromSubview(view));
   });
 });

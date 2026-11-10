@@ -61,7 +61,8 @@ Commands:
   daemon <sub>        start | stop | status | background of the Agetor core
                       (background status|off: keep Agetor running in the background)
   remote <sub>        status | off — remote access (preview; only the app turns it on)
-  harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
+  harness <sub>       list | add | edit | enable | disable | rm | stack | shell agent harnesses
+                      (stack: an ordered same-kind account train with failover)
   profile <sub>       list | show | add | edit | duplicate | rm | export | import reusable agent profiles
   pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
                       advance | restart | status control a pipeline task's run
@@ -131,10 +132,11 @@ async function main(): Promise<void> {
   if (flags.plain || flags.json) setPlain(true);
 
   if (version) return out(pkg.version);
-  // `agetor help [cmd [sub]]` and `agetor <cmd> [sub] --help` both resolve to a
-  // command/subcommand block; bare `help`/`--help` falls back to the index.
-  if (cmd === "help") return out(helpFor(args[0], args[1]) ?? HELP);
-  if (help) return out(helpFor(cmd, args[0]) ?? HELP);
+  // `agetor help [cmd [sub [subsub]]]` and `agetor <cmd> [sub [subsub]] --help`
+  // both resolve to the most specific block (`harness stack create`); bare
+  // `help`/`--help` falls back to the index.
+  if (cmd === "help") return out(helpFor(args[0], args[1], args[2]) ?? HELP);
+  if (help) return out(helpFor(cmd, args[0], args[1]) ?? HELP);
 
   switch (cmd) {
     case undefined: {

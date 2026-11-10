@@ -4,6 +4,7 @@ import type {
   AgentProfile,
   AgentStatus,
   Harness,
+  HarnessStack,
   PipelineGraph,
   PipelineStep,
 } from "../../shared/types.ts";
@@ -477,5 +478,93 @@ describe("resolvePipelineLaunch purity", () => {
     const before = structuredClone(input);
     resolvePipelineLaunch(input);
     expect(input).toEqual(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Harness account stacks — the core fails over instead of refusing
+// ---------------------------------------------------------------------------
+
+function makeStack(memberIds: string[]): HarnessStack {
+  return {
+    id: "stack-1",
+    label: "Claude train",
+    kind: "claude-code",
+    mirrorMode: "full",
+    members: memberIds.map((harnessId, position) => ({
+      harnessId,
+      position,
+      label: harnessId,
+      kind: "claude-code",
+      enabled: true,
+    })),
+    createdAt: 0,
+    updatedAt: 0,
+    warnings: [],
+  };
+}
+
+describe("resolvePipelineLaunch with a stacked start account", () => {
+  const backup = makeHarness({ id: "harness-2", label: "Claude backup", isBuiltin: false });
+  const backupStatus = makeStatus({ harnessId: "harness-2" });
+
+  test("a logged-out start account with a usable backup is ready, not blocked", () => {
+    const resolution = resolvePipelineLaunch({
+      ...readyInput(oneStep()),
+      harnesses: [makeHarness(), backup],
+      agents: [makeStatus({ loggedIn: false, authHelp: "run `claude login`" }), backupStatus],
+      stacks: [makeStack(["harness-1", "harness-2"])],
+    });
+    expect(resolution.state).toBe("ready");
+    expect(resolution.reason).toBeNull();
+  });
+
+  test("a disabled or unavailable start account with a usable backup is ready", () => {
+    const stacks = [makeStack(["harness-1", "harness-2"])];
+    expect(
+      resolvePipelineLaunch({
+        ...readyInput(oneStep()),
+        harnesses: [makeHarness({ enabled: false }), backup],
+        agents: [makeStatus(), backupStatus],
+        stacks,
+      }).state,
+    ).toBe("ready");
+    expect(
+      resolvePipelineLaunch({
+        ...readyInput(oneStep()),
+        harnesses: [makeHarness(), backup],
+        agents: [makeStatus({ available: false, reason: "the claude binary isn't on PATH" }), backupStatus],
+        stacks,
+      }).state,
+    ).toBe("ready");
+  });
+
+  test("a stack whose other members are all unusable still blocks with the account's own reason", () => {
+    const resolution = resolvePipelineLaunch({
+      ...readyInput(oneStep()),
+      harnesses: [makeHarness(), backup],
+      agents: [makeStatus({ loggedIn: false, authHelp: "run `claude login`" }), makeStatus({ harnessId: "harness-2", loggedIn: false })],
+      stacks: [makeStack(["harness-1", "harness-2"])],
+    });
+    expectBlocked(resolution, "Claude Code isn't logged in — run `claude login`");
+  });
+
+  test("a one-account stack cannot fail over, so it still blocks", () => {
+    const resolution = resolvePipelineLaunch({
+      ...readyInput(oneStep()),
+      agents: [makeStatus({ loggedIn: false })],
+      stacks: [makeStack(["harness-1"])],
+    });
+    expectBlocked(resolution, "Claude Code isn't logged in");
+  });
+
+  test("graph and profile problems still block a stacked start account", () => {
+    const resolution = resolvePipelineLaunch({
+      ...readyInput(makeGraph({ steps: [makeStep({ id: "step-plan", name: "Plan", agentProfileId: null })] })),
+      harnesses: [makeHarness(), backup],
+      agents: [makeStatus({ loggedIn: false }), backupStatus],
+      stacks: [makeStack(["harness-1", "harness-2"])],
+    });
+    expect(resolution.state).toBe("blocked");
   });
 });
