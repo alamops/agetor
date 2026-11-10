@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Task } from "../shared/types.ts";
 import { uniqueRepoSlugs } from "../shared/multi-repo.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-multi-repo-"));
@@ -43,8 +44,17 @@ async function load(): Promise<Mods> {
   return mods;
 }
 
+/** Simulate what a claude spawn leaves in a multi-repository workspace root:
+ *  `ensureInstalledForCwd` writes `<workspace>/.claude/settings.local.json`.
+ *  Teardown must prune this agetor-owned scratch, or the non-empty root stays
+ *  behind forever (review M4). */
+function seedClaudeScratch(workspace: string): void {
+  mkdirSync(path.join(workspace, ".claude"), { recursive: true });
+  writeFileSync(path.join(workspace, ".claude", "settings.local.json"), "{}");
+}
+
 afterAll(() => {
-  rmSync(DATA_DIR, { recursive: true, force: true });
+  rmTestDataDir(DATA_DIR);
 });
 
 async function git(args: string[], cwd: string) {
@@ -66,6 +76,28 @@ async function makeRepo(name = "repo", remote?: string): Promise<string> {
 
 function cleanup(...paths: (string | undefined)[]) {
   for (const p of paths) if (p) rmSync(p, { recursive: true, force: true });
+}
+
+async function waitFor(cond: () => boolean, timeoutMs = 8_000, stepMs = 20): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for condition");
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+}
+
+/** Wait until the task's current run (if any) has settled. A fixed sleep was
+ *  both slow and flaky: too short on a loaded box (archive/delete racing a
+ *  live run) and needlessly long on a fast one. */
+async function settleRun(taskId: string): Promise<void> {
+  const { tasks } = await load();
+  const { runs } = await import("./db.ts");
+  await waitFor(() => {
+    const runId = tasks.get(taskId)?.runId;
+    if (!runId) return true;
+    const run = runs.get(runId);
+    return !!run && run.status !== "running";
+  });
 }
 
 test("createTask pins a workspace with one entry, branch and base per repository", async () => {
@@ -130,7 +162,7 @@ test("createTask gives a secondary repository a fresh branch instead of re-attac
 
     const res = await startTask(id);
     if ("error" in res) throw new Error(res.error);
-    await new Promise((r) => setTimeout(r, 350));
+    await settleRun(id);
     const started = tasks.get(id)!;
     const backend = started.repositories!.find((r) => r.name === repos[1]!.name)!;
     expect(backend.branch).toBe("feature/auth-2");
@@ -273,7 +305,7 @@ test("startTask materializes both worktrees, spawns at the workspace and appends
   try {
     const res = await startTask(id);
     if ("error" in res) throw new Error(res.error);
-    await new Promise((r) => setTimeout(r, 350));
+    await settleRun(id);
     const t = tasks.get(id)!;
     const workspace = path.join(WORKTREES_DIR, id);
     expect(t.worktreePath).toBe(workspace);
@@ -317,13 +349,18 @@ test("archive detaches every clean repository and unarchive restores them", asyn
   try {
     const res = await startTask(id);
     if ("error" in res) throw new Error(res.error);
-    await new Promise((r) => setTimeout(r, 350));
+    await settleRun(id);
+    // A claude run writes agetor's settings scratch into the workspace root.
+    seedClaudeScratch(workspace);
     tasks.update(id, { column: "done" });
     const archived = await archiveTask(id, { awaitTeardown: true, stopRun: true });
     if ("error" in archived) throw new Error(archived.error);
     const names = uniqueRepoSlugs([a, b]);
     expect(existsSync(path.join(workspace, names[0]!))).toBe(false);
     expect(existsSync(path.join(workspace, names[1]!))).toBe(false);
+    // The workspace root itself is reclaimed too — its only leftover was
+    // agetor's own `.claude/settings.local.json`.
+    expect(existsSync(workspace)).toBe(false);
     // Branches survive a detach.
     expect(tasks.get(id)?.repositories?.map((r) => r.branch)).toEqual([
       expect.any(String),
@@ -358,7 +395,8 @@ test("deleteTask removes every repository worktree and branch", async () => {
   try {
     const res = await startTask(id);
     if ("error" in res) throw new Error(res.error);
-    await new Promise((r) => setTimeout(r, 350));
+    await settleRun(id);
+    seedClaudeScratch(workspace);
     await deleteTask(id);
     expect(existsSync(workspace)).toBe(false);
     expect(tasks.get(id)).toBeNull();
@@ -391,7 +429,7 @@ test("deleteTask removes the branch a repository's worktree drifted onto", async
   try {
     const res = await startTask(id);
     if ("error" in res) throw new Error(res.error);
-    await new Promise((r) => setTimeout(r, 350));
+    await settleRun(id);
     const repoA = tasks.get(id)!.repositories![0]!;
     // Switch repo A's worktree onto a new branch (drift), then delete.
     await git(["checkout", "-b", "drifted-work"], repoA.worktreePath!);

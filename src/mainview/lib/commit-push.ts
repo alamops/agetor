@@ -84,3 +84,22 @@ export function prHeadBranch(
   if (taskBranch) return live && live !== taskBranch ? live : taskBranch;
   return live;
 }
+
+/**
+ * PR head for ONE repository of a multi-repository task, and its
+ * git-state gate (issue #291 review). Mirrors the single-repository chip:
+ * the branch must be pushed and synced ({@link shouldOfferOpenPr}) before a
+ * pull request is offered, and drift wins over the pinned entry branch —
+ * the commits the agent pushed live on the branch actually checked out
+ * ({@link prHeadBranch}). `status` is that repository's entry from the
+ * batched `GET /tasks/:id/git-status` response; `null` (not polled yet, or
+ * the repo's status failed) hides the affordance rather than opening a PR
+ * from a stale stored branch.
+ */
+export function repositoryPrHead(
+  repo: { branch: string | null; branchSource?: "created" | "existing" | null },
+  status: TaskGitStatus | null,
+): string | null {
+  if (!shouldOfferOpenPr(status)) return null;
+  return prHeadBranch(repo.branch, status, repo.branchSource ?? undefined);
+}

@@ -349,6 +349,12 @@ export async function readCheckoutBranch(
  * remote-qualified `origin/main`) and strips the remote/refs prefix so the
  * result is comparable against a local branch name. `root` should be the repo
  * root (or any dir inside the repo). Never throws.
+ *
+ * Deliberately NOT process-cached (unlike `repoRoot`): a repo's default branch
+ * can change mid-session (`git symbolic-ref refs/remotes/origin/HEAD`), and a
+ * stale value in a teardown plan could delete the branch that is now the
+ * default. Callers that resolve it once per repository per operation memoize
+ * locally instead (`teardownBranchesForTask`).
  */
 export async function resolveDefaultBranchName(root: string): Promise<string | null> {
   try {
@@ -472,6 +478,16 @@ export async function repoRoot(dir: string): Promise<string | null> {
  * writable cwd, or when `cwd` isn't a git repo / git is unavailable
  * (non-throwing — callers just get no extra roots).
  *
+ * Multi-repository workspaces (issue #291): the agent's cwd is the task
+ * workspace root, which is NOT itself a git checkout — it holds one linked
+ * worktree per repository. A bare `git rev-parse` there fails, so the old
+ * implementation returned `[]` and codex's sandbox stayed on
+ * `workspace-write`, blocking every `git add`/`git commit` in the children
+ * because their shared `.git` lives in each source repo (outside the
+ * workspace). When `cwd` isn't a checkout, resolve every direct child that
+ * carries a `.git` pointer file the same way and union the roots. Non-git
+ * child directories (a scratch dir an agent created) contribute nothing.
+ *
  * Async, via the file's shared `git()` helper (`Bun.spawn` + its own 5s
  * timeout here) rather than a sync `child_process.spawnSync` — the codex
  * spawn paths this feeds (`buildCodexCommand` → `spawnAgent`) run on the same
@@ -487,26 +503,70 @@ export async function repoRoot(dir: string): Promise<string | null> {
  * ordinary `.git`-inside-cwd checkout as "outside" and add a redundant root.
  */
 export async function gitWritableRoots(cwd: string): Promise<string[]> {
+  const self = await gitCommonDirOutside(cwd);
+  if (self !== null) return self ? [self] : [];
+  // Not a git checkout itself. A multi-repository task workspace is exactly
+  // this shape: linked worktrees as direct children. Only children with a
+  // `.git` POINTER file can be linked worktrees (an ordinary nested checkout
+  // would have a `.git` directory, which is already inside the writable cwd,
+  // so it needs no root either).
+  return await linkedWorktreeChildRoots(cwd);
+}
+
+/**
+ * The common dir of `cwd`'s checkout when it lives OUTSIDE `cwd`, `""` when
+ * the checkout's `.git` is already inside (no extra root needed), or `null`
+ * when `cwd` isn't a git checkout / git is unavailable.
+ */
+async function gitCommonDirOutside(cwd: string): Promise<string | "" | null> {
   let res: GitResult;
   try {
     res = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd, 5_000);
   } catch {
     // `git()` itself can throw synchronously (`Bun.spawn` throws on a
     // missing `git` binary or a `cwd` that no longer exists) even though
-    // THIS function's own contract, documented above, is non-throwing — a
-    // codex spawn on a host without git must proceed unescalated, not
-    // hard-fail. Same outcome as every other "can't tell" branch below.
-    return [];
+    // THIS function's own contract is non-throwing — a codex spawn on a host
+    // without git must proceed unescalated, not hard-fail. Same outcome as
+    // every other "can't tell" branch.
+    return null;
   }
-  if (!res.ok) return [];
+  if (!res.ok) return null;
   const out = res.stdout;
-  if (!out) return [];
+  if (!out) return null;
   const commonDir = path.resolve(cwd, out);
   let realCwd = cwd;
   try { realCwd = realpathSync(cwd); } catch { /* cwd missing — compare as-is */ }
   const rel = path.relative(realCwd, commonDir);
   const insideCwd = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-  return insideCwd ? [] : [commonDir];
+  return insideCwd ? "" : commonDir;
+}
+
+/** Union of external git common dirs for the linked worktrees directly under
+ *  a multi-repository workspace root (`<workspace>/<repo-slug>/.git` files). */
+async function linkedWorktreeChildRoots(workspace: string): Promise<string[]> {
+  let children: string[];
+  try {
+    children = readdirSync(workspace, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith("."))
+      .map((d) => d.name);
+  } catch {
+    return [];
+  }
+  const roots = new Set<string>();
+  for (const child of children) {
+    const childPath = path.join(workspace, child);
+    // Cheap fs gate before spawning git: only a linked worktree has `.git`
+    // as a file. A nested ordinary checkout's `.git` is inside the writable
+    // workspace root already.
+    try {
+      if (!lstatSync(path.join(childPath, ".git")).isFile()) continue;
+    } catch {
+      continue;
+    }
+    const common = await gitCommonDirOutside(childPath);
+    if (common) roots.add(common);
+  }
+  return [...roots];
 }
 
 /**
@@ -1473,7 +1533,7 @@ export async function prepareTaskWorkdir(
       if (branch) await git(["branch", "-D", branch], a.root);
       await git(["worktree", "prune"], a.root, 10_000);
     });
-    removeDirIfEmpty(workspace);
+    removeWorkspaceIfEmpty(workspace);
     return {
       error: `could not prepare ${failures.length} of ${repos.length} repositories:\n${failures
         .map((f) => `- ${f.repo.name} (${f.repo.path}): ${("error" in f.result && f.result.error) || "unknown error"}`)
@@ -1508,13 +1568,58 @@ export async function prepareTaskWorkdir(
   };
 }
 
-/** Remove `dir` only when it exists and is empty (never a recursive wipe). */
-function removeDirIfEmpty(dir: string): void {
+/**
+ * Remove the agetor-owned scratch dirs a claude session leaves in a task
+ * workspace root, so the root can be removed once its repository worktrees
+ * are gone. `ensureInstalledForCwd` writes `<workspace>/.claude/settings.local.json`
+ * on every claude spawn (cwd is the workspace root for a multi-repository
+ * task); `git worktree remove` can't clear that because the root is not
+ * itself a worktree. Only agetor's own settings file is touched — anything
+ * else in `.claude` (or the root) is agent/user data and keeps the directory
+ * alive, exactly like the non-recursive contract below. `.claude` is removed
+ * only once it is empty.
+ */
+function pruneWorkspaceScratch(dir: string): void {
+  const claudeDir = path.join(dir, ".claude");
   try {
-    if (existsSync(dir) && lstatSync(dir).isDirectory()) {
-      const entries = readdirSync(dir);
-      if (entries.length === 0) rmdirSync(dir);
-    }
+    if (!lstatSync(claudeDir).isDirectory()) return;
+    const settings = path.join(claudeDir, "settings.local.json");
+    if (lstatSync(settings).isFile()) rmSync(settings, { force: true });
+    if (readdirSync(claudeDir).length === 0) rmdirSync(claudeDir);
+  } catch {
+    /* best-effort — missing dir/file, permissions, ... */
+  }
+}
+
+/**
+ * Remove a multi-repository workspace root only when nothing else is left in
+ * it (never a recursive wipe — an agent may have written notes or artifacts
+ * the user still wants). Agetor's own `.claude/settings.local.json` scratch
+ * is pruned first so a completed teardown doesn't strand
+ * `<WORKTREES_DIR>/<task-id>` forever.
+ *
+ * Exported because the Worktrees page's orphan cleanup
+ * (`deleteOrphanWorktree` in orchestrator.ts) removes the same nested root
+ * after its last repository child is deleted.
+ */
+export function removeWorkspaceIfEmpty(dir: string): void {
+  let entries: string[];
+  try {
+    if (!lstatSync(dir).isDirectory()) return;
+    entries = readdirSync(dir);
+  } catch {
+    return; // missing or unreadable — nothing to do
+  }
+  // Only `.claude` left: it may be entirely agetor's settings scratch, which
+  // would otherwise keep the root alive forever. Anything else means real
+  // content (a still-present repository checkout, or agent artifacts) — leave
+  // the directory and its settings alone.
+  if (entries.length > 0) {
+    if (entries.some((entry) => entry !== ".claude")) return;
+    pruneWorkspaceScratch(dir);
+  }
+  try {
+    if (readdirSync(dir).length === 0) rmdirSync(dir);
   } catch {
     /* best-effort */
   }
@@ -1902,7 +2007,7 @@ export async function removeWorktree(
     }
     // Each nested directory is its own worktree; only the now-empty workspace
     // root is ours to delete (never recursively).
-    removeDirIfEmpty(workspacePathFor(task));
+    removeWorkspaceIfEmpty(workspacePathFor(task));
     return;
   }
   if (!task.worktreePath) return;
@@ -1998,7 +2103,7 @@ export async function detachWorktree(
     }
     // Only the empty workspace root is removed; a dirty repository's checkout
     // (and the workspace holding it) stays put.
-    removeDirIfEmpty(workspacePathFor(task));
+    removeWorkspaceIfEmpty(workspacePathFor(task));
     const removed = outcomes.every((o) => o.result.removed);
     if (removed) return { removed, repositories: outcomes };
     const reason = outcomes.find((o) => !o.result.removed)?.result.reason ?? "failed";

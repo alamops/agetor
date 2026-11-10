@@ -57,6 +57,7 @@ import {
   launchesFrozen,
   pipelineUpdateColumn,
   publishGlobalEvent,
+  recordPreparedRepositoryCheckouts,
   sendInput,
   setDisplacedStepRunSettledHandler,
   setHeldStepStoppedHandler,
@@ -995,6 +996,11 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   if ("error" in prepared) return { error: prepared.error };
   if (prepared.repositories && prepared.repositories.length > 1) {
     tasks.setRepositories(parent.id, prepared.repositories);
+    // setRepositories keeps a stored checkout (a concurrent settle/archive
+    // write wins over this snapshot); the live reads from THIS prepare are
+    // authoritative for the parent row, which is the pipeline's last-seen
+    // checkout (D14).
+    recordPreparedRepositoryCheckouts(parent.id, prepared.repositories);
   }
   // The parent carries the pipeline's last-seen checkout (D14); steps mirror
   // it. `setCheckoutBranch` is compare-then-write, so an unchanged value
@@ -1047,6 +1053,9 @@ function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): vo
       const stepNames = (step.repositories ?? []).map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
       const parentNames = parent.repositories.map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
       if (stepNames !== parentNames) tasks.setRepositories(a.taskId, parent.repositories);
+      // The step shares the parent's checkouts; mirror the parent's last-seen
+      // values too (setRepositories alone keeps the step's older stored value).
+      recordPreparedRepositoryCheckouts(a.taskId, parent.repositories);
     }
     // Mirror the parent's last-seen checkout too (compare-then-write; the
     // step→parent mirror inside `setCheckoutBranch` writes the same value

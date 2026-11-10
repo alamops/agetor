@@ -1,9 +1,10 @@
 import { test, expect, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Task, TaskRepository } from "../shared/types.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-db-repos-"));
@@ -12,7 +13,7 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 const { db, tasks } = await import("./db.ts");
 
 afterAll(() => {
-  rmSync(DATA_DIR, { recursive: true, force: true });
+  rmTestDataDir(DATA_DIR);
 });
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -152,6 +153,41 @@ test("setRepositories is a targeted writer that does not bump updated_at", () =>
   ])!;
   expect(next.repositories?.[1]?.branch).toBe("feature/x-2");
   expect(next.updatedAt).toBe(before);
+  tasks.delete(t.id);
+});
+
+test("setRepositories merges a stale snapshot without erasing a PR stamp or recorded checkout", () => {
+  // Review should-fix: the caller's array was read before `prepareTaskWorkdir`
+  // awaited, so writing it wholesale erased a concurrent `setRepositoryPrUrl`
+  // or `setRepositoryCheckout` write.
+  const t = makeTask({
+    repositories: [repo("a", { checkoutBranch: null }), repo("b", { checkoutBranch: null })],
+  });
+  tasks.insert(t);
+  tasks.setRepositoryPrUrl(t.id, "b", "https://gh/pr/9");
+  tasks.setRepositoryCheckout(t.id, "a", "feature/live");
+  const next = tasks.setRepositories(t.id, [
+    repo("a", { worktreePath: "/data/worktrees/t/a", checkoutBranch: "feature/x" }),
+    repo("b", { worktreePath: "/data/worktrees/t/b", checkoutBranch: "feature/x", prUrl: null }),
+  ])!;
+  expect(next.repositories?.[0]?.checkoutBranch).toBe("feature/live");
+  expect(next.repositories?.[1]?.prUrl).toBe("https://gh/pr/9");
+  // Materialization-owned fields from the snapshot still land.
+  expect(next.repositories?.[0]?.worktreePath).toBe("/data/worktrees/t/a");
+  expect(next.repositories?.[1]?.worktreePath).toBe("/data/worktrees/t/b");
+  tasks.delete(t.id);
+});
+
+test("setRepositories accepts the prepare's checkout when nothing is stored yet", () => {
+  const t = makeTask({
+    repositories: [repo("a", { checkoutBranch: null }), repo("b", { checkoutBranch: null })],
+  });
+  tasks.insert(t);
+  const next = tasks.setRepositories(t.id, [
+    repo("a", { worktreePath: "/data/worktrees/t/a", checkoutBranch: "agetor/abc-a" }),
+    repo("b", { worktreePath: "/data/worktrees/t/b", checkoutBranch: "agetor/abc-b" }),
+  ])!;
+  expect(next.repositories?.map((r) => r.checkoutBranch)).toEqual(["agetor/abc-a", "agetor/abc-b"]);
   tasks.delete(t.id);
 });
 

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { prHeadBranch, shouldOfferCommitPush, shouldOfferCommitPushForTask, shouldOfferOpenPr, type TaskGitStatus } from "./commit-push.ts";
+import { prHeadBranch, repositoryPrHead, shouldOfferCommitPush, shouldOfferCommitPushForTask, shouldOfferOpenPr, type TaskGitStatus } from "./commit-push.ts";
 
 function status(overrides: Partial<TaskGitStatus>): TaskGitStatus {
   return {
@@ -150,4 +150,25 @@ test("prHeadBranch: an ignored status never contributes a live branch", () => {
 test("prHeadBranch: a PR-head task always keeps its own branch", () => {
   expect(prHeadBranch("pr-head", status({ branch: "implement/x" }), "existing")).toBe("pr-head");
   expect(prHeadBranch("pr-head", null, "existing")).toBe("pr-head");
+});
+
+// ── repositoryPrHead (multi-repository "Create all PRs") ─────────────────
+// Each repository is gated and headed exactly like the single-repo chip: the
+// branch must be pushed/synced, and a drifted live checkout wins.
+
+test("repositoryPrHead: refuses an unpushed or un-polled repository", () => {
+  const repo = { branch: "agetor/abc-thing", branchSource: "created" as const };
+  expect(repositoryPrHead(repo, null)).toBeNull();
+  expect(repositoryPrHead(repo, status({ remoteSynced: false }))).toBeNull();
+  expect(repositoryPrHead(repo, status({ ignored: true, remoteSynced: true }))).toBeNull();
+});
+
+test("repositoryPrHead: uses the live drifted branch once the repo is synced", () => {
+  const repo = { branch: "agetor/abc-thing", branchSource: "created" as const };
+  expect(repositoryPrHead(repo, status({ remoteSynced: true, branch: "implement/x" }))).toBe("implement/x");
+  expect(repositoryPrHead(repo, status({ remoteSynced: true, branch: "agetor/abc-thing" }))).toBe("agetor/abc-thing");
+  // A repository sitting on its default branch falls back to the pinned branch
+  // rather than opening a base == head PR.
+  expect(repositoryPrHead(repo, status({ remoteSynced: true, branch: "main", isDefaultBranch: true })))
+    .toBe("agetor/abc-thing");
 });

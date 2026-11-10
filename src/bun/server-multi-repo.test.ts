@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Task } from "../shared/types.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import. Port unique among
 // *.test.ts files (see draft-endpoint.test.ts's convention).
@@ -26,7 +27,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   server?.stop?.();
-  rmSync(DATA_DIR, { recursive: true, force: true });
+  rmTestDataDir(DATA_DIR);
 });
 
 const call = (p: string, init: RequestInit = {}) =>

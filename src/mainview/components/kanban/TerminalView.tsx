@@ -330,18 +330,33 @@ export function TerminalView({
   taskId,
   archived = false,
   repositories,
+  activeRepo = null,
 }: {
   taskId: string;
   archived?: boolean;
-  /** Workspace names for a multi-repository task (issue #291) — the open
-   *  button then offers a cwd selector instead of always using the task
-   *  workspace root. */
+  /** Workspace names for a multi-repository task (issue #291) — the header
+   *  then offers a cwd selector instead of always using the task workspace
+   *  root. */
   repositories?: string[];
+  /** The run panel's selected repository tab, or `null` for the workspace
+   *  root. A new terminal opens in this cwd; the local selector below can
+   *  override it until the tab changes again. */
+  activeRepo?: string | null;
 }) {
+  const multiRepo = (repositories?.length ?? 0) > 1;
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
-  const [repo, setRepo] = useState<string | null>(repositories?.[0] ?? null);
+  // `null` = the task workspace root, where the agent runs and every
+  // repository is visible — the documented default (T5/T11). Selecting a
+  // repository only changes where a NEW shell starts; existing tabs keep
+  // their own cwd.
+  const [repo, setRepo] = useState<string | null>(activeRepo);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  // Follow the run panel's repository tab (issue #291): picking a repository
+  // there also points new terminals at that worktree; switching back (or to
+  // another task) resets to the workspace root.
+  useEffect(() => { setRepo(activeRepo); }, [activeRepo]);
 
   const refresh = useCallback(async () => {
     try {
@@ -405,6 +420,7 @@ export function TerminalView({
               <button type="button" className="flex items-center gap-1" onClick={() => setActiveId(t.id)}>
                 <TerminalSquare className="size-3" />
                 {t.title}
+                {t.repoName && <span className="font-mono text-[10px] opacity-70">{t.repoName}</span>}
               </button>
               <button
                 type="button"
@@ -417,6 +433,21 @@ export function TerminalView({
             </div>
           ))}
         </div>
+        {multiRepo && (
+          <select
+            data-testid="terminal-repo-select"
+            aria-label="Working directory for new terminals"
+            title="Where the next terminal starts"
+            value={repo ?? ""}
+            onChange={(e) => setRepo(e.target.value || null)}
+            className="h-6 max-w-[9rem] shrink-0 appearance-none rounded border border-border/60 bg-transparent px-1 text-[11px] text-muted-foreground hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
+            <option value="">Workspace</option>
+            {repositories!.map((name) => (
+              <option key={name} value={name}>{name}</option>
+            ))}
+          </select>
+        )}
         <button
           type="button"
           className="shrink-0 rounded-md p-1 text-muted-foreground hover:bg-accent/40 disabled:opacity-50"

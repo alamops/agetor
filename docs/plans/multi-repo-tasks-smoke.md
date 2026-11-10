@@ -42,7 +42,7 @@ bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 | Focused multi-repo/unit suites | green — 1,047 tests across the 25 files above |
 | `bun test` | 12,512 tests, 496 files — 12,477 pass, 31 skip, 4 fail. All four are load/timing-sensitive fake-tmux/opencode-fixture cases; re-running each failing file rotated the failing case and every individual test passed on a rerun. Every multi-repo/shared/mainview/CLI suite is green. |
 | `bun test src/shared src/mainview src/cli` | green (included in the full run above) |
-| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 4 passed |
+| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 5 passed |
 | Migration 087 on an 086 DB | `src/bun/db-repositories.test.ts` / `src/bun/migrate.test.ts` |
 | Existing worktree tests | unchanged and green (the pre-change 116 plus the new multi-repo cases) |
 
@@ -82,6 +82,30 @@ popover), the repro test no longer sleeps, the e2e spec no longer carries
 unreachable `test.skip` guards, and the commit-chip regression is now asserted
 through the real UI (only a sibling repository dirty) rather than the pure
 helper alone.
+
+The third review round found four must-fix defects (nothing shipped to users —
+all on this branch) plus the should-fixes below:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| A codex multi-repository run could not `git add`/`git commit`: the workspace root is not a git checkout, so `gitWritableRoots` returned `[]` and the sandbox stayed on `workspace-write` while each child's shared `.git` lives in its source repo | `gitWritableRoots` now falls back to the direct children with a `.git` pointer file and unions their common dirs; `buildCodexCommand` escalates as it already did for a single linked worktree | `worktree.test.ts` — "finds every linked worktree's common dir…" and "buildCodexCommand escalates from a multi-repository workspace root" |
+| The per-repository terminal selector was unwired: `TerminalView`'s repo state was never set, defaulted to `repositories[0]` (not the documented workspace root), and had no UI; the run panel tab never reached it | `TerminalView` defaults to `null` (workspace), grows a `Workspace`/repository `<select>` for new shells, shows each tab's repository, and follows the run-panel repository tab; `RunPanelBody` passes `repoTab` down | `e2e/multi-repo-task.spec.ts` — "the terminal section defaults to the workspace and follows the repository tab" |
+| `repoTab`/`allPrsBusy` were not reset in `RunPanelBody`'s `[task.id]` effect | both reset with the rest of the per-task state (documented rule in `run-panel.md`) | `docs/architecture/run-panel.md` |
+| Archiving/deleting a Claude multi task left `<worktrees>/<task-id>` forever: `ensureInstalledForCwd` writes `.claude/settings.local.json` into the non-git workspace root, so the non-recursive `removeDirIfEmpty` refused | `removeWorkspaceIfEmpty` prunes only agetor's own `.claude/settings.local.json` (and the `.claude` dir once empty) before the non-recursive rmdir; the boot sweep also enqueues when only that root is left; orphan deletion reuses the same helper | `orchestrator-multi-repo.test.ts` — archive/delete tests seed the scratch and assert the workspace is gone |
+
+Should-fixes closed with them: per-repository checkouts are refreshed on run
+settle (`noteRunSettledCheckout` loops entries via `setRepositoryCheckout`) and
+the header drift banner compares against the live `git-status` branch (not the
+stored `checkoutBranch`); `teardownBranchesForTask` fetches the row list and
+memoizes `repoRoot` and the default-branch lookup once per preview, removing
+the N+1 git spawns per repository; `setRepositories` merges a possibly-stale
+prepare snapshot with the current row so it can no longer erase a concurrent
+PR stamp or checkout write (with a dedicated `recordPreparedRepositoryCheckouts`
+at the refresh points); "Create all PRs" is gated by each repository's pushed/
+synced git state and uses its live (possibly drifted) branch as the PR head
+(`repositoryPrHead` in `commit-push.ts`); the three new test files use
+`rmTestDataDir`; and the five fixed 350 ms sleeps are replaced with a poll on
+the run's settled status.
 
 ## Live harness smoke matrix
 

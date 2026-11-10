@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -311,6 +311,37 @@ test("gitWritableRoots returns [] for a non-git directory", async () => {
   expect(await gitWritableRoots(dir)).toEqual([]);
 });
 
+test("gitWritableRoots finds every linked worktree's common dir from a multi-repository workspace root", async () => {
+  // Issue #291 / review M1: the workspace root is NOT a git checkout; the
+  // repositories are direct children. Without walking them, codex's sandbox
+  // never escalated and every git commit inside a child was blocked because
+  // the shared .git lives in the source repo.
+  const { prepareTaskWorkdir, gitWritableRoots } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const entry = (repoPath: string, name: string) => ({
+    path: repoPath, name, branch: null, branchSource: "created" as const,
+    worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null,
+  });
+  const task = fakeTask({
+    workdir: a,
+    repositories: [entry(a, "frontend"), entry(b, "backend")],
+  });
+  const prepared = await prepareTaskWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  const roots = await gitWritableRoots(prepared.cwd);
+  expect(roots).toHaveLength(2);
+  expect(new Set(roots)).toEqual(new Set([
+    realpathSync(path.join(a, ".git")),
+    realpathSync(path.join(b, ".git")),
+  ]));
+  for (const root of roots) {
+    expect(root.startsWith(prepared.cwd + path.sep)).toBe(false);
+    expect(existsSync(path.join(root, "HEAD"))).toBe(true);
+  }
+});
+
 // Async-conversion regression guard (gitWritableRootsSync -> gitWritableRoots):
 // prove several calls can genuinely be in flight together and each still
 // resolves with its own correct, independent result — rather than requiring
@@ -366,6 +397,30 @@ test("buildCodexCommand keeps workspace-write for an ordinary in-repo checkout",
   const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts }, repo);
   expect(cmd).toContain("workspace-write");
   expect(cmd).not.toContain("danger-full-access");
+});
+
+test("buildCodexCommand escalates from a multi-repository workspace root (not itself a git checkout)", async () => {
+  // Review M1 regression: cwd is the non-git workspace root, so resolving its
+  // own git dir returned [] and the sandbox stayed on workspace-write — codex
+  // could not git add/commit in any child worktree.
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const { buildCodexCommand } = await import("./agents.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const entry = (repoPath: string, name: string) => ({
+    path: repoPath, name, branch: null, branchSource: "created" as const,
+    worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null,
+  });
+  const prepared = await prepareTaskWorkdir(fakeTask({
+    workdir: a,
+    repositories: [entry(a, "frontend"), entry(b, "backend")],
+  }));
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts }, prepared.cwd);
+  expect(cmd).toContain("danger-full-access");
+  expect(cmd).not.toContain("workspace-write");
+  expect(cmd).toContain("approval_policy=never");
 });
 
 test("prepareWorkdir is idempotent: second call reuses the recorded worktree", async () => {

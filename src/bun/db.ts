@@ -1725,10 +1725,31 @@ export const tasks = {
    * one entry stores `'[]'` on purpose, so a single-repository row keeps
    * deriving its entry from the scalar columns (which the caller updates
    * separately). An unknown id matches zero rows.
+   *
+   * The caller's array is a *snapshot* taken before one or more awaits
+   * (`prepareTaskWorkdir` can take seconds), so it must not clobber fields
+   * another writer stamped meanwhile. `prUrl` (first-write-wins, stamped by
+   * `setRepositoryPrUrl`) and `checkoutBranch` (last-seen drift, written by
+   * the dedicated `setRepositoryCheckout` compare-then-write at every refresh
+   * point) are therefore merged from the CURRENT row: a stored value wins, and
+   * the incoming value is only used when nothing is stored yet (first
+   * materialization). Callers that genuinely observed a new checkout record it
+   * through `setRepositoryCheckout` after this call.
    */
   setRepositories(taskId: string, repos: TaskRepository[]): Task | null {
     const stored = repos.length > 1 ? repos : [];
-    db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(stored), taskId]);
+    const cur = this.get(taskId);
+    const byName = new Map((cur?.repositories ?? []).map((r) => [r.name, r]));
+    const merged = stored.map((r) => {
+      const prev = byName.get(r.name);
+      if (!prev) return r;
+      return {
+        ...r,
+        prUrl: prev.prUrl ?? r.prUrl,
+        checkoutBranch: prev.checkoutBranch ?? r.checkoutBranch,
+      };
+    });
+    db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(merged), taskId]);
     return this.get(taskId);
   },
   /**

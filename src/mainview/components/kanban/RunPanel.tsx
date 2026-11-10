@@ -9,7 +9,7 @@ import {
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
-import { prHeadBranch, shouldOfferCommitPushForTask, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { prHeadBranch, repositoryPrHead, shouldOfferCommitPushForTask, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
@@ -1060,6 +1060,12 @@ function RunPanelBody({
     setImportRetryOk(false);
     setImportedBranchBusy(false);
     setImportedBranchError(null);
+    // Per-repository UI state (issue #291): the tab selection and the
+    // "Create all PRs" in-flight flag belong to the old task and must not
+    // leak into the new panel (the repo list is re-derived from the next
+    // task's row, but these two are local state).
+    setRepoTab(null);
+    setAllPrsBusy(false);
     // `editingId` (the backlog tray's inline-editor state) lives inside the
     // `BacklogTray` child component, not here — it's reset by keying that
     // component on `task.id` at its call site below instead (a fresh mount
@@ -2924,6 +2930,9 @@ function RunPanelBody({
       ?? gitStatus?.repositories?.[0]
       ?? null)
     : gitStatus;
+  /** One repository's live status inside the batched multi-repo response. */
+  const gitStatusForRepo = (name: string): TaskGitStatus | null =>
+    gitStatus?.repositories?.find((r) => r.name === name) ?? null;
   // The PR the header/mergeability surfaces follow: each repository stamps
   // its own entry, so a multi task follows the selected tab's PR (task.prUrl
   // stays null by design). The status fetch also needs that repository's path
@@ -3718,9 +3727,17 @@ function RunPanelBody({
     // Only repositories that don't have a PR yet. This is what makes the
     // action safe to press again after a partial failure (the stamped entries
     // are skipped) and stops a second press from opening duplicate PRs.
-    const todo = repositoriesNeedingPr(repos);
+    // Each candidate also has to be pushed/synced, and its PR head is the
+    // branch actually checked out (drift is tolerated, never corrected) —
+    // same rules as the single-repository "Open PR" chip.
+    const needing = repositoriesNeedingPr(repos);
+    const todo = needing.filter((repo) => repositoryPrHead(repo, gitStatusForRepo(repo.name)) !== null);
     if (todo.length === 0) {
-      toast("Every repository already has a pull request");
+      toast(
+        needing.length === 0
+          ? "Every repository already has a pull request"
+          : "No repository is ready for a pull request yet",
+      );
       return;
     }
     setAllPrsBusy(true);
@@ -3728,8 +3745,9 @@ function RunPanelBody({
     const proposals = latestRepositoryProposals(events, repos[0]?.name);
     try {
       for (const repo of todo) {
-        if (!repo.branch) {
-          failures.push(`${repo.name}: no branch yet`);
+        const head = repositoryPrHead(repo, gitStatusForRepo(repo.name));
+        if (!head) {
+          failures.push(`${repo.name}: branch is not pushed yet`);
           continue;
         }
         const projectPath = repo.worktreePath ?? repo.path;
@@ -3739,7 +3757,7 @@ function RunPanelBody({
           await api.createGitHubPull({
             path: projectPath,
             title: proposal?.title || task.title,
-            head: repo.branch,
+            head,
             base: defaults.base,
             body: appendIssueCloseDirective(
               proposal?.description ?? "",
@@ -3764,13 +3782,19 @@ function RunPanelBody({
   };
 
   const prHead = multiRepo
-    ? (activeRepo?.branch ?? null)
+    ? (activeRepo ? repositoryPrHead(activeRepo, activeGitStatus) : null)
     : prHeadBranch(task.branch ?? null, gitStatus, task.branchSource);
-  // Live checkout vs the branch agetor created (5 s git-status poll). Drift is
-  // tolerated, never corrected — the header and details say where it is.
+  // The branch agetor created for the SELECTED repository (single: the task's
+  // own). Live checkout vs that branch, read from the 5 s git-status poll —
+  // for a multi task `repositories[].checkoutBranch` is only the last-seen
+  // recorded value, so the banner must compare against the live branch the
+  // same way the single-repository path does. Drift is tolerated, never
+  // corrected — the header and details say where it is.
+  const activeTaskBranch = multiRepo ? (activeRepo?.branch ?? null) : (task.branch ?? null);
+  const activeBranchSource = multiRepo ? (activeRepo?.branchSource ?? "created") : task.branchSource;
   const branchDrift = multiRepo
-    ? driftOf(activeRepo?.branch ?? null, activeRepo?.checkoutBranch ?? null)
-    : driftOf(task.branch ?? null, gitStatus?.branch);
+    ? driftOf(activeTaskBranch, activeGitStatus && !activeGitStatus.ignored ? activeGitStatus.branch : null)
+    : driftOf(activeTaskBranch, gitStatus?.branch);
   // Claude-only: an OpenCode import carries no transcript branch, so the
   // "Switch to <branch>" banner never shows for one.
   const importedGitBranch = importedSession?.kind === "claude-code" ? (task.importedClaude?.gitBranch ?? null) : null;
@@ -4339,25 +4363,25 @@ function RunPanelBody({
               return <span className="text-info"> · {at.text}</span>;
             })()}
             {" · "}{task.column}
-            {task.branch && !branchDrift.drifted && <> · <span className="font-mono">{task.branch}</span></>}
+            {activeTaskBranch && !branchDrift.drifted && <> · <span className="font-mono">{activeTaskBranch}</span></>}
             {branchDrift.drifted && (
               <>
                 {" · "}
-                <span className="font-mono" title={driftTitle(task.branch ?? null)}>{branchDrift.live}</span>{" "}
+                <span className="font-mono" title={driftTitle(activeTaskBranch)}>{branchDrift.live}</span>{" "}
                 <span
                   data-testid="run-panel-branch-drift"
-                  title={driftTitle(task.branch ?? null)}
+                  title={driftTitle(activeTaskBranch)}
                   className={cn(
                     "rounded px-1 py-px text-[10px] font-medium",
-                    task.branchSource === "existing" ? "bg-warning/15 text-warning" : "bg-info/15 text-info",
+                    activeBranchSource === "existing" ? "bg-warning/15 text-warning" : "bg-info/15 text-info",
                   )}
                 >
-                  {task.branchSource === "existing" ? "not on PR head" : "drifted"}
+                  {activeBranchSource === "existing" ? "not on PR head" : "drifted"}
                 </span>
               </>
             )}
-            {task.baseRef && (
-              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+            {(multiRepo ? activeRepo?.baseRef : task.baseRef) && (
+              <> · <span className="font-mono opacity-70">base {(multiRepo ? activeRepo?.baseRef : task.baseRef)!.slice(0, 7)}</span></>
             )}
           </span>
           {agentProfileDisplay && agentProfileForCard && (
@@ -4567,7 +4591,7 @@ function RunPanelBody({
           rule for this fragment: every keyed child carries its component's
           name in the key (`PlanDialog` below is the third one). See
           docs/plans/terminal-section-duplication.md. */}
-      <TerminalsSection key={`terminals-${task.id}`} task={task} awaitReady={awaitStreamReady} />
+      <TerminalsSection key={`terminals-${task.id}`} task={task} awaitReady={awaitStreamReady} activeRepo={multiRepo ? repoTab : null} />
 
       {showSubagentTabs && (
         <SubagentTabs
@@ -4897,7 +4921,7 @@ function RunPanelBody({
                     "View PR" link lives in the panel header). The proposal
                     parse runs on click, not per event flush — the stream can
                     be long. */}
-                {multiRepo && canSend && !sending && repositoriesNeedingPr(task.repositories ?? []).length > 0 && (
+                {multiRepo && canSend && !sending && repositoriesNeedingPr(task.repositories ?? []).some((repo) => repositoryPrHead(repo, gitStatusForRepo(repo.name)) !== null) && (
                   <Button
                     size="sm"
                     variant="secondary"
@@ -5878,7 +5902,7 @@ function RunsList({
  * themselves live on the bun side and survive the panel closing entirely.
  * Defaults open when the task already has terminals (`openTerminalCount`).
  */
-function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTaskId: string) => Promise<void> }) {
+function TerminalsSection({ task, awaitReady, activeRepo }: { task: Task; awaitReady: (forTaskId: string) => Promise<void>; activeRepo?: string | null }) {
   const count = task.openTerminalCount;
   // Seed open from the count at mount, then let the user own the toggle —
   // binding `open` to the polled count would re-expand the section whenever
@@ -5936,6 +5960,7 @@ function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTa
             taskId={task.id}
             archived={task.archivedAt != null}
             repositories={(task.repositories?.length ?? 0) > 1 ? task.repositories!.map((r) => r.name) : undefined}
+            activeRepo={activeRepo ?? null}
           />
         )}
       </div>

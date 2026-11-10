@@ -23,7 +23,9 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *     that repository's own changes.
  *  3. the "Commit & push" chip appears when only a sibling repository changed
  *     (the prompt is aggregate, not selected-tab-scoped).
- *  4. archive detaches both clean worktrees, keeps the branches, and
+ *  4. the terminal section defaults to the workspace root and follows the
+ *     run-panel repository tab (issue #291 review M2).
+ *  5. archive detaches both clean worktrees, keeps the branches, and
  *     unarchive restores them.
  */
 
@@ -150,6 +152,24 @@ test("the commit & push chip is offered when only a sibling repository changed",
   await gotoApp(page, backend.bootBase);
   await page.getByText("Multi repository e2e", { exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Commit & push" })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+});
+
+test("the terminal section defaults to the workspace and follows the repository tab", async ({ backend, page }) => {
+  // Review M2 regression: TerminalView's repo state was never set, had no UI,
+  // and always opened in repositories[0] instead of the documented workspace
+  // root; the run panel's repository tab never reached it.
+  await gotoApp(page, backend.bootBase);
+  await page.getByText("Multi repository e2e", { exact: true }).first().click();
+  const section = page.getByTestId("terminals-section");
+  await section.locator("summary").click();
+  const select = page.getByTestId("terminal-repo-select");
+  await expect(select).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  await expect(select).toHaveValue("");
+  await expect(select.locator("option").first()).toHaveText("Workspace");
+
+  const name = uniqueRepoSlugs([repoA, repoB])[1]!;
+  await page.getByTestId(`run-repo-tab-${name}`).click();
+  await expect(select).toHaveValue(name);
 });
 
 test("archive detaches both clean worktrees and keeps the branches", async ({ backend, request }) => {

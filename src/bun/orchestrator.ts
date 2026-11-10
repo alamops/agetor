@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import {
@@ -271,6 +271,7 @@ import {
   prepareWorkdir,
   prepareTaskWorkdir,
   pinMissingRepositoryBaseRefs,
+  workspacePathFor,
   worktreeIdForRepo,
   resolveWorktreeRef,
   removeWorktree,
@@ -290,6 +291,7 @@ import {
   recordableCheckout,
   planTeardownBranches,
   resolveDefaultBranchName,
+  removeWorkspaceIfEmpty,
   type PreparedWorkdir,
 } from "./worktree.ts";
 import { resolveRepositorySet, branchesPinnedByOtherTasks } from "./task-repos.ts";
@@ -2535,6 +2537,9 @@ async function startTaskInner(
     // transaction as the workspace mirror above.
     if (prepared.repositories && prepared.repositories.length > 1) {
       tasks.setRepositories(taskId, prepared.repositories);
+      // The prepare's live reads are the freshest checkout values; record
+      // them through the dedicated setter (see `setRepositories`' merge rule).
+      recordPreparedRepositoryCheckouts(taskId, prepared.repositories);
     }
     // Run start is one of the four last-seen-checkout refresh points (start,
     // settle, terminal open, archive). Isolation "none", or a reuse whose
@@ -3659,6 +3664,20 @@ async function noteRunSettledCheckout(taskId: string): Promise<void> {
   try {
     const task = tasks.get(taskId);
     if (!task || task.isolation !== "worktree" || !task.worktreePath) return;
+    const repos = task.repositories ?? [];
+    if (repos.length > 1) {
+      // Multi-repository: the scalar worktreePath is the non-git workspace
+      // root, so a single read there always failed and every repository's
+      // recorded checkout went stale after a turn that switched branches.
+      // Refresh each entry compare-then-write (an unreadable child leaves its
+      // stored value alone, same contract as the single path).
+      for (const repo of repos) {
+        if (!repo.worktreePath || !existsSync(repo.worktreePath)) continue;
+        const live = await readCheckoutBranch(repo.worktreePath);
+        if (live.ok) tasks.setRepositoryCheckout(taskId, repo.name, live.branch);
+      }
+      return;
+    }
     if (!existsSync(task.worktreePath)) return;
     const live = await readCheckoutBranch(task.worktreePath);
     if (live.ok) tasks.setCheckoutBranch(taskId, live.branch);
@@ -11899,6 +11918,21 @@ export async function archiveTask(
 }
 
 /**
+ * Record each materialized repository's last-seen checkout through the
+ * dedicated compare-then-write setter. Used after `setRepositories`, which
+ * intentionally never overwrites a stored checkout from a possibly-stale
+ * snapshot (issue #291 review): the live read captured by the prepare is the
+ * freshest value here. Entries without a worktree (never materialized) are
+ * skipped; a `null` checkout is a real detached-HEAD reading and is recorded.
+ */
+export function recordPreparedRepositoryCheckouts(taskId: string, repos: TaskRepository[]): void {
+  for (const repo of repos) {
+    if (!repo.worktreePath) continue;
+    tasks.setRepositoryCheckout(taskId, repo.name, repo.checkoutBranch ?? null);
+  }
+}
+
+/**
  * After a `prepareWorkdir` outside a run start (unarchive, `sendInput`'s
  * missing-worktree branch, a terminal open) record the branch the worktree is
  * on, and surface `prepareWorkdir`'s `warning` — a re-attach couldn't bring
@@ -11912,6 +11946,11 @@ export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir):
   if (prepared.repositories && prepared.repositories.length > 1) {
     // Persist the re-materialized per-repo paths/branches/checkouts.
     tasks.setRepositories(taskId, prepared.repositories);
+    // `setRepositories` deliberately keeps a stored checkout (a concurrent
+    // settle/archive write must win over this older snapshot); a live read
+    // from THIS prepare is the freshest value at this point, so record it via
+    // the dedicated compare-then-write setter.
+    recordPreparedRepositoryCheckouts(taskId, prepared.repositories);
   } else {
     const checkout = recordableCheckout(prepared);
     if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
@@ -11984,6 +12023,16 @@ async function planOneRepoTeardown(
   taskBranch: string | null,
   branchSource: Task["branchSource"],
   lastSeenCheckout: string | null,
+  /** The full row list, fetched once per preview — not one `tasks.list()` per
+   *  repository. */
+  allTasks: Task[],
+  /** Per-preview memoized `repoRoot`, so one delete confirm against a
+   *  multi-repository task doesn't spawn a `git rev-parse` per (repo, other
+   *  task) pair (and never repeats a failed lookup). */
+  rootOf: (dir: string) => Promise<string | null>,
+  /** Per-preview memoized default-branch lookup (keyed by root) — one git
+   *  resolution per repository instead of one per repository per plan pass. */
+  defaultBranchOf: (root: string) => Promise<string | null>,
 ): Promise<Omit<RepoTeardownPlan, "name" | "path">> {
   // A repository that was never materialized (create pinned its branch, but
   // the task was archived/deleted before it started) has no checkout to
@@ -12003,10 +12052,10 @@ async function planOneRepoTeardown(
       liveKnown = true;
     }
   }
-  const root = await repoRoot(sourcePath);
-  const defaultBranch = root ? await resolveDefaultBranchName(root) : null;
+  const root = await rootOf(sourcePath);
+  const defaultBranch = root ? await defaultBranchOf(root) : null;
   const heldByOthers = new Set<string>();
-  for (const other of tasks.list()) {
+  for (const other of allTasks) {
     if (other.id === task.id || other.pipelineParentId) continue;
     // Other tasks holding this repo: same selected path, or any repository
     // entry whose git root matches.
@@ -12015,10 +12064,10 @@ async function planOneRepoTeardown(
       const otherRepos = other.repositories ?? [];
       for (const r of otherRepos) {
         if (r.path === sourcePath) { shares = true; break; }
-        if (root && (await repoRoot(r.path)) === root) { shares = true; break; }
+        if (root && (await rootOf(r.path)) === root) { shares = true; break; }
       }
     }
-    if (!shares && root && (await repoRoot(other.workdir)) === root) shares = true;
+    if (!shares && root && (await rootOf(other.workdir)) === root) shares = true;
     if (!shares) continue;
     if (other.branch) heldByOthers.add(other.branch);
     if (other.checkoutBranch) heldByOthers.add(other.checkoutBranch);
@@ -12036,6 +12085,23 @@ async function planOneRepoTeardown(
     heldByOthers,
   });
   return { ...plan, liveBranch, taskBranch };
+}
+
+/** Memoize an async key → value lookup for one teardown-preview pass. A fresh
+ *  map per call keeps the values honest (a repo's default branch can change
+ *  between previews) while collapsing the per-repository-per-task repeats.
+ *  Used for both `repoRoot` and the default-branch lookup, which is where the
+ *  delete-preview N+1 lived. */
+function memoAsync<T>(fn: (key: string) => Promise<T>): (key: string) => Promise<T> {
+  const cache = new Map<string, Promise<T>>();
+  return (key) => {
+    let pending = cache.get(key);
+    if (!pending) {
+      pending = fn(key);
+      cache.set(key, pending);
+    }
+    return pending;
+  };
 }
 
 /**
@@ -12058,6 +12124,9 @@ export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownP
   const repos = task.repositories ?? [];
   if (repos.length > 1 && task.isolation === "worktree" && !task.pipelineParentId) {
     const plans: RepoTeardownPlan[] = [];
+    const allTasks = tasks.list();
+    const rootOf = memoAsync(repoRoot);
+    const defaultBranchOf = memoAsync(resolveDefaultBranchName);
     for (const repo of repos) {
       const plan = await planOneRepoTeardown(
         task,
@@ -12066,6 +12135,9 @@ export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownP
         repo.branch,
         repo.branchSource,
         repo.checkoutBranch,
+        allTasks,
+        rootOf,
+        defaultBranchOf,
       );
       plans.push({ name: repo.name, path: repo.path, ...plan });
     }
@@ -12350,7 +12422,20 @@ export function sweepArchivedTeardowns(): number {
     const repos = task.repositories ?? [];
     const multi = repos.length > 1;
     if (multi) {
-      if (!repos.some((r) => r.worktreePath && existsSync(r.worktreePath))) continue;
+      // Also enqueue when only the (non-git) workspace root is left — a
+      // previous teardown may have removed every repository worktree but
+      // failed to clear agetor's `.claude` scratch from the root. The job's
+      // per-repo detach is idempotent and `removeWorkspaceIfEmpty` then
+      // reclaims the root. Anything else in the root (agent artifacts) means
+      // the workspace is intentionally retained, so skip it rather than
+      // enqueueing a no-op job every boot.
+      let onlyScratchLeft = false;
+      try {
+        onlyScratchLeft = readdirSync(workspacePathFor(task)).every((entry) => entry === ".claude");
+      } catch {
+        /* no workspace root */
+      }
+      if (!onlyScratchLeft && !repos.some((r) => r.worktreePath && existsSync(r.worktreePath))) continue;
     } else {
       if (!task.worktreePath) continue;
       if (!existsSync(task.worktreePath)) continue;
@@ -12692,14 +12777,11 @@ export function listWorktrees(): WorktreeInfo[] {
   return out;
 }
 
-/** Remove a nested multi-repository workspace root only when it is empty. */
+/** Remove a nested multi-repository workspace root only when it is empty
+ *  (agetor's own `.claude` scratch is pruned first — see
+ *  `removeWorkspaceIfEmpty`). */
 function removeEmptyWorkspace(dir: string): void {
-  try {
-    if (!existsSync(dir) || !lstatSync(dir).isDirectory()) return;
-    if (readdirSync(dir).length === 0) rmdirSync(dir);
-  } catch {
-    /* best-effort */
-  }
+  removeWorkspaceIfEmpty(dir);
 }
 
 /**
