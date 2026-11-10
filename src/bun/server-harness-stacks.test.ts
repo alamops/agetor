@@ -399,6 +399,23 @@ describe("harness-stacks routes", () => {
       expect(db.tasks.get(taskId)?.agent).toBe("api-a");
       expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
       expect(db.harnessSessionHandoffs.get(taskId, "api-b", "claude_session_id")).toBeNull();
+
+      // A "Switch to next account" interrupted the same way keeps its label.
+      db.tasks.update(taskId, { agent: "api-b" });
+      db.tasks.setHarnessState(taskId, {
+        stackId,
+        position: 1,
+        count: 2,
+        tried: [],
+        pendingSwap: {
+          from: "api-a", to: "api-b", reason: "quota", runId, startedAt: Date.now(), manual: true, switchNow: "scheduled",
+        },
+        allExhausted: null,
+        lastMove: null,
+      });
+      await reconcileHarnessFailover();
+      expect(db.tasks.get(taskId)?.harnessState?.lastMove).toMatchObject({ from: "api-a", to: "api-b", reason: "switch-now" });
+      expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
     } finally {
       db.harnessSessionHandoffs.deleteOne(taskId, "api-b", "claude_session_id");
       db.runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: 1 });

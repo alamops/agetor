@@ -634,6 +634,10 @@ export interface TaskHarnessState {
      *  failover). Boot completes or visibly reports it instead of treating it
      *  as a quota swap (review R15-S3). */
     manual?: boolean;
+    /** Set on a manual switch that is the "Switch to next account" action
+     *  (`manual` = an idle request, `scheduled` = applied at turn end), so a
+     *  switch the core finishes after a restart keeps the `switch-now` label. */
+    switchNow?: "manual" | "scheduled";
   } | null;
   /** Set when every usable account is exhausted or unusable. */
   allExhausted: {
@@ -721,6 +725,9 @@ export function parseTaskHarnessState(raw: string | null | undefined): TaskHarne
           runId: p.runId,
           startedAt: p.startedAt,
           ...(p.manual === true ? { manual: true } : {}),
+          ...(p.manual === true && (p.switchNow === "manual" || p.switchNow === "scheduled")
+            ? { switchNow: p.switchNow as "manual" | "scheduled" }
+            : {}),
         };
       })()
     : null;

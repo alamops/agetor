@@ -3713,7 +3713,12 @@ export function releaseTaskAccountSwitch(taskId: string): void {
  * automatic swap is protected by its own `pendingSwap`; the manual path had
  * none. Returns false when the task or its stack no longer resolves.
  */
-export function beginManualAccountSwitch(taskId: string, from: string, to: string): boolean {
+export function beginManualAccountSwitch(
+  taskId: string,
+  from: string,
+  to: string,
+  opts: { switchNow?: "manual" | "scheduled" } = {},
+): boolean {
   const task = tasks.get(taskId);
   if (!task) return false;
   const stack = harnessStacks.getByMember(from);
@@ -3733,6 +3738,7 @@ export function beginManualAccountSwitch(taskId: string, from: string, to: strin
       runId: task.runId ?? "",
       startedAt: Date.now(),
       manual: true,
+      ...(opts.switchNow ? { switchNow: opts.switchNow } : {}),
     },
     allExhausted: state?.allExhausted ?? null,
     lastMove: state?.lastMove ?? null,
@@ -3799,7 +3805,7 @@ async function moveTaskForSwitchNow(taskId: string, toId: string, trigger: "manu
   const before = tasks.get(taskId);
   if (!before) return;
   switchNowTaskIds.add(taskId);
-  beginManualAccountSwitch(taskId, before.agent, toId);
+  beginManualAccountSwitch(taskId, before.agent, toId, { switchNow: trigger });
   try {
     const updated = tasks.update(taskId, { agent: toId });
     if (!updated) {
@@ -7070,7 +7076,8 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
       tried: [],
       pendingSwap: null,
       allExhausted: null,
-      lastMove: { from: pending.from, to: pending.to, at: Date.now(), reason: "manual-switch" },
+      // A "Switch to next account" the restart interrupted keeps its label.
+      lastMove: { from: pending.from, to: pending.to, at: Date.now(), reason: pending.switchNow ? "switch-now" : "manual-switch" },
     }),
   });
   for (const warning of moved.warnings) saveStatusLineQuietly(pending.runId, taskId, warning);

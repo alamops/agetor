@@ -121,8 +121,22 @@ describe("switchTaskAccountNow", () => {
     const b = alias("idle-b");
     const stack = stacks.harnessStacks.create({ label: "idle", kind: "claude-code", members: [a, b] });
     const task = makeTask(a, "work", { column: "review" });
-    const result = await orch.switchTaskAccountNow(task.id);
+    // The persisted intent names the action, so a restart mid-move keeps the
+    // switch-now label (the boot completion reads it).
+    const intents: unknown[] = [];
+    const realSet = db.tasks.setHarnessState.bind(db.tasks);
+    db.tasks.setHarnessState = ((id: string, state: Parameters<typeof realSet>[1]) => {
+      if (id === task.id && state?.pendingSwap) intents.push(state.pendingSwap);
+      return realSet(id, state);
+    }) as typeof db.tasks.setHarnessState;
+    let result: Awaited<ReturnType<typeof orch.switchTaskAccountNow>>;
+    try {
+      result = await orch.switchTaskAccountNow(task.id);
+    } finally {
+      db.tasks.setHarnessState = realSet;
+    }
     expect(result.status).toBe("switched");
+    expect(intents).toEqual([expect.objectContaining({ from: a, to: b, manual: true, switchNow: "manual" })]);
     const after = db.tasks.get(task.id)!;
     expect(after.agent).toBe(b);
     expect(after.harnessState?.lastMove?.reason).toBe("switch-now");

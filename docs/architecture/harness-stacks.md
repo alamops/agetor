@@ -1206,6 +1206,10 @@ tried**: the move writes `tried: []`, `lastMove.reason = "switch-now"` (the
 header reads "Switched to the next account — continuing this conversation."
 — the shared `harnessMoveNote`, which `agetor show` also prints, under the same
 24 h `harnessStackBannerMode` window as the webview banner) and one history row.
+The persisted intent carries `pendingSwap.switchNow` (`manual` or `scheduled`),
+so a switch the boot reconcile finishes after a restart keeps
+`lastMove.reason = "switch-now"` and its note (its history row is
+`boot-resume`, like every boot-completed move).
 
 **Refusals** (HTTP 409, body `{ error, code, reasons? }`; `reasons` is one
 `{ harnessId, label, reason }` per member, shown by the webview toast and the CLI

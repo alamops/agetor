@@ -290,7 +290,7 @@ Phase 5 review (opus, parallel dimension and flow passes) → Phase 6 tests (TT1
   - `AGETOR_E2E_HARNESS_SEAMS` is an explicit opt-in e2e flag, set by the fixture.
   - Long-held webview connections for an awaited copy.
   - Large handoff path lists.
-  - A boot-completed switch-now reads `manual-switch`.
+  - A boot-completed switch-now reads `manual-switch` (closed 2026-11-10: `pendingSwap.switchNow` keeps the label).
 - **Phase 6:** rewrite the broken specs `harness-stack-settings`, `harness-stack-swap` and `settings-subpage-guard`.
 
 ## 8. Open questions / assumptions

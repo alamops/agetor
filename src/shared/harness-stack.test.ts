@@ -242,6 +242,20 @@ describe("task-header banner precedence", () => {
     }));
     expect(legacy?.lastMove?.reason).toBe("member-unavailable");
   });
+
+  test("pendingSwap.switchNow survives the parser only on a manual intent with a known value", () => {
+    const pending = (extra: Record<string, unknown>) =>
+      parseTaskHarnessState(JSON.stringify({
+        stackId: "s",
+        position: 0,
+        pendingSwap: { from: "a", to: "b", reason: "quota", runId: "r", startedAt: 1, ...extra },
+      }))?.pendingSwap;
+    expect(pending({ manual: true, switchNow: "scheduled" })?.switchNow).toBe("scheduled");
+    expect(pending({ manual: true, switchNow: "manual" })?.switchNow).toBe("manual");
+    expect(pending({ manual: true, switchNow: "bogus" })).not.toHaveProperty("switchNow");
+    expect(pending({ switchNow: "manual" })).not.toHaveProperty("switchNow");
+    expect(pending({ manual: true })).not.toHaveProperty("switchNow");
+  });
 });
 
 describe("swap notice", () => {
