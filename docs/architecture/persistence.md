@@ -114,12 +114,14 @@ for that today.
 
 `runs.mainUserRows(runId)` (`db.ts`) returns a run's main-stream `user` rows,
 oldest first, each tagged `twin` when the row carries a `line_uuid` (the Claude
-JSONL copy of a send). It is a `run_events` query like `mainUserTexts`, pinned
+JSONL copy of a send). It is a `run_events` query (the old `mainUserTexts` is gone), pinned
 `INDEXED BY idx_run_events_run` and listed in `db-run-events-plans.test.ts`.
 Clean retries and the persisted `allExhausted.cleanRetryOf` chain read it.
 
-Snapshot/restore for tests (`test-harness-state.ts`) covers stacks, members and
-limit rows; it does not yet cover `harness_swap_events` or
-`harness_mirror_provenance` (a test that writes them should clean up after
-itself), and it re-inserts limit rows without their `model`. Model:
+Snapshot/restore for tests (`test-harness-state.ts`) covers stacks, members,
+limit rows (with their `model`) and `harness_mirror_provenance`. It restores
+stacks with an upsert, not `INSERT OR REPLACE`, because REPLACE deletes the row
+first and would fire the `ON DELETE CASCADE` on `harness_swap_events` and the
+members. It does not snapshot `harness_swap_events` itself (a test that writes
+history should clean up after itself). Model:
 [harness-stacks.md](harness-stacks.md).

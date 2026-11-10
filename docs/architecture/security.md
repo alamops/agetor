@@ -228,4 +228,11 @@ member), restore (the account) and switch POST (the task's account and every
 member) — probe those roots through the CLI path gate first
 (`gateStackMemberRoots`, 403 `path-not-accessible`), like stack create/edit and
 a same-stack account PATCH. History and cooldown clear touch no files. The
-preview returns key and file names only, never values.
+preview returns key and file names only, never values, and its path gate runs
+before the draft is validated (validation resolves the account roots and reads
+login evidence inside them in the core's process). The backup store never
+follows a symlink: each ref is resolved by `lstat`-ing every component from
+`mirror-backups/` down, a symlinked or non-directory parent reads as missing
+(writes refuse it), and removal walks the tree cooperatively without following
+links; a narrow directory-swap race between the check and the listing is
+reduced, not closed, since Bun's `fs` has no fd-based directory operations.

@@ -202,9 +202,19 @@ What clears a cooldown:
   clears exactly the row its own chunk handler stored (`limitRecorded`: key and
   `updatedAt`), and only while that row is still the stored one; a newer
   overwrite is never touched.
-- **The explicit "Clear cooldown" action** (`DELETE /harnesses/:id/limit-state`,
-  optional `?model=`) deletes the account's rows, or just that model's row. It
-  does not change what the provider will accept: the confirm text says so.
+- **The explicit "Clear cooldown" action** (`DELETE /harnesses/:id/limit-state`):
+  `?model=<id>` deletes just that model's row, `?scope=account` just the
+  account-wide row, and no parameter every row of the account (`?model=` wins
+  over `?scope=`). It does not change what the provider will accept: the confirm
+  text says so. Afterwards `rearmRetriesAfterCooldownClear` walks the tasks
+  waiting out a limit on a stack that contains the account (an `allExhausted`
+  that is not `inFlight`, not `no-usable-member`, under the attempt cap, not
+  archived): it refreshes their `memberReasons`, re-arms the countdown one retry
+  floor (`retryMinMs()`) out without spending an attempt, and writes a "cooldown
+  cleared on <account> — retrying soon" status line. The response is `{ cleared,
+  rearmed, limitStates }`, `rearmed` being the number of tasks re-armed. The
+  Settings account-wide chip clears only the account-wide row and a per-model
+  chip only that model's.
 - Expiry, and the harness delete.
 
 A manual Run/message forces a cooling account **for that task only** and never
@@ -274,7 +284,10 @@ stack task it hands everything to `handleHarnessLimitSettlement`
      (the tray prepends, so the groups are stashed newest first: messages held
      during the swap window, then whatever sits in the per-kind turn queues —
      Codex queues a live-turn follow-up as its own later turn — then the
-     Claude mid-turn follow-ups the transcript never received). A started
+     Claude mid-turn follow-ups the transcript never received: whether one
+     reached the transcript is decided by pairing the run's echo rows with
+     their JSONL twins (`line_uuid`) per canonical text, so two identical unread
+     sends are not mistaken for one delivered pair). A started
      successor drains these itself and never stashes. An all-exhausted
      **clean** retry replays the follow-ups itself while it is armed (see the
      clean-retry chain below). A hard crash still loses what was only in memory
@@ -341,10 +354,16 @@ Run or message (which resets `allExhausted`), a same-stack account move, a
 hard block, a failed spawn that reaches the attempt cap, the cap itself, or a
 success/cancel that resets the lap — `endCleanRetry` clears the marker first
 (so it happens at most once) and stashes the unread follow-ups, recomputed from
-the persisted rows of that original run (`cleanRetryParts(runs.mainUserRows(…))`;
-a Codex retry replays only the first row, its follow-ups were already stashed as
-queued turns), plus what later swap-origin runs in the chain received. Because
-the marker and the rows are persisted, this survives a restart. An `inFlight`
+the persisted rows of that original run through `cleanRetryChainParts` (a
+Codex retry replays only the first row, its follow-ups were already stashed as
+queued turns), plus what later swap-origin runs in the chain received after their
+first row. The **same chain function feeds the retry's own text** (so a retry
+whose spawn failed once, leaving an empty failed successor as the latest run,
+still replays the right parts) and the stash. The stash drops the chain's first
+part only when it is the task prompt (what the replay would have re-sent
+anyway); a first part that is something else — a fresh start on another account
+whose first message was a follow-up — is kept. Because the marker and the rows
+are persisted, this survives a restart. An `inFlight`
 retry already started its successor, which carries the follow-ups.
 
 **One history row per move or blocked outcome.** Every account move writes
@@ -359,7 +378,7 @@ the trigger depends on the path:
 | Run or message found the account removed, disabled or unavailable and moved on | `unavailable` | `moveTaskToMember`'s `history` (from `prepareTaskHarness`) |
 | a same-stack change from the picker or `agetor edit --agent`, or "Switch to next account" on an idle task | `manual` | `moveTaskToMember`'s `history` (from `reconcileTaskSession`; also written when the transcript could not be copied, with `continuation: "restarted"`) |
 | "Switch to next account" applied at turn end | `scheduled` | the same |
-| no usable member, every account out of quota, or a boot resume that could not finish | `blocked` | `recordBlockedHistory` (reason `quota` for a limit-blocked stack, otherwise `no-usable-member`) |
+| no usable member, every account out of quota, a boot resume that could not finish, or a move that failed after a limit | `blocked` | `recordBlockedHistory` (reason `quota` for a limit-blocked stack, otherwise `no-usable-member`; a move that threw or could not transfer after a provider limit carries that limit's reason and source, with the message "the account switch failed: …") |
 
 The armed timer respects the user: it is cancelled (`cancelHarnessRetryForTask`
 — timer, `allExhausted`, held follow-ups and the clean-retry follow-ups, plus a
@@ -751,7 +770,26 @@ the entry, or when the account's own edit must become the original) replaces an
 orphan; the intent row is written before the overwrite, so a crash leaves the
 link to the saved original; a backup that cannot be written aborts the write,
 so an original is never overwritten unsaved; and dropping a row deletes its
-saved original.
+saved original, **except** a `preexisted` row with a saved original: that stays
+as an *un-owned restore pointer* (below). The store does not trust its own
+directory tree either: every access resolves its ref through
+`resolveBackupPath`, which `lstat`s each component from `mirror-backups/` down
+and treats a symlink or non-directory parent as missing (a write refuses it);
+reads open no-follow handles asynchronously; and `removeMirrorBackups` walks the
+tree cooperatively without following a link (a symlink is unlinked as itself,
+and a directory swapped for a link between the check and the listing is
+skipped). A mirror in flight when its account is deleted stops writing
+(`accountAlive`) so it recreates neither rows nor backups.
+
+**Un-owned restore pointers.** When the mirror stops owning a `preexisted` item
+that has a saved original — the primary deleted it, or safe mode no longer
+mirrors that key — the item stays on the backup as the mirror last wrote it and
+its row is kept, re-stamped with `UNOWNED_STAMP` (-1) in both source columns
+(`isUnownedRow`; no schema change, a real stamp is never negative). Deletion
+propagation and later merges skip such a row, a later mirror write that adopts
+the item again replaces the stamp with the original intact, and Restore still
+puts the original back. Every other dropped row goes with its saved original; an
+invalid-shape row is purged outright.
 
 **Restore** (`restoreMirror`, `POST /harnesses/:id/mirror-restore`) works row by
 row after the same checks:
@@ -761,7 +799,12 @@ row after the same checks:
   reported, and its original not restored);
 - an item the mirror added is removed while unedited, kept when edited, and
   simply forgotten when already gone;
-- a merged TOML file whose restored text would not parse is left alone.
+- a merged TOML file whose restored text would not parse is left alone;
+- a `preexisted` file whose leaf the account has since deleted gets its original
+  written back (only a path through a symlinked parent is refused as unsafe), a
+  link row is restored the same way (missing parent directories are created
+  under the root first), and an added item the account already deleted just has
+  its row forgotten.
 
 A row that was fully handled (restored, removed, nothing left to do, or garbage)
 is deleted together with its saved original. A row that was kept or failed
@@ -770,24 +813,29 @@ backup directory is removed. The result lists `restored`, `removed`, `kept`
 and `warnings`. Restore is offered on every Claude and Codex account (with no
 rows it does nothing); on a current backup member the UI and CLI warn that the next mirror (a stack
 save or a swap) re-applies the primary's config. Deleting an account removes its
-provenance rows (in `harnesses.delete`'s transaction) and then, best effort, its
-backup directory.
+provenance rows (in `harnesses.delete`'s transaction); the route then calls
+`deleteMirrorStateForHarness`, which runs inside the account's mirror queue (so
+it waits for a mirror or Restore already writing there and nothing is recreated
+after it), drops the rows again and removes the backup directory, best effort.
 
-**Safe-mode un-own.** Switching a stack from full to safe drops the provenance
-of every key safe mode no longer mirrors (hooks, permissions, command settings,
-command-running env, Codex `notify`/`hooks`/`permissions`) without deleting
-anything on the backup.
+**Safe-mode un-own.** Switching a stack from full to safe ends the mirror's
+ownership of every key safe mode no longer mirrors (hooks, permissions, command
+settings, command-running env, Codex `notify`/`hooks`/`permissions`) without
+deleting anything on the backup; a `preexisted` key keeps an un-owned restore
+pointer.
 
 **Surfaces.** `POST /harness-stacks/mirror-preview` (body: `kind`, `members`,
 optional `mirrorMode` and `stackId` of the stack being edited) validates the
-draft like a save, then returns `MirrorPreview`. The Settings editor calls it on
+draft like a save, then returns `MirrorPreview`. For a CLI-token caller the
+member-root path gate runs **before** the validation (validation resolves the
+account roots and reads login evidence inside them, in the core's process). The Settings editor calls it on
 Save when the change is mirror-relevant (a new stack with a backup, or an edit
 that changes members, their order or the mirror mode) and shows the preview
 dialog **only when `overwrites` is true**; the CLI `harness stack create|edit`
 prints the preview with `--dry-run` and saves nothing, and without `--yes`
 refuses (exit 1, after printing the preview) a save that would overwrite or
 remove; `harness stack preview <stack>` prints it for a saved stack. Restore is
-a button on the account row in Settings → Harnesses (with a confirm) and
+a button on the account row in Settings → Harnesses (with a confirm; shown only for accounts with mirror records) and
 `agetor harness restore <account> [--yes]` (`--yes` is needed for a current
 backup member).
 
@@ -1083,10 +1131,12 @@ as one line each):
 
 | `code` | When |
 | --- | --- |
-| `not-in-stack` | the task's account is in no stack or in a stack of fewer than two accounts, or the task is archived |
+| `not-in-stack` | the task's account is in no stack or in a stack of fewer than two accounts |
+| `archived` | the task is archived (unarchive it first) |
+| `launches-frozen` | an idle task while launches are frozen (the port is being handed to another core, or the app is quitting); a live run can still schedule, and boot performs it for the next owner |
 | `no-usable-member` | no other member can take the task now, with `reasons` |
 | `background-agents` | running background agents hold the task (the switch would drop the REPL that hosts them) |
-| `busy` | another account switch is copying, or a start claim exists with no live turn to wait for, or the row was put back because background agents appeared meanwhile |
+| `busy` | another account switch is copying; a swap window, a non-manual `pendingSwap`, an in-flight retry or a boot swap claim holds the task (a request scheduled inside one of those would be lost when the swap rewrites the task's state); a start claim exists with no live turn to wait for; or the row was put back because background agents appeared meanwhile |
 
 An unknown task is 404. For a CLI-token caller the roots of the task's account
 and of every member are re-probed through the CLI path gate first (403
@@ -1101,8 +1151,8 @@ transcript cannot be copied the account still changes, the status line says it
 starts fresh, queued follow-ups go to the tray (the reset would delete them),
 and the history row is written with `continuation: "restarted"`.
 
-**Live turn** (a live run, a swap window, a pending swap or an in-flight
-retry). The request is persisted as `harnessState.scheduledSwitch =
+**Live turn** (only a genuinely live run: an active or `running` run; a swap,
+a retry or a pending swap is a `busy` refusal instead). The request is persisted as `harnessState.scheduledSwitch =
 { requestedAt }` with a status line, so it survives a reload, the CLI and a
 restart, and the answer is `scheduled`. Asking again is a no-op. At the end of the
 turn (`settleScheduledSwitchAtTurnEnd`, called before the queued follow-ups
@@ -1121,6 +1171,15 @@ drain, so they start on the new account):
 - a newer turn that already owns the task decides at its own end; a **launch
   freeze** leaves it persisted for the next owner (boot performs it, see Crash
   safety); a stack delete cancels it with a status line.
+
+**Order at a turn end.** The move runs before the queued follow-ups drain, and
+the messages held during it go out **after** whatever the turn had queued
+(a Codex turn's queued follow-ups first, then the held messages), so the order
+stays oldest first; under a launch freeze or for a pipeline step Stop they are
+stashed to the tray instead. `claimTaskForAccountSwitch` itself refuses under a
+launch freeze. A scheduled switch dropped because the stack was cut to a single
+member writes a "scheduled account switch dropped — the stack has fewer than two
+accounts" status line.
 
 **Messages during the move.** While a switch-now claim is held, a message (a
 pipeline handoff reminder included) is **held, never refused**, and delivered
@@ -1189,12 +1248,13 @@ account move and every blocked outcome. The trigger per path is the table under
   | `GET /harness-stacks/:id`, `PATCH`, `DELETE` | detail / edit (mirror inline; `expectedUpdatedAt`) / delete | edit |
   | `GET /harness-stacks/:id/history` | the [swap history](#swap-history) page | no |
   | `POST /harness-stacks/mirror-preview` | the mirror dry run for a draft | every member |
-  | `DELETE /harnesses/:id/limit-state[?model=]` | clear an account's cooldown rows (all, or one model's); answers `{ cleared, limitStates }` | no |
+  | `DELETE /harnesses/:id/limit-state[?model=\|?scope=account]` | clear an account's cooldown rows (all, one model's, or just the account-wide one) and re-arm waiting countdowns; answers `{ cleared, rearmed, limitStates }` | no |
   | `POST /harnesses/:id/mirror-restore` | [Restore](#mirror-provenance-backups-preview-and-restore) | the account |
   | `POST`, `DELETE /tasks/:id/switch-account` | [switch to next account](#switch-to-next-account) / cancel it | POST: the task's account and every member |
 
-  `GET /harnesses` carries `stacks` and `limitStates` (one row per account and,
-  for a per-model limit, per model); `GET /tasks` carries `harnessState`;
+  `GET /harnesses` carries `stacks`, `limitStates` (one row per account and,
+  for a per-model limit, per model) and `mirrorRestorable` (the ids of accounts
+  with mirror provenance rows, i.e. where a Restore has something to undo); `GET /tasks` carries `harnessState`;
   `GET /usage` (CLI scope) carries the quota snapshots the meters read, and
   `POST /harnesses/:id/usage/refresh` stays desktop-only. Create/edit run the
   config mirror inline when the change is mirror-relevant, so those handlers call
@@ -1236,15 +1296,22 @@ account move and every blocked outcome. The trigger per path is the table under
   would overwrite or remove files on a backup refuses, after printing the
   preview, without it). `stack preview <stack>` prints the preview of a saved
   stack; `stack history <stack> [--limit n] [--before cursor]` pages the history;
-  `agetor harness cooldown clear <account> [--model id]`; `agetor harness restore
-  <account> [--yes]`; `agetor switch-account <task> [--cancel]`. `agetor harness ls` and
+  `agetor harness cooldown clear <account> [--model id]` (without `--model` it
+  clears every cooldown row of the account and says so; the account may be a kind
+  name, resolved like the core does; it reports how many waiting tasks were
+  re-armed); `agetor harness restore <account> [--yes]`; `agetor
+  switch-account <task> [--cancel]` (a refusal prints one heading and each member
+  reason once); `agetor harness stack rm` says the stack's switch history is
+  deleted with it. `agetor harness ls` and
   `stack ls|show` show each account's cooldown (reason, reset, the provider's
   message, the model for a per-model row) and 5-hour / weekly quota with the
   snapshot age (`stale` past 20 minutes); there is no force-refresh from the CLI.
   `agetor ls` shows `· 2/3` and the markers `⏳` (the current account is cooling
-  for the task's model), `out of quota` / `blocked: no usable account` and `⇄`
-  (a switch is scheduled); `agetor show` prints `stack:` / `failover:` lines,
-  the cooling rows, and for an all-exhausted task the earliest reset and one line
+  for the task's model), `out of quota` / `blocked: no usable account`,
+  `retrying (attempt n/m)` while the retry run is live (in place of the
+  out-of-quota marker; it does not hide `⏳`) and `⇄` (a switch is scheduled); `agetor show` prints `stack:` / `failover:` lines,
+  the cooling rows that apply to the task's model (the account-wide row and its
+  model's, never another model's), and for an all-exhausted task the earliest reset and one line
   per member reason, pointing at Settings → Harnesses; `agetor edit --agent`
   refused for a live run suggests `switch-account`. The formatted notice appears
   in `logs`; the TUI shows the toast, the notice and the active account with its
@@ -1264,9 +1331,12 @@ account move and every blocked outcome. The trigger per path is the table under
   usage map (no extra fetch; dimmed and marked "stale" past 20 minutes, "no
   quota data" without a snapshot), a **cooldown chip** per active row (reason,
   reset, "for <model>", the provider's message as plain text beside it and in a tooltip) with a
-  **Clear** action (confirm: the provider may still refuse until its own reset),
-  and **Restore pre-stack config** on Claude and Codex accounts (confirm; a
-  current backup member is warned that the next mirror re-applies). The editor
+  **Clear** action (confirm, naming what it clears — the account-wide chip clears
+  only the account-wide row, a per-model chip only that model's; the provider may
+  still refuse until its own reset), and **Restore pre-stack config**, offered only
+  on accounts listed in `mirrorRestorable` (confirm; a current backup member is
+  warned that the next mirror re-applies). The delete-stack confirm says the
+  stack's switch history is deleted too. The editor
   sub-page (order, members, mirror mode) keeps the disabled-member and
   same-config-directory blockers (the latter uses the shared spawn precedence of
   `src/shared/harness-config-root.ts`, env-map `HOME` included, lexically — the
@@ -1276,7 +1346,10 @@ account move and every blocked outcome. The trigger per path is the table under
   save", sends `expectedUpdatedAt`, and on a mirror-relevant Save calls the
   preview route, showing the preview dialog (per backup: files overwritten or
   removed, keys, what is backed up first, what is kept) **only when `overwrites`
-  is true**. A 409 `stack-changed` toasts "This stack changed elsewhere —
+  is true**. Confirm writes **exactly the draft that was previewed**: a draft
+  edited while the dry run was in flight, or after the dialog opened, is previewed
+  again instead of being saved unseen. (The editor lives in
+  `src/mainview/components/settings/StackEditor.tsx`.) A 409 `stack-changed` toasts "This stack changed elsewhere —
   reloaded" and replaces the draft with the stored copy. The History sub-page
   pages the stack's swap history. *Board and RunPanel:* New Task/TaskCard and the
   task-launch pickers' badges (a not-yet-run task derives its `n/m` from the
@@ -1391,12 +1464,11 @@ account move and every blocked outcome. The trigger per path is the table under
   file), so keys it had written earlier stay on the backup. Deleting a *key*
   from a file that still exists, or a mirrored *file* from a directory that
   still exists, propagates.
-- **Restore cannot undo an ownership change.** A provenance row and the saved
-  original behind it go together (`dropRow`). When the mirror stops owning a
-  `preexisted` item — the primary deleted it, or safe mode no longer mirrors that
-  key — the item stays as it is on the backup (the primary's last content) and its
-  saved original is
-  deleted with the row, so a later Restore cannot bring the original back.
+- **Backup removal has a narrow directory-swap race.** `removeMirrorBackups`
+  `lstat`s a directory, lists it, re-checks that it is the same inode and only
+  then descends, so an agent that swaps a directory for a link in the window
+  between those calls is mostly but not entirely excluded: Bun's `fs` has no
+  fd-based directory operations to close it. The window is reduced, not closed.
 - **A backup's own edit to something the mirror owns loses to the primary**
   (the primary wins), reversibly: it is saved first and Restore brings it
   back, but it is not preserved in place.
