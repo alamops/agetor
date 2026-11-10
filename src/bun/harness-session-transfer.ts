@@ -27,7 +27,14 @@ import { lstatSync, readdirSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { encodeProjectPath } from "./claude-tmux.ts";
-import { harnesses, harnessSessionHandoffs, runs, type HarnessSessionHandoff, type SessionIdColumn } from "./db.ts";
+import {
+  harnesses,
+  harnessOrphanedCopies,
+  harnessSessionHandoffs,
+  runs,
+  type HarnessSessionHandoff,
+  type SessionIdColumn,
+} from "./db.ts";
 import {
   copyRegularFileDetailed,
   copyTreeCooperative,
@@ -41,7 +48,12 @@ import {
   sameConfigRoot,
 } from "./harness-file-transfer.ts";
 import { claudeConfigDirFor, codexHomeFor } from "./harness-config-root.ts";
-import { CLAUDE_SESSION_SIDECAR_DIRS, isHandoffCopyShape, isSafePathSegment } from "../shared/harness-mirror.ts";
+import {
+  CLAUDE_SESSION_SIDECAR_DIRS,
+  handoffCopySessionIdFromPath,
+  isHandoffCopyShape,
+  isSafePathSegment,
+} from "../shared/harness-mirror.ts";
 import type { Harness, HarnessStackKind } from "../shared/types.ts";
 import { resolveBin } from "./agents.ts";
 import { childEnv, coreSpawn } from "./core-spawn.ts";
@@ -228,11 +240,15 @@ function restoreHandoff(
   harnessId: string,
   column: SessionIdColumn,
 ): void {
+  // Whatever the failed copy created is recorded under the new session; it
+  // moves to the orphan store (re-key or abandon) so a sweep can remove it,
+  // and the previous session's row comes back whole, its paths reclaimed from
+  // the orphan store.
   if (!prior) {
-    harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
+    harnessSessionHandoffs.abandon(taskId, harnessId, column);
     return;
   }
-  harnessSessionHandoffs.upsert({ ...prior, copiedPaths: [] });
+  harnessSessionHandoffs.upsert(prior);
 }
 
 /**
@@ -263,23 +279,23 @@ function recordIntended(
   });
 }
 
-/** A different session's copies are superseded by a successful transfer. They
- *  are removed only AFTER the new copy succeeded (a failed transfer must leave
- *  the old conversation intact), under the OLD session id captured from the
- *  row before it was re-keyed. Copies that cannot be removed are reported: the
- *  row can name one session only, so they stay on disk and are no longer
- *  recorded as cleanable. */
+/** A different session's copies are superseded by a successful transfer. The
+ *  re-key moved them to the orphan store under the OLD session id (the row can
+ *  name one session only), and they are removed only AFTER the new copy
+ *  succeeded and the row was re-keyed: a failed transfer must leave the old
+ *  conversation intact. Copies that cannot be removed now stay in the orphan
+ *  store, so a later sweep retries them. */
 async function dropSupersededCopies(
   prior: HarnessSessionHandoff | null,
   sessionId: string,
-  root: string,
-  kind: HarnessStackKind,
+  harnessId: string,
+  column: SessionIdColumn,
   warnings: string[],
 ): Promise<void> {
   if (!prior || prior.sessionId === sessionId) return;
-  const result = await removeCopiedPathsDetailed(prior.copiedPaths, root, kind, prior.sessionId);
-  if (result.retained.length > 0) {
-    warnings.push(`${result.retained.length} copied file(s) of the superseded session ${prior.sessionId} could not be removed and were left in place`);
+  const left = await sweepOrphanedHandoffCopies({ harnessId, columnName: column, sessionId: prior.sessionId });
+  if (left.retained > 0) {
+    warnings.push(`${left.retained} copied file(s) of the superseded session ${prior.sessionId} could not be removed yet; they are kept on record and retried later`);
   }
 }
 
@@ -348,7 +364,10 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
       const result = await copyRegularFileDetailed(src, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
       if (result.created) copied.push(dest);
     } catch (err) {
-      if (intended.length > 0) restoreHandoff(prior, taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
+      if (intended.length > 0) {
+        restoreHandoff(prior, taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
+        await sweepOrphanedHandoffCopies({ harnessId: toHarness.id, columnName: CLAUDE_SESSION_COLUMN, sessionId });
+      }
       return { ok: false, reason: "io", message: errMessage(err) };
     }
 
@@ -373,7 +392,6 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
       }
     }
 
-    await dropSupersededCopies(prior, sessionId, toRoot, "claude-code", warnings);
     harnessSessionHandoffs.upsert({
       taskId,
       harnessId: toHarness.id,
@@ -382,6 +400,7 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
       copiedPaths: copied,
       createdAt: Date.now(),
     });
+    await dropSupersededCopies(prior, sessionId, toHarness.id, CLAUDE_SESSION_COLUMN, warnings);
     return { ok: true, sessionId, copiedPaths: copied, ...(warnings.length > 0 ? { warnings } : {}) };
   },
   async cleanup(taskId, harnessId): Promise<string[]> {
@@ -567,11 +586,13 @@ export const codexSessionTransfer: SessionTransferAdapter = {
       const result = await copyRegularFileDetailed(source, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
       if (result.created) copiedPaths.push(dest);
     } catch (err) {
-      if (intended.length > 0) restoreHandoff(prior, taskId, toHarness.id, CODEX_SESSION_COLUMN);
+      if (intended.length > 0) {
+        restoreHandoff(prior, taskId, toHarness.id, CODEX_SESSION_COLUMN);
+        await sweepOrphanedHandoffCopies({ harnessId: toHarness.id, columnName: CODEX_SESSION_COLUMN, sessionId });
+      }
       return { ok: false, reason: "io", message: errMessage(err) };
     }
     const warnings: string[] = [];
-    await dropSupersededCopies(prior, sessionId, toRoot, "codex", warnings);
     const migrationWarning = await migrateCodexRollouts(toHarness);
     if (migrationWarning) warnings.push(migrationWarning);
     harnessSessionHandoffs.upsert({
@@ -582,6 +603,7 @@ export const codexSessionTransfer: SessionTransferAdapter = {
       copiedPaths,
       createdAt: Date.now(),
     });
+    await dropSupersededCopies(prior, sessionId, toHarness.id, CODEX_SESSION_COLUMN, warnings);
     // The migration warning is surfaced through the caller's status line; the
     // transfer itself succeeded because the rollout is on disk.
     return {
@@ -694,15 +716,21 @@ export interface HarnessSessionCopies {
 export function collectHarnessSessionCopies(harnessId: string): HarnessSessionCopies[] {
   const harness = harnesses.getByIdOrKind(harnessId);
   if (!harness) return [];
-  return harnessSessionHandoffs.listForHarness(harnessId).map((handoff) => {
-    const codex = handoff.columnName === CODEX_SESSION_COLUMN;
+  const toCopies = (column: SessionIdColumn, sessionId: string, paths: readonly string[]): HarnessSessionCopies => {
+    const codex = column === CODEX_SESSION_COLUMN;
     return {
       kind: codex ? "codex" : "claude-code",
       root: codex ? codexHomeFor(harness) : claudeConfigDirFor(harness),
-      sessionId: handoff.sessionId,
-      paths: handoff.copiedPaths,
+      sessionId,
+      paths,
     };
-  });
+  };
+  // The orphaned copies (migration 088) are this account's files too.
+  const orphans = groupOrphans(harnessOrphanedCopies.list({ harnessId: harness.id }));
+  return [
+    ...harnessSessionHandoffs.listForHarness(harnessId).map((h) => toCopies(h.columnName, h.sessionId, h.copiedPaths)),
+    ...orphans.map((g) => toCopies(g.columnName, g.sessionId, g.paths)),
+  ];
 }
 
 /** Remove copies captured by {@link collectHarnessSessionCopies}. Only regular
@@ -737,3 +765,152 @@ export async function cleanupHarnessSessionCopies(taskId: string): Promise<strin
   return warnings;
 }
 
+
+// ---------------------------------------------------------------------------
+// Orphaned handoff copies (migration 088)
+// ---------------------------------------------------------------------------
+
+interface OrphanGroup {
+  harnessId: string;
+  columnName: SessionIdColumn;
+  sessionId: string;
+  paths: string[];
+}
+
+function groupOrphans(rows: readonly { harnessId: string; columnName: SessionIdColumn; sessionId: string; path: string }[]): OrphanGroup[] {
+  const groups = new Map<string, OrphanGroup>();
+  for (const row of rows) {
+    const key = `${row.harnessId}\u0000${row.columnName}\u0000${row.sessionId}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { harnessId: row.harnessId, columnName: row.columnName, sessionId: row.sessionId, paths: [] };
+      groups.set(key, group);
+    }
+    group.paths.push(row.path);
+  }
+  return [...groups.values()];
+}
+
+/** What a sweep did: files unlinked, records dropped (gone, or never ours),
+ *  and files still kept on record for a later retry. */
+export interface OrphanSweepResult {
+  removed: number;
+  forgotten: number;
+  retained: number;
+}
+
+let sweepChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * Remove orphaned handoff copies, optionally only one account's, column's or
+ * session's. Each path is removed under exactly the handoff cleanup rules
+ * ({@link removeCopiedPathsDetailed}: inside the account's CURRENT root, of a
+ * handoff shape naming the path's own session, a real path, a regular file).
+ * A record is dropped once its file is removed or gone, or rejected as never
+ * ours; one that may still be ours (the root changed, the unlink failed) is
+ * kept for the next sweep. An account that no longer exists has no root to
+ * resolve against, so its records are dropped, as for a handoff row. A session
+ * that is live again on a handoff row of the same account is skipped: its
+ * files belong to a conversation that can still be resumed.
+ *
+ * Sweeps are serialized, so two never race on one file. Cooperative (the
+ * removal yields every ~20 ms) and never rejects.
+ */
+export function sweepOrphanedHandoffCopies(
+  filter: { harnessId?: string; columnName?: SessionIdColumn; sessionId?: string } = {},
+): Promise<OrphanSweepResult> {
+  const run = sweepChain.then(
+    () => sweepOnce(filter),
+    () => sweepOnce(filter),
+  );
+  sweepChain = run.catch(() => {});
+  return run.catch((err) => {
+    console.warn("[harness-stacks] sweeping orphaned handoff copies failed:", err);
+    return { removed: 0, forgotten: 0, retained: 0 };
+  });
+}
+
+async function sweepOnce(
+  filter: { harnessId?: string; columnName?: SessionIdColumn; sessionId?: string },
+): Promise<OrphanSweepResult> {
+  const out: OrphanSweepResult = { removed: 0, forgotten: 0, retained: 0 };
+  const rows = harnessOrphanedCopies
+    .list(filter.harnessId !== undefined ? { harnessId: filter.harnessId } : {})
+    .filter((r) => (filter.columnName === undefined || r.columnName === filter.columnName)
+      && (filter.sessionId === undefined || r.sessionId === filter.sessionId));
+  for (const group of groupOrphans(rows)) {
+    const harness = harnesses.getByIdOrKind(group.harnessId);
+    if (!harness) {
+      harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths);
+      out.forgotten += group.paths.length;
+      continue;
+    }
+    if (harnessSessionHandoffs.hasLiveSession(group.harnessId, group.columnName, group.sessionId)) {
+      out.retained += group.paths.length;
+      continue;
+    }
+    const codex = group.columnName === CODEX_SESSION_COLUMN;
+    const result = await removeCopiedPathsDetailed(
+      group.paths,
+      codex ? codexHomeFor(harness) : claudeConfigDirFor(harness),
+      codex ? "codex" : "claude-code",
+      group.sessionId,
+    );
+    const keep = new Set(result.retained);
+    const done = group.paths.filter((p) => !keep.has(p));
+    harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, done);
+    out.removed += result.removed.length;
+    out.forgotten += done.length - result.removed.length;
+    out.retained += keep.size;
+  }
+  return out;
+}
+
+/**
+ * Boot normalization for rows written before migration 088: a handoff row
+ * re-keyed to a newer session could still list the old session's copies,
+ * which its cleanup always rejected (the shape names another session). Each
+ * such path whose own session can be read from it moves to the orphan store
+ * under that session. Idempotent; a path whose session cannot be read stays.
+ */
+export function adoptMismatchedHandoffPaths(): number {
+  let moved = 0;
+  for (const row of harnessSessionHandoffs.listAll()) {
+    const kind: HarnessStackKind = row.columnName === CODEX_SESSION_COLUMN ? "codex" : "claude-code";
+    const keep: string[] = [];
+    const bySession = new Map<string, string[]>();
+    for (const p of row.copiedPaths) {
+      const sid = handoffCopySessionIdFromPath(kind, path.resolve(p), row.sessionId);
+      if (sid !== null && sid !== row.sessionId) {
+        const list = bySession.get(sid) ?? [];
+        list.push(p);
+        bySession.set(sid, list);
+      } else {
+        keep.push(p);
+      }
+    }
+    if (bySession.size === 0) continue;
+    for (const [sid, paths] of bySession) {
+      harnessOrphanedCopies.add(row.harnessId, row.columnName, sid, paths);
+      moved += paths.length;
+    }
+    harnessSessionHandoffs.setPaths(row.taskId, row.harnessId, row.columnName, keep);
+  }
+  return moved;
+}
+
+/** The boot pass: normalize old rows, then sweep every orphaned copy. Fired
+ *  without awaiting by `reconcileOrphans`; never rejects. */
+export async function sweepOrphanedHandoffCopiesAtBoot(): Promise<void> {
+  try {
+    const adopted = adoptMismatchedHandoffPaths();
+    const result = await sweepOrphanedHandoffCopies();
+    if (adopted > 0 || result.removed > 0 || result.retained > 0) {
+      console.log(
+        `[harness-stacks] orphaned handoff copies: ${adopted} adopted from re-keyed rows, ${result.removed} removed, ${result.retained} kept for a later retry`,
+      );
+    }
+  } catch (err) {
+    console.warn("[harness-stacks] boot sweep of orphaned handoff copies failed:", err);
+  }
+}

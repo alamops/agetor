@@ -26,7 +26,8 @@ the merged Harnesses page) is `docs/plans/harness-stacks-fix-round.md`.
 | `harness_limit_state` | Cooldown rows keyed by `(harness_id, model)` (migration 087); `model = ''` is the whole account, a model id (lower-cased) is a provider limit scoped to that model. Columns: reason, source, message, `exhausted_until_ms`, `updated_at`. Deliberately has **no FK** and survives a stack delete — a limit is a fact about the account. |
 | `harness_swap_events` | The per-stack swap history (see [Swap history](#swap-history)). `stack_id` is an FK with `ON DELETE CASCADE` and it is the **only** FK: task and account ids are plain columns and the labels and task title are denormalized, so a row survives a task or account delete and goes only with its stack. |
 | `harness_mirror_provenance` | What a mirror run wrote into a backup, `(harness_id, path, key)` → scope (`file`/`key`/`link`), value hash, source mtime/size, `preexisted`, `backup_ref`. **No FK**; rows are untrusted on use (see [Mirror provenance, backups, preview and Restore](#mirror-provenance-backups-preview-and-restore)). |
-| `harness_session_handoffs` | `(task_id, harness_id, column_name)` → copied session id + `copied_paths_json` (the cleanup allowlist). The one exception to per-account session scoping. |
+| `harness_session_handoffs` | `(task_id, harness_id, column_name)` → copied session id + `copied_paths_json` (the cleanup allowlist). The one exception to per-account session scoping. Every listed path belongs to the row's session. |
+| `harness_orphaned_copies` | Handoff copies no handoff row can clean up any more (migration 088): `(harness_id, column_name, path)` → the `session_id` the file was copied for. **No FK**, so a row outlives its task (see [Leftover handoff copies](#leftover-handoff-copies)). |
 | `tasks.harness_state` | `TaskHarnessState` JSON: `stackId`, `position`, `count`, `tried[]`, `pendingSwap`, `allExhausted` (`attempts`, `inFlight`, `nextAttemptAt`, `earliestResetAtMs`, `reason`, plus `cleanRetryOf` and `memberReasons`), `lastMove` (`reason` is `member-removed`, `member-disabled`, `member-unavailable`, `manual-switch` or `switch-now`) and `scheduledSwitch` (`{ requestedAt }`). Server-managed (targeted UPDATE, no `updated_at`, skipped by the generic PATCH clause). Every optional field is omitted when absent, so older state still parses. |
 
 A task's stack is **derived** from `Task.agent` (`harnessStacks.resolveForTask`):
@@ -742,6 +743,16 @@ missing or unsafe file, a tree that hit its copy cap, a refused symlink):
 - a `preexisted` item → ownership is dropped and the backup's file or value
   stays (a primary deletion must not destroy it, nor resurrect an older value).
 
+A **merged file the primary deleted outright** (`settings.json`,
+`.claude.json`, `config.toml`, a plugin registry) is merged as an empty
+document, so its keys follow the same three rules. It counts as deleted only
+when the primary's config root is a directory, the file's own folder exists
+(the base is trusted like the root; every folder below it must be a real,
+non-symlink directory), the open reports `ENOENT`, and the mirror still owns at
+least one key in that file (`primaryDeletionPropagates`). A dangling dotfile
+link, an unreadable file or a missing account is left alone, and a backup that
+has no such file never gets one created.
+
 Rows live in SQLite, which an agent can write, so a row is a claim: before any
 removal or restore the path must pass the mirror-allowlist shape check
 (`isMirrorCopyShape`), lie below the account root with no symlinked component
@@ -921,15 +932,54 @@ source account's config root to the destination's (adapters: Claude, Codex).
   stamps the real time. A failed transfer puts the row back to what it was. A
   path recorded but never created is harmless (cleanup skips a missing file).
 - **Superseded copies are removed after success.** When the account already had
-  a handoff for a different session, its copies are removed only *after* the new
-  copy succeeded (a failed transfer must leave the old conversation intact),
-  under the **old** session id captured before the row was re-keyed. Copies that
-  cannot be removed produce a warning; see Known limitations for what that leaves
-  behind.
+  a handoff for a different session, re-keying the row moves the old session's
+  paths to `harness_orphaned_copies` under the **old** session id (a row names
+  one session, and cleanup only removes paths of its own session). They are
+  swept only *after* the new copy succeeded and the row was re-keyed: a failed
+  transfer must leave the old conversation intact, so it puts the previous row
+  back whole (its paths are reclaimed from the orphan store) and moves whatever
+  the failed copy recorded to the orphan store instead, where the same sweep
+  removes any partial file. Copies that cannot be removed yet stay on record
+  and the transfer reports a warning; see
+  [Leftover handoff copies](#leftover-handoff-copies).
 - Codex: the rollout is copied to the same relative path under the destination
   `CODEX_HOME` (only `sessions/YYYY/MM/DD/rollout-*-<threadId>.jsonl` is a
   recognised shape), with the same pre-recording, then `codex migrate-rollouts`
   as described above.
+
+## Leftover handoff copies
+
+`harness_orphaned_copies` (migration 088) holds copied session files that no
+handoff row can clean up any more, each with the session it was copied for:
+
+- the old session's paths when a row is **re-keyed** to another session (the
+  same task moved onto the same account again);
+- whatever a **failed first transfer** recorded (`harnessSessionHandoffs.abandon`);
+- the paths a **deleted task's** cleanup had to keep (the account's root
+  changed, an unlink failed), adopted by `tasks.delete` before the cascade.
+
+`sweepOrphanedHandoffCopies` removes them under exactly the handoff cleanup
+rules (`removeCopiedPathsDetailed`: inside the account's **current** root, a
+handoff shape naming the path's own session, a real path, a regular file;
+nothing recursive). A record is dropped once its file is removed or gone, or
+when it is rejected as never ours; a `retained` one (outside the current root,
+refused root, failed unlink) stays for the next sweep. An account that no
+longer exists has no root, so its records are dropped. A session that is live
+on a handoff row of the same account is skipped. Sweeps are serialized and
+cooperative and never reject. They run:
+
+- at boot, fired without awaiting at the end of `reconcileOrphans`
+  (`sweepOrphanedHandoffCopiesAtBoot`). It first normalizes rows written before
+  088: a path on a handoff row whose shape names another session
+  (`handoffCopySessionIdFromPath`, which prefers the row's own session) moves
+  to the orphan store under that session;
+- after a successful transfer, for the superseded session; after a failed one,
+  for the session it recorded;
+- after `PATCH /harnesses/:id` changes `home` or `env` (a root changed back
+  brings kept files into reach), not awaited.
+
+Account delete captures the orphaned copies along with its handoffs and
+removes them after the delete succeeds.
 
 ## Crash safety and boot
 
@@ -1008,8 +1058,11 @@ source account's config root to the destination's (adapters: Claude, Codex).
   after the copy, the root is refused, or the unlink failed). **A handoff row is
   deleted only when nothing was retained**; otherwise the row stays and cleanup
   returns a warning, so a later cleanup can still remove the file.
-  Handoff upserts merge `copied_paths_json`, so a second copy onto the same
-  account never orphans the first copy's files.
+  Handoff upserts for the **same** session merge `copied_paths_json`, so a
+  second copy onto the same account never orphans the first copy's files; an
+  upsert for a **different** session moves the old paths to
+  `harness_orphaned_copies` (see below), and a path written back onto a live
+  row is removed from there.
 - **Delete** clears failover state and cancels timers first, then removes the
   copied session files at the very end — immediately before the task row (and
   its handoff rows) is deleted. Every step in between can throw (the pipeline
@@ -1018,6 +1071,10 @@ source account's config root to the destination's (adapters: Claude, Codex).
   resume. A recorded path is removed only when every component below the
   account root is a real, non-symlink path: a symlinked parent inside an
   agent-writable home must never redirect a cleanup outside the account.
+  Whatever that cleanup had to keep is **orphaned, not forgotten**:
+  `tasks.delete` copies the task's remaining handoff paths into
+  `harness_orphaned_copies` in the same transaction as the row delete, so the
+  cascade no longer takes the only record of them.
 - **Archive** clears failover state and keeps the copies so an unarchive can
   resume; the archived-history retention pass removes them after the threshold.
 - **Harness delete** captures the copied session files it owns as a handoff
@@ -1029,8 +1086,9 @@ source account's config root to the destination's (adapters: Claude, Codex).
   derives `position` from the surviving order, so a pre-fix database with a gap
   still reads contiguously) and bumps the stack's `updated_at` strictly
   upward, so an open editor's `expectedUpdatedAt` conflicts. The same
-  transaction deletes the account's cooldown rows, handoff rows and mirror
-  provenance rows; its mirror backup directory is removed right after (best
+  transaction deletes the account's cooldown rows, handoff rows, orphaned-copy
+  rows and mirror provenance rows (the captured files include the orphaned
+  copies); its mirror backup directory is removed right after (best
   effort). The account's swap-history rows stay (denormalized labels).
 - **Stack delete** clears the failover state and cancels the retry timer of
   every task whose recorded `stackId` **or currently resolved stack** is the
@@ -1448,28 +1506,16 @@ account move and every blocked outcome. The trigger per path is the table under
   from the user's other tooling says nothing about Claude. Without a selector
   the key is ignored (and the process-key warning does not name it). The
   direct `ANTHROPIC_*` / `CLAUDE*` keys still count as a login.
-- **Re-keyed handoff rows.** A handoff row names one session. When the same
-  task moves to the same account again under a different session id, the old
-  session's copies are removed after the new copy succeeds; any that cannot be
-  removed (a failed unlink, the account's root changed) stay on disk and in the
-  row under a session id they no longer match, so cleanup skips them
-  (`isHandoffCopyShape` is tied to the recorded id). A per-session handoff store
-  would fix it and is out of scope. The transfer reports a warning.
-- **Retained copies are lost with the task.** When a cleanup retains a copied
-  file (the account's root was changed after the copy) the handoff row is kept
-  so a later cleanup can remove it; but the row cascades with the task, so
-  deleting the task afterwards forgets the file, which stays on disk.
-- **A deleted primary merged file does not propagate key removals.** If the
-  primary's `settings.json`, `.claude.json` or `config.toml` is deleted
-  outright, the mirror treats it as "nothing to merge" (like an unreadable
-  file), so keys it had written earlier stay on the backup. Deleting a *key*
-  from a file that still exists, or a mirrored *file* from a directory that
-  still exists, propagates.
 - **Backup removal has a narrow directory-swap race.** `removeMirrorBackups`
   `lstat`s a directory, lists it, re-checks that it is the same inode and only
   then descends, so an agent that swaps a directory for a link in the window
   between those calls is mostly but not entirely excluded: Bun's `fs` has no
   fd-based directory operations to close it. The window is reduced, not closed.
+- **An orphaned copy outside the account's current root waits.** A kept file
+  whose account was re-pointed elsewhere is retried by every sweep and removed
+  once the root points back; if it never does, it stays on disk (and on record)
+  until the account is deleted. The core never removes a file outside an
+  account's current root.
 - **A backup's own edit to something the mirror owns loses to the primary**
   (the primary wins), reversibly: it is saved first and Restore brings it
   back, but it is not preserved in place.

@@ -2117,7 +2117,7 @@ test("086 on the real schema: cursor Fable 5.2/5.1 variants fold to a base id th
        ('lastModel:fx', 'claude-fable-5-2-high', 7)`,
   );
 
-  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round"]);
+  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies"]);
 
   type TaskRow = {
     id: string;
@@ -2280,7 +2280,7 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
     INSERT INTO subagents (id, task_id, parent_kind, source_path, status, started_at, ended_at)
       VALUES ('opencode-ses_1', 't1', 'opencode_subagent', 'opencode-session:ses_1', 'orphaned', 1, 2);
   `);
-  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round"]);
+  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies"]);
   expect(columnNames(db, "opencode_stopped_children")).toEqual(["child_session_id", "task_id", "stopped_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_stopped_children)`).all()).toEqual([]);
   // A note for a task id that doesn't exist (or no longer does) is accepted.
@@ -2329,7 +2329,7 @@ test("083 adds opencode_watch_tombstones (no foreign key, session id primary key
   const db = new Database(":memory:");
   migrateThrough(db, "082_opencode_child_bookkeeping");
   db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'opencode', '/w', 1, 1)`);
-  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round"]);
+  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies"]);
   expect(columnNames(db, "opencode_watch_tombstones")).toEqual(["session_id", "harness_id", "task_id", "expires_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_watch_tombstones)`).all()).toEqual([]);
   // A tombstone outlives its task: a task id that doesn't exist is accepted.
@@ -2389,6 +2389,7 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
     "085_harness_stack_members_no_harness_fk",
     "086_normalize_cursor_fable_5_2",
     "087_harness_stacks_fix_round",
+    "088_harness_orphaned_copies",
   ]);
   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 
@@ -2485,7 +2486,7 @@ test("085 rebuilds harness_stack_members without the harnesses FK, keeping rows,
     INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'Claude', 'claude-code', 1, 1);
     INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'claude-code', 0), ('s1', 'cc-b', 1);
   `);
-  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round"]);
+  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies"]);
   expect(columnNames(db, "harness_stack_members")).toEqual(["stack_id", "harness_id", "position"]);
   const fks = db.query<{ table: string; on_delete: string }, []>(`PRAGMA foreign_key_list(harness_stack_members)`).all();
   expect(fks.map((f) => [f.table, f.on_delete])).toEqual([["harness_stacks", "CASCADE"]]);
@@ -2545,7 +2546,7 @@ test("087 keeps cooldown rows as whole-account (model ''), keys by (harness, mod
   migrateThrough(db, "086_normalize_cursor_fable_5_2");
   db.exec(`INSERT INTO harness_limit_state (harness_id, reason, source, message, exhausted_until_ms, updated_at)
            VALUES ('cc-a', 'quota', 'claude-pane', 'usage limit', 9000, 100)`);
-  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round"]);
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies"]);
   expect(columnNames(db, "harness_limit_state")).toEqual(
     ["harness_id", "model", "reason", "source", "message", "exhausted_until_ms", "updated_at"],
   );
@@ -2585,7 +2586,7 @@ test("087 N-1: several real cooldown rows survive byte-for-byte as whole-account
       [id, reason, source, message, until, at],
     );
   }
-  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round"]);
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies"]);
   const rows = db.query(`SELECT * FROM harness_limit_state ORDER BY harness_id`).all();
   expect(rows).toEqual(
     seeded.map(([harness_id, reason, source, message, exhausted_until_ms, updated_at]) => ({
@@ -2619,5 +2620,29 @@ test("087 N-1: several real cooldown rows survive byte-for-byte as whole-account
   db.run(`DELETE FROM harness_stacks WHERE id = 's1'`);
   expect(db.query(`SELECT id FROM harness_swap_events`).all()).toEqual([]);
   expect(db.query<{ name: string }, []>(`PRAGMA foreign_key_list(harness_mirror_provenance)`).all()).toEqual([]);
+  db.close();
+});
+
+test("088 adds harness_orphaned_copies (no foreign key, (harness, column, path) key) on an 087 DB and leaves handoff rows alone (N-1 recipe)", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "087_harness_stacks_fix_round");
+  db.run(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'claude-code', '/w', 1, 1)`);
+  db.run(
+    `INSERT INTO harness_session_handoffs (task_id, harness_id, column_name, session_id, copied_paths_json, created_at)
+     VALUES ('t1', 'cc-b', 'claude_session_id', 's-new', '["/r/projects/e/s-old.jsonl","/r/projects/e/s-new.jsonl"]', 5)`,
+  );
+  const before = db.query(`SELECT * FROM harness_session_handoffs`).all();
+  expect(migrate(db, migrations)).toEqual(["088_harness_orphaned_copies"]);
+  expect(db.query(`SELECT * FROM harness_session_handoffs`).all()).toEqual(before);
+  expect(columnNames(db, "harness_orphaned_copies")).toEqual(["harness_id", "column_name", "session_id", "path", "created_at"]);
+  expect(db.query<{ name: string }, []>(`PRAGMA foreign_key_list(harness_orphaned_copies)`).all()).toEqual([]);
+  db.exec(`PRAGMA foreign_keys = ON`);
+  // Rows outlive any task or account: nothing references them.
+  db.run(`INSERT INTO harness_orphaned_copies VALUES ('no-such-account', 'claude_session_id', 's-old', '/r/projects/e/s-old.jsonl', 1)`);
+  db.run(`DELETE FROM tasks WHERE id = 't1'`);
+  expect(db.query(`SELECT COUNT(*) AS n FROM harness_orphaned_copies`).get()).toEqual({ n: 1 });
+  // One record per (account, column, path).
+  expect(() => db.run(`INSERT INTO harness_orphaned_copies VALUES ('no-such-account', 'claude_session_id', 's-x', '/r/projects/e/s-old.jsonl', 2)`)).toThrow();
+  expect(migrate(db, migrations)).toEqual([]);
   db.close();
 });

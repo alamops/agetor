@@ -2730,3 +2730,82 @@ describe("TT-C: backups and Restore", () => {
     expect(existsSync(backupsOf(b))).toBe(false);
   });
 });
+
+describe("a deleted primary merged file propagates key removals", () => {
+  test("settings.json deleted on the primary: unedited mirrored keys go, edited and the backup's own keys stay; preview shows it", async () => {
+    const { primary, backup, a, b, stack } = claudePair("del-settings");
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus", env: { FOO: "1", BAR: "2" } }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ theme: "dark", env: { MINE: "x" } }));
+    await mirror.mirrorStack(stack, {});
+    const mirrored = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(mirrored.env).toEqual({ MINE: "x", FOO: "1", BAR: "2" });
+    // The backup edits one mirrored key, then the primary deletes the whole file.
+    mirrored.env.BAR = "edited";
+    writeFileSync(path.join(backup, "settings.json"), JSON.stringify(mirrored));
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(primary, "settings.json"));
+
+    const preview = await mirror.previewMirror({ kind: "claude-code", members: [a, b], mirrorMode: "full" });
+    expect(preview.plans[0]!.keys).toContainEqual({ file: "settings.json", key: "env.FOO", action: "remove" });
+    expect(preview.plans[0]!.keys).toContainEqual({ file: "settings.json", key: "model", action: "remove" });
+    expect(preview.plans[0]!.kept).toContain("settings.json:env.BAR");
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env.FOO).toBe("1");
+
+    const result = await mirror.mirrorStack(stack, {});
+    const after = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(after).toEqual({ theme: "dark", env: { MINE: "x", BAR: "edited" } });
+    expect(result.warnings.some((w) => w.includes("env.BAR") && w.includes("edited on this account"))).toBe(true);
+    // Nothing left to own: a later run is a no-op.
+    await mirror.mirrorStack(stack, {});
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"))).toEqual(after);
+  });
+
+  test("a primary deletion never creates a backup file that does not exist", async () => {
+    const { primary, backup, stack } = claudePair("del-settings-nofile");
+    write(path.join(primary, "settings.json"), JSON.stringify({ env: { FOO: "1" } }));
+    await mirror.mirrorStack(stack, {});
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(primary, "settings.json"));
+    rmSync(path.join(backup, "settings.json"));
+    await mirror.mirrorStack(stack, {});
+    expect(existsSync(path.join(backup, "settings.json"))).toBe(false);
+  });
+
+  test("an unreadable or missing primary account is not a deletion: nothing is removed", async () => {
+    const { primary, backup, stack } = claudePair("del-settings-noroot");
+    write(path.join(primary, "settings.json"), JSON.stringify({ env: { FOO: "1" } }));
+    await mirror.mirrorStack(stack, {});
+    const { rmSync } = await import("node:fs");
+    rmSync(primary, { recursive: true });
+    await mirror.mirrorStack(stack, {}).catch(() => undefined);
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env.FOO).toBe("1");
+  });
+
+  test("a primary settings.json that is a dangling dotfile link is left alone, not treated as deleted", async () => {
+    const { primary, backup, stack } = claudePair("del-settings-dangling");
+    write(path.join(primary, "settings.json"), JSON.stringify({ env: { FOO: "1" } }));
+    await mirror.mirrorStack(stack, {});
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(primary, "settings.json"));
+    symlinkSync(path.join(primary, "no-such-target.json"), path.join(primary, "settings.json"));
+    await mirror.mirrorStack(stack, {});
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env.FOO).toBe("1");
+  });
+
+  test("Codex config.toml deleted on the primary: mirrored keys and tables go, the backup's own keys stay", async () => {
+    const { pRoot, bRoot, stack } = codexPair("del-config");
+    write(path.join(pRoot, "config.toml"), ['model = "gpt-5"', "", "[mcp_servers.docs]", 'command = "docs-mcp"', ""].join("\n"));
+    write(path.join(bRoot, "config.toml"), ['model_reasoning_effort = "high"', ""].join("\n"));
+    await mirror.mirrorStack(stack, {});
+    const mirrored = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, unknown>;
+    expect(mirrored.model).toBe("gpt-5");
+    expect((mirrored.mcp_servers as Record<string, unknown>).docs).toBeDefined();
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(pRoot, "config.toml"));
+    await mirror.mirrorStack(stack, {});
+    const after = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, unknown>;
+    expect(after.model).toBeUndefined();
+    expect((after.mcp_servers as Record<string, unknown> | undefined)?.docs).toBeUndefined();
+    expect(after.model_reasoning_effort).toBe("high");
+  });
+});

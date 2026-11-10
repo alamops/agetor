@@ -1468,24 +1468,41 @@ function loadMergeTexts(
   fromPath: string,
   toBase: string,
   toPath: string,
-  opts: { dotfile: boolean },
+  opts: { dotfile: boolean; emptyText: string; fromBase?: string },
 ): MergeTexts | null {
-  let readPath = fromPath;
+  const fromBase = opts.fromBase ?? ctx.fromRoot;
+  let primaryText: string;
+  // The primary deleted the whole file: merge it as an empty document so the
+  // keys this mirror wrote (and the account never edited) are removed, exactly
+  // as deleting one key does. Only a real deletion counts — see
+  // {@link primaryDeletionPropagates}.
+  let deleted = false;
   const srcSt = lstatOrNull(fromPath);
-  if (!srcSt) return null;
-  if (srcSt.isSymbolicLink() && opts.dotfile) {
-    const resolved = resolveDotfile(ctx, fromPath, path.basename(fromPath));
-    if (!resolved.ok) {
-      warn(ctx, `${rel}: primary file ${resolved.reason}`);
+  if (!srcSt) {
+    if (!primaryDeletionPropagates(ctx, rel, fromBase, fromPath)) return null;
+    primaryText = opts.emptyText;
+    deleted = true;
+  } else {
+    let readPath = fromPath;
+    if (srcSt.isSymbolicLink() && opts.dotfile) {
+      const resolved = resolveDotfile(ctx, fromPath, path.basename(fromPath));
+      if (!resolved.ok) {
+        warn(ctx, `${rel}: primary file ${resolved.reason}`);
+        return null;
+      }
+      readPath = resolved.path;
+    }
+    const primaryRead = readTextIfRegular(readPath, MAX_MIRROR_FILE_BYTES);
+    if (primaryRead.ok) {
+      primaryText = primaryRead.text;
+    } else if (primaryRead.missing && readPath === fromPath && primaryDeletionPropagates(ctx, rel, fromBase, fromPath)) {
+      // Deleted between the lstat and the open.
+      primaryText = opts.emptyText;
+      deleted = true;
+    } else {
+      if (!primaryRead.missing) warn(ctx, `${rel}: primary file could not be read safely — left alone (${primaryRead.reason})`);
       return null;
     }
-    readPath = resolved.path;
-  }
-  const primaryRead = readTextIfRegular(readPath, MAX_MIRROR_FILE_BYTES);
-  if (!primaryRead.ok) {
-    if (primaryRead.missing) return null;
-    warn(ctx, `${rel}: primary file could not be read safely — left alone (${primaryRead.reason})`);
-    return null;
   }
   const state = destinationState(toBase, toPath);
   if (state === "unsafe") {
@@ -1509,7 +1526,38 @@ function loadMergeTexts(
       backupText = backupRead.text;
     }
   }
-  return { primaryText: primaryRead.text, backupText, toPath, toBase };
+  // Nothing to remove from a backup that has no such file, and an empty
+  // primary must never create one.
+  if (deleted && backupText === null) return null;
+  return { primaryText, backupText, toPath, toBase };
+}
+
+/**
+ * Whether a primary file that does not exist is a deletion to propagate to
+ * the backup. All must hold: the primary's config root is a directory
+ * (`ctx.propagate`; an unreadable or missing account is never a deletion), the
+ * file's folder exists — `fromBase` (trusted like the root: it passed the
+ * protected-folder gate) is a directory and every folder below it is a real,
+ * non-symlink directory (a `.claude.json` beside a missing home, or a removed
+ * `plugins/` folder, is not a deletion) — and the mirror still owns at least
+ * one key in this file. A dangling dotfile link or an unreadable file never gets here:
+ * those are left alone.
+ */
+function primaryDeletionPropagates(ctx: MirrorCtx, rel: string, fromBase: string, fromPath: string): boolean {
+  if (!ctx.propagate || !isDirectory(fromBase)) return false;
+  const base = path.resolve(fromBase);
+  const relDir = path.relative(base, path.dirname(path.resolve(fromPath)));
+  if (relDir.startsWith("..") || path.isAbsolute(relDir)) return false;
+  let cur = base;
+  for (const part of relDir.split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    const st = lstatOrNull(cur);
+    if (!st || st.isSymbolicLink() || !st.isDirectory()) return false;
+  }
+  for (const row of ctx.rows.values()) {
+    if (row.path === rel && row.scope === "key" && !isUnownedRow(row)) return true;
+  }
+  return false;
 }
 
 interface JsonEntry {
@@ -1754,7 +1802,7 @@ async function commitMerged(ctx: MirrorCtx, c: MergedCommit): Promise<void> {
 async function mergeClaudeSettings(ctx: MirrorCtx): Promise<void> {
   const rel = "settings.json";
   const toPath = path.join(ctx.toRoot, rel);
-  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: true });
+  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: true, emptyText: "{}" });
   if (!texts) return;
   const raw = parseJsonObject(texts.primaryText);
   const backup = parseJsonObject(texts.backupText ?? "{}");
@@ -1878,7 +1926,7 @@ async function mergeClaudeJson(ctx: MirrorCtx, primary: Harness, target: Harness
   if (!isPlainAncestorPathUnder(fromBase, fromPath)) {
     return void warn(ctx, ".claude.json: symlinked parent directory refused — left alone");
   }
-  const texts = loadMergeTexts(ctx, rel, fromPath, toBase, toPath, { dotfile: true });
+  const texts = loadMergeTexts(ctx, rel, fromPath, toBase, toPath, { dotfile: true, emptyText: "{}", fromBase });
   if (!texts) return;
   const raw = parseJsonObject(texts.primaryText);
   const backup = parseJsonObject(texts.backupText ?? "{}");
@@ -1964,7 +2012,7 @@ function enumerateClaudeJson(doc: Record<string, unknown>): JsonEntry[] {
  */
 async function mergePluginRegistry(ctx: MirrorCtx, rel: string): Promise<void> {
   const toPath = path.join(ctx.toRoot, rel);
-  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: false });
+  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: false, emptyText: "{}" });
   if (!texts) return;
   const raw = parseJsonObject(texts.primaryText);
   const backup = parseJsonObject(texts.backupText ?? "{}");
@@ -2050,7 +2098,7 @@ async function mergePluginRegistry(ctx: MirrorCtx, rel: string): Promise<void> {
 async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
   const rel = "config.toml";
   const toPath = path.join(ctx.toRoot, rel);
-  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: true });
+  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: true, emptyText: "" });
   if (!texts) return;
   const safe = ctx.safe;
   let primaryParsed: Record<string, unknown>;

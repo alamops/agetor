@@ -25,8 +25,7 @@ import {
   isMirrorNeverImportedEnvKey,
   isMirrorNeverImportedSettingsKey,
   isNeverCopyPath,
-  tccProtectedFolderOf,
-} from "./harness-mirror.ts";
+  tccProtectedFolderOf, handoffCopySessionIdFromPath } from "./harness-mirror.ts";
 
 describe("mirror allowlist", () => {
   test("no credential or session path is ever in a copy/merge list", () => {
@@ -484,5 +483,30 @@ describe("TT-C: finding 14 predicates", () => {
     expect(isCodexSecretKeyPath(["otel", "exporter", "otlp-http", "headers"])).toBe(true);
     expect(isCodexSecretKeyPath(["otel", "exporter", "otlp-http", "headers", "authorization"])).toBe(true);
     expect(isCodexSecretKeyPath(["otel", "environment"])).toBe(false);
+  });
+});
+
+describe("handoffCopySessionIdFromPath", () => {
+  const a = "11111111-1111-4111-8111-111111111111";
+  const b = "22222222-2222-4222-8222-222222222222";
+  test("reads the session from every handoff shape", () => {
+    expect(handoffCopySessionIdFromPath("claude-code", `/r/projects/enc/${a}.jsonl`)).toBe(a);
+    expect(handoffCopySessionIdFromPath("claude-code", `/r/projects/enc/${a}/subagents/x.jsonl`)).toBe(a);
+    expect(handoffCopySessionIdFromPath("claude-code", `/r/file-history/${a}/abc@v1`)).toBe(a);
+    expect(handoffCopySessionIdFromPath("codex", `/r/.codex/sessions/2026/11/10/rollout-2026-11-10T00-00-00-${a}.jsonl`)).toBe(a);
+  });
+  test("a root folder named like an anchor does not confuse it", () => {
+    expect(handoffCopySessionIdFromPath("claude-code", `/home/projects/acct/projects/enc/${a}.jsonl`)).toBe(a);
+    expect(handoffCopySessionIdFromPath("codex", `/sessions/x/.codex/sessions/2026/11/10/rollout-t-${a}.jsonl`)).toBe(a);
+  });
+  test("the preferred session wins over a nested anchor-named folder", () => {
+    const nested = `/r/projects/enc/${a}/tool-results/projects/x/${b}.jsonl`;
+    expect(handoffCopySessionIdFromPath("claude-code", nested, a)).toBe(a);
+  });
+  test("anything else is null", () => {
+    expect(handoffCopySessionIdFromPath("claude-code", "/r/settings.json")).toBeNull();
+    expect(handoffCopySessionIdFromPath("claude-code", `/r/projects/enc/${a}/other/x.jsonl`)).toBeNull();
+    expect(handoffCopySessionIdFromPath("codex", `/r/.codex/sessions/2026/11/rollout-${a}.jsonl`)).toBeNull();
+    expect(handoffCopySessionIdFromPath("codex", "/r/.codex/sessions/2026/11/10/rollout-not-a-uuid.jsonl")).toBeNull();
   });
 });

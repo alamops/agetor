@@ -95,7 +95,12 @@ import {
 } from "../shared/harness-stack.ts";
 import { harnessStacks } from "./harness-stacks.ts";
 import { canonicalizeUserText, cleanRetryParts as cleanRetryPartsFromRows, composeCleanRetryText, normalizeDeliveredUserText } from "../shared/user-message.ts";
-import { cleanupHarnessSessionCopies, findSessionIdForHarness, hasPriorSessionForHarness } from "./harness-session-transfer.ts";
+import {
+  cleanupHarnessSessionCopies,
+  findSessionIdForHarness,
+  hasPriorSessionForHarness,
+  sweepOrphanedHandoffCopiesAtBoot,
+} from "./harness-session-transfer.ts";
 import {
   HARNESS_STACK_RETRY_MAX,
   armAutoRetry,
@@ -1545,6 +1550,11 @@ export async function reconcileOrphans(): Promise<number> {
   if (reArmed > 0 || released > 0) {
     console.log(`[agetor] held tasks: re-armed ${reArmed} watcher(s), released ${released} background-agent row(s)`);
   }
+
+  // Harness-stack handoff copies no row can clean up any more (re-keyed
+  // sessions, deleted tasks; migration 088). Cooperative, never rejects, and
+  // not awaited: boot must not wait on file removal.
+  void sweepOrphanedHandoffCopiesAtBoot();
 
   return orphaned.length;
 }

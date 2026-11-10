@@ -1228,3 +1228,206 @@ describe("roots redirected into a macOS-protected folder (contract CR4, review R
     }
   });
 });
+
+describe("orphaned handoff copies (migration 088)", () => {
+  const cwd = "/tmp/agetor-orphan-cwd";
+  const oldSid = "88888888-0000-4000-8000-000000000001";
+  const newSid = "88888888-0000-4000-8000-000000000002";
+  const run = (from: { id: string }, to: { id: string }, taskId: string, s: string) =>
+    transfer.claudeSessionTransfer.transfer({
+      taskId,
+      fromHarness: dbm.harnesses.get(from.id)!,
+      toHarness: dbm.harnesses.get(to.id)!,
+      sessionId: s,
+      cwd,
+    });
+  const orphansOf = (harnessId: string) =>
+    dbm.harnessOrphanedCopies.list({ harnessId }).map((r) => ({ sessionId: r.sessionId, path: r.path }));
+
+  test("a re-key whose old copy cannot be unlinked keeps it on record under the old session, and a sweep removes it later", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`orph-rekey-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "old");
+    write(path.join(from.home, "projects", column, oldSid, "subagents", "agent-1.jsonl"), "old sub");
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(true);
+    const oldTranscript = path.join(to.home, "projects", column, `${oldSid}.jsonl`);
+    const stuckDir = path.join(to.home, "projects", column, oldSid, "subagents");
+    const stuck = path.join(stuckDir, "agent-1.jsonl");
+    expect(existsSync(stuck)).toBe(true);
+
+    // The old sidecar cannot be unlinked while its folder is read-only.
+    chmodSync(stuckDir, 0o500);
+    try {
+      write(path.join(from.home, "projects", column, `${newSid}.jsonl`), "new");
+      const result = await run(from, to, taskId, newSid);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.warnings?.some((w) => w.includes("retried later"))).toBe(true);
+      expect(existsSync(oldTranscript)).toBe(false);
+      expect(existsSync(stuck)).toBe(true);
+      // The live row names only the new session's files; the stuck one is an
+      // orphan under the session it was copied for.
+      const row = dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")!;
+      expect(row.sessionId).toBe(newSid);
+      expect(row.copiedPaths.some((p) => p.includes(oldSid))).toBe(false);
+      expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: stuck }]);
+    } finally {
+      chmodSync(stuckDir, 0o700);
+    }
+    const swept = await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    expect(swept.removed).toBe(1);
+    expect(existsSync(stuck)).toBe(false);
+    expect(orphansOf(to.id)).toEqual([]);
+    // The new session is untouched.
+    expect(readFileSync(path.join(to.home, "projects", column, `${newSid}.jsonl`), "utf8")).toBe("new");
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("a deleted task's kept copies are orphaned instead of cascading away; restoring the account root sweeps them", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`orph-delete-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "t");
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(true);
+    const dest = path.join(to.home, "projects", column, `${oldSid}.jsonl`);
+    // The account's root changes: cleanup must keep the file and the row.
+    dbm.harnesses.update(to.id, { home: mkdtempSync(path.join(tmpdir(), "agetor-orph-newroot-")) });
+    expect((await transfer.cleanupHarnessSessionCopies(taskId)).length).toBe(1);
+    dbm.tasks.delete(taskId);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+    expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: dest }]);
+    // Out of reach while the root differs: kept, not forgotten.
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).retained).toBe(1);
+    expect(existsSync(dest)).toBe(true);
+    dbm.harnesses.update(to.id, { home: to.home });
+    await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    expect(existsSync(dest)).toBe(false);
+    expect(orphansOf(to.id)).toEqual([]);
+  });
+
+  test("a failed first transfer orphans whatever it recorded, and the sweep drops records whose files never appeared", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    const taskId = seedTask(`orph-abandon-${seq}`);
+    write(path.join(from.home, "projects", column, `${oldSid}.jsonl`), "t");
+    write(path.join(from.home, "projects", column, oldSid, "subagents", "agent-1.jsonl"), "sub");
+    // The transcript's destination is a directory, so the copy throws after
+    // the sidecar destinations were recorded.
+    mkdirSync(path.join(to.home, "projects", column, `${oldSid}.jsonl`), { recursive: true });
+    expect((await run(from, to, taskId, oldSid)).ok).toBe(false);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toBeNull();
+    expect(orphansOf(to.id)).toEqual([]);
+  });
+
+  test("a session live on a handoff row of the same account is never swept", async () => {
+    const to = alias("claude-code");
+    const taskId = seedTask(`orph-live-${seq}`);
+    const file = path.join(to.home, "projects", "enc", oldSid, "subagents", "a.jsonl");
+    write(file, "live");
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: oldSid, copiedPaths: [], createdAt: 1,
+    });
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).retained).toBe(1);
+    expect(existsSync(file)).toBe(true);
+    // Back on a live row, a path stops being an orphan.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: oldSid, copiedPaths: [file], createdAt: 1,
+    });
+    expect(orphansOf(to.id)).toEqual([]);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  test("an orphan record naming another shape or another session deletes nothing; one outside the root is kept on record", async () => {
+    const to = alias("claude-code");
+    const settings = path.join(to.home, "settings.json");
+    const otherTranscript = path.join(to.home, "projects", "enc", `${newSid}.jsonl`);
+    write(settings, "{}");
+    write(otherTranscript, "someone else's");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [settings, otherTranscript, "/etc/hosts"]);
+    const swept = await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    expect(swept.removed).toBe(0);
+    expect(existsSync(settings)).toBe(true);
+    expect(existsSync(otherTranscript)).toBe(true);
+    // Outside the account's current root reads as "the root changed", the
+    // handoff rule: kept for a later sweep, never touched.
+    expect(swept.retained).toBe(1);
+    expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: "/etc/hosts" }]);
+    dbm.harnessOrphanedCopies.deleteForHarness(to.id);
+  });
+
+  test("boot normalization moves a pre-088 re-keyed row's old-session paths to the orphan store and sweeps them", async () => {
+    const to = alias("claude-code");
+    const taskId = seedTask(`orph-boot-${seq}`);
+    const oldFile = path.join(to.home, "projects", "enc", `${oldSid}.jsonl`);
+    const oldSidecar = path.join(to.home, "projects", "enc", oldSid, "tool-results", "r.txt");
+    const newFile = path.join(to.home, "projects", "enc", `${newSid}.jsonl`);
+    for (const f of [oldFile, oldSidecar, newFile]) write(f, "x");
+    // The shape a pre-088 re-key left: new session id, old paths merged in.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: newSid,
+      copiedPaths: [oldFile, oldSidecar, newFile], createdAt: 1,
+    });
+    await transfer.sweepOrphanedHandoffCopiesAtBoot();
+    expect(existsSync(oldFile)).toBe(false);
+    expect(existsSync(oldSidecar)).toBe(false);
+    expect(existsSync(newFile)).toBe(true);
+    expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")?.copiedPaths).toEqual([newFile]);
+    expect(orphansOf(to.id)).toEqual([]);
+    // Idempotent.
+    expect(transfer.adoptMismatchedHandoffPaths()).toBe(0);
+    await transfer.cleanupHarnessSessionCopies(taskId);
+  });
+
+  test("Codex: a superseded rollout that cannot be unlinked is orphaned under the codex column and swept later", async () => {
+    const from = alias("codex");
+    const to = alias("codex");
+    const taskId = seedTask(`orph-codex-${seq}`);
+    const day = path.join("sessions", "2026", "11", "10");
+    const nextDay = path.join("sessions", "2026", "11", "11");
+    write(path.join(from.home, ".codex", day, `rollout-2026-11-10T00-00-00-${oldSid}.jsonl`), "old");
+    write(path.join(from.home, ".codex", nextDay, `rollout-2026-11-11T01-00-00-${newSid}.jsonl`), "new");
+    const runCodex = (s: string) =>
+      transfer.codexSessionTransfer.transfer({
+        taskId, fromHarness: dbm.harnesses.get(from.id)!, toHarness: dbm.harnesses.get(to.id)!, sessionId: s, cwd,
+      });
+    expect((await runCodex(oldSid)).ok).toBe(true);
+    const oldDest = path.join(to.home, ".codex", day, `rollout-2026-11-10T00-00-00-${oldSid}.jsonl`);
+    expect(existsSync(oldDest)).toBe(true);
+    // A read-only day folder blocks the unlink; the new rollout lands in
+    // another day's folder.
+    const newDest = path.join(to.home, ".codex", nextDay, `rollout-2026-11-11T01-00-00-${newSid}.jsonl`);
+    chmodSync(path.dirname(oldDest), 0o500);
+    try {
+      expect((await runCodex(newSid)).ok).toBe(true);
+      expect(existsSync(oldDest)).toBe(true);
+      expect(dbm.harnessOrphanedCopies.list({ harnessId: to.id })).toEqual([
+        expect.objectContaining({ columnName: "codex_session_id", sessionId: oldSid, path: oldDest }),
+      ]);
+    } finally {
+      chmodSync(path.dirname(oldDest), 0o700);
+    }
+    await transfer.sweepOrphanedHandoffCopies();
+    expect(existsSync(oldDest)).toBe(false);
+    expect(readFileSync(newDest, "utf8")).toBe("new");
+    await transfer.cleanupHarnessSessionCopies(taskId);
+    expect(existsSync(newDest)).toBe(false);
+  });
+
+  test("account delete collects its orphaned copies with its handoffs and drops their records", async () => {
+    const to = alias("claude-code");
+    const file = path.join(to.home, "projects", "enc", `${oldSid}.jsonl`);
+    write(file, "x");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
+    const copies = transfer.collectHarnessSessionCopies(to.id);
+    expect(copies).toEqual([expect.objectContaining({ sessionId: oldSid, paths: [file] })]);
+    dbm.harnesses.delete(to.id);
+    expect(dbm.harnessOrphanedCopies.list({ harnessId: to.id })).toEqual([]);
+    await transfer.removeHarnessSessionCopies(copies);
+    expect(existsSync(file)).toBe(false);
+  });
+});

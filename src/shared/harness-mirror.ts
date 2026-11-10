@@ -775,6 +775,44 @@ export function isHandoffCopyShape(kind: HarnessStackKind, rel: string, sessionI
 }
 
 /**
+ * The session a recorded handoff path was copied for, read from the path
+ * itself, or null when no handoff shape matches; `prefer` (the row's own
+ * session) wins whenever it matches. Only the boot normalization
+ * of rows written before migration 088 uses it (a re-keyed row could still
+ * list the old session's paths); the session it returns is a proposal that
+ * removal re-checks against the account's current root with
+ * {@link isHandoffCopyShape}.
+ */
+export function handoffCopySessionIdFromPath(kind: HarnessStackKind, absPath: string, prefer?: string): string | null {
+  const parts = absPath.split("/").filter(Boolean);
+  const anchors = kind === "claude-code" ? ["projects", "file-history"] : ["sessions"];
+  // A path that is a handoff shape for the preferred session at ANY anchor is
+  // that session's: a nested folder named like an anchor must not win.
+  if (prefer !== undefined) {
+    for (let i = 0; i < parts.length; i++) {
+      if (anchors.includes(parts[i]!) && isHandoffCopyShape(kind, parts.slice(i).join("/"), prefer)) return prefer;
+    }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (!anchors.includes(parts[i]!)) continue;
+    const rel = parts.slice(i).join("/");
+    let candidate: string | undefined;
+    if (kind === "codex") {
+      candidate = /-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$/.exec(parts[parts.length - 1]!)?.[1];
+    } else if (parts[i] === "file-history") {
+      candidate = parts[i + 1];
+    } else if (parts.length - i === 3) {
+      const leaf = parts[i + 2]!;
+      candidate = leaf.endsWith(".jsonl") ? leaf.slice(0, -".jsonl".length) : undefined;
+    } else {
+      candidate = parts[i + 2];
+    }
+    if (candidate && isHandoffCopyShape(kind, rel, candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
  * True when `rel` names a DIRECTORY inside a handoff shape for `sessionId`
  * that cleanup may prune once it is empty: for claude-code the session folder
  * `projects/<enc>/<sid>` and its sidecar folders, and `file-history/<sid>` and

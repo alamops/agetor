@@ -151,27 +151,45 @@ describe("084 tables and tasks.harness_state", () => {
       copiedPaths: ["/tmp/y.jsonl"],
       createdAt: 20,
     });
-    // The session id is replaced but the cleanup allowlist is merged: the
-    // first transfer's file is still on disk and must stay removable.
+    // A different session re-keys the row: its list names only the new
+    // session's files, and the first transfer's file (still on disk) moves to
+    // the orphan store under the session it was copied for, so it stays
+    // removable (migration 088).
     expect(dbm.harnessSessionHandoffs.get(taskId, "claude-b", "claude_session_id")).toMatchObject({
       sessionId: "s-2",
-      copiedPaths: ["/tmp/x.jsonl", "/tmp/y.jsonl"],
+      copiedPaths: ["/tmp/y.jsonl"],
       createdAt: 20,
     });
-    // A repeat path is not duplicated.
+    const orphans = () =>
+      dbm.harnessOrphanedCopies.list({ harnessId: "claude-b" }).map((r) => [r.sessionId, r.path]);
+    expect(orphans()).toEqual([["s-1", "/tmp/x.jsonl"]]);
+    // The same session merges, and a repeat path is not duplicated.
     dbm.harnessSessionHandoffs.upsert({
       taskId,
       harnessId: "claude-b",
       columnName: "claude_session_id",
-      sessionId: "s-2b",
+      sessionId: "s-2",
       copiedPaths: ["/tmp/y.jsonl", "/tmp/z.jsonl"],
       createdAt: 25,
     });
     expect(dbm.harnessSessionHandoffs.get(taskId, "claude-b", "claude_session_id")?.copiedPaths).toEqual([
-      "/tmp/x.jsonl",
       "/tmp/y.jsonl",
       "/tmp/z.jsonl",
     ]);
+    // Putting the first session back whole reclaims its path from the store.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId,
+      harnessId: "claude-b",
+      columnName: "claude_session_id",
+      sessionId: "s-1",
+      copiedPaths: ["/tmp/x.jsonl"],
+      createdAt: 10,
+    });
+    expect(orphans()).toEqual([
+      ["s-2", "/tmp/y.jsonl"],
+      ["s-2", "/tmp/z.jsonl"],
+    ]);
+    dbm.harnessOrphanedCopies.deleteForHarness("claude-b");
     expect(dbm.harnessSessionHandoffs.listForTask(taskId)).toHaveLength(1);
     dbm.harnessSessionHandoffs.deleteOne(taskId, "claude-b", "claude_session_id");
     expect(dbm.harnessSessionHandoffs.listForTask(taskId)).toEqual([]);

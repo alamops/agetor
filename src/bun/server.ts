@@ -65,7 +65,11 @@ import { clearFailoverState, failoverTaskIdsForStack } from "./harness-failover.
 import { harnessIdsWithProvenance } from "./harness-mirror-provenance.ts";
 import { deleteMirrorStateForHarness, mirrorStack, previewMirror, restoreMirror } from "./harness-mirror.ts";
 import { harnessSwapEvents } from "./harness-swap-history.ts";
-import { collectHarnessSessionCopies, removeHarnessSessionCopies } from "./harness-session-transfer.ts";
+import {
+  collectHarnessSessionCopies,
+  removeHarnessSessionCopies,
+  sweepOrphanedHandoffCopies,
+} from "./harness-session-transfer.ts";
 import {
   applyHarnessAutoEnable,
   flushPendingHarnessAutoEnableNotice,
@@ -4897,6 +4901,12 @@ export function startApiServer(
           }
           try {
             const updated = harnesses.update(req.params.id, patch);
+            // A changed config root may bring orphaned handoff copies kept
+            // because they were outside the old one back in reach (or put
+            // them out of reach, which the sweep just keeps). Not awaited.
+            if (patch.home !== undefined || patch.env !== undefined) {
+              void sweepOrphanedHandoffCopies({ harnessId: updated.id });
+            }
             // home/bin/env can each change which account's (or which
             // binary's) catalog this harness resolves to — re-probe rather
             // than let the picker show a stale list until the next periodic

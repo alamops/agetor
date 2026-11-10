@@ -1335,7 +1335,12 @@ export const tasks = {
     return this.get(id) ?? next;
   },
   delete(id: string) {
-    db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+    // The handoff rows cascade with the task; any copies they still hold are
+    // orphaned first so a later sweep can remove them (migration 088).
+    db.transaction(() => {
+      harnessOrphanedCopies.adoptFromTask(id);
+      db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+    })();
   },
   /**
    * Mark a task's unread watermark caught-up-to-date: `last_seen_event_id`
@@ -2321,6 +2326,7 @@ export const harnesses = {
       db.run(`DELETE FROM harness_stack_members WHERE harness_id = ?`, [id]);
       db.run(`DELETE FROM harness_limit_state WHERE harness_id = ?`, [id]);
       harnessSessionHandoffs.deleteForHarness(id);
+      harnessOrphanedCopies.deleteForHarness(id);
       // Mirror provenance names the account by id with no FK (087); its store
       // imports this module, so the delete is inline here. Swap-history rows
       // are kept on purpose (denormalized labels).
@@ -2426,17 +2432,39 @@ export const harnessSessionHandoffs = {
   },
   /**
    * Record (or replace) the handoff for one (task, destination, column). The
-   * session id and timestamp are replaced, but `copiedPaths` is MERGED with
-   * the existing row's list (existing order first, duplicates dropped): a file
-   * an earlier transfer copied onto this account is still on disk, and
-   * dropping it from the allowlist would leak it past task delete, retention
-   * and harness delete (docs/architecture/harness-stacks.md). Read and write
-   * share one transaction so two upserts can't lose each other's paths.
+   * session id and timestamp are replaced. For the SAME session `copiedPaths`
+   * is MERGED with the existing row's list (existing order first, duplicates
+   * dropped): a file an earlier transfer copied onto this account is still on
+   * disk, and dropping it from the allowlist would leak it past task delete,
+   * retention and harness delete. For a DIFFERENT session the old paths move
+   * to `harnessOrphanedCopies` under the old session id, because cleanup only
+   * removes paths of the row's own session (docs/architecture/harness-stacks.md).
+   * Read and write share one transaction so two upserts can't lose each
+   * other's paths.
    */
   upsert(handoff: HarnessSessionHandoff): void {
     db.transaction(() => {
       const existing = this.get(handoff.taskId, handoff.harnessId, handoff.columnName);
-      const copiedPaths = [...new Set([...(existing?.copiedPaths ?? []), ...handoff.copiedPaths])];
+      let copiedPaths: string[];
+      if (existing && existing.sessionId !== handoff.sessionId) {
+        // Re-keyed to another session: cleanup removes a path only when its
+        // shape names the row's session, so the old session's copies could
+        // never be removed from here. They move to the orphan store under
+        // their own session id, where a sweep removes them.
+        const incoming = new Set(handoff.copiedPaths);
+        harnessOrphanedCopies.add(
+          existing.harnessId,
+          existing.columnName,
+          existing.sessionId,
+          existing.copiedPaths.filter((p) => !incoming.has(p)),
+        );
+        copiedPaths = [...incoming];
+      } else {
+        copiedPaths = [...new Set([...(existing?.copiedPaths ?? []), ...handoff.copiedPaths])];
+      }
+      // A path back on a live row (a failed transfer restoring the previous
+      // session) is no longer an orphan.
+      harnessOrphanedCopies.forget(handoff.harnessId, handoff.columnName, handoff.sessionId, copiedPaths);
       db.run(
         `INSERT INTO harness_session_handoffs
            (task_id, harness_id, column_name, session_id, copied_paths_json, created_at)
@@ -2465,6 +2493,44 @@ export const harnessSessionHandoffs = {
       [taskId, harnessId, column],
     );
   },
+  /** Drop a row whose files may still be on disk (a transfer that failed with
+   *  no earlier handoff to restore): its paths move to the orphan store first,
+   *  so a sweep can still remove whatever the copy created. */
+  abandon(taskId: string, harnessId: string, column: SessionIdColumn): void {
+    db.transaction(() => {
+      const row = this.get(taskId, harnessId, column);
+      if (!row) return;
+      harnessOrphanedCopies.add(row.harnessId, row.columnName, row.sessionId, row.copiedPaths);
+      this.deleteOne(taskId, harnessId, column);
+    })();
+  },
+  /** Replace a row's path list (the boot normalization; see
+   *  `adoptMismatchedHandoffPaths`). */
+  setPaths(taskId: string, harnessId: string, column: SessionIdColumn, paths: readonly string[]): void {
+    db.run(
+      `UPDATE harness_session_handoffs SET copied_paths_json = ?
+        WHERE task_id = ? AND harness_id = ? AND column_name = ?`,
+      [JSON.stringify([...paths]), taskId, harnessId, column],
+    );
+  },
+  listAll(): HarnessSessionHandoff[] {
+    return db
+      .query<HandoffRow, []>(`SELECT * FROM harness_session_handoffs ORDER BY created_at ASC`)
+      .all()
+      .map(toHandoff);
+  },
+  /** True when a live row for this account and column names `sessionId`: its
+   *  files belong to a conversation that can still be resumed. */
+  hasLiveSession(harnessId: string, column: SessionIdColumn, sessionId: string): boolean {
+    return (
+      db
+        .query<{ n: number }, [string, string, string]>(
+          `SELECT COUNT(*) AS n FROM harness_session_handoffs
+            WHERE harness_id = ? AND column_name = ? AND session_id = ?`,
+        )
+        .get(harnessId, column, sessionId)?.n ?? 0
+    ) > 0;
+  },
   listForTask(taskId: string): HarnessSessionHandoff[] {
     return db
       .query<HandoffRow, [string]>(
@@ -2481,6 +2547,104 @@ export const harnessSessionHandoffs = {
       )
       .all(harnessId)
       .map(toHandoff);
+  },
+};
+
+type OrphanedCopyRow = {
+  harness_id: string;
+  column_name: string;
+  session_id: string;
+  path: string;
+  created_at: number;
+};
+
+export interface HarnessOrphanedCopy {
+  harnessId: string;
+  columnName: SessionIdColumn;
+  /** The session the file was copied for: its shape must name it. */
+  sessionId: string;
+  path: string;
+  createdAt: number;
+}
+
+const toOrphanedCopy = (r: OrphanedCopyRow): HarnessOrphanedCopy => ({
+  harnessId: r.harness_id,
+  columnName: r.column_name as SessionIdColumn,
+  sessionId: r.session_id,
+  path: r.path,
+  createdAt: r.created_at,
+});
+
+/**
+ * Handoff copies no handoff row can clean up any more (migration 088): the
+ * old session's files after a row was re-keyed, and the kept files of a
+ * deleted task. Each path carries the session it was copied for. The sweep in
+ * `harness-session-transfer.ts` removes them under the handoff cleanup rules;
+ * a path is never removed just because it is listed here.
+ */
+export const harnessOrphanedCopies = {
+  add(harnessId: string, column: SessionIdColumn, sessionId: string, paths: readonly string[], now = Date.now()): void {
+    if (paths.length === 0) return;
+    db.transaction(() => {
+      for (const p of new Set(paths)) {
+        if (typeof p !== "string" || p === "") continue;
+        db.run(
+          `INSERT INTO harness_orphaned_copies (harness_id, column_name, session_id, path, created_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(harness_id, column_name, path) DO UPDATE SET
+             session_id = excluded.session_id,
+             created_at = excluded.created_at`,
+          [harnessId, column, sessionId, p, now],
+        );
+      }
+    })();
+  },
+  /** Forget the listed paths of one session: they are on a live row again, or
+   *  a sweep removed them, found them gone or rejected them as never ours. The
+   *  session id is part of the match, so a path re-orphaned under another
+   *  session meanwhile is kept. */
+  forget(harnessId: string, column: SessionIdColumn, sessionId: string, paths: readonly string[]): void {
+    if (paths.length === 0) return;
+    db.transaction(() => {
+      for (const p of new Set(paths)) {
+        db.run(
+          `DELETE FROM harness_orphaned_copies
+            WHERE harness_id = ? AND column_name = ? AND path = ? AND session_id = ?`,
+          [harnessId, column, p, sessionId],
+        );
+      }
+    })();
+  },
+  list(filter: { harnessId?: string } = {}): HarnessOrphanedCopy[] {
+    if (filter.harnessId !== undefined) {
+      return db
+        .query<OrphanedCopyRow, [string]>(
+          `SELECT * FROM harness_orphaned_copies WHERE harness_id = ? ORDER BY created_at ASC, path ASC`,
+        )
+        .all(filter.harnessId)
+        .map(toOrphanedCopy);
+    }
+    return db
+      .query<OrphanedCopyRow, []>(`SELECT * FROM harness_orphaned_copies ORDER BY created_at ASC, path ASC`)
+      .all()
+      .map(toOrphanedCopy);
+  },
+  deleteForHarness(harnessId: string): void {
+    db.run(`DELETE FROM harness_orphaned_copies WHERE harness_id = ?`, [harnessId]);
+  },
+  /**
+   * Keep a task's remaining handoff copies before its rows cascade away. Task
+   * delete first runs the normal cleanup, which drops every row whose files
+   * are gone; whatever is still recorded here could not be removed (the
+   * account's root changed, an unlink failed), so it is orphaned instead of
+   * forgotten. Rows for an account that no longer exists are skipped: there is
+   * no root to resolve them against, as in handoff cleanup.
+   */
+  adoptFromTask(taskId: string): void {
+    for (const row of harnessSessionHandoffs.listForTask(taskId)) {
+      if (!harnesses.getByIdOrKind(row.harnessId)) continue;
+      this.add(row.harnessId, row.columnName, row.sessionId, row.copiedPaths);
+    }
   },
 };
 

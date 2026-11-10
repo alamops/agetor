@@ -484,6 +484,33 @@ describe("harness-stacks routes", () => {
       if (db.harnesses.get(harnessId)) db.harnesses.delete(harnessId);
     }
   }, 60_000);
+
+  test("an account edit that brings an orphaned handoff copy back into its root sweeps it (migration 088)", async () => {
+    const { mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+    const harnessId = `api-orph-${randomUUID().slice(0, 8)}`;
+    const home = path.join(db.dataDir, "homes", harnessId);
+    const elsewhere = path.join(db.dataDir, "homes", `${harnessId}-moved`);
+    mkdirSync(elsewhere, { recursive: true });
+    db.harnesses.insert({ id: harnessId, kind: "claude-code", label: harnessId, home: elsewhere, env: {} } as never);
+    const sid = "33333333-3333-4333-8333-333333333333";
+    const copied = path.join(home, "projects", "p", `${sid}.jsonl`);
+    mkdirSync(path.dirname(copied), { recursive: true });
+    writeFileSync(copied, "{}\n");
+    db.harnessOrphanedCopies.add(harnessId, "claude_session_id", sid, [copied]);
+    try {
+      const res = await call("PATCH", `/harnesses/${harnessId}`, { home });
+      expect(res.status).toBe(200);
+      const deadline = Date.now() + 10_000;
+      // The record is dropped after the unlink: wait for both.
+      while ((existsSync(copied) || db.harnessOrphanedCopies.list({ harnessId }).length > 0) && Date.now() < deadline) {
+        await Bun.sleep(20);
+      }
+      expect(existsSync(copied)).toBe(false);
+      expect(db.harnessOrphanedCopies.list({ harnessId })).toEqual([]);
+    } finally {
+      if (db.harnesses.get(harnessId)) db.harnesses.delete(harnessId);
+    }
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------

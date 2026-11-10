@@ -1170,3 +1170,24 @@ describe("cancelHarnessRetryForTask with a live in-flight retry (22b)", () => {
     stacks.harnessStacks.delete(stack.id);
   });
 });
+
+describe("boot sweeps orphaned handoff copies (migration 088)", () => {
+  test("reconcileOrphans removes an orphaned copy and its record", async () => {
+    const { existsSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const id = alias("boot-orphan");
+    const root = db.harnesses.get(id)!.home!;
+    const sid = "44444444-4444-4444-8444-444444444444";
+    const file = path.join(root, "projects", "enc", `${sid}.jsonl`);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, "x");
+    db.harnessOrphanedCopies.add(id, "claude_session_id", sid, [file]);
+    await orch.reconcileOrphans();
+    const deadline = Date.now() + 10_000;
+    // The record is dropped after the unlink: wait for both.
+    while ((existsSync(file) || db.harnessOrphanedCopies.list({ harnessId: id }).length > 0) && Date.now() < deadline) {
+      await Bun.sleep(20);
+    }
+    expect(existsSync(file)).toBe(false);
+    expect(db.harnessOrphanedCopies.list({ harnessId: id })).toEqual([]);
+  }, 20_000);
+});

@@ -61,7 +61,7 @@ A new `run_events` method that isn't exercised by that test fails it by name.
 
 **Adding a migration** (numbered `.sql` files, the `migrations/index.ts` entry, never editing an applied one, and why the SQL is inlined at bundle time) is described once, in [CLAUDE.md § Persistence, in brief](../../CLAUDE.md#persistence-in-brief).
 
-## Harness stack tables (migrations 084, 085, 087)
+## Harness stack tables (migrations 084, 085, 087, 088)
 
 `harness_stacks`, `harness_stack_members`, `harness_limit_state` and
 `harness_session_handoffs` are additive; `tasks.harness_state` is another
@@ -100,6 +100,16 @@ survives a stack delete. `harness_session_handoffs` cascades with the task; its
   FK** (the same 085 reasoning), `scope` `CHECK`-ed to `file`/`key`/`link`.
   `harnesses.delete` removes the account's rows inline in its transaction (the
   store module imports `db.ts`, so it cannot be called from there).
+
+**Migration 088** (`088_harness_orphaned_copies.sql`) adds
+`harness_orphaned_copies`, primary key `(harness_id, column_name, path)`, with
+the session each copied file belongs to. **No FK** on purpose: rows must
+outlive the task whose handoff rows cascade away (`tasks.delete` adopts the
+task's remaining handoff paths into it in the same transaction), and an FK to
+`harnesses` would be wiped by a rebuild of that table; `harnesses.delete`
+removes the account's rows explicitly. Rows written before 088 need no SQL
+backfill: the boot sweep moves a re-keyed handoff row's old-session paths into
+the new table ([harness-stacks.md](harness-stacks.md#leftover-handoff-copies)).
 
 **A future `harness_stacks` rebuild must turn foreign keys off first.**
 `harness_swap_events` cascades on `harness_stacks`, so the documented SQLite
