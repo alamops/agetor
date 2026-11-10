@@ -442,3 +442,81 @@ test("createHarnessStack / patchHarnessStack use the long mirror budget, and a t
   }
   expect((err as ApiError).message).toContain("may have been saved");
 });
+
+test("ids are URL-encoded; switch/preview/restore/agent-patch use the long budget; a lost switch says it may have gone through", async () => {
+  const seen: { method: string; url: string }[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (req) => {
+      const u = new URL(req.url);
+      seen.push({ method: req.method, url: u.pathname + u.search });
+      return new Response(JSON.stringify({}), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const realTimeout = AbortSignal.timeout;
+  const budgets: number[] = [];
+  AbortSignal.timeout = ((ms: number) => {
+    budgets.push(ms);
+    return realTimeout.call(AbortSignal, ms);
+  }) as typeof AbortSignal.timeout;
+  try {
+    const client = new AgetorClient({ port: server.port!, token: "tok" });
+    const odd = "a/b c?#";
+    const enc = encodeURIComponent(odd);
+    await client.getHarnessStack(odd);
+    await client.deleteHarnessStack(odd);
+    await client.patchHarnessStack(odd, { label: "x", expectedUpdatedAt: 5 });
+    await client.getTask(odd);
+    await client.harnessUsage(odd);
+    await client.getHarnessStackHistory(odd, { limit: 10, before: "cur sor" });
+    await client.clearHarnessCooldown(odd, "m/1");
+    await client.switchTaskAccount(odd);
+    await client.cancelScheduledAccountSwitch(odd);
+    await client.restoreHarnessMirror(odd);
+    await client.previewHarnessMirror({ kind: "claude-code", members: ["a", "b"] });
+    await client.patchTask(odd, { agent: "b" });
+    await client.patchTask(odd, { title: "t" });
+    await client.getUsage();
+    expect(seen.map((s) => `${s.method} ${s.url}`)).toEqual([
+      `GET /harness-stacks/${enc}`,
+      `DELETE /harness-stacks/${enc}`,
+      `PATCH /harness-stacks/${enc}`,
+      `GET /tasks/${enc}`,
+      `GET /harnesses/${enc}/usage`,
+      `GET /harness-stacks/${enc}/history?limit=10&before=cur+sor`,
+      `DELETE /harnesses/${enc}/limit-state?model=${encodeURIComponent("m/1")}`,
+      `POST /tasks/${enc}/switch-account`,
+      `DELETE /tasks/${enc}/switch-account`,
+      `POST /harnesses/${enc}/mirror-restore`,
+      `POST /harness-stacks/mirror-preview`,
+      `PATCH /tasks/${enc}`,
+      `PATCH /tasks/${enc}`,
+      `GET /usage`,
+    ]);
+    const long = 15 * 60_000;
+    expect(budgets[2]).toBe(long); // patchHarnessStack
+    expect(budgets[7]).toBe(long); // switchTaskAccount
+    expect(budgets[9]).toBe(long); // restore
+    expect(budgets[10]).toBe(long); // preview
+    expect(budgets[11]).toBe(long); // agent patch
+    expect(budgets[12]).toBe(15_000); // plain patch keeps the default
+  } finally {
+    AbortSignal.timeout = realTimeout;
+    server.stop(true);
+  }
+
+  const dead = Bun.serve({ port: 0, fetch: () => new Response("") });
+  const deadPort = dead.port!;
+  dead.stop(true);
+  const client = new AgetorClient({ port: deadPort, token: "tok" });
+  for (const call of [() => client.switchTaskAccount("t1"), () => client.patchTask("t1", { agent: "b" })]) {
+    let err: unknown;
+    try {
+      await call();
+    } catch (e) {
+      err = e;
+    }
+    expect((err as ApiError).status).toBe(0);
+    expect((err as ApiError).message).toContain("the switch may have gone through; check 'agetor show t1' before retrying");
+  }
+});

@@ -16,6 +16,7 @@ import {
   MODEL_MIN_CLI_VERSION,
   type Harness,
   type HarnessLimitSignal,
+  type HarnessLimitState,
   type HarnessMemberReason,
   type HarnessStack,
   type HarnessStackMember,
@@ -179,8 +180,8 @@ export function retryMinMs(): number {
 
 /** Record the cooldown for a limit signal: account-wide, or one model's row
  *  when `signal.model` is set (the store keys the row on it). */
-export function recordLimitSignal(harnessId: string, signal: HarnessLimitSignal): void {
-  harnessStacks.setLimitState(harnessId, signal);
+export function recordLimitSignal(harnessId: string, signal: HarnessLimitSignal): HarnessLimitState {
+  return harnessStacks.setLimitState(harnessId, signal);
 }
 
 /** Mark an account as tried in the current lap. */
@@ -237,7 +238,7 @@ export function memberUnusableReason(member: { harnessId: string; enabled: boole
 
 /** The lower-cased model a task's turn would run on `harnessId`, which keys
  *  per-model cooldown rows (`parseLimitedModel` also yields lower-case). */
-function cooldownModelFor(task: Pick<Task, "model">, harnessId: string): string | null {
+export function cooldownModelFor(task: Pick<Task, "model">, harnessId: string): string | null {
   const harness = harnesses.getByIdOrKind(harnessId);
   const model = task.model ?? (harness ? DEFAULT_MODEL[harness.kind] : null) ?? null;
   return model ? model.toLowerCase() : null;
@@ -323,11 +324,24 @@ export function planExhausted(
   taskId: string,
   plan: Extract<NextMemberPlan, { kind: "all-exhausted" | "none-usable" }>,
   now = Date.now(),
-  opts: { startedThisAttempt?: boolean } = {},
+  opts: {
+    startedThisAttempt?: boolean;
+    /** The limited run a CLEAN retry would replay (first turn, no tool call).
+     *  Persisted as `allExhausted.cleanRetryOf` only when a retry timer is
+     *  armed, so every path that ends the retry unrun can stash that run's
+     *  unread follow-ups. `undefined` carries the existing marker, `null`
+     *  clears it. */
+    cleanRetryOf?: string | null;
+  } = {},
 ): TaskHarnessState | null {
   return updateTaskState(taskId, (state, task) => {
     const resolved = harnessStacks.resolveForTask(task);
     const base = stateBase(state, resolved);
+    // Why each member could not take the task (banners, `agetor show`),
+    // including the account that was running it.
+    const memberReasons = resolved ? memberReasonsFor(resolved.stack, task, now, { includeCurrent: true }) : [];
+    const reasonsField = memberReasons.length > 0 ? { memberReasons } : {};
+    const cleanRetryOf = opts.cleanRetryOf === undefined ? base.allExhausted?.cleanRetryOf : opts.cleanRetryOf ?? undefined;
     const priorAttempts = base.allExhausted?.attempts ?? 0;
     const attempts = opts.startedThisAttempt === false ? priorAttempts : priorAttempts + 1;
     const capReached = attempts >= HARNESS_STACK_RETRY_MAX;
@@ -345,6 +359,7 @@ export function planExhausted(
           nextAttemptAt: 0,
           earliestResetAtMs: null,
           reason: "no-usable-member",
+          ...reasonsField,
         },
       };
     }
@@ -359,6 +374,7 @@ export function planExhausted(
           nextAttemptAt: 0,
           earliestResetAtMs: earliest,
           reason: plan.kind === "none-usable" ? "no-usable-member" : "quota",
+          ...reasonsField,
         },
       };
     }
@@ -374,6 +390,8 @@ export function planExhausted(
         nextAttemptAt,
         earliestResetAtMs: earliest,
         reason: plan.kind === "none-usable" ? "no-usable-member" : "quota",
+        ...(cleanRetryOf ? { cleanRetryOf } : {}),
+        ...reasonsField,
       },
     };
   });
@@ -760,6 +778,8 @@ export async function prepareTaskHarness(
         pendingSwap: null,
         allExhausted: null,
         lastMove: state?.lastMove ?? null,
+        // A requested "switch to next account" is not part of the lap.
+        ...(state?.scheduledSwitch ? { scheduledSwitch: state.scheduledSwitch } : {}),
       }));
       cancelAutoRetry(taskId);
     }

@@ -457,6 +457,37 @@ const ROWS: Record<ClientMethod, Row> = {
       return client.getHarnessStack(scopeStackId);
     },
   },
+  getHarnessStackHistory: {
+    expect: [200],
+    why: "empty history page of the stack just created",
+    call: () => client.getHarnessStackHistory(scopeStackId, { limit: 5 }),
+  },
+  previewHarnessMirror: {
+    expect: [200],
+    why: "dry run of the one-member stack (nothing to mirror); the CLI path gate probes the account roots",
+    call: () => client.previewHarnessMirror({ kind: "claude-code", members: ["scope-claude"], stackId: scopeStackId }),
+  },
+  restoreHarnessMirror: {
+    expect: [200],
+    why: "nothing was backed up for the account, so the restore is an empty success",
+    call: () => client.restoreHarnessMirror("scope-claude"),
+  },
+  clearHarnessCooldown: {
+    expect: [200],
+    why: "no cooldown rows is still a success",
+    call: () => client.clearHarnessCooldown("scope-claude"),
+  },
+  getUsage: { expect: [200], why: "quota snapshots", call: () => client.getUsage() },
+  switchTaskAccount: {
+    expect: [409],
+    why: "the extra task is in no stack, so the switch is refused (route reached, not gated)",
+    call: () => client.switchTaskAccount(fx.extraTaskId),
+  },
+  cancelScheduledAccountSwitch: {
+    expect: [200, 409],
+    why: "nothing scheduled on the extra task",
+    call: () => client.cancelScheduledAccountSwitch(fx.extraTaskId),
+  },
   patchHarnessStack: {
     expect: [200],
     why: "label patch on the stack just created",

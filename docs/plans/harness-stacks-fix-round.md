@@ -271,6 +271,14 @@ Phase 5 review (opus, parallel dimension and flow passes) → Phase 6 tests (TT1
 - **W2 review N6 (T10 docs, Known limitations).** If the primary's merged file (`settings.json` / `config.toml`) is deleted outright, key removals do not propagate.
 - **W2 review N3 (T7 contract).** `prepareTaskHarness` moves already record their history through `moveTaskToMember`'s `history`. T7 records limit, retry and boot swaps at `spawnSwapContinuation`, records manual and scheduled switches through `history`, and must never record the same move twice.
 
+- **W3 review decisions (orchestrator):**
+  - **Stop during a switch or scheduled-switch copy:** the copy finishes, and queued follow-ups are stashed to the tray rather than drained.
+  - **Background agents still hold the task at turn end:** the scheduled switch is deferred until they release it.
+  - **Message arrives while a scheduled switch holds the claim (pipeline reminders included):** it is held and delivered after the move, never refused.
+  - **Second consecutive clean retry:** its follow-ups are recovered from the original run of the chain.
+  - **Codex self-clear:** matches the exact stored cooldown row.
+  - **Boot resume throws:** the task is blocked with `harness-swap-failed`.
+
 ## 8. Open questions / assumptions
 
 - No unratified decisions: every grill question was answered by the owner.

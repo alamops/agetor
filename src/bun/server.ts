@@ -42,7 +42,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, isHeldByBackgroundAgents, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, isHeldByBackgroundAgents, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -59,10 +59,11 @@ import {
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, reviewHumanStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
-import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackInputError } from "./harness-stacks.ts";
+import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackChangedError, StackInputError, validateInput as validateStackInput } from "./harness-stacks.ts";
 import { claudeConfigDirFor } from "./harness-config-root.ts";
 import { clearFailoverState, failoverTaskIdsForStack } from "./harness-failover.ts";
-import { mirrorStack } from "./harness-mirror.ts";
+import { mirrorStack, previewMirror, removeMirrorBackups, restoreMirror } from "./harness-mirror.ts";
+import { harnessSwapEvents } from "./harness-swap-history.ts";
 import { collectHarnessSessionCopies, removeHarnessSessionCopies } from "./harness-session-transfer.ts";
 import {
   applyHarnessAutoEnable,
@@ -270,6 +271,11 @@ import type {
   TaskGitStatus,
   TaskTeardownPreview,
   TaskReference,
+  HarnessStackChanged,
+  HarnessSwapHistoryPage,
+  MirrorRestoreResult,
+  SwitchAccountRefusal,
+  SwitchAccountResult,
 } from "../shared/types.ts";
 import { REMOTE_ACCESS_PREF_KEY } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, hasAppEventListeners, requestQuitCompletely, subscribeAppEvents } from "./quit-guard.ts";
@@ -624,7 +630,14 @@ const REACTION_CONTENTS = new Set<string>(["+1", "-1", "laugh", "confused", "hea
  * label, kind and members. Validation of the *values* stays in
  * `harness-stacks.ts` so the CLI shares one rulebook.
  */
-type StackInput = { label: string; kind: "claude-code" | "codex"; members: string[]; mirrorMode?: "full" | "safe" };
+type StackInput = {
+  label: string;
+  kind: "claude-code" | "codex";
+  members: string[];
+  mirrorMode?: "full" | "safe";
+  /** Edit only: the `updatedAt` the draft was based on (optimistic concurrency, D16). */
+  expectedUpdatedAt?: number;
+};
 
 async function parseStackBody(
   req: Request,
@@ -653,8 +666,14 @@ async function parseStackBody(
   if (mirrorMode !== undefined && mirrorMode !== "full" && mirrorMode !== "safe") {
     return { error: "mirrorMode must be 'full' or 'safe'" };
   }
+  const expectedUpdatedAt = body.expectedUpdatedAt;
+  if (opts.partial && expectedUpdatedAt !== undefined && expectedUpdatedAt !== null
+    && (typeof expectedUpdatedAt !== "number" || !Number.isFinite(expectedUpdatedAt))) {
+    return { error: "expectedUpdatedAt must be a number" };
+  }
   if (opts.partial) {
     const patch: Partial<StackInput> = {};
+    if (typeof expectedUpdatedAt === "number") patch.expectedUpdatedAt = expectedUpdatedAt;
     if (typeof label === "string") patch.label = label;
     if (kind === "claude-code" || kind === "codex") patch.kind = kind;
     if (Array.isArray(members)) patch.members = members as string[];
@@ -4585,6 +4604,82 @@ export function startApiServer(
         }),
       },
 
+      // Dry run of a mirror save (D10): what the save would add, update or
+      // remove on each backup. Names only, never values. The static path wins
+      // over `/harness-stacks/:id`.
+      "/harness-stacks/mirror-preview": {
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => null);
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            return json({ error: "invalid JSON body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const body = raw as Record<string, unknown>;
+          if (body.kind !== "claude-code" && body.kind !== "codex") {
+            return json({ error: "kind must be 'claude-code' or 'codex'" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!Array.isArray(body.members) || !body.members.every((m) => typeof m === "string")) {
+            return json({ error: "members must be an array of harness ids" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.mirrorMode !== undefined && body.mirrorMode !== "full" && body.mirrorMode !== "safe") {
+            return json({ error: "mirrorMode must be 'full' or 'safe'" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.stackId !== undefined && typeof body.stackId !== "string") {
+            return json({ error: "stackId must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const members = body.members as string[];
+          const existing = typeof body.stackId === "string" ? harnessStacks.get(body.stackId) : null;
+          if (typeof body.stackId === "string" && !existing) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const mirrorMode: "full" | "safe" = body.mirrorMode === "safe" || body.mirrorMode === "full"
+            ? body.mirrorMode
+            : existing?.mirrorMode ?? "full";
+          const validation = validateStackInput(
+            { label: existing?.label ?? "preview", kind: body.kind, members, mirrorMode },
+            existing?.id,
+          );
+          if (validation.blockers.length > 0) {
+            return json(
+              { error: validation.blockers[0]!.message, blockers: validation.blockers },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const rootRefusal = await gateStackMemberRoots(req, members);
+          if (rootRefusal) return rootRefusal;
+          // The dry run walks the primary's plugin tree like a real mirror.
+          server.timeout(req, 0);
+          try {
+            const preview = await previewMirror(
+              { kind: body.kind, members, mirrorMode },
+              existing ? { stackId: existing.id } : {},
+            );
+            return json(preview, { headers: corsHeaders(req) });
+          } catch (err) {
+            return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      // Newest-first swap history of one stack, paged by an opaque cursor.
+      "/harness-stacks/:id/history": {
+        GET: authed((req) => {
+          if (!harnessStacks.get(req.params.id)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const params = new URL(req.url).searchParams;
+          const limitRaw = params.get("limit");
+          const limit = limitRaw !== null && limitRaw.trim() !== "" ? Number(limitRaw) : undefined;
+          const before = params.get("before");
+          // The store clamps the limit to its own bounds and treats a
+          // malformed cursor as "first page".
+          const page: HarnessSwapHistoryPage = harnessSwapEvents.page(req.params.id, {
+            ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+            before: before || null,
+          });
+          return json(page, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/harness-stacks/:id": {
         GET: authed((req) => {
           // The detail read is what `agetor harness stack show` prints, so it
@@ -4624,6 +4719,14 @@ export function startApiServer(
               { headers: corsHeaders(req) },
             );
           } catch (err) {
+            if (err instanceof StackChangedError) {
+              const changed: HarnessStackChanged = {
+                error: "This stack changed elsewhere",
+                code: "stack-changed",
+                stack: err.current,
+              };
+              return json(changed, { status: 409, headers: corsHeaders(req) });
+            }
             if (err instanceof StackInputError) {
               return json({ error: err.message, blockers: err.blockers }, { status: 400, headers: corsHeaders(req) });
             }
@@ -4643,6 +4746,16 @@ export function startApiServer(
           // this stack after its last state write still names the old stack
           // id, so the stored-id filter alone would miss it (review S10).
           const affected = failoverTaskIdsForStack(stack.id);
+          // An armed quota-reset retry or an all-exhausted block would
+          // otherwise lose its countdown silently: cancel it first so the card
+          // says why (the cancel also hands held follow-ups back to the
+          // backlog), then drop the rest of the failover state.
+          for (const taskId of affected) {
+            if (tasks.get(taskId)?.harnessState?.scheduledSwitch) {
+              cancelScheduledAccountSwitch(taskId, "scheduled account switch cancelled — the stack was deleted");
+            }
+            cancelHarnessRetryForTask(taskId, "automatic account retry cancelled — the stack was deleted");
+          }
           harnessStacks.delete(stack.id);
           for (const taskId of affected) clearFailoverState(taskId);
           return json({ removed: true }, { headers: corsHeaders(req) });
@@ -4801,6 +4914,14 @@ export function startApiServer(
             const copies = collectHarnessSessionCopies(req.params.id);
             harnesses.delete(req.params.id);
             await removeHarnessSessionCopies(copies);
+            // The row (and, with it, its provenance rows) is gone, so the
+            // account's mirror backups can never be restored. Best effort:
+            // a leftover directory must not fail a delete that succeeded.
+            try {
+              await removeMirrorBackups(req.params.id);
+            } catch (err) {
+              console.error("[agetor] removing mirror backups failed:", err);
+            }
             // Prunes the deleted harness out of the per-harness discovery
             // cache and its transition-detector bookkeeping, then publishes
             // once — cheaper than a full `refreshAllModels()` sweep (which
@@ -5442,6 +5563,39 @@ export function startApiServer(
             },
             { status: 201, headers: corsHeaders(req) },
           );
+        }),
+      },
+
+      // Clear an account's cooldown rows (D13): all of them, or just the one
+      // for `?model=`. Touches no files, so no path gate.
+      "/harnesses/:id/limit-state": {
+        DELETE: authed((req) => {
+          const harness = harnesses.getByIdOrKind(req.params.id);
+          if (!harness) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          const model = new URL(req.url).searchParams.get("model")?.trim().toLowerCase();
+          harnessStacks.clearLimitState(harness.id, model ? { model } : undefined);
+          return json(
+            { cleared: true, limitStates: harnessStacks.listLimitStates() },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      // Put an account's mirror backups back (D9). It writes inside the
+      // account's config root, so a CLI-token caller is path-gated.
+      "/harnesses/:id/mirror-restore": {
+        POST: authed(async (req) => {
+          const harness = harnesses.getByIdOrKind(req.params.id);
+          if (!harness) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          const rootRefusal = await gateStackMemberRoots(req, [harness.id]);
+          if (rootRefusal) return rootRefusal;
+          server.timeout(req, 0);
+          try {
+            const result: MirrorRestoreResult = await restoreMirror(harness.id);
+            return json(result, { headers: corsHeaders(req) });
+          } catch (err) {
+            return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
         }),
       },
 
@@ -6134,6 +6288,9 @@ export function startApiServer(
             // unhandledRejection — every failure mode the function knows about
             // already surfaces via SSE.
             if (sameStackAccountSwitch) {
+              // The awaited transcript copy can outlast Bun's 255 s idle cap on
+              // a large session; lift it like the other long-copy routes.
+              server.timeout(req, 0);
               try {
                 await reconcileTaskSession(req.params.id, before, updated);
               } catch (err) {
@@ -6181,6 +6338,50 @@ export function startApiServer(
           // a step's entry is its parent's, and the parent outlives the step.
           removeTaskNotification(req.params.id);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Switch a stacked task to its next account (D12): now when idle,
+      // after the turn when a run is live. Moves transcripts between the
+      // members' roots, so a CLI-token caller is path-gated on all of them.
+      "/tasks/:id/switch-account": {
+        POST: authed(async (req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          if (task.archivedAt != null) {
+            return json(
+              { error: "this task is archived", code: "not-in-stack" } satisfies SwitchAccountRefusal,
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          const resolved = harnessStacks.resolveForTask(task);
+          const rootRefusal = await gateStackMemberRoots(req, [
+            task.agent,
+            ...(resolved ? resolved.stack.members.map((m) => m.harnessId) : []),
+          ]);
+          if (rootRefusal) return rootRefusal;
+          // An idle switch awaits the transcript copy.
+          server.timeout(req, 0);
+          try {
+            const result: SwitchAccountResult = await switchTaskAccountNow(req.params.id);
+            const fresh = tasks.get(req.params.id);
+            return json(
+              { ...result, task: withRunningSubagents(fresh ?? result.task) },
+              { headers: corsHeaders(req) },
+            );
+          } catch (err) {
+            if (err instanceof SwitchAccountRefusedError) {
+              return json(err.body, { status: 409, headers: corsHeaders(req) });
+            }
+            return json({ error: (err as Error).message }, { status: 500, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          if (!tasks.get(req.params.id)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const task = cancelScheduledAccountSwitch(req.params.id);
+          return json({ task: withRunningSubagents(task) }, { headers: corsHeaders(req) });
         }),
       },
 

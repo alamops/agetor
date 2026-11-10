@@ -1032,3 +1032,76 @@ describe("claude file readers follow claudeConfigDirFor", () => {
     }
   }, 30_000);
 });
+
+describe("fix-round routes: cooldown clear, history, preview, restore, switch, concurrency", () => {
+  test("DELETE /harnesses/:id/limit-state: 404 for an unknown account; clears all rows or one model's", async () => {
+    expect((await call("DELETE", "/harnesses/nope-acct/limit-state")).status).toBe(404);
+    const { harnessStacks } = await import("./harness-stacks.ts");
+    const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "limit", resetAtMs: Date.now() + 3_600_000 };
+    harnessStacks.setLimitState("api-x", base);
+    harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
+    const rows = (await call("GET", "/harnesses")).body.limitStates as { harnessId: string; model: string | null }[];
+    expect(rows.filter((r) => r.harnessId === "api-x").map((r) => r.model).sort()).toEqual([null, "gpt-x"].sort());
+
+    const one = await call("DELETE", "/harnesses/api-x/limit-state?model=%20GPT-X%20");
+    expect(one.status).toBe(200);
+    expect(one.body.cleared).toBe(true);
+    expect((one.body.limitStates as { harnessId: string }[]).filter((r) => r.harnessId === "api-x")).toHaveLength(1);
+
+    const all = await call("DELETE", "/harnesses/api-x/limit-state");
+    expect(all.status).toBe(200);
+    expect((all.body.limitStates as { harnessId: string }[]).some((r) => r.harnessId === "api-x")).toBe(false);
+  });
+
+  test("GET /harness-stacks/:id/history: 404 unknown, empty page for a fresh stack", async () => {
+    expect((await call("GET", "/harness-stacks/nope/history")).status).toBe(404);
+    const created = await call("POST", "/harness-stacks", { label: "History", kind: "claude-code", members: ["api-a", "api-b"], mirrorMode: "safe" });
+    const id = created.body.stack.id as string;
+    const page = await call("GET", `/harness-stacks/${id}/history?limit=9999&before=garbage`);
+    expect(page.status).toBe(200);
+    expect(page.body).toEqual({ events: [], nextCursor: null });
+    await call("DELETE", `/harness-stacks/${id}`);
+  }, 60_000);
+
+  test("POST /harness-stacks/mirror-preview validates the draft and answers a preview", async () => {
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "gemini", members: [] })).status).toBe(400);
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: "x" })).status).toBe(400);
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: ["api-a"], stackId: "nope" })).status).toBe(404);
+    const blocked = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: ["api-a", "api-a"] });
+    expect(blocked.status).toBe(400);
+    expect(Array.isArray(blocked.body.blockers)).toBe(true);
+    const ok = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: ["api-a", "api-b"], mirrorMode: "safe" });
+    expect(ok.status).toBe(200);
+    expect(Array.isArray(ok.body.plans)).toBe(true);
+    expect(typeof ok.body.overwrites).toBe("boolean");
+  }, 60_000);
+
+  test("POST /harnesses/:id/mirror-restore: 404 unknown, 200 with a result for a known account", async () => {
+    expect((await call("POST", "/harnesses/nope-acct/mirror-restore")).status).toBe(404);
+    const ok = await call("POST", "/harnesses/api-b/mirror-restore");
+    expect(ok.status).toBe(200);
+    expect(ok.body.harnessId).toBe("api-b");
+  }, 60_000);
+
+  test("POST/DELETE /tasks/:id/switch-account: 404 unknown, 409 archived", async () => {
+    expect((await call("POST", "/tasks/nope/switch-account")).status).toBe(404);
+    expect((await call("DELETE", "/tasks/nope/switch-account")).status).toBe(404);
+    const archived = seedTaskRow({ archivedAt: Date.now() });
+    const refused = await call("POST", `/tasks/${archived}/switch-account`);
+    expect(refused.status).toBe(409);
+    expect(refused.body).toEqual({ error: "this task is archived", code: "not-in-stack" });
+  });
+
+  test("PATCH /harness-stacks/:id with a stale expectedUpdatedAt answers 409 stack-changed with the stored stack", async () => {
+    const created = await call("POST", "/harness-stacks", { label: "Concurrent", kind: "claude-code", members: ["api-a", "api-b"], mirrorMode: "safe" });
+    const stack = created.body.stack as { id: string; updatedAt: number };
+    const fresh = await call("PATCH", `/harness-stacks/${stack.id}`, { label: "Concurrent 2", expectedUpdatedAt: stack.updatedAt });
+    expect(fresh.status).toBe(200);
+    const stale = await call("PATCH", `/harness-stacks/${stack.id}`, { label: "Concurrent 3", expectedUpdatedAt: stack.updatedAt });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe("stack-changed");
+    expect(stale.body.stack.label).toBe("Concurrent 2");
+    expect((await call("PATCH", `/harness-stacks/${stack.id}`, { expectedUpdatedAt: "x" })).status).toBe(400);
+    await call("DELETE", `/harness-stacks/${stack.id}`);
+  }, 60_000);
+});

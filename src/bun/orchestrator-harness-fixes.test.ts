@@ -600,7 +600,10 @@ describe("manual prepare holds the start claim (S8)", () => {
     // The move really happened, and the claim covered the copy: a retry timer
     // firing then defers instead of minting a competing successor.
     expect(db.tasks.get(task.id)!.agent).toBe(b);
-    expect(claimedDuringCopy).toEqual([true]);
+    // (The copy records its intended paths before copying, then the result:
+    // every handoff write happens under the claim.)
+    expect(claimedDuringCopy.length).toBeGreaterThan(0);
+    expect(claimedDuringCopy.every(Boolean)).toBe(true);
     // The claim is released afterwards.
     expect(orch.isTaskRunLive(task.id)).toBe(false);
     stacks.harnessStacks.delete(stack.id);
@@ -966,6 +969,42 @@ describe("Codex limit settle and the retry timer at the orchestrator (R-S16)", (
     // No swap divider, and the successful settle cleared the cooldown.
     expect(statusLines(rows[0]!.id).some((l) => l.includes("switching"))).toBe(false);
     expect(cooldownAfter).toBeNull();
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("the self-clear of a recovered 429 keeps a newer cooldown another task wrote", async () => {
+    const [a, b] = ids("recovered-newer", 2);
+    codexAccount(a);
+    codexAccount(b);
+    const stack = stacks.harnessStacks.create({ label: "recovered-newer", kind: "codex", members: [a, b] });
+    const task = makeTask(a, "plain codex work", { model: "fixture-codex-model" } as Partial<Task>);
+    const signal = { reason: "rate_limit", resetAtMs: null, message: "429 Too Many Requests", source: "codex-error" };
+    const prevTap = orch.__setChunkHandlerTapForTest((_runId, hooked, handler) => {
+      if (hooked !== task.id) return;
+      orch.__setChunkHandlerTapForTest(null);
+      setTimeout(() => {
+        handler("status", `${HARNESS_LIMIT_STATUS_PREFIX}${JSON.stringify(signal)}`);
+        // Another task overwrites the account-wide row after this run's own.
+        stacks.harnessStacks.setLimitState(a, { ...signal, message: "another task" } as never, Date.now() + 5);
+      }, 150);
+    });
+    let after: ReturnType<typeof stacks.harnessStacks.getLimitState> = null;
+    try {
+      await withEnv(
+        { AGETOR_CODEX_DRIVER: "fake", AGETOR_CODEX_BIN: "/bin/echo", AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS: "800" },
+        async () => {
+          expect(await orch.startTask(task.id)).toHaveProperty("runId");
+          await waitFor(() => db.tasks.get(task.id)?.column === "review", 10_000);
+          after = stacks.harnessStacks.getLimitState(a);
+        },
+      );
+    } finally {
+      orch.__setChunkHandlerTapForTest(prevTap);
+      stacks.harnessStacks.clearLimitState(a);
+      stacks.harnessStacks.clearLimitState(b);
+    }
+    expect(after).not.toBeNull();
+    expect(after!.message).toBe("another task");
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 
