@@ -46,8 +46,9 @@
  *
  * A mirror is idempotent and cheap to repeat: a copied file keeps the source's
  * mtime and an unchanged destination (same size + mtime, or the recorded source
- * size/mtime plus the recorded hash) is not rewritten, a merged file whose
- * result equals the backup's current text is not rewritten, and
+ * size/mtime plus the recorded hash) is not rewritten, a merged JSON file whose
+ * document equals the backup's (or a TOML file whose text does) is not
+ * rewritten, and
  * `mirrorForSwap` is single-flight per destination account. Work on one
  * destination (mirror, preview, restore) is serialized, so a stack save and a
  * swap never write the same account at once.
@@ -57,7 +58,6 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import {
-  chmodSync,
   closeSync,
   fstatSync,
   lstatSync,
@@ -117,6 +117,8 @@ import {
   resolvePathLexically,
   rootsRedirectRefusal,
   sameConfigRoot,
+  sweepStaleTempFiles,
+  TRANSFER_MAX_BYTES,
 } from "./harness-file-transfer.ts";
 import {
   backupFileOriginal,
@@ -356,6 +358,50 @@ function serializeForDestination<T>(harnessId: string, work: () => Promise<T>): 
   return run;
 }
 
+/** Where a test can pause a mirror run of one destination account:
+ *  `after-copy` sits between the copy phase and the merge phase (rows and saved
+ *  originals already written, more to come); `file-copied` between a copied
+ *  file's rename and its final provenance row (where a crash would land);
+ *  `primary-deletion-recheck` where a merged file the primary seems to have
+ *  deleted is about to be looked at again ({@link loadMergeTexts}). */
+export type MirrorHoldPoint = "after-copy" | "file-copied" | "primary-deletion-recheck";
+
+const mirrorHolds = new Map<string, { reached: () => void; released: Promise<void> }>();
+
+/**
+ * Tests only (like `holdTransferForTests` in harness-session-transfer.ts):
+ * the next mirror run (real or dry) into `harnessId` that gets to `point`
+ * resolves `reached` and waits there until `release()`. One-shot; `release()`
+ * also cancels a hold no run reached, so a later run never hangs on it.
+ */
+export function holdMirrorForTests(
+  harnessId: string,
+  point: MirrorHoldPoint = "after-copy",
+): { reached: Promise<void>; release: () => void } {
+  const key = `${harnessId}\u0000${point}`;
+  let reached!: () => void;
+  const reachedPromise = new Promise<void>((resolve) => { reached = resolve; });
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  mirrorHolds.set(key, { reached, released });
+  return {
+    reached: reachedPromise,
+    release: () => {
+      if (mirrorHolds.get(key)?.released === released) mirrorHolds.delete(key);
+      release();
+    },
+  };
+}
+
+async function mirrorHoldPoint(harnessId: string, point: MirrorHoldPoint): Promise<void> {
+  const key = `${harnessId}\u0000${point}`;
+  const hold = mirrorHolds.get(key);
+  if (!hold) return;
+  mirrorHolds.delete(key);
+  hold.reached();
+  await hold.released;
+}
+
 /** In-flight `mirrorForSwap` per destination account (contract C4). */
 const swapMirrorsInFlight = new Map<string, Promise<MirrorResult>>();
 
@@ -391,15 +437,20 @@ export { removeMirrorBackups };
  * recreated after it. Safe for an id that no longer exists; never throws.
  */
 export function deleteMirrorStateForHarness(harnessId: string): Promise<void> {
-  return serializeForDestination(harnessId, async () => {
-    try {
-      mirrorProvenance.deleteForHarness(harnessId);
-      mirrorSources.deleteForHarness(harnessId);
-    } catch (err) {
-      console.warn(`[harness-mirror] could not drop provenance for a deleted account: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    await removeMirrorBackups(harnessId);
-  });
+  return serializeForDestination(harnessId, () => dropMirrorState(harnessId));
+}
+
+/** The body of {@link deleteMirrorStateForHarness}, for a caller already
+ *  running inside the account's mirror queue (queuing again would wait for
+ *  itself). Never throws. */
+async function dropMirrorState(harnessId: string): Promise<void> {
+  try {
+    mirrorProvenance.deleteForHarness(harnessId);
+    mirrorSources.deleteForHarness(harnessId);
+  } catch (err) {
+    console.warn(`[harness-mirror] could not drop an account's mirror records: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  await removeMirrorBackups(harnessId);
 }
 
 // ---------------------------------------------------------------------------
@@ -606,19 +657,47 @@ async function mirrorOne(
   // (and later remove it, or strand a preexisted key on its value), so this
   // backup is skipped entirely, with a warning, and the recorded folder kept.
   // A recorded folder that no longer exists is stale and does not block.
-  const source = primarySourceOf(primary, fromRoot);
+  //
+  // The backup's own folder is pinned the same way: a backup with no folder of
+  // its own resolves through the core's environment too, and its provenance
+  // rows describe the folder they were written in. Applied to another folder,
+  // every recorded file there would read as edited, its "original" would be
+  // saved over the real one, and Restore would later write those originals
+  // into the wrong folder.
+  const source = folderSourceOf(primary, fromRoot);
+  const destination = folderSourceOf(target, toRoot);
   const recorded = mirrorSources.get(target.id);
-  const recordedRoot = recorded?.primaryRoot.split("\n")[0] ?? "";
-  if (
-    recorded !== null
-    && recorded.primaryId === primary.id
-    && recorded.primaryConfig === source.primaryConfig
-    && recorded.primaryRoot !== source.primaryRoot
-    && isDirectory(recordedRoot)
-  ) {
-    return refuse(
-      `skipped: the primary account's config folder is now ${fromRoot}, but it was ${recordedRoot} on the last mirror and the account's settings did not change (Agetor was probably started with a different ${kind === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"}); nothing is copied to or removed from this account until it resolves back. To use the new folder, give the primary account its own config folder`,
-    );
+  const envName = kind === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR";
+  if (recorded !== null && recorded.primaryId === primary.id && recorded.primaryConfig === source.config) {
+    const moved = movedRecordedFolder(recorded.primaryRoot, source.root);
+    if (moved) {
+      return refuse(
+        `skipped: the primary account's ${moved.what} is now ${moved.now}, but it was ${moved.was} on the last mirror and the account's settings did not change (Agetor was probably started with a different ${envName}); nothing is copied to or removed from this account until it resolves back. To use the new folder, give the primary account its own config folder`,
+      );
+    }
+  }
+  if (recorded !== null && recorded.backupRoot !== "" && recorded.backupConfig === destination.config) {
+    const moved = movedRecordedFolder(recorded.backupRoot, destination.root);
+    if (moved) {
+      return refuse(
+        `skipped: this account's ${moved.what} is now ${moved.now}, but it was ${moved.was} on the last mirror and its settings did not change (Agetor was probably started with a different ${envName}); nothing is copied to or removed from this account until it resolves back, so its mirror records are never applied to another folder. To use the new folder, give this account its own config folder`,
+      );
+    }
+  }
+  // Not skipped, yet the backup's folder is not the recorded one: the user
+  // re-pointed the account (its fingerprint changed) or the recorded folder is
+  // gone. Every provenance row and saved original describes that other folder,
+  // so none of them may drive an edit, a removal or a forced backup here. A
+  // real run drops them, exactly as an account delete does, and mirrors into
+  // the new folder as into a fresh account; a preview plans the same way.
+  const changed = recorded !== null && recorded.backupRoot !== ""
+    ? firstFolderDifference(recorded.backupRoot, destination.root)
+    : null;
+  const propagate = isDirectory(fromRoot);
+  if (changed) {
+    const notice = `this account's ${changed.what} changed from ${changed.was} to ${changed.now}; the mirror's record and saved originals for ${changed.was} are dropped and this account is mirrored as new`;
+    plan.warnings.push(notice);
+    if (!dry && propagate && harnesses.getByIdOrKind(target.id)) await dropMirrorState(target.id);
   }
   const ctx: MirrorCtx = {
     dry,
@@ -629,11 +708,11 @@ async function mirrorOne(
     fromRoot,
     toRoot,
     guard,
-    propagate: isDirectory(fromRoot),
-    rows: new Map(mirrorProvenance.list(target.id).map((r) => [rowId(r.path, r.key), r] as const)),
+    propagate,
+    rows: changed ? new Map() : new Map(mirrorProvenance.list(target.id).map((r) => [rowId(r.path, r.key), r] as const)),
     plan,
     copied: [],
-    warnings: [],
+    warnings: changed ? [...plan.warnings] : [],
     lastYield: Date.now(),
   };
 
@@ -643,16 +722,21 @@ async function mirrorOne(
   //    registry: the CLI would resolve plugins to files that do not exist.
   const incompletePayloads = new Set<string>();
   for (const rel of spec.copy) {
+    if (ctx.gone) break;
     try {
       await copyEntry(ctx, spec, rel, copyLimits, incompletePayloads);
     } catch (err) {
+      if (ctx.gone) break;
       warn(ctx, `${rel}: ${err instanceof Error ? err.message : String(err)}`);
       incompletePayloads.add(rel);
     }
   }
 
+  await mirrorHoldPoint(target.id, "after-copy");
+
   // 2. Merge the declared JSON/TOML files.
   for (const rel of spec.merge) {
+    if (ctx.gone) break;
     try {
       assertNotCredentialPath(rel, kind);
       // `.claude.json` does not live in `~/.claude`: it sits directly in the
@@ -685,30 +769,83 @@ async function mirrorOne(
     }
   }
 
-  // Record the folder this run read. Only an existing folder becomes the
-  // reference: a run against a missing one copied nothing.
+  // Record the folders this run read and wrote. Only an existing primary
+  // folder becomes the reference: a run against a missing one copied nothing.
   if (!dry && ctx.propagate && accountAlive(ctx)) {
-    mirrorSources.set({ harnessId: target.id, ...source, updatedAt: Date.now() });
+    mirrorSources.set({
+      harnessId: target.id,
+      primaryId: primary.id,
+      primaryRoot: source.root,
+      primaryConfig: source.config,
+      backupRoot: destination.root,
+      backupConfig: destination.config,
+      updatedAt: Date.now(),
+    });
   }
 
   return { copied: ctx.copied, warnings: ctx.warnings, plan };
 }
 
-/** The primary's resolved folder(s) and a fingerprint of the settings that
+/** An account's resolved folder(s) — the config root, plus the `.claude.json`
+ *  folder for Claude, one per line — and a fingerprint of its own settings that
  *  choose them (see {@link mirrorOne}). */
-function primarySourceOf(primary: Harness, fromRoot: string): { primaryId: string; primaryRoot: string; primaryConfig: string } {
-  const roots = [path.resolve(fromRoot)];
-  if (primary.kind === "claude-code") roots.push(path.resolve(claudeJsonDirFor(primary)));
+function folderSourceOf(harness: Harness, root: string): { root: string; config: string } {
+  const roots = [path.resolve(root)];
+  if (harness.kind === "claude-code") roots.push(path.resolve(claudeJsonDirFor(harness)));
   const env: Record<string, string> = {};
   for (const key of ROOT_ENV_KEYS) {
-    const value = primary.env?.[key];
+    const value = harness.env?.[key];
     if (nonBlankRootValue(value)) env[key] = value;
   }
   return {
-    primaryId: primary.id,
-    primaryRoot: roots.join("\n"),
-    primaryConfig: JSON.stringify({ home: nonBlankRootValue(primary.home) ? primary.home : null, env }),
+    root: roots.join("\n"),
+    config: JSON.stringify({ home: nonBlankRootValue(harness.home) ? harness.home : null, env }),
   };
+}
+
+/** A recorded folder that differs from the one the account resolves to now
+ *  and still exists (the first such); null when nothing moved or every
+ *  differing recorded folder is gone (stale). Every differing line counts: a
+ *  Claude account whose old config root is gone while its old `.claude.json`
+ *  folder still exists has not moved for good, and treating it as stale would
+ *  drop the saved originals of a folder that is still there. */
+function movedRecordedFolder(recorded: string, current: string): { what: string; was: string; now: string } | null {
+  for (const moved of folderDifferences(recorded, current)) {
+    if (recordedFolderExists(moved.was)) return moved;
+  }
+  return null;
+}
+
+/** The first recorded folder that differs from the current resolution, with
+ *  no existence check; null when they are the same. */
+function firstFolderDifference(recorded: string, current: string): { what: string; was: string; now: string } | null {
+  return folderDifferences(recorded, current)[0] ?? null;
+}
+
+/** Every recorded folder (one per line) that differs from the current one. */
+function folderDifferences(recorded: string, current: string): Array<{ what: string; was: string; now: string }> {
+  if (recorded === current) return [];
+  const was = recorded.split("\n");
+  const now = current.split("\n");
+  const out: Array<{ what: string; was: string; now: string }> = [];
+  for (let i = 0; i < Math.max(was.length, now.length); i++) {
+    if (was[i] === now[i]) continue;
+    out.push({ what: i === 0 ? "config folder" : ".claude.json folder", was: was[i] ?? "", now: now[i] ?? "" });
+  }
+  return out;
+}
+
+/** Whether a folder named by a mirror-sources row still exists. The row is
+ *  agent-writable, so its path is resolved lexically first and never stat'ed
+ *  inside a macOS-protected folder: one that lands there (or cannot be
+ *  resolved) counts as existing, which can only make the mirror skip or
+ *  Restore refuse, never write anywhere. */
+function recordedFolderExists(p: string): boolean {
+  if (!p || !path.isAbsolute(p)) return false;
+  const resolved = resolvePathLexically(p);
+  if (resolved.protectedFolder || resolved.error) return true;
+  if (resolved.missing) return false;
+  return lstatOrNull(resolved.path)?.isDirectory() ?? false;
 }
 
 function isDirectory(p: string): boolean {
@@ -776,15 +913,39 @@ async function copyEntry(
     const tree = await planTree(ctx, src, rel, limits);
     const visited = new Set<string>();
     const reasons = new Map<string, number>();
+    // One file that cannot be copied (EACCES, a file that grew past the cap,
+    // a disk error) is a skip, not the end of the entry: the rest still
+    // mirrors and deletion propagation still runs (the failed file is in
+    // `visited`, so it is never removed). The payload counts as incomplete, so
+    // a plugin registry is not pointed at it.
+    const failures: string[] = [];
+    // Each file may be as large as its tree's own budget (`planTree` already
+    // kept the tree within it), so a big plugin asset under a 512 MB payload
+    // budget is not refused by the generic per-file cap.
+    const fileCap = limits.maxBytes ?? TRANSFER_MAX_BYTES;
     for (const file of tree.files) {
       const fileRel = `${toRel}/${file.child}`;
       visited.add(fileRel);
-      const result = await mirrorFile(ctx, fileRel, file.abs, file.st);
+      let result: { reason?: string };
+      try {
+        result = await mirrorFile(ctx, fileRel, file.abs, file.st, fileCap);
+      } catch (err) {
+        if (ctx.gone) throw err;
+        failures.push(`${fileRel}: could not be copied — ${err instanceof Error ? err.message : String(err)}`);
+        result = {};
+      }
       if (result.reason) reasons.set(result.reason, (reasons.get(result.reason) ?? 0) + 1);
       await tick(ctx);
     }
     for (const [reason, count] of reasons) {
       warn(ctx, `${rel}: ${reason}${count > 1 ? ` (${count} files)` : ""}`);
+    }
+    if (failures.length > 0) {
+      incompletePayloads.add(rel);
+      for (const failure of failures.slice(0, MAX_LISTED_FAILURES)) warn(ctx, failure);
+      if (failures.length > MAX_LISTED_FAILURES) {
+        warn(ctx, `${rel}: ${failures.length - MAX_LISTED_FAILURES} more files could not be copied`);
+      }
     }
     if (tree.truncated) {
       incompletePayloads.add(rel);
@@ -829,6 +990,14 @@ async function copyEntry(
     incompletePayloads.add(rel);
   }
 }
+
+function formatMegabytes(bytes: number): string {
+  return `${Math.round((bytes / (1024 * 1024)) * 10) / 10} MB`;
+}
+
+/** Per-file copy failures listed one by one in a run's warnings; the rest are
+ *  counted. */
+const MAX_LISTED_FAILURES = 5;
 
 interface PlannedFile {
   /** Relative to the tree root. */
@@ -911,18 +1080,24 @@ async function planTree(
 
 /**
  * Decide and apply one file: add, update or leave it. See the module comment
- * for the provenance rules. `reason` is set when the file was skipped.
+ * for the provenance rules. `reason` is set when the file was skipped. A file
+ * over `maxBytes` is a skip, decided before anything is written, so a preview
+ * reports the same skip a real run makes.
  */
 async function mirrorFile(
   ctx: MirrorCtx,
   rel: string,
   from: string,
   srcSt: Stats,
+  maxBytes: number = TRANSFER_MAX_BYTES,
 ): Promise<{ outcome: "add" | "update" | "unchanged" | "skipped"; reason?: string }> {
   const to = path.join(ctx.toRoot, rel);
   const state = destinationState(ctx.toRoot, to);
   if (state === "unsafe") {
     return { outcome: "skipped", reason: "destination path goes through a symlink or non-directory — skipped" };
+  }
+  if (srcSt.size > maxBytes) {
+    return { outcome: "skipped", reason: `larger than the ${formatMegabytes(maxBytes)} mirror limit for this entry — skipped` };
   }
   const row = getRow(ctx, rel);
   let existing: Stats | null = null;
@@ -932,12 +1107,30 @@ async function mirrorFile(
       return { outcome: "skipped", reason: "destination is a symlink — kept, not replaced by a regular file" };
     }
     if (existing && !existing.isFile()) return { outcome: "skipped", reason: "destination is not a regular file — kept" };
+    // The folder is verified plain (`destinationState`): clear what an
+    // interrupted earlier copy left in it, even when nothing is written now.
+    if (!ctx.dry) sweepStaleTempFiles(path.dirname(to));
   }
   const write = async (preexisted: boolean, backupRef: string | null, planned: "add" | "update") => {
-    (planned === "add" ? ctx.plan.files.add : ctx.plan.files.update).push(rel);
-    ctx.copied.push(rel);
-    if (ctx.dry) return;
-    await copyRegularFileDetailed(from, to, { root: ctx.toRoot, skipUnchanged: true });
+    const record = () => {
+      (planned === "add" ? ctx.plan.files.add : ctx.plan.files.update).push(rel);
+      ctx.copied.push(rel);
+    };
+    if (ctx.dry) return record();
+    if (planned === "add") {
+      // Record the intent before the copy, as an update does: the copy keeps
+      // the source's mtime, so after a crash between the two the next run
+      // would see an unchanged file with no record, never own it, and neither
+      // a primary deletion nor Restore would ever touch it. The pending row
+      // (no source stamp) is adopted by the equal-stamp branch below.
+      if (!accountAlive(ctx)) throw new Error("account deleted");
+      putRow(ctx, {
+        scope: "file", path: rel, key: "", valueHash: null,
+        srcMtimeMs: null, srcSize: null, preexisted, backupRef,
+      });
+    }
+    await copyRegularFileDetailed(from, to, { root: ctx.toRoot, skipUnchanged: true, maxBytes });
+    await mirrorHoldPoint(ctx.harnessId, "file-copied");
     putRow(ctx, {
       scope: "file",
       path: rel,
@@ -948,9 +1141,14 @@ async function mirrorFile(
       preexisted,
       backupRef,
     });
+    record();
   };
   if (!existing) {
-    await write(false, null, "add");
+    // The account deleted a file the mirror had replaced: the saved original
+    // still belongs to it, so the re-added copy keeps the record's
+    // `preexisted`/`backupRef` and Restore can still put the original back.
+    const keepOriginal = row !== undefined && row.preexisted && row.backupRef !== null;
+    await write(keepOriginal, keepOriginal ? row.backupRef : null, "add");
     return { outcome: "add" };
   }
   const srcMatchesRow = (r: MirrorProvenanceRow) =>
@@ -1360,9 +1558,18 @@ async function linkTopLevelSymlinks(
         ctx.plan.files.add.push(relPath);
         ctx.copied.push(relPath);
         if (!ctx.dry) {
+          if (!accountAlive(ctx)) throw new Error("account deleted");
+          // A link the account deleted after the mirror replaced its own keeps
+          // the saved original. The row goes in first (its value, the target,
+          // is known before the link exists), so a crash in between never
+          // leaves a link no record owns.
+          const keepOriginal = row !== undefined && row.preexisted && row.backupRef !== null;
+          putRow(ctx, {
+            scope: "link", path: relPath, key: "", valueHash: target, srcMtimeMs: null, srcSize: null,
+            preexisted: keepOriginal, backupRef: keepOriginal ? row.backupRef : null,
+          });
           ensurePlainDirUnder(ctx.toRoot, to);
           symlinkSync(target, dest);
-          putRow(ctx, { scope: "link", path: relPath, key: "", valueHash: target, srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null });
         }
         continue;
       }
@@ -1391,6 +1598,7 @@ async function linkTopLevelSymlinks(
       ctx.plan.files.update.push(relPath);
       ctx.copied.push(relPath);
       if (ctx.dry) continue;
+      sweepStaleTempFiles(to);
       const tmp = path.join(to, `.agetor-tmp-${randomUUID()}`);
       symlinkSync(target, tmp);
       try {
@@ -1425,8 +1633,9 @@ const MAX_MIRROR_FILE_BYTES = 8 * 1024 * 1024;
  * `disabledMcpjsonServers`).
  *
  * Per-key rules for every caller (see the callers' own comments):
- * - `settings.json`: this function, except that `env` entries, `mcpServers`
- *   and `enabledPlugins` entries are replaced whole per name, and (full mode)
+ * - `settings.json`: this function, except that `env`, `mcpServers`,
+ *   `enabledPlugins` and `extraKnownMarketplaces` entries are replaced whole
+ *   per name (`SETTINGS_NAMED_CONTAINERS`), and (full mode)
  *   `hooks`/`permissions` replace outright;
  * - `.claude.json`: only per-name replacement of the three owned structures;
  * - plugin registries: this function for flat registries; install records by
@@ -1527,6 +1736,7 @@ async function loadMergeTexts(
   const srcSt = lstatOrNull(fromPath);
   if (!srcSt) {
     if (!primaryDeletionPropagates(ctx, rel, fromBase, fromPath)) return null;
+    await mirrorHoldPoint(ctx.harnessId, "primary-deletion-recheck");
     // An editor that saves by renaming leaves the file absent for a moment:
     // look again before treating it as deleted. Back already → leave it for
     // the next run rather than merge a half-observed state.
@@ -1710,7 +1920,14 @@ async function mergeJsonDoc(ctx: MirrorCtx, m: JsonMerge): Promise<void> {
     rel,
     toBase: texts.toBase,
     toPath: texts.toPath,
-    text: `${JSON.stringify(merged, null, 2)}\n`,
+    // A merge that changes nothing writes nothing: Claude writes these files
+    // without a trailing newline, so comparing re-serialized text rewrote
+    // `.claude.json` on every run (and showed it as an update in every
+    // preview), and each rewrite is a window in which a live CLI's own write
+    // can be lost. When a write is needed it keeps the file's own layout.
+    text: texts.backupText !== null && canonicalJson(merged) === canonicalJson(m.backup)
+      ? texts.backupText
+      : renderJsonLike(merged, texts.backupText),
     backupText: texts.backupText,
     upserts,
     removals,
@@ -1842,7 +2059,31 @@ async function commitMerged(ctx: MirrorCtx, c: MergedCommit): Promise<void> {
   for (const f of c.foreign) if (!f.needsBackup) await dropRow(ctx, c.rel, f.key);
 }
 
+/**
+ * `doc` serialized in the layout of `like` (the file it replaces): the same
+ * indentation (detected from the first indented line; none for a one-line
+ * file), line endings and trailing newline. A new file gets two-space
+ * indentation and a trailing newline.
+ */
+function renderJsonLike(doc: unknown, like: string | null): string {
+  if (like === null) return `${JSON.stringify(doc, null, 2)}\n`;
+  const newline = like.includes("\r\n") ? "\r\n" : "\n";
+  const body = like.trimEnd();
+  let indent = "";
+  if (body.includes("\n")) indent = /\n([ \t]+)\S/.exec(body)?.[1] ?? "  ";
+  // JSON.stringify escapes every newline inside a string, so each "\n" here
+  // is a line break of the layout.
+  let out = JSON.stringify(doc, null, indent);
+  if (newline !== "\n") out = out.replace(/\n/g, newline);
+  return /\n$/.test(like) ? `${out}${newline}` : out;
+}
+
 // ---- settings.json ---------------------------------------------------------
+
+/** `settings.json` objects whose entries are owned, replaced and propagated
+ *  per name. `extraKnownMarketplaces` is one: deep-merged as a whole key, a
+ *  marketplace the primary removed stayed on every backup forever. */
+const SETTINGS_NAMED_CONTAINERS: readonly string[] = ["env", "mcpServers", "enabledPlugins", "extraKnownMarketplaces"];
 
 /** Merge Claude's `settings.json`, stripping the primary's provider
  *  credential and provider-selector env keys and login-bearing settings while
@@ -1852,7 +2093,8 @@ async function commitMerged(ctx: MirrorCtx, c: MergedCommit): Promise<void> {
  *  `hooks`/`permissions` replace the backup's (no array union — an edited hook
  *  would otherwise run twice and a revoked permission survive forever). Every
  *  other array the primary defines replaces the backup's value too, and
- *  `env`, `mcpServers` and `enabledPlugins` entries replace per name. */
+ *  `env`, `mcpServers`, `enabledPlugins` and `extraKnownMarketplaces` entries
+ *  replace (and are owned, so a primary removal propagates) per name. */
 async function mergeClaudeSettings(ctx: MirrorCtx): Promise<void> {
   const rel = "settings.json";
   const toPath = path.join(ctx.toRoot, rel);
@@ -1932,7 +2174,7 @@ async function mergeClaudeSettings(ctx: MirrorCtx): Promise<void> {
     backup,
     mergeDoc: (f, b) => {
       const merged = deepMerge(f, b) as Record<string, unknown>;
-      for (const container of ["env", "mcpServers", "enabledPlugins"]) {
+      for (const container of SETTINGS_NAMED_CONTAINERS) {
         if (isPlainObject(f[container])) setOwn(merged, container, replaceEntries(f[container], b[container]));
       }
       if (!safe) {
@@ -1942,7 +2184,7 @@ async function mergeClaudeSettings(ctx: MirrorCtx): Promise<void> {
       }
       return merged;
     },
-    enumerate: (doc) => enumerateNamed(doc, ["env", "mcpServers", "enabledPlugins"], true),
+    enumerate: (doc) => enumerateNamed(doc, SETTINGS_NAMED_CONTAINERS, true),
     excluded: (key) => {
       const top = key.split(".")[0]!;
       if (isMirrorNeverImportedSettingsKey(top)) return true;
@@ -2355,8 +2597,12 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
   }
   if (topParts.some((t) => t.trim().length > 0)) {
     out.push(topParts.join("\n"));
-  } else if (!primaryTopAssignments.length && backupTopText.trim()) {
-    // Primary has no top-level keys; keep the backup's block (comments incl.).
+  } else if (!primaryTopAssignments.length && removeTop.size === 0 && backupTopText.trim()) {
+    // Primary has no top-level keys and nothing is being removed: keep the
+    // backup's block as it is (a comment-only header). With a removal, the
+    // block is what `topParts` rebuilt from the backup's assignments minus the
+    // removed ones (each keeps its own comments): writing the old block back
+    // would keep the removed keys while their records are dropped.
     out.push(backupTopText.trimEnd());
   }
   for (const block of keptBlocks) out.push(block.text);
@@ -2403,6 +2649,15 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
     { isExcluded: (segments) => segments[0] === "projects" || isCodexLoginBearingKeyPath(segments) || isCodexSecretKeyPath(segments) || safeExcluded(segments), droppedPrefixes, replacedPrefixes },
   );
   if (lost) return void warn(ctx, `config.toml: the merge would have lost ${lost} — backup left untouched`);
+  // Backstop the other way: a top-level key this run removes (and the primary
+  // does not define) must really be gone, or its record would be dropped
+  // while the key stays.
+  for (const key of removeTop) {
+    const segments = splitTomlKeyPath(key);
+    if (getAt(mergedParsed, segments).found && !getAt(primaryParsed, segments).found) {
+      return void warn(ctx, `config.toml: the merge would have kept ${key}, which it was removing — backup left untouched`);
+    }
+  }
 
   if (skippedProjects > 0) {
     warn(ctx, "config.toml: did not copy the primary's [projects.*] trust entries");
@@ -2883,14 +3138,14 @@ function segsForKey(rel: string, key: string, doc: Record<string, unknown>): str
     const m = /^projects\.(.*)\.mcpServers\.(.*)$/.exec(key);
     if (m) return ["projects", m[1]!, "mcpServers", m[2]!];
   }
-  for (const container of ["env", "mcpServers", "enabledPlugins", "plugins"]) {
+  for (const container of [...SETTINGS_NAMED_CONTAINERS, "plugins"]) {
     if (key.startsWith(`${container}.`)) return [container, key.slice(container.length + 1)];
   }
   return [key];
 }
 
 function enumeratorFor(rel: string): ((doc: Record<string, unknown>) => JsonEntry[]) | null {
-  if (rel === "settings.json") return (doc) => enumerateNamed(doc, ["env", "mcpServers", "enabledPlugins"], true);
+  if (rel === "settings.json") return (doc) => enumerateNamed(doc, SETTINGS_NAMED_CONTAINERS, true);
   if (rel === ".claude.json") return enumerateClaudeJson;
   if (rel === "plugins/installed_plugins.json") return (doc) => enumerateNamed(doc, ["plugins"], true);
   if (rel === "plugins/known_marketplaces.json") return (doc) => Object.keys(doc).map((k) => ({ key: k, segs: [k] }));
@@ -2935,6 +3190,24 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
   if (redirected) {
     result.warnings.push(redirected);
     return result;
+  }
+  // The rows describe the folder the mirror wrote into. Restoring them into
+  // any other folder would write saved originals into the wrong place and
+  // delete the records, so Restore refuses whenever the account now resolves
+  // elsewhere, whether or not the recorded folder still exists (when it is
+  // gone, or the account was re-pointed, the next mirror run drops the stale
+  // records).
+  const recorded = mirrorSources.get(harnessId);
+  if (recorded !== null && recorded.backupRoot !== "") {
+    const moved = firstFolderDifference(recorded.backupRoot, folderSourceOf(harness, root).root);
+    if (moved) {
+      result.warnings.push(
+        recordedFolderExists(moved.was)
+          ? `restore refused: this account's ${moved.what} is now ${moved.now}, but the mirror wrote into ${moved.was}; restoring here would put its saved originals into the wrong folder. Start Agetor with the environment that resolves the account to ${moved.was} (or give the account that folder) and restore again`
+          : `restore refused: the mirror's record is for ${moved.was}, but this account's ${moved.what} is now ${moved.now}; its saved originals belong to that folder and are not restored here. The next mirror of this account drops that record`,
+      );
+      return result;
+    }
   }
   const rows = mirrorProvenance.list(harnessId);
   const spec = MIRROR_SPECS[kind];
@@ -2988,9 +3261,10 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
             result.kept.push(rel);
             failed(`${rel}: edited since the mirror wrote it — kept, original not restored`);
           } else {
-            await atomicWriteFile(abs, original, { root });
+            // The mode goes on the temp file before the rename: a chmod of the
+            // final path afterwards would follow a symlink swapped in there.
             const mode = await readBackupMode(harnessId, rel);
-            if (mode !== null) chmodSync(abs, mode);
+            await atomicWriteFile(abs, original, { root, ...(mode !== null ? { mode } : {}) });
             result.restored.push(rel);
             await finish(row);
           }
@@ -3021,6 +3295,7 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
             failed(`${rel}: link changed since the mirror wrote it — kept, original not restored`);
           } else {
             ensurePlainDirUnder(root, path.dirname(abs));
+            sweepStaleTempFiles(path.dirname(abs));
             const tmp = path.join(path.dirname(abs), `.agetor-tmp-${randomUUID()}`);
             symlinkSync(original.toString("utf8"), tmp);
             renameSync(tmp, abs);
@@ -3152,7 +3427,7 @@ async function restoreJsonKeys(
       failed(`${name}: edited since the mirror wrote it — kept`);
     }
   }
-  return { text: changed ? `${JSON.stringify(doc, null, 2)}\n` : null, done };
+  return { text: changed ? renderJsonLike(doc, text) : null, done };
 }
 
 async function restoreTomlKeys(

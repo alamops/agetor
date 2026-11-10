@@ -2599,6 +2599,33 @@ const toOrphanedCopy = (r: OrphanedCopyRow): HarnessOrphanedCopy => ({
 });
 
 /**
+ * The newest `created_at` this process has stamped on (or seen in)
+ * `harness_orphaned_copies`. Stamps only move forward, so a sweep can take a
+ * mark (`sweepMark`) and later forget only the records stamped at or before
+ * it: a record a transfer wrote while the sweep was running is always stamped
+ * after the mark, even within the same millisecond. Seeded from the table on
+ * first use, so a record from an earlier run whose clock was ahead is still
+ * at or below the first mark.
+ */
+let orphanStamp: number | null = null;
+
+function currentOrphanStamp(): number {
+  if (orphanStamp === null) {
+    const max = db
+      .query<{ m: number | null }, []>(`SELECT MAX(created_at) AS m FROM harness_orphaned_copies`)
+      .get()?.m;
+    orphanStamp = typeof max === "number" && Number.isFinite(max) ? max : 0;
+  }
+  return orphanStamp;
+}
+
+/** A stamp strictly after every earlier stamp and every mark. */
+function nextOrphanStamp(): number {
+  orphanStamp = Math.max(Date.now(), currentOrphanStamp() + 1);
+  return orphanStamp;
+}
+
+/**
  * Handoff copies no handoff row can clean up any more (migration 088): the
  * old session's files after a row was re-keyed, and the kept files of a
  * deleted task. Each path carries the session it was copied for. The sweep in
@@ -2606,9 +2633,10 @@ const toOrphanedCopy = (r: OrphanedCopyRow): HarnessOrphanedCopy => ({
  * a path is never removed just because it is listed here.
  */
 export const harnessOrphanedCopies = {
-  add(harnessId: string, column: SessionIdColumn, sessionId: string, paths: readonly string[], now = Date.now()): void {
+  add(harnessId: string, column: SessionIdColumn, sessionId: string, paths: readonly string[]): void {
     if (paths.length === 0) return;
     db.transaction(() => {
+      const now = nextOrphanStamp();
       for (const p of new Set(paths)) {
         if (typeof p !== "string" || p === "") continue;
         db.run(
@@ -2622,18 +2650,38 @@ export const harnessOrphanedCopies = {
       }
     })();
   },
+  /**
+   * A mark for a sweep, taken before it lists the records: every record listed
+   * after it is stamped at or before the mark, and every record written later
+   * (a transfer of the same session recording its pending paths while the
+   * sweep yields) is stamped after it. Pass it to `forget` as `notAfter`.
+   */
+  sweepMark(): number {
+    orphanStamp = Math.max(Date.now(), currentOrphanStamp());
+    return orphanStamp;
+  },
   /** Forget the listed paths of one session: they are on a live row again, or
    *  a sweep removed them, found them gone or rejected them as never ours. The
    *  session id is part of the match, so a path re-orphaned under another
-   *  session meanwhile is kept. */
-  forget(harnessId: string, column: SessionIdColumn, sessionId: string, paths: readonly string[]): void {
+   *  session meanwhile is kept. With `notAfter` (a sweep's mark), a record
+   *  written after the mark is kept too: it is a newer transfer's pending
+   *  record of a file that transfer may be creating right now. */
+  forget(
+    harnessId: string,
+    column: SessionIdColumn,
+    sessionId: string,
+    paths: readonly string[],
+    opts: { notAfter?: number } = {},
+  ): void {
     if (paths.length === 0) return;
+    const notAfter = opts.notAfter ?? Number.MAX_SAFE_INTEGER;
     db.transaction(() => {
       for (const p of new Set(paths)) {
         db.run(
           `DELETE FROM harness_orphaned_copies
-            WHERE harness_id = ? AND column_name = ? AND path = ? AND session_id = ?`,
-          [harnessId, column, p, sessionId],
+            WHERE harness_id = ? AND column_name = ? AND path = ? AND session_id = ?
+              AND created_at <= ?`,
+          [harnessId, column, p, sessionId, notAfter],
         );
       }
     })();
@@ -4301,6 +4349,22 @@ export const runs = {
          WHERE task_id = ? AND ${column} IS NOT NULL
          ORDER BY started_at DESC, rowid DESC`,
     ).all(taskId);
+  },
+  /**
+   * Every task with a run that recorded `sessionId` in `column`, of any agent.
+   * The orphaned-copy sweep asks each one whether the session is still the one
+   * it resumes on the swept account, so a planted orphan record naming a live
+   * conversation never deletes its transcript. Both columns are indexed
+   * (068's `runs_claude_session_id_idx`, 090's `runs_codex_session_id_idx`),
+   * and the sweep runs it once per orphan group, not per file.
+   */
+  taskIdsWithSession(column: SessionIdColumn, sessionId: string): string[] {
+    const col = SESSION_ID_COLUMNS.find((c) => c === column);
+    if (!col || !sessionId) return [];
+    return db
+      .query<{ task_id: string }, [string]>(`SELECT DISTINCT task_id FROM runs WHERE ${col} = ?`)
+      .all(sessionId)
+      .map((r) => r.task_id);
   },
   /** True when any run already records this Claude session id. Not a
    *  uniqueness check — several runs on one task share an id. */

@@ -9,12 +9,17 @@
 // Harness account stacks (migration 084) are harness state too: a leaked
 // `harness_stack_members` row makes a later file's `UNIQUE(harness_id)` block
 // fail for reasons it never created. The stack, membership and cooldown rows
-// are snapshotted and restored alongside the harnesses.
+// are snapshotted and restored alongside the harnesses. So are the orphaned
+// handoff copies (migration 088) and the mirror's recorded primary folders
+// (migration 089): a leaked row would make a later file's sweep or mirror act
+// on an account id it reuses. Those two are copied whole-row (every column
+// SQLite reports), so a column a later migration adds round-trips too.
 //
 // Usage, after `db.ts` is imported:
 //   const restoreHarnesses = snapshotHarnessState();
 //   afterAll(() => restoreHarnesses());
 
+import type { SQLQueryBindings } from "bun:sqlite";
 import { db, harnesses } from "./db.ts";
 
 type StackRow = {
@@ -49,6 +54,23 @@ type LimitRow = {
   updated_at: number;
 };
 
+/** Tables restored as they were, every column of every row. */
+const WHOLE_ROW_TABLES = ["harness_orphaned_copies", "harness_mirror_sources"] as const;
+
+type AnyRow = Record<string, SQLQueryBindings>;
+
+function restoreWholeRows(table: (typeof WHOLE_ROW_TABLES)[number], rows: readonly AnyRow[]): void {
+  db.run(`DELETE FROM ${table}`);
+  for (const row of rows) {
+    const columns = Object.keys(row);
+    db.run(
+      `INSERT INTO ${table} (${columns.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ")})
+       VALUES (${columns.map(() => "?").join(", ")})`,
+      columns.map((c) => row[c]) as SQLQueryBindings[],
+    );
+  }
+}
+
 export function snapshotHarnessState(): () => void {
   const enabledById = new Map(harnesses.list().map((h) => [h.id, h.enabled] as const));
   const autoEnabledIds = new Set(
@@ -59,6 +81,9 @@ export function snapshotHarnessState(): () => void {
   const members = db.query("SELECT * FROM harness_stack_members").all() as MemberRow[];
   const limits = db.query("SELECT * FROM harness_limit_state").all() as LimitRow[];
   const provenance = db.query("SELECT * FROM harness_mirror_provenance").all() as ProvenanceRow[];
+  const wholeRows = new Map(
+    WHOLE_ROW_TABLES.map((t) => [t, db.query(`SELECT * FROM ${t}`).all() as AnyRow[]] as const),
+  );
   return () => {
     // Stacks first: deleting every test-created stack cascades its members,
     // then the snapshot rows go back. Deleting a row whose harness is about
@@ -106,6 +131,7 @@ export function snapshotHarnessState(): () => void {
         [r.harness_id, r.stack_id, r.scope, r.path, r.key, r.value_hash, r.src_mtime_ms, r.src_size, r.preexisted, r.backup_ref, r.updated_at],
       );
     }
+    for (const [table, rows] of wholeRows) restoreWholeRows(table, rows);
     for (const h of harnesses.list()) {
       const enabled = enabledById.get(h.id);
       if (enabled === undefined) {

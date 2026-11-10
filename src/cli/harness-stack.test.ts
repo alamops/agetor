@@ -39,7 +39,7 @@ afterAll(() => {
   mock.module("./output.ts", () => realOutputSnapshot);
 });
 
-const { cmdHarness, applyMemberOps, STACK_CHANGED_MESSAGE } = await import("./commands/harness.ts");
+const { cmdHarness, applyMemberOps, stackEditPatch, STACK_CHANGED_MESSAGE } = await import("./commands/harness.ts");
 const { cmdSwitchAccount } = await import("./commands/switch-account.ts");
 const { resolveStack } = await import("./resolve-stack.ts");
 const { agentCell } = await import("./commands/ls.ts");
@@ -181,6 +181,59 @@ test("stack edit: any other 409 propagates unchanged", async () => {
   });
   currentClient = client;
   await expect(cmdHarness(["stack", "edit", "Train", "--label", "x"], flags)).rejects.toThrow("boom");
+});
+
+test("stackEditPatch keeps only the fields that differ from the stack", () => {
+  const s = stack();
+  expect(stackEditPatch(s, { mirrorMode: "full", kind: "claude-code", label: "Train", members: ["a", "b", "c"] })).toEqual({});
+  expect(stackEditPatch(s, { mirrorMode: "safe" })).toEqual({ mirrorMode: "safe" });
+  expect(stackEditPatch(s, { kind: "codex" })).toEqual({ kind: "codex" });
+  expect(stackEditPatch(s, { label: "New" })).toEqual({ label: "New" });
+  expect(stackEditPatch(s, { members: ["b", "a", "c"] })).toEqual({ members: ["b", "a", "c"] });
+  expect(stackEditPatch(s, { members: ["a", "b"] })).toEqual({ members: ["a", "b"] });
+});
+
+test("stack edit: a flag already at its value sends nothing — no mirror, no preview, no PATCH", async () => {
+  const { client, calls } = fakeClient({ previewHarnessMirror: async (d: unknown) => { calls.push(`preview:${JSON.stringify(d)}`); return OVERWRITE; } });
+  currentClient = client;
+  // `--mirror full` on a full stack: the server would re-run the mirror for a
+  // `mirrorMode` field of any value, past the --yes check.
+  await cmdHarness(["stack", "edit", "Train", "--mirror", "full"], flags);
+  expect(calls).toEqual([]);
+  expect(outputs.join("\n")).toBe("no changes — stack Train already matches");
+
+  outputs.length = 0;
+  await cmdHarness(["stack", "edit", "Train", "--kind", "claude-code", "--member", "a", "--member", "b", "--member", "c"], flags);
+  expect(calls).toEqual([]);
+
+  outputs.length = 0;
+  await cmdHarness(["stack", "edit", "Train", "--mirror", "full"], jsonFlags);
+  expect(JSON.parse(outputs[0]!)).toMatchObject({ saved: false, unchanged: true, preview: null });
+  expect(calls).toEqual([]);
+});
+
+test("stack edit --dry-run with nothing changed says so instead of reporting a no-op mirror", async () => {
+  const { client, calls } = fakeClient({ previewHarnessMirror: async () => OVERWRITE });
+  currentClient = client;
+  await cmdHarness(["stack", "edit", "Train", "--mirror", "full", "--dry-run"], flags);
+  expect(calls).toEqual([]);
+  expect(outputs.join("\n")).toBe("no changes — stack Train already matches; nothing saved");
+});
+
+test("stack edit: unchanged fields ride neither the preview gate nor the PATCH", async () => {
+  const { client, calls } = fakeClient();
+  currentClient = client;
+  // A rename plus a mirror mode already in place is a rename: no preview, and
+  // no `mirrorMode` in the body (the server would mirror on its presence).
+  await cmdHarness(["stack", "edit", "Train", "--label", "New", "--mirror", "full"], flags);
+  expect(calls.some((c) => c.startsWith("preview"))).toBe(false);
+  expect(calls.at(-1)).toBe('patch:stk-aaaa1111:{"label":"New","expectedUpdatedAt":42}');
+
+  // A real mirror change keeps its preview; the unchanged kind and members stay out.
+  calls.length = 0;
+  await cmdHarness(["stack", "edit", "Train", "--mirror", "safe", "--kind", "claude-code", "--member", "a", "--member", "b", "--member", "c"], flags);
+  expect(calls[0]).toStartWith("preview:");
+  expect(calls.at(-1)).toBe('patch:stk-aaaa1111:{"mirrorMode":"safe","expectedUpdatedAt":42}');
 });
 
 // ── preview gate (D10) ───────────────────────────────────────────────────────
@@ -475,12 +528,69 @@ test("switch-account: other errors propagate; --cancel calls the cancel route; u
   await expect(cmdSwitchAccount(["abcdefgh"], flags)).rejects.toThrow(/may have gone through/);
 
   const cancelled: string[] = [];
-  currentClient = taskClient({ cancelScheduledAccountSwitch: async (id: string) => { cancelled.push(id); return { task: makeTask() }; } });
+  currentClient = taskClient({ cancelScheduledAccountSwitch: async (id: string) => { cancelled.push(id); return { task: makeTask(), cancelled: true }; } });
   await cmdSwitchAccount(["abcdefgh", "--cancel"], flags);
   expect(cancelled).toEqual(["abcdefgh12345678"]);
-  expect(outputs.join("\n")).toContain("cancelled");
+  expect(outputs.join("\n")).toBe("cancelled the scheduled account switch on abcdefgh");
 
   await expect(cmdSwitchAccount([], flags)).rejects.toThrow(/usage: agetor switch-account/);
+});
+
+test("switch-account --cancel says so when nothing was scheduled (the core's `cancelled: false`)", async () => {
+  currentClient = taskClient({ cancelScheduledAccountSwitch: async () => ({ task: makeTask(), cancelled: false }) });
+  await cmdSwitchAccount(["abcdefgh", "--cancel"], flags);
+  const text = outputs.join("\n");
+  expect(text).toBe("nothing was scheduled on abcdefgh — no account switch to cancel");
+  expect(text).not.toContain("cancelled");
+});
+
+test("switch-account --cancel against a core without `cancelled` falls back to the task as read before", async () => {
+  const scheduledState = {
+    stackId: "s", position: 0, tried: [], pendingSwap: null, lastMove: null, allExhausted: null,
+    scheduledSwitch: { requestedAt: 1 },
+  };
+  // Nothing scheduled on the task the CLI read: no "cancelled".
+  currentClient = taskClient({ cancelScheduledAccountSwitch: async () => ({ task: makeTask() }) });
+  await cmdSwitchAccount(["abcdefgh", "--cancel"], flags);
+  expect(outputs.join("\n")).toBe("nothing was scheduled on abcdefgh — no account switch to cancel");
+
+  outputs.length = 0;
+  const t = makeTask({ id: "abcdefgh12345678", agent: "b", harnessState: scheduledState as Task["harnessState"] });
+  currentClient = {
+    listTasks: async () => [t],
+    cancelScheduledAccountSwitch: async () => ({ task: makeTask() }),
+  } as unknown as AgetorClient;
+  await cmdSwitchAccount(["abcdefgh", "--cancel"], flags);
+  expect(outputs.join("\n")).toBe("cancelled the scheduled account switch on abcdefgh");
+});
+
+test("switch-account: a not-in-stack refusal prints the core's sentence, never the member-reasons heading", async () => {
+  currentClient = taskClient({
+    switchTaskAccount: async () => {
+      throw new ApiError(409, {
+        error: "this task's account is not in a stack with a backup account",
+        code: "not-in-stack",
+        reasons: [],
+      }, "this task's account is not in a stack with a backup account");
+    },
+  });
+  const err = await cmdSwitchAccount(["abcdefgh"], flags).then(() => null, (e: Error) => e);
+  expect(err!.message).toBe("this task's account is not in a stack with a backup account");
+
+  // A code this CLI does not know, even one carrying reasons, prints the
+  // core's own sentence rather than claiming no account can take the task.
+  currentClient = taskClient({
+    switchTaskAccount: async () => {
+      throw new ApiError(409, {
+        code: "some-new-code",
+        reasons: [{ harnessId: "a", label: "A", reason: "x" }],
+      }, "a new refusal\u001b[2J");
+    },
+  });
+  const err2 = await cmdSwitchAccount(["abcdefgh"], flags).then(() => null, (e: Error) => e);
+  expect(err2!.message).toContain("a new refusal");
+  expect(err2!.message).not.toContain("no other account in the stack can take this task");
+  expect(err2!.message).not.toContain("\u001b");
 });
 
 // ── item 19: edit --agent ────────────────────────────────────────────────────

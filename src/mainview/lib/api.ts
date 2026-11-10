@@ -720,7 +720,7 @@ export const api = {
   switchTaskAccount: (taskId: string) =>
     j<SwitchAccountResult>(`/tasks/${encodeURIComponent(taskId)}/switch-account`, { method: "POST" }, { retry: false }),
   cancelScheduledAccountSwitch: (taskId: string) =>
-    j<{ task: Task }>(`/tasks/${encodeURIComponent(taskId)}/switch-account`, { method: "DELETE" }),
+    j<{ task: Task; cancelled?: boolean }>(`/tasks/${encodeURIComponent(taskId)}/switch-account`, { method: "DELETE" }),
   deleteHarnessStack: (id: string) =>
     j<{ removed: true }>(`/harness-stacks/${encodeURIComponent(id)}`, { method: "DELETE" }),
   createHarness: (input: HarnessInput) =>

@@ -288,6 +288,14 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
   return `In use by ${segments.join(" and ")}`;
 }
 
+/** The view after a subpage's async save lands: back from `saved` while it is
+ *  still the view on screen, else unchanged. Compared by identity, because
+ *  every navigation makes a new view object, so a reopened editor on the same
+ *  stack is not the one that saved. */
+export function viewAfterSave(current: SettingsView, saved: SettingsView): SettingsView {
+  return current === saved ? backFromSubview(saved) : current;
+}
+
 /** The view the modal opens on: a deep-linked agent's edit subpage, else the
  *  requested section, else General. */
 function entryView(
@@ -970,7 +978,13 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 void refresh();
                 onChange?.();
               }}
-              onSaved={() => setView(backFromSubview(viewRef.current))}
+              onSaved={() => {
+                // The save may land after the user left this editor (rail
+                // click, Escape-pop, the History subpage): pop only while this
+                // editor's own view is still the one showing.
+                const saved = view;
+                setView((current) => viewAfterSave(current, saved));
+              }}
               onDirtyChange={(dirty) => {
                 subpageDirtyRef.current = dirty;
               }}

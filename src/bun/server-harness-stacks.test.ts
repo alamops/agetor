@@ -1482,6 +1482,36 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     }
   }, 60_000);
 
+  test("stack DELETE leaves a task whose account has since moved into another stack alone (N5)", async () => {
+    const a = makeAccount("mva");
+    const b = makeAccount("mvb");
+    const c = makeAccount("mvc");
+    const old = await makeStack([a, b], "n5-old");
+    const fresh = await makeStack([c], "n5-new");
+    const scheduled = seedTaskRow({ agent: a, column: "running" });
+    const schedRun = seedRun(scheduled, a, "running");
+    db.tasks.update(scheduled, { runId: schedRun });
+    const requestedAt = Date.now();
+    db.tasks.setHarnessState(scheduled, { ...baseState(old), scheduledSwitch: { requestedAt } } as never);
+    try {
+      // The account moves to the other stack; the task's state still records
+      // the old stack id (nothing has written it since).
+      expect((await call("PATCH", `/harness-stacks/${old}`, { members: [b] })).status).toBe(200);
+      expect((await call("PATCH", `/harness-stacks/${fresh}`, { members: [c, a] })).status).toBe(200);
+      expect(db.tasks.get(scheduled)!.harnessState?.stackId).toBe(old);
+      expect((await call("DELETE", `/harness-stacks/${old}`)).status).toBe(200);
+      const state = db.tasks.get(scheduled)!.harnessState;
+      // Its scheduled switch now belongs to the stack it is in: kept, and the
+      // state re-pointed there instead of wiped with the deleted stack.
+      expect(state?.scheduledSwitch?.requestedAt).toBe(requestedAt);
+      expect(state?.stackId).toBe(fresh);
+      expect(statusLines(schedRun).some((l) => l.includes("the stack was deleted"))).toBe(false);
+    } finally {
+      db.runs.update(schedRun, { status: "failed", endedAt: Date.now(), exitCode: 1 });
+      db.tasks.delete(scheduled);
+    }
+  }, 60_000);
+
   // ---- harness DELETE removes backups ------------------------------------
 
   test("harness DELETE removes the account's mirror backups and provenance; `mirrorRestorable` stops listing it", async () => {
@@ -1642,10 +1672,12 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
 
     const cancelled = await call("DELETE", `/tasks/${live}/switch-account`);
     expect(cancelled.status).toBe(200);
+    expect(cancelled.body.cancelled).toBe(true);
     expect(cancelled.body.task.harnessState?.scheduledSwitch ?? null).toBeNull();
     expect(statusLines(liveRun).some((l) => l.includes("scheduled account switch cancelled"))).toBe(true);
     const noop = await call("DELETE", `/tasks/${live}/switch-account`);
     expect(noop.status).toBe(200);
+    expect(noop.body.cancelled).toBe(false);
     expect(statusLines(liveRun).filter((l) => l.includes("scheduled account switch cancelled"))).toHaveLength(1);
     for (const id of [idle, live]) db.tasks.delete(id);
   }, 60_000);

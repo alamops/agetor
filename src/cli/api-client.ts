@@ -281,7 +281,7 @@ export class AgetorClient {
       throw switchMayHaveLanded(e, taskId);
     }
   }
-  cancelScheduledAccountSwitch(taskId: string): Promise<{ task: Task }> {
+  cancelScheduledAccountSwitch(taskId: string): Promise<{ task: Task; cancelled?: boolean }> {
     return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/switch-account`);
   }
   deleteTask(id: string): Promise<void> {

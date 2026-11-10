@@ -61,7 +61,7 @@ import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./tas
 import { checkAllHarnesses } from "./agent-status.ts";
 import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackChangedError, StackInputError, validateInput as validateStackInput } from "./harness-stacks.ts";
 import { claudeConfigDirFor } from "./harness-config-root.ts";
-import { clearFailoverState, failoverTaskIdsForStack } from "./harness-failover.ts";
+import { clearFailoverState, failoverTaskIdsForStack, repointTaskStatesAwayFromStack } from "./harness-failover.ts";
 import { harnessIdsWithProvenance } from "./harness-mirror-provenance.ts";
 import { deleteMirrorStateForHarness, mirrorStack, previewMirror, restoreMirror } from "./harness-mirror.ts";
 import { harnessSwapEvents } from "./harness-swap-history.ts";
@@ -4759,6 +4759,11 @@ export function startApiServer(
           // this stack after its last state write still names the old stack
           // id, so the stored-id filter alone would miss it (review S10).
           const affected = failoverTaskIdsForStack(stack.id);
+          // A task whose account has since moved into another stack still
+          // records this id until its next write: re-point it first, so the
+          // delete neither cancels its retry or scheduled switch nor wipes the
+          // state it now carries for the other stack.
+          repointTaskStatesAwayFromStack(stack.id);
           // An armed quota-reset retry or an all-exhausted block would
           // otherwise lose its countdown silently: cancel it first so the card
           // says why (the cancel also hands held follow-ups back to the
@@ -6405,8 +6410,11 @@ export function startApiServer(
           if (!tasks.get(req.params.id)) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
+          // `cancelled` says whether a switch was actually scheduled, so a
+          // caller can tell a cancel from a no-op.
+          const cancelled = tasks.get(req.params.id)?.harnessState?.scheduledSwitch != null;
           const task = cancelScheduledAccountSwitch(req.params.id);
-          return json({ task: withRunningSubagents(task) }, { headers: corsHeaders(req) });
+          return json({ task: withRunningSubagents(task), cancelled }, { headers: corsHeaders(req) });
         }),
       },
 

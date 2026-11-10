@@ -253,6 +253,11 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     expect(rows.some((r) => r.status === "running")).toBe(false);
     expect(db.tasks.get(task.id)!.agent).toBe(c);
     expect(histRows(stack.id, task.id).map((r) => r.trigger).sort()).toEqual(["limit", "limit"]);
+    // The held message was still waiting for its delivery when the successor
+    // it was meant for hit the limit: it never reached an account (no run
+    // echoes it, so it is not duplicated) and lands in the tray exactly once.
+    expect(rows.flatMap((r) => userRows(r.id)).filter((t) => t.includes("typed during the swap"))).toEqual([]);
+    expect(backlogTexts(task.id)).toEqual(["typed during the swap"]);
     for (const id of [a, b, c]) stacks.harnessStacks.clearLimitState(id);
     stacks.harnessStacks.delete(stack.id);
   }, 40_000);
@@ -276,7 +281,7 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     const prevSettle = orch.__setHarnessSwapSettleHookForTest(async (hooked, runId, phase) => {
       if (hooked !== task.id || phase !== "after-transfer") return;
       orch.__setHarnessSwapSettleHookForTest(null);
-      await orch.sendInput(runId, "typed during the swap");
+      expect((await orch.sendInput(runId, "typed during the swap")).delivered).toBe(true);
     });
     try {
       await withEnv({ AGETOR_FAKE_CLAUDE_TURN_MS: "250" }, async () => {
@@ -300,6 +305,10 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     expect(db.tasks.get(task.id)!.column).toBe("blocked");
     // Both accounts are cooling: a counted retry is armed, one blocked row written.
     expect(db.tasks.get(task.id)!.harnessState?.allExhausted?.nextAttemptAt).toBeGreaterThan(0);
+    // A blocked ending stashes the message held during the swap: in the tray
+    // once, on no run.
+    expect(rows.flatMap((r) => userRows(r.id)).filter((t) => t.includes("typed during the swap"))).toEqual([]);
+    expect(backlogTexts(task.id)).toEqual(["typed during the swap"]);
     for (const id of [a, b]) stacks.harnessStacks.clearLimitState(id);
     stacks.harnessStacks.delete(stack.id);
   }, 40_000);
@@ -359,6 +368,10 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     expect(rows[1]!.status).toBe("failed");
     expect(rows[2]!.agent).toBe(c);
     expect(rows.some((r) => r.status === "running")).toBe(false);
+    // The message held by the boot claim was waiting for the successor that
+    // limited: in the tray once, on no run.
+    expect(rows.flatMap((r) => userRows(r.id)).filter((t) => t.includes("typed during boot"))).toEqual([]);
+    expect(backlogTexts(task.id)).toEqual(["typed during boot"]);
     for (const id of [a, b, c]) stacks.harnessStacks.clearLimitState(id);
     stacks.harnessStacks.delete(stack.id);
   }, 40_000);
@@ -401,6 +414,95 @@ describe("finding 1: a successor limit while a claim is held is deferred, then s
     stacks.harnessStacks.clearLimitState(a);
     stacks.harnessStacks.delete(stack.id);
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Review S8: a live successor that limits while the boot claim is held is
+// settled once, by its deferred settlement, not blocked first
+// ---------------------------------------------------------------------------
+
+describe("S8: a live successor's deferred limit during the boot swap claim", () => {
+  test("is swapped once on release, never blocked by the boot reconcile first", async () => {
+    // The task the review is about: its successor (on B) is live after the
+    // restart, and the persisted swap (A -> B) is still in its state.
+    const a = alias("s8-a");
+    const b = alias("s8-b");
+    const c = alias("s8-c");
+    const stack = stacks.harnessStacks.create({ label: "s8", kind: "claude-code", members: [a, b, c] });
+    const task = makeTask(b, "plain work");
+    // A second, newer task whose boot resume runs first (newest first): its
+    // spawn hook holds the reconcile loop until the first task's successor has
+    // limited, so that limit lands inside the boot claim deterministically.
+    const x1 = alias("s8-x1");
+    const x2 = alias("s8-x2");
+    const other = stacks.harnessStacks.create({ label: "s8x", kind: "claude-code", members: [x1, x2] });
+    const blocker = makeTask(x1, "work", { column: "running", createdAt: Date.now() + 60_000 });
+    const blockerRun = insertRun(blocker.id, x1, { status: "running", endedAt: null, exitCode: null });
+    db.tasks.update(blocker.id, { runId: blockerRun });
+
+    const state = { handler: null as ((s: never, d: string) => void) | null };
+    const prevTap = orch.__setChunkHandlerTapForTest((_runId, hooked, handler) => {
+      if (hooked === task.id && state.handler === null) state.handler = handler as never;
+    });
+    const deferredLine = () => {
+      const live = db.tasks.get(task.id)!.runId;
+      return live ? statusLines(live).some((l) => l.includes("switching once the current switch settles")) : false;
+    };
+    let sawDeferred = false;
+    const prevSpawn = orch.__setHarnessSwapSpawnHookForTest(async (hooked) => {
+      if (hooked !== blocker.id) return;
+      orch.__setHarnessSwapSpawnHookForTest(null);
+      await waitFor(deferredLine, 10_000);
+      sawDeferred = deferredLine();
+    });
+    let booted: Promise<number> | null = null;
+    try {
+      await withEnv({ AGETOR_FAKE_CLAUDE_TURN_MS: "1500" }, async () => {
+        const started = await orch.startTask(task.id);
+        const liveRunId = (started as { runId: string }).runId;
+        await waitFor(() => state.handler !== null);
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline && stacks.harnessStacks.getLimitState(b) === null) {
+          state.handler!("status" as never, limitChunk());
+          await Bun.sleep(5);
+        }
+        expect(stacks.harnessStacks.getLimitState(b)).not.toBeNull();
+        // The restart left both swaps persisted.
+        const oldRun = insertRun(task.id, a, { status: "failed", exitCode: -1 });
+        db.tasks.setHarnessState(task.id, {
+          stackId: stack.id, position: 1, count: 3, tried: [a], allExhausted: null, lastMove: null,
+          pendingSwap: { from: a, to: b, reason: "quota", runId: oldRun, startedAt: Date.now() },
+        });
+        db.tasks.setHarnessState(blocker.id, {
+          stackId: other.id, position: 0, count: 2, tried: [x1], allExhausted: null, lastMove: null,
+          pendingSwap: { from: x1, to: x2, reason: "quota", runId: blockerRun, startedAt: Date.now() },
+        });
+        expect(db.runs.get(liveRunId)!.status).toBe("running");
+        booted = orch.reconcilePendingHarnessSwaps();
+        await booted;
+        await waitFor(settledRuns(task.id, 3), 15_000);
+        await waitFor(settledRuns(blocker.id, 2), 15_000);
+      });
+    } finally {
+      await booted;
+      orch.__setChunkHandlerTapForTest(prevTap);
+      orch.__setHarnessSwapSpawnHookForTest(prevSpawn);
+    }
+    expect(sawDeferred).toBe(true);
+    const rows = sortedRuns(task.id).filter((r) => r.agent !== a);
+    expect(rows.map((r) => r.agent)).toEqual([b, c]);
+    expect(rows[0]!.status).toBe("failed");
+    expect(rows[1]!.origin).toBe("harness-swap");
+    // Decided once, by the deferred settlement: no blocked row, no "run the
+    // task to continue" line the swap then contradicts.
+    expect(histRows(stack.id, task.id).map((r) => r.trigger)).toEqual(["limit"]);
+    expect(sortedRuns(task.id).some((r) => statusLines(r.id).some((l) => l.includes("the core restarted during the account switch")))).toBe(false);
+    expect(db.tasks.get(task.id)!.agent).toBe(c);
+    expect(db.tasks.get(task.id)!.column).not.toBe("blocked");
+    for (const id of [a, b, c, x1, x2]) stacks.harnessStacks.clearLimitState(id);
+    stacks.harnessStacks.delete(stack.id);
+    stacks.harnessStacks.delete(other.id);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -829,9 +931,12 @@ describe("finding 5: cooldown clears are conditional", () => {
     let sawOwn = false;
     let ownAfter: unknown = "unset";
     let newerAfter: ReturnType<typeof stacks.harnessStacks.getLimitState> = null;
+    let wideAfter: unknown = "unset";
     try {
       await withEnv({ AGETOR_CODEX_DRIVER: "fake", AGETOR_CODEX_BIN: "/bin/echo", AGETOR_FAKE_CODEX_RESOLVE_DELAY_MS: "700" }, async () => {
-        feed(own, () => { sawOwn = stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" }) !== null; });
+        // `getLimitState(a, { model })` also returns the account-wide row, so
+        // only the stored row's own `model` proves the signal kept its model.
+        feed(own, () => { sawOwn = stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" })?.model === "fixture-codex-model"; });
         expect(await orch.startTask(own.id)).toHaveProperty("runId");
         await waitFor(() => db.tasks.get(own.id)?.column === "review", 10_000);
         ownAfter = stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" });
@@ -841,6 +946,7 @@ describe("finding 5: cooldown clears are conditional", () => {
         expect(await orch.startTask(newer.id)).toHaveProperty("runId");
         await waitFor(() => db.tasks.get(newer.id)?.column === "review", 10_000);
         newerAfter = stacks.harnessStacks.getLimitState(a, { model: "fixture-codex-model" });
+        wideAfter = stacks.harnessStacks.getLimitState(a);
       });
     } finally {
       orch.__setChunkHandlerTapForTest(null);
@@ -850,6 +956,9 @@ describe("finding 5: cooldown clears are conditional", () => {
     expect(ownAfter).toBeNull();
     expect(newerAfter).not.toBeNull();
     expect(newerAfter!.message).toBe("newer model overwrite");
+    expect(newerAfter!.model).toBe("fixture-codex-model");
+    // Nothing was written account-wide: other models stay usable.
+    expect(wideAfter).toBeNull();
     stacks.harnessStacks.delete(stack.id);
   }, 40_000);
 

@@ -71,6 +71,23 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
   const [scrollTop, setScrollTop] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
   const dirty = useRef(false);
+  // A save can settle after the user has left this editor for another form;
+  // its dirty report must not overwrite that form's. Report only while
+  // mounted, and say "clean" once on unmount (the parent's discard prompt has
+  // already run by then), as the other settings forms do.
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
+  const mountedRef = useRef(true);
+  const reportDirty = (value: boolean) => {
+    if (mountedRef.current) onDirtyChangeRef.current?.(value);
+  };
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      onDirtyChangeRef.current?.(false);
+    };
+  }, []);
 
   useEffect(() => {
     const next = existing ? draftFromStack(existing) : emptyDraft();
@@ -78,7 +95,7 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
     setDraft(next);
     setPreview(null);
     dirty.current = false;
-    onDirtyChange?.(false);
+    reportDirty(false);
   }, [stackId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A refresh landed (or the stack list loaded after the editor opened) and
@@ -95,7 +112,7 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
     setDraft(next);
     if (!dirty.current) {
       dirty.current = true;
-      onDirtyChange?.(true);
+      reportDirty(true);
     }
   };
 
@@ -155,7 +172,7 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
       }
       setPreview(null);
       dirty.current = false;
-      onDirtyChange?.(false);
+      reportDirty(false);
       // The config copy is best-effort per file: a partially mirrored stack is
       // a success with warnings, not a silent one. The CLI and the swap status
       // line surface these; the primary UI must too (review R13-M2).
@@ -182,7 +199,7 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
         setBase(e.current);
         setDraft(draftFromStack(e.current));
         dirty.current = false;
-        onDirtyChange?.(false);
+        reportDirty(false);
         setError(null);
         onChange?.();
         return;
@@ -205,7 +222,7 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
 
   const finishWithoutChanges = () => {
     dirty.current = false;
-    onDirtyChange?.(false);
+    reportDirty(false);
     toast.info("No changes to save");
     onSaved?.();
   };

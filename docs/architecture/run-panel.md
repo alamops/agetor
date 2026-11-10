@@ -46,14 +46,16 @@ nor loses the request:
 - `SwitchAccountControl`'s `busy` (`{ taskId, op: "switch" | "cancel" }`, the
   Switch to next account / Cancel guard; the scheduled state itself is not local,
   it reads `task.harnessState.scheduledSwitch`, so a reload or a CLI request
-  shows the same thing);
-- `RunPanelBody`'s `switchingAgentFor` (the account picker is disabled with a
-  "Switching…" note while the awaited same-stack PATCH copies the transcript).
+  shows the same thing; an archived task is offered no switch, but a switch
+  still scheduled on one keeps its Cancel);
+- `TaskDetails`'s `switchingAgentFor` (the account picker is disabled with a
+  "Switching…" note while the awaited same-stack PATCH copies the transcript;
+  `TaskDetails` is rendered by `RunPanelBody`).
 
 New per-task state in these children should follow the same tagging, or get a
 reset line. For a task in a stack of two or more accounts the account picker
 lists only the stack's members (`stackPickerOptions`); its cooling marks are
-recomputed on a 30 s `pickerNow` tick (only while `limitStates` is non-empty,
+recomputed on a 30 s `pickerNow` tick (`TaskDetails` state) (only while `limitStates` is non-empty,
 cleared on unmount), so an expired cooldown stops reading "cooling" without a
 new payload. The non-editable Harness row shows the account's label. A completed account PATCH or switch calls
 `onTaskFieldsChanged` with only the fields it owns (`agent`, `harnessState` and,

@@ -331,6 +331,19 @@ describe("parseHarnessLimitSignal", () => {
     }
   });
 
+  test("passes a per-model signal's model through, and drops a malformed one", () => {
+    const base = { reason: "rate_limit", resetAtMs: null, message: "429 for the model", source: "codex-error" } as const;
+    // Dropping the model here would turn a per-model cooldown into one for the
+    // whole account.
+    expect(parseHarnessLimitSignal({ ...base, model: "gpt-5.6-codex" })).toEqual({ ...base, model: "gpt-5.6-codex" });
+    for (const model of ["", 42, null, "m".repeat(81)]) {
+      const parsed = parseHarnessLimitSignal({ ...base, model });
+      expect(parsed, JSON.stringify(model)).toEqual({ ...base });
+      expect(parsed && "model" in parsed).toBe(false);
+    }
+    expect(parseHarnessLimitSignal({ ...base, model: "m".repeat(80) })?.model).toBe("m".repeat(80));
+  });
+
   test("caps a runaway message", () => {
     const parsed = parseHarnessLimitSignal({
       reason: "rate_limit",

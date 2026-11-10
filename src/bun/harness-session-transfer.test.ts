@@ -1367,7 +1367,9 @@ describe("orphaned handoff copies (migration 088)", () => {
     expect((await run(from, to, taskId, newSid)).ok).toBe(false);
     expect(dbm.harnessSessionHandoffs.get(taskId, to.id, "claude_session_id")).toEqual(oldRow);
     expect(readFileSync(path.join(to.home, "projects", column, `${oldSid}.jsonl`), "utf8")).toBe("old");
-    // The pending record of the never-created sidecar was swept away.
+    // The pending record of the never-created sidecar was swept away (the
+    // failure sweep is fired, not awaited, by the transfer).
+    await transfer.orphanSweepsSettled();
     expect(orphansOf(to.id)).toEqual([]);
     await transfer.cleanupHarnessSessionCopies(taskId);
   });
@@ -1390,6 +1392,98 @@ describe("orphaned handoff copies (migration 088)", () => {
     // Once the transfer is over (and failed, so no row names it), it goes.
     expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).removed).toBe(1);
     expect(existsSync(copying)).toBe(false);
+  });
+
+  test("a sweep never forgets the pending record of a transfer of the same session that started mid-sweep (review S5)", async () => {
+    const to = alias("claude-code");
+    // An old pending record of the session, from a transfer that failed.
+    const file = path.join(to.home, "projects", "enc", oldSid, "tool-results", "r.txt");
+    write(file, "left behind");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
+    const paused = transfer.pauseOrphanSweepForTests();
+    const sweeping = transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    await paused.reached;
+    // The sweep has unlinked the file but not yet forgotten its record. A new
+    // transfer of the same session starts now: it records the same path as
+    // pending (in the same millisecond, as fast as it can) and recreates it.
+    expect(existsSync(file)).toBe(false);
+    const release = transfer.holdTransferForTests(to.id, "claude_session_id", oldSid);
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [file]);
+    write(file, "being copied");
+    paused.resume();
+    await sweeping;
+    // The transfer's pending record survives the sweep that was already running.
+    expect(orphansOf(to.id)).toEqual([{ sessionId: oldSid, path: file }]);
+    // The transfer fails: its own sweep still finds and removes the new copy.
+    release();
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).removed).toBe(1);
+    expect(existsSync(file)).toBe(false);
+    expect(orphansOf(to.id)).toEqual([]);
+  });
+
+  test("a failed transfer returns without waiting for its cleanup sweep to get a turn (review N4)", async () => {
+    const from = alias("claude-code");
+    const to = alias("claude-code");
+    const blocker = alias("claude-code");
+    const column = claudeTmux.encodeProjectPath(cwd);
+    // Another sweep holds the (serialized) sweep queue.
+    const blocking = path.join(blocker.home, "projects", "enc", oldSid, "tool-results", "b.txt");
+    write(blocking, "x");
+    dbm.harnessOrphanedCopies.add(blocker.id, "claude_session_id", oldSid, [blocking]);
+    const paused = transfer.pauseOrphanSweepForTests();
+    const queued = transfer.sweepOrphanedHandoffCopies({ harnessId: blocker.id });
+    await paused.reached;
+    try {
+      const taskId = seedTask(`orph-n4-${seq}`);
+      write(path.join(from.home, "projects", column, `${newSid}.jsonl`), "new");
+      write(path.join(from.home, "projects", column, newSid, "subagents", "agent-2.jsonl"), "sub");
+      // The transcript's destination is a directory: the copy fails after the
+      // sidecar destination was recorded.
+      mkdirSync(path.join(to.home, "projects", column, `${newSid}.jsonl`), { recursive: true });
+      const outcome = await Promise.race([
+        run(from, to, taskId, newSid).then((r) => (r.ok ? "ok" : "failed")),
+        Bun.sleep(3000).then(() => "still waiting"),
+      ]);
+      expect(outcome).toBe("failed");
+      // Its sweep is queued behind the blocked one and has not run yet.
+      expect(orphansOf(to.id).length).toBeGreaterThan(0);
+    } finally {
+      paused.resume();
+    }
+    await queued;
+    await transfer.orphanSweepsSettled();
+    expect(orphansOf(to.id)).toEqual([]);
+    expect(orphansOf(blocker.id)).toEqual([]);
+  });
+
+  test("a planted record naming a session another task still resumes on the account deletes nothing (review S18)", async () => {
+    const to = alias("claude-code");
+    const taskId = seedTask(`orph-runs-${seq}`);
+    // The account's own conversation: a run on it recorded the session, and no
+    // handoff row names it.
+    const runId = randomUUID();
+    dbm.runs.insert({
+      id: runId, taskId, agent: to.id, status: "succeeded", startedAt: Date.now(), endedAt: Date.now(),
+      exitCode: 0, tmuxSession: null, claudeSessionId: oldSid, codexSessionId: null, cursorSessionId: null,
+      geminiSessionId: null, fxSessionId: null,
+    } as never);
+    const transcript = path.join(to.home, "projects", "enc", `${oldSid}.jsonl`);
+    write(transcript, "live conversation");
+    dbm.harnessOrphanedCopies.add(to.id, "claude_session_id", oldSid, [transcript]);
+    const swept = await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id });
+    expect(swept).toEqual({ removed: 0, forgotten: 0, retained: 1 });
+    expect(readFileSync(transcript, "utf8")).toBe("live conversation");
+
+    // Once a handoff of another session supersedes it on this account, the
+    // older session is no longer the one the task resumes there: swept.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: to.id, columnName: "claude_session_id", sessionId: newSid, copiedPaths: [],
+      createdAt: Date.now() + 1,
+    });
+    expect((await transfer.sweepOrphanedHandoffCopies({ harnessId: to.id })).removed).toBe(1);
+    expect(existsSync(transcript)).toBe(false);
+    dbm.db.run("DELETE FROM runs WHERE id = ?", [runId]);
+    dbm.harnessSessionHandoffs.deleteOne(taskId, to.id, "claude_session_id");
   });
 
   test("a session live on a handoff row of the same account is never swept", async () => {

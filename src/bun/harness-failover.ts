@@ -118,21 +118,41 @@ export function patchTaskState(
 }
 
 /**
- * The ids of every task whose failover state belongs to `stackId`: the
- * recorded `stackId` OR the stack the task's account resolves to right now.
- * A stack delete must clear both — an account edited into this stack after the
- * task's last write still names the old train (review S10). Call BEFORE the
- * stack row is deleted (the resolution needs the membership).
+ * The ids of every task whose failover state belongs to `stackId`: the stack
+ * the task resolves to right now — its account's current stack, or, for an
+ * account that left every stack, the recorded one. A stack delete must clear
+ * those — an account edited into this stack after the task's last write still
+ * names the old train (review S10) — and nothing else: a task whose account
+ * has since moved into ANOTHER stack still names this one until its next
+ * write, but its retry and scheduled switch belong to the stack it is in now.
+ * Call BEFORE the stack row is deleted (the resolution needs the membership),
+ * together with {@link repointTaskStatesAwayFromStack}.
  */
 export function failoverTaskIdsForStack(stackId: string): string[] {
   const ids: string[] = [];
   for (const task of tasks.list()) {
-    if (task.harnessState?.stackId === stackId) {
-      ids.push(task.id);
-      continue;
-    }
     if (!task.harnessState && !retryTimers.has(task.id)) continue;
     if (harnessStacks.resolveForTask(task)?.stack.id === stackId) ids.push(task.id);
+  }
+  return ids;
+}
+
+/**
+ * Re-point the state of every task that still records `stackId` but whose
+ * account now belongs to another stack, so the stack delete (which clears
+ * every state recording the deleted id) leaves it alone. Call BEFORE the
+ * delete. Returns the re-pointed ids.
+ */
+export function repointTaskStatesAwayFromStack(stackId: string): string[] {
+  const ids: string[] = [];
+  for (const task of tasks.list()) {
+    if (task.harnessState?.stackId !== stackId) continue;
+    const resolved = harnessStacks.resolveForTask(task);
+    if (!resolved || resolved.stack.id === stackId) continue;
+    // An identity mutation: `updateTaskState` re-points the base at the
+    // stack the task resolves to now.
+    updateTaskState(task.id, (state) => state);
+    ids.push(task.id);
   }
   return ids;
 }
@@ -909,7 +929,11 @@ export function planManualSwitchTarget(
   | { kind: "next"; stack: HarnessStack; member: HarnessStackMember }
   | { kind: "refused"; code: "not-in-stack" | "no-usable-member"; reasons: HarnessMemberReason[] } {
   const resolved = harnessStacks.resolveForTask(task);
-  if (!resolved || resolved.stack.members.length < 2) {
+  // An account that left every stack still resolves to the stack it was in
+  // (`orphaned`), but it is not a member any more: a move from it is not a
+  // same-stack switch, so it would take the outside-stack reset path (no
+  // transfer, follow-ups dropped, no history row) while reporting success.
+  if (!resolved || resolved.orphaned || resolved.stack.members.length < 2) {
     return { kind: "refused", code: "not-in-stack", reasons: [] };
   }
   const { stack, current } = resolved;

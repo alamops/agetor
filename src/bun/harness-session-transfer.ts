@@ -267,7 +267,10 @@ export function holdTransferForTests(harnessId: string, column: SessionIdColumn,
 }
 
 /** Run one adapter transfer with its session marked in flight (set before the
- *  first await), then, after a failure, sweep whatever it recorded. */
+ *  first await), then, after a failure, sweep whatever it recorded. The sweep
+ *  is fired, not awaited: it queues behind every other sweep, and the caller
+ *  usually holds the task's start claim while it waits for this result. It
+ *  never rejects, and what it cannot remove stays on record for a later one. */
 async function heldTransfer(
   harnessId: string,
   column: SessionIdColumn,
@@ -281,7 +284,7 @@ async function heldTransfer(
   } finally {
     release();
   }
-  if (!result.ok) await sweepOrphanedHandoffCopies({ harnessId, columnName: column, sessionId });
+  if (!result.ok) void sweepOrphanedHandoffCopies({ harnessId, columnName: column, sessionId });
   return result;
 }
 
@@ -874,6 +877,40 @@ export interface OrphanSweepResult {
 
 let sweepChain: Promise<unknown> = Promise.resolve();
 
+/** Resolves once every sweep queued so far has finished (a failed transfer's
+ *  sweep is fired without awaiting). Never rejects. */
+export function orphanSweepsSettled(): Promise<void> {
+  return sweepChain.then(() => {}, () => {});
+}
+
+/** Test seam: the next sweep that removes a group pauses after the removal and
+ *  before it forgets the records, until `resume` is called. */
+let sweepPauseForTests: { arrive: () => void; gate: Promise<void> } | null = null;
+
+export function pauseOrphanSweepForTests(): { reached: Promise<void>; resume: () => void } {
+  let arrive!: () => void;
+  let resume!: () => void;
+  const reached = new Promise<void>((r) => { arrive = r; });
+  const gate = new Promise<void>((r) => { resume = r; });
+  sweepPauseForTests = { arrive, gate };
+  return { reached, resume };
+}
+
+/**
+ * True when a task's run on this account recorded `sessionId` and that is
+ * still the session the task resumes there (`findSessionIdForHarness`): its
+ * files are a live conversation, even though no handoff row names it (the
+ * account's own session, or one it resumed after a handoff). Orphan records
+ * are untrusted rows, so one naming such a session is never acted on. A
+ * session only an older run used, superseded since, is not live.
+ */
+function liveOnRunsOfHarness(harnessId: string, column: SessionIdColumn, sessionId: string): boolean {
+  for (const taskId of runs.taskIdsWithSession(column, sessionId)) {
+    if (findSessionIdForHarness(taskId, column, harnessId) === sessionId) return true;
+  }
+  return false;
+}
+
 /**
  * Remove orphaned handoff copies, optionally only one account's, column's or
  * session's. Each path is removed under exactly the handoff cleanup rules
@@ -908,6 +945,11 @@ async function sweepOnce(
   filter: { harnessId?: string; columnName?: SessionIdColumn; sessionId?: string },
 ): Promise<OrphanSweepResult> {
   const out: OrphanSweepResult = { removed: 0, forgotten: 0, retained: 0 };
+  // Taken before the listing: a record written after it belongs to a transfer
+  // of the same session that started while this sweep yielded (its pending
+  // path, possibly one this sweep had just unlinked and the copy is about to
+  // recreate). Only records stamped at or before the mark are forgotten.
+  const mark = harnessOrphanedCopies.sweepMark();
   const rows = harnessOrphanedCopies
     .list(filter.harnessId !== undefined ? { harnessId: filter.harnessId } : {})
     .filter((r) => (filter.columnName === undefined || r.columnName === filter.columnName)
@@ -915,14 +957,17 @@ async function sweepOnce(
   for (const group of groupOrphans(rows)) {
     const harness = harnesses.getByIdOrKind(group.harnessId);
     if (!harness) {
-      harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths);
+      harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths, { notAfter: mark });
       out.forgotten += group.paths.length;
       continue;
     }
     const busy = () =>
       transferInFlight(group.harnessId, group.columnName, group.sessionId)
       || harnessSessionHandoffs.hasLiveSession(group.harnessId, group.columnName, group.sessionId);
-    if (busy()) {
+    // The runs lookup is asked once per group, not between files: a run
+    // cannot start resuming this session on the account mid-sweep without a
+    // live handoff row or a transfer, which `busy` re-checks.
+    if (busy() || liveOnRunsOfHarness(harness.id, group.columnName, group.sessionId)) {
       out.retained += group.paths.length;
       continue;
     }
@@ -936,9 +981,15 @@ async function sweepOnce(
       // transfer of this session may start (or its row go live) meanwhile.
       { shouldStop: busy },
     );
+    if (sweepPauseForTests) {
+      const pause = sweepPauseForTests;
+      sweepPauseForTests = null;
+      pause.arrive();
+      await pause.gate;
+    }
     const keep = new Set(result.retained);
     const done = group.paths.filter((p) => !keep.has(p));
-    harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, done);
+    harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, done, { notAfter: mark });
     out.removed += result.removed.length;
     out.forgotten += done.length - result.removed.length;
     out.retained += keep.size;

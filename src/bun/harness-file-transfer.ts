@@ -11,6 +11,9 @@
  *   linked intermediate directory cannot redirect a read outside the account;
  * - writes go to a sibling temp file, are fsynced, then renamed — so a reader
  *   never sees a half-written credential or session;
+ * - a temp file an interrupted write left behind is removed, once it is an
+ *   hour old, the next time a write lands in its folder
+ *   (`sweepStaleTempFiles`);
  * - the mirror's tree copy preserves each file's mtime and skips a destination
  *   that already has the same size and mtime, so a repeat mirror rewrites only
  *   what changed;
@@ -38,7 +41,6 @@ import {
   unlinkSync,
 } from "node:fs";
 import {
-  chmod,
   open,
   rename,
   unlink,
@@ -344,6 +346,77 @@ export function ensurePlainDirUnder(root: string, dir: string): void {
   }
 }
 
+/** A temp file this much older than now (by its last data OR inode change, so
+ *  a copy that just stamped the source's old mtime onto its temp file still
+ *  reads as fresh) was left by an interrupted write: no live write keeps a
+ *  temp file anywhere near this long. */
+const STALE_TEMP_MS = 60 * 60 * 1000;
+/** One sweep per directory per this interval; a tree copy writes many files
+ *  into one folder. */
+const TEMP_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+const TEMP_SWEEP_MEMO_MAX = 10_000;
+/** Exactly the names {@link atomicWriteFile}, {@link copyRegularFileDetailed}
+ *  and the mirror's link swaps create: `.agetor-tmp-<uuid>`. */
+const TEMP_NAME_RE = /^\.agetor-tmp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const sweptDirs = new Map<string, number>();
+let staleTempAgeMs = STALE_TEMP_MS;
+
+/**
+ * Remove the `.agetor-tmp-*` leftovers of interrupted writes from `dir`. A crash
+ * (or a kill) between a temp file's creation and its rename leaves it behind,
+ * now of any size, and nothing else ever looks at it. Called wherever a write
+ * is about to land in a folder (so every mirror and session transfer sweeps
+ * the folders it writes into) and by the mirror for the destination folders it
+ * visits. Only a direct entry with the exact temp-name shape that is a regular
+ * file or a symlink (a link swap's temp) is removed, after an `lstat`: nothing
+ * is followed, `unlink` of a link removes the link itself, and a folder is
+ * never entered. `dir` must already be verified by the caller (a plain
+ * directory below its trusted root). Best effort, never throws; at most one
+ * sweep per folder per {@link TEMP_SWEEP_INTERVAL_MS}. Returns how many it
+ * removed.
+ */
+export function sweepStaleTempFiles(dir: string): number {
+  const key = path.resolve(dir);
+  const now = Date.now();
+  const last = sweptDirs.get(key);
+  if (last !== undefined && now - last < TEMP_SWEEP_INTERVAL_MS) return 0;
+  if (sweptDirs.size >= TEMP_SWEEP_MEMO_MAX) {
+    for (const [d, at] of sweptDirs) if (now - at >= TEMP_SWEEP_INTERVAL_MS) sweptDirs.delete(d);
+    if (sweptDirs.size >= TEMP_SWEEP_MEMO_MAX) sweptDirs.clear();
+  }
+  sweptDirs.set(key, now);
+  let names: string[];
+  try {
+    if (!lstatSync(key).isDirectory()) return 0;
+    names = readdirSync(key);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!TEMP_NAME_RE.test(name)) continue;
+    const p = path.join(key, name);
+    try {
+      const st = lstatSync(p);
+      if (!st.isFile() && !st.isSymbolicLink()) continue;
+      if (now - Math.max(st.mtimeMs, st.ctimeMs) < staleTempAgeMs) continue;
+      unlinkSync(p);
+      removed++;
+    } catch {
+      // Gone already, or not ours to remove: leave it.
+    }
+  }
+  return removed;
+}
+
+/** Tests only: treat temp files older than `ms` as stale (null restores the
+ *  default) and forget which folders were swept. `bun test` shares one
+ *  process, so restore it. */
+export function setStaleTempAgeForTests(ms: number | null): void {
+  staleTempAgeMs = ms ?? STALE_TEMP_MS;
+  sweptDirs.clear();
+}
+
 /**
  * Chunk size for reads and writes. Every task shares Bun's main thread, so a
  * 64 MB session copy must yield between chunks instead of issuing one
@@ -369,6 +442,7 @@ export async function atomicWriteFile(
   // historical recursive mkdir is fine.
   if (opts.root) ensurePlainDirUnder(opts.root, dir);
   else mkdirSync(dir, { recursive: true, mode: 0o700 });
+  sweepStaleTempFiles(dir);
   const tmp = path.join(dir, `.agetor-tmp-${randomUUID()}`);
   try {
     const handle = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
@@ -380,11 +454,13 @@ export async function atomicWriteFile(
         if (bytesWritten <= 0) throw new Error(`short write to ${tmp}`);
         written += bytesWritten;
       }
+      // On the open descriptor, never by path: the temp name sits in an
+      // agent-writable folder, and a link swapped in at it would be followed.
+      await handle.chmod(opts.mode ?? 0o600);
       await handle.sync();
     } finally {
       await handle.close();
     }
-    await chmod(tmp, opts.mode ?? 0o600);
     await rename(tmp, p);
   } catch (err) {
     try {
@@ -458,6 +534,7 @@ export async function copyRegularFileDetailed(
     const dir = path.dirname(dest);
     if (opts.root) ensurePlainDirUnder(opts.root, dir);
     else mkdirSync(dir, { recursive: true, mode: 0o700 });
+    sweepStaleTempFiles(dir);
     let created = false;
     try {
       const existing = lstatSync(dest);
@@ -495,11 +572,12 @@ export async function copyRegularFileDetailed(
         // The rename below keeps the inode's times, so the mirror's
         // unchanged-file check sees the source's mtime on the next run.
         if (opts.skipUnchanged) await target.utimes(st.atime, st.mtime);
+        // By descriptor, like the write itself (see `atomicWriteFile`).
+        await target.chmod(0o600);
         await target.sync();
       } finally {
         await target.close();
       }
-      await chmod(tmp, 0o600);
       await rename(tmp, dest);
     } catch (err) {
       try {

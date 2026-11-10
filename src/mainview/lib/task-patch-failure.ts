@@ -57,7 +57,10 @@ export function switchAccountFailureToast(error: unknown): TaskPatchFailureToast
     };
   }
   const body = error instanceof ApiError ? (error.body as Partial<SwitchAccountRefusal> | null) : null;
-  const reasons = Array.isArray(body?.reasons) ? body.reasons : [];
+  // The per-member heading fits only the no-usable-member refusal (or an older
+  // core that sent no code); any other code reads as the core's own sentence.
+  const memberRefusal = body?.code === "no-usable-member" || body?.code === undefined;
+  const reasons = memberRefusal && Array.isArray(body?.reasons) ? body.reasons : [];
   if (reasons.length > 0) {
     return {
       title: "Couldn't switch account",

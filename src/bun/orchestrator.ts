@@ -953,16 +953,20 @@ function maybeReleaseHeldTask(taskId: string): void {
   if (deletingTaskIds.has(taskId)) return;
   drainSessionJsonl(taskId);
   const task = tasks.get(taskId);
-  if (!task || task.archivedAt != null || task.column !== "running" || task.runId == null) return;
-  if (runs.get(task.runId)?.status !== "succeeded") return;
-  if (subagents.hasRunning(taskId)) return;
-  updateColumn(taskId, task.runId, "review");
-  // A "switch to next account" deferred behind the background agents runs now.
-  if (task.harnessState?.scheduledSwitch) {
-    void applyScheduledSwitch(taskId).catch((err) => {
-      console.warn(`[agetor] deferred account switch for ${taskId} failed:`, err);
-    });
+  if (!task || task.archivedAt != null) return;
+  if (
+    task.column === "running"
+    && task.runId != null
+    && runs.get(task.runId)?.status === "succeeded"
+    && !subagents.hasRunning(taskId)
+  ) {
+    updateColumn(taskId, task.runId, "review");
   }
+  // A "switch to next account" deferred behind the background agents runs now.
+  // Not only on the release above: a turn that FAILED with background agents
+  // still running (an API error) is never held in `running`, yet its switch
+  // waited for the same agents, and this edge is the only one left to apply it.
+  settleWaitingScheduledSwitch(taskId);
 }
 
 /**
@@ -1890,9 +1894,17 @@ function adoptPendingTaskCancel(taskId: string, runId: string): boolean {
  *  against the claim that no minted run adopted. */
 function releaseStartingClaim(taskId: string): void {
   startingTaskIds.delete(taskId);
-  pendingCancelTaskIds.delete(taskId);
+  const stopped = pendingCancelTaskIds.delete(taskId);
   // An OpenCode wake that arrived while the claim was held waits for this edge.
   if (hasDeferredOpencodeWake(taskId)) queueMicrotask(() => retryDeferredOpencodeWake(taskId));
+  // A turn that ended while this claim was held left its scheduled switch to
+  // the claim holder (`settleScheduledSwitchAtTurnEnd`). A holder that minted a
+  // run hands it to that run's turn end; one that ended without a live run (a
+  // failed pre-flight, a failed spawn) must settle it here, or it would fire at
+  // some unrelated later turn end.
+  if (tasks.get(taskId)?.harnessState?.scheduledSwitch) {
+    queueMicrotask(() => settleWaitingScheduledSwitch(taskId, { stopped }));
+  }
 }
 
 /**
@@ -3781,6 +3793,7 @@ function noteRunIdOf(taskId: string): string | null {
 function accountSwitchMustWait(task: Task): boolean {
   return (
     (task.runId != null && active.has(task.runId))
+    || isTurnSettling(task.id)
     || runs.hasRunning(task.id)
     || startingTaskIds.has(task.id)
     || swapWindowTaskIds.has(task.id)
@@ -4030,6 +4043,8 @@ async function settleScheduledSwitchAtTurnEnd(
     dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
     return;
   }
+  // Another start holds the task: its run's turn end decides, or, when it ends
+  // without a live run, the claim release does (`releaseStartingClaim`).
   if (startingTaskIds.has(taskId)) return;
   if (isHeldByBackgroundAgents(taskId) || subagents.hasRunning(taskId)) {
     // Dropping the REPL would abandon the background agents: wait for them
@@ -4039,6 +4054,45 @@ async function settleScheduledSwitchAtTurnEnd(
     return;
   }
   await applyScheduledSwitch(taskId, true);
+}
+
+/**
+ * A scheduled switch whose turn already ended but had to wait (for background
+ * agents, or for another start's claim): apply it now that the task is idle,
+ * the same as at a turn end. `stopped`: the user pressed Stop on the claim
+ * that held the task, which drops the request like a Stop on the turn. A
+ * request on an archived task is dropped, as at boot. Anything still owning
+ * the task (a live turn, a claim, a swap, background agents) keeps it for its
+ * own end. Fire-and-forget.
+ */
+function settleWaitingScheduledSwitch(taskId: string, opts: { stopped?: boolean } = {}): void {
+  const task = tasks.get(taskId);
+  const scheduled = task?.harnessState?.scheduledSwitch;
+  if (!task || !scheduled) return;
+  if (task.archivedAt != null) {
+    patchTaskState(taskId, { scheduledSwitch: null });
+    return;
+  }
+  // A Stop that landed on the start holding the task: either recorded on the
+  // claim with no run to adopt it, or adopted by a run that was cancelled
+  // before it registered (no done handler ever settles that run).
+  const latest = task.runId ? runs.get(task.runId) : null;
+  if (opts.stopped || (latest?.status === "cancelled" && (latest.endedAt ?? 0) >= scheduled.requestedAt)) {
+    dropScheduledSwitch(taskId, "scheduled account switch cancelled (stopped)");
+    return;
+  }
+  if (launchesFrozenFlag) return;
+  if (accountSwitchMustWait(task) || isHeldByBackgroundAgents(taskId) || subagents.hasRunning(taskId)) return;
+  void applyScheduledSwitch(taskId).catch((err) => {
+    console.warn(`[agetor] deferred account switch for ${taskId} failed:`, err);
+  });
+}
+
+/** A limit settlement that threw supersedes a scheduled switch exactly as one
+ *  that moved or blocked the task does (it is consumed there); the throw can
+ *  land before that point, and the task is blocked either way. */
+function dropScheduledSwitchAfterFailedLimitMove(taskId: string): void {
+  dropScheduledSwitch(taskId, "scheduled account switch dropped: the account switch after the limit failed");
 }
 
 /**
@@ -4062,6 +4116,24 @@ async function reconcileScheduledSwitchesAtBoot(): Promise<void> {
     }
   }
 }
+/**
+ * Test seam: runs synchronously in a done handler right where it pumps the
+ * subagent watcher (`pumpWatcherForHoldCheck`), after the run left `active`
+ * and its status was written, before the turn-end account switch. A test can
+ * settle the last background agent here, exactly as a pump that reads its
+ * completion line would.
+ */
+type TurnSettlePumpHook = (taskId: string, runId: string) => void;
+let turnSettlePumpHook: TurnSettlePumpHook | null = null;
+
+/** Test-only: install/clear {@link turnSettlePumpHook}. Returns the previous
+ *  hook so a test can restore it. */
+export function __setTurnSettlePumpHookForTest(hook: TurnSettlePumpHook | null): TurnSettlePumpHook | null {
+  const prev = turnSettlePumpHook;
+  turnSettlePumpHook = hook;
+  return prev;
+}
+
 /** Tasks whose all-exhausted retry is currently starting a successor. A
  *  duplicate timer callback must not mint a second run. */
 const harnessRetriesInFlight = new Set<string>();
@@ -4454,6 +4526,7 @@ async function settleDeferredLimit(taskId: string, runId: string, signal: Harnes
       swapCancelRequested.delete(taskId);
       runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
       saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${err instanceof Error ? err.message : String(err)}`);
+      dropScheduledSwitchAfterFailedLimitMove(taskId);
       updateColumn(taskId, runId, "blocked", "harness-swap-failed");
       recordBlockedHistory(taskId, runId, signal.reason, { ...signal, message: `the account switch failed: ${err instanceof Error ? err.message : String(err)}` });
       emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
@@ -5588,6 +5661,7 @@ function attachDoneHandler(
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
+      settlingTurnRuns.set(runId, taskId);
       // First thing, so nothing below can leave a settled server turn counted as busy.
       const wasOpencodeServerRun = forgetOpencodeServerTurn(runId);
       // Nothing can arrive for a run that's no longer running — drop its
@@ -5642,6 +5716,7 @@ function attachDoneHandler(
             swapCancelRequested.delete(taskId);
             runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
             saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${message}`);
+            dropScheduledSwitchAfterFailedLimitMove(taskId);
             updateColumn(taskId, runId, "blocked", "harness-swap-failed");
             recordBlockedHistory(taskId, runId, limitSignal.reason, { ...limitSignal, message: `the account switch failed: ${message}` });
             emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
@@ -5714,6 +5789,7 @@ function attachDoneHandler(
         // misleading breadcrumb. Pumping here reads the launch line that is
         // already on disk and makes the hold decision deterministic.
         try {
+          turnSettlePumpHook?.(taskId, runId);
           pumpWatcherForHoldCheck(taskId);
         } catch {
           // Belt-and-braces: the callee already swallows its own errors, but a
@@ -5769,6 +5845,7 @@ function attachDoneHandler(
       const wasSessionDied = handle?.sessionDied ?? false;
       const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
+      settlingTurnRuns.set(runId, taskId);
       const wasOpencodeServerRun = forgetOpencodeServerTurn(runId);
       pendingSentFilesByRun.delete(runId);
       // A driver that rejects after emitting a limit signal still has a stack
@@ -5796,6 +5873,7 @@ function attachDoneHandler(
             swapCancelRequested.delete(taskId);
             runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
             saveStatusLineQuietly(runId, taskId, `switching accounts failed: ${message}`);
+            dropScheduledSwitchAfterFailedLimitMove(taskId);
             updateColumn(taskId, runId, "blocked", "harness-swap-failed");
             recordBlockedHistory(taskId, runId, limitSignal.reason, { ...limitSignal, message: `the account switch failed: ${message}` });
             emitGlobal({ kind: "run-status", taskId, runId, status: "failed", ts: Date.now(), reason: "harness-swap" });
@@ -5835,7 +5913,42 @@ function attachDoneHandler(
       await drainFollowUpQueues(taskId, runId, wasCancelled);
       await settleHarnessStateAndFollowUps(taskId, runId, newStatus, wasCancelled);
       if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
-    });
+    })
+    .finally(() => endTurnSettle(runId, taskId));
+}
+
+/**
+ * Runs whose done handler is settling (`runId` -> `taskId`): from the moment
+ * the run leaves `active` until its whole settle chain (turn-end switch,
+ * follow-up drain, harness-state settle) is over. Between those points the
+ * task has no live run and no claim, yet the settle path still owns it: a
+ * scheduled switch applied from another edge then (the last background agent
+ * settling inside `pumpWatcherForHoldCheck`, or during any await of the
+ * chain) would take the account-switch claim without `behindQueue`, the
+ * turn-end call would fail to claim, and the queue would drain under the held
+ * claim with the held messages ahead of the turn's own follow-ups. So
+ * {@link accountSwitchMustWait} counts a settling turn, and the turn-end path
+ * is the one that applies it.
+ */
+const settlingTurnRuns = new Map<string, string>();
+
+function isTurnSettling(taskId: string): boolean {
+  for (const settling of settlingTurnRuns.values()) if (settling === taskId) return true;
+  return false;
+}
+
+/** End of a done handler's settle chain: a scheduled switch that became
+ *  applicable meanwhile (its background agents finished after the turn end
+ *  deferred it) and that every edge skipped while the turn was settling is
+ *  applied now. */
+function endTurnSettle(runId: string, taskId: string): void {
+  settlingTurnRuns.delete(runId);
+  if (isTurnSettling(taskId)) return;
+  try {
+    if (tasks.get(taskId)?.harnessState?.scheduledSwitch) settleWaitingScheduledSwitch(taskId);
+  } catch (err) {
+    console.warn(`[agetor] settling a waiting account switch for ${taskId} failed:`, err);
+  }
 }
 
 /**
@@ -6932,8 +7045,12 @@ async function reconcileHarnessSwapInClaim(task: Task, pending: PendingSwapState
     await resumeInterruptedSwap(task, pending);
     return;
   }
-  if (liveRunId && active.has(liveRunId)) {
+  if (liveRunId && (active.has(liveRunId) || deferredLimitSettlements.get(taskId)?.runId === liveRunId)) {
     // The successor registered before the restart: let its done handler settle.
+    // One that already hit a limit while this claim was held has left `active`
+    // but is still owned: its deferred settlement swaps (or blocks) it as soon
+    // as the claim is released, so blocking it here first would write a
+    // blocked row and a "run the task" line the swap then contradicts.
     patchTaskState(taskId, { pendingSwap: null });
     return;
   }

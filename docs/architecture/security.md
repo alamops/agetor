@@ -161,14 +161,39 @@ so cleanup trusts a recorded path only when it lies below the destination
 account's config root, matches a handoff shape **for the row's recorded session
 id** (Claude `projects/<enc>/<sid>.jsonl`, `…/<sid>/{subagents,tool-results,
 mcp-tasks}/…` or `file-history/<sid>/…`; Codex
-`sessions/YYYY/MM/DD/rollout-*-<sid>.jsonl`), so a planted row cannot name
-another session's transcript, has no symlinked component and is a regular file;
+`sessions/YYYY/MM/DD/rollout-*-<sid>.jsonl`), so a row can only reach files of
+the session it names (the session id is a claim too), has no symlinked
+component and is a regular file;
 it unlinks files only (never a recursive delete) and then prunes only empty plain
 directories inside those shapes. A path outside the account's current root is
 *retained* (the row is kept), never followed. Session transcripts are copied
 with no size cap, in asynchronous 1 MiB chunks; the destination is checked one
 path component at a time (`destinationState`) and the source's directory chain
 is `lstat`-checked before any leaf is stat'ed. Full behaviour: [harness-stacks.md](harness-stacks.md).
+
+`harness_orphaned_copies` rows (copies no handoff row can clean up any more)
+and `harness_mirror_sources` rows (the folders each backup's last mirror read
+and wrote) are **untrusted** the same way: the SQLite file is agent-writable.
+
+- An **orphan row** is trusted for at most this: deleting one regular file of
+  a handoff shape for the row's session, below the account's **current** root,
+  with no symlinked component (the handoff cleanup rules,
+  `removeCopiedPathsDetailed`), and only for a session no live handoff row of
+  that account holds, no transfer onto it has in flight, and no task still
+  resumes on that account (a task whose runs recorded the session and for which
+  `findSessionIdForHarness` still returns it, `liveOnRunsOfHarness`). So a
+  planted row naming a live conversation deletes nothing; one naming a dead
+  session's copy can remove only that copy.
+- A **mirror-sources row** is only compared and checked for existence, never
+  read from or written into: its folders are resolved lexically and never
+  stat'ed inside a macOS-protected folder (such a folder counts as existing).
+  A planted row can at most make that backup's mirror skip, make its Restore
+  refuse, or make the next mirror drop that same account's own mirror records
+  and saved originals under `<dataDir>/mirror-backups/<id>/` (removed by
+  `removeMirrorBackups`, which never follows a link) and mirror it as new
+  into its own current folder, where every file it already has counts as
+  preexisted and is backed up before an overwrite. The row's folders are
+  never a write or delete target.
 
 ### Mirror provenance, the backup store and the widened stripper
 

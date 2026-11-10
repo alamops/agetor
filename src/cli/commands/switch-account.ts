@@ -3,7 +3,7 @@ import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { ApiError } from "../api-client.ts";
 import { usageError } from "../usage.ts";
-import type { HarnessMemberReason, HarnessStack } from "../../shared/types.ts";
+import type { HarnessMemberReason, HarnessStack, Task } from "../../shared/types.ts";
 import { memberReasonText, stackPositionText } from "../../shared/harness-stack.ts";
 import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
 
@@ -27,7 +27,11 @@ export async function cmdSwitchAccount(args: string[], flags: Flags): Promise<vo
   if (cancel) {
     const result = await client.cancelScheduledAccountSwitch(task.id);
     if (flags.json) return printJson(result);
-    out(`${c.gray("cancelled")} the scheduled account switch on ${c.dim(short)}`);
+    if (cancelledSomething(task, result)) {
+      out(`${c.gray("cancelled")} the scheduled account switch on ${c.dim(short)}`);
+    } else {
+      out(c.dim(`nothing was scheduled on ${short} — no account switch to cancel`));
+    }
     return;
   }
 
@@ -60,14 +64,31 @@ export async function cmdSwitchAccount(args: string[], flags: Flags): Promise<vo
   );
 }
 
-/** A 409 from the route. When it carries member reasons the error text already
- *  embeds them, so print a fixed heading plus one escaped line per reason;
- *  without reasons print the error itself. The central error printer escapes
- *  again; escaping here keeps the text safe when shown another way. */
+/**
+ * Whether `--cancel` dropped a scheduled switch. The route answers a boolean
+ * `cancelled` (false when nothing was scheduled); a core that predates the
+ * field answers `{ task }` alone, so fall back to the task as read just before
+ * the request: no `scheduledSwitch` on it means there was nothing to cancel.
+ */
+export function cancelledSomething(before: Pick<Task, "harnessState">, result: object): boolean {
+  const cancelled = (result as { cancelled?: unknown }).cancelled;
+  if (typeof cancelled === "boolean") return cancelled;
+  return before.harnessState?.scheduledSwitch != null;
+}
+
+/** A 409 from the route. A `no-usable-member` refusal's error text already
+ *  embeds its member reasons, so print a fixed heading plus one escaped line
+ *  per reason. Any other code (`not-in-stack`, `busy`, `archived`, one this
+ *  CLI does not know yet) prints the core's own sentence, which names the
+ *  cause. The central error printer escapes again; escaping here keeps the
+ *  text safe when shown another way. */
 function refusal(e: ApiError): Error {
   const body = (e.body ?? {}) as { reasons?: HarnessMemberReason[] };
   const reasons = Array.isArray(body.reasons) ? body.reasons : [];
-  if (reasons.length === 0) return new Error(escapeFreeText(e.message));
+  const code = e.code;
+  if (reasons.length === 0 || (code !== undefined && code !== "no-usable-member")) {
+    return new Error(escapeFreeText(e.message));
+  }
   const lines = [
     "no other account in the stack can take this task:",
     ...reasons.map((r) => `  - ${escapeFreeText(memberReasonText(r))}`),

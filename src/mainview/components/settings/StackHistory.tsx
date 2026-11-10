@@ -1,15 +1,78 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef } from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { formatHarnessSwapEvent } from "../../../shared/harness-stack.ts";
-import type { HarnessSwapEvent } from "../../../shared/types.ts";
+import type { HarnessSwapEvent, HarnessSwapHistoryPage } from "../../../shared/types.ts";
 
 const PAGE = 50;
 
 interface Props {
   stackId: string;
   stackLabel: string;
+}
+
+export interface HistoryState {
+  events: HarnessSwapEvent[];
+  cursor: string | null;
+  loading: boolean;
+  loadingMore: boolean;
+  error: string | null;
+  /** Which action produced the error, so Retry repeats that one. */
+  failedAction: "load" | "more";
+  /** The request generation answers must carry to land: a refresh starts a
+   *  new one, which drops the answer of anything it superseded. */
+  generation: number;
+}
+
+export type HistoryAction =
+  | { type: "load"; generation: number }
+  | { type: "more"; generation: number }
+  | { type: "page"; generation: number; page: Pick<HarnessSwapHistoryPage, "events" | "nextCursor">; append: boolean }
+  | { type: "failed"; generation: number; action: "load" | "more"; message: string };
+
+export const INITIAL_HISTORY_STATE: HistoryState = {
+  events: [],
+  cursor: null,
+  loading: true,
+  loadingMore: false,
+  error: null,
+  failedAction: "load",
+  generation: 0,
+};
+
+/**
+ * The history pager's state machine. A refresh (`load`) supersedes a "Load
+ * more" still in flight: its answer is dropped by the generation check, so the
+ * refresh must clear `loadingMore` itself, or the button would stay on
+ * "Loading…" for good.
+ */
+export function historyReducer(state: HistoryState, action: HistoryAction): HistoryState {
+  switch (action.type) {
+    case "load":
+      return { ...state, generation: action.generation, loading: true, loadingMore: false, error: null };
+    case "more":
+      if (action.generation !== state.generation) return state;
+      return { ...state, loadingMore: true, error: null };
+    case "page":
+      if (action.generation !== state.generation) return state;
+      return {
+        ...state,
+        events: action.append ? [...state.events, ...action.page.events] : action.page.events,
+        cursor: action.page.nextCursor,
+        loading: action.append ? state.loading : false,
+        loadingMore: action.append ? false : state.loadingMore,
+      };
+    case "failed":
+      if (action.generation !== state.generation) return state;
+      return {
+        ...state,
+        error: action.message,
+        failedAction: action.action,
+        loading: action.action === "load" ? false : state.loading,
+        loadingMore: action.action === "more" ? false : state.loadingMore,
+      };
+  }
 }
 
 /**
@@ -19,34 +82,23 @@ interface Props {
  * previous fetch.
  */
 export function StackHistory({ stackId, stackLabel }: Props) {
-  const [events, setEvents] = useState<HarnessSwapEvent[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // Which action produced the error, so Retry repeats that one.
-  const [failedAction, setFailedAction] = useState<"load" | "more">("load");
+  const [state, dispatch] = useReducer(historyReducer, INITIAL_HISTORY_STATE);
+  const { events, cursor, loading, loadingMore, error, failedAction } = state;
   // Drops the answer of a request the user has since superseded (refresh,
-  // another stack, unmount).
+  // another stack, unmount); the reducer checks the same number.
   const generation = useRef(0);
 
   const load = useCallback(() => {
     const mine = ++generation.current;
-    setLoading(true);
-    setError(null);
+    dispatch({ type: "load", generation: mine });
     api.getHarnessStackHistory(stackId, { limit: PAGE })
       .then((page) => {
         if (generation.current !== mine) return;
-        setEvents(page.events);
-        setCursor(page.nextCursor);
+        dispatch({ type: "page", generation: mine, page, append: false });
       })
       .catch((e) => {
         if (generation.current !== mine) return;
-        setFailedAction("load");
-        setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
-        if (generation.current === mine) setLoading(false);
+        dispatch({ type: "failed", generation: mine, action: "load", message: e instanceof Error ? e.message : String(e) });
       });
   }, [stackId]);
 
@@ -55,24 +107,20 @@ export function StackHistory({ stackId, stackLabel }: Props) {
     return () => { generation.current++; };
   }, [load]);
 
+  // A page requested during a refresh would be appended to the refreshed
+  // list from the old cursor, so "Load more" waits for the refresh.
   const loadMore = () => {
-    if (!cursor || loadingMore) return;
+    if (!cursor || loadingMore || loading) return;
     const mine = generation.current;
-    setLoadingMore(true);
-    setError(null);
+    dispatch({ type: "more", generation: mine });
     api.getHarnessStackHistory(stackId, { limit: PAGE, before: cursor })
       .then((page) => {
         if (generation.current !== mine) return;
-        setEvents((prev) => [...prev, ...page.events]);
-        setCursor(page.nextCursor);
+        dispatch({ type: "page", generation: mine, page, append: true });
       })
       .catch((e) => {
         if (generation.current !== mine) return;
-        setFailedAction("more");
-        setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
-        if (generation.current === mine) setLoadingMore(false);
+        dispatch({ type: "failed", generation: mine, action: "more", message: e instanceof Error ? e.message : String(e) });
       });
   };
 
@@ -128,7 +176,7 @@ export function StackHistory({ stackId, stackLabel }: Props) {
       )}
 
       {cursor && (
-        <Button size="sm" variant="outline" onClick={loadMore} disabled={loadingMore}>
+        <Button size="sm" variant="outline" onClick={loadMore} disabled={loadingMore || loading}>
           {loadingMore ? "Loading…" : "Load more"}
         </Button>
       )}

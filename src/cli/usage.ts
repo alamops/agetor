@@ -346,8 +346,9 @@ export const USAGE: Record<string, string> = {
   A change to the members, kind or mirror mode is previewed first: --dry-run
   prints the preview and saves nothing; a save that would overwrite or remove
   files on a backup account refuses until you pass --yes (originals are backed
-  up). If the stack was edited elsewhere since it was read, the edit is refused;
-  re-run it.`,
+  up). A flag already at the stack's value is left out of the edit, so an edit
+  that changes nothing saves and mirrors nothing. If the stack was edited
+  elsewhere since it was read, the edit is refused; re-run it.`,
 
   "harness stack preview": `usage: agetor harness stack preview <stack>
 

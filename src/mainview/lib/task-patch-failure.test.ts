@@ -54,6 +54,17 @@ describe("switchAccountFailureToast", () => {
     expect(switchAccountFailureToast(err).description).toBe("background agents are running");
   });
 
+  test("another refusal code that carries reasons reads as the server's sentence, not the member heading", () => {
+    const err = new ApiError("x", 409, {
+      error: "this task's account is not in a stack with a backup account",
+      code: "not-in-stack",
+      reasons: [{ harnessId: "a", label: "Work", reason: "cooling until 15:00" }],
+    });
+    expect(switchAccountFailureToast(err).description).toBe(
+      "this task's account is not in a stack with a backup account",
+    );
+  });
+
   test("a transit failure says the switch may have landed", () => {
     expect(switchAccountFailureToast(new ApiTransitError("t")).title).toBe("Couldn't confirm the account switch");
   });

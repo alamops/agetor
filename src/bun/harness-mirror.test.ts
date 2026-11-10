@@ -1985,20 +1985,33 @@ describe("fix round F-B: backup store trust, link restore, deleted originals, ac
     expect(result.restored).toContain("CLAUDE.md");
   });
 
-  test("account delete: deleteMirrorStateForHarness leaves no rows or backups, even mid-mirror", async () => {
+  test("account delete: a mirror in flight stops writing once its account row is gone (accountAlive)", async () => {
     const { primary, backup, b, stack } = claudePair("fb-delete");
     write(path.join(primary, "CLAUDE.md"), "primary\n");
     write(path.join(backup, "CLAUDE.md"), "mine\n");
-    for (let i = 0; i < 150; i++) write(path.join(primary, "skills", `s${i}`, "SKILL.md"), `# ${i}`);
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    // The merge phase, still ahead of the pause, would record keys and the
+    // mirror source, and save the backup's own key originals.
+    write(path.join(primary, "settings.json"), JSON.stringify({ env: { FOO: "1" }, model: "opus" }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ model: "mine" }));
+    const hold = mirror.holdMirrorForTests(b, "after-copy");
     const running = mirror.mirrorStack(stack, {});
+    await hold.reached;
     const p = await provs();
-    for (let i = 0; i < 2000 && p.list(b).length === 0; i++) await Bun.sleep(0);
+    // The copy phase has written rows: the delete provably lands mid-mirror.
+    expect(p.list(b).length).toBeGreaterThan(0);
     dbm.harnesses.delete(b);
-    await mirror.deleteMirrorStateForHarness(b);
-    await running;
-    // The delete was queued behind the mirror in flight, so nothing it wrote survives.
-    await mirror.deleteMirrorStateForHarness(b);
     expect(p.list(b)).toEqual([]);
+    hold.release();
+    const result = await running;
+    expect(result.warnings.some((w) => w.includes("deleted during the mirror"))).toBe(true);
+    // Nothing after the delete was recorded: no key rows, no source, no key originals.
+    expect(p.list(b)).toEqual([]);
+    expect((await import("./harness-mirror-provenance.ts")).mirrorSources.get(b)).toBeNull();
+    expect(existsSync(path.join(backupsOf(b), "keys"))).toBe(false);
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"))).toEqual({ model: "mine" });
+    // The route then drops what the copy phase saved before the delete.
+    await mirror.deleteMirrorStateForHarness(b);
     expect(existsSync(backupsOf(b))).toBe(false);
     expect((await import("./harness-mirror-provenance.ts")).harnessIdsWithProvenance()).not.toContain(b);
   });
@@ -2720,14 +2733,25 @@ describe("TT-C: backups and Restore", () => {
     const { primary, backup, b, stack } = claudePair("ttc-delete-queued");
     write(path.join(primary, "CLAUDE.md"), "p\n");
     write(path.join(backup, "CLAUDE.md"), "mine\n");
-    for (let i = 0; i < 120; i++) write(path.join(primary, "skills", `s${i}`, "SKILL.md"), `# ${i}`);
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    write(path.join(primary, "settings.json"), JSON.stringify({ env: { FOO: "1" }, model: "opus" }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ model: "mine" }));
+    const hold = mirror.holdMirrorForTests(b, "after-copy");
     const running = mirror.mirrorStack(stack, {});
+    await hold.reached;
     const p = await provs();
-    for (let i = 0; i < 2000 && p.list(b).length === 0; i++) await Bun.sleep(0);
-    const deleting = mirror.deleteMirrorStateForHarness(b);
+    expect(p.list(b).length).toBeGreaterThan(0);
+    // Requested mid-mirror (the account row stays, so only the queue protects
+    // it): it must wait for the run, which still has the merge phase to write.
+    let deleted = false;
+    const deleting = mirror.deleteMirrorStateForHarness(b).then(() => { deleted = true; });
+    for (let i = 0; i < 20; i++) await Bun.sleep(0);
+    expect(deleted).toBe(false);
+    hold.release();
     await running;
     await deleting;
     expect(p.list(b)).toEqual([]);
+    expect((await import("./harness-mirror-provenance.ts")).mirrorSources.get(b)).toBeNull();
     expect(existsSync(backupsOf(b))).toBe(false);
   });
 });
@@ -2922,5 +2946,565 @@ describe("a primary whose folder comes from the core's environment", () => {
     stacks.harnessStacks.delete(stack.id);
     dbm.harnesses.delete(b);
     expect(mirrorSources.get(b)).toBeNull();
+  });
+});
+
+describe("review fix round: mirror correctness (R-M1, R-M2, S1-S4, S14, N1-N3)", () => {
+  const provs = async () => (await import("./harness-mirror-provenance.ts")).mirrorProvenance;
+  const sources = async () => (await import("./harness-mirror-provenance.ts")).mirrorSources;
+
+  /** Run `fn` with the process CLAUDE_CONFIG_DIR / CODEX_HOME set as given
+   *  (undefined unsets), restoring both afterwards. */
+  async function withProcessRoots(fn: (set: (name: "CLAUDE_CONFIG_DIR" | "CODEX_HOME", value: string | undefined) => void) => Promise<void>) {
+    const saved = { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR, CODEX_HOME: process.env.CODEX_HOME };
+    const set = (name: "CLAUDE_CONFIG_DIR" | "CODEX_HOME", value: string | undefined) => {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    };
+    try {
+      await fn(set);
+    } finally {
+      set("CLAUDE_CONFIG_DIR", saved.CLAUDE_CONFIG_DIR);
+      set("CODEX_HOME", saved.CODEX_HOME);
+    }
+  }
+
+  test("R-M1: when every top-level key on the backup is mirror-owned and the primary drops them, they are really removed", async () => {
+    const { pRoot, bRoot, a, b, stack } = codexPair("rm1-all-owned");
+    write(path.join(pRoot, "config.toml"), ['model = "gpt-5"', 'approval_policy = "never"', ""].join("\n"));
+    await mirror.mirrorStack(stack, {});
+    const p = await provs();
+    expect(p.listForPath(b, "config.toml").map((r) => r.key).sort()).toEqual(["approval_policy", "model"]);
+
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(pRoot, "config.toml"));
+    const preview = await mirror.previewMirror({ kind: "codex", members: [a, b], mirrorMode: "full" });
+    expect(preview.plans[0]!.keys).toContainEqual({ file: "config.toml", key: "model", action: "remove" });
+    expect(preview.plans[0]!.keys).toContainEqual({ file: "config.toml", key: "approval_policy", action: "remove" });
+
+    await mirror.mirrorStack(stack, {});
+    const after = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, unknown>;
+    expect(after.model).toBeUndefined();
+    expect(after.approval_policy).toBeUndefined();
+    expect(p.listForPath(b, "config.toml")).toEqual([]);
+  });
+
+  test("R-M1: a primary that drops its last top-level key (keeping a table) removes the mirrored keys and keeps the table", async () => {
+    const { pRoot, bRoot, b, stack } = codexPair("rm1-last-top");
+    write(path.join(pRoot, "config.toml"), ['model = "gpt-5"', "", "[mcp_servers.docs]", 'command = "docs-mcp"', ""].join("\n"));
+    await mirror.mirrorStack(stack, {});
+    write(path.join(pRoot, "config.toml"), ["[mcp_servers.docs]", 'command = "docs-mcp"', ""].join("\n"));
+    await mirror.mirrorStack(stack, {});
+    const after = Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, unknown>;
+    expect(after.model).toBeUndefined();
+    expect((after.mcp_servers as Record<string, Record<string, unknown>>).docs!.command).toBe("docs-mcp");
+    expect((await provs()).get(b, "config.toml", "model")).toBeNull();
+  });
+
+  test("R-M2: a backup whose folder comes from the environment is skipped when it resolves elsewhere; Restore refuses there", async () => {
+    const primary = mkdtempSync(path.join(tmpdir(), "agetor-rm2-p-"));
+    const dirX = mkdtempSync(path.join(tmpdir(), "agetor-rm2-x-"));
+    const dirY = mkdtempSync(path.join(tmpdir(), "agetor-rm2-y-"));
+    const a = alias(unique("rm2-a"), primary);
+    const b = unique("rm2-b");
+    dbm.harnesses.insert({ id: b, kind: "claude-code", label: b, home: null, env: {} } as never);
+    const stack = stacks.harnessStacks.create({ label: "rm2", kind: "claude-code", members: [a, b], mirrorMode: "full" });
+    write(path.join(primary, "CLAUDE.md"), "primary\n");
+    write(path.join(dirX, "CLAUDE.md"), "mine\n");
+    write(path.join(dirY, "CLAUDE.md"), "another folder\n");
+    try {
+      await withProcessRoots(async (set) => {
+        set("CLAUDE_CONFIG_DIR", dirX);
+        await mirror.mirrorStack(stack, {});
+        expect(readFileSync(path.join(dirX, "CLAUDE.md"), "utf8")).toBe("primary\n");
+        expect((await sources()).get(b)?.backupRoot.split("\n")[0]).toBe(path.resolve(dirX));
+
+        // Another core environment: the same account now resolves to dirY.
+        set("CLAUDE_CONFIG_DIR", dirY);
+        const preview = await mirror.previewMirror({ kind: "claude-code", members: [a, b], mirrorMode: "full" });
+        expect(preview.plans[0]!.files).toEqual({ add: [], update: [], remove: [] });
+        expect(preview.plans[0]!.backups).toEqual([]);
+        expect(preview.plans[0]!.warnings.some((w) => w.startsWith("skipped: this account's config folder is now"))).toBe(true);
+        const moved = await mirror.mirrorStack(stack, {});
+        expect(moved.warnings.some((w) => w.includes("this account's config folder is now") && w.includes(dirX))).toBe(true);
+        // dirY is untouched, and the original saved from dirX is not replaced by dirY's file.
+        expect(readFileSync(path.join(dirY, "CLAUDE.md"), "utf8")).toBe("another folder\n");
+        const refused = await mirror.restoreMirror(b);
+        expect(refused.warnings.some((w) => w.startsWith("restore refused: this account's config folder is now"))).toBe(true);
+        expect(refused.restored).toEqual([]);
+        expect(readFileSync(path.join(dirY, "CLAUDE.md"), "utf8")).toBe("another folder\n");
+        expect((await provs()).list(b).length).toBeGreaterThan(0);
+
+        // Back to the recorded folder: Restore puts the real original back there.
+        set("CLAUDE_CONFIG_DIR", dirX);
+        const restored = await mirror.restoreMirror(b);
+        expect(restored.restored).toContain("CLAUDE.md");
+        expect(readFileSync(path.join(dirX, "CLAUDE.md"), "utf8")).toBe("mine\n");
+      });
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("R-M2: a recorded backup folder that no longer exists is stale; re-pointing the backup is a real change", async () => {
+    const primary = mkdtempSync(path.join(tmpdir(), "agetor-rm2s-p-"));
+    const dirX = mkdtempSync(path.join(tmpdir(), "agetor-rm2s-x-"));
+    const dirY = mkdtempSync(path.join(tmpdir(), "agetor-rm2s-y-"));
+    const a = alias(unique("rm2s-a"), primary);
+    const b = unique("rm2s-b");
+    dbm.harnesses.insert({ id: b, kind: "claude-code", label: b, home: null, env: {} } as never);
+    const stack = stacks.harnessStacks.create({ label: "rm2s", kind: "claude-code", members: [a, b], mirrorMode: "full" });
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    const { rmSync } = await import("node:fs");
+    try {
+      await withProcessRoots(async (set) => {
+        set("CLAUDE_CONFIG_DIR", dirX);
+        await mirror.mirrorStack(stack, {});
+        rmSync(dirX, { recursive: true });
+        set("CLAUDE_CONFIG_DIR", dirY);
+        const result = await mirror.mirrorStack(stack, {});
+        expect(result.warnings.some((w) => w.includes("config folder is now"))).toBe(false);
+        expect(existsSync(path.join(dirY, "skills", "s", "SKILL.md"))).toBe(true);
+        expect((await sources()).get(b)?.backupRoot.split("\n")[0]).toBe(path.resolve(dirY));
+        // The user gives the account its own folder: a changed fingerprint is never skipped.
+        const own = mkdtempSync(path.join(tmpdir(), "agetor-rm2s-own-"));
+        dbm.harnesses.update(b, { home: own });
+        const repointed = await mirror.mirrorStack(stacks.harnessStacks.get(stack.id)!, {});
+        expect(repointed.warnings.some((w) => w.includes("config folder is now"))).toBe(false);
+        expect(existsSync(path.join(own, "skills", "s", "SKILL.md"))).toBe(true);
+      });
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("R-M2: a Claude backup whose old config root is gone but whose old .claude.json folder still exists is skipped, its originals kept", async () => {
+    const primary = mkdtempSync(path.join(tmpdir(), "agetor-rm2j-p-"));
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-rm2j-home-"));
+    const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-rm2j-z-"));
+    const a = alias(unique("rm2j-a"), primary);
+    const b = unique("rm2j-b");
+    // No folder of its own: config root <HOME>/.claude, `.claude.json` in <HOME>,
+    // unless the core has a CLAUDE_CONFIG_DIR.
+    dbm.harnesses.insert({ id: b, kind: "claude-code", label: b, home: null, env: { HOME: home } } as never);
+    const stack = stacks.harnessStacks.create({ label: "rm2j", kind: "claude-code", members: [a, b], mirrorMode: "full" });
+    write(path.join(primary, ".claude.json"), JSON.stringify({ mcpServers: { docs: { command: "primary" } } }));
+    write(path.join(home, ".claude.json"), JSON.stringify({ mcpServers: { docs: { command: "mine" } } }));
+    write(path.join(home, ".claude", "CLAUDE.md"), "x\n");
+    const { rmSync } = await import("node:fs");
+    try {
+      await withProcessRoots(async (set) => {
+        set("CLAUDE_CONFIG_DIR", undefined);
+        await mirror.mirrorStack(stack, {});
+        const p = await provs();
+        expect(p.get(b, ".claude.json", "mcpServers.docs")?.backupRef).toBeTruthy();
+        rmSync(path.join(home, ".claude"), { recursive: true });
+        set("CLAUDE_CONFIG_DIR", elsewhere);
+        const result = await mirror.mirrorStack(stack, {});
+        expect(result.warnings.some((w) => w.includes("skipped: this account's .claude.json folder is now"))).toBe(true);
+        expect(result.warnings.some((w) => w.includes("are dropped"))).toBe(false);
+        expect(p.get(b, ".claude.json", "mcpServers.docs")?.backupRef).toBeTruthy();
+        // Back where it was, the original still comes back.
+        set("CLAUDE_CONFIG_DIR", undefined);
+        mkdirSync(path.join(home, ".claude"));
+        const restored = await mirror.restoreMirror(b);
+        expect(restored.restored).toContain(".claude.json:mcpServers.docs");
+        expect(JSON.parse(readFileSync(path.join(home, ".claude.json"), "utf8")).mcpServers.docs.command).toBe("mine");
+      });
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("R-M2: a planted mirror-sources row naming a folder inside a protected folder only causes a skip, never a stat or a write", async () => {
+    const home = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-rm2-tcc-home-")));
+    const documents = path.join(home, "Documents");
+    mkdirSync(documents);
+    transfer.setTccHomeForTests(home);
+    try {
+      const { primary, backup, b, stack } = claudePair("rm2-planted");
+      write(path.join(primary, "CLAUDE.md"), "primary\n");
+      await mirror.mirrorStack(stack, {});
+      const src = await sources();
+      const row = src.get(b)!;
+      // The planted folder does not exist: a stat would call it stale and the
+      // run would go ahead. Locked, any stat below Documents fails anyway.
+      src.set({ ...row, backupRoot: `${path.join(documents, "planted")}\n${path.join(documents, "planted")}` });
+      chmodSync(documents, 0o000);
+      write(path.join(primary, "CLAUDE.md"), "primary v2\n");
+      const result = await mirror.mirrorStack(stack, {});
+      chmodSync(documents, 0o700);
+      expect(result.warnings.some((w) => w.includes("skipped: this account's config folder is now"))).toBe(true);
+      expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("primary\n");
+      expect(existsSync(path.join(documents, "planted"))).toBe(false);
+    } finally {
+      chmodSync(documents, 0o700);
+      transfer.setTccHomeForTests(null);
+    }
+  });
+
+  test("R-M2: a backup re-pointed to another folder has its old records dropped: they never remove, back up or restore anything there", async () => {
+    const { primary, backup, a, b, stack } = claudePair("rm2-repoint");
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# shared skill");
+    write(path.join(primary, "CLAUDE.md"), "primary\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    await mirror.mirrorStack(stack, {});
+    const p = await provs();
+    expect(p.get(b, "skills/s/SKILL.md")).not.toBeNull();
+    // The user re-points the backup at a folder that has its own copy of the
+    // same skill (identical bytes), and the primary then drops the skill.
+    const moved = mkdtempSync(path.join(tmpdir(), "agetor-rm2-repoint-new-"));
+    write(path.join(moved, "skills", "s", "SKILL.md"), "# shared skill");
+    write(path.join(moved, "CLAUDE.md"), "new folder's own\n");
+    dbm.harnesses.update(b, { home: moved });
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(primary, "skills", "s"), { recursive: true });
+
+    const preview = await mirror.previewMirror({ kind: "claude-code", members: [a, b], mirrorMode: "full" });
+    const notice = `this account's config folder changed from ${path.resolve(backup)} to ${path.resolve(moved)}`;
+    expect(preview.plans[0]!.warnings.some((w) => w.startsWith(notice))).toBe(true);
+    expect(preview.plans[0]!.files.remove).toEqual([]);
+    expect(preview.plans[0]!.kept).toEqual([]);
+
+    const result = await mirror.mirrorStack(stacks.harnessStacks.get(stack.id)!, {});
+    expect(result.warnings.some((w) => w.includes(notice) && w.includes("are dropped"))).toBe(true);
+    // The new folder's own skill is not removed on the strength of a record
+    // written in the old folder.
+    expect(readFileSync(path.join(moved, "skills", "s", "SKILL.md"), "utf8")).toBe("# shared skill");
+    expect(p.get(b, "skills/s/SKILL.md")).toBeNull();
+    expect((await sources()).get(b)?.backupRoot.split("\n")[0]).toBe(path.resolve(moved));
+    // Restore now puts back the new folder's own original, never the old one's.
+    const restored = await mirror.restoreMirror(b);
+    expect(restored.restored).toContain("CLAUDE.md");
+    expect(readFileSync(path.join(moved, "CLAUDE.md"), "utf8")).toBe("new folder's own\n");
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("R-M2: Restore refuses records for a folder that is gone; the next mirror drops them", async () => {
+    const primary = mkdtempSync(path.join(tmpdir(), "agetor-rm2g-p-"));
+    const dirX = mkdtempSync(path.join(tmpdir(), "agetor-rm2g-x-"));
+    const dirY = mkdtempSync(path.join(tmpdir(), "agetor-rm2g-y-"));
+    const a = alias(unique("rm2g-a"), primary);
+    const b = unique("rm2g-b");
+    dbm.harnesses.insert({ id: b, kind: "claude-code", label: b, home: null, env: {} } as never);
+    const stack = stacks.harnessStacks.create({ label: "rm2g", kind: "claude-code", members: [a, b], mirrorMode: "full" });
+    write(path.join(primary, "CLAUDE.md"), "primary\n");
+    write(path.join(dirX, "CLAUDE.md"), "mine\n");
+    write(path.join(dirY, "CLAUDE.md"), "dirY's own\n");
+    const { rmSync } = await import("node:fs");
+    try {
+      await withProcessRoots(async (set) => {
+        set("CLAUDE_CONFIG_DIR", dirX);
+        await mirror.mirrorStack(stack, {});
+        rmSync(dirX, { recursive: true });
+        set("CLAUDE_CONFIG_DIR", dirY);
+        const refused = await mirror.restoreMirror(b);
+        expect(refused.warnings.some((w) => w.startsWith(`restore refused: the mirror's record is for ${path.resolve(dirX)}`))).toBe(true);
+        expect(readFileSync(path.join(dirY, "CLAUDE.md"), "utf8")).toBe("dirY's own\n");
+        expect((await provs()).list(b).length).toBeGreaterThan(0);
+        await mirror.mirrorStack(stack, {});
+        // Mirrored as new: dirY's own file is the original now.
+        const restored = await mirror.restoreMirror(b);
+        expect(restored.warnings.some((w) => w.startsWith("restore refused"))).toBe(false);
+        expect(readFileSync(path.join(dirY, "CLAUDE.md"), "utf8")).toBe("dirY's own\n");
+      });
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("S1: an unchanged merge never rewrites .claude.json or settings.json, and the preview lists no update", async () => {
+    const { primary, backup, a, b, stack } = claudePair("s1-noop");
+    const servers = { docs: { command: "docs-mcp", args: ["--x"] } };
+    write(path.join(primary, ".claude.json"), JSON.stringify({ mcpServers: servers, userID: "p" }, null, 2));
+    // A layout no serializer reproduces (nested values on one line, no
+    // trailing newline): only "nothing changed, nothing written" keeps it.
+    const claudeJson = `{\n  "numStartups": 3,\n  "mcpServers": ${JSON.stringify(servers)}\n}`;
+    write(path.join(backup, ".claude.json"), claudeJson);
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus" }));
+    const settings = '{ "theme": "dark", "model": "opus" }\n';
+    write(path.join(backup, "settings.json"), settings);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(path.join(backup, ".claude.json"), old, old);
+    const before = statSync(path.join(backup, ".claude.json")).mtimeMs;
+
+    const preview = await mirror.previewMirror({ kind: "claude-code", members: [a, b], mirrorMode: "full" });
+    expect(preview.plans[0]!.files.update).not.toContain(".claude.json");
+    expect(preview.plans[0]!.files.update).not.toContain("settings.json");
+    const result = await mirror.mirrorStack(stack, {});
+    expect(rels(result)).not.toContain(".claude.json");
+    expect(readFileSync(path.join(backup, ".claude.json"), "utf8")).toBe(claudeJson);
+    expect(statSync(path.join(backup, ".claude.json")).mtimeMs).toBe(before);
+    expect(readFileSync(path.join(backup, "settings.json"), "utf8")).toBe(settings);
+  });
+
+  test("S1: a needed write keeps the file's own indentation and trailing-newline style", async () => {
+    const { primary, backup, stack } = claudePair("s1-style");
+    write(path.join(primary, ".claude.json"), JSON.stringify({ mcpServers: { docs: { command: "d" } } }));
+    write(path.join(backup, ".claude.json"), JSON.stringify({ numStartups: 3 }, null, 2));
+    write(path.join(primary, "settings.json"), JSON.stringify({ model: "opus" }));
+    write(path.join(backup, "settings.json"), '{\n\t"theme": "dark"\n}\n');
+    await mirror.mirrorStack(stack, {});
+    const claudeJson = readFileSync(path.join(backup, ".claude.json"), "utf8");
+    expect(claudeJson).toBe(JSON.stringify({ numStartups: 3, mcpServers: { docs: { command: "d" } } }, null, 2));
+    const settings = readFileSync(path.join(backup, "settings.json"), "utf8");
+    expect(settings).toBe('{\n\t"theme": "dark",\n\t"model": "opus"\n}\n');
+  });
+
+  test("S2: one file that cannot be copied is a skip: the rest of the entry mirrors and deletions still propagate", async () => {
+    const { primary, backup, stack } = claudePair("s2-one-file");
+    write(path.join(primary, "skills", "a-locked", "SKILL.md"), "# locked");
+    write(path.join(primary, "skills", "b-fine", "SKILL.md"), "# fine");
+    write(path.join(primary, "skills", "c-gone", "SKILL.md"), "# gone");
+    await mirror.mirrorStack(stack, {});
+    expect(existsSync(path.join(backup, "skills", "c-gone", "SKILL.md"))).toBe(true);
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(backup, "skills", "a-locked"), { recursive: true });
+    rmSync(path.join(primary, "skills", "c-gone"), { recursive: true });
+    write(path.join(primary, "skills", "b-fine", "SKILL.md"), "# fine v2");
+    chmodSync(path.join(primary, "skills", "a-locked", "SKILL.md"), 0o000);
+    try {
+      const result = await mirror.mirrorStack(stack, {});
+      expect(result.warnings.some((w) => w.includes("skills/a-locked/SKILL.md: could not be copied"))).toBe(true);
+      expect(readFileSync(path.join(backup, "skills", "b-fine", "SKILL.md"), "utf8")).toBe("# fine v2");
+      expect(existsSync(path.join(backup, "skills", "c-gone", "SKILL.md"))).toBe(false);
+      expect(existsSync(path.join(backup, "skills", "a-locked", "SKILL.md"))).toBe(false);
+    } finally {
+      chmodSync(path.join(primary, "skills", "a-locked", "SKILL.md"), 0o600);
+    }
+  });
+
+  test("S2: a file over the generic 64 MB cap copies under its payload budget; a single file over its cap is a skip in the preview and the run", async () => {
+    const { primary, backup, a, b, stack } = claudePair("s2-cap");
+    const { truncateSync, rmSync } = await import("node:fs");
+    const big = 65 * 1024 * 1024;
+    const asset = path.join(primary, "plugins", "cache", "mk", "plug", "1.0.0", "asset.bin");
+    write(asset, "");
+    truncateSync(asset, big);
+    write(path.join(primary, "plugins", "installed_plugins.json"), JSON.stringify({
+      version: 2,
+      plugins: { "plug@mk": [{ scope: "user", installPath: path.join(primary, "plugins", "cache", "mk", "plug", "1.0.0") }] },
+    }));
+    write(path.join(primary, "CLAUDE.md"), "");
+    truncateSync(path.join(primary, "CLAUDE.md"), big);
+    try {
+      const preview = await mirror.previewMirror({ kind: "claude-code", members: [a, b], mirrorMode: "full" });
+      expect(preview.plans[0]!.files.add).not.toContain("CLAUDE.md");
+      expect(preview.plans[0]!.warnings.some((w) => w.startsWith("CLAUDE.md: larger than the 64 MB mirror limit"))).toBe(true);
+      const result = await mirror.mirrorStack(stack, {});
+      expect(result.warnings.some((w) => w.includes(": CLAUDE.md: larger than the 64 MB mirror limit"))).toBe(true);
+      expect(existsSync(path.join(backup, "CLAUDE.md"))).toBe(false);
+      expect(statSync(path.join(backup, "plugins", "cache", "mk", "plug", "1.0.0", "asset.bin")).size).toBe(big);
+      const registry = JSON.parse(readFileSync(path.join(backup, "plugins", "installed_plugins.json"), "utf8"));
+      expect(registry.plugins["plug@mk"][0].installPath).toBe(path.join(backup, "plugins", "cache", "mk", "plug", "1.0.0"));
+    } finally {
+      rmSync(primary, { recursive: true, force: true });
+      rmSync(backup, { recursive: true, force: true });
+    }
+  });
+
+  test("S3: a marketplace the primary removes from extraKnownMarketplaces leaves the backups; the backup's own and edited ones stay", async () => {
+    const { primary, backup, stack } = claudePair("s3-markets");
+    const market = (repo: string) => ({ source: { source: "github", repo } });
+    write(path.join(primary, "settings.json"), JSON.stringify({ extraKnownMarketplaces: { one: market("o/one"), two: market("o/two"), three: market("o/three") } }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ extraKnownMarketplaces: { own: market("me/own") } }));
+    await mirror.mirrorStack(stack, {});
+    const mirrored = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(Object.keys(mirrored.extraKnownMarketplaces).sort()).toEqual(["one", "own", "three", "two"]);
+    mirrored.extraKnownMarketplaces.three = market("me/edited");
+    writeFileSync(path.join(backup, "settings.json"), JSON.stringify(mirrored));
+    write(path.join(primary, "settings.json"), JSON.stringify({ extraKnownMarketplaces: { one: market("o/one") } }));
+    const result = await mirror.mirrorStack(stack, {});
+    const after = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(after.extraKnownMarketplaces).toEqual({ one: market("o/one"), own: market("me/own"), three: market("me/edited") });
+    expect(result.warnings.some((w) => w.includes("extraKnownMarketplaces.three") && w.includes("edited on this account"))).toBe(true);
+  });
+
+  test("S4: an added file is recorded before it is copied, so a crash before the final record leaves it owned", async () => {
+    const { primary, backup, b, stack } = claudePair("s4-intent");
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    const p = await provs();
+    const hold = mirror.holdMirrorForTests(b, "file-copied");
+    const running = mirror.mirrorStack(stack, {});
+    await hold.reached;
+    // The file is in place; this is where a crash would stop the run.
+    expect(readFileSync(path.join(backup, "skills", "s", "SKILL.md"), "utf8")).toBe("# s");
+    const intent = p.get(b, "skills/s/SKILL.md");
+    expect(intent).not.toBeNull();
+    expect(intent!.srcMtimeMs).toBeNull();
+    hold.release();
+    await running;
+    // Put the database back to the crash state and run again: the equal-stamp
+    // file is adopted, so a later primary deletion removes it.
+    p.upsert(intent!);
+    await mirror.mirrorStack(stack, {});
+    expect(p.get(b, "skills/s/SKILL.md")!.srcMtimeMs).not.toBeNull();
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(primary, "skills", "s"), { recursive: true });
+    await mirror.mirrorStack(stack, {});
+    expect(existsSync(path.join(backup, "skills", "s", "SKILL.md"))).toBe(false);
+  });
+
+  test("S14: a primary merged file back within the recheck window is not a deletion", async () => {
+    const { primary, backup, b, stack } = claudePair("s14-recheck");
+    write(path.join(primary, "settings.json"), JSON.stringify({ env: { FOO: "1" } }));
+    await mirror.mirrorStack(stack, {});
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(primary, "settings.json"));
+    const hold = mirror.holdMirrorForTests(b, "primary-deletion-recheck");
+    const running = mirror.mirrorStack(stack, {});
+    await hold.reached;
+    // An editor saving by rename puts the file back a moment later.
+    write(path.join(primary, "settings.json"), JSON.stringify({ env: { FOO: "1" } }));
+    hold.release();
+    await running;
+    expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env.FOO).toBe("1");
+    expect((await provs()).get(b, "settings.json", "env.FOO")).not.toBeNull();
+  });
+
+  test("S14: a primary whose CODEX_HOME comes from the environment is skipped when it resolves elsewhere", async () => {
+    const dirA = mkdtempSync(path.join(tmpdir(), "agetor-s14-cx-a-"));
+    const dirB = mkdtempSync(path.join(tmpdir(), "agetor-s14-cx-b-"));
+    const backupHome = mkdtempSync(path.join(tmpdir(), "agetor-s14-cx-backup-"));
+    const primaryId = unique("s14-cx-p");
+    dbm.harnesses.insert({ id: primaryId, kind: "codex", label: primaryId, home: null, env: {} } as never);
+    const b = codexAlias(unique("s14-cx-b"), backupHome);
+    const bRoot = path.join(backupHome, ".codex");
+    const stack = stacks.harnessStacks.create({ label: "s14-cx", kind: "codex", members: [primaryId, b], mirrorMode: "full" });
+    try {
+      await withProcessRoots(async (set) => {
+        write(path.join(dirA, "config.toml"), ['model = "gpt-5"', ""].join("\n"));
+        write(path.join(dirA, "skills", "x", "SKILL.md"), "# x");
+        set("CODEX_HOME", dirA);
+        await mirror.mirrorStack(stack, {});
+        expect(existsSync(path.join(bRoot, "skills", "x", "SKILL.md"))).toBe(true);
+        set("CODEX_HOME", dirB);
+        const result = await mirror.mirrorStack(stack, {});
+        expect(result.warnings.some((w) => w.includes("the primary account's config folder is now") && w.includes("CODEX_HOME"))).toBe(true);
+        expect(existsSync(path.join(bRoot, "skills", "x", "SKILL.md"))).toBe(true);
+        expect((Bun.TOML.parse(readFileSync(path.join(bRoot, "config.toml"), "utf8")) as Record<string, unknown>).model).toBe("gpt-5");
+      });
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("S14: a primary whose .claude.json folder alone moves (HOME-only) is skipped; its keys are not removed", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-s14-home-"));
+    const backup = mkdtempSync(path.join(tmpdir(), "agetor-s14-home-backup-"));
+    const primaryId = unique("s14-home-p");
+    // No folder of its own, an env-map HOME: the config root is <HOME>/.claude
+    // either way, but `.claude.json` sits in <HOME> unless the core has a
+    // CLAUDE_CONFIG_DIR, which then holds it.
+    dbm.harnesses.insert({ id: primaryId, kind: "claude-code", label: primaryId, home: null, env: { HOME: home } } as never);
+    const b = alias(unique("s14-home-b"), backup);
+    const stack = stacks.harnessStacks.create({ label: "s14-home", kind: "claude-code", members: [primaryId, b], mirrorMode: "full" });
+    write(path.join(home, ".claude", "CLAUDE.md"), "rules\n");
+    write(path.join(home, ".claude.json"), JSON.stringify({ mcpServers: { docs: { command: "d" } } }));
+    try {
+      await withProcessRoots(async (set) => {
+        set("CLAUDE_CONFIG_DIR", undefined);
+        await mirror.mirrorStack(stack, {});
+        expect(JSON.parse(readFileSync(path.join(backup, ".claude.json"), "utf8")).mcpServers.docs).toBeDefined();
+        set("CLAUDE_CONFIG_DIR", path.join(home, ".claude"));
+        const result = await mirror.mirrorStack(stack, {});
+        expect(result.warnings.some((w) => w.includes("the primary account's .claude.json folder is now"))).toBe(true);
+        expect(JSON.parse(readFileSync(path.join(backup, ".claude.json"), "utf8")).mcpServers.docs).toBeDefined();
+      });
+    } finally {
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("N1: Restore sets an original's mode before the rename, so a link swapped in afterwards is never chmod-ed through", async () => {
+    const { primary, backup, b, stack } = claudePair("n1-chmod");
+    const outside = mkdtempSync(path.join(tmpdir(), "agetor-n1-outside-"));
+    const victim = path.join(outside, "victim.txt");
+    writeFileSync(victim, "outside\n");
+    chmodSync(victim, 0o600);
+    write(path.join(primary, "commands", "run.sh"), "new");
+    const target = path.join(backup, "commands", "run.sh");
+    write(target, "#!/bin/sh\n");
+    chmodSync(target, 0o755);
+    await mirror.mirrorStack(stack, {});
+    const restoring = mirror.restoreMirror(b);
+    let done = false;
+    void restoring.then(() => { done = true; });
+    let swapped = false;
+    const { renameSync, readFileSync: readNow } = await import("node:fs");
+    while (!done) {
+      // As soon as the original is back, an agent swaps the file for a link.
+      if (!swapped) {
+        try {
+          if (readNow(target, "utf8") === "#!/bin/sh\n") {
+            const tmpLink = path.join(outside, "link");
+            symlinkSync(victim, tmpLink);
+            renameSync(tmpLink, target);
+            swapped = true;
+          }
+        } catch {
+          // Not there yet.
+        }
+      }
+      await Bun.sleep(0);
+    }
+    await restoring;
+    expect(swapped).toBe(true);
+    expect(statSync(victim).mode & 0o777).toBe(0o600);
+  });
+
+  test("N2: re-adding a file or link the backup deleted keeps its saved original, and Restore puts it back", async () => {
+    const { primary, backup, b, stack } = claudePair("n2-readd");
+    write(path.join(primary, "CLAUDE.md"), "primary\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    const ownTarget = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-n2-own-")));
+    const primaryTarget = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-n2-primary-")));
+    mkdirSync(path.join(primary, "skills"), { recursive: true });
+    mkdirSync(path.join(backup, "skills"), { recursive: true });
+    symlinkSync(primaryTarget, path.join(primary, "skills", "linked"));
+    symlinkSync(ownTarget, path.join(backup, "skills", "linked"));
+    await mirror.mirrorStack(stack, {});
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("primary\n");
+    expect(readlinkSync(path.join(backup, "skills", "linked"))).toBe(primaryTarget);
+    const { unlinkSync } = await import("node:fs");
+    unlinkSync(path.join(backup, "CLAUDE.md"));
+    unlinkSync(path.join(backup, "skills", "linked"));
+    await mirror.mirrorStack(stack, {});
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("primary\n");
+    expect(readlinkSync(path.join(backup, "skills", "linked"))).toBe(primaryTarget);
+    const result = await mirror.restoreMirror(b);
+    expect(result.restored).toEqual(expect.arrayContaining(["CLAUDE.md", "skills/linked"]));
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("mine\n");
+    expect(readlinkSync(path.join(backup, "skills", "linked"))).toBe(ownTarget);
+  });
+
+  test("N3: a mirror sweeps stale .agetor-tmp-* leftovers from the folders it visits, and only those", async () => {
+    const { primary, backup, stack } = claudePair("n3-sweep");
+    write(path.join(primary, "skills", "s", "SKILL.md"), "# s");
+    await mirror.mirrorStack(stack, {});
+    const dir = path.join(backup, "skills", "s");
+    const staleFile = path.join(dir, `.agetor-tmp-${randomUUID()}`);
+    const staleLink = path.join(dir, `.agetor-tmp-${randomUUID()}`);
+    const staleDir = path.join(dir, `.agetor-tmp-${randomUUID()}`);
+    const lookalike = path.join(dir, ".agetor-tmp-notours");
+    const outside = path.join(mkdtempSync(path.join(tmpdir(), "agetor-n3-outside-")), "keep.txt");
+    writeFileSync(staleFile, "half a copy");
+    writeFileSync(outside, "keep");
+    symlinkSync(outside, staleLink);
+    mkdirSync(staleDir);
+    writeFileSync(lookalike, "x");
+    transfer.setStaleTempAgeForTests(0);
+    try {
+      await mirror.mirrorStack(stack, {});
+    } finally {
+      transfer.setStaleTempAgeForTests(null);
+    }
+    expect(existsSync(staleFile)).toBe(false);
+    expect(lstatSync(dir).isDirectory()).toBe(true);
+    expect(existsSync(staleLink)).toBe(false);
+    expect(readFileSync(outside, "utf8")).toBe("keep");
+    expect(lstatSync(staleDir).isDirectory()).toBe(true);
+    expect(existsSync(lookalike)).toBe(true);
+    expect(readFileSync(path.join(dir, "SKILL.md"), "utf8")).toBe("# s");
   });
 });

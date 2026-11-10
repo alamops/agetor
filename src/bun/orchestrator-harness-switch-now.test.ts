@@ -643,3 +643,285 @@ describe("a scheduled switch is performed when the turn FAILS (TT-D)", () => {
     stacks.harnessStacks.delete(stack.id);
   }, 20_000);
 });
+
+// ---------------------------------------------------------------------------
+// Review fixes: an account no longer in its stack (S6), a scheduled switch
+// left waiting after its turn ended (S7), the boot `manual` label.
+// ---------------------------------------------------------------------------
+
+describe("an account removed from its stack (S6)", () => {
+  function orphanedTask(prefix: string, extra: Partial<Task> = {}) {
+    const a = alias(`${prefix}-a`);
+    const b = alias(`${prefix}-b`);
+    const c = alias(`${prefix}-c`);
+    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b, c] });
+    const task = makeTask(a, "work", { column: "review", ...extra });
+    const prior = insertRun(task.id, a);
+    db.tasks.update(task.id, { runId: prior });
+    db.tasks.setHarnessState(task.id, {
+      stackId: stack.id, position: 0, count: 3, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
+    });
+    // The task's account leaves the stack; the task still resolves to it
+    // through its recorded state.
+    stacks.harnessStacks.update(stack.id, { members: [b, c] });
+    expect(stacks.harnessStacks.resolveForTask(db.tasks.get(task.id)!)?.orphaned).toBe(true);
+    return { a, b, c, stack, task, prior };
+  }
+
+  test("a switch is refused not-in-stack instead of a silent fresh start", async () => {
+    const { a, stack, task } = orphanedTask("s6");
+    let refusal: unknown = null;
+    try {
+      await orch.switchTaskAccountNow(task.id);
+    } catch (err) {
+      refusal = err;
+    }
+    expect(refusal).toBeInstanceOf(orch.SwitchAccountRefusedError);
+    expect((refusal as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code).toBe("not-in-stack");
+    const after = db.tasks.get(task.id)!;
+    expect(after.agent).toBe(a);
+    expect(after.harnessState?.pendingSwap ?? null).toBeNull();
+    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("a scheduled switch is dropped with a status line, not applied", async () => {
+    const { a, stack, task, prior } = orphanedTask("s6sched");
+    db.tasks.setHarnessState(task.id, {
+      ...db.tasks.get(task.id)!.harnessState!, scheduledSwitch: { requestedAt: Date.now() },
+    });
+    await orch.reconcilePendingHarnessSwaps();
+    const after = db.tasks.get(task.id)!;
+    expect(after.agent).toBe(a);
+    expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
+    expect(db.runs.events(prior).some((e) => e.stream === "status" && e.data.includes("no longer in a stack with a backup account"))).toBe(true);
+    expect(events(stack.id).filter((e) => e.taskId === task.id)).toHaveLength(0);
+    stacks.harnessStacks.delete(stack.id);
+  });
+});
+
+describe("a scheduled switch left waiting after its turn ended (S7)", () => {
+  const statusOf = (runId: string) => db.runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+
+  test("a FAILED turn whose background agents were still running switches once they finish", async () => {
+    const { settleSubagentById } = await import("./claude-subagents.ts");
+    const a = alias("s7bg-a");
+    const b = alias("s7bg-b");
+    const stack = stacks.harnessStacks.create({ label: "s7bg", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "p");
+    // The turn ended in an API error (failed, card blocked) while a background
+    // agent kept running, so its turn end deferred the switch to the agents.
+    const runId = insertRun(task.id, a, { status: "failed", exitCode: 1, claudeSessionId: `s7bg-${task.id}` });
+    db.tasks.update(task.id, { runId, column: "blocked" });
+    const subagentId = `agent-${randomUUID()}`;
+    db.subagents.insertIfAbsent({
+      id: subagentId, taskId: task.id, runId, parentKind: "subagent", agentType: "general-purpose",
+      description: "background review", spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`),
+      status: "running", startedAt: Date.now() - 1000, endedAt: null,
+    } as never);
+    db.tasks.setHarnessState(task.id, {
+      stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
+      scheduledSwitch: { requestedAt: Date.now() },
+    });
+    expect(settleSubagentById(subagentId, "completed", "receipt")).toBe(true);
+    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    const after = db.tasks.get(task.id)!;
+    expect(after.agent).toBe(b);
+    expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
+    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  /** Run a fake turn, schedule a switch, and hold a claim on the task across
+   *  the turn end: the turn end leaves the request to the claim holder. */
+  async function turnEndsUnderClaim(prefix: string) {
+    const a = alias(`${prefix}-a`);
+    const b = alias(`${prefix}-b`);
+    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "plain work");
+    let runId = "";
+    process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "600";
+    try {
+      const started = await orch.startTask(task.id);
+      runId = (started as { runId: string }).runId;
+      expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
+      // The start's own claim is released once its spawn returns; take one as
+      // soon as it is free (the turn is still running).
+      let claimed = false;
+      const deadline = Date.now() + 5000;
+      while (!claimed && Date.now() < deadline) {
+        claimed = orch.claimTaskForAccountSwitch(task.id);
+        if (!claimed) await Bun.sleep(5);
+      }
+      expect(claimed).toBe(true);
+      expect(db.runs.get(runId)!.status).toBe("running");
+      await waitFor(() => db.runs.get(runId)?.status !== "running");
+    } finally {
+      delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+    }
+    // Give the settle chain past the turn end a moment: the request must still
+    // be there, on the old account.
+    await waitFor(() => statusOf(runId).some((l) => l.startsWith("exit:")));
+    await Bun.sleep(50);
+    expect(db.runs.get(runId)!.status).toBe("succeeded");
+    expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch).toBeTruthy();
+    expect(db.tasks.get(task.id)!.agent).toBe(a);
+    return { a, b, stack, task, runId };
+  }
+
+  test("the start holding the task at the turn end ends without a run: the switch is applied then", async () => {
+    const { b, stack, task } = await turnEndsUnderClaim("s7claim");
+    orch.releaseTaskAccountSwitch(task.id);
+    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    const after = db.tasks.get(task.id)!;
+    expect(after.agent).toBe(b);
+    expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
+    expect(after.harnessState?.lastMove?.reason).toBe("switch-now");
+    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+
+  test("a start holding the task that fails before minting a run applies it; a Stop on that start drops it", async () => {
+    for (const stop of [false, true]) {
+      const { a, b, stack, task, runId } = await turnEndsUnderClaim(stop ? "s7stop" : "s7pre");
+      // Hand the task from the stand-in claim to a real start, in the same
+      // tick, and hold that start in its pre-flight (the teardown queue).
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      void orch.__enqueueTeardownForTest(task.id, task.workdir, () => gate);
+      // Worktree isolation on a folder that is no git repo: the start fails
+      // its workdir pre-flight, after the claim and before any run exists.
+      db.tasks.update(task.id, { isolation: "worktree" });
+      orch.releaseTaskAccountSwitch(task.id);
+      const starting = orch.startTask(task.id);
+      // Nothing is live, so a Stop lands on the start's claim.
+      if (stop) expect(await orch.cancelLiveRunOfTask(task.id)).toBe(true);
+      release();
+      const result = await starting;
+      expect(result).toHaveProperty("error");
+      expect((result as { error: string }).error).toContain("not inside a git repo");
+      expect(db.runs.listForTask(task.id)).toHaveLength(1);
+      if (stop) {
+        await waitFor(() => db.tasks.get(task.id)?.harnessState?.scheduledSwitch == null);
+        expect(db.tasks.get(task.id)!.agent).toBe(a);
+        expect(statusOf(runId).some((l) => l.includes("scheduled account switch cancelled (stopped)"))).toBe(true);
+        expect(events(stack.id).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(0);
+      } else {
+        await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+        expect(db.tasks.get(task.id)!.agent).toBe(b);
+        expect(events(stack.id).filter((e) => e.taskId === task.id && e.trigger === "scheduled")).toHaveLength(1);
+      }
+      expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+      stacks.harnessStacks.delete(stack.id);
+    }
+  }, 40_000);
+});
+
+describe("boot completion of an interrupted switch-now (label)", () => {
+  test("an idle `manual` switch-now finished at boot keeps the switch-now label; a plain manual switch does not", async () => {
+    for (const switchNow of ["manual", undefined] as const) {
+      const a = alias(`bootlbl-${switchNow ?? "plain"}-a`);
+      const b = alias(`bootlbl-${switchNow ?? "plain"}-b`);
+      const stack = stacks.harnessStacks.create({ label: "bootlbl", kind: "claude-code", members: [a, b] });
+      // The row update landed on the destination before the restart.
+      const task = makeTask(b, "work", { column: "review" });
+      const prior = insertRun(task.id, a);
+      db.tasks.update(task.id, { runId: prior });
+      db.tasks.setHarnessState(task.id, {
+        stackId: stack.id, position: 1, count: 2, tried: [], allExhausted: null, lastMove: null,
+        pendingSwap: {
+          from: a, to: b, reason: "quota", runId: prior, startedAt: Date.now(), manual: true,
+          ...(switchNow ? { switchNow } : {}),
+        },
+      });
+      await orch.reconcilePendingHarnessSwaps();
+      const after = db.tasks.get(task.id)!;
+      expect(after.agent).toBe(b);
+      expect(after.harnessState?.pendingSwap ?? null).toBeNull();
+      expect(after.harnessState?.lastMove).toMatchObject({
+        from: a, to: b, reason: switchNow ? "switch-now" : "manual-switch",
+      });
+      expect(after.harnessState?.tried ?? []).toEqual([]);
+      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["boot-resume"]);
+      expect(stacks.harnessStacks.getLimitState(a)).toBeNull();
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+});
+
+describe("a limit settlement that throws before consuming a scheduled switch (S7)", () => {
+  test("drops the request with a status line instead of leaving it for a later turn", async () => {
+    const a = alias("s7throw-a");
+    const b = alias("s7throw-b");
+    const stack = stacks.harnessStacks.create({ label: "s7throw", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, `work ${FAKE_CLAUDE_LIMIT_PROMPT_MARKER}`);
+    // The earliest point of the settlement, before the request is consumed.
+    const prev = orch.__setHarnessSwapSettleHookForTest((hooked, _runId, phase) => {
+      if (hooked !== task.id || phase !== "settle") return;
+      orch.__setHarnessSwapSettleHookForTest(null);
+      throw new Error("synthetic settlement failure");
+    });
+    let runId = "";
+    process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "300";
+    try {
+      runId = ((await orch.startTask(task.id)) as { runId: string }).runId;
+      expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
+      await waitFor(() => db.tasks.get(task.id)?.column === "blocked");
+    } finally {
+      delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+      orch.__setHarnessSwapSettleHookForTest(prev);
+    }
+    const after = db.tasks.get(task.id)!;
+    expect(after.column).toBe("blocked");
+    expect(after.agent).toBe(a);
+    expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
+    const lines = db.runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(lines.some((l) => l.includes("switching accounts failed: synthetic settlement failure"))).toBe(true);
+    expect(lines.some((l) => l.includes("scheduled account switch dropped: the account switch after the limit failed"))).toBe(true);
+    stacks.harnessStacks.clearLimitState(a);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});
+
+describe("a background agent settling inside the turn-end pump (S7 race)", () => {
+  test("the turn-end path applies the scheduled switch, not the subagent release edge", async () => {
+    const { settleSubagentById } = await import("./claude-subagents.ts");
+    const a = alias("s7pump-a");
+    const b = alias("s7pump-b");
+    const stack = stacks.harnessStacks.create({ label: "s7pump", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "plain work");
+    const subagentId = `agent-${randomUUID()}`;
+    // Whether the account-switch claim was free right after the last
+    // background agent settled inside the done handler: if the release edge
+    // had applied the switch there, it would hold the claim (without the
+    // turn-end ordering) and the turn end could not claim it.
+    let claimFreeAfterRelease: boolean | null = null;
+    const prev = orch.__setTurnSettlePumpHookForTest((hooked) => {
+      if (hooked !== task.id) return;
+      orch.__setTurnSettlePumpHookForTest(null);
+      settleSubagentById(subagentId, "completed", "receipt");
+      claimFreeAfterRelease = orch.claimTaskForAccountSwitch(task.id);
+      if (claimFreeAfterRelease) orch.releaseTaskAccountSwitch(task.id);
+    });
+    process.env.AGETOR_FAKE_CLAUDE_TURN_MS = "500";
+    try {
+      const runId = ((await orch.startTask(task.id)) as { runId: string }).runId;
+      db.subagents.insertIfAbsent({
+        id: subagentId, taskId: task.id, runId, parentKind: "subagent", agentType: "general-purpose",
+        description: "background review", spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`),
+        status: "running", startedAt: Date.now(), endedAt: null,
+      } as never);
+      expect((await orch.switchTaskAccountNow(task.id)).status).toBe("scheduled");
+      await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isTaskRunLive(task.id));
+    } finally {
+      delete process.env.AGETOR_FAKE_CLAUDE_TURN_MS;
+      orch.__setTurnSettlePumpHookForTest(prev);
+    }
+    expect(claimFreeAfterRelease as boolean | null).toBe(true);
+    const after = db.tasks.get(task.id)!;
+    expect(after.agent).toBe(b);
+    expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
+    expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});

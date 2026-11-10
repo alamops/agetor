@@ -424,3 +424,36 @@ describe("boot normalization re-reads the row (088 review N1)", () => {
     dbm.harnessOrphanedCopies.deleteForHarness("claude-n1b");
   });
 });
+
+describe("snapshotHarnessState covers the 088/089 tables (review N8)", () => {
+  test("orphaned copies and mirror sources a test adds are removed, and the snapshot's rows come back whole", async () => {
+    const { snapshotHarnessState } = await import("./test-harness-state.ts");
+    const sid = "cccccccc-0000-4000-8000-000000000001";
+    const sources = () =>
+      dbm.db.query("SELECT * FROM harness_mirror_sources WHERE harness_id LIKE 'n8-%' ORDER BY harness_id").all();
+    const orphans = () => dbm.harnessOrphanedCopies.list().filter((r) => r.harnessId.startsWith("n8-"));
+    // Rows that exist before the snapshot.
+    dbm.harnessOrphanedCopies.add("n8-kept", "claude_session_id", sid, [`/r/projects/e/${sid}.jsonl`]);
+    dbm.db.run(
+      `INSERT INTO harness_mirror_sources (harness_id, primary_id, primary_root, primary_config, updated_at)
+       VALUES ('n8-kept', 'n8-primary', '/kept/root', '/kept/root/.claude.json', 11)`,
+    );
+    const before = { orphans: orphans(), sources: sources() };
+    const restoreState = snapshotHarnessState();
+
+    // What a test file would leave behind.
+    dbm.harnessOrphanedCopies.deleteForHarness("n8-kept");
+    dbm.harnessOrphanedCopies.add("n8-leak", "codex_session_id", sid, [`/r/sessions/2026/11/10/rollout-x-${sid}.jsonl`]);
+    dbm.db.run(`UPDATE harness_mirror_sources SET primary_root = '/moved' WHERE harness_id = 'n8-kept'`);
+    dbm.db.run(
+      `INSERT INTO harness_mirror_sources (harness_id, primary_id, primary_root, primary_config, updated_at)
+       VALUES ('n8-leak', 'n8-primary', '/leak', '/leak/.claude.json', 12)`,
+    );
+
+    restoreState();
+    expect(orphans()).toEqual(before.orphans);
+    expect(sources()).toEqual(before.sources);
+    dbm.harnessOrphanedCopies.deleteForHarness("n8-kept");
+    dbm.db.run(`DELETE FROM harness_mirror_sources WHERE harness_id = 'n8-kept'`);
+  });
+});

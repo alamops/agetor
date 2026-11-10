@@ -492,14 +492,10 @@ async function cmdHarnessStack(client: Client, args: string[], flags: Flags): Pr
       if (hasOps && parsed.members.length > 0) {
         throw new Error("--member replaces the whole list; it cannot be combined with --add / --remove / --move");
       }
-      const patch: { label?: string; kind?: "claude-code" | "codex"; members?: string[]; mirrorMode?: "full" | "safe" } = {};
-      if (parsed.label !== undefined) patch.label = parsed.label;
-      // `--kind` is honoured, not silently dropped. The server validates it
-      // against the members (a stack is one harness kind), so an impossible
-      // edit fails loudly instead of leaving the row unchanged.
-      if (parsed.kind !== undefined) patch.kind = parsed.kind;
-      if (parsed.mirror !== undefined) patch.mirrorMode = parsed.mirror;
-      if (parsed.members.length === 0 && !hasOps && Object.keys(patch).length === 0) {
+      if (
+        parsed.members.length === 0 && !hasOps
+        && parsed.label === undefined && parsed.kind === undefined && parsed.mirror === undefined
+      ) {
         throw new Error("nothing to edit — pass --label / --kind / --member / --add / --remove / --move / --mirror");
       }
       // Always read the stack first: its `updatedAt` rides along as
@@ -507,13 +503,26 @@ async function cmdHarnessStack(client: Client, args: string[], flags: Flags): Pr
       // (409 `stack-changed`) instead of overwritten (D16).
       const stack = await resolveStack(client, ref);
       const currentIds = stack.members.map((m) => m.harnessId);
-      if (parsed.members.length > 0) patch.members = parsed.members;
-      else if (hasOps) patch.members = applyMemberOps(stack, parsed.ops);
-      const membersChanged = patch.members !== undefined && patch.members.join("\n") !== currentIds.join("\n");
+      // `--kind` is honoured, not silently dropped. The server validates it
+      // against the members (a stack is one harness kind), so an impossible
+      // edit fails loudly instead of leaving the row unchanged.
+      const patch = stackEditPatch(stack, {
+        label: parsed.label,
+        kind: parsed.kind,
+        mirrorMode: parsed.mirror,
+        members: parsed.members.length > 0 ? parsed.members : hasOps ? applyMemberOps(stack, parsed.ops) : undefined,
+      });
+      if (Object.keys(patch).length === 0) {
+        // Every flag already matches the stack: send nothing, so nothing is
+        // mirrored and `--dry-run` has nothing to hide.
+        if (flags.json) return printJson({ saved: false, unchanged: true, preview: null, stack });
+        out(c.dim(`no changes — stack ${escapeControlChars(stack.label)} already matches${parsed.dryRun ? "; nothing saved" : ""}`));
+        return;
+      }
+      // The same rule the server applies to the PATCH body: a members, kind or
+      // mirror-mode field re-runs the mirror.
       const mirrorRelevant =
-        membersChanged ||
-        (patch.kind !== undefined && patch.kind !== stack.kind) ||
-        (patch.mirrorMode !== undefined && patch.mirrorMode !== stack.mirrorMode);
+        patch.members !== undefined || patch.kind !== undefined || patch.mirrorMode !== undefined;
       const gate = await previewGate(
         client,
         flags,
@@ -556,6 +565,35 @@ async function cmdHarnessStack(client: Client, args: string[], flags: Flags): Pr
         `unknown harness stack subcommand: ${escapeControlChars(sub)} (use ls | create | show | edit | preview | history | rm)`,
       );
   }
+}
+
+type StackEditFields = { label?: string; kind?: "claude-code" | "codex"; members?: string[]; mirrorMode?: "full" | "safe" };
+
+/**
+ * The PATCH body of `harness stack edit`: only the fields that differ from the
+ * stored stack. The server re-runs the mirror whenever `members`, `kind` or
+ * `mirrorMode` is present, whatever its value, so a field already at its value
+ * (`--mirror full` on a full stack, `--member` with the current order) must be
+ * left out, or the save would mirror without the preview or the `--yes` check.
+ * Same rule as the webview's `draftPatch` (src/mainview/lib/stack-editor.ts),
+ * plus `kind`, which only the CLI can edit.
+ */
+export function stackEditPatch(
+  stack: Pick<HarnessStack, "label" | "kind" | "mirrorMode" | "members">,
+  wanted: StackEditFields,
+): StackEditFields {
+  const patch: StackEditFields = {};
+  if (wanted.label !== undefined && wanted.label !== stack.label) patch.label = wanted.label;
+  if (wanted.kind !== undefined && wanted.kind !== stack.kind) patch.kind = wanted.kind;
+  if (wanted.mirrorMode !== undefined && wanted.mirrorMode !== stack.mirrorMode) patch.mirrorMode = wanted.mirrorMode;
+  const currentIds = stack.members.map((m) => m.harnessId);
+  if (
+    wanted.members !== undefined
+    && (wanted.members.length !== currentIds.length || wanted.members.some((id, i) => id !== currentIds[i]))
+  ) {
+    patch.members = wanted.members;
+  }
+  return patch;
 }
 
 function printStackWriteNotes(result: StackWrite): void {

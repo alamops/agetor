@@ -7107,9 +7107,11 @@ function HarnessStackBanner({
  * reflects the answer. The in-flight and scheduled flags live in the core's
  * answer and `task.harnessState.scheduledSwitch`, so a reload or a CLI
  * request shows the same state; the busy flag is tagged with the task id so
- * switching tasks mid-request leaks nothing.
+ * switching tasks mid-request leaks nothing. An archived task offers no
+ * switch (the core refuses it); a switch still scheduled on one keeps its
+ * Cancel. Exported for its render test.
  */
-function SwitchAccountControl({
+export function SwitchAccountControl({
   task,
   stacks,
   harnesses,
@@ -7122,8 +7124,8 @@ function SwitchAccountControl({
 }) {
   const [busy, setBusy] = useState<{ taskId: string; op: "switch" | "cancel" } | null>(null);
   const scheduled = task.harnessState?.scheduledSwitch != null;
-  const stacked = stackPositionFor(stacks, task.agent) !== null;
-  if (!stacked && !scheduled) return null;
+  const offerSwitch = task.archivedAt == null && stackPositionFor(stacks, task.agent) !== null;
+  if (!offerSwitch && !scheduled) return null;
   const taskBusy = busy?.taskId === task.id ? busy.op : null;
   const mergeResult = (updated: Task) => {
     onTaskFieldsChanged?.(task.id, { agent: updated.agent, harnessState: updated.harnessState });
