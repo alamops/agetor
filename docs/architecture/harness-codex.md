@@ -47,6 +47,13 @@ MCP OAuth tokens are not copied (no stable standalone file in `auto`/`file`
 mode); the swap warns that sign-in may need repeating. The mirror never imports
 the primary's login-bearing `config.toml` keys or `[model_providers.*]` tables.
 
+A Codex limit worded "You've hit your usage limit for <model>." is scoped to
+that model: the signal carries the (lower-cased) model id, the cooldown row is
+keyed `(account, model)`, and only tasks whose resolved model matches skip the
+account; any other wording cools the whole account. A zero (or negative) Codex
+`credits` balance in the usage meter counts as a full credits meter, so it no
+longer shields a full session or weekly window from the quota check.
+
 A limit signal comes only from a terminal `turn.failed` (its own message, or
 the classification remembered from the last top-level `error`). A top-level
 `error`, an `error` item and a non-JSON log line never signal, and

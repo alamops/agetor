@@ -61,7 +61,7 @@ A new `run_events` method that isn't exercised by that test fails it by name.
 
 **Adding a migration** (numbered `.sql` files, the `migrations/index.ts` entry, never editing an applied one, and why the SQL is inlined at bundle time) is described once, in [CLAUDE.md § Persistence, in brief](../../CLAUDE.md#persistence-in-brief).
 
-## Harness stack tables (migrations 084, 085)
+## Harness stack tables (migrations 084, 085, 087)
 
 `harness_stacks`, `harness_stack_members`, `harness_limit_state` and
 `harness_session_handoffs` are additive; `tasks.harness_state` is another
@@ -78,6 +78,48 @@ that FK (the cascade from `harness_stacks` stays), and `harnesses.delete`
 removes the account's membership row explicitly and re-packs the ranks.
 `harness_limit_state` has no FK on purpose: it is account-global and
 survives a stack delete. `harness_session_handoffs` cascades with the task; its
-`copied_paths_json` is the only allowlist cleanup may remove. Snapshot/restore
-for tests covers all three (`test-harness-state.ts`). Model:
+`copied_paths_json` is the only allowlist cleanup may remove.
+
+**Migration 087** (`087_harness_stacks_fix_round.sql`):
+
+- **`harness_limit_state` is rebuilt** with a `model` column and the primary key
+  `(harness_id, model)`; `model = ''` is the whole-account cooldown every earlier
+  row was, so existing cooldowns keep their meaning (the rows are copied with
+  `model = ''`; the `exhausted_until_ms` index is recreated). It is safe to
+  rebuild because nothing references it by FK, and it still has none.
+  `harnesses.delete` clears the account's rows explicitly.
+- **`harness_swap_events`** (the per-stack swap history). Its **only FK is
+  `stack_id REFERENCES harness_stacks(id) ON DELETE CASCADE`**; task and account
+  ids are plain columns and the labels and task title are denormalized, so a row
+  outlives the task and the account. `trigger` has no `CHECK` (the set may grow
+  without a table rebuild; the store validates on insert and drops unknown
+  triggers on read), `continuation` is `CHECK`-ed to `transferred`/`restarted`
+  or `NULL`. The page index is `(stack_id, at DESC, id DESC)`. There is no cap
+  and no pruning.
+- **`harness_mirror_provenance`**, primary key `(harness_id, path, key)`, **no
+  FK** (the same 085 reasoning), `scope` `CHECK`-ed to `file`/`key`/`link`.
+  `harnesses.delete` removes the account's rows inline in its transaction (the
+  store module imports `db.ts`, so it cannot be called from there).
+
+**A future `harness_stacks` rebuild must turn foreign keys off first.**
+`harness_swap_events` cascades on `harness_stacks`, so the documented SQLite
+rebuild (`DROP TABLE harness_stacks` is an implicit `DELETE` with foreign keys
+on, and `db.ts` turns them on before `migrate()`) would delete every stack's
+history, exactly as the 084 `harness_stack_members` FK would have deleted every
+membership on a `harnesses` rebuild. `harness_stack_members` also cascades on
+`harness_stacks`. Such a migration must run with foreign keys off, or copy the
+dependent tables out and back around the rebuild: the runner applies each file
+in one transaction, where `PRAGMA foreign_keys` is a no-op, so there is no hook
+for that today.
+
+`runs.mainUserRows(runId)` (`db.ts`) returns a run's main-stream `user` rows,
+oldest first, each tagged `twin` when the row carries a `line_uuid` (the Claude
+JSONL copy of a send). It is a `run_events` query like `mainUserTexts`, pinned
+`INDEXED BY idx_run_events_run` and listed in `db-run-events-plans.test.ts`.
+Clean retries and the persisted `allExhausted.cleanRetryOf` chain read it.
+
+Snapshot/restore for tests (`test-harness-state.ts`) covers stacks, members and
+limit rows; it does not yet cover `harness_swap_events` or
+`harness_mirror_provenance` (a test that writes them should clean up after
+itself), and it re-inserts limit rows without their `model`. Model:
 [harness-stacks.md](harness-stacks.md).

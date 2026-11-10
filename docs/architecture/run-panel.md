@@ -30,5 +30,30 @@ not open a section. A `status`
 event with the `harness-swap:` prefix renders as a divider carrying the exact
 notice plus `(2/3)`; a `user` event that is exactly the hidden
 `<harness-stack-continuation>` wrapper renders nothing. The panel takes an
-optional `stacks` prop; no extra fetch is made. See
+optional `stacks` prop and, new in the fix round, `limitStates` (cooldown rows,
+one per account and model) and `onOpenSettingsHarnesses`; no extra fetch is made
+(App's `reconcileById` keys cooldown rows by account **and** model). See
 [harness-stacks.md](harness-stacks.md).
+
+The fix round added three pieces of per-task state in the harness-stack
+children. None is cleared by the `[task.id]` reset effect: each is **tagged with
+the task id it belongs to** and only counts while `task.id` still matches, so
+switching tasks mid-request neither shows the previous task's disabled button
+nor loses the request:
+
+- `HarnessStackBanner`'s `runningNowFor` (the Run now in-flight guard: the
+  button is disabled and reads "Starting…" until `onRunTask`'s promise settles);
+- `SwitchAccountControl`'s `busy` (`{ taskId, op: "switch" | "cancel" }`, the
+  Switch to next account / Cancel guard; the scheduled state itself is not local,
+  it reads `task.harnessState.scheduledSwitch`, so a reload or a CLI request
+  shows the same thing);
+- `RunPanelBody`'s `switchingAgentFor` (the account picker is disabled with a
+  "Switching…" note while the awaited same-stack PATCH copies the transcript).
+
+New per-task state in these children should follow the same tagging, or get a
+reset line. For a task in a stack of two or more accounts the account picker
+lists only the stack's members (`stackPickerOptions`); the non-editable Harness
+row shows the account's label. A completed account PATCH or switch calls
+`onTaskFieldsChanged` with only the fields it owns (`agent`, `harnessState` and,
+for a PATCH, mode/model/effort/speed/Max mode), so the panel shows the new
+account before the next 2 s poll.

@@ -279,6 +279,20 @@ Phase 5 review (opus, parallel dimension and flow passes) → Phase 6 tests (TT1
   - **Codex self-clear:** matches the exact stored cooldown row.
   - **Boot resume throws:** the task is blocked with `harness-swap-failed`.
 
+- **Phase 5 review decisions (orchestrator):**
+  - **Switch-now during a swap, retry or boot-swap window, or during a launch freeze:** refused with 409 (`busy` / `launches-frozen`). It is never scheduled, so a request can't be silently dropped.
+  - **Clear cooldown:** re-arms the countdowns of blocked tasks waiting on that account and refreshes their member reasons.
+  - **Clear on the account-wide chip:** clears only the account-wide row. Plain `DELETE` (CLI `cooldown clear` without `--model`) still clears every row.
+  - **Restore:** offered only on accounts that have mirror records (`mirrorRestorable` in the `/harnesses` payload).
+  - **Harness delete:** removes its provenance rows and backups inside the destination's mirror queue.
+  - **Archived refusal:** uses code `archived`.
+- **Accepted without change:**
+  - `AGETOR_E2E_HARNESS_SEAMS` is an explicit opt-in e2e flag, set by the fixture.
+  - Long-held webview connections for an awaited copy.
+  - Large handoff path lists.
+  - A boot-completed switch-now reads `manual-switch`.
+- **Phase 6:** rewrite the broken specs `harness-stack-settings`, `harness-stack-swap` and `settings-subpage-guard`.
+
 ## 8. Open questions / assumptions
 
 - No unratified decisions: every grill question was answered by the owner.
