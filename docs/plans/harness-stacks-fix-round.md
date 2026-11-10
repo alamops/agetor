@@ -7,7 +7,7 @@
 | Config | AGENTS_CONFIG.yml (balanced: investigate/implement/tests sonnet, review opus, test-running haiku) |
 | Flags | none |
 | Gates | grilled via decision form (`docs/plans/harness-stacks-fix-round-grill/round-1..3/answers.json`, all complete; every question answered by the owner) + plan approved by owner (chat, 2026-11-09) |
-| Status | approved by owner; wave 0 in progress |
+| Status | done on the branch, nothing pushed. Final run at `210e8c20`: typecheck clean; `bun test` 12,696 pass / 0 fail / 30 env-gated skips (492 files); Playwright 459 passed / 1 failed, a stale assertion in `agent-profiles-launch.spec.ts`, since fixed (10/10). No production code changed after that e2e run. |
 | Branch | `fix/harness-stacks-fix-round` |
 | Base SHA | `c45fd80699c931472f584c347695de0f521fa1cd` |
 
@@ -325,3 +325,24 @@ Phase 5 review (opus, parallel dimension and flow passes) → Phase 6 tests (TT1
 - Agent kinds other than Claude Code and Codex, and cross-kind stacks (PR #295 grill).
 
 **Owner-deferred:** none.
+
+### Ledger outcome (final)
+
+- **Swept in:** every row above.
+  - Findings 1–22, every gap and nit, and the five owner features (provenance with backup/Restore/preview, history, quota, switch to next account, Settings merge).
+  - Everything the reviews found: the W1–W3 wave reviews and the Phase 5 four-pass review, 5 must-fix and 18 should-fix.
+  - Five defects the tests found:
+    - the data-dir link guard compared only one spelling of the path;
+    - a credentialed inline shell env policy made the merge refuse;
+    - mixed table/inline `set` forms;
+    - identical unread follow-ups collapsed into one;
+    - the restore message after a lost answer.
+- **Ruled out of scope:** the rows marked out of scope above (return to the primary after a reset; interrupting a live turn for switch-now; a mirror timer/watch; CLI force-refresh of usage; other agent kinds and cross-kind stacks).
+- **Accepted known limitations**, documented in `harness-stacks.md`:
+  - re-keyed handoff rows can strand unremovable old-session paths;
+  - retained copies are lost on task delete;
+  - a deleted primary merged file doesn't propagate key removals;
+  - a narrow directory-swap race in backup removal is reduced, not closed;
+  - a boot-completed switch-now reads `manual-switch`.
+- **Owner-deferred:** none.
+
