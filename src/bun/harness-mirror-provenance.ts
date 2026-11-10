@@ -128,6 +128,61 @@ export function isUnownedRow(row: MirrorProvenanceRow): boolean {
   return row.srcMtimeMs === UNOWNED_STAMP && row.srcSize === UNOWNED_STAMP;
 }
 
+/** Where a backup's mirror last read its primary from (migration 089). */
+export interface MirrorSourceRow {
+  harnessId: string;
+  primaryId: string;
+  /** The primary's resolved config folder (and, for Claude, a second line with
+   *  its `.claude.json` folder), `path.resolve`d. */
+  primaryRoot: string;
+  /** Fingerprint of the primary's own root settings (`home` and the root env
+   *  keys); a change means the user re-pointed the account. */
+  primaryConfig: string;
+  updatedAt: number;
+}
+
+type SourceDbRow = {
+  harness_id: string;
+  primary_id: string;
+  primary_root: string;
+  primary_config: string;
+  updated_at: number;
+};
+
+/** One row per backup account; untrusted like provenance rows, but only ever
+ *  compared, never used as a path. */
+export const mirrorSources = {
+  get(harnessId: string): MirrorSourceRow | null {
+    const row = db
+      .query<SourceDbRow, [string]>(`SELECT * FROM harness_mirror_sources WHERE harness_id = ?`)
+      .get(harnessId);
+    return row
+      ? {
+        harnessId: row.harness_id,
+        primaryId: row.primary_id,
+        primaryRoot: row.primary_root,
+        primaryConfig: row.primary_config,
+        updatedAt: row.updated_at,
+      }
+      : null;
+  },
+  set(row: MirrorSourceRow): void {
+    db.run(
+      `INSERT INTO harness_mirror_sources (harness_id, primary_id, primary_root, primary_config, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(harness_id) DO UPDATE SET
+         primary_id = excluded.primary_id,
+         primary_root = excluded.primary_root,
+         primary_config = excluded.primary_config,
+         updated_at = excluded.updated_at`,
+      [row.harnessId, row.primaryId, row.primaryRoot, row.primaryConfig, row.updatedAt],
+    );
+  },
+  deleteForHarness(harnessId: string): void {
+    db.run(`DELETE FROM harness_mirror_sources WHERE harness_id = ?`, [harnessId]);
+  },
+};
+
 /** Distinct harness ids with at least one provenance row (the primary key
  *  index covers the scan). */
 export function harnessIdsWithProvenance(): string[] {

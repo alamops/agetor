@@ -133,9 +133,11 @@ import {
 import {
   isUnownedRow,
   mirrorProvenance,
+  mirrorSources,
   UNOWNED_STAMP,
   type MirrorProvenanceRow,
 } from "./harness-mirror-provenance.ts";
+import { nonBlankRootValue, ROOT_ENV_KEYS } from "../shared/harness-config-root.ts";
 import { claudeConfigDirFor, claudeJsonDirFor, codexHomeFor } from "./harness-stacks.ts";
 import { dataDir, harnesses } from "./db.ts";
 
@@ -392,6 +394,7 @@ export function deleteMirrorStateForHarness(harnessId: string): Promise<void> {
   return serializeForDestination(harnessId, async () => {
     try {
       mirrorProvenance.deleteForHarness(harnessId);
+      mirrorSources.deleteForHarness(harnessId);
     } catch (err) {
       console.warn(`[harness-mirror] could not drop provenance for a deleted account: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -596,6 +599,16 @@ async function mirrorOne(
       ? [canonicalRoot(claudeJsonDirFor(primary)), canonicalRoot(claudeJsonDirFor(target))]
       : [],
   };
+  // Deletion propagation trusts that the primary's folder is the one the last
+  // run read. The same primary, with unchanged root settings, resolving to a
+  // different folder means the core's environment changed, not the user's
+  // files: copy as usual, but remove nothing (and keep the recorded folder).
+  const source = primarySourceOf(primary, fromRoot);
+  const recorded = mirrorSources.get(target.id);
+  const rootMoved = recorded !== null
+    && recorded.primaryId === primary.id
+    && recorded.primaryConfig === source.primaryConfig
+    && recorded.primaryRoot !== source.primaryRoot;
   const ctx: MirrorCtx = {
     dry,
     harnessId: target.id,
@@ -605,13 +618,19 @@ async function mirrorOne(
     fromRoot,
     toRoot,
     guard,
-    propagate: isDirectory(fromRoot),
+    propagate: isDirectory(fromRoot) && !rootMoved,
     rows: new Map(mirrorProvenance.list(target.id).map((r) => [rowId(r.path, r.key), r] as const)),
     plan,
     copied: [],
     warnings: [],
     lastYield: Date.now(),
   };
+  if (rootMoved) {
+    warn(
+      ctx,
+      `the primary account's config folder is now ${fromRoot}, but it was ${recorded.primaryRoot.split("\n")[0]} on the last mirror and the account's settings did not change (Agetor was probably started with a different ${kind === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"}): nothing is removed from this account until it resolves back, or give the primary account its own config folder`,
+    );
+  }
 
   // 1. Copy the allowlisted dirs/files verbatim FIRST, so the registry merge
   //    below can tell whether the payload it points at was copied completely.
@@ -661,7 +680,31 @@ async function mirrorOne(
     }
   }
 
+  // Record the folder this run read, except when it was the unexpected one:
+  // the recorded folder stays the reference until the primary resolves back
+  // or its own settings change.
+  if (!dry && !rootMoved && accountAlive(ctx)) {
+    mirrorSources.set({ harnessId: target.id, ...source, updatedAt: Date.now() });
+  }
+
   return { copied: ctx.copied, warnings: ctx.warnings, plan };
+}
+
+/** The primary's resolved folder(s) and a fingerprint of the settings that
+ *  choose them (see {@link mirrorOne}). */
+function primarySourceOf(primary: Harness, fromRoot: string): { primaryId: string; primaryRoot: string; primaryConfig: string } {
+  const roots = [path.resolve(fromRoot)];
+  if (primary.kind === "claude-code") roots.push(path.resolve(claudeJsonDirFor(primary)));
+  const env: Record<string, string> = {};
+  for (const key of ROOT_ENV_KEYS) {
+    const value = primary.env?.[key];
+    if (nonBlankRootValue(value)) env[key] = value;
+  }
+  return {
+    primaryId: primary.id,
+    primaryRoot: roots.join("\n"),
+    primaryConfig: JSON.stringify({ home: nonBlankRootValue(primary.home) ? primary.home : null, env }),
+  };
 }
 
 function isDirectory(p: string): boolean {
@@ -2874,6 +2917,7 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
   const result: MirrorRestoreResult = { harnessId, restored: [], removed: [], kept: [], warnings: [] };
   if (!harness || (harness.kind !== "claude-code" && harness.kind !== "codex")) {
     mirrorProvenance.deleteForHarness(harnessId);
+    mirrorSources.deleteForHarness(harnessId);
     await removeMirrorBackups(harnessId);
     result.warnings.push("the account no longer exists or cannot be mirrored — its mirror records were dropped");
     return result;

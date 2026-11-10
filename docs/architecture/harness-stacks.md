@@ -743,6 +743,22 @@ missing or unsafe file, a tree that hit its copy cap, a refused symlink):
 - a `preexisted` item → ownership is dropped and the backup's file or value
   stays (a primary deletion must not destroy it, nor resurrect an older value).
 
+**The primary's folder must be the one the last run read.** A primary with no
+config folder of its own resolves through the core's process environment
+(`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, else the home default), so a core started
+differently can read another, existing folder in which everything looks
+deleted. `harness_mirror_sources` (migration 089) records, per backup, the
+primary's id, its resolved folder(s) (the config root, plus the `.claude.json`
+folder for Claude) and a fingerprint of its own root settings (`home` and the
+non-blank `CLAUDE_CONFIG_DIR`/`CODEX_HOME`/`HOME` of its env map). When the same
+primary with the same settings resolves to a different folder, the run (and its
+preview) copies as usual but **removes nothing** from that backup and warns; the
+recorded folder is kept, so deletions resume when the primary resolves back. A
+changed fingerprint (the user re-pointed the account) or a different primary is
+a real change: propagation runs and the record is updated. The record is
+written only by a real run, dropped with the account (`harnesses.delete`,
+account cleanup, a Restore of a missing account).
+
 A **merged file the primary deleted outright** (`settings.json`,
 `.claude.json`, `config.toml`, a plugin registry) is merged as an empty
 document, so its keys follow the same three rules. It counts as deleted only
@@ -1533,12 +1549,6 @@ account move and every blocked outcome. The trigger per path is the table under
   from the user's other tooling says nothing about Claude. Without a selector
   the key is ignored (and the process-key warning does not name it). The
   direct `ANTHROPIC_*` / `CLAUDE*` keys still count as a login.
-- **Deletion propagation follows whatever root the primary resolves to now.**
-  A primary account with no `home` or config-dir env of its own resolves
-  through the core's process environment (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`).
-  If a core launched differently resolves another, existing folder, files and
-  keys missing there read as deleted on the primary. Give the primary account
-  an explicit root to avoid it.
 - **An orphaned copy outside the account's current root waits.** A kept file
   whose account was re-pointed elsewhere is retried by every sweep and removed
   once the root points back; if it never does, it stays on disk (and on record)

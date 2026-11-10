@@ -2332,6 +2332,7 @@ export const harnesses = {
       // imports this module, so the delete is inline here. Swap-history rows
       // are kept on purpose (denormalized labels).
       db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ?`, [id]);
+      db.run(`DELETE FROM harness_mirror_sources WHERE harness_id = ?`, [id]);
       if (membership) {
         renumberStackPositions(membership.stack_id);
         // The membership changed, so the stack's `updated_at` must too or an

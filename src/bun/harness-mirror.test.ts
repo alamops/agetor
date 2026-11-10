@@ -2809,3 +2809,76 @@ describe("a deleted primary merged file propagates key removals", () => {
     expect(after.model_reasoning_effort).toBe("high");
   });
 });
+
+describe("a primary whose folder comes from the core's environment", () => {
+  test("a changed CLAUDE_CONFIG_DIR, with the account unchanged, copies but removes nothing; it propagates again once it resolves back", async () => {
+    const dirA = mkdtempSync(path.join(tmpdir(), "agetor-envroot-a-"));
+    const dirB = mkdtempSync(path.join(tmpdir(), "agetor-envroot-b-"));
+    const backup = mkdtempSync(path.join(tmpdir(), "agetor-envroot-backup-"));
+    const primaryId = unique("envroot-p");
+    dbm.harnesses.insert({ id: primaryId, kind: "claude-code", label: primaryId, home: null, env: {} } as never);
+    const b = alias(unique("envroot-b"), backup);
+    const stack = stacks.harnessStacks.create({ label: "envroot", kind: "claude-code", members: [primaryId, b], mirrorMode: "full" });
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      write(path.join(dirA, "settings.json"), JSON.stringify({ env: { FOO: "1" } }));
+      write(path.join(dirA, "skills", "a-skill", "SKILL.md"), "# a");
+      process.env.CLAUDE_CONFIG_DIR = dirA;
+      await mirror.mirrorStack(stack, {});
+      expect(JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8")).env.FOO).toBe("1");
+      expect(existsSync(path.join(backup, "skills", "a-skill", "SKILL.md"))).toBe(true);
+
+      // Another core environment: the same account now resolves to dirB,
+      // which has neither the key nor the skill.
+      write(path.join(dirB, "settings.json"), JSON.stringify({ model: "sonnet" }));
+      process.env.CLAUDE_CONFIG_DIR = dirB;
+      const preview = await mirror.previewMirror({ kind: "claude-code", members: [primaryId, b], mirrorMode: "full" });
+      expect(preview.plans[0]!.files.remove).toEqual([]);
+      expect(preview.plans[0]!.keys.filter((k) => k.action === "remove")).toEqual([]);
+      const moved = await mirror.mirrorStack(stack, {});
+      expect(moved.warnings.some((w) => w.includes("config folder is now") && w.includes("nothing is removed"))).toBe(true);
+      const during = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+      expect(during.env.FOO).toBe("1");
+      expect(during.model).toBe("sonnet");
+      expect(existsSync(path.join(backup, "skills", "a-skill", "SKILL.md"))).toBe(true);
+      // Still the unexpected folder on the next run: still nothing removed.
+      await mirror.mirrorStack(stack, {});
+      expect(existsSync(path.join(backup, "skills", "a-skill", "SKILL.md"))).toBe(true);
+
+      // Back to the recorded folder: deletions propagate again.
+      process.env.CLAUDE_CONFIG_DIR = dirA;
+      const { rmSync } = await import("node:fs");
+      rmSync(path.join(dirA, "skills", "a-skill"), { recursive: true });
+      const back = await mirror.mirrorStack(stack, {});
+      expect(back.warnings.some((w) => w.includes("config folder is now"))).toBe(false);
+      expect(existsSync(path.join(backup, "skills", "a-skill", "SKILL.md"))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = saved;
+      stacks.harnessStacks.delete(stack.id);
+    }
+  });
+
+  test("re-pointing the primary account itself is a real change: deletions propagate from the new folder", async () => {
+    const { primary, backup, a, stack } = claudePair("envroot-explicit");
+    write(path.join(primary, "skills", "old-skill", "SKILL.md"), "# old");
+    await mirror.mirrorStack(stack, {});
+    expect(existsSync(path.join(backup, "skills", "old-skill", "SKILL.md"))).toBe(true);
+    const moved = mkdtempSync(path.join(tmpdir(), "agetor-envroot-explicit-new-"));
+    write(path.join(moved, "settings.json"), "{}");
+    dbm.harnesses.update(a, { home: moved });
+    const result = await mirror.mirrorStack(stacks.harnessStacks.get(stack.id)!, {});
+    expect(result.warnings.some((w) => w.includes("config folder is now"))).toBe(false);
+    expect(existsSync(path.join(backup, "skills", "old-skill", "SKILL.md"))).toBe(false);
+  });
+
+  test("account delete drops the backup's recorded source", async () => {
+    const { b, stack } = claudePair("envroot-delete");
+    await mirror.mirrorStack(stack, {});
+    const { mirrorSources } = await import("./harness-mirror-provenance.ts");
+    expect(mirrorSources.get(b)).not.toBeNull();
+    stacks.harnessStacks.delete(stack.id);
+    dbm.harnesses.delete(b);
+    expect(mirrorSources.get(b)).toBeNull();
+  });
+});

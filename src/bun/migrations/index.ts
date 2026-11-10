@@ -118,6 +118,7 @@ import m085 from "./085_harness_stack_members_no_harness_fk.sql" with { type: "t
 import m086 from "./086_normalize_cursor_fable_5_2.sql" with { type: "text" };
 import m087 from "./087_harness_stacks_fix_round.sql" with { type: "text" };
 import m088 from "./088_harness_orphaned_copies.sql" with { type: "text" };
+import m089 from "./089_harness_mirror_sources.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -224,4 +225,5 @@ export const migrations: Migration[] = [
   { id: "086_normalize_cursor_fable_5_2", sql: m086 },
   { id: "087_harness_stacks_fix_round", sql: m087 },
   { id: "088_harness_orphaned_copies", sql: m088 },
+  { id: "089_harness_mirror_sources", sql: m089 },
 ];

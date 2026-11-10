@@ -61,7 +61,7 @@ A new `run_events` method that isn't exercised by that test fails it by name.
 
 **Adding a migration** (numbered `.sql` files, the `migrations/index.ts` entry, never editing an applied one, and why the SQL is inlined at bundle time) is described once, in [CLAUDE.md § Persistence, in brief](../../CLAUDE.md#persistence-in-brief).
 
-## Harness stack tables (migrations 084, 085, 087, 088)
+## Harness stack tables (migrations 084, 085, 087, 088, 089)
 
 `harness_stacks`, `harness_stack_members`, `harness_limit_state` and
 `harness_session_handoffs` are additive; `tasks.harness_state` is another
@@ -110,6 +110,15 @@ task's remaining handoff paths into it in the same transaction), and an FK to
 removes the account's rows explicitly. Rows written before 088 need no SQL
 backfill: the boot sweep moves a re-keyed handoff row's old-session paths into
 the new table ([harness-stacks.md](harness-stacks.md#leftover-handoff-copies)).
+
+**Migration 089** (`089_harness_mirror_sources.sql`) adds
+`harness_mirror_sources`, one row per backup account (primary key
+`harness_id`): the primary id, its resolved folder(s) and a fingerprint of its
+root settings from the last real mirror run, which gate deletion propagation
+([harness-stacks.md](harness-stacks.md#mirror-provenance-backups-preview-and-restore)).
+**No FK** (the 085 reasoning); `harnesses.delete` removes the row inline and
+account cleanup removes it too. No backfill: the first run after upgrade
+records it.
 
 **A future `harness_stacks` rebuild must turn foreign keys off first.**
 `harness_swap_events` cascades on `harness_stacks`, so the documented SQLite
