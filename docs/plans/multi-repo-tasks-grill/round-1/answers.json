@@ -1,0 +1,235 @@
+{
+  "version": 1,
+  "formId": "multi-repo-tasks-grill-r1",
+  "title": "Grill — multiple repositories in one card (#291)",
+  "round": 1,
+  "mode": "standalone",
+  "specFile": "questions.json",
+  "specSha256": null,
+  "submittedAt": "2026-11-10T15:53:14.251Z",
+  "receivedAt": "2026-11-10T15:55:28.332Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 19,
+    "answered": 19,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 11,
+    "overrodeRecommendations": [
+      "isolation-none",
+      "repo-set-editing",
+      "prompt-context",
+      "branch-base",
+      "commit-pr",
+      "cli-parity",
+      "primary-mirrors",
+      "repo-identity-cap"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "partial-failure",
+      "ui-surfaces"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "agent-architecture": {
+      "n": 1,
+      "title": "What does a multi-repo task look like to the agent?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "workspace-root",
+      "display": "Per-task workspace root, one conversation",
+      "acceptedRecommendation": true
+    },
+    "v1-scope": {
+      "n": 2,
+      "title": "Which of the issue's six bullets ships in this change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "all-six",
+      "display": "All six bullets",
+      "acceptedRecommendation": true
+    },
+    "isolation-none": {
+      "n": 3,
+      "title": "Must a multi-repo task use worktree isolation?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "support-none-live",
+      "display": "Support `none` by running in the live repos",
+      "acceptedRecommendation": false,
+      "recommended": "require-worktree"
+    },
+    "repo-set-editing": {
+      "n": 4,
+      "title": "When may the repository set change?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "create-only",
+      "display": "Fixed at creation",
+      "acceptedRecommendation": false,
+      "recommended": "pre-run"
+    },
+    "partial-failure": {
+      "n": 5,
+      "title": "What happens when one repo's worktree cannot be created at start?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "all-or-nothing",
+      "display": "All-or-nothing",
+      "acceptedRecommendation": true,
+      "note": "It'd be important to list the repos that didn't work in the error message"
+    },
+    "harness-scope": {
+      "n": 6,
+      "title": "Which harnesses get multi-repo in the first release?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "all-eight",
+      "display": "All eight, with a smoke matrix",
+      "acceptedRecommendation": true
+    },
+    "prompt-context": {
+      "n": 7,
+      "title": "How do the repo directories reach the agent in the launch prompt?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "new-paragraph",
+      "display": "A new 'Repositories:' paragraph",
+      "acceptedRecommendation": false,
+      "recommended": "references-block"
+    },
+    "branch-base": {
+      "n": 8,
+      "title": "How are branch names and base refs chosen across repos?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "same-branch",
+      "display": "Same branch name everywhere, per-repo base",
+      "acceptedRecommendation": false,
+      "recommended": "per-repo"
+    },
+    "commit-pr": {
+      "n": 9,
+      "title": "How do commit/push and PR creation work across repos?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "aggregate",
+      "display": "One aggregate flow",
+      "acceptedRecommendation": false,
+      "recommended": "per-repo"
+    },
+    "pipelines-issue": {
+      "n": 10,
+      "title": "Do pipelines and issue-created tasks support multiple repos in v1?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "both",
+      "display": "Both",
+      "acceptedRecommendation": true
+    },
+    "cli-parity": {
+      "n": 11,
+      "title": "How far does CLI/TUI parity go in this change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "full",
+      "display": "Full CLI + TUI parity",
+      "acceptedRecommendation": false,
+      "recommended": "cli-only"
+    },
+    "primary-mirrors": {
+      "n": 12,
+      "title": "Primary-repo mirrors and backward compatibility",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "We don't need a primary term here, all multi repos are in same level in importancy for Agetor and its tasks",
+      "acceptedRecommendation": false,
+      "recommended": "`workdir`, `branch`, `worktreePath`, `baseRef`, `prUrl` stay the primary repo's mirrors; `repositories[]` is the source of truth. Legacy rows derive a one-entry array from the existing columns — no backfill. `existingBranch`, `issueUrl` and `isolation` stay primary/global. Document that an older build sees only the primary and may tear down only its worktree."
+    },
+    "repo-identity-cap": {
+      "n": 13,
+      "title": "Repo identity, primary selection and cap",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Again, no primary term here, all repos are important. and no cap",
+      "acceptedRecommendation": false,
+      "recommended": "Dedupe by git root; the first selected repo is primary and can be reordered before the first run; hard cap 10 repositories per task (400 above that), with 2–5 the expected range."
+    },
+    "workspace-layout": {
+      "n": 14,
+      "title": "Workspace layout and Worktrees page",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Multi-repo workspace is `<dataDir>/worktrees/<task-id>/<slug>` (slug = repo basename, uniquified); single-repo tasks keep today's `<dataDir>/worktrees/<task-id>`. The Worktrees page shows one row per repo grouped under its task, with an opaque id `<taskId>__<slug>`; owned rows still route deletion to archiving the task, orphan rows keep per-row delete.",
+      "acceptedRecommendation": true
+    },
+    "ui-surfaces": {
+      "n": 15,
+      "title": "Card, diff, filters and progress",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "New Task form shows one compact row per repo (branch/base) and collapses to today's form for one repo. Card shows the primary repo plus `+N`. Diff dialog gets per-repo tabs/selector. Repo filter and text search match any selected repo. Context menu gets a per-repo submenu. The agent's existing todo progress stays one shared list; per-repo change counts live in the run panel.",
+      "acceptedRecommendation": true,
+      "note": "for repo selection for new task, or even in the modals from Git Integration, we can have a dialog to select the repos and their base branch, otherwise, I think we'll consume too much of the height of New Task panel."
+    },
+    "create-validation": {
+      "n": 16,
+      "title": "Create-time validation",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Create rejects with 400 if any selected repo is missing, is not a git repo, has an unresolvable base ref, has an invalid branch name, or has that branch checked out in another live task; nothing is created. `isolation: none` with 2+ repos is rejected with the worktree-required message.",
+      "acceptedRecommendation": true
+    },
+    "archive-dirty": {
+      "n": 17,
+      "title": "Archive and delete with dirty repos",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Archive teardown is best-effort per repo: clean worktrees are detached, dirty ones are kept on disk with their branch, and every per-repo outcome is reported. Archive still succeeds. Delete is explicit and per repo; it never deletes a `branchSource: existing` branch.",
+      "acceptedRecommendation": true
+    },
+    "runtime-defaults": {
+      "n": 18,
+      "title": "Terminals, polling and extra roots",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Terminals open at the workspace root (with a repo selector); `/tasks/:id/git-status` returns all repo statuses in one batched response per poll; each repo is also passed as an extra root (`--add-dir` / include-directories) where the harness supports it, even though cwd is the workspace.",
+      "acceptedRecommendation": true
+    },
+    "spec-and-tests": {
+      "n": 19,
+      "title": "Spec and acceptance",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Commit the issue's asks and these decisions as `docs/specs/multi-repo-tasks.md` before planning. Add one e2e spec covering create → fake-driver run → two worktrees/branches → per-repo diff → per-repo PR stamp → archive teardown, plus unit tests for per-repo prepare/reuse/cleanup, nested worktree ids and route policy, and pipeline step copy.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

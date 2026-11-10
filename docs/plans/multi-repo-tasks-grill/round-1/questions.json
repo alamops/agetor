@@ -1,0 +1,716 @@
+{
+  "version": 1,
+  "id": "multi-repo-tasks-grill-r1",
+  "title": "Grill — multiple repositories in one card (#291)",
+  "skill": "grill",
+  "slug": "multi-repo-tasks",
+  "round": 1,
+  "flags": [],
+  "summary": "Before this gets planned: **11 decisions** that change the shape of the build, plus **8 defaults** to confirm or override.\n\nStart with the five in **Shape** — they decide the data model, the agent's working directory, what can be edited, and what the first release is. Every question carries a recommendation, so you can accept all non-one-way-door answers with one click and only touch what you disagree with.\n\nSource: issue #291 (outside the repo — proposed to commit as `docs/specs/multi-repo-tasks.md`). Grounding: `docs/plans/multi-repo-tasks-investigation.md`.",
+  "proven": [
+    {
+      "text": "**Today a multi-repo payload is silently dropped.** `CreateTaskInput extends Partial<Task>`, so a `repositories` array is accepted by the HTTP body and ignored; a scratch probe returned `repositories = undefined` and materialized exactly one worktree.",
+      "evidence": [
+        {
+          "label": "the input type is a Partial<Task>, so unknown keys ride along",
+          "path": "src/bun/orchestrator.ts",
+          "line": 10904,
+          "lang": "ts",
+          "code": "export interface CreateTaskInput extends Partial<Task> {\n  title: string;\n  prompt: string;\n  /** Optional ref name (branch / tag / sha). Defaults to \"HEAD\". */\n  baseRef?: string;"
+        },
+        {
+          "label": "one worktree path per task, derived from the task id",
+          "path": "src/bun/worktree.ts",
+          "line": 842,
+          "lang": "ts",
+          "code": "export function worktreePath(task: Task): string {\n  return path.join(WORKTREES_DIR, task.id);\n}"
+        }
+      ]
+    },
+    {
+      "text": "**A per-task workspace root is the only layout every harness can see.** Cursor and fx ACP advertise no `additionalDirectories` capability; fx also refused to read a file outside its session cwd. Claude, Codex, Gemini and Copilot expose `--add-dir` / include-directories, but that is not universal. Both ACP agents do accept a non-git directory as `session/new.cwd`.",
+      "evidence": [
+        {
+          "label": "harness capability matrix from live probes",
+          "path": "docs/plans/multi-repo-tasks-investigation.md",
+          "line": 68
+        },
+        {
+          "label": "the eight harness kinds",
+          "path": "src/shared/types.ts",
+          "line": 299,
+          "lang": "ts",
+          "code": "export type AgentKind = \"claude-code\" | \"codex\" | \"cursor\" | \"gemini\" | \"fx\" | \"antigravity\" | \"opencode\" | \"copilot\";"
+        }
+      ]
+    },
+    {
+      "text": "**`@` references already behave correctly under a workspace root.** `resolveAtPath` resolves `frontend/a.ts` inside the workspace and refuses `../outside/secret.ts`; the containment is a realpath check. That is why each repo worktree must live *under* the workspace, not beside it.",
+      "evidence": [
+        {
+          "label": "realpath containment",
+          "path": "src/bun/project-files.ts",
+          "line": 455,
+          "lang": "ts",
+          "code": "const realAbs = realpathSync(abs);\nconst realCwd = realpathSync(cwd);\nconst withinCwd = realAbs === realCwd || realAbs.startsWith(realCwd + path.sep);\nif (!withinCwd) return null;"
+        }
+      ]
+    },
+    {
+      "text": "**The worktree-id guard is deliberately one level deep.** `listWorktrees` treats every direct child of `<dataDir>/worktrees` as a task id, and `resolveWorktreeDir` refuses `/`, `\\` and `..`. A nested `<task-id>/<repo>` layout needs a new strict two-level parser; relaxing this guard would widen an `rm -rf` surface.",
+      "evidence": [
+        {
+          "label": "the id guard",
+          "path": "src/bun/orchestrator.ts",
+          "line": 12289,
+          "lang": "ts",
+          "code": "function resolveWorktreeDir(id: string): { dir: string } | { error: string } {\n  if (!id || id.includes(\"/\") || id.includes(\"\\\\\") || id.includes(\"..\")) {\n    return { error: \"invalid worktree id\" };\n  }"
+        }
+      ]
+    },
+    {
+      "text": "**A naive change passes the current suite.** Adding a JSON column and a multi-select, without touching `prepareWorkdir`, `startTask`, the diff/status routes or `listWorktrees`, compiles and leaves every existing test green — while only the primary repo gets a worktree and the agent never sees the rest. The plan must add tests that assert two worktrees, a second repo in cwd, per-repo diff/PR and multi-repo teardown."
+    }
+  ],
+  "sections": [
+    {
+      "id": "shape",
+      "title": "Shape — the five that decide the build",
+      "intro": "These are the blocking ones. Their answers determine the data model, the on-disk layout, the agent's cwd and the acceptance bar.",
+      "questions": [
+        {
+          "id": "agent-architecture",
+          "type": "single",
+          "title": "What does a multi-repo task look like to the agent?",
+          "impact": "blocking",
+          "why": "This decides the data model, the on-disk layout, the agent's cwd, whether every harness can see every repo, and how much diff/status/PR code changes.",
+          "context": "The issue asks for one card and **shared context** across repos. Your comment says worktrees must keep working. The evidence is that a workspace root containing one subdirectory per repo is the only layout every harness can see: Cursor/fx/OpenCode cannot add roots, and fx treats cwd as its workspace boundary. Keeping the primary repo as cwd would work only for Claude/Codex/Gemini/Copilot and would break `@` into the other repos.",
+          "evidence": [
+            {
+              "label": "the only cwd every spawn path uses today",
+              "path": "src/bun/orchestrator.ts",
+              "line": 2337,
+              "lang": "ts",
+              "code": "const prepared = await prepareWorkdir(task, {\n  takenBranches: new Set(\n    tasks.list()\n      .filter((t) => t.id !== taskId)\n      .map((t) => t.branch)\n      .filter((b): b is string => Boolean(b)),\n  ),\n});\nif (\"error\" in prepared) return { error: prepared.error };"
+            },
+            {
+              "label": "P4/P6: Cursor and fx ACP have no extra-root capability; fx refuses outside-cwd reads",
+              "path": "docs/plans/multi-repo-tasks-investigation.md",
+              "line": 123
+            }
+          ],
+          "options": [
+            {
+              "id": "workspace-root",
+              "label": "Per-task workspace root, one conversation",
+              "description": "`<dataDir>/worktrees/<task-id>/` is the agent's cwd; each repo is a subdirectory with its own worktree and branch. One session sees all of them.",
+              "consequence": "Works for all 8 harnesses; `@frontend/src` resolves inside cwd; single-repo tasks keep today's layout. Cost: cwd is not a git repo, so per-repo diff/status, `@` listing, Codex's git sandbox and project-config discovery all need work.",
+              "preview": "worktrees/\n  <task-id>/            <- agent cwd (plain dir, not a repo)\n    frontend/           <- git worktree, branch feature/auth\n    backend/            <- git worktree, branch feature/auth\n    infra/              <- git worktree, branch feature/auth"
+            },
+            {
+              "id": "primary-cwd",
+              "label": "Primary repo cwd + extra directories",
+              "description": "Keep today's primary worktree as cwd; create the others as siblings and pass them via `--add-dir` / include-directories / absolute paths.",
+              "consequence": "Smaller change to diff/status, but Cursor, fx and OpenCode cannot see the extra repos, and `@` into them fails `resolveAtPath`. Would need per-harness gating or a degraded experience.",
+              "preview": "worktrees/\n  <task-id>/        <- primary worktree, agent cwd\n  <task-id>-backend/ <- sibling worktree, only visible with --add-dir"
+            },
+            {
+              "id": "coordinator",
+              "label": "Coordinator + one agent per repo",
+              "description": "One card, one lead conversation, one child agent/run per repo that reports back.",
+              "consequence": "Contradicts the issue's single shared context; adds N sessions, branch coordination and PR attribution. Closer to a pipeline than a task."
+            }
+          ],
+          "recommendation": {
+            "value": "workspace-root",
+            "reason": "It is the only layout that works for every harness without per-kind degradation, and it preserves the existing realpath containment for `@`."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "v1-scope",
+          "type": "single",
+          "title": "Which of the issue's six bullets ships in this change?",
+          "impact": "blocking",
+          "why": "It decides whether the plan needs per-repo diff/status, per-repo PR creation and their tests, or only the selection/worktree core.",
+          "context": "The six asks are: (1) select multiple repos on create/edit, (2) one worktree/branch per repo, (3) the agent can access and modify all of them, (4) shared context, (5) track progress/changes in one card, (6) review and create separate PRs per repo. A staged release that stops after (4) leaves the reporter's card unable to show or ship the other repos' changes.",
+          "evidence": [
+            {
+              "label": "the six asks",
+              "path": "docs/plans/multi-repo-tasks-investigation.md",
+              "line": 20
+            },
+            {
+              "label": "one diff scope and one PR stamp today",
+              "path": "src/bun/server.ts",
+              "line": 3255,
+              "lang": "ts",
+              "code": "if (\n  task &&\n  task.archivedAt == null &&\n  !task.prUrl &&\n  task.workdir === dir &&\n  result.item?.htmlUrl\n) {\n  tasks.update(task.id, { prUrl: result.item.htmlUrl });\n}"
+            }
+          ],
+          "options": [
+            {
+              "id": "all-six",
+              "label": "All six bullets",
+              "description": "Selection, per-repo worktrees, one agent seeing them, per-repo diff/status, and per-repo PR creation in one change.",
+              "consequence": "Largest plan and the issue can be closed end-to-end. The per-repo PR UI is the extra surface; there is no bulk create-all flow in v1."
+            },
+            {
+              "id": "core-first",
+              "label": "Core first (bullets 1–4), diff/PR second",
+              "description": "Ship multiple selection, per-repo worktrees and shared agent context; leave per-repo diff/status and PR creation for a follow-up.",
+              "consequence": "Faster first ship, but the card cannot show or land the other repos' changes — the reporter's actual workflow stays incomplete and the issue remains open."
+            },
+            {
+              "id": "selection-only",
+              "label": "Selection + worktrees only",
+              "description": "Persist the repo list and materialize worktrees; the agent still runs in the primary repo.",
+              "consequence": "Does not satisfy asks 3–6 and would be a misleading UI. Not recommended."
+            }
+          ],
+          "recommendation": {
+            "value": "all-six",
+            "reason": "The issue's acceptance is the six bullets; shipping 1–4 still leaves the card unable to track or PR the extra repos."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "isolation-none",
+          "type": "single",
+          "title": "Must a multi-repo task use worktree isolation?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Supporting `isolation: none` means the workspace must point at live checkouts, which either mutates the source repos or needs symlinks the current `resolveAtPath` containment rejects.",
+          "context": "`prepareWorkdir` returns `task.workdir` unchanged when isolation is none — there is no worktree to nest under a workspace root. Today `isolation: none` tasks are allowed to run directly in the project. The issue's own comment emphasizes worktrees, and the security model depends on agent-writable paths staying inside the task directory.",
+          "evidence": [
+            {
+              "label": "isolation none short-circuits before any worktree is created",
+              "path": "src/bun/worktree.ts",
+              "line": 959,
+              "lang": "ts",
+              "code": "if (task.isolation !== \"worktree\") {\n  return { cwd: task.workdir, branch: null, worktreePath: null, note: \"isolation: none\", checkoutBranch: null, checkoutKnown: false };\n}"
+            },
+            {
+              "label": "the containment that makes `@` safe",
+              "path": "src/bun/project-files.ts",
+              "line": 455,
+              "lang": "ts",
+              "code": "const withinCwd = realAbs === realCwd || realAbs.startsWith(realCwd + path.sep);\nif (!withinCwd) return null;"
+            }
+          ],
+          "options": [
+            {
+              "id": "require-worktree",
+              "label": "Require worktree isolation for 2+ repos",
+              "description": "Selecting a second repository forces/validates `isolation: \"worktree\"`; the mixed state is rejected at create with a clear error.",
+              "consequence": "Each repo gets its own worktree and branch; no symlink or containment change; matches your comment. Single-repo tasks can still use `none`.",
+              "preview": "isolation: \"worktree\"  +  repositories: [frontend, backend, infra]  -> allowed\nisolation: \"none\"      +  repositories: [frontend, backend]       -> 400"
+            },
+            {
+              "id": "support-none-copies",
+              "label": "Support `none` via a symlinked/copied workspace",
+              "description": "The workspace root contains links/copies to the live repos; the agent runs in it without worktrees.",
+              "consequence": "Needs a new containment rule (realpath rejects links outside cwd), risks edits to the user's real checkouts, and adds a second teardown model. A much larger security surface."
+            },
+            {
+              "id": "support-none-live",
+              "label": "Support `none` by running in the live repos",
+              "description": "The workspace root exists only as a display path; the agent's real cwd is the first repo and the others are referenced absolutely.",
+              "consequence": "No branch isolation at all; contradicts the worktree promise and reproduces the primary-cwd harness problem."
+            }
+          ],
+          "recommendation": {
+            "value": "require-worktree",
+            "reason": "It keeps every agent-writable path inside the task directory and needs no relaxation of the realpath containment."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "repo-set-editing",
+          "type": "single",
+          "title": "When may the repository set change?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Editing after worktrees exist means adding a repo with a branch created from that moment, and removing one means deciding what happens to its uncommitted work and commits.",
+          "context": "The issue explicitly asks to select repos when **creating or editing** a card. Today `workdir` is locked once a worktree exists (`PATCH /tasks/:id` returns 400), because the worktree is registered against the original repo. A pre-run edit is the safe middle: it satisfies 'editing a card' before any worktree exists, and it matches the existing lock.",
+          "evidence": [
+            {
+              "label": "the existing workdir lock",
+              "path": "src/bun/server.ts",
+              "line": 5962,
+              "lang": "ts",
+              "code": "if (\"workdir\" in patch && patch.workdir !== before.workdir && before.worktreePath !== null) {\n  return json(\n    { error: \"workdir cannot be changed once a worktree exists — delete the task to start fresh with a new workdir\" },\n    { status: 400, headers: corsHeaders(req) },\n  );\n}"
+            },
+            {
+              "label": "the issue's wording",
+              "path": "docs/plans/multi-repo-tasks-investigation.md",
+              "line": 20
+            }
+          ],
+          "options": [
+            {
+              "id": "pre-run",
+              "label": "Editable until the first run creates worktrees",
+              "description": "Add/remove/reorder repos while `worktreePath` is null; lock the set once materialized. Reordering can change the primary.",
+              "consequence": "Satisfies 'editing' for drafts and pre-start cards; no worktree/commit preservation policy; matches today's workdir lock."
+            },
+            {
+              "id": "create-only",
+              "label": "Fixed at creation",
+              "description": "No edit UI for the repo set; change means a new task.",
+              "consequence": "Simplest, but directly misses the issue's 'or editing a card' wording."
+            },
+            {
+              "id": "any-time",
+              "label": "Editable after runs too",
+              "description": "Add a repo mid-task (new worktree/branch from now) and remove one (decide keep/delete branch, dirty work, commits).",
+              "consequence": "Most flexible, but needs a worktree/commit preservation policy, new teardown rules, and tests for add/remove during a live run. Large destructive surface."
+            }
+          ],
+          "recommendation": {
+            "value": "pre-run",
+            "reason": "It covers the issue's editing ask before any work exists and reuses the existing 'workdir is locked after a worktree' rule instead of inventing a preservation policy."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "partial-failure",
+          "type": "single",
+          "title": "What happens when one repo's worktree cannot be created at start?",
+          "impact": "blocking",
+          "why": "The failure mode decides whether the agent can ever run with a silent subset of the repos, and what the user sees when a source repo moved or a branch is already checked out.",
+          "context": "Preparing N worktrees is N git operations. A repo can be missing, not a git repo, have an unresolvable base ref, or already have the branch checked out elsewhere. Today a single failure returns `{ error }` before the agent spawns.",
+          "evidence": [
+            {
+              "label": "the single-repo failure contract",
+              "path": "src/bun/orchestrator.ts",
+              "line": 2344,
+              "lang": "ts",
+              "code": "if (\"error\" in prepared) return { error: prepared.error };"
+            }
+          ],
+          "options": [
+            {
+              "id": "all-or-nothing",
+              "label": "All-or-nothing",
+              "description": "Validate every repo, create all worktrees, and only then spawn. If one fails, remove the worktrees created in that attempt and return the failing repo's error.",
+              "consequence": "The agent never runs with a missing repo; retries are idempotent because preparation reuses existing worktrees. Cost: cleanup logic for a mid-way failure."
+            },
+            {
+              "id": "partial-start",
+              "label": "Start with the repos that worked",
+              "description": "Create what can be created, spawn the agent, and show the failed repo as an error chip on the card.",
+              "consequence": "Faster to the first token, but a task silently missing its backend is worse than a failed start — especially for the issue's exact use case."
+            },
+            {
+              "id": "ask",
+              "label": "Stop and ask the user",
+              "description": "Show a dialog listing failed repos with retry/skip; skip starts with the subset.",
+              "consequence": "New UI state and no API/CLI equivalent; still allows a subset run."
+            }
+          ],
+          "recommendation": {
+            "value": "all-or-nothing",
+            "reason": "A multi-repo task's premise is that all selected repos are present; a partial run is the failure the reporter would least expect."
+          },
+          "allowOther": true
+        }
+      ]
+    },
+    {
+      "id": "harness",
+      "title": "Harness and prompt context",
+      "questions": [
+        {
+          "id": "harness-scope",
+          "type": "single",
+          "title": "Which harnesses get multi-repo in the first release?",
+          "impact": "shape",
+          "why": "It decides whether the plan carries a per-kind validation matrix and gating, or ships the workspace layout to every kind with smoke coverage where accounts exist.",
+          "context": "The workspace layout needs no extra-root capability, and both ACP agents accepted a non-git workspace as cwd. What is unproven is each kind's project-config discovery (CLAUDE.md / AGENTS.md / GEMINI.md in subdirectories) and Codex's git sandbox under a non-git cwd. Installed here: Claude, Codex, Cursor, fx. Not installed: Gemini, Copilot, Antigravity, OpenCode.",
+          "evidence": [
+            {
+              "label": "Codex's git sandbox only sees the cwd's git common dir",
+              "path": "src/bun/worktree.ts",
+              "line": 488,
+              "lang": "ts",
+              "code": "export async function gitWritableRoots(cwd: string): Promise<string[]> {\n  let res: GitResult;\n  try {\n    res = await git([\"rev-parse\", \"--path-format=absolute\", \"--git-common-dir\"], cwd, 5_000);\n  } catch {\n    return [];\n  }\n  if (!res.ok) return [];"
+            },
+            {
+              "label": "P9: which installed CLIs expose extra-root flags",
+              "path": "docs/plans/multi-repo-tasks-investigation.md",
+              "line": 128
+            }
+          ],
+          "options": [
+            {
+              "id": "all-eight",
+              "label": "All eight, with a smoke matrix",
+              "description": "Enable multi-repo for every kind under the workspace root. Live-smoke Claude/Codex/Cursor/fx; label Gemini/Copilot/Antigravity/OpenCode 'layout-supported, smoke pending' until accounts exist.",
+              "consequence": "No gating and no second-class kinds; the risk is a per-kind config/sandbox surprise found during smoke. Fixes can land as follow-ups without changing the layout."
+            },
+            {
+              "id": "validated-only",
+              "label": "Only validated kinds",
+              "description": "Hide/disable multi-repo unless the harness is on a validated allow-list (start with Claude and Codex).",
+              "consequence": "Safest promise, but excludes Cursor/fx users — the exact kinds that cannot add roots and therefore need the workspace layout most."
+            },
+            {
+              "id": "opt-in",
+              "label": "All kinds, experimental badge",
+              "description": "Enable everywhere but mark non-smoked kinds 'experimental' in the picker.",
+              "consequence": "Honest, but adds a UI state and a support matrix to maintain; the badge has to be removed later by another change."
+            }
+          ],
+          "recommendation": {
+            "value": "all-eight",
+            "reason": "The layout is capability-free by design; gating would exclude the harnesses that motivated it, and the smoke matrix gives us evidence before claiming support."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "prompt-context",
+          "type": "single",
+          "title": "How do the repo directories reach the agent in the launch prompt?",
+          "impact": "shape",
+          "why": "The prompt-text rule says Agetor adds no text of its own except a fixed list. A new 'Repositories:' block is a documented exception; reusing the references block is compliant.",
+          "context": "The agent will already see the repos as subdirectories of its cwd and can `ls`. But the launch prompt currently names the working directory and references; pipelines and CLI sends may need the repo list spelled out. The existing `formatReferences` helper already renders a heading plus one bullet per folder.",
+          "evidence": [
+            {
+              "label": "the prompt-text contract",
+              "path": "CLAUDE.md",
+              "line": 93
+            },
+            {
+              "label": "the existing block",
+              "path": "src/shared/refs.ts",
+              "line": 7,
+              "lang": "ts",
+              "code": "export const REFS_HEADING = \"Referenced files/folders:\";\n\nexport function formatReferences(refs: TaskReference[]): string {\n  if (!refs.length) return \"\";\n  const lines = refs.map((r) => `- ${r.path}${r.isDirectory ? \"/\" : \"\"}`);\n  return `${REFS_HEADING}\\n${lines.join(\"\\n\")}`;\n}"
+            }
+          ],
+          "options": [
+            {
+              "id": "references-block",
+              "label": "Reuse the references block",
+              "description": "Add each repo worktree directory as a folder reference. No new machine-added text or exception.",
+              "consequence": "Compliant with the current rule and uses the same path the agent already reads. Less legible than a labeled repo list, and it mixes user attachments with task structure."
+            },
+            {
+              "id": "new-paragraph",
+              "label": "A new 'Repositories:' paragraph",
+              "description": "A dedicated machine-added block naming each repo and its branch.",
+              "consequence": "Clearest for the agent, but needs a documented exception to the prompt-text rule and an update to the rule's docs and tests."
+            },
+            {
+              "id": "none",
+              "label": "No machine text",
+              "description": "The workspace cwd is the only signal; the agent discovers the rest.",
+              "consequence": "No rule change, but the agent may not know which subdirectories are task repos vs scratch files, and the issue's shared-context ask becomes implicit."
+            }
+          ],
+          "recommendation": {
+            "value": "references-block",
+            "reason": "It keeps the documented prompt contract intact and reuses the helper both create-time and per-message paths already share."
+          },
+          "allowOther": true
+        }
+      ]
+    },
+    {
+      "id": "workflow",
+      "title": "Per-repo workflow",
+      "questions": [
+        {
+          "id": "branch-base",
+          "type": "single",
+          "title": "How are branch names and base refs chosen across repos?",
+          "impact": "shape",
+          "why": "Each repo can have its own branch nomenclature and default branch; the answer decides the form layout and the branch uniqueness checks.",
+          "context": "`createTask` reads `projects.get(workdir)?.branchConfig` and renders a branch from a pattern, falling back to the legacy scheme. Repos commonly differ: `main` vs `master`, `feature/` vs `feat/`. A single shared base ref is wrong when the default branches differ.",
+          "evidence": [
+            {
+              "label": "branch naming already reads the project's config",
+              "path": "src/bun/orchestrator.ts",
+              "line": 11250,
+              "lang": "ts",
+              "code": "const config = projects.get(workdir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;\ndesired = renderBranchTemplate(branchPattern(config, taskType), ctx);\nif (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });"
+            }
+          ],
+          "options": [
+            {
+              "id": "per-repo",
+              "label": "Per-repo branch and base",
+              "description": "Each repo derives its branch from its own `Project.branchConfig` and picks its own base ref; the form shows one compact row per repo.",
+              "consequence": "Respects each repo's nomenclature and default branch; 3–5 rows of UI. Branch names may differ across repos, which is fine for separate PRs."
+            },
+            {
+              "id": "same-branch",
+              "label": "Same branch name everywhere, per-repo base",
+              "description": "One branch name (from the primary's config or a task slug) applied to all repos; each repo keeps its own base ref.",
+              "consequence": "Easy cross-repo correlation (`feature/auth` in all three) but ignores a repo whose config mandates another prefix; a repo may reject the name."
+            },
+            {
+              "id": "shared",
+              "label": "One branch and one base ref, overridable",
+              "description": "A single branch/base pair applied to every repo, with per-repo overrides behind a disclosure.",
+              "consequence": "Simplest UI, but a single base ref is wrong whenever the repos' default branches differ; the override path is the real complexity."
+            }
+          ],
+          "recommendation": {
+            "value": "per-repo",
+            "reason": "The branch settings already live on each project, and separate PRs make one shared branch name unnecessary."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "commit-pr",
+          "type": "single",
+          "title": "How do commit/push and PR creation work across repos?",
+          "impact": "shape",
+          "why": "The existing `commitPushPrompt` and PR-proposal parser assume one branch; an aggregate flow needs multi-proposal parsing, while per-repo actions reuse today's machinery.",
+          "context": "The RunPanel has one 'Commit & push' chip and one 'Create PR' prefill driven by one `TaskGitStatus`. `POST /github/pull-create` stamps `tasks.pr_url` only when the task's workdir matches the PR's directory. The issue asks for separate PRs per repo, not one bulk action.",
+          "evidence": [
+            {
+              "label": "the single-branch prompt",
+              "path": "src/shared/types.ts",
+              "line": 6359,
+              "lang": "ts",
+              "code": "export function commitPushPrompt(task: Pick<Task, \"branch\" | \"taskType\">): string {\n  const ccType = branchCommitType(task.branch, task.taskType);\n  const branchLabel = task.branch ? `'${task.branch.replace(/'/g, \"'\\\\''\")}'` : \"<branch>\";"
+            },
+            {
+              "label": "the one-PR guard",
+              "path": "src/bun/server.ts",
+              "line": 3263,
+              "lang": "ts",
+              "code": "if (\n  task &&\n  task.archivedAt == null &&\n  !task.prUrl &&\n  task.workdir === dir &&\n  result.item?.htmlUrl\n) {\n  tasks.update(task.id, { prUrl: result.item.htmlUrl });\n}"
+            }
+          ],
+          "options": [
+            {
+              "id": "per-repo",
+              "label": "Per-repo actions",
+              "description": "Each repo row gets its own 'Commit & push' and 'Create PR'; the prompt names that repo's branch and the PR URL stamps that repo's entry.",
+              "consequence": "Reuses the existing prompt, prefill and one-PR guard with a repo selector; safe and testable. Many clicks for 5 repos, and the PR-proposal parser keeps its one-proposal shape."
+            },
+            {
+              "id": "aggregate",
+              "label": "One aggregate flow",
+              "description": "One 'Commit & push all' prompt lists every repo/branch and asks for one PR proposal per repo; one 'Create all PRs' action walks them.",
+              "consequence": "Fewer clicks, but needs multi-proposal parsing, repo labels in the transcript, and a new aggregate prompt; more UI and parsing risk."
+            },
+            {
+              "id": "hybrid",
+              "label": "Aggregate commit, per-repo PR",
+              "description": "One prompt commits/pushes every repo; PR creation stays a per-repo action with its own link.",
+              "consequence": "Balances clicks and safety; still needs the multi-proposal parser for the commit prompt, but not a bulk PR action."
+            }
+          ],
+          "recommendation": {
+            "value": "per-repo",
+            "reason": "It is the smallest safe change to a contract that currently assumes one branch and one proposal, and it satisfies 'separate PRs' without new parsing."
+          },
+          "allowOther": true
+        }
+      ]
+    },
+    {
+      "id": "surfaces",
+      "title": "Surfaces and parity",
+      "questions": [
+        {
+          "id": "pipelines-issue",
+          "type": "single",
+          "title": "Do pipelines and issue-created tasks support multiple repos in v1?",
+          "impact": "shape",
+          "why": "Pipelines share one parent worktree across step rows; the issue dialog reuses the project picker. Either the repo array propagates through them, or the feature must be hidden/rejected there.",
+          "context": "A pipeline parent prepares one worktree and copies `workdir`/`isolation`/`branch`/`worktreePath`/`baseRef` onto every step row; steps never materialize or own teardown. `CreateTaskFromIssueDialog` is rooted at the issue's repo. If multi-repo is offered in the shared New Task form but not these, users hit an inconsistent picker or a broken step.",
+          "evidence": [
+            {
+              "label": "step rows copy the parent's single worktree fields",
+              "path": "src/bun/pipeline-runner.ts",
+              "line": 1370,
+              "lang": "ts",
+              "code": "tasks.insert({\n  id: childId,\n  title: `${run.pipelineName} · ${step.name}`,\n  prompt: composed,\n  column: \"ready\",\n  agent: profile.harness,\n  workdir: parent.workdir,\n  isolation: parent.isolation,\n  taskType: parent.taskType,\n  branch: parent.branch,\n  branchSource: parent.branchSource,\n  worktreePath: parent.worktreePath,\n  checkoutBranch: parent.checkoutBranch ?? null,\n  baseRef: parent.baseRef,"
+            }
+          ],
+          "options": [
+            {
+              "id": "both",
+              "label": "Both",
+              "description": "Pipeline parents may be multi-repo (steps copy the workspace/repo array; teardown stays parent-owned). Create-from-issue can add extra repos, with the issue's repo as primary.",
+              "consequence": "Consistent surfaces. Pipeline propagation and the issue PR body (`Closes #N` only on the issue's repo) need tests. Extra repos' PRs must not claim the issue."
+            },
+            {
+              "id": "pipelines-only",
+              "label": "Pipelines only",
+              "description": "Pipeline parents support multiple repos; the issue dialog stays single-repo.",
+              "consequence": "Covers the shared-worktree machinery but leaves the issue flow single; the picker divergence remains."
+            },
+            {
+              "id": "issue-only",
+              "label": "Issue tasks only",
+              "description": "Create-from-issue can add repos; pipeline parents stay single.",
+              "consequence": "Covers the reporter's GitHub-repo case but requires rejecting/hiding multi-repo in the pipeline form."
+            },
+            {
+              "id": "neither",
+              "label": "Neither — ordinary New Task only",
+              "description": "Hide/reject multi-repo in both flows; a pipeline or issue task stays single-repo in v1.",
+              "consequence": "Smallest v1, but a reviewer may call it unfinished because the shared picker appears in both flows, and the issue's exact use case is issue-driven work."
+            }
+          ],
+          "recommendation": {
+            "value": "both",
+            "reason": "Pipelines already copy one parent worktree, so copying a repo array is the same rule; an issue task is exactly the cross-repo use case."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "cli-parity",
+          "type": "single",
+          "title": "How far does CLI/TUI parity go in this change?",
+          "impact": "shape",
+          "why": "The API must accept repositories in every case; the question is whether `agetor add`, `show`, `shell`, `rm` and the TUI can create and display them in the same change.",
+          "context": "The house style keeps CLI/TUI in step with the webview (the at-file-references and harness-stacks docs both call out parity). The CLI is how scripts and agents create tasks, and its `--workdir` is single. The TUI create form is a separate, dense surface.",
+          "evidence": [
+            {
+              "label": "the single --workdir flag",
+              "path": "src/cli/commands/add.ts",
+              "line": 114,
+              "lang": "ts",
+              "code": "case \"--workdir\": o.workdir = val(); break;\ncase \"--isolation\": o.isolation = val() === \"none\" ? \"none\" : \"worktree\"; break;\ncase \"--base-ref\": o.baseRef = val(); break;"
+            },
+            {
+              "label": "one scope for the `@` popover",
+              "path": "src/shared/file-scope.ts",
+              "line": 24,
+              "lang": "ts",
+              "code": "export function fileScopeForTask(\n  task: Pick<Task, \"workdir\" | \"worktreePath\" | \"isolation\" | \"baseRef\" | \"branchSource\" | \"branch\">,\n): { dir: string; ref?: string | null } {\n  if (task.worktreePath) return { dir: task.worktreePath };"
+            }
+          ],
+          "options": [
+            {
+              "id": "full",
+              "label": "Full CLI + TUI parity",
+              "description": "`agetor add --repo` (repeatable), `show`/`shell`/`rm` repo-aware, TUI multi-select and multi-scope `@` completion.",
+              "consequence": "Matches house style and leaves no second-class surface; the TUI create form is the largest non-core piece and adds tests."
+            },
+            {
+              "id": "cli-only",
+              "label": "CLI create/read, TUI read-only",
+              "description": "`add --repo` and `show`/`shell`/`rm` parity; the TUI displays multi-repo tasks and `@` scopes but its create form stays single-repo in v1.",
+              "consequence": "Scripts and agents can create the feature; TUI users can inspect but not create. A smaller, honest gap documented as a follow-up."
+            },
+            {
+              "id": "webview-only",
+              "label": "Webview only",
+              "description": "The API accepts repositories, but the CLI and TUI are unchanged.",
+              "consequence": "Smallest change; `agetor add` cannot create the feature and `show`/`rm` show only the primary, which the house style treats as drift."
+            }
+          ],
+          "recommendation": {
+            "value": "cli-only",
+            "reason": "The CLI is the scriptable surface and must not be blind to the feature; the TUI create form can follow without blocking the issue."
+          },
+          "allowOther": true
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Low-stakes defaults I'd bet on. Confirm each with one click, or override with what it should be. These are recorded as owner decisions; none is a one-way door.",
+      "questions": [
+        {
+          "id": "primary-mirrors",
+          "type": "confirm",
+          "title": "Primary-repo mirrors and backward compatibility",
+          "impact": "minor",
+          "why": "Decides the shape old clients and the CLI read.",
+          "recommendation": {
+            "value": "`workdir`, `branch`, `worktreePath`, `baseRef`, `prUrl` stay the primary repo's mirrors; `repositories[]` is the source of truth. Legacy rows derive a one-entry array from the existing columns — no backfill. `existingBranch`, `issueUrl` and `isolation` stay primary/global. Document that an older build sees only the primary and may tear down only its worktree.",
+            "reason": "Additive, so old clients keep compiling; a downgrade guard would be a new migration for a case the user controls."
+          }
+        },
+        {
+          "id": "repo-identity-cap",
+          "type": "confirm",
+          "title": "Repo identity, primary selection and cap",
+          "impact": "minor",
+          "why": "Prevents two worktrees of the same repo and bounds N-worktree cost.",
+          "recommendation": {
+            "value": "Dedupe by git root; the first selected repo is primary and can be reordered before the first run; hard cap 10 repositories per task (400 above that), with 2–5 the expected range.",
+            "reason": "Two registered projects under one git root would otherwise get two branches/worktrees; 10 bounds git and polling work without limiting real use."
+          }
+        },
+        {
+          "id": "workspace-layout",
+          "type": "confirm",
+          "title": "Workspace layout and Worktrees page",
+          "impact": "minor",
+          "why": "This is the on-disk and API shape the plan builds against.",
+          "recommendation": {
+            "value": "Multi-repo workspace is `<dataDir>/worktrees/<task-id>/<slug>` (slug = repo basename, uniquified); single-repo tasks keep today's `<dataDir>/worktrees/<task-id>`. The Worktrees page shows one row per repo grouped under its task, with an opaque id `<taskId>__<slug>`; owned rows still route deletion to archiving the task, orphan rows keep per-row delete.",
+            "reason": "Nested paths stay inside the existing task-dir containment; the `__` id keeps one URL path segment and a strict two-level parser."
+          }
+        },
+        {
+          "id": "ui-surfaces",
+          "type": "confirm",
+          "title": "Card, diff, filters and progress",
+          "impact": "minor",
+          "why": "Decides what a user sees without opening a new page.",
+          "recommendation": {
+            "value": "New Task form shows one compact row per repo (branch/base) and collapses to today's form for one repo. Card shows the primary repo plus `+N`. Diff dialog gets per-repo tabs/selector. Repo filter and text search match any selected repo. Context menu gets a per-repo submenu. The agent's existing todo progress stays one shared list; per-repo change counts live in the run panel.",
+            "reason": "One card must show all repos without a new page; the todo list is conversation-scoped, not repo-scoped."
+          }
+        },
+        {
+          "id": "create-validation",
+          "type": "confirm",
+          "title": "Create-time validation",
+          "impact": "minor",
+          "why": "Failing early is better than a half-created task.",
+          "recommendation": {
+            "value": "Create rejects with 400 if any selected repo is missing, is not a git repo, has an unresolvable base ref, has an invalid branch name, or has that branch checked out in another live task; nothing is created. `isolation: none` with 2+ repos is rejected with the worktree-required message.",
+            "reason": "Matches today's create-time base-ref and existing-branch validation and avoids discovering a bad repo at start."
+          }
+        },
+        {
+          "id": "archive-dirty",
+          "type": "confirm",
+          "title": "Archive and delete with dirty repos",
+          "impact": "minor",
+          "why": "Protects uncommitted work without making a task unarchivable.",
+          "recommendation": {
+            "value": "Archive teardown is best-effort per repo: clean worktrees are detached, dirty ones are kept on disk with their branch, and every per-repo outcome is reported. Archive still succeeds. Delete is explicit and per repo; it never deletes a `branchSource: existing` branch.",
+            "reason": "It is exactly what `detachWorktree` does today; all-or-nothing would make one dirty repo block archiving the card."
+          }
+        },
+        {
+          "id": "runtime-defaults",
+          "type": "confirm",
+          "title": "Terminals, polling and extra roots",
+          "impact": "minor",
+          "why": "These are the 5 s-poll and multi-process constraints the plan must not violate.",
+          "recommendation": {
+            "value": "Terminals open at the workspace root (with a repo selector); `/tasks/:id/git-status` returns all repo statuses in one batched response per poll; each repo is also passed as an extra root (`--add-dir` / include-directories) where the harness supports it, even though cwd is the workspace.",
+            "reason": "5 s × N repos would exceed the webview connection budget; extra roots help project-config discovery and Codex's git sandbox."
+          }
+        },
+        {
+          "id": "spec-and-tests",
+          "type": "confirm",
+          "title": "Spec and acceptance",
+          "impact": "minor",
+          "why": "The contract is outside the repo today; the plan must cite a path a reviewer can open.",
+          "recommendation": {
+            "value": "Commit the issue's asks and these decisions as `docs/specs/multi-repo-tasks.md` before planning. Add one e2e spec covering create → fake-driver run → two worktrees/branches → per-repo diff → per-repo PR stamp → archive teardown, plus unit tests for per-repo prepare/reuse/cleanup, nested worktree ids and route policy, and pipeline step copy.",
+            "reason": "The issue is a tracker tab, and the current suite passes a naive multi-select that creates one worktree."
+          }
+        }
+      ]
+    }
+  ]
+}

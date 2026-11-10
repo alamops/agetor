@@ -1,0 +1,394 @@
+{
+  "version": 1,
+  "id": "multi-repo-tasks-grill-r2",
+  "title": "Grill — multiple repositories in one card (#291) — round 2",
+  "skill": "grill",
+  "slug": "multi-repo-tasks",
+  "round": 2,
+  "flags": [],
+  "summary": "Round 1 is fully answered. This round is **only** the contradictions and gaps those answers opened — 11 items, 2 of them one-way doors.\n\nThe sharpest one: you chose `support-none-live` for `isolation: none`, but also accepted a create-validation rule that **rejects** `isolation: none` with 2+ repos, and chose a workspace root as the agent's cwd. Those cannot all hold, and `support-none-live` assumed a 'first repo' that your no-primary answer rules out.\n\nThe second: 'no primary repo' is now a real data-model change, because `Task` still has one `workdir`, one `branch`, one `worktreePath` and one `prUrl` that dozens of readers use. We need an explicit rule for multi-repo rows before the plan can be written.\n\nEverything else is a consequence or a default: card display without a primary, the repo-selection dialog, shared-branch fallback, aggregate PR failure, issue attribution, `existingBranch`, and the exact `Repositories:` block.",
+  "proven": [
+    "Round 1 settled: per-task workspace root as the agent cwd, all six issue bullets, all eight harnesses, both pipeline and issue flows, full CLI/TUI parity, aggregate commit/PR, a new `Repositories:` prompt paragraph, a fixed (create-only) repo set, best-effort archive per repo, batched git status, and the spec + e2e acceptance matrix.",
+    "Round 1 also confirmed: dedupe was not rejected, but the 'first repo is primary' and 'hard cap 10' parts of that answer were. The no-primary answer is what forces the data-model question below."
+  ],
+  "sections": [
+    {
+      "id": "contradictions",
+      "title": "The contradiction to resolve",
+      "intro": "One answer has to win. This is a one-way door: it decides whether an agent can ever write to a live repo, and whether the containment that keeps `@` safe is relaxed.",
+      "questions": [
+        {
+          "id": "isolation-none-final",
+          "type": "single",
+          "title": "Which `isolation: none` behaviour wins?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "It decides whether multi-repo always uses worktrees, or whether the agent can edit live checkouts — a trust-boundary change to `resolveAtPath` and the task-dir containment.",
+          "context": "Your round-1 answers conflict:\n\n- `agent-architecture` = **workspace-root** (the agent's cwd is the per-task workspace).\n- `isolation-none` = **support-none-live** (the option text said the agent runs directly in live repos, with the workspace as a display path).\n- `create-validation` = accepts **“`isolation: none` with 2+ repos is rejected with the worktree-required message.”**\n- `primary-mirrors` = **“We don't need a primary term here”**, which removes the 'first repo' that `support-none-live` assumed as cwd.\n\nSo the current answers reject and support the same combination, and the support path has no defined cwd. Pick the one that wins.",
+          "evidence": [
+            {
+              "label": "today `none` means running in the source repo with no worktree",
+              "path": "src/bun/worktree.ts",
+              "line": 959,
+              "lang": "ts",
+              "code": "if (task.isolation !== \"worktree\") {\n  return { cwd: task.workdir, branch: null, worktreePath: null, note: \"isolation: none\", checkoutBranch: null, checkoutKnown: false };\n}"
+            },
+            {
+              "label": "the containment a live-repo workspace would have to relax",
+              "path": "src/bun/project-files.ts",
+              "line": 455,
+              "lang": "ts",
+              "code": "const withinCwd = realAbs === realCwd || realAbs.startsWith(realCwd + path.sep);\nif (!withinCwd) return null;"
+            }
+          ],
+          "options": [
+            {
+              "id": "require-worktree",
+              "label": "Require worktrees for 2+ repos (reverses round 1's `support-none-live`)",
+              "description": "A multi-repo task always uses `isolation: \"worktree\"`; `none` stays a single-repo mode. The create-validation rejection stands.",
+              "consequence": "Consistent with the workspace-root answer, the accepted validation rule and the realpath containment. `none` users cannot use multi-repo; the UI auto-switches to worktree when a second repo is added."
+            },
+            {
+              "id": "none-symlink-workspace",
+              "label": "Support `none` with a workspace of symlinks",
+              "description": "The workspace root contains one symlink per live repo; the agent's cwd is the workspace. The validation clause is removed and the workspace symlinks are explicitly allowed by the containment check.",
+              "consequence": "The agent edits the user's real checkouts (that is what `none` means) and every repo path must be allowed through realpath containment. A new, intentional security exception and a no-op teardown path."
+            },
+            {
+              "id": "none-copy-workspace",
+              "label": "Support `none` with copies",
+              "description": "Copy the live repos into the workspace; the agent edits the copies.",
+              "consequence": "Changes never reach the source repo unless a copy-back feature exists. That is not a usable `none` mode; it would need a sync/merge feature this issue does not ask for."
+            },
+            {
+              "id": "none-live-no-workspace",
+              "label": "Support `none` with no workspace root",
+              "description": "The agent runs in one live repo and gets the others as absolute paths; the validation clause is removed.",
+              "consequence": "Reintroduces a de facto first repo, and Cursor/fx/OpenCode cannot see the other repos or resolve `@` into them. Contradicts the no-primary answer."
+            }
+          ],
+          "recommendation": {
+            "value": "require-worktree",
+            "reason": "It is the only option consistent with the workspace-root answer you chose, the create-validation rule you accepted, and the containment that makes `@` safe."
+          },
+          "allowOther": true
+        }
+      ]
+    },
+    {
+      "id": "no-primary",
+      "title": "What 'no primary' means in the data model and UI",
+      "intro": "You rejected the primary term: every repo is equally important. That is a real contract change, because the task row and many readers still assume one `workdir`/`branch`/`worktreePath`/`prUrl`.",
+      "questions": [
+        {
+          "id": "legacy-columns",
+          "type": "single",
+          "title": "What do `workdir`, `branch`, `worktreePath`, `baseRef` and `prUrl` mean on a multi-repo task?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "These columns are read by the card, filters, git status, diff, teardown, Worktrees page, CLI and older builds. Leaving them as 'the first repo' silently reintroduces the primary you rejected.",
+          "context": "`Task` has exactly one of each (`src/shared/types.ts:1890-1926`), and `createTask` writes one `workdir` and one `branch` at insert (`src/bun/orchestrator.ts:11030, 11298`). The git-status route and diff pick one directory (`worktreePath ?? workdir`). Your answer was **“We don't need a primary term here, all multi repos are in same level in importancy”**. So choose what those columns mean for a multi-repo row.",
+          "evidence": [
+            {
+              "label": "one workdir, one branch, one worktreePath, one prUrl",
+              "path": "src/shared/types.ts",
+              "line": 1890,
+              "lang": "ts",
+              "code": "workdir: string;\n/** \"worktree\" runs the agent in a per-task git worktree off `workdir`. \"none\" runs directly in `workdir`. */\nisolation: Isolation;\n// ...\nbranch: string | null;\n// ...\nworktreePath: string | null;\n// ...\nbaseRef: string | null;\n// ...\nprUrl: string | null;"
+            },
+            {
+              "label": "the single-directory readers",
+              "path": "src/bun/server.ts",
+              "line": 6876,
+              "lang": "ts",
+              "code": "const dir = t.worktreePath ?? t.workdir;\nconst [result, syncState, headState] = await Promise.all([\n  hasUncommittedChanges(dir),\n  remoteSyncState(dir),\n  headBranchState(dir),\n]);"
+            },
+            {
+              "label": "the card prints one path and one branch",
+              "path": "src/mainview/components/kanban/TaskCard.tsx",
+              "line": 334,
+              "lang": "tsx",
+              "code": "<p\n  className=\"text-[10px] text-muted-foreground/70 font-mono truncate\"\n  title={task.workdir}\n>\n  {abbreviateHome(task.workdir, homeDir)}\n</p>"
+            }
+          ],
+          "options": [
+            {
+              "id": "workspace-mirror",
+              "label": "Point the legacy columns at the workspace",
+              "description": "For multi-repo rows: `workdir` and `worktreePath` are the workspace root; `branch`, `baseRef` and `prUrl` are null. Every repo's real branch/base/PR lives in `repositories[]`. Single-repo rows are unchanged.",
+              "consequence": "No semantic primary, and every existing reader gets a real path. Older builds see a non-git workspace and no branch/PR; an older delete may remove the workspace root and orphan the repo worktrees. Every new reader must switch to `repositories[]`.",
+              "preview": "multi-repo task:\n  workdir      = <dataDir>/worktrees/<task-id>   (workspace)\n  worktreePath = <dataDir>/worktrees/<task-id>   (workspace)\n  branch       = null\n  baseRef      = null\n  prUrl        = null\n  repositories = [frontend, backend, infra]"
+            },
+            {
+              "id": "compat-mirror",
+              "label": "Keep a compatibility mirror of one repo",
+              "description": "One repo's branch/base/worktree/PR fills the legacy columns so old builds still show a real repo; the UI never calls it primary and `repositories[]` is the source of truth.",
+              "consequence": "Old builds keep working per repo, but an implicit 'first' remains in the data and the no-primary claim is only true in the UI. Choosing which repo fills the mirror is itself a primary decision."
+            },
+            {
+              "id": "nullable-drop",
+              "label": "Null/ignore the legacy columns for multi-repo",
+              "description": "Leave `workdir` as the only required path (or make it nullable) and update every reader to use `repositories[]`; no compatibility mirror at all.",
+              "consequence": "Cleanest new model, largest contract break: `workdir` is required by `Task`, route policy, CLI and many helpers. Old builds break more visibly than with the workspace mirror."
+            }
+          ],
+          "recommendation": {
+            "value": "workspace-mirror",
+            "reason": "It is the only option with no semantic primary, and it gives existing readers a real path (the workspace) instead of a null they must special-case."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "card-without-primary",
+          "type": "single",
+          "title": "How does the card show repositories when there is no primary?",
+          "impact": "shape",
+          "why": "The round-1 UI answer still said 'Card shows the primary repo plus +N', which is now invalid. This decides the card and the filter/search display.",
+          "context": "A card currently prints one `task.workdir` and one branch (`TaskCard.tsx:334-348`). With no primary, we cannot show 'the' repo. The repo-selection note you wrote asked for a dialog to save vertical height, so the card should stay compact too.",
+          "evidence": [
+            {
+              "label": "the one-repo card line",
+              "path": "src/mainview/components/kanban/TaskCard.tsx",
+              "line": 334,
+              "lang": "tsx",
+              "code": "<p className=\"text-[10px] text-muted-foreground/70 font-mono truncate\" title={task.workdir}>\n  {abbreviateHome(task.workdir, homeDir)}\n</p>"
+            }
+          ],
+          "options": [
+            {
+              "id": "count-popover",
+              "label": "A count badge with a popover",
+              "description": "The card shows e.g. `3 repositories`; hover/click lists each repo name, branch and PR link.",
+              "consequence": "Compact and primary-free; the full list is one click away. The card can't show a branch at a glance, so the run panel becomes the place for per-repo state."
+            },
+            {
+              "id": "all-chips",
+              "label": "All repo names as chips",
+              "description": "The card shows every repo name as a small chip, wrapping as needed.",
+              "consequence": "No click needed, but with 5–10 repos the card grows and the board gets noisy."
+            },
+            {
+              "id": "first-plus-n",
+              "label": "One repo name + `+N`",
+              "description": "Show one repo and a count; the popover lists the rest.",
+              "consequence": "Most compact, but visually reintroduces a primary even if the code has none; conflicts with your no-primary answer."
+            }
+          ],
+          "recommendation": {
+            "value": "count-popover",
+            "reason": "It keeps the board compact and does not privilege any repo; the per-repo detail already belongs in the run panel."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "issue-repo-attribution",
+          "type": "single",
+          "title": "Which repo's PR gets `Closes #N` when there is no primary?",
+          "impact": "shape",
+          "why": "An issue task can add repos that have nothing to do with the issue; putting `Closes #N` on all their PRs would close the issue from the wrong repo.",
+          "context": "`issueUrl` is currently checked against the single `workdir`'s remote at create, and the PR prefill reads the task's `issueUrl`. With no primary, the task still needs to know which repo the issue belongs to. That repo is known at create time from the dialog's `context.path` — it does not need a user choice.",
+          "evidence": [
+            {
+              "label": "the issue dialog knows the source repo",
+              "path": "src/mainview/components/kanban/CreateTaskFromIssueDialog.tsx",
+              "line": 228,
+              "lang": "tsx",
+              "code": "workdir: context.path,\n...\nissueUrl: thread.item.htmlUrl,\nissueSnapshot: renderIssueThreadMarkdown(thread),"
+            },
+            {
+              "label": "the current same-repo validation",
+              "path": "src/bun/orchestrator.ts",
+              "line": 11268,
+              "lang": "ts",
+              "code": "// Issue provenance ... validated once,\n// at create time only ... A bad or wrong-repo URL rejects\n// the whole create, since \"View issue\" and the PR-body \"Closes #N\" prefill\n// both trust this field being correct."
+            }
+          ],
+          "options": [
+            {
+              "id": "issue-repo-field",
+              "label": "Store the issue's repo with the task",
+              "description": "Record the source repo (e.g. `issueRepoPath`, or that repo's `repositories[i].issueUrl`) at create; only that repo's PR body gets `Closes #N`.",
+              "consequence": "GitHub linkage survives without a primary. Adds one field and a per-repo prefill rule; the other repos' PRs are plain."
+            },
+            {
+              "id": "no-closes",
+              "label": "Drop `Closes #N` for multi-repo issue tasks",
+              "description": "Only single-repo issue tasks keep the closing keyword; multi-repo PRs never prefill it.",
+              "consequence": "No wrong-repo closes, but the user must close the issue by hand and the linkage is lost for the feature's main use case."
+            },
+            {
+              "id": "user-picks",
+              "label": "Ask in the repo dialog",
+              "description": "The dialog shows which repo owns the issue and lets the user change it.",
+              "consequence": "Explicit and flexible, but it is a choice the app already knows; adds a field to the dialog and a way to get it wrong."
+            }
+          ],
+          "recommendation": {
+            "value": "issue-repo-field",
+            "reason": "The source repo is already known when the issue dialog opens; recording it keeps `Closes #N` correct without a primary."
+          },
+          "allowOther": true
+        }
+      ]
+    },
+    {
+      "id": "workflow",
+      "title": "Workflow details the overrides opened",
+      "questions": [
+        {
+          "id": "same-branch-fallback",
+          "type": "single",
+          "title": "Same branch name everywhere — what if one repo rejects it?",
+          "impact": "shape",
+          "why": "A shared branch name is your choice, but each repo can have its own `Project.branchConfig`, protected prefixes, or a name already checked out.",
+          "context": "You chose **same-branch** with a per-repo base ref. `createTask` renders the branch from the selected project's config and validates it; with one shared name we need a rule for a repo whose config or git refuses that name.",
+          "evidence": [
+            {
+              "label": "the per-project branch config today",
+              "path": "src/bun/orchestrator.ts",
+              "line": 11250,
+              "lang": "ts",
+              "code": "const config = projects.get(workdir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;\ndesired = renderBranchTemplate(branchPattern(config, taskType), ctx);\nif (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });"
+            }
+          ],
+          "options": [
+            {
+              "id": "shared-with-fallback",
+              "label": "Shared name by default, per-repo fallback",
+              "description": "Use the same name in every repo; if a repo's config/validation/git refuses it, derive that repo's own name and show it in the repo dialog.",
+              "consequence": "Keeps the cross-repo correlation you asked for and still lets the task start. Branch names can differ in the rare fallback case, which the UI shows."
+            },
+            {
+              "id": "shared-strict",
+              "label": "Always the shared name",
+              "description": "Ignore each repo's `branchConfig`; if git rejects the name in a repo, fail the create.",
+              "consequence": "One name everywhere, but a repo with a protected prefix can block the whole task; the create error names the repo."
+            },
+            {
+              "id": "per-repo-revert",
+              "label": "Go back to per-repo names",
+              "description": "Each repo derives its name from its own config, as recommended in round 1.",
+              "consequence": "No fallback edge cases, but loses the correlation and adds one branch field per repo in the dialog."
+            }
+          ],
+          "recommendation": {
+            "value": "shared-with-fallback",
+            "reason": "It preserves the one-name preference without letting a single repo's naming policy block the task."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "aggregate-result",
+          "type": "single",
+          "title": "One aggregate commit/push/PR flow — what happens when one repo fails?",
+          "impact": "shape",
+          "why": "You chose the aggregate flow. The existing parser handles one proposal, and PR creation can fail per repo (no changes, no remote, auth, already exists).",
+          "context": "The aggregate prompt will list every repo and branch and ask for one PR proposal per repo; one `Create all PRs` action will walk them. The question is whether one failure stops the rest or is reported per repo.",
+          "evidence": [
+            {
+              "label": "the one-proposal prompt today",
+              "path": "src/shared/types.ts",
+              "line": 6359,
+              "lang": "ts",
+              "code": "export function commitPushPrompt(task: Pick<Task, \"branch\" | \"taskType\">): string {\n  const ccType = branchCommitType(task.branch, task.taskType);\n  const branchLabel = task.branch ? `'${task.branch.replace(/'/g, \"'\\\\''\")}'` : \"<branch>\";"
+            },
+            {
+              "label": "the one-PR stamp",
+              "path": "src/bun/server.ts",
+              "line": 3263,
+              "lang": "ts",
+              "code": "if (\n  task &&\n  task.archivedAt == null &&\n  !task.prUrl &&\n  task.workdir === dir &&\n  result.item?.htmlUrl\n) {\n  tasks.update(task.id, { prUrl: result.item.htmlUrl });\n}"
+            }
+          ],
+          "options": [
+            {
+              "id": "best-effort",
+              "label": "Per-repo best effort",
+              "description": "Commit/push and create PRs per repo independently; show a per-repo success/failure result and allow retrying only the failed repo.",
+              "consequence": "One dirty or unpushed repo does not block the others' PRs; needs a per-repo result model and a retry action."
+            },
+            {
+              "id": "all-or-nothing",
+              "label": "All-or-nothing",
+              "description": "If any repo fails to commit/push, stop; create no further PRs.",
+              "consequence": "Predictable, but one repo with no remote or a dirty tree blocks the whole card. A retry redoes every repo."
+            },
+            {
+              "id": "ask",
+              "label": "Ask per failure",
+              "description": "Show a dialog with the failed repos and retry/skip per repo.",
+              "consequence": "Most control, most UI; still a per-repo result model underneath."
+            }
+          ],
+          "recommendation": {
+            "value": "best-effort",
+            "reason": "The repos are independent; a single failure should not prevent the other repos' PRs from landing."
+          },
+          "allowOther": true
+        },
+        {
+          "id": "repo-dialog-scope",
+          "type": "confirm",
+          "title": "Repo selection dialog: where it is used and what it contains",
+          "impact": "minor",
+          "why": "Your note asked for a dialog instead of inline rows to save New Task height; we need to pin its scope.",
+          "recommendation": {
+            "value": "One shared `Repositories` dialog used by New Task and `CreateTaskFromIssueDialog` (the Git Integration issue modal). It offers multi-select of registered projects, an `Add folder…` native picker, a base-branch field per repo, and remove. The New Task panel shows a summary line (`3 repositories`) and a `Manage` button instead of per-repo rows; with exactly one repo, today's inline branch/base fields stay. The pipeline form needs no separate dialog because it is the same New Task form.",
+            "reason": "It matches your panel-height note and keeps the Git Integration path consistent; one repo keeps the familiar form."
+          }
+        },
+        {
+          "id": "dedupe-no-cap",
+          "type": "confirm",
+          "title": "Dedupe and the no-cap rule",
+          "impact": "minor",
+          "why": "You rejected the primary and the cap; dedupe is still a technical necessity, and an unbounded selection needs a runtime policy.",
+          "recommendation": {
+            "value": "Dedupe selected projects by git root: two registered projects under one repo collapse to one worktree. No hard cap and no 400 for a large selection; show a non-blocking warning above 10 repositories (`this task will create 11 worktrees and may be slow`). Worktree creation and status polling run in bounded batches regardless of N.",
+            "reason": "Two worktrees of the same repo in one task would conflict; a warning respects 'no cap' while making the cost visible."
+          }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Last confirms",
+      "intro": "Two defaults that close the remaining gaps. Confirm or override each.",
+      "questions": [
+        {
+          "id": "prompt-block-format",
+          "type": "confirm",
+          "title": "Exact `Repositories:` block",
+          "impact": "minor",
+          "why": "You chose a new machine-added paragraph, which is an exception to the prompt-text rule; the plan needs the exact text and where it is emitted.",
+          "recommendation": {
+            "value": "In the launch prompt only:\n\n`Repositories:`\n`- <name>: <absolute worktree path> (branch <branch>)`\n\nOne bullet per repo, no product name, no other prose. The aggregate commit/push prompt is the existing user-triggered template and names the repos itself, so it does not repeat this block.",
+            "reason": "It is the shortest block that names every repo and branch; the plan will amend the prompt-text rule in CLAUDE.md and its tests."
+          }
+        },
+        {
+          "id": "existing-branch-multi",
+          "type": "confirm",
+          "title": "`existingBranch` with multiple repos",
+          "impact": "minor",
+          "why": "The current API takes one pre-existing branch; with no primary there is no obvious repo for it.",
+          "recommendation": {
+            "value": "`existingBranch` stays single-repo only. A multi-repo create that sends it is rejected 400 with a clear message; per-repo existing-branch selection is a separate future feature.",
+            "reason": "The issue asks for new worktrees/branches; per-repo existing branches would need N branch pickers and N collision checks."
+          }
+        },
+        {
+          "id": "create-only-confirm",
+          "type": "confirm",
+          "title": "Confirm create-only drops the issue's 'or editing a card'",
+          "impact": "minor",
+          "why": "This is the one answer that consciously narrows what the ticket asked for, so it should be explicit in the record.",
+          "recommendation": {
+            "value": "Confirm: the repo set is fixed at creation. Changing it means a new card. This narrows issue #291's 'creating or editing a card' to creation only.",
+            "reason": "It is the safest scope, but a reviewer should see it as an owner decision rather than a missing feature."
+          }
+        }
+      ]
+    }
+  ]
+}

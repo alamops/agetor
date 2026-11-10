@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "formId": "multi-repo-tasks-grill-r2",
+  "title": "Grill — multiple repositories in one card (#291) — round 2",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "05e5ef52c59314ec7a47408ecfc48b0ffdfaa353ea9e62dfec92d548ee57b395",
+  "submittedAt": "2026-11-10T15:59:59.541Z",
+  "receivedAt": "2026-11-10T15:59:59.549Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 11,
+    "answered": 11,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 10,
+    "overrodeRecommendations": [
+      "card-without-primary"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "isolation-none-final": {
+      "n": 1,
+      "title": "Which `isolation: none` behaviour wins?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "require-worktree",
+      "display": "Require worktrees for 2+ repos (reverses round 1's `support-none-live`)",
+      "acceptedRecommendation": true
+    },
+    "legacy-columns": {
+      "n": 2,
+      "title": "What do `workdir`, `branch`, `worktreePath`, `baseRef` and `prUrl` mean on a multi-repo task?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "workspace-mirror",
+      "display": "Point the legacy columns at the workspace",
+      "acceptedRecommendation": true
+    },
+    "card-without-primary": {
+      "n": 3,
+      "title": "How does the card show repositories when there is no primary?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": null,
+      "other": "the count badge with a popover but with the number and an icon representing worktree instead",
+      "display": "Other: the count badge with a popover but with the number and an icon representing worktree instead",
+      "acceptedRecommendation": false,
+      "recommended": "count-popover"
+    },
+    "issue-repo-attribution": {
+      "n": 4,
+      "title": "Which repo's PR gets `Closes #N` when there is no primary?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "issue-repo-field",
+      "display": "Store the issue's repo with the task",
+      "acceptedRecommendation": true
+    },
+    "same-branch-fallback": {
+      "n": 5,
+      "title": "Same branch name everywhere — what if one repo rejects it?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "shared-with-fallback",
+      "display": "Shared name by default, per-repo fallback",
+      "acceptedRecommendation": true
+    },
+    "aggregate-result": {
+      "n": 6,
+      "title": "One aggregate commit/push/PR flow — what happens when one repo fails?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "best-effort",
+      "display": "Per-repo best effort",
+      "acceptedRecommendation": true
+    },
+    "repo-dialog-scope": {
+      "n": 7,
+      "title": "Repo selection dialog: where it is used and what it contains",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "One shared `Repositories` dialog used by New Task and `CreateTaskFromIssueDialog` (the Git Integration issue modal). It offers multi-select of registered projects, an `Add folder…` native picker, a base-branch field per repo, and remove. The New Task panel shows a summary line (`3 repositories`) and a `Manage` button instead of per-repo rows; with exactly one repo, today's inline branch/base fields stay. The pipeline form needs no separate dialog because it is the same New Task form.",
+      "acceptedRecommendation": true
+    },
+    "dedupe-no-cap": {
+      "n": 8,
+      "title": "Dedupe and the no-cap rule",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Dedupe selected projects by git root: two registered projects under one repo collapse to one worktree. No hard cap and no 400 for a large selection; show a non-blocking warning above 10 repositories (`this task will create 11 worktrees and may be slow`). Worktree creation and status polling run in bounded batches regardless of N.",
+      "acceptedRecommendation": true
+    },
+    "prompt-block-format": {
+      "n": 9,
+      "title": "Exact `Repositories:` block",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "In the launch prompt only:\n\n`Repositories:`\n`- <name>: <absolute worktree path> (branch <branch>)`\n\nOne bullet per repo, no product name, no other prose. The aggregate commit/push prompt is the existing user-triggered template and names the repos itself, so it does not repeat this block.",
+      "acceptedRecommendation": true
+    },
+    "existing-branch-multi": {
+      "n": 10,
+      "title": "`existingBranch` with multiple repos",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "`existingBranch` stays single-repo only. A multi-repo create that sends it is rejected 400 with a clear message; per-repo existing-branch selection is a separate future feature.",
+      "acceptedRecommendation": true
+    },
+    "create-only-confirm": {
+      "n": 11,
+      "title": "Confirm create-only drops the issue's 'or editing a card'",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Confirm: the repo set is fixed at creation. Changing it means a new card. This narrows issue #291's 'creating or editing a card' to creation only.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}
