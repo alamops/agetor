@@ -748,8 +748,10 @@ A **merged file the primary deleted outright** (`settings.json`,
 document, so its keys follow the same three rules. It counts as deleted only
 when the primary's config root is a directory, the file's own folder exists
 (the base is trusted like the root; every folder below it must be a real,
-non-symlink directory), the open reports `ENOENT`, and the mirror still owns at
-least one key in that file (`primaryDeletionPropagates`). A dangling dotfile
+non-symlink directory), it is still missing 250 ms later (an editor saving by
+rename leaves a file absent for a moment; a file that reappears, or vanishes
+between the `lstat` and the open, is left for the next run), and the mirror
+still owns at least one key in that file (`primaryDeletionPropagates`). A dangling dotfile
 link, an unreadable file or a missing account is left alone, and a backup that
 has no such file never gets one created.
 
@@ -790,8 +792,11 @@ reads open no-follow handles asynchronously; and `removeMirrorBackups`, after
 `lstat`-checking `mirror-backups/` and the account's folder, deletes with Bun's
 recursive `fs.rm`, which is fd-relative (Zig `deleteTree`: each folder opened
 from its parent's descriptor with `O_NOFOLLOW`, each entry unlinked relative to
-its folder), so a link is removed as itself and a folder swapped for a link
-mid-delete is refused, never followed. A path-based walk cannot give that: a
+its folder), so inside the account's backup folder a link is removed as
+itself and a folder swapped for a link mid-delete is refused, never followed.
+The two top folders (`mirror-backups/`, `<id>`) are `lstat`-checked just
+before; that check-then-delete on the top folders is the one remaining
+window. A path-based walk cannot give that: a
 spike (racing a folder↔link swap during the delete, 100+ trials each) lost
 outside files with our earlier `lstat`/re-check walk, with `/bin/rm -rf` (macOS
 `fts` has its dev/ino check compiled out and opens folders without
@@ -940,15 +945,16 @@ source account's config root to the destination's (adapters: Claude, Codex).
   stamps the real time. A failed transfer puts the row back to what it was. A
   path recorded but never created is harmless (cleanup skips a missing file).
 - **Superseded copies are removed after success.** When the account already had
-  a handoff for a different session, re-keying the row moves the old session's
-  paths to `harness_orphaned_copies` under the **old** session id (a row names
-  one session, and cleanup only removes paths of its own session). They are
-  swept only *after* the new copy succeeded and the row was re-keyed: a failed
-  transfer must leave the old conversation intact, so it puts the previous row
-  back whole (its paths are reclaimed from the orphan store) and moves whatever
-  the failed copy recorded to the orphan store instead, where the same sweep
-  removes any partial file. Copies that cannot be removed yet stay on record
-  and the transfer reports a warning; see
+  a handoff for a different session, that row is **not touched until the copy
+  succeeds**: until then its session is the one a resume uses, so its files
+  stay protected. The new session's intended paths are recorded as *pending
+  orphans* under the new session instead. The final upsert re-keys the row
+  (the old session's paths move to `harness_orphaned_copies` under the **old**
+  id, since a row names one session and cleanup only removes paths of its own
+  session) and reclaims the pending paths onto it; only then is the old session
+  swept. A failed copy leaves the old row as it was and its pending paths are
+  swept; a crash leaves them for the boot sweep. Copies that cannot be removed
+  yet stay on record and the transfer reports a warning; see
   [Leftover handoff copies](#leftover-handoff-copies).
 - Codex: the rollout is copied to the same relative path under the destination
   `CODEX_HOME` (only `sessions/YYYY/MM/DD/rollout-*-<threadId>.jsonl` is a
@@ -961,8 +967,10 @@ source account's config root to the destination's (adapters: Claude, Codex).
 handoff row can clean up any more, each with the session it was copied for:
 
 - the old session's paths when a row is **re-keyed** to another session (the
-  same task moved onto the same account again);
-- whatever a **failed first transfer** recorded (`harnessSessionHandoffs.abandon`);
+  same task moved onto the same account again), at the transfer's final upsert;
+- the paths a transfer onto an account with another session's row is about to
+  create (*pending*, reclaimed onto the row when the copy succeeds), and
+  whatever a **failed first transfer** recorded (`harnessSessionHandoffs.abandon`);
 - the paths a **deleted task's** cleanup had to keep (the account's root
   changed, an unlink failed), adopted by `tasks.delete` before the cascade.
 
@@ -973,14 +981,19 @@ nothing recursive). A record is dropped once its file is removed or gone, or
 when it is rejected as never ours; a `retained` one (outside the current root,
 refused root, failed unlink) stays for the next sweep. An account that no
 longer exists has no root, so its records are dropped. A session that is live
-on a handoff row of the same account is skipped. Sweeps are serialized and
+on a handoff row of the same account, or **being transferred onto it**
+(`heldTransfer` marks it before the transfer's first await), is skipped, and a
+sweep already removing it stops before the next file (`shouldStop`, checked in
+the same synchronous step as each unlink). Sweeps are serialized and
 cooperative and never reject. They run:
 
 - at boot, fired without awaiting at the end of `reconcileOrphans`
   (`sweepOrphanedHandoffCopiesAtBoot`). It first normalizes rows written before
   088: a path on a handoff row whose shape names another session
   (`handoffCopySessionIdFromPath`, which prefers the row's own session) moves
-  to the orphan store under that session;
+  to the orphan store under that session, one transaction per row; a row
+  stamped 0 (a transfer that never completed) is skipped, because its old
+  session is still the one a resume uses;
 - after a successful transfer, for the superseded session; after a failed one,
   for the session it recorded;
 - after `PATCH /harnesses/:id` changes `home` or `env` (a root changed back
@@ -1514,6 +1527,12 @@ account move and every blocked outcome. The trigger per path is the table under
   from the user's other tooling says nothing about Claude. Without a selector
   the key is ignored (and the process-key warning does not name it). The
   direct `ANTHROPIC_*` / `CLAUDE*` keys still count as a login.
+- **Deletion propagation follows whatever root the primary resolves to now.**
+  A primary account with no `home` or config-dir env of its own resolves
+  through the core's process environment (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`).
+  If a core launched differently resolves another, existing folder, files and
+  keys missing there read as deleted on the primary. Give the primary account
+  an explicit root to avoid it.
 - **An orphaned copy outside the account's current root waits.** A kept file
   whose account was re-pointed elsewhere is retried by every sweep and removed
   once the root points back; if it never does, it stays on disk (and on record)

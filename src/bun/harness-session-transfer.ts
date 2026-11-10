@@ -232,18 +232,72 @@ function claudeSessionTrees(
   return candidates.filter((t) => isPlainAncestorPathUnder(fromRoot, t.src) && isPlainDir(t.src));
 }
 
+/**
+ * Transfers in flight, by (destination account, column, session), with a
+ * count because two may overlap. A sweep never touches a session being
+ * copied: it skips the group, and stops mid-group (between files) as soon as
+ * a transfer of that session begins, so it can never unlink a file a transfer
+ * is creating or has just recorded.
+ */
+const transfersInFlight = new Map<string, number>();
+
+const flightKey = (harnessId: string, column: SessionIdColumn, sessionId: string) =>
+  `${harnessId}\u0000${column}\u0000${sessionId}`;
+
+function transferInFlight(harnessId: string, column: SessionIdColumn, sessionId: string): boolean {
+  return (transfersInFlight.get(flightKey(harnessId, column, sessionId)) ?? 0) > 0;
+}
+
+function holdFlight(key: string): () => void {
+  transfersInFlight.set(key, (transfersInFlight.get(key) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (transfersInFlight.get(key) ?? 1) - 1;
+    if (left > 0) transfersInFlight.set(key, left);
+    else transfersInFlight.delete(key);
+  };
+}
+
+/** Test seam: mark a session as being transferred, as `heldTransfer` does.
+ *  Returns the release. */
+export function holdTransferForTests(harnessId: string, column: SessionIdColumn, sessionId: string): () => void {
+  return holdFlight(flightKey(harnessId, column, sessionId));
+}
+
+/** Run one adapter transfer with its session marked in flight (set before the
+ *  first await), then, after a failure, sweep whatever it recorded. */
+async function heldTransfer(
+  harnessId: string,
+  column: SessionIdColumn,
+  sessionId: string,
+  run: () => Promise<TransferResult>,
+): Promise<TransferResult> {
+  const release = holdFlight(flightKey(harnessId, column, sessionId));
+  let result: TransferResult;
+  try {
+    result = await run();
+  } finally {
+    release();
+  }
+  if (!result.ok) await sweepOrphanedHandoffCopies({ harnessId, columnName: column, sessionId });
+  return result;
+}
+
 /** Keep a handoff row's session id and timestamp as they were, after a failed
- *  attempt wrote the intended paths into it. */
+ *  attempt recorded its intended paths. */
 function restoreHandoff(
   prior: HarnessSessionHandoff | null,
   taskId: string,
   harnessId: string,
   column: SessionIdColumn,
 ): void {
-  // Whatever the failed copy created is recorded under the new session; it
-  // moves to the orphan store (re-key or abandon) so a sweep can remove it,
-  // and the previous session's row comes back whole, its paths reclaimed from
-  // the orphan store.
+  // No earlier row: the stamped-0 intent row is abandoned, its paths orphaned
+  // under the new session. A row for another session was never touched (the
+  // intended paths are already pending orphans), and one for the same session
+  // keeps its paths. `heldTransfer` sweeps the new session once the transfer
+  // is no longer in flight.
   if (!prior) {
     harnessSessionHandoffs.abandon(taskId, harnessId, column);
     return;
@@ -255,10 +309,18 @@ function restoreHandoff(
  * Record the files a transfer is ABOUT to create, before copying them. A
  * crash between the copy and the final row would otherwise leave files no row
  * names, and the boot re-run would see the destination existing and never
- * record it. `upsert` merges `copiedPaths`, and a path recorded but never
- * created is harmless (cleanup skips a missing file). The session id is
- * recorded with a zero timestamp on a new row so the resume lookup prefers any
- * run the account really made until the final upsert stamps the real time.
+ * record it. A path recorded but never created is harmless (cleanup skips a
+ * missing file).
+ *
+ * - No row, or a row for the same session: the paths go on the row (merged).
+ *   A new row is stamped 0 so the resume lookup prefers any run the account
+ *   really made until the final upsert stamps the real time.
+ * - A row for ANOTHER session: that row is left exactly as it is until the
+ *   copy succeeds, because until then its session is still the one a resume
+ *   uses and its files must stay protected (a sweep skips a live session).
+ *   The intended paths are recorded as pending orphans under the NEW session
+ *   instead: the final upsert re-keys the row and reclaims them, a failed
+ *   copy leaves them for the sweep, and so does a crash, at boot.
  */
 function recordIntended(
   taskId: string,
@@ -269,13 +331,17 @@ function recordIntended(
   intended: readonly string[],
 ): void {
   if (intended.length === 0) return;
+  if (prior && prior.sessionId !== sessionId) {
+    harnessOrphanedCopies.add(harnessId, column, sessionId, intended);
+    return;
+  }
   harnessSessionHandoffs.upsert({
     taskId,
     harnessId,
     columnName: column,
     sessionId,
     copiedPaths: [...intended],
-    createdAt: prior && prior.sessionId === sessionId ? prior.createdAt : 0,
+    createdAt: prior ? prior.createdAt : 0,
   });
 }
 
@@ -299,109 +365,115 @@ async function dropSupersededCopies(
   }
 }
 
+async function claudeTransferUnheld({ taskId, fromHarness, toHarness, sessionId, cwd }: TransferArgs): Promise<TransferResult> {
+  if (fromHarness.kind !== "claude-code" || toHarness.kind !== "claude-code") {
+    return { ok: false, reason: "unsupported", message: "session transfer needs two claude-code accounts" };
+  }
+  const fromRoot = claudeConfigDirFor(fromHarness);
+  const toRoot = claudeConfigDirFor(toHarness);
+  // Contract CR4: refuse a root that now resolves into a macOS-protected
+  // folder it was not saved under, before anything (realpath included)
+  // touches it.
+  const redirected = rootsRedirectRefusal([
+    [fromRoot, "the source account's config directory"],
+    [toRoot, "the destination account's config directory"],
+  ]);
+  if (redirected) return unsafeReason(redirected);
+  // realpath, not `path.resolve`: a later `PATCH /harnesses/:id` can point a
+  // backup's root at the primary's through a symlink, and copying an account
+  // onto itself then lets cleanup delete the source's own transcript.
+  if (sameConfigRoot(fromRoot, toRoot)) {
+    return { ok: false, reason: "unsafe-source", message: "source and destination share a config directory" };
+  }
+  // The id becomes a file name on the destination; a separator or `..`
+  // would write outside `projects/<enc>/`.
+  if (!isSafePathSegment(sessionId)) return unsafeReason("the session id is not a plain file name");
+  // Ancestors are lstat-checked before any leaf is stat'ed (see
+  // `locateClaudeTranscript`); the leaf is checked no-follow again at open.
+  const located = await locateClaudeTranscript(fromRoot, cwd, sessionId);
+  if (located.kind === "unsafe") return unsafeReason(located.message);
+  if (located.kind === "none") return { ok: false, reason: "no-session", message: "no transcript recorded yet" };
+  const src = located.src;
+  if (!isRegularFileNoFollow(src)) {
+    return unsafeReason("the transcript is not a regular file (symlink or special file refused)");
+  }
+  // The destination's Claude derives the same project dir name from the same
+  // cwd, so the directory name found on the source is reused verbatim.
+  const dest = path.join(toRoot, "projects", located.projectDirName, `${sessionId}.jsonl`);
+  const trees = claudeSessionTrees(fromRoot, toRoot, located, sessionId);
+
+  const warnings: string[] = [];
+  const prior = harnessSessionHandoffs.get(taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
+  // Only files this transfer will CREATE go on the cleanup allowlist. A
+  // pre-existing destination is the account's own file (e.g. its original
+  // transcript after an A→B→A wrap): the copy still updates it, but deleting
+  // it later would destroy that account's conversation (contract C5).
+  const intended: string[] = [];
+  const destState = destinationState(toRoot, dest);
+  if (destState === "unsafe") return unsafeReason("the destination path traverses a symlinked directory");
+  if (destState === "absent") intended.push(dest);
+  for (const tree of trees) {
+    try {
+      intended.push(...(await planTreeDestinations(tree.src, tree.dest, { maxEntries: SIDECAR_MAX_ENTRIES, root: toRoot })));
+    } catch (err) {
+      warnings.push(`${tree.label}: could not be scanned (${errMessage(err)})`);
+    }
+  }
+  recordIntended(taskId, toHarness.id, CLAUDE_SESSION_COLUMN, sessionId, prior, intended);
+
+  const copied: string[] = [];
+  try {
+    const result = await copyRegularFileDetailed(src, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
+    if (result.created) copied.push(dest);
+  } catch (err) {
+    // Whatever this transfer recorded is swept by `heldTransfer` once the
+    // transfer is no longer in flight.
+    if (intended.length > 0) restoreHandoff(prior, taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
+    return { ok: false, reason: "io", message: errMessage(err) };
+  }
+
+  // The transcript is the conversation; a tree that cannot be copied in full
+  // is reported as a warning instead of failing the transfer or vanishing.
+  for (const tree of trees) {
+    try {
+      const result = await copyTreeCooperative(tree.src, tree.dest, {
+        maxBytes: NO_SIZE_LIMIT,
+        maxEntries: SIDECAR_MAX_ENTRIES,
+        root: toRoot,
+      });
+      copied.push(...result.created.map((rel) => path.join(tree.dest, rel)));
+      if (result.truncated) {
+        warnings.push(`${tree.label}: stopped at the ${SIDECAR_MAX_ENTRIES}-entry limit; some files were not transferred`);
+      }
+      if (result.skipped.length > 0) {
+        warnings.push(`${tree.label}: ${result.skipped.length} entries were skipped (links, special files or files that vanished)`);
+      }
+    } catch (err) {
+      warnings.push(`${tree.label}: not transferred (${errMessage(err)})`);
+    }
+  }
+
+  harnessSessionHandoffs.upsert({
+    taskId,
+    harnessId: toHarness.id,
+    columnName: CLAUDE_SESSION_COLUMN,
+    sessionId,
+    // The intended paths too: on a re-key they were recorded as pending
+    // orphans (see `recordIntended`), and putting them on the row reclaims
+    // them; one never created is harmless (cleanup skips a missing file).
+    copiedPaths: [...new Set([...intended, ...copied])],
+    createdAt: Date.now(),
+  });
+  await dropSupersededCopies(prior, sessionId, toHarness.id, CLAUDE_SESSION_COLUMN, warnings);
+  return { ok: true, sessionId, copiedPaths: copied, ...(warnings.length > 0 ? { warnings } : {}) };
+}
+
 /** The Claude adapter: transcript + `/rewind` checkpoints + the sidecar dirs. */
 export const claudeSessionTransfer: SessionTransferAdapter = {
   kind: "claude-code",
   column: CLAUDE_SESSION_COLUMN,
-  async transfer({ taskId, fromHarness, toHarness, sessionId, cwd }): Promise<TransferResult> {
-    if (fromHarness.kind !== "claude-code" || toHarness.kind !== "claude-code") {
-      return { ok: false, reason: "unsupported", message: "session transfer needs two claude-code accounts" };
-    }
-    const fromRoot = claudeConfigDirFor(fromHarness);
-    const toRoot = claudeConfigDirFor(toHarness);
-    // Contract CR4: refuse a root that now resolves into a macOS-protected
-    // folder it was not saved under, before anything (realpath included)
-    // touches it.
-    const redirected = rootsRedirectRefusal([
-      [fromRoot, "the source account's config directory"],
-      [toRoot, "the destination account's config directory"],
-    ]);
-    if (redirected) return unsafeReason(redirected);
-    // realpath, not `path.resolve`: a later `PATCH /harnesses/:id` can point a
-    // backup's root at the primary's through a symlink, and copying an account
-    // onto itself then lets cleanup delete the source's own transcript.
-    if (sameConfigRoot(fromRoot, toRoot)) {
-      return { ok: false, reason: "unsafe-source", message: "source and destination share a config directory" };
-    }
-    // The id becomes a file name on the destination; a separator or `..`
-    // would write outside `projects/<enc>/`.
-    if (!isSafePathSegment(sessionId)) return unsafeReason("the session id is not a plain file name");
-    // Ancestors are lstat-checked before any leaf is stat'ed (see
-    // `locateClaudeTranscript`); the leaf is checked no-follow again at open.
-    const located = await locateClaudeTranscript(fromRoot, cwd, sessionId);
-    if (located.kind === "unsafe") return unsafeReason(located.message);
-    if (located.kind === "none") return { ok: false, reason: "no-session", message: "no transcript recorded yet" };
-    const src = located.src;
-    if (!isRegularFileNoFollow(src)) {
-      return unsafeReason("the transcript is not a regular file (symlink or special file refused)");
-    }
-    // The destination's Claude derives the same project dir name from the same
-    // cwd, so the directory name found on the source is reused verbatim.
-    const dest = path.join(toRoot, "projects", located.projectDirName, `${sessionId}.jsonl`);
-    const trees = claudeSessionTrees(fromRoot, toRoot, located, sessionId);
-
-    const warnings: string[] = [];
-    const prior = harnessSessionHandoffs.get(taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
-    // Only files this transfer will CREATE go on the cleanup allowlist. A
-    // pre-existing destination is the account's own file (e.g. its original
-    // transcript after an A→B→A wrap): the copy still updates it, but deleting
-    // it later would destroy that account's conversation (contract C5).
-    const intended: string[] = [];
-    const destState = destinationState(toRoot, dest);
-    if (destState === "unsafe") return unsafeReason("the destination path traverses a symlinked directory");
-    if (destState === "absent") intended.push(dest);
-    for (const tree of trees) {
-      try {
-        intended.push(...(await planTreeDestinations(tree.src, tree.dest, { maxEntries: SIDECAR_MAX_ENTRIES, root: toRoot })));
-      } catch (err) {
-        warnings.push(`${tree.label}: could not be scanned (${errMessage(err)})`);
-      }
-    }
-    recordIntended(taskId, toHarness.id, CLAUDE_SESSION_COLUMN, sessionId, prior, intended);
-
-    const copied: string[] = [];
-    try {
-      const result = await copyRegularFileDetailed(src, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
-      if (result.created) copied.push(dest);
-    } catch (err) {
-      if (intended.length > 0) {
-        restoreHandoff(prior, taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
-        await sweepOrphanedHandoffCopies({ harnessId: toHarness.id, columnName: CLAUDE_SESSION_COLUMN, sessionId });
-      }
-      return { ok: false, reason: "io", message: errMessage(err) };
-    }
-
-    // The transcript is the conversation; a tree that cannot be copied in full
-    // is reported as a warning instead of failing the transfer or vanishing.
-    for (const tree of trees) {
-      try {
-        const result = await copyTreeCooperative(tree.src, tree.dest, {
-          maxBytes: NO_SIZE_LIMIT,
-          maxEntries: SIDECAR_MAX_ENTRIES,
-          root: toRoot,
-        });
-        copied.push(...result.created.map((rel) => path.join(tree.dest, rel)));
-        if (result.truncated) {
-          warnings.push(`${tree.label}: stopped at the ${SIDECAR_MAX_ENTRIES}-entry limit; some files were not transferred`);
-        }
-        if (result.skipped.length > 0) {
-          warnings.push(`${tree.label}: ${result.skipped.length} entries were skipped (links, special files or files that vanished)`);
-        }
-      } catch (err) {
-        warnings.push(`${tree.label}: not transferred (${errMessage(err)})`);
-      }
-    }
-
-    harnessSessionHandoffs.upsert({
-      taskId,
-      harnessId: toHarness.id,
-      columnName: CLAUDE_SESSION_COLUMN,
-      sessionId,
-      copiedPaths: copied,
-      createdAt: Date.now(),
-    });
-    await dropSupersededCopies(prior, sessionId, toHarness.id, CLAUDE_SESSION_COLUMN, warnings);
-    return { ok: true, sessionId, copiedPaths: copied, ...(warnings.length > 0 ? { warnings } : {}) };
+  transfer(args: TransferArgs): Promise<TransferResult> {
+    return heldTransfer(args.toHarness.id, CLAUDE_SESSION_COLUMN, args.sessionId, () => claudeTransferUnheld(args));
   },
   async cleanup(taskId, harnessId): Promise<string[]> {
     return cleanupHandoff(taskId, harnessId, CLAUDE_SESSION_COLUMN, "claude-code", claudeConfigDirFor);
@@ -533,85 +605,86 @@ function readdirSyncSafe(dir: string): string[] {
   }
 }
 
+async function codexTransferUnheld({ taskId, fromHarness, toHarness, sessionId }: TransferArgs): Promise<TransferResult> {
+  if (fromHarness.kind !== "codex" || toHarness.kind !== "codex") {
+    return { ok: false, reason: "unsupported", message: "session transfer needs two codex accounts" };
+  }
+  const fromRoot = codexHomeFor(fromHarness);
+  const toRoot = codexHomeFor(toHarness);
+  // Contract CR4, as in the Claude adapter.
+  const redirected = rootsRedirectRefusal([
+    [fromRoot, "the source account's CODEX_HOME"],
+    [toRoot, "the destination account's CODEX_HOME"],
+  ]);
+  if (redirected) return unsafeReason(redirected);
+  if (sameConfigRoot(fromRoot, toRoot)) {
+    return { ok: false, reason: "unsafe-source", message: "source and destination share a CODEX_HOME" };
+  }
+  if (!isSafePathSegment(sessionId)) return unsafeReason("the thread id is not a plain file name");
+  const source = await findCodexRollout(fromRoot, sessionId);
+  if (!source) return { ok: false, reason: "no-session", message: "no rollout recorded yet" };
+  // Defense in depth: the walk already skips symlinked entries, but the
+  // recorded path must still be a real-directory chain below CODEX_HOME.
+  if (!isPlainAncestorPathUnder(fromRoot, source)) {
+    return unsafeReason("the rollout path traverses a symlinked directory");
+  }
+  if (!isRegularFileNoFollow(source)) {
+    return unsafeReason("the rollout is not a regular file (symlink or special file refused)");
+  }
+  const rel = path.relative(fromRoot, source);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return unsafeReason("rollout path escapes CODEX_HOME");
+  // Only Codex's own `sessions/YYYY/MM/DD/rollout-*.jsonl` layout is copied:
+  // it is the only shape cleanup will ever remove, so a copy of any other
+  // shape could never be cleaned up.
+  if (!isHandoffCopyShape("codex", rel.split(path.sep).join("/"), sessionId)) {
+    return unsafeReason("the rollout is not in Codex's sessions/YYYY/MM/DD layout");
+  }
+  const dest = path.join(toRoot, rel);
+  const prior = harnessSessionHandoffs.get(taskId, toHarness.id, CODEX_SESSION_COLUMN);
+  // Same rules as the Claude adapter: a rollout the destination already had
+  // is its own, never put on the cleanup allowlist (contract C5), and the
+  // new path is recorded BEFORE it is created.
+  const destState = destinationState(toRoot, dest);
+  if (destState === "unsafe") return unsafeReason("the destination path traverses a symlinked directory");
+  const intended = destState === "absent" ? [dest] : [];
+  recordIntended(taskId, toHarness.id, CODEX_SESSION_COLUMN, sessionId, prior, intended);
+  const copiedPaths: string[] = [];
+  try {
+    const result = await copyRegularFileDetailed(source, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
+    if (result.created) copiedPaths.push(dest);
+  } catch (err) {
+    if (intended.length > 0) restoreHandoff(prior, taskId, toHarness.id, CODEX_SESSION_COLUMN);
+    return { ok: false, reason: "io", message: errMessage(err) };
+  }
+  const warnings: string[] = [];
+  const migrationWarning = await migrateCodexRollouts(toHarness);
+  if (migrationWarning) warnings.push(migrationWarning);
+  harnessSessionHandoffs.upsert({
+    taskId,
+    harnessId: toHarness.id,
+    columnName: CODEX_SESSION_COLUMN,
+    sessionId,
+    copiedPaths: [...new Set([...intended, ...copiedPaths])],
+    createdAt: Date.now(),
+  });
+  await dropSupersededCopies(prior, sessionId, toHarness.id, CODEX_SESSION_COLUMN, warnings);
+  // The migration warning is surfaced through the caller's status line; the
+  // transfer itself succeeded because the rollout is on disk.
+  return {
+    ok: true,
+    sessionId,
+    copiedPaths,
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
+}
+
 /** The Codex adapter: rollout copy, optional projection migration, resume by
  *  thread id. */
 export const codexSessionTransfer: SessionTransferAdapter = {
   kind: "codex",
   column: CODEX_SESSION_COLUMN,
-  async transfer({ taskId, fromHarness, toHarness, sessionId }): Promise<TransferResult> {
-    if (fromHarness.kind !== "codex" || toHarness.kind !== "codex") {
-      return { ok: false, reason: "unsupported", message: "session transfer needs two codex accounts" };
-    }
-    const fromRoot = codexHomeFor(fromHarness);
-    const toRoot = codexHomeFor(toHarness);
-    // Contract CR4, as in the Claude adapter.
-    const redirected = rootsRedirectRefusal([
-      [fromRoot, "the source account's CODEX_HOME"],
-      [toRoot, "the destination account's CODEX_HOME"],
-    ]);
-    if (redirected) return unsafeReason(redirected);
-    if (sameConfigRoot(fromRoot, toRoot)) {
-      return { ok: false, reason: "unsafe-source", message: "source and destination share a CODEX_HOME" };
-    }
-    if (!isSafePathSegment(sessionId)) return unsafeReason("the thread id is not a plain file name");
-    const source = await findCodexRollout(fromRoot, sessionId);
-    if (!source) return { ok: false, reason: "no-session", message: "no rollout recorded yet" };
-    // Defense in depth: the walk already skips symlinked entries, but the
-    // recorded path must still be a real-directory chain below CODEX_HOME.
-    if (!isPlainAncestorPathUnder(fromRoot, source)) {
-      return unsafeReason("the rollout path traverses a symlinked directory");
-    }
-    if (!isRegularFileNoFollow(source)) {
-      return unsafeReason("the rollout is not a regular file (symlink or special file refused)");
-    }
-    const rel = path.relative(fromRoot, source);
-    if (rel.startsWith("..") || path.isAbsolute(rel)) return unsafeReason("rollout path escapes CODEX_HOME");
-    // Only Codex's own `sessions/YYYY/MM/DD/rollout-*.jsonl` layout is copied:
-    // it is the only shape cleanup will ever remove, so a copy of any other
-    // shape could never be cleaned up.
-    if (!isHandoffCopyShape("codex", rel.split(path.sep).join("/"), sessionId)) {
-      return unsafeReason("the rollout is not in Codex's sessions/YYYY/MM/DD layout");
-    }
-    const dest = path.join(toRoot, rel);
-    const prior = harnessSessionHandoffs.get(taskId, toHarness.id, CODEX_SESSION_COLUMN);
-    // Same rules as the Claude adapter: a rollout the destination already had
-    // is its own, never put on the cleanup allowlist (contract C5), and the
-    // new path is recorded BEFORE it is created.
-    const destState = destinationState(toRoot, dest);
-    if (destState === "unsafe") return unsafeReason("the destination path traverses a symlinked directory");
-    const intended = destState === "absent" ? [dest] : [];
-    recordIntended(taskId, toHarness.id, CODEX_SESSION_COLUMN, sessionId, prior, intended);
-    const copiedPaths: string[] = [];
-    try {
-      const result = await copyRegularFileDetailed(source, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
-      if (result.created) copiedPaths.push(dest);
-    } catch (err) {
-      if (intended.length > 0) {
-        restoreHandoff(prior, taskId, toHarness.id, CODEX_SESSION_COLUMN);
-        await sweepOrphanedHandoffCopies({ harnessId: toHarness.id, columnName: CODEX_SESSION_COLUMN, sessionId });
-      }
-      return { ok: false, reason: "io", message: errMessage(err) };
-    }
-    const warnings: string[] = [];
-    const migrationWarning = await migrateCodexRollouts(toHarness);
-    if (migrationWarning) warnings.push(migrationWarning);
-    harnessSessionHandoffs.upsert({
-      taskId,
-      harnessId: toHarness.id,
-      columnName: CODEX_SESSION_COLUMN,
-      sessionId,
-      copiedPaths,
-      createdAt: Date.now(),
-    });
-    await dropSupersededCopies(prior, sessionId, toHarness.id, CODEX_SESSION_COLUMN, warnings);
-    // The migration warning is surfaced through the caller's status line; the
-    // transfer itself succeeded because the rollout is on disk.
-    return {
-      ok: true,
-      sessionId,
-      copiedPaths,
-      ...(warnings.length > 0 ? { warnings } : {}),
-    };
+  transfer(args: TransferArgs): Promise<TransferResult> {
+    return heldTransfer(args.toHarness.id, CODEX_SESSION_COLUMN, args.sessionId, () => codexTransferUnheld(args));
   },
   async cleanup(taskId, harnessId): Promise<string[]> {
     return cleanupHandoff(taskId, harnessId, CODEX_SESSION_COLUMN, "codex", codexHomeFor);
@@ -810,8 +883,9 @@ let sweepChain: Promise<unknown> = Promise.resolve();
  * ours; one that may still be ours (the root changed, the unlink failed) is
  * kept for the next sweep. An account that no longer exists has no root to
  * resolve against, so its records are dropped, as for a handoff row. A session
- * that is live again on a handoff row of the same account is skipped: its
- * files belong to a conversation that can still be resumed.
+ * that is live on a handoff row of the same account, or being transferred onto
+ * it right now, is skipped, and a sweep already removing it stops before the
+ * next file: its files belong to a conversation that can still be resumed.
  *
  * Sweeps are serialized, so two never race on one file. Cooperative (the
  * removal yields every ~20 ms) and never rejects.
@@ -845,7 +919,10 @@ async function sweepOnce(
       out.forgotten += group.paths.length;
       continue;
     }
-    if (harnessSessionHandoffs.hasLiveSession(group.harnessId, group.columnName, group.sessionId)) {
+    const busy = () =>
+      transferInFlight(group.harnessId, group.columnName, group.sessionId)
+      || harnessSessionHandoffs.hasLiveSession(group.harnessId, group.columnName, group.sessionId);
+    if (busy()) {
       out.retained += group.paths.length;
       continue;
     }
@@ -855,6 +932,9 @@ async function sweepOnce(
       codex ? codexHomeFor(harness) : claudeConfigDirFor(harness),
       codex ? "codex" : "claude-code",
       group.sessionId,
+      // Re-checked before every file: removal yields between files, and a
+      // transfer of this session may start (or its row go live) meanwhile.
+      { shouldStop: busy },
     );
     const keep = new Set(result.retained);
     const done = group.paths.filter((p) => !keep.has(p));
@@ -871,11 +951,20 @@ async function sweepOnce(
  * re-keyed to a newer session could still list the old session's copies,
  * which its cleanup always rejected (the shape names another session). Each
  * such path whose own session can be read from it moves to the orphan store
- * under that session. Idempotent; a path whose session cannot be read stays.
+ * under that session, in one transaction per row. A row stamped 0 is skipped:
+ * it is a transfer that never completed, and its OLD session is still the one
+ * a resume uses, so those files must stay. Idempotent; a path whose session
+ * cannot be read stays. Cooperative: yields every ~20 ms.
  */
-export function adoptMismatchedHandoffPaths(): number {
+export async function adoptMismatchedHandoffPaths(): Promise<number> {
   let moved = 0;
+  let lastYield = Date.now();
   for (const row of harnessSessionHandoffs.listAll()) {
+    if (Date.now() - lastYield >= ROLLOUT_WALK_YIELD_MS) {
+      await Bun.sleep(0);
+      lastYield = Date.now();
+    }
+    if (row.createdAt === 0) continue;
     const kind: HarnessStackKind = row.columnName === CODEX_SESSION_COLUMN ? "codex" : "claude-code";
     const keep: string[] = [];
     const bySession = new Map<string, string[]>();
@@ -890,11 +979,8 @@ export function adoptMismatchedHandoffPaths(): number {
       }
     }
     if (bySession.size === 0) continue;
-    for (const [sid, paths] of bySession) {
-      harnessOrphanedCopies.add(row.harnessId, row.columnName, sid, paths);
-      moved += paths.length;
-    }
-    harnessSessionHandoffs.setPaths(row.taskId, row.harnessId, row.columnName, keep);
+    harnessSessionHandoffs.orphanPaths(row, bySession, keep);
+    for (const paths of bySession.values()) moved += paths.length;
   }
   return moved;
 }
@@ -903,7 +989,7 @@ export function adoptMismatchedHandoffPaths(): number {
  *  without awaiting by `reconcileOrphans`; never rejects. */
 export async function sweepOrphanedHandoffCopiesAtBoot(): Promise<void> {
   try {
-    const adopted = adoptMismatchedHandoffPaths();
+    const adopted = await adoptMismatchedHandoffPaths();
     const result = await sweepOrphanedHandoffCopies();
     if (adopted > 0 || result.removed > 0 || result.retained > 0) {
       console.log(

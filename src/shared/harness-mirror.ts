@@ -787,7 +787,8 @@ export function handoffCopySessionIdFromPath(kind: HarnessStackKind, absPath: st
   const parts = absPath.split("/").filter(Boolean);
   const anchors = kind === "claude-code" ? ["projects", "file-history"] : ["sessions"];
   // A path that is a handoff shape for the preferred session at ANY anchor is
-  // that session's: a nested folder named like an anchor must not win.
+  // that session's: a folder inside it that happens to be named like an
+  // anchor must not make it read as another session's.
   if (prefer !== undefined) {
     for (let i = 0; i < parts.length; i++) {
       if (anchors.includes(parts[i]!) && isHandoffCopyShape(kind, parts.slice(i).join("/"), prefer)) return prefer;

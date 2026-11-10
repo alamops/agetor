@@ -263,3 +263,24 @@ describe("rootRedirectRefusal (contract CR4)", () => {
     expect(readFileSync(recorded, "utf8")).toBe("theirs");
   });
 });
+
+describe("removeCopiedPathsDetailed shouldStop", () => {
+  test("stops before the next file once asked, retaining the rest", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const path = (await import("node:path")).default;
+    const ft = await import("./harness-file-transfer.ts");
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-stop-"));
+    const sid = "12121212-1212-4212-8212-121212121212";
+    const dir = path.join(root, "projects", "enc", sid, "subagents");
+    mkdirSync(dir, { recursive: true });
+    const files = ["a.jsonl", "b.jsonl", "c.jsonl"].map((n) => path.join(dir, n));
+    for (const f of files) writeFileSync(f, "x");
+    let calls = 0;
+    const result = await ft.removeCopiedPathsDetailed(files, root, "claude-code", sid, { shouldStop: () => ++calls > 1 });
+    expect(result.removed).toEqual(files.slice(0, 1));
+    expect(result.retained).toEqual(files.slice(1));
+    expect(existsSync(files[1]!)).toBe(true);
+    expect(existsSync(files[2]!)).toBe(true);
+  });
+});

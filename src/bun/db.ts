@@ -8,6 +8,7 @@ import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts"
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { HARNESS_STACK_CONTINUATION_TAG, parseTaskHarnessState, type TaskHarnessState } from "../shared/types.ts";
 import { isHarnessStackContinuation } from "../shared/harness-stack.ts";
+import { handoffCopySessionIdFromPath } from "../shared/harness-mirror.ts";
 import { normalizeDeliveredUserText, type CleanRetryRow } from "../shared/user-message.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
@@ -2504,14 +2505,18 @@ export const harnessSessionHandoffs = {
       this.deleteOne(taskId, harnessId, column);
     })();
   },
-  /** Replace a row's path list (the boot normalization; see
+  /** Move some of a row's paths to the orphan store under the sessions they
+   *  belong to and keep the rest, atomically (the boot normalization; see
    *  `adoptMismatchedHandoffPaths`). */
-  setPaths(taskId: string, harnessId: string, column: SessionIdColumn, paths: readonly string[]): void {
-    db.run(
-      `UPDATE harness_session_handoffs SET copied_paths_json = ?
-        WHERE task_id = ? AND harness_id = ? AND column_name = ?`,
-      [JSON.stringify([...paths]), taskId, harnessId, column],
-    );
+  orphanPaths(row: HarnessSessionHandoff, bySession: ReadonlyMap<string, readonly string[]>, keep: readonly string[]): void {
+    db.transaction(() => {
+      for (const [sid, paths] of bySession) harnessOrphanedCopies.add(row.harnessId, row.columnName, sid, paths);
+      db.run(
+        `UPDATE harness_session_handoffs SET copied_paths_json = ?
+          WHERE task_id = ? AND harness_id = ? AND column_name = ?`,
+        [JSON.stringify([...keep]), row.taskId, row.harnessId, row.columnName],
+      );
+    })();
   },
   listAll(): HarnessSessionHandoff[] {
     return db
@@ -2643,7 +2648,15 @@ export const harnessOrphanedCopies = {
   adoptFromTask(taskId: string): void {
     for (const row of harnessSessionHandoffs.listForTask(taskId)) {
       if (!harnesses.getByIdOrKind(row.harnessId)) continue;
-      this.add(row.harnessId, row.columnName, row.sessionId, row.copiedPaths);
+      // Label each path with the session it names (a pre-088 re-keyed row can
+      // still hold another session's paths); the row's own session wins.
+      const kind = row.columnName === "codex_session_id" ? "codex" : "claude-code";
+      const bySession = new Map<string, string[]>();
+      for (const p of row.copiedPaths) {
+        const sid = handoffCopySessionIdFromPath(kind, path.resolve(p), row.sessionId) ?? row.sessionId;
+        bySession.set(sid, [...(bySession.get(sid) ?? []), p]);
+      }
+      for (const [sid, paths] of bySession) this.add(row.harnessId, row.columnName, sid, paths);
     }
   },
 };

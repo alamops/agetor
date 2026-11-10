@@ -1462,14 +1462,14 @@ interface MergeTexts {
  * dotfile manager's link) is skipped, never replaced by a regular file. The
  * primary file may be a dotfile-manager symlink ({@link resolveDotfile}).
  */
-function loadMergeTexts(
+async function loadMergeTexts(
   ctx: MirrorCtx,
   rel: string,
   fromPath: string,
   toBase: string,
   toPath: string,
   opts: { dotfile: boolean; emptyText: string; fromBase?: string },
-): MergeTexts | null {
+): Promise<MergeTexts | null> {
   const fromBase = opts.fromBase ?? ctx.fromRoot;
   let primaryText: string;
   // The primary deleted the whole file: merge it as an empty document so the
@@ -1480,6 +1480,11 @@ function loadMergeTexts(
   const srcSt = lstatOrNull(fromPath);
   if (!srcSt) {
     if (!primaryDeletionPropagates(ctx, rel, fromBase, fromPath)) return null;
+    // An editor that saves by renaming leaves the file absent for a moment:
+    // look again before treating it as deleted. Back already → leave it for
+    // the next run rather than merge a half-observed state.
+    await Bun.sleep(PRIMARY_DELETION_RECHECK_MS);
+    if (lstatOrNull(fromPath)) return null;
     primaryText = opts.emptyText;
     deleted = true;
   } else {
@@ -1495,11 +1500,9 @@ function loadMergeTexts(
     const primaryRead = readTextIfRegular(readPath, MAX_MIRROR_FILE_BYTES);
     if (primaryRead.ok) {
       primaryText = primaryRead.text;
-    } else if (primaryRead.missing && readPath === fromPath && primaryDeletionPropagates(ctx, rel, fromBase, fromPath)) {
-      // Deleted between the lstat and the open.
-      primaryText = opts.emptyText;
-      deleted = true;
     } else {
+      // Gone between the lstat and the open (most likely mid-save) is left
+      // for the next run, like an unreadable file.
       if (!primaryRead.missing) warn(ctx, `${rel}: primary file could not be read safely — left alone (${primaryRead.reason})`);
       return null;
     }
@@ -1531,6 +1534,10 @@ function loadMergeTexts(
   if (deleted && backupText === null) return null;
   return { primaryText, backupText, toPath, toBase };
 }
+
+/** How long a missing primary merged file must stay missing before it counts
+ *  as deleted (see {@link loadMergeTexts}). */
+const PRIMARY_DELETION_RECHECK_MS = 250;
 
 /**
  * Whether a primary file that does not exist is a deletion to propagate to
@@ -1802,7 +1809,7 @@ async function commitMerged(ctx: MirrorCtx, c: MergedCommit): Promise<void> {
 async function mergeClaudeSettings(ctx: MirrorCtx): Promise<void> {
   const rel = "settings.json";
   const toPath = path.join(ctx.toRoot, rel);
-  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: true, emptyText: "{}" });
+  const texts = await loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: true, emptyText: "{}" });
   if (!texts) return;
   const raw = parseJsonObject(texts.primaryText);
   const backup = parseJsonObject(texts.backupText ?? "{}");
@@ -1926,7 +1933,7 @@ async function mergeClaudeJson(ctx: MirrorCtx, primary: Harness, target: Harness
   if (!isPlainAncestorPathUnder(fromBase, fromPath)) {
     return void warn(ctx, ".claude.json: symlinked parent directory refused — left alone");
   }
-  const texts = loadMergeTexts(ctx, rel, fromPath, toBase, toPath, { dotfile: true, emptyText: "{}", fromBase });
+  const texts = await loadMergeTexts(ctx, rel, fromPath, toBase, toPath, { dotfile: true, emptyText: "{}", fromBase });
   if (!texts) return;
   const raw = parseJsonObject(texts.primaryText);
   const backup = parseJsonObject(texts.backupText ?? "{}");
@@ -2012,7 +2019,7 @@ function enumerateClaudeJson(doc: Record<string, unknown>): JsonEntry[] {
  */
 async function mergePluginRegistry(ctx: MirrorCtx, rel: string): Promise<void> {
   const toPath = path.join(ctx.toRoot, rel);
-  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: false, emptyText: "{}" });
+  const texts = await loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: false, emptyText: "{}" });
   if (!texts) return;
   const raw = parseJsonObject(texts.primaryText);
   const backup = parseJsonObject(texts.backupText ?? "{}");
@@ -2098,7 +2105,7 @@ async function mergePluginRegistry(ctx: MirrorCtx, rel: string): Promise<void> {
 async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
   const rel = "config.toml";
   const toPath = path.join(ctx.toRoot, rel);
-  const texts = loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: true, emptyText: "" });
+  const texts = await loadMergeTexts(ctx, rel, path.join(ctx.fromRoot, rel), ctx.toRoot, toPath, { dotfile: true, emptyText: "" });
   if (!texts) return;
   const safe = ctx.safe;
   let primaryParsed: Record<string, unknown>;

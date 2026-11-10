@@ -892,13 +892,16 @@ export interface RemoveCopiesResult {
  * `projects/<enc>`, `projects`, `file-history` and `sessions` are never pruned.
  *
  * Cooperative: it yields to the shared event loop every ~20 ms, because a
- * handoff with large sidecars can record thousands of files. Never throws.
+ * handoff with large sidecars can record thousands of files. `shouldStop` is
+ * asked before each file; once it says yes, the rest are `retained`. Never
+ * throws.
  */
 export async function removeCopiedPathsDetailed(
   paths: readonly string[],
   root: string,
   kind: HarnessStackKind,
   sessionId: string,
+  opts: { shouldStop?: () => boolean } = {},
 ): Promise<RemoveCopiesResult> {
   const resolvedRoot = path.resolve(root);
   const out: RemoveCopiesResult = { removed: [], gone: [], retained: [], rejected: [] };
@@ -911,10 +914,17 @@ export async function removeCopiedPathsDetailed(
     return out;
   }
   let lastYield = Date.now();
-  for (const p of valid) {
+  for (let i = 0; i < valid.length; i++) {
+    const p = valid[i]!;
     if (Date.now() - lastYield >= YIELD_EVERY_MS) {
       await Bun.sleep(0);
       lastYield = Date.now();
+    }
+    // Checked in the same synchronous step as the unlink below, so nothing a
+    // caller cares about can start between the check and the removal.
+    if (opts.shouldStop?.()) {
+      out.retained.push(...valid.slice(i));
+      break;
     }
     const resolved = path.resolve(p);
     const rel = path.relative(resolvedRoot, resolved);

@@ -11,8 +11,9 @@
 --     (the account's config directory had changed, or an unlink failed), and
 --     the row cascaded with the task.
 -- Such paths move here, each with the session it was copied for, and a sweep
--- (boot, the retention pass, an account edit, a later transfer) retries them
--- under the same rules as handoff cleanup: inside the account's CURRENT root,
+-- (at boot, after an account's root is edited, and by a transfer for its own
+-- superseded or failed session) removes them under the same rules as handoff
+-- cleanup: inside the account's CURRENT root,
 -- of a handoff shape for this row's session, a real path, a regular file.
 --
 -- No foreign keys on purpose: the rows must outlive their task, and an FK to
