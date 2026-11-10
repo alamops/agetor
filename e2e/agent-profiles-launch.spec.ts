@@ -653,7 +653,9 @@ test.describe("agent profiles: launch surfaces", () => {
     await expect(agentRow.getByTestId("task-agent-profile-manage")).toBeVisible();
     await expect(detailsRow(panel, "Harness").locator("select")).toHaveCount(0);
     await expect(detailsRow(panel, "Model").locator("select")).toHaveCount(0);
-    await expect(detailsRow(panel, "Harness")).toContainText("claude-code");
+    // The read-only Harness row shows the account's label, never its raw id.
+    await expect(detailsRow(panel, "Harness")).toContainText("Claude Code");
+    await expect(detailsRow(panel, "Harness")).not.toContainText("claude-code");
 
     // Clicking the chip opens the details dialog (D2) with the task's own
     // frozen snapshot.

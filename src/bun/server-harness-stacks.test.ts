@@ -1442,10 +1442,13 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
 
   test("harness DELETE removes the account's mirror backups and provenance; `mirrorRestorable` stops listing it", async () => {
     const id = makeAccount("bk");
-    const dir = path.join(DATA_DIR, "mirror-backups", id);
+    // The backup store lives under the db singleton's data dir (the first
+    // test file to import db.ts wins in a full `bun test` run), not this
+    // file's DATA_DIR.
+    const dir = path.join(db.dataDir, "mirror-backups", id);
     mkdirSync(path.join(dir, "files"), { recursive: true, mode: 0o700 });
     writeFileSync(path.join(dir, "files", "settings.json"), "{}", { mode: 0o600 });
-    const keep = path.join(DATA_DIR, "mirror-backups", `${id}-sibling`);
+    const keep = path.join(db.dataDir, "mirror-backups", `${id}-sibling`);
     mkdirSync(keep, { recursive: true });
     writeFileSync(path.join(keep, "x"), "1");
     db.db.run(
@@ -1495,7 +1498,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     const cliToken = (await import("./api-config.ts")).CLI_TOKEN;
     const a = makeAccount("ra");
     const unlock = lockHome(a);
-    const sentinel = path.join(DATA_DIR, "mirror-backups", a);
+    const sentinel = path.join(db.dataDir, "mirror-backups", a);
     const denied = await call("POST", `/harnesses/${a}/mirror-restore`, undefined, cliToken);
     expect(denied.status).toBe(403);
     expect(denied.body.code).toBe("path-not-accessible");
