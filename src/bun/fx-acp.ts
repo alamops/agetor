@@ -517,7 +517,8 @@ import {
  *     curated 2026-10-26 (openai/gpt-6.1-terra, minimax/minimax-m3.1-flash,
  *     meta/muse-spark-open, inception/mercury-3, moonshotai/kimi-k3.1-pro,
  *     deepseek/deepseek-v4.1-flash-1017, meta/muse-wonder-1.0,
- *     mistral/mistral-large-4, reflection/beam) postdate it): 16
+ *     mistral/mistral-large-4, reflection/beam) and
+ *     anthropic/claude-fable-5.2 (curated 2026-11-09) postdate it): 16
  *     advertise efforts, 12 advertise none. Example: `zai/glm-5.3-
  *     flash` → `auto, low, high, max`. **`session/set_config_option
  *     {sessionId, configId:"effort", value}` sets it** (`server.zig:2222-

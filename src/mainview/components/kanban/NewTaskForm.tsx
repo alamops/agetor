@@ -1122,7 +1122,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                 </div>
               )}
 
-              {/* Fable models (5, 5.1, …) sit above Opus in the picker but bill at
+              {/* Fable models (5, 5.1, 5.2, …) sit above Opus in the picker but bill at
                   2x the usage — surface that under the model row so the cost is
                   obvious before Create. Family check (not an exact id) so every
                   point release picks this up with no code change. */}

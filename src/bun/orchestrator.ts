@@ -5558,10 +5558,11 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   // agetor id to the coarse family the picker actually offers as a row
   // (`Opus`/`Sonnet`/`Fable`/`Haiku`); an id the 2.1.246 picker can't select
   // exactly (an older pinned version within a family the picker only offers
-  // the CURRENT release of — including the now-superseded `fable-5`, demoted
-  // once `fable-5.1` took over the "Fable" row, and `opus-5`, demoted once
-  // `opus-5.5` took over the "Opus" row on claude 2.1.280 — `mythos-5`,
-  // `mythos-5.1`, or
+  // the CURRENT release of — `fable-5.1` and `fable-5`, both demoted once
+  // claude 2.1.321's alias table took `fable` to `claude-fable-5-2`, and
+  // `opus-5`, demoted once
+  // `opus-5.5` took over the "Opus" row on claude 2.1.280 — `mythos-5.2`,
+  // `mythos-5.1`, `mythos-5`, or
   // an unknown id) is a live-session no-op — the row already has the new id,
   // only the mirror into the running session is skipped.
   // `mirrorModelViaPicker`'s own resolved result already
@@ -11179,13 +11180,14 @@ export async function createTask(
   // `supportedEfforts` makes both cases resolve to `null` for gemini — that's
   // what the PATCH null-clear guard and every picker already compute for an
   // unknown id, so this closes a known inconsistency, on purpose. fx is
-  // different: 40 of its 42 curated models advertise real efforts
+  // different: 41 of its 43 curated models advertise real efforts
   // (`MODEL_EFFORT_SUPPORT.fx`, refreshed against fx 0.0.14's
-  // `models[].efforts` on 2026-10-22 and extended 2026-10-26), so both a
+  // `models[].efforts` on 2026-10-22 and extended 2026-10-26 and 2026-11-09),
+  // so both a
   // listed and an unlisted fx model resolve through `supportedEfforts` to
   // `DEFAULT_EFFORT.fx` (`"auto"`) whenever the model — or the
   // `DEFAULT_MODEL.fx` fallback used for an unlisted id — is one of those
-  // 40; only the remaining 2 no-effort fx models (`minimax/minimax-m3`,
+  // 41; only the remaining 2 no-effort fx models (`minimax/minimax-m3`,
   // `anthropic/claude-haiku-4.5`) resolve to `null`. That whole computation
   // is `defaultEffortFor` below.
   //

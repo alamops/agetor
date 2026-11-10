@@ -1,0 +1,416 @@
+{
+  "version": 1,
+  "id": "add-fable-5-2-grill-r1",
+  "title": "Grill — Add Fable 5.2 to the supported harnesses",
+  "skill": "grill",
+  "slug": "add-fable-5-2",
+  "round": 1,
+  "flags": [],
+  "summary": "Before this gets planned: **9 decisions** the build would otherwise make silently, plus **4 defaults** I'd bet on. Start with **harness scope**, **Mythos 5.2 parity** and the **default model** — those change the plan's shape. The confirm list at the end is one click each.\n\nSource: the pipeline task title (\"Add Fable 5.2 to the supported harnesses — Claude Code, primarily\") plus `docs/plans/add-fable-5-2-investigation.md`. There is no external spec to commit.",
+  "proven": [
+    {
+      "text": "**Fable 5.2 is real in the installed Claude Code 2.1.321.** Its changelog and binary carry `claude-fable-5-2` as the default Fable model — 1M context, 128K output, $8/$40 per MTok, $0.20 cache reads, full low→max effort, thinking always on, API/CLI default effort medium. The `fable` alias resolves to 5.2.",
+      "evidence": [
+        { "label": "investigation: model facts", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 27, "endLine": 43 },
+        { "label": "Claude Code changelog 2.1.321", "url": "https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md" }
+      ]
+    },
+    {
+      "text": "**Cursor offers it in exactly five plain effort variants** — `claude-fable-5-2-{low,medium,high,xhigh,max}` — with no `-thinking-*` and no `-fast` ids. Every label contains `1M`, so max mode is inferred, not live-probed.",
+      "evidence": [
+        { "label": "investigation: Cursor probe", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 77, "endLine": 91 }
+      ]
+    },
+    {
+      "text": "**fx has it in the public/unauth Gateway catalog but not in your signed-in catalog.** `HOME=<empty> fx models --json` and the public Gateway list `anthropic/claude-fable-5.2` (low→max, no toggle/none); your real signed-in catalog has 138 ids and **zero** `anthropic/*` ids. A curated fx row must therefore be `catalogOnly` and will be invisible on your account today.",
+      "evidence": [
+        { "label": "investigation: fx probe", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 96, "endLine": 103 },
+        { "label": "catalogOnly rule", "path": "docs/architecture/harness-fx.md", "line": 124 }
+      ]
+    },
+    {
+      "text": "**The other harnesses need nothing.** Copilot CLI 1.0.108 (published 2026-11-09) mentions Fable 5.1 and Fable 5, never 5.2, and its binary has no `claude-fable*` id. Antigravity 1.5.1 carries only Opus/Sonnet 5.5 and Gemini ids. OpenCode already lists `opencode/claude-fable-5-2` through discovery. Codex and Gemini run non-Anthropic models.",
+      "evidence": [
+        { "label": "investigation: harness matrix", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 47, "endLine": 56 }
+      ]
+    },
+    {
+      "text": "**There is no Claude Code data migration.** `task.model` is a free string: 227 tasks on `fable-5` and 84 on `fable-5.1` keep launching those models. Cursor has **zero** stored Fable variant rows in prod or dev, so migration 084 is data-clean on this machine and exists for future/other users.",
+      "evidence": [
+        { "label": "investigation: existing data", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 113, "endLine": 117 },
+        { "label": "investigation: zero Cursor rows", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 137 }
+      ]
+    },
+    {
+      "text": "**The load-bearing edit is the argv map.** Unknown model ids pass through verbatim, so without a `CLAUDE_MODEL_FLAG` entry the launched argv is `--model fable-5.2` instead of `--model claude-fable-5-2`.",
+      "evidence": [
+        { "label": "CLAUDE_MODEL_FLAG", "path": "src/bun/agents.ts", "line": 226, "endLine": 241, "lang": "ts", "code": "const CLAUDE_MODEL_FLAG: Record<string, string> = {\n  \"mythos-5.1\": \"claude-mythos-5-1\",\n  \"fable-5.1\": \"claude-fable-5-1\",\n  ...\n};" }
+      ]
+    },
+    {
+      "text": "**The pipeline config needs no change.** `AGENTS_CONFIG.yml` uses the alias `fable` (`model is opus | sonnet | haiku | fable`), and the installed CLI now resolves that alias to Fable 5.2 — cheaper than Fable 5.1 ($8/$40 vs $10/$50).",
+      "evidence": [
+        { "label": "pipeline alias comment", "path": "AGENTS_CONFIG.yml", "line": 7 },
+        { "label": "investigation: pipeline note", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 111 }
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "scope",
+      "title": "Scope & targets",
+      "intro": "These three decide how much of the repo moves. The model facts are settled; these are product/scope calls.",
+      "questions": [
+        {
+          "id": "harness-scope",
+          "type": "single",
+          "title": "Which harnesses should get a curated Fable 5.2 row in this change?",
+          "impact": "blocking",
+          "why": "Each harness adds a different surface: Claude Code is the row/argv/effort/picker work; Cursor adds a spec + migration; fx adds a catalogOnly row plus count and e2e updates.",
+          "context": "Claude Code is required. Cursor's live catalog (2026.10.22) has five `claude-fable-5-2-{low,medium,high,xhigh,max}` rows. A `CURSOR_MODEL_SPECS` entry gives one row with an effort picker and max mode, and hides the five discovered rows. fx's public/unauth Gateway catalog has `anthropic/claude-fable-5.2`, but a `catalogOnly` row only appears when the harness's discovered catalog positively contains it — your signed-in catalog has zero `anthropic/*` ids, so it would be invisible to you today. OpenCode already lists the model through discovery.",
+          "evidence": [
+            { "label": "Cursor Fable 5.1 spec — the exact shape a 5.2 spec would clone", "path": "src/shared/types.ts", "line": 3134, "endLine": 3145, "lang": "ts", "code": "\"claude-fable-5-1\": {\n  label: \"Fable 5.1\",\n  hint: \"Anthropic Fable 5.1 via Cursor.\",\n  supportsMaxMode: true,\n  effortIds: { max/…/low → claude-fable-5-1-<effort> },\n}," },
+            { "label": "fx Fable 5.1 row — the exact shape a 5.2 row would clone", "path": "src/shared/types.ts", "line": 4372, "lang": "ts", "code": "{ id: \"anthropic/claude-fable-5.1\", label: \"Claude Fable 5.1\", hint: \"Premium Gateway tier — offered only when this account's catalog includes it.\", catalogOnly: true }," },
+            { "label": "investigation: harness support matrix", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 47, "endLine": 56 }
+          ],
+          "options": [
+            {
+              "id": "all",
+              "label": "Claude Code + Cursor + fx (`catalogOnly`)",
+              "description": "Full parity with Opus 5.5, Sonnet 5.5 and Haiku 5.5.",
+              "consequence": "Adds the Cursor spec + migration 084, the fx row/effort entry, and fx's 26→27 / 42→43 count and e2e updates. The fx row will not show on your signed-in account today.",
+              "preview": "Claude Code: fable-5.2 row + flag + effort/mode + picker\nCursor: claude-fable-5-2 spec + 084 normalization\nfx: anthropic/claude-fable-5.2 catalogOnly + effort"
+            },
+            {
+              "id": "claude-cursor",
+              "label": "Claude Code + Cursor",
+              "description": "The two harnesses with a verified live catalog on this machine.",
+              "consequence": "Drops the fx row and its count/docs/e2e churn. fx users still get a generic discovered row if their catalog contains the id, just without the curated label/effort table.",
+              "preview": "Claude Code: full curated row\nCursor: spec + 084\nfx: discovery-only (no change)"
+            },
+            {
+              "id": "claude-only",
+              "label": "Claude Code only",
+              "description": "Smallest diff; read the task's 'primarily' literally.",
+              "consequence": "Cursor keeps five separate discovered variant rows (no effort composition, no max mode) and no migration; fx gets a generic discovered row. Diverges from the Fable 5.1 plan, where Cursor was in scope.",
+              "preview": "Claude Code: full curated row\nCursor: no spec, five discovered rows\nfx: discovery-only"
+            }
+          ],
+          "recommendation": {
+            "value": "all",
+            "reason": "Recent model additions shipped both Cursor and fx, and Fable 5.1 got Cursor in its own plan plus fx in the next catalog refresh; parity avoids a half-supported model."
+          }
+        },
+        {
+          "id": "mythos-5-2",
+          "type": "single",
+          "title": "Add `mythos-5.2` alongside Fable 5.2, or leave the Mythos block at 5.1/5?",
+          "impact": "shape",
+          "why": "The CLI ships Mythos 5.2 as Fable 5.2's org-gated twin. The task names only Fable 5.2, so this is a scope decision, not an evidence question.",
+          "context": "Claude Code 2.1.321's metadata has `claude-mythos-5-2` with the same price, context and effort as Fable 5.2, gated to approved orgs (Project Glasswing). No Cursor, fx, Copilot or Antigravity catalog carries any Mythos id, so a Mythos 5.2 row would be Claude Code-only. Today's top Mythos row is 5.1.",
+          "evidence": [
+            { "label": "current Mythos rows", "path": "src/shared/types.ts", "line": 4136, "endLine": 4138, "lang": "ts", "code": "{ id: \"mythos-5.1\", label: \"Mythos 5.1\", hint: \"Fable 5.1's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.\" },\n{ id: \"mythos-5\", label: \"Mythos 5\", hint: \"Prior Mythos release — Fable 5's twin; …\" }," },
+            { "label": "investigation: Mythos 5.2 metadata", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 31, "endLine": 37 }
+          ],
+          "options": [
+            {
+              "id": "leave-out",
+              "label": "Leave Mythos 5.2 out (owner-deferred)",
+              "description": "Record it as a separate ticket in the completeness ledger.",
+              "consequence": "Mythos 5.1 stays the newest Mythos row and still launches; Fable 5.2 becomes the newest Fable. No extra row, flag, effort/mode entry or tests."
+            },
+            {
+              "id": "add",
+              "label": "Add `mythos-5.2` (Claude Code only)",
+              "description": "`mythos-5.2` → `claude-mythos-5-2`, full effort ladder, `[]` mode deny, picker family `null`.",
+              "consequence": "Restores newest-first Mythos parity; adds one row, one flag, one effort entry, one mode entry and ~4 test/comment updates."
+            }
+          ],
+          "recommendation": {
+            "value": "leave-out",
+            "reason": "The ticket is Fable 5.2; Mythos is org-gated and no other harness catalog carries it, so it is a clean separate decision."
+          }
+        },
+        {
+          "id": "default-model",
+          "type": "single",
+          "title": "Keep Opus 5.5 as the Claude Code default, or make Fable 5.2 the default?",
+          "impact": "blocking",
+          "why": "A default flip changes what every new task runs and what it costs — Fable 5.2 is exactly 2× Opus 5.5's $4/$20.",
+          "context": "`DEFAULT_MODEL['claude-code']` is `opus-5.5`; the comment says the default stays on the most-capable non-premium tier because Fable/Mythos cost 2×. Your prod DB has 227 `fable-5` tasks and 84 `fable-5.1` tasks, so Fable is chosen deliberately, not by default. A flip also touches `e2e/agent-profiles-launch.spec.ts`, README:78 and the default comment.",
+          "evidence": [
+            { "label": "current default and its rationale", "path": "src/shared/types.ts", "line": 2822, "endLine": 2828, "lang": "ts", "code": "// Default to Opus 5.5 — … and Fable 5.1 / 5 still sit above it in the picker but cost 2x the usage,\n// so the default stays on the most-capable non-premium tier.\n\"claude-code\": \"opus-5.5\"," },
+            { "label": "README default-model table", "path": "README.md", "line": 78, "code": "| **Claude Code** | `claude` | … | Opus 5.5 | … |" },
+            { "label": "Fable 5.2 price vs Opus 5.5", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 33 }
+          ],
+          "options": [
+            {
+              "id": "keep-opus",
+              "label": "Keep Opus 5.5",
+              "description": "Fable 5.2 is one click away at the top of the Fable block.",
+              "consequence": "No change to new-task cost; README, default tests and the profiles e2e stay untouched."
+            },
+            {
+              "id": "flip-fable",
+              "label": "Make Fable 5.2 the default",
+              "description": "Every new Claude Code task starts on the 2× premium tier.",
+              "consequence": "Update `DEFAULT_MODEL`, the default-output test, `e2e/agent-profiles-launch.spec.ts`, README:78 and the default comments in the same wave."
+            }
+          ],
+          "recommendation": {
+            "value": "keep-opus",
+            "reason": "Same house rule as the Fable 5.1 plan: premium 2× tiers stay opt-in; a flip is a separate product decision with a visible cost change."
+          }
+        }
+      ]
+    },
+    {
+      "id": "picker-copy",
+      "title": "Picker placement & copy",
+      "intro": "The list is family-grouped, newest first. These decide where the new row sits and what the picker tells users about cost.",
+      "questions": [
+        {
+          "id": "picker-order",
+          "type": "single",
+          "title": "Where should Fable 5.2 sit in the Claude Code picker?",
+          "impact": "shape",
+          "why": "The order is the first thing users see; it also determines whether the row reads as the newest model or as one family's current release.",
+          "context": "Today: Mythos 5.1, Mythos 5, Fable 5.1, Fable 5, Opus 5.5, … — family-grouped, newest first within each family. The prior Fable 5.1 plan explicitly chose family grouping, not global newest-first. Fable 5.2 is 'our most intelligent generally available model', but the Mythos tier sits above it (and is org-gated).",
+          "evidence": [
+            { "label": "current Claude Code model order", "path": "src/shared/types.ts", "line": 4136, "endLine": 4142, "lang": "ts", "code": "{ id: \"mythos-5.1\", … },\n{ id: \"mythos-5\", … },\n{ id: \"fable-5.1\", … },\n{ id: \"fable-5\", … },\n{ id: \"opus-5.5\", … }," },
+            { "label": "prior owner decision: family-grouped, newest first within family", "path": "docs/plans/claude-code-fable-5-1-mythos-5-1.md", "line": 32 }
+          ],
+          "options": [
+            {
+              "id": "family",
+              "label": "Keep family grouping: Mythos 5.1, Mythos 5, Fable 5.2, Fable 5.1, Fable 5, Opus 5.5…",
+              "description": "Fable 5.2 is the first row in the Fable block.",
+              "consequence": "Consistent with every existing Claude row and the Fable 5.1 precedent; no other rows move."
+            },
+            {
+              "id": "top",
+              "label": "Put Fable 5.2 at the very top, above Mythos",
+              "description": "Newest widely released first.",
+              "consequence": "Breaks the family grouping and puts a generally available model above the org-gated tier; the Mythos block moves down one."
+            }
+          ],
+          "recommendation": {
+            "value": "family",
+            "reason": "Matches the existing picker structure and the Fable 5.1 decision; the hint already says 'most capable widely released'."
+          }
+        },
+        {
+          "id": "hint-copy",
+          "type": "single",
+          "title": "How should the Fable/Mythos hints change?",
+          "impact": "shape",
+          "why": "The picker is the only place users see the 2× cost signal, and Fable 5.1 is now more expensive than Fable 5.2 relative to today's default Opus.",
+          "context": "Current hints: Fable 5.1 = 'Most capable widely released model — above Opus. Uses 2x the usage of Opus.'; Fable 5 = 'Prior Fable release — above Opus. Uses 2x…'; Mythos 5.1 = 'Fable 5.1's twin — same capability and cost… Uses 2x…'. Fable 5.2 is $8/$40 (2× Opus 5.5's $4/$20); Fable 5.1 and Mythos 5.1 are $10/$50 (2.5× Opus 5.5, though still 2× Opus 5 at $5/$25). Fable 5's current price was not re-verified, so it is left alone.",
+          "evidence": [
+            { "label": "current Fable/Mythos hints", "path": "src/shared/types.ts", "line": 4136, "endLine": 4141, "lang": "ts", "code": "{ id: \"mythos-5.1\", … \"Uses 2x the usage of Opus.\" },\n{ id: \"fable-5.1\", … \"Most capable widely released model — above Opus. Uses 2x the usage of Opus.\" },\n{ id: \"fable-5\", … \"Prior Fable release — above Opus. Uses 2x the usage of Opus.\" }," },
+            { "label": "price evidence", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 33 },
+            { "label": "investigation: 2x copy assessment", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 151 }
+          ],
+          "options": [
+            {
+              "id": "family-standard",
+              "label": "Add 5.2 with the current Fable wording; demote 5.1/5; leave multipliers as-is",
+              "description": "Minimal copy diff.",
+              "consequence": "5.1's 2x remains historically true vs Opus 5 but overstates its cost vs today's Opus 5.5. No test changes.",
+              "preview": "Fable 5.2: Most capable widely released model — above Opus. Uses 2x the usage of Opus.\nFable 5.1: Prior Fable release — above Opus. Uses 2x the usage of Opus.\nFable 5: Earlier Fable release — above Opus. Uses 2x the usage of Opus."
+            },
+            {
+              "id": "family-corrected",
+              "label": "Same demotion, but correct 5.1/Mythos 5.1 to 2.5x Opus 5.5",
+              "description": "Make the cost signal match today's default model.",
+              "consequence": "Two extra hint edits, no test changes. Fable 5/Mythos 5 are left untouched because their price was not re-verified.",
+              "preview": "Fable 5.2: Most capable widely released model — above Opus. Uses 2x the usage of Opus 5.5.\nFable 5.1: Prior Fable release — above Opus. Uses 2.5x the usage of Opus 5.5.\nFable 5: Earlier Fable release — above Opus. Uses 2x the usage of Opus.\nMythos 5.1: … Uses 2.5x the usage of Opus 5.5."
+            },
+            {
+              "id": "add-only",
+              "label": "Only add the 5.2 row; leave every existing hint as-is",
+              "description": "Smallest possible diff.",
+              "consequence": "Two rows claim to be 'Most capable widely released model', and Fable 5.1 still reads as current. Not recommended."
+            }
+          ],
+          "recommendation": {
+            "value": "family-corrected",
+            "reason": "The picker's only cost signal should not tell users 5.1 costs the same as 5.2; the correction is two strings and no test changes."
+          }
+        }
+      ]
+    },
+    {
+      "id": "cursor-data",
+      "title": "Cursor data migration",
+      "intro": "Only relevant if Cursor is in scope. A spec entry 'covers' the five variant ids; stored variant rows need normalizing, per repo convention.",
+      "questions": [
+        {
+          "id": "cursor-migration",
+          "type": "single",
+          "title": "Include Cursor migration 084 for the five Fable 5.2 variants?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "showIf": { "question": "harness-scope", "in": ["all", "claude-cursor"] },
+          "why": "Adding the spec hides the five discovered rows. A stored variant id would then render unlisted with a collapsed effort picker. Migrations are one-way in this repo.",
+          "context": "Next free number is 084. The convention (055/056/060/062/064/076) is a kind-joined normalization into base id + effort + `speed='off'` for cursor-kind `tasks`, `agent_profiles` and `lastModel:cursor`, leaving `lastEffort:cursor`, `updated_at` and frozen snapshots alone. Prod and dev have zero `claude-fable-5-1-*` / `claude-fable-5-2-*` rows, so the migration is data-clean here; it protects future/other users.",
+          "evidence": [
+            { "label": "076 — the exact template (header + tasks/profile/preferences updates)", "path": "src/bun/migrations/076_normalize_cursor_new_families.sql", "line": 1, "endLine": 30, "lang": "sql", "code": "-- Cursor: this release adds CURSOR_MODEL_SPECS entries for three new families …\n-- Normalize to base id + effort, the shape cursorModelArg re-composes …\nUPDATE tasks SET effort = substr(...), speed = 'off', model = '…'\nWHERE model IN (…) AND agent IN (SELECT id FROM harnesses WHERE kind = 'cursor');" },
+            { "label": "last registered migration is 083", "path": "src/bun/migrate.test.ts", "line": 2028, "endLine": 2031, "lang": "ts", "code": "test(\"083 (opencode watch tombstones) is the last registered migration, after 082 …\", () => {\n  const at = migrations.findIndex((m) => m.id === \"083_opencode_watch_tombstones\");\n  expect(at).toBe(migrations.length - 1);" },
+            { "label": "investigation: zero stored rows today", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 137 }
+          ],
+          "options": [
+            {
+              "id": "include",
+              "label": "Include 084 now",
+              "description": "Five UPDATEs, kind-joined, idempotent, plus the migrate test.",
+              "consequence": "Follows the 076 template; adds the migration file, index registration and a migrate.test pin. One-way, but no rows are mutated on this machine."
+            },
+            {
+              "id": "skip",
+              "label": "Skip the migration",
+              "description": "No stored 5.2 variant data exists today.",
+              "consequence": "Any user who picked a 5.2 variant before the spec lands gets an unlisted row + collapsed effort picker. Record as owner-deferred."
+            }
+          ],
+          "recommendation": {
+            "value": "include",
+            "reason": "Every prior Cursor spec addition shipped its normalization migration; the cost is one SQL file + one test, and it is data-clean here."
+          }
+        },
+        {
+          "id": "cursor-backfill-51",
+          "type": "single",
+          "title": "Should 084 also backfill the pre-existing Fable 5.1 plain variants?",
+          "impact": "shape",
+          "oneWayDoor": true,
+          "showIf": { "question": "cursor-migration", "in": ["include"] },
+          "why": "Fable 5.1's spec shipped without a normalization migration, so any stored plain 5.1 variant is already in the unlisted/collapsed state.",
+          "context": "The 5.1 spec covers `claude-fable-5-1-{max,xhigh,high,medium,low}`; its `-thinking-*` variants are intentionally uncovered. There is no 5.1 normalization migration in `src/bun/migrations`. Prod and dev have zero such rows today. Including it is one extra block in the same SQL file; leaving it out is a separate ticket.",
+          "evidence": [
+            { "label": "Fable 5.1 Cursor spec — plain ids only", "path": "src/shared/types.ts", "line": 3134, "endLine": 3145, "lang": "ts", "code": "\"claude-fable-5-1\": {\n  effortIds: { max: \"claude-fable-5-1-max\", … low: \"claude-fable-5-1-low\" },\n}" },
+            { "label": "investigation: the 5.1 spec shipped without a migration", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 92 }
+          ],
+          "options": [
+            {
+              "id": "backfill",
+              "label": "Backfill the five plain 5.1 variants in 084",
+              "description": "One extra block in the same file; `-thinking-*` stays untouched.",
+              "consequence": "Fixes the pre-existing gap in the same pass; adds test cases. Kind-joined and idempotent like the 5.2 block."
+            },
+            {
+              "id": "leave",
+              "label": "Leave 5.1 out; separate ticket",
+              "description": "Keep 084 focused on 5.2.",
+              "consequence": "Any stored 5.1 plain variant stays unlisted until a later migration. Record as owner-deferred."
+            }
+          ],
+          "recommendation": {
+            "value": "backfill",
+            "reason": "It is a two-block addition to a migration already being written, and it closes a gap the 5.1 plan left open."
+          }
+        }
+      ]
+    },
+    {
+      "id": "other",
+      "title": "Other harnesses & anything else",
+      "questions": [
+        {
+          "id": "other-harnesses",
+          "type": "single",
+          "title": "Confirm the no-change set and how to record the Copilot follow-up.",
+          "impact": "minor",
+          "why": "A row for a CLI that doesn't serve the model would be a picker entry that fails at spawn.",
+          "context": "Copilot CLI 1.0.108 (2026-11-09) mentions only Fable 5.1 (1.0.83) and Fable 5 — never 5.2 — and its binary contains no `claude-fable*` id. Antigravity 1.5.1 carries only Opus/Sonnet 5.5 and Gemini ids. OpenCode already lists `opencode/claude-fable-5-2` through discovery. Codex and Gemini run non-Anthropic models.",
+          "evidence": [
+            { "label": "investigation: Copilot / Antigravity / OpenCode", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 52, "endLine": 54 },
+            { "label": "Copilot CLI-floor rule", "path": "docs/architecture/harness-copilot.md", "line": 69 }
+          ],
+          "options": [
+            {
+              "id": "ledger",
+              "label": "No rows now; record Copilot (and Mythos, if deferred) in the completeness ledger",
+              "description": "The plan's ledger carries the follow-up.",
+              "consequence": "No unsupported rows; the next planner sees the pending work. No external tracker item."
+            },
+            {
+              "id": "issue",
+              "label": "Same, plus open a GitHub issue for Copilot Fable 5.2",
+              "description": "Adds an external tracker item.",
+              "consequence": "The plan gains an issue-creation step; the repo currently records follow-ups in plan ledgers, not issues."
+            },
+            {
+              "id": "copilot-row",
+              "label": "Add a Copilot row now anyway",
+              "description": "Not recommended — 1.0.108 has no Fable 5.2.",
+              "consequence": "The row would fail at spawn on the installed CLI; users would see a model they cannot run."
+            }
+          ],
+          "recommendation": {
+            "value": "ledger",
+            "reason": "The completeness ledger is where pending harness support is recorded; a row without CLI support is a broken picker entry."
+          }
+        },
+        {
+          "id": "other-requirements",
+          "type": "longtext",
+          "title": "Anything else 'supported' must mean for Fable 5.2 beyond the row, argv, effort/mode maps, picker mirror, Cursor spec/migration, tests and docs?",
+          "impact": "minor",
+          "why": "A requirement that isn't in the repo is the one the plan cannot infer.",
+          "placeholder": "e.g. a specific default profile, a pipeline config, a demo, or a harness I missed",
+          "required": false
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Low-stakes defaults I'd bet on. One click each, or override with what it should be.",
+      "questions": [
+        {
+          "id": "fx-row",
+          "type": "confirm",
+          "impact": "minor",
+          "showIf": { "question": "harness-scope", "in": ["all"] },
+          "title": "fx Fable 5.2 row shape",
+          "recommendation": {
+            "value": "`anthropic/claude-fable-5.2` — label 'Claude Fable 5.2', generic premium hint, `catalogOnly: true`, effort `[max, xhigh, high, medium, low, auto]`; update the 26→27 / 42→43 counts and the fx e2e exclusion list; no new positive e2e test.",
+            "reason": "Matches the Fable 5.1 row and the public Gateway's `reasoning_options`; catalogOnly is required because your signed-in catalog has no `anthropic/*` ids."
+          }
+        },
+        {
+          "id": "cursor-spec",
+          "type": "confirm",
+          "impact": "minor",
+          "showIf": { "question": "harness-scope", "in": ["all", "claude-cursor"] },
+          "title": "Cursor Fable 5.2 spec shape",
+          "recommendation": {
+            "value": "One `CURSOR_MODEL_SPECS['claude-fable-5-2']` entry with the five plain effort ids, `supportsMaxMode: true`, no `fastEfforts`, no `-thinking-*` ids; no live Cursor spawn probe.",
+            "reason": "All five live labels contain '1M' and there are no thinking/fast variants; max mode is inferred from the labels (if rejected, one flag/test changes)."
+          }
+        },
+        {
+          "id": "cli-floor",
+          "type": "confirm",
+          "impact": "minor",
+          "title": "No Claude Code CLI version floor for Fable 5.2",
+          "recommendation": {
+            "value": "Add no `MODEL_MIN_CLI_VERSION['claude-code']` entry; an older CLI fails at spawn on the unknown id.",
+            "reason": "Fable 5.1, Opus 5.5 and Sonnet 5.5 deliberately added none; adding a 2.1.321 floor would also touch the exact-keys test."
+          }
+        },
+        {
+          "id": "verification",
+          "type": "confirm",
+          "impact": "minor",
+          "title": "Verification bar",
+          "recommendation": {
+            "value": "`bun run typecheck`; targeted `types` / `agents` / `effort-support` / `claude-local-setting` / `migrate` / `orchestrator-paste-withheld` tests; the existing self-deriving `e2e/fx-models.spec.ts`; then a full `bun test` (re-run known flaky tmux tests once).",
+            "reason": "Matches the repo's precedent for table-driven model additions; the e2e Claude picker assertion self-derives from `AGENT_OPTIONS`."
+          }
+        }
+      ]
+    }
+  ]
+}

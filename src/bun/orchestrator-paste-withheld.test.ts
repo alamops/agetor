@@ -867,6 +867,16 @@ const SWITCH_MODEL_CONFIRM_PANE = [
   "  2. No, go back",
 ].join("\n");
 
+/** The same confirm for a Fable target. Only the "Switch model?" header and
+ *  the first choice's `Yes, switch to ` prefix matter to
+ *  `matchSlashConfirmModal`. */
+const SWITCH_MODEL_CONFIRM_FABLE_PANE = [
+  "Switch model?",
+  "",
+  "❯ 1. Yes, switch to Fable 5.2 (1M context)",
+  "  2. No, go back",
+].join("\n");
+
 test("reconcileTaskSession: a full /model picker mirror walks the cursor, confirms session-only ('s'), and auto-accepts the resulting 'Switch model?' confirm — never a typed /model <id>", async () => {
   const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
   const { db, tasks } = await import("./db.ts");
@@ -925,6 +935,66 @@ test("reconcileTaskSession: a full /model picker mirror walks the cursor, confir
       // model?" Enter. (The very first Enter in the full log submits the
       // bare `/model` line itself, opening the picker.)
       expect(sendKeys.slice(-4)).toEqual(["Up", "Up", "s", "Enter"]);
+    });
+  } finally {
+    claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
+    claudeTmux.__forTest.setCapturePastePane(prevPastePane);
+    claudeTmux.__forTest.setSlashCommandSettleMs(prevSettle);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+test("reconcileTaskSession: a change to fable-5.2 drives the bare /model picker to the Fable row and confirms session-only — the new current release owns the row", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-fable-5-2-current",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(async () => ""); // idle — guard passes
+  let confirmPaneCalls = 0;
+  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(async () => {
+    confirmPaneCalls++;
+    // First sighting = the picker itself (its detection poll registers on
+    // first sight); every later call belongs to the separate
+    // `autoConfirmSlashModal` poll, which must see the "Switch model?"
+    // confirm instead.
+    return confirmPaneCalls <= 1 ? MODEL_PICKER_PANE_CURSOR_ON_SONNET : SWITCH_MODEL_CONFIRM_FABLE_PANE;
+  });
+
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const before = tasks.get(taskId)!;
+      // fable-5.2 is the Fable row's current owner on claude 2.1.321
+      // (claudeModelPickerFamily → "Fable"). The picker fixture's cursor sits
+      // on Sonnet (row 4) and the Fable row is row 3, so the walk is one Up —
+      // a different ladder from the Opus test's Up, Up, which pins the
+      // family-word match rather than a hardcoded arrow count.
+      const after = { ...before, model: "fable-5.2" };
+      await reconcileTaskSession(taskId, before, after);
+      await claudeTmux.__forTest.pasteChains.get(taskId);
+
+      const log = readTmuxLog(logPath);
+      const loadBufferStdins = log.filter((e) => e.argv[0] === "load-buffer").map((e) => e.stdin);
+      // Only ever the BARE `/model` — never a typed `/model claude-fable-5-2`
+      // (that would rewrite claude's global default).
+      expect(loadBufferStdins).toEqual(["/model"]);
+      const sendKeys = log.filter((e) => e.argv[0] === "send-keys").map((e) => e.argv[e.argv.length - 1]);
+      expect(sendKeys.slice(-3)).toEqual(["Up", "s", "Enter"]);
     });
   } finally {
     claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
@@ -1123,6 +1193,69 @@ test("reconcileTaskSession: a superseded pinned id (sonnet-5) never drives the p
   }
 }, 10_000);
 
+test("reconcileTaskSession: a superseded pinned id (fable-5.1) never drives the picker — next-run breadcrumb, no paste", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-fable-5-1-superseded",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+    fxSessionId: null,
+  });
+
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const before = tasks.get(taskId)!;
+      // fable-5.1 is now superseded by fable-5.2 as the "Fable" row's owner
+      // (claude 2.1.321's alias table maps `fable` to claude-fable-5-2), so
+      // claudeModelPickerFamily("fable-5.1") returns null — the mirror must
+      // skip the picker entirely, same as opus-5 / sonnet-5 above. The task
+      // is created on sonnet-5 so before.model !== after.model and the mirror
+      // actually has a change to consider.
+      const after = { ...before, model: "fable-5.1" };
+      await reconcileTaskSession(taskId, before, after);
+
+      const log = readTmuxLog(logPath);
+      expect(log.some((e) => e.argv[0] === "load-buffer")).toBe(false);
+      expect(log.filter((e) => e.argv[0] === "send-keys")).toHaveLength(0);
+    });
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts).toContain(
+      "model fable-5.1 applies on the next run — claude's picker can't select it for this session",
+    );
+  } finally {
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * 10 — Model mirror: the picker never renders (idle pane throughout) → poll
  * timeout → "picker not shown" breadcrumb, with no keystroke ever sent.
@@ -1250,11 +1383,12 @@ test("reconcileTaskSession: model mirror closes the picker with Escape when the 
   try {
     await withRecordingTmuxBin(async (logPath) => {
       const before = tasks.get(taskId)!;
-      // fable-5.1, not fable-5: claudeModelPickerFamily("fable-5") is now
-      // null (superseded — the mirror never even starts for it), so only
-      // fable-5.1 still owns the "Fable" row and exercises this "picker is
-      // up but doesn't offer the target family" path at all.
-      const after = { ...before, model: "fable-5.1" };
+      // fable-5.2, not fable-5.1 or fable-5: claudeModelPickerFamily now
+      // returns null for both older Fable ids (superseded — the mirror never
+      // even starts for them), so only fable-5.2 still owns the "Fable" row
+      // and exercises this "picker is up but doesn't offer the target
+      // family" path at all.
+      const after = { ...before, model: "fable-5.2" };
       await reconcileTaskSession(taskId, before, after);
       await claudeTmux.__forTest.pasteChains.get(taskId);
 
@@ -1268,7 +1402,7 @@ test("reconcileTaskSession: model mirror closes the picker with Escape when the 
 
     const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
     expect(statusTexts.some((t) => t.startsWith("⚠️ model change not applied — target not offered"))).toBe(true);
-    expect(statusTexts.some((t) => t.includes("fable-5.1"))).toBe(true);
+    expect(statusTexts.some((t) => t.includes("fable-5.2"))).toBe(true);
   } finally {
     claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
     claudeTmux.__forTest.setCapturePastePane(prevPastePane);

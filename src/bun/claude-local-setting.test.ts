@@ -44,6 +44,11 @@ test("claudeModelIdFromArg resolves the Fable 5.1 / Mythos 5.1 CLAUDE_MODEL_FLAG
   expect(claudeModelIdFromArg("claude-mythos-5-1")).toBe("mythos-5.1");
 });
 
+test("claudeModelIdFromArg resolves the Fable 5.2 / Mythos 5.2 CLAUDE_MODEL_FLAG values back to their agetor ids", () => {
+  expect(claudeModelIdFromArg("claude-fable-5-2")).toBe("fable-5.2");
+  expect(claudeModelIdFromArg("claude-mythos-5-2")).toBe("mythos-5.2");
+});
+
 test("claudeModelIdFromArg resolves the Opus 5.5 CLAUDE_MODEL_FLAG value back to its agetor id", () => {
   expect(claudeModelIdFromArg("claude-opus-5-5")).toBe("opus-5.5");
 });
@@ -219,6 +224,66 @@ test("model: 'Kept model as Fable 5.1' parses as the kept/no-change outcome with
 });
 
 // ---------------------------------------------------------------------------
+// parseClaudeLocalSetting — Fable 5.2 / Mythos 5.2
+// (docs/plans/add-fable-5-2.md). Mirrors the Fable 5.1 / Mythos 5.1 cases
+// above: claude 2.1.321 made claude-fable-5-2 its default Fable model.
+// ---------------------------------------------------------------------------
+
+test("model: 'Set model to Fable 5.2' resolves to fable-5.2", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Fable 5.2 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "fable-5.2" });
+});
+
+test("model: 'Set model to Fable 5.2' with appended qualifiers still resolves to fable-5.2", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Fable 5.2 (1M context) and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "fable-5.2" });
+});
+
+test("model: 'Set model to Mythos 5.2' resolves to mythos-5.2", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Mythos 5.2 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "mythos-5.2" });
+});
+
+test("model: 'Kept model as Fable 5.2' parses as the kept/no-change outcome with id fable-5.2", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Kept model as Fable 5.2",
+    viaMirror: false,
+  });
+  expect(result).toEqual({ kind: "model", id: "fable-5.2", kept: true });
+});
+
+test("model: the 5.2 rows do not steal the 5.1 / 5 display names — 'Fable 5.1' and 'Fable 5' still resolve to themselves", () => {
+  // Guards the prefix matcher against rounding 5.1 / 5 up to 5.2 (or 5.1
+  // down to 5). Same word-boundary rule the 5.1 label needed.
+  for (const [stdout, id] of [
+    ["Set model to Fable 5.1 and saved as your default for new sessions", "fable-5.1"],
+    ["Set model to Fable 5 and saved as your default for new sessions", "fable-5"],
+    ["Kept model as Fable 5.1", "fable-5.1"],
+    ["Kept model as Fable 5", "fable-5"],
+  ] as const) {
+    const result = parseClaudeLocalSetting({ setting: "model", args: "", stdout, viaMirror: false });
+    expect(result, stdout).toEqual({ kind: "model", id, ...(stdout.startsWith("Kept") ? { kept: true } : {}) });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // parseClaudeLocalSetting — Opus 5.5 (docs/plans/add-claude-opus-5-5.md).
 // Mirrors the Fable 5.1 "Set model to"/"Kept model as" cases above: claude
 // 2.1.280 makes claude-opus-5-5 the default Opus model, so opus-5.5 now owns
@@ -376,6 +441,31 @@ test("claudeModelIdFromDisplayName: 'Fable 5.1' does not word-boundary-match the
   // shorter, superseded "Fable 5" label.
   expect(claudeModelIdFromDisplayName("Fable 5.1")).not.toBe("fable-5");
   expect(claudeModelIdFromDisplayName("Fable 5.1 and saved as your default for new sessions")).toBe("fable-5.1");
+});
+
+test("claudeModelIdFromDisplayName: 'Fable 5.2' resolves to fable-5.2", () => {
+  expect(claudeModelIdFromDisplayName("Fable 5.2")).toBe("fable-5.2");
+  expect(claudeModelIdFromDisplayName("Fable 5.2 and saved as your default for new sessions")).toBe("fable-5.2");
+});
+
+test("claudeModelIdFromDisplayName: 'Fable 5.2 (1M context)' strips the qualifier and resolves to fable-5.2", () => {
+  expect(claudeModelIdFromDisplayName("Fable 5.2 (1M context)")).toBe("fable-5.2");
+});
+
+test("claudeModelIdFromDisplayName: 'Mythos 5.2' resolves to mythos-5.2", () => {
+  expect(claudeModelIdFromDisplayName("Mythos 5.2")).toBe("mythos-5.2");
+});
+
+test("claudeModelIdFromDisplayName: 5.2 never conflates with the 5.1 / 5 labels in either direction", () => {
+  // The label set now has three Fable rows and three Mythos rows; the
+  // longest-label word-boundary rule must keep every point release distinct.
+  expect(claudeModelIdFromDisplayName("Fable 5.2")).not.toBe("fable-5.1");
+  expect(claudeModelIdFromDisplayName("Fable 5.2")).not.toBe("fable-5");
+  expect(claudeModelIdFromDisplayName("Fable 5.1")).not.toBe("fable-5.2");
+  expect(claudeModelIdFromDisplayName("Fable 5")).not.toBe("fable-5.2");
+  expect(claudeModelIdFromDisplayName("Mythos 5.2")).not.toBe("mythos-5.1");
+  expect(claudeModelIdFromDisplayName("Mythos 5.1")).not.toBe("mythos-5.2");
+  expect(claudeModelIdFromDisplayName("Mythos 5")).not.toBe("mythos-5.2");
 });
 
 // ---------------------------------------------------------------------------

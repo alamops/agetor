@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "formId": "add-fable-5-2-grill-r1",
+  "title": "Grill — Add Fable 5.2 to the supported harnesses",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "3d0670379d31cd69e15ac4ff9fa528b87bebf1961b53fda50e88a16ad417c94d",
+  "submittedAt": "2026-11-09T22:29:11.642Z",
+  "receivedAt": "2026-11-09T22:29:11.675Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 13,
+    "answered": 13,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 10,
+    "overrodeRecommendations": [
+      "mythos-5-2",
+      "hint-copy"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "harness-scope": {
+      "n": 1,
+      "title": "Which harnesses should get a curated Fable 5.2 row in this change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "all",
+      "display": "Claude Code + Cursor + fx (`catalogOnly`)",
+      "acceptedRecommendation": true
+    },
+    "mythos-5-2": {
+      "n": 2,
+      "title": "Add `mythos-5.2` alongside Fable 5.2, or leave the Mythos block at 5.1/5?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "add",
+      "display": "Add `mythos-5.2` (Claude Code only)",
+      "acceptedRecommendation": false,
+      "recommended": "leave-out"
+    },
+    "default-model": {
+      "n": 3,
+      "title": "Keep Opus 5.5 as the Claude Code default, or make Fable 5.2 the default?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "keep-opus",
+      "display": "Keep Opus 5.5",
+      "acceptedRecommendation": true
+    },
+    "picker-order": {
+      "n": 4,
+      "title": "Where should Fable 5.2 sit in the Claude Code picker?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "family",
+      "display": "Keep family grouping: Mythos 5.1, Mythos 5, Fable 5.2, Fable 5.1, Fable 5, Opus 5.5…",
+      "acceptedRecommendation": true
+    },
+    "hint-copy": {
+      "n": 5,
+      "title": "How should the Fable/Mythos hints change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "family-standard",
+      "display": "Add 5.2 with the current Fable wording; demote 5.1/5; leave multipliers as-is",
+      "acceptedRecommendation": false,
+      "recommended": "family-corrected"
+    },
+    "cursor-migration": {
+      "n": 6,
+      "title": "Include Cursor migration 084 for the five Fable 5.2 variants?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "include",
+      "display": "Include 084 now",
+      "acceptedRecommendation": true
+    },
+    "cursor-backfill-51": {
+      "n": 7,
+      "title": "Should 084 also backfill the pre-existing Fable 5.1 plain variants?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "shape",
+      "value": "backfill",
+      "display": "Backfill the five plain 5.1 variants in 084",
+      "acceptedRecommendation": true
+    },
+    "other-harnesses": {
+      "n": 8,
+      "title": "Confirm the no-change set and how to record the Copilot follow-up.",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "ledger",
+      "display": "No rows now; record Copilot (and Mythos, if deferred) in the completeness ledger",
+      "acceptedRecommendation": true
+    },
+    "other-requirements": {
+      "n": 9,
+      "title": "Anything else 'supported' must mean for Fable 5.2 beyond the row, argv, effort/mode maps, picker mirror, Cursor spec/migration, tests and docs?",
+      "type": "longtext",
+      "status": "answered",
+      "optional": true,
+      "impact": "minor",
+      "value": "Give me more context, what do you mean? I don't think I understood your question here"
+    },
+    "fx-row": {
+      "n": 10,
+      "title": "fx Fable 5.2 row shape",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "`anthropic/claude-fable-5.2` — label 'Claude Fable 5.2', generic premium hint, `catalogOnly: true`, effort `[max, xhigh, high, medium, low, auto]`; update the 26→27 / 42→43 counts and the fx e2e exclusion list; no new positive e2e test.",
+      "acceptedRecommendation": true
+    },
+    "cursor-spec": {
+      "n": 11,
+      "title": "Cursor Fable 5.2 spec shape",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "One `CURSOR_MODEL_SPECS['claude-fable-5-2']` entry with the five plain effort ids, `supportsMaxMode: true`, no `fastEfforts`, no `-thinking-*` ids; no live Cursor spawn probe.",
+      "acceptedRecommendation": true
+    },
+    "cli-floor": {
+      "n": 12,
+      "title": "No Claude Code CLI version floor for Fable 5.2",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "Add no `MODEL_MIN_CLI_VERSION['claude-code']` entry; an older CLI fails at spawn on the unknown id.",
+      "acceptedRecommendation": true
+    },
+    "verification": {
+      "n": 13,
+      "title": "Verification bar",
+      "type": "confirm",
+      "status": "answered",
+      "impact": "minor",
+      "value": "`bun run typecheck`; targeted `types` / `agents` / `effort-support` / `claude-local-setting` / `migrate` / `orchestrator-paste-withheld` tests; the existing self-deriving `e2e/fx-models.spec.ts`; then a full `bun test` (re-run known flaky tmux tests once).",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

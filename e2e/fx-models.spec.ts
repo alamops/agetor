@@ -61,7 +61,7 @@ const FX_DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash";
  *  the 4-id stub catalog: five ordinary curated rows absent from the stub
  *  (`spacexai/grok-4.6`, `moonshotai/kimi-k2.7-code`, and the three standard
  *  rows added 2026-10-26: `minimax/minimax-m3.1-flash`, `meta/muse-spark-open`,
- *  `inception/mercury-3`) and eighteen of the twenty-six
+ *  `inception/mercury-3`) and nineteen of the twenty-seven
  *  `catalogOnly` premium rows (absent from the stub the same as any other
  *  id would be — catalogOnly gates them even harder, but plain absence
  *  already excludes them under the scoped merge). `Claude Fable 5.1`
@@ -85,6 +85,10 @@ const EXCLUDED_FX_OPTION_LABELS = [
   "Gemini 3.8 Flash",
   "Kimi K3",
   "Claude Fable 5.1",
+  // Claude Fable 5.2 (docs/plans/add-fable-5-2.md, 2026-11-09) — catalogOnly,
+  // absent from this file's frozen 4-id fx stub catalog like every other
+  // premium row above.
+  "Claude Fable 5.2",
   "Claude Opus 5.5",
   "Claude Sonnet 5.5",
   // GPT-6 Sol / Luna (docs/plans/add-gpt-6-sol-and-luna.md, 2026-09-22) —
@@ -392,7 +396,7 @@ test.describe("fx model catalog picker", () => {
       .toEqual(claudeCuratedLabels);
 
     // Named explicitly per this task's ask: the curated first option
-    // (fx-model-catalog-refresh.md's own "Mythos 5" row today) must be
+    // (Mythos 5.2 — the top row since Fable 5.2's release, 2026-11-09) must be
     // present, not just the list length.
     expect(claudeCuratedLabels[0]).toBeTruthy();
     const texts = await modelSelect.locator("option").allTextContents();

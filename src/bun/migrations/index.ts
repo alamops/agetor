@@ -113,6 +113,9 @@ import m082 from "./082_opencode_child_bookkeeping.sql" with { type: "text" };
 import m083 from "./083_opencode_watch_tombstones.sql" with { type: "text" };
 import m084 from "./084_harness_stacks.sql" with { type: "text" };
 import m085 from "./085_harness_stack_members_no_harness_fk.sql" with { type: "text" };
+// Authored as 084 on its own branch; main's harness-stacks migrations took
+// 084/085 first, so this one landed as 086 on merge.
+import m086 from "./086_normalize_cursor_fable_5_2.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -216,4 +219,5 @@ export const migrations: Migration[] = [
   { id: "083_opencode_watch_tombstones", sql: m083 },
   { id: "084_harness_stacks", sql: m084 },
   { id: "085_harness_stack_members_no_harness_fk", sql: m085 },
+  { id: "086_normalize_cursor_fable_5_2", sql: m086 },
 ];

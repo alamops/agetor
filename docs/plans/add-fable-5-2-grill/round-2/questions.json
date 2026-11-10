@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "id": "add-fable-5-2-grill-r2",
+  "title": "Grill — Add Fable 5.2 (round 2: Mythos copy + one clarification)",
+  "skill": "grill",
+  "slug": "add-fable-5-2",
+  "round": 2,
+  "flags": [],
+  "summary": "Round 1 is complete (13/13 answered). Two follow-ups: the **Mythos 5.2 override** changes the Mythos block's copy, and your note on the last question asked what I meant. Everything else is recorded as decided.",
+  "proven": [
+    {
+      "text": "**Round-1 decisions already recorded:** harness scope = Claude Code + Cursor + fx; Mythos 5.2 = **add**; default = Opus 5.5; picker order = family-grouped; hint copy = `family-standard` (add Fable 5.2, demote Fable 5.1/5, leave multipliers as-is); Cursor migration 084 = **include**; Fable 5.1 plain-variant backfill = **include**; Copilot follow-up = ledger only; fx/Cursor/CLI-floor/verification defaults accepted.",
+      "evidence": [
+        { "label": "round-1 answers", "path": "docs/plans/add-fable-5-2-grill/round-1/answers.json", "line": 12, "endLine": 28 }
+      ]
+    },
+    {
+      "text": "**Mythos 5.2 is Fable 5.2's org-gated twin** — same price, context and effort ladder; approved-org (Project Glasswing) access only. No Cursor/fx/Copilot/Antigravity catalog carries it, so it is Claude Code-only.",
+      "evidence": [
+        { "label": "investigation: Mythos 5.2", "path": "docs/plans/add-fable-5-2-investigation.md", "line": 31, "endLine": 37 }
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "mythos",
+      "title": "Mythos block copy",
+      "intro": "Adding Mythos 5.2 makes it the newest Mythos row. The Fable block already has a demotion pattern; this asks whether the Mythos block should mirror it.",
+      "questions": [
+        {
+          "id": "mythos-copy",
+          "type": "single",
+          "title": "With Mythos 5.2 added, how should the Mythos block read?",
+          "impact": "shape",
+          "why": "The new top row needs a hint, and Mythos 5.1 is no longer the newest release. The answer decides two or three hint strings.",
+          "context": "Current hints: Mythos 5.1 = 'Fable 5.1's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.'; Mythos 5 = 'Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.' You chose `family-standard` for the Fable block: the new row gets the current wording, prior rows get 'Prior'/'Earlier', and the multipliers stay as they are. Mirroring that in the Mythos block means adding 'Prior Mythos release —' to 5.1 and giving 5.2 the twin sentence.",
+          "evidence": [
+            { "label": "current Mythos rows", "path": "src/shared/types.ts", "line": 4136, "endLine": 4138, "lang": "ts", "code": "{ id: \"mythos-5.1\", label: \"Mythos 5.1\", hint: \"Fable 5.1's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.\" },\n{ id: \"mythos-5\", label: \"Mythos 5\", hint: \"Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.\" }," },
+            { "label": "Fable demotion pattern you chose", "path": "src/shared/types.ts", "line": 4140, "endLine": 4141, "lang": "ts", "code": "{ id: \"fable-5.1\", label: \"Fable 5.1\", hint: \"Most capable widely released model — above Opus. Uses 2x the usage of Opus.\" },\n{ id: \"fable-5\", label: \"Fable 5\", hint: \"Prior Fable release — above Opus. Uses 2x the usage of Opus.\" }" }
+          ],
+          "options": [
+            {
+              "id": "mirror-fable",
+              "label": "Mirror the Fable pattern",
+              "description": "Mythos 5.2 gets the twin sentence; Mythos 5.1 becomes 'Prior Mythos release — Fable 5.1's twin…'; Mythos 5 stays.",
+              "consequence": "Newest-first and consistent with the Fable block; three hint strings change.",
+              "preview": "Mythos 5.2: Fable 5.2's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.\nMythos 5.1: Prior Mythos release — Fable 5.1's twin; same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.\nMythos 5: Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus."
+            },
+            {
+              "id": "add-only",
+              "label": "Only add Mythos 5.2; leave 5.1 exactly as-is",
+              "description": "Smallest copy diff.",
+              "consequence": "Mythos 5.1 still reads as the current twin of Fable 5.1 without a 'Prior' marker; the Mythos block is less obviously ordered.",
+              "preview": "Mythos 5.2: Fable 5.2's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.\nMythos 5.1: Fable 5.1's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus.\nMythos 5: Prior Mythos release — Fable 5's twin; …"
+            }
+          ],
+          "recommendation": {
+            "value": "mirror-fable",
+            "reason": "Matches the Fable demotion you already chose and keeps the picker's newest-first-within-family reading consistent."
+          }
+        }
+      ]
+    },
+    {
+      "id": "clarify",
+      "title": "Clarification",
+      "intro": "You asked what the last round-1 question meant. This is the plain version.",
+      "questions": [
+        {
+          "id": "other-requirements-clarified",
+          "type": "single",
+          "title": "What I meant: is there a concrete 'done' check outside the repo's model tables?",
+          "impact": "minor",
+          "why": "The plan will already add the curated rows, argv mapping, effort/mode maps, picker mirror, Cursor spec/migration, tests and docs. I was asking whether you have a specific acceptance check I can't infer from the repo.",
+          "context": "Examples of what would count: 'a fresh install shows Fable 5.2 in the New Task picker', 'the pipeline can select it by name', 'profile X must default to it', or 'send me a screenshot of the row'. If the listed scope is the whole definition of done, pick 'Nothing else'.",
+          "options": [
+            {
+              "id": "nothing-else",
+              "label": "Nothing else; the listed scope is the definition of done",
+              "description": "The plan's existing acceptance list is enough.",
+              "consequence": "No extra acceptance work; the plan proceeds with the model-table + tests + docs scope."
+            },
+            {
+              "id": "picker-check",
+              "label": "Show Fable 5.2 in the New Task picker on a fresh install",
+              "description": "A manual or e2e picker check.",
+              "consequence": "The plan adds a picker smoke check to the acceptance list (the existing e2e already self-derives the Claude list)."
+            },
+            {
+              "id": "pipeline-check",
+              "label": "The pipeline must be able to select Fable 5.2 by name",
+              "description": "AGENTS_CONFIG.yml / pipeline model selection.",
+              "consequence": "The plan adds a pipeline-selection check; note the `fable` alias already resolves to 5.2, but a versioned pin is a separate config choice."
+            },
+            {
+              "id": "profile-check",
+              "label": "A specific profile or template must default to Fable 5.2",
+              "description": "Tell me which profile in the note.",
+              "consequence": "The plan adds a profile-default change and its test; this is otherwise not part of the model-table work."
+            },
+            {
+              "id": "demo",
+              "label": "A screenshot/demo of the new row",
+              "description": "Visual proof for the handoff.",
+              "consequence": "The plan adds a demo step; no code change."
+            }
+          ],
+          "recommendation": {
+            "value": "nothing-else",
+            "reason": "Your round-1 answers cover the full 'supported' contract mapped by the investigation; this is only a catch-all."
+          }
+        }
+      ]
+    }
+  ]
+}
