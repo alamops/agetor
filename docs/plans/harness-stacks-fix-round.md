@@ -338,11 +338,12 @@ Phase 5 review (opus, parallel dimension and flow passes) → Phase 6 tests (TT1
     - identical unread follow-ups collapsed into one;
     - the restore message after a lost answer.
 - **Ruled out of scope:** the rows marked out of scope above (return to the primary after a reset; interrupting a live turn for switch-now; a mirror timer/watch; CLI force-refresh of usage; other agent kinds and cross-kind stacks).
+- **Known limitations closed after the final ledger** (owner asked to cover them, 2026-11-10; commits `c3b1453c`, `6be049ac`):
+  - re-keyed handoff rows and a deleted task's kept copies: migration 088 `harness_orphaned_copies`, swept at boot (with a normalization of pre-088 rows), after a transfer and after an account root edit; account delete collects them;
+  - a deleted primary merged file now propagates key removals (merged as an empty document under the deletion-propagation rules);
+  - the backup-removal directory-swap race: a spike showed the old walk, `/bin/rm -rf` and `find -delete` can all be redirected on macOS, while Bun's fd-relative `fs.rm` lost nothing; `removeMirrorBackups` uses it.
 - **Accepted known limitations**, documented in `harness-stacks.md`:
-  - re-keyed handoff rows can strand unremovable old-session paths;
-  - retained copies are lost on task delete;
-  - a deleted primary merged file doesn't propagate key removals;
-  - a narrow directory-swap race in backup removal is reduced, not closed;
+  - an orphaned copy outside its account's current root waits until the root points back or the account is deleted;
   - a boot-completed switch-now reads `manual-switch`.
 - **Owner-deferred:** none.
 
