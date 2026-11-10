@@ -124,7 +124,70 @@ export function isLoginSelectorEnvKey(key: string): boolean {
  *  and provider/login selectors ({@link isLoginSelectorEnvKey}). A backup's
  *  own value always survives. */
 export function isMirrorNeverImportedEnvKey(key: string): boolean {
-  return isCredentialShapedEnvKey(key) || isLoginSelectorEnvKey(key);
+  return isCredentialShapedEnvKey(key) || isLoginSelectorEnvKey(key) || isLoginSelectorEnvKey(key.toUpperCase());
+}
+
+/** True for a URL-shaped value with userinfo (`scheme://user[:pass]@host`). */
+export function urlHasUserinfo(value: unknown): boolean {
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#\s]*@/.test(value.trim());
+}
+
+/**
+ * Entry-level form of {@link isMirrorNeverImportedEnvKey}: also refuses ANY
+ * variable whose value is a URL carrying userinfo (`HTTPS_PROXY`,
+ * `DATABASE_URL=postgres://u:pw@db`, …), which is a credential whatever the
+ * name looks like.
+ */
+export function isMirrorNeverImportedEnvEntry(key: string, value: unknown): boolean {
+  return isMirrorNeverImportedEnvKey(key) || urlHasUserinfo(value);
+}
+
+/** True when any string anywhere inside `value` is a URL with userinfo. */
+export function containsUrlUserinfo(value: unknown): boolean {
+  if (typeof value === "string") return urlHasUserinfo(value);
+  if (Array.isArray(value)) return value.some(containsUrlUserinfo);
+  if (typeof value === "object" && value !== null) return Object.values(value).some(containsUrlUserinfo);
+  return false;
+}
+
+/** Env var names (any case) that make a spawned command run something: a shell
+ *  prefix, a startup script, a loader hook, or a helper/command by suffix. Safe
+ *  mode never imports them from the primary; the backup's own value survives. */
+const COMMAND_RUNNING_ENV_KEYS: readonly string[] = [
+  "CLAUDE_CODE_SHELL_PREFIX",
+  "NODE_OPTIONS",
+  "BASH_ENV",
+  "ENV",
+  "PROMPT_COMMAND",
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "PYTHONSTARTUP",
+  "PYTHONPATH",
+  "NODE_PATH",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_PAGER",
+  "BROWSER",
+  "ZDOTDIR",
+  "PERL5LIB",
+  "RUBYLIB",
+  "PERL5OPT",
+  "RUBYOPT",
+  "GIT_SSH_COMMAND",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+  "EDITOR",
+  "VISUAL",
+  "PAGER",
+];
+
+/** True for an env var that runs a command (see {@link COMMAND_RUNNING_ENV_KEYS}),
+ *  including `DYLD_*` and any name ending `_HELPER` or `_COMMAND`. */
+export function isCommandRunningEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  return COMMAND_RUNNING_ENV_KEYS.includes(upper)
+    || upper.startsWith("DYLD_")
+    || upper.endsWith("_HELPER")
+    || upper.endsWith("_COMMAND");
 }
 
 /** Prefixes owned by a model provider (or the cloud that fronts one). A
@@ -220,6 +283,39 @@ export const CLAUDE_CODE_LOGIN_ENV_KEYS: readonly string[] = [
  * {@link isHarnessAuthEnvKey} to ask "does this log the harness in?".
  */
 export function isCredentialShapedEnvKey(key: string): boolean {
+  // Case-insensitive: `github_token` is as much a secret as `GITHUB_TOKEN`.
+  const upper = key.toUpperCase();
+  if (HARNESS_AUTH_ENV_KEYS.includes(upper)) return true;
+  if (upper.split("_").some((segment) => MIRROR_EXTRA_CREDENTIAL_SEGMENTS.includes(segment))) return true;
+  return isLoginShapedEnvKey(upper);
+}
+
+/** Whole-segment credential names the MIRROR strips on top of
+ *  {@link CREDENTIAL_SEGMENTS}: `SERPAPI_APIKEY`, `DB_PASS`, `GH_PAT`,
+ *  `NPM_AUTH`, `OTEL_EXPORTER_OTLP_HEADERS`, cookies and session blobs. Only a
+ *  whole `_`-separated segment matches, so `PATH` never matches `PAT`. They are
+ *  deliberately NOT part of login evidence ({@link isHarnessAuthEnvKey}):
+ *  `TERM_SESSION_ID` in the process env is not a harness login. */
+const MIRROR_EXTRA_CREDENTIAL_SEGMENTS: readonly string[] = [
+  "APIKEY",
+  "PASS",
+  "PASSWD",
+  "PAT",
+  "AUTH",
+  "HEADERS",
+  "COOKIE",
+  "COOKIES",
+  "SESSION",
+  "DSN",
+  "WEBHOOK",
+  "CONNECTION",
+  "PASSPHRASE",
+];
+
+/** The original (case-sensitive-era) credential shape rule: explicit list,
+ *  credential segment, then vendor prefix + marker. Login evidence keeps using
+ *  exactly this. */
+function isLoginShapedEnvKey(key: string): boolean {
   if (HARNESS_AUTH_ENV_KEYS.includes(key)) return true;
   // Shape first: a credential segment is a credential under any vendor.
   const segments = key.split("_");
@@ -246,7 +342,7 @@ export function isCredentialShapedEnvKey(key: string): boolean {
  *  (`src/bun/harness-stacks.ts`) use this. */
 export function isHarnessAuthEnvKey(key: string): boolean {
   if (key.startsWith("CLAUDE_CODE_")) return CLAUDE_CODE_LOGIN_ENV_KEYS.includes(key);
-  return isCredentialShapedEnvKey(key);
+  return isLoginShapedEnvKey(key);
 }
 
 /**
@@ -344,6 +440,24 @@ export function isCodexLoginBearingKeyPath(segments: readonly string[]): boolean
   return segments[0] === "profiles"
     && segments.length >= 3
     && CODEX_LOGIN_BEARING_CONFIG_KEYS.includes(segments[2]!);
+}
+
+/**
+ * True for a Codex config key path (already split into unquoted segments) that
+ * holds a secret the mirror must not import although it is not a login: a
+ * credential-shaped variable in `shell_environment_policy.set` (`set.GH_TOKEN`)
+ * or anything named `headers` under `otel` (OTLP exporters carry auth headers).
+ * The backup's own value of such a key survives. A path that STOPS at
+ * `shell_environment_policy.set` (an inline `set = {…}`) is not matched here:
+ * the engine filters that table's members one by one.
+ */
+export function isCodexSecretKeyPath(segments: readonly string[]): boolean {
+  if (segments.length === 0) return false;
+  if (segments[0] === "otel") return segments.slice(1).some((s) => s.toLowerCase() === "headers");
+  if (segments[0] === "shell_environment_policy" && segments[1] === "set" && segments.length >= 3) {
+    return isMirrorNeverImportedEnvKey(segments[2]!);
+  }
+  return false;
 }
 
 /**
@@ -594,6 +708,21 @@ export function isNeverCopyPath(kind: HarnessStackKind, rel: string): boolean {
     return segments.some((segment) => isCodexNeverCopyName(segment));
   }
   return false;
+}
+
+/**
+ * True when `rel` (relative to the account's config root, `/`-separated) is a
+ * path the mirror's `copy` allowlist can have written: a listed entry or
+ * something below one, and not a never-copy path. Provenance rows live in
+ * SQLite, which an agent can write, so a removal or restore of a recorded file
+ * must pass this shape check besides the usual path checks.
+ */
+export function isMirrorCopyShape(kind: HarnessStackKind, rel: string): boolean {
+  if (rel.length === 0 || rel.startsWith("/") || rel.includes("\0") || rel.includes("\\")) return false;
+  const parts = rel.split("/");
+  if (parts.some((p) => p === "" || p === "." || p === "..")) return false;
+  if (isNeverCopyPath(kind, rel)) return false;
+  return MIRROR_SPECS[kind].copy.some((entry) => rel === entry || rel.startsWith(`${entry}/`));
 }
 
 /** The per-session sidecar folders Claude Code keeps next to a transcript

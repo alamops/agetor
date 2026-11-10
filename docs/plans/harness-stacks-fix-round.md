@@ -267,6 +267,10 @@ Phase 5 review (opus, parallel dimension and flow passes) → Phase 6 tests (TT1
 
 - **W1 review S6 residual (T10 docs, Known limitations).** When a handoff row is re-keyed to a new session on the same account, old-session paths that can't be removed stay on disk and in the row under a session id they no longer match, so cleanup skips them. Fixing it needs a per-session handoff store, which is out of scope.
 
+- **W2 review M3 (orchestrator decision).** An item the backup edited after the mirror wrote it is still overwritten (primary wins), but reversibly. The edit is backed up first, its row is marked `preexisted`, and it appears in `plan.backups`, so the preview asks before saving and Restore can bring the edit back.
+- **W2 review N6 (T10 docs, Known limitations).** If the primary's merged file (`settings.json` / `config.toml`) is deleted outright, key removals do not propagate.
+- **W2 review N3 (T7 contract).** `prepareTaskHarness` moves already record their history through `moveTaskToMember`'s `history`. T7 records limit, retry and boot swaps at `spawnSwapContinuation`, records manual and scheduled switches through `history`, and must never record the same move twice.
+
 ## 8. Open questions / assumptions
 
 - No unratified decisions: every grill question was answered by the owner.

@@ -934,3 +934,66 @@ describe("review fixes (fix round)", () => {
     }
   });
 });
+
+describe("retry-wait seam (D20)", () => {
+  test("AGETOR_HARNESS_RETRY_MIN_MS is honored under NODE_ENV=test, bounded, and ignored in production", () => {
+    const prevEnv = process.env.NODE_ENV;
+    const prevMs = process.env.AGETOR_HARNESS_RETRY_MIN_MS;
+    const prevSeam = process.env.AGETOR_E2E_HARNESS_SEAMS;
+    try {
+      process.env.AGETOR_HARNESS_RETRY_MIN_MS = "200";
+      expect(fo.retryMinMs()).toBe(200);
+      process.env.AGETOR_HARNESS_RETRY_MIN_MS = "10";
+      expect(fo.retryMinMs()).toBe(fo.HARNESS_STACK_RETRY_MIN_MS);
+      process.env.AGETOR_HARNESS_RETRY_MIN_MS = "abc";
+      expect(fo.retryMinMs()).toBe(fo.HARNESS_STACK_RETRY_MIN_MS);
+      process.env.AGETOR_HARNESS_RETRY_MIN_MS = "200";
+      process.env.NODE_ENV = "production";
+      delete process.env.AGETOR_E2E_HARNESS_SEAMS;
+      expect(fo.retryMinMs()).toBe(fo.HARNESS_STACK_RETRY_MIN_MS);
+      process.env.AGETOR_E2E_HARNESS_SEAMS = "1";
+      expect(fo.retryMinMs()).toBe(200);
+    } finally {
+      process.env.NODE_ENV = prevEnv;
+      if (prevMs === undefined) delete process.env.AGETOR_HARNESS_RETRY_MIN_MS; else process.env.AGETOR_HARNESS_RETRY_MIN_MS = prevMs;
+      if (prevSeam === undefined) delete process.env.AGETOR_E2E_HARNESS_SEAMS; else process.env.AGETOR_E2E_HARNESS_SEAMS = prevSeam;
+    }
+  });
+});
+
+describe("memberReasonsFor and the 1-member early return", () => {
+  test("includeCurrent prefixes the current account; a tried, non-cooling member reads 'tried this lap'", () => {
+    const a = account();
+    const b = account();
+    const stack = stacks.harnessStacks.create({ label: "reasons", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    const now = Date.now();
+    stacks.harnessStacks.setLimitState(a, { reason: "quota", resetAtMs: now + 60_000, message: "x", source: "claude-pane" }, now);
+    fo.recordTried(taskId, b);
+    const task = dbm.tasks.get(taskId)!;
+    const withoutCurrent = fo.memberReasonsFor(stack, task, now);
+    expect(withoutCurrent.map((r) => r.harnessId)).toEqual([b]);
+    expect(withoutCurrent[0]!.reason).toBe("tried this lap");
+    const all = fo.memberReasonsFor(stack, task, now, { includeCurrent: true });
+    expect(all.map((r) => r.harnessId)).toEqual([a, b]);
+    expect(all[0]!.reason.startsWith("current — cooling until ")).toBe(true);
+    stacks.harnessStacks.clearLimitState(a);
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("a stack cut to one member clears a stale exhausted state and its timer", async () => {
+    const a = account();
+    const b = account();
+    const stack = stacks.harnessStacks.create({ label: "shrunk", kind: "claude-code", members: [a, b] });
+    const taskId = makeTask(a);
+    fo.recordTried(taskId, a);
+    fo.planExhausted(taskId, { kind: "all-exhausted", earliestResetAtMs: Date.now() + 60_000, skipped: [] });
+    expect(fo.hasArmedAutoRetry(taskId)).toBe(true);
+    stacks.harnessStacks.update(stack.id, { members: [a] } as never);
+    const res = await fo.prepareTaskHarness(taskId, { manual: true });
+    expect(res.ok).toBe(true);
+    expect(dbm.tasks.get(taskId)!.harnessState).toBeNull();
+    expect(fo.hasArmedAutoRetry(taskId)).toBe(false);
+    stacks.harnessStacks.delete(stack.id);
+  });
+});
