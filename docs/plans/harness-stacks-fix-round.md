@@ -91,7 +91,7 @@ Owner decisions are from the grill; the rest are reasoning.
 | --- | --- | --- |
 | D1 | **Claim-held limit (item 1).** If the claim belongs to this task's own swap window or boot swap claim, the signal is queued (`deferredLimitSettlements`) and settled when the claim is released. Otherwise the run takes the normal settle (passthrough). A run is never marked failed without its column being decided. | reasoning |
 | D2 | **Boot (item 2).** `reconcileOrphans` does not orphan a running run that is the `runId` of a non-manual `pendingSwap`. It records that run `failed` with `reason:"harness-swap"`, leaves `tasks.run_id`/column alone and emits no `orphaned` run-status, so the swap reconcile resumes it. Defensive: `task.runId == null && runs.latestForTask == pending.runId` also counts as "no successor minted". | reasoning |
-| D3 | **Follow-ups (items 3/4).** One helper stashes, to the backlog, every follow-up a handled ending leaves without a started successor: the Codex `codexTurnQueue`, undelivered mid-turn rows and `swapFollowUps`. A clean-retry arm persists `allExhausted.cleanRetryOf = oldRunId`. Its cancel, manual-message reset and cap paths recompute the unread follow-ups from `runs.mainUserTexts(cleanRetryOf)` (persisted, crash-safe) and stash them. | reasoning |
+| D3 | **Follow-ups (items 3/4).** One helper stashes, to the backlog, every follow-up a handled ending leaves without a started successor: the Codex `codexTurnQueue`, undelivered mid-turn rows and `swapFollowUps`. A clean-retry arm persists `allExhausted.cleanRetryOf = oldRunId`. Its cancel, manual-message reset and cap paths recompute the unread follow-ups from `cleanRetryParts(runs.mainUserRows(cleanRetryOf))` (persisted, crash-safe; echo↔twin paired by `line_uuid`) and stash them. | reasoning |
 | D4 | **Cooldown clear (item 5).** `clearLimitState(harnessId, { startedAtMs, model })` deletes only rows with `updated_at <= startedAtMs` for the account-wide row and the run's model. | review |
 | D5 | **Per-model Codex cooldown.** `harness_limit_state` gains `model` ('' = account-wide; table rebuilt in 087, PK `(harness_id, model)`, still no FK). `HarnessLimitSignal.model?` comes from "usage limit for <model>". Selection skips a member for a task whose resolved model matches, or for any account-wide row. | owner (grill r1 `codex-per-model`) |
 | D6 | **Swap history.** New table `harness_swap_events`, FK `stack_id → harness_stacks ON DELETE CASCADE`, **no FK** to tasks or harnesses. Labels and the task title are denormalized, so history survives task delete, archive and account delete, and is removed with the stack. **No cap**: paged by `(at DESC, id DESC)` cursor, index `(stack_id, at DESC, id DESC)`. Events: limit, retry (incl. same-account), manual, scheduled, unavailable, boot-resume, blocked. | owner (r1 `history-lifetime`, `history-events`; r2 `history-cap-why`) |
@@ -256,6 +256,16 @@ Phase 5 review (opus, parallel dimension and flow passes) → Phase 6 tests (TT1
 - `orchestrator.ts` (12k lines) concentrates T7. The wave review targets it.
 - Provenance diffing on large plugin trees is mitigated by size/mtime fast paths.
 - Preview accuracy must match the real run: one code path with a write sink.
+
+## 7a. Carried from the wave reviews
+
+- **W1 review S2.** Waves 1–3 form one unit, so no intermediate wave commit is run on its own. T5 matches per-model cooldowns against the task's resolved model (`task.model ?? DEFAULT_MODEL[kind]`, lower-cased). T7 passes `{ startedAtMs, model }` to `clearLimitState`. T9b keys `limitStates` by `harnessId` + `model` in `App.tsx` `reconcileById`, and shows a per-model cooldown as "cooling for <model>" (`TaskCard`, Settings).
+- **W1 review S3.** T7 replaces `cleanRetryPartsOf` with `cleanRetryParts(runs.mainUserRows(runId), …)`.
+- **W1 review N6/N7 (T10 docs).**
+  - Retained copies (left after a root change) are lost when their task is deleted.
+  - `harness_swap_events` cascades on `harness_stacks`, so a future `harness_stacks` table rebuild must turn foreign keys off, or it wipes the history.
+
+- **W1 review S6 residual (T10 docs, Known limitations).** When a handoff row is re-keyed to a new session on the same account, old-session paths that can't be removed stay on disk and in the row under a session id they no longer match, so cleanup skips them. Fixing it needs a per-session handoff store, which is out of scope.
 
 ## 8. Open questions / assumptions
 

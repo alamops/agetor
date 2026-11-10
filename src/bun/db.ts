@@ -8,7 +8,7 @@ import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts"
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { HARNESS_STACK_CONTINUATION_TAG, parseTaskHarnessState, type TaskHarnessState } from "../shared/types.ts";
 import { isHarnessStackContinuation } from "../shared/harness-stack.ts";
-import { normalizeDeliveredUserText } from "../shared/user-message.ts";
+import { normalizeDeliveredUserText, type CleanRetryRow } from "../shared/user-message.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -2321,7 +2321,17 @@ export const harnesses = {
       db.run(`DELETE FROM harness_stack_members WHERE harness_id = ?`, [id]);
       db.run(`DELETE FROM harness_limit_state WHERE harness_id = ?`, [id]);
       harnessSessionHandoffs.deleteForHarness(id);
-      if (membership) renumberStackPositions(membership.stack_id);
+      // Mirror provenance names the account by id with no FK (087); its store
+      // imports this module, so the delete is inline here. Swap-history rows
+      // are kept on purpose (denormalized labels).
+      db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ?`, [id]);
+      if (membership) {
+        renumberStackPositions(membership.stack_id);
+        // The membership changed, so the stack's `updated_at` must too or an
+        // editor's `expectedUpdatedAt` would not see it. Strictly increasing,
+        // like `harnessStacks.update`.
+        db.run(`UPDATE harness_stacks SET updated_at = MAX(?, updated_at + 1) WHERE id = ?`, [Date.now(), membership.stack_id]);
+      }
     })();
   },
   /**
@@ -3478,6 +3488,18 @@ export const runs = {
       )
       .all(runId)
       .map((row) => row.data);
+  },
+  /** Same query and order as `mainUserTexts`, with `twin` set on a row that
+   *  carries a `line_uuid` (the Claude JSONL twin of a live echo, which has
+   *  none). `composeCleanRetryText` pairs each echo with at most one twin. */
+  mainUserRows(runId: string): CleanRetryRow[] {
+    return db
+      .query<{ data: string; line_uuid: string | null }, [string]>(
+        `SELECT data, line_uuid FROM run_events INDEXED BY idx_run_events_run
+         WHERE run_id = ? AND stream = 'user' AND subagent_id IS NULL ORDER BY id ASC`,
+      )
+      .all(runId)
+      .map((row) => ({ data: row.data, twin: row.line_uuid != null }));
   },
   /**
    * Whether a run recorded ANY tool call (main stream or a subagent's — a

@@ -257,6 +257,16 @@ describe("parseCodexSessionRateLimits", () => {
     expect(meters[1]).toEqual({ id: "credits", label: "Credits: 5", usedPercent: 0, resetsAtMs: null });
   });
 
+  test("a zero credits balance (number or string) reads as used 100", () => {
+    for (const balance of [0, "0", "0.00"]) {
+      const meters = parseCodexSessionRateLimits(
+        { primary: { used_percent: 6, window_minutes: 10080, resets_in_seconds: 100 }, credits: { has_credits: true, unlimited: false, balance } },
+        FETCHED_AT_MS,
+      );
+      expect(meters[1]?.usedPercent).toBe(100);
+    }
+  });
+
   test("returns [] when rate_limits is null (exec-mode sessions per openai/codex#14728)", () => {
     expect(parseCodexSessionRateLimits(null, FETCHED_AT_MS)).toEqual([]);
   });

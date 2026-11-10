@@ -597,7 +597,9 @@ export function isNeverCopyPath(kind: HarnessStackKind, rel: string): boolean {
 }
 
 /** The per-session sidecar folders Claude Code keeps next to a transcript
- *  (`projects/<encoded cwd>/<session>/<sidecar>/…`). */
+ *  (`projects/<encoded cwd>/<session>/<sidecar>/…`). `file-history/<session>/`
+ *  (the `/rewind` checkpoints) sits beside `projects/`, not under it, and is
+ *  handled separately by the handoff shapes. */
 export const CLAUDE_SESSION_SIDECAR_DIRS: readonly string[] = ["subagents", "tool-results", "mcp-tasks"];
 
 /** A single path segment Agetor may treat as a session or project name: no
@@ -613,41 +615,51 @@ export function isSafePathSegment(segment: string): boolean {
 
 /**
  * True when `rel` (relative to an account's config root, `/`-separated) has
- * the shape a session handoff writes — the only shapes cleanup may unlink:
- * - claude-code: `projects/<enc>/<sid>.jsonl`, or a file below
- *   `projects/<enc>/<sid>/{subagents,tool-results,mcp-tasks}/`;
- * - codex: `sessions/YYYY/MM/DD/rollout-*.jsonl`.
+ * the shape a session handoff writes for the recorded `sessionId` — the only
+ * shapes cleanup may unlink:
+ * - claude-code: `projects/<enc>/<sid>.jsonl`, a file below
+ *   `projects/<enc>/<sid>/{subagents,tool-results,mcp-tasks}/`, or a file
+ *   below `file-history/<sid>/`;
+ * - codex: `sessions/YYYY/MM/DD/rollout-*-<sid>.jsonl` (Codex embeds the
+ *   thread id as the file name's suffix).
  * Handoff rows live in SQLite, which an agent can write; a recorded path of
- * any other shape is never touched, whatever the row says.
+ * any other shape, or one naming a different session, is never touched,
+ * whatever the row says.
  */
-export function isHandoffCopyShape(kind: HarnessStackKind, rel: string): boolean {
+export function isHandoffCopyShape(kind: HarnessStackKind, rel: string, sessionId: string): boolean {
+  if (!isSafePathSegment(sessionId)) return false;
   const parts = rel.split("/");
   if (parts.some((p) => !isSafePathSegment(p))) return false;
   if (kind === "claude-code") {
+    if (parts[0] === "file-history") return parts.length >= 3 && parts[1] === sessionId;
     if (parts[0] !== "projects" || parts.length < 3) return false;
-    if (parts.length === 3) return parts[2]!.endsWith(".jsonl") && parts[2]!.length > ".jsonl".length;
-    return parts.length >= 5 && CLAUDE_SESSION_SIDECAR_DIRS.includes(parts[3]!);
+    if (parts.length === 3) return parts[2] === `${sessionId}.jsonl`;
+    return parts.length >= 5 && parts[2] === sessionId && CLAUDE_SESSION_SIDECAR_DIRS.includes(parts[3]!);
   }
   return parts.length === 5
     && parts[0] === "sessions"
     && /^\d{4}$/.test(parts[1]!)
     && /^\d{2}$/.test(parts[2]!)
     && /^\d{2}$/.test(parts[3]!)
-    && /^rollout-.+\.jsonl$/.test(parts[4]!);
+    && parts[4]!.startsWith("rollout-")
+    && parts[4]!.endsWith(`-${sessionId}.jsonl`);
 }
 
 /**
- * True when `rel` names a DIRECTORY inside a handoff shape that cleanup may
- * prune once it is empty: for claude-code the session folder
- * `projects/<enc>/<sid>` and anything below it; for codex the date folders
- * `sessions/YYYY[/MM[/DD]]`. Never `projects/<enc>`, `projects` or `sessions`
- * themselves — those belong to the account.
+ * True when `rel` names a DIRECTORY inside a handoff shape for `sessionId`
+ * that cleanup may prune once it is empty: for claude-code the session folder
+ * `projects/<enc>/<sid>` and its sidecar folders, and `file-history/<sid>` and
+ * anything below it; for codex the date folders `sessions/YYYY[/MM[/DD]]`.
+ * Never `projects/<enc>`, `projects`, `file-history` or `sessions` themselves —
+ * those belong to the account.
  */
-export function isHandoffPrunableDir(kind: HarnessStackKind, rel: string): boolean {
+export function isHandoffPrunableDir(kind: HarnessStackKind, rel: string, sessionId: string): boolean {
+  if (!isSafePathSegment(sessionId)) return false;
   const parts = rel.split("/");
   if (parts.some((p) => !isSafePathSegment(p))) return false;
   if (kind === "claude-code") {
-    if (parts[0] !== "projects" || parts.length < 3) return false;
+    if (parts[0] === "file-history") return parts.length >= 2 && parts[1] === sessionId;
+    if (parts[0] !== "projects" || parts.length < 3 || parts[2] !== sessionId) return false;
     return parts.length === 3 || CLAUDE_SESSION_SIDECAR_DIRS.includes(parts[3]!);
   }
   if (parts[0] !== "sessions" || parts.length < 2 || parts.length > 4) return false;

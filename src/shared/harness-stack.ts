@@ -12,12 +12,17 @@ import {
   HARNESS_STACK_CONTINUATION_TAG,
   HARNESS_SWAP_STATUS_TOKEN,
   type HarnessLimitReason,
+  type HarnessLimitState,
+  type HarnessMemberReason,
+  type HarnessQuota,
   type HarnessStack,
   type HarnessStackMember,
+  type HarnessSwapEvent,
   type HarnessSwapNotice,
   type TaskHarnessState,
 } from "./types.ts";
 import { escapeFreeText } from "./terminal-text.ts";
+import { BLOCKING_METER_IDS, HARNESS_QUOTA_STALE_MS } from "./harness-limits.ts";
 
 /** How long a completed move stays in the task header. */
 export const HARNESS_STACK_MOVED_TTL_MS = 24 * 60 * 60 * 1000;
@@ -134,6 +139,7 @@ export function pickNextMember(args: PickNextMemberArgs): NextMemberPlan {
   const from = startIndex;
   let earliestResetAtMs: number | null = null;
   let limitBlocked = 0;
+  let triedAvailableNow = false;
   let triedCount = 0;
   const noteReset = (at: number) => {
     if (!Number.isFinite(at) || at <= now) return;
@@ -168,6 +174,12 @@ export function pickNextMember(args: PickNextMemberArgs): NextMemberPlan {
       continue;
     }
     if (wasTried) {
+      // A tried member whose cooldown has expired (and whose quota is not
+      // exhausted) is available again: a retry should fire at once (the caller
+      // clamps to its minimum) instead of waiting for another member's far-off
+      // reset. Only when it is otherwise usable: a tried member that has since
+      // logged out (or can't run the model) must not schedule an early retry.
+      if (usable(member) === null) triedAvailableNow = true;
       skipped.push({ harnessId: id, reason: "tried this lap" });
       continue;
     }
@@ -180,7 +192,7 @@ export function pickNextMember(args: PickNextMemberArgs): NextMemberPlan {
   }
 
   if (limitBlocked > 0 || (members.length > 0 && triedCount === members.length)) {
-    return { kind: "all-exhausted", earliestResetAtMs, skipped };
+    return { kind: "all-exhausted", earliestResetAtMs: triedAvailableNow ? now : earliestResetAtMs, skipped };
   }
   return { kind: "none-usable", reasons: skipped, earliestResetAtMs, skipped };
 }
@@ -354,3 +366,101 @@ export function stripHarnessStackContinuation(text: string): string {
   return trimmed.slice(open.length, trimmed.length - close.length).replace(/^\n+|\n+$/g, "");
 }
 
+
+const LIMIT_REASON_TEXT: Record<HarnessLimitReason, string> = {
+  quota: "usage limit",
+  rate_limit: "rate limit",
+  insufficient_credits: "out of credits",
+};
+
+/** The parts of a cooldown row every surface renders (CLI, TUI, webview), so
+ *  none of them re-derives the reason wording. */
+export function memberStateText(
+  state: HarnessLimitState,
+): { reasonText: string; until: number; model: string | null; message: string | null } {
+  return {
+    reasonText: LIMIT_REASON_TEXT[state.reason],
+    until: state.exhaustedUntilMs,
+    model: state.model ?? null,
+    message: state.message,
+  };
+}
+
+/** `"<label>: <reason>"` for a member that can't take a task. Data, not escaped. */
+export function memberReasonText(r: HarnessMemberReason): string {
+  return `${r.label}: ${r.reason}`;
+}
+
+const MEMBER_EVENT_REASON_TEXT: Record<string, string> = {
+  "member-removed": "removed from the stack",
+  "member-disabled": "disabled",
+  "member-unavailable": "unavailable",
+};
+
+/**
+ * One human line per swap-history row. Labels and the reset time are data;
+ * terminal renderers escape the whole line (this does not).
+ */
+export function formatHarnessSwapEvent(e: HarnessSwapEvent): string {
+  const from = e.fromLabel ?? "an account";
+  const to = e.toLabel ?? "an account";
+  switch (e.trigger) {
+    case "limit": {
+      const why = typeof e.reason === "string" && Object.hasOwn(LIMIT_REASON_TEXT, e.reason)
+        ? LIMIT_REASON_TEXT[e.reason as HarnessLimitReason]
+        : "limit";
+      const resets = e.resetsAtMs !== null ? `, resets ${new Date(e.resetsAtMs).toLocaleString()}` : "";
+      return `limit: ${from} → ${to} (${why}${resets})`;
+    }
+    case "retry":
+      return `retry on ${e.toLabel ?? e.fromLabel ?? "an account"} after the reset`;
+    case "manual":
+      return `manual switch: ${from} → ${to}`;
+    case "scheduled":
+      return `scheduled switch: ${from} → ${to}`;
+    case "unavailable": {
+      const why = typeof e.reason === "string" && Object.hasOwn(MEMBER_EVENT_REASON_TEXT, e.reason)
+        ? MEMBER_EVENT_REASON_TEXT[e.reason]
+        : undefined;
+      return `moved off ${from}${why ? ` (${why})` : ""} → ${to}`;
+    }
+    case "boot-resume":
+      return `resumed after restart: ${from} → ${to}`;
+    case "blocked":
+      return e.reason === "no-usable-member"
+        ? "blocked: no account in the stack can run this task"
+        : "blocked: every account out of quota";
+    default:
+      return `${String((e as { trigger?: unknown }).trigger ?? "event")}: ${from} → ${to}`;
+  }
+}
+
+export interface QuotaSummaryMeter {
+  id: string;
+  label: string;
+  usedPercent: number;
+  resetsAtMs: number | null;
+}
+
+/** The blocking windows of an account's cached quota snapshot (5 h / weekly /
+ *  Codex session / weekly, in {@link BLOCKING_METER_IDS} order), how old the
+ *  snapshot is, and whether the failover would ignore it as stale. A missing
+ *  snapshot is `status: "missing"`, `stale: true`. */
+export function quotaSummary(
+  quota: HarnessQuota | null | undefined,
+  now: number,
+): { meters: QuotaSummaryMeter[]; ageMs: number | null; stale: boolean; status: HarnessQuota["status"] | "missing" } {
+  if (!quota) return { meters: [], ageMs: null, stale: true, status: "missing" };
+  const ageMs = Number.isFinite(quota.fetchedAtMs) ? Math.max(0, now - quota.fetchedAtMs) : null;
+  const meters: QuotaSummaryMeter[] = [];
+  for (const id of BLOCKING_METER_IDS) {
+    const m = quota.meters.find((x) => x.id === id && !x.scope);
+    if (m) meters.push({ id: m.id, label: m.label, usedPercent: m.usedPercent, resetsAtMs: m.resetsAtMs });
+  }
+  return {
+    meters,
+    ageMs,
+    stale: ageMs === null || ageMs > HARNESS_QUOTA_STALE_MS,
+    status: quota.status,
+  };
+}

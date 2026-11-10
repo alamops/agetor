@@ -761,20 +761,20 @@ describe("cleanup", () => {
   test("removeCopiedPaths refuses a path behind a symlinked parent", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "agetor-clean-root-"));
     const outside = mkdtempSync(path.join(tmpdir(), "agetor-clean-outside-"));
-    const victim = path.join(outside, "s.jsonl");
+    const victim = path.join(outside, "sid.jsonl");
     writeFileSync(victim, "do not delete");
     mkdirSync(path.join(root, "projects", "real"), { recursive: true });
     symlinkSync(outside, path.join(root, "projects", "linked"));
 
-    expect(await transfer.removeCopiedPaths([path.join(root, "projects", "linked", "s.jsonl")], root, "claude-code"))
+    expect(await transfer.removeCopiedPaths([path.join(root, "projects", "linked", "sid.jsonl")], root, "claude-code", "sid"))
       .toEqual([]);
     expect(readFileSync(victim, "utf8")).toBe("do not delete");
 
     // A plain, shape-matching path under the root still cleans up, and the
     // account's own `projects/<enc>` folder is never pruned.
-    const own = path.join(root, "projects", "real", "copy.jsonl");
+    const own = path.join(root, "projects", "real", "sid.jsonl");
     writeFileSync(own, "copied");
-    expect(await transfer.removeCopiedPaths([own], root, "claude-code")).toEqual([own]);
+    expect(await transfer.removeCopiedPaths([own], root, "claude-code", "sid")).toEqual([own]);
     expect(existsSync(own)).toBe(false);
     expect(existsSync(path.join(root, "projects", "real"))).toBe(true);
     expect(existsSync(root)).toBe(true);
@@ -787,7 +787,7 @@ describe("cleanup", () => {
     const copied = path.join(sidecar, "agent.jsonl");
     write(copied, "copy");
     write(kept, "backup's own");
-    expect(await transfer.removeCopiedPaths([copied], root, "claude-code")).toEqual([copied]);
+    expect(await transfer.removeCopiedPaths([copied], root, "claude-code", "sid")).toEqual([copied]);
     // The empty `subagents/` is pruned…
     expect(existsSync(sidecar)).toBe(false);
     // …and pruning stops at the first non-empty directory, so the sibling
@@ -798,7 +798,7 @@ describe("cleanup", () => {
 
     // With the last sidecar file gone, the whole session folder is pruned —
     // but never `projects/<enc>` itself.
-    expect(await transfer.removeCopiedPaths([kept], root, "claude-code")).toEqual([kept]);
+    expect(await transfer.removeCopiedPaths([kept], root, "claude-code", "sid")).toEqual([kept]);
     expect(existsSync(path.join(root, "projects", "enc", "sid"))).toBe(false);
     expect(existsSync(path.join(root, "projects", "enc"))).toBe(true);
   });
@@ -821,6 +821,7 @@ describe("cleanup", () => {
       [dir, settings, creds, sessionFolderFile, strayJsonl, root, path.join(root, "projects")],
       root,
       "claude-code",
+      "sid",
     );
     expect(removed).toEqual([]);
     expect(readFileSync(path.join(dir, "inner.txt"), "utf8")).toBe("inner");
@@ -833,15 +834,15 @@ describe("cleanup", () => {
     const auth = path.join(codexRoot, "auth.json");
     const odd = path.join(codexRoot, "sessions", "rollout-x-thread.jsonl");
     for (const p of [rollout, auth, odd]) write(p, "x");
-    expect(await transfer.removeCopiedPaths([auth, odd, rollout], codexRoot, "codex")).toEqual([rollout]);
+    expect(await transfer.removeCopiedPaths([auth, odd, rollout], codexRoot, "codex", "thread")).toEqual([rollout]);
     expect(existsSync(auth)).toBe(true);
     expect(existsSync(odd)).toBe(true);
     expect(existsSync(path.join(codexRoot, "sessions", "2026"))).toBe(false);
     expect(existsSync(path.join(codexRoot, "sessions"))).toBe(true);
     // A claude shape is not a codex shape and vice versa.
-    const claudeShaped = path.join(codexRoot, "projects", "enc", "s.jsonl");
+    const claudeShaped = path.join(codexRoot, "projects", "enc", "sid.jsonl");
     write(claudeShaped, "x");
-    expect(await transfer.removeCopiedPaths([claudeShaped], codexRoot, "codex")).toEqual([]);
+    expect(await transfer.removeCopiedPaths([claudeShaped], codexRoot, "codex", "thread")).toEqual([]);
     expect(existsSync(claudeShaped)).toBe(true);
   });
 
@@ -853,7 +854,7 @@ describe("cleanup", () => {
     const recorded = path.join(root, "projects", "enc", "sid.jsonl");
     mkdirSync(path.dirname(recorded), { recursive: true });
     symlinkSync(victim, recorded);
-    expect(await transfer.removeCopiedPaths([recorded], root, "claude-code")).toEqual([]);
+    expect(await transfer.removeCopiedPaths([recorded], root, "claude-code", "sid")).toEqual([]);
     expect(lstatSync(recorded).isSymbolicLink()).toBe(true);
     expect(readFileSync(victim, "utf8")).toBe("keep");
   });

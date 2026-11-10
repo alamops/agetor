@@ -237,6 +237,7 @@ function invocationTable(s: Seed): Record<string, Invocation[]> {
     "runs.lastEventData": [{ label: "lastEventData(runId)", run: () => runs.lastEventData(s.runId) }],
     "runs.lastToolUseData": [{ label: "lastToolUseData(runId)", run: () => runs.lastToolUseData(s.runId) }],
     "runs.mainUserTexts": [{ label: "mainUserTexts(runId)", run: () => runs.mainUserTexts(s.runId) }],
+    "runs.mainUserRows": [{ label: "mainUserRows(runId)", run: () => runs.mainUserRows(s.runId) }],
     "runs.hasToolUse": [{ label: "hasToolUse(runId)", run: () => runs.hasToolUse(s.runId) }],
     "runs.findToolUseEvent": [
       { label: "findToolUseEvent(runId, id)", run: () => runs.findToolUseEvent(s.runId, "toolu_0") },

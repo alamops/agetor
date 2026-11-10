@@ -10,8 +10,8 @@
  * cleanup can remove it later.
  *
  * Every source path is agent-writable, so reads are no-follow/regular-file,
- * copies are atomic and 0600, and a symlink/FIFO/oversized transcript is
- * refused rather than followed. A config root that now resolves (through a
+ * copies are atomic and 0600, and a symlink/FIFO transcript is refused rather
+ * than followed, and no transcript is ever refused for its size. A config root that now resolves (through a
  * symlink planted after the account was saved) into a macOS-protected home
  * folder its stored path did not name is refused before anything touches it
  * (contract CR4, `rootRedirectRefusal`). Two accounts whose config roots resolve to the
@@ -23,7 +23,7 @@
  * conversation is gone and the swap blocks (`harness-swap-failed`) rather than
  * silently starting fresh.
  */
-import { existsSync, lstatSync, readdirSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { encodeProjectPath } from "./claude-tmux.ts";
@@ -34,7 +34,9 @@ import {
   isPlainAncestorPathUnder,
   isPlainDir,
   isRegularFileNoFollow,
-  removeCopiedPaths,
+  destinationState,
+  planTreeDestinations,
+  removeCopiedPathsDetailed,
   rootsRedirectRefusal,
   sameConfigRoot,
 } from "./harness-file-transfer.ts";
@@ -47,7 +49,20 @@ import { childEnv, coreSpawn } from "./core-spawn.ts";
 export const CLAUDE_SESSION_COLUMN = "claude_session_id" as const satisfies SessionIdColumn;
 export const CODEX_SESSION_COLUMN = "codex_session_id" as const satisfies SessionIdColumn;
 
-const MAX_SESSION_BYTES = 64 * 1024 * 1024;
+/** A transcript or rollout is never refused for its size: dropping the
+ *  conversation to stay under a cap loses exactly what the swap exists to
+ *  keep. The copy streams in 1 MB async chunks, so a huge file still yields to
+ *  the shared main thread between chunks. */
+const NO_SIZE_LIMIT = Number.POSITIVE_INFINITY;
+/** Entry budget for a sidecar tree (`subagents`, `tool-results`, `mcp-tasks`,
+ *  `file-history/<sid>`); the walk is cooperative. Reaching it is reported as
+ *  a transfer warning, never silently. */
+const SIDECAR_MAX_ENTRIES = 50_000;
+/** Directories examined while looking for a transcript by session id. */
+const PROJECTS_SCAN_MAX_ENTRIES = 50_000;
+const YIELD_EVERY_MS = 20;
+/** Longest encoded project dir name Claude uses verbatim (longer ones are hashed). */
+const MAX_PLAIN_PROJECT_DIR_NAME = 200;
 const SIDECAR_DIRS = CLAUDE_SESSION_SIDECAR_DIRS;
 
 export type TransferResult =
@@ -55,14 +70,15 @@ export type TransferResult =
       ok: true;
       sessionId: string;
       copiedPaths: string[];
-      /** Non-fatal maintenance problems (e.g. Codex's rollout projection
-       *  migration). The transfer succeeded; callers surface these as status
-       *  lines / logs instead of dropping them. */
+      /** Non-fatal problems (a sidecar or `/rewind` checkpoint tree that could
+       *  not be copied in full, Codex's rollout projection migration). The
+       *  transfer succeeded; callers surface these as status lines / logs
+       *  instead of dropping them. */
       warnings?: string[];
     }
   | {
       ok: false;
-      reason: "no-session" | "unsafe-source" | "too-large" | "io" | "unsupported";
+      reason: "no-session" | "unsafe-source" | "io" | "unsupported";
       message: string;
     };
 
@@ -78,28 +94,196 @@ export interface SessionTransferAdapter {
   kind: "claude-code" | "codex";
   column: SessionIdColumn;
   transfer(args: TransferArgs): Promise<TransferResult>;
-  /** Remove this adapter's recorded copies for one task/account pair. */
-  cleanup(taskId: string, harnessId: string): Promise<void>;
+  /** Remove this adapter's recorded copies for one task/account pair. Resolves
+   *  to warnings (copies that could not be removed yet and were kept on the
+   *  row); never rejects for a path problem. */
+  cleanup(taskId: string, harnessId: string): Promise<string[]>;
 }
 
 function unsafeReason(message: string): TransferResult {
   return { ok: false, reason: "unsafe-source", message };
 }
 
-function claudeTranscriptPath(root: string, cwd: string, sessionId: string): {
-  fresh: string;
-  legacy: string;
-  encoded: string;
-} {
-  const encoded = encodeProjectPath(cwd);
-  return {
-    fresh: path.join(root, "projects", encoded, `${sessionId}.jsonl`),
-    legacy: path.join(root, ".claude", "projects", encoded, `${sessionId}.jsonl`),
-    encoded,
-  };
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
-/** The Claude adapter: transcript + the three sidecar dirs. */
+type LocatedTranscript =
+  | { kind: "found"; src: string; projectDirName: string; legacy: boolean }
+  | { kind: "none" }
+  | { kind: "unsafe"; message: string };
+
+/** `lstat` of a leaf whose ancestors were already verified plain. */
+function leafKind(p: string): "file" | "missing" | "other" {
+  try {
+    return lstatSync(p).isFile() ? "file" : "other";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "missing" : "other";
+  }
+}
+
+/**
+ * Find the source transcript `<root>/projects/<project dir>/<sid>.jsonl`
+ * (or the legacy `<root>/.claude/projects/…`). The encoded cwd names the
+ * project dir when it is short enough; Claude hashes longer names in a way
+ * `encodeProjectPath` cannot reproduce, so a miss falls back to scanning the
+ * project dirs for the session id (a UUID, unique across projects).
+ *
+ * Nothing is stat'ed before the chain of directories between the trusted
+ * config root and it has been `lstat`-checked: a `projects` swapped for a
+ * symlink into a protected folder must not be followed even to ask whether
+ * the transcript exists.
+ */
+async function locateClaudeTranscript(root: string, cwd: string, sessionId: string): Promise<LocatedTranscript> {
+  const encoded = encodeProjectPath(cwd);
+  const bases = [
+    { dir: path.join(root, "projects"), legacy: false },
+    { dir: path.join(root, ".claude", "projects"), legacy: true },
+  ];
+  // Claude cuts an encoded name over 200 characters and appends a hash this
+  // function cannot reproduce; that name is not a usable path component, so
+  // such a cwd goes straight to the scan below.
+  for (const base of encoded.length > MAX_PLAIN_PROJECT_DIR_NAME ? [] : bases) {
+    const candidate = path.join(base.dir, encoded, `${sessionId}.jsonl`);
+    if (!isPlainAncestorPathUnder(root, candidate)) {
+      return { kind: "unsafe", message: "the transcript path traverses a symlinked directory" };
+    }
+    const leaf = leafKind(candidate);
+    if (leaf === "file") return { kind: "found", src: candidate, projectDirName: encoded, legacy: base.legacy };
+    if (leaf === "other") {
+      return { kind: "unsafe", message: "the transcript is not a regular file (symlink or special file refused)" };
+    }
+  }
+  let seen = 0;
+  let lastYield = Date.now();
+  for (const base of bases) {
+    // The ancestors of `<base>/x` are the base's own components.
+    if (!isPlainAncestorPathUnder(root, path.join(base.dir, "x")) || !isPlainDir(base.dir)) continue;
+    let entries;
+    try {
+      entries = await readdir(base.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (++seen > PROJECTS_SCAN_MAX_ENTRIES) return { kind: "none" };
+      if (Date.now() - lastYield >= YIELD_EVERY_MS) {
+        lastYield = Date.now();
+        await Bun.sleep(0);
+      }
+      // A Dirent is not followed: a symlinked project dir reports neither
+      // directory nor file here.
+      if (!entry.isDirectory() || !isSafePathSegment(entry.name)) continue;
+      const candidate = path.join(base.dir, entry.name, `${sessionId}.jsonl`);
+      if (leafKind(candidate) === "file") {
+        return { kind: "found", src: candidate, projectDirName: entry.name, legacy: base.legacy };
+      }
+    }
+  }
+  return { kind: "none" };
+}
+
+/** A tree to carry beside the transcript: where it is and where it goes. */
+interface SessionTree {
+  label: string;
+  src: string;
+  dest: string;
+}
+
+/** The directories to copy alongside a Claude transcript, keeping only those
+ *  whose every ancestor below the config root is a real directory. */
+function claudeSessionTrees(
+  fromRoot: string,
+  toRoot: string,
+  located: { src: string; projectDirName: string; legacy: boolean },
+  sessionId: string,
+): SessionTree[] {
+  const srcProject = path.dirname(located.src);
+  const destProject = path.join(toRoot, "projects", located.projectDirName);
+  const candidates: SessionTree[] = SIDECAR_DIRS.map((dir) => ({
+    label: dir,
+    src: path.join(srcProject, sessionId, dir),
+    dest: path.join(destProject, sessionId, dir),
+  }));
+  // `/rewind` checkpoints: `<root>/file-history/<sid>/<hash>@vN`. Only this
+  // session's folder moves; the mirror never copies `file-history` as a whole.
+  const historyBase = located.legacy ? path.join(fromRoot, ".claude", "file-history") : path.join(fromRoot, "file-history");
+  candidates.push({
+    label: "file-history",
+    src: path.join(historyBase, sessionId),
+    dest: path.join(toRoot, "file-history", sessionId),
+  });
+  // Same rule as the transcript: every folder between the config root and the
+  // tree must be a real directory, not a plantable symlink.
+  return candidates.filter((t) => isPlainAncestorPathUnder(fromRoot, t.src) && isPlainDir(t.src));
+}
+
+/** Keep a handoff row's session id and timestamp as they were, after a failed
+ *  attempt wrote the intended paths into it. */
+function restoreHandoff(
+  prior: HarnessSessionHandoff | null,
+  taskId: string,
+  harnessId: string,
+  column: SessionIdColumn,
+): void {
+  if (!prior) {
+    harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
+    return;
+  }
+  harnessSessionHandoffs.upsert({ ...prior, copiedPaths: [] });
+}
+
+/**
+ * Record the files a transfer is ABOUT to create, before copying them. A
+ * crash between the copy and the final row would otherwise leave files no row
+ * names, and the boot re-run would see the destination existing and never
+ * record it. `upsert` merges `copiedPaths`, and a path recorded but never
+ * created is harmless (cleanup skips a missing file). The session id is
+ * recorded with a zero timestamp on a new row so the resume lookup prefers any
+ * run the account really made until the final upsert stamps the real time.
+ */
+function recordIntended(
+  taskId: string,
+  harnessId: string,
+  column: SessionIdColumn,
+  sessionId: string,
+  prior: HarnessSessionHandoff | null,
+  intended: readonly string[],
+): void {
+  if (intended.length === 0) return;
+  harnessSessionHandoffs.upsert({
+    taskId,
+    harnessId,
+    columnName: column,
+    sessionId,
+    copiedPaths: [...intended],
+    createdAt: prior && prior.sessionId === sessionId ? prior.createdAt : 0,
+  });
+}
+
+/** A different session's copies are superseded by a successful transfer. They
+ *  are removed only AFTER the new copy succeeded (a failed transfer must leave
+ *  the old conversation intact), under the OLD session id captured from the
+ *  row before it was re-keyed. Copies that cannot be removed are reported: the
+ *  row can name one session only, so they stay on disk and are no longer
+ *  recorded as cleanable. */
+async function dropSupersededCopies(
+  prior: HarnessSessionHandoff | null,
+  sessionId: string,
+  root: string,
+  kind: HarnessStackKind,
+  warnings: string[],
+): Promise<void> {
+  if (!prior || prior.sessionId === sessionId) return;
+  const result = await removeCopiedPathsDetailed(prior.copiedPaths, root, kind, prior.sessionId);
+  if (result.retained.length > 0) {
+    warnings.push(`${result.retained.length} copied file(s) of the superseded session ${prior.sessionId} could not be removed and were left in place`);
+  }
+}
+
+/** The Claude adapter: transcript + `/rewind` checkpoints + the sidecar dirs. */
 export const claudeSessionTransfer: SessionTransferAdapter = {
   kind: "claude-code",
   column: CLAUDE_SESSION_COLUMN,
@@ -126,62 +310,70 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
     // The id becomes a file name on the destination; a separator or `..`
     // would write outside `projects/<enc>/`.
     if (!isSafePathSegment(sessionId)) return unsafeReason("the session id is not a plain file name");
-    const source = claudeTranscriptPath(fromRoot, cwd, sessionId);
-    const isFresh = existsSync(source.fresh);
-    const src = isFresh ? source.fresh : source.legacy;
-    if (!existsSync(src)) {
-      return { ok: false, reason: "no-session", message: "no transcript recorded yet" };
-    }
-    // The leaf is checked no-follow below, but a linked *parent*
-    // (`projects/` → outside the account) would make the leaf look like a
-    // regular file inside the account. Refuse the whole chain below the
-    // trusted config root.
-    if (!isPlainAncestorPathUnder(fromRoot, src)) {
-      return unsafeReason("the transcript path traverses a symlinked directory");
-    }
+    // Ancestors are lstat-checked before any leaf is stat'ed (see
+    // `locateClaudeTranscript`); the leaf is checked no-follow again at open.
+    const located = await locateClaudeTranscript(fromRoot, cwd, sessionId);
+    if (located.kind === "unsafe") return unsafeReason(located.message);
+    if (located.kind === "none") return { ok: false, reason: "no-session", message: "no transcript recorded yet" };
+    const src = located.src;
     if (!isRegularFileNoFollow(src)) {
       return unsafeReason("the transcript is not a regular file (symlink or special file refused)");
     }
-    try {
-      const st = lstatSync(src);
-      if (st.size > MAX_SESSION_BYTES) {
-        return { ok: false, reason: "too-large", message: "the transcript is larger than the transfer limit" };
-      }
-    } catch (err) {
-      return { ok: false, reason: "io", message: err instanceof Error ? err.message : String(err) };
-    }
-    const destDir = path.join(toRoot, "projects", source.encoded);
-    const dest = path.join(destDir, `${sessionId}.jsonl`);
-    // Only files this transfer CREATED go on the cleanup allowlist. A
+    // The destination's Claude derives the same project dir name from the same
+    // cwd, so the directory name found on the source is reused verbatim.
+    const dest = path.join(toRoot, "projects", located.projectDirName, `${sessionId}.jsonl`);
+    const trees = claudeSessionTrees(fromRoot, toRoot, located, sessionId);
+
+    const warnings: string[] = [];
+    const prior = harnessSessionHandoffs.get(taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
+    // Only files this transfer will CREATE go on the cleanup allowlist. A
     // pre-existing destination is the account's own file (e.g. its original
     // transcript after an A→B→A wrap): the copy still updates it, but deleting
     // it later would destroy that account's conversation (contract C5).
+    const intended: string[] = [];
+    const destState = destinationState(toRoot, dest);
+    if (destState === "unsafe") return unsafeReason("the destination path traverses a symlinked directory");
+    if (destState === "absent") intended.push(dest);
+    for (const tree of trees) {
+      try {
+        intended.push(...(await planTreeDestinations(tree.src, tree.dest, { maxEntries: SIDECAR_MAX_ENTRIES, root: toRoot })));
+      } catch (err) {
+        warnings.push(`${tree.label}: could not be scanned (${errMessage(err)})`);
+      }
+    }
+    recordIntended(taskId, toHarness.id, CLAUDE_SESSION_COLUMN, sessionId, prior, intended);
+
     const copied: string[] = [];
     try {
-      const result = await copyRegularFileDetailed(src, dest, { maxBytes: MAX_SESSION_BYTES, root: toRoot });
+      const result = await copyRegularFileDetailed(src, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
       if (result.created) copied.push(dest);
     } catch (err) {
-      return { ok: false, reason: "io", message: err instanceof Error ? err.message : String(err) };
+      if (intended.length > 0) restoreHandoff(prior, taskId, toHarness.id, CLAUDE_SESSION_COLUMN);
+      return { ok: false, reason: "io", message: errMessage(err) };
     }
 
-    const srcBase = isFresh ? path.join(fromRoot, "projects", source.encoded) : path.join(fromRoot, ".claude", "projects", source.encoded);
-    for (const dir of SIDECAR_DIRS) {
-      const sidecar = path.join(srcBase, sessionId, dir);
-      // Same rule as the transcript: every folder between the config root and
-      // the sidecar must be a real directory, not a plantable symlink.
-      if (!isPlainAncestorPathUnder(fromRoot, sidecar) || !isPlainDir(sidecar)) continue;
+    // The transcript is the conversation; a tree that cannot be copied in full
+    // is reported as a warning instead of failing the transfer or vanishing.
+    for (const tree of trees) {
       try {
-        const result = await copyTreeCooperative(sidecar, path.join(destDir, sessionId, dir), {
-          maxBytes: MAX_SESSION_BYTES,
+        const result = await copyTreeCooperative(tree.src, tree.dest, {
+          maxBytes: NO_SIZE_LIMIT,
+          maxEntries: SIDECAR_MAX_ENTRIES,
           root: toRoot,
         });
-        copied.push(...result.created.map((rel) => path.join(destDir, sessionId, dir, rel)));
-      } catch {
-        // A sidecar that cannot be copied is not fatal: the transcript is the
-        // conversation; the sidecar only carries subagent/tool scratch files.
+        copied.push(...result.created.map((rel) => path.join(tree.dest, rel)));
+        if (result.truncated) {
+          warnings.push(`${tree.label}: stopped at the ${SIDECAR_MAX_ENTRIES}-entry limit; some files were not transferred`);
+        }
+        if (result.skipped.length > 0) {
+          warnings.push(`${tree.label}: ${result.skipped.length} entries were skipped (links, special files or files that vanished)`);
+        }
+      } catch (err) {
+        warnings.push(`${tree.label}: not transferred (${errMessage(err)})`);
       }
     }
 
+    await dropSupersededCopies(prior, sessionId, toRoot, "claude-code", warnings);
     harnessSessionHandoffs.upsert({
       taskId,
       harnessId: toHarness.id,
@@ -190,16 +382,44 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
       copiedPaths: copied,
       createdAt: Date.now(),
     });
-    return { ok: true, sessionId, copiedPaths: copied };
+    return { ok: true, sessionId, copiedPaths: copied, ...(warnings.length > 0 ? { warnings } : {}) };
   },
-  async cleanup(taskId, harnessId): Promise<void> {
-    const handoff = harnessSessionHandoffs.get(taskId, harnessId, CLAUDE_SESSION_COLUMN);
-    if (!handoff) return;
-    const harness = harnesses.getByIdOrKind(harnessId);
-    if (harness) await removeCopiedPaths(handoff.copiedPaths, claudeConfigDirFor(harness), "claude-code");
-    harnessSessionHandoffs.deleteOne(taskId, harnessId, CLAUDE_SESSION_COLUMN);
+  async cleanup(taskId, harnessId): Promise<string[]> {
+    return cleanupHandoff(taskId, harnessId, CLAUDE_SESSION_COLUMN, "claude-code", claudeConfigDirFor);
   },
 };
+
+/**
+ * Remove one handoff's copies and then its row. The row goes only once every
+ * recorded path is unlinked or confirmed gone (or rejected as never ours): a
+ * path outside the account's CURRENT root (its `home` was changed after the
+ * copy), a refused root or a failed unlink keeps the row, so a later cleanup
+ * can still remove the file, and returns a warning. A harness that no longer
+ * exists has nothing to resume, so its row is dropped.
+ */
+async function cleanupHandoff(
+  taskId: string,
+  harnessId: string,
+  column: SessionIdColumn,
+  kind: HarnessStackKind,
+  rootFor: (harness: Harness) => string,
+): Promise<string[]> {
+  const handoff = harnessSessionHandoffs.get(taskId, harnessId, column);
+  if (!handoff) return [];
+  const harness = harnesses.getByIdOrKind(harnessId);
+  if (!harness) {
+    harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
+    return [];
+  }
+  const result = await removeCopiedPathsDetailed(handoff.copiedPaths, rootFor(harness), kind, handoff.sessionId);
+  if (result.retained.length > 0) {
+    return [
+      `${result.retained.length} copied session file(s) for task ${taskId} were left in place (account ${harnessId}: its config directory changed or a file could not be removed); the record is kept so a later cleanup can remove them`,
+    ];
+  }
+  harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
+  return [];
+}
 
 /** Codex lays rollouts out as `sessions/YYYY/MM/DD/rollout-*-<threadId>.jsonl`.
  *  The walk is async and yields to the shared Bun main thread: a large
@@ -330,21 +550,28 @@ export const codexSessionTransfer: SessionTransferAdapter = {
     // Only Codex's own `sessions/YYYY/MM/DD/rollout-*.jsonl` layout is copied:
     // it is the only shape cleanup will ever remove, so a copy of any other
     // shape could never be cleaned up.
-    if (!isHandoffCopyShape("codex", rel.split(path.sep).join("/"))) {
+    if (!isHandoffCopyShape("codex", rel.split(path.sep).join("/"), sessionId)) {
       return unsafeReason("the rollout is not in Codex's sessions/YYYY/MM/DD layout");
     }
     const dest = path.join(toRoot, rel);
+    const prior = harnessSessionHandoffs.get(taskId, toHarness.id, CODEX_SESSION_COLUMN);
+    // Same rules as the Claude adapter: a rollout the destination already had
+    // is its own, never put on the cleanup allowlist (contract C5), and the
+    // new path is recorded BEFORE it is created.
+    const destState = destinationState(toRoot, dest);
+    if (destState === "unsafe") return unsafeReason("the destination path traverses a symlinked directory");
+    const intended = destState === "absent" ? [dest] : [];
+    recordIntended(taskId, toHarness.id, CODEX_SESSION_COLUMN, sessionId, prior, intended);
     const copiedPaths: string[] = [];
     try {
-      const result = await copyRegularFileDetailed(source, dest, { maxBytes: MAX_SESSION_BYTES, root: toRoot });
-      // Same rule as the Claude adapter: a rollout the destination already
-      // had is its own, never put on the cleanup allowlist (contract C5).
+      const result = await copyRegularFileDetailed(source, dest, { maxBytes: NO_SIZE_LIMIT, root: toRoot });
       if (result.created) copiedPaths.push(dest);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { ok: false, reason: message.includes("too large") ? "too-large" : "io", message };
+      if (intended.length > 0) restoreHandoff(prior, taskId, toHarness.id, CODEX_SESSION_COLUMN);
+      return { ok: false, reason: "io", message: errMessage(err) };
     }
     const warnings: string[] = [];
+    await dropSupersededCopies(prior, sessionId, toRoot, "codex", warnings);
     const migrationWarning = await migrateCodexRollouts(toHarness);
     if (migrationWarning) warnings.push(migrationWarning);
     harnessSessionHandoffs.upsert({
@@ -364,12 +591,8 @@ export const codexSessionTransfer: SessionTransferAdapter = {
       ...(warnings.length > 0 ? { warnings } : {}),
     };
   },
-  async cleanup(taskId, harnessId): Promise<void> {
-    const handoff = harnessSessionHandoffs.get(taskId, harnessId, CODEX_SESSION_COLUMN);
-    if (!handoff) return;
-    const harness = harnesses.getByIdOrKind(harnessId);
-    if (harness) await removeCopiedPaths(handoff.copiedPaths, codexHomeFor(harness), "codex");
-    harnessSessionHandoffs.deleteOne(taskId, harnessId, CODEX_SESSION_COLUMN);
+  async cleanup(taskId, harnessId): Promise<string[]> {
+    return cleanupHandoff(taskId, harnessId, CODEX_SESSION_COLUMN, "codex", codexHomeFor);
   },
 };
 
@@ -396,7 +619,9 @@ export function findSessionIdForHarness(
   harnessId: string,
 ): string | null {
   const handoff = harnessSessionHandoffs.get(taskId, harnessId, column);
-  if (handoff) {
+  // A row stamped 0 is a pre-recorded intent whose copy never completed (the
+  // final upsert stamps the real time): never resume it.
+  if (handoff && handoff.createdAt > 0) {
     const own = runs.newestSessionForHarness(taskId, column, harnessId);
     if (!own || handoff.createdAt >= own.startedAt) return handoff.sessionId;
   }
@@ -459,6 +684,8 @@ export function hasPriorSessionForHarness(
 export interface HarnessSessionCopies {
   kind: HarnessStackKind;
   root: string;
+  /** The handoff's recorded session id: every path must name it. */
+  sessionId: string;
   paths: readonly string[];
 }
 
@@ -472,6 +699,7 @@ export function collectHarnessSessionCopies(harnessId: string): HarnessSessionCo
     return {
       kind: codex ? "codex" : "claude-code",
       root: codex ? codexHomeFor(harness) : claudeConfigDirFor(harness),
+      sessionId: handoff.sessionId,
       paths: handoff.copiedPaths,
     };
   });
@@ -484,7 +712,7 @@ export function collectHarnessSessionCopies(harnessId: string): HarnessSessionCo
 export async function removeHarnessSessionCopies(copies: readonly HarnessSessionCopies[]): Promise<void> {
   for (const copy of copies) {
     try {
-      await removeCopiedPaths(copy.paths, copy.root, copy.kind);
+      await removeCopiedPathsDetailed(copy.paths, copy.root, copy.kind, copy.sessionId);
     } catch (err) {
       console.warn("[harness-stacks] removing handoff copies failed:", err);
     }
@@ -494,15 +722,18 @@ export async function removeHarnessSessionCopies(copies: readonly HarnessSession
 /**
  * Remove every copied session file belonging to a task, across all its
  * handoffs. A missing destination harness still drops the row (there is
- * nothing left to resume); a path outside the destination root is ignored.
+ * nothing left to resume). A row whose files could not all be removed (the
+ * account's root changed, say) is kept, and the returned warnings say so.
  */
-export async function cleanupHarnessSessionCopies(taskId: string): Promise<void> {
-  const handoffs = harnessSessionHandoffs.listForTask(taskId);
-  for (const handoff of handoffs) {
+export async function cleanupHarnessSessionCopies(taskId: string): Promise<string[]> {
+  const warnings: string[] = [];
+  for (const handoff of harnessSessionHandoffs.listForTask(taskId)) {
     const adapter = sessionTransferAdapter(handoff.columnName === CODEX_SESSION_COLUMN ? "codex" : "claude-code");
     const harness = harnesses.getByIdOrKind(handoff.harnessId);
-    if (adapter) await adapter.cleanup(taskId, handoff.harnessId);
+    if (adapter) warnings.push(...(await adapter.cleanup(taskId, handoff.harnessId)));
     else if (!harness) harnessSessionHandoffs.deleteOne(taskId, handoff.harnessId, handoff.columnName);
   }
+  for (const warning of warnings) console.warn(`[harness-stacks] ${warning}`);
+  return warnings;
 }
 

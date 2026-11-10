@@ -317,33 +317,40 @@ describe("safe mode and login-bearing config keys", () => {
 describe("handoff copy shapes (review S4)", () => {
   test("Claude: a transcript or a file in a session sidecar folder", () => {
     for (const rel of [
-      "projects/-tmp-x/11111111-1111-4111-8111-111111111111.jsonl",
-      "projects/enc/sid/subagents/agent-1.jsonl",
-      "projects/enc/sid/tool-results/a/b.txt",
-      "projects/enc/sid/mcp-tasks/t.json",
+      "projects/-tmp-x/SID.jsonl",
+      "file-history/SID/abcd1234@v2",
+      "projects/enc/SID/subagents/agent-1.jsonl",
+      "projects/enc/SID/tool-results/a/b.txt",
+      "projects/enc/SID/mcp-tasks/t.json",
     ]) {
-      expect(isHandoffCopyShape("claude-code", rel), rel).toBe(true);
+      expect(isHandoffCopyShape("claude-code", rel, "SID"), rel).toBe(true);
     }
     for (const rel of [
       "settings.json",
       ".credentials.json",
       "projects/enc",
       "projects/enc/.jsonl",
-      "projects/enc/sid.json",
-      "projects/enc/sid/notes.txt",
-      "projects/enc/sid/other/x",
-      "projects/enc/sid/subagents",
+      "projects/enc/other-sid.jsonl",
+      "projects/enc/other-sid/subagents/a.jsonl",
+      "file-history/other-sid/abcd@v1",
+      "file-history/SID",
+      "file-history",
+      "projects/enc/SID.json",
+      "projects/enc/SID/notes.txt",
+      "projects/enc/SID/other/x",
+      "projects/enc/SID/subagents",
       "projects/../x/s.jsonl",
       "projects/enc/../s.jsonl",
       "skills/s/SKILL.md",
       "sessions/2026/11/08/rollout-x.jsonl",
     ]) {
-      expect(isHandoffCopyShape("claude-code", rel), rel).toBe(false);
+      expect(isHandoffCopyShape("claude-code", rel, "SID"), rel).toBe(false);
     }
   });
 
   test("Codex: only sessions/YYYY/MM/DD/rollout-*.jsonl", () => {
-    expect(isHandoffCopyShape("codex", "sessions/2026/11/08/rollout-2026-11-08T00-00-00-t.jsonl")).toBe(true);
+    expect(isHandoffCopyShape("codex", "sessions/2026/11/08/rollout-2026-11-08T00-00-00-SID.jsonl", "SID")).toBe(true);
+    expect(isHandoffCopyShape("codex", "sessions/2026/11/08/rollout-2026-11-08T00-00-00-other.jsonl", "SID")).toBe(false);
     for (const rel of [
       "auth.json",
       "config.toml",
@@ -354,20 +361,20 @@ describe("handoff copy shapes (review S4)", () => {
       "sessions/2026/11/08/sub/rollout-x.jsonl",
       "projects/enc/s.jsonl",
     ]) {
-      expect(isHandoffCopyShape("codex", rel), rel).toBe(false);
+      expect(isHandoffCopyShape("codex", rel, "SID"), rel).toBe(false);
     }
   });
 
   test("prunable folders stay inside the shape", () => {
-    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid")).toBe(true);
-    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid/subagents/nested")).toBe(true);
-    expect(isHandoffPrunableDir("claude-code", "projects/enc")).toBe(false);
-    expect(isHandoffPrunableDir("claude-code", "projects")).toBe(false);
-    expect(isHandoffPrunableDir("claude-code", "projects/enc/sid/other")).toBe(false);
-    expect(isHandoffPrunableDir("codex", "sessions/2026/11/08")).toBe(true);
-    expect(isHandoffPrunableDir("codex", "sessions/2026")).toBe(true);
-    expect(isHandoffPrunableDir("codex", "sessions")).toBe(false);
-    expect(isHandoffPrunableDir("codex", "sessions/archive")).toBe(false);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/SID", "SID")).toBe(true);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/SID/subagents/nested", "SID")).toBe(true);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc", "SID")).toBe(false);
+    expect(isHandoffPrunableDir("claude-code", "projects", "SID")).toBe(false);
+    expect(isHandoffPrunableDir("claude-code", "projects/enc/SID/other", "SID")).toBe(false);
+    expect(isHandoffPrunableDir("codex", "sessions/2026/11/08", "SID")).toBe(true);
+    expect(isHandoffPrunableDir("codex", "sessions/2026", "SID")).toBe(true);
+    expect(isHandoffPrunableDir("codex", "sessions", "SID")).toBe(false);
+    expect(isHandoffPrunableDir("codex", "sessions/archive", "SID")).toBe(false);
   });
 });
 

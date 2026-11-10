@@ -247,8 +247,39 @@ describe("harnessQuotaResetAt", () => {
     reason: null,
   };
 
-  test("returns the earliest future reset of an exhausted snapshot", () => {
-    expect(harnessQuotaResetAt(base, 2000, 5000)).toBe(9000);
+  test("returns the latest reset among the exhausted blocking windows", () => {
+    expect(harnessQuotaResetAt(base, 2000, 5000)).toBe(15_000);
+  });
+
+  test("any blocking window at 100% counts, even with other meters below it", () => {
+    const partial: HarnessQuota = {
+      ...base,
+      meters: [
+        { id: "five_hour", label: "5h", usedPercent: 100, resetsAtMs: 9000 },
+        { id: "seven_day", label: "7d", usedPercent: 40, resetsAtMs: 15_000 },
+        { id: "seven_day_routines", label: "Routines", usedPercent: 0, resetsAtMs: null },
+      ],
+    };
+    expect(harnessQuotaLooksExhausted(partial, 2000, 5000)).toBe(true);
+    expect(harnessQuotaResetAt(partial, 2000, 5000)).toBe(9000);
+  });
+
+  test("weekly_all at 100% counts as a blocking window", () => {
+    const q: HarnessQuota = { ...base, meters: [{ id: "weekly_all", label: "Weekly", usedPercent: 100, resetsAtMs: 9000 }] };
+    expect(harnessQuotaLooksExhausted(q, 2000, 5000)).toBe(true);
+  });
+
+  test("a credits meter at 100 does not block exhaustion", () => {
+    const q: HarnessQuota = { ...base, meters: [...base.meters, { id: "credits", label: "Credits: 0", usedPercent: 100, resetsAtMs: null }] };
+    expect(harnessQuotaLooksExhausted(q, 2000, 5000)).toBe(true);
+  });
+
+  test("a credits or extra-usage meter with headroom keeps the account usable", () => {
+    const withCredits: HarnessQuota = {
+      ...base,
+      meters: [...base.meters, { id: "extra_usage", label: "Extra usage", usedPercent: 10, resetsAtMs: null }],
+    };
+    expect(harnessQuotaLooksExhausted(withCredits, 2000, 5000)).toBe(false);
   });
 
   test("null when nothing definitive says the account is exhausted", () => {
@@ -331,5 +362,26 @@ describe("classifier inputs the fake drivers rely on (CR2)", () => {
       .toBe(new Date(2026, 10, 1, 15, 0, 0, 0).getTime());
     expect(classifyHarnessLimitSignal("codex", { text, now: evening })?.resetAtMs)
       .toBe(new Date(2026, 10, 2, 15, 0, 0, 0).getTime());
+  });
+});
+
+describe("fix-round limit parsing", () => {
+  test("a just-passed time-only reset is null, an older one is tomorrow", () => {
+    const at = (h: number, m: number, sec = 0) => new Date(2026, 10, 9, h, m, sec).getTime();
+    expect(parseClaudeResetNotice("You've hit your limit · resets 3pm", at(15, 0, 30))).toBeNull();
+    const old = parseClaudeResetNotice("You've hit your limit · resets 3pm", at(17, 0));
+    expect(old).toBe(new Date(2026, 10, 10, 15, 0).getTime());
+  });
+
+  test("a Codex per-model limit carries the model; account-wide has none", () => {
+    const perModel = classifyHarnessLimitSignal("codex", {
+      text: "You've hit your usage limit for gpt-5.6-codex. Switch to another model now, or try again at 3:00 PM.",
+      now: new Date(2026, 10, 9, 10, 0).getTime(),
+    });
+    expect(perModel?.reason).toBe("quota");
+    expect(perModel?.model).toBe("gpt-5.6-codex");
+    expect(classifyHarnessLimitSignal("codex", { text: "You've hit your usage limit for GPT-5.6-Codex. Switch." })?.model).toBe("gpt-5.6-codex");
+    const wide = classifyHarnessLimitSignal("codex", { text: "You've hit your usage limit. Upgrade to Plus." });
+    expect(wide?.model).toBeNull();
   });
 });

@@ -243,6 +243,10 @@ describe("084 tables and tasks.harness_state", () => {
       { harness_id: ids[0]!, position: 0 },
       { harness_id: ids[2]!, position: 1 },
     ]);
+    // The membership change bumps the stack's updated_at (optimistic edits).
+    expect(
+      dbm.db.query<{ updated_at: number }, [string]>(`SELECT updated_at FROM harness_stacks WHERE id = ?`).get(stackId)!.updated_at,
+    ).toBeGreaterThan(1);
     dbm.db.run(`DELETE FROM harness_stacks WHERE id = ?`, [stackId]);
     for (const id of [ids[0]!, ids[2]!]) dbm.harnesses.delete(id);
   });

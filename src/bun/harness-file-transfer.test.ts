@@ -258,7 +258,7 @@ describe("rootRedirectRefusal (contract CR4)", () => {
     const parent = realpathSync(mkdtempSync(path.join(tmpdir(), "agetor-cr4-rm-")));
     const root = path.join(parent, "acct-home");
     symlinkSync(path.join(documents, "acct"), root);
-    const removed = await removeCopiedPaths([path.join(root, "projects", "enc", "s.jsonl")], root, "claude-code");
+    const removed = await removeCopiedPaths([path.join(root, "projects", "enc", "s.jsonl")], root, "claude-code", "s");
     expect(removed).toEqual([]);
     expect(readFileSync(recorded, "utf8")).toBe("theirs");
   });

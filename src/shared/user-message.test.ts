@@ -3,6 +3,7 @@ import {
   AGETOR_PASTE_LEAD_IN,
   AGETOR_PASTE_LEAD_INS,
   canonicalizeUserText,
+  cleanRetryParts,
   composeCleanRetryText,
   forkedSkillLabel,
   hasTagSegments,
@@ -1495,6 +1496,33 @@ describe("composeCleanRetryText", () => {
   test("canonicalizes a slash-command twin so it dedupes with the live echo", () => {
     const xml = "<command-message>implement</command-message><command-name>/implement</command-name><command-args>do the thing</command-args>";
     expect(composeCleanRetryText(["/implement do the thing", xml])).toBe("/implement do the thing");
+  });
+
+  test("a non-adjacent echo/twin pair collapses; separate same-text sends survive", () => {
+    const rows = [
+      { data: "P", twin: false },
+      { data: "yes", twin: false },
+      { data: "P", twin: true },
+      { data: "yes", twin: true },
+    ];
+    expect(composeCleanRetryText(rows)).toBe("P\n\nyes");
+    const two = [
+      { data: "yes", twin: false },
+      { data: "yes", twin: true },
+      { data: "yes", twin: false },
+      { data: "yes", twin: true },
+    ];
+    expect(composeCleanRetryText(two)).toBe("yes\n\nyes");
+  });
+
+  test("untagged strings de-duplicate globally; a raw continuation and its paste twin collapse", () => {
+    const wrapped = "<harness-stack-continuation>\nbody\n</harness-stack-continuation>";
+    expect(composeCleanRetryText([wrapped, wrapPastedContent("ef56", wrapped)])).toBe("body");
+    expect(composeCleanRetryText(["yes", "x", "yes"])).toBe("yes\n\nx");
+  });
+
+  test("cleanRetryParts returns the parts, preserving blank lines inside a part", () => {
+    expect(cleanRetryParts(["a\n\nb", "c"])).toEqual(["a\n\nb", "c"]);
   });
 
   test("firstOnly keeps only the turn's first text (sequential-turn harnesses)", () => {

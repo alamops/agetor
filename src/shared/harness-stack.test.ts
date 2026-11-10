@@ -116,7 +116,21 @@ describe("stack positions and the forward walk", () => {
     expect(plan.skipped.map((s) => s.harnessId).sort()).toEqual(["a", "b"]);
   });
 
-  test("a full lap with no recorded reset still retries with a backoff", () => {
+  test("a full lap of expired/uncooled tried members is available now, not a far reset", () => {
+    const plan = pickNextMember({
+      members: [member("a"), member("b")],
+      currentId: "b",
+      tried: ["a", "b"],
+      now: 1000,
+      cooling: (id) => (id === "b" ? { exhaustedUntilMs: 5_000_000 } : { exhaustedUntilMs: 400 }),
+      usable: () => null,
+    });
+    expect(plan.kind).toBe("all-exhausted");
+    if (plan.kind !== "all-exhausted") return;
+    expect(plan.earliestResetAtMs).toBe(1000);
+  });
+
+  test("a full lap with no recorded reset retries now (the caller clamps)", () => {
     const plan = pickNextMember({
       members: [member("a"), member("b")],
       currentId: "b",
@@ -127,7 +141,7 @@ describe("stack positions and the forward walk", () => {
     });
     expect(plan.kind).toBe("all-exhausted");
     if (plan.kind !== "all-exhausted") return;
-    expect(plan.earliestResetAtMs).toBeNull();
+    expect(plan.earliestResetAtMs).toBe(1000);
   });
 
   test("none-usable records every reason and no reset when nothing can reset", () => {
