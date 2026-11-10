@@ -115,3 +115,24 @@ export const mirrorProvenance = {
     db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ?`, [harnessId]);
   },
 };
+
+/** Stamp (in both source columns) of a row whose ownership ended while its
+ *  saved original is still needed: a `preexisted` item stays as the mirror
+ *  last wrote it, and Restore must still be able to put the original back.
+ *  Propagation and deletion skip such a row; a later mirror write that
+ *  re-adopts the item replaces the stamp. No schema change: a real source
+ *  stamp is never negative. */
+export const UNOWNED_STAMP = -1;
+
+export function isUnownedRow(row: MirrorProvenanceRow): boolean {
+  return row.srcMtimeMs === UNOWNED_STAMP && row.srcSize === UNOWNED_STAMP;
+}
+
+/** Distinct harness ids with at least one provenance row (the primary key
+ *  index covers the scan). */
+export function harnessIdsWithProvenance(): string[] {
+  return db
+    .query<{ harness_id: string }, []>(`SELECT DISTINCT harness_id FROM harness_mirror_provenance`)
+    .all()
+    .map((r) => r.harness_id);
+}

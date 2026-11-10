@@ -90,7 +90,7 @@ export function StackBadge({
     : retrying
       ? "Retrying on the next available account…"
       : noUsable
-        ? "No account in this stack can run this task — fix one in Settings"
+        ? "No account in this stack can run this task — fix one in Settings → Harnesses"
         : exhausted
           ? "Every account in this stack is out of quota"
           : pending

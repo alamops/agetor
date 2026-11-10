@@ -61,6 +61,10 @@ export interface FailoverHooks {
    *  live). A manual prepare must leave such a task alone exactly like a live
    *  run (review Q6). Omitted ⇒ never held. */
   isTaskHeld?(taskId: string): boolean;
+  /** A requested "switch to next account" was dropped by the engine (the
+   *  stack was cut to a single account); the orchestrator says why on the
+   *  task's latest run. Omitted ⇒ no status line. */
+  onScheduledSwitchDropped?(taskId: string, line: string): void;
 }
 
 let hooks: FailoverHooks | null = null;
@@ -755,7 +759,11 @@ export async function prepareTaskHarness(
   if (stack.members.length < 2) {
     // A stack cut down to one account may still carry a stale exhausted
     // countdown and armed timer from when it had two: drop both.
+    const hadScheduledSwitch = Boolean(task.harnessState?.scheduledSwitch);
     if (task.harnessState) clearFailoverState(taskId);
+    if (hadScheduledSwitch) {
+      hooks?.onScheduledSwitchDropped?.(taskId, "scheduled account switch dropped — the stack has fewer than two accounts");
+    }
     return { ok: true };
   }
   const member = stack.members.find((m) => m.harnessId === current);

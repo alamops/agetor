@@ -234,6 +234,70 @@ describe("switchTaskAccountNow", () => {
   }, 20_000);
 });
 
+describe("refusals during a swap, retry or launch freeze (review S1, S3)", () => {
+  async function refusalCode(taskId: string): Promise<string | null> {
+    try {
+      await orch.switchTaskAccountNow(taskId);
+      return null;
+    } catch (err) {
+      return (err as InstanceType<typeof orch.SwitchAccountRefusedError>).body.code;
+    }
+  }
+
+  test("an in-flight retry or a limit swap refuses 409 busy and schedules nothing", async () => {
+    const a = alias("busy-a");
+    const b = alias("busy-b");
+    const stack = stacks.harnessStacks.create({ label: "busy", kind: "claude-code", members: [a, b] });
+    const base = { stackId: stack.id, position: 0, count: 2, tried: [] as string[], lastMove: null };
+    const retrying = makeTask(a, "work", { column: "blocked" });
+    db.tasks.setHarnessState(retrying.id, {
+      ...base, pendingSwap: null,
+      allExhausted: { at: Date.now(), attempts: 0, max: 3, nextAttemptAt: 0, earliestResetAtMs: null, reason: "quota", inFlight: true },
+    });
+    expect(await refusalCode(retrying.id)).toBe("busy");
+    expect(db.tasks.get(retrying.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+
+    const swapping = makeTask(a, "work", { column: "running" });
+    const oldRun = insertRun(swapping.id, a, { status: "running", endedAt: null, exitCode: null });
+    db.tasks.update(swapping.id, { runId: oldRun });
+    db.tasks.setHarnessState(swapping.id, {
+      ...base, allExhausted: null,
+      pendingSwap: { from: a, to: b, reason: "quota", runId: oldRun, startedAt: Date.now() },
+    });
+    expect(await refusalCode(swapping.id)).toBe("busy");
+    expect(db.tasks.get(swapping.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+    db.runs.update(oldRun, { status: "failed", endedAt: Date.now() });
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("a launch freeze refuses an idle switch with launches-frozen and blocks the claim", async () => {
+    const a = alias("frozen-a");
+    const b = alias("frozen-b");
+    const stack = stacks.harnessStacks.create({ label: "frozen", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "work", { column: "review" });
+    orch.freezeLaunches();
+    try {
+      expect(await refusalCode(task.id)).toBe("launches-frozen");
+      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(false);
+      expect(db.tasks.get(task.id)!.agent).toBe(a);
+    } finally {
+      orch.__resetLaunchFreezeForTest();
+    }
+    expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+    orch.releaseTaskAccountSwitch(task.id);
+    stacks.harnessStacks.delete(stack.id);
+  });
+
+  test("an archived task is refused with code archived", async () => {
+    const a = alias("arch-a");
+    const b = alias("arch-b");
+    const stack = stacks.harnessStacks.create({ label: "arch", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "work", { column: "review", archivedAt: Date.now() });
+    expect(await refusalCode(task.id)).toBe("archived");
+    stacks.harnessStacks.delete(stack.id);
+  });
+});
+
 describe("boot", () => {
   test("a scheduled switch whose turn ended during downtime is performed", async () => {
     const a = alias("boot-a");

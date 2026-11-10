@@ -3,10 +3,10 @@ import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { ApiError, type AgetorClient } from "../api-client.ts";
-import { defaultModeFor, type Run, type Task } from "../../shared/types.ts";
+import { DEFAULT_MODEL, defaultModeFor, type Run, type Task } from "../../shared/types.ts";
 import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
-import { memberReasonText, memberStateText, stackPositionText } from "../../shared/harness-stack.ts";
-import { coolingText, limitRowsFor } from "../stack-display.ts";
+import { harnessMoveNote, harnessStackBannerMode, memberReasonText, memberStateText, stackPositionText } from "../../shared/harness-stack.ts";
+import { coolingText, limitRowsForModel } from "../stack-display.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import { colorRunStatus } from "./pipeline.ts";
 import { profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
@@ -30,10 +30,16 @@ export function failoverText(
   if (ex.inFlight === true || task.column === "running") {
     return `running on ${accountLabel ?? task.agent} after a quota reset (${attempt})`;
   }
-  if (ex.attempts >= ex.max) return "every account is out of quota — run the task manually after a reset";
-  if (ex.nextAttemptAt > 0) return `waiting until ${new Date(ex.nextAttemptAt).toLocaleString()} (${attempt})`;
-  if (ex.reason !== "no-usable-member") return `retrying on the next available account (${attempt})`;
-  return "no usable account — fix one under Settings → Harnesses (or agetor harness …)";
+  if (ex.reason === "no-usable-member") {
+    if (ex.attempts >= ex.max) return "blocked: no usable account — fix one under Settings → Harnesses (or agetor harness …)";
+    if (ex.nextAttemptAt > 0) {
+      return `blocked: no usable account — retrying at ${new Date(ex.nextAttemptAt).toLocaleString()} (${attempt})`;
+    }
+    return "blocked: no usable account — fix one under Settings → Harnesses (or agetor harness …)";
+  }
+  if (ex.attempts >= ex.max) return "out of quota — run the task manually after a reset";
+  if (ex.nextAttemptAt > 0) return `out of quota — waiting until ${new Date(ex.nextAttemptAt).toLocaleString()} (${attempt})`;
+  return `out of quota — retrying on the next available account (${attempt})`;
 }
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
@@ -78,7 +84,10 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     const pos = stackPositionText(stack, task.agent);
     const position = pos === null ? "" : ` (${pos})`;
     out(`  ${label("stack")} ${escapeFreeText(stack.label)}${position}`);
-    for (const s of limitRowsFor(stacksPayload?.limitStates ?? [], task.agent)) {
+    // Only rows that apply to this task's model: the account-wide row and the
+    // row for its resolved model, never another model's.
+    const taskModel = task.model ?? DEFAULT_MODEL[stack.kind];
+    for (const s of limitRowsForModel(stacksPayload?.limitStates ?? [], task.agent, taskModel)) {
       out(`  ${label("cooling")} ${c.yellow(coolingText(s))}`);
       const msg = memberStateText(s).message;
       if (msg) out(`    ${c.dim(escapeFreeText(msg))}`);
@@ -97,8 +106,9 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   if (hs?.scheduledSwitch) {
     out(`  ${label("switch")} ${c.cyan("switch to the next account scheduled for the end of this turn")} ${c.dim(`(agetor switch-account ${task.id.slice(0, 8)} --cancel to undo)`)}`);
   }
-  if (hs?.lastMove?.reason === "switch-now") {
-    out(`  ${label("switch")} switched to the next account ${c.dim(`(${new Date(hs.lastMove.at).toLocaleString()})`)}`);
+  // Same TTL and precedence as the webview banner.
+  if (hs?.lastMove?.reason === "switch-now" && harnessStackBannerMode(hs) === "moved") {
+    out(`  ${label("switch")} ${escapeFreeText(harnessMoveNote(hs.lastMove, task.agent))} ${c.dim(`(${new Date(hs.lastMove.at).toLocaleString()})`)}`);
   }
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
   if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);

@@ -68,7 +68,9 @@ test("fix-round calls encode ids, carry the query, and the mutating ones are not
     seen.push(`${init?.method ?? "GET"} ${u.replace(/^https?:\/\/[^/]+/, "")}`);
     return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
   }) as unknown as typeof fetch;
-  await api.clearHarnessCooldown("a/b", "m 1");
+  await api.clearHarnessCooldown("a/b", { model: "m 1" });
+  await api.clearHarnessCooldown("a/b", { accountWideOnly: true });
+  await api.clearHarnessCooldown("a/b");
   await api.getHarnessStackHistory("s 1", { limit: 5, before: "c" });
   await api.previewHarnessMirror({ kind: "claude-code", members: ["a", "b"] });
   await api.restoreHarnessMirror("a/b");
@@ -76,6 +78,8 @@ test("fix-round calls encode ids, carry the query, and the mutating ones are not
   await api.cancelScheduledAccountSwitch("t 1");
   expect(seen).toEqual([
     "DELETE /harnesses/a%2Fb/limit-state?model=m%201",
+    "DELETE /harnesses/a%2Fb/limit-state?scope=account",
+    "DELETE /harnesses/a%2Fb/limit-state",
     "GET /harness-stacks/s%201/history?limit=5&before=c",
     "POST /harness-stacks/mirror-preview",
     "POST /harnesses/a%2Fb/mirror-restore",

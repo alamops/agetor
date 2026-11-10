@@ -8166,10 +8166,19 @@ function TaskDetails({
   // Tagged with the task id so another task's panel never inherits it.
   const [switchingAgentFor, setSwitchingAgentFor] = useState<string | null>(null);
   const switchingAgent = switchingAgentFor === task.id;
+  // Cooling marks are time-based: a slow tick lets an expired cooldown drop
+  // off the picker without waiting for `limitStates` to change.
+  const [pickerNow, setPickerNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (limitStates.length === 0) return;
+    setPickerNow(Date.now());
+    const t = setInterval(() => setPickerNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, [limitStates]);
   const pickerOptions = useMemo(
-    () => stackPickerOptions({ task, stacks, harnesses, agents, limitStates, now: Date.now() }),
+    () => stackPickerOptions({ task, stacks, harnesses, agents, limitStates, now: pickerNow }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [task.agent, task.model, stacks, harnesses, agents, limitStates],
+    [task.agent, task.model, stacks, harnesses, agents, limitStates, pickerNow],
   );
 
   const onAgentChange = (nextId: string) => {

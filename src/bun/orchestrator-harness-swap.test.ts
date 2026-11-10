@@ -1165,7 +1165,7 @@ describe("harness-stack swap", () => {
     // and exactly once: the swap window holds the text without writing an
     // optimistic bubble on the displaced run, so the drain's send is the only
     // user event (that duplicate bubble was the review's should-fix).
-    expect(db.runs.mainUserTexts(runs[1]!.id)).toEqual(["follow-up during the limit"]);
+    expect(db.runs.mainUserRows(runs[1]!.id).map((r) => r.data)).toEqual(["follow-up during the limit"]);
     const userBubbles = db.runs
       .listForTask(task.id)
       .flatMap((r) => db.runs.events(r.id))

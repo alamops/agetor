@@ -200,6 +200,16 @@ function coolingCell(states: readonly HarnessLimitState[], harnessId: string): s
   return rows.length === 0 ? "" : c.yellow(rows.map(coolingText).join("; "));
 }
 
+/** The harness id a ref names: an exact id, else the harness of that kind (the
+ *  core resolves `/harnesses/:ref/...` the same way). Falls back to the ref
+ *  itself when the list is unavailable or has no match. */
+async function resolveHarnessId(client: Awaited<ReturnType<typeof getClient>>, ref: string): Promise<string> {
+  if (typeof client.listHarnesses !== "function") return ref;
+  const payload = await client.listHarnesses().catch(() => null);
+  const list = payload?.harnesses ?? [];
+  return (list.find((h) => h.id === ref) ?? list.find((h) => h.kind === ref))?.id ?? ref;
+}
+
 /** `agetor harness cooldown clear <account> [--model <m>]` (D13). */
 async function cmdHarnessCooldown(
   client: Awaited<ReturnType<typeof getClient>>,
@@ -215,11 +225,17 @@ async function cmdHarnessCooldown(
     if (a === "--model") model = flagValue(args, ++i, a);
     else throw new Error(`unknown flag ${escapeControlChars(a)}`);
   }
-  const result = await client.clearHarnessCooldown(id, model);
+  const resolved = await resolveHarnessId(client, id);
+  const result = await client.clearHarnessCooldown(resolved, { model: model ?? null });
   if (flags.json) return printJson(result);
-  const name = escapeControlChars(id);
-  out(`${c.green("✓")} cleared the cooldown on ${c.bold(name)}${model ? ` for ${escapeControlChars(model)}` : ""}`);
-  const left = limitRowsFor(result.limitStates, id);
+  const name = escapeControlChars(resolved);
+  out(
+    `${c.green("✓")} cleared ${model ? "the cooldown" : "every cooldown"} on ${c.bold(name)}` +
+      `${model ? ` for ${escapeControlChars(model)}` : " (pass --model to clear one model's only)"}`,
+  );
+  const rearmed = (result as { rearmed?: number }).rearmed ?? 0;
+  if (rearmed > 0) out(`  re-armed ${rearmed} waiting task(s)`);
+  const left = limitRowsFor(result.limitStates, resolved);
   for (const s of left) out(`  ${c.yellow("still cooling:")} ${coolingText(s)}`);
   if (left.length === 0) out(c.dim(`  no cooldown remains on ${name}`));
   out(c.dim("  the provider may still refuse until its own reset"));
@@ -241,8 +257,9 @@ async function cmdHarnessRestore(
   // A current backup member is re-mirrored on the next swap or stack save, so
   // a restore would be undone: ask first.
   if (!yes) {
+    const resolved = await resolveHarnessId(client, id);
     const { stacks } = await client.listHarnessStacks();
-    const stack = stacks.find((s) => s.members.length >= 2 && s.members.findIndex((m) => m.harnessId === id) >= 1);
+    const stack = stacks.find((s) => s.members.length >= 2 && s.members.findIndex((m) => m.harnessId === resolved) >= 1);
     if (stack) {
       throw new Error(
         `${escapeControlChars(id)} is a backup in stack "${escapeControlChars(stack.label)}": the next mirror will re-apply the primary's config — re-run with --yes to restore anyway`,
@@ -531,7 +548,7 @@ async function cmdHarnessStack(client: Client, args: string[], flags: Flags): Pr
       const stack = await resolveStack(client, ref);
       await client.deleteHarnessStack(stack.id);
       if (flags.json) return printJson({ removed: stack.id });
-      out(`${c.red("✗")} removed stack ${c.bold(escapeControlChars(stack.id))}`);
+      out(`${c.red("✗")} removed stack ${c.bold(escapeControlChars(stack.id))} — its account-switch history is deleted too`);
       return;
     }
     default:

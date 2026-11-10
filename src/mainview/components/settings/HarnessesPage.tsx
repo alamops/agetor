@@ -48,6 +48,7 @@ interface Props {
  */
 export function HarnessesPage(props: Props) {
   const { payload, statusByHarness, usage } = props;
+  const mirrorRestorable = useMemo(() => new Set(payload.mirrorRestorable ?? []), [payload.mirrorRestorable]);
   const stacks = payload.stacks ?? [];
   const limitStates = payload.limitStates ?? [];
   // Cooldown expiry and quota staleness are time-based; a slow tick keeps the
@@ -85,6 +86,7 @@ export function HarnessesPage(props: Props) {
         onToggleProfileMcp={props.onToggleProfileMcp}
         onClearCooldown={props.onClearCooldown}
         onRestore={props.onRestore}
+        restorable={mirrorRestorable.has(h.id)}
       />
     );
   };

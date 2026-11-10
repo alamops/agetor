@@ -17,11 +17,6 @@ export function isExperimentalKind(kind: AgentKind): boolean {
   return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx" || kind === "opencode" || kind === "copilot";
 }
 
-/** Only these kinds have a config mirror to undo. */
-export function canRestoreMirror(kind: AgentKind): boolean {
-  return kind === "claude-code" || kind === "codex";
-}
-
 type HarnessStatusRow = HarnessesPayload["statuses"][number];
 
 // Literal class strings: Tailwind cannot see a `bg-${token}` built at runtime.
@@ -106,6 +101,9 @@ export interface AccountRowProps {
   onToggleProfileMcp: (h: Harness, next: boolean) => void;
   onClearCooldown: (h: Harness, model: string | null) => void;
   onRestore: (h: Harness) => void;
+  /** True only when the account has mirror records to undo (its id is in the
+   *  `/harnesses` payload's `mirrorRestorable`). */
+  restorable: boolean;
 }
 
 /** One account row — the same in a stack card and under "Other accounts". */
@@ -220,7 +218,7 @@ export function AccountRow(props: AccountRowProps) {
             <BarChart3 className="size-4" />
           </Button>
         )}
-        {canRestoreMirror(h.kind) && (
+        {props.restorable && (
           <Button
             size="icon"
             variant="ghost"

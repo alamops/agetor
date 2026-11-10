@@ -685,7 +685,7 @@ export type SwitchAccountResult =
 /** `POST /tasks/:id/switch-account` refusal body (409). */
 export interface SwitchAccountRefusal {
   error: string;
-  code: "no-usable-member" | "background-agents" | "not-in-stack" | "busy";
+  code: "no-usable-member" | "background-agents" | "not-in-stack" | "busy" | "archived" | "launches-frozen";
   reasons?: HarnessMemberReason[];
 }
 

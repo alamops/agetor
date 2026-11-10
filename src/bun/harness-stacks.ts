@@ -1036,13 +1036,20 @@ export const harnessStacks = {
    *    before the limit was recorded must not erase that limit), limited to
    *    the account-wide row and `opts.model`'s row;
    *  - `model` alone: that model's row only. */
-  clearLimitState(harnessId: string, opts: { startedAtMs?: number; model?: string | null } = {}): void {
+  clearLimitState(
+    harnessId: string,
+    opts: { startedAtMs?: number; model?: string | null; accountWideOnly?: boolean } = {},
+  ): void {
     const model = opts.model ? opts.model : "";
     if (opts.startedAtMs !== undefined) {
       db.run(
         `DELETE FROM harness_limit_state WHERE harness_id = ? AND updated_at <= ? AND model IN ('', ?)`,
         [harnessId, opts.startedAtMs, model],
       );
+      return;
+    }
+    if (opts.accountWideOnly) {
+      db.run(`DELETE FROM harness_limit_state WHERE harness_id = ? AND model = ''`, [harnessId]);
       return;
     }
     if (opts.model !== undefined) {

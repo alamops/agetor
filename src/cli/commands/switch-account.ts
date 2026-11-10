@@ -60,12 +60,17 @@ export async function cmdSwitchAccount(args: string[], flags: Flags): Promise<vo
   );
 }
 
-/** A 409 from the route: its message plus one line per member reason. The
- *  central error printer escapes again; escaping here keeps the text safe when
- *  the error is shown another way. */
+/** A 409 from the route. When it carries member reasons the error text already
+ *  embeds them, so print a fixed heading plus one escaped line per reason;
+ *  without reasons print the error itself. The central error printer escapes
+ *  again; escaping here keeps the text safe when shown another way. */
 function refusal(e: ApiError): Error {
   const body = (e.body ?? {}) as { reasons?: HarnessMemberReason[] };
   const reasons = Array.isArray(body.reasons) ? body.reasons : [];
-  const lines = [escapeFreeText(e.message), ...reasons.map((r) => `  - ${escapeFreeText(memberReasonText(r))}`)];
+  if (reasons.length === 0) return new Error(escapeFreeText(e.message));
+  const lines = [
+    "no other account in the stack can take this task:",
+    ...reasons.map((r) => `  - ${escapeFreeText(memberReasonText(r))}`),
+  ];
   return new Error(lines.join("\n"));
 }

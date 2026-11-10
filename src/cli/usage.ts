@@ -214,7 +214,9 @@ export const USAGE: Record<string, string> = {
 
   "harness cooldown": `usage: agetor harness cooldown clear <account> [--model <id>]
 
-  Clear an account's cooldown (all of its rows, or only the one for --model).
+  Clears every cooldown on the account (the account-wide row and every
+  model's); --model clears one model's only. Tasks waiting on the cooldown
+  are re-armed.
   The provider may still refuse until its own reset; the cooldown only stops
   Agetor skipping the account.`,
 
@@ -362,7 +364,8 @@ export const USAGE: Record<string, string> = {
 
   "harness stack rm": `usage: agetor harness stack rm <stack>
 
-  Remove a stack. The accounts themselves are kept.`,
+  Remove a stack. The accounts themselves are kept; the stack's account-switch
+  history is deleted too.`,
 
   "profile add": `usage: agetor profile add <name> --harness <id> --model <id> [--effort <id>] [--mode <id>] [--speed off|fast|ultrafast] [--max-mode|--no-max-mode] [--instructions <text> | --instructions-file <path|-> ] [--skill <name> …]
 

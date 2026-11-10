@@ -1902,3 +1902,153 @@ describe("fix round: wave 2 review fixes (T3)", () => {
     expect(statSync(path.join(backup, "commands", "run.sh")).mode & 0o777).toBe(0o755);
   });
 });
+
+describe("fix round F-B: backup store trust, link restore, deleted originals, account delete", () => {
+  const provs = async () => (await import("./harness-mirror-provenance.ts")).mirrorProvenance;
+  const backupsOf = (id: string) => path.join(dbm.dataDir, "mirror-backups", id);
+
+  test("M2: a planted symlink inside the backup store is never read or unlinked through", async () => {
+    const { primary, backup, b, stack } = claudePair("fb-m2");
+    write(path.join(primary, "skills", "x", "SKILL.md"), "primary skill");
+    write(path.join(backup, "skills", "x", "SKILL.md"), "my own skill");
+    await mirror.mirrorStack(stack, {});
+    expect(readFileSync(path.join(backup, "skills", "x", "SKILL.md"), "utf8")).toBe("primary skill");
+
+    const outside = mkdtempSync(path.join(tmpdir(), "agetor-fb-m2-out-"));
+    write(path.join(outside, "x", "SKILL.md"), "PLANTED DOCUMENTS CONTENT");
+    const { renameSync } = await import("node:fs");
+    renameSync(path.join(backupsOf(b), "files", "skills"), path.join(backupsOf(b), "files", "skills.real"));
+    symlinkSync(outside, path.join(backupsOf(b), "files", "skills"));
+
+    const result = await mirror.restoreMirror(b);
+    // The planted bytes were never copied into the account...
+    expect(readFileSync(path.join(backup, "skills", "x", "SKILL.md"), "utf8")).not.toBe("PLANTED DOCUMENTS CONTENT");
+    expect(result.restored).not.toContain("skills/x/SKILL.md");
+    // ...and nothing outside the store was unlinked.
+    expect(readFileSync(path.join(outside, "x", "SKILL.md"), "utf8")).toBe("PLANTED DOCUMENTS CONTENT");
+  });
+
+  test("M2: removeMirrorBackups refuses a symlinked account directory and never follows links inside", async () => {
+    const { b } = claudePair("fb-m2-rm");
+    const outside = mkdtempSync(path.join(tmpdir(), "agetor-fb-m2-rm-out-"));
+    write(path.join(outside, "keep.txt"), "keep");
+    mkdirSync(path.dirname(backupsOf(b)), { recursive: true });
+    symlinkSync(outside, backupsOf(b));
+    await mirror.removeMirrorBackups(b);
+    expect(readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+    expect(lstatSync(backupsOf(b)).isSymbolicLink()).toBe(true);
+    const { unlinkSync } = await import("node:fs");
+    unlinkSync(backupsOf(b));
+
+    // A link nested inside the tree is unlinked as itself, not followed.
+    mkdirSync(path.join(backupsOf(b), "files"), { recursive: true });
+    symlinkSync(outside, path.join(backupsOf(b), "files", "evil"));
+    await mirror.removeMirrorBackups(b);
+    expect(existsSync(backupsOf(b))).toBe(false);
+    expect(readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+  });
+
+  test("M3: Restore removes an added link and puts a replaced link's original target back", async () => {
+    const { primary, backup, b, stack } = claudePair("fb-m3");
+    const shared = mkdtempSync(path.join(tmpdir(), "agetor-fb-m3-shared-"));
+    write(path.join(shared, "added", "SKILL.md"), "# added");
+    write(path.join(shared, "new", "SKILL.md"), "# new");
+    write(path.join(shared, "old", "SKILL.md"), "# old");
+    mkdirSync(path.join(primary, "skills"), { recursive: true });
+    symlinkSync(path.join(shared, "added"), path.join(primary, "skills", "added"));
+    symlinkSync(path.join(shared, "new"), path.join(primary, "skills", "swapped"));
+    mkdirSync(path.join(backup, "skills"), { recursive: true });
+    symlinkSync(path.join(shared, "old"), path.join(backup, "skills", "swapped"));
+
+    await mirror.mirrorStack(stack, {});
+    expect(lstatSync(path.join(backup, "skills", "added")).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(path.join(backup, "skills", "swapped"))).toBe(realpathSync(path.join(shared, "new")));
+
+    const result = await mirror.restoreMirror(b);
+    expect(existsSync(path.join(backup, "skills", "added"))).toBe(false);
+    expect(readlinkSync(path.join(backup, "skills", "swapped"))).toBe(path.join(shared, "old"));
+    expect(result.removed).toContain("skills/added");
+    expect(result.restored).toContain("skills/swapped");
+    expect((await provs()).list(b)).toEqual([]);
+  });
+
+  test("S1: Restore puts back a preexisted file the account deleted", async () => {
+    const { primary, backup, b, stack } = claudePair("fb-s1");
+    write(path.join(primary, "CLAUDE.md"), "primary\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    await mirror.mirrorStack(stack, {});
+    const { unlinkSync } = await import("node:fs");
+    unlinkSync(path.join(backup, "CLAUDE.md"));
+    const result = await mirror.restoreMirror(b);
+    expect(readFileSync(path.join(backup, "CLAUDE.md"), "utf8")).toBe("mine\n");
+    expect(result.restored).toContain("CLAUDE.md");
+  });
+
+  test("account delete: deleteMirrorStateForHarness leaves no rows or backups, even mid-mirror", async () => {
+    const { primary, backup, b, stack } = claudePair("fb-delete");
+    write(path.join(primary, "CLAUDE.md"), "primary\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    for (let i = 0; i < 150; i++) write(path.join(primary, "skills", `s${i}`, "SKILL.md"), `# ${i}`);
+    const running = mirror.mirrorStack(stack, {});
+    const p = await provs();
+    for (let i = 0; i < 2000 && p.list(b).length === 0; i++) await Bun.sleep(0);
+    dbm.harnesses.delete(b);
+    await mirror.deleteMirrorStateForHarness(b);
+    await running;
+    // The delete was queued behind the mirror in flight, so nothing it wrote survives.
+    await mirror.deleteMirrorStateForHarness(b);
+    expect(p.list(b)).toEqual([]);
+    expect(existsSync(backupsOf(b))).toBe(false);
+    expect((await import("./harness-mirror-provenance.ts")).harnessIdsWithProvenance()).not.toContain(b);
+  });
+
+  test("harnessIdsWithProvenance lists the accounts that have rows", async () => {
+    const { primary, backup, b, stack } = claudePair("fb-ids");
+    write(path.join(primary, "CLAUDE.md"), "primary rules\n");
+    write(path.join(backup, "CLAUDE.md"), "mine\n");
+    await mirror.mirrorStack(stack, {});
+    const ids = (await import("./harness-mirror-provenance.ts")).harnessIdsWithProvenance();
+    expect(ids).toContain(b);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  test("reversibility: a preexisted skill file the primary deleted is still restored", async () => {
+    const { primary, backup, b, stack } = claudePair("fb-rev-file");
+    write(path.join(primary, "skills", "s", "SKILL.md"), "primary");
+    write(path.join(backup, "skills", "s", "SKILL.md"), "mine");
+    await mirror.mirrorStack(stack, {});
+    const { rmSync } = await import("node:fs");
+    rmSync(path.join(primary, "skills", "s"), { recursive: true });
+    await mirror.mirrorStack(stack, {});
+    // Propagation keeps the file (it was the account's own)...
+    expect(readFileSync(path.join(backup, "skills", "s", "SKILL.md"), "utf8")).toBe("primary");
+    // ...but the row and the saved original remain as an un-owned restore pointer.
+    const row = (await provs()).get(b, "skills/s/SKILL.md");
+    expect(row?.preexisted).toBe(true);
+    expect(row?.backupRef).toBeTruthy();
+    // A later mirror that writes the item again re-adopts it without re-backing-up over "mine".
+    write(path.join(primary, "skills", "s", "SKILL.md"), "primary v2");
+    await mirror.mirrorStack(stack, {});
+    expect(readFileSync(path.join(backup, "skills", "s", "SKILL.md"), "utf8")).toBe("primary v2");
+    rmSync(path.join(primary, "skills", "s"), { recursive: true });
+    await mirror.mirrorStack(stack, {});
+
+    const result = await mirror.restoreMirror(b);
+    expect(readFileSync(path.join(backup, "skills", "s", "SKILL.md"), "utf8")).toBe("mine");
+    expect(result.restored).toContain("skills/s/SKILL.md");
+  });
+
+  test("reversibility: a preexisted hook un-owned by safe mode is restored", async () => {
+    const { primary, backup, b, stack } = claudePair("fb-rev-hook");
+    write(path.join(primary, "settings.json"), JSON.stringify({ hooks: { PostToolUse: [{ command: "primary-hook" }] } }));
+    write(path.join(backup, "settings.json"), JSON.stringify({ hooks: { PostToolUse: [{ command: "my-hook" }] } }));
+    await mirror.mirrorStack(stack, {});
+    expect(readFileSync(path.join(backup, "settings.json"), "utf8")).toContain("primary-hook");
+    await mirror.mirrorStack({ ...stack, mirrorMode: "safe" }, {});
+    const result = await mirror.restoreMirror(b);
+    const settings = JSON.parse(readFileSync(path.join(backup, "settings.json"), "utf8"));
+    expect(JSON.stringify(settings.hooks)).toContain("my-hook");
+    expect(JSON.stringify(settings.hooks)).not.toContain("primary-hook");
+    expect(result.restored.some((r) => r.startsWith("settings.json:hooks"))).toBe(true);
+  });
+});

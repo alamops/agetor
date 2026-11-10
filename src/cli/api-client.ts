@@ -678,9 +678,10 @@ export class AgetorClient {
   /** Clear an account's cooldown rows (all, or only `model`'s). */
   clearHarnessCooldown(
     id: string,
-    model?: string,
-  ): Promise<{ cleared: true; limitStates: HarnessLimitState[] }> {
-    const qs = model ? `?model=${encodeURIComponent(model)}` : "";
+    opts?: { model?: string | null; accountWideOnly?: boolean } | string,
+  ): Promise<{ cleared: true; rearmed?: number; limitStates: HarnessLimitState[] }> {
+    const o = typeof opts === "string" ? { model: opts } : opts ?? {};
+    const qs = o.model ? `?model=${encodeURIComponent(o.model)}` : o.accountWideOnly ? "?scope=account" : "";
     return this.req("DELETE", `/harnesses/${encodeURIComponent(id)}/limit-state${qs}`);
   }
   /** `GET /usage` — the latest quota snapshot per account. */

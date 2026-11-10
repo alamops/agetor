@@ -9,6 +9,19 @@ export function limitRowsFor(states: readonly HarnessLimitState[], harnessId: st
   return states.filter((s) => s.harnessId === harnessId);
 }
 
+/** The cooldown rows that apply to a task on `model`: the account-wide row and
+ *  the row for that model (case-insensitive). Other models' rows are left out. */
+export function limitRowsForModel(
+  states: readonly HarnessLimitState[],
+  harnessId: string,
+  model: string | null,
+): HarnessLimitState[] {
+  const want = model?.toLowerCase() ?? null;
+  return limitRowsFor(states, harnessId).filter(
+    (s) => !s.model || (want !== null && s.model.toLowerCase() === want),
+  );
+}
+
 /** `usage limit until <time>[ for <model>]` — the reason and reset of one row,
  *  worded by the shared {@link memberStateText}. Model ids are escaped. */
 export function coolingText(state: HarnessLimitState): string {
@@ -24,10 +37,7 @@ export function isCoolingFor(
   harnessId: string,
   model: string | null,
 ): boolean {
-  const want = model?.toLowerCase() ?? null;
-  return limitRowsFor(states, harnessId).some(
-    (s) => !s.model || (want !== null && s.model.toLowerCase() === want),
-  );
+  return limitRowsForModel(states, harnessId, model).length > 0;
 }
 
 /** What `ls` and the TUI header flag about a task's stack state, one rule for
@@ -36,6 +46,9 @@ export function isCoolingFor(
 export interface StackMarkers {
   cooling: boolean;
   exhausted: "out of quota" | "blocked: no usable account" | null;
+  /** The retry run is running (or being spawned): `retrying (attempt n/m)`.
+   *  Replaces `exhausted`, and does not suppress `cooling`. */
+  retrying: string | null;
   scheduledSwitch: boolean;
 }
 
@@ -45,12 +58,15 @@ export function stackMarkers(
   limitStates: readonly HarnessLimitState[],
 ): StackMarkers {
   const hs = task.harnessState;
-  const exhausted = hs?.allExhausted
-    ? (hs.allExhausted.reason === "no-usable-member" ? "blocked: no usable account" : "out of quota")
+  const ex = hs?.allExhausted ?? null;
+  const live = ex !== null && (ex.inFlight === true || task.column === "running");
+  const retrying = ex && live ? `retrying (attempt ${Math.min(ex.attempts + 1, ex.max)}/${ex.max})` : null;
+  const exhausted = ex && !live
+    ? (ex.reason === "no-usable-member" ? "blocked: no usable account" : "out of quota")
     : null;
   const cooling = !exhausted && stack !== undefined && task.column !== "done"
     && isCoolingFor(limitStates, task.agent, task.model ?? DEFAULT_MODEL[stack.kind]);
-  return { cooling, exhausted, scheduledSwitch: Boolean(hs?.scheduledSwitch) };
+  return { cooling, exhausted, retrying, scheduledSwitch: Boolean(hs?.scheduledSwitch) };
 }
 
 function ageText(ms: number): string {

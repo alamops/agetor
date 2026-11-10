@@ -196,6 +196,17 @@ describe("harnessStacks", () => {
     expect(safe.warnings.map((w) => w.code)).not.toContain("full-mirror-hooks");
   });
 
+  test("clearLimitState accountWideOnly leaves per-model rows", () => {
+    stacks.harnessStacks.clearLimitState("stack-a");
+    const base = { reason: "quota" as const, resetAtMs: Date.now() + 60_000, message: "m", source: "claude-api-error" as const };
+    stacks.harnessStacks.setLimitState("stack-a", base);
+    stacks.harnessStacks.setLimitState("stack-a", { ...base, model: "m1" });
+    stacks.harnessStacks.clearLimitState("stack-a", { accountWideOnly: true });
+    const left = stacks.harnessStacks.listLimitStates().filter((l) => l.harnessId === "stack-a");
+    expect(left.map((l) => l.model)).toEqual(["m1"]);
+    stacks.harnessStacks.clearLimitState("stack-a");
+  });
+
   test("cooldown upsert, isCooling, prune and clear", () => {
     stacks.harnessStacks.clearLimitState("stack-a");
     const now = 1_000_000;

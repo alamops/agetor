@@ -1053,6 +1053,61 @@ describe("fix-round routes: cooldown clear, history, preview, restore, switch, c
     expect((all.body.limitStates as { harnessId: string }[]).some((r) => r.harnessId === "api-x")).toBe(false);
   });
 
+  test("DELETE /harnesses/:id/limit-state?scope=account clears only the account-wide row; the response carries rearmed", async () => {
+    const { harnessStacks } = await import("./harness-stacks.ts");
+    const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "limit", resetAtMs: Date.now() + 3_600_000 };
+    harnessStacks.setLimitState("api-x", base);
+    harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
+    const res = await call("DELETE", "/harnesses/api-x/limit-state?scope=account");
+    expect(res.status).toBe(200);
+    expect(typeof res.body.rearmed).toBe("number");
+    const left = (res.body.limitStates as { harnessId: string; model: string | null }[]).filter((r) => r.harnessId === "api-x");
+    expect(left.map((r) => r.model)).toEqual(["gpt-x"]);
+    await call("DELETE", "/harnesses/api-x/limit-state");
+  });
+
+  test("GET /harnesses lists accounts with mirror records; deleting the account drops them", async () => {
+    const id = `api-mr-${randomUUID().slice(0, 6)}`;
+    const home = path.join(DATA_DIR, "homes", id);
+    mkdirSync(home, { recursive: true });
+    db.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+    db.db.run(
+      `INSERT INTO harness_mirror_provenance (harness_id, stack_id, scope, path, key, preexisted, updated_at)
+       VALUES (?, NULL, 'file', 'settings.json', '', 0, ?)`,
+      [id, Date.now()],
+    );
+    const listed = await call("GET", "/harnesses");
+    expect(listed.body.mirrorRestorable as string[]).toContain(id);
+    expect((await call("DELETE", `/harnesses/${id}`)).status).toBe(204);
+    const count = db.db.query("SELECT COUNT(*) AS n FROM harness_mirror_provenance WHERE harness_id = ?").get(id) as { n: number };
+    expect(count.n).toBe(0);
+    expect((await call("GET", "/harnesses")).body.mirrorRestorable as string[]).not.toContain(id);
+  }, 30_000);
+
+  test.skipIf(IS_ROOT)("a CLI-token mirror-preview is path-gated BEFORE validation: a protected root answers 403, not the validator's 400", async () => {
+    const cliToken = (await import("./api-config.ts")).CLI_TOKEN;
+    const id = `api-mp-${randomUUID().slice(0, 6)}`;
+    const home = path.join(DATA_DIR, "homes", id);
+    const lockedParent = mkdtempSync(path.join(tmpdir(), "agetor-mp-"));
+    const target = path.join(lockedParent, "acct");
+    mkdirSync(target);
+    chmodSync(target, 0o300);
+    symlinkSync(target, home);
+    db.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+    try {
+      // A duplicate member is a validator blocker (400) if validation ran first.
+      const res = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [id, id] }, cliToken);
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("path-not-accessible");
+      // The app caller is never gated and still gets the validator's answer.
+      const app = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [id, id] });
+      expect(app.status).toBe(400);
+    } finally {
+      chmodSync(target, 0o700);
+      db.harnesses.delete(id);
+    }
+  });
+
   test("GET /harness-stacks/:id/history: 404 unknown, empty page for a fresh stack", async () => {
     expect((await call("GET", "/harness-stacks/nope/history")).status).toBe(404);
     const created = await call("POST", "/harness-stacks", { label: "History", kind: "claude-code", members: ["api-a", "api-b"], mirrorMode: "safe" });
@@ -1089,7 +1144,7 @@ describe("fix-round routes: cooldown clear, history, preview, restore, switch, c
     const archived = seedTaskRow({ archivedAt: Date.now() });
     const refused = await call("POST", `/tasks/${archived}/switch-account`);
     expect(refused.status).toBe(409);
-    expect(refused.body).toEqual({ error: "this task is archived", code: "not-in-stack" });
+    expect(refused.body).toEqual({ error: "this task is archived", code: "archived" });
   });
 
   test("PATCH /harness-stacks/:id with a stale expectedUpdatedAt answers 409 stack-changed with the stored stack", async () => {

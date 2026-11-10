@@ -752,6 +752,7 @@ function Detail({
         <Text color={columnColor(task.column)}>{task.column}</Text>
         {account ? <Text dimColor> · {escapeControlChars(account)}</Text> : null}
         {markers.exhausted ? <Text color="yellow"> · {markers.exhausted}</Text> : null}
+        {markers.retrying ? <Text color="yellow"> · {markers.retrying}</Text> : null}
         {markers.cooling ? <Text color="yellow"> · ⏳ cooling</Text> : null}
         {markers.scheduledSwitch ? (
           <Text color="cyan"> · ⇄ switching to the next account at the end of this turn</Text>

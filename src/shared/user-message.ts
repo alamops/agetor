@@ -1049,7 +1049,7 @@ export function canonicalizeUserText(text: string): string {
 
 /**
  * Rebuild the text a harness-stack clean retry should send on a fresh session
- * from a run's main-stream `user` events, oldest first (`runs.mainUserTexts`).
+ * from a run's main-stream `user` events, oldest first (`runs.mainUserRows`).
  *
  * One send can be stored twice — the orchestrator's live echo (plain) and the
  * CLI's JSONL twin (claude wraps a slash command in `<command-name>` XML and a

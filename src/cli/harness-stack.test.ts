@@ -276,7 +276,7 @@ test("stack history: one escaped line per event, cursor line, --json", async () 
 test("harness cooldown clear calls the client and warns the provider may still refuse", async () => {
   const seen: unknown[] = [];
   const left: HarnessLimitState = { harnessId: "a", reason: "quota", source: "claude-pane", message: null, exhaustedUntilMs: 5, updatedAt: 1, model: "opus" };
-  currentClient = { clearHarnessCooldown: async (id: string, m?: string) => { seen.push([id, m]); return { cleared: true as const, limitStates: [left] }; } } as unknown as AgetorClient;
+  currentClient = { clearHarnessCooldown: async (id: string, o?: { model?: string | null }) => { seen.push([id, o?.model]); return { cleared: true as const, limitStates: [left] }; } } as unknown as AgetorClient;
   await cmdHarness(["cooldown", "clear", "a", "--model", "sonnet"], flags);
   expect(seen[0]).toEqual(["a", "sonnet"]);
   const text = outputs.join("\n");
@@ -411,6 +411,14 @@ test("agentCell: cooling, out of quota, blocked, scheduled markers; one-member s
   expect(agentCell(exhausted("quota"), byHarness, [cool])).toContain("out of quota");
   expect(agentCell(exhausted("quota"), byHarness, [cool])).not.toContain("⏳");
   expect(agentCell(exhausted("no-usable-member"), byHarness, [])).toContain("blocked: no usable account");
+  // the retry run is live: retrying marker, cooling kept
+  const live = exhausted("quota");
+  live.harnessState!.allExhausted!.inFlight = true;
+  const liveCell = agentCell(live, byHarness, [cool]);
+  expect(liveCell).toContain("retrying (attempt 1/3)");
+  expect(liveCell).toContain("⏳");
+  expect(liveCell).not.toContain("out of quota");
+  expect(agentCell({ ...exhausted("quota"), column: "running" }, byHarness, [])).toContain("retrying (attempt 1/3)");
 
   const scheduled = makeTask({
     agent: "a",
@@ -454,9 +462,10 @@ test("switch-account: a 409 prints the error and each escaped reason, and throws
   });
   const err = await cmdSwitchAccount(["abcdefgh"], flags).then(() => null, (e: Error) => e);
   expect(err).not.toBeNull();
-  expect(err!.message).toContain("no account can take this task");
+  expect(err!.message).toContain("no other account in the stack can take this task:");
+  expect(err!.message).not.toContain("no account can take this task");
+  expect(err!.message.match(/cooling until 15:00/g)?.length).toBe(1);
   expect(err!.message).toContain("- A");
-  expect(err!.message).toContain("cooling until 15:00");
   expect(err!.message).toContain("- C: logged out");
   expect(err!.message).not.toContain("\u001b");
 });
@@ -494,4 +503,25 @@ test("edit --agent: the transport 'may have gone through' message is surfaced un
   await expect(cmdEdit(["abcdefgh", "--agent", "b"], flags)).rejects.toThrow(
     "stop the run before switching accounts — or run 'agetor switch-account abcdefgh' to schedule the switch for the end of the turn",
   );
+});
+
+test("harness cooldown clear by kind alias filters leftovers by the resolved id and reports re-armed tasks; restore by alias asks for --yes", async () => {
+  const left: HarnessLimitState = { harnessId: "claude-b", reason: "quota", source: "claude-pane", message: null, exhaustedUntilMs: 5, updatedAt: 1, model: "opus" };
+  const seen: unknown[] = [];
+  currentClient = {
+    listHarnesses: async () => ({ harnesses: [{ id: "claude-b", kind: "claude-code" }], statuses: [] }),
+    clearHarnessCooldown: async (id: string, o?: { model?: string | null }) => { seen.push([id, o?.model]); return { cleared: true as const, limitStates: [left], rearmed: 2 }; },
+  } as unknown as AgetorClient;
+  outputs.length = 0;
+  await cmdHarness(["cooldown", "clear", "claude-code"], flags);
+  expect(seen[0]).toEqual(["claude-b", null]);
+  const text = outputs.join("\n");
+  expect(text).toContain("still cooling:");
+  expect(text).not.toContain("no cooldown remains");
+  expect(text).toContain("re-armed 2 waiting task(s)");
+  expect(text).toContain("every cooldown");
+
+  currentClient = fakeClient({ restoreHarnessMirror: async () => { throw new Error("must not run"); } }).client;
+  (currentClient as unknown as { listHarnesses: unknown }).listHarnesses = async () => ({ harnesses: [{ id: "b", kind: "claude-code" }], statuses: [] });
+  await expect(cmdHarness(["restore", "claude-code"], flags)).rejects.toThrow(/next mirror will re-apply/);
 });

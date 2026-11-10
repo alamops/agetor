@@ -16,25 +16,37 @@
  * 0600 and are removed with the account.
  *
  * Nothing here trusts a provenance row: refs are recomputed from the harness id
- * and the relative path, never taken from a row's text.
+ * and the relative path, never taken from a row's text. Nor does it trust the
+ * directory tree: the data dir is agent-writable, so every access resolves its
+ * ref through {@link resolveBackupPath}, which lstats each component from
+ * `mirror-backups/` down and treats a symlink or non-directory parent as
+ * missing (it never follows one). Reads open no-follow handles and are
+ * asynchronous; removal walks the tree cooperatively without following links.
  */
-import { closeSync, fstatSync, lstatSync, mkdirSync, readSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync } from "node:fs";
+import { lstat, open, readdir, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { assertSafeRelPath, atomicWriteFile, copyRegularFileDetailed } from "./harness-file-transfer.ts";
 import { dataDir } from "./db.ts";
-import { openReadNoFollow } from "./no-follow.ts";
+import { READ_NOFOLLOW } from "./no-follow.ts";
 import { isSafePathSegment } from "../shared/harness-mirror.ts";
 
 /** Largest file a backup will hold (matches the mirror's own merged-file cap
  *  scaled up for a skill's bundled assets). */
 const MAX_BACKUP_BYTES = 64 * 1024 * 1024;
 
+const YIELD_EVERY_MS = 20;
+
 function backupsRoot(): string {
   return path.join(dataDir, "mirror-backups");
 }
 
-function harnessDir(harnessId: string): string {
+function assertSafeId(harnessId: string): void {
   if (!isSafePathSegment(harnessId)) throw new Error("invalid account id for a mirror backup");
+}
+
+function harnessDir(harnessId: string): string {
+  assertSafeId(harnessId);
   return path.join(backupsRoot(), harnessId);
 }
 
@@ -58,29 +70,29 @@ function ensureBackupDir(dir: string): void {
   }
 }
 
-function exists(p: string): boolean {
-  try {
-    lstatSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** The ref (relative to the mirror-backups directory) of a file original. */
 export function fileBackupRef(harnessId: string, rel: string): string {
+  assertSafeId(harnessId);
   assertSafeRelPath(rel);
   return `${harnessId}/files/${rel}`;
 }
 
 function linkBackupRef(harnessId: string, rel: string): string {
+  assertSafeId(harnessId);
   assertSafeRelPath(rel);
   return `${harnessId}/links/${rel}`;
 }
 
 function keyBackupRef(harnessId: string, file: string): string {
+  assertSafeId(harnessId);
   assertSafeRelPath(file);
   return `${harnessId}/keys/${encodeURIComponent(file)}.json`;
+}
+
+function modeRef(harnessId: string, rel: string): string {
+  assertSafeId(harnessId);
+  assertSafeRelPath(rel);
+  return `${harnessId}/modes/${rel}`;
 }
 
 function absForRef(ref: string): string {
@@ -90,26 +102,74 @@ function absForRef(ref: string): string {
   return abs;
 }
 
-function readBounded(p: string, maxBytes: number): Buffer {
-  const fd = openReadNoFollow(p, { maxBytes });
-  try {
-    const size = Math.min(fstatSync(fd).size, maxBytes);
-    const buf = Buffer.allocUnsafe(size);
-    let read = 0;
-    while (read < size) {
-      const n = readSync(fd, buf, read, size - read, read);
-      if (n <= 0) break;
-      read += n;
+/**
+ * Resolve a ref to an absolute path AND verify the chain from the data dir is
+ * plain: `mirror-backups/` and every parent directory of the leaf must be a
+ * real directory (a missing one is fine: nothing is there). Returns null, with
+ * a warning, when a component is a symlink or not a directory. The leaf itself
+ * is the caller's business (reads open it no-follow; an unlink or atomic
+ * rename only ever touches the link, never its target). Throws on a ref that
+ * escapes the store.
+ */
+function resolveBackupPath(ref: string): string | null {
+  const abs = absForRef(ref);
+  const rel = path.relative(backupsRoot(), abs);
+  const parts = rel.split(path.sep).filter(Boolean);
+  let cur = backupsRoot();
+  const chain = [cur];
+  for (const part of parts.slice(0, -1)) {
+    cur = path.join(cur, part);
+    chain.push(cur);
+  }
+  for (const dir of chain) {
+    let st;
+    try {
+      st = lstatSync(dir);
+    } catch {
+      return abs;
     }
-    return buf.subarray(0, read);
-  } finally {
-    closeSync(fd);
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      console.warn(`[harness-mirror] a mirror backup path goes through a non-directory (${path.basename(dir)}) — treated as missing`);
+      return null;
+    }
+  }
+  return abs;
+}
+
+/** Like {@link resolveBackupPath}, but a write needs a usable path. */
+function resolveForWrite(ref: string): string {
+  const abs = resolveBackupPath(ref);
+  if (abs === null) throw new Error("refusing a backup path through a symlink or non-directory");
+  return abs;
+}
+
+function exists(p: string | null): boolean {
+  if (p === null) return false;
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
   }
 }
 
-function modeRef(harnessId: string, rel: string): string {
-  assertSafeRelPath(rel);
-  return `${harnessId}/modes/${rel}`;
+async function readBounded(p: string, maxBytes: number): Promise<Buffer> {
+  const handle = await open(p, READ_NOFOLLOW);
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) throw new Error(`not a regular file: ${p}`);
+    if (st.size > maxBytes) throw new Error("file too large");
+    const buf = Buffer.allocUnsafe(st.size);
+    let read = 0;
+    while (read < buf.length) {
+      const { bytesRead } = await handle.read(buf, read, buf.length - read, read);
+      if (bytesRead <= 0) break;
+      read += bytesRead;
+    }
+    return buf.subarray(0, read);
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -128,13 +188,13 @@ export async function backupFileOriginal(
   opts: { force?: boolean } = {},
 ): Promise<string> {
   const ref = fileBackupRef(harnessId, rel);
-  const dest = absForRef(ref);
+  const dest = resolveForWrite(ref);
   if (!opts.force && exists(dest)) return ref;
   const st = lstatSync(src);
   if (!st.isFile()) throw new Error(`not a regular file: ${src}`);
   ensureBackupDir(path.dirname(dest));
   await copyRegularFileDetailed(src, dest, { root: dataDir, maxBytes: MAX_BACKUP_BYTES });
-  const modePath = absForRef(modeRef(harnessId, rel));
+  const modePath = resolveForWrite(modeRef(harnessId, rel));
   ensureBackupDir(path.dirname(modePath));
   // Permission bits only: never a setuid/setgid/sticky bit.
   await atomicWriteFile(modePath, (st.mode & 0o777).toString(8), { mode: 0o600 });
@@ -142,9 +202,11 @@ export async function backupFileOriginal(
 }
 
 /** The saved permission bits of a file original, or null. */
-export function readBackupMode(harnessId: string, rel: string): number | null {
+export async function readBackupMode(harnessId: string, rel: string): Promise<number | null> {
   try {
-    const text = readBounded(absForRef(modeRef(harnessId, rel)), 16).toString("utf8").trim();
+    const abs = resolveBackupPath(modeRef(harnessId, rel));
+    if (abs === null) return null;
+    const text = (await readBounded(abs, 16)).toString("utf8").trim();
     return /^[0-7]{1,4}$/.test(text) ? parseInt(text, 8) & 0o777 : null;
   } catch {
     return null;
@@ -160,7 +222,7 @@ export async function backupLinkOriginal(
   opts: { force?: boolean } = {},
 ): Promise<string> {
   const ref = linkBackupRef(harnessId, rel);
-  const dest = absForRef(ref);
+  const dest = resolveForWrite(ref);
   if (!opts.force && exists(dest)) return ref;
   ensureBackupDir(path.dirname(dest));
   await atomicWriteFile(dest, target, { mode: 0o600 });
@@ -181,8 +243,8 @@ export async function backupKeyOriginal(
   opts: { force?: boolean } = {},
 ): Promise<string> {
   const ref = keyBackupRef(harnessId, file);
-  const dest = absForRef(ref);
-  const existing = readKeyFile(dest);
+  const dest = resolveForWrite(ref);
+  const existing = await readKeyFile(dest);
   if (!opts.force && Object.prototype.hasOwnProperty.call(existing, keyPath)) return ref;
   const next: Record<string, unknown> = { ...existing };
   Object.defineProperty(next, keyPath, { value, enumerable: true, writable: true, configurable: true });
@@ -191,13 +253,23 @@ export async function backupKeyOriginal(
   return ref;
 }
 
-function readKeyFile(dest: string): Record<string, unknown> {
-  if (!exists(dest)) return {};
+async function readKeyFile(dest: string | null): Promise<Record<string, unknown>> {
+  if (dest === null || !exists(dest)) return {};
   try {
-    const parsed = JSON.parse(readBounded(dest, MAX_BACKUP_BYTES).toString("utf8"));
+    const parsed = JSON.parse((await readBounded(dest, MAX_BACKUP_BYTES)).toString("utf8"));
     return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
   } catch {
     return {};
+  }
+}
+
+async function unlinkSafe(ref: string): Promise<void> {
+  const abs = resolveBackupPath(ref);
+  if (abs === null) return;
+  try {
+    await unlink(abs);
+  } catch {
+    // Not there.
   }
 }
 
@@ -205,66 +277,49 @@ function readKeyFile(dest: string): Record<string, unknown> {
  * Delete the saved original behind a provenance row that is being dropped, so
  * no orphan can shadow a later original. Never throws.
  */
-export function removeBackupEntry(harnessId: string, scope: "file" | "key" | "link", p: string, key: string): void {
+export async function removeBackupEntry(harnessId: string, scope: "file" | "key" | "link", p: string, key: string): Promise<void> {
   try {
     if (scope === "file") {
-      for (const ref of [fileBackupRef(harnessId, p), modeRef(harnessId, p)]) {
-        try {
-          unlinkSync(absForRef(ref));
-        } catch {
-          // Not there.
-        }
-      }
+      await unlinkSafe(fileBackupRef(harnessId, p));
+      await unlinkSafe(modeRef(harnessId, p));
     } else if (scope === "link") {
-      try {
-        unlinkSync(absForRef(linkBackupRef(harnessId, p)));
-      } catch {
-        // Not there.
-      }
+      await unlinkSafe(linkBackupRef(harnessId, p));
     } else {
-      const dest = absForRef(keyBackupRef(harnessId, p));
-      const existing = readKeyFile(dest);
+      const dest = resolveBackupPath(keyBackupRef(harnessId, p));
+      if (dest === null) return;
+      const existing = await readKeyFile(dest);
       if (!Object.prototype.hasOwnProperty.call(existing, key)) return;
       const next = { ...existing };
       delete next[key];
-      if (Object.keys(next).length === 0) unlinkSync(dest);
-      else rewriteSync(dest, next);
+      if (Object.keys(next).length === 0) await unlink(dest);
+      else await atomicWriteFile(dest, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
     }
   } catch {
     // Best effort: an orphan is overwritten by the next forced backup.
   }
 }
 
-function rewriteSync(dest: string, value: Record<string, unknown>): void {
-  const tmp = `${dest}.tmp-${process.pid}`;
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmp, dest);
-}
-
-/** The bytes of a file or link backup, or null when it does not exist. */
-export function readBackup(ref: string): Buffer | null {
-  let abs: string;
+/** The bytes of a file or link backup, or null when it does not exist or its
+ *  path is not a plain chain. */
+export async function readBackup(ref: string): Promise<Buffer | null> {
   try {
-    abs = absForRef(ref);
-  } catch {
-    return null;
-  }
-  try {
-    return readBounded(abs, MAX_BACKUP_BYTES);
+    const abs = resolveBackupPath(ref);
+    if (abs === null) return null;
+    return await readBounded(abs, MAX_BACKUP_BYTES);
   } catch {
     return null;
   }
 }
 
 /** The saved original of one key, or `{ found: false }`. */
-export function readKeyBackup(harnessId: string, file: string, keyPath: string): { found: true; value: unknown } | { found: false } {
-  let dest: string;
+export async function readKeyBackup(harnessId: string, file: string, keyPath: string): Promise<{ found: true; value: unknown } | { found: false }> {
+  let dest: string | null;
   try {
-    dest = absForRef(keyBackupRef(harnessId, file));
+    dest = resolveBackupPath(keyBackupRef(harnessId, file));
   } catch {
     return { found: false };
   }
-  const all = readKeyFile(dest);
+  const all = await readKeyFile(dest);
   if (!Object.prototype.hasOwnProperty.call(all, keyPath)) return { found: false };
   return { found: true, value: all[keyPath] };
 }
@@ -274,19 +329,51 @@ export function linkRef(harnessId: string, rel: string): string {
   return linkBackupRef(harnessId, rel);
 }
 
+/**
+ * Remove a directory tree without following a link: a symlink (to a file or a
+ * directory) is unlinked as itself, a directory is emptied and removed. Yields
+ * every ~20 ms so a large store never blocks the main thread.
+ */
+async function removeTreeNoFollow(dir: string, state: { last: number }): Promise<void> {
+  const before = await lstat(dir);
+  if (before.isSymbolicLink() || !before.isDirectory()) return;
+  const names = await readdir(dir);
+  // The directory must still be the one that was checked, not swapped for a
+  // link to somewhere else between the lstat and the listing.
+  const after = await lstat(dir);
+  if (after.isSymbolicLink() || after.ino !== before.ino || after.dev !== before.dev) return;
+  for (const name of names) {
+    if (Date.now() - state.last >= YIELD_EVERY_MS) {
+      await Bun.sleep(0);
+      state.last = Date.now();
+    }
+    const child = path.join(dir, name);
+    const st = await lstat(child);
+    if (st.isDirectory() && !st.isSymbolicLink()) await removeTreeNoFollow(child, state);
+    else await unlink(child);
+  }
+  await rmdir(dir);
+}
+
 /** Remove every saved original of one account (account delete, or a clean
- *  Restore). Refuses a symlinked directory; never throws. */
-export function removeMirrorBackups(harnessId: string): void {
+ *  Restore). Refuses a symlinked `mirror-backups/` or `<id>`; cooperative and
+ *  never follows a link; never throws. */
+export async function removeMirrorBackups(harnessId: string): Promise<void> {
   let dir: string;
   try {
     dir = harnessDir(harnessId);
-    const st = lstatSync(dir);
-    if (st.isSymbolicLink() || !st.isDirectory()) return;
+    for (const p of [backupsRoot(), dir]) {
+      const st = await lstat(p);
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        console.warn("[harness-mirror] mirror backup directory is a symlink or not a directory — not removed");
+        return;
+      }
+    }
   } catch {
     return;
   }
   try {
-    rmSync(dir, { recursive: true, force: true });
+    await removeTreeNoFollow(dir, { last: Date.now() });
   } catch {
     // Best effort: a leftover backup is inert (nothing reads it without a row).
   }

@@ -472,7 +472,7 @@ test("show: a stacked task prints its stack position and an awaiting-reset failo
 
   const rendered = outputs.join("\n");
   expect(rendered).toContain("stack: Claude train (2/2)");
-  expect(rendered).toContain("failover: waiting until");
+  expect(rendered).toContain("failover: out of quota — waiting until");
   expect(rendered).toContain("(attempt 2/3)");
 });
 
@@ -571,13 +571,14 @@ test("show: not running and no timer still reads as retrying (pre-spawn window)"
 
   await cmdShow([TASK_ID], flags);
 
-  expect(outputs.join("\n")).toContain("failover: retrying on the next available account (attempt 2/3)");
+  expect(outputs.join("\n")).toContain("failover: out of quota — retrying on the next available account (attempt 2/3)");
 });
 
 test("show: a blocked stack prints the earliest reset, each member reason, the Harnesses pointer, and the cooling message (D14/D23)", async () => {
   outputs.length = 0;
   const reset = Date.now() + 3_600_000;
   const t = exhaustedTask({ column: "blocked", inFlight: false, attempts: 3 });
+  t.model = "opus";
   t.harnessState!.allExhausted = {
     ...t.harnessState!.allExhausted!,
     reason: "no-usable-member",
@@ -596,6 +597,14 @@ test("show: a blocked stack prints the earliest reset, each member reason, the H
         exhaustedUntilMs: reset,
         updatedAt: 1,
         model: "opus",
+      }, {
+        harnessId: "claude-b",
+        reason: "quota",
+        source: "claude-pane",
+        message: null,
+        exhaustedUntilMs: reset,
+        updatedAt: 1,
+        model: "other-model",
       }],
     }),
   });
@@ -610,6 +619,7 @@ test("show: a blocked stack prints the earliest reset, each member reason, the H
   expect(rendered).toContain("logged out");
   expect(rendered).toContain("cooling: usage limit until");
   expect(rendered).toContain("for opus");
+  expect(rendered).not.toContain("other-model");
   expect(rendered).toContain("You've hit your limit");
   expect(rendered).not.toContain("\u001b");
 });
@@ -634,8 +644,13 @@ test("show: a scheduled switch and a switch-now move read in words", async () =>
   expect(outputs.join("\n")).toContain("switch-account");
 
   outputs.length = 0;
-  t.harnessState = { ...t.harnessState!, scheduledSwitch: null, lastMove: { from: "a", to: "b", at: 1, reason: "switch-now" } };
+  t.harnessState = { ...t.harnessState!, scheduledSwitch: null, lastMove: { from: "a", to: "b", at: Date.now(), reason: "switch-now" } };
   currentClient = makeClient(t, {});
   await cmdShow([TASK_ID], flags);
-  expect(outputs.join("\n")).toContain("switched to the next account");
+  expect(outputs.join("\n")).toContain("Switched to the next account");
+  // past the banner TTL the note is gone
+  outputs.length = 0;
+  t.harnessState = { ...t.harnessState!, lastMove: { from: "a", to: "b", at: 1, reason: "switch-now" } };
+  await cmdShow([TASK_ID], flags);
+  expect(outputs.join("\n")).not.toContain("Switched to the next account");
 });

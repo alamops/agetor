@@ -25,9 +25,23 @@ type StackRow = {
   created_at: number;
   updated_at: number;
 };
+type ProvenanceRow = {
+  harness_id: string;
+  stack_id: string | null;
+  scope: string;
+  path: string;
+  key: string;
+  value_hash: string | null;
+  src_mtime_ms: number | null;
+  src_size: number | null;
+  preexisted: number;
+  backup_ref: string | null;
+  updated_at: number;
+};
 type MemberRow = { stack_id: string; harness_id: string; position: number };
 type LimitRow = {
   harness_id: string;
+  model: string;
   reason: string;
   source: string;
   message: string | null;
@@ -44,6 +58,7 @@ export function snapshotHarnessState(): () => void {
   const stacks = db.query("SELECT * FROM harness_stacks").all() as StackRow[];
   const members = db.query("SELECT * FROM harness_stack_members").all() as MemberRow[];
   const limits = db.query("SELECT * FROM harness_limit_state").all() as LimitRow[];
+  const provenance = db.query("SELECT * FROM harness_mirror_provenance").all() as ProvenanceRow[];
   return () => {
     // Stacks first: deleting every test-created stack cascades its members,
     // then the snapshot rows go back. Deleting a row whose harness is about
@@ -55,8 +70,13 @@ export function snapshotHarnessState(): () => void {
     }
     for (const s of stacks) {
       db.run(
-        `INSERT OR REPLACE INTO harness_stacks (id, label, kind, mirror_mode, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        // An upsert, not INSERT OR REPLACE: REPLACE deletes the row first and
+        // fires ON DELETE CASCADE on harness_swap_events / members.
+        `INSERT INTO harness_stacks (id, label, kind, mirror_mode, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET label = excluded.label, kind = excluded.kind,
+           mirror_mode = excluded.mirror_mode, created_at = excluded.created_at,
+           updated_at = excluded.updated_at`,
         [s.id, s.label, s.kind, s.mirror_mode, s.created_at, s.updated_at],
       );
     }
@@ -72,9 +92,18 @@ export function snapshotHarnessState(): () => void {
     for (const l of limits) {
       db.run(
         `INSERT INTO harness_limit_state
-           (harness_id, reason, source, message, exhausted_until_ms, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [l.harness_id, l.reason, l.source, l.message, l.exhausted_until_ms, l.updated_at],
+           (harness_id, model, reason, source, message, exhausted_until_ms, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [l.harness_id, l.model, l.reason, l.source, l.message, l.exhausted_until_ms, l.updated_at],
+      );
+    }
+    db.run("DELETE FROM harness_mirror_provenance");
+    for (const r of provenance) {
+      db.run(
+        `INSERT INTO harness_mirror_provenance
+           (harness_id, stack_id, scope, path, key, value_hash, src_mtime_ms, src_size, preexisted, backup_ref, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [r.harness_id, r.stack_id, r.scope, r.path, r.key, r.value_hash, r.src_mtime_ms, r.src_size, r.preexisted, r.backup_ref, r.updated_at],
       );
     }
     for (const h of harnesses.list()) {

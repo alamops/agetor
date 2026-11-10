@@ -61,6 +61,11 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
   const [saving, setSaving] = useState(false);
   const [previewing, setPreviewing] = useState(false);
   const [preview, setPreview] = useState<MirrorPreview | null>(null);
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  // The draft the open preview was computed for; Confirm writes exactly this.
+  const previewedDraft = useRef<StackDraft | null>(null);
+  const rerunSave = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [picker, setPicker] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
@@ -127,14 +132,14 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
   const visible = draft.members.slice(window.start, window.end);
 
   /** Write the draft (after any preview confirmation). */
-  const commit = async () => {
+  const commit = async (toSave: StackDraft = draft) => {
     setSaving(true);
     setError(null);
     try {
       let result: HarnessStackResult;
       if (stackId) {
         if (!base) return;
-        const patch = guardedPatch(base, draft);
+        const patch = guardedPatch(base, toSave);
         if (Object.keys(patch).length === 0) {
           finishWithoutChanges();
           return;
@@ -142,10 +147,10 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
         result = await api.patchHarnessStack(stackId, patch);
       } else {
         result = await api.createHarnessStack({
-          label: draft.label,
-          kind: draft.kind,
-          members: draft.members,
-          mirrorMode: draft.mirrorMode,
+          label: toSave.label,
+          kind: toSave.kind,
+          members: toSave.members,
+          mirrorMode: toSave.mirrorMode,
         });
       }
       setPreview(null);
@@ -208,18 +213,28 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
   const save = async () => {
     if (blockers.length > 0 || saving || previewing) return;
     if (stackId && !base) return;
-    if (base && Object.keys(guardedPatch(base, draft)).length === 0) {
+    // Everything below acts on this snapshot: the preview, and the write that
+    // follows it, must describe the same draft.
+    const snapshot = draft;
+    if (base && Object.keys(guardedPatch(base, snapshot)).length === 0) {
       finishWithoutChanges();
       return;
     }
-    if (isMirrorRelevant(base, draft)) {
+    if (isMirrorRelevant(base, snapshot)) {
       // The dry run walks the plugin trees, so it can take a while: the Save
       // button shows a pending state meanwhile.
       setPreviewing(true);
       setError(null);
       try {
-        const result = await api.previewHarnessMirror(previewBody(draft, stackId));
+        const result = await api.previewHarnessMirror(previewBody(snapshot, stackId));
+        // Edited while the dry run was in flight: the result describes an
+        // older draft, so check the current one instead.
+        if (draftRef.current !== snapshot) {
+          rerunSave.current = true;
+          return;
+        }
         if (result.overwrites) {
+          previewedDraft.current = snapshot;
           setPreview(result);
           return;
         }
@@ -232,7 +247,28 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
         setPreviewing(false);
       }
     }
-    await commit();
+    await commit(snapshot);
+  };
+
+  // A draft edited while the preview was pending re-runs the whole save once
+  // the pending state has cleared (the guard above refuses while it is set).
+  useEffect(() => {
+    if (!previewing && rerunSave.current) {
+      rerunSave.current = false;
+      void save();
+    }
+  });
+
+  const confirmPreview = () => {
+    const previewed = previewedDraft.current;
+    if (!previewed) return;
+    if (draftRef.current !== previewed) {
+      // The draft changed since it was previewed: check it again.
+      setPreview(null);
+      void save();
+      return;
+    }
+    void commit(previewed);
   };
 
   const switchKind = async (kind: HarnessStackKind) => {
@@ -441,7 +477,7 @@ export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange,
         preview={preview}
         saving={saving}
         onCancel={() => setPreview(null)}
-        onConfirm={() => void commit()}
+        onConfirm={confirmPreview}
       />
     </div>
   );

@@ -3480,18 +3480,9 @@ export const runs = {
    * `composeCleanRetryText` (shared/user-message.ts) does the normalization
    * and de-duplication.
    */
-  mainUserTexts(runId: string): string[] {
-    return db
-      .query<{ data: string }, [string]>(
-        `SELECT data FROM run_events INDEXED BY idx_run_events_run
-         WHERE run_id = ? AND stream = 'user' AND subagent_id IS NULL ORDER BY id ASC`,
-      )
-      .all(runId)
-      .map((row) => row.data);
-  },
-  /** Same query and order as `mainUserTexts`, with `twin` set on a row that
-   *  carries a `line_uuid` (the Claude JSONL twin of a live echo, which has
-   *  none). `composeCleanRetryText` pairs each echo with at most one twin. */
+  // `twin` is set on a row that carries a `line_uuid` (the Claude JSONL twin
+  // of a live echo, which has none); `cleanRetryParts` pairs each echo with
+  // at most one twin.
   mainUserRows(runId: string): CleanRetryRow[] {
     return db
       .query<{ data: string; line_uuid: string | null }, [string]>(

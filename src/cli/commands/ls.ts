@@ -139,7 +139,8 @@ function titleCell(t: Task): string {
  *  `· 2/3` is the account's position in its stack (only for a stack of two or
  *  more accounts, via the shared one-member rule). Markers:
  *  `⏳` the current account is cooling for the task's model (or account-wide),
- *  `out of quota` / `blocked: no usable account` once every account failed,
+ *  `out of quota` / `blocked: no usable account` once every account failed
+ *  (`retrying (attempt n/m)` while the retry run is live),
  *  `⇄` a switch to the next account is scheduled for the end of the turn. */
 export function agentCell(
   t: Task,
@@ -152,7 +153,10 @@ export function agentCell(
   let cell = position ? `${c.gray(escapeControlChars(raw))} ${c.dim(`· ${position}`)}` : c.gray(escapeControlChars(raw));
   const m = stackMarkers(t, stack, limitStates);
   if (m.exhausted) cell += ` ${c.yellow(m.exhausted)}`;
-  else if (m.cooling) cell += ` ${c.yellow("⏳")}`;
+  else {
+    if (m.retrying) cell += ` ${c.yellow(m.retrying)}`;
+    if (m.cooling) cell += ` ${c.yellow("⏳")}`;
+  }
   if (m.scheduledSwitch) cell += ` ${c.cyan("⇄")}`;
   return cell;
 }

@@ -554,6 +554,8 @@ export interface HarnessesPayload {
   stacks?: HarnessStack[];
   /** Account-global limit cooldowns currently in force. */
   limitStates?: HarnessLimitState[];
+  /** Account ids that have mirror records (a restore is possible). */
+  mirrorRestorable?: string[];
 }
 export interface HarnessStacksPayload { stacks: HarnessStack[]; limitStates: HarnessLimitState[] }
 export interface HarnessStackResult {
@@ -704,11 +706,14 @@ export const api = {
   restoreHarnessMirror: (id: string) =>
     j<MirrorRestoreResult>(`/harnesses/${encodeURIComponent(id)}/mirror-restore`, { method: "POST" }, { retry: false }),
   /** Clear an account's cooldown (all rows, or only `model`'s). */
-  clearHarnessCooldown: (id: string, model?: string) =>
-    j<{ cleared: true; limitStates: HarnessLimitState[] }>(
-      `/harnesses/${encodeURIComponent(id)}/limit-state${model ? `?model=${encodeURIComponent(model)}` : ""}`,
+  clearHarnessCooldown: (id: string, opts?: { model?: string | null; accountWideOnly?: boolean } | string) => {
+    const o = typeof opts === "string" ? { model: opts } : opts ?? {};
+    const qs = o.model ? `?model=${encodeURIComponent(o.model)}` : o.accountWideOnly ? "?scope=account" : "";
+    return j<{ cleared: true; rearmed?: number; limitStates: HarnessLimitState[] }>(
+      `/harnesses/${encodeURIComponent(id)}/limit-state${qs}`,
       { method: "DELETE" },
-    ),
+    );
+  },
   /** Move a stacked task to its next account now (idle) or after the turn
    *  (live run). 409 refusals carry a `SwitchAccountRefusal` body on the
    *  thrown `ApiError`. `retry: false` — a replay could switch twice. */

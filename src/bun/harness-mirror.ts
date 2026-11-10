@@ -130,7 +130,12 @@ import {
   removeBackupEntry,
   removeMirrorBackups,
 } from "./harness-mirror-backup.ts";
-import { mirrorProvenance, type MirrorProvenanceRow } from "./harness-mirror-provenance.ts";
+import {
+  isUnownedRow,
+  mirrorProvenance,
+  UNOWNED_STAMP,
+  type MirrorProvenanceRow,
+} from "./harness-mirror-provenance.ts";
 import { claudeConfigDirFor, claudeJsonDirFor, codexHomeFor } from "./harness-stacks.ts";
 import { dataDir, harnesses } from "./db.ts";
 
@@ -377,6 +382,23 @@ export function mirrorForSwap(
 
 export { removeMirrorBackups };
 
+/**
+ * Delete everything the mirror keeps for one account: its provenance rows and
+ * its saved originals. Runs inside the account's mirror queue, so it waits for
+ * a mirror or Restore already writing into the account and nothing is
+ * recreated after it. Safe for an id that no longer exists; never throws.
+ */
+export function deleteMirrorStateForHarness(harnessId: string): Promise<void> {
+  return serializeForDestination(harnessId, async () => {
+    try {
+      mirrorProvenance.deleteForHarness(harnessId);
+    } catch (err) {
+      console.warn(`[harness-mirror] could not drop provenance for a deleted account: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    await removeMirrorBackups(harnessId);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // The run context: decisions go in, effects come out
 // ---------------------------------------------------------------------------
@@ -401,6 +423,8 @@ interface MirrorCtx {
   copied: string[];
   warnings: string[];
   lastYield: number;
+  /** The destination account was deleted while this run was in flight. */
+  gone?: boolean;
 }
 
 const rowId = (p: string, key: string) => `${p}\u0000${key}`;
@@ -409,21 +433,48 @@ function getRow(ctx: MirrorCtx, p: string, key = ""): MirrorProvenanceRow | unde
   return ctx.rows.get(rowId(p, key));
 }
 
+/** True while the destination account still exists. A mirror in flight when
+ *  the account is deleted must not recreate its provenance or backups; the
+ *  first check that finds it gone says so once. */
+function accountAlive(ctx: MirrorCtx): boolean {
+  if (ctx.dry) return true;
+  if (ctx.gone) return false;
+  if (harnesses.getByIdOrKind(ctx.harnessId)) return true;
+  ctx.gone = true;
+  warn(ctx, "this account was deleted during the mirror — it stopped writing");
+  return false;
+}
+
 function putRow(ctx: MirrorCtx, row: Omit<MirrorProvenanceRow, "harnessId" | "stackId" | "updatedAt">): void {
   if (ctx.dry) return;
+  if (!accountAlive(ctx)) return;
   const full: MirrorProvenanceRow = { ...row, harnessId: ctx.harnessId, stackId: ctx.stackId, updatedAt: Date.now() };
   mirrorProvenance.upsert(full);
   ctx.rows.set(rowId(row.path, row.key), full);
 }
 
-/** Drop a provenance row AND the saved original behind it, so an orphaned
- *  backup can never shadow a later, different original. */
-function dropRow(ctx: MirrorCtx, p: string, key = ""): void {
+/** End the mirror's ownership of an item. A row whose item was the account's
+ *  own before the mirror (`preexisted`, with a saved original) is KEPT as an
+ *  un-owned restore pointer: propagation and the mirror skip it, a later write
+ *  re-adopts it with the original intact, and Restore still puts the original
+ *  back. Any other row goes, with its saved original (so an orphaned backup can
+ *  never shadow a later, different original). `purge` drops the row whatever
+ *  it is (a row that is garbage: an invalid shape). */
+async function dropRow(ctx: MirrorCtx, p: string, key = "", purge = false): Promise<void> {
   if (ctx.dry) return;
   const row = ctx.rows.get(rowId(p, key));
+  if (row && !purge && row.preexisted && row.backupRef) {
+    if (!isUnownedRow(row)) {
+      putRow(ctx, {
+        scope: row.scope, path: p, key, valueHash: row.valueHash,
+        srcMtimeMs: UNOWNED_STAMP, srcSize: UNOWNED_STAMP, preexisted: true, backupRef: row.backupRef,
+      });
+    }
+    return;
+  }
   mirrorProvenance.remove(ctx.harnessId, p, key);
   ctx.rows.delete(rowId(p, key));
-  if (row?.backupRef) removeBackupEntry(ctx.harnessId, row.scope, p, key);
+  if (row?.backupRef) await removeBackupEntry(ctx.harnessId, row.scope, p, key);
 }
 
 function warn(ctx: MirrorCtx, message: string): void {
@@ -897,6 +948,7 @@ async function mirrorFile(
   if (!row || edited || (preexisted && !backupRef)) {
     ctx.plan.backups.push(rel);
     if (!ctx.dry) {
+      if (!accountAlive(ctx)) throw new Error("account deleted");
       backupRef = await backupFileOriginal(ctx.harnessId, rel, to, { force: true });
       // Record the intent before the write (no source stamp marks it pending):
       // a crash in between must not lose the link to the saved original.
@@ -932,7 +984,8 @@ async function propagateRemovals(
 ): Promise<void> {
   if (!opts.complete) return;
   const rows = [...ctx.rows.values()].filter(
-    (r) => (r.scope === "file" || r.scope === "link") && (r.path === entry || r.path.startsWith(`${entry}/`)),
+    (r) => (r.scope === "file" || r.scope === "link") && !isUnownedRow(r)
+      && (r.path === entry || r.path.startsWith(`${entry}/`)),
   );
   for (const row of rows) {
     await tick(ctx);
@@ -959,32 +1012,36 @@ async function propagateRemovals(
 async function removeOwnedFile(ctx: MirrorCtx, row: MirrorProvenanceRow): Promise<void> {
   const rel = row.path;
   const abs = path.join(ctx.toRoot, rel);
-  if (!isMirrorCopyShape(ctx.kind, rel) || !isPlainPathUnder(ctx.toRoot, abs)) {
-    dropRow(ctx, rel);
+  if (!isMirrorCopyShape(ctx.kind, rel)) {
+    await dropRow(ctx, rel, "", true);
+    return;
+  }
+  if (!isPlainPathUnder(ctx.toRoot, abs)) {
+    await dropRow(ctx, rel);
     return;
   }
   const st = lstatOrNull(abs);
   if (!st || !st.isFile()) {
-    dropRow(ctx, rel);
+    await dropRow(ctx, rel);
     return;
   }
   // A preexisted item was the backup's own before the mirror: ownership ends,
   // the file stays (a primary deletion must not resurrect or destroy it).
   if (row.preexisted) {
-    dropRow(ctx, rel);
+    await dropRow(ctx, rel);
     return;
   }
   let hash: string;
   try {
     hash = await hashFile(abs);
   } catch {
-    dropRow(ctx, rel);
+    await dropRow(ctx, rel);
     return;
   }
   if (hash !== row.valueHash) {
     ctx.plan.kept.push(rel);
     warn(ctx, `${rel}: edited on this account since the mirror wrote it — kept, no longer mirrored`);
-    dropRow(ctx, rel);
+    await dropRow(ctx, rel);
     return;
   }
   ctx.plan.files.remove.push(rel);
@@ -999,7 +1056,7 @@ async function removeOwnedFile(ctx: MirrorCtx, row: MirrorProvenanceRow): Promis
     }
     pruneEmptyMirrorDirs(ctx, path.dirname(abs));
   }
-  dropRow(ctx, rel);
+  await dropRow(ctx, rel);
 }
 
 /** Remove now-empty plain directories below a mirrored entry, from `start`
@@ -1027,26 +1084,30 @@ function pruneEmptyMirrorDirs(ctx: MirrorCtx, start: string): void {
 async function removeOwnedLink(ctx: MirrorCtx, row: MirrorProvenanceRow): Promise<void> {
   const rel = row.path;
   const abs = path.join(ctx.toRoot, rel);
-  if (!isMirrorCopyShape(ctx.kind, rel) || destinationState(ctx.toRoot, abs) !== "present") {
-    dropRow(ctx, rel);
+  if (!isMirrorCopyShape(ctx.kind, rel)) {
+    await dropRow(ctx, rel, "", true);
+    return;
+  }
+  if (destinationState(ctx.toRoot, abs) !== "present") {
+    await dropRow(ctx, rel);
     return;
   }
   const st = lstatOrNull(abs);
   if (!st?.isSymbolicLink() || row.preexisted) {
-    dropRow(ctx, rel);
+    await dropRow(ctx, rel);
     return;
   }
   let current: string;
   try {
     current = readlinkSync(abs);
   } catch {
-    dropRow(ctx, rel);
+    await dropRow(ctx, rel);
     return;
   }
   if (current !== row.valueHash) {
     ctx.plan.kept.push(rel);
     warn(ctx, `${rel}: link changed on this account since the mirror wrote it — kept, no longer mirrored`);
-    dropRow(ctx, rel);
+    await dropRow(ctx, rel);
     return;
   }
   ctx.plan.files.remove.push(rel);
@@ -1057,7 +1118,7 @@ async function removeOwnedLink(ctx: MirrorCtx, row: MirrorProvenanceRow): Promis
       // Already gone.
     }
   }
-  dropRow(ctx, rel);
+  await dropRow(ctx, rel);
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,7 +1309,7 @@ async function linkTopLevelSymlinks(
       }
       const current = readlinkSync(dest);
       if (current === target) {
-        if (row && row.valueHash !== target) {
+        if (row && (row.valueHash !== target || isUnownedRow(row))) {
           putRow(ctx, { scope: "link", path: relPath, key: "", valueHash: target, srcMtimeMs: null, srcSize: null, preexisted: row.preexisted, backupRef: row.backupRef });
         }
         continue;
@@ -1259,6 +1320,7 @@ async function linkTopLevelSymlinks(
       if (!row || edited || (preexisted && !backupRef)) {
         ctx.plan.backups.push(relPath);
         if (!ctx.dry) {
+          if (!accountAlive(ctx)) throw new Error("account deleted");
           backupRef = await backupLinkOriginal(ctx.harnessId, relPath, current, { force: true });
           putRow(ctx, { scope: "link", path: relPath, key: "", valueHash: current, srcMtimeMs: null, srcSize: null, preexisted: true, backupRef });
         }
@@ -1490,7 +1552,7 @@ async function mergeJsonDoc(ctx: MirrorCtx, m: JsonMerge): Promise<void> {
     const nextHash = hashValue(next.value);
     if (old.found && canonicalJson(old.value) === canonicalJson(next.value)) {
       const row = getRow(ctx, rel, entry.key);
-      if (row && row.valueHash !== nextHash) refresh.push({ key: entry.key, valueHash: nextHash });
+      if (row && (row.valueHash !== nextHash || isUnownedRow(row))) refresh.push({ key: entry.key, valueHash: nextHash });
       continue;
     }
     upserts.push({
@@ -1504,7 +1566,7 @@ async function mergeJsonDoc(ctx: MirrorCtx, m: JsonMerge): Promise<void> {
   const rawKeys = new Set(m.enumerate(m.raw).map((e) => e.key));
   if (ctx.propagate) {
     for (const row of [...ctx.rows.values()]) {
-      if (row.path !== rel || row.scope !== "key" || ownedKeys.has(row.key)) continue;
+      if (row.path !== rel || row.scope !== "key" || ownedKeys.has(row.key) || isUnownedRow(row)) continue;
       await tick(ctx);
       if (m.excluded(row.key) || rawKeys.has(row.key)) {
         drops.push(row.key);
@@ -1620,6 +1682,7 @@ async function commitMerged(ctx: MirrorCtx, c: MergedCommit): Promise<void> {
   for (const item of pending) {
     // `force`: the entry may be an orphan of a dropped row; this value is the
     // original now.
+    if (!accountAlive(ctx)) throw new Error("account deleted");
     const ref = await backupKeyOriginal(ctx.harnessId, c.rel, item.key, item.oldValue, { force: true });
     savedRefs.set(item.key, ref);
     // Record the intent before the write (crash safety, as for files).
@@ -1630,6 +1693,7 @@ async function commitMerged(ctx: MirrorCtx, c: MergedCommit): Promise<void> {
   }
   for (const f of c.foreign) {
     if (!f.needsBackup) continue;
+    if (!accountAlive(ctx)) throw new Error("account deleted");
     const ref = await backupKeyOriginal(ctx.harnessId, c.rel, f.key, f.oldValue, { force: true });
     savedRefs.set(f.key, ref);
     putRow(ctx, {
@@ -1652,12 +1716,12 @@ async function commitMerged(ctx: MirrorCtx, c: MergedCommit): Promise<void> {
   }
   for (const r of c.refresh) {
     const row = getRow(ctx, c.rel, r.key);
-    if (row) putRow(ctx, { ...row, valueHash: r.valueHash });
+    if (row) putRow(ctx, { ...row, valueHash: r.valueHash, srcMtimeMs: null, srcSize: null });
   }
-  for (const key of [...c.removals, ...c.drops]) dropRow(ctx, c.rel, key);
+  for (const key of [...c.removals, ...c.drops]) await dropRow(ctx, c.rel, key);
   // A stale subtable that was the mirror's own and unedited just goes away; one
   // that was not stays as a `preexisted` row until Restore.
-  for (const f of c.foreign) if (!f.needsBackup) dropRow(ctx, c.rel, f.key);
+  for (const f of c.foreign) if (!f.needsBackup) await dropRow(ctx, c.rel, f.key);
 }
 
 // ---- settings.json ---------------------------------------------------------
@@ -2103,7 +2167,7 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
   const drops: string[] = [];
   if (ctx.propagate) {
     for (const row of [...ctx.rows.values()]) {
-      if (row.path !== rel || row.scope !== "key" || ownedKeys.has(row.key) || staleHeaders.has(row.key)) continue;
+      if (row.path !== rel || row.scope !== "key" || ownedKeys.has(row.key) || staleHeaders.has(row.key) || isUnownedRow(row)) continue;
       await tick(ctx);
       const segments = splitTomlKeyPath(row.key);
       if (
@@ -2211,7 +2275,7 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
     const old = oldValues.get(key);
     if (old === value) {
       const row = getRow(ctx, rel, key);
-      if (row && row.valueHash !== sha256(value)) refresh.push({ key, valueHash: sha256(value) });
+      if (row && (row.valueHash !== sha256(value) || isUnownedRow(row))) refresh.push({ key, valueHash: sha256(value) });
       continue;
     }
     upserts.push({
@@ -2699,7 +2763,7 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
   const result: MirrorRestoreResult = { harnessId, restored: [], removed: [], kept: [], warnings: [] };
   if (!harness || (harness.kind !== "claude-code" && harness.kind !== "codex")) {
     mirrorProvenance.deleteForHarness(harnessId);
-    removeMirrorBackups(harnessId);
+    await removeMirrorBackups(harnessId);
     result.warnings.push("the account no longer exists or cannot be mirrored — its mirror records were dropped");
     return result;
   }
@@ -2726,9 +2790,9 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
   /** A row that was fully handled (restored, removed, nothing left to do, or
    *  garbage) goes away with its saved original; a kept or failed row stays so
    *  Restore can be retried. */
-  const finish = (row: MirrorProvenanceRow) => {
+  const finish = async (row: MirrorProvenanceRow) => {
     mirrorProvenance.remove(harnessId, row.path, row.key);
-    removeBackupEntry(harnessId, row.scope, row.path, row.key);
+    await removeBackupEntry(harnessId, row.scope, row.path, row.key);
   };
 
   // Files and links.
@@ -2738,12 +2802,14 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
     const rel = row.path;
     const abs = path.join(root, rel);
     if (!isMirrorCopyShape(kind, rel)) {
-      finish(row);
+      await finish(row);
       continue;
     }
-    if (!isPlainPathUnder(root, abs)) {
-      if (destinationState(root, abs) === "unsafe") failed(`${rel}: path goes through a symlink — left alone`);
-      else finish(row);
+    // Only a path through a symlinked or non-directory parent is skipped. A
+    // missing leaf is handled below (a preexisted original goes back), and a
+    // symlink leaf is a link row's normal state, so neither is "unsafe".
+    if (destinationState(root, abs) === "unsafe") {
+      failed(`${rel}: path goes through a symlink — left alone`);
       continue;
     }
     const st = lstatOrNull(abs);
@@ -2756,7 +2822,7 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
         const currentHash = st ? await hashFile(abs) : null;
         const untouched = currentHash !== null && row.valueHash !== null && currentHash === row.valueHash;
         if (row.preexisted) {
-          const original = readBackup(fileBackupRef(harnessId, rel));
+          const original = await readBackup(fileBackupRef(harnessId, rel));
           if (!original) {
             failed(`${rel}: the saved original is missing — left alone`);
           } else if (st && !untouched) {
@@ -2764,18 +2830,18 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
             failed(`${rel}: edited since the mirror wrote it — kept, original not restored`);
           } else {
             await atomicWriteFile(abs, original, { root });
-            const mode = readBackupMode(harnessId, rel);
+            const mode = await readBackupMode(harnessId, rel);
             if (mode !== null) chmodSync(abs, mode);
             result.restored.push(rel);
-            finish(row);
+            await finish(row);
           }
         } else if (!st) {
-          finish(row);
+          await finish(row);
         } else if (untouched) {
           unlinkSync(abs);
           pruneEmptyDirsUnder(root, path.dirname(abs));
           result.removed.push(rel);
-          finish(row);
+          await finish(row);
         } else {
           result.kept.push(rel);
           failed(`${rel}: edited since the mirror wrote it — kept`);
@@ -2788,25 +2854,26 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
         }
         const untouched = current !== null && current === row.valueHash;
         if (row.preexisted) {
-          const original = readBackup(linkRef(harnessId, rel));
+          const original = await readBackup(linkRef(harnessId, rel));
           if (!original) {
             failed(`${rel}: the saved original link is missing — left alone`);
           } else if (st && !untouched) {
             result.kept.push(rel);
             failed(`${rel}: link changed since the mirror wrote it — kept, original not restored`);
           } else {
+            ensurePlainDirUnder(root, path.dirname(abs));
             const tmp = path.join(path.dirname(abs), `.agetor-tmp-${randomUUID()}`);
             symlinkSync(original.toString("utf8"), tmp);
             renameSync(tmp, abs);
             result.restored.push(rel);
-            finish(row);
+            await finish(row);
           }
         } else if (!st) {
-          finish(row);
+          await finish(row);
         } else if (untouched) {
           unlinkSync(abs);
           result.removed.push(rel);
-          finish(row);
+          await finish(row);
         } else {
           result.kept.push(rel);
           failed(`${rel}: link changed since the mirror wrote it — kept`);
@@ -2828,7 +2895,7 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
     try {
       if (!spec.merge.includes(rel)) {
         failed(`${rel}: not a mirrored file — left alone`);
-        fileRows.forEach(finish);
+        for (const r of fileRows) await finish(r);
         continue;
       }
       const base = baseForPath(harness, rel);
@@ -2840,7 +2907,7 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
       }
       if (state === "absent") {
         // Nothing to restore into; an unrestorable original keeps its row.
-        for (const row of fileRows) if (!row.preexisted) finish(row);
+        for (const row of fileRows) if (!row.preexisted) await finish(row);
         continue;
       }
       if (lstatOrNull(toPath)?.isSymbolicLink()) {
@@ -2853,17 +2920,17 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
         continue;
       }
       const outcome = rel === "config.toml"
-        ? restoreTomlKeys(harnessId, rel, fileRows, read.text, result, failed)
-        : restoreJsonKeys(harnessId, rel, fileRows, read.text, result, failed);
+        ? await restoreTomlKeys(harnessId, rel, fileRows, read.text, result, failed)
+        : await restoreJsonKeys(harnessId, rel, fileRows, read.text, result, failed);
       if (outcome.text !== null && outcome.text !== read.text) await atomicWriteFile(toPath, outcome.text, { root: base });
       // Only after the file is back in place do the handled rows go.
-      for (const row of outcome.done) finish(row);
+      for (const row of outcome.done) await finish(row);
     } catch (err) {
       failed(`${rel}: could not restore — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  if (mirrorProvenance.list(harnessId).length === 0) removeMirrorBackups(harnessId);
+  if (mirrorProvenance.list(harnessId).length === 0) await removeMirrorBackups(harnessId);
   return result;
 }
 
@@ -2874,14 +2941,14 @@ interface KeyRestore {
   done: MirrorProvenanceRow[];
 }
 
-function restoreJsonKeys(
+async function restoreJsonKeys(
   harnessId: string,
   rel: string,
   rows: MirrorProvenanceRow[],
   text: string,
   result: MirrorRestoreResult,
   failed: (m: string) => void,
-): KeyRestore {
+): Promise<KeyRestore> {
   const doc = parseJsonObject(text);
   const enumerate = enumeratorFor(rel);
   if (!doc || !enumerate) {
@@ -2897,7 +2964,7 @@ function restoreJsonKeys(
     const name = `${rel}:${row.key}`;
     const untouched = current.found && row.valueHash !== null && hashValue(current.value) === row.valueHash;
     if (row.preexisted) {
-      const original = readKeyBackup(harnessId, rel, row.key);
+      const original = await readKeyBackup(harnessId, rel, row.key);
       if (!original.found) {
         failed(`${name}: the saved original is missing — left alone`);
       } else if (current.found && !untouched) {
@@ -2924,14 +2991,14 @@ function restoreJsonKeys(
   return { text: changed ? `${JSON.stringify(doc, null, 2)}\n` : null, done };
 }
 
-function restoreTomlKeys(
+async function restoreTomlKeys(
   harnessId: string,
   rel: string,
   rows: MirrorProvenanceRow[],
   text: string,
   result: MirrorRestoreResult,
   failed: (m: string) => void,
-): KeyRestore {
+): Promise<KeyRestore> {
   // Split once: keys are independent, so the values to compare against are the
   // ones the file holds now.
   const blocks = splitTomlBlocks(text);
@@ -2948,7 +3015,7 @@ function restoreTomlKeys(
     const name = `${rel}:${row.key}`;
     const untouched = now !== undefined && row.valueHash !== null && sha256(now) === row.valueHash;
     if (row.preexisted) {
-      const original = readKeyBackup(harnessId, rel, row.key);
+      const original = await readKeyBackup(harnessId, rel, row.key);
       if (!original.found || typeof original.value !== "string") {
         failed(`${name}: the saved original is missing — left alone`);
       } else if (now !== undefined && !untouched) {

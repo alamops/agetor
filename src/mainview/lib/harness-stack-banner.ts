@@ -79,7 +79,9 @@ export function harnessStackBannerView(
   const base = ex.attempts >= ex.max
     ? "Every account in this stack is out of quota — run the task manually after a reset."
     : targetAt > 0
-      ? `Every account in this stack is out of quota — retrying in ${formatCountdown(secondsLeft)} (attempt ${ex.attempts + 1}/${ex.max}).`
+      ? ex.reason === "no-usable-member"
+        ? `No account in this stack can run this task — retrying in ${formatCountdown(secondsLeft)} (attempt ${ex.attempts + 1}/${ex.max}).`
+        : `Every account in this stack is out of quota — retrying in ${formatCountdown(secondsLeft)} (attempt ${ex.attempts + 1}/${ex.max}).`
       : retrying
         ? `Retrying on the next available account (attempt ${ex.attempts + 1}/${ex.max})…`
         : "No account in this stack can run this task — fix one in Settings → Harnesses.";

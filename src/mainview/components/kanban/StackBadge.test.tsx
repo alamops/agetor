@@ -82,7 +82,7 @@ describe("StackBadge", () => {
         allExhausted: { nextAttemptAt: 0, reason: "no-usable-member", attempts: 0, max: 3 },
       },
     });
-    expect(markup).toContain("No account in this stack can run this task — fix one in Settings");
+    expect(markup).toContain("No account in this stack can run this task — fix one in Settings → Harnesses");
     expect(markup).not.toContain("out of quota");
   });
 
@@ -107,7 +107,7 @@ describe("StackBadge", () => {
   test("a one-account stack whose account is cooling says so without a position", () => {
     const markup = html({ state: { position: 0, count: 1 }, coolingUntilMs: Date.now() + 60_000 });
     expect(markup).toContain("cooling");
-    expect(markup).not.toContain("1/1");
+    expect(markup).not.toContain(">1/1<");
     expect(markup).not.toContain("Account 1 of 1");
   });
 

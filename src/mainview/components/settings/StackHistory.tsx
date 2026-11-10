@@ -24,6 +24,8 @@ export function StackHistory({ stackId, stackLabel }: Props) {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Which action produced the error, so Retry repeats that one.
+  const [failedAction, setFailedAction] = useState<"load" | "more">("load");
   // Drops the answer of a request the user has since superseded (refresh,
   // another stack, unmount).
   const generation = useRef(0);
@@ -40,6 +42,7 @@ export function StackHistory({ stackId, stackLabel }: Props) {
       })
       .catch((e) => {
         if (generation.current !== mine) return;
+        setFailedAction("load");
         setError(e instanceof Error ? e.message : String(e));
       })
       .finally(() => {
@@ -65,6 +68,7 @@ export function StackHistory({ stackId, stackLabel }: Props) {
       })
       .catch((e) => {
         if (generation.current !== mine) return;
+        setFailedAction("more");
         setError(e instanceof Error ? e.message : String(e));
       })
       .finally(() => {
@@ -90,7 +94,7 @@ export function StackHistory({ stackId, stackLabel }: Props) {
       {error && (
         <div role="alert" className="flex items-center gap-2 text-xs text-danger">
           <span className="min-w-0 flex-1">Couldn't load the history: {error}</span>
-          <Button size="sm" variant="outline" onClick={events.length > 0 && cursor ? loadMore : load}>
+          <Button size="sm" variant="outline" onClick={failedAction === "more" && cursor ? loadMore : load}>
             Retry
           </Button>
         </div>

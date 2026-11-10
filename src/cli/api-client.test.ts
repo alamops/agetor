@@ -469,7 +469,7 @@ test("ids are URL-encoded; switch/preview/restore/agent-patch use the long budge
     await client.getTask(odd);
     await client.harnessUsage(odd);
     await client.getHarnessStackHistory(odd, { limit: 10, before: "cur sor" });
-    await client.clearHarnessCooldown(odd, "m/1");
+    await client.clearHarnessCooldown(odd, { model: "m/1" });
     await client.switchTaskAccount(odd);
     await client.cancelScheduledAccountSwitch(odd);
     await client.restoreHarnessMirror(odd);

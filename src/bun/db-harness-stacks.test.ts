@@ -251,19 +251,19 @@ describe("084 tables and tasks.harness_state", () => {
     for (const id of [ids[0]!, ids[2]!]) dbm.harnesses.delete(id);
   });
 
-  test("mainUserTexts/hasToolUse read the main run stream", () => {
+  test("mainUserRows/hasToolUse read the main run stream", () => {
     const taskId = seedTask();
     const runId = seedRun(taskId);
-    expect(dbm.runs.mainUserTexts(runId)).toEqual([]);
+    expect(dbm.runs.mainUserRows(runId).map((r) => r.data)).toEqual([]);
     expect(dbm.runs.hasToolUse(runId)).toBe(false);
     dbm.runs.appendEvent(runId, "user", "hello");
     dbm.runs.appendEvent(runId, "assistant", "hi");
-    expect(dbm.runs.mainUserTexts(runId)).toEqual(["hello"]);
+    expect(dbm.runs.mainUserRows(runId).map((r) => r.data)).toEqual(["hello"]);
     // A folded follow-up and a subagent's own user event: the retry needs the
     // ordered main-stream texts and must never pick up a subagent's.
     dbm.runs.appendEvent(runId, "user", "follow-up");
     dbm.runs.appendEvent(runId, "user", "subagent words", null, "agent-1");
-    expect(dbm.runs.mainUserTexts(runId)).toEqual(["hello", "follow-up"]);
+    expect(dbm.runs.mainUserRows(runId).map((r) => r.data)).toEqual(["hello", "follow-up"]);
     dbm.runs.appendEvent(runId, "tool_use", JSON.stringify({ id: "t1", name: "Bash" }));
     expect(dbm.runs.hasToolUse(runId)).toBe(true);
   });

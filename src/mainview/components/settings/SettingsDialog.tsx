@@ -13,7 +13,7 @@ import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { AgentProfileForm } from "@/components/kanban/AgentProfileFormDialog";
 import { AgentProfilesSection } from "@/components/settings/AgentProfilesSection";
-import { StackEditor } from "@/components/settings/HarnessStacksSection";
+import { StackEditor } from "@/components/settings/StackEditor";
 import { HarnessesPage } from "@/components/settings/HarnessesPage";
 import { isExperimentalKind } from "@/components/settings/HarnessAccountRow";
 import { StackHistory } from "@/components/settings/StackHistory";
@@ -488,7 +488,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     const ok = await confirm({
       title: `Delete stack "${stack.label}"?`,
       description:
-        "Tasks keep their current account; automatic failover stops immediately. Copied session files stay with their accounts until retention removes them.",
+        "Tasks keep their current account; automatic failover stops immediately. Copied session files stay with their accounts until retention removes them. Its account-switch history is deleted too.",
       confirmLabel: "Delete",
       variant: "destructive",
     });
@@ -511,14 +511,19 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
 
   const onClearCooldown = async (h: Harness, model: string | null) => {
     const ok = await confirm({
-      title: `Clear the cooldown on ${h.label}?`,
+      title: model
+        ? `Clear the ${model} cooldown on ${h.label}?`
+        : `Clear the account-wide cooldown on ${h.label}?`,
       description: "The provider may still refuse until its own reset.",
       confirmLabel: "Clear",
     });
     if (!ok) return;
     try {
-      await api.clearHarnessCooldown(h.id, model ?? undefined);
+      // The account-wide chip clears only the account-wide row; a per-model
+      // chip clears only that model's row.
+      const result = await api.clearHarnessCooldown(h.id, model ? { model } : { accountWideOnly: true });
       toast.success(`Cleared the cooldown on ${h.label}`);
+      if ((result.rearmed ?? 0) > 0) toast.info("Retrying the waiting task(s) soon");
       await refresh();
       onChange?.();
     } catch (e) {
