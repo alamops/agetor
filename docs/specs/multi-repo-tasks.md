@@ -118,7 +118,7 @@ coordinate changes across every repository in that card.
   It offers multi-select of registered projects, an `Add folder…` native picker, a per-repo base
   branch and remove. The New Task panel shows a summary line with a `Manage` button; with exactly
   one repo, today's inline branch/base fields stay.
-- The card shows a worktree icon plus the repository count, with a popover listing every repo.
+- The card shows a worktree icon plus the repository count, with a hover tooltip naming every repository.
 - Repo filter and text search match any selected repo.
 - Full CLI/TUI parity: `agetor add --repo` (repeatable), `show`/`shell`/`rm` are repo-aware, the
   TUI supports multi-select and multi-scope `@` completion.

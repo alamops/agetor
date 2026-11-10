@@ -171,7 +171,20 @@ export function latestPrProposal(events: RunEvent[]): PrProposal | null {
 // ---------------------------------------------------------------------------
 
 /** A `Repository: <name>` label line the multi-repo commit prompt asks for. */
-const REPO_LABEL_RE = /^\s*#{0,6}\s*[*_]{0,2}\s*repository\s*:\s*([^\n*_]+?)\s*[*_]{0,2}\s*$/i;
+const REPO_LABEL_RE = /^\s*#{0,6}\s*[*_]{0,2}\s*repository\s*:\s*(.*?)\s*$/i;
+
+/**
+ * Strip the markdown emphasis an agent may wrap around a label value
+ * (`**Repository:** agetor_api`, `Repository: **agetor_api**`) without
+ * touching underscores INSIDE the name — `agetor_api` is a real repository
+ * name, so the old `[^\n*_]` capture dropped everything from the underscore
+ * on and the proposal never matched its repository.
+ */
+function repositoryLabelValue(raw: string): string {
+  // Leading/trailing whitespace AND emphasis run together (`**Repository:**
+  // **name**` leaves `** **name**`), so strip the combined class in one pass.
+  return raw.replace(/^[\s*_]+/, "").replace(/[\s*_]+$/, "");
+}
 
 /**
  * Parse one labeled proposal per repository out of an agent's Commit & Push
@@ -197,7 +210,12 @@ export function parseRepositoryProposals(text: string): Map<string, PrProposal> 
     const label = REPO_LABEL_RE.exec(line);
     if (label) {
       flush();
-      currentName = label[1]!.trim();
+      currentName = repositoryLabelValue(label[1]!);
+      if (!currentName) {
+        currentName = null;
+        block = [];
+        continue;
+      }
       block = [];
       continue;
     }

@@ -24,6 +24,20 @@ export function shouldOfferCommitPush(status: TaskGitStatus | null): boolean {
 }
 
 /**
+ * The "Commit & push" gate for a whole task. On a multi-repository task the
+ * prompt is aggregate ("commit all changes in every repository"), so the chip
+ * must appear when ANY repository has something to commit or push — gating on
+ * the selected tab alone hid it exactly when another repository was dirty.
+ * The single-repository path is the plain {@link shouldOfferCommitPush} check.
+ */
+export function shouldOfferCommitPushForTask(status: TaskGitStatus | null): boolean {
+  if (!status) return false;
+  const repos = status.repositories;
+  if (repos && repos.length > 1) return repos.some((repo) => shouldOfferCommitPush(repo));
+  return shouldOfferCommitPush(status);
+}
+
+/**
  * Whether the "Open PR" chip should be offered. Git-state-only, like its
  * sibling above — `prUrl`/read-only gating happens at the call site (a task
  * that already has a PR shows "View PR" instead, regardless of this result).

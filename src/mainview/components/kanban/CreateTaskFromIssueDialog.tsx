@@ -93,6 +93,14 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
   // always first and cannot be removed; extras are added in the shared dialog.
   const [repos, setRepos] = useState<RepoSelection[]>([]);
   const [repositoriesOpen, setRepositoriesOpen] = useState(false);
+  const multiRepo = repos.length > 1;
+  // 2+ repositories force worktree isolation server-side; mirror that here so
+  // the shared branch-name field stays visible and the base-ref/isolate
+  // controls the server ignores are not shown (same as New Task).
+  const { isolate: wtIsolate, setIsolate: setWtIsolate } = wt;
+  useEffect(() => {
+    if (multiRepo && !wtIsolate) setWtIsolate(true);
+  }, [multiRepo, wtIsolate, setWtIsolate]);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -392,7 +400,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
                 )}
               />
 
-              <WorktreeOptions state={wt} />
+              <WorktreeOptions state={wt} variant={multiRepo ? "multi" : "default"} />
               <div className="space-y-1" data-testid="issue-repositories">
                 <label className="text-muted-foreground">Repositories</label>
                 <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 px-2 py-1.5 text-xs">

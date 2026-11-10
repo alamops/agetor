@@ -9,7 +9,7 @@ import {
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
-import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { prHeadBranch, shouldOfferCommitPushForTask, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
@@ -19,6 +19,7 @@ import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
 import { latestPrProposal, latestRepositoryProposals, repositoriesNeedingPr } from "@/lib/pr-proposal";
+import { issueProjectPath } from "@/lib/repo-selection";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
@@ -2900,7 +2901,8 @@ function RunPanelBody({
   }, [planDialogId, plans]);
   // The task's live git status (uncommitted changes / unpushed commits).
   // Drives the "Commit & push" action chip above the textarea via
-  // `shouldOfferCommitPush`. Deliberately independent of run status —
+  // `shouldOfferCommitPushForTask` (aggregate across a multi task's repos).
+  // Deliberately independent of run status —
   // background agents can dirty the worktree (or add unpushed commits)
   // while the latest run is still `running`, so the chip must be able to
   // surface then too, not just after a run succeeds. `null` means unknown
@@ -4122,7 +4124,7 @@ function RunPanelBody({
                 <Button
                   size="icon"
                   variant="outline"
-                  onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
+                  onClick={() => onViewIssue({ projectPath: issueProjectPath(task, activeRepo), issueUrl })}
                   aria-label="View issue"
                   data-testid="view-issue"
                 >
@@ -4867,11 +4869,14 @@ function RunPanelBody({
                   </Button>
                 )}
                 {/* Commit & push keys on live git state (uncommitted changes or
-                    unpushed commits), not run status — see `shouldOfferCommitPush`.
+                    unpushed commits), not run status — see
+                    `shouldOfferCommitPushForTask`. For a multi task the prompt
+                    is aggregate, so ANY repository having work offers the chip
+                    (gating on the selected tab hid it when a sibling was dirty).
                     Can surface even mid-run (a background agent dirtied the tree).
                     Hidden while `!canSend` — e.g. an imported session still
                     importing, or whose import failed — since the send would be refused. */}
-                {canSend && shouldOfferCommitPush(activeGitStatus) && !sending && (
+                {canSend && shouldOfferCommitPushForTask(gitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"

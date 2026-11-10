@@ -291,9 +291,12 @@ test("listWorktrees flags an orphan dir (no task row) as \"orphaned\"", async ()
 
 test("a legacy orphan worktree with a submodule is not split into repository rows", async () => {
   // Review should-fix: the orphan expansion treated ANY child directory with a
-  // `.git` as a linked worktree. A submodule's `.git` is a pointer into
-  // `.git/modules/…`, not `.git/worktrees/…`, so a legacy single-repository
-  // worktree that vendors one must stay ONE row.
+  // `.git` as a linked worktree. A submodule checked out INSIDE a linked
+  // worktree points at `<repo>/.git/worktrees/<wt>/modules/<sub>` (git 2.54),
+  // which contains the same `.git/worktrees/` marker the parser keys on — so
+  // a legacy single-repository worktree that vendors one must still stay ONE
+  // row. This uses the real pointer shape, not the main-checkout
+  // `.git/modules/<sub>` form (which never occurs here).
   const { listWorktrees } = await import("./orchestrator.ts");
   const { WORKTREES_DIR } = await import("./worktree.ts");
 
@@ -307,7 +310,7 @@ test("a legacy orphan worktree with a submodule is not split into repository row
   );
   writeFileSync(
     path.join(submoduleDir, ".git"),
-    "gitdir: /tmp/source-repo/.git/modules/vendor-lib\n",
+    `gitdir: /tmp/source-repo/.git/worktrees/${orphanId}/modules/vendor-lib\n`,
   );
 
   try {

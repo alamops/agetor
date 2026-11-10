@@ -2078,6 +2078,32 @@ describe("parseWorktreeGitPointer", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("a submodule inside a linked worktree is not itself a linked worktree", async () => {
+    const { parseWorktreeGitPointer } = await import("./worktree.ts");
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-wt-submodule-"));
+    try {
+      // Real shape git writes for a submodule checked out in a linked
+      // worktree: `<repo>/.git/worktrees/<wt>/modules/<sub>` (verified with
+      // git 2.54). It carries the `.git/worktrees/` marker but has a deeper
+      // tail, so it must NOT parse as a worktree of `<repo>`.
+      const submodule = path.join(root, "vendor-lib");
+      mkdirSync(submodule);
+      writeFileSync(
+        path.join(submodule, ".git"),
+        "gitdir: /src/repo/.git/worktrees/wt-1/modules/vendor-lib\n",
+      );
+      expect(parseWorktreeGitPointer(submodule)).toBeNull();
+
+      // The linked worktree's own pointer (one segment after the marker) does.
+      const worktree = path.join(root, "wt");
+      mkdirSync(worktree);
+      writeFileSync(path.join(worktree, ".git"), "gitdir: /src/repo/.git/worktrees/wt-1\n");
+      expect(parseWorktreeGitPointer(worktree)).toBe("/src/repo");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // ── multi-repository tasks (issue #291) ───────────────────────────────────

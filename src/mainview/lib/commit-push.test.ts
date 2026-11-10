@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "./commit-push.ts";
+import { prHeadBranch, shouldOfferCommitPush, shouldOfferCommitPushForTask, shouldOfferOpenPr, type TaskGitStatus } from "./commit-push.ts";
 
 function status(overrides: Partial<TaskGitStatus>): TaskGitStatus {
   return {
@@ -32,6 +32,29 @@ test("shouldOfferCommitPush: both hasChanges and ahead offer the chip", () => {
 
 test("shouldOfferCommitPush: clean tree and nothing ahead → false", () => {
   expect(shouldOfferCommitPush(status({ hasChanges: false, ahead: 0 }))).toBe(false);
+});
+
+test("shouldOfferCommitPushForTask: aggregate over every repository", () => {
+  const repo = (name: string, overrides: Partial<TaskGitStatus>) =>
+    ({ ...status(overrides), name, path: `/tmp/${name}` });
+  // The selected tab (mirrored top-level) is clean, but a sibling repo is dirty:
+  // the aggregate prompt covers all repositories, so the chip must show.
+  const statuses = status({
+    hasChanges: false,
+    ahead: 0,
+    repositories: [repo("frontend", {}), repo("backend", { hasChanges: true })],
+  });
+  expect(shouldOfferCommitPushForTask(statuses)).toBe(true);
+  expect(shouldOfferCommitPushForTask(status({
+    repositories: [repo("frontend", { ahead: 2 }), repo("backend", { ignored: true })],
+  }))).toBe(true);
+  // Nothing to do anywhere → hidden.
+  expect(shouldOfferCommitPushForTask(status({
+    repositories: [repo("frontend", {}), repo("backend", {})],
+  }))).toBe(false);
+  // Single-repository rows keep the plain check.
+  expect(shouldOfferCommitPushForTask(status({ hasChanges: true }))).toBe(true);
+  expect(shouldOfferCommitPushForTask(null)).toBe(false);
 });
 
 test("shouldOfferOpenPr: null status → false", () => {

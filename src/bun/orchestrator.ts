@@ -11171,9 +11171,10 @@ export async function createTask(
 
   if (multiRepo) {
     // Per-repository base refs resolved now, so a re-run starts from the same
-    // commit in every repository. The shared branch name is pinned once below
-    // (against the first repository) and attempted in each; a repository that
-    // already holds it gets a `-2` fallback at prepare time.
+    // commit in every repository. The shared desired branch name is resolved
+    // per repository below (against each repository's own refs at create
+    // time), so a name an archived task left behind gets the `-N` fallback
+    // before anything is materialized.
     const requestedByPath = new Map(
       repoInputs.map((r) => [typeof r.path === "string" ? r.path.trim() : "", r.baseRef]),
     );
@@ -11977,9 +11978,18 @@ async function planOneRepoTeardown(
   branchSource: Task["branchSource"],
   lastSeenCheckout: string | null,
 ): Promise<Omit<RepoTeardownPlan, "name" | "path">> {
+  // A repository that was never materialized (create pinned its branch, but
+  // the task was archived/deleted before it started) has no checkout to
+  // remove, and `removeWorktree` skips it. Planning a branch here anyway made
+  // the delete confirm and `agetor rm` promise a removal the delete does not
+  // perform — keep the entry (the UI still lists the repository) with an
+  // empty plan so preview and delete agree.
+  if (!worktreePath) {
+    return { branches: [], liveBranch: null, taskBranch, source: "none", excluded: [] };
+  }
   let liveBranch: string | null = null;
   let liveKnown = false;
-  if (worktreePath && existsSync(worktreePath)) {
+  if (existsSync(worktreePath)) {
     const live = await readCheckoutBranch(worktreePath);
     if (live.ok) {
       liveBranch = live.branch;
@@ -12282,7 +12292,9 @@ export function discardRefusedWorktree(
       return;
     }
     const plan = await teardownBranchesForTask(target);
-    await removeWorktree(target, { branches: plan.branches });
+    // Same per-repository plan delete passes: a multi task's branch ownership
+    // can't be recovered from the top-level union alone.
+    await removeWorktree(target, { branches: plan.branches, repositories: plan.repositories });
   });
 }
 

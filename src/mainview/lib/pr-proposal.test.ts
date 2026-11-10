@@ -501,6 +501,56 @@ describe("multi-repository proposals", () => {
     expect(map.get("backend")?.link).toBe("https://github.com/acme/backend/pull/new/feature/add-login");
   });
 
+  test("repository names containing underscores are not truncated", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const text = [
+      "Repository: agetor_api",
+      LINK,
+      "PR title:",
+      "```",
+      "Add API",
+      "```",
+      "PR description:",
+      "````",
+      "Body.",
+      "````",
+    ].join("\n");
+    const map = parseRepositoryProposals(text);
+    expect([...map.keys()]).toEqual(["agetor_api"]);
+    expect(map.get("agetor_api")?.title).toBe("Add API");
+  });
+
+  test("markdown emphasis around the label and value is stripped", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const text = [
+      "**Repository:** **frontend**",
+      LINK,
+      "PR title:",
+      "```",
+      "UI",
+      "```",
+      "PR description:",
+      "````",
+      "Frontend body.",
+      "````",
+      "",
+      "### _Repository:_ agetor_api",
+      LINK,
+      "PR title:",
+      "```",
+      "API",
+      "```",
+      "PR description:",
+      "````",
+      "API body.",
+      "````",
+    ].join("\n");
+    const map = parseRepositoryProposals(text);
+    expect([...map.keys()]).toEqual(["frontend", "agetor_api"]);
+    expect(map.get("frontend")?.title).toBe("UI");
+    expect(map.get("agetor_api")?.title).toBe("API");
+  });
+
   test("tolerates a missing label only when exactly one proposal exists", () => {
     const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
     const events = [ev({ data: canonicalText() })];

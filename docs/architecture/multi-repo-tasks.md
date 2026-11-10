@@ -132,12 +132,17 @@ final path must be a direct child of its parent, itself a direct child of
 `WORKTREES_DIR`. `listWorktrees` emits one row per repository
 (`repoName`, `workdir = entry.path`), skips the workspace root, and expands an
 orphaned workspace directory only when a child's `.git` is a linked-worktree
-pointer (`gitdir: …/.git/worktrees/…`) — a submodule's `.git` pointer into
-`.git/modules/…` does not split a legacy single-repository worktree into rows.
+pointer with exactly one segment after `.git/worktrees/` (`gitdir:
+<repo>/.git/worktrees/<id>`). A submodule never qualifies: inside a linked
+worktree git writes `<repo>/.git/worktrees/<id>/modules/<sub>` (and in a main
+checkout `.git/modules/<sub>`), so its deeper or different tail does not split
+a legacy single-repository worktree into rows.
 
-Teardown is serialized per source repository: `enqueueTeardownMany` acquires
-every selected repository's key in sorted order (no deadlock), so two tasks
-sharing a repository never run `git worktree` operations concurrently.
+Teardown is serialized per selected repository path: `enqueueTeardownMany`
+acquires every entry's `path` key in sorted order (no deadlock), so two tasks
+that selected the same path never run `git worktree` operations concurrently.
+(Keys are the paths the tasks stored, not their resolved git roots, so two
+subdirectory selections under one root are not serialized against each other.)
 
 ## Surfaces
 
@@ -148,9 +153,9 @@ sharing a repository never run `git worktree` operations concurrently.
 - **`@` files** — client-side union over one `/files/index` per repository
   scope, entries prefixed `<name>/`. No new server listing route; workspace
   containment is unchanged.
-- **Card** — a worktree icon + repository count popover instead of the single
-  workdir/branch line. Board text search and the project filter match any
-  repository.
+- **Card** — a worktree icon + repository count with a hover tooltip naming
+  every repository, instead of the single workdir/branch line. Board text
+  search and the project filter match any repository.
 - **Diff dialog** — one tab per repository.
 - **Run panel** — repository tab selects the per-repo status, PR head, PR path
   and terminal cwd; commit & push uses the aggregate prompt.
@@ -158,9 +163,9 @@ sharing a repository never run `git worktree` operations concurrently.
   teardown; steps never detach a shared worktree.
 - **CLI/TUI** — `agetor add --repo <path[=ref]>` (repeatable), `show` prints the
   repository block, `shell [--repo <name>]` (the task id works with or without
-  the flag), `rm` prints one line per repository (and `--json` carries
-  `repositories[]`), `ls` shows a count, and the TUI `@` listing unions the
-  scopes with prefixes.
+  the flag), `rm` names each repository's own branch removals (and `--json`
+  carries `repositories[]`), `ls` shows a count, and the TUI `@` listing unions
+  the scopes with prefixes.
 
 ## Intentional limits
 

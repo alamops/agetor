@@ -950,6 +950,14 @@ export function parseWorktreeGitPointer(worktreeDir: string): string | null {
     const marker = `${path.sep}.git${path.sep}worktrees${path.sep}`;
     const idx = gitdir.indexOf(marker);
     if (idx < 0) return null;
+    // Exactly ONE segment follows the marker: `.git/worktrees/<id>`.
+    // A submodule checked out inside a linked worktree points at
+    // `<repo>/.git/worktrees/<id>/modules/<sub>` — the same marker, with a
+    // deeper tail. Treating that as a linked worktree would split one
+    // single-repository worktree into bogus nested repository rows (and,
+    // for an orphan, attribute its checkout to the submodule path).
+    const remainder = gitdir.slice(idx + marker.length);
+    if (!remainder || remainder.includes("/") || remainder.includes(path.sep)) return null;
     return gitdir.slice(0, idx);
   } catch {
     return null;

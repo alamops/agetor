@@ -137,3 +137,33 @@ test("teardown-preview names every repository's branches for a multi-repo task",
     await import("./orchestrator.ts").then((m) => m.deleteTask(task.id)).catch(() => {});
   }
 });
+
+test("teardown-preview promises no branches for repositories delete never materialized", async () => {
+  // Review should-fix: create pins each repository's branch, but a task that
+  // is archived/deleted before it starts has no worktree. Delete skips those
+  // entries; the preview used to name their pinned branches anyway, so the
+  // confirm promised removals that never happened.
+  const { createTask, deleteTask, teardownBranchesForTask } = await import("./orchestrator.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "never started multi",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const task = created.task;
+  try {
+    // Branches were pinned at create, but no checkout exists yet.
+    expect(task.repositories?.every((r) => r.branch && r.worktreePath === null)).toBe(true);
+    const preview = await teardownBranchesForTask(task);
+    expect(preview.branches).toEqual([]);
+    expect(preview.repositories?.map((r) => r.branches)).toEqual([[], []]);
+    expect(preview.repositories?.map((r) => r.source)).toEqual(["none", "none"]);
+  } finally {
+    await deleteTask(task.id).catch(() => {});
+  }
+});

@@ -258,6 +258,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // since `wt.isolate`/`wt.baseRef` are read further down by the `fileScope`
   // memo passed to `<PromptComposer fileScope={…}>`.
   const wt = useWorktreeOptions({ workdir, title, taskType });
+  // A 2+ repository selection forces worktree isolation server-side. Force the
+  // same state here so the branch-name field (which only renders while
+  // isolated) stays visible and the `@` scopes keep their pinned refs, even
+  // when the user had unchecked the toggle for a single-project selection.
+  const { isolate: wtIsolate, setIsolate: setWtIsolate } = wt;
+  useEffect(() => {
+    if (multiRepo && !wtIsolate) setWtIsolate(true);
+  }, [multiRepo, wtIsolate, setWtIsolate]);
   const [mode, setMode] = useState<string>(initialMode("claude-code"));
   const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
   // `null` is reserved for the Haiku-style "model doesn't accept effort" case.
@@ -872,7 +880,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                   title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
                 />
               </div>
-              <WorktreeOptions state={wt} />
+              <WorktreeOptions state={wt} variant={multiRepo ? "multi" : "default"} />
               <div className="min-w-0 space-y-1" data-testid="new-task-repositories">
                 <label className="text-muted-foreground">Repositories</label>
                 {multiRepo ? (

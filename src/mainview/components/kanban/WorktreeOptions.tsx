@@ -235,13 +235,28 @@ const isolateTitle =
   "Runs the agent on a dedicated branch off the chosen base, so parallel tasks "
   + "on the same repo don't collide. No-op when the workdir isn't a git repo.";
 
-type Props = { state: WorktreeOptionsState } | { locked: { branch: string } };
+type Props =
+  | {
+      state: WorktreeOptionsState;
+      /**
+       * `"multi"` for a 2+ repository task: isolation is forced on and each
+       * repository's base ref comes from the Repositories dialog, so the
+       * single-project branch picker and the isolate toggle are hidden (they
+       * would show values the server ignores) while the shared branch-name
+       * field stays editable.
+       */
+      variant?: "default" | "multi";
+    }
+  | { locked: { branch: string } };
 
 /**
  * Renders the worktree row. Live variant (`{ state }`): the Branch picker,
  * the isolate checkbox, and — while isolated — the editable branch-name
  * field + `BranchNamingDialog`, byte-identical to `NewTaskForm`'s original
- * JSX. Locked variant (`{ locked: { branch } }`): a read-only row for
+ * JSX. `variant: "multi"` hides the single-project picker and isolate toggle
+ * (2+ repos force isolation and take per-repo base refs from the Repositories
+ * dialog) while keeping the shared branch-name field. Locked variant
+ * (`{ locked: { branch } }`): a read-only row for
  * `existingBranch` tasks (the PR-conflicts modal), where the PR's head
  * branch is always checked out as-is in its own worktree — no base-ref
  * picker, no editable name, no dialog.
@@ -274,7 +289,8 @@ export function WorktreeOptions(props: Props) {
     );
   }
 
-  const { state } = props;
+  const { state, variant = "default" } = props;
+  const multi = variant === "multi";
   const {
     isolate,
     setIsolate,
@@ -296,35 +312,47 @@ export function WorktreeOptions(props: Props) {
 
   return (
     <div data-testid="worktree-options" className="space-y-3">
-      <BranchPicker
-        label="Branch"
-        workdir={workdir}
-        value={baseRef}
-        onChange={setBaseRef}
-        onAutoSelect={setBaseRefAuto}
-        placement="bottom"
-        title={
-          isolate
-            ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
-            : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
-        }
-      />
-
-      <label
-        className="flex cursor-pointer items-center gap-1.5"
-        title={isolateTitle}
-      >
-        <input
-          type="checkbox"
-          checked={isolate}
-          onChange={(e) => setIsolate(e.target.checked)}
-          data-testid="isolate-toggle"
+      {!multi && (
+        <BranchPicker
+          label="Branch"
+          workdir={workdir}
+          value={baseRef}
+          onChange={setBaseRef}
+          onAutoSelect={setBaseRefAuto}
+          placement="bottom"
+          title={
+            isolate
+              ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
+              : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
+          }
         />
-        <GitBranch className="size-3" />
-        <span>Isolate (worktree)</span>
-      </label>
+      )}
 
-      {isolate && (
+      {!multi && (
+        <label
+          className="flex cursor-pointer items-center gap-1.5"
+          title={isolateTitle}
+        >
+          <input
+            type="checkbox"
+            checked={isolate}
+            onChange={(e) => setIsolate(e.target.checked)}
+            data-testid="isolate-toggle"
+          />
+          <GitBranch className="size-3" />
+          <span>Isolate (worktree)</span>
+        </label>
+      )}
+
+      {multi && (
+        <p className="text-[11px] text-muted-foreground">
+          Worktree isolation is always on. Each repository branches from its own base
+          ref (set in the Repositories dialog); this name is used in every repository,
+          with a `-N` fallback where it is already taken.
+        </p>
+      )}
+
+      {(multi || isolate) && (
         <div className="space-y-1">
           <label className="text-muted-foreground">Branch name</label>
           <div className="relative">

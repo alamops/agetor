@@ -49,6 +49,27 @@ export function selectionName(entry: Pick<RepoSelection, "path">): string {
 }
 
 /**
+ * The directory whose provider remote owns a task's issue URL. A
+ * multi-repository task's `workdir` is the workspace root, which is NOT a git
+ * repository — passing it to the GitHub dialog made the issue-thread fetch
+ * 400. Use the entry whose remote matched `issueUrl` (`issueRepoPath`),
+ * falling back to the selected tab for rows created before that field.
+ */
+export function issueProjectPath(
+  task: {
+    workdir: string;
+    issueRepoPath?: string | null;
+    repositories?: { path: string }[];
+  },
+  activeRepo?: { path: string } | null,
+): string {
+  if ((task.repositories?.length ?? 0) > 1) {
+    return task.issueRepoPath ?? activeRepo?.path ?? task.workdir;
+  }
+  return task.workdir;
+}
+
+/**
  * Merge an existing selection with the ProjectPicker's currently chosen path:
  * choosing a project collapses a multi selection back to that one repository
  * (and seeds its base ref), matching the plan's "changing the ProjectPicker
