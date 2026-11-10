@@ -259,12 +259,12 @@ All are table-driven and need no code change beyond the tables:
 
 - **Wrong argv if `CLAUDE_MODEL_FLAG` is missed.** Unknown ids pass through verbatim, so `--model fable-5.2` would be sent instead of `claude-fable-5-2`. This is the single most important edit and must have a `buildCommand` test.
 - **Wrong picker family if 5.1 is not demoted.** If `fable-5.1` still maps to `"Fable"` after 5.2 takes the row, a mid-session dropdown change to 5.1 would drive the picker to 5.2. The existing test currently *asserts* the wrong future behavior (`agents.test.ts:386`), so the suite will not catch this unless the test is moved; the plan must do it.
-- **Cursor spec hides discovered rows.** A stored `claude-fable-5-2-<effort>` would render unlisted with a collapsed effort picker after the spec lands. Migration 084 restores the base+effort shape; without it, runs still launch verbatim but the UI is degraded.
+- **Cursor spec hides discovered rows.** A stored `claude-fable-5-2-<effort>` would render unlisted with a collapsed effort picker after the spec lands. Migration 086 (authored as 084) restores the base+effort shape; without it, runs still launch verbatim but the UI is degraded.
 - **Count drift.** Adding the fx row moves 26→27 `catalogOnly`, 42→43 curated, 40→41 effort-advertising across `types.ts` comments, `types.test.ts`, `orchestrator.ts`, `agent-discovery.ts`, `fx-acp.ts`, `docs/architecture/harness-fx.md` and `e2e/fx-models.spec.ts`. Re-count from the file, never copy an old number.
 - **Do not add rows for unsupported harnesses.** Copilot 1.0.108 has no Fable 5.2, and Antigravity has never carried Fable; adding either would produce a row that fails at spawn. OpenCode needs no curated row.
 - **Default flip is a separate product decision.** Keeping `opus-5.5` avoids a silent 2× usage change for every new task. If the owner flips it, the default anchors listed in §4 Q3 must be updated in the same wave.
 - **Docs/comments drift.** `docs/architecture/harness-claude-code.md:44`, `src/bun/agents.ts:275-312`, `src/bun/orchestrator.ts:3720-3729`, `NewTaskForm.tsx:1120`, `DEFAULT_MODEL` comment and the fx counts all describe the current state and should move with the code.
-- **Rollback:** the new rows/spec/flag are additive; revert the commit(s). Migration 084 is one-way like 055/056/060/062/064/076 — a rollback is a new migration, not a down-migration. No existing Claude data is mutated.
+- **Rollback:** the new rows/spec/flag are additive; revert the commit(s). Migration 086 (authored as 084) is one-way like 055/056/060/062/064/076 — a rollback is a new migration, not a down-migration. No existing Claude data is mutated.
 
 ## 8. Bottom line
 
