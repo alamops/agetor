@@ -786,10 +786,18 @@ as an *un-owned restore pointer* (below). The store does not trust its own
 directory tree either: every access resolves its ref through
 `resolveBackupPath`, which `lstat`s each component from `mirror-backups/` down
 and treats a symlink or non-directory parent as missing (a write refuses it);
-reads open no-follow handles asynchronously; and `removeMirrorBackups` walks the
-tree cooperatively without following a link (a symlink is unlinked as itself,
-and a directory swapped for a link between the check and the listing is
-skipped). A mirror in flight when its account is deleted stops writing
+reads open no-follow handles asynchronously; and `removeMirrorBackups`, after
+`lstat`-checking `mirror-backups/` and the account's folder, deletes with Bun's
+recursive `fs.rm`, which is fd-relative (Zig `deleteTree`: each folder opened
+from its parent's descriptor with `O_NOFOLLOW`, each entry unlinked relative to
+its folder), so a link is removed as itself and a folder swapped for a link
+mid-delete is refused, never followed. A path-based walk cannot give that: a
+spike (racing a folder↔link swap during the delete, 100+ trials each) lost
+outside files with our earlier `lstat`/re-check walk, with `/bin/rm -rf` (macOS
+`fts` has its dev/ino check compiled out and opens folders without
+`O_NOFOLLOW`, so a raced `rm` emptied the whole outside folder) and with
+`find -delete`; Bun's `rm`, sync and async, lost none. It runs off the main
+thread. A mirror in flight when its account is deleted stops writing
 (`accountAlive`) so it recreates neither rows nor backups.
 
 **Un-owned restore pointers.** When the mirror stops owning a `preexisted` item
@@ -1506,11 +1514,6 @@ account move and every blocked outcome. The trigger per path is the table under
   from the user's other tooling says nothing about Claude. Without a selector
   the key is ignored (and the process-key warning does not name it). The
   direct `ANTHROPIC_*` / `CLAUDE*` keys still count as a login.
-- **Backup removal has a narrow directory-swap race.** `removeMirrorBackups`
-  `lstat`s a directory, lists it, re-checks that it is the same inode and only
-  then descends, so an agent that swaps a directory for a link in the window
-  between those calls is mostly but not entirely excluded: Bun's `fs` has no
-  fd-based directory operations to close it. The window is reduced, not closed.
 - **An orphaned copy outside the account's current root waits.** A kept file
   whose account was re-pointed elsewhere is retried by every sweep and removed
   once the root points back; if it never does, it stays on disk (and on record)

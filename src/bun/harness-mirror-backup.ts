@@ -24,7 +24,7 @@
  * asynchronous; removal walks the tree cooperatively without following links.
  */
 import { lstatSync, mkdirSync } from "node:fs";
-import { lstat, open, readdir, rmdir, unlink } from "node:fs/promises";
+import { lstat, open, rm, unlink } from "node:fs/promises";
 import path from "node:path";
 import { assertSafeRelPath, atomicWriteFile, copyRegularFileDetailed } from "./harness-file-transfer.ts";
 import { dataDir } from "./db.ts";
@@ -34,8 +34,6 @@ import { isSafePathSegment } from "../shared/harness-mirror.ts";
 /** Largest file a backup will hold (matches the mirror's own merged-file cap
  *  scaled up for a skill's bundled assets). */
 const MAX_BACKUP_BYTES = 64 * 1024 * 1024;
-
-const YIELD_EVERY_MS = 20;
 
 function backupsRoot(): string {
   return path.join(dataDir, "mirror-backups");
@@ -329,35 +327,10 @@ export function linkRef(harnessId: string, rel: string): string {
   return linkBackupRef(harnessId, rel);
 }
 
-/**
- * Remove a directory tree without following a link: a symlink (to a file or a
- * directory) is unlinked as itself, a directory is emptied and removed. Yields
- * every ~20 ms so a large store never blocks the main thread.
- */
-async function removeTreeNoFollow(dir: string, state: { last: number }): Promise<void> {
-  const before = await lstat(dir);
-  if (before.isSymbolicLink() || !before.isDirectory()) return;
-  const names = await readdir(dir);
-  // The directory must still be the one that was checked, not swapped for a
-  // link to somewhere else between the lstat and the listing.
-  const after = await lstat(dir);
-  if (after.isSymbolicLink() || after.ino !== before.ino || after.dev !== before.dev) return;
-  for (const name of names) {
-    if (Date.now() - state.last >= YIELD_EVERY_MS) {
-      await Bun.sleep(0);
-      state.last = Date.now();
-    }
-    const child = path.join(dir, name);
-    const st = await lstat(child);
-    if (st.isDirectory() && !st.isSymbolicLink()) await removeTreeNoFollow(child, state);
-    else await unlink(child);
-  }
-  await rmdir(dir);
-}
-
 /** Remove every saved original of one account (account delete, or a clean
- *  Restore). Refuses a symlinked `mirror-backups/` or `<id>`; cooperative and
- *  never follows a link; never throws. */
+ *  Restore). Refuses a symlinked `mirror-backups/` or `<id>`, never follows a
+ *  link inside the tree (fd-relative removal), runs off the main thread and
+ *  never throws. */
 export async function removeMirrorBackups(harnessId: string): Promise<void> {
   let dir: string;
   try {
@@ -373,7 +346,14 @@ export async function removeMirrorBackups(harnessId: string): Promise<void> {
     return;
   }
   try {
-    await removeTreeNoFollow(dir, { last: Date.now() });
+    // Bun's recursive `rm` is the fd-relative walker (Zig `deleteTree`): every
+    // folder is opened relative to its parent's descriptor with `O_NOFOLLOW`
+    // and every entry is unlinked relative to its folder's descriptor, so an
+    // agent that swaps a folder for a link mid-delete cannot redirect it out of
+    // the store. A path-based walk (ours before, `/bin/rm -rf`, `find -delete`)
+    // can be redirected; a spike lost outside files with all three
+    // (docs/architecture/harness-stacks.md). It runs off the main thread.
+    await rm(dir, { recursive: true, force: true });
   } catch {
     // Best effort: a leftover backup is inert (nothing reads it without a row).
   }
