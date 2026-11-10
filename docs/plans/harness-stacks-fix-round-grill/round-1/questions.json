@@ -1,0 +1,257 @@
+{
+  "version": 1,
+  "id": "harness-stacks-fix-round-grill-r1",
+  "title": "Grill — harness stacks fix round + improvements",
+  "skill": "implement",
+  "slug": "harness-stacks-fix-round",
+  "round": 1,
+  "flags": [],
+  "summary": "You already decided the big ones in chat: **fix review items 1–22 and every UX gap**, **remove the transcript cap**, and **add** mirror provenance, a per-stack swap history, per-member quota in the Stacks list and a *switch to next account now* action. Returning to the primary after a reset stays **out of scope**.\n\nWhat's left are the decisions the build would otherwise make silently. **Four blocking** ones shape the plan: how *switch now* behaves on a live run, how the swap history is stored and kept, how a per-model Codex limit is scoped, and how far mirror backups/restore go. Then a few that shape parts of it, and a confirm list of defaults I'd bet on (one click each).",
+  "proven": [
+    {
+      "text": "**Claude's `file-history/` is keyed by session id** (`~/.claude/file-history/<sessionId>/<hash>@vN`), so item 17 can copy `/rewind` checkpoints alongside the transcript by sid.",
+      "evidence": [{ "label": "on-disk layout checked (names only)", "note": "file-history/00150406-…/b45a7239a0ca99de@v1 matches projects/<enc>/00150406-….jsonl" }]
+    },
+    {
+      "text": "**Finding the source transcript by scanning `projects/*/<sid>.jsonl`** fixes long worktree paths: Claude hashes project-dir names over 200 chars with an unknown input, but copying to the source's own dir name lets the backup's Claude compute the same name from the same cwd.",
+      "evidence": [{ "label": "current encoder (no hash variant)", "path": "src/bun/claude-tmux.ts", "line": 527 }]
+    },
+    {
+      "text": "**Live accounts can already be continued mid-turn**: the limit settlement (`handleHarnessLimitSettlement` → `executeStackSwap` → `spawnSwapContinuation`) copies the session and resumes on the next account. *Switch now* can reuse it with a manual trigger that does **not** cool the account or mark it tried.",
+      "evidence": [{ "label": "settlement entry", "path": "src/bun/orchestrator.ts", "line": 4100 }]
+    },
+    {
+      "text": "**Quota display needs no new connection**: the webview already holds every `HarnessQuota` snapshot in `App.tsx` (seeded from `GET /usage`, kept live by the `harness_usage` app event). The CLI can read `GET /usage` (CLI scope). The force-refresh route stays desktop-only on purpose (it can trigger a cross-app Cursor database read).",
+      "evidence": [{ "label": "usage map", "path": "src/mainview/App.tsx", "line": 286 }, { "label": "refresh is app-only", "path": "src/bun/route-policy.ts", "line": 356 }]
+    },
+    "**Nothing persists swap events today**: only the successor run's `origin`, a status-line divider and the latest `lastMove` (cleared by the next automatic swap). The history needs a new table (migration 087).",
+    "**Codex is not wired for e2e** (`e2e/fixtures.ts` sets only the Claude fake driver). Adding `AGETOR_CODEX_DRIVER=fake` to the fixture is part of the requested Codex-stack e2e."
+  ],
+  "sections": [
+    {
+      "id": "blocking",
+      "title": "Blocking — these change the plan's shape",
+      "questions": [
+        {
+          "id": "switch-now-live",
+          "type": "single",
+          "title": "What should \"Switch to next account now\" do while the task's run is live?",
+          "impact": "blocking",
+          "why": "Decides whether this is a small route over the existing idle switch, or a new interrupt path into the swap settlement.",
+          "context": "Today a same-stack account change is refused while a run is live (409 \"stop the run before switching accounts\") because the switch copies the transcript and drops the REPL. The limit settlement already knows how to stop a live turn, copy the conversation and resume it on the next account with a hidden continuation prompt. The obvious use case for *switch now* is an account that is slow, degraded or about to run out mid-turn.\n\nIn every option a task held by running background agents is refused (409), as today, and the switch never cools the old account or marks it tried.",
+          "evidence": [{ "label": "live-run refusal", "path": "src/bun/server.ts", "line": 5995 }],
+          "options": [
+            { "id": "interrupt", "label": "Interrupt and continue on the next account", "description": "Stops the live turn and runs the swap: copy the conversation, resume on the next usable account, divider \"Switched to X — continuing this conversation\".", "consequence": "Reuses the swap settlement with a manual trigger. Any in-flight tool call is cut off (the same accepted risk as a limit swap)." },
+            { "id": "after-turn", "label": "Switch after the current turn ends", "description": "Records the request; when the turn settles successfully the task moves to the next account before the next message.", "consequence": "No interrupted tool work, but it doesn't help with an account that is stuck or slow now." },
+            { "id": "idle-only", "label": "Only when idle", "description": "Refused (409) while a run is live; the button is disabled with a hint.", "consequence": "Smallest change; the user must Stop first." }
+          ],
+          "recommendation": { "value": "interrupt", "reason": "It's the case the button exists for, and the swap machinery already handles a mid-turn move safely." }
+        },
+        {
+          "id": "history-lifetime",
+          "type": "single",
+          "title": "How should the per-stack swap history be stored and how long is it kept?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "A migration adds the table; its foreign keys decide what survives task and stack deletes.",
+          "context": "Proposed table `harness_swap_events` (migration 087): stack id, task id + task title (denormalized), from/to account ids and labels, trigger, reason, source, provider reset time, old/new run ids, continuation kind (transferred/restarted), timestamp. No foreign key to `harnesses` (repo rule, migration 085). Labels are stored so a deleted account still reads by name.",
+          "options": [
+            { "id": "stack-scoped-capped", "label": "Kept with the stack, capped per stack", "description": "Survives task delete/archive and account delete; removed when the stack is deleted; oldest rows pruned past a cap (next question).", "consequence": "A history answers \"how often does this stack fail over?\" even after tasks are cleaned up." },
+            { "id": "task-cascade", "label": "Deleted with its task", "description": "FK to `tasks` with ON DELETE CASCADE; removed with the stack too.", "consequence": "History shrinks as tasks are deleted; no cap needed." },
+            { "id": "forever", "label": "Kept forever, even after stack delete", "description": "Shown as \"deleted stack\" in the CLI.", "consequence": "Unbounded growth; needs a separate cleanup command later." }
+          ],
+          "recommendation": { "value": "stack-scoped-capped", "reason": "The history is about the stack's accounts, not the tasks, and a cap keeps it bounded without a new cleanup feature." }
+        },
+        {
+          "id": "history-cap",
+          "type": "number",
+          "title": "How many swap events to keep per stack before pruning the oldest?",
+          "impact": "minor",
+          "unit": "events",
+          "min": 50,
+          "max": 10000,
+          "step": 50,
+          "showIf": { "question": "history-lifetime", "in": ["stack-scoped-capped"] },
+          "recommendation": { "value": 500, "reason": "Months of heavy use at a few swaps a day, and a cheap indexed delete." }
+        },
+        {
+          "id": "history-events",
+          "type": "multi",
+          "title": "Which events go into the swap history?",
+          "impact": "shape",
+          "why": "Each one is a write point in a different move path (six exist).",
+          "options": [
+            { "id": "limit", "label": "Limit swaps", "description": "A provider limit moved a live task to the next account." },
+            { "id": "manual", "label": "Manual switches", "description": "Same-stack account change from the picker/CLI, and *switch now*." },
+            { "id": "unavailable", "label": "Moves off an unusable account", "description": "Run/message found the account removed, disabled or logged out and moved on." },
+            { "id": "retry", "label": "Automatic retries after a reset", "description": "Including a retry that stays on the same account." },
+            { "id": "blocked", "label": "Blocked outcomes", "description": "\"Stack out of quota\" / \"no usable account\" — no move happened, but the stack ran out." },
+            { "id": "boot-resume", "label": "Swaps completed at boot", "description": "A switch the core finished after a restart." }
+          ],
+          "recommendation": { "value": ["limit", "manual", "unavailable", "retry", "blocked", "boot-resume"], "reason": "A history that omits the blocked and retry rows can't explain why a task waited." }
+        },
+        {
+          "id": "codex-per-model",
+          "type": "single",
+          "title": "Codex \"You've hit your usage limit for <model>\" — how should a per-model limit be scoped?",
+          "impact": "blocking",
+          "why": "Decides whether `harness_limit_state` gains a model column (migration) and whether selection checks cooldowns per model.",
+          "context": "Today it is classified as an account-wide quota, so one task on a heavy model cools the account for every task on every model until the reset (review item 11).",
+          "evidence": [{ "label": "classifier", "path": "src/shared/harness-limits.ts", "line": 99 }],
+          "options": [
+            { "id": "per-model-cooldown", "label": "Cool the account for that model only", "description": "`harness_limit_state` gains a `model` column (null = whole account). Selection skips a member only for tasks on that model; the UI says \"cooling for gpt-… until …\".", "consequence": "Migration + selection change; most accurate." },
+            { "id": "task-only", "label": "Move this task only, no cooldown", "description": "The account is marked tried for this task's lap; other tasks keep using it.", "consequence": "No migration; other tasks on the same model will each hit the limit once." }
+          ],
+          "recommendation": { "value": "per-model-cooldown", "reason": "It's the only option that stops every task on that model from re-hitting the limit, and it costs one nullable column." }
+        },
+        {
+          "id": "mirror-backups",
+          "type": "single",
+          "title": "Mirror provenance: what happens to a backup's own files and keys the mirror overwrites?",
+          "impact": "blocking",
+          "why": "Decides the backup store's size, retention and whether a restore surface is built.",
+          "context": "Provenance (DB table, migration 087) records every file/key the mirror wrote, with a hash. The first time the mirror would replace something the backup already had (its own `CLAUDE.md`, hooks, a skill), the original is saved under `<data dir>/mirror-backups/<account>/…` (0600, outside every account root). Deletion propagation only removes what the mirror wrote **and** the backup hasn't edited since; never a pre-existing original.",
+          "options": [
+            { "id": "backup-restore", "label": "Back up everything overwritten + a Restore action", "description": "Merged files, single files and tree files. Settings → Stacks and `agetor harness stack restore <stack> <account>` put the originals back (and drop provenance for them).", "consequence": "Largest: a restore route, UI and CLI command. Plugin trees can make the store big." },
+            { "id": "backup-manual", "label": "Back up everything overwritten; recovery by hand", "description": "The preview and the warning name the backup folder; no restore command.", "consequence": "No restore surface to build or test." },
+            { "id": "backup-small", "label": "Back up merged and single files only", "description": "settings.json, .claude.json, config.toml, CLAUDE.md/AGENTS.md; tree files that pre-existed are left alone instead of overwritten.", "consequence": "Small store; a pre-existing skill with the same name is no longer replaced (behavior change)." }
+          ],
+          "recommendation": { "value": "backup-restore", "reason": "You prefer the complete path, and a backup nobody can restore from the app is easy to forget exists." }
+        }
+      ]
+    },
+    {
+      "id": "shape",
+      "title": "Shape — these change part of the plan",
+      "questions": [
+        {
+          "id": "mirror-preview",
+          "type": "single",
+          "title": "When does the save-time mirror preview appear?",
+          "impact": "shape",
+          "why": "The preview doubles as the confirm the review asked for before a full-mode mirror overwrites backups.",
+          "context": "A dry run returns the planned changes per backup: files added/updated/removed, settings keys changed (secret-shaped values redacted), and what would be backed up first.",
+          "options": [
+            { "id": "every-mirror-change", "label": "Before every mirror-relevant save", "description": "Any change to members, order, kind or mirror mode shows the preview; Save applies it. A preview with no changes skips the dialog." },
+            { "id": "overwrite-only", "label": "Only when something on a backup would be overwritten or removed", "description": "Pure additions save without a dialog." },
+            { "id": "on-demand", "label": "On demand only", "description": "A \"Preview mirror\" button; Save never asks.", "consequence": "Doesn't close the review's \"overwrites without asking\" gap." }
+          ],
+          "recommendation": { "value": "overwrite-only", "reason": "It asks exactly when something the user had could change, and stays out of the way otherwise." }
+        },
+        {
+          "id": "clear-cooldown",
+          "type": "single",
+          "title": "What does \"Clear cooldown\" do?",
+          "impact": "shape",
+          "context": "A cooldown is account-global (`harness_limit_state`). Today only a successful turn or the reset clears it; a manual Run forces the account for that task only.",
+          "options": [
+            { "id": "global", "label": "Delete the account's cooldown for every task", "description": "New `DELETE /harnesses/:id/limit-state` (desktop + CLI); the confirm warns the provider may still refuse.", "consequence": "One route, a button in Settings and `agetor harness cooldown clear <account>`." },
+            { "id": "per-task", "label": "Force it for one task only", "description": "Like Run now; the account stays cooling for others." }
+          ],
+          "recommendation": { "value": "global", "reason": "The gap is a false match locking an account everywhere; per-task forcing already exists as Run now." }
+        },
+        {
+          "id": "cooldown-message",
+          "type": "single",
+          "title": "Show the provider's own limit message next to a cooling account?",
+          "impact": "minor",
+          "context": "`harness_limit_state` stores `reason`, `source` and the provider `message` (e.g. \"You've hit your usage limit… try again at 3:00 PM\"). It is third-party text: escaped in the CLI, rendered as plain text in the webview.",
+          "options": [
+            { "id": "both", "label": "Reason + message (message in a tooltip/detail line)" },
+            { "id": "reason-only", "label": "Normalized reason only (usage limit / rate limit / out of credits)" }
+          ],
+          "recommendation": { "value": "both", "reason": "The raw message is what tells you whether it was a false match." }
+        },
+        {
+          "id": "retry-test-seam",
+          "type": "single",
+          "title": "The automatic retry waits at least 10 s (hard-coded). May the e2e shorten it with an env override?",
+          "impact": "minor",
+          "options": [
+            { "id": "seam", "label": "Yes — `AGETOR_HARNESS_RETRY_MIN_MS`, honored only under NODE_ENV=test or the e2e backend flag", "consequence": "Countdown/Run-now/retry e2e run in ~1 s each." },
+            { "id": "wait", "label": "No — the e2e waits the real 10 s", "consequence": "Slower suite, no new env var." }
+          ],
+          "recommendation": { "value": "seam", "reason": "Same pattern as the other test-only seams (AGETOR_OPENCODE_SERVER_HOST)." }
+        },
+        {
+          "id": "delivery",
+          "type": "single",
+          "title": "How should this ship?",
+          "impact": "shape",
+          "context": "Rough size: well over 5,000 changed lines across core, CLI, webview, two migrations' worth of tables and docs.",
+          "options": [
+            { "id": "one-branch", "label": "One branch, a commit per wave; you open the PR", "description": "Branch `fix/harness-stacks-fix-round`, nothing pushed." },
+            { "id": "stack", "label": "A stack of branches", "description": "1) core bug fixes, 2) mirror fixes + provenance, 3) history/quota/switch-now + surfaces." }
+          ],
+          "recommendation": { "value": "one-branch", "reason": "Your recent features shipped as one PR, and the waves already give reviewable commits." }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override — defaults I'd use",
+      "questions": [
+        {
+          "id": "manual-no-cooldown",
+          "type": "confirm",
+          "title": "A manual switch (picker, CLI, switch now) never cools the old account and never marks it tried",
+          "recommendation": { "value": "Confirmed: only a provider limit cools an account; a manual move just picks the next usable member.", "reason": "Cooling on a user's choice would lock a healthy account for 10 minutes." }
+        },
+        {
+          "id": "switch-now-none",
+          "type": "confirm",
+          "title": "Switch now with no other usable account is refused up front, before anything is stopped",
+          "recommendation": { "value": "409 with the per-member reasons (cooling until …, logged out, …); the live run keeps going.", "reason": "Killing a turn and then discovering there's nowhere to go is the worst outcome." }
+        },
+        {
+          "id": "provenance-edited",
+          "type": "confirm",
+          "title": "A file/key the mirror wrote and the backup later edited is never removed by deletion propagation",
+          "recommendation": { "value": "Kept, with a warning naming it; provenance for it is dropped.", "reason": "The edit is the backup's own work now." }
+        },
+        {
+          "id": "safe-mode-unown",
+          "type": "confirm",
+          "title": "Switching full → safe mirror stops owning hooks/permissions but leaves the backup's current values in place",
+          "recommendation": { "value": "Provenance rows for keys safe mode no longer mirrors are dropped; nothing on the backup is deleted.", "reason": "Safe mode is about not running the primary's commands, not about wiping the backup." }
+        },
+        {
+          "id": "stack-concurrency",
+          "type": "confirm",
+          "title": "Stack edits carry the `updatedAt` they were based on; a mismatch answers 409",
+          "recommendation": { "value": "Webview: toast \"This stack changed elsewhere — reloaded\", the editor reloads with the current stack. CLI: `stack edit` always sends the updatedAt it just fetched; a 409 says to re-run.", "reason": "Silent last-write-wins is what drops members today." }
+        },
+        {
+          "id": "cli-lookup",
+          "type": "confirm",
+          "title": "CLI stack references resolve as exact id → exact label → unique id prefix",
+          "recommendation": { "value": "A label shared by two stacks is an error listing both ids, like an ambiguous task prefix.", "reason": "Same rules as task refs (`src/cli/resolve.ts`)." }
+        },
+        {
+          "id": "picker-outside",
+          "type": "confirm",
+          "title": "The RunPanel account picker keeps outside-stack accounts selectable, grouped and labelled",
+          "recommendation": { "value": "Two groups: \"This stack — keeps the conversation\" (with n/m and cooling marks) and \"Other accounts — starts a fresh session\". The select shows a spinner and stays disabled while a switch copies.", "reason": "Cross-account moves are legitimate; they just need to say what they do." }
+        },
+        {
+          "id": "quota-display",
+          "type": "confirm",
+          "title": "Per-member quota shows the stored snapshot with its age; past 20 minutes it's marked stale",
+          "recommendation": { "value": "Webview: compact meter per member (5h / weekly), from the app's usage map. CLI `stack ls/show`: the same from GET /usage. No force refresh from the CLI.", "reason": "20 min is the selection's own staleness threshold." }
+        },
+        {
+          "id": "quota-exhausted-rule",
+          "type": "confirm",
+          "title": "A quota snapshot counts as exhausted when any blocking window (Claude 5h/weekly, Codex session/weekly) is at 100% and no credits meter has headroom; its reset is the latest exhausted window's",
+          "recommendation": { "value": "Confirmed (review item 8).", "reason": "Requiring every meter at 100% never fires in practice." }
+        },
+        {
+          "id": "cloud-env-evidence",
+          "type": "confirm",
+          "title": "AWS/Azure/Vertex/Google credentials in the process env count as Claude login evidence only with a provider selector (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY), and then as \"unknown\"",
+          "recommendation": { "value": "Confirmed (review item 10).", "reason": "Without a selector Claude never uses them." }
+        }
+      ]
+    }
+  ]
+}

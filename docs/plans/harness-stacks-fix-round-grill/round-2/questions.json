@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "id": "harness-stacks-fix-round-grill-r2",
+  "title": "Grill round 2 — harness stacks fix round",
+  "skill": "implement",
+  "slug": "harness-stacks-fix-round",
+  "round": 2,
+  "flags": [],
+  "summary": "Three follow-ups on round 1: your **switch after the turn ends** choice needs two details, your note on the picker can be read two ways, and you asked **why the history has a cap**.",
+  "proven": [
+    "Round 1 is recorded in `docs/plans/harness-stacks-fix-round-grill/round-1/answers.json` (19 recommendations accepted)."
+  ],
+  "sections": [
+    {
+      "id": "switch-now",
+      "title": "Switch to next account — after the current turn",
+      "intro": "Round 1: *\"Switch after the current turn ends\"* (you turned down interrupting the live turn).",
+      "questions": [
+        {
+          "id": "switch-idle",
+          "type": "single",
+          "title": "On a task with no live run, does \"Switch to next account\" move right away?",
+          "impact": "shape",
+          "options": [
+            { "id": "immediate", "label": "Yes — move now", "description": "Same as today's same-stack switch: mirror, copy the conversation, \"Switched to X — continuing this conversation\"." },
+            { "id": "next-run", "label": "No — move just before the next Run/message", "description": "The request is stored and applied lazily." }
+          ],
+          "recommendation": { "value": "immediate", "reason": "Nothing to wait for, and the header then shows the account the next message goes to." }
+        },
+        {
+          "id": "switch-scheduled-end",
+          "type": "single",
+          "title": "A switch is scheduled during a live turn. What happens when that turn ends?",
+          "impact": "shape",
+          "why": "The turn can end in several ways; each needs a rule.",
+          "context": "In every option: the scheduled request is persisted (survives a core restart), the button turns into **Cancel scheduled switch**, and a provider limit during the turn is handled by the normal failover (which already moves the task), so the request is simply cleared.",
+          "options": [
+            { "id": "success-only", "label": "Move only after a successful turn", "description": "Succeeded → move. Failed, Stop or cancelled → the request is dropped with a status line \"scheduled switch cancelled\"." },
+            { "id": "any-end", "label": "Move whenever the turn ends", "description": "Succeeded, failed or stopped → move (a Stop still moves the task)." },
+            { "id": "any-but-stop", "label": "Move unless the user pressed Stop", "description": "Succeeded or failed → move; Stop drops the request." }
+          ],
+          "recommendation": { "value": "any-but-stop", "reason": "A failed turn is often the reason to leave the account, while Stop means the user wants to take back control." }
+        }
+      ]
+    },
+    {
+      "id": "picker",
+      "title": "RunPanel account picker",
+      "questions": [
+        {
+          "id": "picker-scope",
+          "type": "single",
+          "title": "Your note: \"we should not have this type of picker for out of the stack.\" Which did you mean?",
+          "impact": "shape",
+          "context": "Today the RunPanel's Harness picker lists **every** account. Picking an account outside the task's stack switches with a fresh session; picking one inside it keeps the conversation.",
+          "options": [
+            { "id": "stack-only", "label": "For a stacked task, list only the stack's accounts", "description": "Outside accounts disappear from the picker for a task on a stack. Leaving the stack is done with `agetor edit --agent` or by editing the stack.", "consequence": "The CLI keeps accepting any account." },
+            { "id": "stack-only-everywhere", "label": "Stack's accounts only — and refuse outside switches everywhere", "description": "PATCH /tasks/:id refuses (409) an account outside the task's stack, for the webview and the CLI.", "consequence": "A stacked task can only leave its stack by editing the stack." },
+            { "id": "no-grouping", "label": "Keep listing every account, but without the grouping/labels I proposed", "description": "Only add the cooling mark and the pending state." }
+          ],
+          "recommendation": { "value": "stack-only", "reason": "Matches your note for the picker while keeping a deliberate escape hatch in the CLI." }
+        }
+      ]
+    },
+    {
+      "id": "history",
+      "title": "Swap history size",
+      "questions": [
+        {
+          "id": "history-cap-why",
+          "type": "single",
+          "title": "Keep the per-stack history without a cap?",
+          "impact": "minor",
+          "context": "You asked why a cap. Honest numbers: a row is about 300 bytes, so 20 swaps a day for a year is ~7,300 rows, about 2 MB. Rows are deleted with the stack. The cap only guarded against unbounded growth; the real cost is rendering a long list, which pagination solves.",
+          "options": [
+            { "id": "no-cap", "label": "No cap; the view and the CLI page through it", "description": "Settings shows the latest 50 with \"Load more\"; `agetor harness stack history <stack> --limit N`." },
+            { "id": "cap", "label": "Keep the 500-per-stack cap" }
+          ],
+          "recommendation": { "value": "no-cap", "reason": "The data is tiny and a cap would silently drop the history you might need when auditing a bad week." }
+        }
+      ]
+    }
+  ]
+}

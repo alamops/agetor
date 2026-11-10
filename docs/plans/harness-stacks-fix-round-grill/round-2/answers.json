@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "formId": "harness-stacks-fix-round-grill-r2",
+  "title": "Grill round 2 — harness stacks fix round",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "fe41f9559b4d65bc6954309ab8c1799b2fe3312b8c386d0aa241d32d345ccc0c",
+  "submittedAt": "2026-11-10T04:12:59.838Z",
+  "receivedAt": "2026-11-10T04:12:59.843Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 4,
+    "answered": 4,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 4,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "switch-idle": {
+      "n": 1,
+      "title": "On a task with no live run, does \"Switch to next account\" move right away?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "immediate",
+      "display": "Yes — move now",
+      "acceptedRecommendation": true
+    },
+    "switch-scheduled-end": {
+      "n": 2,
+      "title": "A switch is scheduled during a live turn. What happens when that turn ends?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "any-but-stop",
+      "display": "Move unless the user pressed Stop",
+      "acceptedRecommendation": true
+    },
+    "picker-scope": {
+      "n": 3,
+      "title": "Your note: \"we should not have this type of picker for out of the stack.\" Which did you mean?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "stack-only",
+      "display": "For a stacked task, list only the stack's accounts",
+      "acceptedRecommendation": true
+    },
+    "history-cap-why": {
+      "n": 4,
+      "title": "Keep the per-stack history without a cap?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "no-cap",
+      "display": "No cap; the view and the CLI page through it",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": "Should we keep a Stack option/page in Settings, or combine this with the Harnesses page? What's the better UX UI we can have here?"
+}

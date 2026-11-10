@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "id": "harness-stacks-fix-round-grill-r3",
+  "title": "Grill round 3 — where stacks live in Settings",
+  "skill": "implement",
+  "slug": "harness-stacks-fix-round",
+  "round": 3,
+  "flags": [],
+  "summary": "Your round-2 note: *\"Should we keep a Stack option/page in Settings, or combine this with the Harnesses page? What's the better UX UI we can have here?\"*\n\nMy take: **merge them**. Almost everything this round adds is a property of an *account* — its quota meter, its cooldown and Clear button, its login/install status, why it was skipped — and every \"fix it\" hint (banner, blocked card) already points at **Harnesses**. With a separate Stacks page, the user reads the problem on one page and fixes it on the other. A stack is a group of accounts, so it reads best as a group on the accounts page.",
+  "proven": [
+    {
+      "text": "Settings sections today: General, Harnesses, Stacks, Agents, Pipelines, Git, Prompts. The Stacks editor is already a sub-page (`stack-editor` view) with its own dirty-state guard, so it can be reached from anywhere.",
+      "evidence": [{ "label": "sections", "path": "src/mainview/lib/settings-dialog-view.ts", "line": 4 }]
+    },
+    "The \"no usable account\" banner currently says \"fix one in Settings → Stacks\", but every cause it can name (disabled, logged out, not installed, model, CLI version) is fixed on the Harnesses page."
+  ],
+  "sections": [
+    {
+      "id": "layout",
+      "title": "Settings layout",
+      "questions": [
+        {
+          "id": "stacks-placement",
+          "type": "single",
+          "title": "Where should stacks live in Settings?",
+          "impact": "shape",
+          "why": "Decides which page gets the new per-account quota, cooldown and history UI, and how the two e2e settings specs are rewritten.",
+          "options": [
+            {
+              "id": "merge-grouped",
+              "label": "Merge into Harnesses: stacks render as groups of their accounts",
+              "description": "Harnesses shows each stack as a card holding its accounts in order (primary first), each a full account row with status, quota meter, cooldown + Clear. Accounts in no stack are listed below. The card header has the stack actions: Edit (opens the existing editor sub-page: order, members, mirror mode, preview, Restore), History, Delete. \"New stack\" sits at the top. The Stacks sidebar entry is removed; old deep links open Harnesses.",
+              "consequence": "One page to read and fix; the Stacks section and its list view go away; both settings e2e specs are reworked.",
+              "preview": "Harnesses                                   [+ Account] [+ Stack]\n┌ Work stack · Claude Code · safe mirror      History  Edit  ⋯ ┐\n│ 1 ● claude-main      logged in   5h ▓▓▓▓▓▓▓░ 82%  wk 40%    │\n│ 2 ● claude-backup    logged in   ⏳ cooling until 15:00 [Clear]│\n│ 3 ○ claude-spare     logged out → Log in                     │\n└──────────────────────────────────────────────────────────────┘\nOther accounts\n  ● codex             logged in   5h 12%\n  ● gemini            not installed"
+            },
+            {
+              "id": "separate-crosslinked",
+              "label": "Keep a separate Stacks page, cross-linked",
+              "description": "Stacks stays its own section with quota, cooldown, history; each account row links to its Harnesses row, and Harnesses rows show a stack chip linking back.",
+              "consequence": "Smaller UI change; account state is shown in two places.",
+              "preview": "Stacks                                       [+ New stack]\n  Work stack · Claude Code   1/3 claude-main  2/3 claude-backup ⏳ …\n                             [History] [Edit]\nHarnesses\n  claude-main   [Work stack 1/3 →]   logged in"
+            },
+            {
+              "id": "tabs",
+              "label": "One page with two tabs: Accounts | Stacks",
+              "description": "Same data as today's two sections under one sidebar entry.",
+              "consequence": "Still two views of the same accounts; mostly a navigation change."
+            }
+          ],
+          "recommendation": { "value": "merge-grouped", "reason": "The account is the unit you read and fix; grouping by stack shows order and state in one place and removes the page hop." }
+        }
+      ]
+    }
+  ]
+}
