@@ -97,7 +97,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
   const canSubmit =
     !!context &&
     prompt.trim().length > 0 &&
-    !!launch.effectiveStatus?.available &&
+    launch.effectiveLaunchable &&
     launch.pipelineReady &&
     !submitting &&
     overage == null;

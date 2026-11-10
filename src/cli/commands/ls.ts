@@ -95,11 +95,29 @@ export async function cmdLs(
     out(c.dim("no matching tasks"));
     return;
   }
+  // `GET /harness-stacks` is a plain DB read. Deliberately not `/harnesses`:
+  // that route probes every harness's CLI (model catalogs, login, tmux), a
+  // fan-out `ls` must not trigger just to render a `2/3` suffix. Fall back to
+  // the combined payload only for an older daemon without the stacks route.
+  const stacksPayload = typeof client.listHarnessStacks === "function"
+    ? await client.listHarnessStacks().catch(() => null)
+    : null;
+  const harnessPayload = stacksPayload ?? (typeof client.listHarnesses === "function"
+    ? await client.listHarnesses().catch(() => null)
+    : null);
+  const stackPositionByHarness = new Map<string, string>();
+  for (const stack of harnessPayload?.stacks ?? []) {
+    // A one-member stack has nothing to fail over to: no `· 1/1` suffix.
+    if (stack.members.length < 2) continue;
+    stack.members.forEach((m, i) => {
+      stackPositionByHarness.set(m.harnessId, `${i + 1}/${stack.members.length}`);
+    });
+  }
   const rows = tasks.map((t) => [
     glyph(t),
     c.dim(t.id.slice(0, 8)),
     titleCell(t),
-    agentCell(t),
+    agentCell(t, stackPositionByHarness),
     profileCell(t),
     colorColumn(t.column),
     needsCell(t),
@@ -118,9 +136,12 @@ function titleCell(t: Task): string {
 
 /** Agent column: the raw harness id — always, regardless of whether the task
  *  is bound to an agent profile. The `--agent` filter above matches on the
- *  same `t.agent` field this renders. */
-function agentCell(t: Task): string {
-  return c.gray(t.agent ?? "");
+ *  same `t.agent` field this renders; `· 2/3` is the account's position in
+ *  its stack (only for a stack of two or more accounts). */
+function agentCell(t: Task, stackPositionByHarness: Map<string, string>): string {
+  const raw = t.agent ?? "";
+  const position = stackPositionByHarness.get(raw);
+  return position ? `${c.gray(raw)} ${c.dim(`· ${position}`)}` : c.gray(raw);
 }
 
 /** Profile column: the bound agent profile's name (from the task's own

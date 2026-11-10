@@ -301,6 +301,26 @@ test("logs --rebuild --json: sentinel status events are still emitted raw for pr
   expect(JSON.parse(outputs[0]!)).toEqual(events[0]);
 });
 
+test("logs --rebuild: a harness label in a plain status line is escaped, never printed raw (R7-S1)", async () => {
+  outputs.length = 0;
+  // The route stores a harness label as typed (control characters included),
+  // and the orchestrator interpolates it into ordinary status lines such as
+  // "switched from X to Y". A terminal must see the escape sequence, not act
+  // on it.
+  const events: RunEvent[] = [
+    {
+      runId: "run1", taskId: "t1", stream: "status",
+      data: "switched from \u001b[31mred\u001b[0m to safe",
+      ts: 1,
+    },
+  ];
+  currentClient = makeClient(events);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).not.toContain("\u001b");
+  expect(outputs[0]).toContain("switched from \\u001b[31mred\\u001b[0m to safe");
+});
+
 // --- fx-recovery sentinel rendering (src/shared/fx-recovery.ts, docs/plans/
 // fix-fx-harness-rate-limit.md) --------------------------------------------
 // `createLineRenderer` special-cases `FX_RECOVERY_STATUS_PREFIX` BEFORE the
@@ -998,4 +1018,35 @@ test("logs --rebuild --json: a step task still emits the raw events", async () =
   currentClient = makeTaskClient({ pipelineParentId: "parent-1" }, handoffEvents);
   await cmdLogs(["t1", "--rebuild"], jsonFlags);
   expect(outputs).toEqual(handoffEvents.map((e) => JSON.stringify(e)));
+});
+
+// --- harness-stack swap notice ---------------------------------------------
+test("logs --rebuild: a harness-swap status renders the formatted notice, never raw JSON", async () => {
+  outputs.length = 0;
+  const notice = {
+    from: "a", fromLabel: "Work", to: "b", toLabel: "Backup",
+    reason: "quota", position: 2, count: 3, resetsAtMs: null, at: 1,
+  };
+  currentClient = makeClient([{
+    runId: "run1", taskId: "t1", stream: "status",
+    data: `harness-swap: ${JSON.stringify(notice)}`, ts: 1,
+  }]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  expect(outputs).toHaveLength(1);
+  expect(outputs[0]).toContain("Switched to Backup");
+  expect(outputs[0]).not.toContain("{");
+});
+
+test("logs --rebuild: a hidden harness-stack continuation renders no user bubble", async () => {
+  outputs.length = 0;
+  currentClient = makeClient([{
+    runId: "run1", taskId: "t1", stream: "user",
+    data: "<harness-stack-continuation>\nContinue the task.\n</harness-stack-continuation>", ts: 1,
+  }]);
+  await cmdLogs(["t1", "--rebuild"], flags);
+  const rendered = outputs.join("\n");
+  expect(rendered).not.toContain("Continue the task");
+  expect(rendered).not.toContain("you›");
+  // Not even an empty row (review N3).
+  expect(outputs).toHaveLength(0);
 });

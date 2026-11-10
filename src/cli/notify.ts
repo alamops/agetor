@@ -40,13 +40,31 @@ export function notifyFor(
   // suppression, no caller lookup needed (see `eventPipelineParentId`).
   if (eventPipelineParentId(e) !== null) return null;
   const short = taskId.slice(0, 8);
+  if (e.kind === "harness-swap" && e.taskId === taskId) {
+    return {
+      title: "Agetor — account switched",
+      // No `(1/1)` for a one-member stack's same-account retry (review N1).
+      body: `${short} · ${e.fromLabel} → ${e.toLabel}${e.count < 2 ? "" : ` (${e.position}/${e.count})`}`,
+      kind: "harness-swap",
+    };
+  }
   if (e.kind === "run-status" && e.taskId === taskId) {
+    // A failover's old run is recorded failed while the task keeps running.
+    if (e.reason === "harness-swap" || e.reason === "harness-exhausted") return null;
     if (e.status === "succeeded") return { title: "Agetor — succeeded", body: short, kind: "succeeded" };
     if (e.status === "failed") return { title: "Agetor — failed", body: short, kind: "failed" };
     if (e.status === "orphaned") return { title: "Agetor — orphaned", body: short, kind: "failed" };
     return null; // cancelled: the user did it
   }
   if (e.kind === "column" && e.taskId === taskId && e.column === "blocked") {
+    // A harness-stack block says why, with the same headings the app, the
+    // headless core and the TUI use (docs/architecture/harness-stacks.md).
+    if (e.reason === "harness-exhausted") {
+      return { title: "Agetor — Stack out of quota", body: `${short} is waiting on you`, kind: "blocked" };
+    }
+    if (e.reason === "harness-swap-failed") {
+      return { title: "Agetor — No usable backup account", body: `${short} is waiting on you`, kind: "blocked" };
+    }
     return {
       title: "Agetor — needs you",
       body: e.reason === "api-error" ? `${short} (API error)` : `${short} is waiting on you`,

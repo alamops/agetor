@@ -6,6 +6,7 @@ import path from "node:path";
 import type { Harness } from "../../shared/types.ts";
 import { withDisclaimOn } from "../test-disclaim-on.ts";
 import {
+  codexHome,
   parseCodexSessionRateLimits,
   parseCodexUsage,
   readCodexToken,
@@ -311,6 +312,40 @@ describe("codex account files — agent-writable CODEX_HOME", () => {
     writeFileSync(file, body);
     return file;
   }
+
+  test("the harness env CODEX_HOME wins, and a built-in honors the process override", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-codex-usage-"));
+    const pinned = mkdtempSync(path.join(tmpdir(), "agetor-codex-pinned-"));
+    expect(codexHome({ ...alias(home), env: { CODEX_HOME: pinned } })).toBe(pinned);
+    const prev = process.env.CODEX_HOME;
+    const proc = mkdtempSync(path.join(tmpdir(), "agetor-codex-proc-"));
+    process.env.CODEX_HOME = proc;
+    try {
+      expect(codexHome({ ...alias(home), home: null, env: {} })).toBe(proc);
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prev;
+    }
+  });
+
+  test("an env-map HOME reads <HOME>/.codex unless a CODEX_HOME applies; blanks are unset (S17)", () => {
+    const prev = process.env.CODEX_HOME;
+    delete process.env.CODEX_HOME;
+    try {
+      const envHome = mkdtempSync(path.join(tmpdir(), "agetor-codex-envhome-"));
+      expect(codexHome({ ...alias(envHome), home: null, env: { HOME: envHome } })).toBe(path.join(envHome, ".codex"));
+      // A blank CODEX_HOME in the env map is unset, so the home wins.
+      const home = mkdtempSync(path.join(tmpdir(), "agetor-codex-blank-"));
+      expect(codexHome({ ...alias(home), env: { CODEX_HOME: " " } })).toBe(path.join(home, ".codex"));
+      // An inherited process CODEX_HOME reaches the spawn ahead of the HOME.
+      const proc = mkdtempSync(path.join(tmpdir(), "agetor-codex-proc2-"));
+      process.env.CODEX_HOME = proc;
+      expect(codexHome({ ...alias(envHome), home: null, env: { HOME: envHome } })).toBe(proc);
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prev;
+    }
+  });
 
   test("auth.json and the newest rollout read normally", () => {
     const { home, codex } = freshHome();

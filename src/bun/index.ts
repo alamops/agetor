@@ -16,7 +16,9 @@ import {
   stopOpencodeServersOnQuit,
   stopOpencodeServerDriver,
   launchesInFlight,
+  reconcileHarnessFailover,
   reconcileOrphans,
+  reconcilePendingHarnessSwaps,
   rearmFxAutoResumes,
   sweepArchivedTeardowns,
   reapIdleSessions,
@@ -24,6 +26,7 @@ import {
   waitForLaunchesToSettle,
 } from "./orchestrator.ts";
 import { HANDOFF_LAUNCH_SETTLE_MS } from "./daemon-mode.ts";
+import { stopAllAutoRetryTimers } from "./harness-failover.ts";
 import { createQuitLaunchGate, decideBeforeQuit } from "./quit-launch-gate.ts";
 import { adoptOpencodeServers } from "./opencode-server.ts";
 import { startClaudeSessionLaunchScan } from "./claude-session-launch.ts";
@@ -451,6 +454,12 @@ try {
   if (rearmedFxAutoResumeCount > 0) {
     console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
   }
+
+  // Harness-stack failover: prune expired cooldowns and re-arm all-exhausted
+  // retries now; swaps interrupted by the restart are completed (or visibly
+  // blocked) right after `markBootReady()` below
+  // (docs/architecture/harness-stacks.md).
+  await reconcileHarnessFailover({ includeSwaps: false });
 } catch (err) {
   failBoot(err);
 }
@@ -551,6 +560,14 @@ startPeriodicDiscovery();
 
 // The boot restore above is done: let the routes through (boot-gate.ts).
 markBootReady();
+
+// Complete (or visibly block) harness-stack swaps a restart interrupted. After
+// the gate: a completion mirrors config and copies a transcript, which must not
+// hold every route. Each task is claimed first, so a Run or message cannot race
+// it (docs/architecture/harness-stacks.md).
+void reconcilePendingHarnessSwaps().catch((err) => {
+  console.error("[agetor] harness swap reconcile failed:", err);
+});
 
 // OpenCode server wake + idle sweep: after the reattached turns are registered.
 startOpencodeServerDriver();
@@ -715,6 +732,11 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
 // about letting the process exit at all; it touches no persisted
 // `fxRecovery` row — `rearmFxAutoResumes()` re-arms from the DB on next boot.
 process.on("exit", stopFxAutoResumeTimers);
+// Same for the harness-stack all-exhausted retry timers: the persisted
+// schedules stay, and the next boot re-arms them.
+process.on("exit", () => {
+  stopAllAutoRetryTimers();
+});
 // Detach the OpenCode turns and close the hub's streams (the servers and their
 // turns keep running; the next core adopts and reattaches them).
 process.on("exit", stopOpencodeServerDriver);

@@ -34,6 +34,7 @@ import {
   PipelineNameError,
   dataDir,
   clampWindowByBytes,
+  isHiddenContinuationUserText,
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
@@ -41,7 +42,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { activeRunCount, appendRunStatusLine, archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, isHeldByBackgroundAgents, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -58,13 +59,18 @@ import {
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, reviewHumanStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackInputError } from "./harness-stacks.ts";
+import { claudeConfigDirFor } from "./harness-config-root.ts";
+import { clearFailoverState, failoverTaskIdsForStack } from "./harness-failover.ts";
+import { mirrorStack } from "./harness-mirror.ts";
+import { collectHarnessSessionCopies, removeHarnessSessionCopies } from "./harness-session-transfer.ts";
 import {
   applyHarnessAutoEnable,
   flushPendingHarnessAutoEnableNotice,
   setHarnessAutoEnableBroadcaster,
 } from "./harness-auto-enable.ts";
 import { accountUsageDays } from "./account-usage.ts";
-import { discoverClaudeAccounts, effectiveClaudeConfigDir } from "./harness-discovery.ts";
+import { discoverClaudeAccounts } from "./harness-discovery.ts";
 import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveCloneRepo } from "./clone.ts";
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
@@ -611,6 +617,59 @@ const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
  *  request ever reaches `addGitHubReaction` (which re-validates independently,
  *  same defense-in-depth as the other GitHub POST routes). */
 const REACTION_CONTENTS = new Set<string>(["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"]);
+
+/**
+ * Parse a `/harness-stacks` body into a create/edit input. `partial` keeps the
+ * PATCH semantics (an omitted field means "leave it alone"); a create requires
+ * label, kind and members. Validation of the *values* stays in
+ * `harness-stacks.ts` so the CLI shares one rulebook.
+ */
+type StackInput = { label: string; kind: "claude-code" | "codex"; members: string[]; mirrorMode?: "full" | "safe" };
+
+async function parseStackBody(
+  req: Request,
+  opts: { partial?: boolean } = {},
+): Promise<{ input: StackInput | Partial<StackInput> } | { error: string }> {
+  const raw = await req.json().catch(() => null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: "invalid JSON body" };
+  const body = raw as Record<string, unknown>;
+  const label = body.label;
+  const kind = body.kind;
+  const members = body.members;
+  const mirrorMode = body.mirrorMode;
+  if (!opts.partial) {
+    if (typeof label !== "string" || !label.trim()) return { error: "label required" };
+    if (kind !== "claude-code" && kind !== "codex") return { error: "kind must be 'claude-code' or 'codex'" };
+    if (!Array.isArray(members) || !members.every((m) => typeof m === "string")) {
+      return { error: "members must be an array of harness ids" };
+    }
+  } else {
+    if (label !== undefined && (typeof label !== "string" || !label.trim())) return { error: "label must be a non-empty string" };
+    if (kind !== undefined && kind !== "claude-code" && kind !== "codex") return { error: "kind must be 'claude-code' or 'codex'" };
+    if (members !== undefined && (!Array.isArray(members) || !members.every((m) => typeof m === "string"))) {
+      return { error: "members must be an array of harness ids" };
+    }
+  }
+  if (mirrorMode !== undefined && mirrorMode !== "full" && mirrorMode !== "safe") {
+    return { error: "mirrorMode must be 'full' or 'safe'" };
+  }
+  if (opts.partial) {
+    const patch: Partial<StackInput> = {};
+    if (typeof label === "string") patch.label = label;
+    if (kind === "claude-code" || kind === "codex") patch.kind = kind;
+    if (Array.isArray(members)) patch.members = members as string[];
+    if (mirrorMode === "safe" || mirrorMode === "full") patch.mirrorMode = mirrorMode;
+    return { input: patch };
+  }
+  return {
+    input: {
+      label: typeof label === "string" ? label : "",
+      kind: kind === "codex" ? "codex" : "claude-code",
+      members: Array.isArray(members) ? (members as string[]) : [],
+      ...(mirrorMode === "safe" || mirrorMode === "full" ? { mirrorMode } : {}),
+    },
+  };
+}
 
 function filterPatch(raw: unknown): { patch: Partial<Task> } | { error: string } {
   if (!raw || typeof raw !== "object") return { patch: {} };
@@ -1339,26 +1398,132 @@ function sessionCwdGate(req: Request): { gateCwd?: (cwd: string) => Promise<stri
   return { gateCwd: async (cwd) => (await gateCallerPath(cwd, "cli", "exists"))?.error ?? null };
 }
 
+// Env keys whose value is an account's config root: the core resolves it
+// lexically (path.join/resolve) and the stack mirror and session transfer
+// create, write and delete files under it in-process
+// (docs/architecture/harness-stacks.md). `HOME` counts because Codex reads
+// `<HOME>/.codex` when no `CODEX_HOME` is set.
+const HARNESS_ENV_ROOT_KEYS: ReadonlySet<string> = new Set(["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME"]);
+
+/** True when `p` has a `..` component (either separator). */
+function hasParentSegment(p: string): boolean {
+  return p.split(/[\\/]/).some((seg) => seg === "..");
+}
+
+/**
+ * Validate a harness `home`/`bin` (already known absolute). A `..` component
+ * is refused: the CLI path gate probes the string the kernel resolves
+ * (`/Users/u/Documents/zz/..` is a missing `zz` while `zz` does not exist)
+ * while every consumer resolves it lexically to `~/Documents`, so the two
+ * would disagree on which folder is touched. Without `..` the kernel and a
+ * lexical resolve agree, so the value is stored exactly as given: the stored
+ * `home` is the `CLAUDE_CONFIG_DIR` string Claude Code hashes into its macOS
+ * keychain service name, and rewriting its spelling (a trailing `/`, `//`,
+ * `.`) would log the account out (docs/architecture/harness-stacks.md). The
+ * gate probes that same string.
+ */
+function validateHarnessPath(value: string, field: string): { value: string } | { error: string } {
+  if (hasParentSegment(value)) return { error: `${field} must not contain ".." path segments` };
+  return { value };
+}
+
+/**
+ * The same rule for a harness's `env` map, which is stored exactly as given. A
+ * config-root key (`HARNESS_ENV_ROOT_KEYS`) whose value is blank
+ * (whitespace-only) counts as unset everywhere (harness-config-root.ts) and
+ * passes; any other value must be an absolute path with no `..` component.
+ * A relative value would resolve against whatever cwd the core inherited, and
+ * a `~` one is taken literally by every consumer (nothing expands it), so
+ * neither is ever meaningful — and neither could be probed by the CLI path
+ * gate as the path a consumer will touch. Refused for every caller. Other
+ * keys pass unchecked.
+ */
+function validateHarnessEnv(env: Record<string, string>): { env: Record<string, string> } | { error: string } {
+  for (const [key, value] of Object.entries(env)) {
+    if (!HARNESS_ENV_ROOT_KEYS.has(key)) continue;
+    const trimmed = value.trim();
+    if (trimmed === "") continue;
+    if (hasParentSegment(trimmed)) return { error: `env ${key} must not contain ".." path segments` };
+    // Checked on the value as given: one with leading whitespace is absolute
+    // only after trimming, but the spawn and every consumer use it untrimmed.
+    if (!path.isAbsolute(value)) {
+      return { error: `env ${key} must be an absolute path (no leading whitespace; "~" is not expanded)` };
+    }
+  }
+  return { env: { ...env } };
+}
+
+function gateRefusalResponse(req: Request, refusal: { status: 403; error: string; code: string }): Response {
+  const { status, ...body } = refusal;
+  return json(body, { status, headers: corsHeaders(req) });
+}
+
 // The policy walker gates a harness's top-level `home`/`bin` for a CLI-token
 // caller, but not the values inside its `env` map — and an env value that is an
 // absolute path (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME`…) names a directory
-// the core later tails or reads in-process. So the same disclaimed probe runs
-// over every absolute-path env value (D24); the first denied one refuses the
-// request with the gate's own 403 body. The app caller is never gated.
+// the core later tails, reads, creates or writes in-process. So the same
+// disclaimed probe runs over every absolute-path env value (D24); the first
+// denied one refuses the request with the gate's own 403 body. A config-root
+// key can only hold a blank or an absolute value by now (`validateHarnessEnv`
+// refuses a relative or `~` one), so the string probed is the string every
+// consumer uses. The mode is `nearest-ancestor`: a root that does not exist
+// yet is created by the stack mirror under its nearest existing ancestor, so
+// that ancestor is what the core would touch. Run after `validateHarnessEnv`.
+// The app caller is never gated.
 async function gateHarnessEnvPaths(req: Request, env: Record<string, string>): Promise<Response | null> {
   if (callerOf(req) !== "cli") return null;
   for (const value of Object.values(env)) {
     // Gate the trimmed spelling too: a consumer that trims the value would
     // otherwise act on a protected path the raw string never named.
     const trimmed = value.trim();
-    if (!trimmed.startsWith("/")) continue;
-    for (const p of trimmed === value ? [value] : [value, trimmed]) {
-      const refusal = await gateCallerPath(p, "cli", "exists");
-      if (refusal) {
-        const { status, ...body } = refusal;
-        return json(body, { status, headers: corsHeaders(req) });
-      }
+    const candidates = new Set<string>();
+    if (trimmed.startsWith("/")) {
+      candidates.add(value);
+      candidates.add(trimmed);
     }
+    for (const p of candidates) {
+      const refusal = await gateCallerPath(p, "cli", "nearest-ancestor");
+      if (refusal) return gateRefusalResponse(req, refusal);
+    }
+  }
+  return null;
+}
+
+/**
+ * CLI path gate for a stack save (D24). The stack routes name accounts, not
+ * paths, but creating or editing a stack mirrors config into every member's
+ * root, and later swaps copy transcripts there — all in-process. So for a
+ * CLI-token caller each member's effective roots (the config root, and for
+ * Claude the directory holding `.claude.json`) are probed through the
+ * disclaimed child before anything is saved; a denied one refuses with the
+ * gate's 403 `path-not-accessible`. The probe follows symlinks, so a root
+ * re-pointed into a protected folder after an earlier save is caught again
+ * here. Also run before a CLI-token same-stack account switch
+ * (`PATCH /tasks/:id`), which mirrors and transfers between the two members'
+ * roots (CR5). Unknown ids are left to the stack validator's own 400. The
+ * app caller is never gated.
+ */
+async function gateStackMemberRoots(req: Request, memberIds: readonly string[]): Promise<Response | null> {
+  if (callerOf(req) !== "cli") return null;
+  const roots = new Set<string>();
+  const addRoot = (root: string) => {
+    // The spelling consumers use: they resolve a root lexically against the
+    // core's cwd and never expand `~`. A legacy row saved before a `~` or
+    // relative env value was refused also gets its `~`-expanded form probed,
+    // since the stack validator's realpath compare expands it.
+    roots.add(path.resolve(root));
+    const expanded = expandHomePath(root);
+    if (expanded !== root) roots.add(path.resolve(expanded));
+  };
+  for (const id of memberIds) {
+    const harness = harnesses.getByIdOrKind(id);
+    if (!harness || (harness.kind !== "claude-code" && harness.kind !== "codex")) continue;
+    addRoot(effectiveHome(harness));
+    if (harness.kind === "claude-code") addRoot(claudeJsonDirFor(harness));
+  }
+  for (const root of roots) {
+    const refusal = await gateCallerPath(root, "cli", "nearest-ancestor");
+    if (refusal) return gateRefusalResponse(req, refusal);
   }
   return null;
 }
@@ -4272,7 +4437,7 @@ export function startApiServer(
           // response below either way.
           noteHarnessStatuses(statuses);
           return json(
-            { harnesses: harnesses.list(), statuses },
+            { harnesses: harnesses.list(), statuses, stacks: harnessStacks.list(), limitStates: harnessStacks.listLimitStates() },
             { headers: corsHeaders(req) },
           );
         }),
@@ -4326,7 +4491,17 @@ export function startApiServer(
           if (bin && !path.isAbsolute(bin)) {
             return json({ error: "bin must be an absolute path" }, { status: 400, headers: corsHeaders(req) });
           }
-          const env: Record<string, string> = {};
+          // No `..` components (M7); stored as given (R-S7) — see
+          // `validateHarnessPath`.
+          const homeNorm = home ? validateHarnessPath(home, "home") : null;
+          if (homeNorm && "error" in homeNorm) {
+            return json({ error: homeNorm.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const binNorm = bin ? validateHarnessPath(bin, "bin") : null;
+          if (binNorm && "error" in binNorm) {
+            return json({ error: binNorm.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const rawEnv: Record<string, string> = {};
           if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
             for (const [k, v] of Object.entries(body.env)) {
               if (typeof v !== "string") continue;
@@ -4336,9 +4511,12 @@ export function startApiServer(
                   { status: 400, headers: corsHeaders(req) },
                 );
               }
-              env[k] = v;
+              rawEnv[k] = v;
             }
           }
+          const envNorm = validateHarnessEnv(rawEnv);
+          if ("error" in envNorm) return json({ error: envNorm.error }, { status: 400, headers: corsHeaders(req) });
+          const env = envNorm.env;
           const envRefusal = await gateHarnessEnvPaths(req, env);
           if (envRefusal) return envRefusal;
           // Whether fx sessions load the user's fx profile MCP servers
@@ -4355,8 +4533,8 @@ export function startApiServer(
               id: body.id.trim(),
               kind: body.kind,
               label: body.label.trim(),
-              home,
-              bin,
+              home: homeNorm ? homeNorm.value : null,
+              bin: binNorm ? binNorm.value : null,
               env,
               ...(typeof body.profileMcpServers === "boolean" ? { profileMcpServers: body.profileMcpServers } : {}),
             });
@@ -4372,15 +4550,117 @@ export function startApiServer(
         }),
       },
 
+      // Harness account stacks (docs/architecture/harness-stacks.md): ordered
+      // same-kind accounts whose first member is the primary. Machine-local —
+      // no bundle export, no global flag; deleting the stack makes failover
+      // inert at the task's next selection.
+      "/harness-stacks": {
+        GET: authed((req) =>
+          json(
+            { stacks: harnessStacks.list(), limitStates: harnessStacks.listLimitStates() },
+            { headers: corsHeaders(req) },
+          )),
+        POST: authed(async (req) => {
+          const body = await parseStackBody(req);
+          if ("error" in body) return json({ error: body.error }, { status: 400, headers: corsHeaders(req) });
+          const rootRefusal = await gateStackMemberRoots(req, (body.input as StackInput).members);
+          if (rootRefusal) return rootRefusal;
+          try {
+            const stack = harnessStacks.create(body.input as StackInput);
+            // The mirror copies the primary's whole config tree (plugins alone
+            // can be thousands of files). Keep the request alive so a slow
+            // volume cannot trip Bun's 255 s idle cap after the stack is saved.
+            server.timeout(req, 0);
+            const mirror = await mirrorStack(stack, {});
+            return json(
+              { stack: harnessStacks.get(stack.id, { warnings: true }) ?? stack, warnings: stack.warnings, mirror },
+              { status: 201, headers: corsHeaders(req) },
+            );
+          } catch (err) {
+            if (err instanceof StackInputError) {
+              return json({ error: err.message, blockers: err.blockers }, { status: 400, headers: corsHeaders(req) });
+            }
+            return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+      },
+
+      "/harness-stacks/:id": {
+        GET: authed((req) => {
+          // The detail read is what `agetor harness stack show` prints, so it
+          // carries the member warnings; the runtime lookups skip them.
+          const stack = harnessStacks.get(req.params.id, { warnings: true });
+          return stack
+            ? json({ stack, limitStates: harnessStacks.listLimitStates() }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PATCH: authed(async (req) => {
+          const current = harnessStacks.get(req.params.id);
+          if (!current) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          const body = await parseStackBody(req, { partial: true });
+          if ("error" in body) return json({ error: body.error }, { status: 400, headers: corsHeaders(req) });
+          // Every member the saved stack will hold: the new list, or the
+          // current one when only the label/kind/mirror mode changes.
+          const rootRefusal = await gateStackMemberRoots(
+            req,
+            body.input.members ?? current.members.map((m) => m.harnessId),
+          );
+          if (rootRefusal) return rootRefusal;
+          try {
+            const stack = harnessStacks.update(req.params.id, body.input);
+            // A label-only rename changes nothing the mirror reads. Re-running
+            // the full config copy (hundreds of files, possibly hooks) for a
+            // cosmetic edit is wasted work and a needless write window.
+            const mirrorRelevant =
+              body.input.members !== undefined
+              || body.input.kind !== undefined
+              || body.input.mirrorMode !== undefined;
+            if (mirrorRelevant) server.timeout(req, 0);
+            const mirror = mirrorRelevant
+              ? await mirrorStack(stack, {})
+              : { copied: [], warnings: [] };
+            return json(
+              { stack: harnessStacks.get(stack.id, { warnings: true }) ?? stack, warnings: stack.warnings, mirror },
+              { headers: corsHeaders(req) },
+            );
+          } catch (err) {
+            if (err instanceof StackInputError) {
+              return json({ error: err.message, blockers: err.blockers }, { status: 400, headers: corsHeaders(req) });
+            }
+            return json({ error: (err as Error).message }, { status: 400, headers: corsHeaders(req) });
+          }
+        }),
+        DELETE: authed((req) => {
+          const stack = harnessStacks.get(req.params.id);
+          if (!stack) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // `harnessStacks.delete` clears every task's recorded failover state;
+          // its armed all-exhausted timer is process memory, so collect the
+          // affected ids first and cancel each handle too. Otherwise a deleted
+          // stack leaves a dangling timer for up to 24 h (review nit).
+          // Resolved BEFORE the delete: a task whose account was edited into
+          // this stack after its last state write still names the old stack
+          // id, so the stored-id filter alone would miss it (review S10).
+          const affected = failoverTaskIdsForStack(stack.id);
+          harnessStacks.delete(stack.id);
+          for (const taskId of affected) clearFailoverState(taskId);
+          return json({ removed: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // Existing Claude config dirs (`~/.claude*` + CLAUDE_CONFIG_DIR) with a
       // logged-in account that no registered harness points at yet — the
       // Add-harness picker renders these as one-click "use existing account"
       // entries. Identity fields only; never tokens or account uuids.
       "/harness-discovery": {
         GET: authed((req) => {
+          // The directory each registered account's claude actually reads
+          // (claudeConfigDirFor), not the spawn pin: an account with only an
+          // env-map HOME pins nothing yet reads `<HOME>/.claude`.
           const registeredHomes = harnesses.list()
             .filter((h) => h.kind === "claude-code")
-            .map((h) => h.home);
+            .map((h) => claudeConfigDirFor(h));
           return json(
             { accounts: discoverClaudeAccounts(registeredHomes) },
             { headers: corsHeaders(req) },
@@ -4448,16 +4728,22 @@ export function startApiServer(
           if (typeof body.label === "string") patch.label = body.label.trim();
           if ("home" in body) {
             if (body.home == null || body.home === "") patch.home = null;
-            else if (typeof body.home === "string" && path.isAbsolute(body.home)) patch.home = body.home;
-            else return json({ error: "home must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
+            else if (typeof body.home === "string" && path.isAbsolute(body.home)) {
+              const norm = validateHarnessPath(body.home, "home");
+              if ("error" in norm) return json({ error: norm.error }, { status: 400, headers: corsHeaders(req) });
+              patch.home = norm.value;
+            } else return json({ error: "home must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
           }
           if ("bin" in body) {
             if (body.bin == null || body.bin === "") patch.bin = null;
-            else if (typeof body.bin === "string" && path.isAbsolute(body.bin)) patch.bin = body.bin;
-            else return json({ error: "bin must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
+            else if (typeof body.bin === "string" && path.isAbsolute(body.bin)) {
+              const norm = validateHarnessPath(body.bin, "bin");
+              if ("error" in norm) return json({ error: norm.error }, { status: 400, headers: corsHeaders(req) });
+              patch.bin = norm.value;
+            } else return json({ error: "bin must be absolute or null" }, { status: 400, headers: corsHeaders(req) });
           }
           if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
-            const env: Record<string, string> = {};
+            const rawEnv: Record<string, string> = {};
             for (const [k, v] of Object.entries(body.env)) {
               if (typeof v !== "string") continue;
               if (!isValidEnvKey(k)) {
@@ -4466,11 +4752,26 @@ export function startApiServer(
                   { status: 400, headers: corsHeaders(req) },
                 );
               }
-              env[k] = v;
+              rawEnv[k] = v;
             }
-            const envRefusal = await gateHarnessEnvPaths(req, env);
+            const envNorm = validateHarnessEnv(rawEnv);
+            if ("error" in envNorm) return json({ error: envNorm.error }, { status: 400, headers: corsHeaders(req) });
+            const envRefusal = await gateHarnessEnvPaths(req, envNorm.env);
             if (envRefusal) return envRefusal;
-            patch.env = env;
+            patch.env = envNorm.env;
+          }
+          // A stack member may not be re-pointed at another member's config
+          // root (realpath compare): a later swap would copy a transcript
+          // onto itself and cleanup would delete the primary's own file. The
+          // stack save checks this once; a later edit is checked here
+          // (docs/architecture/harness-stacks.md).
+          if (patch.home !== undefined || patch.env !== undefined) {
+            const rootError = harnessStacks.validateMemberRoot(req.params.id, {
+              kind: current.kind,
+              home: patch.home !== undefined ? patch.home : current.home,
+              env: patch.env ?? current.env,
+            });
+            if (rootError) return json({ error: rootError }, { status: 400, headers: corsHeaders(req) });
           }
           try {
             const updated = harnesses.update(req.params.id, patch);
@@ -4490,9 +4791,16 @@ export function startApiServer(
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
         }),
-        DELETE: authed((req) => {
+        DELETE: authed(async (req) => {
           try {
+            // Capture the handoff copies BEFORE the delete (the root resolves
+            // only while the row exists) but unlink them only AFTER it
+            // succeeded. `harnesses.delete` re-checks in-use atomically with
+            // the row delete, so a task assigned in this window still gets a
+            // 409 with its conversation untouched (review R13-S2).
+            const copies = collectHarnessSessionCopies(req.params.id);
             harnesses.delete(req.params.id);
+            await removeHarnessSessionCopies(copies);
             // Prunes the deleted harness out of the per-harness discovery
             // cache and its transition-detector bookkeeping, then publishes
             // once — cheaper than a full `refreshAllModels()` sweep (which
@@ -5166,7 +5474,9 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const configDir = effectiveClaudeConfigDir(h.home);
+          // The directory this account's claude writes its JSONLs to (an
+          // env-map HOME included), which is what the rollup reads.
+          const configDir = claudeConfigDirFor(h);
           return json(
             { configDir, days: accountUsageDays(configDir) },
             { headers: corsHeaders(req) },
@@ -5564,6 +5874,15 @@ export function startApiServer(
             return json({ error: filtered.error }, { status: 400, headers: corsHeaders(req) });
           }
           const { patch } = filtered;
+          // A prompt that is exactly the hidden account-switch wrapper would
+          // be sent to the agent at the next Run while no transcript shows it
+          // (review S1); `createTask`/`startTask`/`sendInput` refuse it too.
+          if (typeof patch.prompt === "string" && isHiddenContinuationUserText(patch.prompt)) {
+            return json(
+              { error: HIDDEN_CONTINUATION_REFUSAL, code: "hidden-continuation" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
           const before = tasks.get(req.params.id);
           if (!before) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -5660,6 +5979,44 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
+          // A manual switch BETWEEN accounts of the same stack preserves the
+          // conversation, so it must not kill a live run under the user — ask
+          // them to stop first. A switch outside the stack keeps today's
+          // kill-and-reset behavior and its existing guards.
+          const beforeStack = typeof patch.agent === "string" && patch.agent !== before.agent
+            ? harnessStacks.getByMember(before.agent)
+            : null;
+          const afterStack = beforeStack && typeof patch.agent === "string"
+            ? harnessStacks.getByMember(patch.agent)
+            : null;
+          const sameStackAccountSwitch = Boolean(
+            beforeStack && afterStack && beforeStack.id === afterStack.id,
+          );
+          if (sameStackAccountSwitch && runs.hasRunning(before.id)) {
+            return json(
+              { error: "stop the run before switching accounts" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // A held task (its turn succeeded but background agents are still
+          // running in the REPL) is live too: the switch drops the old
+          // session, which would kill the REPL hosting those agents.
+          if (sameStackAccountSwitch && isHeldByBackgroundAgents(before.id)) {
+            return json(
+              { error: "stop the background agents before switching accounts" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          // The switch mirrors config into the target's root and copies the
+          // transcript between the two roots in-process. Both were gated when
+          // the stack was saved, but a root can be re-pointed (a symlink into
+          // a protected folder) afterwards, so a CLI-token switch re-gates
+          // both members' effective roots before anything moves (CR5,
+          // docs/architecture/security.md). The app caller is never gated.
+          if (sameStackAccountSwitch && typeof patch.agent === "string") {
+            const rootRefusal = await gateStackMemberRoots(req, [before.agent, patch.agent]);
+            if (rootRefusal) return rootRefusal;
+          }
           // Enforce the "model is always set, effort is set unless the
           // model declines it" invariant at the PATCH boundary so direct
           // API callers can't reintroduce nulls that `buildCommand` would
@@ -5716,32 +6073,88 @@ export function startApiServer(
               }
             }
           }
-          const updated = tasks.update(req.params.id, patch);
-          if (!updated) {
-            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          // A same-stack account switch copies the transcript and then drops
+          // the old session. Claim the task for the whole operation so a Run
+          // or a message that lands mid-copy is refused (or, for Run, told the
+          // task is starting) instead of being pasted into the old account's
+          // still-live REPL / minting a session the handoff then displaces
+          // (review S3). The claim is released in the `finally` below.
+          if (sameStackAccountSwitch && !claimTaskForAccountSwitch(before.id)) {
+            return json(
+              { error: "task is busy starting a turn — try again in a moment" },
+              { status: 409, headers: corsHeaders(req) },
+            );
           }
-          // A manual move (drag, `agetor move`) emits no global `column` event,
-          // so the notification hooks never see a card leave `blocked` this
-          // way. Its reason-family OS entry goes with the block.
-          if (before.column === "blocked" && updated.column !== "blocked") {
-            removeTaskNotification(req.params.id, UNBLOCKED_REMOVAL_KINDS);
+          // Persist the switch intent BEFORE the row changes accounts, so a
+          // crash between `tasks.update` and the transcript copy is completed
+          // (or visibly reported) by the boot reconcile instead of silently
+          // starting a fresh conversation on the backup (review R15-S3). The
+          // automatic swap already persists its own `pendingSwap`.
+          if (sameStackAccountSwitch && typeof patch.agent === "string") {
+            beginManualAccountSwitch(before.id, before.agent, patch.agent);
           }
-          // Mirror behavioural changes onto a live claude session via slash
-          // commands so the conversation context survives a model/mode/effort
-          // change. Agent changes wipe the session — different harness entirely.
-          // Fire-and-forget: the mode-change path now verifies via the JSONL
-          // event before resolving, which can take up to 4.5s on the
-          // exhaust-retries path. The PATCH response payload only carries the
-          // updated Task row (already in hand); the verify outcome reaches
-          // the user through the `status` SSE events that
-          // `emitModeChangeStatus` writes. Blocking the response would add
-          // unbounded latency for no benefit. `.catch` keeps an unexpected
-          // throw from becoming an unhandledRejection — every failure mode
-          // the function knows about already surfaces via SSE.
-          reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
-            console.error("reconcileTaskSession failed:", err);
-          });
-          return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
+          try {
+            const updated = tasks.update(req.params.id, patch);
+            if (!updated) {
+              clearManualAccountSwitch(before.id);
+              return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+            }
+            // A manual move (drag, `agetor move`) emits no global `column` event,
+            // so the notification hooks never see a card leave `blocked` this
+            // way. Its reason-family OS entry goes with the block.
+            if (before.column === "blocked" && updated.column !== "blocked") {
+              removeTaskNotification(req.params.id, UNBLOCKED_REMOVAL_KINDS);
+            }
+            // Moving a card out of `blocked` (or off an all-exhausted stack)
+            // is the user taking the task back: an armed quota-reset retry
+            // must not fire later and pull it into `running` again. Cancels
+            // the timer, clears `allExhausted` and stashes held follow-ups
+            // to the backlog (docs/architecture/harness-stacks.md).
+            if (
+              "column" in patch
+              && updated.column !== before.column
+              && updated.column !== "blocked"
+              && (before.column === "blocked" || before.harnessState?.allExhausted)
+            ) {
+              cancelHarnessRetryForTask(req.params.id);
+            }
+            // Mirror behavioural changes onto a live claude session via slash
+            // commands so the conversation context survives a model/mode/effort
+            // change. Agent changes wipe the session — different harness entirely.
+            //
+            // A same-stack account switch is AWAITED: its transcript copy must
+            // finish before the response lets the user Run again, and the
+            // caller's claim above is what keeps the window closed. Every other
+            // reconcile is fire-and-forget: the mode-change path verifies via
+            // the JSONL event before resolving, which can take up to 4.5s on the
+            // exhaust-retries path. The PATCH response payload only carries the
+            // updated Task row (already in hand); the verify outcome reaches the
+            // user through the `status` SSE events that `emitModeChangeStatus`
+            // writes. `.catch` keeps an unexpected throw from becoming an
+            // unhandledRejection — every failure mode the function knows about
+            // already surfaces via SSE.
+            if (sameStackAccountSwitch) {
+              try {
+                await reconcileTaskSession(req.params.id, before, updated);
+              } catch (err) {
+                console.error("reconcileTaskSession failed:", err);
+              }
+            } else {
+              reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
+                console.error("reconcileTaskSession failed:", err);
+              });
+            }
+            // The awaited switch wrote `harnessState` (the manual-switch note)
+            // after `tasks.update`, so return the fresh row rather than the
+            // pre-reconcile snapshot — otherwise the header would flash
+            // "no move" until the next fetch.
+            const responseTask = sameStackAccountSwitch
+              ? tasks.get(req.params.id) ?? updated
+              : updated;
+            return json(withRunningSubagents(responseTask), { headers: corsHeaders(req) });
+          } finally {
+            if (sameStackAccountSwitch) releaseTaskAccountSwitch(before.id);
+          }
         }),
         DELETE: authed(async (req) => {
           // A pipeline step task can't be deleted on its own — the parent
@@ -7991,11 +8404,17 @@ export function startApiServer(
           // Reconstruct the cwd claude was launched against. Worktree tasks
           // had cwd = worktreePath; isolation=none had cwd = workdir.
           const cwd = task.worktreePath ?? task.workdir;
-          // Resolve the harness so we read from the alias's CLAUDE_CONFIG_DIR
-          // (multi-account); built-ins resolve to `~/.claude/projects/…` via
-          // the `configDir: null` branch inside jsonlPathFor.
+          // Resolve the harness so we read from the directory its claude
+          // actually wrote the session to (claudeConfigDirFor: the alias's
+          // CLAUDE_CONFIG_DIR, or `<HOME>/.claude` for an env-map HOME, or the
+          // built-in's `~/.claude`); an unknown agent falls back to the
+          // `configDir: null` branch inside jsonlPathFor.
           const harness = harnesses.getByIdOrKind(task.agent);
-          const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
+          const jsonlPath = jsonlPathFor(
+            cwd,
+            run.claudeSessionId,
+            harness ? claudeConfigDirFor(harness) : null,
+          );
           if (!existsSync(jsonlPath)) {
             return json(
               { events: [], reason: `JSONL not found at ${jsonlPath}`, ...(hasLimit ? { hasMore: false } : {}) },
@@ -8065,12 +8484,14 @@ export function startApiServer(
             // to it as long as the span `[userIdx, events.length)` fits
             // EVENTS_REPLAY_ANCHOR_MAX_EVENTS/_BYTES. All-or-nothing: either
             // `start` becomes `userIdx`, or it's left exactly as computed
-            // above.
+            // above. A hidden harness-stack continuation is skipped, as in
+            // `runs.lastUserEventId`: no renderer shows it, so it is not the
+            // user's last message.
             // (`idx`, not `i`: the outer `i` is the live counter `onChunk`
             // closes over for its synthetic `ts`, and must not be shadowed.)
             let userIdx = -1;
             for (let idx = events.length - 1; idx >= 0; idx--) {
-              if (events[idx]!.stream === "user") {
+              if (events[idx]!.stream === "user" && !isHiddenContinuationUserText(events[idx]!.data)) {
                 userIdx = idx;
                 break;
               }

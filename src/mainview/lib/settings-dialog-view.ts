@@ -4,6 +4,7 @@ import type { HarnessTemplate } from "../../shared/types.ts";
 export const SETTINGS_SECTIONS = [
   { id: "general", label: "General" },
   { id: "harnesses", label: "Harnesses" },
+  { id: "stacks", label: "Stacks" },
   { id: "agents", label: "Agents" },
   { id: "pipelines", label: "Pipelines" },
   { id: "git", label: "Git Integration" },
@@ -29,7 +30,8 @@ export type SettingsView =
   | { kind: "section"; section: SettingsSectionId }
   | { kind: "templates" }
   | { kind: "editor"; harnessId: string | null; template: HarnessTemplate }
-  | { kind: "agent-editor"; profileId: string | null; duplicateFromId: string | null };
+  | { kind: "agent-editor"; profileId: string | null; duplicateFromId: string | null }
+  | { kind: "stack-editor"; stackId: string | null };
 
 /** The view shown every time the dialog opens — always General, no persistence. */
 export function initialView(): SettingsView {
@@ -49,6 +51,11 @@ export function openTemplates(): SettingsView {
 /** Navigate to the harness editor — `harnessId` is null when creating. */
 export function openEditor(harnessId: string | null, template: HarnessTemplate): SettingsView {
   return { kind: "editor", harnessId, template };
+}
+
+/** Navigate to the stack editor — `stackId` is null when creating. */
+export function openStackEditor(stackId: string | null): SettingsView {
+  return { kind: "stack-editor", stackId };
 }
 
 /**
@@ -83,6 +90,8 @@ export function backFromSubview(view: SettingsView): SettingsView {
       return { kind: "section", section: "harnesses" };
     case "agent-editor":
       return { kind: "section", section: "agents" };
+    case "stack-editor":
+      return { kind: "section", section: "stacks" };
     default: {
       const _exhaustive: never = view;
       return _exhaustive;
@@ -104,6 +113,8 @@ export function activeSection(view: SettingsView): SettingsSectionId {
       return "harnesses";
     case "agent-editor":
       return "agents";
+    case "stack-editor":
+      return "stacks";
     default: {
       const _exhaustive: never = view;
       return _exhaustive;
@@ -124,6 +135,7 @@ export function resolveEscape(view: SettingsView): "pop" | "close" {
     case "templates":
     case "editor":
     case "agent-editor":
+    case "stack-editor":
       return "pop";
     default: {
       const _exhaustive: never = view;
@@ -142,6 +154,7 @@ export function isFormSubpage(view: SettingsView): boolean {
   switch (view.kind) {
     case "editor":
     case "agent-editor":
+    case "stack-editor":
       return true;
     case "section":
     case "templates":

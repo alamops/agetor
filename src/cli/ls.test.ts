@@ -128,6 +128,66 @@ test("needs column: no pending interactions, no fx pause -> empty needs cell", a
   expect(row).not.toContain("⏸");
 });
 
+test("agent column: stack position comes from /harness-stacks, never a /harnesses probe", async () => {
+  let harnessesCalled = false;
+  let stacksCalled = false;
+  currentClient = {
+    listTasks: async () => [task({ agent: "acct-b" })],
+    listHarnessStacks: async () => {
+      stacksCalled = true;
+      return {
+        stacks: [{
+          id: "st1",
+          label: "train",
+          kind: "claude-code",
+          mirrorMode: "full",
+          createdAt: 0,
+          updatedAt: 0,
+          warnings: [],
+          members: [
+            { harnessId: "acct-a", position: 0, label: "a" },
+            { harnessId: "acct-b", position: 1, label: "b" },
+          ],
+        }],
+        limitStates: [],
+      } as never;
+    },
+    listHarnesses: async () => {
+      harnessesCalled = true;
+      throw new Error("ls must not force the harness probe fan-out");
+    },
+  } as unknown as AgetorClient;
+
+  await cmdLs([], flags);
+  expect(dataRowLine()).toContain("· 2/2");
+  expect(stacksCalled).toBe(true);
+  expect(harnessesCalled).toBe(false);
+});
+
+test("agent column: a one-member stack shows no position suffix (review N1)", async () => {
+  currentClient = {
+    listTasks: async () => [task({ agent: "acct-a" })],
+    listHarnessStacks: async () => ({
+      stacks: [{
+        id: "st1",
+        label: "train",
+        kind: "claude-code",
+        mirrorMode: "full",
+        createdAt: 0,
+        updatedAt: 0,
+        warnings: [],
+        members: [{ harnessId: "acct-a", position: 0, label: "a" }],
+      }],
+      limitStates: [],
+    }) as never,
+  } as unknown as AgetorClient;
+
+  await cmdLs([], flags);
+  expect(dataRowLine()).toContain("acct-a");
+  expect(dataRowLine()).not.toContain("1/1");
+  expect(dataRowLine()).not.toContain("·");
+});
+
 test("needs column: pendingInteractionCount only -> '! N', no pause hint", async () => {
   currentClient = makeClient([task({ pendingInteractionCount: 3 })]);
   await cmdLs([], flags);

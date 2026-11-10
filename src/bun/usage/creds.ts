@@ -11,41 +11,63 @@
  */
 
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import path from "node:path";
 import type { Harness } from "../../shared/types.ts";
 import { coreSpawn } from "../core-spawn.ts";
+import { claudeConfigDirEnvFor, claudeJsonDirFor } from "../harness-config-root.ts";
 import { readAccountFileText } from "../no-follow.ts";
 
 /** Upper bound on a `.credentials.json` we parse — a token blob is ~1 KB. */
 const CREDENTIALS_MAX_BYTES = 1024 * 1024;
 
-/**
- * Path to the `.claude.json` claude reads/writes for this harness.
- *  - main (`harness.home === null`): `~/.claude.json` — HOME is untouched
- *    for this harness, so this is the CLI's real config file.
- *  - alias (`harness.home` set): `<home>/.claude.json` — claude treats
- *    `CLAUDE_CONFIG_DIR` as the `.claude/` equivalent, and `.claude.json`
- *    lives directly under it (not nested under a `.claude/` segment).
- */
-export function claudeDotJsonPath(harness: Harness): string {
-  if (harness.home) return path.join(harness.home, ".claude.json");
-  return path.join(homedir(), ".claude.json");
+/** The Claude config root whose `.credentials.json` holds this harness's
+ *  login, or null when claude keeps it in the unsuffixed macOS Keychain item
+ *  (the main account's). Mirrors the spawn (harness-config-root.ts): the env
+ *  map's `CLAUDE_CONFIG_DIR` wins over `home`, and a home-less built-in
+ *  inherits the process-level override. An account whose env map sets only
+ *  `HOME` spawns with no `CLAUDE_CONFIG_DIR`, so on macOS claude uses the
+ *  unsuffixed Keychain item (the same login as the main account) and
+ *  elsewhere `<HOME>/.claude/.credentials.json`. */
+function claudeConfigRoot(harness: Harness, platform: NodeJS.Platform): string | null {
+  const pinned = claudeConfigDirEnvFor(harness);
+  if (pinned) return pinned;
+  const envHome = harness.env?.HOME;
+  if (typeof envHome === "string" && envHome.trim() !== "" && platform !== "darwin") {
+    return path.join(envHome, ".claude");
+  }
+  return null;
 }
 
 /**
- * Path to the OAuth credentials file for an *alias* harness, or `null` for
- * the main account (whose credentials live in the macOS Keychain instead —
- * see `readKeychainClaudeToken` below). Mirrors `jsonlPathFor`'s fresh/legacy
- * fallback: try the new-layout path (`<home>/.credentials.json`) first, then
- * the legacy `<home>/.claude/.credentials.json` (from when agetor set
- * `HOME=<home>` instead of `CLAUDE_CONFIG_DIR=<home>`).
+ * Path to the `.claude.json` claude reads/writes for this harness.
+ *  - main with no override: `~/.claude.json` (`<HOME>/.claude.json` when the
+ *    env map sets HOME) — the CLI's real config file.
+ *  - any pinned config dir (`home`, an env `CLAUDE_CONFIG_DIR`, or the
+ *    process-level override the built-in inherits): `<dir>/.claude.json` —
+ *    claude treats `CLAUDE_CONFIG_DIR` as the `.claude/` equivalent, and
+ *    `.claude.json` lives directly under it (not nested under `.claude/`).
  */
-export function claudeCredentialsPath(harness: Harness): string | null {
-  if (!harness.home) return null;
-  const fresh = path.join(harness.home, ".credentials.json");
+export function claudeDotJsonPath(harness: Harness): string {
+  return path.join(claudeJsonDirFor(harness), ".claude.json");
+}
+
+/**
+ * Path to the OAuth credentials file for an *aliased/pinned* harness, or
+ * `null` for the main account (whose credentials live in the macOS Keychain
+ * instead — see `readKeychainClaudeToken` below). Mirrors `jsonlPathFor`'s
+ * fresh/legacy fallback: try the new-layout path (`<root>/.credentials.json`)
+ * first, then the legacy `<root>/.claude/.credentials.json` (from when agetor
+ * set `HOME=<home>` instead of `CLAUDE_CONFIG_DIR=<home>`).
+ */
+export function claudeCredentialsPath(
+  harness: Harness,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const root = claudeConfigRoot(harness, platform);
+  if (!root) return null;
+  const fresh = path.join(root, ".credentials.json");
   if (existsSync(fresh)) return fresh;
-  const legacy = path.join(harness.home, ".claude", ".credentials.json");
+  const legacy = path.join(root, ".claude", ".credentials.json");
   if (existsSync(legacy)) return legacy;
   // Neither exists yet — return the fresh (new-layout) path so callers get a
   // consistent "expected but missing" location rather than a legacy guess.
@@ -154,13 +176,14 @@ export async function readClaudeToken(
     // fall through
   }
   // The macOS Keychain item ("Claude Code-credentials") holds the MAIN
-  // account's token only — an aliased harness (home set) must NEVER fall
-  // back to it, or its meters would silently show a *different account's*
-  // usage (observed live: three accounts all reporting the main account's
-  // numbers). An alias with no on-disk creds gets no token; the caller then
-  // falls through to the alias's own `.claude.json` cache, which is at
-  // least the right account.
-  if (harness.home !== null) {
+  // account's token only — any pinned config root (an alias `home`, an env
+  // `CLAUDE_CONFIG_DIR`, or the process override the built-in inherits) must
+  // NEVER fall back to it, or its meters would silently show a *different
+  // account's* usage (observed live: three accounts all reporting the main
+  // account's numbers). A pinned account with no on-disk creds gets no token;
+  // the caller then falls through to that account's own `.claude.json` cache,
+  // which is at least the right account.
+  if (claudeConfigRoot(harness, process.platform) !== null) {
     return { token: null, scopes: [] };
   }
   const keychainToken = await readKeychainClaudeToken();

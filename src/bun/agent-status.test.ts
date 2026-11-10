@@ -1209,3 +1209,37 @@ describe("cachedCliVersion", () => {
     expect((await checkHarness(opencodeHarness(bin, "env-c"))).version).toBe("v-1");
   });
 });
+
+describe("claude account fields read where the spawn reads (CR1)", () => {
+  test("an env-map HOME account's identity comes from <HOME>/.claude.json, not the user's real one", async () => {
+    // Pinning nothing for such an account is deliberate (review R-M1): claude
+    // keeps `<HOME>/.claude` for sessions and `<HOME>/.claude.json` for the
+    // account blob. The status must read exactly there.
+    const envHome = mkdtempSync(path.join(tmpdir(), "agetor-status-envhome-"));
+    mkdirSync(path.join(envHome, ".claude"), { recursive: true });
+    writeFileSync(
+      path.join(envHome, ".claude.json"),
+      JSON.stringify({ oauthAccount: { emailAddress: "envhome@example.com", displayName: "Env Home" } }),
+    );
+    const prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    process.env.AGETOR_CLAUDE_BIN = "/nonexistent/claude-for-status-test";
+    try {
+      const status = await checkHarness({
+        id: "claude-envhome",
+        kind: "claude-code",
+        label: "env home",
+        isBuiltin: false,
+        home: null,
+        bin: null,
+        env: { HOME: envHome },
+        enabled: true,
+      });
+      expect(status.account?.email).toBe("envhome@example.com");
+    } finally {
+      if (prevConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prevConfigDir;
+      rmSync(envHome, { recursive: true, force: true });
+    }
+  });
+});

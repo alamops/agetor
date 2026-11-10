@@ -21,7 +21,7 @@ import copilotHarness from "./migrations/077_copilot_harness.sql" with { type: "
 import opencodeHarness from "./migrations/078_opencode_harness.sql" with { type: "text" };
 import opencodeTaskFields from "./migrations/079_opencode_task_fields.sql" with { type: "text" };
 import harnessAutoEnabled from "./migrations/080_harness_auto_enabled.sql" with { type: "text" };
-import normalizeCursorFable52 from "./migrations/084_normalize_cursor_fable_5_2.sql" with { type: "text" };
+import normalizeCursorFable52 from "./migrations/086_normalize_cursor_fable_5_2.sql" with { type: "text" };
 import { migrations } from "./migrations/index.ts";
 import { cursorModelArg } from "../shared/types.ts";
 
@@ -1763,7 +1763,7 @@ const CURSOR_FABLE_VARIANTS: Array<[string, string[]]> = [
   ["claude-fable-5-1", ["max", "xhigh", "high", "medium", "low"]],
 ];
 
-test("084_normalize_cursor_fable_5_2 folds all ten plain variant ids into base id + effort (speed reset to off) on cursor-kind tasks and profiles and lastModel:cursor, leaving base ids, thinking variants, other kinds, unknown suffixes and orphans alone, idempotently", () => {
+test("086_normalize_cursor_fable_5_2 folds all ten plain variant ids into base id + effort (speed reset to off) on cursor-kind tasks and profiles and lastModel:cursor, leaving base ids, thinking variants, other kinds, unknown suffixes and orphans alone, idempotently", () => {
   const variants = CURSOR_FABLE_VARIANTS.flatMap(([base, efforts]) =>
     efforts.map((e) => ({ base, effort: e, id: `${base}-${e}` })),
   );
@@ -2060,16 +2060,17 @@ test("075 + 076 on the real schema: codex gpt-5.5 rows move, cursor variants fol
 });
 
 // End to end on the REAL schema (the tests above use a minimal hand-built
-// one): a DB migrated through 083 with real task/profile/preference rows, then
-// 084 applied by the runner the app itself uses at boot. Pins the 076
-// properties 084 must also hold — the folded row re-composes the same
+// one): a DB migrated through 085 (main's harness-stacks pair, which landed
+// ahead of this one on merge) with real task/profile/preference rows, then
+// 086 applied by the runner the app itself uses at boot. Pins the 076
+// properties 086 must also hold — the folded row re-composes the same
 // `--model`, `updated_at` and the frozen snapshots are untouched, and the
 // migration is one-way.
-test("084 on the real schema: cursor Fable 5.2/5.1 variants fold to a base id that re-composes the same --model, and updated_at plus frozen snapshots are left alone", () => {
+test("086 on the real schema: cursor Fable 5.2/5.1 variants fold to a base id that re-composes the same --model, and updated_at plus frozen snapshots are left alone", () => {
   const db = new Database(":memory:");
-  const i083 = migrations.findIndex((m) => m.id === "083_opencode_watch_tombstones");
-  expect(i083).toBeGreaterThan(0);
-  migrate(db, migrations.slice(0, i083 + 1));
+  const i085 = migrations.findIndex((m) => m.id === "085_harness_stack_members_no_harness_fk");
+  expect(i085).toBeGreaterThan(0);
+  migrate(db, migrations.slice(0, i085 + 1));
 
   const snapshot = JSON.stringify({ name: "Fable", harness: "cursor", model: "claude-fable-5-2-high", effort: "high" });
   const pipelineRun = JSON.stringify({ status: "done", snapshot: { model: "claude-fable-5-2-high" } });
@@ -2116,7 +2117,7 @@ test("084 on the real schema: cursor Fable 5.2/5.1 variants fold to a base id th
        ('lastModel:fx', 'claude-fable-5-2-high', 7)`,
   );
 
-  expect(migrate(db, migrations)).toEqual(["084_normalize_cursor_fable_5_2"]);
+  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2"]);
 
   type TaskRow = {
     id: string;
@@ -2279,7 +2280,7 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
     INSERT INTO subagents (id, task_id, parent_kind, source_path, status, started_at, ended_at)
       VALUES ('opencode-ses_1', 't1', 'opencode_subagent', 'opencode-session:ses_1', 'orphaned', 1, 2);
   `);
-  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_normalize_cursor_fable_5_2"]);
+  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2"]);
   expect(columnNames(db, "opencode_stopped_children")).toEqual(["child_session_id", "task_id", "stopped_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_stopped_children)`).all()).toEqual([]);
   // A note for a task id that doesn't exist (or no longer does) is accepted.
@@ -2301,10 +2302,19 @@ test("083 (opencode watch tombstones) sits right after 082 (opencode child bookk
   expect(migrations[at]?.sql).toContain("CREATE INDEX opencode_watch_tombstones_expires_idx");
 });
 
-test("084 (normalize cursor fable 5.2) is the last registered migration, after 083 (opencode watch tombstones)", () => {
-  const at = migrations.findIndex((m) => m.id === "084_normalize_cursor_fable_5_2");
-  expect(at).toBe(migrations.length - 1);
+test("084 (harness stacks) follows 083 (opencode watch tombstones)", () => {
+  const at = migrations.findIndex((m) => m.id === "084_harness_stacks");
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at - 1]?.id).toBe("083_opencode_watch_tombstones");
+  expect(migrations[at]?.sql).toContain("CREATE TABLE harness_stacks");
+  expect(migrations[at]?.sql).toContain("CREATE TABLE harness_session_handoffs");
+  expect(migrations[at]?.sql).toContain("ALTER TABLE tasks ADD COLUMN harness_state");
+});
+
+test("086 (normalize cursor fable 5.2) is the last registered migration, after 085 (stack members without the harnesses FK)", () => {
+  const at = migrations.findIndex((m) => m.id === "086_normalize_cursor_fable_5_2");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("085_harness_stack_members_no_harness_fk");
   expect(migrations[at]?.aliases).toBeUndefined();
   expect(migrations[at]?.sql).toBe(normalizeCursorFable52);
   // Both families are folded: the new 5.2 spec's ids and the pre-existing
@@ -2319,7 +2329,7 @@ test("083 adds opencode_watch_tombstones (no foreign key, session id primary key
   const db = new Database(":memory:");
   migrateThrough(db, "082_opencode_child_bookkeeping");
   db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'opencode', '/w', 1, 1)`);
-  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_normalize_cursor_fable_5_2"]);
+  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2"]);
   expect(columnNames(db, "opencode_watch_tombstones")).toEqual(["session_id", "harness_id", "task_id", "expires_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_watch_tombstones)`).all()).toEqual([]);
   // A tombstone outlives its task: a task id that doesn't exist is accepted.
@@ -2375,7 +2385,9 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
     "081_cursor_asks",
     "082_opencode_child_bookkeeping",
     "083_opencode_watch_tombstones",
-    "084_normalize_cursor_fable_5_2",
+    "084_harness_stacks",
+    "085_harness_stack_members_no_harness_fk",
+    "086_normalize_cursor_fable_5_2",
   ]);
   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 
@@ -2453,5 +2465,76 @@ test("080 creates harness_auto_enabled with no foreign key, surviving a harnesse
   db.exec(`PRAGMA foreign_keys = ON`);
   db.exec(`CREATE TABLE h2 AS SELECT * FROM harnesses; DROP TABLE harnesses; ALTER TABLE h2 RENAME TO harnesses;`);
   expect(db.query<{ id: string }, []>(`SELECT harness_id AS id FROM harness_auto_enabled`).all()).toEqual([{ id: "codex" }]);
+  db.close();
+});
+
+test("085 (stack members without the harnesses FK) follows 084 (harness stacks) and precedes 086 (cursor Fable 5.2 normalization)", () => {
+  const at = migrations.findIndex((m) => m.id === "085_harness_stack_members_no_harness_fk");
+  expect(at).toBeGreaterThan(0);
+  expect(migrations[at - 1]?.id).toBe("084_harness_stacks");
+  expect(migrations[at + 1]?.id).toBe("086_normalize_cursor_fable_5_2");
+  expect(migrations[at]?.aliases).toBeUndefined();
+});
+
+test("085 rebuilds harness_stack_members without the harnesses FK, keeping rows, the stack cascade, the PK and both UNIQUEs; a later harnesses rebuild with foreign keys on keeps every membership", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "084_harness_stacks");
+  db.exec(`
+    INSERT INTO harnesses (id, kind, label, created_at, updated_at) VALUES ('cc-b', 'claude-code', 'Backup', 1, 1);
+    INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'Claude', 'claude-code', 1, 1);
+    INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'claude-code', 0), ('s1', 'cc-b', 1);
+  `);
+  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2"]);
+  expect(columnNames(db, "harness_stack_members")).toEqual(["stack_id", "harness_id", "position"]);
+  const fks = db.query<{ table: string; on_delete: string }, []>(`PRAGMA foreign_key_list(harness_stack_members)`).all();
+  expect(fks.map((f) => [f.table, f.on_delete])).toEqual([["harness_stacks", "CASCADE"]]);
+  const members = () =>
+    db.query<{ stack_id: string; harness_id: string; position: number }, []>(
+      `SELECT stack_id, harness_id, position FROM harness_stack_members ORDER BY position`,
+    ).all();
+  expect(members()).toEqual([
+    { stack_id: "s1", harness_id: "claude-code", position: 0 },
+    { stack_id: "s1", harness_id: "cc-b", position: 1 },
+  ]);
+
+  // The documented harnesses rebuild recipe (078's), inside one transaction,
+  // with foreign keys ON as db.ts runs every migration.
+  db.exec(`PRAGMA foreign_keys = ON`);
+  db.transaction(() => {
+    db.run(`CREATE TABLE harnesses_new (
+      id TEXT PRIMARY KEY, kind TEXT NOT NULL, label TEXT NOT NULL, is_builtin INTEGER NOT NULL DEFAULT 0,
+      home TEXT, bin TEXT, env_json TEXT NOT NULL DEFAULT '{}', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1, profile_mcp_servers INTEGER NOT NULL DEFAULT 1)`);
+    db.run(`INSERT INTO harnesses_new SELECT id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled, profile_mcp_servers FROM harnesses`);
+    db.run(`DROP TABLE harnesses`);
+    db.run(`ALTER TABLE harnesses_new RENAME TO harnesses`);
+  })();
+  expect(members()).toHaveLength(2);
+
+  // The stack cascade, the PK and both UNIQUEs still hold.
+  expect(() => db.run(`INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'cc-c', 1)`)).toThrow();
+  db.run(`INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s2', 'Other', 'claude-code', 1, 1)`);
+  expect(() => db.run(`INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s2', 'cc-b', 0)`)).toThrow();
+  expect(() => db.run(`INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('missing', 'cc-z', 0)`)).toThrow();
+  db.run(`DELETE FROM harness_stacks WHERE id = 's1'`);
+  expect(members()).toEqual([]);
+  expect(migrate(db, migrations)).toEqual([]);
+  db.close();
+});
+
+test("084's harnesses FK on its own would wipe memberships on a harnesses rebuild (the defect 085 removes)", () => {
+  const db = new Database(":memory:");
+  migrateThrough(db, "084_harness_stacks");
+  db.exec(`
+    INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'Claude', 'claude-code', 1, 1);
+    INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'claude-code', 0);
+    PRAGMA foreign_keys = ON;
+  `);
+  db.transaction(() => {
+    db.run(`CREATE TABLE harnesses_new AS SELECT * FROM harnesses`);
+    db.run(`DROP TABLE harnesses`);
+    db.run(`ALTER TABLE harnesses_new RENAME TO harnesses`);
+  })();
+  expect(db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM harness_stack_members`).get()?.n).toBe(0);
   db.close();
 });

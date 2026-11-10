@@ -7,12 +7,15 @@ import {
   startOpencodeServerDriver,
   stopIdleOpencodeServersOnRealStop,
   stopOpencodeServerDriver,
+  reconcileHarnessFailover,
   reconcileOrphans,
+  reconcilePendingHarnessSwaps,
   rearmFxAutoResumes,
   reapIdleSessions,
   stopFxAutoResumeTimers,
   waitForLaunchesToSettle,
 } from "./orchestrator.ts";
+import { stopAllAutoRetryTimers } from "./harness-failover.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { adoptOpencodeServers } from "./opencode-server.ts";
 import { startLagMonitor, stopLagMonitor } from "./event-loop-lag.ts";
@@ -178,6 +181,10 @@ function shutdown(reason: string, code = 0, opts: { realStop?: boolean } = {}): 
   // not touch any persisted `fxRecovery` row — `rearmFxAutoResumes()` re-arms
   // them from the DB on the next boot.
   stopFxAutoResumeTimers();
+  // Harness-stack all-exhausted retry timers likewise (`freezeLaunches` above
+  // already stopped them; this keeps the teardown explicit). The persisted
+  // schedules stay; the next boot re-arms them.
+  stopAllAutoRetryTimers();
   // Retention: abort a running pass between chunks and clear its timers; stop
   // the lag sampler. Trimmed rows stay trimmed, the next boot resumes.
   stopRetentionTimers();
@@ -385,6 +392,9 @@ export async function runDaemon(): Promise<void> {
     if (rearmedFxAutoResumeCount > 0) {
       daemonLog(`re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
     }
+    // Harness-stack failover boot reconcile — same as index.ts's desktop path:
+    // cooldowns and retry timers now, interrupted swaps after the gate opens.
+    await reconcileHarnessFailover({ includeSwaps: false });
   } catch (err) {
     daemonLog(`boot restore failed: ${(err as Error)?.stack ?? String(err)}`);
     shutdown("boot restore failed", 1);
@@ -441,6 +451,14 @@ export async function runDaemon(): Promise<void> {
 
   // The boot restore is done: let the routes through.
   markBootReady();
+
+  // Complete (or visibly block) harness-stack swaps a restart interrupted.
+  // After the gate: a completion mirrors config and copies a transcript,
+  // which must not hold every route. Each task is claimed first, so a Run or
+  // message cannot race it (docs/architecture/harness-stacks.md).
+  void reconcilePendingHarnessSwaps().catch((err) => {
+    daemonLog(`harness swap reconcile failed: ${(err as Error)?.message ?? String(err)}`);
+  });
 
   // OpenCode server wake + idle sweep, once the reattached turns are registered.
   startOpencodeServerDriver();

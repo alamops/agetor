@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "formId": "harness-account-stacks-grill-r1",
+  "title": "Grill — Harness account stacks (backup accounts, automatic failover)",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "25f2238aa17184d9b66c280f77ae57be608623ce6ea8e19baa9c40120394773e",
+  "submittedAt": "2026-11-06T21:40:40.098Z",
+  "receivedAt": "2026-11-06T21:40:40.121Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 15,
+    "answered": 15,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 11,
+    "overrodeRecommendations": [
+      "v1-kinds",
+      "capability-sharing",
+      "credentials",
+      "max-size"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "acceptance"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "stack-model": {
+      "n": 1,
+      "title": "What is a \"stack\" in the model: a fallback chain attached to each account, or a separate named group?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "implicit",
+      "display": "A chain attached to each account",
+      "acceptedRecommendation": true
+    },
+    "same-kind": {
+      "n": 2,
+      "title": "Must every member be the same harness kind, or can a stack fall through to a different kind (Claude → Codex)?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "same-kind",
+      "display": "Same kind only",
+      "acceptedRecommendation": true
+    },
+    "v1-kinds": {
+      "n": 3,
+      "title": "Which harness kinds must a stack support in v1?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": null,
+      "other": "Claude Code and Codex for now",
+      "display": "Other: Claude Code and Codex for now",
+      "acceptedRecommendation": false,
+      "recommended": "proven3"
+    },
+    "claude-limit-notice": {
+      "n": 4,
+      "title": "Claude Code handles a usage limit by waiting for the reset itself. Should Agetor preempt that and swap to the backup?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "preempt",
+      "display": "Detect the notice and swap immediately",
+      "acceptedRecommendation": true
+    },
+    "limit-signals": {
+      "n": 5,
+      "title": "Which failures count as \"this account reached its limit\" and should trigger a swap?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "blocking",
+      "value": [
+        "quota",
+        "429",
+        "402"
+      ],
+      "display": "Provider quota exhausted; HTTP 429 / rate limited; 402 / insufficient credits",
+      "acceptedRecommendation": true
+    },
+    "mid-turn": {
+      "n": 6,
+      "title": "When the limit hits mid-turn, what should happen to the turn?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "continue-exact",
+      "display": "Resume the same turn on the backup",
+      "acceptedRecommendation": true
+    },
+    "history-fidelity": {
+      "n": 7,
+      "title": "What does \"preserve the conversation\" mean for the backup?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "exact",
+      "display": "Exact provider session",
+      "acceptedRecommendation": true
+    },
+    "capability-sharing": {
+      "n": 8,
+      "title": "How should the backup get the primary's user-level MCP servers, skills, commands and CLI settings?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "mirror-all",
+      "display": "Mirror everything, including settings and hooks",
+      "acceptedRecommendation": false,
+      "recommended": "copy-on-create"
+    },
+    "credentials": {
+      "n": 9,
+      "title": "Should Agetor ever copy or share authentication tokens between accounts?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "copy-tokens",
+      "display": "Copy credential files between homes",
+      "acceptedRecommendation": false,
+      "recommended": "own-login"
+    },
+    "all-exhausted": {
+      "n": 10,
+      "title": "When every member is exhausted, what should the task do?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "auto-retry",
+      "display": "Block with a countdown, then retry automatically",
+      "acceptedRecommendation": true
+    },
+    "naming": {
+      "n": 11,
+      "title": "Name in the UI and docs",
+      "type": "confirm",
+      "status": "answered",
+      "value": "**Harness stack**, with **accounts** as members and **stack** as the verb",
+      "acceptedRecommendation": true
+    },
+    "max-size": {
+      "n": 12,
+      "title": "Maximum stack size",
+      "type": "confirm",
+      "status": "answered",
+      "value": "no maximum",
+      "acceptedRecommendation": false,
+      "recommended": "**5 members** per stack (hard cap 10)"
+    },
+    "running-ux": {
+      "n": 13,
+      "title": "What the task shows during the swap",
+      "type": "confirm",
+      "status": "answered",
+      "value": "The task stays `running`; the old run's failure toast is suppressed; a status line says `Switching to backup…` before the new run starts, then the swap notice",
+      "acceptedRecommendation": true
+    },
+    "persist-intent": {
+      "n": 14,
+      "title": "Crash/restart safety",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Persist the swap intent (like `fxRecovery`) and reconcile it on boot, so a core restart mid-swap resumes or fails cleanly",
+      "acceptedRecommendation": true
+    },
+    "acceptance": {
+      "n": 15,
+      "title": "What \"done\" means for v1",
+      "type": "confirm",
+      "status": "answered",
+      "value": "An e2e two-account Claude stack survives a simulated limit, shows the swap notice, and preserves the conversation; per-kind adapter tests for Codex and OpenCode; a unit test for the limit classifier; and no credential file is ever copied",
+      "acceptedRecommendation": true,
+      "note": "not necessarily using real claude account for the tests"
+    }
+  },
+  "generalNotes": null
+}

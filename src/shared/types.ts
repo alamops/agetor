@@ -224,17 +224,17 @@ export interface FxRecoveryPayload {
 
 /**
  * True for `status`-stream chunks that are UI-internal sentinel channels, not
- * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
- * now suppressed-only), `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
- * chip), `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip),
- * `FX_SESSION_TITLE_STATUS_PREFIX` (feeds the run-row session-title chip),
- * and `FX_RECOVERY_STATUS_PREFIX` (feeds the live recovery notice, the
- * paused/Resume affordance, and CLI/TUI progress lines) — four fx sentinels
- * in all. Every renderer of raw status events — RunPanel's status dividers,
- * the CLI's `agetor logs` formatter, and the TUI dashboard — must consult
- * this ONE predicate instead of maintaining its own prefix list, so a new
- * sentinel can't silently leak verbatim into one surface while another
- * suppresses it.
+ * transcript content: `PERMISSION_MODE_STATUS_PREFIX` (fed a chip, now
+ * suppressed-only), the four fx sentinels — `FX_USAGE_STATUS_PREFIX` (feeds
+ * the run-row usage chip), `FX_PROVIDER_STATUS_PREFIX` (the run-row provider
+ * chip), `FX_SESSION_TITLE_STATUS_PREFIX` (the run-row session-title chip),
+ * and `FX_RECOVERY_STATUS_PREFIX` (the live recovery notice, the paused/Resume
+ * affordance, and CLI/TUI progress lines) — plus
+ * `HARNESS_LIMIT_STATUS_PREFIX` (the structured provider-limit signal). Every
+ * renderer of raw status events — RunPanel's status dividers, the CLI's
+ * `agetor logs` formatter, and the TUI dashboard — must consult this ONE
+ * predicate instead of maintaining its own prefix list, so a new sentinel
+ * can't silently leak verbatim into one surface while another suppresses it.
  */
 export function isInternalStatusSentinel(data: string): boolean {
   return (
@@ -242,7 +242,8 @@ export function isInternalStatusSentinel(data: string): boolean {
     data.startsWith(FX_USAGE_STATUS_PREFIX) ||
     data.startsWith(FX_PROVIDER_STATUS_PREFIX) ||
     data.startsWith(FX_SESSION_TITLE_STATUS_PREFIX) ||
-    data.startsWith(FX_RECOVERY_STATUS_PREFIX)
+    data.startsWith(FX_RECOVERY_STATUS_PREFIX) ||
+    data.startsWith(HARNESS_LIMIT_STATUS_PREFIX)
   );
 }
 
@@ -348,8 +349,11 @@ export interface Harness {
    *    macOS that would point claude's keychain lookup at a non-existent
    *    `<home>/Library/Keychains/login.keychain-db` and surface as
    *    "Not logged in" even with valid tokens.
-   *  - codex: emitted as HOME=<home> + CODEX_HOME=<home>/.codex (codex doesn't
-   *    use the macOS keychain, so re-homing it is safe).
+   *  - codex: emitted as CODEX_HOME=<home>/.codex. CODEX_HOME alone owns
+   *    login (`auth.json`), config, sessions, MCP servers and every write
+   *    (verified on codex-cli 0.166.0 — see
+   *    docs/plans/harness-account-stacks-codex-spike.md), so HOME is left
+   *    alone; the account keeps the user's real `~/.gitconfig`/`~/.ssh`/gh.
    *  - cursor: emitted as a plain HOME=<home> override — `cursor-agent` has
    *    no documented dedicated config-dir env var, so isolating an
    *    additional account's login/config means re-homing the whole process
@@ -404,6 +408,259 @@ export interface Harness {
    *  kinds. */
   profileMcpServers?: boolean;
 }
+
+/** Kinds a harness stack supports in v1 (`docs/architecture/harness-stacks.md`).
+ *  Same-kind only: the model/mode/effort picks and the provider session format
+ *  stay valid across a failover. */
+export type HarnessStackKind = "claude-code" | "codex";
+
+/** The v1 stack kinds as a runtime list (API/CLI/editor reject the rest). */
+export const HARNESS_STACK_KINDS = ["claude-code", "codex"] as const satisfies readonly HarnessStackKind[];
+
+/** `full` mirrors user-level hooks/permissions too; `safe` deliberately does
+ *  not (the per-stack security opt-out). */
+export type HarnessMirrorMode = "full" | "safe";
+
+/** One account inside a stack. `position` is 0-based; 0 is the primary. */
+export interface HarnessStackMember {
+  harnessId: string;
+  position: number;
+  label: string;
+  kind: HarnessStackKind;
+  enabled: boolean;
+}
+
+/** A non-fatal or blocking problem with a stack draft. Blockers prevent a
+ *  save; warnings are shown and saved. */
+export interface HarnessStackWarning {
+  code: string;
+  message: string;
+  harnessId?: string;
+}
+
+/** An ordered group of same-kind accounts: position 0 is the primary, the rest
+ *  are backups. Machine-local; never exported in a bundle. */
+export interface HarnessStack {
+  id: string;
+  label: string;
+  kind: HarnessStackKind;
+  mirrorMode: HarnessMirrorMode;
+  members: HarnessStackMember[];
+  createdAt: number;
+  updatedAt: number;
+  warnings: HarnessStackWarning[];
+}
+
+/** The create/edit shape accepted by the API and CLI. `members` is the full
+ *  ordered account list (first = primary). */
+export interface HarnessStackInput {
+  label: string;
+  kind: HarnessStackKind;
+  members: string[];
+  mirrorMode?: HarnessMirrorMode;
+}
+
+/** Conservative limit vocabulary: provider quota, HTTP 429, 402/credits. */
+export type HarnessLimitReason = "quota" | "rate_limit" | "insufficient_credits";
+
+/** The structured signal a driver emits when a turn hits a limit. */
+export interface HarnessLimitSignal {
+  reason: HarnessLimitReason;
+  /** Provider-reported reset time (epoch ms), or null when unknown. */
+  resetAtMs: number | null;
+  /** Human-readable notice text. Never contains a token or an email. */
+  message: string;
+  source: "claude-pane" | "claude-api-error" | "codex-error";
+}
+
+/** An account-global cooldown row. Written only by the stack store. */
+export interface HarnessLimitState {
+  harnessId: string;
+  reason: HarnessLimitReason;
+  source: HarnessLimitSignal["source"];
+  message: string | null;
+  exhaustedUntilMs: number;
+  updatedAt: number;
+}
+
+/** The visible divider emitted into the new run's `status` stream when a swap
+ *  completes. `position` is 1-based for display. */
+export interface HarnessSwapNotice {
+  from: string;
+  fromLabel: string;
+  to: string;
+  toLabel: string;
+  reason: HarnessLimitReason;
+  position: number;
+  count: number;
+  resetsAtMs: number | null;
+  at: number;
+  /** How the work continues on the backup. `"transferred"` (the default when
+   *  absent, and every pre-existing payload) means the provider conversation
+   *  was copied and resumed. `"restarted"` is the clean-retry branch before
+   *  any tool call: the original request is re-sent on a fresh session, so
+   *  the divider must not claim a transferred conversation. */
+  continuation?: "transferred" | "restarted";
+}
+
+/** Per-task failover state, persisted in `tasks.harness_state`. Small by
+ *  design: ids, timestamps and short reasons — never prompts or tokens. */
+export interface TaskHarnessState {
+  stackId: string;
+  /** 0-based position of the current account when the state was written. */
+  position: number;
+  /** Member count at the time (display only: `2/3`). Optional so older
+   *  persisted state still parses. */
+  count?: number;
+  /** Account ids already tried in the current lap. */
+  tried: string[];
+  /** A swap that was persisted but not yet completed (crash safety). */
+  pendingSwap: {
+    from: string;
+    to: string;
+    reason: HarnessLimitReason;
+    runId: string;
+    startedAt: number;
+    /** A user-initiated same-stack account switch (not a provider-limit
+     *  failover). Boot completes or visibly reports it instead of treating it
+     *  as a quota swap (review R15-S3). */
+    manual?: boolean;
+  } | null;
+  /** Set when every usable account is exhausted or unusable. */
+  allExhausted: {
+    at: number;
+    attempts: number;
+    max: number;
+    nextAttemptAt: number;
+    earliestResetAtMs: number | null;
+    reason: HarnessLimitReason | "no-usable-member";
+    /** A retry run is being spawned right now. `nextAttemptAt` is 0 while
+     *  this is set; boot recovers an interrupted spawn instead of treating
+     *  the zero as "no timer". Optional so older state still parses. */
+    inFlight?: boolean;
+    /** The retry successor run this marker belongs to, written right after
+     *  the run row is minted. Boot uses it to tell "the retry settled for a
+     *  non-limit reason, stop retrying" from "the core died mid-spawn, retry
+     *  again". Optional so older state still parses (legacy = re-arm). */
+    attemptRunId?: string;
+  } | null;
+  /** The last automatic move, for a visible note in the UI. `manual-switch`
+   *  is the user switching accounts inside one stack (which preserves the
+   *  conversation) — not a member leaving or being unavailable. */
+  lastMove: {
+    from: string;
+    to: string;
+    at: number;
+    reason: "member-removed" | "member-disabled" | "member-unavailable" | "manual-switch";
+  } | null;
+}
+
+/** Defensive parser for `tasks.harness_state`: malformed or absent → null. */
+export function parseTaskHarnessState(raw: string | null | undefined): TaskHarnessState | null {
+  if (!raw) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  if (typeof o.stackId !== "string" || o.stackId.length === 0) return null;
+  if (typeof o.position !== "number" || !Number.isFinite(o.position)) return null;
+  const tried = Array.isArray(o.tried) ? o.tried.filter((v): v is string => typeof v === "string") : [];
+  const pending = o.pendingSwap;
+  const pendingSwap = pending && typeof pending === "object"
+    ? (() => {
+        const p = pending as Record<string, unknown>;
+        if (typeof p.from !== "string" || typeof p.to !== "string") return null;
+        if (typeof p.runId !== "string" || typeof p.startedAt !== "number") return null;
+        const reason: HarnessLimitReason = isHarnessLimitReason(p.reason) ? p.reason : "quota";
+        // Legacy `phase` values (`switching`/`spawning`, and the earlier
+        // `transferring`) are deliberately ignored: the field was never read.
+        // `manual` marks a user-initiated same-stack switch; omitted when
+        // false so persisted-state equality stays stable.
+        return {
+          from: p.from,
+          to: p.to,
+          reason,
+          runId: p.runId,
+          startedAt: p.startedAt,
+          ...(p.manual === true ? { manual: true } : {}),
+        };
+      })()
+    : null;
+  const exhausted = o.allExhausted;
+  const allExhausted = exhausted && typeof exhausted === "object"
+    ? (() => {
+        const e = exhausted as Record<string, unknown>;
+        if (typeof e.at !== "number" || typeof e.attempts !== "number") return null;
+        if (typeof e.max !== "number" || typeof e.nextAttemptAt !== "number") return null;
+        const exhaustedReason: HarnessLimitReason | "no-usable-member" =
+          isHarnessLimitReason(e.reason) || e.reason === "no-usable-member" ? e.reason : "quota";
+        const earliestResetAtMs = typeof e.earliestResetAtMs === "number" ? e.earliestResetAtMs : null;
+        return {
+          at: e.at,
+          attempts: e.attempts,
+          max: e.max,
+          nextAttemptAt: e.nextAttemptAt,
+          earliestResetAtMs,
+          reason: exhaustedReason,
+          ...(e.inFlight === true ? { inFlight: true } : {}),
+          ...(typeof e.attemptRunId === "string" && e.attemptRunId.length > 0
+            ? { attemptRunId: e.attemptRunId }
+            : {}),
+        };
+      })()
+    : null;
+  const move = o.lastMove;
+  const lastMove = move && typeof move === "object"
+    ? (() => {
+        const m = move as Record<string, unknown>;
+        if (typeof m.from !== "string" || typeof m.to !== "string" || typeof m.at !== "number") return null;
+        const moveReason: "member-removed" | "member-disabled" | "member-unavailable" | "manual-switch" =
+          m.reason === "member-removed" || m.reason === "member-disabled" || m.reason === "member-unavailable" || m.reason === "manual-switch"
+            ? m.reason
+            : "member-unavailable";
+        return { from: m.from, to: m.to, at: m.at, reason: moveReason };
+      })()
+    : null;
+  const count = typeof o.count === "number" && Number.isFinite(o.count) ? o.count : undefined;
+  return { stackId: o.stackId, position: o.position, ...(count !== undefined ? { count } : {}), tried, pendingSwap, allExhausted, lastMove };
+}
+
+function isHarnessLimitReason(v: unknown): v is HarnessLimitReason {
+  return v === "quota" || v === "rate_limit" || v === "insufficient_credits";
+}
+
+/**
+ * Sentinel prefix for the `status` chunk a driver emits when a turn hits a
+ * provider limit (`HarnessLimitSignal` JSON after the prefix). Plumbing, not
+ * transcript content — suppressed via `isInternalStatusSentinel`.
+ */
+export const HARNESS_LIMIT_STATUS_PREFIX = "harness-limit: ";
+
+/**
+ * The sentinel token the swap notice's writer and parser share. Kept separate
+ * from the prefix so a parser can tolerate a missing space without repeating
+ * the literal.
+ */
+export const HARNESS_SWAP_STATUS_TOKEN = "harness-swap:";
+
+/**
+ * Sentinel prefix for the visible swap divider written on the successor run's
+ * `status` stream. The payload is a `HarnessSwapNotice` JSON object; renderers
+ * format it with `formatHarnessSwapNotice`. Deliberately NOT suppressed: this
+ * is the user-facing notice.
+ */
+export const HARNESS_SWAP_STATUS_PREFIX = `${HARNESS_SWAP_STATUS_TOKEN} `;
+
+/**
+ * The exact wrapper around the hidden continuation prompt (`runs.origin =
+ * "harness-swap"`). A user message that merely contains the tag is shown;
+ * only a value that is exactly the wrapper is hidden.
+ */
+export const HARNESS_STACK_CONTINUATION_TAG = "harness-stack-continuation";
 
 /** A user-global reusable prompt snippet — not tied to any task or project. */
 export interface SavedPrompt {
@@ -1754,6 +2011,17 @@ export interface Task {
    * non-step task. Set only at insert time; never patchable.
    */
   pipelineStepId?: string | null;
+  /**
+   * Per-task failover state for a harness account stack (see
+   * {@link TaskHarnessState} and docs/architecture/harness-stacks.md).
+   * Server-managed: written only by `tasks.setHarnessState`'s targeted UPDATE
+   * (no `updated_at` bump, skipped by the generic `tasks.update` SET clause),
+   * and it rides the `/tasks` poll so the board/RunPanel can show the active
+   * account, a pending swap, or an all-exhausted countdown without a join.
+   * Optional at the type level for fixture compatibility — `toTask` always
+   * sets it (null when absent).
+   */
+  harnessState?: TaskHarnessState | null;
   /**
    * Friendly mode id ("auto", "ask", "acceptEdits", "plan", …). Maps to
    * agent-specific CLI flags in `src/bun/agents.ts`. NULL means "use the
@@ -4640,8 +4908,12 @@ export interface Run {
    * `"agent"` = OpenCode started an execution on the task's session by itself
    * (e.g. a background subagent finished) and agetor recorded it as a run
    * (plan D7). Same column, a new value.
+   * `"harness-swap"` = a harness-stack failover started this run after the
+   * previous account hit its limit; its prompt is the hidden tagged
+   * continuation (docs/architecture/harness-stacks.md). Same column, a new
+   * value.
    */
-  origin?: "continuation" | "imported" | "auto-resume" | "agent" | null;
+  origin?: "continuation" | "imported" | "auto-resume" | "agent" | "harness-swap" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */
@@ -5584,6 +5856,11 @@ export type GlobalEvent =
       runId: string;
       status: "succeeded" | "failed" | "cancelled" | "orphaned";
       ts: number;
+      /** Set when this settle is one half of a harness-stack failover: the old
+       *  run is recorded `failed` so history is honest, but the task keeps
+       *  running on the backup, so the generic failure toast must stay quiet.
+       *  Optional/additive. */
+      reason?: "harness-swap" | "harness-exhausted";
       /** Set when `taskId` is a hidden pipeline STEP task — the id of its
        *  pipeline parent (board card). Consumers that scope toasts /
        *  notifications / TUI rows per parent read this instead of having to
@@ -5608,7 +5885,7 @@ export type GlobalEvent =
        *  than the generic "waiting on you" used for permission prompts.
        *  Unset for transitions whose reason is fully implied by the
        *  (prev, column) pair (e.g. plain success → review). */
-      reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline";
+      reason?: "api-error" | "approval" | "session-died" | "unknown-command" | "pipeline" | "harness-exhausted" | "harness-swap-failed";
       /** Pipeline parent id when `taskId` is a hidden step task — see the
        *  `run-status` member. Optional/additive. */
       pipelineParentId?: string;
@@ -5748,6 +6025,33 @@ export type GlobalEvent =
        *  starts a new generation, so its gates notify afresh. Optional/
        *  additive. */
       runStartedAt?: number | null;
+    }
+  | {
+      /**
+       * A harness-stack failover completed: the task moved from `fromLabel` to
+       * `toLabel` and kept running. Live-only, like `files-sent` — a replayed
+       * swap must not re-notify. Drives the webview toast / OS notification
+       * and the TUI line; the visible in-transcript divider is the successor
+       * run's `harness-swap:` status event, not this.
+       */
+      kind: "harness-swap";
+      taskId: string;
+      /** The account that hit the limit (the old run's harness id). */
+      from: string;
+      /** The account that continues the task. */
+      to: string;
+      fromLabel: string;
+      toLabel: string;
+      reason: HarnessLimitReason;
+      /** 1-based position of the new account among the stack's members. */
+      position: number;
+      count: number;
+      ts: number;
+      /** Pipeline parent id when `taskId` is a hidden step task — see the
+       *  `run-status` member. Optional/additive. */
+      pipelineParentId?: string;
+      /** See the `run-status` member. */
+      pipelineParentTitle?: string;
     }
   | {
       /**

@@ -116,8 +116,12 @@ const BODY_PATH: readonly PathParam[] = [{ in: "body", name: "path", mode: "exis
 const BODY_PATHS: readonly PathParam[] = [{ in: "body", name: "paths", mode: "exists" }];
 const BODY_DEST: readonly PathParam[] = [{ in: "body", name: "dest", mode: "nearest-ancestor" }];
 const BODY_WORKDIR: readonly PathParam[] = [{ in: "body", name: "workdir", mode: "exists" }];
+/** A harness `home` may not exist yet: the stack mirror and session transfer
+ *  create it (and write under it) in-process, under its nearest existing
+ *  ancestor, so that ancestor is what gets probed. `bin` is executed, never
+ *  created, so it is probed itself. */
 const BODY_HOME_BIN: readonly PathParam[] = [
-  { in: "body", name: "home", mode: "exists" },
+  { in: "body", name: "home", mode: "nearest-ancestor" },
   { in: "body", name: "bin", mode: "exists" },
 ];
 
@@ -293,6 +297,19 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
     POST: cli({ pathParams: BODY_HOME_BIN }),
   },
   "/harness-discovery": { GET: CLI },
+  // Harness account stacks (machine-local; the CLI manages them too). The body
+  // names accounts, not paths, so there is no pathParams entry: for the CLI
+  // token POST/PATCH probe every member's config root in the handler
+  // (`gateStackMemberRoots` in server.ts) before the mirror writes there.
+  "/harness-stacks": {
+    GET: CLI,
+    POST: CLI,
+  },
+  "/harness-stacks/:id": {
+    GET: CLI,
+    PATCH: CLI,
+    DELETE: CLI,
+  },
   "/harnesses/:id": {
     GET: CLI,
     PATCH: cli({ pathParams: BODY_HOME_BIN }),

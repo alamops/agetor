@@ -1,0 +1,685 @@
+{
+  "version": 1,
+  "id": "harness-account-stacks-grill-r1",
+  "title": "Grill — Harness account stacks (backup accounts, automatic failover)",
+  "skill": "grill",
+  "slug": "harness-account-stacks",
+  "round": 1,
+  "summary": "The investigation proved the hard part is real: a backup account can inherit the **conversation** for Claude, Codex and OpenCode, but user-level **MCP servers, skills, commands and settings are per account** today, and only three kinds have live quota. This round settles the **10 decisions that change the plan's shape** plus **5 defaults** I would bet on. Start with the blocking questions in **The stack model** and **When the swap happens**; the confirm list at the end is one click each.\n\nSource: `docs/plans/harness-account-stacks-investigation.md` (step 1). There is no PRD outside this repo; the plan written from these answers becomes the binding spec.",
+  "proven": [
+    {
+      "text": "**Claude Code can resume another account's transcript.** With `CLAUDE_CONFIG_DIR=<backup>`, a transcript copied into `<backup>/projects/<encoded-cwd>/<sid>.jsonl`, and `claude --resume <sid>`, the model received the prior conversation and the backup's transcript grew in place. A bogus path printed `No conversation found with session ID`.",
+      "evidence": [
+        { "label": "S1 verdict", "path": "docs/plans/harness-account-stacks-investigation.md", "line": 137 }
+      ]
+    },
+    {
+      "text": "**Codex can resume a copied rollout.** A `rollout-…-<uuid>.jsonl` copied into a fresh `CODEX_HOME/sessions/…` made `codex exec resume <uuid>` emit `thread.started` with the same id. An unknown id failed with `no rollout found for thread id`.",
+      "evidence": [
+        { "label": "S2 verdict", "path": "docs/plans/harness-account-stacks-investigation.md", "line": 138 }
+      ]
+    },
+    {
+      "text": "**OpenCode can move a session, but not merge it.** `opencode session export` + `import --standalone` preserved the same `ses_…` id and 78 messages in a fresh XDG home; a second import said `Session already exists`. Child sessions are not included.",
+      "evidence": [
+        { "label": "S3 verdict", "path": "docs/plans/harness-account-stacks-investigation.md", "line": 139 }
+      ]
+    },
+    {
+      "text": "**The other five kinds are unproven.** Cursor may be cloud-bound; fx, gemini, copilot and antigravity session copies were not spiked. Including them in v1 needs per-kind proof first.",
+      "evidence": [
+        { "label": "S4 verdict", "path": "docs/plans/harness-account-stacks-investigation.md", "line": 140 }
+      ]
+    },
+    {
+      "text": "**User-level capabilities are per account.** Claude reads `<CLAUDE_CONFIG_DIR>/skills` and `.claude.json`; cursor/fx/opencode read `<HOME>`; codex reads `CODEX_HOME`; copilot reads `$COPILOT_HOME`. Project-level entries are shared because every account runs in the same task worktree.",
+      "evidence": [
+        { "label": "per-kind user roots", "path": "src/bun/commands.ts", "line": 425 },
+        { "label": "home env mapping", "path": "src/bun/agents.ts", "line": 447 }
+      ]
+    },
+    {
+      "text": "**Only three kinds have live quota.** `USAGE_SUPPORTED_KINDS = [\"claude-code\", \"codex\", \"cursor\"]`, polled every 10 minutes; the other five can only be detected reactively.",
+      "evidence": [
+        { "label": "supported kinds", "path": "src/shared/types.ts", "line": 2064 },
+        { "label": "poll cadence", "path": "src/shared/types.ts", "line": 2047 }
+      ]
+    },
+    {
+      "text": "**Today a same-kind alias switch starts fresh.** `findLastSessionIdForHarness` only resumes an id created by the current harness, and `reconcileTaskSession` kills the session on any harness-id change. Stacks are a deliberate exception.",
+      "evidence": [
+        { "label": "session scoping rule", "path": "CLAUDE.md", "line": 99 },
+        { "label": "any id change kills the session", "path": "src/bun/orchestrator.ts", "line": 3637 }
+      ]
+    },
+    {
+      "text": "**No stack/failover tests exist.** `orchestrator-session-harness.test.ts` pins the opposite behavior; a naive change can pass the suite without proving anything.",
+      "evidence": [
+        { "label": "S5 verdict", "path": "docs/plans/harness-account-stacks-investigation.md", "line": 141 }
+      ]
+    }
+  ],
+  "sections": [
+    {
+      "id": "model",
+      "title": "The stack model",
+      "intro": "These decide whether `Task`, `AgentProfile`, pipelines and bundles need a new reference, or whether a stack is just a property of the account.",
+      "questions": [
+        {
+          "id": "stack-model",
+          "type": "single",
+          "title": "What is a \"stack\" in the model: a fallback chain attached to each account, or a separate named group?",
+          "impact": "blocking",
+          "why": "This is the biggest shape decision. It decides whether `Task`, `AgentProfile`, pipeline snapshots and the bundle format need a new field, and whether every picker changes.",
+          "context": "Today `Task.agent` stores one harness id, an Agent profile stores one `harness`, and a pipeline step creates its task with `agent: profile.harness`. Bundles export a `{id, kind, label}` harness ref, never accounts. An implicit chain needs no new task/profile/pipeline/bundle field and makes profiles and pipelines work automatically. An explicit group allows multiple stacks sharing an account and per-task choice, but touches every picker, PATCH validation, the profile snapshot, the pipeline format and the bundle.",
+          "evidence": [
+            {
+              "label": "the account row id is what tasks store",
+              "path": "src/shared/types.ts",
+              "line": 339,
+              "lang": "ts",
+              "code": "export interface Harness {\n  /** Slug used as the row id and as the value stored on `tasks.agent`. */\n  id: string;"
+            },
+            {
+              "label": "pipeline steps bind one account",
+              "path": "src/bun/pipeline-runner.ts",
+              "line": 1370,
+              "lang": "ts",
+              "code": "agent: profile.harness,"
+            },
+            {
+              "label": "bundles carry a harness ref, not accounts",
+              "path": "src/shared/bundle.ts",
+              "line": 70,
+              "lang": "ts",
+              "code": "export interface BundleHarnessRef {\n  id: string;\n  kind: string;\n  label: string;\n}"
+            }
+          ],
+          "options": [
+            {
+              "id": "implicit",
+              "label": "A chain attached to each account",
+              "description": "An account belongs to at most one stack. A task's stack is derived from `Task.agent`; a swap changes `Task.agent` to the next member. No new task/profile/pipeline/bundle field.",
+              "consequence": "Smallest blast radius; profiles, pipelines and bundles work unchanged. Adding a backup applies to every task on that account, and an account cannot be in two stacks.",
+              "preview": "harness_stacks(id, label, kind)\nharness_stack_members(stack_id, harness_id, position)\n  UNIQUE(harness_id)   -- one stack per account\n\nTask.agent = \"claude-work\"  ->  stack [claude-work, claude-backup]"
+            },
+            {
+              "id": "explicit",
+              "label": "A named stack selected per task/profile",
+              "description": "A stack is its own entity. A task or Agent profile stores `harnessStackId`; `Task.agent` remains the current member. Multiple stacks can share an account.",
+              "consequence": "Most flexible, but adds `harnessStackId` to tasks, profiles, pipeline snapshots and the bundle, plus a picker on every launch surface and PATCH validation.",
+              "preview": "harness_stacks(id, label, kind)\nharness_stack_members(stack_id, harness_id, position)\n\nTask.harnessStackId = \"work-train\"\nTask.agent           = \"claude-work\"   -- current member"
+            },
+            {
+              "id": "task-local",
+              "label": "Each task stores its own list of accounts",
+              "description": "No global stack entity; a task carries an ordered list of member ids.",
+              "consequence": "Simple for one-off tasks, but every task repeats the configuration and profiles/pipelines need arrays. Probably not worth it."
+            }
+          ],
+          "recommendation": {
+            "value": "implicit",
+            "reason": "The requirement is a per-account train, and this is the only model where profiles, pipelines and bundles keep working without a format change."
+          }
+        },
+        {
+          "id": "same-kind",
+          "type": "single",
+          "title": "Must every member be the same harness kind, or can a stack fall through to a different kind (Claude → Codex)?",
+          "impact": "blocking",
+          "why": "Model ids, mode/effort semantics, session formats and often the provider change with the kind. Cross-kind would reset the task's model/mode/effort and need a context handoff.",
+          "context": "The requirement says \"same harness\". In this repo a harness row has a `kind`; built-in rows' ids equal the kind, and an additional account is an alias of the same kind. Same-kind keeps the task's model/mode/effort valid and makes the provider session transferable. Cross-kind fallback (Claude → Codex) is a different feature.",
+          "evidence": [
+            {
+              "label": "kind is the identity; aliases share it",
+              "path": "src/shared/types.ts",
+              "line": 330,
+              "lang": "ts",
+              "code": " * A \"harness\" is the user-facing name for an agent configuration. Built-in\n * harnesses (`claude-code`, `codex`, `cursor`, `gemini`, `fx`, `antigravity`, `copilot`) wrap each CLI directly;\n * user-created harnesses are *aliases* that wrap the same underlying `kind`"
+            },
+            {
+              "label": "a cross-kind switch already resets model/mode/effort",
+              "path": "src/bun/orchestrator.ts",
+              "line": 3678,
+              "lang": "ts",
+              "code": "if (afterKind && beforeKind !== afterKind) {\n      const nextMode = defaultModeFor(afterKind);"
+            }
+          ],
+          "options": [
+            {
+              "id": "same-kind",
+              "label": "Same kind only",
+              "description": "Every member has the same `kind`. A cross-kind fallback is rejected at stack creation.",
+              "consequence": "Model, mode and effort stay valid; session transfer is possible. Matches the requirement's \"same harness\"."
+            },
+            {
+              "id": "cross-kind",
+              "label": "Allow any kind, with a reset",
+              "description": "A stack can fall through to a different kind; the new run resets model/mode/effort and starts a fresh session.",
+              "consequence": "A separate, much larger design: context handoff, per-kind model defaults, and a visible \"fresh session\" notice."
+            },
+            {
+              "id": "cross-kind-compatible",
+              "label": "Allow cross-kind only when the model is compatible",
+              "description": "Fall through only if the next kind offers the same model family.",
+              "consequence": "Still needs the cross-kind reset and handoff, plus a compatibility table that will age badly."
+            }
+          ],
+          "recommendation": {
+            "value": "same-kind",
+            "reason": "The requirement says \"same harness\", and same-kind is the only version where the model/mode/effort and the provider session survive the move."
+          }
+        },
+        {
+          "id": "v1-kinds",
+          "type": "single",
+          "title": "Which harness kinds must a stack support in v1?",
+          "impact": "blocking",
+          "why": "Only Claude, Codex and OpenCode have a proven session-transfer mechanism. The other five are unproven and may need provider-specific spikes. This decides the size of v1 and whether \"seamless\" is a promise or a best effort.",
+          "context": "S1 proved Claude transcript copy + `--resume`. S2 proved Codex rollout copy + `exec resume`. S3 proved OpenCode export/import (a move, not a merge). S4 left cursor, gemini, fx, copilot and antigravity unproven; cursor may be server/cloud-bound. A v1 that silently degrades to a summary for those kinds may not meet \"seamless\".",
+          "evidence": [
+            {
+              "label": "S1–S3: transfer proven for claude, codex, opencode",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 137
+            },
+            {
+              "label": "S4: the other five are unproven",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 140
+            }
+          ],
+          "options": [
+            {
+              "id": "claude",
+              "label": "Claude Code only",
+              "description": "The best-supported kind and the most common additional-account case.",
+              "consequence": "Smallest v1; other kinds show \"stacks are not supported yet\"."
+            },
+            {
+              "id": "proven3",
+              "label": "Claude Code + Codex + OpenCode",
+              "description": "Exactly the three kinds with a proven transfer mechanism. Other kinds cannot join a stack in v1 and say so clearly.",
+              "consequence": "No silent degradation. The other five wait for a per-kind adapter and a spike.",
+              "preview": "Claude    copy transcript -> <backup>/projects/<cwd>/<sid>.jsonl, --resume <sid>\nCodex     copy rollout     -> <backup>/.codex/sessions/..., exec resume <id>\nOpenCode  export/import    -> same ses_ id, move not merge"
+            },
+            {
+              "id": "all8-spikes",
+              "label": "All eight, after five more spikes",
+              "description": "Prove cursor, gemini, fx, copilot and antigravity before planning; then support every kind.",
+              "consequence": "Meets the broadest reading of the requirement, but adds five investigations and five adapters before the plan can start."
+            },
+            {
+              "id": "all8-fallback",
+              "label": "All eight, with a visible context-file fallback",
+              "description": "Proven kinds get exact transfer; the rest start a fresh provider session and receive an Agetor-rendered transcript with a visible \"context handoff\" notice.",
+              "consequence": "Every kind can fail over, but the unproven ones are token-heavy, cannot preserve partial tool state, and are visibly not seamless."
+            }
+          ],
+          "recommendation": {
+            "value": "proven3",
+            "reason": "It is the widest scope that can honestly promise \"the conversation survives\"; a silent fallback for the other five would fail the requirement without telling the user."
+          }
+        },
+        {
+          "id": "claude-limit-notice",
+          "type": "single",
+          "title": "Claude Code handles a usage limit by waiting for the reset itself. Should Agetor preempt that and swap to the backup?",
+          "impact": "blocking",
+          "why": "If Agetor does not preempt it, a Claude task can sit idle until the 5-hour reset even with a healthy backup. If it does, Agetor must detect a notice it deliberately ignores today.",
+          "context": "The driver suppresses Claude's `Usage limit reached · continuing automatically at …` notices; the turn stays in flight and Claude resumes itself at reset. There is no persisted event for it. The quota poller may know the session meter is at 100%, but the turn is already running. This is the difference between \"automatic swap when the primary reaches its limit\" and \"swap only after a hard failure\".",
+          "evidence": [
+            {
+              "label": "Claude's auto-continue notice is deliberately not carded",
+              "path": "src/bun/claude-tmux.ts",
+              "line": 6572,
+              "lang": "ts",
+              "code": "/** Usage-limit AUTO-CONTINUE notices, which carry a `MODAL_FOOTER_RE` phrase\n *  (`… · esc to cancel`) but need no user action — claude resumes on its own.\n *  Evidence (2.1.239 binary): `Usage limit reached · continuing automatically\n *  at 8am · esc to cancel`, `… continuing shortly · esc to cancel`, `…\n *  continuing automatically when it resets · esc to cancel`."
+            },
+            {
+              "label": "quota meters know the reset time",
+              "path": "src/shared/types.ts",
+              "line": 1117,
+              "lang": "ts",
+              "code": "export interface QuotaMeter {\n  /** Stable id within the snapshot (e.g. \"five_hour\", \"seven_day_opus\"). */\n  id: string;\n  /** User-facing label for the meter. */\n  label: string;\n  /** 0..100, how much of this meter's allotment has been used. */\n  usedPercent: number;\n  /** Epoch ms when this meter resets, or null if the provider didn't report one. */\n  resetsAtMs: number | null;"
+            }
+          ],
+          "options": [
+            {
+              "id": "preempt",
+              "label": "Detect the notice and swap immediately",
+              "description": "Agetor recognizes Claude's auto-continue notice, stops the turn, transfers the transcript, and continues on the backup.",
+              "consequence": "Delivers the promise for the most-used kind. Needs a new pane/JSONL sentinel and a careful stop/transfer path; the old turn is interrupted at the limit, not at a natural end.",
+              "preview": "Usage limit reached · continuing automatically at 8am · esc to cancel\n        │\n        ▼\nAgetor stops the turn, copies the transcript to the backup,\nresumes with --resume <sid> + a continuation prompt."
+            },
+            {
+              "id": "let-claude-wait",
+              "label": "Leave Claude's own wait alone",
+              "description": "Claude keeps its auto-continue behavior; the stack only reacts to a hard API error or an explicit failure.",
+              "consequence": "No new sentinel, but a task can idle for hours with a healthy backup. This does not meet \"automatically swap when the primary reaches its limit\" for Claude."
+            },
+            {
+              "id": "proactive-only",
+              "label": "Skip an exhausted account before the turn only",
+              "description": "The quota meter prevents starting on an exhausted member; if the limit hits mid-turn, Claude waits.",
+              "consequence": "No new sentinel, but a mid-turn limit still stalls. Best-effort, not seamless."
+            }
+          ],
+          "recommendation": {
+            "value": "preempt",
+            "reason": "The feature's promise is that execution keeps running; leaving Claude's built-in wait in place would make the most common account kind the one case where the train does nothing."
+          }
+        }
+      ]
+    },
+    {
+      "id": "failover",
+      "title": "When the swap happens",
+      "intro": "These decide what triggers a move, and what happens to the turn that hit the limit.",
+      "questions": [
+        {
+          "id": "limit-signals",
+          "type": "multi",
+          "title": "Which failures count as \"this account reached its limit\" and should trigger a swap?",
+          "impact": "blocking",
+          "why": "A false swap can duplicate work and burn the backup; a missed swap leaves the task blocked. The classifier is the safety boundary.",
+          "context": "There is no cross-kind exhaustion concept today. Only Claude, Codex and Cursor have live quota. Claude already turns a synthetic API error into a `blocked` task (reason `api-error`). 5xx/529 are account-independent, so swapping on them just burns the backup. Auth failures are account-specific but are not a limit; the app already has an actionable credential-error panel. A model-scoped meter (e.g. \"Opus\") is not account-wide.",
+          "evidence": [
+            {
+              "label": "only three kinds have live quota",
+              "path": "src/shared/types.ts",
+              "line": 2064,
+              "lang": "ts",
+              "code": "export const USAGE_SUPPORTED_KINDS = [\"claude-code\", \"codex\", \"cursor\"] as const satisfies readonly AgentKind[];"
+            },
+            {
+              "label": "a claude API error already blocks the task",
+              "path": "src/bun/orchestrator.ts",
+              "line": 3417,
+              "lang": "ts",
+              "code": "const nextColumn: ColumnId = wasCancelled\n            ? \"ready\"\n            : (wasApiError || wasSessionDied || wasUnknownCommand) ? \"blocked\"\n            : newStatus === \"succeeded\" ? \"review\" : \"ready\";"
+            },
+            {
+              "label": "meters are model-scoped, not account-wide",
+              "path": "src/shared/types.ts",
+              "line": 1126,
+              "lang": "ts",
+              "code": "/** Optional model/window scope this meter applies to (e.g. \"Opus\", \"Sonnet\"). */\n  scope?: string;"
+            }
+          ],
+          "options": [
+            {
+              "id": "quota",
+              "label": "Provider quota exhausted",
+              "description": "A session/weekly meter at 100%, or a provider usage-limit notice.",
+              "consequence": "The clearest signal; the only one with a known reset time."
+            },
+            {
+              "id": "429",
+              "label": "HTTP 429 / rate limited",
+              "description": "A per-account or per-model rate limit.",
+              "consequence": "Good failover signal, but a model-scoped 429 may not mean the account is exhausted."
+            },
+            {
+              "id": "402",
+              "label": "402 / insufficient credits",
+              "description": "Extra usage required or the account is out of credits.",
+              "consequence": "Account-specific and unlikely to clear soon; a good swap signal."
+            },
+            {
+              "id": "auth",
+              "label": "Auth / login failure",
+              "description": "401, expired token, \"not logged in\".",
+              "consequence": "Not a limit. Swapping hides a real problem; block with the credential panel instead."
+            },
+            {
+              "id": "5xx",
+              "label": "Provider outage / 529 / 5xx / network",
+              "description": "The provider is down or the network failed.",
+              "consequence": "Account-independent; swapping just burns the backup on the same outage."
+            },
+            {
+              "id": "model-unavailable",
+              "label": "The task's model is not offered on this account",
+              "description": "The backup has a smaller catalog and cannot run the task's model.",
+              "consequence": "Pre-flight should skip that member, not discover it after a failed turn."
+            }
+          ],
+          "min": 1,
+          "recommendation": {
+            "value": ["quota", "429", "402"],
+            "reason": "These are account-specific and likely to clear with a reset; the excluded three are either not limits or not account-specific."
+          }
+        },
+        {
+          "id": "mid-turn",
+          "type": "single",
+          "title": "When the limit hits mid-turn, what should happen to the turn?",
+          "impact": "blocking",
+          "why": "Continuing the same turn can duplicate tool side effects; ending the turn loses the seamless requirement. This is the single biggest behavioral decision.",
+          "context": "S1–S3 prove the provider session can be transferred, so the backup can resume with the full conversation. But a tool call may have partially executed when the limit hit. Agetor's `run_events` transcript is canonical; the provider session is the model's context. Pending permission cards and background subagents belong to the old session and cannot move.",
+          "evidence": [
+            {
+              "label": "S1: the transferred transcript is what the model receives",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 143
+            },
+            {
+              "label": "settlement is the natural seam",
+              "path": "src/bun/orchestrator.ts",
+              "line": 3307,
+              "lang": "ts",
+              "code": "function attachDoneHandler(\n  runId: string,\n  taskId: string,"
+            },
+            {
+              "label": "queued follow-ups are drained after a run settles",
+              "path": "src/bun/orchestrator.ts",
+              "line": 3488,
+              "lang": "ts",
+              "code": "async function drainFollowUpQueues(taskId: string, runId: string, wasCancelled: boolean): Promise<void> {"
+            }
+          ],
+          "options": [
+            {
+              "id": "continue-exact",
+              "label": "Resume the same turn on the backup",
+              "description": "Stop the old turn, transfer the provider session, and resume with a synthetic \"continue\" prompt. If the failure happened before any tool call, retry the original prompt instead. If the transfer fails, block with a clear message rather than silently starting fresh.",
+              "consequence": "Meets the seamless promise for proven kinds. Needs per-kind stop/transfer/resume adapters and a careful guard against re-running a tool call that already has a result."
+            },
+            {
+              "id": "continue-always",
+              "label": "Always continue, even after a partial tool call",
+              "description": "Same as above, but never refuse to continue.",
+              "consequence": "Can duplicate a file edit or a command; the user sees the same tool twice. Too risky without per-tool idempotency."
+            },
+            {
+              "id": "next-message",
+              "label": "End the turn, continue on the next message",
+              "description": "Let the turn fail, show the swap notice, and let the next user message run on the backup.",
+              "consequence": "Safest for side effects, but the task visibly stops. Does not meet \"execution must keep running\"."
+            },
+            {
+              "id": "block",
+              "label": "Block and ask the user",
+              "description": "Stop the turn, show the notice, and leave the task blocked for a manual Run.",
+              "consequence": "No automatic failover at all; the user must click."
+            }
+          ],
+          "recommendation": {
+            "value": "continue-exact",
+            "reason": "It is the only option that both keeps the task running and avoids repeating a tool call that already completed; the \"block on transfer failure\" clause keeps the fallback honest."
+          }
+        }
+      ]
+    },
+    {
+      "id": "continuity",
+      "title": "What the backup inherits",
+      "intro": "The conversation is only half of \"keep the context\". These decide what happens to the provider session, the user-level capabilities and the credentials.",
+      "questions": [
+        {
+          "id": "history-fidelity",
+          "type": "single",
+          "title": "What does \"preserve the conversation\" mean for the backup?",
+          "impact": "blocking",
+          "why": "The exact provider session preserves tool calls, plan state and partial turns; an Agetor transcript/summary is universal but token-heavy and cannot preserve partial tool state.",
+          "context": "S1 proved exact Claude transfer: the copied transcript is what the model receives, and the backup writes the updated transcript in place. S2 proved Codex resolves a copied rollout. S3 proved OpenCode export/import preserves the session id and messages but is a move, not a merge. The other five are unproven. Agetor's own transcript is always preserved because the task and its `run_events` stay the same.",
+          "evidence": [
+            {
+              "label": "S1 detail: copy into the next account's standard path",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 143
+            },
+            {
+              "label": "S3 detail: import is not a merge",
+              "path": "docs/plans/harness-account-stacks-investigation.md",
+              "line": 145
+            },
+            {
+              "label": "session ids are scoped to the creating harness",
+              "path": "CLAUDE.md",
+              "line": 99,
+              "lang": "md",
+              "code": "- **Session ids are scoped to the harness that created them.** Every resume asks `findLastSessionIdForHarness(taskId, column, harnessId)` (`orchestrator.ts`) for its own column on a run of the task's current harness, so a second account of the same kind starts fresh instead of resuming an id its data dir doesn't hold."
+            }
+          ],
+          "options": [
+            {
+              "id": "exact",
+              "label": "Exact provider session",
+              "description": "Transfer the provider's session state to the backup and resume it. If the transfer fails, block with a clear message; never silently start a fresh session.",
+              "consequence": "Best fidelity and the only option that preserves tool calls and plan state. Per-kind adapters; OpenCode is a move, so switching back needs a delete/import cycle."
+            },
+            {
+              "id": "transcript",
+              "label": "Agetor transcript + fresh session",
+              "description": "Render the task's event log to a transcript, start a fresh provider session, and tell the new agent to read it and continue.",
+              "consequence": "Works for every kind, but token-heavy, loses partial tool state, and is visibly a different conversation."
+            },
+            {
+              "id": "hybrid",
+              "label": "Exact where proven, transcript elsewhere",
+              "description": "Use the exact session for the proven kinds and the transcript fallback for the rest, with a visible \"context handoff\" notice.",
+              "consequence": "Covers more kinds, but is two mechanisms to build and test, and the fallback is not seamless."
+            }
+          ],
+          "recommendation": {
+            "value": "exact",
+            "reason": "The requirement is to keep the context, not to summarize it; exact transfer is proven for the v1 kinds, and a clear failure is better than a silent fresh session."
+          }
+        },
+        {
+          "id": "capability-sharing",
+          "type": "single",
+          "title": "How should the backup get the primary's user-level MCP servers, skills, commands and CLI settings?",
+          "impact": "blocking",
+          "why": "\"Must be preserved\" cannot be true today without a sharing mechanism: user-level entries live in each account's isolated home. Project-level entries are already shared through the worktree.",
+          "context": "Claude reads `<CLAUDE_CONFIG_DIR>/.claude.json` `mcpServers` and `<CLAUDE_CONFIG_DIR>/skills`; cursor/fx/opencode read `<HOME>`; copilot reads `$COPILOT_HOME`; codex reads `config.toml`. Agetor already discovers these per account. Auto-sharing needs per-kind injection or copies and must exclude credentials and OAuth tokens. Hooks and permission settings are security-sensitive because they execute code.",
+          "evidence": [
+            {
+              "label": "per-kind user roots",
+              "path": "src/bun/commands.ts",
+              "line": 425,
+              "lang": "ts",
+              "code": "function userSelectors(opts: DiscoveryOpts): DiscoverySelector[] {\n  switch (opts.agent) {\n    case \"claude-code\": {\n      const cfg = claudeConfigDir(opts);\n      return [\n        markdownTree(path.join(cfg, \"commands\")),\n        skillsDir(path.join(cfg, \"skills\")),\n        singleFile(path.join(cfg, \"settings.json\")),\n        singleFile(path.join(cfg, \"plugins\", \"installed_plugins.json\")),\n      ];\n    }"
+            },
+            {
+              "label": "five kinds re-home the whole process",
+              "path": "src/bun/agents.ts",
+              "line": 447,
+              "lang": "ts",
+              "code": "if (harness.kind === \"claude-code\") {\n      env.CLAUDE_CONFIG_DIR = harness.home;\n    } else if (harness.kind === \"codex\") {\n      env.HOME = harness.home;\n      env.CODEX_HOME = path.join(harness.home, \".codex\");\n    } else if (harness.kind === \"cursor\") {\n      env.HOME = harness.home;\n    } else if (harness.kind === \"fx\") {\n      env.HOME = harness.home;\n    } else if (harness.kind === \"antigravity\") {\n      env.HOME = harness.home;\n    } else if (harness.kind === \"opencode\") {\n      env.HOME = harness.home;"
+            }
+          ],
+          "options": [
+            {
+              "id": "separate",
+              "label": "Each account is configured separately",
+              "description": "No sharing. Agetor compares the members' user-level MCP servers/skills at stack creation and before a swap, and warns about missing entries.",
+              "consequence": "Smallest v1, but does not meet \"must be preserved\" literally; the backup may be told to use a skill it cannot load."
+            },
+            {
+              "id": "copy-on-create",
+              "label": "Copy the safe subset at creation, with a Sync button",
+              "description": "Copy skills, commands and MCP server definitions (never credentials, OAuth tokens, hooks or permissions) from the primary into each backup; backup-local wins on conflict; a \"Sync from primary\" button in Settings re-runs it.",
+              "consequence": "Inspectable and revocable, and the common case works. A new MCP server on the primary reaches the backup only when the user syncs or when the pre-swap check warns.",
+              "preview": "<primary>/.claude/skills/*        -> <backup>/.claude/skills/*\n<primary>/.claude/commands/*      -> <backup>/.claude/commands/*\n<primary>/.claude.json mcpServers -> <backup>/.claude.json mcpServers\n.credentials.json / auth.json     -> NEVER copied"
+            },
+            {
+              "id": "inject-live",
+              "label": "Merge the primary's config at every spawn",
+              "description": "Pass the primary's MCP config and skill/plugin dirs into each backup's launch (Claude `--mcp-config`, ACP `mcpServers`, codex `-c`), without copying.",
+              "consequence": "Always current, but per-kind launch plumbing and harder to inspect; a primary change takes effect on the next turn with no review."
+            },
+            {
+              "id": "mirror-all",
+              "label": "Mirror everything, including settings and hooks",
+              "description": "Copy the full user-level config, including `settings.json` hooks, permissions and CLI settings.",
+              "consequence": "Most faithful, but hooks execute code and permissions change the safety posture; this needs a security review and is a much larger feature."
+            }
+          ],
+          "recommendation": {
+            "value": "copy-on-create",
+            "reason": "It makes the backup usable without copying credentials, stays inspectable, and keeps the security-sensitive hooks/permissions out of scope."
+          }
+        },
+        {
+          "id": "credentials",
+          "type": "single",
+          "title": "Should Agetor ever copy or share authentication tokens between accounts?",
+          "impact": "blocking",
+          "oneWayDoor": true,
+          "why": "Copying `.credentials.json`, `auth.json`, `cli-config.json` or OpenCode's credential tables breaks the isolation model, may violate provider terms, and puts one account's token in another account's agent-writable home. This is a trust boundary, not a convenience setting.",
+          "context": "The investigation's assumption is no credential copying; each member must already be logged in. A related leak exists today: provider API keys in Agetor's process env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are inherited by every harness unless the harness overrides them, because `childEnv` only scrubs `AGETOR_API_TOKEN`. A \"backup account\" can therefore silently use the primary's key.",
+          "evidence": [
+            {
+              "label": "only the master token is scrubbed",
+              "path": "src/bun/core-spawn.ts",
+              "line": 36,
+              "lang": "ts",
+              "code": "export const SCRUBBED_ENV_KEYS: readonly string[] = [\"AGETOR_API_TOKEN\"];"
+            },
+            {
+              "label": "alias credentials are a plain file; the built-in is the keychain",
+              "path": "src/bun/usage/creds.ts",
+              "line": 44,
+              "lang": "ts",
+              "code": "export function claudeCredentialsPath(harness: Harness): string | null {\n  if (!harness.home) return null;\n  const fresh = path.join(harness.home, \".credentials.json\");\n  if (existsSync(fresh)) return fresh;"
+            }
+          ],
+          "options": [
+            {
+              "id": "own-login",
+              "label": "Each member uses its own login",
+              "description": "Agetor never copies tokens. A logged-out member is skipped with a clear message; the user logs it in through the existing harness login flow.",
+              "consequence": "Keeps the current isolation model and provider terms. The backup must be set up once, which is the honest cost of a backup account."
+            },
+            {
+              "id": "copy-tokens",
+              "label": "Copy credential files between homes",
+              "description": "Copy the primary's token blob into the backup's home so the backup can run without its own login.",
+              "consequence": "Rejected without a security review: a planted or stale token crosses accounts, and provider terms may forbid it."
+            },
+            {
+              "id": "keychain-ref",
+              "label": "Share a keychain item by reference",
+              "description": "Point the backup at the primary's keychain item.",
+              "consequence": "Only works for the built-in Claude account; not portable to alias homes or other kinds, and still shares one identity."
+            }
+          ],
+          "recommendation": {
+            "value": "own-login",
+            "reason": "A backup account is a separate login by definition; copying tokens would turn a failover feature into a credential-sharing feature."
+          }
+        }
+      ]
+    },
+    {
+      "id": "exhaustion",
+      "title": "What happens when the train runs out",
+      "intro": "A stack is only useful if the user knows what happens when every member is exhausted.",
+      "questions": [
+        {
+          "id": "all-exhausted",
+          "type": "single",
+          "title": "When every member is exhausted, what should the task do?",
+          "impact": "shape",
+          "why": "This is the difference between a short pause and a task that looks dead. It also decides whether Agetor needs persisted timers and a boot reconcile.",
+          "context": "The closest precedent is fx auto-resume: `Task.fxRecovery` is persisted, a timer fires, the cap is 3, and the UI shows a resume affordance. Quota resets usually have a known time (`resetsAtMs`), so Agetor can wait for the earliest one instead of polling blindly.",
+          "evidence": [
+            {
+              "label": "fx recovery is persisted and capped",
+              "path": "src/shared/types.ts",
+              "line": 1910,
+              "lang": "ts",
+              "code": "/**\n   * fx's model-response-recovery state for this task, when it is currently\n   * paused on a resumable Gateway checkpoint — see {@link TaskFxRecovery}\n   * and `docs/plans/fx-recovery-follow-ups.md`."
+            },
+            {
+              "label": "the cap",
+              "path": "src/shared/types.ts",
+              "line": 2547,
+              "lang": "ts",
+              "code": "export const FX_AUTO_RESUME_MAX = 3;"
+            }
+          ],
+          "options": [
+            {
+              "id": "auto-retry",
+              "label": "Block with a countdown, then retry automatically",
+              "description": "Show \"all accounts exhausted — earliest reset at HH:MM\", persist the intent, and retry at the earliest reset (cap 3). If it fails again, leave it blocked for a manual Run.",
+              "consequence": "Most seamless; needs a persisted timer and boot reconcile, but the pattern already exists for fx."
+            },
+            {
+              "id": "block",
+              "label": "Block and wait for a manual Run",
+              "description": "Show the notice with the reset time and leave the task blocked.",
+              "consequence": "Simplest and predictable; the user must come back and click."
+            },
+            {
+              "id": "wait-running",
+              "label": "Keep the task running and wait silently",
+              "description": "Stay in `running` until a member resets.",
+              "consequence": "Looks seamless but hides a multi-hour stall; the user cannot tell whether the agent is working."
+            }
+          ],
+          "recommendation": {
+            "value": "auto-retry",
+            "reason": "It keeps the promise without hiding the stall, and the fx auto-resume precedent already has the persisted-state and cap mechanics to copy."
+          }
+        }
+      ]
+    },
+    {
+      "id": "confirm",
+      "title": "Confirm or override",
+      "intro": "Defaults I would bet on. Confirm with one click, or override with what it should be.",
+      "questions": [
+        {
+          "id": "naming",
+          "type": "confirm",
+          "title": "Name in the UI and docs",
+          "recommendation": {
+            "value": "**Harness stack**, with **accounts** as members and **stack** as the verb",
+            "reason": "The repo already uses \"harness\" for the account row and \"agent\" for the profile; \"stack\" is unambiguous and matches the requirement's language."
+          }
+        },
+        {
+          "id": "max-size",
+          "type": "confirm",
+          "title": "Maximum stack size",
+          "recommendation": {
+            "value": "**5 members** per stack (hard cap 10)",
+            "reason": "Enough for several plans and a backup-of-a-backup; keeps the picker and the swap UI readable."
+          }
+        },
+        {
+          "id": "running-ux",
+          "type": "confirm",
+          "title": "What the task shows during the swap",
+          "recommendation": {
+            "value": "The task stays `running`; the old run's failure toast is suppressed; a status line says `Switching to backup…` before the new run starts, then the swap notice",
+            "reason": "A failed toast would contradict \"seamless\", and a short status line explains the gap between the two processes."
+          }
+        },
+        {
+          "id": "persist-intent",
+          "type": "confirm",
+          "title": "Crash/restart safety",
+          "recommendation": {
+            "value": "Persist the swap intent (like `fxRecovery`) and reconcile it on boot, so a core restart mid-swap resumes or fails cleanly",
+            "reason": "The desktop app and a headless core can hand the API port over mid-turn; an in-memory-only swap would leave a `running` task with no live run."
+          }
+        },
+        {
+          "id": "acceptance",
+          "type": "confirm",
+          "title": "What \"done\" means for v1",
+          "recommendation": {
+            "value": "An e2e two-account Claude stack survives a simulated limit, shows the swap notice, and preserves the conversation; per-kind adapter tests for Codex and OpenCode; a unit test for the limit classifier; and no credential file is ever copied",
+            "reason": "This is the smallest set that proves the promise rather than just the plumbing."
+          }
+        }
+      ]
+    }
+  ]
+}

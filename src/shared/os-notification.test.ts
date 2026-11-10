@@ -21,6 +21,7 @@ describe("notificationUrgency (D4)", () => {
     succeeded: "quiet",
     "files-sent": "quiet",
     "pipeline-finished": "quiet",
+    "harness-swap": "quiet",
   };
 
   for (const kind of NOTIFICATION_KINDS) {

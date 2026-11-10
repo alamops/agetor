@@ -1650,7 +1650,11 @@ test.describe("bundle export / import", () => {
     await expect(dialog.getByTestId("bundle-import-confirm")).toBeDisabled();
 
     await dialog.getByTestId("bundle-import-back").click();
-    await dialog.getByTestId("bundle-import-paste").fill(JSON.stringify({ format: "agetor-bundle", version: 2, agents: [] }));
+    // One past the current format version (2, bumped by human steps in
+    // src/shared/bundle.ts). A file at the CURRENT version is valid, so this
+    // must stay > BUNDLE_VERSION to exercise the "newer than this agetor"
+    // branch — pinned to 3 like src/shared/bundle.test.ts.
+    await dialog.getByTestId("bundle-import-paste").fill(JSON.stringify({ format: "agetor-bundle", version: 3, agents: [] }));
     await dialog.getByTestId("bundle-import-paste-preview").click();
     await expect(dialog.getByTestId("bundle-import-error")).toContainText("update agetor to import this file");
   });

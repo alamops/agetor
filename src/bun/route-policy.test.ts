@@ -255,6 +255,21 @@ const HEADLESS_501 = [
   "POST /window/focus",
 ].sort();
 
+describe("harness-stack routes", () => {
+  it("are CLI-managed (the CLI creates/edits stacks, the app may read them)", () => {
+    expect(ROUTE_POLICY["/harness-stacks"]).toEqual({ GET: CLI_POLICY, POST: CLI_POLICY });
+    expect(ROUTE_POLICY["/harness-stacks/:id"]).toEqual({
+      GET: CLI_POLICY,
+      PATCH: CLI_POLICY,
+      DELETE: CLI_POLICY,
+    });
+    // A CLI bearer token resolves to "cli" for the table entry (the gate's
+    // actual answer), not just an equal-looking policy object.
+    const entry = ROUTE_POLICY["/harness-stacks"] as Record<string, RoutePolicy>;
+    expect(resolveCaller(req("http://x/harness-stacks", { token: CLI_TOKEN }), entry.GET!)).toBe("cli");
+  });
+});
+
 describe("desktop-only set", () => {
   it("callers: app is exactly plan §3's set", () => {
     const actual = policyEntries()
@@ -626,9 +641,9 @@ describe("path-valued fields (D24)", () => {
       "GET /agent-discovery: query.workdir(exists)",
       "GET /files/index: query.dir(exists)",
       "GET /projects/branches: query.path(exists)",
-      "PATCH /harnesses/:id: body.home(exists), body.bin(exists)",
+      "PATCH /harnesses/:id: body.home(nearest-ancestor), body.bin(exists)",
       "PATCH /tasks/:id: body.workdir(exists)",
-      "POST /harnesses: body.home(exists), body.bin(exists)",
+      "POST /harnesses: body.home(nearest-ancestor), body.bin(exists)",
       "POST /projects: body.path(exists)",
       "POST /projects/clone: body.dest(nearest-ancestor)",
       "POST /projects/fetch: body.path(exists)",

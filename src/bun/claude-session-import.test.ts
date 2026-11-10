@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { plainEncodedProjectPath, LONG_PATH_IMPORT_ERROR, MISSING_FOLDER_IMPORT_ERROR } from "../shared/claude-session-meta.ts";
 import type { ImportedClaudeSession, Task } from "../shared/types.ts";
+import { wrapHarnessStackContinuation } from "../shared/harness-stack.ts";
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "agetor-import-db-"));
 process.env.AGETOR_DATA_DIR ??= dataDir;
@@ -13,6 +14,7 @@ const {
   checkoutSessionBranch,
   importClaudeSessions,
   IMPORT_TRANSCRIPT_CHUNK_BYTES,
+  importedTaskPrompt,
   pendingImportBackfill,
   resumeIncompleteImports,
   retryImport,
@@ -906,4 +908,55 @@ test("a resume from a full offset does not replay, and a missing seed run is rec
   expect(done.runId).not.toBe(oldRunId);
   expect(runs.get(done.runId!)?.claudeSessionId).toBe("skip-one");
   expect(runs.seenLineUuidsForRun(done.runId!).has("skip-one-user")).toBe(false);
+});
+
+test("a session a harness-stack clean retry started imports with the user's words as its prompt (N4)", async () => {
+  const home = scratchDir("cc-import-continuation-");
+  const cwd = path.join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const sessionId = `continuation-${randomUUID()}`;
+  const config = plant({
+    home,
+    sessionId,
+    cwd,
+    lines: [
+      {
+        type: "user",
+        uuid: `${sessionId}-user`,
+        cwd,
+        timestamp: "2026-10-01T00:00:00.000Z",
+        // The successor of a clean retry opens on the hidden wrapper.
+        message: { role: "user", content: wrapHarnessStackContinuation("please fix the login") },
+      },
+      {
+        type: "assistant",
+        uuid: `${sessionId}-assistant`,
+        timestamp: "2026-10-01T00:00:01.000Z",
+        message: { role: "assistant", model: "claude-sonnet-4-5", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+      },
+    ],
+  });
+  const imported = await importClaudeSessions([sessionId], baseOpts(home, config));
+  const result = imported.results[0]!;
+  // `createTask` refuses the exact wrapper as a user prompt; the import must
+  // not trip over it.
+  expect(result.error).toBeUndefined();
+  expect(result.taskId).toBeTruthy();
+  await pendingImportBackfill(result.taskId!);
+  expect(tasks.get(result.taskId!)!.prompt).toBe("please fix the login");
+});
+
+test("importedTaskPrompt unwraps the hidden continuation as sent and as claude delivered it (N4)", () => {
+  const wrapped = wrapHarnessStackContinuation("rename the helper");
+  expect(importedTaskPrompt(wrapped, "title")).toBe("rename the helper");
+  // The JSONL twin of a pasted prompt: claude's delivery wrapper around it.
+  const delivered = `<pasted_content id="ab12">\n${wrapped}\n</pasted_content id="ab12">`;
+  expect(importedTaskPrompt(delivered, "title")).toBe("rename the helper");
+  // Ordinary prompts and prose that merely mentions the tag are untouched.
+  expect(importedTaskPrompt("fix the login", "title")).toBe("fix the login");
+  const mention = "what does <harness-stack-continuation> mean?";
+  expect(importedTaskPrompt(mention, "title")).toBe(mention);
+  // An empty wrapper falls back to the title; no prompt at all uses it too.
+  expect(importedTaskPrompt(wrapHarnessStackContinuation(""), "the title")).toBe("the title");
+  expect(importedTaskPrompt(null, "the title")).toBe("the title");
 });

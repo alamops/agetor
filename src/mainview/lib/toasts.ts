@@ -394,3 +394,46 @@ export function dismissTaskToast(taskId: string): void {
 export function dismissTaskToastsFor(taskIds: Iterable<string>): void {
   for (const taskId of taskIds) dismissTaskToast(taskId);
 }
+
+/**
+ * A harness-stack failover completed: the task moved from one account of its
+ * stack to the next and kept running. Informational and self-dismissing — the
+ * task is not blocked, and the transcript's own divider carries the detail.
+ * The OS notification is quiet (the `harness-swap` kind) and fires only when
+ * the window is unfocused.
+ */
+export function toastHarnessSwap(args: ToastArgs & { fromLabel: string; toLabel: string; position: number; count: number }): void {
+  const detail = `${args.fromLabel} → ${args.toLabel} (${args.position}/${args.count})`;
+  if (args.isSelected) {
+    maybeNotifyOS(args, "harness-swap", "Account switched", detail);
+    return;
+  }
+  showTaskToast(args.taskId, "harness-swap", args.onOpen, ({ release, openAction }) =>
+    toast.info("Account switched", {
+      description: detail,
+      duration: 6000,
+      action: openAction,
+      onDismiss: release,
+      onAutoClose: release,
+    }),
+  );
+  maybeNotifyOS(args, "harness-swap", "Account switched", detail);
+}
+
+/** The stack ran out of quota: the task is blocked with a countdown. Blocking
+ *  toast, same slot family as the other `blocked` reasons. */
+export function toastHarnessExhausted(args: ToastArgs): void {
+  showBlockingToast(
+    { method: toast.error, heading: "Stack out of quota", kind: "blocked" },
+    args,
+  );
+}
+
+/** No account in the stack could run the task (disabled/logged out/missing
+ *  model) — needs a manual fix, not a wait. */
+export function toastHarnessUnusable(args: ToastArgs): void {
+  showBlockingToast(
+    { method: toast.error, heading: "No usable backup account", kind: "blocked" },
+    args,
+  );
+}

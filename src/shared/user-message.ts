@@ -23,6 +23,7 @@
 import { REFS_HEADING } from "./refs.ts";
 import { AGENT_INSTRUCTIONS_TAG } from "./agent-profile.ts";
 import { HANDOFF_REMINDER_MARKER, isHandoffReminderMarker } from "./pipeline.ts";
+import { isHarnessStackContinuation, stripHarnessStackContinuation } from "./harness-stack.ts";
 
 export interface CommandInvocation {
   /** Command name including the leading slash, e.g. "/implement". */
@@ -1046,6 +1047,51 @@ export function canonicalizeUserText(text: string): string {
   return raw.argsRaw ? `${raw.name} ${raw.argsRaw}` : raw.name;
 }
 
+/**
+ * Rebuild the text a harness-stack clean retry should send on a fresh session
+ * from a run's main-stream `user` events, oldest first (`runs.mainUserTexts`).
+ *
+ * One send can be stored twice — the orchestrator's live echo (plain) and the
+ * CLI's JSONL twin (claude wraps a slash command in `<command-name>` XML and a
+ * large paste in `<pasted_content>`) — and a REPL follow-up typed while the
+ * turn was in flight folds into the SAME run with no row of its own. Re-sending
+ * only the newest row drops the request's earlier text, and re-sending a raw
+ * twin sends the wrapper instead of the user's words. Every row is therefore
+ * reduced to the text the user recognizes (`canonicalizeUserText`), a
+ * predecessor's hidden continuation wrapper is unwrapped to its body (so
+ * re-wrapping cannot nest and stop being recognized), blank rows are skipped,
+ * and duplicates collapse to their first occurrence. The surviving texts are
+ * joined in order with a blank line, so the successor replays the whole
+ * unanswered request.
+ *
+ * `firstOnly` is for a sequential-turn harness (Codex): a message typed while
+ * a turn is live is QUEUED there and delivered as its own later turn, so
+ * replaying its row here would duplicate it. Only the run's first user text
+ * belongs to this turn.
+ *
+ * Returns `null` when there is no user text at all; callers fall back to the
+ * task prompt.
+ */
+export function composeCleanRetryText(
+  raws: readonly string[],
+  opts: { firstOnly?: boolean } = {},
+): string | null {
+  const parts: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of raws) {
+    if (typeof raw !== "string" || raw === "") continue;
+    let text = canonicalizeUserText(raw.replace(/\r\n?/g, "\n")).trim();
+    if (isHarnessStackContinuation(text)) {
+      text = stripHarnessStackContinuation(text).trim();
+    }
+    if (text === "" || seen.has(text)) continue;
+    seen.add(text);
+    parts.push(text);
+    if (opts.firstOnly) break;
+  }
+  return parts.length > 0 ? parts.join("\n\n") : null;
+}
+
 // ---------------------------------------------------------------------------
 // Plain-text rendering (CLI / TUI)
 //
@@ -1151,6 +1197,17 @@ function segmentPlainLines(segments: readonly MessageSegment[]): PlainLine[] {
  * in `segmentPlainLines` above).
  */
 export function userMessageLines(text: string): PlainLine[] {
+  // A harness-stack continuation prompt is Agetor's own hidden send, not the
+  // user's words: render nothing at all (the swap divider explains the move).
+  // Only the EXACT wrapper is hidden — a user message that merely mentions the
+  // tag in prose still renders.
+  //
+  // Check the NORMALIZED text, not the raw wire value: claude's JSONL twin of
+  // a pasted prompt is `<pasted_content id="…">`-wrapped, so the exact-value
+  // check must run after unwrapping or the hidden prompt leaks into the
+  // CLI/TUI transcript as a visible `harness-stack-continuation›` line.
+  const normalized = normalizeDeliveredUserText(text);
+  if (isHarnessStackContinuation(normalized)) return [];
   // A handoff reminder (see HANDOFF_REMINDER_MARKER / composeHandoffReminder
   // in shared/pipeline.ts) is intercepted BEFORE parseUserMessage runs, not
   // routed through its normal command/tagged detection: the reminder's own
@@ -1159,13 +1216,12 @@ export function userMessageLines(text: string): PlainLine[] {
   // mentions the closing form again) that parseMessageSegments would
   // otherwise mis-detect as one top-level tag spanning most of the message.
   // The whole thing always renders as a single plain `agetor›` line instead.
-  const normalizedForReminder = normalizeDeliveredUserText(text);
-  const reminderNl = normalizedForReminder.indexOf("\n");
+  const reminderNl = normalized.indexOf("\n");
   const reminderFirstLine =
-    reminderNl === -1 ? normalizedForReminder : normalizedForReminder.slice(0, reminderNl);
+    reminderNl === -1 ? normalized : normalized.slice(0, reminderNl);
   if (isHandoffReminderMarker(reminderFirstLine)) {
     const rest =
-      reminderNl === -1 ? "" : normalizedForReminder.slice(reminderNl + 1).replace(/^\n+/, "");
+      reminderNl === -1 ? "" : normalized.slice(reminderNl + 1).replace(/^\n+/, "");
     return [{ label: "agetor›", text: rest, tone: "machine" }];
   }
 

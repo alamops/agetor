@@ -11,6 +11,10 @@ import type {
   Harness,
   HarnessStatus,
   HarnessUsage,
+  HarnessLimitState,
+  HarnessStack,
+  HarnessStackInput,
+  HarnessStackWarning,
   AgentKind,
   AgentProfile,
   BranchInfo,
@@ -69,6 +73,14 @@ const CLONE_TIMEOUT_MS = 15 * 60_000;
  *  15s budget would abort while the core was still inserting, and a retry
  *  would create a second profile. */
 const DUPLICATE_WITH_TASKS_TIMEOUT_MS = 10 * 60_000;
+/** `POST /harness-stacks` and a mirror-relevant `PATCH /harness-stacks/:id`
+ *  save the stack, then copy the primary's whole config tree to every backup
+ *  inline (plugins alone can be thousands of files) with the server's idle
+ *  timeout turned off. Same 15-minute ceiling as {@link CLONE_TIMEOUT_MS}: the
+ *  default 15s budget aborted the CLI while the mirror was still running, after
+ *  the stack was already saved, so a re-run of the same command failed with
+ *  "already in another stack". */
+const HARNESS_STACK_MIRROR_TIMEOUT_MS = 15 * 60_000;
 /** `POST /notifications` only hands the post to the OS; a core that does not
  *  answer quickly is as good as absent, and the caller falls back to posting
  *  the notification itself. */
@@ -552,8 +564,42 @@ export class AgetorClient {
   }
 
   // ── harnesses ──────────────────────────────────────────────────────────────
-  listHarnesses(): Promise<{ harnesses: Harness[]; statuses: HarnessStatus[] }> {
+  listHarnesses(): Promise<{ harnesses: Harness[]; statuses: HarnessStatus[]; stacks?: HarnessStack[]; limitStates?: HarnessLimitState[] }> {
     return this.req("GET", "/harnesses");
+  }
+  listHarnessStacks(): Promise<{ stacks: HarnessStack[]; limitStates: HarnessLimitState[] }> {
+    return this.req("GET", "/harness-stacks");
+  }
+  getHarnessStack(id: string): Promise<{ stack: HarnessStack; limitStates: HarnessLimitState[] }> {
+    return this.req("GET", `/harness-stacks/${id}`);
+  }
+  /** Saves the stack, then mirrors the primary's config inline — see
+   *  {@link HARNESS_STACK_MIRROR_TIMEOUT_MS}. A transport failure (no answer
+   *  at all) may land after the save, so the error says to check the stack
+   *  list rather than blindly re-running the create. */
+  createHarnessStack(input: HarnessStackInput): Promise<{ stack: HarnessStack; warnings: HarnessStackWarning[]; mirror: { copied: string[]; warnings: string[] } }> {
+    return this.stackWrite("POST", "/harness-stacks", input);
+  }
+  /** Same budget and transport-failure wording as {@link createHarnessStack}. */
+  patchHarnessStack(id: string, patch: Partial<HarnessStackInput>): Promise<{ stack: HarnessStack; warnings: HarnessStackWarning[]; mirror: { copied: string[]; warnings: string[] } }> {
+    return this.stackWrite("PATCH", `/harness-stacks/${id}`, patch);
+  }
+  private async stackWrite<T>(method: "POST" | "PATCH", path: string, body: unknown): Promise<T> {
+    try {
+      return await this.req<T>(method, path, body, HARNESS_STACK_MIRROR_TIMEOUT_MS);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 0) {
+        throw new ApiError(
+          0,
+          e.body,
+          `${e.message} — the stack may have been saved; check 'agetor harness stack ls' before retrying`,
+        );
+      }
+      throw e;
+    }
+  }
+  deleteHarnessStack(id: string): Promise<{ removed: true }> {
+    return this.req("DELETE", `/harness-stacks/${id}`);
   }
   createHarness(input: CreateHarnessInput): Promise<Harness> {
     return this.req("POST", "/harnesses", input);

@@ -240,3 +240,124 @@ test("harness ls: the Ask-profile hint prints under an fx row only when permissi
     "fx's own profile starts in Ask mode. Agetor sets each task's mode itself; to change fx's default, run `/permissions` inside fx.",
   );
 });
+
+test("harness stack create/list/show/edit/rm drive the client and escape labels", async () => {
+  const stack = {
+    id: "stack-1",
+    label: "Train",
+    kind: "claude-code" as const,
+    mirrorMode: "full" as const,
+    members: [
+      { harnessId: "h1", position: 0, label: "A", kind: "claude-code" as const, enabled: true },
+      { harnessId: "h2", position: 1, label: "B", kind: "claude-code" as const, enabled: true },
+    ],
+    createdAt: 1,
+    updatedAt: 1,
+    warnings: [{ code: "x", message: "a warning" }],
+  };
+  const calls: string[] = [];
+  currentClient = {
+    listHarnessStacks: async () => ({ stacks: [stack], limitStates: [] }),
+    getHarnessStack: async () => ({ stack, limitStates: [] }),
+    createHarnessStack: async (input: unknown) => {
+      calls.push(`create:${JSON.stringify(input)}`);
+      return { stack, warnings: stack.warnings, mirror: { copied: [], warnings: [] } };
+    },
+    patchHarnessStack: async (_id: string, patch: unknown) => {
+      calls.push(`patch:${JSON.stringify(patch)}`);
+      return {
+        stack,
+        warnings: [],
+        mirror: { copied: [], warnings: ["settings.json: backup file is not a JSON object — left alone"] },
+      };
+    },
+    deleteHarnessStack: async (id: string) => {
+      calls.push(`rm:${id}`);
+      return { removed: true as const };
+    },
+  } as unknown as AgetorClient;
+
+  await cmdHarness(["stack", "ls"], flags);
+  expect(outputs.join("\n")).toContain("Train");
+  expect(outputs.join("\n")).toContain("primary A");
+
+  outputs.length = 0;
+  await cmdHarness(["stack", "create", "My train", "--kind", "claude-code", "--member", "h1", "--member", "h2"], flags);
+  expect(calls.at(-1)).toBe('create:{"label":"My train","kind":"claude-code","members":["h1","h2"]}');
+
+  // `--label` is a first-class form, not silently ignored.
+  await cmdHarness(["stack", "create", "--label", "Flag train", "--kind", "claude-code", "--member", "h1"], flags);
+  expect(calls.at(-1)).toBe('create:{"label":"Flag train","kind":"claude-code","members":["h1"]}');
+
+  // Both spellings at once is ambiguous — refuse rather than silently dropping
+  // the positional label (the old `positional ?? --label` precedence).
+  await expect(
+    cmdHarness(["stack", "create", "Positional", "--label", "Flag", "--kind", "claude-code", "--member", "h1"], flags),
+  ).rejects.toThrow(/not both/);
+
+  outputs.length = 0;
+  await cmdHarness(["stack", "show", "stack-1"], flags);
+  expect(outputs.join("\n")).toContain("primary");
+
+  outputs.length = 0;
+  await cmdHarness(["stack", "edit", "stack-1", "--member", "h2", "--member", "h1", "--mirror", "safe"], flags);
+  expect(calls.at(-1)).toBe('patch:{"members":["h2","h1"],"mirrorMode":"safe"}');
+  // A partially mirrored edit must not read as a clean success (R13-M2).
+  expect(outputs.join("\n")).toContain("mirror:");
+  expect(outputs.join("\n")).toContain("not a JSON object");
+
+  // `--kind` is a real edit, not a silently ignored flag.
+  await cmdHarness(["stack", "edit", "stack-1", "--kind", "codex"], flags);
+  expect(calls.at(-1)).toBe('patch:{"kind":"codex"}');
+
+  await expect(cmdHarness(["stack", "edit", "stack-1"], flags)).rejects.toThrow(/nothing to edit/);
+
+  await cmdHarness(["stack", "rm", "stack-1"], flags);
+  expect(calls.at(-1)).toBe("rm:stack-1");
+});
+
+test("harness stack show escapes a member's harness id (review N12)", async () => {
+  const stack = {
+    id: "stack-1",
+    label: "Train",
+    kind: "claude-code" as const,
+    mirrorMode: "full" as const,
+    members: [{ harnessId: "h1\u001b[2Jx", position: 0, label: "A", kind: "claude-code" as const, enabled: true }],
+    createdAt: 1,
+    updatedAt: 1,
+    warnings: [],
+  };
+  currentClient = {
+    getHarnessStack: async () => ({ stack, limitStates: [] }),
+  } as unknown as AgetorClient;
+  await cmdHarness(["stack", "show", "stack-1"], flags);
+  const rendered = outputs.join("\n");
+  expect(rendered).not.toContain("\u001b");
+  expect(rendered).toContain("h1");
+});
+
+test("harness ls: a one-member stack reads 'primary' with no 1/1 position (review N1)", async () => {
+  currentClient = {
+    listHarnesses: async () => ({
+      harnesses: [harness({ id: "h1" }), harness({ id: "h2", label: "H2" })],
+      statuses: [],
+      stacks: [
+        {
+          id: "solo",
+          label: "Solo",
+          kind: "claude-code",
+          mirrorMode: "full",
+          members: [{ harnessId: "h1", position: 0, label: "H1", kind: "claude-code", enabled: true }],
+          createdAt: 1,
+          updatedAt: 1,
+          warnings: [],
+        },
+      ],
+      limitStates: [],
+    }),
+  } as unknown as AgetorClient;
+  await cmdHarness(["ls"], flags);
+  const h1Row = outputs.join("\n").split("\n").find((l) => /\bh1\b/.test(l)) ?? "";
+  expect(h1Row).toContain("primary");
+  expect(h1Row).not.toContain("1/1");
+});

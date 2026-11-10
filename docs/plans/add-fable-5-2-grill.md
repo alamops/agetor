@@ -11,6 +11,8 @@
 
 Both one-way-door questions (Cursor migration 084 and the Fable 5.1 variant backfill) were answered by the owner in round 1. Nothing is unratified.
 
+> Merge note (2026-11-09): main's harness-stacks migrations took 084/085, so this plan's Cursor migration shipped as **086**. Decisions and owner answers below are unchanged.
+
 ## Decisions
 
 | # | Topic | Question | Answer | Source | Confidence |

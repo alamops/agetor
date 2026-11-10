@@ -30,3 +30,34 @@ The read-only (`ask`) sandbox is never escalated.
 Wherever agetor decides which efforts a model supports (the four pickers, `agetor add`, `createTask`'s default effort, the PATCH null-clear guard, model-change cascades), a model's discovered effort set wins over the curated `MODEL_EFFORT_SUPPORT` table when the CLI reported one; the curated table is only the fallback when discovery is empty.
 The PATCH guard stays null-clear-only and never rejects a non-null effort id, because Codex's own catalog understates what the API accepts (`ultra` ran live on Luna despite not being offered there, and `none` ran live on GPT-5.6 Sol and Luna, GPT-6 Luna and GPT-6.1 Terra although the catalog omits it; GPT-6.1 Sol is the exception that answers `none` with a 400, above) — rejecting on the catalog would block values that actually run.
 A catalog change that only alters efforts (not ids) still republishes `agent_models_changed`.
+
+## `CODEX_HOME` isolation and harness stacks
+
+`CODEX_HOME` alone owns login (`auth.json`), config, sessions, MCP servers and
+every write; `HOME` is not overridden. The account's own env map may pin
+`CODEX_HOME` itself, which wins over the home-derived `<home>/.codex` (the
+mirror and rollout transfer use that same root). An account with neither is
+handed this process's `CODEX_HOME`, or has it unset (`pinCodexHome`), so the
+long-lived tmux server's env can never redirect it. A harness-stack failover
+copies the rollout to the same relative path under the destination `CODEX_HOME`, runs
+`codex migrate-rollouts --apply` when a `thread_history_*.sqlite` already
+exists (30 s timeout, best-effort), and resumes with `exec resume <threadId>`.
+A failed resume blocks the swap visibly rather than starting a fresh session.
+MCP OAuth tokens are not copied (no stable standalone file in `auto`/`file`
+mode); the swap warns that sign-in may need repeating. The mirror never imports
+the primary's login-bearing `config.toml` keys or `[model_providers.*]` tables.
+
+A limit signal comes only from a terminal `turn.failed` (its own message, or
+the classification remembered from the last top-level `error`). A top-level
+`error`, an `error` item and a non-JSON log line never signal, and
+`turn.completed` or any `item.*` event discards a remembered one (a codex that
+exits with no terminal event while one is remembered emits it instead of the
+"ended unexpectedly" sentinel), so a 429 that codex retried and
+recovered from is never a limit; the orchestrator also ignores a codex limit on
+a run that exited 0. Codex 0.166 reports quota in prose — "You've hit your usage
+limit. … try again at <date> <time>" (quota, with the reset parsed) and "Quota
+exceeded. Check your plan and billing details." (out of credits) — and the
+classifier matches that prose plus the snake_case codes (`usage_limit_reached`,
+`rate_limit_exceeded`, …) and honours a structured `codex_error_info` /
+`error.code` / `error.type` when one is present. Full behaviour:
+[harness-stacks.md](harness-stacks.md).

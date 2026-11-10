@@ -198,7 +198,7 @@ All are table-driven and need no code change beyond the tables:
 
 - `src/shared/types.ts`
   - `CURSOR_MODEL_SPECS`: add `"claude-fable-5-2"` immediately before `"claude-fable-5-1"` (`:3134-3145`) with label "Fable 5.2", hint "Anthropic Fable 5.2 via Cursor.", `supportsMaxMode: true`, five plain effort ids, **no** `fastEfforts`; comment the 2026-11-09 measurement (279 rows, no thinking/fast variants, `1M` labels).
-- `src/bun/migrations/084_normalize_cursor_fable_5_2.sql` (new)
+- `src/bun/migrations/086_normalize_cursor_fable_5_2.sql` (new; authored as 084, renumbered on merge with main's harness-stacks migrations 084/085)
   - Five UPDATEs (tasks, agent_profiles, preferences), exact IN list `claude-fable-5-2-{max,xhigh,high,medium,low}`, `effort = …`, `speed = 'off'`, `model = 'claude-fable-5-2'`, kind-joined via `harnesses.kind = 'cursor'`; `updated_at` untouched; frozen snapshots untouched; idempotent. If §4 Q4 includes the 5.1 backfill, add a separate block for the five plain 5.1 variants and leave `-thinking-*` alone.
   - `src/bun/migrations/index.ts:113/214` — import + register last.
 - `src/bun/migrate.test.ts` — new 084 test (clone 060's shape); update the last-migration pin at `:2015`, `:2028-2041`, `:2090-2097`.

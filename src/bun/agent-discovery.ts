@@ -219,9 +219,10 @@ let codexProbeTimeoutMs = DEFAULT_CODEX_PROBE_TIMEOUT_MS;
  * `env`, when given, is merged over `process.env` for this one spawn — same
  * convention (and same reason) as `runProbe`/`discoverFx`'s `env` parameter:
  * codex's catalog is account-scoped, so a second codex harness (its own
- * `home` → `HOME`+`CODEX_HOME` override via `harnessEnv`, see
- * `src/bun/agents.ts`) must be probed under *its own* env to see *its own*
- * account's catalog rather than the built-in harness's. `bin`, when given,
+ * `home` → `CODEX_HOME` override via `harnessEnv`, see
+ * `src/bun/agents.ts`; HOME is deliberately left alone) must be probed under
+ * *its own* env to see *its own* account's catalog rather than the built-in
+ * harness's. `bin`, when given,
  * is used verbatim in place of the `AGETOR_CODEX_BIN ?? "codex"` /
  * `Bun.which` resolution below — mirrors `discoverFx`'s `bin` parameter and
  * `resolveBin`'s harness.bin-first resolution in `agents.ts`. Both are
@@ -1171,10 +1172,10 @@ function discoverHarnessKind(
  * `{ harnessId, env, bin }` with no `kind` field — keeps compiling and
  * behaving unchanged). `env` is the harness's spawn-env overrides (typically
  * a `HOME` override for an additional-account fx/cursor-style harness, or
- * `HOME`+`CODEX_HOME` for codex — mirroring `harnessEnv(harness)` one layer
- * up in `agents.ts`) — an empty object means "the built-in harness of this
- * kind, probe under agetor's own process env, same account as the kind-level
- * cache". `bin`, when given, is the harness's own resolved binary path
+ * `CODEX_HOME` for codex — mirroring `harnessEnv(harness)` one layer up in
+ * `agents.ts`, where codex's HOME stays the user's real home) — an empty
+ * object means "the built-in harness of this kind, probe under agetor's own
+ * process env, same account as the kind-level cache". `bin`, when given, is the harness's own resolved binary path
  * (mirroring `resolveBin(harness)` in `agents.ts` — the same resolver every
  * real spawn of that kind uses) — omitted, discovery falls back to that
  * kind's own `AGETOR_*_BIN ?? "<kind>"` default, same as before this field

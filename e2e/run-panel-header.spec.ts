@@ -123,11 +123,14 @@ test.describe("task details header", () => {
     // both rendered below the button row. ----------------------------------
     const buttonRowBox = await header.locator("div").first().boundingBox();
     const titleRow = header.getByText(prompt, { exact: true });
-    const subtitleRow = header.getByText(/claude-code/);
+    // The subtitle names the account by its display label ("Claude Code"), not
+    // the internal harness id — the same label Settings/New Task/TaskCard use
+    // (docs/architecture/harness-stacks.md, "Surfaces").
+    const subtitleRow = header.getByText(/Claude Code/);
 
     await expect(titleRow).toBeVisible();
     await expect(subtitleRow).toBeVisible();
-    await expect(subtitleRow).toContainText("claude-code");
+    await expect(subtitleRow).toContainText("Claude Code");
 
     expect(buttonRowBox, "header's button row should have a bounding box").not.toBeNull();
     const titleBox = await titleRow.boundingBox();

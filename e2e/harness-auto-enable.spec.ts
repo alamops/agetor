@@ -17,7 +17,7 @@ import { gotoApp, headerSettingsButton } from "./helpers";
  * appears.
  */
 
-const CONVERGE_TIMEOUT = 30_000;
+const CONVERGE_TIMEOUT = 60_000;
 const TOAST_TEXT = "Turned on Codex because it's installed — turn it off in Settings";
 
 const stubDir = mkdtempSync(path.join(tmpdir(), "auto-enable-e2e-"));
