@@ -234,3 +234,22 @@ test("harnessNoticeLines: one escaped line per notice, none when absent", async 
   expect(harnessShellLoginHint("claude-code", "claude")).toBe("run claude /login to authenticate");
   expect(harnessShellLoginHint("gemini", "gemini")).toBe("log in to gemini here");
 });
+
+test("cmdShow prints a repositories block for a multi-repository task", async () => {
+  const task = makeTask({
+    workdir: "/wt/task-1",
+    worktreePath: "/wt/task-1",
+    branch: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  currentClient = fakeClient(task);
+  await cmdShow([task.id], flags);
+  const text = outputs.join("\n");
+  expect(text).toContain("repos");
+  expect(text).toContain("frontend: /src/frontend");
+  expect(text).toContain("backend: /src/backend");
+  expect(text).toContain("/wt/task-1/frontend");
+});

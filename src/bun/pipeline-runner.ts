@@ -64,7 +64,7 @@ import {
   subscribeGlobal,
 } from "./orchestrator.ts";
 import { cancelPendingForTask, listPendingForTask } from "./interactions.ts";
-import { prepareWorkdir, recordableCheckout } from "./worktree.ts";
+import { prepareTaskWorkdir, recordableCheckout } from "./worktree.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
   attemptWindowStart,
@@ -981,17 +981,21 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   // nothing live.
   const anyLive = run.active.some((a) => isAnyRunOfTaskLive(a.taskId));
   if (anyLive) {
-    if (parent.isolation === "worktree" && (!parent.worktreePath || !existsSync(parent.worktreePath))) {
+    const repos = parent.repositories ?? [];
+    const missingMulti = repos.length > 1 && repos.some((r) => !r.worktreePath || !existsSync(r.worktreePath));
+    if (parent.isolation === "worktree" && (missingMulti || (repos.length <= 1 && (!parent.worktreePath || !existsSync(parent.worktreePath))))) {
       return { error: "the pipeline's worktree is missing while a step is still running — stop the run and retry" };
     }
     return { parent };
   }
-  const prepared = await prepareWorkdir(parent, {
-    takenBranches: new Set(
-      tasks.list().filter((t) => t.id !== parent.id).map((t) => t.branch).filter((b): b is string => Boolean(b)),
-    ),
+  const { branchesPinnedByOtherTasks } = await import("./task-repos.ts");
+  const prepared = await prepareTaskWorkdir(parent, {
+    takenBranches: branchesPinnedByOtherTasks(parent.id, tasks.list()),
   });
   if ("error" in prepared) return { error: prepared.error };
+  if (prepared.repositories && prepared.repositories.length > 1) {
+    tasks.setRepositories(parent.id, prepared.repositories);
+  }
   // The parent carries the pipeline's last-seen checkout (D14); steps mirror
   // it. `setCheckoutBranch` is compare-then-write, so an unchanged value
   // touches nothing; an unknown read (`recordableCheckout` → undefined) keeps
@@ -1036,6 +1040,13 @@ function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): vo
     const step = tasks.get(a.taskId);
     if (step && (step.worktreePath !== parent.worktreePath || step.branch !== parent.branch)) {
       tasks.update(a.taskId, { worktreePath: parent.worktreePath, branch: parent.branch });
+    }
+    // A multi-repository parent's step must carry the same repository set so
+    // its own read paths (diff/status/prompt) see every repository.
+    if (step && parent.repositories && parent.repositories.length > 1) {
+      const stepNames = (step.repositories ?? []).map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
+      const parentNames = parent.repositories.map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
+      if (stepNames !== parentNames) tasks.setRepositories(a.taskId, parent.repositories);
     }
     // Mirror the parent's last-seen checkout too (compare-then-write; the
     // step→parent mirror inside `setCheckoutBranch` writes the same value
@@ -1382,6 +1393,10 @@ async function launchStep(
     worktreePath: parent.worktreePath,
     checkoutBranch: parent.checkoutBranch ?? null,
     baseRef: parent.baseRef,
+    // Step rows share the parent's workspace and repository set (D2/M6); the
+    // parent owns teardown, so a step never tears a worktree down on its own.
+    repositories: parent.repositories ?? [],
+    issueRepoPath: parent.issueRepoPath ?? null,
     prUrl: null,
     issueUrl: null,
     mode: profile.mode,

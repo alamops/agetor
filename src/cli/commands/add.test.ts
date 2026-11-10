@@ -1464,3 +1464,30 @@ describe("opencode ask mode", () => {
     expect(AGENT_OPTIONS.opencode.modes.map((m) => m.id)).toContain("ask");
   });
 });
+
+// ── --repo (multi-repository, issue #291) ────────────────────────────────
+
+test("parseAdd: --repo is repeatable and splits an optional =ref", () => {
+  const o = parseAdd(["--title", "T", "--prompt", "P", "--repo", "/a", "--repo", "/b=main"]);
+  expect(o.repos).toEqual([{ path: "/a" }, { path: "/b", baseRef: "main" }]);
+});
+
+test("parseAdd: no --repo leaves the list empty", () => {
+  expect(parseAdd(["--title", "T", "--prompt", "P"]).repos).toEqual([]);
+});
+
+test("cmdAdd: --repo sends repositories and forces worktree isolation", async () => {
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+  await cmdAdd(
+    ["--title", "Multi", "--prompt", "Do it", "--workdir", "/tmp/frontend", "--repo", "/tmp/frontend", "--repo", "/tmp/backend=b1"],
+    flags(),
+  );
+  expect(createTaskCalls).toHaveLength(1);
+  const input = createTaskCalls[0]!;
+  expect(input.repositories).toEqual([
+    { path: "/tmp/frontend" },
+    { path: "/tmp/backend", baseRef: "b1" },
+  ]);
+  expect(input.isolation).toBe("worktree");
+});

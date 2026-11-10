@@ -1875,6 +1875,56 @@ export function branchCommitType(
   return conventionalCommitType(taskType);
 }
 
+/**
+ * One repository a task was created against (issue #291). A multi-repository
+ * task stores two or more of these in `tasks.repositories` (migration 087);
+ * a single-repository task stores `[]` and derives its one entry from the
+ * scalar `workdir`/`branch`/`worktreePath`/`baseRef`/`checkoutBranch`/`prUrl`
+ * columns, so those stay authoritative for every legacy row.
+ *
+ * Every entry is server-managed: `createTask` rebuilds it from
+ * `TaskRepositoryInput` and never trusts a client-supplied `worktreePath`,
+ * `checkoutBranch`, `prUrl` or `branchSource`. The set is fixed at creation;
+ * `PATCH /tasks/:id` rejects `repositories`.
+ */
+export interface TaskRepository {
+  /**
+   * The registered project path the user selected (not necessarily the git
+   * root — git operations resolve the root through `repoRoot(path)`). Also
+   * the identity used to dedupe a selection: two paths under one git root
+   * collapse to the first selected one.
+   */
+  path: string;
+  /**
+   * Workspace subdirectory name: the sanitized basename of `path`, made
+   * unique across the set on collision (`-2`, `-3`, …). Predictable on both
+   * sides of the wire — the client uses it for `@` prefixes.
+   */
+  name: string;
+  /** The branch agetor created for this repository (`null` before materialization). */
+  branch: string | null;
+  /** `"created"` for every multi-repo entry in v1; kept for symmetry with `Task`. */
+  branchSource: "created" | "existing";
+  /** This repository's linked worktree, under the task workspace; `null` until materialized. */
+  worktreePath: string | null;
+  /** Pinned base sha resolved at create time in this repository. */
+  baseRef: string | null;
+  /** Last-seen live checkout in this worktree (drift is recorded, never corrected). */
+  checkoutBranch: string | null;
+  /** First PR opened from this repository; never overwritten. */
+  prUrl: string | null;
+}
+
+/**
+ * The create-time input shape for one repository (`POST /tasks` body
+ * `repositories[]`). Only `path` (required) and `baseRef` are read; every
+ * other `TaskRepository` field is computed server-side.
+ */
+export interface TaskRepositoryInput {
+  path: string;
+  baseRef?: string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -2216,6 +2266,29 @@ export interface Task {
    */
   checkoutBranch?: string | null;
   /**
+   * Every repository this task works on, in selection order (issue #291). For
+   * a multi-repository task this is the source of truth: two or more entries,
+   * `workdir`/`worktreePath` both point at the per-task workspace root
+   * (`<dataDir>/worktrees/<task-id>`), and `branch`/`baseRef`/`prUrl`/
+   * `checkoutBranch` are `null`. A single-repository row stores `[]` in the
+   * column and derives a one-entry array from those scalar columns here, so
+   * the scalars stay authoritative as they update.
+   *
+   * Server-managed: written by `createTask` (at creation),
+   * `tasks.setRepositories` (after worktree preparation) and the targeted
+   * `setRepository*` writers; skipped by the generic `tasks.update` SET
+   * clause and not patchable. Optional at the type level for the same
+   * fixture-compatibility reason as `checkoutBranch` — `toTask` always sets it.
+   */
+  repositories?: TaskRepository[];
+  /**
+   * The `repositories[].path` whose remote matches `issueUrl`, or null. Only
+   * that repository's PR body gets `Closes #N`; every other repository gets a
+   * plain reference. Set only at create time (insert-only, never patchable).
+   * Optional for the same fixture-compatibility reason as `repositories`.
+   */
+  issueRepoPath?: string | null;
+  /**
    * Provenance for a Claude Code session imported from outside Agetor.
    * Server-managed: written only by `tasks.setImportedClaude` (a targeted
    * UPDATE, no `updated_at` bump), skipped by the generic `tasks.update`
@@ -2369,6 +2442,12 @@ export interface WorktreeInfo {
   stale: boolean;
   /** Every reason this worktree is considered stale; empty when not stale. */
   staleReasons: WorktreeStaleReason[];
+  /**
+   * For a multi-repository task, the workspace subdirectory name this row
+   * represents (issue #291); `null`/absent for a single-repository task or an
+   * orphan. The row's `id` is `<taskId>__<repoName>` when this is set.
+   */
+  repoName?: string | null;
 }
 
 /**
@@ -2395,6 +2474,12 @@ export interface WorktreeTeardownResult {
   removed: boolean;
   /** Why `removed` is false. Absent when `removed` is true. */
   reason?: "dirty" | "no-worktree" | "already-absent" | "failed";
+  /**
+   * Per-repository outcomes for a multi-repository task (issue #291). The
+   * top-level fields mirror the aggregate: `removed` is true only when every
+   * repository was detached. Absent for a single-repository task.
+   */
+  repositories?: { name: string; result: WorktreeTeardownResult }[];
 }
 
 /**
@@ -2440,6 +2525,30 @@ export interface TaskTeardownPreview {
   /** Candidates deliberately left alone, with why: the repo's default branch,
    *  a pull request's head branch, or a branch another task still holds. */
   excluded: { branch: string; reason: "default-branch" | "pr-head" | "held-by-task" }[];
+  /**
+   * Per-repository plans for a multi-repository task (issue #291); the
+   * top-level fields above mirror `repositories[0]` for old clients.
+   * Absent for a single-repository task.
+   */
+  repositories?: RepoTeardownPlan[];
+}
+
+/** One repository's share of a {@link TaskTeardownPreview} (issue #291). */
+export interface RepoTeardownPlan {
+  /** Workspace subdirectory name. */
+  name: string;
+  /** The selected project path this repository came from. */
+  path: string;
+  /** Branches delete would remove in this repository. */
+  branches: string[];
+  /** The branch currently checked out in this repository's worktree, when readable. */
+  liveBranch: string | null;
+  /** This repository's own branch, null for a non-worktree task. */
+  taskBranch: string | null;
+  /** Where the non-task branch name came from. */
+  source: TaskTeardownPreview["source"];
+  /** Candidates deliberately left alone in this repository. */
+  excluded: TaskTeardownPreview["excluded"];
 }
 
 /**
@@ -2486,6 +2595,20 @@ export interface TaskGitStatus {
    *  `HeadBranchState.isDefaultBranch` in `worktree.ts` for why unknown
    *  resolves to offering the affordance rather than hiding it. */
   isDefaultBranch: boolean;
+  /**
+   * Per-repository status for a multi-repository task (issue #291). The
+   * top-level fields above mirror `repositories[0]` for old clients. Absent
+   * for a single-repository task.
+   */
+  repositories?: TaskRepoGitStatus[];
+}
+
+/** One repository's status inside a multi-repository {@link TaskGitStatus}. */
+export interface TaskRepoGitStatus extends TaskGitStatus {
+  /** Workspace subdirectory name (e.g. `frontend`). */
+  name: string;
+  /** The selected project path this repository came from. */
+  path: string;
 }
 
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;
@@ -2498,6 +2621,12 @@ export interface TerminalTab {
   /** Working directory the shell was spawned in (worktree path or workdir). */
   cwd: string;
   createdAt: number;
+  /**
+   * For a multi-repository task, the workspace subdirectory the shell was
+   * spawned in (issue #291); `null`/absent for a terminal at the workspace
+   * root or for a single-repository task.
+   */
+  repoName?: string | null;
 }
 
 /**
@@ -4954,6 +5083,12 @@ export interface TaskDiff {
    * `files` is non-empty.
    */
   note?: string;
+  /**
+   * The workspace subdirectory this diff belongs to for a multi-repository
+   * task (issue #291); `null`/absent for a single-repository task. Echoes the
+   * `repo` query parameter the caller asked for.
+   */
+  repo?: string | null;
 }
 
 export type GitHubItemKind = "pulls" | "issues";
@@ -6356,8 +6491,35 @@ export interface ToolResultEventData {
  * blocks survive verbatim (verified against micromark, react-markdown's parser:
  * 4-tick outer -> one <pre>; 3-tick outer -> two, split at the inner fence).
  */
-export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): string {
+export function commitPushPrompt(
+  task: Pick<Task, "branch" | "taskType"> & Pick<Partial<Task>, "repositories" | "issueRepoPath">,
+): string {
   const ccType = branchCommitType(task.branch, task.taskType);
+  const repos = task.repositories && task.repositories.length > 1 ? task.repositories : null;
+  if (repos) {
+    const repoLines = repos
+      .map((r) => `- ${r.name}: branch ${r.branch ? `'${r.branch.replace(/'/g, "'\\''")}'` : "<branch>"}`)
+      .join("\n");
+    return (
+      `Commit all changes in every repository with a clear commit message ` +
+      `(prefix each subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
+      `then push each repository's current branch to origin. ` +
+      `If a branch has no upstream yet, set it with \`git push -u origin <branch>\` in that repository. ` +
+      `Repositories:\n${repoLines}\n` +
+      `After pushing, for each repository first print a "Repository: <name>" line, then below it ` +
+      `print the full link to open a pull request for that repository's branch as plain text on its ` +
+      `own line — not inside a code block. ` +
+      `Below each link, propose that pull request as two fenced code blocks so each can be ` +
+      `copied with one click: first a "PR title:" line followed by a \`\`\` block containing ` +
+      `only the concise one-line title, then a "PR description:" line followed by a ` +
+      `\`\`\`\` four-backtick block containing the description in markdown (what changed and ` +
+      `why) — use four backticks so any \`\`\` code fences inside the description don't ` +
+      `close the block early. ` +
+      `Do not include any AI attribution in the commit message, PR title, or PR description — ` +
+      `no "Generated with Claude Code" / "Generated by AI" footers, robot emoji, or ` +
+      `Co-Authored-By trailers crediting an AI tool.`
+    );
+  }
   const branchLabel = task.branch ? `'${task.branch.replace(/'/g, "'\\''")}'` : "<branch>";
   return (
     `Commit all changes with a clear commit message ` +

@@ -63,6 +63,8 @@ const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   "mark-unread": "utility",
   "copy-branch": "utility",
   "copy-worktree-path": "utility",
+  "copy-repo-branch": "utility",
+  "copy-repo-worktree": "utility",
   delete: "danger",
 };
 
@@ -627,4 +629,25 @@ describe("an imported OpenCode session does not offer Run", () => {
     const entries = buildTaskContextMenu(makeTask({ agent: "opencode", importedOpencode: null }), { isOpen: false });
     expect(actions(entries)).toContain("start");
   });
+});
+
+test("multi-repository task offers per-repository copy entries", () => {
+  const task = makeTask({
+    branch: null,
+    worktreePath: "/wt/t1",
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/t1/frontend", baseRef: null, checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x-2", branchSource: "created", worktreePath: "/wt/t1/backend", baseRef: null, checkoutBranch: "feature/x-2", prUrl: null },
+    ],
+  });
+  const entries = buildTaskContextMenu(task, { isOpen: false });
+  const copies = entries.filter((e) => e.action === "copy-repo-branch" || e.action === "copy-repo-worktree");
+  expect(copies.map((e) => `${e.action}:${e.repoName}`)).toEqual([
+    "copy-repo-branch:frontend",
+    "copy-repo-worktree:frontend",
+    "copy-repo-branch:backend",
+    "copy-repo-worktree:backend",
+  ]);
+  expect(entries.some((e) => e.action === "copy-branch")).toBe(false);
+  expect(entries.some((e) => e.action === "copy-worktree-path")).toBe(false);
 });

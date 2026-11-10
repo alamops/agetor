@@ -3,6 +3,7 @@ import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
 import { usageError } from "../usage.ts";
+import { flagValue } from "../args.ts";
 import { escapeFreeText } from "../../shared/terminal-text.ts";
 
 /**
@@ -11,13 +12,20 @@ import { escapeFreeText } from "../../shared/terminal-text.ts";
  * just echoes the directory so you can `cd "$(agetor shell -p <id>)"`.
  */
 export async function cmdShell(args: string[], flags: Flags): Promise<void> {
-  const ref = args.find((a) => !a.startsWith("-"));
+  const repoIdx = args.indexOf("--repo");
+  const repoFlag = repoIdx >= 0 ? flagValue(args, repoIdx + 1, "--repo") : null;
+  const ref = args.find((a, i) => !a.startsWith("-") && i !== repoIdx + 1);
   if (!ref) throw usageError("shell");
   const printOnly = args.includes("--print") || args.includes("-p");
 
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
-  const dir = task.worktreePath ?? task.workdir;
+  let dir = task.worktreePath ?? task.workdir;
+  if (repoFlag) {
+    const entry = (task.repositories ?? []).find((r) => r.name === repoFlag);
+    if (!entry) throw new Error(`no repository "${repoFlag}" on this task (have: ${(task.repositories ?? []).map((r) => r.name).join(", ") || "none"})`);
+    dir = entry.worktreePath ?? entry.path;
+  }
 
   if (printOnly) {
     out(dir);

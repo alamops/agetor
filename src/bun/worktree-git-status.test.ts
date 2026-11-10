@@ -277,3 +277,41 @@ test("deleteOrphanWorktree: two back-to-back orphan deletes in the same source r
   expect(existsSync(dirA)).toBe(false);
   expect(existsSync(dirB)).toBe(false);
 });
+
+test("worktreeGitStatus resolves a nested multi-repository id to that repo's worktree", async () => {
+  const { createTask, worktreeGitStatus } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const { tasks, db } = await import("./db.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi status",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.setRepositories(taskId, prepared.repositories!);
+    const names = uniqueRepoSlugs([a, b]);
+    for (const name of names) {
+      const status = await worktreeGitStatus(`${taskId}__${name}`);
+      if ("error" in status) throw new Error(status.error);
+      expect(status.ignored).toBe(false);
+      expect(status.dirty).toBe(false);
+      expect(status.branch).toBe(prepared.repositories?.[names.indexOf(name)]?.branch ?? null);
+    }
+    // Traversal ids are refused by the shared guard.
+    expect("error" in (await worktreeGitStatus(`${taskId}__..`))).toBe(true);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    rmSync(path.join((await import("./worktree.ts")).WORKTREES_DIR, taskId), { recursive: true, force: true });
+  }
+});

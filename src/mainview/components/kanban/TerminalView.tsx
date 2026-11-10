@@ -326,8 +326,20 @@ const ARCHIVED_HINT = "Unarchive this task to open a terminal";
  * its worktree down; `createTerminal` refuses it), so `archived` disables
  * the open affordances instead of letting them fail with a toast.
  */
-export function TerminalView({ taskId, archived = false }: { taskId: string; archived?: boolean }) {
+export function TerminalView({
+  taskId,
+  archived = false,
+  repositories,
+}: {
+  taskId: string;
+  archived?: boolean;
+  /** Workspace names for a multi-repository task (issue #291) — the open
+   *  button then offers a cwd selector instead of always using the task
+   *  workspace root. */
+  repositories?: string[];
+}) {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
+  const [repo, setRepo] = useState<string | null>(repositories?.[0] ?? null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -354,7 +366,7 @@ export function TerminalView({ taskId, archived = false }: { taskId: string; arc
   const openTerminal = useCallback(async () => {
     setBusy(true);
     try {
-      const tab = await api.createTerminal(taskId);
+      const tab = await api.createTerminal(taskId, repo);
       setTabs((cur) => [...cur, tab]);
       setActiveId(tab.id);
     } catch (e) {
@@ -362,7 +374,7 @@ export function TerminalView({ taskId, archived = false }: { taskId: string; arc
     } finally {
       setBusy(false);
     }
-  }, [taskId]);
+  }, [taskId, repo]);
 
   const closeTab = useCallback(async (id: string) => {
     // Optimistic: drop locally first so the pane unmounts before the round-trip.

@@ -515,3 +515,47 @@ test("a shell that exits is auto-removed from the manager", async () => {
   expect(gone).toBe(true);
   expect(tasks.get(task.id)!.openTerminalCount).toBe(0);
 }, SHELL_READY_MS + 10_000);
+
+test("createTerminal opens at the workspace by default and inside a selected repository", async () => {
+  const { createTask, deleteTask } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir, worktreePath } = await import("./worktree.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi terminal",
+    prompt: "p",
+    agent: "codex",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  const opened: string[] = [];
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(id, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(id, prepared.repositories!);
+    const names = uniqueRepoSlugs([a, b]);
+
+    const atRoot = await createTerminal(id);
+    if ("error" in atRoot) throw new Error(atRoot.error);
+    opened.push(atRoot.id);
+    expect(atRoot.cwd).toBe(worktreePath(created.task));
+    expect(atRoot.repoName).toBeUndefined();
+
+    const inRepo = await createTerminal(id, { repo: names[1]! });
+    if ("error" in inRepo) throw new Error(inRepo.error);
+    opened.push(inRepo.id);
+    expect(inRepo.cwd).toBe(prepared.repositories![1]!.worktreePath ?? "");
+    expect(inRepo.repoName).toBe(names[1]);
+
+    const bad = await createTerminal(id, { repo: "nope" });
+    expect("error" in bad && /unknown repository/.test(bad.error)).toBe(true);
+  } finally {
+    for (const tid of opened) closeTerminal(tid);
+    await deleteTask(id);
+  }
+});

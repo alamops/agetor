@@ -408,3 +408,7 @@ successor run's settle is the step's real outcome. A stack block surfaces as
 `harness-swap-failed` ("no usable backup account") in the step's block
 message. A manual Switch inside the same stack is refused at the route while
 a run is live. See [harness-stacks.md](harness-stacks.md).
+
+## Multiple repositories in one task
+
+A task created against two or more repositories stores `Task.repositories[]` and runs at a per-task workspace root with one linked worktree per repository. Preparation, the `Repositories:` launch block, per-repo diff/status/PR, per-repo teardown, nested worktree ids and the CLI/TUI surfaces are specified in [multi-repo-tasks.md](multi-repo-tasks.md). A single-repository task is unchanged (its one entry is derived from the scalar columns).

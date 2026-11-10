@@ -3360,3 +3360,35 @@ test("opencode server transport: spawnAgent refuses to start without the orchest
     ).rejects.toThrow("opencodeTurnHooks");
   });
 });
+
+// ── extra directories for multi-repository tasks (issue #291) ────────────
+
+test("extraDirectories emits --add-dir pairs for claude-code, codex and copilot only", () => {
+  const dirs = ["/workspace/t1/frontend", "/workspace/t1/backend"];
+  const claude = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, extraDirectories: dirs });
+  const codex = buildCommand(builtin("codex"), "p", { ...codexDefaults, extraDirectories: dirs });
+  const copilot = buildCommand(builtin("copilot"), "p", {
+    mode: "auto",
+    model: "gpt-5",
+    runId: "run-1",
+    sessionId: "sess-1",
+    extraDirectories: dirs,
+  });
+  for (const cmd of [claude.cmd, codex.cmd, copilot.cmd]) {
+    const idx = cmd.indexOf("--add-dir");
+    expect(idx).toBeGreaterThan(-1);
+    expect(cmd[idx + 1]).toBe(dirs[0]);
+    expect(cmd.slice(idx).filter((a) => a === "--add-dir")).toHaveLength(2);
+  }
+  // Kinds without the flag ignore it (the workspace cwd is their access).
+  const fx = buildCommand(builtin("fx"), "p", { ...fxDefaults, extraDirectories: dirs });
+  expect(fx.cmd).not.toContain("--add-dir");
+  const cursor = buildCommand(builtin("cursor"), "p", { ...cursorDefaults, extraDirectories: dirs });
+  expect(cursor.cmd).not.toContain("--add-dir");
+});
+
+test("no extraDirectories leaves every argv byte-identical", () => {
+  const a = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults });
+  const b = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, extraDirectories: [] });
+  expect(b.cmd).toEqual(a.cmd);
+});

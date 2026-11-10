@@ -33,7 +33,7 @@ import { Composer } from "./Composer.tsx";
 import { AnswerOverlay } from "./AnswerOverlay.tsx";
 import { runControl, resumableRunId } from "../run-logic.ts";
 import { Logo } from "./logo.tsx";
-import { fileScopeForTask } from "./at-complete.ts";
+import { fileScopeForTask, fileScopesForTask } from "./at-complete.ts";
 import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 // `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
@@ -194,7 +194,14 @@ export function Dashboard({
   // `target` is resolved by id (see above) so this stays valid even though
   // `sorted` reshuffles every 1.5s poll.
   const composeScope = target ? fileScopeForTask(target) : null;
-  const composeScopeKey = composeScope ? `${composeScope.dir} ${composeScope.ref ?? ""}` : null;
+  // Multi-repository tasks (issue #291): one scope per repository, entries
+  // prefixed with the workspace name. A single-repository task keeps exactly
+  // today's `composeScope`/key.
+  const composeScopes = target ? fileScopesForTask(target) : [];
+  const composeMulti = composeScopes.length > 1;
+  const composeScopeKey = composeMulti
+    ? composeScopes.map((sc) => `${sc.name}:${sc.dir} ${sc.ref ?? ""}`).join("|")
+    : composeScope ? `${composeScope.dir} ${composeScope.ref ?? ""}` : null;
   // Stable string (unlike `target`'s per-poll identity) — its CHANGE is the
   // run-settle signal that invalidates the listing cache below.
   const composeColumn = target ? target.column : null;
@@ -243,6 +250,19 @@ export function Dashboard({
     const columnAtFetch = composeColumn ?? "";
     void (async () => {
       try {
+        if (composeMulti) {
+          const results = await Promise.all(
+            composeScopes.map(async (sc) => ({ sc, res: await client.listProjectFiles({ dir: sc.dir, ref: sc.ref }) })),
+          );
+          if (!alive) return;
+          const merged = results.flatMap(({ sc, res }) => res.files.map((f) => `${sc.name}/${f}`));
+          const truncated = results.some(({ res }) => res.truncated);
+          const entries = buildFileEntries(merged);
+          fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch, truncated });
+          setComposeFileEntries(entries);
+          setComposeTruncated(truncated);
+          return;
+        }
         const { files, truncated } = await client.listProjectFiles(composeScope);
         if (!alive) return;
         const entries = buildFileEntries(files);
@@ -278,7 +298,10 @@ export function Dashboard({
   // object reference here is never a stale VALUE — same trick the file-
   // listing effect above already relies on to stay poll-stable.
   const composeRemoteSearch = useMemo(() => {
-    if (!composeTruncated || !composeScope) return undefined;
+    // A multi-repository listing spans several scopes; a single-scope remote
+    // search would rank only one repository, so local filtering (over the
+    // merged/prefixed set) is used instead.
+    if (composeMulti || !composeTruncated || !composeScope) return undefined;
     const scope = composeScope;
     return async (q: string): Promise<FileEntry[] | null> => {
       try {
@@ -293,7 +316,7 @@ export function Dashboard({
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [composeTruncated, composeScopeKey, client]);
+  }, [composeTruncated, composeScopeKey, composeMulti, client]);
 
   const sendMessage = (task: Task, text: string, okLabel = "→ sent") => {
     if (task.pendingInteractionCount > 0) {

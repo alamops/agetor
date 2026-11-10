@@ -6,7 +6,7 @@
 | Source | `docs/specs/multi-repo-tasks.md` (decided spec), `docs/plans/multi-repo-tasks-grill.md` (2 rounds, 30/30 decisions), `docs/plans/multi-repo-tasks-investigation.md` (evidence P1–P10), [alamops/agetor#291](https://github.com/alamops/agetor/issues/291) |
 | Flags | none |
 | Gates | grilled + decided by the owner (round-1/answers.json, round-2/answers.json); spec committed at `8e308518`; plan self-approved for pipeline execution — owner review happens at the handoff before code lands |
-| Status | planned |
+| Status | implemented — see `docs/plans/multi-repo-tasks-smoke.md` for verification evidence |
 | Branch | `feature/issue-291-feature-request-support-multip` |
 | Base SHA | `8e308518fd4db2630a1b866522548f786b4d80ec` (`8e308518`, decision record; `c45fd806` is main) |
 

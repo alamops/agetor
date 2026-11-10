@@ -45,12 +45,18 @@ export async function duplicateAgentProfile(
       continue;
     }
     try {
+      // A multi-repository task is copied repository-for-repository with each
+      // entry's pinned base, so the copy starts from the same commits. The
+      // workspace root is derived by `createTask` from the new task id.
+      const repos = t.repositories && t.repositories.length > 1
+        ? t.repositories.map((r) => ({ path: r.path, ...(r.baseRef ? { baseRef: r.baseRef } : {}) }))
+        : null;
       const res = await createTask({
         title: t.title,
         prompt: t.prompt,
-        workdir: t.workdir,
+        workdir: repos ? repos[0]!.path : t.workdir,
         isolation: t.isolation,
-        ...(t.baseRef ? { baseRef: t.baseRef } : {}),
+        ...(repos ? { repositories: repos } : t.baseRef ? { baseRef: t.baseRef } : {}),
         references: t.references,
         taskType: t.taskType,
         agentProfileId: profile.id,

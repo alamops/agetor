@@ -15,7 +15,7 @@ import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
-import { useProjectFiles, searchProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { useProjectFiles, useProjectFileScopes, searchProjectFiles, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { unresolvedAtTokens, isSafeClientRelPath, isListedPath } from "@/lib/at-highlight";
 
@@ -294,6 +294,11 @@ export interface PromptComposerProps {
    * no fetch is made for any of them.
    */
   fileScope?: FileScope | null;
+  /** Every repository scope for a multi-repository task (issue #291). When 2+
+   *  are present this replaces `fileScope` for the `@` listing, prefixing each
+   *  entry with its workspace name. A single entry is ignored (use
+   *  `fileScope`). */
+  fileScopes?: NamedFileScope[] | null;
   /** Opaque token whose CHANGE triggers a listing `refresh()` — RunPanel
    *  passes `task.column`, so a run settling (running → review/ready/blocked)
    *  re-lists the tree the agent may have just written files into. The
@@ -444,6 +449,7 @@ export function PromptComposer({
   onReferencesChange,
   setReferences,
   fileScope,
+  fileScopes,
   fileScopeRefreshToken,
   textareaRef,
   capture,
@@ -491,7 +497,10 @@ export function PromptComposer({
   // `projectFiles.error` (a failed listing's message) is intentionally
   // unused here — no error UI in this pass; it's available for a future
   // inline hint if that's ever wanted.
-  const projectFiles = useProjectFiles(fileScope ?? null);
+  const singleScopeFiles = useProjectFiles(fileScope ?? null);
+  const multiScopeFiles = useProjectFileScopes(fileScopes ?? null);
+  const multiScope = (fileScopes?.length ?? 0) > 1;
+  const projectFiles = multiScope ? multiScopeFiles : singleScopeFiles;
 
   // Fire `refresh()` when the caller's run-settle token changes — never on
   // mount (the hook's own scope-change fetch covers that). Guarded by a ref
@@ -574,7 +583,9 @@ export function PromptComposer({
   // mounting them at all is what actually removes their per-keystroke work
   // (see AtHighlightBackdrop's/AtFileAutocomplete's own layout-effect and
   // memo costs).
-  const hasFileScope = !!(fileScope && fileScope.dir);
+  const hasFileScope = multiScope
+    ? (fileScopes ?? []).every((s) => !!s.dir)
+    : !!(fileScope && fileScope.dir);
 
   // --- Unresolved `@` reference warning -----------------------------------
   // Send-time expansion (orchestrator `startTask`/`sendInput`) silently

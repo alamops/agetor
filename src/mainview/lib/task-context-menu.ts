@@ -27,6 +27,8 @@ export type TaskMenuAction =
   | "mark-unread"
   | "copy-branch"
   | "copy-worktree-path"
+  | "copy-repo-branch"
+  | "copy-repo-worktree"
   | "delete";
 
 /** Visual/semantic grouping — T3 inserts a separator between consecutive
@@ -44,6 +46,8 @@ export interface TaskMenuEntry {
   group: TaskMenuGroup;
   /** Danger-styled entry (destructive text color). Only `delete` sets this. */
   danger?: boolean;
+  /** For `copy-repo-*` on a multi-repository task: which entry to copy. */
+  repoName?: string;
 }
 
 /**
@@ -155,11 +159,34 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   if (!task.unread && !ctx.isOpen && task.hasAssistantMessages === true) {
     entries.push({ action: "mark-unread", label: "Mark as unread", group: "utility" });
   }
-  if (task.branch) {
-    entries.push({ action: "copy-branch", label: "Copy branch name", group: "utility" });
-  }
-  if (task.worktreePath) {
-    entries.push({ action: "copy-worktree-path", label: "Copy worktree path", group: "utility" });
+  if ((task.repositories?.length ?? 0) > 1) {
+    // Per-repository copy entries (issue #291): the multi row has no single
+    // branch/worktree path, so name each repository.
+    for (const repo of task.repositories!) {
+      if (repo.branch) {
+        entries.push({
+          action: "copy-repo-branch",
+          label: `Copy ${repo.name} branch`,
+          group: "utility",
+          repoName: repo.name,
+        });
+      }
+      if (repo.worktreePath) {
+        entries.push({
+          action: "copy-repo-worktree",
+          label: `Copy ${repo.name} worktree path`,
+          group: "utility",
+          repoName: repo.name,
+        });
+      }
+    }
+  } else {
+    if (task.branch) {
+      entries.push({ action: "copy-branch", label: "Copy branch name", group: "utility" });
+    }
+    if (task.worktreePath) {
+      entries.push({ action: "copy-worktree-path", label: "Copy worktree path", group: "utility" });
+    }
   }
 
   // danger — always last. A step task can't be deleted individually — the

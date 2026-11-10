@@ -220,7 +220,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
     const q = query.trim().toLowerCase();
     return worktrees.filter((w) => {
       if (q) {
-        const hay = `${w.taskTitle ?? ""}\n${w.branch ?? ""}\n${projectLabel(w)}\n${w.path}`.toLowerCase();
+        const hay = `${w.taskTitle ?? ""}\n${w.branch ?? ""}\n${w.repoName ?? ""}\n${projectLabel(w)}\n${w.path}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       if (projectFilter.length > 0 && !projectFilter.includes(projectValue(w))) return false;
@@ -236,8 +236,16 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
     const arr = [...filtered];
     arr.sort((a, b) => {
       switch (sortField) {
-        case "updated":
-          return ((a.taskUpdatedAt ?? 0) - (b.taskUpdatedAt ?? 0)) * dir;
+        case "updated": {
+          const byTime = ((a.taskUpdatedAt ?? 0) - (b.taskUpdatedAt ?? 0)) * dir;
+          if (byTime !== 0) return byTime;
+          // Tie-break by task, then repository: a multi-repository task's
+          // rows (issue #291) stay grouped together instead of interleaving
+          // with other tasks that share the same `updated_at`.
+          const byTask = (a.taskId ?? "").localeCompare(b.taskId ?? "") * dir;
+          if (byTask !== 0) return byTask;
+          return (a.repoName ?? "").localeCompare(b.repoName ?? "");
+        }
         case "project":
           return projectLabel(a).localeCompare(projectLabel(b)) * dir;
         case "status":
@@ -524,6 +532,11 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                       ) : (
                         <span className="text-sm text-muted-foreground">no ticket</span>
                       )}
+                      {w.repoName ? (
+                        <Badge variant="outline" className="font-mono" title="Repository in this task's workspace">
+                          {w.repoName}
+                        </Badge>
+                      ) : null}
                       {w.column != null && (
                         <Badge variant="outline">{statusLabel(w)}</Badge>
                       )}

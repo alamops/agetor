@@ -144,6 +144,13 @@ export interface AgentRunOptions {
   /** Cursor Max Mode / large-context toggle. Currently consumed by cursor only. */
   maxMode?: boolean | null;
   /**
+   * Extra directories the agent may also read (issue #291): one entry per
+   * sibling repository worktree of a multi-repository task. Emitted as
+   * `--add-dir <path>` for the kinds whose CLI supports it (claude-code,
+   * codex, copilot); every other kind ignores it and relies on the cwd.
+   */
+  extraDirectories?: string[];
+  /**
    * Existing session id to resume a prior conversation on a follow-up turn.
    * For claude-code: the JSONL session uuid, resumed via `claude --resume
    * <id>`. For codex: the `thread_id`, resumed via `codex exec resume <id>`.
@@ -723,6 +730,7 @@ export function buildCommand(
       args.push("--permission-mode", toClaudeModeString(mode));
     }
 
+    for (const dir of opts.extraDirectories ?? []) args.push("--add-dir", dir);
     args.push(...extra);
 
     // Initial prompt as the final argv element — claude's documented form is
@@ -1060,6 +1068,7 @@ export function buildCommand(
       args.push("--allow-all");
     }
     args.push("--usage-output-file", copilotUsagePath(opts.runId));
+    for (const dir of opts.extraDirectories ?? []) args.push("--add-dir", dir);
     args.push(...extra);
 
     // The long-lived tmux server's env may belong to another process, and the
@@ -1134,6 +1143,7 @@ export function buildCommand(
       args.push("--sandbox", "workspace-write");
     }
 
+    for (const dir of opts.extraDirectories ?? []) args.push("--add-dir", dir);
     args.push(...extra);
 
     // Multi-turn: parent flags MUST precede the `resume` subcommand (codex
@@ -2516,6 +2526,9 @@ function makeFakeAgent(
   } = {},
 ): SpawnedAgent {
   const record: string[] = [`spawn:${prompt}`];
+  // Record the cwd so integration tests can prove a multi-repository task
+  // spawns at the workspace root (issue #291).
+  if (fakeOpts.cwd) record.push(`cwd:${fakeOpts.cwd}`);
   let resolveDone!: (code: number) => void;
   let rejectDone!: (err: Error) => void;
   const done = new Promise<number>((res, rej) => { resolveDone = res; rejectDone = rej; });
@@ -3971,6 +3984,12 @@ function makeFakeOpencodeAgent(
 
 export interface SpawnAgentArgs {
   taskId: string;
+  /**
+   * Extra directories a flag-capable harness may also read — the sibling
+   * repository worktrees of a multi-repository task (issue #291). Undefined
+   * for single-repository tasks, so their argv is byte-identical.
+   */
+  extraDirectories?: string[];
   /** The run row this spawn belongs to. Used by the codex driver to key its
    *  per-run log/prompt files (so each turn — and its reattach — is isolated).
    *  Ignored by claude-code. */

@@ -850,6 +850,10 @@ export const api = {
       { method: "POST" },
     ),
   listProjects: () => j<Project[]>("/projects"),
+  /** Resolve a selected path to its git top-level (issue #291) — used by the
+   *  Repositories dialog to dedupe a selection by repository root. */
+  getProjectRepoRoot: (path: string) =>
+    j<{ root: string }>(`/projects/repo-root?path=${encodeURIComponent(path)}`),
   /** The native folder panel; registers the pick as a project. */
   pickProject: (startingFolder?: string) =>
     withCoreBusySuspended(() =>
@@ -1668,6 +1672,10 @@ export const api = {
     agent: string;
     workdir: string;
     isolation: Isolation;
+    /** Selected repositories (issue #291). 2+ makes it a multi-repository
+     *  task; the server validates, dedupes by git root and derives the
+     *  workspace. Requires `isolation: "worktree"`. */
+    repositories?: { path: string; baseRef?: string }[];
     baseRef?: string;
     /** Explicit branch name for worktree isolation. Overrides the project's
      *  nomenclature; the server validates it and makes it unique. */
@@ -1776,8 +1784,11 @@ export const api = {
   // Terminal tabs. State is in-memory on the bun side; the live byte stream
   // runs over the WebSocket whose URL `terminalSocketUrl` builds.
   listTerminals: (taskId: string) => j<TerminalTab[]>(`/tasks/${taskId}/terminals`),
-  createTerminal: (taskId: string) =>
-    j<TerminalTab>(`/tasks/${taskId}/terminals`, { method: "POST" }),
+  createTerminal: (taskId: string, repo?: string | null) =>
+    j<TerminalTab>(`/tasks/${taskId}/terminals`, {
+      method: "POST",
+      body: JSON.stringify(repo ? { repo } : {}),
+    }),
   closeTerminal: (id: string) => j<void>(`/terminals/${id}`, { method: "DELETE" }),
   /** Mint a single-use, 30 s ticket for a terminal's duplex stream and return
    *  the ws:// URL that redeems it (P7/D13). WebSockets can't set the
@@ -1819,7 +1830,8 @@ export const api = {
   listSubagents: (taskId: string) => j<Subagent[]>(`/tasks/${taskId}/subagents`),
   /** Everything the task's worktree changed vs its pinned base. Empty `files`
    *  + a `note` when there's no worktree or no diff. */
-  getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
+  getTaskDiff: (taskId: string, repo?: string | null) =>
+    j<TaskDiff>(`/tasks/${taskId}/diff${repo ? `?repo=${encodeURIComponent(repo)}` : ""}`),
   getTaskGitStatus: (taskId: string) =>
     j<TaskGitStatus>(`/tasks/${taskId}/git-status`),
   /** Which branches deleting the task would remove (`task.branch`, plus the
@@ -2010,8 +2022,8 @@ export const api = {
    *  cwd (worktree or workdir), mirroring what `getTaskDiff`'s underlying
    *  `git diff` compared. Fetched with the header, never used as a bare
    *  `<img src>`. */
-  taskDiffBlobUrl: (taskId: string, path: string, side: "old" | "new"): string =>
-    `${BASE}/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}`,
+  taskDiffBlobUrl: (taskId: string, path: string, side: "old" | "new", repo?: string | null): string =>
+    `${BASE}/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}${repo ? `&repo=${encodeURIComponent(repo)}` : ""}`,
 
   /** Absolute, token-less URL for a GitHub PR's binary blob (old or new
    *  side), for `BinaryFilePreview`. Identifying params mirror

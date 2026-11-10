@@ -32,3 +32,7 @@ notice plus `(2/3)`; a `user` event that is exactly the hidden
 `<harness-stack-continuation>` wrapper renders nothing. The panel takes an
 optional `stacks` prop; no extra fetch is made. See
 [harness-stacks.md](harness-stacks.md).
+
+## Multiple repositories in one task
+
+A task created against two or more repositories stores `Task.repositories[]` and runs at a per-task workspace root with one linked worktree per repository. Preparation, the `Repositories:` launch block, per-repo diff/status/PR, per-repo teardown, nested worktree ids and the CLI/TUI surfaces are specified in [multi-repo-tasks.md](multi-repo-tasks.md). A single-repository task is unchanged (its one entry is derived from the scalar columns).

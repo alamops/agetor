@@ -2079,3 +2079,269 @@ describe("parseWorktreeGitPointer", () => {
     }
   });
 });
+
+// ── multi-repository tasks (issue #291) ───────────────────────────────────
+
+function multiRepoTask(
+  workdir: string,
+  repos: { path: string; name: string; baseRef: string | null }[],
+  overrides: Partial<Task> = {},
+): Task {
+  return fakeTask({
+    workdir,
+    isolation: "worktree",
+    branch: "feature/auth",
+    repositories: repos.map((r) => ({
+      path: r.path,
+      name: r.name,
+      branch: null,
+      branchSource: "created" as const,
+      worktreePath: null,
+      baseRef: r.baseRef,
+      checkoutBranch: null,
+      prUrl: null,
+    })),
+    ...overrides,
+  });
+}
+
+test("prepareTaskWorkdir creates one worktree and branch per repository under the workspace", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR, worktreePath } = await import("./worktree.ts");
+  const { existsSync } = await import("node:fs");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const r = await prepareTaskWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.cwd).toBe(workspace);
+    expect(r.worktreePath).toBe(workspace);
+    expect(r.branch).toBeNull();
+    expect(r.repositories).toHaveLength(2);
+    for (const [repo, expectedBranch] of [[a, "feature/auth"], [b, "feature/auth"]] as const) {
+      const dir = path.join(workspace, repo === a ? "frontend" : "backend");
+      expect(existsSync(path.join(dir, ".git"))).toBe(true);
+      expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], dir)).toBe(expectedBranch);
+      expect(await runCapture(["rev-parse", "HEAD"], dir)).toBe(repo === a ? shaA : shaB);
+    }
+    expect(r.repositories?.map((x) => x.worktreePath)).toEqual([
+      path.join(workspace, "frontend"),
+      path.join(workspace, "backend"),
+    ]);
+    expect(r.repositories?.map((x) => x.branch)).toEqual(["feature/auth", "feature/auth"]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("prepareTaskWorkdir reuses existing per-repo worktrees without creating anything", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const first = await prepareTaskWorkdir(task);
+    if ("error" in first) throw new Error(first.error);
+    const recorded = { ...task, repositories: first.repositories!, worktreePath: workspace };
+    const headBefore = await runCapture(["rev-parse", "HEAD"], path.join(workspace, "frontend"));
+    const second = await prepareTaskWorkdir(recorded);
+    if ("error" in second) throw new Error(second.error);
+    expect(second.repositories?.map((x) => x.branch)).toEqual(["feature/auth", "feature/auth"]);
+    expect(await runCapture(["rev-parse", "HEAD"], path.join(workspace, "frontend"))).toBe(headBefore);
+    expect(second.note).toContain("reusing worktree");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("prepareTaskWorkdir is all-or-nothing: rolls back the good repo and names every failed one", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const good = await makeRepo();
+  const badBase = await makeRepo();
+  const notARepo = mkdtempSync(path.join(tmpdir(), "agetor-wt-notrepo-"));
+  const goodSha = await revParse(good, "HEAD");
+  const task = multiRepoTask(good, [
+    { path: good, name: "frontend", baseRef: goodSha },
+    { path: notARepo, name: "backend", baseRef: null },
+    { path: badBase, name: "infra", baseRef: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const r = await prepareTaskWorkdir(task);
+    expect("error" in r).toBe(true);
+    if (!("error" in r)) return;
+    expect(r.error).toContain("backend");
+    expect(r.error).toContain("infra");
+    expect(existsSync(workspace)).toBe(false);
+    expect(existsSync(path.join(good, ".git"))).toBe(true);
+    // The branch minted in the rolled-back attempt is gone too.
+    expect(await runCapture(["rev-parse", "--verify", "--quiet", "refs/heads/feature/auth"], good)).toBe("");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(good, { recursive: true, force: true });
+    rmSync(badBase, { recursive: true, force: true });
+    rmSync(notARepo, { recursive: true, force: true });
+  }
+});
+
+test("prepareTaskWorkdir falls back to a unique branch when the shared name is held in one repo only", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  // Repo B already has the shared branch checked out in its main worktree.
+  await git(["checkout", "-b", "feature/auth"], b);
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const r = await prepareTaskWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.repositories?.[0]?.branch).toBe("feature/auth");
+    expect(r.repositories?.[1]?.branch).toBe("feature/auth-2");
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], path.join(workspace, "backend"))).toBe("feature/auth-2");
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], path.join(workspace, "frontend"))).toBe("feature/auth");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("getTaskDiff isolates each repository and the blob uses the requested one", async () => {
+  const { getTaskDiff, getTaskDiffBlob, prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const prepared = await prepareTaskWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const started = { ...task, worktreePath: workspace, repositories: prepared.repositories! };
+    writeFileSync(path.join(workspace, "frontend", "front.txt"), "front change\n");
+    writeFileSync(path.join(workspace, "backend", "back.txt"), "back change\n");
+    const front = await getTaskDiff(started, "frontend");
+    expect(front.repo).toBe("frontend");
+    expect(front.files.map((f) => f.path)).toEqual(["front.txt"]);
+    const back = await getTaskDiff(started, "backend");
+    expect(back.repo).toBe("backend");
+    expect(back.files.map((f) => f.path)).toEqual(["back.txt"]);
+    const fallback = await getTaskDiff(started);
+    expect(fallback.repo).toBe("frontend");
+    const unknown = await getTaskDiff(started, "nope");
+    expect(unknown.files).toEqual([]);
+    expect(unknown.note).toContain("Unknown repository");
+    const blob = await getTaskDiffBlob(started, "back.txt", "new", "backend");
+    expect(blob.ok).toBe(true);
+    if (blob.ok) expect(new TextDecoder().decode(blob.bytes)).toBe("back change\n");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("detachWorktree detaches clean repos, keeps a dirty one and its branch", async () => {
+  const { detachWorktree, prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const { existsSync } = await import("node:fs");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const prepared = await prepareTaskWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const started = { ...task, worktreePath: workspace, repositories: prepared.repositories! };
+    writeFileSync(path.join(workspace, "backend", "dirty.txt"), "x\n");
+    const result = await detachWorktree(started);
+    expect(result.removed).toBe(false);
+    expect(result.reason).toBe("dirty");
+    expect(result.repositories?.find((r) => r.name === "frontend")?.result.removed).toBe(true);
+    expect(result.repositories?.find((r) => r.name === "backend")?.result.reason).toBe("dirty");
+    expect(existsSync(path.join(workspace, "frontend"))).toBe(false);
+    expect(existsSync(path.join(workspace, "backend"))).toBe(true);
+    // Both branches survive a detach.
+    expect(await runCapture(["rev-parse", "--verify", "refs/heads/feature/auth"], a)).not.toBe("");
+    expect(await runCapture(["rev-parse", "--verify", "refs/heads/feature/auth"], b)).not.toBe("");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("removeWorktree deletes every repository worktree and branch plus the empty workspace", async () => {
+  const { removeWorktree, prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const { existsSync } = await import("node:fs");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const prepared = await prepareTaskWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const started = { ...task, worktreePath: workspace, repositories: prepared.repositories! };
+    await removeWorktree(started);
+    expect(existsSync(workspace)).toBe(false);
+    expect(await runCapture(["rev-parse", "--verify", "--quiet", "refs/heads/feature/auth"], a)).toBe("");
+    expect(await runCapture(["rev-parse", "--verify", "--quiet", "refs/heads/feature/auth"], b)).toBe("");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("resolveWorktreeRef accepts direct and nested ids and refuses traversal", async () => {
+  const { resolveWorktreeRef, WORKTREES_DIR } = await import("./worktree.ts");
+  const direct = resolveWorktreeRef("abc-123");
+  expect(direct.ok).toBe(true);
+  if (direct.ok) {
+    expect(direct.value.path).toBe(path.join(WORKTREES_DIR, "abc-123"));
+    expect(direct.value.repoName).toBeNull();
+  }
+  const nested = resolveWorktreeRef("abc-123__frontend");
+  expect(nested.ok).toBe(true);
+  if (nested.ok) {
+    expect(nested.value.path).toBe(path.join(WORKTREES_DIR, "abc-123", "frontend"));
+    expect(nested.value.taskId).toBe("abc-123");
+    expect(nested.value.repoName).toBe("frontend");
+  }
+  for (const bad of ["", ".", "..", "../x", "a/b", "a\\b", "abc__", "__x", "abc__..", "abc__x/../../y"]) {
+    expect(resolveWorktreeRef(bad).ok).toBe(false);
+  }
+});

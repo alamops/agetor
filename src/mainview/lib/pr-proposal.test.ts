@@ -466,3 +466,55 @@ describe("review-fix regressions", () => {
     expect(parsePrProposal(text)).toMatchObject({ title: "Heading style", description: "desc" });
   });
 });
+
+describe("multi-repository proposals", () => {
+  const labeled = [
+    "Repository: frontend",
+    LINK,
+    "PR title:",
+    "```",
+    "Add login UI",
+    "```",
+    "PR description:",
+    "````",
+    "Frontend body.",
+    "````",
+    "",
+    "Repository: backend",
+    "https://github.com/acme/backend/pull/new/feature/add-login",
+    "PR title:",
+    "```",
+    "Add login API",
+    "```",
+    "PR description:",
+    "````",
+    "Backend body.",
+    "````",
+  ].join("\n");
+
+  test("parses one proposal per Repository label", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const map = parseRepositoryProposals(labeled);
+    expect([...map.keys()]).toEqual(["frontend", "backend"]);
+    expect(map.get("frontend")?.title).toBe("Add login UI");
+    expect(map.get("frontend")?.description).toBe("Frontend body.");
+    expect(map.get("backend")?.link).toBe("https://github.com/acme/backend/pull/new/feature/add-login");
+  });
+
+  test("tolerates a missing label only when exactly one proposal exists", () => {
+    const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const events = [ev({ data: canonicalText() })];
+    expect([...latestRepositoryProposals(events).keys()]).toEqual([]);
+    expect(latestRepositoryProposals(events, "frontend").get("frontend")?.title).toBe("Add login flow");
+  });
+
+  test("newest run wins and subagent streams are ignored", () => {
+    const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const events = [
+      ev({ runId: "old", data: labeled }),
+      ev({ runId: "new", data: "Repository: frontend\nPR title:\n```\nNewer\n```\nPR description:\n````\nNew body.\n````" }),
+      ev({ runId: "new", subagentId: "s1", data: labeled }),
+    ];
+    expect(latestRepositoryProposals(events).get("frontend")?.title).toBe("Newer");
+  });
+});

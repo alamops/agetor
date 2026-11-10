@@ -167,6 +167,88 @@ export function useProjectFiles(scope: FileScope | null | undefined): {
   return { entries, validPaths, truncated, loading, error, refresh };
 }
 
+/** One repository's scope, tagged with its workspace name (issue #291). */
+export interface NamedFileScope extends FileScope {
+  name: string;
+}
+
+/**
+ * Loads the union of several repository scopes for a multi-repository task's
+ * `@` popover. Each scope keeps its own cache entry (so a single scope still
+ * renders instantly from the shared cache); entries are prefixed with
+ * `<name>/` so `@frontend/src/a.ts` is unambiguous. A single scope returns
+ * exactly what {@link useProjectFiles} would, byte-identical.
+ */
+export function useProjectFileScopes(scopes: NamedFileScope[] | null | undefined): {
+  entries: FileEntry[];
+  validPaths: Set<string>;
+  truncated: boolean;
+  loading: boolean;
+  error: string | null;
+  refresh: () => void;
+} {
+  const multi = (scopes?.length ?? 0) > 1;
+  const key = multi ? scopes!.map((s) => `${s.name}:${cacheKey(s)}`).join("|") : null;
+  const [files, setFiles] = useState<string[]>([]);
+  const [truncated, setTruncated] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [gen, setGen] = useState(0);
+  const requestIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!multi) {
+      setFiles([]);
+      setTruncated(false);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    const list = scopes!;
+    const requestId = ++requestIdRef.current;
+    setLoading(true);
+    void Promise.all(
+      list.map(async (scope) => {
+        const result = await fetchEntry({ dir: scope.dir, ref: scope.ref });
+        return { scope, ...result };
+      }),
+    ).then((results) => {
+      if (requestIdRef.current !== requestId) return;
+      const merged: string[] = [];
+      let anyError: string | null = null;
+      let anyTruncated = false;
+      for (const { scope, entry, error: err } of results) {
+        if (err) {
+          anyError ??= err;
+          // Keep whatever this scope last cached so a transient failure
+          // doesn't blank a repository that was listing fine a moment ago.
+          const cached = cache.get(cacheKey(scope));
+          if (cached) merged.push(...cached.files.map((f) => `${scope.name}/${f}`));
+          if (cached?.truncated) anyTruncated = true;
+          continue;
+        }
+        merged.push(...entry.files.map((f) => `${scope.name}/${f}`));
+        if (entry.truncated) anyTruncated = true;
+      }
+      setFiles(merged);
+      setTruncated(anyTruncated);
+      setError(anyError);
+      setLoading(false);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, gen]);
+
+  const refresh = useCallback(() => {
+    if (!multi) return;
+    for (const scope of scopes!) clearSearchCacheForScope({ dir: scope.dir, ref: scope.ref });
+    setGen((g) => g + 1);
+  }, [multi, key]);
+
+  const entries = useMemo(() => buildFileEntries(files), [files]);
+  const validPaths = useMemo(() => new Set(entries.map((e) => e.path)), [entries]);
+  return { entries, validPaths, truncated, loading, error, refresh };
+}
+
 // ---------------------------------------------------------------------------
 // searchProjectFiles — server-side full-depth search, for when a scope's base
 // listing (above) came back `truncated` (a monorepo past `MAX_PROJECT_FILES`,

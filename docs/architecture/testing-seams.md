@@ -18,3 +18,7 @@ It models the inbox the r3 spike recorded (`docs/plans/opencode-server-driver-sp
 `AGETOR_OPENCODE_TRANSPORT=run` forces the legacy `opencode run` driver, and `AGETOR_OPENCODE_DRIVER=fake` keeps its canned-NDJSON path.
 A test that runs the real driver must restore every one of these env vars, since `bun test` shares one process, and should set `FAKE_OC_HEARTBEAT_MS` well under the driver's 45 s stall watchdog (about 2 s) and wait on events rather than sleeping to prove something did not happen.
 
+
+## Multiple repositories in one task
+
+A task created against two or more repositories stores `Task.repositories[]` and runs at a per-task workspace root with one linked worktree per repository. Preparation, the `Repositories:` launch block, per-repo diff/status/PR, per-repo teardown, nested worktree ids and the CLI/TUI surfaces are specified in [multi-repo-tasks.md](multi-repo-tasks.md). A single-repository task is unchanged (its one entry is derived from the scalar columns).

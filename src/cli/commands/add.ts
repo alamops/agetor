@@ -69,6 +69,8 @@ interface AddOpts {
    *  one-line notice. */
   opencodeServerIgnored?: boolean;
   workdir?: string;
+  /** `--repo <path[=ref]>`, repeatable (issue #291). */
+  repos: { path: string; baseRef?: string }[];
   isolation?: "worktree" | "none";
   baseRef?: string;
   type?: string;
@@ -93,7 +95,7 @@ interface AddOpts {
 }
 
 export function parseAdd(args: string[]): AddOpts {
-  const o: AddOpts = { refs: [] };
+  const o: AddOpts = { refs: [], repos: [] };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
@@ -112,6 +114,16 @@ export function parseAdd(args: string[]): AddOpts {
       case "--no-max-mode": o.maxMode = false; break;
       case "--opencode-server": o.opencodeServerIgnored = parseOpencodeServerFlag(val()); break;
       case "--workdir": o.workdir = val(); break;
+      case "--repo": {
+        const raw = val();
+        const eq = raw.lastIndexOf("=");
+        // `<path>=<ref>` — a path containing `=` still works when the suffix
+        // after the last `=` is a ref the server can resolve; ambiguous cases
+        // are the user's to quote differently.
+        if (eq > 0) o.repos.push({ path: raw.slice(0, eq), baseRef: raw.slice(eq + 1) || undefined });
+        else o.repos.push({ path: raw });
+        break;
+      }
       case "--isolation": o.isolation = val() === "none" ? "none" : "worktree"; break;
       case "--base-ref": o.baseRef = val(); break;
       case "--type": o.type = val(); break;
@@ -478,7 +490,18 @@ function baseInput(
     // `--workdir`-flagged relative path lands on disk where the user meant,
     // matching `projects add`'s path.resolve(target).
     workdir: o.workdir ? path.resolve(o.workdir) : o.workdir,
-    isolation: o.isolation,
+    ...(o.repos.length > 0
+      ? {
+          repositories: o.repos.map((r) => ({
+            path: path.resolve(r.path),
+            ...(r.baseRef ? { baseRef: r.baseRef } : {}),
+          })),
+          // Multi-repository tasks require worktree isolation; 2+ repos force
+          // it so a `--isolation none` combination can't reach the server's
+          // 400.
+          isolation: o.repos.length > 1 ? ("worktree" as const) : o.isolation,
+        }
+      : { isolation: o.isolation }),
     baseRef: o.baseRef,
     taskType: o.type,
     references: resolveRefs(o.refs),

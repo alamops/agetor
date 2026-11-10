@@ -641,6 +641,7 @@ describe("path-valued fields (D24)", () => {
       "GET /agent-discovery: query.workdir(exists)",
       "GET /files/index: query.dir(exists)",
       "GET /projects/branches: query.path(exists)",
+      "GET /projects/repo-root: query.path(exists)",
       "PATCH /harnesses/:id: body.home(nearest-ancestor), body.bin(exists)",
       "PATCH /tasks/:id: body.workdir(exists)",
       "POST /harnesses: body.home(nearest-ancestor), body.bin(exists)",
@@ -649,7 +650,7 @@ describe("path-valued fields (D24)", () => {
       "POST /projects/fetch: body.path(exists)",
       "POST /projects/pull: body.path(exists)",
       "POST /projects/push: body.path(exists)",
-      "POST /tasks: body.workdir(exists)",
+      "POST /tasks: body.workdir(exists), body.repositories(exists)",
     ].sort());
     // Every /github/* route except the token store takes a repo directory.
     const github = declared.filter((d) => d.includes(" /github/"));
@@ -926,6 +927,63 @@ describe("applyRoutePolicy: path gate (D24)", () => {
       "exists:/p",
       "nearest-ancestor:/d/new",
     ]);
+  });
+
+  it("gates an array of objects through itemField (POST /tasks repositories[].path)", async () => {
+    const calls: GateCall[] = [];
+    const table = {
+      "/tasks": {
+        POST: {
+          ...CLI_POLICY,
+          pathParams: [
+            { in: "body", name: "workdir", mode: "exists" },
+            { in: "body", name: "repositories", mode: "exists", itemField: "path" },
+          ] as PathParam[],
+        },
+      },
+    };
+    const routes = { "/tasks": { POST: ok("created") } };
+    const w = applyRoutePolicy(routes, makeOpts({ calls, policy: table }));
+    const res = await call(
+      w["/tasks"].POST,
+      req("http://x/tasks", {
+        method: "POST",
+        token: CLI_TOKEN,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          workdir: "/w",
+          repositories: [{ path: "/a", baseRef: "main" }, { path: "/b" }, { nope: 1 }, null],
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(calls.map((c) => c.p).sort()).toEqual(["/a", "/b", "/w"]);
+  });
+
+  it("refuses a CLI POST /tasks whose repository path is protected", async () => {
+    const table = {
+      "/tasks": {
+        POST: {
+          ...CLI_POLICY,
+          pathParams: [{ in: "body", name: "repositories", mode: "exists", itemField: "path" }] as PathParam[],
+        },
+      },
+    };
+    const w = applyRoutePolicy({ "/tasks": { POST: ok("created") } }, makeOpts({
+      refuse: (p) => p === "/protected",
+      policy: table,
+    }));
+    const res = await call(
+      w["/tasks"].POST,
+      req("http://x/tasks", {
+        method: "POST",
+        token: CLI_TOKEN,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repositories: [{ path: "/protected" }] }),
+      }),
+    );
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "blocked /protected", code: "path-not-accessible" });
   });
 
   it("the handler still reads the body after the gate (the walker only reads a clone)", async () => {

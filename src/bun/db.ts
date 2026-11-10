@@ -11,6 +11,8 @@ import { isHarnessStackContinuation } from "../shared/harness-stack.ts";
 import { normalizeDeliveredUserText } from "../shared/user-message.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
+import { repoNameForPath } from "../shared/multi-repo.ts";
+import type { TaskRepository } from "../shared/types.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { decideForwardResume, type ForwardResumeSnapshotReason } from "./event-resume.ts";
@@ -143,6 +145,14 @@ type TaskRow = {
   // `tasks.setCheckoutBranch`'s targeted UPDATE, never by the generic
   // `update` SET clause below — same rationale as `sent_files`/`fx_recovery`.
   checkout_branch: string | null;
+  // Multi-repository task support (migration 087, issue #291):
+  // `repositories` is `TaskRepository[]` JSON — `'[]'` for a single-repo row,
+  // whose one entry `toTask` derives from the scalar columns. Written by
+  // `tasks.insert` (create time) and `tasks.setRepositories` (after worktree
+  // preparation) only; skipped by the generic `update` SET clause.
+  // `issue_repo_path` names the repository whose remote matches `issue_url`.
+  repositories: string;
+  issue_repo_path: string | null;
   // Provenance for a Claude Code session imported from outside Agetor
   // (migration 068). Written exclusively by `tasks.setImportedClaude`, never
   // by `tasks.insert` (new rows stay NULL) or the generic `update` SET
@@ -999,7 +1009,58 @@ function parseImportedOpencode(raw: string | null | undefined): ImportedOpencode
 const readOpencodeServer = (raw: unknown): OpencodeServerMode =>
   (OPENCODE_SERVER_MODES as readonly unknown[]).includes(raw) ? (raw as OpencodeServerMode) : "shared";
 
-const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
+/**
+ * Parse a `tasks.repositories` column into a validated `TaskRepository[]`.
+ * Anything malformed (not JSON, not an array, an entry missing `path`) reads
+ * as `[]` — the caller then derives the single-repository entry from the
+ * scalar columns, so a corrupted column can never crash a board poll. Values
+ * are re-read defensively because this column is server-managed but still
+ * lives in a user-editable SQLite file.
+ */
+const parseTaskRepositories = (raw: unknown): TaskRepository[] => {
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: TaskRepository[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object") continue;
+    const o = entry as Record<string, unknown>;
+    if (typeof o.path !== "string" || o.path.length === 0) continue;
+    if (typeof o.name !== "string" || o.name.length === 0) continue;
+    out.push({
+      path: o.path,
+      name: o.name,
+      branch: typeof o.branch === "string" ? o.branch : null,
+      branchSource: o.branchSource === "existing" ? "existing" : "created",
+      worktreePath: typeof o.worktreePath === "string" ? o.worktreePath : null,
+      baseRef: typeof o.baseRef === "string" ? o.baseRef : null,
+      checkoutBranch: typeof o.checkoutBranch === "string" ? o.checkoutBranch : null,
+      prUrl: typeof o.prUrl === "string" ? o.prUrl : null,
+    });
+  }
+  return out;
+};
+
+/** The one-entry repository array a single-repository row derives. */
+const derivedRepository = (r: TaskRow): TaskRepository => ({
+  path: r.workdir,
+  name: repoNameForPath(r.workdir),
+  branch: r.branch,
+  branchSource: r.branch_source === "existing" ? "existing" : "created",
+  worktreePath: r.worktree_path,
+  baseRef: r.base_ref,
+  checkoutBranch: r.checkout_branch ?? null,
+  prUrl: r.pr_url,
+});
+
+const toTask = (r: TaskRow, counts?: TaskCounts): Task => {
+  const storedRepositories = parseTaskRepositories(r.repositories);
+  return {
   id: r.id,
   title: r.title,
   prompt: r.prompt,
@@ -1042,6 +1103,11 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   pipelineStepId: r.pipeline_step_id ?? null,
   harnessState: parseTaskHarnessState(r.harness_state),
   checkoutBranch: r.checkout_branch ?? null,
+  // Multi-repository rows keep their stored set; every single-repository row
+  // (and every legacy row, whose column is `'[]'`) derives exactly one entry
+  // from the scalar columns so callers never branch on `undefined`.
+  repositories: storedRepositories.length > 1 ? storedRepositories : [derivedRepository(r)],
+  issueRepoPath: r.issue_repo_path ?? null,
   importedClaude: parseImportedClaude(r.imported_claude),
   importedOpencode: parseImportedOpencode(r.imported_opencode),
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
@@ -1056,7 +1122,8 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
-});
+  };
+};
 
 /** Send and Retry use this when another task holds the session claim.
  *  A duplicate import's losing row still has `importedClaude` after the
@@ -1212,9 +1279,10 @@ export const tasks = {
           agent_profile_id, agent_profile,
           pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
           checkout_branch,
+          repositories, issue_repo_path,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -1232,6 +1300,10 @@ export const tasks = {
         t.pipelineParentId ?? null,
         t.pipelineStepId ?? null,
         t.checkoutBranch ?? null,
+        // Multi-repo rows store their set; single-repo rows store '[]' and
+        // `toTask` derives the one entry from the scalar columns above.
+        JSON.stringify(t.repositories && t.repositories.length > 1 ? t.repositories : []),
+        t.issueRepoPath ?? null,
         // A brand-new task has never had an assistant event or a mark-seen
         // — both start NULL, which `toTask` reads as `unread: false`.
         null, null,
@@ -1241,7 +1313,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, opencodeServer: readOpencodeServer(t.opencodeServer), importedClaude: null, importedOpencode: null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, repositories: t.repositories ?? [], issueRepoPath: t.issueRepoPath ?? null, opencodeServer: readOpencodeServer(t.opencodeServer), importedClaude: null, importedOpencode: null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   /** `fast` is excluded from the patch type: it is only the derived echo of
    *  `speed` (the column migration 072 dropped), so a caller changes the tier
@@ -1643,6 +1715,64 @@ export const tasks = {
         );
       }
     })();
+  },
+  /**
+   * Replace a task's pinned repository set (migration 087, issue #291) in one
+   * targeted `UPDATE` — same pattern as `setCheckoutBranch` above: no
+   * `updated_at` bump (the set is server-managed state) and it bypasses the
+   * generic `update`'s SET clause entirely. Used at create time and after
+   * worktree preparation to persist the materialized paths/branches. A set of
+   * one entry stores `'[]'` on purpose, so a single-repository row keeps
+   * deriving its entry from the scalar columns (which the caller updates
+   * separately). An unknown id matches zero rows.
+   */
+  setRepositories(taskId: string, repos: TaskRepository[]): Task | null {
+    const stored = repos.length > 1 ? repos : [];
+    db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(stored), taskId]);
+    return this.get(taskId);
+  },
+  /**
+   * Stamp one multi-repository task's entry with the PR URL opened for it.
+   * First write wins: an entry that already has a `prUrl` is never
+   * overwritten, so a second "Create PR" click can't lose the durable link.
+   * `selector` matches by workspace name, selected path or worktree path.
+   * No-op (returns the current row) for a single-repository task — its
+   * `prUrl` scalar is written by the ordinary path. Never bumps `updated_at`.
+   */
+  setRepositoryPrUrl(taskId: string, selector: string, prUrl: string): Task | null {
+    const cur = this.get(taskId);
+    if (!cur) return null;
+    const repos = cur.repositories ?? [];
+    if (repos.length <= 1) return cur;
+    let changed = false;
+    const next = repos.map((r) => {
+      const matches = r.name === selector || r.path === selector || r.worktreePath === selector;
+      if (!matches || r.prUrl) return r;
+      changed = true;
+      return { ...r, prUrl };
+    });
+    if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(next), taskId]);
+    return this.get(taskId) ?? cur;
+  },
+  /**
+   * Record the branch last observed checked out in one multi-repository
+   * worktree (`tasks.repositories[].checkoutBranch`), by workspace name.
+   * Same targeted-UPDATE, no-`updated_at` contract as `setCheckoutBranch`;
+   * compare-then-write so an unchanged observation never churns the row.
+   */
+  setRepositoryCheckout(taskId: string, repoName: string, value: string | null): Task | null {
+    const cur = this.get(taskId);
+    if (!cur) return null;
+    const repos = cur.repositories ?? [];
+    if (repos.length <= 1) return cur;
+    let changed = false;
+    const next = repos.map((r) => {
+      if (r.name !== repoName || r.checkoutBranch === value) return r;
+      changed = true;
+      return { ...r, checkoutBranch: value };
+    });
+    if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(next), taskId]);
+    return this.get(taskId) ?? cur;
   },
   /**
    * Bind (or detach, when both arguments are `null`) a task's agent profile

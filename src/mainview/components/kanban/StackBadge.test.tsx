@@ -107,7 +107,9 @@ describe("StackBadge", () => {
   test("a one-account stack whose account is cooling says so without a position", () => {
     const markup = html({ state: { position: 0, count: 1 }, coolingUntilMs: Date.now() + 60_000 });
     expect(markup).toContain("cooling");
-    expect(markup).not.toContain("1/1");
+    // Assert the rendered POSITION label, not the bare "1/1" substring: the
+    // localized date in the title can itself contain "1/1" (e.g. 11/10).
+    expect(markup).not.toContain(">1/1<");
     expect(markup).not.toContain("Account 1 of 1");
   });
 

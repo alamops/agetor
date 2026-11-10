@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, rmSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -8,8 +8,9 @@ import { readTextNoFollow } from "./no-follow.ts";
 import { readFileBytes } from "./core-file-read.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
-import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
+import type { BranchInfo, Task, TaskDiff, TaskRepository, WorktreeTeardownResult } from "../shared/types.ts";
 import { MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
+import { lexicallyInsideRoot } from "./task-repos.ts";
 
 export type { BranchInfo };
 
@@ -843,6 +844,66 @@ export function worktreePath(task: Task): string {
   return path.join(WORKTREES_DIR, task.id);
 }
 
+/** The `GET /worktrees` row id for one repository of a multi-repo task. */
+export function worktreeIdForRepo(taskId: string, repoName: string): string {
+  return `${taskId}__${repoName}`;
+}
+
+/** A single path segment that is safe to join onto a trusted root. */
+function isSafeSegment(segment: string): boolean {
+  return (
+    segment.length > 0
+    && segment !== "."
+    && segment !== ".."
+    && !segment.includes("/")
+    && !segment.includes("\\")
+    && path.basename(segment) === segment
+  );
+}
+
+export interface ResolvedWorktreeRef {
+  /** Absolute path of the worktree directory. */
+  path: string;
+  /** Owning task id (parsed from a nested `<taskId>__<slug>` id too). */
+  taskId: string;
+  /** Repository slug for a nested id, else null. */
+  repoName: string | null;
+}
+
+/**
+ * The single id-to-path guard for `DELETE /worktrees/:id` and
+ * `GET /worktrees/:id/git-status` (issue #291). Accepts either a direct child
+ * id (`<taskId>`, today's layout) or a nested multi-repo id
+ * (`<taskId>__<slug>`). Every segment must be non-empty, not `.`/`..`, free of
+ * `/` and `\`, and equal its own basename; the final path must be a direct
+ * child of its parent, and the parent a direct child of `WORKTREES_DIR`. Any
+ * violation is refused rather than normalized.
+ */
+export function resolveWorktreeRef(
+  id: string,
+): { ok: true; value: ResolvedWorktreeRef } | { ok: false; error: string } {
+  if (!isSafeSegment(id)) return { ok: false, error: "invalid worktree id" };
+  const sepAt = id.indexOf("__");
+  if (sepAt < 0) {
+    const full = path.join(WORKTREES_DIR, id);
+    if (path.dirname(full) !== WORKTREES_DIR) return { ok: false, error: "invalid worktree id" };
+    return { ok: true, value: { path: full, taskId: id, repoName: null } };
+  }
+  const taskId = id.slice(0, sepAt);
+  const repoName = id.slice(sepAt + 2);
+  // Task ids are UUIDs and never contain an underscore, so the first `__` is
+  // the unambiguous boundary even when the slug itself contains `__`.
+  if (!isSafeSegment(taskId) || !isSafeSegment(repoName)) {
+    return { ok: false, error: "invalid worktree id" };
+  }
+  const parent = path.join(WORKTREES_DIR, taskId);
+  const full = path.join(parent, repoName);
+  if (path.dirname(parent) !== WORKTREES_DIR || path.dirname(full) !== parent) {
+    return { ok: false, error: "invalid worktree id" };
+  }
+  return { ok: true, value: { path: full, taskId, repoName } };
+}
+
 /** A `.git` pointer file is one `gitdir: <path>` line; anything bigger is not one. */
 const GIT_POINTER_MAX_BYTES = 8 * 1024;
 
@@ -914,6 +975,12 @@ export interface PreparedWorkdir {
    * worktree came back on `task.branch` instead.
    */
   warning?: string;
+  /**
+   * For a multi-repository task, the materialized entries (each with its
+   * branch/worktree/baseRef). `cwd` is the task workspace root. Absent for a
+   * single-repository task.
+   */
+  repositories?: TaskRepository[];
 }
 
 /**
@@ -999,18 +1066,74 @@ export async function prepareWorkdir(
   const wt = worktreePath(task);
   // Branch name: pinned at create time (task.branch is set by createTask for
   // worktree-isolation tasks). Fall back to computing it for legacy rows
-  // created before the pinning was added. `let` because a create-time
-  // uniqueness race may force us to re-pin below.
-  let branch = task.branch ?? branchName(task);
-  // Pinned base sha if set on the task; otherwise use HEAD at start time.
-  // The sha makes the start state sticky across re-runs even when HEAD moves.
-  const base = task.baseRef ?? "HEAD";
+  // created before the pinning was added.
+  return prepareRepoWorktree({
+    root,
+    worktreePath: wt,
+    branch: task.branch ?? branchName(task),
+    branchSource: task.branchSource,
+    baseRef: task.baseRef,
+    recordedCheckout: task.checkoutBranch ?? null,
+    takenBranches: opts?.takenBranches ?? new Set(),
+    reattach: Boolean(task.worktreePath),
+    fetchExisting: true,
+  });
+}
+
+/** Inputs for {@link prepareRepoWorktree} — the body of `prepareWorkdir`'s
+ *  creation path, extracted so a multi-repository task can run it once per
+ *  repository (issue #291). */
+export interface PrepareRepoWorktreeArgs {
+  /** The source repo's git top-level. */
+  root: string;
+  /** The linked-worktree directory to create (`<workspace>/<slug>`). */
+  worktreePath: string;
+  /** The branch to attempt first (a create-time collision may re-pin it). */
+  branch: string;
+  branchSource: "created" | "existing";
+  /** Pinned base sha, or null to use the repo's HEAD. */
+  baseRef: string | null;
+  /** The branch agetor last recorded for this worktree, if any. */
+  recordedCheckout: string | null;
+  /** Branch names pinned on other tasks, to avoid a collision-recovery steal. */
+  takenBranches: Set<string>;
+  /**
+   * True when this worktree materialized before (the task/worktree entry has a
+   * path). Disables collision recovery: a re-attach failure must stay a hard
+   * error so a previous run's commits are never silently orphaned.
+   */
+  reattach: boolean;
+  /** Fetch a `branchSource: "existing"` branch from origin first (single-repo). */
+  fetchExisting?: boolean;
+}
+
+export interface PreparedRepoWorktree extends PreparedWorkdir {
+  branch: string;
+  /** True when THIS call minted the branch (safe to delete on rollback). */
+  createdBranch: boolean;
+}
+
+/**
+ * Materialize ONE repository's linked worktree at `worktreePath` using
+ * `branch`, restoring the recorded checkout when it still exists and falling
+ * back to the shared branch name. This is today's `prepareWorkdir` creation
+ * body, parameterized so the multi-repository path reuses exactly the same
+ * reuse/drift/re-attach/collision semantics per repository.
+ */
+export async function prepareRepoWorktree(
+  args: PrepareRepoWorktreeArgs,
+): Promise<PreparedRepoWorktree | PrepareError> {
+  const { root, worktreePath: wt, branchSource, baseRef, recordedCheckout, takenBranches, reattach } = args;
+  let branch = args.branch;
+  // Pinned base sha if set; otherwise use HEAD at start time. The sha makes
+  // the start state sticky across re-runs even when HEAD moves.
+  const base = baseRef ?? "HEAD";
 
   // For a task pinned to a pre-existing branch (e.g. a PR's head branch),
   // refresh it from origin before deciding how to materialize the worktree —
   // best-effort, since the branch may already be present locally with no
-  // remote at all.
-  if (task.branchSource === "existing") {
+  // remote at all. Multi-repo entries are always `"created"` in v1.
+  if (branchSource === "existing" && args.fetchExisting !== false) {
     await fetchBranch(root, branch);
   }
 
@@ -1031,11 +1154,12 @@ export async function prepareWorkdir(
   // `task.branch` from base would bring the worktree back without it). When the
   // recorded branch is missing or the attach fails (say it is checked out
   // elsewhere), fall back to the task branch and say so via `warning`.
-  const recorded = task.checkoutBranch ?? null;
+  const recorded = recordedCheckout;
   const wantsRecorded = recorded !== null && recorded !== branch;
   const recordedExists = wantsRecorded
     && (await git(["rev-parse", "--verify", "--quiet", `refs/heads/${recorded}`], root, 5_000)).ok;
   let restoredOn: string | null = null;
+  let createdBranch = false;
   const warnings: string[] = [];
   let created: GitResult | null = null;
   if (recordedExists) {
@@ -1047,7 +1171,7 @@ export async function prepareWorkdir(
       // refreshes the remote-tracking ref, never a local one), so a missing
       // local ref alone doesn't mean the task branch is gone.
       if (!branchExists) {
-        const onOrigin = task.branchSource === "existing"
+        const onOrigin = branchSource === "existing"
           && (await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`], root, 5_000)).ok;
         if (!onOrigin) warnings.push(`task branch ${branch} no longer exists — restored on ${recorded}`);
       }
@@ -1061,18 +1185,19 @@ export async function prepareWorkdir(
   if (!created) {
     if (branchExists) {
       created = await git(["worktree", "add", wt, branch], root);
-    } else if (task.branchSource === "existing") {
+    } else if (branchSource === "existing") {
       created = await git(["worktree", "add", "--track", "-b", branch, wt, `origin/${branch}`], root);
     } else {
       // A re-attach (the task materialized before) whose branch was deleted by
       // hand: the branch comes back fresh from base, without the previous
       // run's commits — say so rather than let it pass silently.
-      if (task.worktreePath) warnings.push(`task branch ${branch} no longer exists — recreated it from ${base === "HEAD" ? "HEAD" : base.slice(0, 7)}`);
+      if (reattach) warnings.push(`task branch ${branch} no longer exists — recreated it from ${base === "HEAD" ? "HEAD" : base.slice(0, 7)}`);
       created = await git(["worktree", "add", "-b", branch, wt, base], root);
+      if (created.ok) createdBranch = true;
     }
   }
 
-  // Collision recovery — ONLY on a first materialization (`!task.worktreePath`).
+  // Collision recovery — ONLY on a first materialization (`!reattach`).
   //
   // Branch names are pinned at create time but only materialized here, so two
   // tasks that computed the same name (a create-time uniqueness race — neither
@@ -1085,7 +1210,7 @@ export async function prepareWorkdir(
   // Rather than fail the run, pin a fresh unique variant off the base. The
   // re-pinned name flows back via the returned `branch`; startTask persists it.
   //
-  // The `!task.worktreePath` gate is load-bearing. Once a task HAS materialized,
+  // The `!reattach` gate is load-bearing. Once a task HAS materialized,
   // `task.branch` is ours and may hold the previous run's commits; we reach this
   // code again only when the worktree dir was deleted, and the `worktree add`
   // above is a deliberate *re-attach* that preserves those commits (see the `-B`
@@ -1104,23 +1229,24 @@ export async function prepareWorkdir(
   // collision there (branch checked out elsewhere) surfaces as a hard error.
   if (
     !created.ok &&
-    !task.worktreePath &&
-    task.branchSource !== "existing" &&
+    !reattach &&
+    branchSource !== "existing" &&
     isBranchNameTakenError(`${created.stderr}\n${created.stdout}`)
   ) {
-    const unique = await ensureUniqueBranch(root, branch, opts?.takenBranches ?? new Set());
+    const unique = await ensureUniqueBranch(root, branch, takenBranches);
     if (unique !== branch) {
       const retry = await git(["worktree", "add", "-b", unique, wt, base], root);
       if (retry.ok) {
         branch = unique;
         created = retry;
+        createdBranch = true;
       }
     }
   }
 
   if (!created.ok) {
     const detail = created.stderr || created.stdout;
-    if (task.branchSource === "existing") {
+    if (branchSource === "existing") {
       const used = /already used by worktree at '?([^'\n]+)'?/.exec(detail);
       if (used) {
         return {
@@ -1142,11 +1268,12 @@ export async function prepareWorkdir(
       note: `restored worktree at ${wt} on ${restoredOn} (task branch ${branch})`,
       checkoutBranch: restoredOn,
       checkoutKnown: true,
+      createdBranch,
       ...(warning ? { warning } : {}),
     };
   }
 
-  const baseLabel = task.baseRef ? `base: ${task.baseRef.slice(0, 7)}` : `base: ${root} HEAD`;
+  const baseLabel = baseRef ? `base: ${baseRef.slice(0, 7)}` : `base: ${root} HEAD`;
   return {
     cwd: wt,
     branch,
@@ -1154,8 +1281,188 @@ export async function prepareWorkdir(
     note: `created worktree at ${wt} on ${branch} (${baseLabel})`,
     checkoutBranch: branch,
     checkoutKnown: true,
+    createdBranch,
     ...(warning ? { warning } : {}),
   };
+}
+
+/** How many repositories prepare/teardown in parallel per task. */
+export const MULTI_REPO_CONCURRENCY = 4;
+
+/** Bounded `Promise.all` — runs at most `limit` calls at once, preserving order. */
+async function mapBounded<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i]!, i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/**
+ * Materialize a task's working directory. A single-repository task (or a
+ * legacy row, whose `repositories` has one derived entry) delegates to
+ * {@link prepareWorkdir} unchanged, so its behavior is byte-identical. A
+ * multi-repository task gets a per-task workspace root
+ * (`<WORKTREES_DIR>/<task-id>`) with one linked worktree per repository
+ * (`<workspace>/<slug>`) and returns the workspace as `cwd`.
+ *
+ * All-or-nothing: every repository is attempted (at most
+ * {@link MULTI_REPO_CONCURRENCY} at a time) so one failure doesn't hide the
+ * others; if any fails, worktrees and branches created in THIS attempt are
+ * removed, any pre-existing/reused ones are left alone, and the returned error
+ * names every failed repository. `takenBranches` is keyed by source git root.
+ */
+export async function prepareTaskWorkdir(
+  task: Task,
+  opts?: { takenBranches?: Map<string, Set<string>> },
+): Promise<PrepareResult> {
+  const repos = task.repositories ?? [];
+  if (repos.length <= 1) {
+    // Preserve the single-repo contract exactly: `takenBranches` was a global
+    // set before the repository dimension existed, so fold every root's set.
+    const taken = new Set<string>();
+    for (const set of opts?.takenBranches?.values() ?? []) for (const b of set) taken.add(b);
+    return prepareWorkdir(task, { takenBranches: taken });
+  }
+  if (task.isolation !== "worktree") {
+    return { error: "multi-repository tasks require worktree isolation" };
+  }
+
+  const workspace = worktreePath(task);
+  mkdirSync(workspace, { recursive: true });
+
+  interface Attempt {
+    repo: TaskRepository;
+    createdHere: boolean;
+    result: PreparedRepoWorktree | PrepareError;
+    root: string | null;
+  }
+
+  const attempts = await mapBounded(repos, MULTI_REPO_CONCURRENCY, async (repo): Promise<Attempt> => {
+    const root = await repoRoot(repo.path);
+    if (!root) {
+      return {
+        repo,
+        createdHere: false,
+        root: null,
+        result: { error: `"${repo.path}" is not inside a git repository` },
+      };
+    }
+    const target = path.join(workspace, repo.name);
+    if (path.dirname(target) !== workspace || !lexicallyInsideRoot(workspace, target)) {
+      return {
+        repo,
+        createdHere: false,
+        root,
+        result: { error: `invalid workspace name "${repo.name}"` },
+      };
+    }
+    const branch = repo.branch ?? task.branch ?? branchName(task);
+
+    // Reuse an existing worktree exactly like the single-repo path: report the
+    // live checkout, never check out or create anything.
+    if (repo.worktreePath && existsSync(repo.worktreePath)) {
+      const live = await readCheckoutBranch(repo.worktreePath);
+      const checkoutBranch = live.ok ? live.branch : null;
+      let where: string;
+      if (!live.ok) where = `on ${branch}`;
+      else if (checkoutBranch === null) where = `(detached HEAD; task branch ${branch})`;
+      else if (checkoutBranch !== branch) where = `on ${checkoutBranch} (task branch ${branch})`;
+      else where = `on ${branch}`;
+      return {
+        repo,
+        createdHere: false,
+        root,
+        result: {
+          cwd: repo.worktreePath,
+          branch,
+          worktreePath: repo.worktreePath,
+          note: `reusing worktree at ${repo.worktreePath} ${where}`,
+          checkoutBranch,
+          checkoutKnown: live.ok,
+          createdBranch: false,
+        },
+      };
+    }
+
+    const result = await prepareRepoWorktree({
+      root,
+      worktreePath: target,
+      branch,
+      branchSource: repo.branchSource ?? "created",
+      baseRef: repo.baseRef,
+      recordedCheckout: repo.checkoutBranch ?? null,
+      takenBranches: opts?.takenBranches?.get(repo.path) ?? new Set(),
+      reattach: Boolean(repo.worktreePath),
+      fetchExisting: false,
+    });
+    return { repo, createdHere: !repo.worktreePath, root, result };
+  });
+
+  const failures = attempts.filter((a) => "error" in a.result);
+  if (failures.length > 0) {
+    // Roll back only what THIS attempt created (a rolled-back branch is one we
+    // just minted, so deleting it can't lose the user's work). Best-effort,
+    // async, and ordered so two repos never race each other into a deadlock.
+    await mapBounded(attempts, MULTI_REPO_CONCURRENCY, async (a) => {
+      if (!a.createdHere || !a.root || "error" in a.result) return;
+      const wt = a.result.worktreePath ?? path.join(workspace, a.repo.name);
+      const branch = a.result.createdBranch ? a.result.branch : null;
+      await git(["worktree", "remove", "--force", wt], a.root);
+      if (branch) await git(["branch", "-D", branch], a.root);
+      await git(["worktree", "prune"], a.root, 10_000);
+    });
+    removeDirIfEmpty(workspace);
+    return {
+      error: `could not prepare ${failures.length} of ${repos.length} repositories:\n${failures
+        .map((f) => `- ${f.repo.name} (${f.repo.path}): ${("error" in f.result && f.result.error) || "unknown error"}`)
+        .join("\n")}`,
+    };
+  }
+
+  const preparedEntries: TaskRepository[] = [
+    ...attempts.map((a) => {
+      const res = a.result as PreparedRepoWorktree;
+      return {
+        ...a.repo,
+        branch: res.branch,
+        worktreePath: res.worktreePath ?? path.join(workspace, a.repo.name),
+        checkoutBranch: res.checkoutKnown ? res.checkoutBranch : a.repo.checkoutBranch,
+      };
+    }),
+  ];
+  const warnings = attempts
+    .map((a) => (a.result as PreparedRepoWorktree).warning)
+    .filter((w): w is string => Boolean(w));
+  const notes = attempts.map((a) => (a.result as PreparedRepoWorktree).note);
+  return {
+    cwd: workspace,
+    branch: null,
+    worktreePath: workspace,
+    note: `workspace ${workspace} — ${notes.join("; ")}`,
+    checkoutBranch: null,
+    checkoutKnown: false,
+    repositories: preparedEntries,
+    ...(warnings.length > 0 ? { warning: warnings.join("; ") } : {}),
+  };
+}
+
+/** Remove `dir` only when it exists and is empty (never a recursive wipe). */
+function removeDirIfEmpty(dir: string): void {
+  try {
+    if (existsSync(dir) && existsSync(dir) && lstatSync(dir).isDirectory()) {
+      const entries = readdirSync(dir);
+      if (entries.length === 0) rmdirSync(dir);
+    }
+  } catch {
+    /* best-effort */
+  }
 }
 
 // Process at most this many newly-created (untracked) files. Each costs a
@@ -1174,13 +1481,34 @@ const MAX_UNTRACKED = 200;
  * Returns a friendly `note` (and empty `files`) when there's nothing to show.
  * Never throws.
  */
-export async function getTaskDiff(task: Task): Promise<TaskDiff> {
+export async function getTaskDiff(task: Task, repoName?: string | null): Promise<TaskDiff> {
   let cwd: string;
   let base: string;
   let shortBase: string | null;
   let emptyNote: string;
+  let repo: string | null = null;
 
-  if (task.isolation === "worktree") {
+  if ((task.repositories?.length ?? 0) > 1) {
+    const repos = task.repositories!;
+    const entry = repoName ? repos.find((r) => r.name === repoName) : repos[0];
+    if (!entry) {
+      return { base: null, files: [], note: `Unknown repository "${repoName}".`, repo: repoName ?? null };
+    }
+    repo = entry.name;
+    const entryPath = entry.worktreePath ?? path.join(worktreePath(task), entry.name);
+    if (!existsSync(entryPath)) {
+      return {
+        base: null,
+        files: [],
+        repo,
+        note: "This repository hasn't created a worktree yet — run the task to see its changes here.",
+      };
+    }
+    cwd = entryPath;
+    base = entry.baseRef ?? "HEAD";
+    shortBase = entry.baseRef ? entry.baseRef.slice(0, 7) : null;
+    emptyNote = "No changes yet — the worktree matches its base.";
+  } else if (task.isolation === "worktree") {
     if (!task.worktreePath || !existsSync(task.worktreePath)) {
       return { base: null, files: [], note: "This task hasn't created a worktree yet — run it to see its changes here." };
     }
@@ -1208,7 +1536,7 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
   // Tracked changes (committed + working-tree) vs the base.
   const tracked = await git(["diff", "--no-color", base], cwd);
   if (!tracked.ok) {
-    return { base: shortBase, files: [], note: `Could not compute diff: ${tracked.stderr || tracked.stdout || "git diff failed"}` };
+    return { base: shortBase, files: [], repo, note: `Could not compute diff: ${tracked.stderr || tracked.stdout || "git diff failed"}` };
   }
   const files = parseGitDiff(tracked.stdout);
 
@@ -1266,7 +1594,7 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
   }
 
   if (files.length === 0) {
-    return { base: shortBase, files: [], note: emptyNote };
+    return { base: shortBase, files: [], repo, note: emptyNote };
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
   if (files.length > MAX_DIFF_FILES) {
@@ -1274,10 +1602,11 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
     return {
       base: shortBase,
       files: files.slice(0, MAX_DIFF_FILES),
+      repo,
       note: `Showing the first ${MAX_DIFF_FILES} of ${total} changed files — the rest are omitted to keep the viewer responsive.`,
     };
   }
-  return { base: shortBase, files };
+  return { base: shortBase, files, repo };
 }
 
 // Re-exported so existing/future importers of `MAX_BLOB_PREVIEW_BYTES` from
@@ -1331,11 +1660,22 @@ export async function getTaskDiffBlob(
   task: Task,
   relPath: string,
   side: "old" | "new",
+  repoName?: string | null,
 ): Promise<{ ok: true; bytes: Uint8Array<ArrayBuffer>; etag: string } | { ok: false; error: string; status: number }> {
   let cwd: string;
   let base: string;
 
-  if (task.isolation === "worktree") {
+  if ((task.repositories?.length ?? 0) > 1) {
+    const repos = task.repositories!;
+    const entry = repoName ? repos.find((r) => r.name === repoName) : repos[0];
+    if (!entry) return { ok: false, error: "unknown repository", status: 400 };
+    const entryPath = entry.worktreePath ?? path.join(worktreePath(task), entry.name);
+    if (!existsSync(entryPath)) {
+      return { ok: false, error: "this repository hasn't created a worktree yet", status: 404 };
+    }
+    cwd = entryPath;
+    base = entry.baseRef ?? "HEAD";
+  } else if (task.isolation === "worktree") {
     if (!task.worktreePath || !existsSync(task.worktreePath)) {
       return { ok: false, error: "this task hasn't created a worktree yet", status: 404 };
     }
@@ -1450,40 +1790,61 @@ export async function getTaskDiffBlob(
  *      where the user edited `task.workdir` after the worktree was created,
  *      so git in the new workdir doesn't know about this worktree.
  */
-export async function removeWorktree(task: Task, opts?: { branches?: string[] }): Promise<void> {
-  if (!task.worktreePath) return;
-  const root = await repoRoot(task.workdir);
+/** Remove one repository's worktree checkout and (optionally) its branches. */
+async function removeOneWorktree(root: string | null, wt: string, branches: string[] | null): Promise<void> {
   if (root) {
-    await git(["worktree", "remove", "--force", task.worktreePath], root);
-    if (opts?.branches) {
+    await git(["worktree", "remove", "--force", wt], root);
+    if (branches) {
       // Caller-planned list: each branch is deleted on its own so one failure
       // (e.g. "checked out at <main repo>") never blocks the rest. A leading
       // "-" would be read as an option, so such a name is skipped.
-      for (const b of opts.branches) {
+      for (const b of branches) {
         if (!b || b.startsWith("-")) continue;
         try { await git(["branch", "-D", b], root); }
         catch { /* best-effort */ }
       }
-    } else if (task.branch && task.branchSource !== "existing") {
-      // A `branchSource: "existing"` branch is the user's own (e.g. a PR's head
-      // branch) — deleting it here would destroy a branch agetor doesn't own.
-      await git(["branch", "-D", task.branch], root);
     }
     // Clean up any stale .git/worktrees/<id>/ registrations left by previous
     // partial removes (e.g. workdir was changed after the worktree was created).
     await git(["worktree", "prune"], root, 10_000);
   }
   const ownedPrefix = WORKTREES_DIR + path.sep;
-  if (
-    task.worktreePath.startsWith(ownedPrefix)
-    && existsSync(task.worktreePath)
-  ) {
+  if (wt.startsWith(ownedPrefix) && existsSync(wt)) {
     // Async on purpose: a synchronous rmSync over a large worktree (e.g. one
     // with node_modules) would block the event loop for seconds, starving
     // every other HTTP connection and SSE stream.
-    try { await rm(task.worktreePath, { recursive: true, force: true }); }
+    try { await rm(wt, { recursive: true, force: true }); }
     catch { /* best-effort */ }
   }
+}
+
+export async function removeWorktree(task: Task, opts?: { branches?: string[] }): Promise<void> {
+  const repos = task.repositories ?? [];
+  if (repos.length > 1) {
+    // Per repository: remove its checkout and the branch agetor minted there.
+    // `branchSource: "existing"` never happens for a multi task in v1, but the
+    // guard keeps a future per-repo PR head safe.
+    for (const repo of repos) {
+      if (!repo.worktreePath) continue;
+      const root = await repoRoot(repo.path);
+      const branches = repo.branch && repo.branchSource !== "existing" ? [repo.branch] : null;
+      await removeOneWorktree(root, repo.worktreePath, branches);
+    }
+    // Each nested directory is its own worktree; only the now-empty workspace
+    // root is ours to delete (never recursively).
+    removeDirIfEmpty(worktreePath(task));
+    return;
+  }
+  if (!task.worktreePath) return;
+  const root = await repoRoot(task.workdir);
+  let branches: string[] | null = null;
+  if (opts?.branches) branches = opts.branches;
+  else if (task.branch && task.branchSource !== "existing") {
+    // A `branchSource: "existing"` branch is the user's own (e.g. a PR's head
+    // branch) — deleting it here would destroy a branch agetor doesn't own.
+    branches = [task.branch];
+  }
+  await removeOneWorktree(root, task.worktreePath, branches);
 }
 
 /**
@@ -1495,6 +1856,33 @@ export async function removeWorktree(task: Task, opts?: { branches?: string[] })
  */
 export async function pruneWorktrees(root: string): Promise<void> {
   await git(["worktree", "prune"], root, 10_000);
+}
+
+/** Detach one repository's worktree, keeping its branch and refusing a dirty checkout. */
+async function detachOneWorktree(
+  sourcePath: string,
+  wt: string | null,
+  opts?: { force?: boolean },
+): Promise<WorktreeTeardownResult> {
+  if (!wt) return { removed: false, reason: "no-worktree" };
+  if (!existsSync(wt)) return { removed: false, reason: "already-absent" };
+  if (!opts?.force) {
+    const dirty = await hasUncommittedChanges(wt);
+    if (dirty !== false) return { removed: false, reason: "dirty" };
+  }
+  const root = await repoRoot(sourcePath);
+  if (root) {
+    await git(["worktree", "remove", "--force", wt], root);
+    // Deliberately no `git branch -D` — the branch survives for a re-attach.
+    await git(["worktree", "prune"], root, 10_000);
+  }
+  const ownedPrefix = WORKTREES_DIR + path.sep;
+  if (wt.startsWith(ownedPrefix) && existsSync(wt)) {
+    try { await rm(wt, { recursive: true, force: true }); }
+    catch { /* best-effort */ }
+  }
+  const removed = !existsSync(wt);
+  return removed ? { removed } : { removed, reason: "failed" };
 }
 
 /**
@@ -1532,6 +1920,20 @@ export async function detachWorktree(
   task: Task,
   opts?: { force?: boolean },
 ): Promise<WorktreeTeardownResult> {
+  const repos = task.repositories ?? [];
+  if (repos.length > 1) {
+    const outcomes: { name: string; result: WorktreeTeardownResult }[] = [];
+    for (const repo of repos) {
+      outcomes.push({ name: repo.name, result: await detachOneWorktree(repo.path, repo.worktreePath, opts) });
+    }
+    // Only the empty workspace root is removed; a dirty repository's checkout
+    // (and the workspace holding it) stays put.
+    removeDirIfEmpty(worktreePath(task));
+    const removed = outcomes.every((o) => o.result.removed);
+    if (removed) return { removed, repositories: outcomes };
+    const reason = outcomes.find((o) => !o.result.removed)?.result.reason ?? "failed";
+    return { removed, reason, repositories: outcomes };
+  }
   if (!task.worktreePath) return { removed: false, reason: "no-worktree" };
   if (!existsSync(task.worktreePath)) return { removed: false, reason: "already-absent" };
 

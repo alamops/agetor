@@ -299,3 +299,57 @@ test("pull-create guards: archived task, mismatched workdir, and existing prUrl 
   expect(tasks.get(elsewhere.id)?.prUrl).toBeNull();
   expect(tasks.get(already.id)?.prUrl).toBe("https://github.com/o/rg/pull/1");
 });
+
+test("pull-create stamps only the matching multi-repository entry, first write wins, task.prUrl stays null", async () => {
+  const { tasks } = await import("./db.ts");
+  const frontendDir = await makeGitHubRepo("o", "fe");
+  const backendDir = await makeGitHubRepo("o", "be");
+  const otherDir = await makeGitHubRepo("o", "other");
+  const repo = (name: string, p: string) => ({
+    path: `/selected/${name}`,
+    name,
+    branch: "feature/multi",
+    branchSource: "created" as const,
+    worktreePath: p,
+    baseRef: null,
+    checkoutBranch: "feature/multi",
+    prUrl: null,
+  });
+  const task = tasks.insert(fakeTask({
+    workdir: "/workspace/multi",
+    worktreePath: "/workspace/multi",
+    branch: null,
+    repositories: [repo("frontend", frontendDir), repo("backend", backendDir)],
+  }));
+
+  const create = async (p: string) => {
+    fetchMock = mockPullCreateRoute("https://github.com/o/be/pull/5");
+    try {
+      const res = await realFetch(url("/github/pull-create"), {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ path: p, title: "Multi", head: "feature/multi", base: "main", taskId: task.id }),
+      });
+      expect(res.status).toBe(200);
+    } finally {
+      fetchMock.restore();
+      fetchMock = null;
+    }
+  };
+
+  await create(backendDir);
+  let reread = tasks.get(task.id)!;
+  expect(reread.prUrl).toBeNull();
+  expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
+  expect(reread.repositories?.find((r) => r.name === "frontend")?.prUrl).toBeNull();
+
+  // A second create for the same repository must not overwrite the link.
+  await create(backendDir);
+  reread = tasks.get(task.id)!;
+  expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
+
+  // A create from an unowned directory stamps nothing.
+  await create(otherDir);
+  reread = tasks.get(task.id)!;
+  expect(reread.repositories?.find((r) => r.name === "frontend")?.prUrl).toBeNull();
+});

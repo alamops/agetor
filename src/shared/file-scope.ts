@@ -11,6 +11,7 @@
 // (`GET /agent-discovery`, whose `workdir`/`branch` params are exactly
 // `scope.dir`/`scope.ref`, via {@link discoveryParamsForTask}).
 import type { Task } from "./types.ts";
+import { repositoriesForTask } from "./multi-repo.ts";
 
 /**
  * The project scope (`GET /files/index` params) a task's `@` popover — and,
@@ -47,4 +48,41 @@ export function discoveryParamsForTask(
 ): { workdir: string; branch: string | null } {
   const scope = fileScopeForTask(task);
   return { workdir: scope.dir, branch: scope.ref ?? null };
+}
+
+/** One repository's `@`/discovery scope, tagged with its workspace name. */
+export interface RepoFileScope {
+  /** Workspace subdirectory name, or null for a single-repository task. */
+  name: string | null;
+  /** The directory to list/validate against (`/files/index`'s `dir`). */
+  dir: string;
+  /** The ref to list/validate at (`/files/index`'s `ref`). */
+  ref?: string | null;
+}
+
+/**
+ * Every scope a task's `@` popover (and capability discovery) should union
+ * over. A single-repository task returns exactly one entry — byte-identical
+ * to {@link fileScopeForTask} — so today's behavior is unchanged. A
+ * multi-repository task returns one entry per repository: the materialized
+ * worktree once it exists, otherwise the source repo at the branch/ref
+ * `prepareRepoWorktree` will use, tagged with the repository's workspace name
+ * so the client can prefix entries (`<name>/src/a.ts`).
+ */
+export function fileScopesForTask(task: Task): RepoFileScope[] {
+  const repos = repositoriesForTask(task);
+  if (repos.length <= 1) return [{ name: null, ...fileScopeForTask(task) }];
+  return repos.map((repo) => {
+    if (repo.worktreePath) return { name: repo.name, dir: repo.worktreePath };
+    if (task.isolation === "worktree") {
+      return {
+        name: repo.name,
+        dir: repo.path,
+        ref: repo.branchSource === "existing" && repo.branch
+          ? repo.branch
+          : (repo.baseRef ?? "HEAD"),
+      };
+    }
+    return { name: repo.name, dir: repo.path };
+  });
 }

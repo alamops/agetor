@@ -594,7 +594,7 @@ test.skipIf(asRoot)("path gate: a whitespace-padded spelling of an unreadable pa
   mkdirSync(locked);
   chmodSync(locked, 0o000);
   try {
-    type Entry = { callers: string; pathParams?: Array<{ in: "query" | "body"; name: string; mode: string }> };
+    type Entry = { callers: string; pathParams?: Array<{ in: "query" | "body"; name: string; mode: string; itemField?: string }> };
     const routes: Array<{ method: string; key: string; policy: Entry }> = [];
     for (const [key, entry] of Object.entries(mods.policy.ROUTE_POLICY)) {
       if (typeof (entry as Entry).callers === "string") routes.push({ method: "POST", key, policy: entry as Entry });
@@ -611,7 +611,13 @@ test.skipIf(asRoot)("path gate: a whitespace-padded spelling of an unreadable pa
           // A nearest-ancestor field names a not-yet-existing child, so only
           // the locked ancestor decides.
           const value = param.mode === "nearest-ancestor" ? `${raw.trimEnd()}/child${raw.slice(raw.trimEnd().length)}` : raw;
-          const fieldValue = param.name === "paths" ? [value] : value;
+          // `paths` is an array of strings; an `itemField` param is an array
+          // of objects whose `itemField` holds the path (repositories[].path).
+          const fieldValue = param.name === "paths"
+            ? [value]
+            : param.itemField
+              ? [{ [param.itemField]: value }]
+              : value;
           const target = new URL(`${APP}${url}`);
           let body: string | undefined;
           if (param.in === "query") target.searchParams.set(param.name, value);

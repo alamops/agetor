@@ -911,6 +911,9 @@ export interface CreateTaskInput {
   prompt: string;
   agent?: string;
   workdir?: string;
+  /** Selected repositories (issue #291): 2+ makes it a multi-repository task
+   *  (requires worktree isolation). `baseRef` is per repository. */
+  repositories?: { path: string; baseRef?: string }[];
   isolation?: "worktree" | "none";
   mode?: string | null;
   model?: string | null;

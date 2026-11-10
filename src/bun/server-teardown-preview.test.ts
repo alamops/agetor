@@ -100,3 +100,40 @@ test("PATCH /tasks/:id ignores checkoutBranch (server-managed)", async () => {
   expect(after.title).toBe("renamed");
   expect(after.checkoutBranch).toBe("implement/x");
 });
+
+test("teardown-preview names every repository's branches for a multi-repo task", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi preview",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const task = created.task;
+  try {
+    const prepared = await prepareTaskWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(task.id, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(task.id, prepared.repositories!);
+    const res = await authed(`/tasks/${task.id}/teardown-preview`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as TaskTeardownPreview;
+    const names = uniqueRepoSlugs([a, b]);
+    expect(body.taskBranch).toBeNull();
+    expect(body.repositories?.map((r) => r.name)).toEqual(names);
+    expect(body.repositories?.map((r) => r.taskBranch)).toEqual(prepared.repositories?.map((r) => r.branch));
+    // The top-level list is the union for old callers.
+    for (const plan of body.repositories ?? []) {
+      for (const branch of plan.branches) expect(body.branches).toContain(branch);
+    }
+  } finally {
+    await import("./orchestrator.ts").then((m) => m.deleteTask(task.id)).catch(() => {});
+  }
+});

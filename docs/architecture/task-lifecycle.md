@@ -88,3 +88,7 @@ successor settles. Delete removes copied sessions at the end of a successful
 delete (after every throwing teardown step, so a failed delete keeps the
 conversation resumable); archive keeps them for the retention sweep. See
 [harness-stacks.md](harness-stacks.md).
+
+## Multiple repositories in one task
+
+A task created against two or more repositories stores `Task.repositories[]` and runs at a per-task workspace root with one linked worktree per repository. Preparation, the `Repositories:` launch block, per-repo diff/status/PR, per-repo teardown, nested worktree ids and the CLI/TUI surfaces are specified in [multi-repo-tasks.md](multi-repo-tasks.md). A single-repository task is unchanged (its one entry is derived from the scalar columns).

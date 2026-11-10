@@ -82,6 +82,14 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     out(`  ${label("failover")} ${c.yellow(escapeFreeText(text))}`);
   }
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
+  if ((task.repositories?.length ?? 0) > 1) {
+    out(`  ${label("repos")} ${task.repositories!.length}`);
+    for (const repo of task.repositories!) {
+      const branch = repo.branch ? ` (${escapeControlChars(repo.branch)})` : "";
+      const wt = repo.worktreePath ? c.dim(` → ${repo.worktreePath}`) : "";
+      out(`    ${escapeControlChars(repo.name)}: ${c.dim(repo.path)}${branch}${wt}`);
+    }
+  }
   if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);
   // Last-seen worktree checkout (recorded at run start/settle, terminal open,
   // archive). Drift off the task branch is tolerated, so say where it is.

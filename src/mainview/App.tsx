@@ -199,6 +199,8 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   "mark-unread": Mail,
   "copy-branch": GitBranch,
   "copy-worktree-path": Copy,
+  "copy-repo-branch": GitBranch,
+  "copy-repo-worktree": Copy,
   delete: Trash2,
 };
 
@@ -1912,10 +1914,16 @@ function AppInner() {
       // effect and `GET /tasks/:id/pipeline` both need the full list/row).
       if (t.pipelineParentId != null) return false;
       if (q) {
-        const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}`.toLowerCase();
+        const repoHay = (t.repositories ?? []).map((r) => `${r.name} ${r.path}`).join("\n");
+        const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}\n${repoHay}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
-      if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
+      if (repoFilter.length > 0) {
+        // A multi-repository task's workdir is its workspace root, so match
+        // the filter against any selected repository path (issue #291).
+        const paths = (t.repositories ?? []).map((r) => r.path);
+        if (!repoFilter.some((f) => t.workdir === f || paths.includes(f))) return false;
+      }
       if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
       if (typeFilter.length > 0 && !typeFilter.includes(t.taskType)) return false;
       if (archivedView === "active" && t.archivedAt != null) return false;
@@ -2397,7 +2405,7 @@ function AppInner() {
   // (`view-pr` / `copy-*`) read the field from the SNAPSHOT the entry was
   // gated on, falling back to the live task — the live value can't be
   // trusted to still be set, and a `!` would only hide that.
-const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) => {
+const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, repoName?: string) => {
     const t = tasksRef.current.find((x) => x.id === snapshot.id) ?? snapshot;
     switch (action) {
       case "open":
@@ -2473,6 +2481,17 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         if (worktreePath) void copyToClipboard(worktreePath, "worktree path");
         break;
       }
+      case "copy-repo-branch": {
+        const repo = (t.repositories ?? []).find((r) => r.name === repoName);
+        if (repo?.branch) void copyToClipboard(repo.branch, "branch name");
+        break;
+      }
+      case "copy-repo-worktree": {
+        const repo = (t.repositories ?? []).find((r) => r.name === repoName);
+        const worktreePath = repo?.worktreePath ?? repo?.path;
+        if (worktreePath) void copyToClipboard(worktreePath, "worktree path");
+        break;
+      }
       case "delete":
         void del(t);
         break;
@@ -2503,7 +2522,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         label: entry.label,
         danger: entry.danger,
         icon: ICON_BY_ACTION[entry.action],
-        onSelect: () => runTaskMenuAction(entry.action, taskMenu.task),
+        onSelect: () => runTaskMenuAction(entry.action, taskMenu.task, entry.repoName),
       });
       prevGroup = entry.group;
     }

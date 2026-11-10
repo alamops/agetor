@@ -22,3 +22,7 @@ Finally, `dialog.tsx`'s Escape/Tab handling is load-bearing for every consumer t
 — or when the key event arrives already `defaultPrevented`; Tab yields on `defaultPrevented` alone.
 A carrier that wants Escape yielded to it but doesn't want to also swallow other document-level shortcuts opts out via `data-popover-keys="escape-only"` next to the marker — `AtFileAutocomplete` carries it too, same as `SlashAutocomplete` — honored by RunPanel's Cmd/Ctrl+F handler (`[data-popover-open]:not([data-popover-keys="escape-only"])`) so an open `/` or `@` autocomplete or Extensions popover doesn't block Cmd+F too.
 Without this, Escape on the `/` autocomplete menu inside a modal closed the whole modal instead of just the menu.
+
+## Multiple repositories in one task
+
+A task created against two or more repositories stores `Task.repositories[]` and runs at a per-task workspace root with one linked worktree per repository. Preparation, the `Repositories:` launch block, per-repo diff/status/PR, per-repo teardown, nested worktree ids and the CLI/TUI surfaces are specified in [multi-repo-tasks.md](multi-repo-tasks.md). A single-repository task is unchanged (its one entry is derived from the scalar columns).

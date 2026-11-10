@@ -16,6 +16,8 @@ import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
+import { RepositoriesDialog } from "./RepositoriesDialog";
+import { selectionName, type RepoSelection } from "@/lib/repo-selection";
 import { PromptComposer } from "./PromptComposer";
 import { TaskTypePicker } from "./TaskTypePicker";
 
@@ -87,6 +89,10 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     enabled: open,
   });
 
+  // Extra repositories beyond the issue's own (issue #291). The issue repo is
+  // always first and cannot be removed; extras are added in the shared dialog.
+  const [repos, setRepos] = useState<RepoSelection[]>([]);
+  const [repositoriesOpen, setRepositoriesOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -122,6 +128,8 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     setReferences([]);
     setTaskType(DEFAULT_TASK_TYPE);
     setTypeDirty(false);
+    setRepos(context?.path ? [{ path: context.path, root: null }] : []);
+    setRepositoriesOpen(false);
     launch.setPipelineId(null);
     if (!open || !context) return;
     setThreadLoading(true);
@@ -226,7 +234,16 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
         // own harness otherwise; else the manual pick (finding F2-3).
         agent: launch.effectiveAgent,
         workdir: context.path,
-        ...wt.payload(),
+        ...(repos.length > 1
+          ? {
+              isolation: "worktree" as const,
+              branch: wt.payload().branch,
+              repositories: repos.map((r) => ({
+                path: r.path,
+                ...(r.baseRef?.trim() ? { baseRef: r.baseRef.trim() } : {}),
+              })),
+            }
+          : wt.payload()),
         mode: launch.mode,
         model: launch.model,
         effort: launch.effort,
@@ -376,6 +393,29 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
               />
 
               <WorktreeOptions state={wt} />
+              <div className="space-y-1" data-testid="issue-repositories">
+                <label className="text-muted-foreground">Repositories</label>
+                <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 px-2 py-1.5 text-xs">
+                  <span className="min-w-0 truncate">
+                    {repos.map((r) => selectionName(r)).join(", ") || "issue repository"}
+                  </span>
+                  <Button size="sm" variant="outline" onClick={() => setRepositoriesOpen(true)}>
+                    Manage
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  The issue's repository is always included; extras each get their own worktree and branch.
+                </p>
+                <RepositoriesDialog
+                  open={repositoriesOpen}
+                  onClose={() => setRepositoriesOpen(false)}
+                  value={repos}
+                  onSave={(next) => {
+                    const primary = context?.path ? [{ path: context.path, root: null }] : [];
+                    setRepos([...primary, ...next.filter((r) => r.path !== context?.path)]);
+                  }}
+                />
+              </div>
 
               <TaskLaunchPickers
                 launch={launch}

@@ -1,0 +1,155 @@
+# Multi-repository tasks (issue #291)
+
+One task/card can work on two or more registered repositories. Each repository
+gets its own linked git worktree and branch **inside one per-task workspace
+directory**; a single agent conversation runs at that workspace root and every
+surface (card, run panel, diff, terminals, Worktrees page, PRs, pipelines, CLI,
+TUI) carries the repository dimension.
+
+## Data model
+
+`Task.repositories: TaskRepository[]` (`src/shared/types.ts`) is the source of
+truth for a multi-repository row:
+
+```ts
+interface TaskRepository {
+  path: string;            // selected project path (may be a subdirectory)
+  name: string;            // workspace subdirectory (sanitized basename, uniquified)
+  branch: string | null;   // branch agetor pinned for this repo
+  branchSource: "created" | "existing";
+  worktreePath: string | null;
+  baseRef: string | null;  // pinned sha in this repo
+  checkoutBranch: string | null;
+  prUrl: string | null;    // first PR opened from this repo
+}
+```
+
+- **Multi rows** (2+ entries) store the JSON in `tasks.repositories` (migration
+  087). `workdir` and `worktreePath` both point at the workspace root
+  `<dataDir>/worktrees/<task-id>`; `branch`, `baseRef`, `prUrl` and the scalar
+  `checkoutBranch` are `null`. `issue_repo_path` names the repository whose
+  remote matches `issueUrl` — only its PR gets `Closes #N`.
+- **Single rows** store `'[]'` and `toTask` derives exactly one entry from the
+  scalar columns, so those stay authoritative as they update. No backfill.
+- `repositories`/`issue_repo_path` are server-managed: written by `createTask`,
+  `tasks.setRepositories`, `tasks.setRepositoryPrUrl` and
+  `tasks.setRepositoryCheckout`; skipped by the generic `tasks.update` SET
+  clause; never bump `updated_at`; `PATCH /tasks/:id` 400s the field. The set is
+  fixed at creation (the owner deferred editing).
+
+## Creation
+
+`POST /tasks` accepts `repositories: [{ path, baseRef? }]` (`path` absolute).
+`createTask`:
+
+1. Validates every path is inside a git repo, collecting **all** failures
+   (`resolveRepositorySet`, `src/bun/task-repos.ts`).
+2. Dedupes by git root, keeping the first selected path for that root.
+   A selection that collapses to one root uses the ordinary single-repo layout.
+3. Rejects 2+ entries with `isolation: "none"` or `existingBranch`.
+4. Resolves each repository's base ref to a sha and pins one shared branch name
+   (computed against the first repository).
+5. Matches `issueUrl` against every repository's remote.
+6. Inserts `workdir = <dataDir>/worktrees/<task-id>` and the entries with
+   `branch` pinned but `worktreePath` null.
+
+The route declares `repositories[].path` in `ROUTE_POLICY`, so the CLI caller's
+path gate probes every selected path (`PathParam.itemField`).
+
+## Preparation, runtime and the workspace mirror
+
+`prepareTaskWorkdir` (`src/bun/worktree.ts`) delegates to `prepareWorkdir`
+unchanged for ≤1 repository. For 2+ it creates the workspace and one linked
+worktree per repository via `prepareRepoWorktree` (max 4 concurrent), reusing an
+existing entry's checkout without creating or switching anything. It is
+**all-or-nothing**: every failure is collected, worktrees/branches created in
+this attempt are rolled back, reused ones are left alone, and the error names
+every failed repository. A repository that already holds the shared branch gets
+a per-repo `-N` fallback; `takenBranches` is keyed by source root.
+
+`startTask` spawns the agent with `cwd = workspace`, persists the materialized
+entries with `tasks.setRepositories`, and appends the launch block
+
+```
+Repositories:
+- frontend: /…/worktrees/<task-id>/frontend (branch feature/auth)
+- backend: /…/worktrees/<task-id>/backend (branch feature/auth)
+```
+
+after the user prompt and before the references block. This block is the only
+machine-added text for a multi task; a single-repo launch prompt is
+byte-identical to before. Flag-capable harnesses (claude-code, codex, copilot)
+also get `--add-dir <workspace>/<repo>` for every entry; cursor/fx/opencode rely
+on the cwd (the workspace is not itself a git repo).
+
+Because `workdir`/`worktreePath` mirror the workspace, every existing
+`worktreePath ?? workdir` cwd site (terminals at the workspace root, `@`
+expansion, markdown resolution, open-in-Finder) works unchanged. Terminals may
+also open inside one repository (`POST /tasks/:id/terminals { repo }`).
+
+## Diff, status and PRs
+
+- `GET /tasks/:id/diff?repo=<name>` computes that repository's diff against its
+  own `baseRef`; omitted defaults to the first entry; an unknown name 400s.
+- `GET /tasks/:id/diff/blob?...&repo=` reads the matching worktree.
+- `GET /tasks/:id/git-status` returns one batched body: each repository's
+  status in `repositories[]`, with the top-level fields mirroring the first for
+  old clients. One request per 5 s poll, bounded at 4 concurrent repositories.
+- `POST /github/pull-create` matches the task's entry by worktree path (then
+  selected path) and stamps only that entry; first write wins; `task.prUrl`
+  stays null. The run panel's "Create all PRs" walks the repositories,
+  best-effort, appending `Closes #N` only for `issueRepoPath`.
+
+## Teardown, Worktrees page and ids
+
+Archive/delete are per repository and best-effort: a dirty checkout is kept
+(with its branch and the workspace directory), clean ones are detached, and the
+workspace is removed only when empty. Before detaching, archive records each
+repository's live checkout with `tasks.setRepositoryCheckout` so unarchive
+re-attaches onto the same branches. Branch teardown is planned per repository
+(`TaskTeardownPreview.repositories`), with the top-level fields mirroring the
+first.
+
+A multi row's Worktrees id is `<taskId>__<repo-slug>`. Task ids are UUIDs and
+contain no underscore, so the first `__` is the boundary. `resolveWorktreeRef`
+is the single id-to-path guard for `DELETE /worktrees/:id` and
+`GET /worktrees/:id/git-status`: every segment must be a safe basename, and the
+final path must be a direct child of its parent, itself a direct child of
+`WORKTREES_DIR`. `listWorktrees` emits one row per repository
+(`repoName`, `workdir = entry.path`), skips the workspace root, and expands an
+orphaned workspace directory whose children are git worktrees.
+
+Teardown is serialized per source repository: `enqueueTeardownMany` acquires
+every selected repository's key in sorted order (no deadlock), so two tasks
+sharing a repository never run `git worktree` operations concurrently.
+
+## Surfaces
+
+- **New Task / issue dialog** — `RepositoriesDialog` selects two or more
+  projects (add folder, per-repo base, remove, dedupe by git root, non-blocking
+  warning above 10). One repository keeps today's inline project/branch/base;
+  2+ shows a summary and forces worktree isolation.
+- **`@` files** — client-side union over one `/files/index` per repository
+  scope, entries prefixed `<name>/`. No new server listing route; workspace
+  containment is unchanged.
+- **Card** — a worktree icon + repository count popover instead of the single
+  workdir/branch line. Board text search and the project filter match any
+  repository.
+- **Diff dialog** — one tab per repository.
+- **Run panel** — repository tab selects the per-repo status, PR head, PR path
+  and terminal cwd; commit & push uses the aggregate prompt.
+- **Pipelines** — a multi parent copies its set onto every step row and owns
+  teardown; steps never detach a shared worktree.
+- **CLI/TUI** — `agetor add --repo <path[=ref]>` (repeatable), `show` prints the
+  repository block, `shell --repo <name>`, `rm` preview per repository, `ls`
+  shows a count, and the TUI `@` listing unions the scopes with prefixes.
+
+## Intentional limits
+
+- Create-only repository set; 2+ requires worktree isolation; no per-repo
+  `existingBranch`; no hard cap (warning above 10); no per-repo branch
+  configuration; one agent conversation, not one per repository.
+- An older build sees the workspace as `workdir`/`worktreePath` and may orphan
+  secondary worktrees; there is no downgrade guard.
+- Gemini's `context.includeDirectories` settings write is not performed; its
+  layout is supported through the workspace cwd only.

@@ -20,6 +20,7 @@ import {
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
+import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
 
 interface Props {
   open: boolean;
@@ -88,6 +89,8 @@ function lastSelectableIndex(rows: DiffRow[]): number {
 export function DiffDialog({ open, task, onClose }: Props) {
   const taskId = task?.id ?? null;
   const [diff, setDiff] = useState<TaskDiff | null>(null);
+  // Selected repository tab for a multi-repository task (issue #291).
+  const [repo, setRepo] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [openFiles, setOpenFiles] = useState<Set<string>>(new Set());
@@ -412,12 +415,20 @@ export function DiffDialog({ open, task, onClose }: Props) {
     setHint(null);
     cancelDragRef.current();
     if (!open || !taskId) return;
+    const repos = task?.repositories ?? [];
+    const wanted = repos.length > 1
+      ? (repos.some((r) => r.name === repo) ? repo : repos[0]!.name)
+      : null;
+    if (wanted !== repo) {
+      setRepo(wanted);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
     setDiff(null);
     api
-      .getTaskDiff(taskId)
+      .getTaskDiff(taskId, wanted)
       .then((d) => {
         if (cancelled) return;
         setDiff(d);
@@ -435,7 +446,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
     // Key on task?.id, not `task` itself — the parent polls /tasks every 2s,
     // so a new `task` object identity arrives constantly and would otherwise
     // refetch the diff on every poll tick.
-  }, [open, taskId]);
+  }, [open, taskId, repo]);
 
   const totals = useMemo(() => {
     const files = diff?.files ?? [];
@@ -511,6 +522,10 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const fileScope = useMemo<FileScope | null>(() => {
     if (!task) return null;
+    if (isMultiRepoTask(task)) {
+      const entry = (task.repositories ?? []).find((r) => r.name === repo) ?? task.repositories?.[0];
+      return entry ? { dir: entry.worktreePath ?? entry.path } : null;
+    }
     if (task.worktreePath) return { dir: task.worktreePath };
     if (task.isolation === "worktree") {
       return {
@@ -519,7 +534,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
       };
     }
     return { dir: task.workdir };
-  }, [task?.worktreePath, task?.isolation, task?.workdir, task?.baseRef, task?.branchSource, task?.branch]);
+  }, [task?.worktreePath, task?.isolation, task?.workdir, task?.baseRef, task?.branchSource, task?.branch, task?.repositories, repo]);
   const projectFiles = useProjectFiles(open && composerVisible ? fileScope : null);
 
   // A new selection starting (composer reappearing) supersedes whatever hint
@@ -667,6 +682,26 @@ export function DiffDialog({ open, task, onClose }: Props) {
             {task?.title ?? "Task"}
             {diff?.base && <> · vs base <span className="font-mono">{diff.base}</span></>}
           </div>
+          {(task?.repositories?.length ?? 0) > 1 && (
+            <div className="mt-1 flex flex-wrap gap-1" role="tablist" aria-label="Repositories">
+              {task!.repositories!.map((r) => (
+                <button
+                  key={r.name}
+                  type="button"
+                  role="tab"
+                  aria-selected={repo === r.name}
+                  data-testid={`diff-repo-tab-${r.name}`}
+                  onClick={() => setRepo(r.name)}
+                  className={cn(
+                    "rounded px-1.5 py-0.5 font-mono text-[10px]",
+                    repo === r.name ? "bg-info/15 text-info" : "text-muted-foreground hover:bg-muted",
+                  )}
+                >
+                  {r.name}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {diff && diff.files.length > 0 && (
@@ -722,6 +757,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
               <FileBlock
                 key={f.path}
                 taskId={taskId}
+                repo={repo}
                 file={f}
                 open={openFiles.has(f.path)}
                 onToggle={() => toggle(f.path)}
@@ -851,6 +887,7 @@ type RowMouseDownHandler = (
 
 function FileBlock({
   taskId,
+  repo,
   file,
   open,
   onToggle,
@@ -861,6 +898,7 @@ function FileBlock({
   registerBody,
 }: {
   taskId: string | null;
+  repo?: string | null;
   file: DiffFile;
   open: boolean;
   onToggle: () => void;
@@ -891,7 +929,7 @@ function FileBlock({
       </button>
       {open && (
         file.binary ? (
-          <BinaryDiffPreview taskId={taskId} file={file} />
+          <BinaryDiffPreview taskId={taskId} repo={repo} file={file} />
         ) : (
           <>
             <DiffBody
@@ -921,12 +959,12 @@ function FileBlock({
  *  the file's NEW-state path (per `DiffFile`'s doc comment), so it's already
  *  the right side to classify for a rename. Deliberately outside `DiffBody`'s
  *  row machinery — no `data-diff-path`/`data-diff-index`, no selection. */
-function BinaryDiffPreview({ taskId, file }: { taskId: string | null; file: DiffFile }) {
+function BinaryDiffPreview({ taskId, repo, file }: { taskId: string | null; repo?: string | null; file: DiffFile }) {
   const kind = binaryPreviewKind(file.path);
   if (kind === null || !taskId) {
     return <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>;
   }
-  const { oldUrl, newUrl } = binaryPreviewSides(file, (path, side) => api.taskDiffBlobUrl(taskId, path, side));
+  const { oldUrl, newUrl } = binaryPreviewSides(file, (path, side) => api.taskDiffBlobUrl(taskId, path, side, repo));
   return (
     <div className="px-3 py-2">
       <BinaryFilePreview

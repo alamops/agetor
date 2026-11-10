@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2, UserCheck } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, GitFork, ListTodo, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2, UserCheck } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -331,6 +331,23 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
       </CardHeader>
       <CardContent className="space-y-2">
         <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
+        {(task.repositories?.length ?? 0) > 1 ? (
+          // Multi-repository card (issue #291): one worktree icon + count with
+          // a popover naming every repository, instead of a single workdir
+          // and branch line (the workspace root is not a repository).
+          <div
+            className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground"
+            data-testid="task-card-repositories"
+            title={(task.repositories ?? []).map((r) => `${r.name}: ${r.worktreePath ?? r.path}`).join("\n")}
+          >
+            <GitFork className="size-3 shrink-0" />
+            <span className="shrink-0 font-medium">{task.repositories!.length} repositories</span>
+            <span className="truncate opacity-80">
+              · {task.repositories!.map((r) => r.name).join(", ")}
+            </span>
+          </div>
+        ) : (
+          <>
         <p
           className="text-[10px] text-muted-foreground/70 font-mono truncate"
           title={task.workdir}
@@ -359,6 +376,8 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
               </span>
             )}
           </div>
+        )}
+          </>
         )}
         <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
           {archived ? (

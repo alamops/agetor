@@ -165,3 +165,79 @@ export function latestPrProposal(events: RunEvent[]): PrProposal | null {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Multi-repository proposals (issue #291)
+// ---------------------------------------------------------------------------
+
+/** A `Repository: <name>` label line the multi-repo commit prompt asks for. */
+const REPO_LABEL_RE = /^\s*#{0,6}\s*[*_]{0,2}\s*repository\s*:\s*([^\n*_]+?)\s*[*_]{0,2}\s*$/i;
+
+/**
+ * Parse one labeled proposal per repository out of an agent's Commit & Push
+ * reply. Each `Repository: <name>` label starts a block; the block is parsed
+ * with the same tolerant {@link parsePrProposal}. A missing label is only
+ * tolerated when the whole reply contains exactly one proposal-shaped block:
+ * the caller maps that to the single repository it asked about.
+ */
+export function parseRepositoryProposals(text: string): Map<string, PrProposal> {
+  const normalized = text.replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  const out = new Map<string, PrProposal>();
+  let currentName: string | null = null;
+  let block: string[] = [];
+
+  const flush = () => {
+    if (!currentName) return;
+    const proposal = parsePrProposal(block.join("\n"));
+    if (proposal) out.set(currentName, proposal);
+  };
+
+  for (const line of lines) {
+    const label = REPO_LABEL_RE.exec(line);
+    if (label) {
+      flush();
+      currentName = label[1]!.trim();
+      block = [];
+      continue;
+    }
+    if (currentName) block.push(line);
+  }
+  flush();
+  return out;
+}
+
+/**
+ * The newest run's per-repository proposals. Mirrors {@link latestPrProposal}
+ * (newest run wins, subagent streams ignored) but returns every labeled
+ * block, and falls back to a single unlabeled proposal under `fallbackName`.
+ */
+export function latestRepositoryProposals(
+  events: RunEvent[],
+  fallbackName?: string,
+): Map<string, PrProposal> {
+  const textByRun = new Map<string, string[]>();
+  const runOrder: string[] = [];
+  for (const e of events) {
+    if (e.stream !== "assistant" || e.subagentId) continue;
+    let chunks = textByRun.get(e.runId);
+    if (!chunks) {
+      chunks = [];
+      textByRun.set(e.runId, chunks);
+      runOrder.push(e.runId);
+    }
+    chunks.push(e.data ?? "");
+  }
+  for (let i = runOrder.length - 1; i >= 0; i--) {
+    const runId = runOrder[i];
+    if (runId === undefined) continue;
+    const chunks = textByRun.get(runId);
+    if (!chunks) continue;
+    const text = chunks.join("\n\n");
+    const labeled = parseRepositoryProposals(text);
+    if (labeled.size > 0) return labeled;
+    const single = parsePrProposal(text);
+    if (single && fallbackName) return new Map([[fallbackName, single]]);
+  }
+  return new Map();
+}

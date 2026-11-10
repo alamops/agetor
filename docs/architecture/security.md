@@ -163,3 +163,7 @@ account's config root, matches a handoff shape (Claude
 Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`), has no symlinked component and is
 a regular file; it unlinks files only (never a recursive delete) and then
 prunes only empty plain directories inside those shapes. Full behaviour: [harness-stacks.md](harness-stacks.md).
+
+## Multiple repositories in one task
+
+A task created against two or more repositories stores `Task.repositories[]` and runs at a per-task workspace root with one linked worktree per repository. Preparation, the `Repositories:` launch block, per-repo diff/status/PR, per-repo teardown, nested worktree ids and the CLI/TUI surfaces are specified in [multi-repo-tasks.md](multi-repo-tasks.md). A single-repository task is unchanged (its one entry is derived from the scalar columns).

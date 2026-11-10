@@ -18,13 +18,13 @@ import { EXPAND_EVENT } from "@/lib/expand-on-jump";
 import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
-import { latestPrProposal } from "@/lib/pr-proposal";
+import { latestPrProposal, latestRepositoryProposals } from "@/lib/pr-proposal";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
-import { fileScopeForTask } from "../../../shared/file-scope.ts";
+import { fileScopeForTask, fileScopesForTask } from "../../../shared/file-scope.ts";
 import {
   emptyOpencodeDrafts,
   opencodeAnswerBody,
@@ -2908,6 +2908,20 @@ function RunPanelBody({
   // polling effect keeps this in sync with the actual git state for as
   // long as the panel is mounted.
   const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
+  // Selected repository tab for a multi-repository task (issue #291). The
+  // default is the first entry, so every existing single-repo surface below
+  // keeps using the top-level fields.
+  const [repoTab, setRepoTab] = useState<string | null>(null);
+  const [allPrsBusy, setAllPrsBusy] = useState(false);
+  const multiRepo = (task.repositories?.length ?? 0) > 1;
+  const activeRepo = multiRepo
+    ? (task.repositories!.find((r) => r.name === repoTab) ?? task.repositories![0]!)
+    : null;
+  const activeGitStatus = multiRepo
+    ? (gitStatus?.repositories?.find((r) => r.name === activeRepo?.name)
+      ?? gitStatus?.repositories?.[0]
+      ?? null)
+    : gitStatus;
   const [importedBranchBusy, setImportedBranchBusy] = useState(false);
   const [importedBranchError, setImportedBranchError] = useState<string | null>(null);
   const [importRetryBusy, setImportRetryBusy] = useState(false);
@@ -3681,14 +3695,61 @@ function RunPanelBody({
   // Head branch a "Create PR" would open from — agetor's worktree branch, or
   // the workdir's live non-default branch for an isolation:"none" task. `null`
   // means "nothing sensible to PR from", which is also the chip's gate.
-  const prHead = prHeadBranch(task.branch ?? null, gitStatus, task.branchSource);
+  /**
+   * "Create all PRs" (issue #291): open one pull request per repository,
+   * best-effort, stamping each through the ordinary `/github/pull-create`
+   * route (which matches the repository by worktree path). `Closes #N` is
+   * appended only for the repository the issue came from.
+   */
+  const createAllPrs = async () => {
+    if (!multiRepo || allPrsBusy) return;
+    setAllPrsBusy(true);
+    const failures: string[] = [];
+    const proposals = latestRepositoryProposals(events, task.repositories?.[0]?.name);
+    try {
+      for (const repo of task.repositories ?? []) {
+        if (!repo.branch) {
+          failures.push(`${repo.name}: no branch yet`);
+          continue;
+        }
+        const projectPath = repo.worktreePath ?? repo.path;
+        const proposal = proposals.get(repo.name);
+        try {
+          const defaults = await api.getGitHubPullDefaults({ path: projectPath });
+          await api.createGitHubPull({
+            path: projectPath,
+            title: proposal?.title || task.title,
+            head: repo.branch,
+            base: defaults.base,
+            body: appendIssueCloseDirective(
+              proposal?.description ?? "",
+              repo.path === task.issueRepoPath ? task.issueUrl : null,
+            ),
+            taskId: task.id,
+          });
+        } catch (e) {
+          failures.push(`${repo.name}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (failures.length === 0) toast.success("Pull requests created for every repository");
+      else toast.error(`Could not open ${failures.length} pull request(s): ${failures.join("; ")}`);
+    } finally {
+      setAllPrsBusy(false);
+    }
+  };
+
+  const prHead = multiRepo
+    ? (activeRepo?.branch ?? null)
+    : prHeadBranch(task.branch ?? null, gitStatus, task.branchSource);
   // Live checkout vs the branch agetor created (5 s git-status poll). Drift is
   // tolerated, never corrected — the header and details say where it is.
-  const branchDrift = driftOf(task.branch ?? null, gitStatus?.branch);
+  const branchDrift = multiRepo
+    ? driftOf(activeRepo?.branch ?? null, activeRepo?.checkoutBranch ?? null)
+    : driftOf(task.branch ?? null, gitStatus?.branch);
   // Claude-only: an OpenCode import carries no transcript branch, so the
   // "Switch to <branch>" banner never shows for one.
   const importedGitBranch = importedSession?.kind === "claude-code" ? (task.importedClaude?.gitBranch ?? null) : null;
-  const folderBranch = gitStatus && !gitStatus.ignored ? gitStatus.branch : null;
+  const folderBranch = activeGitStatus && !activeGitStatus.ignored ? activeGitStatus.branch : null;
   // The import-time branch is only a hint until the session continues here.
   // After an Agetor turn the folder's branch is whatever that turn left, so
   // the banner would keep naming a branch the session has moved past.
@@ -3848,10 +3909,25 @@ function RunPanelBody({
   // the same scope, so project-level skill/command/MCP discovery reads
   // exactly this tree too, never a stale `task.branch`-against-the-source-repo
   // scope.
+  // Multi-repository `@` scopes: the workspace root is not a git repo, so a
+  // multi task lists each repository's worktree instead (issue #291). The
+  // single-repository path is unchanged.
+  const multiRepoScopes = useMemo(
+    () => (multiRepo
+      ? fileScopesForTask(task)
+        .filter((sc) => sc.name)
+        .map((sc) => ({ name: sc.name!, dir: sc.dir, ref: sc.ref }))
+      : null),
+    [multiRepo, task.worktreePath, task.repositories, task.isolation],
+  );
   const fileScope = useMemo<FileScope>(() => {
+    if (multiRepoScopes && multiRepoScopes.length > 0) {
+      const active = multiRepoScopes.find((sc) => sc.name === activeRepo?.name) ?? multiRepoScopes[0]!;
+      return active.ref ? { dir: active.dir, ref: active.ref } : { dir: active.dir };
+    }
     const scope = fileScopeForTask(task);
     return scope.ref ? { dir: scope.dir, ref: scope.ref } : { dir: scope.dir };
-  }, [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
+  }, [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch, multiRepoScopes, activeRepo?.name]);
   // Hoisted above the composer's own internal calls (passed down via
   // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
   // switches and the archived-without-canSend swap — which unmount and
@@ -3993,7 +4069,12 @@ function RunPanelBody({
                 <Button
                   size="icon"
                   variant="outline"
-                  onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
+                  onClick={() => onViewPullRequest({
+                    projectPath: multiRepo
+                      ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)
+                      : task.workdir,
+                    prUrl,
+                  })}
                   aria-label="View PR"
                 >
                   <GitPullRequest className="size-4" />
@@ -4145,6 +4226,30 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        {multiRepo && (
+          // Per-repository selector (issue #291): the diff tabs' sibling for
+          // status, PR head/path and new terminal cwd.
+          <div className="mt-1 flex flex-wrap gap-1" role="tablist" aria-label="Repositories">
+            {task.repositories!.map((r) => (
+              <button
+                key={r.name}
+                type="button"
+                role="tab"
+                aria-selected={(activeRepo?.name ?? null) === r.name}
+                data-testid={`run-repo-tab-${r.name}`}
+                onClick={() => setRepoTab(r.name)}
+                className={cn(
+                  "rounded px-1.5 py-0.5 font-mono text-[10px]",
+                  (activeRepo?.name ?? null) === r.name
+                    ? "bg-info/15 text-info"
+                    : "text-muted-foreground hover:bg-muted",
+                )}
+              >
+                {r.name}
+              </button>
+            ))}
+          </div>
+        )}
         <HarnessStackBanner task={task} stacks={stacks} harnesses={harnesses} onRunTask={onRunTask} />
         {importedSession && (
           <div
@@ -4395,7 +4500,7 @@ function RunPanelBody({
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
         onTaskFieldsChanged={onTaskFieldsChanged}
-        liveBranch={gitStatus?.branch ?? null}
+        liveBranch={activeGitStatus?.branch ?? null}
         tmuxSession={latestRun?.tmuxSession ?? null}
         // "Has this task ever run" for the Agent-details dialog's status
         // line — the union of every signal in scope, since each is
@@ -4697,6 +4802,7 @@ function RunPanelBody({
             textareaRef={sendRef}
             capture={capture}
             fileScope={fileScope}
+            fileScopes={multiRepoScopes}
             // A column transition = a run settled (or started): the agent may
             // have just written files while focus never left the composer —
             // retrigger the listing fetch (see the prop's doc).
@@ -4743,7 +4849,7 @@ function RunPanelBody({
                     Can surface even mid-run (a background agent dirtied the tree).
                     Hidden while `!canSend` — e.g. an imported session still
                     importing, or whose import failed — since the send would be refused. */}
-                {canSend && shouldOfferCommitPush(gitStatus) && !sending && (
+                {canSend && shouldOfferCommitPush(activeGitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"
@@ -4764,14 +4870,28 @@ function RunPanelBody({
                     "View PR" link lives in the panel header). The proposal
                     parse runs on click, not per event flush — the stream can
                     be long. */}
-                {!task.prUrl && prHead != null && shouldOfferOpenPr(gitStatus) && !sending && (
+                {multiRepo && canSend && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void createAllPrs()}
+                    disabled={allPrsBusy}
+                    title="Open one pull request per repository, prefilled from the agent's labeled proposals"
+                    data-testid="create-all-prs"
+                  >
+                    <GitPullRequest className="mr-1 size-3" /> {allPrsBusy ? "Creating PRs…" : "Create all PRs"}
+                  </Button>
+                )}
+                {!task.prUrl && prHead != null && shouldOfferOpenPr(activeGitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"
                     onClick={() => {
                       const proposal = latestPrProposal(events);
                       onOpenPullRequest({
-                        projectPath: task.workdir,
+                        projectPath: multiRepo
+                          ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)
+                          : task.workdir,
                         head: prHead,
                         title: proposal?.title ?? "",
                         body: appendIssueCloseDirective(proposal?.description ?? "", task.issueUrl),
@@ -5780,7 +5900,13 @@ function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTa
         </span>
       </summary>
       <div className="h-80 border-t border-border/60">
-        {ready && <TerminalView taskId={task.id} archived={task.archivedAt != null} />}
+        {ready && (
+          <TerminalView
+            taskId={task.id}
+            archived={task.archivedAt != null}
+            repositories={(task.repositories?.length ?? 0) > 1 ? task.repositories!.map((r) => r.name) : undefined}
+          />
+        )}
       </div>
     </details>
   );
