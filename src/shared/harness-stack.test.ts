@@ -422,7 +422,7 @@ describe("TT-A: findings 6, helpers and surfaces", () => {
 
   test("memberStateText names the reason, deadline, model and message of a cooldown row", () => {
     const row: HarnessLimitState = {
-      harnessId: "a", reason: "quota", source: "text", message: "hit it", exhaustedUntilMs: 5000, updatedAt: 1, model: "gpt-5.6-codex",
+      harnessId: "a", reason: "quota", source: "codex-error", message: "hit it", exhaustedUntilMs: 5000, updatedAt: 1, model: "gpt-5.6-codex",
     };
     expect(memberStateText(row)).toEqual({ reasonText: "usage limit", until: 5000, model: "gpt-5.6-codex", message: "hit it" });
     expect(memberStateText({ ...row, reason: "rate_limit", model: undefined, message: null }))
