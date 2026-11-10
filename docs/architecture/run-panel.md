@@ -52,8 +52,10 @@ nor loses the request:
 
 New per-task state in these children should follow the same tagging, or get a
 reset line. For a task in a stack of two or more accounts the account picker
-lists only the stack's members (`stackPickerOptions`); the non-editable Harness
-row shows the account's label. A completed account PATCH or switch calls
+lists only the stack's members (`stackPickerOptions`); its cooling marks are
+recomputed on a 30 s `pickerNow` tick (only while `limitStates` is non-empty,
+cleared on unmount), so an expired cooldown stops reading "cooling" without a
+new payload. The non-editable Harness row shows the account's label. A completed account PATCH or switch calls
 `onTaskFieldsChanged` with only the fields it owns (`agent`, `harnessState` and,
 for a PATCH, mode/model/effort/speed/Max mode), so the panel shows the new
 account before the next 2 s poll.

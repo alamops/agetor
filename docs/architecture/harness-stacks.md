@@ -1122,8 +1122,9 @@ wrapping, the first member an automatic swap would also accept (enabled, not
 cooling for the task's model, quota not exhausted, installed, logged in, model
 and CLI floor). It ignores `tried` and **never cools an account or marks one
 tried**: the move writes `tried: []`, `lastMove.reason = "switch-now"` (the
-header reads "Switched to the next account — continuing this conversation.")
-and one history row.
+header reads "Switched to the next account — continuing this conversation."
+— the shared `harnessMoveNote`, which `agetor show` also prints, under the same
+24 h `harnessStackBannerMode` window as the webview banner) and one history row.
 
 **Refusals** (HTTP 409, body `{ error, code, reasons? }`; `reasons` is one
 `{ harnessId, label, reason }` per member, shown by the webview toast and the CLI
