@@ -573,3 +573,69 @@ test("show: not running and no timer still reads as retrying (pre-spawn window)"
 
   expect(outputs.join("\n")).toContain("failover: retrying on the next available account (attempt 2/3)");
 });
+
+test("show: a blocked stack prints the earliest reset, each member reason, the Harnesses pointer, and the cooling message (D14/D23)", async () => {
+  outputs.length = 0;
+  const reset = Date.now() + 3_600_000;
+  const t = exhaustedTask({ column: "blocked", inFlight: false, attempts: 3 });
+  t.harnessState!.allExhausted = {
+    ...t.harnessState!.allExhausted!,
+    reason: "no-usable-member",
+    attempts: 0,
+    earliestResetAtMs: reset,
+    memberReasons: [{ harnessId: "claude-a", label: "Claude A\u001b[2J", reason: "logged out" }],
+  };
+  currentClient = makeClient(t, {
+    listHarnessStacks: async () => ({
+      ...(await SOLO_STACKS()),
+      limitStates: [{
+        harnessId: "claude-b",
+        reason: "quota",
+        source: "claude-pane",
+        message: "You've hit your limit\u001b[31m",
+        exhaustedUntilMs: reset,
+        updatedAt: 1,
+        model: "opus",
+      }],
+    }),
+  });
+
+  await cmdShow([TASK_ID], flags);
+
+  const rendered = outputs.join("\n");
+  expect(rendered).toContain("fix one under Settings → Harnesses (or agetor harness …)");
+  expect(rendered).not.toContain("in Settings\n");
+  expect(rendered).toContain("earliest reset:");
+  expect(rendered).toContain("- Claude A");
+  expect(rendered).toContain("logged out");
+  expect(rendered).toContain("cooling: usage limit until");
+  expect(rendered).toContain("for opus");
+  expect(rendered).toContain("You've hit your limit");
+  expect(rendered).not.toContain("\u001b");
+});
+
+test("show: a scheduled switch and a switch-now move read in words", async () => {
+  outputs.length = 0;
+  const t = task({
+    harnessState: {
+      stackId: "stack-1",
+      position: 0,
+      count: 2,
+      tried: [],
+      pendingSwap: null,
+      allExhausted: null,
+      lastMove: null,
+      scheduledSwitch: { requestedAt: 1 },
+    },
+  });
+  currentClient = makeClient(t, {});
+  await cmdShow([TASK_ID], flags);
+  expect(outputs.join("\n")).toContain("switch to the next account scheduled for the end of this turn");
+  expect(outputs.join("\n")).toContain("switch-account");
+
+  outputs.length = 0;
+  t.harnessState = { ...t.harnessState!, scheduledSwitch: null, lastMove: { from: "a", to: "b", at: 1, reason: "switch-now" } };
+  currentClient = makeClient(t, {});
+  await cmdShow([TASK_ID], flags);
+  expect(outputs.join("\n")).toContain("switched to the next account");
+});

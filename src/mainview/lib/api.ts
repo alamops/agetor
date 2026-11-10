@@ -1768,8 +1768,11 @@ export const api = {
   }) =>
     // retry: false — a replay would create a duplicate task + branch.
     j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
-  updateTask: (id: string, patch: Partial<Task>) =>
-    j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  /** `opts.retry: false` for an account-switch PATCH: the core copies the
+   *  transcript before answering, and a replay after a lost response would
+   *  copy it twice (same reason as `switchTaskAccount`). */
+  updateTask: (id: string, patch: Partial<Task>, opts?: { retry?: boolean }) =>
+    j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }, opts),
   moveTask: (id: string, column: ColumnId) =>
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),

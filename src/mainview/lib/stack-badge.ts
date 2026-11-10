@@ -1,5 +1,13 @@
 import { stackPositionText } from "../../shared/harness-stack.ts";
-import type { HarnessStack, Task, TaskHarnessState } from "../../shared/types.ts";
+import {
+  DEFAULT_MODEL,
+  type AgentStatus,
+  type Harness,
+  type HarnessLimitState,
+  type HarnessStack,
+  type Task,
+  type TaskHarnessState,
+} from "../../shared/types.ts";
 
 /**
  * The state the task-card's stack chip renders.
@@ -45,6 +53,7 @@ export function stackBadgeStateFor(
       pendingSwap: state?.pendingSwap ?? null,
       allExhausted: state?.allExhausted ?? null,
       lastMove: state?.lastMove ?? null,
+      ...(state?.scheduledSwitch ? { scheduledSwitch: state.scheduledSwitch } : {}),
     };
   }
   return state ?? null;
@@ -83,4 +92,87 @@ export function stackPositionFor(
     return { stack, position: index + 1, count: stack.members.length, text };
   }
   return null;
+}
+
+/**
+ * The model a task will actually run, lower-cased the way the core stores a
+ * per-model cooldown (`task.model ?? DEFAULT_MODEL[kind]`, review S2). The
+ * kind comes from the task's stack (every member shares it); a task outside
+ * every stack has no per-model rows that matter, so a null model stays null.
+ */
+export function resolvedTaskModel(
+  task: Pick<Task, "agent" | "model">,
+  stacks: readonly HarnessStack[],
+): string | null {
+  if (task.model) return task.model.toLowerCase();
+  const stack = stacks.find((st) => st.members.some((m) => m.harnessId === task.agent));
+  return stack ? DEFAULT_MODEL[stack.kind].toLowerCase() : null;
+}
+
+/**
+ * The cooldown that applies to `harnessId` for a task on `resolvedModel` right
+ * now: an account-wide row, or a per-model row for that exact model (a row for
+ * another model does not stop this task). The latest end wins. A row whose
+ * instant has passed is not cooling. Several rows per account exist since
+ * migration 087.
+ */
+export function activeCooldown(
+  limitStates: readonly HarnessLimitState[],
+  harnessId: string,
+  resolvedModel: string | null,
+  now: number,
+): HarnessLimitState | null {
+  let best: HarnessLimitState | null = null;
+  for (const row of limitStates) {
+    if (row.harnessId !== harnessId || row.exhaustedUntilMs <= now) continue;
+    const rowModel = row.model ? row.model.toLowerCase() : null;
+    if (rowModel !== null && rowModel !== resolvedModel) continue;
+    if (!best || row.exhaustedUntilMs > best.exhaustedUntilMs) best = row;
+  }
+  return best;
+}
+
+/** `HH:MM` for a reset today, with the date added when it is another day. */
+export function formatResetClock(ms: number, now: number): string {
+  const at = new Date(ms);
+  const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return at.toDateString() === new Date(now).toDateString()
+    ? time
+    : `${at.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
+}
+
+export interface StackPickerOption {
+  id: string;
+  label: string;
+}
+
+/**
+ * The RunPanel account picker's rows for a stacked task (D18): only the
+ * stack's members, in stack order, each `<label> n/m`, with a cooling mark
+ * (model-aware) and the unavailable / not-logged-in suffixes. Null when the
+ * task's account is in no stack or in a one-account stack (the caller then
+ * keeps the full account list).
+ */
+export function stackPickerOptions(args: {
+  task: Pick<Task, "agent" | "model">;
+  stacks: readonly HarnessStack[];
+  harnesses: readonly Harness[];
+  agents: readonly AgentStatus[];
+  limitStates: readonly HarnessLimitState[];
+  now: number;
+}): StackPickerOption[] | null {
+  const { task, stacks, harnesses, agents, limitStates, now } = args;
+  const stack = stacks.find((st) => st.members.some((m) => m.harnessId === task.agent));
+  if (!stack || stack.members.length < 2) return null;
+  const model = resolvedTaskModel(task, stacks);
+  return stack.members.map((member, index) => {
+    const label = harnesses.find((h) => h.id === member.harnessId)?.label ?? member.label;
+    const status = agents.find((a) => a.harnessId === member.harnessId);
+    const available = status?.available ?? true;
+    const loggedOut = available && status?.loggedIn === false;
+    const cooling = activeCooldown(limitStates, member.harnessId, model, now);
+    const coolText = cooling ? ` ⏳ cooling until ${formatResetClock(cooling.exhaustedUntilMs, now)}` : "";
+    const suffix = !available ? " (unavailable)" : loggedOut ? " (not logged in)" : "";
+    return { id: member.harnessId, label: `${label} ${index + 1}/${stack.members.length}${coolText}${suffix}` };
+  });
 }

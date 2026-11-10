@@ -1,22 +1,33 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { GripVertical, Plus, Trash2 } from "lucide-react";
+import { GripVertical, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import { api, type HarnessStackResult } from "@/lib/api";
+import { api, StackChangedApiError, type HarnessStackResult } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useConfirm } from "@/components/ui/confirm";
-import type { Harness, HarnessLimitState, HarnessStack, HarnessStackKind } from "../../../shared/types.ts";
+import { MirrorPreviewDialog } from "@/components/settings/MirrorPreviewDialog";
+import { STACK_KIND_LABEL } from "@/components/settings/HarnessStackCard";
+import type {
+  Harness,
+  HarnessLimitState,
+  HarnessStack,
+  HarnessStackKind,
+  MirrorPreview,
+} from "../../../shared/types.ts";
 import {
   addMember,
+  cooldownChips,
   draftBlockers,
   draftFromStack,
-  draftPatch,
   draftWarnings,
   emptyDraft,
+  guardedPatch,
+  isMirrorRelevant,
   memberPickerOptions,
   MIRROR_MODE_COPY,
   moveMember,
+  previewBody,
   removeMember,
   stackSaveFailure,
   virtualWindow,
@@ -24,159 +35,32 @@ import {
 } from "@/lib/stack-editor";
 
 interface Props {
-  /** `list` is the Settings section; `editor` is the create/edit subpage. */
-  mode?: "list" | "editor";
   /** The stack to edit; null creates a new one. */
-  stackId?: string | null;
+  stackId: string | null;
   stacks: HarnessStack[];
   limitStates: HarnessLimitState[];
   harnesses: Harness[];
-  onEdit?: (id: string) => void;
-  onNew?: () => void;
   /** Ask the dialog to reload `/harnesses` after a save/delete. */
   onChange?: () => void;
   onSaved?: () => void;
   onDirtyChange?: (dirty: boolean) => void;
 }
 
-const KIND_LABEL: Record<HarnessStackKind, string> = {
-  "claude-code": "Claude Code",
-  codex: "Codex",
-};
-
-function coolingLabel(state: HarnessLimitState | undefined): string | null {
-  if (!state) return null;
-  return `cooling until ${new Date(state.exhaustedUntilMs).toLocaleString()}`;
-}
-
 /**
- * Settings → Stacks. The list shows every stack with its primary/backup
- * order and any cooling account; the editor builds one draft at a time.
- * Both modes live in one component because the dialog keeps either mounted
- * (the same file owns the create and edit flows).
+ * The create/edit stack subpage (reached from a stack card's Edit or the
+ * Harnesses toolbar's New stack). Stack cards, cooldowns and Restore live on
+ * the Harnesses page; this file owns one draft at a time.
  */
-export function HarnessStacksSection(props: Props) {
-  const mode = props.mode ?? "list";
-  return mode === "editor"
-    ? <StackEditor {...props} />
-    : <StackList {...props} />;
-}
-
-function StackList({ stacks, limitStates, harnesses, onEdit, onNew, onChange }: Props) {
+export function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSaved, onDirtyChange }: Props) {
   const confirm = useConfirm();
-  const [deleting, setDeleting] = useState<string | null>(null);
-  const coolingByHarness = useMemo(
-    () => new Map(limitStates.map((s) => [s.harnessId, s] as const)),
-    [limitStates],
-  );
-  const labelOf = (id: string) => harnesses.find((h) => h.id === id)?.label ?? id;
-
-  const remove = async (stack: HarnessStack) => {
-    const ok = await confirm({
-      title: `Delete stack "${stack.label}"?`,
-      description:
-        "Tasks keep their current account; automatic failover stops immediately. Copied session files stay with their accounts until retention removes them.",
-    });
-    if (!ok) return;
-    setDeleting(stack.id);
-    try {
-      await api.deleteHarnessStack(stack.id);
-      toast.success("Stack deleted");
-      onChange?.();
-    } catch (e) {
-      toast.error("Couldn't delete the stack", {
-        description: e instanceof Error ? e.message : String(e),
-        duration: Infinity,
-      });
-    } finally {
-      setDeleting(null);
-    }
-  };
-
-  return (
-    <div className="space-y-4 pt-3 text-sm" data-testid="harness-stacks-section">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <p className="font-medium">Account stacks</p>
-          <p className="text-xs text-muted-foreground">
-            Stack two or more accounts of the same harness. At its limit, a task continues on the
-            next account with the same conversation, tools and settings. Stacks are machine-local.
-          </p>
-        </div>
-        <Button size="sm" onClick={onNew}>
-          <Plus className="size-4" /> New stack
-        </Button>
-      </div>
-
-      {stacks.length === 0 ? (
-        <p className="text-xs text-muted-foreground">No stacks yet.</p>
-      ) : (
-        <ul className="space-y-2">
-          {stacks.map((stack) => (
-            <li
-              key={stack.id}
-              data-testid="harness-stack-row"
-              className="rounded-md border border-border/60 p-3"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="font-medium">
-                    {stack.label} <span className="text-xs text-muted-foreground">({KIND_LABEL[stack.kind]})</span>
-                  </p>
-                  <p className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
-                    {stack.members.map((m, i) => {
-                      const cooling = coolingLabel(coolingByHarness.get(m.harnessId));
-                      return (
-                        <span
-                          key={m.harnessId}
-                          className={cn(
-                            "rounded border border-border/60 px-1.5 py-0.5",
-                            i === 0 && "border-info/40 text-info",
-                          )}
-                          title={i === 0 ? "Primary — mirrored onto every backup" : "Backup"}
-                        >
-                          {i === 0 ? "Primary · " : `${i + 1} · `}
-                          {labelOf(m.harnessId)}
-                          {cooling ? ` (${cooling})` : ""}
-                        </span>
-                      );
-                    })}
-                  </p>
-                  {stack.warnings.length > 0 && (
-                    <ul className="mt-2 space-y-0.5 text-xs text-warning">
-                      {stack.warnings.map((w, i) => (
-                        <li key={`${w.code}:${w.harnessId ?? i}`}>{w.message}</li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  <Button size="sm" variant="ghost" onClick={() => onEdit?.(stack.id)}>
-                    Edit
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    disabled={deleting === stack.id}
-                    onClick={() => void remove(stack)}
-                    aria-label={`Delete stack ${stack.label}`}
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
-                </div>
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSaved, onDirtyChange }: Props) {
-  const existing = stackId ? stacks.find((s) => s.id === stackId) : null;
+  const existing = stackId ? stacks.find((s) => s.id === stackId) ?? null : null;
+  // The stack the draft is based on: its `updatedAt` rides every edit as
+  // `expectedUpdatedAt`, and a 409 replaces it with the stored copy.
+  const [base, setBase] = useState<HarnessStack | null>(existing);
   const [draft, setDraft] = useState<StackDraft>(() => (existing ? draftFromStack(existing) : emptyDraft()));
   const [saving, setSaving] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [preview, setPreview] = useState<MirrorPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [picker, setPicker] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
@@ -185,10 +69,22 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
 
   useEffect(() => {
     const next = existing ? draftFromStack(existing) : emptyDraft();
+    setBase(existing);
     setDraft(next);
+    setPreview(null);
     dirty.current = false;
     onDirtyChange?.(false);
   }, [stackId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A refresh landed (or the stack list loaded after the editor opened) and
+  // the user has typed nothing: follow it. A dirty draft keeps its base, so
+  // saving it meets the 409 instead of silently overwriting the newer copy.
+  useEffect(() => {
+    if (dirty.current || !existing) return;
+    if (base && base.updatedAt >= existing.updatedAt) return;
+    setBase(existing);
+    setDraft(draftFromStack(existing));
+  }, [existing, base]);
 
   const markDirty = (next: StackDraft) => {
     setDraft(next);
@@ -215,10 +111,12 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
   // selectable, with the reason. A disabled account IS selectable, with the
   // `member-disabled` warning below (`memberPickerOptions`).
   const available = memberPickerOptions(draft, { harnesses, stacks, membership });
-  const coolingByHarness = useMemo(
-    () => new Map(limitStates.map((s) => [s.harnessId, s] as const)),
-    [limitStates],
-  );
+  const now = Date.now();
+  const coolingByHarness = new Map<string, string>();
+  for (const h of sameKind) {
+    const chips = cooldownChips(limitStates, h.id, now);
+    if (chips.length > 0) coolingByHarness.set(h.id, chips.map((c) => c.text).join("; "));
+  }
 
   const window = virtualWindow({
     rowCount: draft.members.length,
@@ -228,21 +126,17 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
   });
   const visible = draft.members.slice(window.start, window.end);
 
-  const save = async () => {
-    if (blockers.length > 0) return;
+  /** Write the draft (after any preview confirmation). */
+  const commit = async () => {
     setSaving(true);
     setError(null);
     try {
       let result: HarnessStackResult;
       if (stackId) {
-        const patch = existing ? draftPatch(existing, draft) : {
-          label: draft.label,
-          members: draft.members,
-          mirrorMode: draft.mirrorMode,
-        };
+        if (!base) return;
+        const patch = guardedPatch(base, draft);
         if (Object.keys(patch).length === 0) {
-          dirty.current = false;
-          onDirtyChange?.(false);
+          finishWithoutChanges();
           return;
         }
         result = await api.patchHarnessStack(stackId, patch);
@@ -254,6 +148,7 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
           mirrorMode: draft.mirrorMode,
         });
       }
+      setPreview(null);
       dirty.current = false;
       onDirtyChange?.(false);
       // The config copy is best-effort per file: a partially mirrored stack is
@@ -275,6 +170,18 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
       onChange?.();
       onSaved?.();
     } catch (e) {
+      setPreview(null);
+      if (e instanceof StackChangedApiError) {
+        // Edited elsewhere (D16): drop the draft and show the stored copy.
+        toast.warning("This stack changed elsewhere — reloaded");
+        setBase(e.current);
+        setDraft(draftFromStack(e.current));
+        dirty.current = false;
+        onDirtyChange?.(false);
+        setError(null);
+        onChange?.();
+        return;
+      }
       // A dropped connection after the request left may still have saved the
       // stack (it mirrors inline and is never re-sent): say so and reload
       // rather than invite a second save into "already in another stack".
@@ -289,6 +196,57 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
     } finally {
       setSaving(false);
     }
+  };
+
+  const finishWithoutChanges = () => {
+    dirty.current = false;
+    onDirtyChange?.(false);
+    toast.info("No changes to save");
+    onSaved?.();
+  };
+
+  const save = async () => {
+    if (blockers.length > 0 || saving || previewing) return;
+    if (stackId && !base) return;
+    if (base && Object.keys(guardedPatch(base, draft)).length === 0) {
+      finishWithoutChanges();
+      return;
+    }
+    if (isMirrorRelevant(base, draft)) {
+      // The dry run walks the plugin trees, so it can take a while: the Save
+      // button shows a pending state meanwhile.
+      setPreviewing(true);
+      setError(null);
+      try {
+        const result = await api.previewHarnessMirror(previewBody(draft, stackId));
+        if (result.overwrites) {
+          setPreview(result);
+          return;
+        }
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        setError(message);
+        toast.error("Couldn't preview the mirror", { description: message, duration: Infinity });
+        return;
+      } finally {
+        setPreviewing(false);
+      }
+    }
+    await commit();
+  };
+
+  const switchKind = async (kind: HarnessStackKind) => {
+    if (kind === draft.kind) return;
+    if (draft.members.length > 0) {
+      const ok = await confirm({
+        title: "Switch harness kind?",
+        description: "Switching kind removes the selected accounts.",
+        confirmLabel: "Switch",
+        variant: "destructive",
+      });
+      if (!ok) return;
+    }
+    markDirty({ ...draft, kind, members: [] });
   };
 
   const dragFrom = useRef<number | null>(null);
@@ -310,14 +268,14 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
         <div className="space-y-1">
           <p className="text-xs font-medium">Harness</p>
           <div className="flex gap-2">
-            {(Object.keys(KIND_LABEL) as HarnessStackKind[]).map((kind) => (
+            {(Object.keys(STACK_KIND_LABEL) as HarnessStackKind[]).map((kind) => (
               <Button
                 key={kind}
                 size="sm"
                 variant={draft.kind === kind ? "secondary" : "outline"}
-                onClick={() => markDirty({ ...draft, kind, members: [] })}
+                onClick={() => void switchKind(kind)}
               >
-                {KIND_LABEL[kind]}
+                {STACK_KIND_LABEL[kind]}
               </Button>
             ))}
           </div>
@@ -367,7 +325,7 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
                   >
                     {index === 0 ? "Primary · " : `${index + 1} · `}
                     {harness?.label ?? id}
-                    {cooling ? <span className="text-xs text-warning"> ({coolingLabel(cooling)})</span> : null}
+                    {cooling ? <span className="text-xs text-warning"> ({cooling})</span> : null}
                   </span>
                   <Button
                     size="sm"
@@ -433,7 +391,7 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
         </div>
         {sameKind.length === 0 && (
           <p className="text-xs text-muted-foreground">
-            No {KIND_LABEL[draft.kind]} accounts yet — add one under Harnesses first.
+            No {STACK_KIND_LABEL[draft.kind]} accounts yet — add one under Harnesses first.
           </p>
         )}
       </div>
@@ -470,10 +428,21 @@ function StackEditor({ stackId, stacks, limitStates, harnesses, onChange, onSave
       {error && <p className="text-xs text-destructive">{error}</p>}
 
       <div className="flex items-center gap-2">
-        <Button size="sm" disabled={saving || blockers.length > 0} onClick={() => void save()}>
-          {saving ? "Saving…" : stackId ? "Save stack" : "Create stack"}
+        <Button
+          size="sm"
+          disabled={saving || previewing || blockers.length > 0 || (stackId !== null && !base)}
+          onClick={() => void save()}
+        >
+          {previewing ? "Checking mirror…" : saving ? "Saving…" : stackId ? "Save stack" : "Create stack"}
         </Button>
       </div>
+
+      <MirrorPreviewDialog
+        preview={preview}
+        saving={saving}
+        onCancel={() => setPreview(null)}
+        onConfirm={() => void commit()}
+      />
     </div>
   );
 }

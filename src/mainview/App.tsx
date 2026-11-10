@@ -801,7 +801,7 @@ function AppInner() {
       // The board's stack chip marks a cooling current account, so the
       // account-global cooldowns are kept here too (reconciled by harness id
       // so an unchanged poll keeps the array reference).
-      setHarnessLimitStates((prev) => reconcileById(prev, payload.limitStates ?? [], (s) => s.harnessId));
+      setHarnessLimitStates((prev) => reconcileById(prev, payload.limitStates ?? [], (s) => `${s.harnessId}\u0000${s.model ?? ""}`));
       setAgents((prev) => reconcileById(prev, payload.statuses, (a) => a.harnessId));
       // Harness rows (carries `enabled`) are already fetched here for the
       // header's status dots — onboarding's harness step reuses this same
@@ -2935,6 +2935,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         agents={agents}
         harnesses={harnesses}
         stacks={harnessStacks}
+        limitStates={harnessLimitStates}
+        onOpenSettingsHarnesses={openSettingsHarnesses}
         onRunTask={start}
         profiles={profilesLoaded ? profiles : null}
         onOpenSettingsAgents={openSettingsAgents}
@@ -3011,6 +3013,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       />
       <SettingsDialog
         open={settingsOpen}
+        usage={usage}
         stickyUserMessages={stickyUserMessages}
         onStickyUserMessagesChange={(sticky) => {
           setStickyUserMessages(sticky);

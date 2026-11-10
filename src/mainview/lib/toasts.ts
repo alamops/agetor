@@ -403,7 +403,10 @@ export function dismissTaskToastsFor(taskIds: Iterable<string>): void {
  * the window is unfocused.
  */
 export function toastHarnessSwap(args: ToastArgs & { fromLabel: string; toLabel: string; position: number; count: number }): void {
-  const detail = `${args.fromLabel} → ${args.toLabel} (${args.position}/${args.count})`;
+  // Same rule as `stackPositionText` (src/shared/harness-stack.ts): a stack
+  // with fewer than two accounts has no meaningful position to print.
+  const place = args.count >= 2 ? ` (${args.position}/${args.count})` : "";
+  const detail = `${args.fromLabel} → ${args.toLabel}${place}`;
   if (args.isSelected) {
     maybeNotifyOS(args, "harness-swap", "Account switched", detail);
     return;

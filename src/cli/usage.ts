@@ -149,7 +149,9 @@ export const USAGE: Record<string, string> = {
     --speed <s>   off | fast | ultrafast; --fast = --speed fast, --no-fast =
                   --speed off — the later flag wins
     --max-mode | --no-max-mode   cursor Max Mode
-    --detach-profile   unbind from the task's agent profile (keeps its values)`,
+    --detach-profile   unbind from the task's agent profile (keeps its values)
+  Changing --agent to another account in the task's stack needs the run
+  stopped; 'agetor switch-account <id>' instead waits for the end of the turn.`,
 
   move: `usage: agetor move <task-id> <column>   (columns: ${COLUMN_IDS})
 
@@ -190,13 +192,38 @@ export const USAGE: Record<string, string> = {
                        otherwise writes ELI5.md at the clone's root
   Ctrl+C cancels an in-flight clone (the partial checkout is removed).`,
 
-  harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id> | stack <sub> | shell <id>>
+  "switch-account": `usage: agetor switch-account <task-id> [--cancel]
+
+  Move a task in a harness stack to the next usable account (forward from its
+  current one, wrapping), keeping the conversation. An idle task moves now; a
+  task with a live run schedules the switch for the end of the turn (pressing
+  Stop drops it). --cancel undoes a scheduled switch. Refused (with a reason
+  per account) when no account can take it or background agents hold the task.
+  Unlike 'agetor edit --agent', this stays inside the task's stack.`,
+
+  harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id> | stack <sub> | cooldown clear <id> | restore <id> | shell <id>>
 
   Manage agent harnesses (aliases / parallel accounts).
   Run 'agetor harness add --help' / 'edit --help' for their flags;
   'agetor harness stack --help' manages an ordered account train (automatic
-  failover at a provider limit); 'agetor harness shell <id>' opens a shell
-  with the harness env for login.`,
+  failover at a provider limit; ls/show/create/edit/preview/history/rm);
+  'agetor harness cooldown clear <id>' clears a cooldown; 'agetor harness
+  restore <id>' puts back what a stack mirror replaced; 'agetor harness shell
+  <id>' opens a shell with the harness env for login. 'harness ls' shows each
+  account's cooldown (reason and reset) and its 5-hour / weekly quota.`,
+
+  "harness cooldown": `usage: agetor harness cooldown clear <account> [--model <id>]
+
+  Clear an account's cooldown (all of its rows, or only the one for --model).
+  The provider may still refuse until its own reset; the cooldown only stops
+  Agetor skipping the account.`,
+
+  "harness restore": `usage: agetor harness restore <account> [--yes]
+
+  Undo a stack mirror on an account: put back every original file or key the
+  mirror replaced, remove what it added (if you haven't edited it since), and
+  forget its provenance. An account that is currently a backup in a stack asks
+  for --yes: the next mirror re-applies the primary's config.`,
 
   profile: `usage: agetor profile <ls | show <ref> | add <name> … | edit <ref> … | duplicate <ref> [--name <name>] [--with-tasks] | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> […]>
 
@@ -276,35 +303,64 @@ export const USAGE: Record<string, string> = {
   env, bin on PATH). Run 'claude /login' (or 'codex login', 'opencode auth login')
   here to authenticate a parallel account against its own config. Ctrl-D to exit.`,
 
-  "harness stack": `usage: agetor harness stack <ls | create <label> … | show <id> | edit <id> … | rm <id>>
+  "harness stack": `usage: agetor harness stack <ls | create <label> … | show <stack> | edit <stack> … | preview <stack> | history <stack> | rm <stack>>
+
+  <stack> is its id, its exact label, or a unique id prefix (a label shared by
+  two stacks is refused, naming both ids).
 
   Stack same-kind accounts into an ordered train: position 1 is the primary,
   the rest are backups. A turn that hits the primary's provider limit settles
   and continues automatically on the next usable account with the conversation,
   config, MCP servers and skills preserved. Each member keeps its own login.
-  Run 'agetor harness stack create --help' / 'edit --help' for their flags.`,
+  Run 'agetor harness stack create --help' / 'edit --help' for their flags.
+  'ls' and 'show' list each member's cooldown (reason, reset, provider
+  message) and its 5-hour / weekly quota with the snapshot age.`,
 
-  "harness stack create": `usage: agetor harness stack create <label> --kind <claude-code|codex> --member <id> --member <id> [--mirror full|safe]   (--label <label> instead of the positional label is also accepted; pass one or the other, not both)
+  "harness stack create": `usage: agetor harness stack create <label> --kind <claude-code|codex> --member <id> --member <id> [--mirror full|safe] [--dry-run] [--yes]   (--label <label> instead of the positional label is also accepted; pass one or the other, not both)
 
   Members are ordered: the first --member is the primary, the rest are the
   train's backups. --kind defaults to claude-code. --mirror (default full)
   copies the primary's config tree to the backups: full mirrors everything
   eligible. Safe skips settings hooks, permissions, status line and helper
-  commands (Codex: notify); plugins and MCP servers are still mirrored.`,
+  commands (Codex: notify); plugins and MCP servers are still mirrored.
+  Before saving, the mirror is previewed. --dry-run prints the preview and
+  saves nothing. If the save would overwrite or remove files on a backup
+  account (originals are backed up first), it refuses until you pass --yes.`,
 
-  "harness stack show": `usage: agetor harness stack show <id>
+  "harness stack show": `usage: agetor harness stack show <stack>
 
-  Show one stack's members, their order, any cooling state and its warnings.`,
+  Show one stack's members, their order, any cooling state (reason, reset and
+  the provider's message), quota and its warnings.`,
 
-  "harness stack edit": `usage: agetor harness stack edit <id> [--label <label>] [--kind claude-code|codex] [--member <id> ...] [--mirror full|safe]
+  "harness stack edit": `usage: agetor harness stack edit <stack> [--label <label>] [--kind claude-code|codex] [--member <id> ...] [--add <account>] [--remove <account>] [--move <account>:<position>] [--mirror full|safe] [--dry-run] [--yes]
 
-  Replace the member list when --member is given (first = primary), rename the
-  stack with --label, change the harness kind with --kind, and/or change the
-  mirror mode with --mirror. Safe skips settings hooks, permissions, status
-  line and helper commands (Codex: notify); plugins and MCP servers are still
-  mirrored.`,
+  Replace the member list when --member is given (first = primary), or adjust
+  it with --add (appended), --remove and --move (1-based position, 1 = primary);
+  those three repeat and apply in order, and cannot be mixed with --member.
+  Rename the stack with --label, change the harness kind with --kind, and/or
+  change the mirror mode with --mirror. Safe skips settings hooks, permissions,
+  status line and helper commands (Codex: notify); plugins and MCP servers are
+  still mirrored.
+  A change to the members, kind or mirror mode is previewed first: --dry-run
+  prints the preview and saves nothing; a save that would overwrite or remove
+  files on a backup account refuses until you pass --yes (originals are backed
+  up). If the stack was edited elsewhere since it was read, the edit is refused;
+  re-run it.`,
 
-  "harness stack rm": `usage: agetor harness stack rm <id>
+  "harness stack preview": `usage: agetor harness stack preview <stack>
+
+  Print what the stack's mirror would change on each backup account: files
+  added / updated / removed, keys changed (names only), what would be backed
+  up first, what is kept because the backup edited it, and warnings.`,
+
+  "harness stack history": `usage: agetor harness stack history <stack> [--limit <n>] [--before <cursor>]
+
+  List the stack's account moves and blocked outcomes, newest first (limit,
+  retry, manual, scheduled, unavailable, resumed after restart, blocked), each
+  with its task. When more remain, the last line gives the --before cursor.
+  --json prints the page { events, nextCursor }.`,
+
+  "harness stack rm": `usage: agetor harness stack rm <stack>
 
   Remove a stack. The accounts themselves are kept.`,
 

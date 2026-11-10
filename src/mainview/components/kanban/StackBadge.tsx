@@ -12,6 +12,8 @@ export interface StackBadgeState {
   position: number;
   count?: number;
   pendingSwap?: { to: string } | null;
+  /** "Switch to next account" requested during a live turn. */
+  scheduledSwitch?: { requestedAt: number } | null;
   allExhausted?: {
     nextAttemptAt: number;
     reason: string;
@@ -39,6 +41,9 @@ export function StackBadge({
    *  The card used to hide a cooling account until the task itself blocked;
    *  the badge now marks it (review nit). A past instant reads as not cooling. */
   coolingUntilMs,
+  /** The model a per-model cooldown is for (null/absent: the whole account).
+   *  Named in the title so "cooling" never reads as the account being out. */
+  coolingModel,
   /** The task is running right now (`task.column === "running"`). With an
    *  `allExhausted` marker that is the retry run itself, not a wait. */
   running,
@@ -46,6 +51,7 @@ export function StackBadge({
 }: {
   state: StackBadgeState | null | undefined;
   coolingUntilMs?: number | null;
+  coolingModel?: string | null;
   running?: boolean;
   className?: string;
 }) {
@@ -54,6 +60,7 @@ export function StackBadge({
   const count = state.count ?? position;
   const single = count < 2;
   const pending = state.pendingSwap != null;
+  const scheduled = state.scheduledSwitch != null && !pending;
   const ex = state.allExhausted;
   // The retry run is live: the marker keeps its attempt count (and
   // `inFlight`) for the successor's whole life, so a running task with the
@@ -68,12 +75,13 @@ export function StackBadge({
   const noUsable = ex != null && !retrying && ex.reason === "no-usable-member";
   const exhausted = ex != null && !retrying;
   const cooling = coolingUntilMs != null && coolingUntilMs > Date.now();
-  if (single && !pending && ex == null && !cooling) return null;
+  if (single && !pending && !scheduled && ex == null && !cooling) return null;
   const attempt = ex ? `attempt ${Math.min(ex.attempts + 1, ex.max)}/${ex.max}` : "";
+  const forModel = coolingModel ? ` for ${coolingModel}` : "";
   const coolingDetail = cooling
     ? single
-      ? `Its account is cooling until ${new Date(coolingUntilMs).toLocaleString()}`
-      : `Account ${position} of ${count} — its current account is cooling until ${new Date(coolingUntilMs).toLocaleString()}`
+      ? `Its account is cooling${forModel} until ${new Date(coolingUntilMs).toLocaleString()}`
+      : `Account ${position} of ${count} — its current account is cooling${forModel} until ${new Date(coolingUntilMs).toLocaleString()}`
     : null;
   const title = liveRetry
     ? ex!.reason === "no-usable-member"
@@ -87,7 +95,9 @@ export function StackBadge({
           ? "Every account in this stack is out of quota"
           : pending
             ? "Switching to the next account…"
-            : coolingDetail ?? `Account ${position} of ${count} — fails over to the next account at its limit`;
+            : scheduled
+              ? "Switch to the next account scheduled for the end of this turn"
+              : coolingDetail ?? `Account ${position} of ${count} — fails over to the next account at its limit`;
   // A one-account stack has no meaningful position: name the state instead.
   const label = !single
     ? `${position}/${count}`
@@ -101,10 +111,14 @@ export function StackBadge({
             ? "out of quota"
             : pending
               ? "switching"
-              : "cooling";
+              : scheduled
+                ? "switch scheduled"
+                : "cooling";
   return (
     <span
       data-testid="task-card-stack-badge"
+      role="img"
+      aria-label={`${label}: ${title}`}
       title={title}
       className={cn(
         "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium",
@@ -114,7 +128,7 @@ export function StackBadge({
         className,
       )}
     >
-      {pending || retrying ? "⇄ " : ""}
+      {pending || retrying || scheduled ? "⇄ " : ""}
       {cooling ? "⏳ " : ""}
       {label}
     </span>

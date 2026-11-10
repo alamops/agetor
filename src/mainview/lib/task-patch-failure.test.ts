@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { taskPatchFailureToast } from "./task-patch-failure.ts";
+import { switchAccountFailureToast, taskPatchFailureToast } from "./task-patch-failure.ts";
 import { ApiError } from "./api.ts";
 import { ApiTransitError } from "./net-retry.ts";
 
@@ -30,5 +30,31 @@ describe("taskPatchFailureToast (N8)", () => {
   test("dropdown patches without an agent stay quiet", () => {
     expect(taskPatchFailureToast({ model: "m" } as { agent?: unknown }, new Error("boom"))).toBeNull();
     expect(taskPatchFailureToast({}, new Error("boom"))).toBeNull();
+  });
+});
+
+describe("switchAccountFailureToast", () => {
+  test("a 409 with reasons lists each member", () => {
+    const err = new ApiError("no usable member", 409, {
+      error: "no usable member",
+      code: "no-usable-member",
+      reasons: [
+        { harnessId: "a", label: "Work", reason: "cooling until 15:00" },
+        { harnessId: "b", label: "Personal", reason: "logged out" },
+      ],
+    });
+    expect(switchAccountFailureToast(err)).toEqual({
+      title: "Couldn't switch account",
+      description: "No other account can take this task: Work: cooling until 15:00; Personal: logged out",
+    });
+  });
+
+  test("a refusal without reasons shows the server's error", () => {
+    const err = new ApiError("x", 409, { error: "background agents are running", code: "background-agents" });
+    expect(switchAccountFailureToast(err).description).toBe("background agents are running");
+  });
+
+  test("a transit failure says the switch may have landed", () => {
+    expect(switchAccountFailureToast(new ApiTransitError("t")).title).toBe("Couldn't confirm the account switch");
   });
 });

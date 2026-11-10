@@ -47,6 +47,8 @@ describe("harnessStackBannerView", () => {
       kind: "exhausted",
       text: "Every account in this stack is out of quota — retrying in 1m 30s (attempt 1/3).",
       runNow: true,
+      reasons: [],
+      openHarnesses: true,
     });
   });
 
@@ -68,6 +70,8 @@ describe("harnessStackBannerView", () => {
       kind: "exhausted",
       text: "Retrying on the next available account (attempt 2/3)…",
       runNow: true,
+      reasons: [],
+      openHarnesses: true,
     });
   });
 
@@ -78,7 +82,39 @@ describe("harnessStackBannerView", () => {
 
   test("no usable member points at Settings", () => {
     const v = view("blocked", state({ allExhausted: exhausted({ nextAttemptAt: 0, reason: "no-usable-member" }) }));
-    expect(v?.text).toBe("No account in this stack can run this task — fix one in Settings → Stacks.");
+    expect(v?.text).toBe("No account in this stack can run this task — fix one in Settings → Harnesses.");
+  });
+
+  test("a switch-now move reads as a conversation-preserving switch", () => {
+    const v = view("review", state({ lastMove: { from: "a", to: "b", at: NOW - 1000, reason: "switch-now" } }));
+    expect(v).toEqual({ kind: "moved", text: "Switched to the next account — continuing this conversation." });
+  });
+
+  test("the earliest reset and one line per member reason are shown", () => {
+    const resetAt = NOW + 3_600_000;
+    const v = view("blocked", state({
+      allExhausted: exhausted({
+        earliestResetAtMs: resetAt,
+        memberReasons: [
+          { harnessId: "a", label: "Work", reason: "cooling until 15:00" },
+          { harnessId: "b", label: "Personal", reason: "logged out" },
+        ],
+      }),
+    }));
+    expect(v?.kind).toBe("exhausted");
+    if (v?.kind !== "exhausted") return;
+    expect(v.text).toContain("Next reset around");
+    expect(v.reasons).toEqual(["Work: cooling until 15:00", "Personal: logged out"]);
+    expect(v.openHarnesses).toBe(true);
+  });
+
+  test("no reset note when the reset is unknown or no member is usable", () => {
+    const v = view("blocked", state({ allExhausted: exhausted() }));
+    expect(v?.text).not.toContain("Next reset");
+    const n = view("blocked", state({
+      allExhausted: exhausted({ nextAttemptAt: 0, reason: "no-usable-member", earliestResetAtMs: NOW + 5000 }),
+    }));
+    expect(n?.text).not.toContain("Next reset");
   });
 });
 

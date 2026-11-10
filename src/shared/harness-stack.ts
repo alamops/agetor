@@ -71,6 +71,7 @@ export function harnessMoveNote(
   move: NonNullable<TaskHarnessState["lastMove"]>,
   toLabel: string,
 ): string {
+  if (move.reason === "switch-now") return "Switched to the next account — continuing this conversation.";
   return move.reason === "manual-switch"
     ? `Switched to ${toLabel} — continuing this conversation.`
     : `Moved to ${toLabel} — the previous account left the stack or was unavailable.`;

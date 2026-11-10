@@ -6,12 +6,14 @@ import {
   isFormSubpage,
   openAgentEditor,
   openStackEditor,
+  openStackHistory,
+  resolveSectionId,
   openEditor,
   openSection,
   openTemplates,
   resolveEscape,
   SETTINGS_SECTIONS,
-  type SettingsSectionId,
+  type SidebarSectionId,
   type SettingsView,
 } from "./settings-dialog-view.ts";
 import type { HarnessTemplate } from "../../shared/types.ts";
@@ -30,13 +32,12 @@ function template(overrides: Partial<HarnessTemplate> = {}): HarnessTemplate {
   };
 }
 
-const SECTION_IDS: SettingsSectionId[] = ["general", "harnesses", "stacks", "agents", "pipelines", "git", "prompts"];
+const SECTION_IDS: SidebarSectionId[] = ["general", "harnesses", "agents", "pipelines", "git", "prompts"];
 
-test("SETTINGS_SECTIONS lists the seven sidebar sections in order", () => {
+test("SETTINGS_SECTIONS lists the six sidebar sections in order", () => {
   expect(SETTINGS_SECTIONS).toEqual([
     { id: "general", label: "General" },
     { id: "harnesses", label: "Harnesses" },
-    { id: "stacks", label: "Stacks" },
     { id: "agents", label: "Agents" },
     { id: "pipelines", label: "Pipelines" },
     { id: "git", label: "Git Integration" },
@@ -208,11 +209,32 @@ describe("round-trip conventions", () => {
     expect(openSection(activeSection(view))).toEqual(backFromSubview(view));
   });
 
-  test("the stack editor is a Stacks form subpage that pops on Escape", () => {
+  test("the stack editor is a Harnesses form subpage that pops on Escape", () => {
     const view = openStackEditor(null);
-    expect(activeSection(view)).toBe("stacks");
+    expect(activeSection(view)).toBe("harnesses");
     expect(isFormSubpage(view)).toBe(true);
     expect(resolveEscape(view)).toBe("pop");
     expect(openSection(activeSection(view))).toEqual(backFromSubview(view));
+  });
+
+  test("the stack history is a Harnesses subpage with no draft, popping on Escape", () => {
+    const view = openStackHistory("s1");
+    expect(view).toEqual({ kind: "stack-history", stackId: "s1" });
+    expect(activeSection(view)).toBe("harnesses");
+    expect(isFormSubpage(view)).toBe(false);
+    expect(resolveEscape(view)).toBe("pop");
+    expect(backFromSubview(view)).toEqual({ kind: "section", section: "harnesses" });
+  });
+});
+
+describe("the legacy stacks deep link", () => {
+  test("opens Harnesses", () => {
+    expect(openSection("stacks")).toEqual({ kind: "section", section: "harnesses" });
+    expect(resolveSectionId("stacks")).toBe("harnesses");
+    expect(resolveSectionId("agents")).toBe("agents");
+  });
+
+  test("is not a sidebar entry", () => {
+    expect(SETTINGS_SECTIONS.map((s) => s.id)).not.toContain("stacks" as never);
   });
 });

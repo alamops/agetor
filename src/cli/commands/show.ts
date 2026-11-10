@@ -5,6 +5,8 @@ import { usageError } from "../usage.ts";
 import { ApiError, type AgetorClient } from "../api-client.ts";
 import { defaultModeFor, type Run, type Task } from "../../shared/types.ts";
 import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
+import { memberReasonText, memberStateText, stackPositionText } from "../../shared/harness-stack.ts";
+import { coolingText, limitRowsFor } from "../stack-display.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
 import { colorRunStatus } from "./pipeline.ts";
 import { profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
@@ -31,7 +33,7 @@ export function failoverText(
   if (ex.attempts >= ex.max) return "every account is out of quota — run the task manually after a reset";
   if (ex.nextAttemptAt > 0) return `waiting until ${new Date(ex.nextAttemptAt).toLocaleString()} (${attempt})`;
   if (ex.reason !== "no-usable-member") return `retrying on the next available account (${attempt})`;
-  return "no usable account — fix one in Settings";
+  return "no usable account — fix one under Settings → Harnesses (or agetor harness …)";
 }
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
@@ -67,19 +69,36 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   // an agent, each step launches on its own frozen profile (L-CLI4).
   const agentNote = task.pipelineId ? c.dim(" (start step's harness — steps own the launch)") : "";
   out(
-    `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${task.agent}${agentNote}` +
+    `  ${label("column")} ${colorColumn(task.column)}   ${label("agent")} ${escapeControlChars(task.agent)}${agentNote}` +
       `   ${label("model")} ${escapeControlChars(task.model ?? "-")}   ${label("mode")} ${escapeControlChars(modeText)}`,
   );
   const stack = (stacksPayload?.stacks ?? []).find((st) => st.members.some((m) => m.harnessId === task.agent));
   if (stack) {
-    const index = stack.members.findIndex((m) => m.harnessId === task.agent);
-    // A one-member stack has nothing to fail over to: no `(1/1)` position.
-    const position = stack.members.length < 2 ? "" : ` (${index + 1}/${stack.members.length})`;
+    // A stack with fewer than two members has no backups: no `(n/m)`.
+    const pos = stackPositionText(stack, task.agent);
+    const position = pos === null ? "" : ` (${pos})`;
     out(`  ${label("stack")} ${escapeFreeText(stack.label)}${position}`);
+    for (const s of limitRowsFor(stacksPayload?.limitStates ?? [], task.agent)) {
+      out(`  ${label("cooling")} ${c.yellow(coolingText(s))}`);
+      const msg = memberStateText(s).message;
+      if (msg) out(`    ${c.dim(escapeFreeText(msg))}`);
+    }
   }
-  if (task.harnessState?.allExhausted) {
+  const hs = task.harnessState;
+  if (hs?.allExhausted) {
     const text = failoverText(task, stack?.members.find((m) => m.harnessId === task.agent)?.label ?? null);
     out(`  ${label("failover")} ${c.yellow(escapeFreeText(text))}`);
+    const resetAt = hs.allExhausted.earliestResetAtMs;
+    if (resetAt != null) out(`    earliest reset: ${new Date(resetAt).toLocaleString()}`);
+    for (const r of hs.allExhausted.memberReasons ?? []) {
+      out(`    - ${escapeFreeText(memberReasonText(r))}`);
+    }
+  }
+  if (hs?.scheduledSwitch) {
+    out(`  ${label("switch")} ${c.cyan("switch to the next account scheduled for the end of this turn")} ${c.dim(`(agetor switch-account ${task.id.slice(0, 8)} --cancel to undo)`)}`);
+  }
+  if (hs?.lastMove?.reason === "switch-now") {
+    out(`  ${label("switch")} switched to the next account ${c.dim(`(${new Date(hs.lastMove.at).toLocaleString()})`)}`);
   }
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
   if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);

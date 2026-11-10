@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { HarnessStack, TaskHarnessState } from "../../shared/types.ts";
-import { stackBadgeStateFor, stackPositionFor } from "./stack-badge.ts";
+import type { HarnessLimitState } from "../../shared/types.ts";
+import { activeCooldown, resolvedTaskModel, stackBadgeStateFor, stackPickerOptions, stackPositionFor } from "./stack-badge.ts";
 import { stackPositionText } from "../../shared/harness-stack.ts";
 
 function stack(id: string, members: string[]): HarnessStack {
@@ -138,5 +139,53 @@ describe("stackPositionFor (N1)", () => {
         expect(stackPositionFor(stacks, id)?.text ?? null).toBe(stackPositionText(stacks[0]!, id));
       }
     }
+  });
+});
+
+function limit(harnessId: string, until: number, model: string | null = null): HarnessLimitState {
+  return { harnessId, reason: "quota", source: "codex-error", message: null, exhaustedUntilMs: until, updatedAt: 1, model };
+}
+
+describe("per-model cooldowns (review S2)", () => {
+  const stacks = [stack("s1", ["a", "b"])];
+
+  test("resolvedTaskModel falls back to the stack kind's default, lower-cased", () => {
+    expect(resolvedTaskModel({ agent: "a", model: "Opus-X" }, stacks)).toBe("opus-x");
+    expect(resolvedTaskModel({ agent: "a", model: null }, stacks)).not.toBeNull();
+    expect(resolvedTaskModel({ agent: "zzz", model: null }, stacks)).toBeNull();
+  });
+
+  test("a per-model row counts only for that model; an account-wide row always counts", () => {
+    const rows = [limit("a", 5000, "opus-x")];
+    expect(activeCooldown(rows, "a", "opus-x", 1000)?.exhaustedUntilMs).toBe(5000);
+    expect(activeCooldown(rows, "a", "sonnet", 1000)).toBeNull();
+    expect(activeCooldown([...rows, limit("a", 3000)], "a", "sonnet", 1000)?.exhaustedUntilMs).toBe(3000);
+    expect(activeCooldown(rows, "a", "opus-x", 6000)).toBeNull();
+  });
+
+  test("the picker lists only the stack's members in order, with position and cooling", () => {
+    const harnesses = [
+      { id: "a", label: "Work" },
+      { id: "b", label: "Personal" },
+      { id: "c", label: "Other" },
+    ] as never;
+    const opts = stackPickerOptions({
+      task: { agent: "a", model: "opus-x" },
+      stacks,
+      harnesses,
+      agents: [{ harnessId: "b", available: true, loggedIn: false }] as never,
+      limitStates: [limit("b", Date.now() + 3_600_000, "opus-x")],
+      now: Date.now(),
+    });
+    expect(opts?.map((o) => o.id)).toEqual(["a", "b"]);
+    expect(opts?.[0]!.label).toBe("Work 1/2");
+    expect(opts?.[1]!.label).toContain("Personal 2/2 ⏳ cooling until");
+    expect(opts?.[1]!.label).toContain("(not logged in)");
+  });
+
+  test("an unstacked or one-member task keeps the full list (null)", () => {
+    const base = { stacks: [stack("s1", ["a"])], harnesses: [] as never, agents: [] as never, limitStates: [], now: 1 };
+    expect(stackPickerOptions({ task: { agent: "a", model: null }, ...base })).toBeNull();
+    expect(stackPickerOptions({ task: { agent: "q", model: null }, ...base })).toBeNull();
   });
 });
