@@ -17,7 +17,7 @@ import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
 import { RepositoriesDialog } from "./RepositoriesDialog";
-import { selectionName, type RepoSelection } from "@/lib/repo-selection";
+import { repositoryFileScopes, selectionName, type RepoSelection } from "@/lib/repo-selection";
 import { PromptComposer } from "./PromptComposer";
 import { TaskTypePicker } from "./TaskTypePicker";
 
@@ -112,6 +112,15 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
   const fileScope = useMemo(
     () => (open ? { dir: context?.path ?? "", ref: wt.isolate ? (wt.baseRef.trim() || "HEAD") : null } : null),
     [open, context?.path, wt.isolate, wt.baseRef],
+  );
+  // Multi-repository `@` scopes (issue #291): the same union New Task builds —
+  // each selected repository lists at its own path and pinned/HEAD ref, and
+  // entries are prefixed with its workspace name. Without this the flagship
+  // issue flow could only `@` files in the issue's own repository, and a
+  // valid `@backend/...` token was flagged unresolved.
+  const fileScopes = useMemo(
+    () => (multiRepo ? repositoryFileScopes(repos, wt.isolate) : null),
+    [multiRepo, repos, wt.isolate],
   );
 
   // Reset per-open transient state, then fetch the thread this dialog was
@@ -389,6 +398,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
                 onReferencesChange={setReferences}
                 setReferences={setReferences}
                 fileScope={fileScope}
+                fileScopes={fileScopes}
                 startingFolder={context.path}
                 rows={12}
                 footer={overage && (

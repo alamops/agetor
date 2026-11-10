@@ -521,6 +521,33 @@ export async function resolveRef(dir: string, ref: string): Promise<string | nul
 }
 
 /**
+ * Fill in any per-repository `baseRef` that was never pinned (a row created
+ * before a path was a git repository, or a hand-edited/legacy row). The
+ * single-repository lazy pin reads the task's own `workdir`; a multi row has
+ * no such scalar, so each entry resolves against its own path — the same
+ * commit `prepareRepoWorktree` used for that repository's worktree.
+ *
+ * Returns a new array (entries with an existing pin are passed through
+ * unchanged). A repository whose HEAD can't be resolved keeps its null
+ * `baseRef` rather than failing the caller, matching the single-repo pin.
+ */
+export async function pinMissingRepositoryBaseRefs(
+  repos: TaskRepository[],
+): Promise<TaskRepository[]> {
+  return Promise.all(repos.map(async (repo) => {
+    if (repo.baseRef) return repo;
+    let sha: string | null = null;
+    try {
+      sha = await resolveRef(repo.path, "HEAD");
+    } catch {
+      // Missing/deleted repository, or git itself unavailable: keep the null
+      // pin like the single-repository lazy pin does.
+    }
+    return sha ? { ...repo, baseRef: sha } : repo;
+  }));
+}
+
+/**
  * List branches at `dir`, sorted by most recent commit first. Includes both
  * local branches (`refs/heads/…`) and remote-tracking branches (`refs/remotes/<remote>/…`),
  * so a fresh clone with only `main` checked out still surfaces every `origin/*`

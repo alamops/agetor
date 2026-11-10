@@ -39,10 +39,10 @@ bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 | Check | Result |
 | --- | --- |
 | `bun run typecheck` | green |
-| Focused multi-repo/unit suites | green (see the command above) |
-| `bun test src/bun` | 7,437 tests, 302 files — green except three load-related flakes verified green in isolation (`opencode-server`, `opencode-tmux` timing, and the whitespace path-gate test updated for `itemField`) |
-| `bun test src/shared src/mainview src/cli` | 5,044 tests, 192 files, green |
-| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 3 passed |
+| Focused multi-repo/unit suites | green — 1,047 tests across the 25 files above |
+| `bun test` | 12,512 tests, 496 files — 12,477 pass, 31 skip, 4 fail. All four are load/timing-sensitive fake-tmux/opencode-fixture cases; re-running each failing file rotated the failing case and every individual test passed on a rerun. Every multi-repo/shared/mainview/CLI suite is green. |
+| `bun test src/shared src/mainview src/cli` | green (included in the full run above) |
+| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 4 passed |
 | Migration 087 on an 086 DB | `src/bun/db-repositories.test.ts` / `src/bun/migrate.test.ts` |
 | Existing worktree tests | unchanged and green (the pre-change 116 plus the new multi-repo cases) |
 
@@ -65,6 +65,23 @@ permanent regression test:
 | "Commit & push" showed only when the selected tab was dirty | aggregate gate (`shouldOfferCommitPushForTask`) across every repository | `src/mainview/lib/commit-push.test.ts` |
 | `Repository: agetor_api` proposals were dropped | label capture keeps `_`; markdown emphasis is stripped | `src/mainview/lib/pr-proposal.test.ts` |
 | A never-started multi repository was promised branch removals | per-repo plan is empty when `worktreePath` is null, matching delete | `src/bun/server-teardown-preview.test.ts` |
+
+The second review round added five more regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| The board card's "View issue" still passed the non-git workspace root | the same `issueProjectPath` helper the run-panel header uses (it also falls back to the first repository, never the workspace); the GitHub dialog's default project uses `taskProjectPath` for the same reason | `src/mainview/lib/repo-selection.test.ts` |
+| The issue dialog's `@` listing only covered the issue repository | `PromptComposer` gets the same multi `fileScopes` as New Task (shared `repositoryFileScopes`, so colliding basenames get the workspace's `-2` suffix too) | `src/mainview/lib/repo-selection.test.ts` |
+| A terminal open refused by a concurrent archive/delete skipped cleanup for multi, leaking the worktrees it materialized | `discardRefusedWorktree` takes the materialized entries and forwards the per-repository plan | `src/bun/terminals.test.ts` — "refused by an archive during prepareTaskWorkdir…" |
+| No per-repository "View PR" in the card context menu | `view-repo-pr` entries resolved to each repository's URL and worktree | `src/mainview/lib/task-context-menu.test.ts` |
+| A slug ending in `_` lost its PR proposal | only a *balanced* emphasis pair is stripped; edge underscores stay | `src/mainview/lib/pr-proposal.test.ts` |
+
+Nits also closed: multi rows lazily pin each repository's `baseRef` on start/terminal
+open (`pinMissingRepositoryBaseRefs`), the card comment says tooltip (not
+popover), the repro test no longer sleeps, the e2e spec no longer carries
+unreachable `test.skip` guards, and the commit-chip regression is now asserted
+through the real UI (only a sibling repository dirty) rather than the pure
+helper alone.
 
 ## Live harness smoke matrix
 

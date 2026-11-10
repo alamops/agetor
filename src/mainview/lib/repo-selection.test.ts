@@ -4,8 +4,10 @@ import {
   collapseToProject,
   dedupeSelections,
   issueProjectPath,
+  repositoryFileScopes,
   selectionName,
   selectionNames,
+  taskProjectPath,
   tooManyRepositories,
 } from "./repo-selection.ts";
 
@@ -56,6 +58,47 @@ describe("warning threshold", () => {
   });
 });
 
+describe("repositoryFileScopes", () => {
+  test("one named scope per repository, pinned at base when isolated", () => {
+    const repos = [
+      { path: "/src/frontend", baseRef: "abc123" },
+      { path: "/src/backend", baseRef: "" },
+    ];
+    expect(repositoryFileScopes(repos, true)).toEqual([
+      { name: "frontend", dir: "/src/frontend", ref: "abc123" },
+      { name: "backend", dir: "/src/backend", ref: "HEAD" },
+    ]);
+    expect(repositoryFileScopes(repos, false)).toEqual([
+      { name: "frontend", dir: "/src/frontend", ref: null },
+      { name: "backend", dir: "/src/backend", ref: null },
+    ]);
+  });
+
+  test("colliding basenames get the same unique suffixes the workspace uses", () => {
+    expect(repositoryFileScopes([
+      { path: "/a/api" },
+      { path: "/b/api" },
+    ], true)).toEqual([
+      { name: "api", dir: "/a/api", ref: "HEAD" },
+      { name: "api-2", dir: "/b/api", ref: "HEAD" },
+    ]);
+  });
+});
+
+describe("taskProjectPath", () => {
+  test("single-repository tasks keep the task workdir", () => {
+    expect(taskProjectPath({ workdir: "/repo", repositories: [{ path: "/repo" }] })).toBe("/repo");
+    expect(taskProjectPath({ workdir: "/repo" })).toBe("/repo");
+  });
+
+  test("multi tasks use the first repository, never the workspace root", () => {
+    expect(taskProjectPath({
+      workdir: "/data/worktrees/t1",
+      repositories: [{ path: "/repos/frontend" }, { path: "/repos/backend" }],
+    })).toBe("/repos/frontend");
+  });
+});
+
 describe("issueProjectPath", () => {
   test("single-repository tasks keep the task workdir", () => {
     expect(issueProjectPath({ workdir: "/repo", repositories: [{ path: "/repo" }] })).toBe("/repo");
@@ -73,13 +116,15 @@ describe("issueProjectPath", () => {
     expect(issueProjectPath(task, { path: "/repos/frontend" })).toBe("/repos/backend");
   });
 
-  test("falls back to the selected tab for a row without issueRepoPath", () => {
+  test("falls back to the selected tab, then the first repository, for a row without issueRepoPath", () => {
     const task = {
       workdir: "/data/worktrees/t1",
       repositories: [{ path: "/repos/frontend" }, { path: "/repos/backend" }],
     };
     expect(issueProjectPath(task, { path: "/repos/backend" })).toBe("/repos/backend");
-    expect(issueProjectPath(task)).toBe("/data/worktrees/t1");
+    // The workspace root is not a git repository, so it must never be the
+    // fallback for a multi task (the issue-thread fetch would 400).
+    expect(issueProjectPath(task)).toBe("/repos/frontend");
   });
 });
 

@@ -80,6 +80,7 @@ import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
 import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
+import { issueProjectPath, taskProjectPath } from "@/lib/repo-selection";
 import { cn } from "@/lib/utils";
 import { autoEnabledToastText, opencodeSessionsFoundText } from "@/lib/import-sessions";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
@@ -194,6 +195,7 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   diff: GitCompare,
   "open-in-finder": Folder,
   "view-pr": GitPullRequest,
+  "view-repo-pr": GitPullRequest,
   "view-issue": CircleDot,
   "mark-read": MailOpen,
   "mark-unread": Mail,
@@ -2459,10 +2461,23 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
         if (prUrl) viewPullRequest({ projectPath: t.workdir, prUrl });
         break;
       }
+      case "view-repo-pr": {
+        // Per-repository sibling of "view-pr" (issue #291): a multi task has
+        // no aggregate PR, so resolve the named repository from the snapshot
+        // the entry was gated on and open its own URL against its own
+        // worktree checkout (the provider remote lives there, never at the
+        // non-git workspace root).
+        const repo = (snapshot.repositories ?? []).find((r) => r.name === repoName)
+          ?? (t.repositories ?? []).find((r) => r.name === repoName);
+        if (repo?.prUrl) viewPullRequest({ projectPath: repo.worktreePath ?? repo.path, prUrl: repo.prUrl });
+        break;
+      }
       case "view-issue": {
-        // Same snapshot-first rationale as "view-pr" above.
+        // Same snapshot-first rationale as "view-pr" above. The project path
+        // must be a real repository: a multi task's `workdir` is the non-git
+        // workspace root, so the issue-thread fetch 400s.
         const issueUrl = snapshot.issueUrl ?? t.issueUrl;
-        if (issueUrl) viewIssue({ projectPath: t.workdir, issueUrl });
+        if (issueUrl) viewIssue({ projectPath: issueProjectPath(t), issueUrl });
         break;
       }
       case "mark-read":
@@ -2999,7 +3014,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, r
       <GitHubDialog
         open={githubOpen}
         projects={projects}
-        initialProjectPath={githubItemDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        initialProjectPath={githubItemDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? (selected ? taskProjectPath(selected) : tasks[0] ? taskProjectPath(tasks[0]) : null)}
         pullPrefill={githubPullPrefill}
         itemDetailPrefill={githubItemDetailPrefill}
         onClose={closeGithubDialog}

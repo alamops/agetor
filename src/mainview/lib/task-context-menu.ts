@@ -22,6 +22,7 @@ export type TaskMenuAction =
   | "diff"
   | "open-in-finder"
   | "view-pr"
+  | "view-repo-pr"
   | "view-issue"
   | "mark-read"
   | "mark-unread"
@@ -46,7 +47,8 @@ export interface TaskMenuEntry {
   group: TaskMenuGroup;
   /** Danger-styled entry (destructive text color). Only `delete` sets this. */
   danger?: boolean;
-  /** For `copy-repo-*` on a multi-repository task: which entry to copy. */
+  /** For `copy-repo-*` / `view-repo-pr` on a multi-repository task: which
+   *  repository entry the action targets. */
   repoName?: string;
 }
 
@@ -143,6 +145,22 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   entries.push({ action: "open-in-finder", label: "Open in Finder", group: "inspect" });
   if (task.prUrl) {
     entries.push({ action: "view-pr", label: "View pull request", group: "inspect" });
+  }
+  if ((task.repositories?.length ?? 0) > 1) {
+    // Per-repository PRs (issue #291): a multi row has no single `prUrl` —
+    // each repository stamps its own — so name every repository that opened
+    // one. The board handler resolves `repoName` back to that entry's URL and
+    // worktree path.
+    for (const repo of task.repositories!) {
+      if (repo.prUrl) {
+        entries.push({
+          action: "view-repo-pr",
+          label: `View ${repo.name} pull request`,
+          group: "inspect",
+          repoName: repo.name,
+        });
+      }
+    }
   }
   if (task.issueUrl) {
     entries.push({ action: "view-issue", label: "View issue", group: "inspect" });

@@ -58,6 +58,7 @@ const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   diff: "inspect",
   "open-in-finder": "inspect",
   "view-pr": "inspect",
+  "view-repo-pr": "inspect",
   "view-issue": "inspect",
   "mark-read": "utility",
   "mark-unread": "utility",
@@ -650,4 +651,36 @@ test("multi-repository task offers per-repository copy entries", () => {
   ]);
   expect(entries.some((e) => e.action === "copy-branch")).toBe(false);
   expect(entries.some((e) => e.action === "copy-worktree-path")).toBe(false);
+});
+
+test("multi-repository task offers a View PR entry for every repository that opened one", () => {
+  const repo = (name: string, prUrl: string | null) => ({
+    path: `/src/${name}`,
+    name,
+    branch: "feature/x",
+    branchSource: "created" as const,
+    worktreePath: `/wt/t1/${name}`,
+    baseRef: null,
+    checkoutBranch: "feature/x",
+    prUrl,
+  });
+  const task = makeTask({
+    branch: null,
+    worktreePath: "/wt/t1",
+    repositories: [
+      repo("frontend", "https://github.com/o/frontend/pull/1"),
+      repo("backend", null),
+      repo("infra", "https://github.com/o/infra/pull/2"),
+    ],
+  });
+  const entries = buildTaskContextMenu(task, { isOpen: false });
+  expect(entries.filter((e) => e.action === "view-repo-pr").map((e) => `${e.repoName}:${e.label}`)).toEqual([
+    "frontend:View frontend pull request",
+    "infra:View infra pull request",
+  ]);
+  // A multi task has no aggregate `prUrl`, so the single-repo entry never shows.
+  expect(entries.some((e) => e.action === "view-pr")).toBe(false);
+  for (const e of entries) {
+    expect(e.group).toBe(ACTION_GROUP[e.action]);
+  }
 });

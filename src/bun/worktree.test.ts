@@ -2168,6 +2168,32 @@ test("prepareTaskWorkdir creates one worktree and branch per repository under th
   }
 });
 
+test("pinMissingRepositoryBaseRefs resolves each unpinned entry against its own repository", async () => {
+  const { pinMissingRepositoryBaseRefs } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  // A second commit in b proves the lookup runs in b, not in the first repo.
+  writeFileSync(path.join(b, "README"), "b2\n");
+  await git(["add", "."], b);
+  await git(["commit", "-m", "second"], b);
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: null },
+  ]);
+  try {
+    const pinned = await pinMissingRepositoryBaseRefs(task.repositories!);
+    expect(pinned.map((r) => r.baseRef)).toEqual([shaA, shaB]);
+    // An unknown path keeps its null pin rather than failing the caller.
+    const unknown = await pinMissingRepositoryBaseRefs([{ ...task.repositories![1]!, path: path.join(b, "missing") }]);
+    expect(unknown[0]!.baseRef).toBeNull();
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
 test("prepareTaskWorkdir reuses existing per-repo worktrees without creating anything", async () => {
   const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
   const a = await makeRepo();

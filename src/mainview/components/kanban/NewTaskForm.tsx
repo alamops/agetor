@@ -52,7 +52,7 @@ import { PipelinePicker } from "@/components/pipelines";
 import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import { RepositoriesDialog } from "./RepositoriesDialog";
-import { collapseToProject, selectionName, type RepoSelection } from "@/lib/repo-selection";
+import { collapseToProject, repositoryFileScopes, selectionName, type RepoSelection } from "@/lib/repo-selection";
 import { TaskTypePicker } from "./TaskTypePicker";
 import { captureDroppedOrPastedItems } from "./ReferencesPicker";
 import { PromptComposer, usePromptCapture } from "./PromptComposer";
@@ -322,13 +322,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // Multi-repository `@` scopes: each selected repo lists at its own path and
   // pinned/HEAD ref; entries are prefixed with the workspace name.
   const fileScopes = useMemo(
-    () => (multiRepo
-      ? repos.map((r) => ({
-          name: selectionName(r),
-          dir: r.path,
-          ref: wt.isolate ? (r.baseRef?.trim() || "HEAD") : null,
-        }))
-      : null),
+    () => (multiRepo ? repositoryFileScopes(repos, wt.isolate) : null),
     [multiRepo, repos, wt.isolate],
   );
   // Drag/paste-to-attach wiring for the prompt textarea, shared with the

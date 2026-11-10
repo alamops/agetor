@@ -270,6 +270,7 @@ import {
 import {
   prepareWorkdir,
   prepareTaskWorkdir,
+  pinMissingRepositoryBaseRefs,
   worktreeIdForRepo,
   resolveWorktreeRef,
   removeWorktree,
@@ -2494,6 +2495,12 @@ async function startTaskInner(
   if (!task.baseRef && prepared.worktreePath) {
     const sha = await resolveRef(task.workdir, "HEAD");
     if (sha) tasks.update(taskId, { baseRef: sha });
+  }
+  // A multi-repository row has no scalar baseRef: pin every entry that is
+  // missing one against its own repository, before the persist transaction
+  // below writes them back.
+  if (prepared.repositories && prepared.repositories.length > 1) {
+    prepared.repositories = await pinMissingRepositoryBaseRefs(prepared.repositories);
   }
 
   // A fresh `startTask` (as opposed to `resumeFxRecovery`'s continue-recovery
@@ -12276,17 +12283,27 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
  * that failed) owns the worktree through its persisted path, so nothing is
  * done; an archived row gets the archive's branch-preserving detach; a deleted
  * task gets the delete's removal, branches planned exactly as delete plans
- * them. Best-effort, never throws.
+ * them. A multi-repository task passes the whole materialized entry list so
+ * each repository is detached/removed in its own repo (the workspace root is
+ * not itself a git checkout). Best-effort, never throws.
  */
 export function discardRefusedWorktree(
   task: Task,
-  prepared: { worktreePath: string; branch: string | null },
+  prepared: { worktreePath: string; branch: string | null; repositories?: TaskRepository[] },
 ): Promise<void> {
   return enqueueTeardownMany(task.id, teardownKeysForTask(task), async () => {
     const cur = tasks.get(task.id);
     if (cur && cur.archivedAt == null) return;
+    // The workspace root counts as materialized whenever any nested checkout
+    // was created; both detach/remove are idempotent when a child is gone.
     if (!existsSync(prepared.worktreePath)) return;
-    const target: Task = { ...(cur ?? task), worktreePath: prepared.worktreePath, branch: prepared.branch };
+    const multi = (prepared.repositories?.length ?? 0) > 1;
+    const target: Task = {
+      ...(cur ?? task),
+      worktreePath: prepared.worktreePath,
+      branch: prepared.branch,
+      ...(multi ? { repositories: prepared.repositories } : {}),
+    };
     if (cur) {
       await detachWorktree(target);
       return;

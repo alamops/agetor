@@ -21,7 +21,9 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *     count, and the task row carries both entries.
  *  2. the diff dialog offers one tab per repository and switching tabs loads
  *     that repository's own changes.
- *  3. archive detaches both clean worktrees, keeps the branches, and
+ *  3. the "Commit & push" chip appears when only a sibling repository changed
+ *     (the prompt is aggregate, not selected-tab-scoped).
+ *  4. archive detaches both clean worktrees, keeps the branches, and
  *     unarchive restores them.
  */
 
@@ -82,7 +84,6 @@ test.afterAll(async ({ backend, request }) => {
 });
 
 test("create + start materializes both worktrees and the card names both repositories", async ({ backend, page, request }) => {
-  test.skip(!taskId, "task create failed in beforeAll");
   const auth = { authorization: `Bearer ${backend.apiToken}` };
   const started = await request.post(`${backend.apiBase}/tasks/${taskId}/start`, { headers: auth });
   expect(started.ok()).toBe(true);
@@ -114,7 +115,6 @@ test("create + start materializes both worktrees and the card names both reposit
 });
 
 test("the diff dialog has one tab per repository and loads each repository's changes", async ({ backend, page, request }) => {
-  test.skip(!taskId, "task create failed in beforeAll");
   const auth = { authorization: `Bearer ${backend.apiToken}` };
   const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
   const task = (await res.json()) as {
@@ -135,10 +135,27 @@ test("the diff dialog has one tab per repository and loads each repository's cha
   await expect(page.getByText("back.txt")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 });
 
+test("the commit & push chip is offered when only a sibling repository changed", async ({ backend, page, request }) => {
+  const auth = { authorization: `Bearer ${backend.apiToken}` };
+  const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
+  const task = (await res.json()) as {
+    repositories: { worktreePath: string }[];
+  };
+  // Test 2 wrote one file in each worktree; clear the first so the selected
+  // (first) repository is clean and only its sibling has changes. Gating on
+  // the selected tab alone would hide the chip; the aggregate prompt must
+  // still offer it.
+  await rm(path.join(task.repositories[0]!.worktreePath, "front.txt"), { force: true });
+
+  await gotoApp(page, backend.bootBase);
+  await page.getByText("Multi repository e2e", { exact: true }).first().click();
+  await expect(page.getByRole("button", { name: "Commit & push" })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+});
+
 test("archive detaches both clean worktrees and keeps the branches", async ({ backend, request }) => {
-  test.skip(!taskId, "task create failed in beforeAll");
   const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
-  // Make exactly one repository dirty (test 2 changed both).
+  // Make exactly one repository dirty (test 2 changed both; the chip test
+  // cleaned the first).
   const before = (await (await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth })).json()) as {
     repositories: { worktreePath: string }[];
   };

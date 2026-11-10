@@ -53,7 +53,6 @@ test("a two-repository create keeps both repositories and materializes one workt
     expect(created.task.repositories?.map((r) => r.path)).toEqual([a, b]);
     const res = await startTask(id);
     if ("error" in res) throw new Error(res.error);
-    await new Promise((r) => setTimeout(r, 300));
     const t = tasks.get(id)!;
     // And only one worktree was materialized.
     const names = uniqueRepoSlugs([a, b]);

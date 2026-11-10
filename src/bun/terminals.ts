@@ -173,7 +173,7 @@ export async function createTerminal(
   try {
     // Dynamic imports — see the top-of-file note on the db.ts ↔ worktree.ts
     // cycle; orchestrator.ts imports this module statically.
-    const { prepareTaskWorkdir, resolveRef } = await import("./worktree.ts");
+    const { prepareTaskWorkdir, pinMissingRepositoryBaseRefs, resolveRef } = await import("./worktree.ts");
     const {
       discardRefusedWorktree,
       isTaskTearingDown,
@@ -217,9 +217,14 @@ export async function createTerminal(
 
     // Lazy-pin baseRef and persist worktree fields, exactly as startTask does,
     // so the terminal and any future agent run share one branch/worktree.
+    // A multi row has no scalar baseRef: pin each missing entry against its
+    // own repository before persisting the materialized set.
     if (!multiRepo && !task.baseRef && prepared.worktreePath) {
       const sha = await resolveRef(task.workdir, "HEAD");
       if (sha) tasks.update(taskId, { baseRef: sha });
+    }
+    if (multiRepo && prepared.repositories) {
+      prepared.repositories = await pinMissingRepositoryBaseRefs(prepared.repositories);
     }
     if (
       prepared.worktreePath
@@ -255,8 +260,15 @@ export async function createTerminal(
     // teardown already ran, so queue a cleanup behind it as well.
     const after = current();
     if ("error" in after) {
-      if (!multiRepo && !hadWorktree && prepared.worktreePath) {
-        void discardRefusedWorktree(task, { worktreePath: prepared.worktreePath, branch: prepared.branch });
+      if (!hadWorktree && prepared.worktreePath) {
+        void discardRefusedWorktree(task, {
+          worktreePath: prepared.worktreePath,
+          branch: prepared.branch,
+          // A multi task's workspace root is not itself a git checkout; hand
+          // over every materialized entry so each repository is cleaned up in
+          // its own repo (branch plan included).
+          ...(multiRepo && prepared.repositories ? { repositories: prepared.repositories } : {}),
+        });
       }
       return after;
     }

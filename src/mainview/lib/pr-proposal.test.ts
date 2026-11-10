@@ -520,6 +520,26 @@ describe("multi-repository proposals", () => {
     expect(map.get("agetor_api")?.title).toBe("Add API");
   });
 
+  test("repository names ending or starting with an underscore survive", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const block = (name: string) => [
+      `Repository: ${name}`,
+      LINK,
+      "PR title:",
+      "```",
+      `Add ${name}`,
+      "```",
+      "PR description:",
+      "````",
+      "Body.",
+      "````",
+    ].join("\n");
+    const map = parseRepositoryProposals([block("api_"), block("_worker")].join("\n\n"));
+    // A lone edge underscore is part of the slug — `repoNameForPath` keeps it,
+    // so the label must too (only a *balanced* pair is emphasis).
+    expect([...map.keys()]).toEqual(["api_", "_worker"]);
+  });
+
   test("markdown emphasis around the label and value is stripped", () => {
     const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
     const text = [

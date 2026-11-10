@@ -179,11 +179,28 @@ const REPO_LABEL_RE = /^\s*#{0,6}\s*[*_]{0,2}\s*repository\s*:\s*(.*?)\s*$/i;
  * touching underscores INSIDE the name — `agetor_api` is a real repository
  * name, so the old `[^\n*_]` capture dropped everything from the underscore
  * on and the proposal never matched its repository.
+ *
+ * Underscores are only stripped as a *balanced* emphasis pair. A single
+ * leading/trailing underscore is a legal part of a slug
+ * (`repoNameForPath` preserves it), so stripping it unconditionally dropped
+ * the proposal for a directory like `api_`. Asterisks can never appear in a
+ * slug (`repoNameForPath` replaces them), so any leftover asterisks are
+ * still safe to remove.
  */
 function repositoryLabelValue(raw: string): string {
-  // Leading/trailing whitespace AND emphasis run together (`**Repository:**
-  // **name**` leaves `** **name**`), so strip the combined class in one pass.
-  return raw.replace(/^[\s*_]+/, "").replace(/[\s*_]+$/, "");
+  let value = raw.trim();
+  // The label's own emphasis close can leak into the captured value
+  // (`### _Repository:_ agetor_api` captures `_ agetor_api`). A slug can never
+  // contain a space, so an underscore/asterisk immediately followed by
+  // whitespace is emphasis residue, not part of the name.
+  value = value.replace(/^[*_]+\s+/, "").trim();
+  for (const marker of ["**", "__", "*", "_"]) {
+    if (value.length >= marker.length * 2 && value.startsWith(marker) && value.endsWith(marker)) {
+      value = value.slice(marker.length, -marker.length).trim();
+      break;
+    }
+  }
+  return value.replace(/^\*+|\*+$/g, "").trim();
 }
 
 /**

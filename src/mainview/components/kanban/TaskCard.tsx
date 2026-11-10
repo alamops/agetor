@@ -333,8 +333,8 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
         <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
         {(task.repositories?.length ?? 0) > 1 ? (
           // Multi-repository card (issue #291): one worktree icon + count with
-          // a popover naming every repository, instead of a single workdir
-          // and branch line (the workspace root is not a repository).
+          // a hover tooltip naming every repository, instead of a single
+          // workdir and branch line (the workspace root is not a repository).
           <div
             className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground"
             data-testid="task-card-repositories"
