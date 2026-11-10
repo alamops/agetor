@@ -224,7 +224,9 @@ export interface AgentRunOptions {
 // curated list doesn't know about yet). Codex accepts the friendly ids as-is
 // so it doesn't need a translation table.
 const CLAUDE_MODEL_FLAG: Record<string, string> = {
+  "mythos-5.2": "claude-mythos-5-2",
   "mythos-5.1": "claude-mythos-5-1",
+  "fable-5.2": "claude-fable-5-2",
   "fable-5.1": "claude-fable-5-1",
   "mythos-5": "claude-mythos-5",
   "fable-5": "claude-fable-5",
@@ -285,10 +287,13 @@ export function claudeModelIdFromArg(arg: string): string | null {
  * a newer pinned id) — is deliberately mapped to `null` rather than the
  * nearest family, so the live-session mirror is skipped instead of silently
  * switching the session to a different version than the task row now holds.
- * Fable follows the same current-release convention as Opus: `fable-5.1`
- * owns the "Fable" row since the installed claude CLI (2.1.257) ships the
- * `claude-fable-5-1` model id, so the now-superseded `fable-5` maps to `null`
- * (next-run-only, same as any other superseded pinned id). Opus follows the
+ * Fable follows the same current-release convention as Opus. Claude Code
+ * 2.1.321's binary alias table maps `fable.default` and
+ * `latest_per_family.fable` to `claude-fable-5-2` (its CHANGELOG names 5.2
+ * as the default Fable model), so `fable-5.2` owns the "Fable" row and the
+ * now-superseded `fable-5.1` (the row's owner since 2.1.257) and `fable-5`
+ * both map to `null` (next-run-only, same as any other superseded pinned
+ * id). Opus follows the
  * same rule again: `opus-5.5` now owns the "Opus" row because claude 2.1.280
  * ships `claude-opus-5-5` as its default Opus model (CHANGELOG "now the
  * default Opus model"; the binary's alias table maps `opus` →
@@ -304,7 +309,8 @@ export function claudeModelIdFromArg(arg: string): string | null {
  * bucket too. Haiku follows the same current-release rule: Claude CLI 2.1.293
  * maps the alias `haiku` to `claude-haiku-5-5` (constant HAIKU_ID), so
  * `haiku-5.5` owns the "Haiku" row and the superseded `haiku-4.5` joins the
- * null bucket alongside `opus-5`, `sonnet-5` and `fable-5`. `mythos-5` and `mythos-5.1` both have no picker row
+ * null bucket alongside `opus-5`, `sonnet-5` and `fable-5`. `mythos-5.2`,
+ * `mythos-5.1` and `mythos-5` all have no picker row
  * at all — claude's picker has no Mythos row of any kind. An unknown/future
  * raw id also returns `null` rather than guess. Sole caller:
  * `reconcileTaskSession`'s model mirror (`orchestrator.ts`), which feeds the
@@ -316,7 +322,7 @@ export function claudeModelPickerFamily(id: string): "Opus" | "Sonnet" | "Fable"
       return "Opus";
     case "sonnet-5.5":
       return "Sonnet";
-    case "fable-5.1":
+    case "fable-5.2":
       return "Fable";
     case "haiku-5.5":
       return "Haiku";

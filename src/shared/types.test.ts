@@ -175,14 +175,15 @@ test("MODEL_EFFORT_SUPPORT.fx's keys exactly match AGENT_OPTIONS.fx.models' ids 
 
 /* ── fx effort (docs/plans/fx-0.0.14-and-cursor-updates.md §3.4 / T1) ────── */
 
-// The 40 effort-advertising ids. Twenty were refreshed on 2026-10-22 against
+// The 41 effort-advertising ids. Twenty were refreshed on 2026-10-22 against
 // fx 0.0.14's `models --json` `models[].efforts` (plus fx's always-present
 // `auto`) — the plan §3.4 table, copied verbatim; eleven are unchanged from
 // their earlier live-probe (fx 0.0.10, 2026-09-14) or Gateway
-// `reasoning_options` measurement; the last nine were curated on 2026-10-26
-// (docs/plans/add-gpt-6-1-terra.md §2b). Every row ends in "auto" (fx's own
-// default, off-scale) and lists ids in agetor order (max, xhigh, high,
-// medium, low, minimal, none, auto).
+// `reasoning_options` measurement; nine were curated on 2026-10-26
+// (docs/plans/add-gpt-6-1-terra.md §2b) and anthropic/claude-fable-5.2 on
+// 2026-11-09 (docs/plans/add-fable-5-2.md §2.1). Every row ends in "auto"
+// (fx's own default, off-scale) and lists ids in agetor order (max, xhigh,
+// high, medium, low, minimal, none, auto).
 const FX_EFFORT_MODELS: Record<string, string[]> = {
   // Refreshed 2026-10-22 (plan §3.4).
   "zai/glm-5v-turbo": ["high", "medium", "low", "none", "auto"],
@@ -201,6 +202,9 @@ const FX_EFFORT_MODELS: Record<string, string[]> = {
   "openai/gpt-5.5": ["xhigh", "high", "medium", "low", "minimal", "none", "auto"],
   "google/gemini-3.1-pro-preview": ["high", "low", "auto"],
   "google/gemini-3.8-flash": ["high", "low", "auto"],
+  // Curated 2026-11-09 (docs/plans/add-fable-5-2.md §2.1) — Gateway
+  // `reasoning_options` plus fx's always-present auto.
+  "anthropic/claude-fable-5.2": ["max", "xhigh", "high", "medium", "low", "auto"],
   "anthropic/claude-fable-5.1": ["max", "xhigh", "high", "medium", "low", "auto"],
   "openai/gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"],
   "deepseek/deepseek-v4-pro": ["max", "high", "low", "none", "auto"],
@@ -237,7 +241,7 @@ const FX_NO_EFFORT_MODELS = ["minimax/minimax-m3", "anthropic/claude-haiku-4.5"]
 
 const AGETOR_EFFORT_ORDER = ["max", "xhigh", "high", "medium", "low", "minimal", "none", "auto"];
 
-test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 40 effort models in agetor order each end in auto, 2 named models are empty", () => {
+test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 41 effort models in agetor order each end in auto, 2 named models are empty", () => {
   for (const [id, expected] of Object.entries(FX_EFFORT_MODELS)) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual(expected);
     expect(expected[expected.length - 1]).toBe("auto");
@@ -246,11 +250,11 @@ test("MODEL_EFFORT_SUPPORT.fx exactly matches the 0.0.14-refreshed table — 40 
   for (const id of FX_NO_EFFORT_MODELS) {
     expect(MODEL_EFFORT_SUPPORT.fx[id]).toEqual([]);
   }
-  // The two lists above are exactly the 42 curated fx ids, no more no less.
-  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(40);
+  // The two lists above are exactly the 43 curated fx ids, no more no less.
+  expect(Object.keys(FX_EFFORT_MODELS).length).toBe(41);
   expect(FX_NO_EFFORT_MODELS.length).toBe(2);
-  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(42);
-  expect(AGENT_OPTIONS.fx.models.length).toBe(42);
+  expect(Object.keys(MODEL_EFFORT_SUPPORT.fx).length).toBe(43);
+  expect(AGENT_OPTIONS.fx.models.length).toBe(43);
 });
 
 test("DEFAULT_EFFORT.fx is 'auto' (fx's own default — owner decision D1, docs/plans/fx-0.0.10-compat.md §8)", () => {
@@ -354,7 +358,7 @@ test("none of the seven previously-curated fx ids survives as an unconditional r
   expect(Object.keys(MODEL_EFFORT_SUPPORT.fx)).not.toContain("google/gemini-3-pro");
 });
 
-test("exactly the twenty-six catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
+test("exactly the twenty-seven catalog-gated Gateway ids are catalogOnly in AGENT_OPTIONS.fx, and no other kind's models use catalogOnly", () => {
   const expectedCatalogOnly = new Set([
     "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
@@ -401,12 +405,15 @@ test("exactly the twenty-six catalog-gated Gateway ids are catalogOnly in AGENT_
     "meta/muse-wonder-1.0",
     "mistral/mistral-large-4",
     "reflection/beam",
+    // 2026-11-09 (docs/plans/add-fable-5-2.md §2.1) — released that day; the
+    // owner's signed-in catalog carries no anthropic/* id, same treatment.
+    "anthropic/claude-fable-5.2",
   ]);
   const actualCatalogOnly = new Set(
     AGENT_OPTIONS.fx.models.filter((m) => m.catalogOnly).map((m) => m.id),
   );
   expect(actualCatalogOnly).toEqual(expectedCatalogOnly);
-  expect(actualCatalogOnly.size).toBe(26);
+  expect(actualCatalogOnly.size).toBe(27);
 
   for (const kind of KINDS) {
     if (kind === "fx") continue;
@@ -444,7 +451,7 @@ test("each fx successor row sits directly above its predecessor (M3.1 Flash abov
   }
 });
 
-test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twenty-six catalogOnly rows included)", () => {
+test("every AGENT_OPTIONS.fx.models id has an entry in MODEL_EFFORT_SUPPORT.fx and vice versa (twenty-seven catalogOnly rows included)", () => {
   // Narrower restatement of the bidirectional-keys test above, scoped to
   // just the fx picker's own ids — guards specifically against a
   // catalogOnly row landing in AGENT_OPTIONS.fx.models without a paired
@@ -521,6 +528,55 @@ test("opencode tables: sentinel default, auto effort, Code/Plan → auto/plan, s
   expect(MODEL_EFFORT_SUPPORT.opencode).toEqual({ "opencode-default": [] });
   expect(supportedModes("opencode", null).map((m) => m.id)).toEqual(["auto", "ask", "plan"]);
   expect(supportedModes("opencode", "anthropic/claude-x").map((m) => m.id)).toEqual(["auto", "ask", "plan"]);
+});
+
+/* ── Claude Code Fable 5.2 / Mythos 5.2 (docs/plans/add-fable-5-2.md §1) ── */
+
+const CLAUDE_FABLE_MYTHOS_ROWS: Array<[string, string, string]> = [
+  ["mythos-5.2", "Mythos 5.2", "Fable 5.2's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus."],
+  ["mythos-5.1", "Mythos 5.1", "Prior Mythos release — Fable 5.1's twin; same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus."],
+  ["mythos-5", "Mythos 5", "Prior Mythos release — Fable 5's twin; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus."],
+  ["fable-5.2", "Fable 5.2", "Most capable widely released model — above Opus. Uses 2x the usage of Opus."],
+  ["fable-5.1", "Fable 5.1", "Prior Fable release — above Opus. Uses 2x the usage of Opus."],
+  ["fable-5", "Fable 5", "Earlier Fable release — above Opus. Uses 2x the usage of Opus."],
+];
+
+test("the claude-code picker leads with the six owner-verbatim Mythos/Fable rows in 5.2 → 5 family order", () => {
+  // Owner copy, docs/plans/add-fable-5-2.md §1 — do not paraphrase. The order
+  // is family-grouped (Mythos 5.2 → 5, then Fable 5.2 → 5), not globally
+  // newest-first, per owner decision D4.
+  const rows = AGENT_OPTIONS["claude-code"].models;
+  expect(rows.slice(0, 6).map((m) => [m.id, m.label, m.hint])).toEqual(CLAUDE_FABLE_MYTHOS_ROWS);
+  // The default stays Opus 5.5 — Fable 5.2 is exactly 2x the usage (D3).
+  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-5.5");
+});
+
+test("claude-code Fable 5.2 / Mythos 5.2 offer the full max→low effort ladder and every Claude mode", () => {
+  const allModes = AGENT_OPTIONS["claude-code"].modes.map((m) => m.id);
+  for (const id of ["fable-5.2", "mythos-5.2"]) {
+    expect(supportedEfforts("claude-code", id).map((o) => o.id)).toEqual(["max", "xhigh", "high", "medium", "low"]);
+    expect(supportedModes("claude-code", id).map((m) => m.id)).toEqual(allModes);
+  }
+});
+
+test("CURSOR_MODEL_SPECS['claude-fable-5-2'] is the five plain 1M tiers with max mode and no fast tier, directly above Fable 5.1", () => {
+  const spec = CURSOR_MODEL_SPECS["claude-fable-5-2"];
+  expect(spec).toBeDefined();
+  expect(spec?.label).toBe("Fable 5.2");
+  expect(spec?.hint).toBe("Anthropic Fable 5.2 via Cursor.");
+  expect(spec?.supportsMaxMode).toBe(true);
+  expect(spec?.effortIds).toEqual({
+    max: "claude-fable-5-2-max",
+    xhigh: "claude-fable-5-2-xhigh",
+    high: "claude-fable-5-2-high",
+    medium: "claude-fable-5-2-medium",
+    low: "claude-fable-5-2-low",
+  });
+  // The 2026-11-09 catalog has no -fast or -thinking Fable 5.2 variants.
+  expect(spec?.fastEfforts).toBeUndefined();
+  expect(spec?.fastId).toBeUndefined();
+  const ids = Object.keys(CURSOR_MODEL_SPECS);
+  expect(ids.indexOf("claude-fable-5-2")).toBe(ids.indexOf("claude-fable-5-1") - 1);
 });
 
 /* ── gemini 3.8 Flash + retired gemini-3-pro-preview default (docs/plans/add-gemini-3-8-flash.md §5 TEST-2) ── */

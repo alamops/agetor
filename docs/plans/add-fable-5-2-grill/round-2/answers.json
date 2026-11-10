@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "formId": "add-fable-5-2-grill-r2",
+  "title": "Grill — Add Fable 5.2 (round 2: Mythos copy + one clarification)",
+  "round": 2,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "8221f5089498b8cbb3df2c58215062ee8a0dfc738da37fc0514b9a43112c91aa",
+  "submittedAt": "2026-11-09T22:32:41.412Z",
+  "receivedAt": "2026-11-09T22:32:41.438Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 2,
+    "answered": 2,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 2,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "mythos-copy": {
+      "n": 1,
+      "title": "With Mythos 5.2 added, how should the Mythos block read?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "mirror-fable",
+      "display": "Mirror the Fable pattern",
+      "acceptedRecommendation": true
+    },
+    "other-requirements-clarified": {
+      "n": 2,
+      "title": "What I meant: is there a concrete 'done' check outside the repo's model tables?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "nothing-else",
+      "display": "Nothing else; the listed scope is the definition of done",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

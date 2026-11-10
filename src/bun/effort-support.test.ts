@@ -124,6 +124,18 @@ test("claude mythos-5.1 supports xhigh + max", () => {
   expect(ids).toContain("max");
 });
 
+test("claude fable-5.2 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "fable-5.2").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
+test("claude mythos-5.2 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "mythos-5.2").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
 test("codex DEFAULT_MODEL is GPT-6.1 Sol", () => {
   // Owner decision 2026-09-30 (docs/plans/add-gpt-6-1-sol.md D1): GPT-6.1 Sol
   // supersedes GPT-6 Sol (2026-09-22, docs/plans/add-gpt-6-sol-and-luna.md D1)
@@ -683,6 +695,28 @@ test("cursorModelArg composes Fable 5.1 efforts with no -fast variant (catalog h
 
 test("cursorModelIdCoveredByCatalog recognizes a Fable 5.1 effort variant", () => {
   expect(cursorModelIdCoveredByCatalog("claude-fable-5-1-high")).toBe(true);
+});
+
+test("cursor Fable 5.2 exposes the full max/xhigh/high/medium/low ladder", () => {
+  const ids = supportedEfforts("cursor", "claude-fable-5-2").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("cursorModelArg composes Fable 5.2 efforts with no -fast variant (catalog has none) and supports Max Mode", () => {
+  expect(cursorModelArg("claude-fable-5-2", "xhigh", false)).toBe("claude-fable-5-2-xhigh");
+  // fast never composes for this model — no fastEfforts entry in the catalog.
+  expect(cursorModelArg("claude-fable-5-2", "high", true)).toBe("claude-fable-5-2-high");
+  expect(cursorModelSupportsFast("claude-fable-5-2", "high")).toBe(false);
+  // Every 5.2 label carries "1M", so the Max-Mode bracket applies and omits
+  // `fast=` since fastEfforts is absent (docs/plans/add-fable-5-2.md A1).
+  expect(cursorModelArg("claude-fable-5-2", "xhigh", false, true)).toBe("claude-fable-5-2[context=1m,effort=xhigh]");
+  expect(cursorModelSupportsMaxMode("claude-fable-5-2")).toBe(true);
+});
+
+test("cursorModelIdCoveredByCatalog recognizes a Fable 5.2 plain effort variant but not its discovery-only -thinking sibling", () => {
+  expect(cursorModelIdCoveredByCatalog("claude-fable-5-2-high")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("claude-fable-5-2")).toBe(true);
+  expect(cursorModelIdCoveredByCatalog("claude-fable-5-2-thinking-high")).toBe(false);
 });
 
 test("cursor Opus 5.5 exposes the full max/xhigh/high/medium/low ladder", () => {

@@ -31,6 +31,7 @@ const {
   GEMINI_PROMPT_ARGV_MAX_BYTES,
   isValidEnvKey,
   toTerminalAppleScript,  claudeModelPickerFamily,
+  toClaudeModelArg,
   spawnAgent,
   FAKE_FX_RECOVERY_PROMPT_MARKER,
   FAKE_FX_PERMISSION_PROMPT_MARKER,
@@ -320,6 +321,26 @@ test("claude-code 'mythos-5' maps to --model claude-mythos-5", () => {
   ]);
 });
 
+test("claude-code 'fable-5.2' maps to --model claude-fable-5-2", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "fable-5.2", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-fable-5-2",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
+test("claude-code 'mythos-5.2' maps to --model claude-mythos-5-2", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "mythos-5.2", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-mythos-5-2",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code 'fable-5.1' maps to --model claude-fable-5-1", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "fable-5.1", mode: "auto" });
   expect(cmd).toEqual([
@@ -383,7 +404,9 @@ test("claude-code 'haiku-5.5' maps to --model claude-haiku-5-5 and sets effort e
 test("claudeModelPickerFamily maps each current-release id to its picker row family", () => {
   expect(claudeModelPickerFamily("opus-5.5")).toBe("Opus");
   expect(claudeModelPickerFamily("sonnet-5.5")).toBe("Sonnet");
-  expect(claudeModelPickerFamily("fable-5.1")).toBe("Fable");
+  // claude 2.1.321's alias table maps fable.default and
+  // latest_per_family.fable to claude-fable-5-2, so fable-5.2 owns the row.
+  expect(claudeModelPickerFamily("fable-5.2")).toBe("Fable");
   expect(claudeModelPickerFamily("haiku-5.5")).toBe("Haiku");
 });
 
@@ -395,8 +418,12 @@ test("claudeModelPickerFamily returns null for ids the picker's single per-famil
   expect(claudeModelPickerFamily("opus-4.7")).toBeNull();
   expect(claudeModelPickerFamily("opus-4.6")).toBeNull();
   expect(claudeModelPickerFamily("sonnet-4.6")).toBeNull();
-  // fable-5 is now superseded by fable-5.1 — same "wrong version" hazard.
+  // fable-5 is superseded — same "wrong version" hazard.
   expect(claudeModelPickerFamily("fable-5")).toBeNull();
+  // fable-5.1 is superseded too: claude 2.1.321's alias table maps the bare
+  // `fable` row to claude-fable-5-2, so mirroring 5.1 through it would land
+  // the session on the wrong version.
+  expect(claudeModelPickerFamily("fable-5.1")).toBeNull();
   // opus-5 is now superseded by opus-5.5 — claude 2.1.280 makes
   // claude-opus-5-5 the default Opus model, so the picker's Opus row would
   // land on the wrong version.
@@ -408,13 +435,30 @@ test("claudeModelPickerFamily returns null for ids the picker's single per-famil
   // haiku-4.5 is superseded by haiku-5.5 on CLI 2.1.293 (alias haiku →
   // claude-haiku-5-5), so the picker's Haiku row would land on the wrong version.
   expect(claudeModelPickerFamily("haiku-4.5")).toBeNull();
-  // No picker row at all for either Mythos id.
+  // No picker row at all for any Mythos id.
+  expect(claudeModelPickerFamily("mythos-5.2")).toBeNull();
   expect(claudeModelPickerFamily("mythos-5")).toBeNull();
   expect(claudeModelPickerFamily("mythos-5.1")).toBeNull();
   // Unknown/future raw id — never guess.
   expect(claudeModelPickerFamily("claude-opus-6")).toBeNull();
   // Empty string.
   expect(claudeModelPickerFamily("")).toBeNull();
+});
+
+test("every curated claude-code id translates to a claude-* CLI id — the friendly id is never passed verbatim", () => {
+  // Invariant (docs/plans/add-fable-5-2.md §7): every Claude Code curated id
+  // launches with its exact CLI id, enforced at CLAUDE_MODEL_FLAG via
+  // toClaudeModelArg. A row added without a flag would fall through verbatim
+  // and the CLI would reject `--model fable-5.3`; this loops the whole picker
+  // so the next model addition can't silently skip the table.
+  for (const { id } of AGENT_OPTIONS["claude-code"].models) {
+    const arg = toClaudeModelArg(id);
+    expect(arg, id).not.toBe(id);
+    expect(arg, id).toStartWith("claude-");
+  }
+  // The two rows this change adds, exactly (also pinned by buildCommand above).
+  expect(toClaudeModelArg("fable-5.2")).toBe("claude-fable-5-2");
+  expect(toClaudeModelArg("mythos-5.2")).toBe("claude-mythos-5-2");
 });
 
 test("claude-code prefixes the prompt with `--` so a leading-dash prompt isn't parsed as a flag", () => {
