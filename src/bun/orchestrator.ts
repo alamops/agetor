@@ -291,7 +291,7 @@ import {
   resolveDefaultBranchName,
   type PreparedWorkdir,
 } from "./worktree.ts";
-import { resolveRepositorySet, repoBranchPlan, branchesPinnedByOtherTasks } from "./task-repos.ts";
+import { resolveRepositorySet, branchesPinnedByOtherTasks } from "./task-repos.ts";
 import { formatRepositoriesPrompt } from "../shared/multi-repo.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -1608,6 +1608,19 @@ async function spawnAgentOrFail(
   opts: SpawnAgentOrFailOptions = {},
 ): Promise<{ agent: SpawnedAgent; message?: undefined } | { agent: null; message: string }> {
   try {
+    // Multi-repository tasks: the agent runs at the workspace root, so its
+    // sibling repository worktrees are outside the cwd. Inject them on EVERY
+    // spawn path (start, follow-up, swap, retry) here — one place — rather than
+    // only the first launch; flag-capable harnesses turn them into
+    // `--add-dir`, the rest rely on the cwd. An absent/empty set leaves
+    // `opts` untouched, so a single-repository argv stays byte-identical.
+    const repos = tasks.get(args.taskId)?.repositories ?? [];
+    const extraDirectories = repos.length > 1
+      ? repos.map((r) => r.worktreePath).filter((p): p is string => Boolean(p))
+      : [];
+    const baseOpts = extraDirectories.length > 0
+      ? { ...args.opts, extraDirectories }
+      : args.opts;
     // Claude's pane usage-limit notice only settles a turn when the task is
     // on a stack WITH a backup; a lone account keeps claude's own
     // auto-continue (plan §2.2). One central injection keeps every spawn path
@@ -1615,9 +1628,9 @@ async function spawnAgentOrFail(
     const spawnArgs: SpawnAgentArgs = args.harness.kind === "claude-code"
       ? {
           ...args,
-          opts: { ...args.opts, harnessFailover: harnessFailoverEnabledFor(tasks.get(args.taskId)) },
+          opts: { ...baseOpts, harnessFailover: harnessFailoverEnabledFor(tasks.get(args.taskId)) },
         }
-      : args;
+      : { ...args, opts: baseOpts };
     return { agent: await spawnAgent(spawnArgs) };
   } catch (err) {
     const { runId, taskId, onChunk } = args;
@@ -2581,15 +2594,6 @@ async function startTaskInner(
     harness,
     prompt: promptWithRefs,
     cwd: prepared.cwd,
-    // Extra per-repo worktrees a harness with `--add-dir` support can also
-    // read (claude/codex/copilot); the workspace itself is always the cwd.
-    ...(prepared.repositories && prepared.repositories.length > 1
-      ? {
-          extraDirectories: prepared.repositories
-            .map((r) => r.worktreePath)
-            .filter((p): p is string => Boolean(p)),
-        }
-      : {}),
     onChunk,
     onSessionId: (sessionId) => {
       runs.update(runId, sessionIdPatchFor(harness.kind, sessionId));
@@ -2609,13 +2613,6 @@ async function startTaskInner(
       effort: task.effort,
       speed: task.speed,
       maxMode: task.maxMode,
-      ...(prepared.repositories && prepared.repositories.length > 1
-        ? {
-            extraDirectories: prepared.repositories
-              .map((r) => r.worktreePath)
-              .filter((p): p is string => Boolean(p)),
-          }
-        : {}),
       // opencode: the version the pre-flight above already probed picks the
       // CLI line (D-2); the server mode and title ride along (D-3/D-4).
       ...(harness.kind === "opencode"
@@ -11418,15 +11415,22 @@ export async function createTask(
   // terminal and `@` expansion uses. Single-repository tasks are unchanged.
   if (multiRepo) {
     workdir = join(WORKTREES_DIR, id);
-    // Every repository attempts the same shared name; a repository whose git
-    // root already has that name pinned by another task gets the
-    // per-repository `-N` fallback now, and prepare re-checks the refs.
+    // Every repository attempts the same shared name. Each one is resolved
+    // through `ensureUniqueBranch` against its OWN root, so a name that still
+    // exists there as a ref — e.g. the branch an archived task left behind —
+    // gets the per-repository `-N` fallback instead of silently re-attaching
+    // the new task to that old work. `taken` covers names another
+    // not-yet-started task has pinned but not materialized (no ref yet).
     const roots = new Map(
       repositories.map((r) => [r.path, resolvedSet && resolvedSet.ok ? (resolvedSet.repositoriesRoots.get(r.path) ?? r.path) : r.path]),
     );
     const desired = plannedBranch ?? branchName({ id, title: input.title });
-    const plan = repoBranchPlan(repositories, roots, desired, branchesPinnedByOtherTasks(id, tasks.list()));
-    for (const r of repositories) r.branch = plan.get(r.name) ?? desired;
+    const taken = branchesPinnedByOtherTasks(id, tasks.list());
+    await Promise.all(repositories.map(async (r) => {
+      const root = roots.get(r.path) ?? r.path;
+      const pinned = taken.get(r.path) ?? taken.get(root) ?? new Set<string>();
+      r.branch = await ensureUniqueBranch(root, desired, pinned);
+    }));
   }
 
   // Issue provenance (docs/plans/new-task-from-git-issue.md): validated once,
@@ -12213,7 +12217,10 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     if (!task.pipelineParentId) {
       const cur = tasks.get(taskId) ?? task;
       const plan = await teardownBranchesForTask(cur);
-      await removeWorktree(cur, { branches: plan.branches });
+      // Multi-repository rows carry one plan per repository; pass it through
+      // so a checkout that drifted onto another branch is removed too (the
+      // top-level `branches` union alone can't say which repo owns which name).
+      await removeWorktree(cur, { branches: plan.branches, repositories: plan.repositories });
     }
   });
   // Refs are otherwise path-only — agetor never copies anything to disk for
@@ -12620,7 +12627,12 @@ export function listWorktrees(): WorktreeInfo[] {
       } catch {
         childDirs = [];
       }
-      const gitChildDirs = childDirs.filter((child) => existsSync(join(dirPath, child, ".git")));
+      // Only a linked worktree's `.git` POINTER file (gitdir under
+      // `.git/worktrees/`) identifies a repository child. A legacy
+      // single-repository worktree can contain a submodule whose `.git` is a
+      // file/dir too; treating that as a nested workspace would split one
+      // worktree into bogus per-repository rows.
+      const gitChildDirs = childDirs.filter((child) => parseWorktreeGitPointer(join(dirPath, child)) !== null);
       if (gitChildDirs.length > 0) {
         for (const child of gitChildDirs) {
           const childPath = join(dirPath, child);

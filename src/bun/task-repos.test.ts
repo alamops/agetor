@@ -3,7 +3,6 @@ import path from "node:path";
 import {
   branchesPinnedByOtherTasks,
   lexicallyInsideRoot,
-  repoBranchPlan,
   resolveRepositorySet,
 } from "./task-repos.ts";
 
@@ -58,32 +57,6 @@ describe("resolveRepositorySet", () => {
     expect(res.ok).toBe(true);
     if (!res.ok) return;
     expect(res.repositories).toEqual([]);
-  });
-});
-
-describe("repoBranchPlan", () => {
-  test("gives every repository the shared name when nothing is taken", () => {
-    const repos = [{ path: "/a", name: "a" }, { path: "/b", name: "b" }];
-    const plan = repoBranchPlan(repos, new Map([["/a", "/a"], ["/b", "/b"]]), "feature/x");
-    expect([...plan.entries()]).toEqual([["a", "feature/x"], ["b", "feature/x"]]);
-  });
-
-  test("falls back per repository, never across repositories", () => {
-    const repos = [{ path: "/a", name: "a" }, { path: "/b", name: "b" }];
-    const taken = new Map([["/a", new Set(["feature/x"])]]);
-    const plan = repoBranchPlan(repos, new Map([["/a", "/a"], ["/b", "/b"]]), "feature/x", taken);
-    expect(plan.get("a")).toBe("feature/x-2");
-    expect(plan.get("b")).toBe("feature/x");
-  });
-
-  test("skips several taken names", () => {
-    const plan = repoBranchPlan(
-      [{ path: "/a", name: "a" }],
-      new Map([["/a", "/a"]]),
-      "feature/x",
-      new Map([["/a", new Set(["feature/x", "feature/x-2"])]]),
-    );
-    expect(plan.get("a")).toBe("feature/x-3");
   });
 });
 

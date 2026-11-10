@@ -26,9 +26,11 @@ bun test src/bun/multi-repo-repro.test.ts src/bun/orchestrator-multi-repo.test.t
   src/bun/db-repositories.test.ts src/bun/migrate.test.ts src/bun/route-policy.test.ts \
   src/bun/pull-create-task-url.test.ts src/bun/worktrees-list.test.ts \
   src/bun/worktree-git-status.test.ts src/bun/server-teardown-preview.test.ts \
+  src/bun/pipeline-runner.test.ts src/bun/terminals.test.ts src/bun/agents.test.ts \
   src/shared/multi-repo.test.ts src/shared/file-scope.test.ts \
   src/mainview/lib/repo-selection.test.ts src/mainview/lib/pr-proposal.test.ts \
-  src/cli/commands/add.test.ts src/cli/commands/show.test.ts
+  src/cli/commands/add.test.ts src/cli/commands/show.test.ts \
+  src/cli/commands/shell.test.ts src/cli/commands/rm.test.ts src/cli/tui/at-complete.test.ts
 bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 ```
 
@@ -42,7 +44,23 @@ bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 | `bun test src/shared src/mainview src/cli` | 5,044 tests, 192 files, green |
 | `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 3 passed |
 | Migration 087 on an 086 DB | `src/bun/db-repositories.test.ts` / `src/bun/migrate.test.ts` |
-| Existing 116 worktree tests | unchanged and green |
+| Existing worktree tests | unchanged and green (the pre-change 116 plus the new multi-repo cases) |
+
+## Review-round regressions
+
+The first review round found one blocker and two must-fix defects; each has a
+permanent regression test:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| `agetor shell <task-id>` skipped positional 0 when `--repo` was absent | `repoIdx < 0 || i !== repoIdx + 1` | `src/cli/commands/shell.test.ts` |
+| A secondary repository re-attached a branch left by an archived task | per-repository `ensureUniqueBranch` at create | `orchestrator-multi-repo.test.ts` — "gives a secondary repository a fresh branch…" |
+| A multi-repo pipeline step materialized an empty `<WORKTREES>/<step-id>` | `workspacePathFor` reuses the parent's mirrored workspace | `pipeline-runner.test.ts` — "runs its step in the parent's workspace…" |
+| Delete ignored the per-repository teardown plan | `removeWorktree` takes `repositories[]` | `orchestrator-multi-repo.test.ts` — "removes the branch … drifted onto" |
+| "Create all PRs" could open duplicate PRs | `repositoriesNeedingPr` skips stamped entries | `src/mainview/lib/pr-proposal.test.ts` |
+| `SpawnAgentArgs.extraDirectories` was unread; follow-up turns lost the roots | `spawnAgentOrFail` injects `opts.extraDirectories` on every spawn path | `src/bun/agents.test.ts` argv families + the multi pipeline spawn test |
+| A submodule made a legacy orphan worktree look like a multi workspace | expansion requires a linked-worktree `.git` pointer | `src/bun/worktrees-list.test.ts` |
+| `rm` docs claimed a per-repository preview the CLI never printed | `teardownPhrase` + `--json` carry `repositories[]` | `src/cli/commands/rm.test.ts` |
 
 ## Live harness smoke matrix
 

@@ -98,6 +98,48 @@ test("createTask pins a workspace with one entry, branch and base per repository
   }
 });
 
+test("createTask gives a secondary repository a fresh branch instead of re-attaching a leftover one", async () => {
+  // Review M1: only the first repository was probed for an existing ref, so a
+  // branch left behind by an archived task in repository B was silently
+  // re-attached — the new worktree came back with that task's commits.
+  const { createTask, startTask, tasks, WORKTREES_DIR } = await load();
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  // An archived task's leftovers in repo B: a branch with a commit on it.
+  await git(["checkout", "-b", "feature/auth"], b);
+  writeFileSync(path.join(b, "leftover.txt"), "old work\n");
+  await git(["add", "."], b);
+  await git(["commit", "-m", "old work"], b);
+  await git(["checkout", "main"], b);
+  const created = await createTask({
+    title: "auth across repos",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    branch: "feature/auth",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  const workspace = path.join(WORKTREES_DIR, id);
+  try {
+    const repos = created.task.repositories!;
+    expect(repos[0]!.branch).toBe("feature/auth");
+    expect(repos[1]!.branch).toBe("feature/auth-2");
+
+    const res = await startTask(id);
+    if ("error" in res) throw new Error(res.error);
+    await new Promise((r) => setTimeout(r, 350));
+    const started = tasks.get(id)!;
+    const backend = started.repositories!.find((r) => r.name === repos[1]!.name)!;
+    expect(backend.branch).toBe("feature/auth-2");
+    expect(existsSync(path.join(backend.worktreePath!, "leftover.txt"))).toBe(false);
+  } finally {
+    cleanup(workspace, a, b);
+  }
+});
+
 test("two paths under one git root collapse to the single-repository layout", async () => {
   const { createTask } = await load();
   const a = await makeRepo("mono");
@@ -322,6 +364,45 @@ test("deleteTask removes every repository worktree and branch", async () => {
     expect(tasks.get(id)).toBeNull();
     const branch = (await Bun.spawn(["git", "rev-parse", "--verify", "--quiet", "refs/heads/" + created.task.repositories![0]!.branch], { cwd: a, stdout: "pipe", stderr: "pipe" }).exited) !== 0;
     expect(branch).toBe(true);
+  } finally {
+    cleanup(workspace, a, b);
+  }
+});
+
+test("deleteTask removes the branch a repository's worktree drifted onto", async () => {
+  // Review should-fix: the per-repository teardown plan was computed but
+  // ignored by delete, which deleted only each entry's pinned branch — a
+  // drifted checkout's branch was left behind.
+  const { createTask, startTask, tasks, WORKTREES_DIR } = await load();
+  const { deleteTask } = await import("./orchestrator.ts");
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  const created = await createTask({
+    title: "delete drifted multi",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  const workspace = path.join(WORKTREES_DIR, id);
+  try {
+    const res = await startTask(id);
+    if ("error" in res) throw new Error(res.error);
+    await new Promise((r) => setTimeout(r, 350));
+    const repoA = tasks.get(id)!.repositories![0]!;
+    // Switch repo A's worktree onto a new branch (drift), then delete.
+    await git(["checkout", "-b", "drifted-work"], repoA.worktreePath!);
+    await deleteTask(id);
+    const exists = async (branch: string) =>
+      (await Bun.spawn(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], {
+        cwd: a, stdout: "pipe", stderr: "pipe",
+      }).exited) === 0;
+    expect(await exists(repoA.branch!)).toBe(false);
+    expect(await exists("drifted-work")).toBe(false);
+    expect(existsSync(workspace)).toBe(false);
   } finally {
     cleanup(workspace, a, b);
   }

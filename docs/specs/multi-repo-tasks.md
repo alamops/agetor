@@ -56,8 +56,10 @@ coordinate changes across every repository in that card.
 
 - One shared branch name is used across repositories by default, derived from the task title/type.
 - Each repository has its own base ref.
-- If a repository's config, validation or git refuses the shared name, that repository falls back
-  to its own derived name; the repo dialog shows the actual names.
+- The name is checked against each repository's own refs and against branches pinned by other
+  tasks; a repository where it already exists (including a branch an archived task left behind)
+  falls back to its own `-N` variant instead of re-attaching that old work. The repo dialog shows
+  the actual names.
 
 ### Creation and validation
 

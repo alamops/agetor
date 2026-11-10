@@ -208,6 +208,15 @@ export function parseRepositoryProposals(text: string): Map<string, PrProposal> 
 }
 
 /**
+ * The repositories that still need a pull request — those whose `prUrl` is
+ * unset. "Create all PRs" uses this so a second press never opens duplicate
+ * PRs and a retry after a partial failure only retries the missing ones.
+ */
+export function repositoriesNeedingPr<T extends { prUrl: string | null }>(repos: T[]): T[] {
+  return repos.filter((r) => !r.prUrl);
+}
+
+/**
  * The newest run's per-repository proposals. Mirrors {@link latestPrProposal}
  * (newest run wins, subagent streams ignored) but returns every labeled
  * block, and falls back to a single unlabeled proposal under `fallbackName`.

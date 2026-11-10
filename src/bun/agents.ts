@@ -3984,12 +3984,6 @@ function makeFakeOpencodeAgent(
 
 export interface SpawnAgentArgs {
   taskId: string;
-  /**
-   * Extra directories a flag-capable harness may also read — the sibling
-   * repository worktrees of a multi-repository task (issue #291). Undefined
-   * for single-repository tasks, so their argv is byte-identical.
-   */
-  extraDirectories?: string[];
   /** The run row this spawn belongs to. Used by the codex driver to key its
    *  per-run log/prompt files (so each turn — and its reattach — is isolated).
    *  Ignored by claude-code. */

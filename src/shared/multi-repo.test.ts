@@ -3,9 +3,7 @@ import {
   formatRepositoriesPrompt,
   isMultiRepoTask,
   repoNameForPath,
-  repoNameForSelection,
   repositoriesForTask,
-  repositoryAtPath,
   uniqueRepoSlugs,
 } from "./multi-repo.ts";
 import { commitPushPrompt, type Task, type TaskRepository } from "./types.ts";
@@ -151,27 +149,6 @@ describe("formatRepositoriesPrompt", () => {
 
   test("no repos still renders the header", () => {
     expect(formatRepositoriesPrompt([])).toBe("Repositories:");
-  });
-});
-
-describe("repositoryAtPath / repoNameForSelection", () => {
-  test("finds an entry by selected path", () => {
-    const repos = [repo({ path: "/a/frontend", name: "frontend" }), repo({ path: "/b/backend", name: "backend" })];
-    const t = task({ repositories: repos });
-    expect(repositoryAtPath(t, "/b/backend")?.name).toBe("backend");
-    expect(repositoryAtPath(t, "/nope")).toBeNull();
-    expect(repositoryAtPath(task({}), "/repos/app")).toBeNull();
-  });
-
-  test("ignores a selection for a single-repo task", () => {
-    expect(repoNameForSelection(task({}), "app")).toBeNull();
-  });
-
-  test("accepts a known name for a multi-repo task and rejects unknown ones", () => {
-    const t = task({ repositories: [repo({ name: "frontend" }), repo({ name: "backend" })] });
-    expect(repoNameForSelection(t, "backend")).toBe("backend");
-    expect(repoNameForSelection(t, "infra")).toBeNull();
-    expect(repoNameForSelection(t, null)).toBeNull();
   });
 });
 

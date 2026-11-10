@@ -3544,6 +3544,67 @@ test("M-R6 / M-R5: worktree-isolated pipeline — the shared worktree is only VE
   }
 });
 
+test("a multi-repository pipeline runs its step in the parent's workspace and sees every repository", async () => {
+  // Regression (review M2): `prepareTaskWorkdir` used to derive the workspace
+  // from the STEP row's own id, so a step spawned into a brand-new empty
+  // `<WORKTREES>/<step-id>` instead of reusing the parent's workspace. The
+  // step now reuses the mirrored `worktreePath` and the parent's entries.
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER, __getFakeDriver } = await import("./agents.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const profile = await makeProfile("multi-worktree");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `Do A. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  const pipeline = pipelines.insert({ name: uniqueName("multi-worktree-pipeline"), graph, maxSteps: 25 });
+  const created = await createTask({
+    title: "multi pipeline run",
+    prompt: "goal",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+    pipelineId: pipeline.id,
+  });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  }, 15000);
+  const parent = tasks.get(parentId)!;
+  const workspace = parent.worktreePath!;
+  expect(finished.worktreePath).toBe(workspace);
+  expect(parent.repositories).toHaveLength(2);
+
+  const step = tasks.stepsForParent(parentId)[0]!;
+  // The step shares the parent's workspace and repository set — never a
+  // private `<WORKTREES>/<step-id>` checkout.
+  expect(step.worktreePath).toBe(workspace);
+  expect(step.repositories?.map((r) => r.worktreePath)).toEqual(parent.repositories!.map((r) => r.worktreePath));
+
+  const names = uniqueRepoSlugs([a, b]);
+  expect(existsSync(path.join(workspace, names[0]!, ".git"))).toBe(true);
+  expect(existsSync(path.join(workspace, names[1]!, ".git"))).toBe(true);
+
+  const record = __getFakeDriver(step.id)?._record ?? [];
+  expect(record).toContain(`cwd:${workspace}`);
+  const spawn = record.find((r) => r.startsWith("spawn:")) ?? "";
+  expect(spawn.split("Repositories:").length - 1).toBe(1);
+  expect(spawn).toContain(`- ${names[0]}: ${path.join(workspace, names[0]!)} (branch `);
+  expect(spawn).toContain(`- ${names[1]}: ${path.join(workspace, names[1]!)} (branch `);
+
+  await waitUntilIdle(parentId);
+});
+
 test("M-R7: a delete cascade that throws un-tombstones the parent, which stays runnable; a later delete succeeds", async () => {
   const { createTask, startTask, deleteTask } = await import("./orchestrator.ts");
   const { tasks, pipelines } = await import("./db.ts");

@@ -14,7 +14,10 @@ import { escapeFreeText } from "../../shared/terminal-text.ts";
 export async function cmdShell(args: string[], flags: Flags): Promise<void> {
   const repoIdx = args.indexOf("--repo");
   const repoFlag = repoIdx >= 0 ? flagValue(args, repoIdx + 1, "--repo") : null;
-  const ref = args.find((a, i) => !a.startsWith("-") && i !== repoIdx + 1);
+  // Skip the `--repo` value only when the flag is actually present: with no
+  // `--repo`, `repoIdx` is -1 and the old `i !== repoIdx + 1` test skipped
+  // index 0 — i.e. the task id in the documented `agetor shell <task-id>` form.
+  const ref = args.find((a, i) => !a.startsWith("-") && (repoIdx < 0 || i !== repoIdx + 1));
   if (!ref) throw usageError("shell");
   const printOnly = args.includes("--print") || args.includes("-p");
 

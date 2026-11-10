@@ -289,6 +289,37 @@ test("listWorktrees flags an orphan dir (no task row) as \"orphaned\"", async ()
   }
 });
 
+test("a legacy orphan worktree with a submodule is not split into repository rows", async () => {
+  // Review should-fix: the orphan expansion treated ANY child directory with a
+  // `.git` as a linked worktree. A submodule's `.git` is a pointer into
+  // `.git/modules/…`, not `.git/worktrees/…`, so a legacy single-repository
+  // worktree that vendors one must stay ONE row.
+  const { listWorktrees } = await import("./orchestrator.ts");
+  const { WORKTREES_DIR } = await import("./worktree.ts");
+
+  const orphanId = `orphan-${randomUUID()}`;
+  const orphanDir = path.join(WORKTREES_DIR, orphanId);
+  const submoduleDir = path.join(orphanDir, "vendor-lib");
+  mkdirSync(submoduleDir, { recursive: true });
+  writeFileSync(
+    path.join(orphanDir, ".git"),
+    `gitdir: /tmp/source-repo/.git/worktrees/${orphanId}\n`,
+  );
+  writeFileSync(
+    path.join(submoduleDir, ".git"),
+    "gitdir: /tmp/source-repo/.git/modules/vendor-lib\n",
+  );
+
+  try {
+    const rows = listWorktrees().filter((e) => e.id === orphanId || e.id.startsWith(`${orphanId}__`));
+    expect(rows.map((r) => r.id)).toEqual([orphanId]);
+    expect(rows[0]?.repoName).toBeUndefined();
+    expect(rows[0]?.workdir).toBe("/tmp/source-repo");
+  } finally {
+    rmSync(orphanDir, { recursive: true, force: true });
+  }
+});
+
 test("archiveTask force bypasses the done-only column gate", async () => {
   const { createTask, archiveTask, pendingTeardown } = await import("./orchestrator.ts");
   const { prepareWorkdir } = await import("./worktree.ts");

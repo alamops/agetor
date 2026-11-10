@@ -86,30 +86,6 @@ export async function resolveRepositorySet(
 }
 
 /**
- * The branch name each repository should attempt first. All repositories share
- * `desired`; a repository whose root already holds that name in `takenByRoot`
- * (another task pinned it but has not materialized it yet) gets `-2`, `-3`, …
- * — the per-repository fallback. Keyed by repo root so a name held in repo A
- * never forces a rename in repo B.
- */
-export function repoBranchPlan(
-  repositories: Pick<TaskRepository, "path" | "name">[],
-  roots: Map<string, string>,
-  desired: string,
-  takenByRoot: Map<string, Set<string>> = new Map(),
-): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const repo of repositories) {
-    const root = roots.get(repo.path) ?? repo.path;
-    const taken = takenByRoot.get(root) ?? new Set<string>();
-    let candidate = desired;
-    for (let n = 2; taken.has(candidate) && n < 10_000; n++) candidate = `${desired}-${n}`;
-    out.set(repo.name, candidate);
-  }
-  return out;
-}
-
-/**
  * True when `candidate` is lexically contained in `root` (equal or a
  * descendant). Lexical only — symlinks are not resolved, matching the
  * worktree engine's own ownership guard. Used by tests and callers that must
@@ -122,9 +98,15 @@ export function lexicallyInsideRoot(root: string, candidate: string): boolean {
 
 /**
  * Branch names already pinned on tasks other than `taskId`, grouped by the
- * source git root each one belongs to. Used by `createTask`/`startTask` so a
- * not-yet-started multi-repository task can't be handed a branch another task
- * is holding in the same repository.
+ * selected project path each one belongs to (`workdir` for a single-repository
+ * row, `repositories[].path` for a multi row). Used by
+ * `createTask`/`startTask` so a not-yet-started multi-repository task can't be
+ * handed a branch another task is holding in the same repository.
+ *
+ * Callers that know a repository's git root also probe the map with that root
+ * (see `prepareTaskWorkdir`), so a row that selected a subdirectory of the
+ * same repository still sees the pin. The git-root check inside
+ * `ensureUniqueBranch` is the backstop for the remaining path aliases.
  */
 export function branchesPinnedByOtherTasks(
   taskId: string,

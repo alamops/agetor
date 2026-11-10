@@ -90,22 +90,3 @@ export function formatRepositoriesPrompt(
   );
   return lines.length === 0 ? "Repositories:" : `Repositories:\n${lines.join("\n")}`;
 }
-
-/** The repository whose `path` matches the given selection path, if any. */
-export function repositoryAtPath(
-  task: Pick<Task, "repositories">,
-  projectPath: string,
-): TaskRepository | null {
-  if (!task.repositories) return null;
-  return task.repositories.find((r) => r.path === projectPath) ?? null;
-}
-
-/** The workspace subdirectory name for a diff/terminal request, or null. */
-export function repoNameForSelection(
-  task: Pick<Task, "repositories">,
-  name: string | null | undefined,
-): string | null {
-  if (!name) return null;
-  if (!isMultiRepoTask(task)) return null;
-  return task.repositories?.some((r) => r.name === name) ? name : null;
-}

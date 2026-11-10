@@ -844,6 +844,23 @@ export function worktreePath(task: Task): string {
   return path.join(WORKTREES_DIR, task.id);
 }
 
+/**
+ * The workspace root a multi-repository task's worktrees live under.
+ *
+ * A multi row mirrors its workspace in BOTH `workdir` and `worktreePath`, so a
+ * pipeline step — which copies its parent's workspace onto its own row — must
+ * reuse that path instead of deriving a fresh `<WORKTREES_DIR>/<step-id>` from
+ * its own id (that would materialize a second, empty workspace and strand the
+ * parent's repositories). Falls back to the canonical per-task path when the
+ * mirrored path is absent or outside `WORKTREES_DIR` (a hand-edited/corrupt
+ * row must never widen the ownership boundary).
+ */
+export function workspacePathFor(task: Task): string {
+  const mirrored = task.worktreePath ?? task.workdir;
+  if (mirrored && lexicallyInsideRoot(WORKTREES_DIR, mirrored)) return mirrored;
+  return worktreePath(task);
+}
+
 /** The `GET /worktrees` row id for one repository of a multi-repo task. */
 export function worktreeIdForRepo(taskId: string, repoName: string): string {
   return `${taskId}__${repoName}`;
@@ -1334,7 +1351,7 @@ export async function prepareTaskWorkdir(
     return { error: "multi-repository tasks require worktree isolation" };
   }
 
-  const workspace = worktreePath(task);
+  const workspace = workspacePathFor(task);
   mkdirSync(workspace, { recursive: true });
 
   interface Attempt {
@@ -1398,7 +1415,10 @@ export async function prepareTaskWorkdir(
       branchSource: repo.branchSource ?? "created",
       baseRef: repo.baseRef,
       recordedCheckout: repo.checkoutBranch ?? null,
-      takenBranches: opts?.takenBranches?.get(repo.path) ?? new Set(),
+      // Pins are keyed by the selected project path (`branchesPinnedByOtherTasks`);
+      // fall back to the git root so a row that selected a subdirectory of the
+      // same repository still sees the other task's pin.
+      takenBranches: opts?.takenBranches?.get(repo.path) ?? opts?.takenBranches?.get(root) ?? new Set(),
       reattach: Boolean(repo.worktreePath),
       fetchExisting: false,
     });
@@ -1456,7 +1476,7 @@ export async function prepareTaskWorkdir(
 /** Remove `dir` only when it exists and is empty (never a recursive wipe). */
 function removeDirIfEmpty(dir: string): void {
   try {
-    if (existsSync(dir) && existsSync(dir) && lstatSync(dir).isDirectory()) {
+    if (existsSync(dir) && lstatSync(dir).isDirectory()) {
       const entries = readdirSync(dir);
       if (entries.length === 0) rmdirSync(dir);
     }
@@ -1818,21 +1838,36 @@ async function removeOneWorktree(root: string | null, wt: string, branches: stri
   }
 }
 
-export async function removeWorktree(task: Task, opts?: { branches?: string[] }): Promise<void> {
+export async function removeWorktree(
+  task: Task,
+  opts?: {
+    /** Single-repository: the exact branches to delete. */
+    branches?: string[];
+    /**
+     * Multi-repository: each repository's own teardown plan (the same
+     * `TaskTeardownPreview.repositories` the delete confirm read). Without it
+     * the plan falls back to each entry's pinned branch, which misses a
+     * checkout that drifted onto another branch.
+     */
+    repositories?: { name: string; branches: string[] }[];
+  },
+): Promise<void> {
   const repos = task.repositories ?? [];
   if (repos.length > 1) {
-    // Per repository: remove its checkout and the branch agetor minted there.
-    // `branchSource: "existing"` never happens for a multi task in v1, but the
-    // guard keeps a future per-repo PR head safe.
+    // Per repository: remove its checkout and the branches the per-repo plan
+    // says agetor owns there. `branchSource: "existing"` never happens for a
+    // multi task in v1, but the guard keeps a future per-repo PR head safe.
+    const planned = new Map((opts?.repositories ?? []).map((p) => [p.name, p.branches]));
     for (const repo of repos) {
       if (!repo.worktreePath) continue;
       const root = await repoRoot(repo.path);
-      const branches = repo.branch && repo.branchSource !== "existing" ? [repo.branch] : null;
+      const branches = planned.get(repo.name)
+        ?? (repo.branch && repo.branchSource !== "existing" ? [repo.branch] : null);
       await removeOneWorktree(root, repo.worktreePath, branches);
     }
     // Each nested directory is its own worktree; only the now-empty workspace
     // root is ours to delete (never recursively).
-    removeDirIfEmpty(worktreePath(task));
+    removeDirIfEmpty(workspacePathFor(task));
     return;
   }
   if (!task.worktreePath) return;
@@ -1928,7 +1963,7 @@ export async function detachWorktree(
     }
     // Only the empty workspace root is removed; a dirty repository's checkout
     // (and the workspace holding it) stays put.
-    removeDirIfEmpty(worktreePath(task));
+    removeDirIfEmpty(workspacePathFor(task));
     const removed = outcomes.every((o) => o.result.removed);
     if (removed) return { removed, repositories: outcomes };
     const reason = outcomes.find((o) => !o.result.removed)?.result.reason ?? "failed";

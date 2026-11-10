@@ -36,3 +36,5 @@ optional `stacks` prop; no extra fetch is made. See
 ## Multiple repositories in one task
 
 A task created against two or more repositories stores `Task.repositories[]` and runs at a per-task workspace root with one linked worktree per repository. Preparation, the `Repositories:` launch block, per-repo diff/status/PR, per-repo teardown, nested worktree ids and the CLI/TUI surfaces are specified in [multi-repo-tasks.md](multi-repo-tasks.md). A single-repository task is unchanged (its one entry is derived from the scalar columns).
+
+The repository tabs at the top of the panel select the active entry; the header "View PR" link, mergeability/Resolve Conflicts, the PR head and the terminal cwd all follow that entry (`task.prUrl` stays null for a multi task). "Create all PRs" only walks entries without a `prUrl`, so a retry after a partial failure never duplicates a PR.

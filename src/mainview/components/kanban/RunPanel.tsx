@@ -18,7 +18,7 @@ import { EXPAND_EVENT } from "@/lib/expand-on-jump";
 import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
-import { latestPrProposal, latestRepositoryProposals } from "@/lib/pr-proposal";
+import { latestPrProposal, latestRepositoryProposals, repositoriesNeedingPr } from "@/lib/pr-proposal";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
@@ -2922,6 +2922,14 @@ function RunPanelBody({
       ?? gitStatus?.repositories?.[0]
       ?? null)
     : gitStatus;
+  // The PR the header/mergeability surfaces follow: each repository stamps
+  // its own entry, so a multi task follows the selected tab's PR (task.prUrl
+  // stays null by design). The status fetch also needs that repository's path
+  // to resolve its provider remote.
+  const headerPrUrl = multiRepo ? (activeRepo?.prUrl ?? null) : task.prUrl;
+  const prStatusPath = multiRepo
+    ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)
+    : task.workdir;
   const [importedBranchBusy, setImportedBranchBusy] = useState(false);
   const [importedBranchError, setImportedBranchError] = useState<string | null>(null);
   const [importRetryBusy, setImportRetryBusy] = useState(false);
@@ -3194,9 +3202,10 @@ function RunPanelBody({
   }, [task.id, task.pipelineParentId]);
 
   // PR mergeability for the composer-row "Resolve Conflicts" button. `parsedPrUrl`
-  // is derived once per `task.prUrl` change and reused for both the fetch
-  // effect and the render-time gate (`canOfferResolveConflicts`).
-  const parsedPrUrl = useMemo(() => parsePrUrl(task.prUrl), [task.prUrl]);
+  // is derived once per PR-URL change (the selected repository's for a multi
+  // task) and reused for both the fetch effect and the render-time gate
+  // (`canOfferResolveConflicts`).
+  const parsedPrUrl = useMemo(() => parsePrUrl(headerPrUrl), [headerPrUrl]);
   const [prStatus, setPrStatus] = useState<GitHubPullMergeability | null>(null);
   const [prStatusLoading, setPrStatusLoading] = useState(false);
   const [prStatusError, setPrStatusError] = useState<string | null>(null);
@@ -3274,7 +3283,7 @@ function RunPanelBody({
   // landing between the await and the fetch — `fetchPrStatus` itself would
   // otherwise fire for a task this effect instance no longer represents.
   useEffect(() => {
-    const parsed = parsePrUrl(task.prUrl);
+    const parsed = parsePrUrl(headerPrUrl);
     if (!parsed) {
       prStatusSeqRef.current++; // invalidate any in-flight fetch/retry
       prStatusRetriesRef.current = 0;
@@ -3287,11 +3296,11 @@ function RunPanelBody({
     prStatusRetriesRef.current = 0;
     void awaitStreamReady().then(() => {
       if (cancelled) return;
-      fetchPrStatus(task.workdir, parsed.number);
+      fetchPrStatus(prStatusPath, parsed.number);
     });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [task.id, task.prUrl]);
+  }, [task.id, headerPrUrl, prStatusPath]);
 
   // Re-check mergeability at turn-end: track whether the task was "running"
   // on the previous render and refetch once it transitions away from
@@ -3306,16 +3315,16 @@ function RunPanelBody({
     const wasRunning = wasRunningForPrStatusRef.current;
     wasRunningForPrStatusRef.current = task.column === "running";
     if (!wasRunning || task.column === "running") return;
-    const parsed = parsePrUrl(task.prUrl);
+    const parsed = parsePrUrl(headerPrUrl);
     if (!parsed) return;
     prStatusRetriesRef.current = 0;
-    fetchPrStatus(task.workdir, parsed.number);
-  }, [task.column, task.prUrl, task.workdir, fetchPrStatus]);
+    fetchPrStatus(prStatusPath, parsed.number);
+  }, [task.column, headerPrUrl, prStatusPath, fetchPrStatus]);
 
   const refreshPrStatus = () => {
     if (!parsedPrUrl) return;
     prStatusRetriesRef.current = 0;
-    fetchPrStatus(task.workdir, parsedPrUrl.number);
+    fetchPrStatus(prStatusPath, parsedPrUrl.number);
   };
 
   const send = async () => {
@@ -3703,11 +3712,20 @@ function RunPanelBody({
    */
   const createAllPrs = async () => {
     if (!multiRepo || allPrsBusy) return;
+    const repos = task.repositories ?? [];
+    // Only repositories that don't have a PR yet. This is what makes the
+    // action safe to press again after a partial failure (the stamped entries
+    // are skipped) and stops a second press from opening duplicate PRs.
+    const todo = repositoriesNeedingPr(repos);
+    if (todo.length === 0) {
+      toast("Every repository already has a pull request");
+      return;
+    }
     setAllPrsBusy(true);
     const failures: string[] = [];
-    const proposals = latestRepositoryProposals(events, task.repositories?.[0]?.name);
+    const proposals = latestRepositoryProposals(events, repos[0]?.name);
     try {
-      for (const repo of task.repositories ?? []) {
+      for (const repo of todo) {
         if (!repo.branch) {
           failures.push(`${repo.name}: no branch yet`);
           continue;
@@ -3731,8 +3749,13 @@ function RunPanelBody({
           failures.push(`${repo.name}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-      if (failures.length === 0) toast.success("Pull requests created for every repository");
-      else toast.error(`Could not open ${failures.length} pull request(s): ${failures.join("; ")}`);
+      if (failures.length === 0) {
+        toast.success(
+          todo.length === repos.length
+            ? "Pull requests created for every repository"
+            : `Pull requests created for ${todo.length} of ${repos.length} repositories`,
+        );
+      } else toast.error(`Could not open ${failures.length} pull request(s): ${failures.join("; ")}`);
     } finally {
       setAllPrsBusy(false);
     }
@@ -4044,11 +4067,10 @@ function RunPanelBody({
     capture.handleResult(result);
   };
 
-  // Captured as a local const (not read via `task.prUrl` inline) so its
-  // narrowing to non-null survives into the onClick closure below — TS
-  // drops narrowing on a mutable property access once it's referenced
-  // inside a nested function expression.
-  const prUrl = task.prUrl;
+  // Captured as a local const (not read inline) so its narrowing to non-null
+  // survives into the onClick closure below — TS drops narrowing on a mutable
+  // property access once it's referenced inside a nested function expression.
+  const prUrl = headerPrUrl;
   // Same capture rationale as `prUrl` above, for the "View issue" header
   // affordance.
   const issueUrl = task.issueUrl;
@@ -4870,19 +4892,19 @@ function RunPanelBody({
                     "View PR" link lives in the panel header). The proposal
                     parse runs on click, not per event flush — the stream can
                     be long. */}
-                {multiRepo && canSend && !sending && (
+                {multiRepo && canSend && !sending && repositoriesNeedingPr(task.repositories ?? []).length > 0 && (
                   <Button
                     size="sm"
                     variant="secondary"
                     onClick={() => void createAllPrs()}
                     disabled={allPrsBusy}
-                    title="Open one pull request per repository, prefilled from the agent's labeled proposals"
+                    title="Open one pull request per repository that doesn't have one yet, prefilled from the agent's labeled proposals"
                     data-testid="create-all-prs"
                   >
                     <GitPullRequest className="mr-1 size-3" /> {allPrsBusy ? "Creating PRs…" : "Create all PRs"}
                   </Button>
                 )}
-                {!task.prUrl && prHead != null && shouldOfferOpenPr(activeGitStatus) && !sending && (
+                {!headerPrUrl && prHead != null && shouldOfferOpenPr(activeGitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"
@@ -4894,7 +4916,11 @@ function RunPanelBody({
                           : task.workdir,
                         head: prHead,
                         title: proposal?.title ?? "",
-                        body: appendIssueCloseDirective(proposal?.description ?? "", task.issueUrl),
+                        // Only the repository the issue came from may close it.
+                        body: appendIssueCloseDirective(
+                          proposal?.description ?? "",
+                          !multiRepo || activeRepo?.path === task.issueRepoPath ? task.issueUrl : null,
+                        ),
                         taskId: task.id,
                       });
                     }}

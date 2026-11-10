@@ -508,6 +508,17 @@ describe("multi-repository proposals", () => {
     expect(latestRepositoryProposals(events, "frontend").get("frontend")?.title).toBe("Add login flow");
   });
 
+  test("repositoriesNeedingPr skips already-stamped repositories", () => {
+    const { repositoriesNeedingPr } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const repos = [
+      { name: "frontend", prUrl: "https://github.com/acme/frontend/pull/1" },
+      { name: "backend", prUrl: null },
+      { name: "infra", prUrl: null },
+    ];
+    expect(repositoriesNeedingPr(repos).map((r) => r.name)).toEqual(["backend", "infra"]);
+    expect(repositoriesNeedingPr(repos.map((r) => ({ ...r, prUrl: "x" })))).toEqual([]);
+  });
+
   test("newest run wins and subagent streams are ignored", () => {
     const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
     const events = [

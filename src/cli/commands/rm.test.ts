@@ -140,6 +140,50 @@ test("teardownPhrase escapes branch names in the no-preview fallback", () => {
   expect(teardownPhrase(null, { branch: "x", checkoutBranch: "x" })).toBe("its worktree + branch x");
 });
 
+test("a multi-repository preview names each repository's own branches", async () => {
+  const multi: TaskTeardownPreview = {
+    branches: ["feature/a", "drift", "feature/b"],
+    liveBranch: "drift",
+    taskBranch: null,
+    source: "live",
+    excluded: [],
+    repositories: [
+      { name: "frontend", path: "/src/frontend", branches: ["feature/a", "drift"], liveBranch: "drift", taskBranch: "feature/a", source: "live", excluded: [] },
+      { name: "backend", path: "/src/backend", branches: ["feature/b"], liveBranch: "feature/b", taskBranch: "feature/b", source: "task-branch", excluded: [] },
+    ],
+  };
+  currentClient = fakeClient(multi);
+  await cmdRm(["abcdefgh"], flags);
+  expect(outputs[0]).toContain(
+    "and its worktrees + per-repository branches (frontend: feature/a, drift; backend: feature/b).",
+  );
+  process.exitCode = 0;
+});
+
+test("--json carries the per-repository plan for a multi-repository task", async () => {
+  const multi: TaskTeardownPreview = {
+    branches: ["feature/a", "feature/b"],
+    liveBranch: "feature/a",
+    taskBranch: null,
+    source: "live",
+    excluded: [],
+    repositories: [
+      { name: "frontend", path: "/src/frontend", branches: ["feature/a"], liveBranch: "feature/a", taskBranch: "feature/a", source: "task-branch", excluded: [] },
+      { name: "backend", path: "/src/backend", branches: ["feature/b"], liveBranch: "feature/b", taskBranch: "feature/b", source: "task-branch", excluded: [] },
+    ],
+  };
+  currentClient = fakeClient(multi);
+  await cmdRm(["abcdefgh"], jsonFlags);
+  expect(jsonOutputs).toEqual([{
+    deleted: task.id,
+    branches: ["feature/a", "feature/b"],
+    repositories: [
+      { name: "frontend", branches: ["feature/a"] },
+      { name: "backend", branches: ["feature/b"] },
+    ],
+  }]);
+});
+
 test("--json carries the deleted branches", async () => {
   currentClient = fakeClient(both);
   await cmdRm(["abcdefgh"], jsonFlags);

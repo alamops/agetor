@@ -132,11 +132,13 @@ export const USAGE: Record<string, string> = {
   fx, cursor and an OpenCode 2.x turn (it runs on the agetor-managed OpenCode
   server) have none. Detach with Ctrl-b d.`,
 
-  shell: `usage: agetor shell <task-id> [--print]
+  shell: `usage: agetor shell <task-id> [--repo <name>] [--print]
 
   Open a shell in the task's worktree (or its workdir when isolation is off) —
-  the terminal version of the app's worktree terminal. --print / -p just echoes
-  the directory, e.g. cd "$(agetor shell -p <id>)".`,
+  the terminal version of the app's worktree terminal. For a multi-repository
+  task the shell opens at the workspace root; --repo <name> opens it inside one
+  repository's worktree instead. --print / -p just echoes the directory, e.g.
+  cd "$(agetor shell -p <id>)".`,
 
   edit: `usage: agetor edit <task-id> [flags]   (at least one flag)
 

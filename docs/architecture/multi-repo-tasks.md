@@ -47,8 +47,12 @@ interface TaskRepository {
 2. Dedupes by git root, keeping the first selected path for that root.
    A selection that collapses to one root uses the ordinary single-repo layout.
 3. Rejects 2+ entries with `isolation: "none"` or `existingBranch`.
-4. Resolves each repository's base ref to a sha and pins one shared branch name
-   (computed against the first repository).
+4. Resolves each repository's base ref to a sha and pins a branch per
+   repository through `ensureUniqueBranch` against **that repository's own
+   refs** (plus names other not-yet-started tasks hold), so a branch left
+   behind by an archived task gets the per-repository `-N` fallback instead of
+   being silently re-attached. Repositories share the desired name when it is
+   free everywhere.
 5. Matches `issueUrl` against every repository's remote.
 6. Inserts `workdir = <dataDir>/worktrees/<task-id>` and the entries with
    `branch` pinned but `worktreePath` null.
@@ -59,13 +63,19 @@ path gate probes every selected path (`PathParam.itemField`).
 ## Preparation, runtime and the workspace mirror
 
 `prepareTaskWorkdir` (`src/bun/worktree.ts`) delegates to `prepareWorkdir`
-unchanged for ≤1 repository. For 2+ it creates the workspace and one linked
-worktree per repository via `prepareRepoWorktree` (max 4 concurrent), reusing an
-existing entry's checkout without creating or switching anything. It is
+unchanged for ≤1 repository. For 2+ it resolves the workspace with
+`workspacePathFor` — the task's mirrored `worktreePath`/`workdir` when it is
+inside `<dataDir>/worktrees`, else `<WORKTREES_DIR>/<task-id>` — and creates one
+linked worktree per repository via `prepareRepoWorktree` (max 4 concurrent),
+reusing an existing entry's checkout without creating or switching anything. A
+pipeline step row copies its parent's workspace, so it reuses the same
+workspace instead of materializing an empty `<WORKTREES_DIR>/<step-id>`. It is
 **all-or-nothing**: every failure is collected, worktrees/branches created in
 this attempt are rolled back, reused ones are left alone, and the error names
 every failed repository. A repository that already holds the shared branch gets
-a per-repo `-N` fallback; `takenBranches` is keyed by source root.
+a per-repo `-N` fallback; `takenBranches` is keyed by the selected project path,
+and the per-repository lookup falls back to the git root so a subdirectory
+selection still sees the pin.
 
 `startTask` spawns the agent with `cwd = workspace`, persists the materialized
 entries with `tasks.setRepositories`, and appends the launch block
@@ -80,7 +90,9 @@ after the user prompt and before the references block. This block is the only
 machine-added text for a multi task; a single-repo launch prompt is
 byte-identical to before. Flag-capable harnesses (claude-code, codex, copilot)
 also get `--add-dir <workspace>/<repo>` for every entry; cursor/fx/opencode rely
-on the cwd (the workspace is not itself a git repo).
+on the cwd (the workspace is not itself a git repo). `spawnAgentOrFail` injects
+those directories from the task row on **every** spawn path (first launch,
+follow-up, swap, retry), so a resumed codex/copilot turn keeps the same roots.
 
 Because `workdir`/`worktreePath` mirror the workspace, every existing
 `worktreePath ?? workdir` cwd site (terminals at the workspace root, `@`
@@ -97,8 +109,9 @@ also open inside one repository (`POST /tasks/:id/terminals { repo }`).
   old clients. One request per 5 s poll, bounded at 4 concurrent repositories.
 - `POST /github/pull-create` matches the task's entry by worktree path (then
   selected path) and stamps only that entry; first write wins; `task.prUrl`
-  stays null. The run panel's "Create all PRs" walks the repositories,
-  best-effort, appending `Closes #N` only for `issueRepoPath`.
+  stays null. The run panel's "Create all PRs" walks the repositories that have
+  no PR yet (`repositoriesNeedingPr`), best-effort, appending `Closes #N` only
+  for `issueRepoPath`; a second press never duplicates a stamped repository.
 
 ## Teardown, Worktrees page and ids
 
@@ -108,7 +121,8 @@ workspace is removed only when empty. Before detaching, archive records each
 repository's live checkout with `tasks.setRepositoryCheckout` so unarchive
 re-attaches onto the same branches. Branch teardown is planned per repository
 (`TaskTeardownPreview.repositories`), with the top-level fields mirroring the
-first.
+first; delete passes that plan to `removeWorktree`, so a branch a repository's
+checkout drifted onto is removed in the repository that owns it.
 
 A multi row's Worktrees id is `<taskId>__<repo-slug>`. Task ids are UUIDs and
 contain no underscore, so the first `__` is the boundary. `resolveWorktreeRef`
@@ -117,7 +131,9 @@ is the single id-to-path guard for `DELETE /worktrees/:id` and
 final path must be a direct child of its parent, itself a direct child of
 `WORKTREES_DIR`. `listWorktrees` emits one row per repository
 (`repoName`, `workdir = entry.path`), skips the workspace root, and expands an
-orphaned workspace directory whose children are git worktrees.
+orphaned workspace directory only when a child's `.git` is a linked-worktree
+pointer (`gitdir: …/.git/worktrees/…`) — a submodule's `.git` pointer into
+`.git/modules/…` does not split a legacy single-repository worktree into rows.
 
 Teardown is serialized per source repository: `enqueueTeardownMany` acquires
 every selected repository's key in sorted order (no deadlock), so two tasks
@@ -141,8 +157,10 @@ sharing a repository never run `git worktree` operations concurrently.
 - **Pipelines** — a multi parent copies its set onto every step row and owns
   teardown; steps never detach a shared worktree.
 - **CLI/TUI** — `agetor add --repo <path[=ref]>` (repeatable), `show` prints the
-  repository block, `shell --repo <name>`, `rm` preview per repository, `ls`
-  shows a count, and the TUI `@` listing unions the scopes with prefixes.
+  repository block, `shell [--repo <name>]` (the task id works with or without
+  the flag), `rm` prints one line per repository (and `--json` carries
+  `repositories[]`), `ls` shows a count, and the TUI `@` listing unions the
+  scopes with prefixes.
 
 ## Intentional limits
 
