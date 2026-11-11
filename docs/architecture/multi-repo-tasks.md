@@ -171,11 +171,14 @@ subdirectory selections under one root are not serialized against each other.)
   and terminal cwd; commit & push uses the aggregate prompt.
 - **Pipelines** — a multi parent copies its set onto every step row and owns
   teardown; steps never detach a shared worktree.
-- **CLI/TUI** — `agetor add --repo <path[=ref]>` (repeatable), `show` prints the
-  repository block, `shell [--repo <name>]` (the task id works with or without
-  the flag), `rm` names each repository's own branch removals (and `--json`
-  carries `repositories[]`), `ls` shows a count, and the TUI `@` listing unions
-  the scopes with prefixes.
+- **CLI/TUI** — `agetor add --repo <path[=ref]>` (repeatable) and the
+  interactive wizard's repository multi-select (each picked repository can
+  carry its own base ref; `--repo`/`--workdir` skip the picker), `show` prints
+  the repository block, `shell [--repo <name>]` (the task id works with or
+  without the flag), `rm` names each repository's own branch removals (and
+  `--json` carries `repositories[]`), `ls` shows a count, and the TUI `@`
+  listing unions the scopes with prefixes. `agetor add` without `--start`
+  runs the advisory `@` pre-check against the same per-repository scopes.
 
 ## Intentional limits
 

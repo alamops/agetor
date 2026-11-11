@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
+import { splitNamedScopePath } from "../../shared/file-scope.ts";
 
 /** The project scope a listing is fetched against — mirrors `GET
  *  /files/index`'s two query params. `ref` given selects the `git ls-tree`
@@ -185,13 +186,9 @@ export function resolveNamedScopePath(
   scopes: readonly NamedFileScope[] | null | undefined,
   path: string,
 ): { scope: NamedFileScope; path: string } | null {
-  if (!scopes || scopes.length === 0 || !path) return null;
-  const slash = path.indexOf("/");
-  if (slash <= 0) return null;
-  const name = path.slice(0, slash);
-  const scope = scopes.find((s) => s.name === name);
-  if (!scope) return null;
-  return { scope, path: path.slice(slash + 1) };
+  // The prefix grammar lives in `src/shared/file-scope.ts` so the CLI's
+  // advisory pre-check resolves tokens exactly like this popover does.
+  return splitNamedScopePath(scopes, path);
 }
 
 /**

@@ -9,13 +9,11 @@ import { parseOpencodeServerFlag, parseSpeedFlag, warnOpencodeServerFlagIgnored 
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import {
   discoveredExtensionNames,
-  existsInLiveScope,
   filterUnresolvedRefs,
+  unresolvedRefsForTask,
   unresolvedWarningLine,
-  verifyTokensViaSearch,
   warnUnresolvedRefs,
 } from "../at-warn.ts";
-import { fileScopeForTask } from "../tui/at-complete.ts";
 import {
   parseIssueUrl,
   sameIssueUrl,
@@ -45,13 +43,11 @@ import {
   type DiscoveredModel,
   type ModelOption,
 } from "../../shared/model-options.ts";
-import { buildFileEntries } from "../../shared/at-file-filter.ts";
-import { unresolvedAtTokens } from "../../shared/at-refs.ts";
 import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
 import { matchPipelineRef } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
 
-interface AddOpts {
+export interface AddOpts {
   title?: string;
   prompt?: string;
   promptFile?: string;
@@ -334,61 +330,20 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     }
   } else if (restrictTo !== "" && input.prompt.includes("@")) {
     // Task wasn't started, so there's no server-side send-time expansion to
-    // ask — advisory client-side pre-check instead: list the scope the task
-    // will actually run in (the same `fileScopeForTask` table `RunPanel` /
-    // the TUI composer use, docs/architecture/at-file-references.md) and flag any `@`-token the user
-    // typed that won't resolve there. Never blocks or fails the add; a
-    // listing that errored or came back empty can't prove a token
-    // unresolved, so it's skipped silently rather than false-warning.
+    // ask — advisory client-side pre-check instead: list the scope(s) the
+    // task will actually run in (the same multi-scope table `RunPanel`, the
+    // TUI composer and `at-file-references.md` use) and flag any `@`-token
+    // the user typed that won't resolve there. For a multi-repository task
+    // that means every repository's own scope with its `<name>/` prefix,
+    // never the non-git workspace root (issue #291 review S4). Never blocks
+    // or fails the add; a listing that errored or came back empty can't prove
+    // a token unresolved, so it's skipped silently rather than false-warning.
     // `restrictTo === ""` (an `--issue` add with no user-typed prompt) is
     // checked above before this branch even runs: every candidate token
     // would be filtered out anyway, so there's no reason to pay for the
     // listing fetch.
     try {
-      const scope = fileScopeForTask(task);
-      const listing = await client.listProjectFiles(scope);
-      if (listing.files.length > 0) {
-        const validPaths = new Set(buildFileEntries(listing.files).map((e) => e.path));
-        let unresolvedTokens = unresolvedAtTokens(input.prompt, validPaths);
-        if (scope.ref == null) {
-          // A LIVE scope (`--isolation none`) runs on this same machine, so
-          // mirror the server's real oracle directly: a gitignored-but-
-          // present path (e.g. `@.env`) isn't in the listing but DOES exist
-          // on disk, and send-time expansion will resolve it — must not warn.
-          unresolvedTokens = unresolvedTokens.filter((t) => !existsInLiveScope(scope.dir, t.path));
-        }
-        if (listing.truncated) {
-          // A TRUNCATED listing (the 20k `MAX_PROJECT_FILES` cap — a
-          // monorepo) can't tell "not present" from "present but past the
-          // cap" apart, so a token missing from it isn't provably
-          // unresolved — unlike the untruncated branch below, which can
-          // warn on `unresolvedTokens` directly. Shrink to the candidates
-          // that would otherwise warn (extension mentions and non-user-typed
-          // tokens are exempt regardless of what a search would find, so
-          // there's no reason to spend a round-trip on them) and verify each
-          // one via the server's full-depth search before trusting it as
-          // missing (`verifyTokensViaSearch`, the webview parity in
-          // docs/architecture/at-file-references.md). Only PROVEN-missing tokens warn.
-          const extensionNames = await discoveredExtensionNames(client, task);
-          const candidateRaws = new Set(
-            filterUnresolvedRefs(
-              unresolvedTokens.map((t) => t.raw),
-              { extensionNames, restrictTo },
-            ),
-          );
-          const candidates = unresolvedTokens.filter((t) => candidateRaws.has(t.raw));
-          if (candidates.length) {
-            const missing = await verifyTokensViaSearch(client, scope, candidates);
-            unresolvedRefsWarning = missing.map((t) => t.raw);
-          }
-        } else {
-          const rawUnresolved = unresolvedTokens.map((t) => t.raw);
-          if (rawUnresolved.length) {
-            const extensionNames = await discoveredExtensionNames(client, task);
-            unresolvedRefsWarning = filterUnresolvedRefs(rawUnresolved, { extensionNames, restrictTo });
-          }
-        }
-      }
+      unresolvedRefsWarning = await unresolvedRefsForTask(client, task, input.prompt, { restrictTo });
     } catch {
       // listing failed — skip silently, see comment above.
     }
@@ -547,7 +502,10 @@ export function resolveInitialModel(
   return DEFAULT_MODEL[kind];
 }
 
-async function wizard(
+/** The interactive add wizard. Exported for unit tests (the repo's
+ *  `@clack/prompts` mock drives it directly); `cmdAdd` is the only production
+ *  caller and reaches it via `chooseAddPath`. */
+export async function wizard(
   client: AgetorClient,
   o: AddOpts,
   prefilledPrompt: string | undefined,
@@ -773,25 +731,66 @@ async function wizard(
   }
 
   let workdir = o.workdir;
-  if (!workdir) {
+  if (!workdir && o.repos.length > 0) {
+    // `--repo` already defines the set; don't ask again. The first selected
+    // repository is the form's workdir, matching the server's create contract
+    // (the workspace root is derived from it).
+    workdir = o.repos[0]!.path;
+  } else if (!workdir) {
     const projects = (await client.listProjects().catch(() => [])) as Array<{
       path: string;
       name?: string;
     }>;
-    const pick = await p.select({
-      message: "Working directory",
-      options: [
-        ...projects.map((pr) => ({ value: pr.path, label: pr.name ?? pr.path, hint: pr.path })),
-        { value: "__other__", label: "Other (type a path)…" },
-      ],
-    });
-    if (p.isCancel(pick)) return cancelled();
-    if (pick === "__other__") {
+    if (projects.length > 0) {
+      // Multi-select is the CLI/TUI half of the owner's full-parity decision
+      // (issue #291): one repository keeps today's single-pick flow, 2+ send
+      // the whole set. Clack has no per-row editor, so multi selections are
+      // followed by one optional base-ref prompt per repository — the same
+      // fields the webview's `RepositoriesDialog` exposes.
+      const OTHER = "__other__";
+      const picked = await p.multiselect<string>({
+        message: "Repositories (space to select, enter to confirm)",
+        options: [
+          ...projects.map((pr) => ({
+            value: pr.path,
+            label: pr.name ?? (path.basename(pr.path) || pr.path),
+            hint: pr.path,
+          })),
+          { value: OTHER, label: "Other (type a path)…" },
+        ],
+        initialValues: [projects[0]!.path],
+        required: true,
+      });
+      if (p.isCancel(picked)) return cancelled();
+      const selections: Array<{ path: string; baseRef?: string }> = [];
+      for (const value of picked) {
+        if (value === OTHER) {
+          const typed = await p.text({ message: "Path", placeholder: process.cwd() });
+          if (p.isCancel(typed)) return cancelled();
+          selections.push({ path: typed.trim() || process.cwd() });
+        } else {
+          selections.push({ path: value });
+        }
+      }
+      if (selections.length === 0) return cancelled();
+      if (selections.length > 1) {
+        for (const selection of selections) {
+          const name = path.basename(selection.path.replace(/\/+$/, "")) || selection.path;
+          const ref = await p.text({
+            message: `Base ref for ${name}`,
+            placeholder: "default (HEAD)",
+          });
+          if (p.isCancel(ref)) return cancelled();
+          const trimmed = ref.trim();
+          if (trimmed) selection.baseRef = trimmed;
+        }
+      }
+      o.repos = selections;
+      workdir = selections[0]!.path;
+    } else {
       const typed = await p.text({ message: "Path", placeholder: process.cwd() });
       if (p.isCancel(typed)) return cancelled();
       workdir = typed.trim() || process.cwd();
-    } else {
-      workdir = pick;
     }
   }
 

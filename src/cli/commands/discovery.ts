@@ -16,7 +16,7 @@ export async function cmdCommands(args: string[], flags: Flags): Promise<void> {
   if (!ref) throw usageError("commands");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
-  const agent = task.agent ?? "claude-code";
+  const agent = task.agent;
   // One call per repository; a failed repository contributes nothing so a
   // single broken worktree doesn't hide the others' project-level entries.
   // If every scope fails, surface the first failure (the command's contract

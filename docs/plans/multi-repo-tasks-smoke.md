@@ -30,7 +30,8 @@ bun test src/bun/multi-repo-repro.test.ts src/bun/orchestrator-multi-repo.test.t
   src/shared/multi-repo.test.ts src/shared/file-scope.test.ts \
   src/mainview/lib/repo-selection.test.ts src/mainview/lib/pr-proposal.test.ts \
   src/mainview/lib/use-project-files.test.ts src/mainview/lib/diff-selection.test.ts \
-  src/mainview/lib/commit-push.test.ts src/cli/commands/add.test.ts \
+  src/mainview/lib/commit-push.test.ts src/mainview/lib/agent-capabilities.test.ts \
+  src/cli/commands/add.test.ts \
   src/cli/commands/show.test.ts src/cli/commands/shell.test.ts \
   src/cli/commands/rm.test.ts src/cli/tui/at-complete.test.ts src/cli/at-warn.test.ts
 bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
@@ -41,10 +42,13 @@ bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 | Check | Result |
 | --- | --- |
 | `bun run typecheck` | green |
-| Focused multi-repo/unit suites | green — 1,138 tests across the 28 files above |
-| `bun test` | Round-3 full-suite evidence: 12,512 tests, 496 files — 12,477 pass, 31 skip, 4 fail, all load/timing-sensitive fake-tmux/opencode-fixture cases that rotated and passed on rerun. Round 4 re-ran the focused suite above and `bun test src/shared src/mainview src/cli` (5,084 pass); a fresh full-suite attempt was stopped under shared-machine load after 43/496 files with only the same known fake-tmux/claude-session timing failures. |
-| `bun test src/shared src/mainview src/cli` | green — 5,084 tests across 193 files |
+| Focused multi-repo/unit suites | green — 1,156 tests across the 29 files above (round 5) |
+| `bun test` | Round-3 full-suite evidence: 12,512 tests, 496 files — 12,477 pass, 31 skip, 4 fail, all load/timing-sensitive fake-tmux/opencode-fixture cases that rotated and passed on rerun. Round 4 re-ran the focused suite above and `bun test src/shared src/mainview src/cli` (5,084 pass); a fresh full-suite attempt was stopped under shared-machine load after 43/496 files with only the same known fake-tmux/claude-session timing failures. Round 5 re-ran `bun test src/cli src/shared` (3,025 pass) and `bun test src/mainview` (2,077 pass); a combined `src/shared src/mainview src/cli` run had six known load-sensitive tmux/ink timing failures that all passed when those files were rerun alone. |
+| `bun test src/shared src/mainview src/cli` | 5,101 tests across 194 files — six load-sensitive fake-tmux/ink timing failures (Dashboard/AnswerOverlay/capture-refs); all passed on an isolated rerun |
+| `bun test src/cli src/shared` (round 5) | green — 3,025 tests across 89 files |
+| `bun test src/mainview` (round 5) | green — 2,077 tests across 105 files |
 | `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 6 passed |
+| `bun node_modules/@playwright/test/cli.js test e2e/issue-task.spec.ts` | 12 passed |
 | Migration 087 on an 086 DB | `src/bun/db-repositories.test.ts` / `src/bun/migrate.test.ts` |
 | Existing worktree tests | unchanged and green (the pre-change 116 plus the new multi-repo cases) |
 
@@ -123,6 +127,22 @@ must-fixes plus four should-fixes. All are fixed with regressions:
 | Capability discovery was not unioned per repo: RunPanel used only the active tab and CLI/TUI discovered at the non-git workspace root | `discoveryScopesForTask` is the shared multi-scope contract; `useAgentCapabilities` unions any number of scopes, `RunPanel` passes every repository, and the CLI/TUI (`discoveredExtensionNames`, `agetor commands`) merge one call per repository | `src/shared/file-scope.test.ts`, `src/cli/at-warn.test.ts` |
 | The smoke doc claimed a green typecheck and five e2e tests, and had no round-4 record | results and the round-4 table above are current | this document |
 
+## Fifth review round
+
+At head `3dcd01b5` the re-review confirmed rounds 1–4 closed and opened one
+must-fix plus four should-fixes. All are fixed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| The owner's "Full CLI + TUI parity" decision includes TUI multi-select, but the interactive `agetor add` wizard was still a single `p.select` (and T14 had been narrowed to say it stays single) | the wizard's repository step is a `p.multiselect` over registered projects plus `Other`; picking 2+ follows with one optional base-ref prompt per repository, sends `repositories[]`, and forces worktree isolation. `--repo`/`--workdir` remain authoritative and skip the picker. Every selection (including one) still goes through the same `baseInput` wire shape | `src/cli/commands/add.test.ts` — wizard describe (multi, single, `--repo`) |
+| `RepositoriesDialog` had no test at all, and T16's "Create via the real UI" claim was false (the e2e created via `POST /tasks`) | the multi-repo e2e's first scenario now fills the New Task form, opens the dialog, selects the second repository, pins its base ref, saves and clicks "Run task"; the task it creates drives every later scenario | `e2e/multi-repo-task.spec.ts` — "create via the real UI…" |
+| The dialog's `lockedPath` guards (issue dialog's own repository cannot be unchecked/removed) were untested | a dedicated issue-flow scenario asserts the checked+disabled checkbox and remove button, adds an extra repository, and verifies the created task keeps the issue repo first | `e2e/issue-task.spec.ts` — "repositories dialog: the issue's repository is locked…" |
+| `useAgentCapabilities`' per-repository discovery union was untested | the merge moved to the pure `mergeAgentCapabilities` helper (first occurrence wins; failed scopes contribute nothing) | `src/mainview/lib/agent-capabilities.test.ts` |
+| The diff composer's multi-repository `@` union was untested (only the path prefix was, via e2e) | the `RunPanel`/`DiffDialog` scope derivation is the shared `multiRepoFileScopes` helper, tested for single (empty) and multi (one named scope per repo) | `src/shared/file-scope.test.ts` |
+| `agetor add --repo …` without `--start` silently skipped the advisory `@` pre-check: it listed the not-yet-created, non-git workspace root | `unresolvedRefsForTask` lists every repository scope, merges `<name>/…` paths (including synthesized directories), warns on unprefixed workspace paths, and verifies truncated scopes with a repo-local full-depth search | `src/cli/at-warn.test.ts` — `unresolvedRefsForTask` tests; `src/cli/commands/add.test.ts` |
+| Nit: stale "also in the PR body" smoke heading | retitled "Known limitations" | this document |
+| Nit: literal `claude-code` fallback in `commands/discovery.ts` | `Task.agent` is required, so the dead fallback is gone | `bun run typecheck` |
+
 ## Live harness smoke matrix
 
 Layout support is universal (the agent runs at the workspace root). Extra
@@ -143,7 +163,7 @@ The e2e fixture's fake claude driver is the automated proof of the spawn path
 (prompt block, workspace cwd, persisted entries); a credentialed live launch is
 the reviewer's manual step.
 
-## Known limitations (also in the PR body)
+## Known limitations
 
 Create-only repository set; 2+ requires worktree isolation; no per-repo
 `existingBranch`; no hard cap (warning above 10); an older build sees the

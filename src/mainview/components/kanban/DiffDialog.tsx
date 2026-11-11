@@ -19,9 +19,8 @@ import {
 } from "@/lib/diff-selection";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
-import { fileScopesForTask } from "../../../shared/file-scope.ts";
+import { multiRepoFileScopes } from "../../../shared/file-scope.ts";
 import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
-import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
 
 interface Props {
   open: boolean;
@@ -525,12 +524,12 @@ export function DiffDialog({ open, task, onClose }: Props) {
   // nothing. Expansion stays server-side in sendInput.
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const multiScopes = useMemo<NamedFileScope[] | null>(() => {
-    if (!task || !isMultiRepoTask(task)) return null;
-    const scopes: NamedFileScope[] = [];
-    for (const scope of fileScopesForTask(task)) {
-      if (scope.name) scopes.push({ name: scope.name, dir: scope.dir, ref: scope.ref });
-    }
-    return scopes;
+    if (!task) return null;
+    // `multiRepoFileScopes` is the same derivation RunPanel uses (one named
+    // scope per repository, never the non-git workspace root); `[]`/one entry
+    // means the single-repository path below stays in charge.
+    const scopes = multiRepoFileScopes(task);
+    return scopes.length > 1 ? scopes : null;
   }, [task?.repositories, task?.worktreePath, task?.isolation]);
   const fileScope = useMemo<FileScope | null>(() => {
     if (!task) return null;

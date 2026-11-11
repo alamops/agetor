@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, ReactNode, RefObject, SetStateAction } from "react";
 import { api, type AvailableCommand, type AvailableExtension } from "@/lib/api";
+import { mergeAgentCapabilities } from "@/lib/agent-capabilities";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import type { SavedPrompt, TaskReference } from "../../../shared/types.ts";
@@ -138,18 +139,11 @@ export function useAgentCapabilities(
       // Union in scope order, first occurrence wins (a name declared in two
       // repositories appears once). A failed scope contributes nothing; an
       // all-failed discovery still settles to empty lists, exactly like the
-      // single-scope contract.
-      const byCommand = new Map<string, AvailableCommand>();
-      const byExtension = new Map<string, AvailableExtension>();
-      for (const result of results) {
-        if (!result) continue;
-        for (const command of result.commands) if (!byCommand.has(command.name)) byCommand.set(command.name, command);
-        for (const extension of result.extensions) {
-          if (!byExtension.has(extension.insert)) byExtension.set(extension.insert, extension);
-        }
-      }
-      setCommands([...byCommand.values()]);
-      setExtensions([...byExtension.values()]);
+      // single-scope contract. The merge itself is the tested pure helper in
+      // `src/mainview/lib/agent-capabilities.ts`.
+      const merged = mergeAgentCapabilities(results);
+      setCommands(merged.commands);
+      setExtensions(merged.extensions);
     });
     return () => { cancelled = true; };
     // Deps are primitives (scopeKey aggregates dir/ref strings), not the

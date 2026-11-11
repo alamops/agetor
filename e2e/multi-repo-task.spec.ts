@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test, expect } from "./fixtures";
+import { test, expect, type APIRequestContext, type E2EBackend } from "./fixtures";
 import { gotoApp } from "./helpers";
 import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
 
@@ -11,14 +11,17 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  * E2E coverage for multi-repository tasks (issue #291).
  *
  * Arrange: two throwaway git repos, registered through the real
- * `POST /projects`, and one task created through `POST /tasks` with both
- * repositories. The worker backend already runs the fake claude driver, so
- * `POST /tasks/:id/start` materializes one worktree per repository without a
- * real CLI.
+ * `POST /projects`. The FIRST scenario creates the multi-repository task
+ * through the real New Task form and its `Repositories` dialog (select the
+ * second repository, pin its base ref, save), then "Run task" starts it — so
+ * `RepositoriesDialog`'s multi-select, per-repository base ref and the
+ * create payload are exercised end to end, not just through `POST /tasks`.
+ * The worker backend already runs the fake claude driver, so the start
+ * materializes one worktree per repository without a real CLI.
  *
  * Scenarios:
- *  1. create + start: both worktrees exist, the card shows the repository
- *     count, and the task row carries both entries.
+ *  1. create via the real UI + start: both worktrees exist, the card shows
+ *     the repository count, and the task row carries both entries.
  *  2. the diff dialog offers one tab per repository and switching tabs loads
  *     that repository's own changes.
  *  3. the "Commit & push" chip appears when only a sibling repository changed
@@ -32,14 +35,34 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
 test.describe.configure({ mode: "serial" });
 
 const CONVERGE_TIMEOUT = 30_000;
+const TITLE = "Multi repository e2e";
 
 let repoA: string;
 let repoB: string;
+let repoSibling: string;
+let repoBHead: string;
 let taskId: string;
 let singleTaskId: string;
 
-function git(cwd: string, args: string[]): void {
-  execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+interface TaskRepositoryRow {
+  path: string;
+  name: string;
+  branch: string | null;
+  baseRef: string | null;
+  worktreePath: string | null;
+}
+
+interface TaskRow {
+  id: string;
+  title: string;
+  column: string;
+  workdir: string;
+  worktreePath: string | null;
+  repositories: TaskRepositoryRow[];
+}
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
 }
 
 async function initRepo(name: string): Promise<string> {
@@ -54,26 +77,45 @@ async function initRepo(name: string): Promise<string> {
   return dir;
 }
 
+async function findTaskByTitle(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  title: string,
+): Promise<TaskRow | null> {
+  const res = await request.get(`${backend.apiBase}/tasks`, {
+    headers: { authorization: `Bearer ${backend.apiToken}` },
+  });
+  expect(res.ok()).toBeTruthy();
+  const rows = (await res.json()) as TaskRow[];
+  return rows.find((r) => r.title === title) ?? null;
+}
+
+async function awaitTask(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  title: string,
+): Promise<TaskRow> {
+  let task: TaskRow | null = null;
+  await expect(async () => {
+    task = await findTaskByTitle(request, backend, title);
+    expect(task).not.toBeNull();
+  }).toPass({ timeout: CONVERGE_TIMEOUT });
+  return task!;
+}
+
 test.beforeAll(async ({ backend, request }) => {
   repoA = await initRepo("frontend");
   repoB = await initRepo("backend");
+  // A registered path under repoA's git root. Selecting it alongside repoA in
+  // the dialog must collapse to one repository (dedupeSelections), which the
+  // first scenario asserts by still creating a two-repository task.
+  repoSibling = path.join(repoA, "packages", "feature");
+  await mkdir(repoSibling, { recursive: true });
+  repoBHead = git(repoB, ["rev-parse", "HEAD"]);
   const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
-  for (const p of [repoA, repoB]) {
+  for (const p of [repoA, repoB, repoSibling]) {
     await request.post(`${backend.apiBase}/projects`, { headers: auth, data: { path: p } });
   }
-  const res = await request.post(`${backend.apiBase}/tasks`, {
-    headers: auth,
-    data: {
-      title: "Multi repository e2e",
-      prompt: "make the change",
-      agent: "claude-code",
-      workdir: repoA,
-      isolation: "worktree",
-      repositories: [{ path: repoA }, { path: repoB }],
-    },
-  });
-  expect(res.ok()).toBe(true);
-  taskId = ((await res.json()) as { id: string }).id;
 
   // A second, single-repository task gives the per-task reset test something
   // to switch to and back from without changing the multi row under test.
@@ -103,32 +145,66 @@ test.afterAll(async ({ backend, request }) => {
   }
 });
 
-test("create + start materializes both worktrees and the card names both repositories", async ({ backend, page, request }) => {
-  const auth = { authorization: `Bearer ${backend.apiToken}` };
-  const started = await request.post(`${backend.apiBase}/tasks/${taskId}/start`, { headers: auth });
-  expect(started.ok()).toBe(true);
+test("create via the real UI: the Repositories dialog sends both repos and start materializes both worktrees", async ({ backend, page, request }) => {
+  await gotoApp(page, backend.bootBase);
+  const form = page.locator("aside").first();
 
-  const names = uniqueRepoSlugs([repoA, repoB]);
+  await form.getByPlaceholder("Short description").fill(TITLE);
+  await form.getByTestId("prompt-textarea").fill("make the change");
+
+  // Pin the form's single project first (the worker backend is shared across
+  // spec files, so `autoSelectFirst` is not a stable choice). Wait for that
+  // one-shot auto-selection to land before overriding it — otherwise it can
+  // fire after this pick and swap the project back. Then add the second
+  // repository through the dialog. This is the `RepositoriesDialog` path the
+  // plan's T16 names — multi-select, per-repository base ref, dedupe, save.
+  const projectTrigger = form.getByTitle(/Pick the working directory/);
+  await expect(projectTrigger).not.toContainText("Select project", { timeout: CONVERGE_TIMEOUT });
+  await projectTrigger.click();
+  await form.getByText(repoA, { exact: true }).click();
+  await expect(projectTrigger).toContainText(path.basename(repoA));
+
+  await form.getByRole("button", { name: "Use multiple repositories…" }).click();
+  const reposDialog = page.getByRole("dialog", { name: "Repositories" });
+  await expect(reposDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  await expect(reposDialog.getByLabel(`Select ${repoA}`, { exact: true })).toBeChecked();
+  await reposDialog.getByLabel(`Select ${repoB}`, { exact: true }).check();
+  await reposDialog.getByLabel(`Base ref for ${repoB}`, { exact: true }).fill("main");
+  // A same-git-root sibling is selectable but must dedupe away on save.
+  await reposDialog.getByLabel(`Select ${repoSibling}`, { exact: true }).check();
+  await reposDialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(reposDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+  await expect(form.getByTestId("new-task-repositories")).toContainText("2 repositories");
+
+  const runButton = form.getByRole("button", { name: "Run task", exact: true });
+  await expect(runButton).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+  await runButton.click();
+
+  const created = await awaitTask(request, backend, TITLE);
+  taskId = created.id;
+  expect(created.repositories.map((r) => r.path)).toEqual([repoA, repoB]);
+  expect(created.repositories[1]!.baseRef).toBe(repoBHead);
+
   await expect
     .poll(async () => {
-      const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
-      const t = (await res.json()) as { worktreePath: string | null; repositories?: { worktreePath: string | null }[] };
+      const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, {
+        headers: { authorization: `Bearer ${backend.apiToken}` },
+      });
+      const t = (await res.json()) as TaskRow;
       return t.repositories?.every((r) => !!r.worktreePath) ?? false;
     }, { timeout: CONVERGE_TIMEOUT })
     .toBe(true);
 
-  const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
-  const task = (await res.json()) as {
-    workdir: string;
-    worktreePath: string;
-    repositories: { name: string; worktreePath: string; branch: string }[];
-  };
+  const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, {
+    headers: { authorization: `Bearer ${backend.apiToken}` },
+  });
+  const task = (await res.json()) as TaskRow;
   expect(task.worktreePath).toBe(task.workdir);
+  const names = uniqueRepoSlugs([repoA, repoB]);
   for (const name of names) {
-    expect(existsSync(path.join(task.worktreePath, name))).toBe(true);
+    expect(existsSync(path.join(task.worktreePath!, name))).toBe(true);
   }
 
-  await gotoApp(page, backend.bootBase);
   await expect(page.getByTestId("task-card-repositories").first()).toContainText("2 repositories", {
     timeout: CONVERGE_TIMEOUT,
   });

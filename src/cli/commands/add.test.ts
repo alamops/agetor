@@ -29,9 +29,11 @@ import { buildIssueTaskPrompt, issueTaskTitle, renderIssueThreadMarkdown } from 
 
 import * as realContext from "../context.ts";
 import * as realOutput from "../output.ts";
+import * as realClack from "@clack/prompts";
 
 const realContextSnapshot = { ...realContext };
 const realOutputSnapshot = { ...realOutput };
+const realClackSnapshot = { ...realClack };
 
 let currentClient: AgetorClient | null = null;
 
@@ -50,6 +52,8 @@ mock.module("../output.ts", () => ({
   ...realOutputSnapshot,
   // Force the non-interactive branch regardless of the runner's real tty
   // state, matching every other agetor-launched (headless) invocation.
+  // The wizard describe calls `wizard()` directly instead of routing
+  // through `cmdAdd` + `chooseAddPath`.
   isTTY: false,
   out: (msg = "") => {
     outputs.push(msg);
@@ -59,14 +63,51 @@ mock.module("../output.ts", () => ({
   },
 }));
 
+// `@clack/prompts` drives the interactive `add` wizard. Only the wizard
+// tests below use these scripted answers; the rest of this suite goes
+// non-interactively. Restored in `afterAll` because `mock.module` mutates the
+// shared registry for the whole `bun test` process.
+type ClackPromptKind = "text" | "select" | "multiselect" | "confirm";
+interface ClackAnswer {
+  kind: ClackPromptKind;
+  value: unknown;
+  message?: string;
+  options?: unknown;
+}
+let clackQueue: ClackAnswer[] = [];
+const clackCalls: Array<Pick<ClackAnswer, "kind" | "message" | "options">> = [];
+
+function takeClack(kind: ClackPromptKind, message: string, options: unknown): unknown {
+  clackCalls.push({ kind, message, options });
+  const next = clackQueue.shift();
+  if (!next || next.kind !== kind) {
+    throw new Error(`wizard asked ${kind} (${message}) but the script expected ${next?.kind ?? "nothing"}`);
+  }
+  return next.value;
+}
+
+mock.module("@clack/prompts", () => ({
+  ...realClackSnapshot,
+  intro: () => {},
+  outro: () => {},
+  cancel: () => {},
+  text: async (opts: { message: string }) => takeClack("text", opts.message, undefined),
+  select: async (opts: { message: string; options: unknown }) => takeClack("select", opts.message, opts.options),
+  multiselect: async (opts: { message: string; options: unknown }) =>
+    takeClack("multiselect", opts.message, opts.options),
+  confirm: async (opts: { message: string }) => takeClack("confirm", opts.message, undefined),
+}));
+
 afterAll(() => {
   mock.module("../context.ts", () => realContextSnapshot);
   mock.module("../output.ts", () => realOutputSnapshot);
+  mock.module("@clack/prompts", () => realClackSnapshot);
 });
 
 const {
   parseAdd,
   cmdAdd,
+  wizard,
   chooseAddPath,
   resolveInitialModel,
   defaultNonInteractiveMode,
@@ -1490,4 +1531,124 @@ test("cmdAdd: --repo sends repositories and forces worktree isolation", async ()
     { path: "/tmp/backend", baseRef: "b1" },
   ]);
   expect(input.isolation).toBe("worktree");
+});
+
+// ── add wizard: multi-select repositories (issue #291 review M1) ─────────
+//
+// The owner chose full CLI + TUI parity, which includes picking several
+// repositories in the interactive wizard — not only the repeatable
+// `--repo` flag. These tests drive `cmdAdd` through the real `wizard()` with
+// `@clack/prompts` scripted above.
+
+function makeWizardClient(projects: Array<{ path: string; name?: string }>) {
+  const createTaskCalls: CreateTaskInput[] = [];
+  const client = {
+    listHarnesses: async () => ({ harnesses: [], statuses: [] }),
+    getPreferences: async () => ({}),
+    agentModels: async () => ({}),
+    harnessModels: async () => ({ ready: true, byHarness: {} }),
+    listPipelines: async () => [] as Pipeline[],
+    listAgentProfiles: async () => [] as AgentProfile[],
+    listProjects: async () => projects,
+    setPreference: async () => true,
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "wizard-task-id", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+  return { client, createTaskCalls };
+}
+
+const wizardLaunchFlags = [
+  "--agent",
+  "claude-code",
+  "--model",
+  DEFAULT_MODEL["claude-code"],
+  "--mode",
+  "auto",
+  "--effort",
+  "high",
+  "--speed",
+  "off",
+];
+
+function resetWizardScript(answers: ClackAnswer[]): void {
+  clackQueue = answers;
+  clackCalls.length = 0;
+}
+
+describe("add wizard multi-repository (issue #291)", () => {
+  const projects = [
+    { path: "/src/frontend", name: "frontend" },
+    { path: "/src/backend", name: "backend" },
+  ];
+
+  test("multi-select sends every repository, per-repo base refs, and forces worktree isolation", async () => {
+    const { client } = makeWizardClient(projects);
+    resetWizardScript([
+      { kind: "text", value: "Multi wizard" },
+      { kind: "text", value: "make the change" },
+      { kind: "multiselect", value: ["/src/frontend", "/src/backend"] },
+      { kind: "text", value: "" }, // frontend: default HEAD
+      { kind: "text", value: "release" }, // backend: pinned
+      { kind: "confirm", value: false },
+    ]);
+
+    const input = await wizard(client, parseAdd([...wizardLaunchFlags]), undefined);
+
+    expect(clackCalls.map((c) => c.kind)).toEqual([
+      "text",
+      "text",
+      "multiselect",
+      "text",
+      "text",
+      "confirm",
+    ]);
+    expect(clackCalls[2]!.message).toContain("Repositories");
+    expect(input!.repositories).toEqual([
+      { path: "/src/frontend" },
+      { path: "/src/backend", baseRef: "release" },
+    ]);
+    expect(input!.isolation).toBe("worktree");
+    expect(input!.workdir).toBe("/src/frontend");
+  });
+
+  test("a single selection keeps the single-repository wire shape (no forced isolation)", async () => {
+    const { client } = makeWizardClient(projects);
+    resetWizardScript([
+      { kind: "text", value: "Single wizard" },
+      { kind: "text", value: "make the change" },
+      { kind: "multiselect", value: ["/src/backend"] },
+      { kind: "confirm", value: false },
+    ]);
+
+    const input = await wizard(client, parseAdd([...wizardLaunchFlags]), undefined);
+
+    expect(input!.repositories).toEqual([{ path: "/src/backend" }]);
+    expect(input!.isolation).toBeUndefined();
+    expect(input!.workdir).toBe("/src/backend");
+  });
+
+  test("--repo skips the picker and uses the flags' set", async () => {
+    const { client } = makeWizardClient(projects);
+    resetWizardScript([
+      { kind: "text", value: "Flagged wizard" },
+      { kind: "text", value: "make the change" },
+      { kind: "confirm", value: false },
+    ]);
+
+    const input = await wizard(
+      client,
+      parseAdd([...wizardLaunchFlags, "--repo", "/src/frontend", "--repo", "/src/backend=main"]),
+      undefined,
+    );
+
+    // No `multiselect` prompt — the flags are authoritative.
+    expect(clackCalls.map((c) => c.kind)).toEqual(["text", "text", "confirm"]);
+    expect(input!.repositories).toEqual([
+      { path: "/src/frontend" },
+      { path: "/src/backend", baseRef: "main" },
+    ]);
+    expect(input!.workdir).toBe("/src/frontend");
+  });
 });

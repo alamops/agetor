@@ -102,3 +102,48 @@ export function fileScopesForTask(task: RepoSetShape): RepoFileScope[] {
     return { name: repo.name, dir: repo.path };
   });
 }
+
+/**
+ * The named scopes a multi-repository task's composer/diff surfaces union
+ * over, or `[]` for a single-repository task (whose callers should keep using
+ * {@link fileScopeForTask} unchanged). This is the shared derivation behind
+ * `RunPanel`'s and `DiffDialog`'s `fileScopes` prop — the workspace root is
+ * not a git repository, so listing there would find none of the selected
+ * repositories' files.
+ */
+export function multiRepoFileScopes(
+  task: RepoSetShape,
+): Array<{ name: string; dir: string; ref?: string | null }> {
+  const scopes: Array<{ name: string; dir: string; ref?: string | null }> = [];
+  for (const scope of fileScopesForTask(task)) {
+    if (!scope.name) continue;
+    scopes.push(
+      scope.ref === undefined
+        ? { name: scope.name, dir: scope.dir }
+        : { name: scope.name, dir: scope.dir, ref: scope.ref },
+    );
+  }
+  return scopes;
+}
+
+/**
+ * Split a `<workspace-name>/<repo-local-path>` token into its owning scope and
+ * the path inside that scope. Returns `null` when the path has no known
+ * workspace prefix (it cannot resolve from the multi-repository workspace
+ * root) or when there are no scopes at all. Pure and shared by the webview's
+ * `@` popover/search (`src/mainview/lib/use-project-files.ts`) and the CLI's
+ * advisory pre-check (`src/cli/at-warn.ts`), so the prefix grammar can't
+ * drift between them.
+ */
+export function splitNamedScopePath<T extends { name: string | null }>(
+  scopes: readonly T[] | null | undefined,
+  path: string,
+): { scope: T; path: string } | null {
+  if (!scopes || scopes.length === 0 || !path) return null;
+  const slash = path.indexOf("/");
+  if (slash <= 0) return null;
+  const name = path.slice(0, slash);
+  const scope = scopes.find((s) => s.name === name);
+  if (!scope) return null;
+  return { scope, path: path.slice(slash + 1) };
+}

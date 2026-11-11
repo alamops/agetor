@@ -34,6 +34,7 @@ const {
   isSafeClientRelPath,
   existsInLiveScope,
   discoveredExtensionNames,
+  unresolvedRefsForTask,
   verifyTokensViaSearch,
 } = await import("./at-warn.ts");
 
@@ -485,4 +486,119 @@ test("verifyTokensViaSearch: caps at 8 candidates — a 9th token is never searc
   expect(queried.length).toBe(8);
   expect(missing.length).toBe(8);
   expect(missing.some((t) => t.path === "f8.md")).toBe(false);
+});
+
+// ── unresolvedRefsForTask (issue #291 review S4) ─────────────────────────
+//
+// `agetor add --repo ...` without `--start` used to derive ONE scope from
+// `fileScopeForTask`, which for a multi task is the non-git workspace root —
+// the listing came back empty and the whole advisory pre-check was silently
+// skipped. These tests pin the multi-scope union (and the unchanged
+// single-scope contract).
+
+function singleRepoTask(overrides: Partial<ScopeTask> = {}): ScopeTask {
+  return fakeTask({
+    workdir: "/wt/t1",
+    worktreePath: "/wt/t1",
+    isolation: "worktree",
+    baseRef: "main",
+    ...overrides,
+  });
+}
+
+test("unresolvedRefsForTask: single repository warns only on paths missing from a complete listing", async () => {
+  const client = {
+    listProjectFiles: async () => ({ files: ["src/a.ts"], truncated: false }),
+    agentDiscovery: async () => ({ commands: [], extensions: [] }),
+  } as unknown as AgetorClient;
+
+  expect(await unresolvedRefsForTask(client, singleRepoTask(), "look at @src/a.ts and @missing.ts")).toEqual([
+    "@missing.ts",
+  ]);
+});
+
+test("unresolvedRefsForTask: multi lists every repository, never the workspace root", async () => {
+  const dirs: string[] = [];
+  const client = {
+    listProjectFiles: async (scope: { dir: string }) => {
+      dirs.push(scope.dir);
+      return scope.dir.endsWith("frontend")
+        ? { files: ["src/a.ts"], truncated: false }
+        : { files: ["src/b.ts"], truncated: false };
+    },
+    agentDiscovery: async () => ({ commands: [], extensions: [] }),
+  } as unknown as AgetorClient;
+
+  const warned = await unresolvedRefsForTask(
+    client,
+    multiRepoTask(),
+    "@frontend/src/a.ts @backend/src/b.ts @src/a.ts @frontend/nope.ts",
+  );
+  expect(warned).toEqual(["@src/a.ts", "@frontend/nope.ts"]);
+  expect(dirs.sort()).toEqual(["/wt/t1/backend", "/wt/t1/frontend"]);
+});
+
+test("unresolvedRefsForTask: a truncated repository verifies its own repo-local path", async () => {
+  const searches: Array<{ dir: string; q?: string | null }> = [];
+  const client = {
+    listProjectFiles: async (scope: { dir: string; q?: string | null }) => {
+      if (scope.q) {
+        searches.push({ dir: scope.dir, q: scope.q });
+        return { files: ["src/maybe.ts"], truncated: true };
+      }
+      return scope.dir.endsWith("frontend")
+        ? { files: ["src/known.ts"], truncated: true }
+        : { files: ["src/b.ts"], truncated: false };
+    },
+    agentDiscovery: async () => ({ commands: [], extensions: [] }),
+  } as unknown as AgetorClient;
+
+  const warned = await unresolvedRefsForTask(
+    client,
+    multiRepoTask(),
+    "@frontend/src/known.ts @frontend/src/maybe.ts @backend/nope.ts @loose.ts",
+  );
+  // `maybe` is found by the full-depth search, so it is NOT proven missing;
+  // the complete backend listing proves `nope`, and an unprefixed workspace
+  // path can never resolve at the multi root.
+  expect(warned).toEqual(["@backend/nope.ts", "@loose.ts"]);
+  expect(searches).toEqual([{ dir: "/wt/t1/frontend", q: "src/maybe.ts" }]);
+});
+
+test("unresolvedRefsForTask: empty listings cannot prove a token unresolved", async () => {
+  let discoveryCalls = 0;
+  const client = {
+    listProjectFiles: async () => ({ files: [], truncated: false }),
+    agentDiscovery: async () => {
+      discoveryCalls++;
+      return { commands: [], extensions: [] };
+    },
+  } as unknown as AgetorClient;
+
+  expect(await unresolvedRefsForTask(client, multiRepoTask(), "@loose.ts")).toEqual([]);
+  expect(discoveryCalls).toBe(0);
+});
+
+test("unresolvedRefsForTask: extension mentions and restrictTo filter the final warnings", async () => {
+  const client = {
+    listProjectFiles: async () => ({ files: ["src/a.ts"], truncated: false }),
+    agentDiscovery: async () => ({ commands: [], extensions: [{ name: "github", insert: "@github" }] }),
+  } as unknown as AgetorClient;
+
+  const warned = await unresolvedRefsForTask(
+    client,
+    singleRepoTask(),
+    "ping @github about @nope.md and @other.md",
+    { restrictTo: "ping @github about @nope.md" },
+  );
+  expect(warned).toEqual(["@nope.md"]);
+});
+
+test("unresolvedRefsForTask: a listed directory ('src/') resolves like a file", async () => {
+  const client = {
+    listProjectFiles: async () => ({ files: ["src/a.ts"], truncated: false }),
+    agentDiscovery: async () => ({ commands: [], extensions: [] }),
+  } as unknown as AgetorClient;
+
+  expect(await unresolvedRefsForTask(client, singleRepoTask(), "look in @src/ please")).toEqual([]);
 });

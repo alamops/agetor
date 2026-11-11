@@ -25,7 +25,7 @@ import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
 import { useProjectFiles, useProjectFileScopes, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
-import { fileScopeForTask, fileScopesForTask } from "../../../shared/file-scope.ts";
+import { fileScopeForTask, multiRepoFileScopes } from "../../../shared/file-scope.ts";
 import {
   emptyOpencodeDrafts,
   opencodeAnswerBody,
@@ -3962,11 +3962,7 @@ function RunPanelBody({
   // multi task lists each repository's worktree instead (issue #291). The
   // single-repository path is unchanged.
   const multiRepoScopes = useMemo(
-    () => (multiRepo
-      ? fileScopesForTask(task)
-        .filter((sc) => sc.name)
-        .map((sc) => ({ name: sc.name!, dir: sc.dir, ref: sc.ref }))
-      : null),
+    () => (multiRepo ? multiRepoFileScopes(task) : null),
     [multiRepo, task.worktreePath, task.repositories, task.isolation],
   );
   const fileScope = useMemo<FileScope>(() => {
