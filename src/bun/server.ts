@@ -5975,7 +5975,21 @@ export function startApiServer(
           // persist) can land during the parse and move the column; a
           // snapshot taken beforehand would still treat the run as `done`
           // and write `column: "done"` onto a run that is no longer finished.
-          const rawPatch = (await req.json().catch(() => ({}))) as Record<string, unknown> | null;
+          //
+          // A malformed non-empty body is a 400, not an empty patch: the old
+          // `req.json().catch(() => ({})))` silently turned junk into "PATCH
+          // nothing" and returned 200, so a client with a serialization bug
+          // saw success while its edit never landed. An absent body stays a
+          // no-op (an empty patch is harmless).
+          let rawPatch: Record<string, unknown> | null = {};
+          const rawBody = await req.text().catch(() => "");
+          if (rawBody.trim() !== "") {
+            try {
+              rawPatch = JSON.parse(rawBody) as Record<string, unknown> | null;
+            } catch {
+              return json({ error: "invalid JSON body" }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
           if (rawPatch && typeof rawPatch === "object" && "repositories" in rawPatch) {
             return json(
               { error: "the repository set is fixed at creation — create a new task to change it" },

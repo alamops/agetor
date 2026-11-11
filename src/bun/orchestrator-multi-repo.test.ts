@@ -289,6 +289,53 @@ test("a single repositories entry keeps its per-repository base ref", async () =
   }
 });
 
+test("a single repositories entry's own base ref beats the task-level default", async () => {
+  // Review M1 (round 9): a selection that collapses to one repository took
+  // the ordinary single path, where the top-level `baseRef` was read first.
+  // That let `--base-ref` silently override an explicit
+  // `--repo <path>=<ref>` pin, while the same two flags on a 2+ selection
+  // honored the pin. The documented rule is entry-pin-wins everywhere.
+  const { createTask } = await load();
+  const a = await makeRepo("collapsed-base");
+  writeFileSync(path.join(a, "next.txt"), "next\n");
+  await git(["checkout", "-b", "release/next"], a);
+  await git(["add", "."], a);
+  await git(["commit", "-m", "next"], a);
+  await git(["checkout", "main"], a);
+  const nextSha = await revParse(a, "release/next");
+  const mainSha = await revParse(a, "main");
+  expect(nextSha).not.toBe(mainSha);
+  try {
+    const pinned = await createTask({
+      title: "collapsed pinned",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: a,
+      isolation: "worktree",
+      baseRef: "main",
+      repositories: [{ path: a, baseRef: "release/next" }],
+    });
+    if ("error" in pinned) throw new Error(pinned.error);
+    expect(pinned.task.baseRef).toBe(nextSha);
+    expect(pinned.task.repositories?.[0]?.baseRef).toBe(nextSha);
+
+    const defaulted = await createTask({
+      title: "collapsed default",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: a,
+      isolation: "worktree",
+      baseRef: "release/next",
+      repositories: [{ path: a }],
+    });
+    if ("error" in defaulted) throw new Error(defaulted.error);
+    expect(defaulted.task.baseRef).toBe(nextSha);
+    expect(defaulted.task.repositories?.[0]?.baseRef).toBe(nextSha);
+  } finally {
+    cleanup(a);
+  }
+});
+
 test("a task-level base ref is the default for unpinned multi-repository entries", async () => {
   // Review M1: `agetor add --repo a --repo b --base-ref release/next` (and a
   // direct POST /tasks with `baseRef`) resolved each entry's own pin or HEAD
@@ -530,6 +577,59 @@ test("archive detaches every clean repository and unarchive restores them", asyn
     if ("error" in unarchived) throw new Error(unarchived.error);
     expect(existsSync(path.join(workspace, names[0]!, ".git"))).toBe(true);
     expect(existsSync(path.join(workspace, names[1]!, ".git"))).toBe(true);
+  } finally {
+    cleanup(workspace, a, b);
+  }
+});
+
+test("a retained multi workspace is listed and can be cleaned by a repeat archive", async () => {
+  // Review S1 (round 9): teardown keeps the workspace root when an agent left
+  // files in it. `listWorktrees` must surface that retained root (it emitted
+  // zero rows once every repository checkout was gone), and a repeat archive
+  // must then reclaim it once the artifact is removed.
+  const { createTask, startTask, archiveTask, tasks, WORKTREES_DIR } = await load();
+  const { listWorktrees } = await import("./orchestrator.ts");
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  const created = await createTask({
+    title: "retained multi",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  const workspace = path.join(WORKTREES_DIR, id);
+  try {
+    const res = await startTask(id);
+    if ("error" in res) throw new Error(res.error);
+    await settleRun(id);
+    const names = uniqueRepoSlugs([a, b]);
+    // A user-visible agent artifact (not agetor's own scratch): teardown must
+    // preserve it and therefore keep the root.
+    writeFileSync(path.join(workspace, "notes.md"), "agent notes\n");
+    tasks.update(id, { column: "done" });
+    const archived = await archiveTask(id, { awaitTeardown: true, stopRun: true });
+    if ("error" in archived) throw new Error(archived.error);
+    expect(existsSync(path.join(workspace, names[0]!))).toBe(false);
+    expect(existsSync(path.join(workspace, names[1]!))).toBe(false);
+    expect(existsSync(path.join(workspace, "notes.md"))).toBe(true);
+
+    const row = listWorktrees().find((entry) => entry.id === id);
+    expect(row).toBeDefined();
+    expect(row?.taskId).toBe(id);
+    expect(row?.path).toBe(workspace);
+    expect(row?.staleReasons).toContain("archived");
+
+    // The Worktrees page's delete action archives again; once the artifact is
+    // gone this pass reclaims the empty root.
+    rmSync(path.join(workspace, "notes.md"));
+    const retried = await archiveTask(id, { awaitTeardown: true, stopRun: true });
+    if ("error" in retried) throw new Error(retried.error);
+    expect(existsSync(workspace)).toBe(false);
+    expect(listWorktrees().some((entry) => entry.id === id)).toBe(false);
   } finally {
     cleanup(workspace, a, b);
   }

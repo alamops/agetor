@@ -1053,6 +1053,50 @@ test("opening the composer fetches the task's project-file listing and feeds the
   unmount();
 });
 
+test("a multi-repository listing still offers the root row of a repository with no files", async () => {
+  // Round-9 nit: the TUI merged listing only carried paths INSIDE each repo,
+  // so an empty repository contributed no rows and a bare `@empty-repo` — a
+  // real directory at the workspace root — was missing from the popover
+  // (the webview already adds these roots via `addScopeRoots`).
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/empty", name: "empty-repo", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/empty-repo", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string }) => ({
+      files: scope.dir.endsWith("/frontend") ? ["README.md"] : [],
+      truncated: false,
+    }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the per-repository listing fetch
+  await wait(80);
+  stdin.write("@emp");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("empty-repo/");
+  unmount();
+});
+
 test("a send whose reply carries unresolvedRefs surfaces a one-line warning after the ok status", async () => {
   const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
   const client = {

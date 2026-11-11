@@ -53,7 +53,9 @@ bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 | Focused unit suites (round 6) | green — `worktree` 134, `multi-repo`/`server`/teardown/CLI/mainview batches all pass |
 | `bun test src/mainview` (round 6) | green — 2,079 tests across 105 files |
 | `bun test src/shared src/cli` (round 6) | 2,948 pass; 88 known load-sensitive TUI/ink/bundle failures (none in the files this round touched); every touched file passes in isolation |
-| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 6 passed (round 5); 7 passed after the round-6 archive round-trip split |
+| `bun run typecheck` (round 9) | green |
+| Focused round-9 suites | green — `orchestrator-multi-repo`/`worktrees-list`/`server-multi-repo`/`worktree-delete-intent`/`at-file-filter` 107 tests; `Dashboard` 73; 11 multi-repo/CLI/shared files 314; 8 CLI files 237 |
+| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 6 passed (round 5); 7 passed after the round-6 archive round-trip split; 7 passed (round 9) |
 | `bun node_modules/@playwright/test/cli.js test e2e/issue-task.spec.ts` | 12 passed |
 | Migration 087 on an 086 DB | `src/bun/db-repositories.test.ts` / `src/bun/migrate.test.ts` |
 | Existing worktree tests | unchanged and green (the pre-change 116 plus the new multi-repo cases) |
@@ -193,7 +195,20 @@ must-fix and one should-fix. Both are closed with regressions:
 | Finding | Fix | Test |
 | --- | --- | --- |
 | Must-fix: a task-level `baseRef` was silently ignored for 2+ repositories — `agetor add --repo a --repo b --base-ref release/next` (and a direct `POST /tasks` body) pinned each repository's HEAD instead of the requested sha | the task-level ref is the default for every entry without its own `repositories[].baseRef` pin (`--repo <path>=<ref>` still wins); the pre-validation error path resolves the same effective ref, so a typo'd default names every repository it is missing from | `src/bun/orchestrator-multi-repo.test.ts` — "a task-level base ref is the default for unpinned multi-repository entries" |
-| Should-fix: the Worktrees delete confirm fetched every repository's git status with one unbounded `Promise.all` (N+1 subprocesses from one click), bypassing the page's `GIT_STATUS_CONCURRENCY` cap | the confirm batches its status reads at the same `GIT_STATUS_CONCURRENCY` (5) used by the list's own pass | `bun run typecheck` (`src/mainview/components/worktrees/WorktreesDialog.tsx`); the copy/classification itself stays covered by `worktree-delete-intent.test.ts` |
+| Should-fix: the Worktrees delete confirm fetched every repository's git status with one unbounded `Promise.all` (N+1 subprocesses from one click), bypassing the page's `GIT_STATUS_CONCURRENCY` cap | the confirm batches its status reads through `mapWithConcurrency` at the same `GIT_STATUS_CONCURRENCY` (5) used by the list's own pass | `src/mainview/components/worktrees/worktree-delete-intent.test.ts` — `mapWithConcurrency` caps in-flight work, preserves input order, and treats a non-positive limit as 1 |
+
+## Ninth review round
+
+At head `6377875f` the re-review confirmed round 8 closed and opened one
+must-fix and one should-fix plus three nits. All are closed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Must-fix: on the single/collapsed (one repository) path the top-level `baseRef` still beat an explicit `repositories[].baseRef` pin, contradicting the documented entry-pin-wins rule that the multi path follows | `requestedRef` now reads the surviving entry's pin first, then the task-level default, then HEAD — one precedence for both paths | `src/bun/orchestrator-multi-repo.test.ts` — "a single repositories entry's own base ref beats the task-level default" |
+| Should-fix: a multi workspace retained because it holds agent files (every repository checkout already removed) emitted zero rows from `listWorktrees`, so it was invisible and could never be cleaned from the Worktrees page | when no repository row exists, the retained workspace root is emitted as a task-backed row (`id = taskId`, no `repoName`), so Archive & delete can retry the teardown | `src/bun/worktrees-list.test.ts` — "listWorktrees surfaces a retained workspace root with no repository checkouts left"; `src/bun/orchestrator-multi-repo.test.ts` — a repeat archive reclaims the root once the agent artifact is removed |
+| Nit: `PATCH /tasks/:id` answered 200 for a malformed JSON body, silently doing nothing | a non-empty unparseable body is now a 400 `invalid JSON body`; an absent body stays a no-op | `src/bun/server-multi-repo.test.ts` — "PATCH /tasks/:id rejects a malformed JSON body with 400" |
+| Nit: the TUI merged `@` listing omitted the root row of an empty repository | it now uses the same `addScopeRoots` contract as the webview composer | `src/cli/tui/Dashboard.test.tsx` — "a multi-repository listing still offers the root row of a repository with no files" |
+| Nit: the round-8 record claimed regression coverage for the batching cap that only amounted to a typecheck | the pool moved to the unit-tested `mapWithConcurrency` helper and the round-8 row names that test | this document |
 
 ## Live harness smoke matrix
 

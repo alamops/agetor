@@ -11199,12 +11199,15 @@ export async function createTask(
   // two paths under one git root) is created through the ordinary
   // single-repository path, so it must still honor that entry's per-repository
   // base ref: the CLI's `--repo <path>=<ref>` puts its ref there, not in the
-  // top-level `baseRef`, and ignoring it silently branched from HEAD. An
-  // explicit top-level baseRef wins, then the entry's pin, then HEAD.
+  // top-level `baseRef`, and ignoring it silently branched from HEAD. The
+  // precedence matches the multi path and the documented rule: an entry pin
+  // wins, then the task-level default, then HEAD. (Top-level-wins here would
+  // make `--repo <path>=<ref>` silently override `--base-ref` only when the
+  // selection happened to collapse.)
   const singleRepoInput = keptRepositories.length === 1
     ? repoInputs.find((r) => typeof r.path === "string" && r.path.trim() === keptRepositories[0]!.path)
     : undefined;
-  const requestedRef = input.baseRef?.trim() || singleRepoInput?.baseRef?.trim() || "HEAD";
+  const requestedRef = singleRepoInput?.baseRef?.trim() || defaultBaseRef || "HEAD";
 
   // The directory whose git root the BRANCH PLAN is resolved against. For a
   // multi-repository task `workdir` is still the daemon cwd (or an explicit
@@ -12753,6 +12756,7 @@ export function listWorktrees(): WorktreeInfo[] {
     // A multi-repository task's workspace root is not itself a worktree: it
     // expands to one row per repository directory that exists on disk.
     if (task && (task.repositories?.length ?? 0) > 1) {
+      let repoRows = 0;
       for (const repo of task.repositories!) {
         const repoDir = repo.worktreePath ?? join(dirPath, repo.name);
         let repoIsDir = false;
@@ -12762,6 +12766,7 @@ export function listWorktrees(): WorktreeInfo[] {
           continue;
         }
         if (!repoIsDir) continue;
+        repoRows += 1;
         out.push(makeRow(
           worktreeIdForRepo(name, repo.name),
           repoDir,
@@ -12770,6 +12775,17 @@ export function listWorktrees(): WorktreeInfo[] {
           repo.branch,
           repo.path,
         ));
+      }
+      // Every repository checkout is gone but the workspace root survives
+      // because an agent left files in it (teardown never recursively wipes
+      // user content — see `removeWorkspaceIfEmpty`). The root has no
+      // repository row to represent it, so without this fallback it was
+      // invisible on the Worktrees page and could never be cleaned from there.
+      // Emit it as a task-backed row (id = task id) so the page's normal
+      // Archive & delete action can retry the teardown once the agent files
+      // are gone.
+      if (repoRows === 0) {
+        out.push(makeRow(name, dirPath, task, null, null, task.workdir ?? dirPath));
       }
       continue;
     }

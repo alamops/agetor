@@ -520,6 +520,62 @@ test("listWorktrees emits one row per repository and skips the workspace root", 
   }
 });
 
+test("listWorktrees surfaces a retained workspace root with no repository checkouts left", async () => {
+  // Review S1 (round 9): teardown keeps a multi workspace root that holds
+  // agent files (it never recursively wipes user content). With every
+  // repository checkout gone, the per-repository expansion emitted zero rows,
+  // so that retained root was invisible on the Worktrees page and could never
+  // be cleaned from there. It must surface as one task-backed row.
+  const { createTask, listWorktrees } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir, worktreePath } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "retained workspace",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const workspace = prepared.worktreePath!;
+    tasks.update(taskId, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(taskId, prepared.repositories!);
+    // Simulate a completed teardown that stopped short of the non-empty root:
+    // every repository checkout is gone, an agent artifact remains.
+    for (const repo of prepared.repositories!) {
+      rmSync(repo.worktreePath!, { recursive: true, force: true });
+    }
+    writeFileSync(path.join(workspace, "notes.md"), "keep me\n");
+    tasks.update(taskId, { archivedAt: Date.now() });
+
+    const rows = listWorktrees().filter((e) => e.taskId === taskId);
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.id).toBe(taskId);
+    expect(row.repoName).toBeUndefined();
+    expect(row.path).toBe(workspace);
+    expect(row.taskTitle).toBe("retained workspace");
+    expect(row.stale).toBe(true);
+    expect(row.staleReasons).toContain("archived");
+    // The retained artifact is still there — surfacing the row must not wipe
+    // the workspace.
+    expect(existsSync(path.join(workspace, "notes.md"))).toBe(true);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    rmSync(worktreePath(created.task), { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
 test("deleteOrphanWorktree removes one nested repo dir and the workspace only when empty", async () => {
   const { createTask } = await import("./orchestrator.ts");
   const { prepareTaskWorkdir, worktreePath, WORKTREES_DIR } = await import("./worktree.ts");

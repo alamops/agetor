@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildDeleteConfirmCopy, triageDeleteOutcome } from "./worktree-delete-intent.ts";
+import { buildDeleteConfirmCopy, mapWithConcurrency, triageDeleteOutcome } from "./worktree-delete-intent.ts";
 import type { WorktreeGitStatus, WorktreeInfo, WorktreeTeardownResult } from "../../../shared/types.ts";
 
 function worktree(overrides: Partial<WorktreeInfo> = {}): WorktreeInfo {
@@ -333,5 +333,45 @@ describe("triageDeleteOutcome", () => {
       expect(outcome.message).toContain("this worktree");
       expect(outcome.message.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("mapWithConcurrency", () => {
+  test("caps in-flight work at the limit and preserves input order", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const results = await mapWithConcurrency([5, 1, 4, 2, 3], 2, async (ms, index) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      inFlight -= 1;
+      return `${index}:${ms}`;
+    });
+    expect(peak).toBe(2);
+    expect(results).toEqual(["0:5", "1:1", "2:4", "3:2", "4:3"]);
+  });
+
+  test("an empty input resolves to an empty array without calling the worker", async () => {
+    let calls = 0;
+    const results = await mapWithConcurrency([], 5, async () => {
+      calls += 1;
+      return 0;
+    });
+    expect(results).toEqual([]);
+    expect(calls).toBe(0);
+  });
+
+  test("a non-positive limit still runs the work (treated as 1)", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const results = await mapWithConcurrency([1, 2, 3], 0, async (n) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await Promise.resolve();
+      inFlight -= 1;
+      return n * 2;
+    });
+    expect(peak).toBe(1);
+    expect(results).toEqual([2, 4, 6]);
   });
 });

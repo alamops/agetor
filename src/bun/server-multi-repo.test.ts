@@ -120,6 +120,29 @@ test("PATCH /tasks/:id rejects the repository set", async () => {
   }
 });
 
+test("PATCH /tasks/:id rejects a malformed JSON body with 400", async () => {
+  // Round-9 nit: `req.json().catch(() => ({}))` turned junk into an empty
+  // patch and answered 200, so a client bug looked like a successful edit.
+  const { task, a, b } = await createMulti();
+  try {
+    const res = await call(`/tasks/${task.id}`, {
+      method: "PATCH",
+      body: '{"title": "unterminated',
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("invalid JSON body");
+
+    // An absent body is still a harmless no-op, not a 400.
+    const empty = await call(`/tasks/${task.id}`, { method: "PATCH" });
+    expect(empty.status).toBe(200);
+    const { tasks } = await import("./db.ts");
+    expect(tasks.get(task.id)?.title).toBe(task.title);
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
 test("GET /tasks/:id/diff routes by repo and 400s an unknown one", async () => {
   const { task, a, b } = await createMulti();
   try {

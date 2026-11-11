@@ -35,7 +35,7 @@ import { runControl, resumableRunId } from "../run-logic.ts";
 import { Logo } from "./logo.tsx";
 import { fileScopeForTask, fileScopesForTask } from "./at-complete.ts";
 import { splitNamedScopePath } from "../../shared/file-scope.ts";
-import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
+import { addScopeRoots, buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 // `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
 import { trimmedResultNote } from "../commands/logs.ts";
@@ -258,7 +258,15 @@ export function Dashboard({
           if (!alive) return;
           const merged = results.flatMap(({ sc, res }) => res.files.map((f) => `${sc.name}/${f}`));
           const truncated = results.some(({ res }) => res.truncated);
-          const entries = buildFileEntries(merged);
+          // The merged listing only holds paths inside each repository, so a
+          // repository with no files contributes nothing and a bare
+          // `@<name>` (a real directory at the workspace root) had no row to
+          // match. Add one root row per scope — same contract as the webview
+          // composer (`use-project-files.ts`).
+          const entries = addScopeRoots(
+            buildFileEntries(merged),
+            composeScopes.flatMap((sc) => (sc.name ? [sc.name] : [])),
+          );
           fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch, truncated });
           setComposeFileEntries(entries);
           setComposeTruncated(truncated);

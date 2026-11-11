@@ -20,7 +20,7 @@ import {
   type WorktreeInfo,
   type WorktreeStaleReason,
 } from "../../../shared/types.ts";
-import { buildDeleteConfirmCopy, triageDeleteOutcome } from "./worktree-delete-intent.ts";
+import { buildDeleteConfirmCopy, mapWithConcurrency, triageDeleteOutcome } from "./worktree-delete-intent.ts";
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 
 interface Props {
@@ -309,14 +309,14 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
         }
       };
       const rows = [w, ...siblings];
-      const statuses: (WorktreeGitStatus | null)[] = [];
-      for (let i = 0; i < rows.length; i += GIT_STATUS_CONCURRENCY) {
-        statuses.push(
-          ...(await Promise.all(
-            rows.slice(i, i + GIT_STATUS_CONCURRENCY).map((row) => fetchStatus(row.id)),
-          )),
-        );
-      }
+      // Bounded by GIT_STATUS_CONCURRENCY: a task may select 10+ repositories
+      // and each call is a git subprocess on the bun side, so an unbounded
+      // `Promise.all` would fan out N+1 processes from one confirm.
+      const statuses = await mapWithConcurrency<WorktreeInfo, WorktreeGitStatus | null>(
+        rows,
+        GIT_STATUS_CONCURRENCY,
+        (row) => fetchStatus(row.id),
+      );
       const [status, ...siblingStatuses] = statuses;
       const copy = buildDeleteConfirmCopy(
         w,

@@ -45,7 +45,9 @@ interface TaskRepository {
 1. Validates every path is inside a git repo, collecting **all** failures
    (`resolveRepositorySet`, `src/bun/task-repos.ts`).
 2. Dedupes by git root, keeping the first selected path for that root.
-   A selection that collapses to one root uses the ordinary single-repo layout.
+   A selection that collapses to one root uses the ordinary single-repo layout
+   with the same base-ref precedence: an entry pin wins, then the task-level
+   default, then that repository's HEAD.
 3. Rejects 2+ entries with `isolation: "none"` or `existingBranch`.
 4. Resolves each repository's base ref to a sha and pins a branch per
    repository through `ensureUniqueBranch` against **that repository's own
@@ -155,7 +157,11 @@ is the single id-to-path guard for `DELETE /worktrees/:id` and
 `GET /worktrees/:id/git-status`: every segment must be a safe basename, and the
 final path must be a direct child of its parent, itself a direct child of
 `WORKTREES_DIR`. `listWorktrees` emits one row per repository
-(`repoName`, `workdir = entry.path`), skips the workspace root, and expands an
+(`repoName`, `workdir = entry.path`) and skips the workspace root while any
+repository checkout exists. When every checkout is gone but the root survives
+because it holds agent files (teardown never recursively wipes user content),
+it emits that root as a task-backed row (`id = taskId`, no `repoName`) so the
+page can still show it and retry the teardown. It expands an
 orphaned workspace directory only when a child's `.git` is a linked-worktree
 pointer with exactly one segment after `.git/worktrees/` (`gitdir:
 <repo>/.git/worktrees/<id>`). A submodule never qualifies: inside a linked
