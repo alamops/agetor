@@ -613,6 +613,30 @@ describe("multi-repository proposals", () => {
     expect(repositoriesNeedingPr(repos.map((r) => ({ ...r, prUrl: "x" })))).toEqual([]);
   });
 
+  test("latestProposalForRepository never returns another repository's labeled block", () => {
+    const { latestProposalForRepository, latestPrProposal } =
+      require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const events = [ev({ data: labeled })];
+    // `latestPrProposal` takes the LAST PR title label (backend) regardless of
+    // which repository the user is acting on — the bug this helper closes.
+    expect(latestPrProposal(events)?.title).toBe("Add login API");
+    expect(latestProposalForRepository(events, "frontend")?.title).toBe("Add login UI");
+    expect(latestProposalForRepository(events, "backend")?.title).toBe("Add login API");
+    expect(latestProposalForRepository(events, "infra")).toBeNull();
+  });
+
+  test("latestProposalsForTargets attributes an unlabeled proposal only when there is one target", () => {
+    const { latestProposalsForTargets } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const events = [ev({ data: canonicalText() })];
+    // Several PR targets: an unlabeled block could belong to any of them, so
+    // it is not stamped onto the first one.
+    expect([...latestProposalsForTargets(events, ["frontend", "backend"]).keys()]).toEqual([]);
+    expect(latestProposalsForTargets(events, ["frontend"]).get("frontend")?.title).toBe("Add login flow");
+    // Duplicates collapse before the one-target rule.
+    expect(latestProposalsForTargets(events, ["frontend", "frontend"]).get("frontend")?.title)
+      .toBe("Add login flow");
+  });
+
   test("newest run wins and subagent streams are ignored", () => {
     const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
     const events = [

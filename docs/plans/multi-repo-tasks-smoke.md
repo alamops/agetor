@@ -210,6 +210,32 @@ must-fix and one should-fix plus three nits. All are closed with regressions:
 | Nit: the TUI merged `@` listing omitted the root row of an empty repository | it now uses the same `addScopeRoots` contract as the webview composer | `src/cli/tui/Dashboard.test.tsx` — "a multi-repository listing still offers the root row of a repository with no files" |
 | Nit: the round-8 record claimed regression coverage for the batching cap that only amounted to a typecheck | the pool moved to the unit-tested `mapWithConcurrency` helper and the round-8 row names that test | this document |
 
+## Tenth review round
+
+At head `ad21ee61` the re-review confirmed round 9 closed and opened two
+must-fixes, three should-fixes and three nits. All are closed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Must-fix R-M1: create-time branch uniqueness read only `t.branch`, so a multi task created before a same-title single task (pins live in `repositories[].branch`; the scalar is null) was invisible — the single task pinned the same name and whichever started second silently attached to the other's branch and commits | the single path folds the whole `branchesPinnedByOtherTasks` map (every row's scalar and per-repository pins), the same map `prepareTaskWorkdir` already consumes. As a start-time backstop, a never-materialized task whose existing ref is still pinned by another row re-pins instead of attaching. `GET /projects/branches` also hides `repositories[].branch`. | `orchestrator-multi-repo.test.ts` — "a not-yet-started multi task's branch pins keep a later same-title single task unique"; `worktree.test.ts` — existing pinned branch is not adopted; `server-multi-repo.test.ts` — branches route hides a multi pin |
+| Must-fix R-M2: "Resolve Conflicts" on a multi task's per-repository PR ran `git fetch` at the non-git workspace root and claimed the agent was on the PR head | `buildResolveConflictsPrompt` takes the PR repository's checkout path/name and instructs `cd <repo> && git fetch origin` there; the single-repository prompt is byte-identical | `src/mainview/lib/resolve-conflicts-prompt.test.ts` — multi checkout, shell-quoted path |
+| Should-fix: a root-level file in a multi task's workspace (`@notes.md`) falsely warned "won't resolve" — the merged per-repository listing cannot see the root the agent actually runs in | unprefixed tokens are stat-checked against the task workspace root (`multiScopeStatTargets`) and are never confirmed missing by a repo-scoped truncated search | `src/mainview/lib/at-scope-targets.test.ts` |
+| Should-fix: PR proposal attribution — the single "Create PR" chip took the last labeled block (another repository's), and "Create all PRs" fell back to `repos[0]` for an unlabeled reply | the chip uses `latestProposalForRepository(active)`; create-all uses `latestProposalsForTargets(todo)` and attributes an unlabeled block only when there is exactly one target | `src/mainview/lib/pr-proposal.test.ts` |
+| Should-fix: deleting a retained multi workspace root reported silent success while the row survived (every repository `already-absent`, root kept on agent files) | `detachWorktree` returns `reason: "workspace-not-empty"` when the root survives after all checkouts are gone; the Worktrees delete toasts why and does not claim success | `orchestrator-multi-repo.test.ts` — retained root teardown reason; `worktree-delete-intent.test.ts` |
+| Nit: `PATCH /tasks/:id` accepted valid non-object JSON (`"hi"`, `42`, `null`, `[]`) with 200 | non-object bodies are 400 `JSON body must be an object`; an absent body stays a no-op | `server-multi-repo.test.ts` |
+| Nit: `agetor add --issue <url> --repo <path>` without `--workdir` resolved the issue against cwd and failed "belongs to a different repository" | the thread lookup uses the explicit `--workdir`, else each `--repo` in order, else cwd; a multi selection matches the issue in any repository, leaving workdir derivation to the server | `src/cli/commands/add.test.ts` — single and multi `--repo` |
+| Nit: the diff dialog painted the previous repository's diff for a frame after a tab switch | fetched data is stamped with its repository and rendered only while that stamp matches the selected tab | `bun run typecheck` (`DiffDialog.tsx`; the component has no render test) |
+
+Round-10 verification: `bun run typecheck` green; the focused multi-repo/unit
+set green (394 tests across 10 files, including the new regressions);
+`bun test src/mainview` green (2,100 tests); `bun test src/shared src/cli` green
+(3,044 tests); the directly-affected bun batch (branch nomenclature, base ref,
+issue, archive, worktrees, teardown preview, route policy, pipeline runner)
+green (285 tests); `e2e/multi-repo-task.spec.ts` 7 passed. A wide
+`bun test src/bun/orchestrator*.test.ts` run (499 tests) had three known
+load-sensitive fake-codex queue timing failures; that file is 3/3 green when
+run alone, and none of the touched suites failed.
+
 ## Live harness smoke matrix
 
 Layout support is universal (the agent runs at the workspace root). Extra

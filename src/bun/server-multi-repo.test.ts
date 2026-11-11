@@ -103,6 +103,25 @@ test("POST /tasks rejects malformed repository payloads with 400", async () => {
   }
 });
 
+test("GET /projects/branches hides a multi task's pinned repository branches", async () => {
+  // Review R-M1 companion: the managed set read only `t.branch`, which is null
+  // for a multi row by design, so every branch agetor minted for it cluttered
+  // the base-ref picker in its repositories.
+  const { task, a, b } = await createMulti();
+  try {
+    const pinned = task.repositories![0]!.branch!;
+    await git(["branch", pinned], a);
+    const res = await call(`/projects/branches?path=${encodeURIComponent(a)}`);
+    expect(res.status).toBe(200);
+    const list = (await res.json()) as Array<{ name: string }>;
+    expect(list.map((row) => row.name)).toContain("main");
+    expect(list.map((row) => row.name)).not.toContain(pinned);
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
 test("PATCH /tasks/:id rejects the repository set", async () => {
   const { task, a, b } = await createMulti();
   try {
@@ -114,6 +133,25 @@ test("PATCH /tasks/:id rejects the repository set", async () => {
     expect((await res.json()).error).toContain("fixed at creation");
     const { tasks } = await import("./db.ts");
     expect(tasks.get(task.id)?.repositories).toHaveLength(2);
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("PATCH /tasks/:id rejects valid JSON that isn't an object with 400", async () => {
+  // Review nit: `"hi"`, `42`, `null` and `[]` parse fine, then `filterPatch`'s
+  // non-object guard turned them into an empty patch and answered 200 — a
+  // second flavor of the false-success the malformed-body check closed.
+  const { task, a, b } = await createMulti();
+  try {
+    for (const body of ['"hi"', "42", "null", "[]", "true"]) {
+      const res = await call(`/tasks/${task.id}`, { method: "PATCH", body });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toContain("must be an object");
+    }
+    const { tasks } = await import("./db.ts");
+    expect(tasks.get(task.id)?.title).toBe(task.title);
   } finally {
     rmSync(a, { recursive: true, force: true });
     rmSync(b, { recursive: true, force: true });

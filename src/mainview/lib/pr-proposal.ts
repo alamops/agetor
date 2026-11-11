@@ -265,6 +265,35 @@ export function repositoriesNeedingPr<T extends { prUrl: string | null }>(repos:
 }
 
 /**
+ * The newest run's labeled proposal for ONE repository. Unlike
+ * {@link latestPrProposal}, a proposal labeled for a different repository is
+ * never returned — a multi task's Commit & push reply carries one labeled
+ * block per repository, and using the last block blindly prefilled the wrong
+ * repository's title/description.
+ */
+export function latestProposalForRepository(
+  events: RunEvent[],
+  repositoryName: string,
+): PrProposal | null {
+  return latestRepositoryProposals(events).get(repositoryName) ?? null;
+}
+
+/**
+ * Proposals for the repositories a PR action is about to target. An
+ * unlabeled proposal is only attributable when there is EXACTLY one target —
+ * with several, any attribution would be a guess (and the old
+ * `repos[0]` fallback handed the first repository's identity to a proposal
+ * from any of them). Missing entries simply fall back to the task title.
+ */
+export function latestProposalsForTargets(
+  events: RunEvent[],
+  targetNames: readonly string[],
+): Map<string, PrProposal> {
+  const unique = [...new Set(targetNames.filter((n) => n.length > 0))];
+  return latestRepositoryProposals(events, unique.length === 1 ? unique[0] : undefined);
+}
+
+/**
  * The newest run's per-repository proposals. Mirrors {@link latestPrProposal}
  * (newest run wins, subagent streams ignored) but returns every labeled
  * block, and falls back to a single unlabeled proposal under `fallbackName`.

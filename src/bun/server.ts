@@ -2149,9 +2149,16 @@ export function startApiServer(
           // the base-ref picker. The legacy `agetor/` prefix is filtered inside
           // listBranches; custom-prefixed branches (feature/…, fix/…) are only
           // recognizable via the pinned names on task rows, so pass those too.
-          const managed = new Set(
-            tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
-          );
+          // A multi-repository task pins its branches on `repositories[]`, not
+          // the scalar column (that is null by design) — omitting them left
+          // every task branch of a multi task visible here.
+          const managed = new Set<string>();
+          for (const t of tasks.list()) {
+            if (t.branch) managed.add(t.branch);
+            for (const repo of t.repositories ?? []) {
+              if (repo.branch) managed.add(repo.branch);
+            }
+          }
           return json(await listBranches(dir, { exclude: managed }), { headers: corsHeaders(req) });
         }),
       },
@@ -5989,6 +5996,20 @@ export function startApiServer(
             } catch {
               return json({ error: "invalid JSON body" }, { status: 400, headers: corsHeaders(req) });
             }
+          }
+          // Valid JSON that isn't an object (`"hi"`, `42`, `null`, `[]`) used
+          // to fall through `filterPatch`'s non-object guard and answer 200
+          // with nothing applied — the same false-success the unparseable-body
+          // check above closes. An array is accepted as an empty patch by
+          // `typeof`, so exclude it explicitly.
+          if (
+            rawBody.trim() !== ""
+            && (rawPatch === null || typeof rawPatch !== "object" || Array.isArray(rawPatch))
+          ) {
+            return json(
+              { error: "JSON body must be an object" },
+              { status: 400, headers: corsHeaders(req) },
+            );
           }
           if (rawPatch && typeof rawPatch === "object" && "repositories" in rawPatch) {
             return json(

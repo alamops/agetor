@@ -235,12 +235,55 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     // Resolve relative to the CLI's cwd (not the daemon's — see `baseInput`'s
     // comment) so the thread fetch and the eventual task both land on the
     // same absolute path the user meant.
-    const workdir = path.resolve(o.workdir ?? process.cwd());
-    o.workdir = workdir;
-    const thread = await client.getIssueThread(workdir, parsed.number);
-    if (!sameIssueUrl(thread.item.htmlUrl, o.issue)) {
-      throw new Error("--issue: that issue belongs to a different repository than --workdir");
+    //
+    // `--repo` is a first-class way to name the project: `agetor add --issue
+    // <url> --repo ~/src/widgets` used to resolve the thread against cwd (or
+    // worse, a different checkout the user happened to be in) and fail with
+    // "that issue belongs to a different repository". Try the explicit
+    // `--workdir` when given; otherwise every selected repository in order;
+    // otherwise cwd as before. For a multi-repository selection the issue may
+    // live in ANY of them — the server matches it against the whole set — so
+    // the first candidate whose remote matches wins.
+    const explicitWorkdir = o.workdir?.trim() ? path.resolve(o.workdir) : null;
+    const candidateDirs = explicitWorkdir
+      ? [explicitWorkdir]
+      : (o.repos.length > 0
+        ? o.repos.map((r) => path.resolve(r.path))
+        : [path.resolve(process.cwd())]);
+    let thread: Awaited<ReturnType<AgetorClient["getIssueThread"]>> | null = null;
+    let matchedDir: string | null = null;
+    let lastError: unknown = null;
+    for (const dir of candidateDirs) {
+      try {
+        const candidate = await client.getIssueThread(dir, parsed.number);
+        if (sameIssueUrl(candidate.item.htmlUrl, o.issue)) {
+          thread = candidate;
+          matchedDir = dir;
+          break;
+        }
+        // Keep one successful-but-mismatched answer so the error below can
+        // name what git actually found instead of pretending nothing loaded.
+        lastError ??= new Error(
+          explicitWorkdir
+            ? "--issue: that issue belongs to a different repository than --workdir"
+            : `--issue: that issue belongs to a different repository than ${candidateDirs.length > 1 ? "any of the selected repositories" : "--repo"} (tried ${candidateDirs.join(", ")})`,
+        );
+      } catch (err) {
+        // A repo with no matching forge remote (or a fetch failure) must not
+        // abort the search through the remaining candidates.
+        lastError ??= err;
+      }
     }
+    if (!thread) {
+      throw lastError instanceof Error
+        ? lastError
+        : new Error("--issue: that issue belongs to a different repository");
+    }
+    // Preserve the historical single-project behavior: the task's workdir is
+    // the directory the issue matched (an explicit `--workdir`, or cwd).
+    // With `--repo`, the server derives it from the selected set, so leave
+    // `o.workdir` unset rather than arbitrarily pinning one candidate.
+    if (candidateDirs.length === 1 && o.repos.length === 0) o.workdir = matchedDir!;
     o.title ??= issueTaskTitle(thread.item);
     prompt ??= buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
     // An explicit `--type` stays authoritative; only fill it from the

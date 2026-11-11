@@ -11469,9 +11469,19 @@ export async function createTask(
     if (multiRepo) {
       plannedBranch = desired;
     } else {
-      const taken = new Set(
-        tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
-      );
+      // Fold EVERY pin from the other rows, exactly like
+      // `prepareTaskWorkdir`'s single-repository path does. Reading only
+      // `t.branch` missed a not-yet-started multi task's `repositories[].branch`
+      // pins: a multi task created first could hold this name with no git ref
+      // yet, so this single task pinned the same branch and later attached to
+      // (or collided with) that task's commits. The map is flattened rather
+      // than looked up by workdir so a task that selected a sibling
+      // subdirectory of the same repo still counts — the pre-#291 behavior
+      // (a global set of every task's branch) is preserved.
+      const taken = new Set<string>();
+      for (const set of branchesPinnedByOtherTasks(id, tasks.list()).values()) {
+        for (const b of set) taken.add(b);
+      }
       plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
     }
   }

@@ -176,6 +176,27 @@ test("prepareWorkdir re-pins a unique branch when the pinned name is already che
   expect(existsSync(rb.worktreePath!)).toBe(true);
 });
 
+test("prepareWorkdir re-pins instead of attaching to another task's existing pinned branch", async () => {
+  // Review R-M1 backstop: the ref exists (e.g. the other task already
+  // started) but is not checked out anywhere, so `git worktree add wt X`
+  // would SUCCEED and silently adopt that task's commits. `takenBranches`
+  // names the owner, so the never-materialized task must get a fresh variant.
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  await git(["checkout", "-b", "feature/shared"], repo);
+  writeFileSync(path.join(repo, "other-task.txt"), "someone else's work\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "other task"], repo);
+  await git(["checkout", "main"], repo);
+
+  const task = fakeTask({ workdir: repo, branch: "feature/shared" });
+  const r = await prepareWorkdir(task, { takenBranches: new Set(["feature/shared"]) });
+  if ("error" in r) throw new Error(r.error);
+  expect(r.branch).not.toBe("feature/shared");
+  expect(r.branch!.startsWith("feature/shared")).toBe(true);
+  expect(existsSync(path.join(r.cwd, "other-task.txt"))).toBe(false);
+});
+
 test("prepareWorkdir re-pin never steals a branch another task has pinned but not started", async () => {
   const { prepareWorkdir } = await import("./worktree.ts");
   const repo = await makeRepo();

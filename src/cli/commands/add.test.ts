@@ -353,6 +353,52 @@ test("cmdAdd: --issue --workdir --json derives title/prompt/issueUrl/issueSnapsh
   expect((jsonOutputs[0] as { started: boolean }).started).toBe(false);
 });
 
+test("cmdAdd: --issue uses --repo as the match target when --workdir is omitted", async () => {
+  // Review nit: the issue thread was always resolved against cwd without
+  // --workdir, so `agetor add --issue <url> --repo ~/src/widgets` run from a
+  // different checkout failed with "belongs to a different repository".
+  reset();
+  const thread = makeThread();
+  const { client, getIssueThreadCalls, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const repo = "/tmp/agetor-issue-repo";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--repo", repo], flags({ json: true }));
+
+  expect(getIssueThreadCalls).toEqual([{ path: repo, number: 7 }]);
+  expect(createTaskCalls).toHaveLength(1);
+  expect(createTaskCalls[0]!.repositories?.map((r) => r.path)).toEqual([repo]);
+  // No --workdir was given: let the server derive it from the repository set.
+  expect(createTaskCalls[0]!.workdir).toBeUndefined();
+});
+
+test("cmdAdd: --issue with several --repo entries tries each until one matches", async () => {
+  reset();
+  const thread = makeThread();
+  const other = makeThread({ item: makeItem({ htmlUrl: "https://github.com/someone-else/other/issues/7" }) });
+  const getIssueThreadCalls: Array<{ path: string; number: number }> = [];
+  const createTaskCalls: CreateTaskInput[] = [];
+  currentClient = {
+    getIssueThread: async (dir: string, number: number) => {
+      getIssueThreadCalls.push({ path: dir, number });
+      return { ok: true as const, ...(dir === "/tmp/b-repo" ? thread : other) };
+    },
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "multi-issue", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+
+  await cmdAdd(
+    ["--issue", thread.item.htmlUrl, "--repo", "/tmp/a-repo", "--repo", "/tmp/b-repo"],
+    flags({ json: true }),
+  );
+
+  expect(getIssueThreadCalls.map((c) => c.path)).toEqual(["/tmp/a-repo", "/tmp/b-repo"]);
+  expect(createTaskCalls).toHaveLength(1);
+  expect(createTaskCalls[0]!.repositories?.map((r) => r.path)).toEqual(["/tmp/a-repo", "/tmp/b-repo"]);
+});
+
 test("cmdAdd: --issue --workdir --start --json also starts the created task", async () => {
   reset();
   const thread = makeThread();

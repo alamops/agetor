@@ -88,9 +88,14 @@ function lastSelectableIndex(rows: DiffRow[]): number {
  */
 export function DiffDialog({ open, task, onClose }: Props) {
   const taskId = task?.id ?? null;
-  const [diff, setDiff] = useState<TaskDiff | null>(null);
+  // The fetched diff is stamped with the repository it belongs to, so a tab
+  // switch can never paint the previous repository's diff for a frame: the
+  // derived `diff` below is null until the matching response lands (the
+  // effect's own `setDiffState(null)` only runs after paint).
+  const [diffState, setDiffState] = useState<{ repo: string | null; data: TaskDiff } | null>(null);
   // Selected repository tab for a multi-repository task (issue #291).
   const [repo, setRepo] = useState<string | null>(null);
+  const diff = diffState && diffState.repo === repo ? diffState.data : null;
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [openFiles, setOpenFiles] = useState<Set<string>>(new Set());
@@ -426,12 +431,12 @@ export function DiffDialog({ open, task, onClose }: Props) {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    setDiff(null);
+    setDiffState(null);
     api
       .getTaskDiff(taskId, wanted)
       .then((d) => {
         if (cancelled) return;
-        setDiff(d);
+        setDiffState({ repo: wanted, data: d });
         // Expand everything by default for small change sets; keep large ones
         // collapsed so the dialog stays responsive.
         setOpenFiles(d.files.length <= 8 ? new Set(d.files.map((f) => f.path)) : new Set());

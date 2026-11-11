@@ -189,6 +189,17 @@ export function triageDeleteOutcome(teardown: WorktreeTeardownResult | undefined
         kind: "error",
         message: `Couldn't delete ${name}: it still has uncommitted changes.`,
       };
+    case "workspace-not-empty":
+      // Every repository checkout is gone but the task's workspace root
+      // survives on files outside them (agent notes, scratch, …). The row
+      // the user clicked represents that root, so a silent success made the
+      // delete look broken — say why it is still there and how to finish.
+      return {
+        kind: "error",
+        message:
+          "Couldn't delete the task workspace: it still contains files outside its repositories. " +
+          "Move or remove them, then try again.",
+      };
     case "failed":
     default:
       return {

@@ -19,6 +19,7 @@ import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { useProjectFiles, useProjectFileScopes, searchProjectFiles, resolveNamedScopePath, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { unresolvedAtTokens, isSafeClientRelPath, isListedPath } from "@/lib/at-highlight";
+import { multiScopeStatTargets } from "@/lib/at-scope-targets";
 
 /** Stable empty set so clearing the on-disk override doesn't churn state
  *  identity (and thus the warning memo) on every effect pass. */
@@ -315,6 +316,16 @@ export interface PromptComposerProps {
    *  entry with its workspace name. A single entry is ignored (use
    *  `fileScope`). */
   fileScopes?: NamedFileScope[] | null;
+  /**
+   * The multi-repository task's workspace root (issue #291). The agent's cwd
+   * is this directory, not a repository, so `@records.md` (a file the agent
+   * left at the root) DOES expand at send time even though no repository
+   * listing contains it. Used only to stat unprefixed tokens before warning
+   * that they won't resolve; ignored unless `fileScopes` is multi. `null`
+   * leaves the listing-only verdict in place (a not-yet-started workspace
+   * doesn't exist, so an unprefixed path genuinely cannot resolve there).
+   */
+  workspaceRoot?: string | null;
   /** Opaque token whose CHANGE triggers a listing `refresh()` — RunPanel
    *  passes `task.column`, so a run settling (running → review/ready/blocked)
    *  re-lists the tree the agent may have just written files into. The
@@ -466,6 +477,7 @@ export function PromptComposer({
   setReferences,
   fileScope,
   fileScopes,
+  workspaceRoot,
   fileScopeRefreshToken,
   textareaRef,
   capture,
@@ -662,27 +674,19 @@ export function PromptComposer({
   // scope maps plain token paths; a multi task maps each prefixed token to its
   // own repository scope and strips the workspace prefix — `<dir>/frontend/src/a`
   // is not a path inside any repository, so the old single-scope stat could
-  // never rescue a gitignored file in a multi-repository task. A token with no
-  // known prefix (or a ref scope, which lists exactly what the worktree will
-  // contain) is skipped, leaving the listing verdict in place.
+  // never rescue a gitignored file in a multi-repository task.
+  //
+  // An UNPREFIXED token on a multi task is checked against the workspace root
+  // (the agent's actual cwd), not skipped. The merged listing only contains
+  // paths inside each repository, so a root-level file the agent created
+  // (`@notes.md`) looked unresolved even though send-time expansion resolves it
+  // from the workspace root. When no workspace root is supplied (a
+  // not-yet-started task) the listing verdict stands. A ref scope still lists
+  // exactly what the worktree will contain, so it is skipped.
   const liveStatTargets = useMemo(() => {
     if (!hasFileScope) return [];
     if (multiScope) {
-      const targets = new Map<string, { dir: string; paths: Map<string, string> }>();
-      for (const t of unlistedTokens) {
-        const split = resolveNamedScopePath(fileScopes, t.path);
-        if (!split || (split.scope.ref ?? "").trim()) continue;
-        const local = split.path.replace(/\/+$/, "");
-        const dir = split.scope.dir.trim();
-        if (!local || !dir || !isSafeClientRelPath(local)) continue;
-        let target = targets.get(split.scope.name);
-        if (!target) {
-          target = { dir, paths: new Map() };
-          targets.set(split.scope.name, target);
-        }
-        target.paths.set(local, t.path.replace(/\/+$/, ""));
-      }
-      return [...targets.values()].filter((t) => t.paths.size > 0);
+      return multiScopeStatTargets(unlistedTokens, fileScopes, workspaceRoot);
     }
     const dir = fileScope?.dir?.trim();
     if (!dir || (fileScope?.ref ?? "").trim()) return [];
@@ -693,7 +697,7 @@ export function PromptComposer({
     }
     return paths.size > 0 ? [{ dir, paths }] : [];
     // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKey/multiScopesKey stand in for the arrays
-  }, [hasFileScope, multiScope, unlistedKey, multiScopesKey, fileScope?.dir, fileScope?.ref]);
+  }, [hasFileScope, multiScope, unlistedKey, multiScopesKey, fileScope?.dir, fileScope?.ref, workspaceRoot]);
   const liveStatKey = liveStatTargets
     .map((t) => `${t.dir}\0${[...t.paths.keys()].join("\0")}`)
     .join("\u0001");
@@ -799,14 +803,17 @@ export function PromptComposer({
         // (`backend/src/a.ts`). Search THAT repository for the repo-local
         // path — searching the single active repo with the prefixed path
         // could never match, so every valid prefixed token was falsely
-        // confirmed missing. An unprefixed token can never resolve inside a
-        // multi workspace (the merged listing always prefixes), so it is
-        // confirmed missing without a round trip.
+        // confirmed missing.
+        //
+        // An unprefixed token is NOT confirmed missing here: it resolves
+        // against the multi task's workspace root at send time (the agent's
+        // cwd), and no repository's full-depth search covers that directory.
+        // It is rescued by the live-root stat above when it exists there;
+        // otherwise it stays unproven, which the warning layer already treats
+        // as "never warn" in truncated mode. Confirming it missing made
+        // `@notes.md` (a root file the agent wrote) flash a false warning.
         const named = multiScope ? resolveNamedScopePath(fileScopes, token.path) : null;
-        if (multiScope && !named) {
-          missing.add(key);
-          return;
-        }
+        if (multiScope && !named) return;
         const lookupPath = named ? named.path : token.path;
         const query = lookupPath.replace(/\/+$/, "");
         const scope = named?.scope ?? fileScope;

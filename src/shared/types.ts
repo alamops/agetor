@@ -2472,8 +2472,16 @@ export interface WorktreeInfo {
 export interface WorktreeTeardownResult {
   /** True when the worktree directory is no longer on disk after the teardown. */
   removed: boolean;
-  /** Why `removed` is false. Absent when `removed` is true. */
-  reason?: "dirty" | "no-worktree" | "already-absent" | "failed";
+  /**
+   * Why `removed` is false. Absent when `removed` is true.
+   *
+   * `workspace-not-empty` is multi-repository-only: every repository checkout
+   * was removed (or was already absent) but the task's workspace root still
+   * holds user/agent files outside the repositories, so the root — and the
+   * Worktrees row that represents it — survives. It is NOT "already absent";
+   * reporting it as success left the row silently present after a delete.
+   */
+  reason?: "dirty" | "no-worktree" | "already-absent" | "failed" | "workspace-not-empty";
   /**
    * Per-repository outcomes for a multi-repository task (issue #291). The
    * top-level fields mirror the aggregate: `removed` is true only when every

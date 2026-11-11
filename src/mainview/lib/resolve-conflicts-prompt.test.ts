@@ -82,6 +82,33 @@ test("special characters in title don't break the prompt and core instructions s
   expect(prompt).toContain("Commit the merge locally");
 });
 
+test("a multi-repository checkout names the repository directory and never claims the workspace root is the branch", () => {
+  const prompt = buildResolveConflictsPrompt(input({
+    repositoryPath: "/data/worktrees/t1/frontend",
+    repositoryName: "frontend",
+  }));
+  // The agent's cwd is the non-git workspace root: every command must run in
+  // the named checkout.
+  expect(prompt).toContain("workspace root");
+  expect(prompt).toContain("not itself a git repository");
+  expect(prompt).toContain("`/data/worktrees/t1/frontend`");
+  expect(prompt).toContain("workspace subdirectory `frontend`");
+  expect(prompt).toContain("cd '/data/worktrees/t1/frontend' && git fetch origin");
+  expect(prompt).toContain("origin/main");
+  // The old single-repository wording asserted the agent was already on the
+  // head branch, which is false at the workspace root.
+  expect(prompt).not.toContain("You're already on the PR's head branch");
+  expect(prompt).toContain("Both branches' changes matter here");
+  expect(prompt).toContain("Do not push");
+});
+
+test("a repository path with a quote is shell-quoted safely", () => {
+  const prompt = buildResolveConflictsPrompt(input({
+    repositoryPath: "/tmp/it's/repo",
+  }));
+  expect(prompt).toContain("cd '/tmp/it'\\''s/repo' && git fetch origin");
+});
+
 test("null title drops the dash/quotes clause but keeps the rest of the template intact", () => {
   const prompt = buildResolveConflictsPrompt(input({ title: null }));
   const firstLine = prompt.split("\n")[0];

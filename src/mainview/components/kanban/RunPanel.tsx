@@ -18,7 +18,12 @@ import { EXPAND_EVENT } from "@/lib/expand-on-jump";
 import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
-import { latestPrProposal, latestRepositoryProposals, repositoriesNeedingPr } from "@/lib/pr-proposal";
+import {
+  latestPrProposal,
+  latestProposalForRepository,
+  latestProposalsForTargets,
+  repositoriesNeedingPr,
+} from "@/lib/pr-proposal";
 import { issueProjectPath } from "@/lib/repo-selection";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
@@ -3742,7 +3747,10 @@ function RunPanelBody({
     }
     setAllPrsBusy(true);
     const failures: string[] = [];
-    const proposals = latestRepositoryProposals(events, repos[0]?.name);
+    // Attribute an unlabeled proposal only when there is exactly one PR
+    // target; with several it could belong to any repository, and the old
+    // `repos[0]` fallback stamped the wrong repo's title/description.
+    const proposals = latestProposalsForTargets(events, todo.map((repo) => repo.name));
     try {
       for (const repo of todo) {
         const head = repositoryPrHead(repo, gitStatusForRepo(repo.name));
@@ -3870,12 +3878,19 @@ function RunPanelBody({
     // sync with the current task's PR, refuse to send unless it still
     // matches the PR the button is currently showing.
     if (!parsedPrUrl || !prStatus || prStatus.pullNumber !== parsedPrUrl.number) return;
+    // A multi-repository task runs at the workspace root, which is not a git
+    // repository: the prompt has to name this PR repository's checkout
+    // explicitly or every git command lands in the wrong place. The active
+    // tab is the one whose `prUrl` produced `parsedPrUrl`/`prStatus`.
+    const resolveRepo = multiRepo ? activeRepo : null;
     const prompt = buildResolveConflictsPrompt({
       repo: prStatus.repo,
       number: prStatus.pullNumber,
       title: null,
       headRef: prStatus.headRef,
       baseRef: prStatus.baseRef,
+      repositoryPath: resolveRepo ? (resolveRepo.worktreePath ?? resolveRepo.path) : null,
+      repositoryName: resolveRepo?.name ?? null,
     });
     // Captured before the first await — see `currentTaskIdRef`'s doc comment.
     const sentTaskId = task.id;
@@ -4851,6 +4866,10 @@ function RunPanelBody({
             capture={capture}
             fileScope={fileScope}
             fileScopes={multiRepoScopes}
+            // Unprefixed `@tokens` resolve at the workspace root (the agent's
+            // cwd), which the per-repository listing can't see — stat that
+            // root before warning they won't resolve.
+            workspaceRoot={multiRepo ? (task.worktreePath ?? task.workdir) : null}
             // A column transition = a run settled (or started): the agent may
             // have just written files while focus never left the composer —
             // retrigger the listing fetch (see the prop's doc).
@@ -4938,7 +4957,14 @@ function RunPanelBody({
                     size="sm"
                     variant="secondary"
                     onClick={() => {
-                      const proposal = latestPrProposal(events);
+                      // A multi task's reply carries one labeled block per
+                      // repository; only THIS repository's block may prefill
+                      // the chip's composer. Falling back to the newest
+                      // unlabeled/last block attributed a sibling's proposal
+                      // to the active repository. Single tasks are unchanged.
+                      const proposal = multiRepo && activeRepo
+                        ? latestProposalForRepository(events, activeRepo.name)
+                        : latestPrProposal(events);
                       onOpenPullRequest({
                         projectPath: multiRepo
                           ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)

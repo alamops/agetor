@@ -54,7 +54,12 @@ interface TaskRepository {
    refs** (plus names other not-yet-started tasks hold), so a branch left
    behind by an archived task gets the per-repository `-N` fallback instead of
    being silently re-attached. Repositories share the desired name when it is
-   free everywhere. An entry's own `repositories[].baseRef`
+   free everywhere. The ordinary single-repository path folds the same pin
+   map (every other task's `branch` and `repositories[].branch`), so a
+   same-title single task created after a not-yet-started multi task gets the
+   `-N` variant instead of later attaching to that task's branch and commits.
+   `GET /projects/branches` hides both kinds of pin. An entry's own
+   `repositories[].baseRef`
    (`--repo <path>=<ref>`) wins; a task-level `baseRef` (CLI `--base-ref`) is
    the default for entries without one; omitted both means that repository's
    HEAD.
@@ -133,6 +138,13 @@ also open inside one repository (`POST /tasks/:id/terminals { repo }`).
   stays null. The run panel's "Create all PRs" walks the repositories that have
   no PR yet (`repositoriesNeedingPr`), best-effort, appending `Closes #N` only
   for `issueRepoPath`; a second press never duplicates a stamped repository.
+- PR proposal prefill is repository-scoped: the single "Create PR" chip only
+  accepts the active repository's `Repository:` block, and "Create all PRs"
+  attributes an unlabeled proposal only when exactly one repository is being
+  targeted (`latestProposalForRepository` / `latestProposalsForTargets`).
+- "Resolve Conflicts" for a per-repository PR sends a prompt that names that
+  checkout's absolute path (the run's cwd is the non-git workspace root) and
+  runs every git command inside it; the single-repository prompt is unchanged.
 
 ## Teardown, Worktrees page and ids
 
@@ -161,7 +173,10 @@ final path must be a direct child of its parent, itself a direct child of
 repository checkout exists. When every checkout is gone but the root survives
 because it holds agent files (teardown never recursively wipes user content),
 it emits that root as a task-backed row (`id = taskId`, no `repoName`) so the
-page can still show it and retry the teardown. It expands an
+page can still show it and retry the teardown. Deleting that row reports
+`reason: "workspace-not-empty"` when the root survives on user/agent files
+(even after every repository checkout was removed) rather than the silent
+`already-absent` success that left the row in place. It expands an
 orphaned workspace directory only when a child's `.git` is a linked-worktree
 pointer with exactly one segment after `.git/worktrees/` (`gitdir:
 <repo>/.git/worktrees/<id>`). A submodule never qualifies: inside a linked

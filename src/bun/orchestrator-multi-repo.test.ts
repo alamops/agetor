@@ -231,6 +231,46 @@ test("createTask gives a secondary repository a fresh branch instead of re-attac
   }
 });
 
+test("a not-yet-started multi task's branch pins keep a later same-title single task unique", async () => {
+  // Review R-M1: create-time uniqueness read only `t.branch`, so a multi task
+  // created FIRST (its pins live in `repositories[].branch`, scalar branch is
+  // null) was invisible. A same-title single task then pinned the SAME name,
+  // and whichever materialized second silently attached to the other's
+  // branch — including its commits.
+  const { createTask, tasks } = await load();
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  try {
+    const multi = await createTask({
+      title: "shared title",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: a,
+      isolation: "worktree",
+      repositories: [{ path: a }, { path: b }],
+    });
+    if ("error" in multi) throw new Error(multi.error);
+    const pinned = multi.task.repositories!.map((r) => r.branch);
+    expect(pinned[0]).toBe(pinned[1]);
+
+    const single = await createTask({
+      title: "shared title",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: a,
+      isolation: "worktree",
+    });
+    if ("error" in single) throw new Error(single.error);
+
+    expect(single.task.branch).not.toBe(pinned[0]);
+    expect(single.task.branch).toBe(`${pinned[0]}-2`);
+    // The multi row's own pins are untouched by the later single create.
+    expect(tasks.get(multi.task.id)?.repositories?.map((r) => r.branch)).toEqual(pinned);
+  } finally {
+    cleanup(a, b);
+  }
+});
+
 test("two paths under one git root collapse to the single-repository layout", async () => {
   const { createTask } = await load();
   const a = await makeRepo("mono");
@@ -616,6 +656,11 @@ test("a retained multi workspace is listed and can be cleaned by a repeat archiv
     expect(existsSync(path.join(workspace, names[0]!))).toBe(false);
     expect(existsSync(path.join(workspace, names[1]!))).toBe(false);
     expect(existsSync(path.join(workspace, "notes.md"))).toBe(true);
+    // Review R-S3: every repository checkout is gone but the root survives on
+    // user files, so the Worktrees row (id = task id) is still there. The
+    // teardown must say so instead of reporting "already absent" success.
+    expect(archived.teardown?.removed).toBe(false);
+    expect(archived.teardown?.reason).toBe("workspace-not-empty");
 
     const row = listWorktrees().find((entry) => entry.id === id);
     expect(row).toBeDefined();
@@ -628,6 +673,7 @@ test("a retained multi workspace is listed and can be cleaned by a repeat archiv
     rmSync(path.join(workspace, "notes.md"));
     const retried = await archiveTask(id, { awaitTeardown: true, stopRun: true });
     if ("error" in retried) throw new Error(retried.error);
+    expect(retried.teardown?.removed).toBe(true);
     expect(existsSync(workspace)).toBe(false);
     expect(listWorktrees().some((entry) => entry.id === id)).toBe(false);
   } finally {

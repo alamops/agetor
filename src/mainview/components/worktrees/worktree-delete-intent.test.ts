@@ -261,6 +261,27 @@ describe("triageDeleteOutcome", () => {
     expect(triageDeleteOutcome(teardown, "feature-branch")).toEqual({ kind: "silent" });
   });
 
+  test('reason "workspace-not-empty" -> error explaining the retained workspace root, NOT silent success', () => {
+    // Every repository checkout was removed but the multi task's workspace
+    // root survives on files outside them. The Worktrees row represents that
+    // root, so silence made the delete look like it worked while the row
+    // stayed put.
+    const teardown: WorktreeTeardownResult = {
+      removed: false,
+      reason: "workspace-not-empty",
+      repositories: [
+        { name: "frontend", result: { removed: true } },
+        { name: "backend", result: { removed: false, reason: "already-absent" } },
+      ],
+    };
+    const outcome = triageDeleteOutcome(teardown, null);
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toContain("files outside its repositories");
+      expect(outcome.message).toContain("try again");
+    }
+  });
+
   test('reason "dirty" -> error, naming the branch', () => {
     const teardown: WorktreeTeardownResult = { removed: false, reason: "dirty" };
     const outcome = triageDeleteOutcome(teardown, "feature-branch");

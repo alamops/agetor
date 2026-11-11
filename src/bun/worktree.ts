@@ -1263,7 +1263,19 @@ export async function prepareRepoWorktree(
   // but the branch survived), re-attach rather than reset — using `-B` would
   // forcibly rewind the branch back to `base`, discarding any commits the
   // previous run made.
-  const branchExists = (await git(["rev-parse", "--verify", `refs/heads/${branch}`], root, 5_000)).ok;
+  let branchExists = (await git(["rev-parse", "--verify", `refs/heads/${branch}`], root, 5_000)).ok;
+  // Create-time uniqueness normally keeps two tasks from ever sharing a
+  // pinned name. A row created before that guard (or written directly) can
+  // still hold another task's pin: the ref exists, `takenBranches` says
+  // another task owns that name, and this task has never materialized — a
+  // plain `git worktree add wt <branch>` below would silently attach this
+  // task to the OTHER task's commits. Re-pin off the base instead. An
+  // `existingBranch` task is exempt: that name is the user's PR head, not a
+  // name agetor minted (the same rule collision recovery below follows).
+  if (branchExists && !reattach && branchSource !== "existing" && takenBranches.has(branch)) {
+    branch = await ensureUniqueBranch(root, branch, takenBranches);
+    branchExists = false;
+  }
   // Prune stale worktree registrations before any `add` — git rejects adding
   // a path it still tracks as a missing-but-registered worktree without a
   // prune step first.
@@ -2203,11 +2215,25 @@ export async function detachWorktree(
     }
     // Only the empty workspace root is removed; a dirty repository's checkout
     // (and the workspace holding it) stays put.
-    removeWorkspaceIfEmpty(workspacePathFor(task));
-    const removed = outcomes.every((o) => o.result.removed);
-    if (removed) return { removed, repositories: outcomes };
-    const reason = outcomes.find((o) => !o.result.removed)?.result.reason ?? "failed";
-    return { removed, reason, repositories: outcomes };
+    const workspace = workspacePathFor(task);
+    removeWorkspaceIfEmpty(workspace);
+    // A real per-repository failure (dirty checkout, failed removal) is the
+    // reason to report — it is what blocks the delete.
+    const failed = outcomes.find(
+      (o) =>
+        !o.result.removed
+        && o.result.reason !== "already-absent"
+        && o.result.reason !== "no-worktree",
+    );
+    if (failed) return { removed: false, reason: failed.result.reason ?? "failed", repositories: outcomes };
+    // Every repository checkout can be gone while the root survives on files
+    // the agent/user left there. That root is the row the Worktrees page
+    // showed (id = task id), so claiming success would make the delete look
+    // like a no-op. Report the distinct reason; the client explains it.
+    if (existsSync(workspace)) {
+      return { removed: false, reason: "workspace-not-empty", repositories: outcomes };
+    }
+    return { removed: true, repositories: outcomes };
   }
   if (!task.worktreePath) return { removed: false, reason: "no-worktree" };
   if (!existsSync(task.worktreePath)) return { removed: false, reason: "already-absent" };
