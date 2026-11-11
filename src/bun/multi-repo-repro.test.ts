@@ -1,8 +1,9 @@
-import { test, expect } from "bun:test";
+import { afterAll, test, expect } from "bun:test";
 import { mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { uniqueRepoSlugs } from "../shared/multi-repo.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Permanent regression for issue #291's reported behavior: before the fix,
 // `POST /tasks` silently dropped `repositories` and materialized exactly one
@@ -10,6 +11,15 @@ import { uniqueRepoSlugs } from "../shared/multi-repo.ts";
 // passes once multi-repository tasks are supported.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-multi-repro-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
+
+// Temp dirs are otherwise never reclaimed: the per-repo fixtures are removed
+// in the test's own `finally`, but the data dir (db + worktrees) was not.
+// `rmTestDataDir` keeps it when it holds the process-wide live sqlite — `bun
+// test` runs every file in one process, so deleting that here would pull the
+// database out from under every later test file.
+afterAll(() => {
+  rmTestDataDir(DATA_DIR);
+});
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";

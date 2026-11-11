@@ -49,6 +49,19 @@ function parseLsFilters(args: string[]): LsFilters {
   return f;
 }
 
+/**
+ * `--repo`/`--workdir` match: the task's own `workdir`, or — for a
+ * multi-repository task, whose `workdir` is the non-git workspace root — any
+ * selected repository's path or workspace name. Without the repository arm a
+ * multi task could never match the repo it actually works in.
+ */
+function matchesRepoFilter(task: Task, needle: string): boolean {
+  if (task.workdir.toLowerCase().includes(needle)) return true;
+  return (task.repositories ?? []).some(
+    (repo) => repo.path.toLowerCase().includes(needle) || repo.name.toLowerCase().includes(needle),
+  );
+}
+
 export async function cmdLs(
   args: string[],
   flags: Flags,
@@ -82,7 +95,7 @@ export async function cmdLs(
   if (f.type) tasks = tasks.filter((t) => t.taskType === f.type);
   if (f.repo) {
     const r = f.repo.toLowerCase();
-    tasks = tasks.filter((t) => t.workdir.toLowerCase().includes(r));
+    tasks = tasks.filter((t) => matchesRepoFilter(t, r));
   }
   if (f.search) {
     const q = f.search.toLowerCase();

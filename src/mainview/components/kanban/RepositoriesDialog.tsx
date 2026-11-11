@@ -34,6 +34,12 @@ interface Props {
  * (the issue's own repository) cannot be deselected — the issue dialog always
  * includes it, so letting the user uncheck it only meant pinPrimaryRepository
  * silently re-added it after save.
+ *
+ * A per-repository base ref is only offered for a genuinely multi selection
+ * (two or more entries after git-root dedupe). A single-repository task keeps
+ * the historical inline `WorktreeOptions` base ref, and the create payload
+ * never carries `repositories[]` for it — offering a second, ignored base-ref
+ * input here silently discarded whatever the user typed.
  */
 export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -52,6 +58,11 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
 
   const paths = useMemo(() => new Set(draft.map((e) => e.path)), [draft]);
   const names = useMemo(() => selectionNames(draft), [draft]);
+  // Whether a per-repository base ref is meaningful for this draft. Two
+  // entries under one git root collapse to a single-repository task on save
+  // (`dedupeSelections`), so they must not offer a second base-ref control
+  // either — the inline Branch picker owns that task's base ref.
+  const multiSelection = useMemo(() => dedupeSelections(draft).length > 1, [draft]);
 
   const toggle = (path: string) => {
     if (path === lockedPath) return;
@@ -99,7 +110,16 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
           }
         }),
       );
-      onSave(dedupeSelections(resolved));
+      const final = dedupeSelections(resolved);
+      // A single-repository selection has no per-repository base ref: the
+      // task's inline Branch picker owns it. Drop any value left over from an
+      // earlier multi selection so it can't resurface (and silently apply) if
+      // the user later adds a second repository.
+      onSave(
+        final.length > 1
+          ? final
+          : final.map((entry) => ({ path: entry.path, root: entry.root })),
+      );
       onClose();
     } finally {
       setBusy(false);
@@ -154,13 +174,19 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
               </label>
               {entry ? (
                 <div className="mt-1 flex items-center gap-2 pl-6">
-                  <Input
-                    value={entry.baseRef ?? ""}
-                    onChange={(e) => setBaseRef(path, e.target.value)}
-                    placeholder="Base ref (default HEAD)"
-                    className="h-7 text-xs"
-                    aria-label={`Base ref for ${path}`}
-                  />
+                  {multiSelection ? (
+                    <Input
+                      value={entry.baseRef ?? ""}
+                      onChange={(e) => setBaseRef(path, e.target.value)}
+                      placeholder="Base ref (default HEAD)"
+                      className="h-7 text-xs"
+                      aria-label={`Base ref for ${path}`}
+                    />
+                  ) : (
+                    <span className="min-w-0 flex-1 text-[10px] text-muted-foreground">
+                      Branches from the Branch field's base ref.
+                    </span>
+                  )}
                   <Button
                     size="icon"
                     variant="ghost"

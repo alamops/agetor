@@ -303,8 +303,9 @@ export class AgetorClient {
   getRuns(id: string): Promise<Run[]> {
     return this.req("GET", `/tasks/${id}/runs`);
   }
-  getDiff(id: string): Promise<TaskDiff> {
-    return this.req("GET", `/tasks/${id}/diff`);
+  getDiff(id: string, repo?: string | null): Promise<TaskDiff> {
+    const query = repo ? `?repo=${encodeURIComponent(repo)}` : "";
+    return this.req("GET", `/tasks/${id}/diff${query}`);
   }
   getGitStatus(id: string): Promise<TaskGitStatus> {
     return this.req("GET", `/tasks/${id}/git-status`);

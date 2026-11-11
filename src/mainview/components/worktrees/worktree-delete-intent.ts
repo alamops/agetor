@@ -77,12 +77,28 @@ export type DeleteOutcome = { kind: "silent" } | { kind: "error"; message: strin
  * `undefined` means the caller didn't request `awaitTeardown` (or the server
  * predates it) — nothing to report, so treat it as silent success and let the
  * list refresh speak for itself.
+ *
+ * For a multi-repository teardown the failing entry is named
+ * (`repositories[]`), because deleting any one row archives the whole task:
+ * the branch passed by the clicked row may belong to a repository that was
+ * removed successfully, while a sibling is the one holding uncommitted work.
  */
 export function triageDeleteOutcome(teardown: WorktreeTeardownResult | undefined, branch: string | null): DeleteOutcome {
   if (teardown === undefined) return { kind: "silent" };
   if (teardown.removed) return { kind: "silent" };
-  const name = branch ?? "this worktree";
-  switch (teardown.reason) {
+  // A multi-repository delete archives the WHOLE task, so the failure may
+  // belong to a sibling repository, not the row the user clicked. Name the
+  // repository that actually failed rather than that row's branch, or the
+  // toast points the user at the wrong checkout.
+  const failedRepo = teardown.repositories?.find(
+    (repo) =>
+      !repo.result.removed
+      && repo.result.reason !== "no-worktree"
+      && repo.result.reason !== "already-absent",
+  );
+  const reason = failedRepo?.result.reason ?? teardown.reason;
+  const name = failedRepo ? `repository "${failedRepo.name}"` : (branch ?? "this worktree");
+  switch (reason) {
     case "no-worktree":
     case "already-absent":
       return { kind: "silent" };

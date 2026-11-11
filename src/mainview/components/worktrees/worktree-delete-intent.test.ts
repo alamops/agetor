@@ -212,6 +212,38 @@ describe("triageDeleteOutcome", () => {
     }
   });
 
+  test("multi-repository partial teardown names the failing repository, not the clicked row's branch", () => {
+    // Deleting any repository row archives the WHOLE task: the dirty sibling
+    // is the failure, while the clicked row may have been removed cleanly.
+    const teardown: WorktreeTeardownResult = {
+      removed: false,
+      reason: "dirty",
+      repositories: [
+        { name: "frontend", result: { removed: true } },
+        { name: "backend", result: { removed: false, reason: "dirty" } },
+      ],
+    };
+    const outcome = triageDeleteOutcome(teardown, "agetor/frontend-branch");
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toContain('repository "backend"');
+      expect(outcome.message).not.toContain("frontend");
+      expect(outcome.message).toContain("uncommitted");
+    }
+  });
+
+  test("multi-repository teardown where only no-op entries failed is silent", () => {
+    const teardown: WorktreeTeardownResult = {
+      removed: false,
+      reason: "already-absent",
+      repositories: [
+        { name: "frontend", result: { removed: false, reason: "already-absent" } },
+        { name: "backend", result: { removed: false, reason: "no-worktree" } },
+      ],
+    };
+    expect(triageDeleteOutcome(teardown, "branch")).toEqual({ kind: "silent" });
+  });
+
   test("error messages fall back sensibly when branch is null", () => {
     const teardown: WorktreeTeardownResult = { removed: false, reason: "failed" };
     const outcome = triageDeleteOutcome(teardown, null);

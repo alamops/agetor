@@ -28,8 +28,11 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *     (the prompt is aggregate, not selected-tab-scoped).
  *  4. the terminal section defaults to the workspace root and follows the
  *     run-panel repository tab (issue #291 review M2).
- *  5. archive detaches both clean worktrees, keeps the branches, and
- *     unarchive restores them.
+ *  5. the selected repository tab resets on a task switch.
+ *  6. archive detaches every clean repository worktree (keeping the branches)
+ *     and unarchive restores them.
+ *  7. a later archive that finds one repository dirty leaves just that
+ *     checkout and the workspace in place.
  */
 
 test.describe.configure({ mode: "serial" });
@@ -168,7 +171,12 @@ test("create via the real UI: the Repositories dialog sends both repos and start
   const reposDialog = page.getByRole("dialog", { name: "Repositories" });
   await expect(reposDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await expect(reposDialog.getByLabel(`Select ${repoA}`, { exact: true })).toBeChecked();
+  // A single-repository selection keeps the inline Branch field's base ref:
+  // no per-repository input may be offered, or whatever the user typed there
+  // was silently discarded at create time (review round six).
+  await expect(reposDialog.getByLabel(`Base ref for ${repoA}`, { exact: true })).toHaveCount(0);
   await reposDialog.getByLabel(`Select ${repoB}`, { exact: true }).check();
+  await expect(reposDialog.getByLabel(`Base ref for ${repoA}`, { exact: true })).toBeVisible();
   await reposDialog.getByLabel(`Base ref for ${repoB}`, { exact: true }).fill("main");
   // A same-git-root sibling is selectable but must dedupe away on save.
   await reposDialog.getByLabel(`Select ${repoSibling}`, { exact: true }).check();
@@ -310,14 +318,19 @@ test("the selected repository tab resets on a task switch (sibling of the allPrs
   await expect(secondTab).toHaveAttribute("aria-selected", "false");
 });
 
-test("archive detaches both clean worktrees and keeps the branches", async ({ backend, request }) => {
+test("archive detaches every clean worktree (keeping the branches) and unarchive restores them", async ({ backend, request }) => {
   const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
-  // Make exactly one repository dirty (test 2 changed both; the chip test
-  // cleaned the first).
+  // Test 2 wrote one file into each worktree; clean both so the teardown has
+  // no dirty repository to protect.
   const before = (await (await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth })).json()) as {
-    repositories: { worktreePath: string }[];
+    worktreePath: string;
+    repositories: { path: string; worktreePath: string; branch: string }[];
   };
-  await rm(path.join(before.repositories[0]!.worktreePath, "front.txt"), { force: true });
+  for (const repo of before.repositories) {
+    await rm(path.join(repo.worktreePath, "front.txt"), { force: true });
+    await rm(path.join(repo.worktreePath, "back.txt"), { force: true });
+  }
+
   // `force` bypasses the Done-column gate (the Worktrees page's own delete
   // path); `stopRun` stops a still-live fake run first.
   const res = await request.post(`${backend.apiBase}/tasks/${taskId}/archive`, {
@@ -326,14 +339,50 @@ test("archive detaches both clean worktrees and keeps the branches", async ({ ba
   });
   expect(res.ok()).toBe(true);
   const body = (await res.json()) as {
-    repositories: { worktreePath: string; branch: string }[];
+    repositories: { path: string; worktreePath: string; branch: string }[];
     teardown?: { removed: boolean; repositories?: { name: string; result: { removed: boolean } }[] };
   };
-  // The two changed files make one repository dirty, so the aggregate teardown
-  // reports not-removed and that repository's checkout (and the workspace)
-  // stays; the clean one was detached and both branches survive.
+  expect(body.teardown?.removed).toBe(true);
+  expect(body.teardown?.repositories?.map((r) => r.result.removed)).toEqual([true, true]);
+  expect(existsSync(before.worktreePath)).toBe(false);
+  for (const repo of body.repositories) {
+    expect(existsSync(repo.worktreePath)).toBe(false);
+    // Branches (and every commit on them) survive the detach.
+    expect(git(repo.path, ["rev-parse", "--verify", `refs/heads/${repo.branch}`])).not.toBe("");
+  }
+
+  // Unarchive re-materializes every repository at the same deterministic
+  // paths, back on the task branch.
+  const unarchived = await request.post(`${backend.apiBase}/tasks/${taskId}/unarchive`, { headers: auth });
+  expect(unarchived.ok()).toBe(true);
+  const restored = (await (await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth })).json()) as {
+    repositories: { worktreePath: string; branch: string }[];
+  };
+  for (const repo of restored.repositories) {
+    expect(existsSync(repo.worktreePath)).toBe(true);
+    expect(git(repo.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(repo.branch);
+  }
+});
+
+test("archive leaves a dirty repository's checkout and the workspace in place", async ({ backend, request }) => {
+  const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+  const before = (await (await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth })).json()) as {
+    worktreePath: string;
+    repositories: { worktreePath: string }[];
+  };
+  // Only the second repository is dirty; the first must still be detached.
+  await writeFile(path.join(before.repositories[1]!.worktreePath, "dirty.txt"), "uncommitted\n");
+  const res = await request.post(`${backend.apiBase}/tasks/${taskId}/archive`, {
+    headers: auth,
+    data: { force: true, awaitTeardown: true, stopRun: true },
+  });
+  expect(res.ok()).toBe(true);
+  const body = (await res.json()) as {
+    teardown?: { removed: boolean; repositories?: { name: string; result: { removed: boolean } }[] };
+  };
   expect(body.teardown?.removed).toBe(false);
-  expect(body.repositories.every((r) => r.branch.length > 0)).toBe(true);
-  const dirty = body.repositories.filter((r) => existsSync(r.worktreePath));
-  expect(dirty).toHaveLength(1);
+  expect(body.teardown?.repositories?.map((r) => r.result.removed)).toEqual([true, false]);
+  expect(existsSync(before.repositories[0]!.worktreePath)).toBe(false);
+  expect(existsSync(before.repositories[1]!.worktreePath)).toBe(true);
+  expect(existsSync(before.worktreePath)).toBe(true);
 });

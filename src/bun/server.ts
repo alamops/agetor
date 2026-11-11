@@ -111,6 +111,7 @@ import {
 import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
 import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels, formatCursorAskFollowup } from "../shared/cursor-ask.ts";
 import {
+  MULTI_REPO_CONCURRENCY,
   getAheadCount,
   getTaskDiff,
   getTaskDiffBlob,
@@ -6996,7 +6997,8 @@ export function startApiServer(
           if (isMultiRepoTask(t)) {
             // One batched response for every repository (issue #291) — the
             // webview polls this once per 5 s, never once per repo. Bounded at
-            // 4 concurrent repositories so N repos can't fan out 3N git
+            // the same concurrency as worktree preparation
+            // (`MULTI_REPO_CONCURRENCY`) so N repos can't fan out 3N git
             // spawns at once on the shared main thread.
             const repos = (t.repositories ?? []).map((repo) => ({
               name: repo.name,
@@ -7005,10 +7007,10 @@ export function startApiServer(
               baseRef: repo.baseRef,
             }));
             const perRepo: TaskRepoGitStatus[] = [];
-            for (let i = 0; i < repos.length; i += 4) {
+            for (let i = 0; i < repos.length; i += MULTI_REPO_CONCURRENCY) {
               perRepo.push(
                 ...(await Promise.all(
-                  repos.slice(i, i + 4).map(async (repo) => ({
+                  repos.slice(i, i + MULTI_REPO_CONCURRENCY).map(async (repo) => ({
                     ...(await taskGitStatusForDir(repo.dir, repo.baseRef)),
                     name: repo.name,
                     path: repo.path,

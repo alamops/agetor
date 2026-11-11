@@ -545,3 +545,34 @@ test("needs column: a plain (non-pipeline) task's null pipelineId never shows a 
   const row = dataRowLine();
   expect(row).not.toContain("pipeline");
 });
+
+test("--repo matches a multi task's selected repositories, not just its workspace workdir", async () => {
+  const multi = task({
+    id: "multi001",
+    title: "Cross-repo",
+    // The workspace root is what `workdir` holds — it names neither repo.
+    workdir: "/data/worktrees/multi001",
+    repositories: [
+      "/src/frontend",
+      "/src/backend",
+    ].map((p) => ({
+      path: p,
+      name: p.split("/").pop()!,
+      branch: "feature/auth",
+      branchSource: "created" as const,
+      worktreePath: null,
+      baseRef: null,
+      checkoutBranch: null,
+      prUrl: null,
+    })),
+  } as unknown as Partial<Task>);
+  currentClient = makeClient([multi]);
+
+  await cmdLs(["--repo", "backend"], flags);
+  expect(dataRowLine()).toContain("Cross-repo");
+  expect(outputs[0]).toContain("2 repos");
+
+  outputs.length = 0;
+  await cmdLs(["--repo", "nope"], flags);
+  expect(outputs).toEqual(["no matching tasks"]);
+});

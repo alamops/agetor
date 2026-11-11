@@ -167,9 +167,10 @@ export const USAGE: Record<string, string> = {
 
   Restore an archived task.`,
 
-  diff: `usage: agetor diff <task-id>
+  diff: `usage: agetor diff <task-id> [--repo <name>]
 
-  Show the task's git diff (worktree vs its pinned base ref).`,
+  Show the task's git diff (worktree vs its pinned base ref). A
+  multi-repository task prints every repository by default; --repo picks one.`,
 
   rm: `usage: agetor rm <task-id> [--yes]
 

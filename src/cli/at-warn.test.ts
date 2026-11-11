@@ -538,6 +538,54 @@ test("unresolvedRefsForTask: multi lists every repository, never the workspace r
   expect(dirs.sort()).toEqual(["/wt/t1/backend", "/wt/t1/frontend"]);
 });
 
+test("unresolvedRefsForTask: a repository's own root resolves (`@frontend`, `@frontend/`)", async () => {
+  const client = {
+    listProjectFiles: async (scope: { dir: string }) => (
+      scope.dir.endsWith("frontend")
+        ? { files: ["src/a.ts"], truncated: false }
+        : // An empty listing still proves nothing about tokens, but the
+          // repository root itself is a real directory at the workspace root.
+          { files: [], truncated: false }
+    ),
+    agentDiscovery: async () => ({ commands: [], extensions: [] }),
+  } as unknown as AgetorClient;
+
+  expect(
+    await unresolvedRefsForTask(
+      client,
+      multiRepoTask(),
+      "read @frontend, @frontend/ and @backend/ plus @frontend/src/a.ts",
+    ),
+  ).toEqual([]);
+});
+
+test("unresolvedRefsForTask: repeated tokens spend the verification budget once", async () => {
+  const searches: string[] = [];
+  const client = {
+    listProjectFiles: async (scope: { dir: string; q?: string | null }) => {
+      if (scope.q) {
+        searches.push(scope.q);
+        return { files: [], truncated: true };
+      }
+      return scope.dir.endsWith("frontend")
+        ? { files: ["src/known.ts"], truncated: true }
+        : { files: ["src/b.ts"], truncated: false };
+    },
+    agentDiscovery: async () => ({ commands: [], extensions: [] }),
+  } as unknown as AgetorClient;
+
+  const repeated = Array.from({ length: 9 }, () => "@frontend/missing.ts").join(" ");
+  const warned = await unresolvedRefsForTask(
+    client,
+    multiRepoTask(),
+    `${repeated} @frontend/other.ts`,
+  );
+  // Deduped before the 8-candidate budget, so `other.ts` is still verified —
+  // and the warning names each distinct reference once.
+  expect(searches.sort()).toEqual(["missing.ts", "other.ts"]);
+  expect(warned.sort()).toEqual(["@frontend/missing.ts", "@frontend/other.ts"]);
+});
+
 test("unresolvedRefsForTask: a truncated repository verifies its own repo-local path", async () => {
   const searches: Array<{ dir: string; q?: string | null }> = [];
   const client = {

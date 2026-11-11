@@ -75,6 +75,30 @@ export function buildFileEntries(files: string[]): FileEntry[] {
   return entries;
 }
 
+/**
+ * Add one `<name>/` directory row per named scope (a multi-repository
+ * workspace's repository roots), preserving the listing's sort order and
+ * de-duplicating an already-present root. The merged multi listing only holds
+ * paths *inside* each repository — `frontend/src/a.ts`, never `frontend/` —
+ * so a bare `@frontend` token (a real directory at the workspace root, which
+ * send-time expansion resolves) looked unresolved in the popover/highlight
+ * and triggered a false "won't resolve" warning. `names` is `[]` for a
+ * single-scope listing, where this is a no-op returning `entries` unchanged.
+ */
+export function addScopeRoots(entries: FileEntry[], names: readonly string[]): FileEntry[] {
+  if (names.length === 0) return entries;
+  const present = new Set(entries.map((e) => e.path));
+  const roots: FileEntry[] = [];
+  for (const name of names) {
+    const root = `${name}/`;
+    if (present.has(root)) continue;
+    present.add(root);
+    roots.push({ path: root, isDirectory: true });
+  }
+  if (roots.length === 0) return entries;
+  return [...entries, ...roots].sort((a, b) => comparePaths(a.path, b.path));
+}
+
 /** A successful fuzzy match: `score` for ranking (higher is better) and
  *  `indices` — the positions in `path` (original string, original case)
  *  that matched a query character, in ascending order, for a caller to bold

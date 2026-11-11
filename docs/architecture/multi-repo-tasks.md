@@ -64,15 +64,24 @@ path gate probes every selected path (`PathParam.itemField`).
 
 `prepareTaskWorkdir` (`src/bun/worktree.ts`) delegates to `prepareWorkdir`
 unchanged for ≤1 repository. For 2+ it resolves the workspace with
-`workspacePathFor` — the task's mirrored `worktreePath`/`workdir` when it is
-inside `<dataDir>/worktrees`, else `<WORKTREES_DIR>/<task-id>` — and creates one
-linked worktree per repository via `prepareRepoWorktree` (max 4 concurrent),
-reusing an existing entry's checkout without creating or switching anything. A
-pipeline step row copies its parent's workspace, so it reuses the same
-workspace instead of materializing an empty `<WORKTREES_DIR>/<step-id>`. It is
-**all-or-nothing**: every failure is collected, worktrees/branches created in
-this attempt are rolled back, reused ones are left alone, and the error names
-every failed repository. A repository that already holds the shared branch gets
+`workspacePathFor` — the task's mirrored `worktreePath`/`workdir` when it is a
+*strict direct child* of `<dataDir>/worktrees` (the root itself and deeper
+paths are refused, so a corrupt row can never make teardown rmdir the managed
+directory), else `<WORKTREES_DIR>/<task-id>` — and creates one linked worktree
+per repository via `prepareRepoWorktree` (`MULTI_REPO_CONCURRENCY`, 4 at a
+time), reusing an existing entry's checkout without creating or switching
+anything. A recorded path that is no longer a linked worktree of that
+repository is not reused (it would start the agent in a broken cwd); a real
+checkout still sitting at the deterministic target is adopted instead of
+deleted, and only a stale non-worktree child is cleared before
+`git worktree add` so a failed attempt/teardown cannot permanently block the
+next start. A pipeline step row copies its parent's workspace, so it reuses the
+same workspace instead of materializing an empty
+`<WORKTREES_DIR>/<step-id>`. It is **all-or-nothing**: every failure is
+collected, worktrees/branches materialized in this attempt are rolled back
+(including an `rm` fallback when `git worktree remove` fails, mirroring
+`removeOneWorktree`; the branch is only deleted when this attempt minted it),
+reused ones are left alone, and the error names every failed repository. A repository that already holds the shared branch gets
 a per-repo `-N` fallback; `takenBranches` is keyed by the selected project path,
 and the per-repository lookup falls back to the git root so a subdirectory
 selection still sees the pin.
@@ -103,10 +112,17 @@ also open inside one repository (`POST /tasks/:id/terminals { repo }`).
 
 - `GET /tasks/:id/diff?repo=<name>` computes that repository's diff against its
   own `baseRef`; omitted defaults to the first entry; an unknown name 400s.
+  `agetor diff <task-id>` prints every repository in labelled sections (JSON:
+  an array) and `--repo <name>` narrows it to one, so the CLI never silently
+  shows only `repositories[0]`.
 - `GET /tasks/:id/diff/blob?...&repo=` reads the matching worktree.
 - `GET /tasks/:id/git-status` returns one batched body: each repository's
   status in `repositories[]`, with the top-level fields mirroring the first for
-  old clients. One request per 5 s poll, bounded at 4 concurrent repositories.
+  old clients. One request per 5 s poll, bounded at `MULTI_REPO_CONCURRENCY`
+  (4) concurrent repositories — the same constant worktree preparation uses.
+- `agetor ls --repo`/`--workdir` matches the task's `workdir` or any selected
+  repository's path/workspace name; a multi task's `workdir` is the workspace
+  root, so matching only that never found its repositories.
 - `POST /github/pull-create` matches the task's entry by worktree path (then
   selected path) and stamps only that entry; first write wins; `task.prUrl`
   stays null. The run panel's "Create all PRs" walks the repositories that have
@@ -148,11 +164,16 @@ subdirectory selections under one root are not serialized against each other.)
 
 - **New Task / issue dialog** — `RepositoriesDialog` selects two or more
   projects (add folder, per-repo base, remove, dedupe by git root, non-blocking
-  warning above 10). One repository keeps today's inline project/branch/base;
-  2+ shows a summary and forces worktree isolation.
+  warning above 10). One repository keeps today's inline project/branch/base,
+  and the dialog offers **no** per-repository base input for it (a second,
+  ignored control silently discarded what the user typed); 2+ shows a summary
+  and forces worktree isolation. Saving a selection that promotes a different
+  first repository resets the inline base ref, exactly like the ProjectPicker.
 - **`@` files** — client-side union over one `/files/index` per repository
-  scope, entries prefixed `<name>/`. No new server listing route; workspace
-  containment is unchanged.
+  scope, entries prefixed `<name>/`, plus a `<name>/` root row per repository
+  so `@frontend` itself resolves (highlight, warning and the CLI advisory
+  pre-check all agree with send-time expansion). No new server listing route;
+  workspace containment is unchanged.
 - **Capability discovery** — `/agent-discovery` (project commands, skills,
   MCP servers and custom agents) is unioned over the same per-repository
   scopes as `@`: the webview composer, the run panel, the CLI (`agetor

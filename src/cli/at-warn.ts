@@ -236,6 +236,15 @@ export async function unresolvedRefsForTask(
     // rewrite.
     for (const file of buildFileEntries(entry.files)) validPaths.add(prefix + file.path);
   }
+  // The merged listing only contains paths *inside* each repository, but a
+  // repository's own root is a real directory at the workspace root — the
+  // agent can `@frontend` / `@frontend/` it and send-time expansion resolves
+  // it. Add the root for every multi scope (an empty or failed listing still
+  // does not make the repository itself suspect) or the advisory pre-check
+  // falsely warned about a valid reference.
+  for (const scope of scopes) {
+    if (scope.name) validPaths.add(`${scope.name}/`);
+  }
 
   let unresolved = unresolvedAtTokens(prompt, validPaths);
   // A LIVE scope (`--isolation none`) runs on this same machine, so mirror
@@ -256,6 +265,7 @@ export async function unresolvedRefsForTask(
   );
 
   const proven = new Set<string>();
+  const seenVerify = new Set<string>();
   const verify: Array<{ raw: string; scope: RepoFileScope; path: string; isDirectory: boolean }> = [];
   for (const token of unresolved) {
     if (!keep.has(token.raw)) continue;
@@ -278,6 +288,10 @@ export async function unresolvedRefsForTask(
       proven.add(token.raw);
       continue;
     }
+    // A prompt may repeat the same token; each raw token costs one full-depth
+    // search below, so count it against the verification budget once.
+    if (seenVerify.has(token.raw)) continue;
+    seenVerify.add(token.raw);
     verify.push({ raw: token.raw, scope, path: localPath, isDirectory: token.isDirectory });
   }
 
@@ -293,7 +307,16 @@ export async function unresolvedRefsForTask(
     }),
   );
 
-  return unresolved.filter((token) => proven.has(token.raw)).map((token) => token.raw);
+  // Report each distinct reference once: a prompt that repeats the same
+  // unresolved token should not read as "9 @ references won't resolve".
+  const warned: string[] = [];
+  const seenWarned = new Set<string>();
+  for (const token of unresolved) {
+    if (!proven.has(token.raw) || seenWarned.has(token.raw)) continue;
+    seenWarned.add(token.raw);
+    warned.push(token.raw);
+  }
+  return warned;
 }
 
 /** `agentDiscovery`'s extension names, as the set `filterUnresolvedRefs`

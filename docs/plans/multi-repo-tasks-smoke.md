@@ -33,7 +33,9 @@ bun test src/bun/multi-repo-repro.test.ts src/bun/orchestrator-multi-repo.test.t
   src/mainview/lib/commit-push.test.ts src/mainview/lib/agent-capabilities.test.ts \
   src/cli/commands/add.test.ts \
   src/cli/commands/show.test.ts src/cli/commands/shell.test.ts \
-  src/cli/commands/rm.test.ts src/cli/tui/at-complete.test.ts src/cli/at-warn.test.ts
+  src/cli/commands/rm.test.ts src/cli/commands/diff.test.ts src/cli/ls.test.ts \
+  src/cli/tui/at-complete.test.ts src/cli/at-warn.test.ts \
+  src/mainview/components/worktrees/worktree-delete-intent.test.ts
 bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 ```
 
@@ -47,7 +49,11 @@ bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 | `bun test src/shared src/mainview src/cli` | 5,101 tests across 194 files — six load-sensitive fake-tmux/ink timing failures (Dashboard/AnswerOverlay/capture-refs); all passed on an isolated rerun |
 | `bun test src/cli src/shared` (round 5) | green — 3,025 tests across 89 files |
 | `bun test src/mainview` (round 5) | green — 2,077 tests across 105 files |
-| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 6 passed |
+| `bun run typecheck` (round 6) | green |
+| Focused unit suites (round 6) | green — `worktree` 134, `multi-repo`/`server`/teardown/CLI/mainview batches all pass |
+| `bun test src/mainview` (round 6) | green — 2,079 tests across 105 files |
+| `bun test src/shared src/cli` (round 6) | 2,948 pass; 88 known load-sensitive TUI/ink/bundle failures (none in the files this round touched); every touched file passes in isolation |
+| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 6 passed (round 5); 7 passed after the round-6 archive round-trip split |
 | `bun node_modules/@playwright/test/cli.js test e2e/issue-task.spec.ts` | 12 passed |
 | Migration 087 on an 086 DB | `src/bun/db-repositories.test.ts` / `src/bun/migrate.test.ts` |
 | Existing worktree tests | unchanged and green (the pre-change 116 plus the new multi-repo cases) |
@@ -142,6 +148,26 @@ must-fix plus four should-fixes. All are fixed with regressions:
 | `agetor add --repo …` without `--start` silently skipped the advisory `@` pre-check: it listed the not-yet-created, non-git workspace root | `unresolvedRefsForTask` lists every repository scope, merges `<name>/…` paths (including synthesized directories), warns on unprefixed workspace paths, and verifies truncated scopes with a repo-local full-depth search | `src/cli/at-warn.test.ts` — `unresolvedRefsForTask` tests; `src/cli/commands/add.test.ts` |
 | Nit: stale "also in the PR body" smoke heading | retitled "Known limitations" | this document |
 | Nit: literal `claude-code` fallback in `commands/discovery.ts` | `Task.agent` is required, so the dead fallback is gone | `bun run typecheck` |
+
+## Sixth review round
+
+At head `4b3a9b16` the re-review confirmed rounds 1–5 closed and opened one
+must-fix, six should-fixes and five nits. All are closed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| A single-repository selection still showed a per-repository base-ref input whose value create never sent (single tasks carry the branch inline) | the dialog only renders that input for a genuinely multi selection (`dedupeSelections`), drops a leftover single entry's `baseRef` on save, and says the Branch field owns it | `e2e/multi-repo-task.spec.ts` — single selection has no base input, adding a second reveals it |
+| Promoting a different first repository from the dialog kept the inline base ref picked for the old project | the dialog's `onSave` resets it, exactly like the ProjectPicker's `onChange` | `NewTaskForm.tsx` (same reset path as the picker) |
+| A stale workspace child left by a failed prepare/teardown permanently blocked the next start, and the rollback skipped checks it had just created | `clearWorkspaceChild` (stale non-worktree child only; a real checkout is adopted) + `createdHere` covers re-attach + rollback gained the `rm` fallback | `worktree.test.ts` — stale child, adopted checkout, reattach rollback |
+| `workspacePathFor` accepted `WORKTREES_DIR` itself as a workspace | it now requires a strict direct child of `WORKTREES_DIR` | `worktree.test.ts` — `workspacePathFor` confinement |
+| `agetor ls --repo` only compared `workdir`, which is the non-git workspace root for a multi task | matches any selected repository's path/workspace name too | `src/cli/ls.test.ts` |
+| `agetor diff` silently printed only `repositories[0]` | prints every repository in labelled sections; `--repo <name>` narrows; JSON array for the aggregate | `src/cli/commands/diff.test.ts` |
+| The archive e2e's title/header claimed clean detach + unarchive while it only exercised a dirty partial teardown | it now archives both clean worktrees, asserts the branches survive, unarchives and asserts both checkouts return; a separate test covers the dirty partial case | `e2e/multi-repo-task.spec.ts` |
+| Nit: `@<repo-root>` (e.g. `@frontend`) falsely warned "won't resolve" | each merged listing gains its repositories' root rows; the CLI pre-check adds the same roots | `src/cli/at-warn.test.ts`, `src/mainview/lib/use-project-files.test.ts`, `src/shared/at-file-filter.test.ts` |
+| Nit: repeated `@` tokens each spent one full-depth verification round trip | candidates are deduped by raw token before the budget | `src/cli/at-warn.test.ts` |
+| Nit: the git-status batch hardcoded 4 instead of the shared preparation constant | imports `MULTI_REPO_CONCURRENCY` | `bun run typecheck` (single source of truth) |
+| Nit: a partial multi teardown toasted the clicked row's branch even when a sibling repository failed | `triageDeleteOutcome` names the failing `repositories[]` entry | `src/mainview/components/worktrees/worktree-delete-intent.test.ts` |
+| Nit: the reproduction test leaked its temp data dir | `afterAll` removes it | `src/bun/multi-repo-repro.test.ts` |
 
 ## Live harness smoke matrix
 

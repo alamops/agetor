@@ -2433,6 +2433,106 @@ test("removeWorktree deletes every repository worktree and branch plus the empty
   }
 });
 
+test("workspacePathFor only adopts a strict direct child of WORKTREES_DIR", async () => {
+  const { workspacePathFor, WORKTREES_DIR, worktreePath } = await import("./worktree.ts");
+  const id = randomUUID();
+  const canonical = worktreePath(fakeTask({ id, workdir: WORKTREES_DIR }));
+  // The root itself must never become a workspace (teardown would rmdir the
+  // whole managed directory); a deeper/nested path is equally invalid.
+  expect(workspacePathFor(fakeTask({ id, workdir: WORKTREES_DIR, worktreePath: WORKTREES_DIR }))).toBe(canonical);
+  const deep = path.join(WORKTREES_DIR, "parent", "child");
+  expect(workspacePathFor(fakeTask({ id, workdir: deep, worktreePath: deep }))).toBe(canonical);
+  // A pipeline step's mirrored parent workspace is a direct child and is kept.
+  const mirrored = path.join(WORKTREES_DIR, "parent-id");
+  expect(workspacePathFor(fakeTask({ id, workdir: mirrored, worktreePath: mirrored }))).toBe(mirrored);
+});
+
+test("prepareTaskWorkdir clears a stale non-worktree child so it can start again", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: await revParse(a, "HEAD") },
+    { path: b, name: "backend", baseRef: await revParse(b, "HEAD") },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  const stale = path.join(workspace, "frontend");
+  // A failed `git worktree add` / teardown can leave a plain directory here;
+  // `git worktree add` refuses non-empty destinations, which used to block the
+  // task forever.
+  mkdirSync(stale, { recursive: true });
+  writeFileSync(path.join(stale, "leftover.txt"), "half-built\n");
+  try {
+    const r = await prepareTaskWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(existsSync(path.join(stale, "leftover.txt"))).toBe(false);
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], stale)).toBe("feature/auth");
+    expect(existsSync(path.join(workspace, "backend", ".git"))).toBe(true);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("prepareTaskWorkdir adopts a real checkout left at the target instead of discarding its work", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: await revParse(b, "HEAD") },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  const frontend = path.join(workspace, "frontend");
+  mkdirSync(workspace, { recursive: true });
+  // The row lost its recorded path, but the checkout (with uncommitted work)
+  // is real — adopting it must not delete that work.
+  await git(["worktree", "add", "-b", "feature/auth", frontend, shaA], a);
+  writeFileSync(path.join(frontend, "wip.txt"), "wip\n");
+  try {
+    const r = await prepareTaskWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.repositories?.[0]?.worktreePath).toBe(frontend);
+    expect(r.note).toContain("reusing worktree");
+    expect(existsSync(path.join(frontend, "wip.txt"))).toBe(true);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("a failed prepare rolls back a re-attached worktree it materialized", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const notARepo = mkdtempSync(path.join(tmpdir(), "agetor-wt-repo-notrepo-"));
+  await git(["branch", "feature/auth"], a);
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: null },
+    { path: notARepo, name: "backend", baseRef: null },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  // The frontend materialized before (recorded path) but its directory is
+  // gone — this attempt re-attaches it, so it is this attempt's to roll back.
+  task.repositories![0]!.worktreePath = path.join(workspace, "frontend");
+  task.worktreePath = workspace;
+  task.workdir = workspace;
+  try {
+    const r = await prepareTaskWorkdir(task);
+    expect("error" in r).toBe(true);
+    if (!("error" in r)) return;
+    expect(r.error).toContain("backend");
+    expect(existsSync(path.join(workspace, "frontend"))).toBe(false);
+    expect(existsSync(workspace)).toBe(false);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(notARepo, { recursive: true, force: true });
+  }
+});
+
 test("resolveWorktreeRef accepts direct and nested ids and refuses traversal", async () => {
   const { resolveWorktreeRef, WORKTREES_DIR } = await import("./worktree.ts");
   const direct = resolveWorktreeRef("abc-123");

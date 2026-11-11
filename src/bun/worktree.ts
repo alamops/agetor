@@ -944,7 +944,17 @@ export function worktreePath(task: Task): string {
  */
 export function workspacePathFor(task: Task): string {
   const mirrored = task.worktreePath ?? task.workdir;
-  if (mirrored && lexicallyInsideRoot(WORKTREES_DIR, mirrored)) return mirrored;
+  // Require a direct child of WORKTREES_DIR: the root itself must never be
+  // adopted as a workspace (a hand-edited/corrupt row pointing at
+  // `WORKTREES_DIR` would make teardown rmdir the whole managed directory and
+  // preparation mkdir it). Deeper descendants are equally invalid — every
+  // workspace is exactly `<WORKTREES_DIR>/<task-id>`.
+  if (
+    mirrored
+    && path.dirname(path.resolve(mirrored)) === path.resolve(WORKTREES_DIR)
+  ) {
+    return mirrored;
+  }
   return worktreePath(task);
 }
 
@@ -1417,6 +1427,48 @@ async function mapBounded<T, R>(items: T[], limit: number, fn: (item: T, index: 
 }
 
 /**
+ * True when `dir` is a linked worktree whose `.git` pointer names `root` as
+ * its source repository. Used to distinguish a recorded worktree whose
+ * `symbolic-ref` read transiently failed (keep it!) from a stale directory a
+ * crash left at the same path (safe to clear).
+ */
+function isLinkedWorktreeOf(dir: string, root: string): boolean {
+  const source = parseWorktreeGitPointer(dir);
+  if (!source) return false;
+  try {
+    return realpathSync(source) === realpathSync(root);
+  } catch {
+    return source === root;
+  }
+}
+
+/**
+ * Clear a stale directory sitting at a repository's deterministic workspace
+ * child (`<workspace>/<slug>`), so `git worktree add` can materialize the
+ * checkout there again.
+ *
+ * A previous prepare can leave such a directory behind when `git worktree add`
+ * fails after creating the path, or when a teardown's `git worktree remove`
+ * fails (its `rm` fallback is best-effort). `git worktree add` refuses a
+ * non-empty destination and the branch-collision recovery deliberately does
+ * not treat "already exists" as a name collision, so without this the task
+ * could never start again. The path is confined to agetor's own workspace and
+ * the branch (with every commit on it) lives in the source repo, so removing
+ * the checkout loses nothing. Never recursive-deletes outside `WORKTREES_DIR`.
+ */
+async function clearWorkspaceChild(target: string, root: string): Promise<void> {
+  if (!existsSync(target)) return;
+  const resolved = path.resolve(target);
+  if (resolved === path.resolve(WORKTREES_DIR) || !lexicallyInsideRoot(WORKTREES_DIR, target)) return;
+  const removed = await git(["worktree", "remove", "--force", target], root);
+  if (!removed.ok && existsSync(target)) {
+    try { await rm(target, { recursive: true, force: true }); }
+    catch { /* best-effort — the add below reports the real failure */ }
+  }
+  await git(["worktree", "prune"], root, 10_000);
+}
+
+/**
  * Materialize a task's working directory. A single-repository task (or a
  * legacy row, whose `repositories` has one derived entry) delegates to
  * {@link prepareWorkdir} unchanged, so its behavior is byte-identical. A
@@ -1426,9 +1478,10 @@ async function mapBounded<T, R>(items: T[], limit: number, fn: (item: T, index: 
  *
  * All-or-nothing: every repository is attempted (at most
  * {@link MULTI_REPO_CONCURRENCY} at a time) so one failure doesn't hide the
- * others; if any fails, worktrees and branches created in THIS attempt are
- * removed, any pre-existing/reused ones are left alone, and the returned error
- * names every failed repository. `takenBranches` is keyed by source git root.
+ * others; if any fails, every checkout materialized in THIS attempt is
+ * removed (a reused-and-still-present one is left alone), any branch minted in
+ * this attempt is deleted, and the returned error names every failed
+ * repository. `takenBranches` is keyed by source git root.
  */
 export async function prepareTaskWorkdir(
   task: Task,
@@ -1478,9 +1531,22 @@ export async function prepareTaskWorkdir(
     const branch = repo.branch ?? task.branch ?? branchName(task);
 
     // Reuse an existing worktree exactly like the single-repo path: report the
-    // live checkout, never check out or create anything.
+    // live checkout, never check out or create anything. A recorded path that
+    // is no longer a linked worktree of this repository (a crash left a plain
+    // directory there) is NOT reused — doing so started the agent in a broken
+    // cwd forever — and falls through to the creation path, which clears it.
+    // A checkout still sitting at the deterministic target is adopted when the
+    // row lost its recorded path; it may hold uncommitted work, so deleting
+    // it as "stale" would be wrong.
+    let reusable: { dir: string; live: Awaited<ReturnType<typeof readCheckoutBranch>> } | null = null;
     if (repo.worktreePath && existsSync(repo.worktreePath)) {
       const live = await readCheckoutBranch(repo.worktreePath);
+      if (live.ok || isLinkedWorktreeOf(repo.worktreePath, root)) reusable = { dir: repo.worktreePath, live };
+    } else if (existsSync(target) && isLinkedWorktreeOf(target, root)) {
+      reusable = { dir: target, live: await readCheckoutBranch(target) };
+    }
+    if (reusable) {
+      const { dir, live } = reusable;
       const checkoutBranch = live.ok ? live.branch : null;
       let where: string;
       if (!live.ok) where = `on ${branch}`;
@@ -1492,10 +1558,10 @@ export async function prepareTaskWorkdir(
         createdHere: false,
         root,
         result: {
-          cwd: repo.worktreePath,
+          cwd: dir,
           branch,
-          worktreePath: repo.worktreePath,
-          note: `reusing worktree at ${repo.worktreePath} ${where}`,
+          worktreePath: dir,
+          note: `reusing worktree at ${dir} ${where}`,
           checkoutBranch,
           checkoutKnown: live.ok,
           createdBranch: false,
@@ -1503,6 +1569,11 @@ export async function prepareTaskWorkdir(
       };
     }
 
+    // Not reusable. Clear a stale checkout left at the deterministic target
+    // before `git worktree add` (see `clearWorkspaceChild`), then materialize
+    // it — so this attempt owns whatever now sits at `target`, including the
+    // re-attach case where the recorded directory had vanished.
+    await clearWorkspaceChild(target, root);
     const result = await prepareRepoWorktree({
       root,
       worktreePath: target,
@@ -1517,14 +1588,21 @@ export async function prepareTaskWorkdir(
       reattach: Boolean(repo.worktreePath),
       fetchExisting: false,
     });
-    return { repo, createdHere: !repo.worktreePath, root, result };
+    // This branch always materializes `target` (a recorded-but-absent
+    // directory is re-attached here too), so it is owned by this attempt for
+    // rollback purposes. The branch itself is only deleted when WE minted it.
+    return { repo, createdHere: true, root, result };
   });
 
   const failures = attempts.filter((a) => "error" in a.result);
   if (failures.length > 0) {
-    // Roll back only what THIS attempt created (a rolled-back branch is one we
-    // just minted, so deleting it can't lose the user's work). Best-effort,
-    // async, and ordered so two repos never race each other into a deadlock.
+    // Roll back only what THIS attempt materialized (a rolled-back branch is
+    // one we just minted, so deleting it can't lose the user's work).
+    // Best-effort, async, and ordered so two repos never race each other into
+    // a deadlock. `git worktree remove` can fail (e.g. the registration was
+    // already pruned or the path is a leftover plain directory); mirror
+    // `removeOneWorktree`'s rm fallback so a half-built child can't survive
+    // and permanently block the next start.
     await mapBounded(attempts, MULTI_REPO_CONCURRENCY, async (a) => {
       if (!a.createdHere || !a.root || "error" in a.result) return;
       const wt = a.result.worktreePath ?? path.join(workspace, a.repo.name);
@@ -1532,6 +1610,10 @@ export async function prepareTaskWorkdir(
       await git(["worktree", "remove", "--force", wt], a.root);
       if (branch) await git(["branch", "-D", branch], a.root);
       await git(["worktree", "prune"], a.root, 10_000);
+      if (existsSync(wt) && lexicallyInsideRoot(WORKTREES_DIR, wt)) {
+        try { await rm(wt, { recursive: true, force: true }); }
+        catch { /* best-effort — the boot sweep still lists the leftover */ }
+      }
     });
     removeWorkspaceIfEmpty(workspace);
     return {

@@ -138,6 +138,54 @@ test("teardown-preview names every repository's branches for a multi-repo task",
   }
 });
 
+test("a sharing task's other repository does not protect this repository's branch", async () => {
+  // Review should-fix: `heldByOthers` used to union EVERY branch of any task
+  // that shared the repository, so a sibling repository's same-named branch
+  // (frontend/backend commonly share a branch name) shielded this repo's
+  // branch from delete. Only the sharing task's entries for THIS repository
+  // may protect a name.
+  const { createTask, deleteTask, teardownBranchesForTask } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const base = { prompt: "p", agent: "claude-code", workdir: a, isolation: "worktree" as const, repositories: [{ path: a }, { path: b }] };
+  const victim = await createTask({ title: "victim task", ...base });
+  if ("error" in victim) throw new Error(victim.error);
+  const other = await createTask({ title: "other task", ...base });
+  if ("error" in other) throw new Error(other.error);
+  try {
+    const victimBranch = victim.task.repositories![0]!.branch!;
+    const prepared = await prepareTaskWorkdir(victim.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(victim.task.id, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(victim.task.id, prepared.repositories!);
+
+    const otherEntries = other.task.repositories!;
+    // Shares repo A, but the victim's branch name is held only in repo B.
+    tasks.setRepositories(other.task.id, [
+      { ...otherEntries[0]!, branch: "feature/other-a" },
+      { ...otherEntries[1]!, branch: victimBranch },
+    ]);
+    let preview = await teardownBranchesForTask(tasks.get(victim.task.id)!);
+    let planA = preview.repositories![0]!;
+    expect(planA.branches).toContain(victimBranch);
+    expect(planA.excluded.map((e) => e.branch)).not.toContain(victimBranch);
+
+    // The same name held in repo A really is protected.
+    tasks.setRepositories(other.task.id, [
+      { ...otherEntries[0]!, branch: victimBranch },
+      { ...otherEntries[1]!, branch: victimBranch },
+    ]);
+    preview = await teardownBranchesForTask(tasks.get(victim.task.id)!);
+    planA = preview.repositories![0]!;
+    expect(planA.branches).not.toContain(victimBranch);
+    expect(planA.excluded).toContainEqual({ branch: victimBranch, reason: "held-by-task" });
+  } finally {
+    await deleteTask(victim.task.id).catch(() => {});
+    await deleteTask(other.task.id).catch(() => {});
+  }
+});
+
 test("teardown-preview promises no branches for repositories delete never materialized", async () => {
   // Review should-fix: create pins each repository's branch, but a task that
   // is archived/deleted before it starts has no worktree. Delete skips those

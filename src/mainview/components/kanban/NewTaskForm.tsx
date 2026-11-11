@@ -909,7 +909,16 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                   value={repos.length > 0 ? repos : workdir ? [{ path: workdir, root: null }] : []}
                   onSave={(next) => {
                     setRepos(next);
-                    if (next[0] && next[0].path !== workdir) setWorkdir(next[0].path);
+                    // Saving can promote the second repository (or collapse the
+                    // selection back to a different first one), which changes
+                    // the task's project exactly like the ProjectPicker does.
+                    // Drop the base ref picked for the old project rather than
+                    // silently branching the new one from a ref that may not
+                    // exist there.
+                    if (next[0] && next[0].path !== workdir) {
+                      setWorkdir(next[0].path);
+                      wt.resetBaseRef();
+                    }
                   }}
                 />
               </div>

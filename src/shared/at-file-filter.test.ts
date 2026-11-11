@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import {
+  addScopeRoots,
   buildFileEntries,
   descendInto,
   filterFileEntries,
@@ -40,6 +41,34 @@ test("buildFileEntries: a directory sorts immediately before its own contents", 
     "src/mainview/",
     "src/mainview/app.tsx",
   ]);
+});
+
+// ── addScopeRoots ───────────────────────────────────────────────────────────
+
+test("addScopeRoots: adds one directory row per named scope, sorted and deduped", () => {
+  const entries = buildFileEntries(["frontend/src/a.ts", "backend/b.ts"]);
+  const withRoots = addScopeRoots(entries, ["frontend", "backend"]);
+  expect(withRoots.map((e) => e.path)).toEqual([
+    "backend/",
+    "backend/b.ts",
+    "frontend/",
+    "frontend/src/",
+    "frontend/src/a.ts",
+  ]);
+  expect(withRoots.find((e) => e.path === "frontend/")).toEqual({ path: "frontend/", isDirectory: true });
+});
+
+test("addScopeRoots: an already-listed root is not duplicated, and no names is a no-op", () => {
+  const entries: FileEntry[] = [
+    { path: "frontend/", isDirectory: true },
+    { path: "frontend/a.ts", isDirectory: false },
+  ];
+  expect(addScopeRoots(entries, ["frontend"])).toEqual(entries);
+  expect(addScopeRoots(entries, [])).toBe(entries);
+});
+
+test("addScopeRoots: a repository with no listed files still gets its root row", () => {
+  expect(addScopeRoots([], ["empty-repo"])).toEqual([{ path: "empty-repo/", isDirectory: true }]);
 });
 
 test("buildFileEntries: a file named like a directory prefix coexists with that directory", () => {

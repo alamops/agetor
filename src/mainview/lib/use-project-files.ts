@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
-import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
+import { addScopeRoots, buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 import { splitNamedScopePath } from "../../shared/file-scope.ts";
 
 /** The project scope a listing is fetched against — mirrors `GET
@@ -263,7 +263,15 @@ export function useProjectFileScopes(scopes: NamedFileScope[] | null | undefined
     setGen((g) => g + 1);
   }, [multi, key]);
 
-  const entries = useMemo(() => buildFileEntries(files), [files]);
+  const entries = useMemo(() => {
+    // Each repository's own root is a real directory at the workspace root,
+    // but the merged listing only carries its files. Add `<name>/` rows so
+    // `@frontend` resolves (send-time expansion already resolves it).
+    // `key` changes with the scope list, including its names.
+    const names = multi ? (scopes ?? []).map((s) => s.name) : [];
+    return addScopeRoots(buildFileEntries(files), names);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- key encodes scopes/names
+  }, [files, key, multi]);
   const validPaths = useMemo(() => new Set(entries.map((e) => e.path)), [entries]);
   return { entries, validPaths, truncated, loading, error, refresh };
 }

@@ -12069,20 +12069,27 @@ async function planOneRepoTeardown(
   for (const other of allTasks) {
     if (other.id === task.id || other.pipelineParentId) continue;
     // Other tasks holding this repo: same selected path, or any repository
-    // entry whose git root matches.
-    let shares = other.workdir === sourcePath;
-    if (!shares) {
-      const otherRepos = other.repositories ?? [];
-      for (const r of otherRepos) {
-        if (r.path === sourcePath) { shares = true; break; }
-        if (root && (await rootOf(r.path)) === root) { shares = true; break; }
+    // entry whose git root matches. Collect the matching ENTRIES too — a
+    // sharing task's other repositories must not shield this repository's
+    // branch just because they happen to use the same branch name.
+    const otherRepos = other.repositories ?? [];
+    const sharingEntries: TaskRepository[] = [];
+    for (const r of otherRepos) {
+      if (r.path === sourcePath || (root != null && (await rootOf(r.path)) === root)) {
+        sharingEntries.push(r);
       }
     }
-    if (!shares && root && (await rootOf(other.workdir)) === root) shares = true;
-    if (!shares) continue;
-    if (other.branch) heldByOthers.add(other.branch);
-    if (other.checkoutBranch) heldByOthers.add(other.checkoutBranch);
-    for (const r of other.repositories ?? []) {
+    // The scalar branch/checkout describes `workdir` (a single-repository
+    // row's only checkout; a multi row's workspace root is not a git repo, so
+    // this is false there and its per-repository entries are used instead).
+    const workdirInThisRepo = other.workdir === sourcePath
+      || (root != null && (await rootOf(other.workdir)) === root);
+    if (!workdirInThisRepo && sharingEntries.length === 0) continue;
+    if (workdirInThisRepo) {
+      if (other.branch) heldByOthers.add(other.branch);
+      if (other.checkoutBranch) heldByOthers.add(other.checkoutBranch);
+    }
+    for (const r of sharingEntries) {
       if (r.branch) heldByOthers.add(r.branch);
       if (r.checkoutBranch) heldByOthers.add(r.checkoutBranch);
     }
