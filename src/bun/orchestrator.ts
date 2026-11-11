@@ -11207,7 +11207,10 @@ export async function createTask(
   }
   if (keptRepositories.length === 1) {
     // Dedupe collapsed the selection (or the caller sent one path): use that
-    // path as the task's workdir, matching what the user selected.
+    // path as the task's workdir, matching what the user selected. This is the
+    // documented precedence — the repository set owns `workdir`, so an
+    // `input.workdir` alongside `repositories` never survives (the CLI sends
+    // this same anchor). For 2+ the workspace root is assigned further below.
     workdir = keptRepositories[0]!.path;
   }
 

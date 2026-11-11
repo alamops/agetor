@@ -245,7 +245,7 @@ must-fix and two should-fixes. All three are closed with regressions:
 | --- | --- | --- |
 | Must-fix R11-M1: `branchesPinnedByOtherTasks` keyed pins only by the selected path, so two multi tasks that picked sibling subdirectories of one repository never saw each other's pins — the second start silently attached to the first task's branch and commits | every pin is keyed by both its selected path and its resolved git root (`resolveRoot` injected as `repoRoot`, memoized), and both key sets are unioned at each lookup, covering create-time `ensureUniqueBranch` and start-time `prepareTaskWorkdir`; per-repository `-N` renames are preserved | `task-repos.test.ts` — root keying, resolver-failure fallback, union lookup; `orchestrator-multi-repo.test.ts` — sibling-subdirectory create; `worktree.test.ts` — sibling pin re-pins instead of adopting |
 | Should-fix R11-S1: `multiScopeStatTargets` used the prefixed token path as the stat key instead of the repo-relative path, so `@backend/.env` statted `<backend>/backend/.env` — the gitignored-file rescue was dead and valid prefixed tokens false-warned; the unit test asserted the inverted key | `paths` maps repo-local stat path → full token key (the warning layer's key): prefixed tokens use `splitNamedScopePath(...).path`; repository-root-only tokens are skipped | `at-scope-targets.test.ts` — `src/a.ts` and a prefixed `.env` map to the token, plus the root-only case |
-| Should-fix R11-S2: `agetor add --issue --repo` with an explicit `--workdir` matched the issue only against `--workdir`, which is not in the created repository set | the candidate list is the explicit `--workdir`, then every `--repo` in order, deduped, then cwd only when neither was given; the explicit workdir stays the task's workdir | `src/cli/commands/add.test.ts` — workdir-then-repo candidate order and created set |
+| Should-fix R11-S2: `agetor add --issue --repo` with an explicit `--workdir` matched the issue only against `--workdir`, which is not in the created repository set | the candidate list is the explicit `--workdir`, then every `--repo` in order, deduped, then cwd only when neither was given; the issue is attributed to the repository that matched, while the repository set owns the created task's workdir | `src/cli/commands/add.test.ts` — workdir-then-repo candidate order and created set |
 
 ## Twelfth review round
 
@@ -264,6 +264,22 @@ Round-12 verification: `bun run typecheck` green; the focused batch
 `task-repos`, `worktree`, `orchestrator-multi-repo`, `pipeline-runner`,
 `use-project-files`, `at-scope-targets`, `add` and `Dashboard` green (518
 tests across 8 files).
+
+## Thirteenth review round
+
+At head `15914fc1` the re-review confirmed round 12 closed and found no
+must-fixes or should-fixes — two nits in `DiffDialog.tsx` plus one owner
+question about `--workdir` precedence. All three are closed:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Nit R13-N1: `DiffDialog`'s fetched payload was stamped with the repository tab only, so opening the diff on task B while task A's active tab had the same repo name painted A's file list for one frame (the component stays mounted across close/open) | the payload is stamped with `{ taskId, repo }` and the derived `diff` requires both to match; the reset effect also clears it on close, so a reopen never holds the previous task's data | no component test (DOM behavior, per house convention); `bun run typecheck` plus the mainview suite |
+| Nit R13-N2: the fetch effect's comment still described deps as `[open, taskId]` when they are `[open, taskId, repo]` | the comment now names the repository tab as its own refetch trigger and explains why `task` itself is not a dep | — |
+| Q1 R13-Q1 (owner decision): `agetor add --workdir A --repo B` sent A as the task's workdir, but `createTask` always derives it from the repository set, so A was silently dropped — the R11-S2 note claimed A survived | the repository set owns `workdir`: `baseInput` sends the first `--repo` entry (the same anchor the server uses) instead of a conflicting `--workdir`; a `--workdir` alongside `--repo` remains an `--issue` attribution candidate only, and `usage.ts` plus the architecture doc state the rule | `src/cli/commands/add.test.ts` — conflicting `--workdir`/`--repo` payload; `src/bun/orchestrator-multi-repo.test.ts` — one kept entry vs 2+ anchors |
+
+Round-13 verification: `bun run typecheck` green; `add` (116), the full CLI
+suite (1,096), the mainview suite (2,105) and `orchestrator-multi-repo` (19)
+green.
 
 ## Live harness smoke matrix
 

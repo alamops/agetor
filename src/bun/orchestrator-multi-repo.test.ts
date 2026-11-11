@@ -341,6 +341,43 @@ test("two paths under one git root collapse to the single-repository layout", as
   }
 });
 
+test("the repository set owns workdir over an explicit one", async () => {
+  // Review round thirteen (Q1): `--workdir A --repo B` sent A as the task's
+  // workdir, but createTask derives it from the selected repositories, so A
+  // was silently dropped server-side. Pin the rule at the contract: one kept
+  // entry -> that entry's path, 2+ -> the per-task workspace root.
+  const { createTask, WORKTREES_DIR } = await load();
+  const a = await makeRepo("single-anchor");
+  const b = await makeRepo("multi-anchor");
+  const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-workdir-anchor-"));
+  try {
+    const single = await createTask({
+      title: "single anchor",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: elsewhere,
+      isolation: "worktree",
+      repositories: [{ path: a }],
+    });
+    if ("error" in single) throw new Error(single.error);
+    expect(single.task.workdir).toBe(a);
+    expect(single.task.repositories).toHaveLength(1);
+
+    const multi = await createTask({
+      title: "multi anchor",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: elsewhere,
+      isolation: "worktree",
+      repositories: [{ path: a }, { path: b }],
+    });
+    if ("error" in multi) throw new Error(multi.error);
+    expect(multi.task.workdir).toBe(path.join(WORKTREES_DIR, multi.task.id));
+  } finally {
+    cleanup(elsewhere, a, b);
+  }
+});
+
 test("a single repositories entry keeps its per-repository base ref", async () => {
   // Review S1: `agetor add --repo <path>=<ref>` sends ONE entry and its ref in
   // `repositories[].baseRef`. createTask took the ordinary single-repository

@@ -88,14 +88,20 @@ function lastSelectableIndex(rows: DiffRow[]): number {
  */
 export function DiffDialog({ open, task, onClose }: Props) {
   const taskId = task?.id ?? null;
-  // The fetched diff is stamped with the repository it belongs to, so a tab
-  // switch can never paint the previous repository's diff for a frame: the
-  // derived `diff` below is null until the matching response lands (the
-  // effect's own `setDiffState(null)` only runs after paint).
-  const [diffState, setDiffState] = useState<{ repo: string | null; data: TaskDiff } | null>(null);
+  // The fetched diff is stamped with both the task and the repository it
+  // belongs to, so neither a tab switch nor opening another task can paint the
+  // previous payload for a frame: the derived `diff` below is null until the
+  // matching response lands (the effect's own `setDiffState(null)` only runs
+  // after paint). Stamping `taskId` matters because this component stays
+  // mounted across close/open — switching from task A to task B whose active
+  // repository tab has the same name would otherwise leave A's file list
+  // visible for one frame.
+  const [diffState, setDiffState] = useState<
+    { taskId: string; repo: string | null; data: TaskDiff } | null
+  >(null);
   // Selected repository tab for a multi-repository task (issue #291).
   const [repo, setRepo] = useState<string | null>(null);
-  const diff = diffState && diffState.repo === repo ? diffState.data : null;
+  const diff = diffState && diffState.taskId === taskId && diffState.repo === repo ? diffState.data : null;
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [openFiles, setOpenFiles] = useState<Set<string>>(new Set());
@@ -408,16 +414,22 @@ export function DiffDialog({ open, task, onClose }: Props) {
 
   useEffect(() => {
     // Reset selection + composer state on every dialog close/reopen and on
-    // every diff refetch (this effect's deps mirror the fetch below), and
-    // abandon any drag that was still in flight (e.g. the dialog was closed
-    // mid-drag). Reads `cancelDrag` through the ref rather than depending on
-    // it directly — this effect also owns the diff fetch, so a dependency on
-    // the drag-callback chain would risk a refetch loop on future dep churn
-    // there; the ref keeps this effect's deps to just `[open, taskId]`.
+    // every diff refetch (this effect's deps are `[open, taskId, repo]`: the
+    // repository tab is its own refetch trigger, and `taskId` is the only task
+    // field that matters — the parent polls /tasks every 2s, so `task` itself
+    // would refetch on every poll tick), and abandon any drag that was still in
+    // flight (e.g. the dialog was closed mid-drag). Reads `cancelDrag` through
+    // the ref rather than depending on it directly — a dependency on the
+    // drag-callback chain would risk a refetch loop on future dep churn there.
     setSelected(new Map());
     updateLastClicked(null);
     setDraft("");
     setHint(null);
+    // Drop the stale payload on close/task switch too, not just before a
+    // refetch: a closed dialog still holds the last diff, and the stamp in
+    // `diff` is only a one-frame paint guard. Clearing here means reopening
+    // never briefly shows the previous task's file list.
+    setDiffState(null);
     cancelDragRef.current();
     if (!open || !taskId) return;
     const repos = task?.repositories ?? [];
@@ -431,12 +443,11 @@ export function DiffDialog({ open, task, onClose }: Props) {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    setDiffState(null);
     api
       .getTaskDiff(taskId, wanted)
       .then((d) => {
         if (cancelled) return;
-        setDiffState({ repo: wanted, data: d });
+        setDiffState({ taskId, repo: wanted, data: d });
         // Expand everything by default for small change sets; keep large ones
         // collapsed so the dialog stays responsive.
         setOpenFiles(d.files.length <= 8 ? new Set(d.files.map((f) => f.path)) : new Set());
@@ -448,9 +459,6 @@ export function DiffDialog({ open, task, onClose }: Props) {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-    // Key on task?.id, not `task` itself — the parent polls /tasks every 2s,
-    // so a new `task` object identity arrives constantly and would otherwise
-    // refetch the diff on every poll tick.
   }, [open, taskId, repo]);
 
   const totals = useMemo(() => {

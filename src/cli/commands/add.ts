@@ -288,10 +288,12 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
         ? lastError
         : new Error("--issue: that issue belongs to a different repository");
     }
-    // Preserve the historical single-project behavior: the task's workdir is
-    // the directory the issue matched (an explicit `--workdir`, or cwd).
-    // With `--repo`, the server derives it from the selected set, so leave
-    // `o.workdir` unset rather than arbitrarily pinning one candidate.
+    // Preserve the historical single-project behavior: with no repository set,
+    // the task's workdir is the directory the issue matched (an explicit
+    // `--workdir`, or cwd). With `--repo`, the repository set owns the
+    // workdir (baseInput sends its first entry), so leave `o.workdir` alone
+    // rather than arbitrarily pinning one candidate — a `--workdir` here only
+    // widened the issue-attribution search above.
     if (candidateDirs.length === 1 && o.repos.length === 0) o.workdir = matchedDir!;
     o.title ??= issueTaskTitle(thread.item);
     prompt ??= buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
@@ -504,7 +506,19 @@ function baseInput(
     // long-lived detached process with a stale/unrelated cwd) so a typed or
     // `--workdir`-flagged relative path lands on disk where the user meant,
     // matching `projects add`'s path.resolve(target).
-    workdir: o.workdir ? path.resolve(o.workdir) : o.workdir,
+    //
+    // The repository set owns the task's workdir: the server derives it from
+    // the selected entries (first kept path for a selection that collapses to
+    // one, the per-task workspace root for 2+), so an explicit `--workdir`
+    // alongside `--repo` must not be sent as the task's workdir — it would be
+    // silently overwritten server-side. Send the same anchor the server will
+    // use, keeping the payload self-consistent (a `--workdir` given only for
+    // `--issue` attribution has already done its job in `cmdAdd`).
+    workdir: o.repos.length > 0
+      ? path.resolve(o.repos[0]!.path)
+      : o.workdir
+        ? path.resolve(o.workdir)
+        : o.workdir,
     ...(o.repos.length > 0
       ? {
           repositories: o.repos.map((r) => ({

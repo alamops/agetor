@@ -21,7 +21,11 @@ export const USAGE: Record<string, string> = {
     --agent <id>       harness id          --workdir <path>   git repo to run in
     --repo <path[=ref]>  another repository for this task (repeatable; 2+
                         repos share one workspace and force worktree isolation;
-                        a repo without =ref starts from --base-ref, else HEAD)
+                        a repo without =ref starts from --base-ref, else HEAD;
+                        the repository set owns the task's workdir — its first
+                        entry when one is kept, the shared workspace for 2+ —
+                        so a bare --workdir alongside --repo only widens the
+                        --issue match)
     --isolation <m>    worktree | none     --base-ref <ref>   branch base (default HEAD)
     --model <id>   --mode <id>   --effort <id>
     --speed <s>        off | fast | ultrafast (what the model offers: cursor

@@ -368,8 +368,9 @@ test("cmdAdd: --issue uses --repo as the match target when --workdir is omitted"
   expect(getIssueThreadCalls).toEqual([{ path: repo, number: 7 }]);
   expect(createTaskCalls).toHaveLength(1);
   expect(createTaskCalls[0]!.repositories?.map((r) => r.path)).toEqual([repo]);
-  // No --workdir was given: let the server derive it from the repository set.
-  expect(createTaskCalls[0]!.workdir).toBeUndefined();
+  // No --workdir was given: the repository set owns it, so the payload names
+  // the same anchor the server derives from the selected entry.
+  expect(createTaskCalls[0]!.workdir).toBe(repo);
 });
 
 test("cmdAdd: --issue with several --repo entries tries each until one matches", async () => {
@@ -440,9 +441,12 @@ test("cmdAdd: --issue tries the --repo set after an explicit --workdir that does
     "/tmp/b-repo",
   ]);
   expect(createTaskCalls).toHaveLength(1);
-  // The explicit --workdir stays the task's workdir; the issue is attributed
-  // to the repository that matched, but creation still uses the given set.
-  expect(createTaskCalls[0]!.workdir).toBe("/tmp/elsewhere");
+  // The explicit --workdir is only an issue-attribution candidate: the
+  // repository set owns the task's workdir (the server overwrites it with the
+  // first kept path for a collapsed selection, or derives the workspace root
+  // for 2+), so the payload names that same anchor instead of sending a path
+  // the server would silently discard.
+  expect(createTaskCalls[0]!.workdir).toBe("/tmp/a-repo");
   expect(createTaskCalls[0]!.repositories?.map((r) => r.path)).toEqual([
     "/tmp/a-repo",
     "/tmp/b-repo",
@@ -1668,6 +1672,24 @@ test("cmdAdd: --repo sends repositories and forces worktree isolation", async ()
     { path: "/tmp/backend", baseRef: "b1" },
   ]);
   expect(input.isolation).toBe("worktree");
+  expect(input.workdir).toBe("/tmp/frontend");
+});
+
+test("cmdAdd: a repository set owns the workdir over a conflicting --workdir", async () => {
+  // Review round thirteen (Q1): `--workdir A --repo B` sent A as the task's
+  // workdir, but createTask always derives it from the repository set, so A
+  // was silently dropped server-side. The payload now sends the anchor the
+  // server will actually use; `--workdir` remains an `--issue` candidate.
+  const { client, createTaskCalls } = makePlainClient();
+  currentClient = client;
+  await cmdAdd(
+    ["--title", "Single", "--prompt", "Do it", "--workdir", "/tmp/elsewhere", "--repo", "/tmp/only-repo"],
+    flags(),
+  );
+  expect(createTaskCalls).toHaveLength(1);
+  const input = createTaskCalls[0]!;
+  expect(input.repositories).toEqual([{ path: "/tmp/only-repo" }]);
+  expect(input.workdir).toBe("/tmp/only-repo");
 });
 
 // ── add wizard: multi-select repositories (issue #291 review M1) ─────────
