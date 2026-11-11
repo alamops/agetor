@@ -3984,7 +3984,10 @@ function RunPanelBody({
   // the saved-prompts fetch on every round trip. See the comment above
   // `sendRef`. Scoped by `fileScope` (the same `{dir, ref?}` pair the `@`
   // popover uses), not a separate workdir/branch pair — see that memo above.
-  const capabilities = useAgentCapabilities(task.agent, fileScope);
+  const capabilities = useAgentCapabilities(
+    task.agent,
+    multiRepoScopes && multiRepoScopes.length > 1 ? multiRepoScopes : fileScope,
+  );
   const savedPromptsState = useSavedPrompts();
   // Stable identity for RunEventList/UserMessageBlock's display-only path
   // shortening (see the `pathRoots` prop doc) — both are memoized, so a

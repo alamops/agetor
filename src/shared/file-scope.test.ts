@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { discoveryParamsForTask, fileScopeForTask, fileScopesForTask } from "./file-scope.ts";
+import { discoveryParamsForTask, discoveryScopesForTask, fileScopeForTask, fileScopesForTask } from "./file-scope.ts";
 import type { Task, TaskRepository } from "./types.ts";
 
 const repo = (over: Partial<TaskRepository>): TaskRepository => ({
@@ -89,5 +89,24 @@ describe("fileScopesForTask", () => {
 
   test("discoveryParamsForTask stays the single-repo mapping", () => {
     expect(discoveryParamsForTask(task({}))).toEqual({ workdir: "/wt/t1", branch: null });
+  });
+
+  test("discoveryScopesForTask stays byte-identical for a single repository", () => {
+    expect(discoveryScopesForTask(task({}))).toEqual([{ workdir: "/wt/t1", branch: null }]);
+  });
+
+  test("discoveryScopesForTask unions every repository, never the non-git workspace", () => {
+    const t = task({
+      workdir: "/wt/t1",
+      worktreePath: "/wt/t1",
+      repositories: [
+        repo({ name: "frontend", path: "/src/frontend", worktreePath: "/wt/t1/frontend" }),
+        repo({ name: "backend", path: "/src/backend", worktreePath: null, baseRef: "bbb" }),
+      ],
+    });
+    expect(discoveryScopesForTask(t)).toEqual([
+      { workdir: "/wt/t1/frontend", branch: null },
+      { workdir: "/src/backend", branch: "bbb" },
+    ]);
   });
 });

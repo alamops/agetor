@@ -29,8 +29,10 @@ bun test src/bun/multi-repo-repro.test.ts src/bun/orchestrator-multi-repo.test.t
   src/bun/pipeline-runner.test.ts src/bun/terminals.test.ts src/bun/agents.test.ts \
   src/shared/multi-repo.test.ts src/shared/file-scope.test.ts \
   src/mainview/lib/repo-selection.test.ts src/mainview/lib/pr-proposal.test.ts \
-  src/cli/commands/add.test.ts src/cli/commands/show.test.ts \
-  src/cli/commands/shell.test.ts src/cli/commands/rm.test.ts src/cli/tui/at-complete.test.ts
+  src/mainview/lib/use-project-files.test.ts src/mainview/lib/diff-selection.test.ts \
+  src/mainview/lib/commit-push.test.ts src/cli/commands/add.test.ts \
+  src/cli/commands/show.test.ts src/cli/commands/shell.test.ts \
+  src/cli/commands/rm.test.ts src/cli/tui/at-complete.test.ts src/cli/at-warn.test.ts
 bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 ```
 
@@ -39,10 +41,10 @@ bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 | Check | Result |
 | --- | --- |
 | `bun run typecheck` | green |
-| Focused multi-repo/unit suites | green — 1,047 tests across the 25 files above |
-| `bun test` | 12,512 tests, 496 files — 12,477 pass, 31 skip, 4 fail. All four are load/timing-sensitive fake-tmux/opencode-fixture cases; re-running each failing file rotated the failing case and every individual test passed on a rerun. Every multi-repo/shared/mainview/CLI suite is green. |
-| `bun test src/shared src/mainview src/cli` | green (included in the full run above) |
-| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 5 passed |
+| Focused multi-repo/unit suites | green — 1,138 tests across the 28 files above |
+| `bun test` | Round-3 full-suite evidence: 12,512 tests, 496 files — 12,477 pass, 31 skip, 4 fail, all load/timing-sensitive fake-tmux/opencode-fixture cases that rotated and passed on rerun. Round 4 re-ran the focused suite above and `bun test src/shared src/mainview src/cli` (5,084 pass); a fresh full-suite attempt was stopped under shared-machine load after 43/496 files with only the same known fake-tmux/claude-session timing failures. |
+| `bun test src/shared src/mainview src/cli` | green — 5,084 tests across 193 files |
+| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 6 passed |
 | Migration 087 on an 086 DB | `src/bun/db-repositories.test.ts` / `src/bun/migrate.test.ts` |
 | Existing worktree tests | unchanged and green (the pre-change 116 plus the new multi-repo cases) |
 
@@ -106,6 +108,20 @@ synced git state and uses its live (possibly drifted) branch as the PR head
 (`repositoryPrHead` in `commit-push.ts`); the three new test files use
 `rmTestDataDir`; and the five fixed 350 ms sleeps are replaced with a poll on
 the run's settled status.
+
+## Fourth review round
+
+At head `6f3db47a` the re-review confirmed rounds 1–3 closed and opened two
+must-fixes plus four should-fixes. All are fixed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| `bun run typecheck` was red: `rows` possibly null in the new search-limit test | the assertion reads `rows?.map(...)`, so a null answer fails the expected value instead of breaking the typecheck | `src/mainview/lib/use-project-files.test.ts` |
+| The diff dialog's composer was repo-local while the agent reads the message at the workspace root, so labels omitted `<name>/` and `@` suggestions did not resolve | `prefixDiffSelectionPaths` prefixes each selected block with the active repository's workspace name; the composer now unions every repository's `@` scope, exactly like RunPanel, and renders the prefixed merged listing | `src/mainview/lib/diff-selection.test.ts` plus the e2e diff flow's compose-and-save assertion (`<name>/front.txt`) |
+| A single `agetor add --repo <path>=<ref>` silently branched from HEAD | `createTask` reads the surviving single entry's `baseRef` when no top-level ref is given (top-level still wins) | `src/bun/orchestrator-multi-repo.test.ts` — "a single repositories entry keeps its per-repository base ref" |
+| The issue dialog's fixed primary could be unchecked and re-added without git-root dedupe, so a same-root sibling made the client show multi while the server created single | `RepositoriesDialog` takes `lockedPath` (the issue repo cannot be unchecked or removed) and `pinPrimaryRepository` runs the same `dedupeSelections` as the dialog | `src/mainview/lib/repo-selection.test.ts` — "collapses a same-root sibling added while the primary was selected" |
+| Capability discovery was not unioned per repo: RunPanel used only the active tab and CLI/TUI discovered at the non-git workspace root | `discoveryScopesForTask` is the shared multi-scope contract; `useAgentCapabilities` unions any number of scopes, `RunPanel` passes every repository, and the CLI/TUI (`discoveredExtensionNames`, `agetor commands`) merge one call per repository | `src/shared/file-scope.test.ts`, `src/cli/at-warn.test.ts` |
+| The smoke doc claimed a green typecheck and five e2e tests, and had no round-4 record | results and the round-4 table above are current | this document |
 
 ## Live harness smoke matrix
 

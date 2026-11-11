@@ -230,7 +230,7 @@ test("existsInLiveScope: false for an empty path", () => {
 type ScopeTask = Pick<
   Task,
   "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch"
->;
+> & { repositories?: Task["repositories"] };
 
 /** Defaults to a plain, non-isolated task (no worktree, no ref) — the
  *  simplest scope — with per-test overrides for the fields that drive
@@ -285,6 +285,61 @@ test("discoveredExtensionNames: passes the task's agent through to agentDiscover
 
   await discoveredExtensionNames(client, fakeTask({ agent: "codex", workdir: "/x" }));
   expect(calls).toEqual([["codex", "/x", null]]);
+});
+
+// Review S3: the workspace root is not a git repository, so one discovery call
+// there found nothing from any selected repository. A multi task unions every
+// repository's own scope; a failed scope must not discard the others.
+function multiRepoTask(): ScopeTask {
+  const entry = (path: string, name: string) => ({
+    path,
+    name,
+    branch: "feature/auth",
+    branchSource: "created" as const,
+    worktreePath: `/wt/t1/${name}`,
+    baseRef: "abc123",
+    checkoutBranch: "feature/auth",
+    prUrl: null,
+  });
+  return fakeTask({
+    workdir: "/wt/t1",
+    worktreePath: "/wt/t1",
+    isolation: "worktree",
+    repositories: [entry("/src/frontend", "frontend"), entry("/src/backend", "backend")],
+  });
+}
+
+test("discoveredExtensionNames: unions every repository's extensions, never the workspace root", async () => {
+  const calls: Array<[string, string, string | null]> = [];
+  const client = {
+    agentDiscovery: async (agent: string, workdir: string, branch: string | null) => {
+      calls.push([agent, workdir, branch]);
+      return {
+        commands: [],
+        extensions: workdir.endsWith("frontend")
+          ? [{ name: "front-ext", insert: "@front" }]
+          : [{ name: "back-ext", insert: "back" }],
+      };
+    },
+  } as unknown as AgetorClient;
+
+  const names = await discoveredExtensionNames(client, multiRepoTask());
+  expect(calls).toEqual([
+    ["claude-code", "/wt/t1/frontend", null],
+    ["claude-code", "/wt/t1/backend", null],
+  ]);
+  expect(names).toEqual(new Set(["front", "back-ext"]));
+});
+
+test("discoveredExtensionNames: a failed repository scope keeps the others' extensions", async () => {
+  const client = {
+    agentDiscovery: async (_agent: string, workdir: string) => {
+      if (workdir.endsWith("frontend")) throw new Error("boom");
+      return { commands: [], extensions: [{ name: "back-ext", insert: "@back" }] };
+    },
+  } as unknown as AgetorClient;
+
+  expect(await discoveredExtensionNames(client, multiRepoTask())).toEqual(new Set(["back"]));
 });
 
 // `discoveredExtensionNames` derives `agentDiscovery`'s workdir/branch args via

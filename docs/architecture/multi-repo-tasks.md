@@ -153,10 +153,20 @@ subdirectory selections under one root are not serialized against each other.)
 - **`@` files** — client-side union over one `/files/index` per repository
   scope, entries prefixed `<name>/`. No new server listing route; workspace
   containment is unchanged.
+- **Capability discovery** — `/agent-discovery` (project commands, skills,
+  MCP servers and custom agents) is unioned over the same per-repository
+  scopes as `@`: the webview composer, the run panel, the CLI (`agetor
+  commands`, the `@`-warning exemption) and the TUI all issue one discovery
+  call per repository and merge by command name / extension insert. The
+  non-git workspace root is never a discovery scope, so every selected
+  repository contributes.
 - **Card** — a worktree icon + repository count with a hover tooltip naming
   every repository, instead of the single workdir/branch line. Board text
   search and the project filter match any repository.
-- **Diff dialog** — one tab per repository.
+- **Diff dialog** — one tab per repository; compose-from-diff labels the
+  selected lines with the workspace prefix (`<name>/src/a.ts`) and its `@`
+  suggestions union every repository, because the message is delivered to the
+  agent at the workspace root.
 - **Run panel** — repository tab selects the per-repo status, PR head, PR path
   and terminal cwd; commit & push uses the aggregate prompt.
 - **Pipelines** — a multi parent copies its set onto every step row and owns

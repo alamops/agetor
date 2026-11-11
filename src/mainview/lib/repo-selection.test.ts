@@ -180,4 +180,17 @@ describe("pinPrimaryRepository", () => {
     ]);
     expect(out.map((e) => e.path)).toEqual(["/repos/issue", "/repos/api"]);
   });
+
+  test("collapses a same-root sibling added while the primary was selected", () => {
+    // Review S2: the issue dialog let its fixed primary be unchecked, then
+    // re-added it without the dialog's git-root dedupe — a subdirectory of the
+    // issue repo made the client show two repositories while the server
+    // deduped to one and created a single-repository task.
+    const out = pinPrimaryRepository("/repos/issue", [
+      { path: "/repos/issue", root: "/repos/issue" },
+      { path: "/repos/issue/packages/app", root: "/repos/issue" },
+      { path: "/repos/api", root: "/repos/api" },
+    ]);
+    expect(out.map((e) => e.path)).toEqual(["/repos/issue", "/repos/api"]);
+  });
 });

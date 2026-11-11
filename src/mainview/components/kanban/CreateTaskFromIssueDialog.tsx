@@ -428,6 +428,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
                   open={repositoriesOpen}
                   onClose={() => setRepositoriesOpen(false)}
                   value={repos}
+                  lockedPath={context.path}
                   onSave={(next) => {
                     if (!context) {
                       setRepos(next);

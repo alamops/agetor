@@ -107,34 +107,56 @@ const EMPTY_PATH_SET: ReadonlySet<string> = new Set();
  */
 export function useAgentCapabilities(
   agent: string,
-  scope: FileScope | null | undefined,
+  scope: FileScope | FileScope[] | null | undefined,
   opts?: { enabled?: boolean },
 ): { commands: AvailableCommand[]; extensions: AvailableExtension[] } {
   const enabled = opts?.enabled ?? true;
   const [commands, setCommands] = useState<AvailableCommand[]>([]);
   const [extensions, setExtensions] = useState<AvailableExtension[]>([]);
-  const dir = scope?.dir;
-  const ref = scope?.ref;
+  // One scope for a single-repository task; one per repository for a multi
+  // task (issue #291). The workspace root is not a git repo, so discovery
+  // there would find nothing from any selected repository.
+  const scopes: FileScope[] = !scope ? [] : Array.isArray(scope) ? scope : [scope];
+  const scopeKey = scopes.map((s) => `${s.dir}\0${s.ref ?? ""}`).join("\0");
 
   useEffect(() => {
-    if (!enabled || !dir || !dir.trim()) { setCommands([]); setExtensions([]); return; }
+    const targets = scopes.filter((s) => !!s.dir?.trim());
+    if (!enabled || targets.length === 0) { setCommands([]); setExtensions([]); return; }
     let cancelled = false;
     // Pass the harness id (not just the kind) so aliased multi-account
     // harnesses read their own per-harness commands/skills — the server
     // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
     // honored unchanged.
-    api
-      .listAgentCapabilities({ agent, workdir: dir.trim(), branch: ref?.trim() || undefined })
-      .then(({ commands, extensions }) => {
-        if (cancelled) return;
-        setCommands(commands);
-        setExtensions(extensions);
-      })
-      .catch(() => { if (!cancelled) { setCommands([]); setExtensions([]); } });
+    Promise.all(
+      targets.map((s) =>
+        api
+          .listAgentCapabilities({ agent, workdir: s.dir.trim(), branch: s.ref?.trim() || undefined })
+          .catch(() => null),
+      ),
+    ).then((results) => {
+      if (cancelled) return;
+      // Union in scope order, first occurrence wins (a name declared in two
+      // repositories appears once). A failed scope contributes nothing; an
+      // all-failed discovery still settles to empty lists, exactly like the
+      // single-scope contract.
+      const byCommand = new Map<string, AvailableCommand>();
+      const byExtension = new Map<string, AvailableExtension>();
+      for (const result of results) {
+        if (!result) continue;
+        for (const command of result.commands) if (!byCommand.has(command.name)) byCommand.set(command.name, command);
+        for (const extension of result.extensions) {
+          if (!byExtension.has(extension.insert)) byExtension.set(extension.insert, extension);
+        }
+      }
+      setCommands([...byCommand.values()]);
+      setExtensions([...byExtension.values()]);
+    });
     return () => { cancelled = true; };
-    // Deps are primitives (dir/ref strings), not the `scope` object, so a
-    // fresh-identity scope with equal fields never refetches.
-  }, [agent, dir, ref, enabled]);
+    // Deps are primitives (scopeKey aggregates dir/ref strings), not the
+    // `scope` object, so a fresh-identity scope with equal fields never
+    // refetches.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent, scopeKey, enabled]);
 
   return { commands, extensions };
 }
@@ -487,7 +509,11 @@ export function PromptComposer({
   // `capabilities`/`savedPrompts` (see those props' docs for why a caller
   // would hoist them). `?? internal` below picks whichever the caller
   // actually wants driving this render.
-  const internalCapabilities = useAgentCapabilities(agent, fileScope ?? null, { enabled: !capabilities });
+  const internalCapabilities = useAgentCapabilities(
+    agent,
+    fileScopes && fileScopes.length > 1 ? fileScopes : fileScope ?? null,
+    { enabled: !capabilities },
+  );
   const { commands, extensions } = capabilities ?? internalCapabilities;
   const internalSavedPrompts = useSavedPrompts({ enabled: !savedPromptsProp });
   const { savedPrompts, reload } = savedPromptsProp ?? internalSavedPrompts;

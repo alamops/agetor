@@ -187,7 +187,7 @@ describe("multi-repository scopes", () => {
     const scopes = scopesFor("cap");
     stub(async () => ({ files: ["a.ts", "b.ts", "c.ts"], truncated: false }));
     const rows = await searchProjectFileScopes(scopes, "a", 3);
-    expect(rows.map((r) => r.path)).toEqual(["frontend/a.ts", "backend/a.ts", "frontend/b.ts"]);
+    expect(rows?.map((r) => r.path)).toEqual(["frontend/a.ts", "backend/a.ts", "frontend/b.ts"]);
   });
 
   test("null only when every targeted request failed; a partial failure keeps the successes", async () => {

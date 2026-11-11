@@ -137,12 +137,16 @@ export function pinPrimaryRepository(
   const chosen = next.find((e) => e.path === path);
   const prior = previous.find((e) => e.path === path);
   const baseRef = chosen?.baseRef ?? prior?.baseRef;
-  return [
-    {
-      path,
-      root: chosen?.root ?? prior?.root ?? null,
-      ...(baseRef === undefined ? {} : { baseRef }),
-    },
-    ...next.filter((e) => e.path !== path),
-  ];
+  const primary: RepoSelection = {
+    path,
+    root: chosen?.root ?? prior?.root ?? null,
+    ...(baseRef === undefined ? {} : { baseRef }),
+  };
+  // Dedupe again after re-adding the primary: when the dialog resolved the
+  // primary's git root, a same-root sibling (e.g. a subdirectory of the issue
+  // repo added through "Add folder") collapses here, so the client's view
+  // matches the server's createTask dedupe instead of showing a multi-repo
+  // task that the server creates as single. Unknown roots are kept (see
+  // `dedupeSelections`).
+  return dedupeSelections([primary, ...next.filter((e) => e.path !== path)]);
 }

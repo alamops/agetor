@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { c, errln } from "./output.ts";
 import { findAtTokens, isListedPath } from "../shared/at-refs.ts";
-import { discoveryParamsForTask } from "../shared/file-scope.ts";
+import { discoveryScopesForTask } from "../shared/file-scope.ts";
 import type { AgetorClient } from "./api-client.ts";
 import type { Task } from "../shared/types.ts";
 
@@ -181,25 +181,37 @@ export async function verifyTokensViaSearch<T extends { path: string; isDirector
  *  Shared by `add.ts` (`cmdAdd`'s pre-check and `--start`) and
  *  `lifecycle.ts` (`cmdSend`, `cmdStart`) so there's one copy of this
  *  fail-open lookup rather than one per caller. Discovery params come from
- *  `discoveryParamsForTask` (`src/shared/file-scope.ts`) — the same
+ *  `discoveryScopesForTask` (`src/shared/file-scope.ts`) — the same
  *  worktree-vs-committed-ref rule the webview's `RunPanel`/the TUI/the `@`
  *  file listing use (docs/architecture/at-file-references.md), not the raw `task.workdir`/`branch`
  *  pair, so a materialized worktree reads its own live tree instead of the
- *  source repo's committed ref. A discovery failure must not block or fail
- *  the caller's own operation: falls back to an empty set (over-warn rather
- *  than crash) — the network call itself is the only non-injectable part,
- *  reached through the passed-in `client` so a test can swap in a fake
- *  `agentDiscovery` that throws or returns a controlled list without a real
- *  server. */
+ *  source repo's committed ref. A multi-repository task unions every
+ *  repository's scope (the workspace root is not a git repo). A discovery
+ *  failure must not block or fail the caller's own operation: a failed scope
+ *  is skipped (successful ones still contribute) and all failures fall back
+ *  to an empty set (over-warn rather than crash) — the network call itself is
+ *  the only non-injectable part, reached through the passed-in `client` so a
+ *  test can swap in a fake `agentDiscovery` that throws or returns a
+ *  controlled list without a real server. */
 export async function discoveredExtensionNames(
   client: AgetorClient,
-  task: Pick<Task, "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch">,
+  task: Pick<Task, "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch"> & {
+    repositories?: Task["repositories"];
+  },
 ): Promise<Set<string>> {
-  try {
-    const { workdir, branch } = discoveryParamsForTask(task);
-    const { extensions } = await client.agentDiscovery(task.agent, workdir, branch);
-    return new Set(extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name)));
-  } catch {
-    return new Set();
+  const names = new Set<string>();
+  const results = await Promise.all(
+    discoveryScopesForTask(task).map(async ({ workdir, branch }) => {
+      try {
+        return await client.agentDiscovery(task.agent, workdir, branch);
+      } catch {
+        return null;
+      }
+    }),
+  );
+  for (const result of results) {
+    if (!result) continue;
+    for (const e of result.extensions) names.add(e.insert.startsWith("@") ? e.insert.slice(1) : e.name);
   }
+  return names;
 }

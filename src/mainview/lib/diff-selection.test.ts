@@ -7,6 +7,7 @@ import {
   formatDiffSelection,
   groupSelectedRows,
   isRowInDragRange,
+  prefixDiffSelectionPaths,
   selectableIndicesInRange,
   type DiffDragRange,
   type DiffSelectionBlock,
@@ -212,6 +213,22 @@ test("formatDiffSelection includes the heading and separates multiple blocks", (
   expect(out.startsWith(DIFF_SELECTION_HEADING)).toBe(true);
   expect(out).toContain("a.ts (line 1)");
   expect(out).toContain("b.ts (line 2)");
+});
+
+// --- prefixDiffSelectionPaths (issue #291) ------------------------------
+
+test("prefixDiffSelectionPaths labels a multi-repository selection with its workspace name", () => {
+  const blocks: DiffSelectionBlock[] = [{ path: "src/a.ts", lines: [{ old: 1, neu: 1, kind: "ctx", text: "hi" }] }];
+  expect(prefixDiffSelectionPaths(blocks, "frontend")).toEqual([
+    { path: "frontend/src/a.ts", lines: blocks[0]!.lines },
+  ]);
+  expect(formatDiffSelection(prefixDiffSelectionPaths(blocks, "frontend"))).toContain("frontend/src/a.ts (line 1)");
+});
+
+test("prefixDiffSelectionPaths is a no-op without a name (single repository)", () => {
+  const blocks: DiffSelectionBlock[] = [{ path: "src/a.ts", lines: [] }];
+  expect(prefixDiffSelectionPaths(blocks, null)).toBe(blocks);
+  expect(prefixDiffSelectionPaths(blocks, "")).toBe(blocks);
 });
 
 // --- composeDiffMessage --------------------------------------------------

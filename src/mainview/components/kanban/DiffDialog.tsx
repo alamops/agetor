@@ -8,17 +8,18 @@ import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { useProjectFiles, useProjectFileScopes, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { api, type PendingInteraction } from "@/lib/api";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import {
   addRangeToSelection, composeDiffMessage, groupSelectedRows, isRowInDragRange, isSelectableKind,
-  type DiffDragRange, type DiffSelectionBlock,
+  prefixDiffSelectionPaths, type DiffDragRange, type DiffSelectionBlock,
 } from "@/lib/diff-selection";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
+import { fileScopesForTask } from "../../../shared/file-scope.ts";
 import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
 import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
 
@@ -514,17 +515,28 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const composerVisible = totalSelected > 0;
 
   // `@` popover + highlight for the compose-from-diff box — the same scope
-  // table as RunPanel's composer (docs/architecture/at-file-references.md): the live worktree once it
-  // exists; a not-yet-started isolated task previews its pinned base ref
-  // (existing-branch tasks their branch); else the plain workdir. Gated on
-  // the composer actually showing so an open dialog with no selection
-  // fetches nothing. Expansion stays server-side in sendInput.
+  // table as RunPanel's composer (docs/architecture/at-file-references.md).
+  // A multi-repository task lists every repository's worktree (entries
+  // prefixed `<name>/`) because the agent reads this message at the workspace
+  // root; the single-repository path is the live worktree once it exists, a
+  // not-yet-started isolated task previews its pinned base ref (existing-
+  // branch tasks their branch), else the plain workdir. Gated on the
+  // composer actually showing so an open dialog with no selection fetches
+  // nothing. Expansion stays server-side in sendInput.
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const multiScopes = useMemo<NamedFileScope[] | null>(() => {
+    if (!task || !isMultiRepoTask(task)) return null;
+    const scopes: NamedFileScope[] = [];
+    for (const scope of fileScopesForTask(task)) {
+      if (scope.name) scopes.push({ name: scope.name, dir: scope.dir, ref: scope.ref });
+    }
+    return scopes;
+  }, [task?.repositories, task?.worktreePath, task?.isolation]);
   const fileScope = useMemo<FileScope | null>(() => {
     if (!task) return null;
-    if (isMultiRepoTask(task)) {
-      const entry = (task.repositories ?? []).find((r) => r.name === repo) ?? task.repositories?.[0];
-      return entry ? { dir: entry.worktreePath ?? entry.path } : null;
+    if (multiScopes) {
+      const entry = multiScopes.find((s) => s.name === repo) ?? multiScopes[0];
+      return entry ? { dir: entry.dir, ref: entry.ref } : null;
     }
     if (task.worktreePath) return { dir: task.worktreePath };
     if (task.isolation === "worktree") {
@@ -534,8 +546,13 @@ export function DiffDialog({ open, task, onClose }: Props) {
       };
     }
     return { dir: task.workdir };
-  }, [task?.worktreePath, task?.isolation, task?.workdir, task?.baseRef, task?.branchSource, task?.branch, task?.repositories, repo]);
-  const projectFiles = useProjectFiles(open && composerVisible ? fileScope : null);
+  }, [task?.worktreePath, task?.isolation, task?.workdir, task?.baseRef, task?.branchSource, task?.branch, multiScopes, repo]);
+  // Both hooks are called unconditionally (rules of hooks); only the one that
+  // applies to this task type fetches, because the other receives null.
+  const singleProjectFiles = useProjectFiles(open && composerVisible && !multiScopes ? fileScope : null);
+  const multiProjectFiles = useProjectFileScopes(open && composerVisible ? multiScopes : null);
+  const projectFiles = multiScopes ? multiProjectFiles : singleProjectFiles;
+  const hasFileScope = multiScopes ? multiScopes.length > 1 : !!(fileScope && fileScope.dir);
 
   // A new selection starting (composer reappearing) supersedes whatever hint
   // was left over from the last send/save — e.g. the "Sent to agent." success
@@ -600,6 +617,13 @@ export function DiffDialog({ open, task, onClose }: Props) {
     }
     return result;
   }, [diff, selected]);
+  // Multi-repository tasks: label the selected lines with the workspace
+  // directory (`frontend/src/a.ts`) because the agent reads the message at the
+  // workspace root, not inside the repository's worktree (plan T11).
+  const messageBlocks = useMemo(
+    () => (multiScopes ? prefixDiffSelectionPaths(blocks, repo ?? multiScopes[0]?.name ?? null) : blocks),
+    [blocks, multiScopes, repo],
+  );
 
   const clearSelection = () => {
     setSelected(new Map());
@@ -621,7 +645,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
         setHint("A prompt is waiting for a response — answer it, or Save for later instead.");
         return;
       }
-      const composed = composeDiffMessage(draft.trim(), blocks);
+      const composed = composeDiffMessage(draft.trim(), messageBlocks);
       const res = await api.sendRunInput(resumableRunId, composed);
       if (!res.delivered && res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the paste was withheld and the server
@@ -654,7 +678,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
     setBusy(true);
     setHint(null);
     try {
-      const composed = composeDiffMessage(draft.trim(), blocks);
+      const composed = composeDiffMessage(draft.trim(), messageBlocks);
       await api.addBacklogItem(task.id, { text: composed, references: [] });
       clearSelection();
       setHint("Saved to backlog.");
@@ -786,7 +810,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
                 </Button>
               </div>
               <div className="relative">
-              {fileScope && (
+              {hasFileScope && (
                 <AtHighlightBackdrop textareaRef={composerRef} value={draft} validPaths={projectFiles.validPaths} />
               )}
               <Textarea
@@ -813,7 +837,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
                 disabled={busy}
                 className="relative h-16 min-h-0 w-full resize-none text-xs"
               />
-              {fileScope && (
+              {hasFileScope && (
                 <AtFileAutocomplete
                   entries={projectFiles.entries}
                   truncated={projectFiles.truncated}
@@ -822,7 +846,8 @@ export function DiffDialog({ open, task, onClose }: Props) {
                   onChange={setDraft}
                   textareaRef={composerRef}
                   placement="above"
-                  fileScope={fileScope}
+                  fileScope={multiScopes ? null : fileScope}
+                  fileScopes={multiScopes}
                 />
               )}
               </div>

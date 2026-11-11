@@ -17,6 +17,17 @@ export type RepoTaskShape = Pick<
   | "repositories"
 >;
 
+/**
+ * The subset {@link repositoriesForTask} and the `@`/discovery scope helpers
+ * need. Narrower than {@link RepoTaskShape} so CLI callers that only know the
+ * repository set don't have to invent checkout/PR fields; those two are
+ * optional (a derived single-repository entry reports them when present).
+ */
+export type RepoSetShape = Pick<
+  Task,
+  "workdir" | "isolation" | "branch" | "branchSource" | "worktreePath" | "baseRef"
+> & { repositories?: TaskRepository[] };
+
 /** Sanitized directory/branch-safe name from a project path's basename. */
 export function repoNameForPath(projectPath: string): string {
   if (typeof projectPath !== "string") return "repo";
@@ -56,7 +67,9 @@ export function uniqueRepoSlugs(paths: string[]): string[] {
  * `[]`) derives one entry from the scalar columns so callers never branch on
  * `undefined`.
  */
-export function repositoriesForTask(task: RepoTaskShape): TaskRepository[] {
+export function repositoriesForTask(
+  task: RepoSetShape & Partial<Pick<Task, "checkoutBranch" | "prUrl">>,
+): TaskRepository[] {
   if (task.repositories && task.repositories.length > 1) return task.repositories;
   return [
     {

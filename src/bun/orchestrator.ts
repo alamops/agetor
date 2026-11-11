@@ -11150,7 +11150,6 @@ export async function createTask(
   const explicitWorkdir = input.workdir?.trim() ? input.workdir.trim() : null;
   let workdir = explicitWorkdir ?? process.cwd();
   const isolation = input.isolation ?? "worktree";
-  const requestedRef = input.baseRef?.trim() || "HEAD";
   const existingBranch = input.existingBranch?.trim() || null;
 
   // Repository set (issue #291). Validated before any side effect: every bad
@@ -11189,6 +11188,17 @@ export async function createTask(
     // path as the task's workdir, matching what the user selected.
     workdir = keptRepositories[0]!.path;
   }
+
+  // A `repositories` selection that collapses to one entry (a single path, or
+  // two paths under one git root) is created through the ordinary
+  // single-repository path, so it must still honor that entry's per-repository
+  // base ref: the CLI's `--repo <path>=<ref>` puts its ref there, not in the
+  // top-level `baseRef`, and ignoring it silently branched from HEAD. An
+  // explicit top-level baseRef wins, then the entry's pin, then HEAD.
+  const singleRepoInput = keptRepositories.length === 1
+    ? repoInputs.find((r) => typeof r.path === "string" && r.path.trim() === keptRepositories[0]!.path)
+    : undefined;
+  const requestedRef = input.baseRef?.trim() || singleRepoInput?.baseRef?.trim() || "HEAD";
 
   let baseRef: string | null = null;
   let plannedBranch: string | null = null;

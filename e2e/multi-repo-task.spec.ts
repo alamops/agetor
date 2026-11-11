@@ -151,6 +151,22 @@ test("the diff dialog has one tab per repository and loads each repository's cha
   await page.getByRole("button", { name: "View diff" }).first().click();
   await expect(page.getByTestId(`diff-repo-tab-${first!.name}`)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await expect(page.getByText("front.txt")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+  // Compose-from-diff on a multi task must label the selection with the
+  // repository's workspace prefix: the message is delivered to the agent at
+  // the workspace root, where `src/a.ts` alone does not exist (review M2).
+  const addRows = page.locator('[data-diff-path="front.txt"][data-diff-index]');
+  await addRows.last().click();
+  await expect(page.getByPlaceholder(/Add a message about the selected lines/)).toBeVisible();
+  await page.getByRole("button", { name: "Save for later" }).click();
+  await expect
+    .poll(async () => {
+      const detail = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
+      const row = (await detail.json()) as { backlog?: { text: string }[] };
+      return (row.backlog ?? []).map((item) => item.text).join("\n");
+    }, { timeout: CONVERGE_TIMEOUT })
+    .toContain(`${first!.name}/front.txt`);
+
   await page.getByTestId(`diff-repo-tab-${second!.name}`).click();
   await expect(page.getByText("back.txt")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 });

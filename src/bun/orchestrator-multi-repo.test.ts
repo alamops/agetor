@@ -196,6 +196,40 @@ test("two paths under one git root collapse to the single-repository layout", as
   }
 });
 
+test("a single repositories entry keeps its per-repository base ref", async () => {
+  // Review S1: `agetor add --repo <path>=<ref>` sends ONE entry and its ref in
+  // `repositories[].baseRef`. createTask took the ordinary single-repository
+  // path, which only read the top-level `baseRef`, so the ref was silently
+  // ignored and the task branched from HEAD.
+  const { createTask } = await load();
+  const a = await makeRepo("single-base");
+  writeFileSync(path.join(a, "next.txt"), "next\n");
+  await git(["checkout", "-b", "release/next"], a);
+  await git(["add", "."], a);
+  await git(["commit", "-m", "next"], a);
+  await git(["checkout", "main"], a);
+  const proc = Bun.spawn(["git", "rev-parse", "release/next"], { cwd: a, stdout: "pipe", stderr: "pipe" });
+  const sha = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  try {
+    const created = await createTask({
+      title: "single base",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: a,
+      isolation: "worktree",
+      repositories: [{ path: a, baseRef: "release/next" }],
+    });
+    if ("error" in created) throw new Error(created.error);
+    expect(created.task.workdir).toBe(a);
+    expect(created.task.baseRef).toBe(sha);
+    expect(created.task.repositories).toHaveLength(1);
+    expect(created.task.repositories?.[0]?.baseRef).toBe(sha);
+  } finally {
+    cleanup(a);
+  }
+});
+
 test("createTask names every bad repository and inserts nothing", async () => {
   const { createTask, tasks } = await load();
   const good = await makeRepo("good");

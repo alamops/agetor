@@ -120,6 +120,21 @@ export function formatDiffSelection(blocks: DiffSelectionBlock[]): string {
   return `${DIFF_SELECTION_HEADING}\n\n${sections.join("\n\n")}`;
 }
 
+/**
+ * Prefix every block's path with a multi-repository task's workspace name.
+ * The agent reads the message at the workspace root, where each repository is
+ * a `<name>/` subdirectory — an unprefixed `src/a.ts` from a repository's diff
+ * would point at the workspace root instead (issue #291, plan T11). A null
+ * name (single-repository task) is a no-op so today's message is byte-identical.
+ */
+export function prefixDiffSelectionPaths(
+  blocks: DiffSelectionBlock[],
+  name: string | null | undefined,
+): DiffSelectionBlock[] {
+  if (!name) return blocks;
+  return blocks.map((block) => ({ ...block, path: `${name}/${block.path}` }));
+}
+
 /** `${text}\n\n${formatted}`; text-only when no blocks; formatted-only when
  *  text is blank — exactly the appendReferences contract in shared/refs.ts. */
 export function composeDiffMessage(text: string, blocks: DiffSelectionBlock[]): string {

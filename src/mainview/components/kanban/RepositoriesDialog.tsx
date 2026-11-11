@@ -20,6 +20,9 @@ interface Props {
   value: RepoSelection[];
   /** Called with the deduped, ordered selection on Save. */
   onSave: (next: RepoSelection[]) => void;
+  /** A path that must stay selected (the issue dialog's own repository). The
+   *  row cannot be unchecked or removed; it is always re-added on save. */
+  lockedPath?: string | null;
 }
 
 /**
@@ -27,9 +30,12 @@ interface Props {
  * form and the create-from-issue modal: pick two or more registered projects
  * (or add a folder), optionally pin a per-repository base ref, remove rows,
  * and dedupe by git root. Above {@link MANY_REPOSITORIES} it shows a
- * non-blocking warning (the owner decided against a hard cap).
+ * non-blocking warning (the owner decided against a hard cap). A `lockedPath`
+ * (the issue's own repository) cannot be deselected — the issue dialog always
+ * includes it, so letting the user uncheck it only meant pinPrimaryRepository
+ * silently re-added it after save.
  */
-export function RepositoriesDialog({ open, onClose, value, onSave }: Props) {
+export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [draft, setDraft] = useState<RepoSelection[]>(value);
   const [picking, setPicking] = useState(false);
@@ -48,6 +54,7 @@ export function RepositoriesDialog({ open, onClose, value, onSave }: Props) {
   const names = useMemo(() => selectionNames(draft), [draft]);
 
   const toggle = (path: string) => {
+    if (path === lockedPath) return;
     setDraft((cur) =>
       cur.some((e) => e.path === path)
         ? cur.filter((e) => e.path !== path)
@@ -137,6 +144,7 @@ export function RepositoriesDialog({ open, onClose, value, onSave }: Props) {
                 <input
                   type="checkbox"
                   checked={selected}
+                  disabled={path === lockedPath}
                   onChange={() => toggle(path)}
                   aria-label={`Select ${path}`}
                 />
@@ -158,6 +166,8 @@ export function RepositoriesDialog({ open, onClose, value, onSave }: Props) {
                     variant="ghost"
                     className="h-7 w-7"
                     aria-label={`Remove ${path}`}
+                    disabled={path === lockedPath}
+                    title={path === lockedPath ? "The issue's repository is always included" : undefined}
                     onClick={() => toggle(path)}
                   >
                     <Trash2 className="h-3.5 w-3.5" />

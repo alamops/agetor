@@ -12,6 +12,7 @@
 // `scope.dir`/`scope.ref`, via {@link discoveryParamsForTask}).
 import type { Task } from "./types.ts";
 import { repositoriesForTask } from "./multi-repo.ts";
+import type { RepoSetShape } from "./multi-repo.ts";
 
 /**
  * The project scope (`GET /files/index` params) a task's `@` popover — and,
@@ -50,6 +51,21 @@ export function discoveryParamsForTask(
   return { workdir: scope.dir, branch: scope.ref ?? null };
 }
 
+/**
+ * Every `GET /agent-discovery` scope a multi-repository task should union
+ * over. A single-repository task returns exactly one entry — byte-identical to
+ * {@link discoveryParamsForTask} — so today's behavior is unchanged. A multi
+ * task returns one entry per repository (its materialized worktree, or the
+ * source repo at the pinned branch/ref before start), because the workspace
+ * root is not a git repository: discovery there finds no project-level
+ * commands, skills or MCP servers from any of the selected repositories.
+ */
+export function discoveryScopesForTask(
+  task: RepoSetShape,
+): Array<{ workdir: string; branch: string | null }> {
+  return fileScopesForTask(task).map((scope) => ({ workdir: scope.dir, branch: scope.ref ?? null }));
+}
+
 /** One repository's `@`/discovery scope, tagged with its workspace name. */
 export interface RepoFileScope {
   /** Workspace subdirectory name, or null for a single-repository task. */
@@ -69,7 +85,7 @@ export interface RepoFileScope {
  * `prepareRepoWorktree` will use, tagged with the repository's workspace name
  * so the client can prefix entries (`<name>/src/a.ts`).
  */
-export function fileScopesForTask(task: Task): RepoFileScope[] {
+export function fileScopesForTask(task: RepoSetShape): RepoFileScope[] {
   const repos = repositoriesForTask(task);
   if (repos.length <= 1) return [{ name: null, ...fileScopeForTask(task) }];
   return repos.map((repo) => {
