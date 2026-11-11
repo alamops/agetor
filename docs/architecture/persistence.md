@@ -101,7 +101,7 @@ survives a stack delete. `harness_session_handoffs` cascades with the task; its
   or `NULL`. The page index is `(stack_id, at DESC, id DESC)`. There is no cap
   and no pruning.
 - **`harness_mirror_provenance`**, primary key `(harness_id, path, key)`, **no
-  FK** (the same 085 reasoning), `scope` `CHECK`-ed to `file`/`key`/`link`.
+  FK** (the same 085 reasoning), `scope` `CHECK`-ed to `file`/`key`/`link`. A merged file the mirror created carries one extra `file` row keyed `(created by the mirror)` (no schema change).
   `harnesses.delete` removes the account's rows inline in its transaction (the
   store module imports `db.ts`, so it cannot be called from there).
 

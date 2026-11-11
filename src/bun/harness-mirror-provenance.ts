@@ -1,7 +1,8 @@
 /**
  * What a mirror run wrote into a backup account (`harness_mirror_provenance`,
  * migration 087): one row per file, merged key or symlink, keyed by
- * (account, path, key). A later run uses it to tell its own output from the
+ * (account, path, key), plus a marker row for a merged file the mirror created
+ * ({@link CREATED_FILE_KEY}). A later run uses it to tell its own output from the
  * user's edits and to know which files it may remove or restore.
  *
  * Rows are UNTRUSTED on use: the database is agent-writable, so a row's `path`
@@ -131,6 +132,24 @@ export const UNOWNED_STAMP = -1;
 
 export function isUnownedRow(row: MirrorProvenanceRow): boolean {
   return row.srcMtimeMs === UNOWNED_STAMP && row.srcSize === UNOWNED_STAMP;
+}
+
+/**
+ * The `key` of a merged file's "created" marker: a `file`-scope row at the
+ * merged file's path that says the mirror created that file (it did not
+ * exist before the mirror wrote it), with `valueHash` the sha256 of the text
+ * the mirror last wrote there. Restore removes a merged file only with this
+ * marker, and only while the file still holds those bytes. Merged files have
+ * only `key` rows otherwise, and a whole-file or link row's key is always "",
+ * so no other row is ever a `file` row with this key (the mirror never owns a
+ * merged key spelled this way either). No schema change: the scope CHECK
+ * already allows `file`. A row from before the marker existed has none, so a
+ * file it describes is never removed.
+ */
+export const CREATED_FILE_KEY = "(created by the mirror)";
+
+export function isCreatedFileMarker(row: Pick<MirrorProvenanceRow, "scope" | "key">): boolean {
+  return row.scope === "file" && row.key === CREATED_FILE_KEY;
 }
 
 /** Where a backup's mirror last read its primary from (migration 089) and

@@ -7826,13 +7826,16 @@ function signalSubagentApiError(
     // `signalSessionDeath`'s held branch ("say so honestly instead of
     // reusing the sentinel": there's no handle for the orchestrator to flip
     // to `blocked`, so a sentinel here would just lie). Neither in flight
-    // nor held: truly nothing to do.
+    // nor held: truly nothing to do. The probe also answers true for a turn
+    // that failed with its agents still running, whose card is already
+    // `blocked` and never releases to `review`; it can't tell the two apart,
+    // so the line holds for both, like the session-death one.
     if (heldProbeSafe(state.taskId)) {
       const onChunk = state.lastChunk ?? (() => {});
       onChunk(
         "status",
-        `background agent hit an API error (${info.detail}) — it stopped; task releases when `
-          + `remaining agents finish`,
+        `background agent hit an API error (${info.detail}) — it stopped; the other background agents `
+          + `keep running (a card held open for them is released when they finish)`,
       );
     }
     return;

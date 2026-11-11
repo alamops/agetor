@@ -934,6 +934,14 @@ export function isHeldByBackgroundAgents(taskId: string): boolean {
  * boot, "Switch to next account", a same-stack PATCH) asks this one question
  * and treats both cases alike. A live turn is not "held": it owns the task,
  * and its own end decides.
+ *
+ * The failed case is exactly a `blocked` card whose current run `failed`: the
+ * two states that still show a Stop for the agents (the card's and the run
+ * panel's controls are offered on `running` and `blocked` cards only). A
+ * running agent row on any other card (a turn the user stopped, which leaves
+ * a background shell or a persistent monitor running, or a card the user moved
+ * on) holds nothing: such rows may never finish, and with no Stop on the card
+ * the switch would wait for them forever.
  */
 export function backgroundAgentsHoldTask(taskId: string): boolean {
   // Polled by the claude death watch on every tick of an idle session, so the
@@ -941,8 +949,10 @@ export function backgroundAgentsHoldTask(taskId: string): boolean {
   const task = tasks.get(taskId);
   if (!task) return false;
   if (isTaskHeldByBackgroundAgents(task)) return true;
+  if (task.column !== "blocked" || task.runId == null) return false;
   if (!subagents.hasRunning(taskId)) return false;
-  return !((task.runId != null && active.has(task.runId)) || runs.hasRunning(taskId));
+  if (runs.get(task.runId)?.status !== "failed") return false;
+  return !(active.has(task.runId) || runs.hasRunning(taskId));
 }
 
 /**
@@ -3743,10 +3753,26 @@ export function claimTaskForAccountSwitch(taskId: string): boolean {
 
 /** Whether an account switch (a PATCH, a "Switch to next account" move, a
  *  scheduled one being applied, or a boot completion) is copying the task's
- *  conversation right now. A Cancel then has nothing left to cancel: the
- *  route answers 409 `busy` instead of a no-op. */
+ *  conversation right now. */
 export function isAccountSwitchUnderway(taskId: string): boolean {
   return accountSwitchTaskIds.has(taskId);
+}
+
+/**
+ * Whether the account move holding the task's claim is one that settles a
+ * scheduled "switch to next account" itself: a "Switch to next account" move
+ * (the scheduled one being applied, or one the user started on an idle task),
+ * whose end always consumes the request (`moveTaskForSwitchNow`), or the boot
+ * completion of such a move. A Cancel then has nothing left to cancel, and the
+ * route answers 409 `busy`. Any other claim (a same-stack PATCH, the boot
+ * completion of one) may still be refused or fail and leave the request
+ * behind, so a Cancel then drops the request as usual.
+ */
+export function isScheduledSwitchUnderway(taskId: string): boolean {
+  if (!accountSwitchTaskIds.has(taskId)) return false;
+  if (switchNowTaskIds.has(taskId)) return true;
+  const pending = tasks.get(taskId)?.harnessState?.pendingSwap;
+  return bootSwapClaims.has(taskId) && pending?.manual === true && pending.switchNow != null;
 }
 
 /** Release a claim taken by {@link claimTaskForAccountSwitch}. Safe to call
@@ -3866,7 +3892,9 @@ async function moveTaskForSwitchNow(taskId: string, toId: string, trigger: "manu
   beginManualAccountSwitch(taskId, before.agent, toId, { switchNow: trigger });
   let threw = false;
   try {
-    scheduledSwitchTestHooks.afterIntent?.(taskId);
+    // Awaited only when a test hook returns a promise: no yield in production.
+    const heldByTest = scheduledSwitchTestHooks.afterIntent?.(taskId);
+    if (heldByTest) await heldByTest;
     const updated = tasks.update(taskId, { agent: toId });
     if (!updated) {
       clearManualAccountSwitch(taskId);
@@ -4192,18 +4220,18 @@ export function __setTurnSettlePumpHookForTest(hook: TurnSettlePumpHook | null):
 }
 
 /**
- * Test seams for the scheduled-switch edges, all synchronous and all no-ops in
- * production:
+ * Test seams for the scheduled-switch edges, all no-ops in production:
  * - `afterIntent`: inside a switch-now move, right after the intent
  *   (`pendingSwap`) is persisted and before the row changes accounts. A throw
  *   there is a move that failed after its first write; the state read there is
- *   what a crash would leave.
+ *   what a crash would leave. A returned promise holds the move there (with
+ *   its claim) until it settles.
  * - `waitingSettle`: at the top of `settleWaitingScheduledSwitch`.
  * - `turnDrain`: in a done handler right after the turn-end switch decision,
  *   before the follow-up drain (inside the settling window).
  */
 interface ScheduledSwitchTestHooks {
-  afterIntent?: (taskId: string) => void;
+  afterIntent?: (taskId: string) => void | Promise<void>;
   waitingSettle?: (taskId: string) => void;
   turnDrain?: (taskId: string, runId: string) => void;
 }
@@ -7248,7 +7276,9 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
   if (task.agent === pending.from) {
     // The row update never landed; the task is still on the source account.
     // A scheduled switch is still recorded (`beginManualAccountSwitch` carries
-    // it), and `reconcileScheduledSwitchesAtBoot` retries it right after.
+    // it, whichever move wrote the intent), and
+    // `reconcileScheduledSwitchesAtBoot` retries it right after, so the line
+    // says so whenever one is recorded.
     clear();
     const stillScheduled = tasks.get(taskId)?.harnessState?.scheduledSwitch != null;
     saveStatusLineQuietly(
@@ -7258,7 +7288,9 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
         ? stillScheduled
           ? "the core restarted before the scheduled account switch started — it stays scheduled"
           : "the core restarted before the scheduled account switch started — switch again to move the task"
-        : "the core restarted before the account switch started — run the task to switch",
+        : stillScheduled
+          ? "the core restarted before the account switch started — the switch to the next account scheduled for this task stays scheduled"
+          : "the core restarted before the account switch started — run the task to switch",
     );
     return;
   }
@@ -7718,7 +7750,7 @@ export function rearmRetriesAfterCooldownClear(harnessId: string): number {
 /**
  * Stop a task whose background agents still run with no turn in flight (see
  * `backgroundAgentsHoldTask`): its terminal run succeeded (held in `running`)
- * or failed (an API error left the card `blocked`/`ready`), so there's no
+ * or failed (an API error left the card `blocked`), so there's no
  * `active` handle to kill. Interrupt the live session and orphan the agents'
  * rows. Nothing here moves the card or touches the run: the settle hook's
  * `maybeReleaseHeldTask` advances only a held `running` card to `review`, and
@@ -7799,6 +7831,17 @@ export async function cancelRun(runId: string): Promise<boolean> {
       return true;
     }
     if (backgroundAgentsHoldTask(taskId)) {
+      // A start holds the task's claim and has not minted its run yet (a
+      // Run's pre-flight, a follow-up's spawn): the Stop is meant for the turn
+      // it is about to start. Record it against the claim, as
+      // `cancelLiveRunOfTask` does, so that turn is killed instead of
+      // registering. Interrupting the REPL here would land a Ctrl+C just
+      // before the new turn's paste and let the turn go ahead.
+      if (startingTaskIds.has(taskId)) {
+        pendingCancelTaskIds.add(taskId);
+        cancelPendingForTask(taskId, "cancelled by user");
+        return true;
+      }
       // Before the interrupt: the runner queues its record of the stop
       // ahead of the settle the hold's release triggers. Only a held
       // SUCCEEDED step is still unsettled for the runner; a failed turn

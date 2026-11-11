@@ -25,7 +25,7 @@ the merged Harnesses page) is `docs/plans/harness-stacks-fix-round.md`.
 | `harness_stack_members` | `(stack_id, harness_id, position)`. `UNIQUE(harness_id)` enforces **one stack per account**; `UNIQUE(stack_id, position)` keeps the order unique. Cascades with its stack but has **no FK to `harnesses`** (migration 085): a `harnesses` table rebuild would otherwise cascade every membership away. `harnesses.delete` removes the account's row explicitly and re-packs the ranks. |
 | `harness_limit_state` | Cooldown rows keyed by `(harness_id, model)` (migration 087); `model = ''` is the whole account, a model id (lower-cased) is a provider limit scoped to that model. Columns: reason, source, message, `exhausted_until_ms`, `updated_at`. Deliberately has **no FK** and survives a stack delete — a limit is a fact about the account. |
 | `harness_swap_events` | The per-stack swap history (see [Swap history](#swap-history)). `stack_id` is an FK with `ON DELETE CASCADE` and it is the **only** FK: task and account ids are plain columns and the labels and task title are denormalized, so a row survives a task or account delete and goes only with its stack. |
-| `harness_mirror_provenance` | What a mirror run wrote into a backup, `(harness_id, path, key)` → scope (`file`/`key`/`link`), value hash, source mtime/size, `preexisted`, `backup_ref`. **No FK**; rows are untrusted on use (see [Mirror provenance, backups, preview and Restore](#mirror-provenance-backups-preview-and-restore)). |
+| `harness_mirror_provenance` | What a mirror run wrote into a backup, `(harness_id, path, key)` → scope (`file`/`key`/`link`), value hash, source mtime/size, `preexisted`, `backup_ref`, plus one created-file marker row per merged file the mirror created (`scope` `file`, key `(created by the mirror)`). **No FK**; rows are untrusted on use (see [Mirror provenance, backups, preview and Restore](#mirror-provenance-backups-preview-and-restore)). |
 | `harness_session_handoffs` | `(task_id, harness_id, column_name)` → copied session id + `copied_paths_json` (the cleanup allowlist). The one exception to per-account session scoping. Every listed path belongs to the row's session. |
 | `harness_orphaned_copies` | Handoff copies no handoff row can clean up any more (migration 088): `(harness_id, column_name, path)` → the `session_id` the file was copied for, and `created_at`, a monotonic stamp (never below the wall clock, always above every earlier stamp and sweep mark) that lets a sweep forget only what it listed. **No FK**, so a row outlives its task; rows are untrusted on use (see [Leftover handoff copies](#leftover-handoff-copies)). |
 | `harness_mirror_sources` | One row per backup account (migration 089, primary key `harness_id`): the primary's id, `primary_root` (its resolved folder(s)) and `primary_config` (a fingerprint of its root settings) from the last real mirror run; migration 090 adds `backup_root` and `backup_config`, the same two for the backup's own folder (`''` = not recorded yet). **No FK**; untrusted, and only ever compared or checked for existence (see "The primary's and the backup's folders are pinned" under [Mirror provenance, backups, preview and Restore](#mirror-provenance-backups-preview-and-restore)). |
@@ -395,7 +395,7 @@ marker goes, with no claim and no stash (the live successor carries the
 follow-ups). The timer itself bails the same way if it fires on a card the user
 moved. A fire
 while a run is live or background agents still run in the task's REPL (after a
-succeeded or a failed turn, `backgroundAgentsHoldTask`) is deferred by 10 s
+succeeded turn, or a failed one — a `blocked` card whose run `failed` — `backgroundAgentsHoldTask`) is deferred by 10 s
 (`deferAutoRetryNow`) rather than consumed: a retry on another account would
 drop that REPL.
 
@@ -541,11 +541,17 @@ transfer target the directory the CLI really reads.
   propagation removes top-level keys, the top block is rebuilt from the
   backup's assignments minus the removed ones: a kept key keeps its comments,
   a removed key's own comment lines (directly above it, no blank line between)
-  go with it, but the file's header comment (the comment block above the first
-  key, set off by a blank line, `fileHeaderOf`) stays when that first key is
-  removed; a Restore that removes the first key keeps the header the same
-  way. The backup's original top block is kept verbatim only when the primary has no
-  top-level keys and nothing is being removed. A second backstop runs the other
+  go with it. The file's header comment (the comment block above the first
+  key, set off by a blank line, `fileHeaderOf`; or the whole top block when it
+  holds only comments) belongs to the file, not to that key: whenever the
+  backup's first key does not stay first as it is (the primary's top-level
+  keys go above it, replace it, or deletion propagation removes it), the header
+  is lifted off it and written once at the top, so a second run writes the
+  same text. The backup's own header wins; the primary's crosses only to a
+  backup that has none. A Restore that removes or puts back the first key keeps
+  the header the same way, and a comment-only top block stays above a key
+  Restore puts back. The backup's original top block is kept verbatim only when
+  no primary top-level key is written and nothing is being removed. A second backstop runs the other
   way: a removed top-level key the primary does not define that is still in
   the parsed result refuses the write ("the merge would have kept X, which it
   was removing — backup left untouched"), so a key's record is never dropped
@@ -733,7 +739,8 @@ still present, so it is never removed). A **sub-folder that cannot be listed**
 (EACCES, a folder that vanished) is a skip too: its files on the account are
 left as they are (never removed), the rest of the entry mirrors and
 propagates, and the warning reads "could not read <entry>/<folder> (EACCES) —
-left as it is on this account; the rest of the entry was mirrored"; an entry
+left as it is on this account; the rest of the entry was mirrored" (reported
+only there, never also in the entry's "skipped N entries" count); an entry
 whose own top folder cannot be listed still fails as a whole. Only a deleted
 account still aborts the run. `copyTreeCooperative` reports whether a cap
 truncated the tree: if a plugin payload copy was incomplete (truncated, a file
@@ -786,7 +793,16 @@ directory), `key` (`''` for a file or link; the key path for a merged file —
 header or top-level key in `config.toml`), the hash of what the mirror wrote
 (sha256 of the file, of the canonical JSON value or TOML text; the target for a
 link), the source's mtime and size (a cheap "nothing changed" check), whether
-the target `preexisted`, and the saved original's `backup_ref`. An item the
+the target `preexisted`, and the saved original's `backup_ref`. A merged file the mirror **created**
+(absent before the write) also gets a marker row: `scope` `file`, `key`
+`(created by the mirror)` (`CREATED_FILE_KEY`), `value_hash` the sha256 of the
+text the mirror last wrote. It is written before the write that creates the
+file and refreshed after each later write while the file still holds that
+text; a run that finds the file holding anything else (the account rewrote it,
+or deleted it and made its own) drops it, and so does a run after which the
+mirror owns no key in that file. Every other reader ignores it (propagation,
+the merges, previews, `mirrorRecordsAffectedByEdit`'s counts, Restore's file
+pass), and a merged key spelled like it is never owned; no schema change. An item the
 backup **already had with identical content is not recorded**: the mirror did
 not write it, so it never removes it. A row written before a crash and not yet
 stamped with a source mtime marks an interrupted write and is refreshed on the
@@ -799,7 +815,16 @@ neither a primary deletion nor Restore would ever touch). Because the intent
 row has that hash, a primary deletion or a Restore that comes before the
 adoption still recognizes the file as the mirror's own and removes it; a
 source that changes during the copy reads as an edit, so the file is kept
-(the safe side). An added link gets its row, whose value is the known target,
+(the safe side). An **update** that saves the account's original first writes
+its intent row (with `backup_ref`) the same way: it carries the hash of the
+source bytes about to be copied, not the original's, so after a crash past the
+copy a primary deletion or a Restore before the adoption still puts the
+original back, and a copy that never happened reads as an edit and saves the
+same original again. An update of a file the mirror already owns (no backup
+needed) writes no intent row: a crash past its copy is healed by the next run,
+which finds the file equal to the source and adopts it, but a primary deletion
+or a Restore that comes before that run reads the file as edited and keeps it
+(known narrow window; closing it needs a second hash per row). An added link gets its row, whose value is the known target,
 before `symlinkSync`. Re-adding a file or link the backup had deleted keeps the row's
 `preexisted`/`backup_ref`, so Restore still puts the original back.
 
@@ -988,10 +1013,15 @@ row after the same checks:
 - an item the mirror added is removed while unedited, kept when edited, and
   simply forgotten when already gone;
 - a merged TOML file whose restored text would not parse is left alone;
-- a merged file the mirror created (every row for it was an add, none
-  preexisted) that the restore leaves empty (`{}`, or only blank and comment
-  lines in TOML, `isEmptyDocument`) is removed rather than left behind, and
-  listed in `removed`; an account's own merged file stays;
+- a merged file the mirror created, known only from its created-file marker
+  and never guessed from the keys (an account's own `{}` or comment-only
+  `config.toml` has only added keys too), that still holds exactly the text the
+  mirror last wrote and that the restore leaves empty (`{}`, or only blank and
+  comment lines in TOML, `isEmptyDocument`) is removed rather than left behind,
+  and listed in `removed`. An account's own merged file stays, comments
+  included, and so does a file recorded before the marker existed or one the
+  account has rewritten since. Restore drops a marker whose file has no key
+  rows left;
 - a `preexisted` file whose leaf the account has since deleted gets its original
   written back (only a path through a symlinked parent is refused as unsafe), a
   link row is restored the same way (missing parent directories are created
@@ -1080,9 +1110,13 @@ answers 409 `{ error, code: "mirror-records", folders: [{ what, was, now,
 records, savedOriginals }] }` (`HarnessEditMirrorRefusal`) unless the body
 carries `confirmMirrorDrop: true` (a non-boolean is 400). The prediction is
 `mirrorRecordsAffectedByEdit`, the same folder comparison `mirrorOne` makes for
-the next run: only a folder line the edit itself moves counts (a folder the
-core's environment already moved is not blamed on an edit that leaves it
-alone), an edit back to the recorded settings never counts (the next run skips
+the next run: once the edit changes the account's root settings away from the
+recorded ones, every recorded folder the edited account does not resolve to
+counts (`folderDifferences(recorded, after)`), a folder the core's environment
+had already moved it away from included (before the edit the next run would
+only skip; after it, the run drops that folder's records too). An edit that
+leaves the root settings alone (label, binary) or goes back to the recorded
+ones never counts (the next run skips
 rather than drops), and an account with no rows, or no recorded backup folder,
 is never asked. The error is the core's sentence (`describeMirrorEditDrop`),
 naming the folder, the record and saved-original counts, and that Restore can
@@ -1325,13 +1359,15 @@ next ([testing-seams.md](testing-seams.md)).
   task that still has a live run, a swap/start claim or a pending swap keeps the
   request for its own turn end. A task whose background agents are still
   running (the subagent watcher is re-armed at boot), after a succeeded **or a
-  failed** turn (`backgroundAgentsHoldTask`), keeps it until they finish, and
+  failed** turn (`backgroundAgentsHoldTask`; failed means a `blocked` card whose run `failed`), keeps it until they finish, and
   their release edge (`maybeReleaseHeldTask` → `settleWaitingScheduledSwitch`)
   applies it. A switch the core was applying when it stopped, before the row
   changed accounts, is still recorded (`beginManualAccountSwitch` carries
   `scheduledSwitch`): the manual-switch reconcile writes "the core restarted
   before the scheduled account switch started — it stays scheduled" and this
-  pass retries it; a boot completion of a row that already moved consumes the
+  pass retries it (an intent written by another move that carried the request
+  says "the core restarted before the account switch started — the switch to
+  the next account scheduled for this task stays scheduled"); a boot completion of a row that already moved consumes the
   request, even when the copy fails, so it never switches twice. Under a launch
   freeze the request stays persisted for the next owner.
 - `allExhausted.nextAttemptAt` is re-armed on boot; overdue retries are
@@ -1437,17 +1473,20 @@ next ([testing-seams.md](testing-seams.md)).
   account is forced; an account removed/disabled/logged out moves to the next
   usable one, mirrors the config onto it and transfers the conversation
   (`moveTaskToMember`; its warnings become status lines on the run). A live
-  run, or running background agents after a succeeded or a failed turn (the
+  run, or running background agents after a succeeded or a failed turn (a `blocked` card whose run `failed`; the
   `isTaskHeld` failover hook, `backgroundAgentsHoldTask`), leaves the task
   alone (the message queues). The message path holds the task's start claim for the whole
   move, so an armed retry cannot mint a competing successor mid-copy.
 - `PATCH /tasks/:id` with an `agent` inside the same stack is refused while a
   run is live (409 "stop the run before switching accounts") and while
   running background agents hold the task, whether its turn succeeded (held in
-  `running`) or failed (409 "stop the background agents before switching
+  `running`) or failed (a `blocked` card whose run `failed`; 409 "stop the background agents before switching
   accounts", code `background-agents`); for a CLI-token caller both members' roots are
   re-probed through the CLI path gate first (403 `path-not-accessible`). An
-  outside-stack switch keeps the old kill/reset behavior.
+  outside-stack switch keeps the old kill/reset behavior. A running agent row
+  on any other card (a stopped turn's background shell or monitor, a card the
+  user moved to `ready`, `review` or `done`) holds nothing: the switch goes
+  through, and the REPL hosting that row is dropped with it.
 - A same-stack manual switch is AWAITED by the PATCH route (which lifts Bun's
   255 s idle cap with `server.timeout(req, 0)`, because a large transcript copy
   can outlast it; the CLI gives `agetor edit --agent` the 15-minute mirror
@@ -1509,11 +1548,13 @@ provider limit (`switchTaskAccountNow` / `cancelScheduledAccountSwitch` in
 `src/bun/orchestrator.ts`). `POST /tasks/:id/switch-account` answers
 `{ status: "switched" | "scheduled", task }`; `DELETE` cancels a scheduled
 switch and answers `{ task, cancelled }`, `cancelled` being false when nothing
-was scheduled (a no-op), so a caller can tell a cancel from a no-op. While an
-account switch is copying the task's conversation (`isAccountSwitchUnderway`; a
-scheduled switch being applied included), the copy is past the point of
+was scheduled (a no-op), so a caller can tell a cancel from a no-op. While the
+scheduled switch, or a "Switch to next account" move, is copying the task's
+conversation (`isScheduledSwitchUnderway`), the copy is past the point of
 cancelling, so `DELETE` answers 409 `{ error: "the switch is already under
-way", code: "busy" }` and leaves the request alone.
+way", code: "busy" }` and leaves the request alone. A Cancel while another
+switch holds the claim (a same-stack PATCH) drops the request as usual: that
+switch never applies it.
 
 **Target.** `planManualSwitchTarget`: forward from the task's current account,
 wrapping, the first member an automatic swap would also accept (enabled, not
@@ -1540,7 +1581,7 @@ per member reason only for `no-usable-member` (or a core old enough to send no
 | `archived` | the task is archived (unarchive it first) |
 | `launches-frozen` | an idle task while launches are frozen (the port is being handed to another core, or the app is quitting); a live run can still schedule, and boot performs it for the next owner |
 | `no-usable-member` | no other member can take the task now, with `reasons` |
-| `background-agents` | running background agents hold the task, after a succeeded turn (held in `running`) or a failed one (`backgroundAgentsHoldTask`; the switch would drop the REPL that hosts them); a same-stack PATCH refuses with the same code |
+| `background-agents` | running background agents hold the task, after a succeeded turn (held in `running`) or a failed one (a `blocked` card whose run `failed`, the cards that still offer a Stop; `backgroundAgentsHoldTask`; the switch would drop the REPL that hosts them); a running agent row on any other card holds nothing; a same-stack PATCH refuses with the same code |
 | `busy` | another account switch is copying; a swap window, a non-manual `pendingSwap`, an in-flight retry or a boot swap claim holds the task (a request scheduled inside one of those would be lost when the swap rewrites the task's state); a start claim exists with no live turn to wait for; or the row was put back because background agents appeared meanwhile |
 
 An unknown task is 404. For a CLI-token caller the roots of the task's account
@@ -1574,7 +1615,8 @@ drain, so they start on the new account):
 - a **Stop** (the run settled `cancelled`, or Stop on a task whose background
   agents still run after a succeeded or a failed turn) drops it with
   "scheduled account switch cancelled (stopped)"; it is also dropped by a Stop
-  during a swap;
+  during a swap, and a Stop sent while a start holds the claim (no run minted
+  yet) cancels the turn that start mints, whose end drops it;
 - a **provider limit supersedes it**: failover moves or blocks the task anyway,
   so the request is consumed in the limit settlement with no second move; a
   limit settlement that **throws** before consuming it drops it with
@@ -1585,7 +1627,8 @@ drain, so they start on the new account):
   line; it runs when they finish (`maybeReleaseHeldTask` →
   `settleWaitingScheduledSwitch`), whether the turn succeeded or failed (a
   failed turn is never held in `running`, so the release edge is the only one
-  left to apply it);
+  left to apply it); a turn that ends in `ready` (rejected) is not held, so it
+  applies the request at its own turn end even while agent rows still run;
 - **another start holding the task** at turn end (`startingTaskIds`) decides
   at its own run's turn end; when that start ends without a live turn (a failed
   pre-flight or spawn), the switch is applied as it releases its claim
@@ -1631,10 +1674,11 @@ turn end.
 Surfaces: the RunPanel "Switch to next account" button (with a "Switch scheduled
 for the end of this turn" line and Cancel; not offered on an archived task,
 whose switch the core refuses, though a switch still scheduled on one keeps its
-Cancel; a Cancel while the switch is being applied toasts "Couldn't switch
+Cancel; a Cancel while the scheduled switch, or a "Switch to next account" move, is
+being applied toasts "Couldn't switch
 account: the switch is already under way"), `agetor switch-account <task>
 [--cancel]` (`--cancel` with nothing scheduled prints "nothing was scheduled on
-<task> — no account switch to cancel"; while the switch is being applied it
+<task> — no account switch to cancel"; while that switch is being applied it
 prints the core's "the switch is already under way" and exits non-zero;
 against a core that predates `cancelled` it decides from the task as read
 before the request), the `⇄` marker in `agetor ls` and the TUI header, the `switch:`

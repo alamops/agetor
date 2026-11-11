@@ -212,7 +212,10 @@ and wrote) are **untrusted** the same way: the SQLite file is agent-writable.
 
 `harness_mirror_provenance` rows (what a mirror wrote into a backup account) are
 **untrusted data**, like the handoff rows, because the database is
-agent-writable. A row's `path`, `key`, `value_hash` and `backup_ref` are claims.
+agent-writable. A row's `path`, `key`, `value_hash` and `backup_ref` are claims, and so is a
+created-file marker: Restore removes a merged file only for a merge-spec path,
+only while the file's text hashes to the marker's, and only when removing the
+rows' unedited keys leaves it empty.
 Every removal and every Restore re-checks the path before touching the disk: it
 must have a mirror-allowlist shape (`isMirrorCopyShape`: below a `copy` entry,
 not a never-copy path, no `..`/absolute/backslash/NUL), lie below the account's

@@ -1265,3 +1265,139 @@ describe("a FAILED turn's background agents are stopped and respected like a hel
     }
   });
 });
+
+describe("only a held card or a FAILED blocked one is held by its background agents (A1)", () => {
+  /** A stacked task on `a` whose last run ended with `status` on a `column`
+   *  card while one agent row (a background shell, a persistent monitor) is
+   *  still `running`. */
+  function cardWithAgent(
+    prefix: string,
+    column: "ready" | "review" | "done" | "blocked",
+    status: "cancelled" | "failed" | "succeeded",
+    extra: { scheduled?: boolean } = {},
+  ) {
+    const a = alias(`${prefix}-a`);
+    const b = alias(`${prefix}-b`);
+    const stack = stacks.harnessStacks.create({ label: prefix, kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "p");
+    const runId = insertRun(task.id, a, { status, exitCode: status === "succeeded" ? 0 : 1 });
+    db.tasks.update(task.id, { runId, column });
+    const subagentId = `agent-${randomUUID()}`;
+    db.subagents.insertIfAbsent({
+      id: subagentId, taskId: task.id, runId, parentKind: "subagent", agentType: "general-purpose",
+      description: "npm run dev", spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`),
+      status: "running", startedAt: Date.now() - 1000, endedAt: null,
+    } as never);
+    db.tasks.setHarnessState(task.id, {
+      stackId: stack.id, position: 0, count: 2, tried: [], pendingSwap: null, allExhausted: null, lastMove: null,
+      ...(extra.scheduled ? { scheduledSwitch: { requestedAt: Date.now() } } : {}),
+    });
+    const done = () => {
+      db.subagents.setStatus(subagentId, "completed", Date.now());
+      stacks.harnessStacks.delete(stack.id);
+    };
+    return { a, b, stack, task, runId, subagentId, done };
+  }
+
+  const NOT_HELD = [
+    ["ready", "cancelled"],
+    ["ready", "failed"],
+    ["review", "succeeded"],
+    ["done", "succeeded"],
+    ["blocked", "cancelled"],
+  ] as const;
+
+  test("Switch to next account moves a card whose turn was stopped (or that moved on) instead of refusing it", async () => {
+    for (const [column, status] of NOT_HELD) {
+      const { b, task, done } = cardWithAgent(`a1now-${column}-${status}`, column, status);
+      try {
+        expect({ column, status, held: orch.backgroundAgentsHoldTask(task.id) }).toEqual({ column, status, held: false });
+        const result = await orch.switchTaskAccountNow(task.id);
+        expect({ column, status, result: result.status }).toEqual({ column, status, result: "switched" });
+        expect(db.tasks.get(task.id)!.agent).toBe(b);
+      } finally {
+        done();
+      }
+    }
+  }, 30_000);
+
+  test("a scheduled switch on a stopped card is applied when a claim on it is released", async () => {
+    const { b, stack, task, done } = cardWithAgent("a1claim", "ready", "cancelled", { scheduled: true });
+    try {
+      expect(orch.claimTaskForAccountSwitch(task.id)).toBe(true);
+      orch.releaseTaskAccountSwitch(task.id);
+      await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isAccountSwitchUnderway(task.id));
+      const after = db.tasks.get(task.id)!;
+      expect(after.agent).toBe(b);
+      expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
+      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    } finally {
+      done();
+    }
+  }, 20_000);
+
+  test("boot applies a scheduled switch of a stopped card instead of waiting for its agent rows", async () => {
+    const { b, stack, task, done } = cardWithAgent("a1boot", "review", "succeeded", { scheduled: true });
+    try {
+      await orch.reconcilePendingHarnessSwaps();
+      await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isAccountSwitchUnderway(task.id));
+      expect(db.tasks.get(task.id)!.agent).toBe(b);
+      expect(db.tasks.get(task.id)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+      expect(events(stack.id).filter((e) => e.taskId === task.id).map((e) => e.trigger)).toEqual(["scheduled"]);
+    } finally {
+      done();
+    }
+  }, 20_000);
+
+  test("a FAILED turn on a blocked card still holds, and the death watch probes it; a stopped card is not probed", async () => {
+    const { setHeldSessionProbe } = await import("./claude-tmux.ts");
+    const probe = setHeldSessionProbe(null);
+    setHeldSessionProbe(probe);
+    const failed = cardWithAgent("a1failed", "blocked", "failed");
+    const stopped = cardWithAgent("a1stopped", "ready", "cancelled");
+    try {
+      expect(orch.backgroundAgentsHoldTask(failed.task.id)).toBe(true);
+      expect(probe?.(failed.task.id)).toBe(true);
+      expect(orch.claimTaskForAccountSwitch(failed.task.id)).toBe(false);
+      expect(orch.backgroundAgentsHoldTask(stopped.task.id)).toBe(false);
+      expect(probe?.(stopped.task.id)).toBe(false);
+      // The user drags the failed card on: nothing on it offers a Stop any
+      // more, so it no longer holds either.
+      db.tasks.update(failed.task.id, { column: "ready" });
+      expect(orch.backgroundAgentsHoldTask(failed.task.id)).toBe(false);
+    } finally {
+      failed.done();
+      stopped.done();
+    }
+  });
+});
+
+describe("a restart before a switch-now move started keeps a carried scheduled request (A4)", () => {
+  test("a manual switch-now intent carrying a scheduled request says it stays scheduled, and boot applies it", async () => {
+    const a = alias("a4-a");
+    const b = alias("a4-b");
+    const stack = stacks.harnessStacks.create({ label: "a4", kind: "claude-code", members: [a, b] });
+    const task = makeTask(a, "p", { column: "review" });
+    const runId = insertRun(task.id, a);
+    db.tasks.update(task.id, { runId });
+    // What a crash right after the intent write of an idle "Switch to next
+    // account" leaves when a scheduled request was recorded too: the row is
+    // still on the source account.
+    db.tasks.setHarnessState(task.id, {
+      stackId: stack.id, position: 0, count: 2, tried: [], allExhausted: null, lastMove: null,
+      pendingSwap: { from: a, to: b, reason: "quota", runId, startedAt: Date.now(), manual: true, switchNow: "manual" },
+      scheduledSwitch: { requestedAt: Date.now() },
+    });
+    await orch.reconcilePendingHarnessSwaps();
+    await waitFor(() => db.tasks.get(task.id)?.agent === b && !orch.isAccountSwitchUnderway(task.id));
+    const after = db.tasks.get(task.id)!;
+    expect(after.agent).toBe(b);
+    expect(after.harnessState?.scheduledSwitch ?? null).toBeNull();
+    const lines = db.runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(lines).toContain(
+      "the core restarted before the account switch started — the switch to the next account scheduled for this task stays scheduled",
+    );
+    expect(lines.some((l) => l.includes("run the task to switch"))).toBe(false);
+    stacks.harnessStacks.delete(stack.id);
+  }, 20_000);
+});

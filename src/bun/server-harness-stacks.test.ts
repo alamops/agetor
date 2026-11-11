@@ -1075,6 +1075,47 @@ describe("same-stack switch guards on PATCH /tasks/:id", () => {
     }
   }, 60_000);
 
+  test("a running agent row on a card whose turn was STOPPED (or that moved on) does not refuse the switch (A1)", async () => {
+    const created = await call("POST", "/harness-stacks", { label: "stopped-row", kind: "claude-code", members: ["api-a", "api-b"] });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    // Stop leaves a background shell or a persistent monitor running, and a
+    // card the user moved on keeps such rows too. Neither card shows a Stop,
+    // so a refusal here would be a dead end.
+    const cases = [
+      { column: "ready", status: "cancelled" },
+      { column: "ready", status: "failed" },
+      { column: "review", status: "succeeded" },
+      { column: "done", status: "succeeded" },
+    ] as const;
+    try {
+      for (const { column, status } of cases) {
+        const runId = randomUUID();
+        const taskId = seedTaskRow({ column, runId });
+        db.runs.insert({
+          id: runId, taskId, agent: "api-a", status,
+          startedAt: Date.now(), endedAt: Date.now(), exitCode: status === "succeeded" ? 0 : 1,
+          tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+        });
+        const subagentId = `stopped-${randomUUID().slice(0, 8)}`;
+        db.subagents.insertIfAbsent({
+          id: subagentId, taskId, runId, parentKind: "subagent", agentType: "Bash", description: "npm run dev",
+          spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`), status: "running", startedAt: Date.now(), endedAt: null,
+        });
+        try {
+          const switched = await call("PATCH", `/tasks/${taskId}`, { agent: "api-b" });
+          expect({ column, status, code: switched.status }).toEqual({ column, status, code: 200 });
+          expect(db.tasks.get(taskId)?.agent).toBe("api-b");
+        } finally {
+          db.subagents.setStatus(subagentId, "completed", Date.now());
+          db.tasks.delete(taskId);
+        }
+      }
+    } finally {
+      await call("DELETE", `/harness-stacks/${stackId}`);
+    }
+  }, 60_000);
+
   test.skipIf(IS_ROOT)("a CLI-token switch re-gates both members' roots: a root re-pointed into a protected folder after the save is refused (CR5)", async () => {
     const cliToken = (await import("./api-config.ts")).CLI_TOKEN;
     const ids = ["a", "b"].map((x) => `api-cr5-${x}-${randomUUID().slice(0, 6)}`);
@@ -1760,7 +1801,7 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     }
   }, 60_000);
 
-  test("switch-account: a Cancel while the switch is being applied answers 409 busy and leaves the request alone (N2)", async () => {
+  test("switch-account: a Cancel while the scheduled switch is being applied answers 409 busy and leaves the request alone (N2)", async () => {
     const a = makeAccount("ca");
     const b = makeAccount("cb");
     const stackId = await makeStack([a, b], "swbusy");
@@ -1769,9 +1810,27 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     const runId = seedRun(t, a, "succeeded");
     db.tasks.update(t, { runId });
     db.tasks.setHarnessState(t, { ...baseState(stackId), scheduledSwitch: { requestedAt: Date.now() } });
-    // The scheduled switch is being applied: its account-switch claim is held.
-    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    // Hold the scheduled move right after its intent is written, with its
+    // account-switch claim held.
+    let reached = false;
+    let open = (): void => {};
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    const prev = orch.__setScheduledSwitchHooksForTest({
+      afterIntent: (id) => {
+        if (id !== t) return;
+        reached = true;
+        return gate;
+      },
+    });
     try {
+      // A claim release is one of the edges that applies a waiting request.
+      expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+      orch.releaseTaskAccountSwitch(t);
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline && !reached) await Bun.sleep(10);
+      expect(reached).toBe(true);
+      expect(orch.isScheduledSwitchUnderway(t)).toBe(true);
+
       const busy = await call("DELETE", `/tasks/${t}/switch-account`);
       expect(busy.status).toBe(409);
       expect(busy.body.code).toBe("busy");
@@ -1779,14 +1838,45 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
       expect(db.tasks.get(t)!.harnessState?.scheduledSwitch).toBeTruthy();
       expect(statusLines(runId).some((l) => l.includes("cancelled"))).toBe(false);
     } finally {
-      orch.releaseTaskAccountSwitch(t);
-      // The claim release applies the still-scheduled switch: let it finish
-      // before the row goes.
+      open();
+      // Let the move finish before the row goes.
       const deadline = Date.now() + 8000;
       while (Date.now() < deadline && db.tasks.get(t)?.harnessState?.scheduledSwitch) await Bun.sleep(15);
       while (Date.now() < deadline && orch.isAccountSwitchUnderway(t)) await Bun.sleep(15);
-      db.tasks.delete(t);
+      orch.__setScheduledSwitchHooksForTest(prev);
     }
+    expect(db.tasks.get(t)!.agent).toBe(b);
+    expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+    db.tasks.delete(t);
+  }, 60_000);
+
+  test("switch-account: a Cancel while another switch holds the claim (a same-stack PATCH) drops the request (A5)", async () => {
+    const a = makeAccount("pa");
+    const stackId = await makeStack([a, makeAccount("pb")], "swpatch");
+    const orch = await import("./orchestrator.ts");
+    const t = seedTaskRow({ agent: a });
+    const runId = seedRun(t, a, "succeeded");
+    db.tasks.update(t, { runId });
+    db.tasks.setHarnessState(t, { ...baseState(stackId), scheduledSwitch: { requestedAt: Date.now() } });
+    // The claim the PATCH route takes for a same-stack agent change. That
+    // PATCH may still be refused, which would leave the request behind.
+    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    try {
+      expect(orch.isAccountSwitchUnderway(t)).toBe(true);
+      expect(orch.isScheduledSwitchUnderway(t)).toBe(false);
+      const cancel = await call("DELETE", `/tasks/${t}/switch-account`);
+      expect(cancel.status).toBe(200);
+      expect(cancel.body.cancelled).toBe(true);
+      expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+      expect(statusLines(runId)).toContain("scheduled account switch cancelled");
+    } finally {
+      orch.releaseTaskAccountSwitch(t);
+    }
+    // The claim ends (the PATCH refused) with nothing left to apply.
+    await Bun.sleep(50);
+    expect(db.tasks.get(t)!.agent).toBe(a);
+    expect(orch.isAccountSwitchUnderway(t)).toBe(false);
+    db.tasks.delete(t);
   }, 60_000);
 
   test("switch-account: an idle task moves to the next member now; a live turn schedules it; DELETE cancels with a status line (and is a no-op when nothing is scheduled)", async () => {

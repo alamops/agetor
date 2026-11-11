@@ -42,7 +42,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, backgroundAgentsHoldTask, isAccountSwitchUnderway, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, rearmRetriesAfterCooldownClear, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, backgroundAgentsHoldTask, isScheduledSwitchUnderway, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, rearmRetriesAfterCooldownClear, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -6451,8 +6451,12 @@ export function startApiServer(
           }
           // A scheduled switch being applied right now is past the point of
           // cancelling (the copy is never aborted halfway): say so instead of
-          // answering a no-op while the task moves.
-          if (isAccountSwitchUnderway(req.params.id)) {
+          // answering a no-op while the task moves. Only that move (or a
+          // "Switch to next account" move, which also consumes the request)
+          // counts: another switch holding the claim, such as a same-stack
+          // PATCH, may be refused and leave the request behind, so the
+          // Cancel drops it as usual.
+          if (isScheduledSwitchUnderway(req.params.id)) {
             return json(
               { error: "the switch is already under way", code: "busy" } satisfies SwitchAccountRefusal,
               { status: 409, headers: corsHeaders(req) },

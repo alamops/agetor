@@ -135,6 +135,8 @@ import {
   removeMirrorBackups,
 } from "./harness-mirror-backup.ts";
 import {
+  CREATED_FILE_KEY,
+  isCreatedFileMarker,
   isUnownedRow,
   mirrorProvenance,
   mirrorSources,
@@ -527,8 +529,17 @@ interface MirrorCtx {
 
 const rowId = (p: string, key: string) => `${p}\u0000${key}`;
 
+/** The row of a file, link or merged key. A merged key spelled like the
+ *  created-file marker's key is never one the mirror owns: it has no row. */
 function getRow(ctx: MirrorCtx, p: string, key = ""): MirrorProvenanceRow | undefined {
+  if (key === CREATED_FILE_KEY) return undefined;
   return ctx.rows.get(rowId(p, key));
+}
+
+/** The created-file marker of a merged file ({@link CREATED_FILE_KEY}). */
+function createdMarkerOf(ctx: MirrorCtx, rel: string): MirrorProvenanceRow | undefined {
+  const row = ctx.rows.get(rowId(rel, CREATED_FILE_KEY));
+  return row && isCreatedFileMarker(row) ? row : undefined;
 }
 
 /** True while the destination account still exists. A mirror in flight when
@@ -546,6 +557,8 @@ function accountAlive(ctx: MirrorCtx): boolean {
 function putRow(ctx: MirrorCtx, row: Omit<MirrorProvenanceRow, "harnessId" | "stackId" | "updatedAt">): void {
   if (ctx.dry) return;
   if (!accountAlive(ctx)) return;
+  // Only the marker itself may use the marker's key (see `getRow`).
+  if (row.key === CREATED_FILE_KEY && row.scope !== "file") return;
   const full: MirrorProvenanceRow = { ...row, harnessId: ctx.harnessId, stackId: ctx.stackId, updatedAt: Date.now() };
   mirrorProvenance.upsert(full);
   ctx.rows.set(rowId(row.path, row.key), full);
@@ -754,7 +767,7 @@ async function mirrorOne(
     );
   }
   const allRows = mirrorProvenance.list(target.id);
-  const dropsRecords = allRows.some((r) => changedLines.has(folderLineOf(kind, r)));
+  const dropsRecords = allRows.some((r) => !isCreatedFileMarker(r) && changedLines.has(folderLineOf(kind, r)));
   for (const moved of changed) {
     plan.warnings.push(
       `this account's ${moved.what} changed from ${moved.was} to ${moved.now}; the mirror's record and saved originals for ${moved.was} are dropped and what this account has in ${moved.now} is mirrored as new`,
@@ -850,6 +863,16 @@ async function mirrorOne(
     }
   }
 
+  // A created-file marker outlives no key of its file: once the mirror owns
+  // nothing in that file any more, the file is no longer the mirror's to remove.
+  if (!dry && !ctx.gone) {
+    for (const row of [...ctx.rows.values()]) {
+      if (!isCreatedFileMarker(row)) continue;
+      const owned = [...ctx.rows.values()].some((r) => r.path === row.path && r.scope === "key");
+      if (!owned) await dropRow(ctx, row.path, CREATED_FILE_KEY);
+    }
+  }
+
   return { copied: ctx.copied, warnings: ctx.warnings, plan, dropsRecords };
 }
 
@@ -924,16 +947,19 @@ export interface MirrorEditDropFolder {
  * changed) would cost the account's mirror records: each recorded folder the
  * edit moves the account away from that still holds records, or null when
  * nothing would be dropped. It predicts {@link mirrorOne}'s own decision for
- * the next run into the account: a folder is dropped there when the
- * account's root settings changed and it no longer resolves to the recorded
- * folder. Only a folder line the edit itself changes counts (an edit that
- * keeps the folders, or touches only the label or binary, never does), and
- * only a line with records (an account with none loses nothing).
+ * the next run into the account: once the account's root settings are no
+ * longer the recorded ones, that run drops every recorded folder the account
+ * does not resolve to (`folderDifferences(recorded, after)`), including one
+ * the core's environment had already moved it away from, which the run
+ * before the edit would only have skipped. An edit that leaves the root
+ * settings alone (the label, the binary) or goes back to the recorded ones
+ * never counts, and only a line with records does (an account with none
+ * loses nothing).
  */
 export function mirrorRecordsAffectedByEdit(current: Harness, patched: Harness): MirrorEditDropFolder[] | null {
   const kind = current.kind;
   if (kind !== "claude-code" && kind !== "codex") return null;
-  const rows = mirrorProvenance.list(current.id);
+  const rows = mirrorProvenance.list(current.id).filter((r) => !isCreatedFileMarker(r));
   if (rows.length === 0) return null;
   const recorded = mirrorSources.get(current.id);
   // No folder on record: the next run applies the rows where it is and drops
@@ -941,14 +967,13 @@ export function mirrorRecordsAffectedByEdit(current: Harness, patched: Harness):
   if (recorded === null || recorded.backupRoot === "") return null;
   const before = folderSourceOf(current, mirrorRootFor(current));
   const after = folderSourceOf(patched, mirrorRootFor(patched));
-  // The next run skips (keeping every record) rather than drops when the
-  // account's root settings are the recorded ones.
+  // An edit that keeps the root settings changes nothing about the next run,
+  // and one back to the recorded settings makes it skip (keeping every
+  // record) rather than drop.
   if (before.config === after.config || after.config === recorded.backupConfig) return null;
-  const editedLines = new Set(folderDifferences(before.root, after.root).map((d) => d.line));
-  if (editedLines.size === 0) return null;
   const out: MirrorEditDropFolder[] = [];
   for (const moved of folderDifferences(recorded.backupRoot, after.root)) {
-    if (!folderLinesOf(kind).includes(moved.line) || !editedLines.has(moved.line)) continue;
+    if (!folderLinesOf(kind).includes(moved.line)) continue;
     const inFolder = rows.filter((r) => folderLineOf(kind, r) === moved.line);
     if (inFolder.length === 0) continue;
     out.push({
@@ -1108,7 +1133,7 @@ async function copyEntry(
       // rest of the entry (the unreadable folders are in `skipped`), while a
       // plugin registry is not pointed at a payload that may lack files.
       incompletePayloads.add(rel);
-      const listed = tree.unreadable.slice(0, MAX_LISTED_FAILURES).map((u) => `${rel}/${u}`).join(", ");
+      const listed = tree.unreadable.slice(0, MAX_LISTED_FAILURES).map((u) => `${rel}/${u.rel} (${u.code})`).join(", ");
       const more = tree.unreadable.length > MAX_LISTED_FAILURES ? ` and ${tree.unreadable.length - MAX_LISTED_FAILURES} more` : "";
       warn(ctx, `${rel}: could not read ${listed}${more} — left as it is on this account; the rest of the entry was mirrored`);
     }
@@ -1119,7 +1144,10 @@ async function copyEntry(
       const links = await linkTopLevelSymlinks(ctx, src, rel);
       for (const name of links.handled) linkedNames.add(name);
     }
-    const skipped = tree.skipped.filter((entry) => !linkedNames.has(entry));
+    // An unreadable sub-folder has its own warning above; it is not counted
+    // again here (it stays in `tree.skipped`, which keeps its files).
+    const unreadable = new Set(tree.unreadable.map((u) => u.rel));
+    const skipped = tree.skipped.filter((entry) => !linkedNames.has(entry) && !unreadable.has(entry));
     if (skipped.length > 0) {
       // Not silent: a never-copy cache, a symlink, a vanished entry or a
       // size/entry cap is exactly what a user needs to know did not move
@@ -1175,14 +1203,14 @@ async function planTree(
   srcDir: string,
   entryRel: string,
   limits: { maxBytes?: number; maxEntries?: number },
-): Promise<{ files: PlannedFile[]; skipped: string[]; truncated: boolean; unreadable: string[] }> {
+): Promise<{ files: PlannedFile[]; skipped: string[]; truncated: boolean; unreadable: Array<{ rel: string; code: string }> }> {
   const maxBytes = limits.maxBytes ?? 64 * 1024 * 1024;
   const maxEntries = limits.maxEntries ?? 5_000;
   const files: PlannedFile[] = [];
   const skipped: string[] = [];
   /** Sub-folders that could not be listed (EACCES, a folder that vanished):
    *  skipped like any other entry, and they make the copy incomplete. */
-  const unreadable: string[] = [];
+  const unreadable: Array<{ rel: string; code: string }> = [];
   let truncated = false;
   let bytes = 0;
   let entries = 0;
@@ -1233,7 +1261,7 @@ async function planTree(
         // the rest of the entry still mirrors.
         if (!rel) throw err;
         skipped.push(rel);
-        unreadable.push(`${rel} (${(err as NodeJS.ErrnoException)?.code ?? "read error"})`);
+        unreadable.push({ rel, code: (err as NodeJS.ErrnoException)?.code ?? "read error" });
         return;
       }
       for (const name of names) await walk(rel ? path.join(rel, name) : name);
@@ -1385,11 +1413,20 @@ async function mirrorFile(
     ctx.plan.backups.push(rel);
     if (!ctx.dry) {
       if (!accountAlive(ctx)) throw new Error("account deleted");
+      const intendedHash = await hashFile(from);
       backupRef = await backupFileOriginal(ctx.harnessId, rel, to, { force: true });
       // Record the intent before the write (no source stamp marks it pending):
-      // a crash in between must not lose the link to the saved original.
+      // a crash in between must not lose the link to the saved original. Like
+      // an add's intent row, it carries the hash of the bytes about to be
+      // copied, not the original's (the saved original is `backupRef`): after
+      // a crash past the copy, a primary deletion or a Restore that comes
+      // before the next run's adoption still sees the mirror's own bytes and
+      // puts the original back. A copy that never happened leaves the
+      // original in place, which reads as an edit and is saved again as the
+      // same original; a source that changes during the copy reads as an
+      // edit too, which keeps the file (the safe side).
       putRow(ctx, {
-        scope: "file", path: rel, key: "", valueHash: destHash ?? (await hashFile(to)),
+        scope: "file", path: rel, key: "", valueHash: intendedHash,
         srcMtimeMs: null, srcSize: null, preexisted: true, backupRef,
       });
     }
@@ -1420,7 +1457,7 @@ async function propagateRemovals(
 ): Promise<void> {
   if (!opts.complete) return;
   const rows = [...ctx.rows.values()].filter(
-    (r) => (r.scope === "file" || r.scope === "link") && !isUnownedRow(r)
+    (r) => (r.scope === "file" || r.scope === "link") && !isUnownedRow(r) && !isCreatedFileMarker(r)
       && (r.path === entry || r.path.startsWith(`${entry}/`)),
   );
   for (const row of rows) {
@@ -2227,9 +2264,29 @@ async function commitMerged(ctx: MirrorCtx, c: MergedCommit): Promise<void> {
       srcMtimeMs: null, srcSize: null, preexisted: true, backupRef: ref,
     });
   }
+  // Whether the mirror created this file, recorded explicitly (`preexisted` is
+  // per key, and "every key was an add" also fits an account's own `{}` or
+  // comment-only file). The marker goes in before the write that creates the
+  // file; it holds the hash of the text the mirror last wrote, and a file that
+  // no longer holds exactly that (the account rewrote it, or deleted it and
+  // made its own) is no longer known to be the mirror's creation.
+  const marker = createdMarkerOf(ctx, c.rel);
+  const markerRow = (text: string) => ({
+    scope: "file" as const, path: c.rel, key: CREATED_FILE_KEY, valueHash: sha256(text),
+    srcMtimeMs: null, srcSize: null, preexisted: false, backupRef: null,
+  });
+  let keepMarker = false;
+  if (fileChanged && c.backupText === null) {
+    if (!accountAlive(ctx)) throw new Error("account deleted");
+    putRow(ctx, markerRow(c.text));
+  } else if (marker && c.backupText !== null) {
+    if (sha256(c.backupText) === marker.valueHash) keepMarker = true;
+    else await dropRow(ctx, c.rel, CREATED_FILE_KEY);
+  }
   if (fileChanged) {
     await atomicWriteFile(c.toPath, c.text, { root: c.toBase });
     ctx.copied.push(c.rel);
+    if (keepMarker) putRow(ctx, markerRow(c.text));
   }
   for (const u of c.upserts) {
     const row = getRow(ctx, c.rel, u.key);
@@ -2778,26 +2835,39 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
     }
   }
 
-  // Assemble.
+  // Assemble. The file's header comment (`splitFileHeader`) rides on its
+  // first assignment's text, or is the whole top block when that holds only
+  // comments. It belongs to the file, not to that key: whenever the backup's
+  // first key does not stay first as it is (the primary's keys go above it,
+  // or replace or remove it), the header is lifted off it and kept at the top.
+  // The backup's own header wins; the primary's crosses (as it always did, on
+  // its first key) only when the backup has none. A lifted header is never
+  // written twice, so a second run writes the same file.
   const out: string[] = [];
-  const topParts = keptTop.map((a) => a.text.trimEnd());
+  const firstBackupTop = backupTopAssignments[0];
+  const lifted = keptTop.length > 0 || (firstBackupTop !== undefined && removeTop.has(firstBackupTop.key));
+  const backupHeader = !lifted
+    ? ""
+    : firstBackupTop !== undefined
+      ? splitFileHeader(firstBackupTop.text).header
+      : commentOnlyBlock(backupTopText);
+  const primaryFirst = keptTop[0] !== undefined && keptTop[0].key === primaryTopAssignments[0]?.key
+    ? splitFileHeader(keptTop[0].text)
+    : null;
+  const topParts = keptTop.map((a, i) => (i === 0 && primaryFirst ? primaryFirst.rest : a.text).trimEnd());
   const primaryTopKeys = new Set(keptTop.map((a) => a.key));
   for (const assignment of backupTopAssignments) {
     if (primaryTopKeys.has(assignment.key) || removeTop.has(assignment.key)) continue;
-    topParts.push(assignment.text.trimEnd());
+    const text = lifted && assignment === firstBackupTop ? splitFileHeader(assignment.text).rest : assignment.text;
+    topParts.push(text.trimEnd());
   }
-  // The file's header comment rides on its first assignment's text; removing
-  // that key must not take the header with it.
-  const firstBackupTop = backupTopAssignments[0];
-  const keptHeader = firstBackupTop !== undefined && removeTop.has(firstBackupTop.key)
-    ? fileHeaderOf(firstBackupTop.text)
-    : "";
+  const keptHeader = backupHeader || (primaryFirst?.header ?? "");
   const topText = [keptHeader, topParts.join("\n")].filter((t) => t.trim().length > 0).join("\n\n");
   if (topText.trim().length > 0) {
     out.push(topText);
-  } else if (!primaryTopAssignments.length && removeTop.size === 0 && backupTopText.trim()) {
-    // Primary has no top-level keys and nothing is being removed: keep the
-    // backup's block as it is (a comment-only header). With a removal, the
+  } else if (keptTop.length === 0 && removeTop.size === 0 && backupTopText.trim()) {
+    // No primary top-level key is written and nothing is being removed: keep
+    // the backup's block as it is (a comment-only header). With a removal, the
     // block is what `topParts` rebuilt from the backup's assignments minus the
     // removed ones (each keeps its own comments): writing the old block back
     // would keep the removed keys while their records are dropped.
@@ -3211,6 +3281,12 @@ export function splitTomlBlocks(text: string): TomlBlock[] {
  * go with it; a header is set off by a blank line. "" when there is none.
  */
 function fileHeaderOf(firstAssignmentText: string): string {
+  return splitFileHeader(firstAssignmentText).header;
+}
+
+/** {@link fileHeaderOf}'s header, and the assignment's text without it (the
+ *  whole text when there is no header). */
+function splitFileHeader(firstAssignmentText: string): { header: string; rest: string } {
   const lines = firstAssignmentText.split(/\r?\n/);
   let lastBlank = -1;
   for (let i = 0; i < lines.length; i++) {
@@ -3219,7 +3295,17 @@ function fileHeaderOf(firstAssignmentText: string): string {
     else if (!line.startsWith("#")) break;
   }
   const header = lastBlank < 0 ? "" : lines.slice(0, lastBlank).join("\n");
-  return header.trim() === "" ? "" : header.trimEnd();
+  if (header.trim() === "") return { header: "", rest: firstAssignmentText };
+  return { header: header.trimEnd(), rest: lines.slice(lastBlank + 1).join("\n") };
+}
+
+/** A TOML top block with no assignment that holds only comment and blank
+ *  lines: its comments (leading blank lines dropped), or "" otherwise. */
+function commentOnlyBlock(topText: string): string {
+  const lines = topText.split(/\r?\n/);
+  if (!lines.every((l) => l.trim() === "" || l.trim().startsWith("#"))) return "";
+  const first = lines.findIndex((l) => l.trim() !== "");
+  return first < 0 ? "" : lines.slice(first).join("\n").trimEnd();
 }
 
 export interface TomlAssignment {
@@ -3340,11 +3426,17 @@ function replaceTomlKey(text: string, key: string, replacement: string | null): 
   if (isHeaderText) return `${[...blocks.map((b) => b.text.trimEnd()), replacement.trimEnd()].filter(Boolean).join("\n\n")}\n`;
   const topBlock = blocks.find((b) => b.header === "");
   const assignments = topBlock ? splitTopLevelAssignments(topBlock.text).assignments : [];
+  // Replacing the first key keeps the file's header comment, and a top block
+  // of comments only stays above the restored key (see `fileHeaderOf`).
+  const header = assignments.length === 0
+    ? commentOnlyBlock(topBlock?.text ?? "")
+    : assignments[0]!.key === key ? fileHeaderOf(assignments[0]!.text) : "";
   const parts = assignments.some((a) => a.key === key)
     ? assignments.map((a) => (a.key === key ? replacement.trimEnd() : a.text.trimEnd()))
     : [...assignments.map((a) => a.text.trimEnd()), replacement.trimEnd()];
+  const top = [header, parts.join("\n")].filter((t) => t.trim().length > 0).join("\n\n");
   const rest = blocks.filter((b) => b.header !== "").map((b) => b.text.trimEnd());
-  return `${[parts.join("\n"), ...rest].filter(Boolean).join("\n\n")}\n`;
+  return `${[top, ...rest].filter(Boolean).join("\n\n")}\n`;
 }
 
 /** The object path of a provenance key in a JSON file (the key string joins
@@ -3429,7 +3521,7 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
     const recordedRows = mirrorProvenance.list(harnessId);
     const staleLines = new Set<number>();
     for (const moved of moves) {
-      const hasRows = recordedRows.some((r) => folderLineOf(kind, r) === moved.line);
+      const hasRows = recordedRows.some((r) => !isCreatedFileMarker(r) && folderLineOf(kind, r) === moved.line);
       if (recordedFolderExists(moved.was)) {
         refusedLines.add(moved.line);
         if (hasRows) {
@@ -3466,9 +3558,10 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
     await removeBackupEntry(harnessId, row.scope, row.path, row.key);
   };
 
-  // Files and links.
+  // Files and links. A merged file's created-file marker is not a file the
+  // mirror copied: the merged-file pass below reads it.
   for (const row of rows) {
-    if (row.scope === "key") continue;
+    if (row.scope === "key" || isCreatedFileMarker(row)) continue;
     await yieldNow();
     const rel = row.path;
     const abs = path.join(root, rel);
@@ -3596,10 +3689,19 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
         ? await restoreTomlKeys(harnessId, rel, fileRows, read.text, result, failed)
         : await restoreJsonKeys(harnessId, rel, fileRows, read.text, result, failed);
       if (outcome.text !== null && outcome.text !== read.text) {
-        // A file the mirror created (every key it holds was added, none was
-        // the account's own) that Restore empties goes away, rather than
-        // staying behind as `{}` or a comment-only TOML file.
-        if (fileRows.every((r) => !r.preexisted) && isEmptyDocument(rel, outcome.text)) {
+        // A file the mirror created that Restore empties goes away, rather
+        // than staying behind as `{}` or a comment-only TOML file. "Created"
+        // is the marker the mirror wrote when it made the file, never a guess
+        // from the keys (an account's own `{}` or comment-only file has only
+        // added keys too), and the file must still hold exactly the text the
+        // mirror last wrote. No marker (rows from before it existed): kept.
+        const marker = rows.find((r) => isCreatedFileMarker(r) && r.path === rel);
+        if (
+          marker !== undefined
+          && marker.valueHash === sha256(read.text)
+          && fileRows.every((r) => !r.preexisted)
+          && isEmptyDocument(rel, outcome.text)
+        ) {
           // `unlink` removes the leaf itself, never a link's target, and the
           // folders above it were checked by `destinationState`.
           unlinkSync(toPath);
@@ -3612,6 +3714,15 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
       for (const row of outcome.done) await finish(row);
     } catch (err) {
       failed(`${rel}: could not restore — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // A created-file marker whose file has no key rows left has nothing more to
+  // say (its file was removed, or the account keeps it).
+  for (const marker of rows) {
+    if (!isCreatedFileMarker(marker)) continue;
+    if (!mirrorProvenance.listForPath(harnessId, marker.path).some((r) => r.scope === "key")) {
+      mirrorProvenance.remove(harnessId, marker.path, marker.key);
     }
   }
 
