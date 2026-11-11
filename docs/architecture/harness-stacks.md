@@ -387,14 +387,17 @@ The armed timer respects the user: it is cancelled (`cancelHarnessRetryForTask`
 status line "automatic account retry cancelled", or "… cancelled — the stack was
 deleted" for a stack delete) when the card is no longer `blocked` (a drag,
 `agetor move` or any `PATCH /tasks/:id` column change off `blocked`), when the
-user presses Stop on the blocked card, and on archive/delete/stack delete (a
+user presses Stop on the blocked card (when that card's background agents still
+run, the Stop also interrupts them), and on archive/delete/stack delete (a
 stack delete also drops a task's scheduled switch with its own status line).
 A retry whose successor run is still live is not "cancelled": only the loop
 marker goes, with no claim and no stash (the live successor carries the
 follow-ups). The timer itself bails the same way if it fires on a card the user
 moved. A fire
-while a run is live or the task is held by background agents is deferred by
-10 s (`deferAutoRetryNow`) rather than consumed.
+while a run is live or background agents still run in the task's REPL (after a
+succeeded or a failed turn, `backgroundAgentsHoldTask`) is deferred by 10 s
+(`deferAutoRetryNow`) rather than consumed: a retry on another account would
+drop that REPL.
 
 A retry in flight is persisted (`allExhausted.inFlight` with
 `nextAttemptAt: 0`) before its spawn, so a crash, a spawn failure or the retry
@@ -536,8 +539,12 @@ transfer target the directory the CLI really reads.
   contributes and every backup key the merge was not meant to replace is still
   there; otherwise the backup is left untouched with a warning. When deletion
   propagation removes top-level keys, the top block is rebuilt from the
-  backup's assignments minus the removed ones (each keeps its comments); the
-  backup's original top block is kept verbatim only when the primary has no
+  backup's assignments minus the removed ones: a kept key keeps its comments,
+  a removed key's own comment lines (directly above it, no blank line between)
+  go with it, but the file's header comment (the comment block above the first
+  key, set off by a blank line, `fileHeaderOf`) stays when that first key is
+  removed; a Restore that removes the first key keeps the header the same
+  way. The backup's original top block is kept verbatim only when the primary has no
   top-level keys and nothing is being removed. A second backstop runs the other
   way: a removed top-level key the primary does not define that is still in
   the parsed result refuses the write ("the merge would have kept X, which it
@@ -713,15 +720,26 @@ be as large as that tree's own budget (so a big asset under the 512 MB plugin
 budget copies; the generic 64 MB per-file cap does not apply there), and a
 single file over its entry's cap is a skip, "larger than the … mirror limit
 for this entry — skipped", decided before anything is written, so the preview
-reports the same skip. One file that cannot be copied (EACCES, a disk error,
+reports the same skip. A file the mirror would overwrite, and so back up
+first, whose own copy on the account is over the backup store's 64 MB limit
+(`MAX_BACKUP_BYTES`) is planned and run as the same kind of skip, "this
+account's own copy is larger than the 64 MB backup limit — not updated": an
+original is never overwritten unsaved, and the preview says so instead of
+promising an update. One file that cannot be copied (EACCES, a disk error,
 a file that grew) is a **per-file skip** with a warning (the first five are
 listed, the rest counted), not the end of its entry: the rest of the entry
 still mirrors and deletion propagation still runs (the failed file counts as
-still present, so it is never removed). Only a deleted account still aborts
-the run. `copyTreeCooperative` reports whether a cap truncated the tree: if a
-plugin payload copy was incomplete (truncated, or a file failed), the mirror
-leaves that account's plugin registry untouched and warns, so a rewritten
-registry can never point at payload files that were never copied.
+still present, so it is never removed). A **sub-folder that cannot be listed**
+(EACCES, a folder that vanished) is a skip too: its files on the account are
+left as they are (never removed), the rest of the entry mirrors and
+propagates, and the warning reads "could not read <entry>/<folder> (EACCES) —
+left as it is on this account; the rest of the entry was mirrored"; an entry
+whose own top folder cannot be listed still fails as a whole. Only a deleted
+account still aborts the run. `copyTreeCooperative` reports whether a cap
+truncated the tree: if a plugin payload copy was incomplete (truncated, a file
+failed, or a sub-folder could not be read), the mirror leaves that account's
+plugin registry untouched and warns, so a rewritten registry can never point
+at payload files that were never copied.
 
 **Temp files.** Every atomic write goes through a sibling `.agetor-tmp-<uuid>`
 file, which a crash or kill between its creation and the rename leaves behind
@@ -756,7 +774,8 @@ nothing: no file, no saved original, no provenance row. So a preview is exactly
 what a real run would do. A plan carries names only, never a value (values can
 be secrets). `previewMirror(draft, { stackId? })` runs the dry pass for a draft
 stack; `overwrites` is true when any plan backs something up or removes
-something. A mirror, a preview and a Restore of one destination account are
+something, or when a re-pointed backup's run would drop records of its old
+folder (below), since that loses the way back as surely. A mirror, a preview and a Restore of one destination account are
 serialized (`serializeForDestination`).
 
 **What is recorded.** For every file, merged key and symlink the mirror *wrote*,
@@ -771,13 +790,17 @@ the target `preexisted`, and the saved original's `backup_ref`. An item the
 backup **already had with identical content is not recorded**: the mirror did
 not write it, so it never removes it. A row written before a crash and not yet
 stamped with a source mtime marks an interrupted write and is refreshed on the
-next run. That holds for an **add** too: an added file gets its intent row (no
-hash, no source stamp) before the copy, and the equal-stamp branch adopts a
-file that matches such a row on the next run (the copy keeps the source's
-mtime, so without the row a crash would leave a file that looks unchanged and
-that nothing owns, which neither a primary deletion nor Restore would ever
-touch); an added link gets its row, whose value is the known target, before
-`symlinkSync`. Re-adding a file or link the backup had deleted keeps the row's
+next run. That holds for an **add** too: an added file gets its intent row
+before the copy, carrying the hash of the source bytes about to be copied but
+no source stamp, and the equal-stamp branch adopts a file that matches such a
+row on the next run (the copy keeps the source's mtime, so without the row a
+crash would leave a file that looks unchanged and that nothing owns, which
+neither a primary deletion nor Restore would ever touch). Because the intent
+row has that hash, a primary deletion or a Restore that comes before the
+adoption still recognizes the file as the mirror's own and removes it; a
+source that changes during the copy reads as an edit, so the file is kept
+(the safe side). An added link gets its row, whose value is the known target,
+before `symlinkSync`. Re-adding a file or link the backup had deleted keeps the row's
 `preexisted`/`backup_ref`, so Restore still puts the original back.
 
 **Deletion propagation.** Only when the primary's config root is a real
@@ -828,29 +851,61 @@ and fingerprint for the backup itself (`backup_root`, `backup_config`;
   re-pointed the account), a different primary, or a recorded folder that no
   longer exists: the run proceeds and the record is updated. For the backup,
   a changed fingerprint or a recorded folder that is gone, while its current
-  folder differs from the recorded one (`firstFolderDifference`): every
-  provenance row and saved original describes the old folder, so none may
-  drive an edit, a removal or a forced backup in the new one; the run plans
-  with no rows. A real run whose primary folder exists first drops the account's provenance rows, its mirror-sources row and its saved
-  originals (`dropMirrorState`, the body of `deleteMirrorStateForHarness`, run
-  inside the account's mirror queue), then mirrors into the new folder as into a
-  fresh account (its own files count as preexisted and are backed up before an
-  overwrite) and records the new folders, with the warning "this account's
-  config folder changed from X to Y; the mirror's record and saved originals
-  for X are dropped and this account is mirrored as new". A preview plans with
-  no old rows and shows the same notice. A row from before migration 090 has no
-  recorded backup folder (`''`) and none of this applies until the next real
-  run records one.
+  folder differs from the recorded one (`folderDifferences`): each recorded
+  folder is judged **on its own** (a Claude account records its config root
+  and its `.claude.json` folder), and folders are compared by resolved path
+  (`sameRecordedFolder`, through `resolvePathLexically`), so a symlinked
+  spelling of the same folder is not a change; a recorded folder that is
+  missing, lands in a protected folder or cannot be resolved matches only by
+  its spelling. The provenance rows and saved originals of the items in a
+  folder that differs describe the old folder, so none of them may drive an
+  edit, a removal or a forced backup in the new one; the run plans without
+  them (`.claude.json` keys belong to the `.claude.json` folder, everything
+  else to the config root). The other folder's records stay: pinning an
+  account to the config root it already used moves only its `.claude.json`
+  folder, so only the `.claude.json` records go. A real run whose primary
+  folder exists first drops the moved folder's provenance rows and saved
+  originals (`dropFolderState`, run inside the account's mirror queue; when
+  every folder of the account moved, that is all of its mirror state, the
+  mirror-sources row included, `dropMirrorState`, the body of
+  `deleteMirrorStateForHarness`), records the new folders **before its first
+  write**, then mirrors into the new folder as new (its own files count as
+  preexisted and are backed up before an overwrite), with one warning per
+  moved folder: "this account's config folder changed from X to Y; the
+  mirror's record and saved originals for X are dropped and what this account
+  has in Y is mirrored as new" (naming the `.claude.json` folder when that is
+  the one that moved). When the primary's config root is not a directory, such
+  a backup is **skipped** instead ("skipped: this account's config folder
+  changed from X to Y, but the primary account's config folder P is not a
+  directory; nothing is copied to or removed from this account until it is"):
+  the drop needs a primary to mirror from, and a merge from outside the
+  primary's config root (Claude's `.claude.json`) would otherwise save
+  originals and write rows beside the old folder's, which the next run's drop
+  would delete with them. A preview plans without the moved folder's rows,
+  shows the same notice, and sets `overwrites` when the run would drop any
+  record, so the save-time confirmation covers the drop. When the re-point is
+  an account edit (`PATCH /harnesses/:id` changing `home` or `env`), the user
+  confirmed this when saving the edit (see Surfaces below); the drop itself
+  still happens on the next real run. A recorded folder that is **gone**
+  counts as moved for good, even if it only vanished for a while (an unmounted
+  volume): its records and saved originals are dropped, by the next real run
+  or by Restore, rather than kept for a folder nothing can restore into. A row from before
+  migration 090 has no recorded backup folder (`''`) and none of this applies
+  until the next real run records one.
 
 Recorded folders come from an agent-writable row, so they are only compared
 and checked for existence, resolved lexically and never stat'ed inside a
 macOS-protected folder (`recordedFolderExists`: such a folder, or one that
 cannot be resolved, counts as existing, which can only cause a skip or a
-refusal). The record is written only by a real run whose primary folder exists
-(a run against a missing folder copies nothing and records nothing), and
-dropped with the account (`harnesses.delete`, account cleanup, a Restore of a
-missing account), by a Restore that returns the backup to its own originals,
-and by the re-point drop above.
+refusal). The record is written only by a real run whose primary folder
+exists, **before that run's first write** (a run against a missing folder
+copies nothing and records nothing): a run cut short afterwards never leaves
+the old folder on record, which would make the next run read the new folder as
+moved again and drop what this run saved there, and a first run never leaves
+rows with no folder pinned. It is dropped with the account (`harnesses.delete`,
+account cleanup, a Restore of a missing account), by a Restore that returns the
+backup to its own originals, by the re-point drop above when every folder
+moved, and by a Restore that finds every recorded folder gone.
 
 A **merged file the primary deleted outright** (`settings.json`,
 `.claude.json`, `config.toml`, a plugin registry) is merged as an empty
@@ -933,6 +988,10 @@ row after the same checks:
 - an item the mirror added is removed while unedited, kept when edited, and
   simply forgotten when already gone;
 - a merged TOML file whose restored text would not parse is left alone;
+- a merged file the mirror created (every row for it was an add, none
+  preexisted) that the restore leaves empty (`{}`, or only blank and comment
+  lines in TOML, `isEmptyDocument`) is removed rather than left behind, and
+  listed in `removed`; an account's own merged file stays;
 - a `preexisted` file whose leaf the account has since deleted gets its original
   written back (only a path through a symlinked parent is refused as unsafe), a
   link row is restored the same way (missing parent directories are created
@@ -942,14 +1001,22 @@ row after the same checks:
 A restored file gets its saved mode on the temp file before the rename
 (`atomicWriteFile`'s `mode`, set through the open handle, never by path), never
 a `chmod` of the final path afterwards, which would follow a symlink swapped in
-there. `copyRegularFileDetailed` sets its temp file's mode the same way. **Restore refuses** (nothing
-written, nothing forgotten, one warning) whenever a recorded backup folder is
-known and differs from the folder the account resolves to now, whether or not
-the old folder still exists: the rows and saved originals belong to that
-folder. While it exists the warning says to start Agetor with the environment
-that resolves the account there (or give the account that folder) and restore
-again; when it is gone it says "restore refused: the mirror's record is for X
-…", and the next mirror of the account drops that record.
+there. `copyRegularFileDetailed` sets its temp file's mode the same way.
+**A recorded folder the account no longer resolves to** is judged on its own
+(the same per-folder comparison as the mirror's), because its rows and saved
+originals belong to that folder; the other folder's rows restore as usual:
+
+- while the old folder still **exists**, its rows are refused and kept
+  (nothing written, nothing forgotten), with one warning: "restore refused:
+  this account's config folder is now Y, but the mirror wrote into X; … Start
+  Agetor with the environment that resolves the account to X (or give the
+  account that folder) and restore again";
+- when it is **gone**, nothing can ever be restored into it, and an account
+  that left its stack is never mirrored again, so nothing else would drop the
+  records: Restore drops that folder's rows and saved originals itself
+  (`dropFolderState`) and says so, "the mirror's record is for X, which no
+  longer exists (this account's config folder is now Y); nothing was restored
+  from it, and its records and saved originals were dropped".
 
 A row that was fully handled (restored, removed, nothing left to do, or garbage)
 is deleted together with its saved original. A row that was kept or failed
@@ -970,9 +1037,10 @@ deleting anything on the backup; a `preexisted` key keeps an un-owned restore
 pointer.
 
 **Test seams.** `holdMirrorForTests(harnessId, point)` pauses the next mirror
-run (real or dry) into that account at `after-copy` (between the copy and
-merge phases), `file-copied` (between a copied file's rename and its final
-provenance row, where a crash would land) or `primary-deletion-recheck`
+run into that account at `after-copy` (between the copy and merge phases;
+real or dry), `file-copied` (between a copied file's rename and its final
+provenance row, where a crash would land; reached only by a real write, never
+by a dry run) or `primary-deletion-recheck`
 (before a merged file the primary seems to have deleted is looked at again),
 so an account delete or an editor's rename provably lands there; `release()`
 also cancels a hold no run reached. `setStaleTempAgeForTests(ms)`
@@ -987,10 +1055,11 @@ member-root path gate runs **before** the validation (validation resolves the
 account roots and reads login evidence inside them, in the core's process). The Settings editor calls it on
 Save when the change is mirror-relevant (a new stack with a backup, or an edit
 that changes members, their order or the mirror mode) and shows the preview
-dialog **only when `overwrites` is true**; the CLI `harness stack create|edit`
-prints the preview with `--dry-run` and saves nothing, and without `--yes`
-refuses (exit 1, after printing the preview) a save that would overwrite or
-remove; `harness stack preview <stack>` prints it for a saved stack. The
+dialog **only when `overwrites` is true** (a backup or a removal, or a
+re-pointed account whose old folder's records would be dropped); the CLI
+`harness stack create|edit` prints the preview with `--dry-run` and saves
+nothing, and without `--yes` refuses (exit 1, after printing the preview) a
+save that would overwrite, remove or drop such records; `harness stack preview <stack>` prints it for a saved stack. The
 server re-runs the mirror whenever `members`, `kind` or `mirrorMode` is in the
 PATCH body, whatever its value, so both clients send **only the fields that
 differ** from the stored stack (the webview's `draftPatch`, the CLI's
@@ -1003,6 +1072,29 @@ only when a mirror-relevant field actually changes. Restore is
 a button on the account row in Settings → Harnesses (with a confirm; shown only for accounts with mirror records) and
 `agetor harness restore <account> [--yes]` (`--yes` is needed for a current
 backup member).
+
+**Account edits that drop mirror records.** A re-point can also come from the
+account itself: `PATCH /harnesses/:id` with a `home` or `env` change that moves
+the account away from a recorded backup folder that still has provenance rows
+answers 409 `{ error, code: "mirror-records", folders: [{ what, was, now,
+records, savedOriginals }] }` (`HarnessEditMirrorRefusal`) unless the body
+carries `confirmMirrorDrop: true` (a non-boolean is 400). The prediction is
+`mirrorRecordsAffectedByEdit`, the same folder comparison `mirrorOne` makes for
+the next run: only a folder line the edit itself moves counts (a folder the
+core's environment already moved is not blamed on an edit that leaves it
+alone), an edit back to the recorded settings never counts (the next run skips
+rather than drops), and an account with no rows, or no recorded backup folder,
+is never asked. The error is the core's sentence (`describeMirrorEditDrop`),
+naming the folder, the record and saved-original counts, and that Restore can
+no longer put the originals back. A refused or invalid body applies nothing,
+its `enabled` toggle included. The Settings account editor shows that sentence
+in a destructive confirm ("Save anyway") and re-sends the save with the flag
+(`saveConfirmingMirrorDrop`, `src/mainview/lib/harness-edit-confirm.ts`);
+Cancel saves nothing and keeps the draft. `agetor harness edit … --yes` sends
+the flag; without it the CLI prints the core's sentence, asks for `--yes` and
+exits 1 (`--json` prints `{ saved: false, refusal }`). One narrow window is
+left: while an account's very first mirror run is still in flight, the check
+sees no rows yet and does not ask.
 
 ## Codex `CODEX_HOME`
 
@@ -1094,8 +1186,9 @@ source account's config root to the destination's (adapters: Claude, Codex).
   id, since a row names one session and cleanup only removes paths of its own
   session) and reclaims the pending paths onto it; only then is the old session
   swept. A failed copy leaves the old row as it was and its pending paths are
-  swept; a crash leaves them for the boot sweep. Copies that cannot be removed
-  yet stay on record and the transfer reports a warning; see
+  swept; a crash leaves them for the boot sweep. The sweep of the superseded
+  session is fired once the transfer has returned, so copies it cannot remove
+  yet stay on record and are logged, not returned as a transfer warning; see
   [Leftover handoff copies](#leftover-handoff-copies).
 - Codex: the rollout is copied to the same relative path under the destination
   `CODEX_HOME` (only `sessions/YYYY/MM/DD/rollout-*-<threadId>.jsonl` is a
@@ -1122,7 +1215,15 @@ handoff shape naming the path's own session, a real path, a regular file;
 nothing recursive). A record is dropped once its file is removed or gone, or
 when it is rejected as never ours; a `retained` one (outside the current root,
 refused root, failed unlink) stays for the next sweep. An account that no
-longer exists has no root, so its records are dropped. A session that is live
+longer exists has no root, so its records are dropped. A record whose column
+is not the session column of its account's kind (`claude-code` ↔
+`claude_session_id`, `codex` ↔ `codex_session_id`, `columnMatchesHarness`) is
+forgotten whatever its stamp and never acted on: the column picks the root a
+path is checked against and the shapes it may have, so a `claude_session_id`
+record on a Codex account would resolve the Claude root and find no Codex run
+to protect a live Claude session there. A record naming no handoff column at
+all is never listed by the store (`toOrphanedCopy`), and each sweep deletes
+such rows (`forgetForeignColumns`). A session that is live
 on a handoff row of the same account, or **being transferred onto it**
 (`heldTransfer` marks it before the transfer's first await), is skipped, and a
 sweep already removing it stops before the next file (`shouldStop`, checked in
@@ -1142,6 +1243,14 @@ clock, always above every earlier stamp and mark, seeded from the table on
 first use), so a pending record written by a transfer of the same session that
 started while the sweep yielded (possibly for a file the sweep had just
 unlinked and the copy is about to recreate) is stamped after the mark and kept.
+The table is agent-writable, so the seed reads integer stamps only and is
+clamped to a day past the wall clock: a planted `created_at` at or above 2^53
+(where `+ 1` no longer changes a double), a huge REAL or a TEXT can never
+freeze later stamps at one value. A row stamped past the clamp is never
+forgotten by a sweep's marked `forget` (the safe side); a `forget` without
+`notAfter` (a record whose column does not match its account, a path written
+back onto a live handoff row) compares no stamp at all, so it still drops such
+a record.
 Sweeps are serialized and cooperative and never reject. They run:
 
 - at boot, fired without awaiting at the end of `reconcileOrphans`
@@ -1152,21 +1261,31 @@ Sweeps are serialized and cooperative and never reject. They run:
   re-reads the row first (the pass yields, and a transfer may change a row
   meanwhile); a row stamped 0 (a transfer that never completed) is skipped, because its old
   session is still the one a resume uses;
-- after a successful transfer, for the superseded session; after a failed one,
-  for the session it recorded. The failure sweep is fired without being
-  awaited: it queues behind every other sweep, and the caller usually holds
-  the task's start claim while it waits for the transfer's result
-  (`orphanSweepsSettled()` resolves once every sweep queued so far is done);
+- after a transfer, once its in-flight mark is released: after a success, for
+  the superseded session; after a failure, for the session it recorded. Both
+  are fired without being awaited: they queue behind every other sweep, and
+  the caller usually holds the task's start claim while it waits for the
+  transfer's result (`orphanSweepsSettled()` resolves once every sweep queued
+  so far is done). A superseded copy the sweep cannot remove yet is logged
+  (console), not returned as a transfer warning;
 - after `PATCH /harnesses/:id` changes `home` or `env` (a root changed back
   brings kept files into reach), not awaited.
 
-Account delete captures the orphaned copies along with its handoffs and
-removes them after the delete succeeds.
+Account delete captures the orphaned copies along with its handoffs (only the
+records whose column matches the account's kind; the others are dropped with
+the account's rows, their paths never acted on) and removes them after the
+delete succeeds. Task cleanup drops a handoff row whose column does not match
+its account's kind without touching its paths.
 
-Test seams: `holdTransferForTests` pauses a transfer, `pauseOrphanSweepForTests()`
-pauses the next sweep that removes a group after the removal and before it
-forgets the records, and `orphanSweepsSettled()` waits for the fired failure
-sweeps (all in `src/bun/harness-session-transfer.ts`). `snapshotHarnessState`
+Test seams: `holdTransferForTests` pauses a transfer;
+`pauseOrphanSweepForTests({ harnessId, sessionId })` pauses the next sweep of
+that group after the removal and before it forgets the records (keyed, so a
+sweep of another account or session queued earlier never takes it; arm it
+after `orphanSweepsSettled()` and call `resetOrphanSweepPauseForTests()` in
+`afterEach`); `orphanSweepsSettled()` waits for every fired sweep, the failure
+and the superseded ones (all in `src/bun/harness-session-transfer.ts`); and
+`resetOrphanStampForTests()` (`src/bun/db.ts`) makes the next stamp re-read
+the table. `snapshotHarnessState`
 (`src/bun/test-harness-state.ts`) restores `harness_orphaned_copies` and
 `harness_mirror_sources` whole-row, so one test file's rows never reach the
 next ([testing-seams.md](testing-seams.md)).
@@ -1203,9 +1322,18 @@ next ([testing-seams.md](testing-seams.md)).
   (`reconcileScheduledSwitchesAtBoot`, inside `reconcilePendingHarnessSwaps`,
   i.e. after the boot gate), a task with `scheduledSwitch` whose turn ended
   during the downtime is switched now; an archived task's request is dropped; a
-  task that still has a live run, a swap/start claim, a pending swap or
-  background agents keeps the request for its own turn end. Under a launch freeze
-  the request stays persisted for the next owner.
+  task that still has a live run, a swap/start claim or a pending swap keeps the
+  request for its own turn end. A task whose background agents are still
+  running (the subagent watcher is re-armed at boot), after a succeeded **or a
+  failed** turn (`backgroundAgentsHoldTask`), keeps it until they finish, and
+  their release edge (`maybeReleaseHeldTask` → `settleWaitingScheduledSwitch`)
+  applies it. A switch the core was applying when it stopped, before the row
+  changed accounts, is still recorded (`beginManualAccountSwitch` carries
+  `scheduledSwitch`): the manual-switch reconcile writes "the core restarted
+  before the scheduled account switch started — it stays scheduled" and this
+  pass retries it; a boot completion of a row that already moved consumes the
+  request, even when the copy fails, so it never switches twice. Under a launch
+  freeze the request stays persisted for the next owner.
 - `allExhausted.nextAttemptAt` is re-armed on boot; overdue retries are
   staggered (`now + 5 s + i × 2 s`) so N tasks on one stack do not all mirror
   into the same backup in one tick, and a card `reconcileOrphans` sent to
@@ -1309,13 +1437,15 @@ next ([testing-seams.md](testing-seams.md)).
   account is forced; an account removed/disabled/logged out moves to the next
   usable one, mirrors the config onto it and transfers the conversation
   (`moveTaskToMember`; its warnings become status lines on the run). A live
-  run — or a task held by running background agents — is left alone (the
-  message queues). The message path holds the task's start claim for the whole
+  run, or running background agents after a succeeded or a failed turn (the
+  `isTaskHeld` failover hook, `backgroundAgentsHoldTask`), leaves the task
+  alone (the message queues). The message path holds the task's start claim for the whole
   move, so an armed retry cannot mint a competing successor mid-copy.
 - `PATCH /tasks/:id` with an `agent` inside the same stack is refused while a
-  run is live (409 "stop the run before switching accounts") and while the
-  task is held by running background agents (409 "stop the background agents
-  before switching accounts"); for a CLI-token caller both members' roots are
+  run is live (409 "stop the run before switching accounts") and while
+  running background agents hold the task, whether its turn succeeded (held in
+  `running`) or failed (409 "stop the background agents before switching
+  accounts", code `background-agents`); for a CLI-token caller both members' roots are
   re-probed through the CLI path gate first (403 `path-not-accessible`). An
   outside-stack switch keeps the old kill/reset behavior.
 - A same-stack manual switch is AWAITED by the PATCH route (which lifts Bun's
@@ -1326,8 +1456,8 @@ next ([testing-seams.md](testing-seams.md)).
   (`accountSwitchTaskIds` plus `startingTaskIds`). A Run during the copy is refused ("switching accounts —
   try again in a moment") and a message is declined for the same reason: the old
   REPL is about to be dropped and a fresh session would be displaced by the
-  handoff. A same-stack switch of a task held by running background agents is
-  refused at every entry (the route answers 409; `claimTaskForAccountSwitch`
+  handoff. A same-stack switch of a task whose background agents are still
+  running (after a succeeded or a failed turn) is refused at every entry (the route answers 409; `claimTaskForAccountSwitch`
   and `reconcileTaskSession` revert a direct caller's switch with a status
   line), so the REPL hosting them is never dropped. The intent is persisted as `harnessState.pendingSwap.manual` **before**
   the task row changes accounts, so a crash between the row update and the
@@ -1379,7 +1509,11 @@ provider limit (`switchTaskAccountNow` / `cancelScheduledAccountSwitch` in
 `src/bun/orchestrator.ts`). `POST /tasks/:id/switch-account` answers
 `{ status: "switched" | "scheduled", task }`; `DELETE` cancels a scheduled
 switch and answers `{ task, cancelled }`, `cancelled` being false when nothing
-was scheduled (a no-op), so a caller can tell a cancel from a no-op.
+was scheduled (a no-op), so a caller can tell a cancel from a no-op. While an
+account switch is copying the task's conversation (`isAccountSwitchUnderway`; a
+scheduled switch being applied included), the copy is past the point of
+cancelling, so `DELETE` answers 409 `{ error: "the switch is already under
+way", code: "busy" }` and leaves the request alone.
 
 **Target.** `planManualSwitchTarget`: forward from the task's current account,
 wrapping, the first member an automatic swap would also accept (enabled, not
@@ -1406,7 +1540,7 @@ per member reason only for `no-usable-member` (or a core old enough to send no
 | `archived` | the task is archived (unarchive it first) |
 | `launches-frozen` | an idle task while launches are frozen (the port is being handed to another core, or the app is quitting); a live run can still schedule, and boot performs it for the next owner |
 | `no-usable-member` | no other member can take the task now, with `reasons` |
-| `background-agents` | running background agents hold the task (the switch would drop the REPL that hosts them) |
+| `background-agents` | running background agents hold the task, after a succeeded turn (held in `running`) or a failed one (`backgroundAgentsHoldTask`; the switch would drop the REPL that hosts them); a same-stack PATCH refuses with the same code |
 | `busy` | another account switch is copying; a swap window, a non-manual `pendingSwap`, an in-flight retry or a boot swap claim holds the task (a request scheduled inside one of those would be lost when the swap rewrites the task's state); a start claim exists with no live turn to wait for; or the row was put back because background agents appeared meanwhile |
 
 An unknown task is 404. For a CLI-token caller the roots of the task's account
@@ -1432,11 +1566,15 @@ drain, so they start on the new account):
 - the target is **re-planned**; with no usable member the request is dropped
   with the member reasons in a status line; a task whose account left the stack
   (`not-in-stack`) drops it with "scheduled account switch dropped: the task is
-  no longer in a stack with a backup account"; a failed move drops it with the
-  error;
-- a **Stop** (the run settled `cancelled`, or Stop on a task held by background
-  agents) drops it with "scheduled account switch cancelled (stopped)"; it is
-  also dropped by a Stop during a swap;
+  no longer in a stack with a backup account"; a failed move drops it with
+  "scheduled account switch failed: <error>". The request stays persisted
+  through the move (`beginManualAccountSwitch` carries `scheduledSwitch`) and
+  the move's final state write clears it, so a crash before the row changes
+  accounts leaves it for boot to retry (see Crash safety);
+- a **Stop** (the run settled `cancelled`, or Stop on a task whose background
+  agents still run after a succeeded or a failed turn) drops it with
+  "scheduled account switch cancelled (stopped)"; it is also dropped by a Stop
+  during a swap;
 - a **provider limit supersedes it**: failover moves or blocks the task anyway,
   so the request is consumed in the limit settlement with no second move; a
   limit settlement that **throws** before consuming it drops it with
@@ -1493,10 +1631,13 @@ turn end.
 Surfaces: the RunPanel "Switch to next account" button (with a "Switch scheduled
 for the end of this turn" line and Cancel; not offered on an archived task,
 whose switch the core refuses, though a switch still scheduled on one keeps its
-Cancel), `agetor switch-account <task> [--cancel]` (`--cancel` with nothing
-scheduled prints "nothing was scheduled on <task> — no account switch to
-cancel"; against a core that predates `cancelled` it decides from the task as
-read before the request), the `⇄` marker in `agetor ls` and the TUI header, the `switch:`
+Cancel; a Cancel while the switch is being applied toasts "Couldn't switch
+account: the switch is already under way"), `agetor switch-account <task>
+[--cancel]` (`--cancel` with nothing scheduled prints "nothing was scheduled on
+<task> — no account switch to cancel"; while the switch is being applied it
+prints the core's "the switch is already under way" and exits non-zero;
+against a core that predates `cancelled` it decides from the task as read
+before the request), the `⇄` marker in `agetor ls` and the TUI header, the `switch:`
 line in `agetor show`, and the card badge ("switch scheduled").
 
 ## Swap history
@@ -1577,7 +1718,10 @@ account move and every blocked outcome. The trigger per path is the table under
   given — the stored `CLAUDE_CONFIG_DIR`/`home` spelling is the string Claude
   hashes into its keychain item. `PATCH /harnesses/:id` refuses re-pointing a
   stack member onto another member's config root or another kind
-  (`harnessStacks.validateMemberRoot`), and a `PATCH /tasks/:id` column move off
+  (`harnessStacks.validateMemberRoot`) and, without `confirmMirrorDrop: true`,
+  a `home`/`env` change that would drop the account's mirror records (409
+  `mirror-records`, see [Mirror provenance, backups, preview and
+  Restore](#mirror-provenance-backups-preview-and-restore)), and a `PATCH /tasks/:id` column move off
   `blocked` cancels an armed retry. The CLI client URL-encodes the ids it puts in
   request paths (tasks, runs, interactions, stacks, harnesses;
   `src/cli/api-client.ts`).
@@ -1599,7 +1743,10 @@ account move and every blocked outcome. The trigger per path is the table under
   `agetor harness cooldown clear <account> [--model id]` (without `--model` it
   clears every cooldown row of the account and says so; the account may be a kind
   name, resolved like the core does; it reports how many waiting tasks were
-  re-armed); `agetor harness restore <account> [--yes]`; `agetor
+  re-armed); `agetor harness restore <account> [--yes]`; `agetor harness edit
+  <account> … [--yes]` (a `--home`/`--env` edit that would drop the account's
+  mirror records prints the core's sentence and exits 1 without `--yes`;
+  `--json` prints `{ saved: false, refusal }`); `agetor
   switch-account <task> [--cancel]` (a `no-usable-member` refusal prints one
   heading and each member reason once, any other refusal the core's sentence); `agetor harness stack rm` says the stack's switch history is
   deleted with it. `agetor harness ls` and
@@ -1646,7 +1793,8 @@ account move and every blocked outcome. The trigger per path is the table under
   save", sends `expectedUpdatedAt`, and on a mirror-relevant Save calls the
   preview route, showing the preview dialog (per backup: files overwritten or
   removed, keys, what is backed up first, what is kept) **only when `overwrites`
-  is true**. Confirm writes **exactly the draft that was previewed**: a draft
+  is true** (a backup or a removal, or a re-pointed account whose old folder's
+  records would be dropped). Confirm writes **exactly the draft that was previewed**: a draft
   edited while the dry run was in flight, or after the dialog opened, is previewed
   again instead of being saved unseen. (The editor lives in
   `src/mainview/components/settings/StackEditor.tsx`.) A 409 `stack-changed` toasts "This stack changed elsewhere —
@@ -1657,7 +1805,9 @@ account move and every blocked outcome. The trigger per path is the table under
   settles after the user left the editor (rail click, Escape, the History
   sub-page) pops back only while that editor's own view is still the one
   showing (`viewAfterSave`, compared by identity, so a reopened editor on the
-  same stack is not the one that saved), and `StackEditor` reports its dirty
+  same stack is not the one that saved; `stackSavedHandler` builds the
+  editor's `onSaved` and reads the current view through the state updater,
+  never the render-time one), and `StackEditor` reports its dirty
   state only while mounted, saying "clean" once on unmount, so a late save never
   overwrites another form's dirty flag. *Board and RunPanel:* New Task/TaskCard and the
   task-launch pickers' badges (a not-yet-run task derives its `n/m` from the

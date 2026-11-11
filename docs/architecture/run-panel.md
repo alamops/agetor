@@ -47,7 +47,10 @@ nor loses the request:
   Switch to next account / Cancel guard; the scheduled state itself is not local,
   it reads `task.harnessState.scheduledSwitch`, so a reload or a CLI request
   shows the same thing; an archived task is offered no switch, but a switch
-  still scheduled on one keeps its Cancel);
+  still scheduled on one keeps its Cancel; a Cancel that lands while the switch
+  is being applied gets the core's 409 `busy` and toasts "Couldn't switch
+  account: the switch is already under way", through
+  `switchAccountFailureToast`);
 - `TaskDetails`'s `switchingAgentFor` (the account picker is disabled with a
   "Switching…" note while the awaited same-stack PATCH copies the transcript;
   `TaskDetails` is rendered by `RunPanelBody`).

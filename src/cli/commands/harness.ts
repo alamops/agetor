@@ -2,7 +2,7 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table, isTTY } from "../output.ts";
 import { flagValue } from "../args.ts";
 import { ApiError, type HarnessPatchInput } from "../api-client.ts";
-import type { AgentKind, HarnessLimitState, HarnessQuota, HarnessStack, HarnessStatus, MirrorPreview } from "../../shared/types.ts";
+import type { AgentKind, Harness, HarnessLimitState, HarnessQuota, HarnessStack, HarnessStatus, MirrorPreview } from "../../shared/types.ts";
 import { formatHarnessSwapEvent, stackPositionText, memberStateText } from "../../shared/harness-stack.ts";
 import { usageError } from "../usage.ts";
 import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
@@ -112,9 +112,21 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
       if (Object.keys(patch).length === 0) {
         throw new Error("nothing to edit — pass --label / --home / --bin / --env / --profile-mcp / --no-profile-mcp");
       }
-      const updated = await client.patchHarness(id, patch);
+      let updated: Harness;
+      try {
+        updated = await client.patchHarness(id, f.yes ? { ...patch, confirmMirrorDrop: true } : patch);
+      } catch (e) {
+        // The edit moves the account away from a folder the config mirror
+        // keeps records and saved originals for: like a stack save whose
+        // preview overwrites, it needs `--yes`.
+        if (e instanceof ApiError && e.status === 409 && e.code === "mirror-records") {
+          if (flags.json) printJson({ saved: false, refusal: e.body });
+          throw new Error(`${escapeFreeText(e.message)} Re-run with --yes to save anyway.`);
+        }
+        throw e;
+      }
       if (flags.json) return printJson(updated);
-      out(`${c.green("✓")} updated harness ${c.bold(updated.id)}`);
+      out(`${c.green("✓")} updated harness ${c.bold(escapeControlChars(updated.id))}`);
       return;
     }
     case "enable":
@@ -312,6 +324,9 @@ interface HarnessFlags {
   env?: Record<string, string>;
   /** fx only: `--profile-mcp` / `--no-profile-mcp` (last one wins). */
   profileMcpServers?: boolean;
+  /** `edit` only: save even when the edit drops the account's config-mirror
+   *  records (the core's `mirror-records` refusal). */
+  yes?: boolean;
 }
 
 export function parseHarnessFlags(args: string[]): HarnessFlags {
@@ -326,6 +341,8 @@ export function parseHarnessFlags(args: string[]): HarnessFlags {
       case "--bin": { const v = val(); f.bin = v === "none" ? null : v; f.binSet = true; break; }
       case "--profile-mcp": f.profileMcpServers = true; break;
       case "--no-profile-mcp": f.profileMcpServers = false; break;
+      case "--yes":
+      case "-y": f.yes = true; break;
       case "--env": {
         const v = val();
         const eq = v.indexOf("=");

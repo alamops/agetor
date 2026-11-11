@@ -39,6 +39,7 @@ import {
 import { abbreviateHome, cn } from "@/lib/utils";
 import { resolveTemplateInitialHome } from "@/lib/harness-template";
 import { harnessEditorDirty } from "@/lib/harness-editor-dirty";
+import { saveConfirmingMirrorDrop } from "@/lib/harness-edit-confirm";
 import { restoreSummary } from "@/lib/stack-editor";
 import {
   SETTINGS_SECTIONS,
@@ -294,6 +295,18 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
  *  stack is not the one that saved. */
 export function viewAfterSave(current: SettingsView, saved: SettingsView): SettingsView {
   return current === saved ? backFromSubview(saved) : current;
+}
+
+/** StackEditor's `onSaved` for the editor rendered as `viewAtRender`. The save
+ *  may land after the user left this editor (rail click, Escape-pop, the
+ *  History subpage), so it pops only while this editor's own view is still the
+ *  one showing: the decision reads the CURRENT view through the state updater,
+ *  never the render-time one. */
+export function stackSavedHandler(
+  viewAtRender: SettingsView,
+  setView: (update: (current: SettingsView) => SettingsView) => void,
+): () => void {
+  return () => setView((current) => viewAfterSave(current, viewAtRender));
 }
 
 /** The view the modal opens on: a deep-linked agent's edit subpage, else the
@@ -978,13 +991,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 void refresh();
                 onChange?.();
               }}
-              onSaved={() => {
-                // The save may land after the user left this editor (rail
-                // click, Escape-pop, the History subpage): pop only while this
-                // editor's own view is still the one showing.
-                const saved = view;
-                setView((current) => viewAfterSave(current, saved));
-              }}
+              onSaved={stackSavedHandler(view, setView)}
               onDirtyChange={(dirty) => {
                 subpageDirtyRef.current = dirty;
               }}
@@ -1024,12 +1031,27 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 setFormError(null);
                 try {
                   if (view.harnessId) {
-                    await api.updateHarness(view.harnessId, {
-                      label: input.label,
-                      home: input.home,
-                      bin: input.bin,
-                      env: input.env,
-                    });
+                    const harnessId = view.harnessId;
+                    const outcome = await saveConfirmingMirrorDrop(
+                      (confirmMirrorDrop) =>
+                        api.updateHarness(harnessId, {
+                          label: input.label,
+                          home: input.home,
+                          bin: input.bin,
+                          env: input.env,
+                          ...(confirmMirrorDrop ? { confirmMirrorDrop: true } : {}),
+                        }),
+                      (refusal) =>
+                        confirm({
+                          title: "Drop this account's mirror records?",
+                          description: refusal.error,
+                          confirmLabel: "Save anyway",
+                          variant: "destructive",
+                        }),
+                    );
+                    // Cancelled: nothing was saved; the editor stays open
+                    // with the draft as typed.
+                    if (outcome === "cancelled") return;
                   } else {
                     await api.createHarness(input);
                   }

@@ -111,6 +111,11 @@ export const mirrorProvenance = {
   removeForPath(harnessId: string, path: string): void {
     db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ? AND path = ?`, [harnessId, path]);
   },
+  /** Every row of the account except those for `path` (a Claude account whose
+   *  config folder moved while its `.claude.json` folder did not). */
+  removeAllButPath(harnessId: string, path: string): void {
+    db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ? AND path <> ?`, [harnessId, path]);
+  },
   deleteForHarness(harnessId: string): void {
     db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ?`, [harnessId]);
   },
@@ -161,8 +166,8 @@ type SourceDbRow = {
  *  only compared and checked for existence (resolved lexically, never stat'ed
  *  inside a macOS-protected folder), never read from or written to, so a
  *  planted row can at most make a mirror skip, a Restore refuse, or a mirror
- *  drop this same account's own mirror records and saved originals (never a
- *  file in any account folder). */
+ *  or a Restore drop this same account's own mirror records and saved
+ *  originals (never a file in any account folder). */
 export const mirrorSources = {
   get(harnessId: string): MirrorSourceRow | null {
     const row = db

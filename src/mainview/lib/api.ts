@@ -725,7 +725,13 @@ export const api = {
     j<{ removed: true }>(`/harness-stacks/${encodeURIComponent(id)}`, { method: "DELETE" }),
   createHarness: (input: HarnessInput) =>
     j<Harness>("/harnesses", { method: "POST", body: JSON.stringify(input) }),
-  updateHarness: (id: string, patch: Partial<Omit<HarnessInput, "id" | "kind">>) =>
+  /** A `home`/`env` edit that would drop the account's config-mirror records
+   *  is refused with 409 `mirror-records` unless `confirmMirrorDrop` is set
+   *  (`saveConfirmingMirrorDrop` in harness-edit-confirm.ts). */
+  updateHarness: (
+    id: string,
+    patch: Partial<Omit<HarnessInput, "id" | "kind">> & { confirmMirrorDrop?: boolean },
+  ) =>
     j<Harness>(`/harnesses/${encodeURIComponent(id)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),

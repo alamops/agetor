@@ -25,7 +25,15 @@ export async function cmdSwitchAccount(args: string[], flags: Flags): Promise<vo
   const short = task.id.slice(0, 8);
 
   if (cancel) {
-    const result = await client.cancelScheduledAccountSwitch(task.id);
+    let result;
+    try {
+      result = await client.cancelScheduledAccountSwitch(task.id);
+    } catch (e) {
+      // `busy`: the scheduled switch is being applied right now and can no
+      // longer be cancelled. The core's sentence says so.
+      if (e instanceof ApiError && e.status === 409) throw refusal(e);
+      throw e;
+    }
     if (flags.json) return printJson(result);
     if (cancelledSomething(task, result)) {
       out(`${c.gray("cancelled")} the scheduled account switch on ${c.dim(short)}`);

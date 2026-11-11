@@ -580,6 +580,16 @@ export interface MirrorPreview {
   overwrites: boolean;
 }
 
+/** `PATCH /harnesses/:id` refusal body (409 `mirror-records`): the edit moves
+ *  the account away from a config folder the config mirror keeps records and
+ *  saved originals for, which the next mirror into the account would drop.
+ *  Re-sending the same body with `confirmMirrorDrop: true` saves it. */
+export interface HarnessEditMirrorRefusal {
+  error: string;
+  code: "mirror-records";
+  folders: Array<{ what: string; was: string; now: string; records: number; savedOriginals: number }>;
+}
+
 /** `POST /harnesses/:id/mirror-restore`. */
 export interface MirrorRestoreResult {
   harnessId: string;

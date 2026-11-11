@@ -67,6 +67,19 @@ describe("mirrorProvenance CRUD", () => {
     mirrorProvenance.deleteForHarness(B);
   });
 
+  test("removeAllButPath keeps only the named path's rows, of that account only", () => {
+    mirrorProvenance.upsert(row({ path: ".claude.json", scope: "key", key: "mcpServers.x" }));
+    mirrorProvenance.upsert(row({ path: ".claude.json", scope: "key", key: "mcpServers.y" }));
+    mirrorProvenance.upsert(row({ path: "CLAUDE.md" }));
+    mirrorProvenance.upsert(row({ path: "settings.json", scope: "key", key: "env.X" }));
+    mirrorProvenance.upsert(row({ harnessId: B, path: "CLAUDE.md" }));
+    mirrorProvenance.removeAllButPath(A, ".claude.json");
+    expect(mirrorProvenance.list(A).map((r) => `${r.path}|${r.key}`)).toEqual([".claude.json|mcpServers.x", ".claude.json|mcpServers.y"]);
+    expect(mirrorProvenance.list(B)).toHaveLength(1);
+    mirrorProvenance.deleteForHarness(A);
+    mirrorProvenance.deleteForHarness(B);
+  });
+
   test("a row read back from SQL with an unknown scope is coerced to file, never passed through", () => {
     db.exec(`PRAGMA ignore_check_constraints = ON`);
     try {

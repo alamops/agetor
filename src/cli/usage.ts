@@ -293,11 +293,15 @@ export const USAGE: Record<string, string> = {
   from your own fx profile into each task's session (fx 0.0.13 or later).
   Last flag wins.`,
 
-  "harness edit": `usage: agetor harness edit <id> [--label …] [--home <abs>|none] [--bin <abs>|none] [--env KEY=VAL …] [--profile-mcp | --no-profile-mcp]
+  "harness edit": `usage: agetor harness edit <id> [--label …] [--home <abs>|none] [--bin <abs>|none] [--env KEY=VAL …] [--profile-mcp | --no-profile-mcp] [--yes]
 
   Update a harness; pass 'none' to clear --home / --bin. --profile-mcp /
   --no-profile-mcp (fx only) toggles loading your fx profile's MCP servers —
-  also accepted on a built-in harness.`,
+  also accepted on a built-in harness.
+  A --home / --env edit that moves the account away from a config folder the
+  stack config mirror keeps records and saved originals for is refused (the
+  next mirror would drop them, and Restore could no longer put the originals
+  back); --yes saves it anyway.`,
 
   "harness shell": `usage: agetor harness shell <id>
 

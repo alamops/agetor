@@ -266,25 +266,36 @@ export function holdTransferForTests(harnessId: string, column: SessionIdColumn,
   return holdFlight(flightKey(harnessId, column, sessionId));
 }
 
+/** Filled in by an adapter's unheld transfer: the session a successful re-key
+ *  superseded on the destination (its copies are now orphaned under it), for
+ *  `heldTransfer` to sweep once it has let go. */
+interface TransferOutcome {
+  superseded?: string;
+}
+
 /** Run one adapter transfer with its session marked in flight (set before the
- *  first await), then, after a failure, sweep whatever it recorded. The sweep
- *  is fired, not awaited: it queues behind every other sweep, and the caller
- *  usually holds the task's start claim while it waits for this result. It
- *  never rejects, and what it cannot remove stays on record for a later one. */
+ *  first await), then sweep: after a failure, whatever it recorded; after a
+ *  re-key, the superseded session's copies. Both sweeps are fired, not
+ *  awaited, and only after the in-flight mark is released: they queue behind
+ *  every other sweep, and the caller usually holds the task's start claim
+ *  while it waits for this result. They never reject, and what they cannot
+ *  remove stays on record for a later sweep. */
 async function heldTransfer(
   harnessId: string,
   column: SessionIdColumn,
   sessionId: string,
-  run: () => Promise<TransferResult>,
+  run: (out: TransferOutcome) => Promise<TransferResult>,
 ): Promise<TransferResult> {
   const release = holdFlight(flightKey(harnessId, column, sessionId));
+  const out: TransferOutcome = {};
   let result: TransferResult;
   try {
-    result = await run();
+    result = await run(out);
   } finally {
     release();
   }
   if (!result.ok) void sweepOrphanedHandoffCopies({ harnessId, columnName: column, sessionId });
+  else if (out.superseded !== undefined) dropSupersededCopies(harnessId, column, out.superseded);
   return result;
 }
 
@@ -348,27 +359,35 @@ function recordIntended(
   });
 }
 
+/** The session a successful transfer superseded on the destination: the
+ *  prior row's, when it named another one. */
+function supersededSession(prior: HarnessSessionHandoff | null, sessionId: string): string | undefined {
+  return prior && prior.sessionId !== sessionId ? prior.sessionId : undefined;
+}
+
 /** A different session's copies are superseded by a successful transfer. The
  *  re-key moved them to the orphan store under the OLD session id (the row can
  *  name one session only), and they are removed only AFTER the new copy
  *  succeeded and the row was re-keyed: a failed transfer must leave the old
- *  conversation intact. Copies that cannot be removed now stay in the orphan
- *  store, so a later sweep retries them. */
-async function dropSupersededCopies(
-  prior: HarnessSessionHandoff | null,
-  sessionId: string,
-  harnessId: string,
-  column: SessionIdColumn,
-  warnings: string[],
-): Promise<void> {
-  if (!prior || prior.sessionId === sessionId) return;
-  const left = await sweepOrphanedHandoffCopies({ harnessId, columnName: column, sessionId: prior.sessionId });
-  if (left.retained > 0) {
-    warnings.push(`${left.retained} copied file(s) of the superseded session ${prior.sessionId} could not be removed yet; they are kept on record and retried later`);
-  }
+ *  conversation intact. Fired without awaiting once the transfer has let go
+ *  (`heldTransfer`), so a busy sweep queue never holds up a successful
+ *  handoff. Copies that cannot be removed now stay in the orphan store, so a
+ *  later sweep retries them; that is logged, the transfer having already
+ *  returned. */
+function dropSupersededCopies(harnessId: string, column: SessionIdColumn, superseded: string): void {
+  void sweepOrphanedHandoffCopies({ harnessId, columnName: column, sessionId: superseded }).then((left) => {
+    if (left.retained > 0) {
+      console.warn(
+        `[harness-stacks] ${left.retained} copied file(s) of the superseded session ${superseded} on account ${harnessId} could not be removed yet; they are kept on record and retried later`,
+      );
+    }
+  });
 }
 
-async function claudeTransferUnheld({ taskId, fromHarness, toHarness, sessionId, cwd }: TransferArgs): Promise<TransferResult> {
+async function claudeTransferUnheld(
+  { taskId, fromHarness, toHarness, sessionId, cwd }: TransferArgs,
+  out: TransferOutcome,
+): Promise<TransferResult> {
   if (fromHarness.kind !== "claude-code" || toHarness.kind !== "claude-code") {
     return { ok: false, reason: "unsupported", message: "session transfer needs two claude-code accounts" };
   }
@@ -467,7 +486,7 @@ async function claudeTransferUnheld({ taskId, fromHarness, toHarness, sessionId,
     copiedPaths: [...new Set([...intended, ...copied])],
     createdAt: Date.now(),
   });
-  await dropSupersededCopies(prior, sessionId, toHarness.id, CLAUDE_SESSION_COLUMN, warnings);
+  out.superseded = supersededSession(prior, sessionId);
   return { ok: true, sessionId, copiedPaths: copied, ...(warnings.length > 0 ? { warnings } : {}) };
 }
 
@@ -476,7 +495,7 @@ export const claudeSessionTransfer: SessionTransferAdapter = {
   kind: "claude-code",
   column: CLAUDE_SESSION_COLUMN,
   transfer(args: TransferArgs): Promise<TransferResult> {
-    return heldTransfer(args.toHarness.id, CLAUDE_SESSION_COLUMN, args.sessionId, () => claudeTransferUnheld(args));
+    return heldTransfer(args.toHarness.id, CLAUDE_SESSION_COLUMN, args.sessionId, (out) => claudeTransferUnheld(args, out));
   },
   async cleanup(taskId, harnessId): Promise<string[]> {
     return cleanupHandoff(taskId, harnessId, CLAUDE_SESSION_COLUMN, "claude-code", claudeConfigDirFor);
@@ -501,7 +520,9 @@ async function cleanupHandoff(
   const handoff = harnessSessionHandoffs.get(taskId, harnessId, column);
   if (!handoff) return [];
   const harness = harnesses.getByIdOrKind(harnessId);
-  if (!harness) {
+  // A row whose column is not the account's kind was never written by a
+  // transfer (`columnMatchesHarness`): dropped, its paths never acted on.
+  if (!harness || !columnMatchesHarness(harness, column)) {
     harnessSessionHandoffs.deleteOne(taskId, harnessId, column);
     return [];
   }
@@ -608,7 +629,10 @@ function readdirSyncSafe(dir: string): string[] {
   }
 }
 
-async function codexTransferUnheld({ taskId, fromHarness, toHarness, sessionId }: TransferArgs): Promise<TransferResult> {
+async function codexTransferUnheld(
+  { taskId, fromHarness, toHarness, sessionId }: TransferArgs,
+  out: TransferOutcome,
+): Promise<TransferResult> {
   if (fromHarness.kind !== "codex" || toHarness.kind !== "codex") {
     return { ok: false, reason: "unsupported", message: "session transfer needs two codex accounts" };
   }
@@ -670,7 +694,7 @@ async function codexTransferUnheld({ taskId, fromHarness, toHarness, sessionId }
     copiedPaths: [...new Set([...intended, ...copiedPaths])],
     createdAt: Date.now(),
   });
-  await dropSupersededCopies(prior, sessionId, toHarness.id, CODEX_SESSION_COLUMN, warnings);
+  out.superseded = supersededSession(prior, sessionId);
   // The migration warning is surfaced through the caller's status line; the
   // transfer itself succeeded because the rollout is on disk.
   return {
@@ -687,7 +711,7 @@ export const codexSessionTransfer: SessionTransferAdapter = {
   kind: "codex",
   column: CODEX_SESSION_COLUMN,
   transfer(args: TransferArgs): Promise<TransferResult> {
-    return heldTransfer(args.toHarness.id, CODEX_SESSION_COLUMN, args.sessionId, () => codexTransferUnheld(args));
+    return heldTransfer(args.toHarness.id, CODEX_SESSION_COLUMN, args.sessionId, (out) => codexTransferUnheld(args, out));
   },
   async cleanup(taskId, harnessId): Promise<string[]> {
     return cleanupHandoff(taskId, harnessId, CODEX_SESSION_COLUMN, "codex", codexHomeFor);
@@ -738,6 +762,20 @@ export function findSessionIdForHarness(
 /** The adapter for a harness kind, or null for kinds stacks don't support. */
 export function sessionTransferAdapter(kind: string): SessionTransferAdapter | null {
   return ADAPTERS.find((a) => a.kind === kind) ?? null;
+}
+
+/**
+ * Whether a recorded copy's column is the session column of the account it
+ * names (`claude-code` ↔ `claude_session_id`, `codex` ↔ `codex_session_id`).
+ * Handoff and orphan rows are untrusted (the SQLite file is agent-writable),
+ * and the column picks both the root a path is checked against and the
+ * shapes it may have: a `claude_session_id` record on a Codex account would
+ * resolve the Claude root (`~/.claude` for an account with no Claude
+ * settings) and find no Codex run to protect a live Claude session there. A
+ * record that fails this is forgotten, never acted on.
+ */
+function columnMatchesHarness(harness: Harness, column: string): boolean {
+  return sessionTransferAdapter(harness.kind)?.column === column;
 }
 
 /**
@@ -801,11 +839,18 @@ export function collectHarnessSessionCopies(harnessId: string): HarnessSessionCo
       paths,
     };
   };
-  // The orphaned copies (migration 088) are this account's files too.
+  // The orphaned copies (migration 088) are this account's files too. A
+  // record whose column is not this account's kind is never acted on; the
+  // delete drops its row with the account's other rows.
   const orphans = groupOrphans(harnessOrphanedCopies.list({ harnessId: harness.id }));
   return [
-    ...harnessSessionHandoffs.listForHarness(harnessId).map((h) => toCopies(h.columnName, h.sessionId, h.copiedPaths)),
-    ...orphans.map((g) => toCopies(g.columnName, g.sessionId, g.paths)),
+    ...harnessSessionHandoffs
+      .listForHarness(harnessId)
+      .filter((h) => columnMatchesHarness(harness, h.columnName))
+      .map((h) => toCopies(h.columnName, h.sessionId, h.copiedPaths)),
+    ...orphans
+      .filter((g) => columnMatchesHarness(harness, g.columnName))
+      .map((g) => toCopies(g.columnName, g.sessionId, g.paths)),
   ];
 }
 
@@ -883,17 +928,27 @@ export function orphanSweepsSettled(): Promise<void> {
   return sweepChain.then(() => {}, () => {});
 }
 
-/** Test seam: the next sweep that removes a group pauses after the removal and
- *  before it forgets the records, until `resume` is called. */
-let sweepPauseForTests: { arrive: () => void; gate: Promise<void> } | null = null;
+/** Test seam: the next sweep that removes the group of `{harnessId,
+ *  sessionId}` pauses after the removal and before it forgets the records,
+ *  until `resume` is called. Keyed, so a sweep of another account or session
+ *  queued earlier never takes it. Arm it after `orphanSweepsSettled()` so a
+ *  sweep fired by an earlier test is not the one that reaches it, and call
+ *  {@link resetOrphanSweepPauseForTests} in `afterEach`. */
+let sweepPauseForTests: { harnessId: string; sessionId: string; arrive: () => void; gate: Promise<void>; resume: () => void } | null = null;
 
-export function pauseOrphanSweepForTests(): { reached: Promise<void>; resume: () => void } {
+export function pauseOrphanSweepForTests(key: { harnessId: string; sessionId: string }): { reached: Promise<void>; resume: () => void } {
   let arrive!: () => void;
   let resume!: () => void;
   const reached = new Promise<void>((r) => { arrive = r; });
   const gate = new Promise<void>((r) => { resume = r; });
-  sweepPauseForTests = { arrive, gate };
+  sweepPauseForTests = { harnessId: key.harnessId, sessionId: key.sessionId, arrive, gate, resume };
   return { reached, resume };
+}
+
+/** Test seam: disarm a pause no sweep reached (and let go of one that did). */
+export function resetOrphanSweepPauseForTests(): void {
+  sweepPauseForTests?.resume();
+  sweepPauseForTests = null;
 }
 
 /**
@@ -950,6 +1005,9 @@ async function sweepOnce(
   // path, possibly one this sweep had just unlinked and the copy is about to
   // recreate). Only records stamped at or before the mark are forgotten.
   const mark = harnessOrphanedCopies.sweepMark();
+  // A record under a column no handoff writes was planted: never listed, and
+  // dropped here.
+  out.forgotten += harnessOrphanedCopies.forgetForeignColumns(filter.harnessId);
   const rows = harnessOrphanedCopies
     .list(filter.harnessId !== undefined ? { harnessId: filter.harnessId } : {})
     .filter((r) => (filter.columnName === undefined || r.columnName === filter.columnName)
@@ -958,6 +1016,15 @@ async function sweepOnce(
     const harness = harnesses.getByIdOrKind(group.harnessId);
     if (!harness) {
       harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths, { notAfter: mark });
+      out.forgotten += group.paths.length;
+      continue;
+    }
+    // A column that is not the account's kind would pick the wrong root and
+    // shapes, and skip the live check of the account's real sessions
+    // (`columnMatchesHarness`). No transfer writes one, so the records are
+    // forgotten whatever their stamp, never acted on.
+    if (!columnMatchesHarness(harness, group.columnName)) {
+      harnessOrphanedCopies.forget(group.harnessId, group.columnName, group.sessionId, group.paths);
       out.forgotten += group.paths.length;
       continue;
     }
@@ -981,8 +1048,8 @@ async function sweepOnce(
       // transfer of this session may start (or its row go live) meanwhile.
       { shouldStop: busy },
     );
-    if (sweepPauseForTests) {
-      const pause = sweepPauseForTests;
+    const pause = sweepPauseForTests;
+    if (pause && pause.harnessId === group.harnessId && pause.sessionId === group.sessionId) {
       sweepPauseForTests = null;
       pause.arrive();
       await pause.gate;

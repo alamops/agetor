@@ -798,6 +798,58 @@ describe("PATCH /harnesses/:id on a stack member", () => {
   }, 60_000);
 });
 
+// An account edit that moves a backup away from the folder the config mirror
+// keeps records and saved originals for is refused until confirmed.
+// ---------------------------------------------------------------------------
+
+describe("PATCH /harnesses/:id that would drop the account's mirror records", () => {
+  test("refused 409 mirror-records without confirmMirrorDrop (nothing applied); saved with it; never asked when nothing would drop", async () => {
+    const ids = ["p", "b", "fresh"].map((x) => `api-md-${x}-${randomUUID().slice(0, 6)}`);
+    const homes = ids.map((id) => path.join(DATA_DIR, "homes", id));
+    ids.forEach((id, i) => {
+      mkdirSync(homes[i]!, { recursive: true });
+      db.harnesses.insert({ id, kind: "claude-code", label: `Label ${id}`, home: homes[i]!, env: {} } as never);
+    });
+    writeFileSync(path.join(homes[0]!, "CLAUDE.md"), "primary\n");
+    writeFileSync(path.join(homes[1]!, "CLAUDE.md"), "mine\n");
+    const created = await call("POST", "/harness-stacks", { label: "md", kind: "claude-code", members: [ids[0], ids[1]], mirrorMode: "full" });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    try {
+      const moved = path.join(DATA_DIR, "homes", `${ids[1]}-moved`);
+      mkdirSync(moved, { recursive: true });
+
+      const refused = await call("PATCH", `/harnesses/${ids[1]}`, { home: moved, enabled: false });
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe("mirror-records");
+      expect(String(refused.body.error)).toContain(`Label ${ids[1]}`);
+      expect(String(refused.body.error)).toContain("config folder");
+      expect(String(refused.body.error)).toContain(path.resolve(homes[1]!));
+      expect(refused.body.folders[0].what).toBe("config folder");
+      expect(refused.body.folders[0].savedOriginals).toBe(1);
+      // Nothing of the refused body was applied, the toggle included.
+      expect(db.harnesses.get(ids[1]!)?.home).toBe(homes[1]!);
+      expect(db.harnesses.get(ids[1]!)?.enabled).toBe(true);
+
+      // An edit that keeps the folders is never asked.
+      expect((await call("PATCH", `/harnesses/${ids[1]}`, { label: "renamed" })).status).toBe(200);
+      expect((await call("PATCH", `/harnesses/${ids[1]}`, { home: homes[1]! })).status).toBe(200);
+      expect((await call("PATCH", `/harnesses/${ids[1]}`, { home: moved, confirmMirrorDrop: "yes" })).status).toBe(400);
+
+      const confirmed = await call("PATCH", `/harnesses/${ids[1]}`, { home: moved, confirmMirrorDrop: true });
+      expect(confirmed.status).toBe(200);
+      expect(db.harnesses.get(ids[1]!)?.home).toBe(moved);
+
+      // An account with no mirror records re-points without a question.
+      const fresh = await call("PATCH", `/harnesses/${ids[2]}`, { home: path.join(DATA_DIR, "homes", `${ids[2]}-moved`) });
+      expect(fresh.status).toBe(200);
+    } finally {
+      await call("DELETE", `/harness-stacks/${stackId}`);
+      for (const id of ids) await call("DELETE", `/harnesses/${id}`);
+    }
+  }, 60_000);
+});
+
 // ---------------------------------------------------------------------------
 // M5 server part (contract C3): moving a card out of `blocked` cancels the
 // armed all-exhausted retry.
@@ -981,6 +1033,39 @@ describe("same-stack switch guards on PATCH /tasks/:id", () => {
       const refused = await call("PATCH", `/tasks/${taskId}`, { agent: "api-b" });
       expect(refused.status).toBe(409);
       expect(refused.body.error).toBe("stop the background agents before switching accounts");
+      expect(refused.body.code).toBe("background-agents");
+      expect(db.tasks.get(taskId)?.agent).toBe("api-a");
+      expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
+    } finally {
+      db.subagents.setStatus(subagentId, "completed", Date.now());
+      db.tasks.delete(taskId);
+      await call("DELETE", `/harness-stacks/${stackId}`);
+    }
+  }, 60_000);
+
+  test("a FAILED turn whose background agents are still running refuses the switch exactly like a held one (Q1)", async () => {
+    const created = await call("POST", "/harness-stacks", { label: "failed-held", kind: "claude-code", members: ["api-a", "api-b"] });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    const runId = randomUUID();
+    // An API error ended the turn (card blocked) while a background agent
+    // kept running in the REPL.
+    const taskId = seedTaskRow({ column: "blocked", runId });
+    db.runs.insert({
+      id: runId, taskId, agent: "api-a", status: "failed",
+      startedAt: Date.now(), endedAt: Date.now(), exitCode: 1,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+    const subagentId = `failheld-${randomUUID().slice(0, 8)}`;
+    db.subagents.insertIfAbsent({
+      id: subagentId, taskId, runId, parentKind: "subagent", agentType: "Explore", description: "bg",
+      spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`), status: "running", startedAt: Date.now(), endedAt: null,
+    });
+    try {
+      const refused = await call("PATCH", `/tasks/${taskId}`, { agent: "api-b" });
+      expect(refused.status).toBe(409);
+      expect(refused.body.error).toBe("stop the background agents before switching accounts");
+      expect(refused.body.code).toBe("background-agents");
       expect(db.tasks.get(taskId)?.agent).toBe("api-a");
       expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
     } finally {
@@ -1643,6 +1728,65 @@ describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
     }
     for (const id of [lone, t, held]) db.tasks.delete(id);
     expect(stack).toBeTruthy();
+  }, 60_000);
+
+  test("switch-account: a FAILED turn whose background agents still run is refused background-agents, like a held one (Q1)", async () => {
+    const a = makeAccount("fa");
+    const b = makeAccount("fb");
+    await makeStack([a, b], "swfail");
+    const t = seedTaskRow({ agent: a, column: "blocked" });
+    const runId = randomUUID();
+    db.runs.insert({
+      id: runId, taskId: t, agent: a, status: "failed",
+      startedAt: Date.now(), endedAt: Date.now(), exitCode: 1,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+    db.tasks.update(t, { runId });
+    const subId = `tte-${randomUUID().slice(0, 8)}`;
+    db.subagents.insertIfAbsent({
+      id: subId, taskId: t, runId, parentKind: "subagent", agentType: "Explore", description: "bg",
+      spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subId}.jsonl`), status: "running", startedAt: Date.now(), endedAt: null,
+    });
+    try {
+      const bg = await call("POST", `/tasks/${t}/switch-account`);
+      expect(bg.status).toBe(409);
+      expect(bg.body.code).toBe("background-agents");
+      expect(db.tasks.get(t)!.agent).toBe(a);
+      expect(db.tasks.get(t)!.harnessState?.pendingSwap ?? null).toBeNull();
+      expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+    } finally {
+      db.subagents.setStatus(subId, "completed", Date.now());
+      db.tasks.delete(t);
+    }
+  }, 60_000);
+
+  test("switch-account: a Cancel while the switch is being applied answers 409 busy and leaves the request alone (N2)", async () => {
+    const a = makeAccount("ca");
+    const b = makeAccount("cb");
+    const stackId = await makeStack([a, b], "swbusy");
+    const orch = await import("./orchestrator.ts");
+    const t = seedTaskRow({ agent: a });
+    const runId = seedRun(t, a, "succeeded");
+    db.tasks.update(t, { runId });
+    db.tasks.setHarnessState(t, { ...baseState(stackId), scheduledSwitch: { requestedAt: Date.now() } });
+    // The scheduled switch is being applied: its account-switch claim is held.
+    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    try {
+      const busy = await call("DELETE", `/tasks/${t}/switch-account`);
+      expect(busy.status).toBe(409);
+      expect(busy.body.code).toBe("busy");
+      expect(busy.body.error).toBe("the switch is already under way");
+      expect(db.tasks.get(t)!.harnessState?.scheduledSwitch).toBeTruthy();
+      expect(statusLines(runId).some((l) => l.includes("cancelled"))).toBe(false);
+    } finally {
+      orch.releaseTaskAccountSwitch(t);
+      // The claim release applies the still-scheduled switch: let it finish
+      // before the row goes.
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline && db.tasks.get(t)?.harnessState?.scheduledSwitch) await Bun.sleep(15);
+      while (Date.now() < deadline && orch.isAccountSwitchUnderway(t)) await Bun.sleep(15);
+      db.tasks.delete(t);
+    }
   }, 60_000);
 
   test("switch-account: an idle task moves to the next member now; a live turn schedules it; DELETE cancels with a status line (and is a no-op when nothing is scheduled)", async () => {

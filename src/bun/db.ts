@@ -2590,13 +2590,24 @@ export interface HarnessOrphanedCopy {
   createdAt: number;
 }
 
-const toOrphanedCopy = (r: OrphanedCopyRow): HarnessOrphanedCopy => ({
-  harnessId: r.harness_id,
-  columnName: r.column_name as SessionIdColumn,
-  sessionId: r.session_id,
-  path: r.path,
-  createdAt: r.created_at,
-});
+/** The only columns a handoff copy is ever recorded under. The table is
+ *  agent-writable, so a row naming any other column is never returned and is
+ *  never acted on (`forgetForeignColumns` drops it). */
+const ORPHAN_COLUMNS: readonly SessionIdColumn[] = ["claude_session_id", "codex_session_id"];
+
+const toOrphanedCopy = (r: OrphanedCopyRow): HarnessOrphanedCopy | null => {
+  const columnName = ORPHAN_COLUMNS.find((c) => c === r.column_name);
+  if (!columnName) return null;
+  return {
+    harnessId: r.harness_id,
+    columnName,
+    sessionId: r.session_id,
+    path: r.path,
+    createdAt: r.created_at,
+  };
+};
+
+const isOrphanedCopy = (r: HarnessOrphanedCopy | null): r is HarnessOrphanedCopy => r !== null;
 
 /**
  * The newest `created_at` this process has stamped on (or seen in)
@@ -2606,17 +2617,36 @@ const toOrphanedCopy = (r: OrphanedCopyRow): HarnessOrphanedCopy => ({
  * after the mark, even within the same millisecond. Seeded from the table on
  * first use, so a record from an earlier run whose clock was ahead is still
  * at or below the first mark.
+ *
+ * The table is agent-writable, so the seed reads only integer stamps and is
+ * clamped to {@link ORPHAN_STAMP_SEED_MARGIN_MS} past the wall clock: a
+ * planted `created_at` at or above 2^53 (where `+ 1` no longer changes a
+ * double) or a huge REAL would otherwise freeze every later stamp at one value,
+ * and a sweep would then forget a record written mid-sweep. A row stamped
+ * past the clamp is simply never forgotten by a sweep (the safe side).
  */
 let orphanStamp: number | null = null;
+
+/** How far ahead of the wall clock an earlier run's stamp may seed the next
+ *  one (a clock that was ahead, then corrected). */
+const ORPHAN_STAMP_SEED_MARGIN_MS = 24 * 60 * 60 * 1000;
 
 function currentOrphanStamp(): number {
   if (orphanStamp === null) {
     const max = db
-      .query<{ m: number | null }, []>(`SELECT MAX(created_at) AS m FROM harness_orphaned_copies`)
+      .query<{ m: number | null }, []>(
+        `SELECT MAX(created_at) AS m FROM harness_orphaned_copies WHERE typeof(created_at) = 'integer'`,
+      )
       .get()?.m;
-    orphanStamp = typeof max === "number" && Number.isFinite(max) ? max : 0;
+    const seed = typeof max === "number" && Number.isSafeInteger(max) ? max : 0;
+    orphanStamp = Math.min(seed, Date.now() + ORPHAN_STAMP_SEED_MARGIN_MS);
   }
   return orphanStamp;
+}
+
+/** Test seam: forget the seeded stamp, so the next stamp re-reads the table. */
+export function resetOrphanStampForTests(): void {
+  orphanStamp = null;
 }
 
 /** A stamp strictly after every earlier stamp and every mark. */
@@ -2665,7 +2695,9 @@ export const harnessOrphanedCopies = {
    *  session id is part of the match, so a path re-orphaned under another
    *  session meanwhile is kept. With `notAfter` (a sweep's mark), a record
    *  written after the mark is kept too: it is a newer transfer's pending
-   *  record of a file that transfer may be creating right now. */
+   *  record of a file that transfer may be creating right now. Without it the
+   *  stamp is not compared at all, so a record with a planted `created_at`
+   *  (past 2^53, a REAL, a TEXT) is still forgotten. */
   forget(
     harnessId: string,
     column: SessionIdColumn,
@@ -2674,17 +2706,41 @@ export const harnessOrphanedCopies = {
     opts: { notAfter?: number } = {},
   ): void {
     if (paths.length === 0) return;
-    const notAfter = opts.notAfter ?? Number.MAX_SAFE_INTEGER;
+    const notAfter = opts.notAfter;
     db.transaction(() => {
       for (const p of new Set(paths)) {
-        db.run(
-          `DELETE FROM harness_orphaned_copies
-            WHERE harness_id = ? AND column_name = ? AND path = ? AND session_id = ?
-              AND created_at <= ?`,
-          [harnessId, column, p, sessionId, notAfter],
-        );
+        if (notAfter === undefined) {
+          db.run(
+            `DELETE FROM harness_orphaned_copies
+              WHERE harness_id = ? AND column_name = ? AND path = ? AND session_id = ?`,
+            [harnessId, column, p, sessionId],
+          );
+        } else {
+          db.run(
+            `DELETE FROM harness_orphaned_copies
+              WHERE harness_id = ? AND column_name = ? AND path = ? AND session_id = ?
+                AND created_at <= ?`,
+            [harnessId, column, p, sessionId, notAfter],
+          );
+        }
       }
     })();
+  },
+  /** Drop every record (of one account, when given) whose column is not a
+   *  handoff column. Nothing agetor writes has one, so such a row was planted;
+   *  it is never listed, and this removes it. Returns how many rows went. */
+  forgetForeignColumns(harnessId?: string): number {
+    const placeholders = ORPHAN_COLUMNS.map(() => "?").join(", ");
+    if (harnessId !== undefined) {
+      return db.run(
+        `DELETE FROM harness_orphaned_copies WHERE harness_id = ? AND column_name NOT IN (${placeholders})`,
+        [harnessId, ...ORPHAN_COLUMNS],
+      ).changes;
+    }
+    return db.run(
+      `DELETE FROM harness_orphaned_copies WHERE column_name NOT IN (${placeholders})`,
+      [...ORPHAN_COLUMNS],
+    ).changes;
   },
   list(filter: { harnessId?: string } = {}): HarnessOrphanedCopy[] {
     if (filter.harnessId !== undefined) {
@@ -2693,12 +2749,14 @@ export const harnessOrphanedCopies = {
           `SELECT * FROM harness_orphaned_copies WHERE harness_id = ? ORDER BY created_at ASC, path ASC`,
         )
         .all(filter.harnessId)
-        .map(toOrphanedCopy);
+        .map(toOrphanedCopy)
+        .filter(isOrphanedCopy);
     }
     return db
       .query<OrphanedCopyRow, []>(`SELECT * FROM harness_orphaned_copies ORDER BY created_at ASC, path ASC`)
       .all()
-      .map(toOrphanedCopy);
+      .map(toOrphanedCopy)
+      .filter(isOrphanedCopy);
   },
   deleteForHarness(harnessId: string): void {
     db.run(`DELETE FROM harness_orphaned_copies WHERE harness_id = ?`, [harnessId]);

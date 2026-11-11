@@ -163,7 +163,9 @@ id** (Claude `projects/<enc>/<sid>.jsonl`, `…/<sid>/{subagents,tool-results,
 mcp-tasks}/…` or `file-history/<sid>/…`; Codex
 `sessions/YYYY/MM/DD/rollout-*-<sid>.jsonl`), so a row can only reach files of
 the session it names (the session id is a claim too), has no symlinked
-component and is a regular file;
+component and is a regular file (a row whose column is not the session column
+of its account's kind is dropped, its paths never acted on, by task cleanup
+and account delete alike);
 it unlinks files only (never a recursive delete) and then prunes only empty plain
 directories inside those shapes. A path outside the account's current root is
 *retained* (the row is kept), never followed. Session transcripts are copied
@@ -176,24 +178,35 @@ and `harness_mirror_sources` rows (the folders each backup's last mirror read
 and wrote) are **untrusted** the same way: the SQLite file is agent-writable.
 
 - An **orphan row** is trusted for at most this: deleting one regular file of
-  a handoff shape for the row's session, below the account's **current** root,
-  with no symlinked component (the handoff cleanup rules,
+  a handoff shape of the account's own kind for the row's session (a
+  `claude_session_id` row only on a Claude account, a `codex_session_id` row
+  only on a Codex account; any other column is forgotten unread,
+  `columnMatchesHarness`), below the account's **current** root, with no
+  symlinked component (the handoff cleanup rules,
   `removeCopiedPathsDetailed`), and only for a session no live handoff row of
   that account holds, no transfer onto it has in flight, and no task still
   resumes on that account (a task whose runs recorded the session and for which
   `findSessionIdForHarness` still returns it, `liveOnRunsOfHarness`). So a
-  planted row naming a live conversation deletes nothing; one naming a dead
-  session's copy can remove only that copy.
+  planted row deletes nothing an Agetor task still resumes on that account. It
+  can still name a session file of that shape under the account's own root
+  that the user ran in the CLI outside Agetor (no Agetor run knows it, so it
+  is not live to Agetor), or a dead session's copy, and remove that file. Its
+  `created_at` never stalls the monotonic stamp: the seed reads integer stamps
+  only, clamped to a day ahead of the clock.
 - A **mirror-sources row** is only compared and checked for existence, never
   read from or written into: its folders are resolved lexically and never
   stat'ed inside a macOS-protected folder (such a folder counts as existing).
   A planted row can at most make that backup's mirror skip, make its Restore
-  refuse, or make the next mirror drop that same account's own mirror records
-  and saved originals under `<dataDir>/mirror-backups/<id>/` (removed by
-  `removeMirrorBackups`, which never follows a link) and mirror it as new
-  into its own current folder, where every file it already has counts as
-  preexisted and is backed up before an overwrite. The row's folders are
-  never a write or delete target.
+  refuse, make an edit of the account ask for confirmation (409
+  `mirror-records`), or make a mirror or a Restore drop that same account's own mirror
+  records and saved originals under `<dataDir>/mirror-backups/<id>/` (removed
+  by `removeMirrorBackups` or `removeFolderBackups`, which never follow a
+  link), after which the mirror treats that account as new in its own current
+  folder, where every file it already has counts as preexisted and is backed
+  up before an overwrite. A recorded folder that is gone (even one that only
+  vanished, such as an unmounted volume) counts as moved for good, so its
+  records and saved originals are dropped, not kept for a folder nothing can
+  restore into. The row's folders are never a write or delete target.
 
 ### Mirror provenance, the backup store and the widened stripper
 

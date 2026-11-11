@@ -544,6 +544,20 @@ test("switch-account --cancel says so when nothing was scheduled (the core's `ca
   expect(text).not.toContain("cancelled");
 });
 
+test("switch-account --cancel while the switch is being applied prints the core's `busy` sentence, not 'nothing was scheduled'", async () => {
+  currentClient = taskClient({
+    cancelScheduledAccountSwitch: async () => {
+      throw new ApiError(409, { error: "the switch is already under way\u001b[2J", code: "busy" }, "the switch is already under way\u001b[2J");
+    },
+  });
+  const err = await cmdSwitchAccount(["abcdefgh", "--cancel"], flags).then(() => null, (e: Error) => e);
+  expect(err).not.toBeNull();
+  expect(err).not.toBeInstanceOf(ApiError);
+  expect(err!.message).toContain("the switch is already under way");
+  expect(err!.message).not.toContain("\u001b");
+  expect(outputs.join("\n")).not.toContain("nothing was scheduled");
+});
+
 test("switch-account --cancel against a core without `cancelled` falls back to the task as read before", async () => {
   const scheduledState = {
     stackId: "s", position: 0, tried: [], pendingSwap: null, lastMove: null, allExhausted: null,
@@ -698,4 +712,52 @@ test("harness cooldown clear: with no row left it says no cooldown remains and n
   expect(text).toContain("no cooldown remains");
   expect(text).not.toContain("still cooling");
   expect(text).not.toContain("re-armed");
+});
+
+// `harness edit` that moves an account away from the folder the config mirror
+// keeps records for: the core refuses with `mirror-records` unless confirmed.
+const MIRROR_DROP_BODY = {
+  error: "This edit moves B\u001b[31m's config folder from /a to /b (the config mirror keeps 2 records for /a).",
+  code: "mirror-records",
+  folders: [{ what: "config folder", was: "/a", now: "/b", records: 2, savedOriginals: 1 }],
+};
+
+function mirrorDropClient(patches: Array<Record<string, unknown>>): AgetorClient {
+  return {
+    patchHarness: async (id: string, patch: Record<string, unknown>) => {
+      patches.push(patch);
+      if (patch.confirmMirrorDrop !== true) throw new ApiError(409, MIRROR_DROP_BODY, MIRROR_DROP_BODY.error);
+      return { id, kind: "claude-code", label: "B", home: "/b", bin: null, env: {}, isBuiltin: false, createdAt: 0, enabled: true };
+    },
+  } as unknown as AgetorClient;
+}
+
+test("harness edit: a mirror-records refusal is printed (escaped) and asks for --yes; nothing is confirmed", async () => {
+  const patches: Array<Record<string, unknown>> = [];
+  currentClient = mirrorDropClient(patches);
+  const err = await cmdHarness(["edit", "b", "--home", "/b"], flags).catch((e: unknown) => e);
+  expect(err).toBeInstanceOf(Error);
+  const message = (err as Error).message;
+  expect(message).toContain("config folder from /a to /b");
+  expect(message).toContain("--yes");
+  expect(message).not.toContain("\u001b");
+  expect(patches).toEqual([{ home: "/b" }]);
+});
+
+test("harness edit --yes sends the confirmation and saves", async () => {
+  const patches: Array<Record<string, unknown>> = [];
+  currentClient = mirrorDropClient(patches);
+  await cmdHarness(["edit", "b", "--home", "/b", "--yes"], flags);
+  expect(patches).toEqual([{ home: "/b", confirmMirrorDrop: true }]);
+  expect(outputs.join("\n")).toContain("updated harness b");
+});
+
+test("harness edit --json prints a structured refusal", async () => {
+  const patches: Array<Record<string, unknown>> = [];
+  currentClient = mirrorDropClient(patches);
+  await expect(cmdHarness(["edit", "b", "--home", "/b"], jsonFlags)).rejects.toThrow("--yes");
+  const printed = JSON.parse(outputs[0]!);
+  expect(printed.saved).toBe(false);
+  expect(printed.refusal.code).toBe("mirror-records");
+  expect(printed.refusal.folders[0].records).toBe(2);
 });

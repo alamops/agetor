@@ -1120,6 +1120,9 @@ export interface HarnessPatchInput {
   enabled?: boolean;
   /** fx only: the "Load profile MCP servers" toggle. */
   profileMcpServers?: boolean;
+  /** Save a `home`/`env` edit even though it drops the account's
+   *  config-mirror records (otherwise 409 `mirror-records`). */
+  confirmMirrorDrop?: boolean;
 }
 
 function safeJson(text: string): unknown {

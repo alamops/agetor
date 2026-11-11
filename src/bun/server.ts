@@ -42,7 +42,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, isHeldByBackgroundAgents, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, rearmRetriesAfterCooldownClear, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, backgroundAgentsHoldTask, isAccountSwitchUnderway, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, rearmRetriesAfterCooldownClear, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -63,7 +63,14 @@ import { claudeJsonDirFor, effectiveHome, expandHomePath, harnessStacks, StackCh
 import { claudeConfigDirFor } from "./harness-config-root.ts";
 import { clearFailoverState, failoverTaskIdsForStack, repointTaskStatesAwayFromStack } from "./harness-failover.ts";
 import { harnessIdsWithProvenance } from "./harness-mirror-provenance.ts";
-import { deleteMirrorStateForHarness, mirrorStack, previewMirror, restoreMirror } from "./harness-mirror.ts";
+import {
+  deleteMirrorStateForHarness,
+  describeMirrorEditDrop,
+  mirrorRecordsAffectedByEdit,
+  mirrorStack,
+  previewMirror,
+  restoreMirror,
+} from "./harness-mirror.ts";
 import { harnessSwapEvents } from "./harness-swap-history.ts";
 import {
   collectHarnessSessionCopies,
@@ -276,6 +283,7 @@ import type {
   TaskGitStatus,
   TaskTeardownPreview,
   TaskReference,
+  HarnessEditMirrorRefusal,
   HarnessStackChanged,
   HarnessSwapHistoryPage,
   MirrorRestoreResult,
@@ -4837,7 +4845,14 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          if (typeof body.enabled === "boolean") {
+          if ("confirmMirrorDrop" in body && typeof body.confirmMirrorDrop !== "boolean") {
+            return json(
+              { error: "confirmMirrorDrop must be a boolean" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const applyEnabled = () => {
+            if (typeof body.enabled !== "boolean") return;
             harnesses.setEnabled(req.params.id, body.enabled);
             // Re-enabling a harness that was previously excluded from every
             // discovery sweep (disabled harnesses are skipped — see
@@ -4847,8 +4862,9 @@ export function startApiServer(
             // skips disabled harnesses, so it drops out of the picker
             // immediately with no probe required.
             if (body.enabled) void refreshHarnessModels(req.params.id);
-          }
+          };
           if (!hasConfigPatch) {
+            applyEnabled();
             if (typeof body.profileMcpServers === "boolean") {
               harnesses.update(req.params.id, { profileMcpServers: body.profileMcpServers });
             }
@@ -4904,6 +4920,28 @@ export function startApiServer(
             });
             if (rootError) return json({ error: rootError }, { status: 400, headers: corsHeaders(req) });
           }
+          // Moving an account away from a config folder the config mirror
+          // keeps records and saved originals for makes the next mirror into
+          // it drop them (they describe the old folder), so the edit is
+          // refused until the caller confirms, like a stack save whose
+          // preview overwrites (docs/architecture/harness-stacks.md). Checked
+          // synchronously right before the write, so nothing lands between.
+          if ((patch.home !== undefined || patch.env !== undefined) && body.confirmMirrorDrop !== true) {
+            const drops = mirrorRecordsAffectedByEdit(current, {
+              ...current,
+              home: patch.home !== undefined ? patch.home : current.home,
+              env: patch.env ?? current.env,
+            });
+            if (drops) {
+              const refusal: HarnessEditMirrorRefusal = {
+                error: describeMirrorEditDrop(current.label, drops),
+                code: "mirror-records",
+                folders: drops,
+              };
+              return json(refusal, { status: 409, headers: corsHeaders(req) });
+            }
+          }
+          applyEnabled();
           try {
             const updated = harnesses.update(req.params.id, patch);
             // A changed config root may bring orphaned handoff copies kept
@@ -6182,12 +6220,13 @@ export function startApiServer(
               { status: 409, headers: corsHeaders(req) },
             );
           }
-          // A held task (its turn succeeded but background agents are still
-          // running in the REPL) is live too: the switch drops the old
-          // session, which would kill the REPL hosting those agents.
-          if (sameStackAccountSwitch && isHeldByBackgroundAgents(before.id)) {
+          // A task whose background agents are still running in the REPL is
+          // live too, whether the turn that left them succeeded (held in
+          // `running`) or failed: the switch drops the old session, which
+          // would kill the REPL hosting those agents.
+          if (sameStackAccountSwitch && backgroundAgentsHoldTask(before.id)) {
             return json(
-              { error: "stop the background agents before switching accounts" },
+              { error: "stop the background agents before switching accounts", code: "background-agents" },
               { status: 409, headers: corsHeaders(req) },
             );
           }
@@ -6409,6 +6448,15 @@ export function startApiServer(
         DELETE: authed((req) => {
           if (!tasks.get(req.params.id)) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // A scheduled switch being applied right now is past the point of
+          // cancelling (the copy is never aborted halfway): say so instead of
+          // answering a no-op while the task moves.
+          if (isAccountSwitchUnderway(req.params.id)) {
+            return json(
+              { error: "the switch is already under way", code: "busy" } satisfies SwitchAccountRefusal,
+              { status: 409, headers: corsHeaders(req) },
+            );
           }
           // `cancelled` says whether a switch was actually scheduled, so a
           // caller can tell a cancel from a no-op.

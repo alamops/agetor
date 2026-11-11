@@ -126,10 +126,12 @@ import {
   backupLinkOriginal,
   fileBackupRef,
   linkRef,
+  MAX_BACKUP_BYTES,
   readBackup,
   readBackupMode,
   readKeyBackup,
   removeBackupEntry,
+  removeFolderBackups,
   removeMirrorBackups,
 } from "./harness-mirror-backup.ts";
 import {
@@ -277,7 +279,10 @@ export async function previewMirror(
   if (run.fatal) {
     plans.unshift({ ...emptyPlan(primaryId, primaryId), warnings: [run.fatal] });
   }
-  const overwrites = plans.some(
+  // Dropping a re-pointed account's records and saved originals loses its
+  // way back as surely as an overwrite does, so it needs the same
+  // confirmation (the dialog, the CLI's `--yes`).
+  const overwrites = run.results.some((r) => r.dropsRecords === true) || plans.some(
     (p) => p.backups.length > 0 || p.files.remove.length > 0 || p.keys.some((k) => k.action === "remove"),
   );
   return { plans, overwrites };
@@ -297,6 +302,9 @@ interface OneResult extends MirrorResult {
   harnessId: string;
   label: string;
   plan: MirrorPlan;
+  /** The run drops (a preview: would drop) records or saved originals of a
+   *  folder this account no longer resolves to. */
+  dropsRecords?: boolean;
 }
 
 async function runMirror(input: MirrorRunInput): Promise<{ results: OneResult[]; fatal: string | null }> {
@@ -451,6 +459,42 @@ async function dropMirrorState(harnessId: string): Promise<void> {
     console.warn(`[harness-mirror] could not drop an account's mirror records: ${err instanceof Error ? err.message : String(err)}`);
   }
   await removeMirrorBackups(harnessId);
+}
+
+/** The recorded folder (line of a mirror-sources folder record) a provenance
+ *  row's item lives in: a Claude account's `.claude.json` keys sit in its
+ *  `.claude.json` folder (line 1), everything else under the config root
+ *  (line 0). */
+function folderLineOf(kind: HarnessStackKind, row: Pick<MirrorProvenanceRow, "path">): number {
+  return kind === "claude-code" && row.path === ".claude.json" ? 1 : 0;
+}
+
+/** Every folder line an account of `kind` records. */
+function folderLinesOf(kind: HarnessStackKind): number[] {
+  return kind === "claude-code" ? [0, 1] : [0];
+}
+
+/**
+ * Drop the provenance rows and saved originals of the items in the given
+ * recorded folders only (a Claude account whose `.claude.json` folder moved
+ * keeps its config root's records, and the other way round); with every
+ * folder of the account named, all of its mirror state, the mirror-sources
+ * row included ({@link dropMirrorState}). For a caller already inside the
+ * account's mirror queue. Never throws.
+ */
+async function dropFolderState(harnessId: string, kind: HarnessStackKind, lines: ReadonlySet<number>): Promise<void> {
+  if (folderLinesOf(kind).every((line) => lines.has(line))) {
+    await dropMirrorState(harnessId);
+    return;
+  }
+  const folder = lines.has(1) ? "claude-json" : "config-root";
+  try {
+    if (folder === "claude-json") mirrorProvenance.removeForPath(harnessId, ".claude.json");
+    else mirrorProvenance.removeAllButPath(harnessId, ".claude.json");
+  } catch (err) {
+    console.warn(`[harness-mirror] could not drop an account's mirror records: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  await removeFolderBackups(harnessId, folder, MIRROR_SPECS[kind].merge);
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +659,7 @@ async function mirrorOne(
   copyLimits: MirrorOptions["copyLimits"],
   dry: boolean,
   stackId: string | null,
-): Promise<MirrorResult & { plan: MirrorPlan }> {
+): Promise<MirrorResult & { plan: MirrorPlan; dropsRecords?: boolean }> {
   const plan = emptyPlan(target.id, target.label);
   const fromRoot = mirrorRootFor(primary);
   const toRoot = mirrorRootFor(target);
@@ -684,20 +728,55 @@ async function mirrorOne(
       );
     }
   }
-  // Not skipped, yet the backup's folder is not the recorded one: the user
-  // re-pointed the account (its fingerprint changed) or the recorded folder is
-  // gone. Every provenance row and saved original describes that other folder,
-  // so none of them may drive an edit, a removal or a forced backup here. A
-  // real run drops them, exactly as an account delete does, and mirrors into
-  // the new folder as into a fresh account; a preview plans the same way.
+  // Not skipped, yet a folder of the backup's is not the recorded one: the
+  // user re-pointed the account (its fingerprint changed) or the recorded
+  // folder is gone. Every provenance row and saved original of an item in that
+  // folder describes the other folder, so none of them may drive an edit, a
+  // removal or a forced backup here. Each recorded folder is judged on its own
+  // (a Claude account records its config root and its `.claude.json` folder):
+  // pinning an account to the config root it already used moves only its
+  // `.claude.json`, and the config root's records and saved originals stay. A
+  // real run drops the moved folder's state, exactly as an account delete does
+  // for the whole account, and mirrors into the new folder as new; a preview
+  // plans the same way.
   const changed = recorded !== null && recorded.backupRoot !== ""
-    ? firstFolderDifference(recorded.backupRoot, destination.root)
-    : null;
+    ? folderDifferences(recorded.backupRoot, destination.root).filter((d) => folderLinesOf(kind).includes(d.line))
+    : [];
+  const changedLines = new Set(changed.map((d) => d.line));
   const propagate = isDirectory(fromRoot);
-  if (changed) {
-    const notice = `this account's ${changed.what} changed from ${changed.was} to ${changed.now}; the mirror's record and saved originals for ${changed.was} are dropped and this account is mirrored as new`;
-    plan.warnings.push(notice);
-    if (!dry && propagate && harnesses.getByIdOrKind(target.id)) await dropMirrorState(target.id);
+  if (changed.length > 0 && !propagate) {
+    // Nothing here could be dropped (the drop needs a primary to mirror from),
+    // yet a merge from a folder outside the primary's config root (Claude's
+    // `.claude.json`) would still save originals and write rows next to the
+    // old folder's, which the next run's drop would then delete with them.
+    return refuse(
+      `skipped: this account's ${changed[0]!.what} changed from ${changed[0]!.was} to ${changed[0]!.now}, but the primary account's config folder ${fromRoot} is not a directory; nothing is copied to or removed from this account until it is`,
+    );
+  }
+  const allRows = mirrorProvenance.list(target.id);
+  const dropsRecords = allRows.some((r) => changedLines.has(folderLineOf(kind, r)));
+  for (const moved of changed) {
+    plan.warnings.push(
+      `this account's ${moved.what} changed from ${moved.was} to ${moved.now}; the mirror's record and saved originals for ${moved.was} are dropped and what this account has in ${moved.now} is mirrored as new`,
+    );
+  }
+  if (!dry && propagate && harnesses.getByIdOrKind(target.id)) {
+    if (changed.length > 0) await dropFolderState(target.id, kind, changedLines);
+    // Record the folders this run reads and writes BEFORE the first write: a
+    // run cut short afterwards must not leave the old folder on record (the
+    // next run would read the new folder as moved again and drop what this run
+    // saved there), nor, on a first run, leave rows with no folder pinned.
+    // Only an existing primary folder becomes the reference: a run against a
+    // missing one copies nothing.
+    mirrorSources.set({
+      harnessId: target.id,
+      primaryId: primary.id,
+      primaryRoot: source.root,
+      primaryConfig: source.config,
+      backupRoot: destination.root,
+      backupConfig: destination.config,
+      updatedAt: Date.now(),
+    });
   }
   const ctx: MirrorCtx = {
     dry,
@@ -709,10 +788,12 @@ async function mirrorOne(
     toRoot,
     guard,
     propagate,
-    rows: changed ? new Map() : new Map(mirrorProvenance.list(target.id).map((r) => [rowId(r.path, r.key), r] as const)),
+    rows: new Map(
+      allRows.filter((r) => !changedLines.has(folderLineOf(kind, r))).map((r) => [rowId(r.path, r.key), r] as const),
+    ),
     plan,
     copied: [],
-    warnings: changed ? [...plan.warnings] : [],
+    warnings: [...plan.warnings],
     lastYield: Date.now(),
   };
 
@@ -769,21 +850,7 @@ async function mirrorOne(
     }
   }
 
-  // Record the folders this run read and wrote. Only an existing primary
-  // folder becomes the reference: a run against a missing one copied nothing.
-  if (!dry && ctx.propagate && accountAlive(ctx)) {
-    mirrorSources.set({
-      harnessId: target.id,
-      primaryId: primary.id,
-      primaryRoot: source.root,
-      primaryConfig: source.config,
-      backupRoot: destination.root,
-      backupConfig: destination.config,
-      updatedAt: Date.now(),
-    });
-  }
-
-  return { copied: ctx.copied, warnings: ctx.warnings, plan };
+  return { copied: ctx.copied, warnings: ctx.warnings, plan, dropsRecords };
 }
 
 /** An account's resolved folder(s) — the config root, plus the `.claude.json`
@@ -803,36 +870,121 @@ function folderSourceOf(harness: Harness, root: string): { root: string; config:
   };
 }
 
+interface FolderDifference {
+  /** The line of the folder record: 0 the config root, 1 Claude's
+   *  `.claude.json` folder. */
+  line: number;
+  what: string;
+  was: string;
+  now: string;
+}
+
 /** A recorded folder that differs from the one the account resolves to now
  *  and still exists (the first such); null when nothing moved or every
  *  differing recorded folder is gone (stale). Every differing line counts: a
  *  Claude account whose old config root is gone while its old `.claude.json`
  *  folder still exists has not moved for good, and treating it as stale would
  *  drop the saved originals of a folder that is still there. */
-function movedRecordedFolder(recorded: string, current: string): { what: string; was: string; now: string } | null {
+function movedRecordedFolder(recorded: string, current: string): FolderDifference | null {
   for (const moved of folderDifferences(recorded, current)) {
     if (recordedFolderExists(moved.was)) return moved;
   }
   return null;
 }
 
-/** The first recorded folder that differs from the current resolution, with
- *  no existence check; null when they are the same. */
-function firstFolderDifference(recorded: string, current: string): { what: string; was: string; now: string } | null {
-  return folderDifferences(recorded, current)[0] ?? null;
-}
-
-/** Every recorded folder (one per line) that differs from the current one. */
-function folderDifferences(recorded: string, current: string): Array<{ what: string; was: string; now: string }> {
+/** Every recorded folder (one per line) that is not the current one. A line
+ *  spelled differently that resolves to the same existing folder (a symlinked
+ *  spelling) is the same folder. */
+function folderDifferences(recorded: string, current: string): FolderDifference[] {
   if (recorded === current) return [];
   const was = recorded.split("\n");
   const now = current.split("\n");
-  const out: Array<{ what: string; was: string; now: string }> = [];
+  const out: FolderDifference[] = [];
   for (let i = 0; i < Math.max(was.length, now.length); i++) {
-    if (was[i] === now[i]) continue;
-    out.push({ what: i === 0 ? "config folder" : ".claude.json folder", was: was[i] ?? "", now: now[i] ?? "" });
+    if (sameRecordedFolder(was[i], now[i])) continue;
+    out.push({ line: i, what: i === 0 ? "config folder" : ".claude.json folder", was: was[i] ?? "", now: now[i] ?? "" });
   }
   return out;
+}
+
+/** A recorded folder an account edit moves the account away from, with the
+ *  mirror records (and saved originals) kept for it. */
+export interface MirrorEditDropFolder {
+  what: string;
+  was: string;
+  now: string;
+  /** Provenance rows of items in that folder. */
+  records: number;
+  /** Those of them that hold a saved original. */
+  savedOriginals: number;
+}
+
+/**
+ * What saving `patched` over `current` (the same account, its `home` or env
+ * changed) would cost the account's mirror records: each recorded folder the
+ * edit moves the account away from that still holds records, or null when
+ * nothing would be dropped. It predicts {@link mirrorOne}'s own decision for
+ * the next run into the account: a folder is dropped there when the
+ * account's root settings changed and it no longer resolves to the recorded
+ * folder. Only a folder line the edit itself changes counts (an edit that
+ * keeps the folders, or touches only the label or binary, never does), and
+ * only a line with records (an account with none loses nothing).
+ */
+export function mirrorRecordsAffectedByEdit(current: Harness, patched: Harness): MirrorEditDropFolder[] | null {
+  const kind = current.kind;
+  if (kind !== "claude-code" && kind !== "codex") return null;
+  const rows = mirrorProvenance.list(current.id);
+  if (rows.length === 0) return null;
+  const recorded = mirrorSources.get(current.id);
+  // No folder on record: the next run applies the rows where it is and drops
+  // nothing (see mirrorOne).
+  if (recorded === null || recorded.backupRoot === "") return null;
+  const before = folderSourceOf(current, mirrorRootFor(current));
+  const after = folderSourceOf(patched, mirrorRootFor(patched));
+  // The next run skips (keeping every record) rather than drops when the
+  // account's root settings are the recorded ones.
+  if (before.config === after.config || after.config === recorded.backupConfig) return null;
+  const editedLines = new Set(folderDifferences(before.root, after.root).map((d) => d.line));
+  if (editedLines.size === 0) return null;
+  const out: MirrorEditDropFolder[] = [];
+  for (const moved of folderDifferences(recorded.backupRoot, after.root)) {
+    if (!folderLinesOf(kind).includes(moved.line) || !editedLines.has(moved.line)) continue;
+    const inFolder = rows.filter((r) => folderLineOf(kind, r) === moved.line);
+    if (inFolder.length === 0) continue;
+    out.push({
+      ...moved,
+      records: inFolder.length,
+      savedOriginals: inFolder.filter((r) => r.backupRef !== null).length,
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+/** The sentence a refused account edit carries (PATCH /harnesses/:id answers
+ *  409 `mirror-records` with it): which folder moves and what the mirror
+ *  drops for the old one. */
+export function describeMirrorEditDrop(label: string, folders: readonly MirrorEditDropFolder[]): string {
+  const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+  const parts = folders.map((f) => {
+    const originals = f.savedOriginals > 0 ? `, ${plural(f.savedOriginals, "saved original")}` : "";
+    return `its ${f.what} from ${f.was} to ${f.now} (the config mirror keeps ${plural(f.records, "record")}${originals} for ${f.was})`;
+  });
+  return `This edit moves ${label}'s ${parts.join(" and ").replace(/^its /, "")}. Saving drops those records and saved originals on the next mirror into this account, and Restore can no longer put the originals back.`;
+}
+
+/** Whether a recorded folder and a current one are the same directory. The
+ *  recorded one comes from an agent-writable row, so it is resolved lexically
+ *  ({@link resolvePathLexically}: nothing below a macOS-protected folder is
+ *  stat'ed); one that is missing, lands in a protected folder or cannot be
+ *  resolved is never "the same" by resolution, only by its spelling. */
+function sameRecordedFolder(was: string | undefined, now: string | undefined): boolean {
+  if (was === now) return true;
+  if (!was || !now || !path.isAbsolute(was) || !path.isAbsolute(now)) return false;
+  const a = resolvePathLexically(was);
+  if (a.missing || a.protectedFolder || a.error) return false;
+  const b = resolvePathLexically(now);
+  if (b.missing || b.protectedFolder || b.error) return false;
+  return a.path === b.path;
 }
 
 /** Whether a folder named by a mirror-sources row still exists. The row is
@@ -951,6 +1103,15 @@ async function copyEntry(
       incompletePayloads.add(rel);
       warn(ctx, `${rel}: copy hit its size/entry budget — the copy on this account is incomplete`);
     }
+    if (tree.unreadable.length > 0) {
+      // Incomplete, but not truncated: deletion propagation still runs for the
+      // rest of the entry (the unreadable folders are in `skipped`), while a
+      // plugin registry is not pointed at a payload that may lack files.
+      incompletePayloads.add(rel);
+      const listed = tree.unreadable.slice(0, MAX_LISTED_FAILURES).map((u) => `${rel}/${u}`).join(", ");
+      const more = tree.unreadable.length > MAX_LISTED_FAILURES ? ` and ${tree.unreadable.length - MAX_LISTED_FAILURES} more` : "";
+      warn(ctx, `${rel}: could not read ${listed}${more} — left as it is on this account; the rest of the entry was mirrored`);
+    }
     // Top-level symlinked skills/commands/agents are re-created as links
     // on the backup instead of being skipped (the walk never follows them).
     const linkedNames = new Set<string>();
@@ -1014,15 +1175,18 @@ async function planTree(
   srcDir: string,
   entryRel: string,
   limits: { maxBytes?: number; maxEntries?: number },
-): Promise<{ files: PlannedFile[]; skipped: string[]; truncated: boolean }> {
+): Promise<{ files: PlannedFile[]; skipped: string[]; truncated: boolean; unreadable: string[] }> {
   const maxBytes = limits.maxBytes ?? 64 * 1024 * 1024;
   const maxEntries = limits.maxEntries ?? 5_000;
   const files: PlannedFile[] = [];
   const skipped: string[] = [];
+  /** Sub-folders that could not be listed (EACCES, a folder that vanished):
+   *  skipped like any other entry, and they make the copy incomplete. */
+  const unreadable: string[] = [];
   let truncated = false;
   let bytes = 0;
   let entries = 0;
-  if (!isPlainDir(srcDir)) return { files, skipped, truncated };
+  if (!isPlainDir(srcDir)) return { files, skipped, truncated, unreadable };
   const walk = async (rel: string): Promise<void> => {
     if (rel && entries >= maxEntries) {
       truncated = true;
@@ -1059,7 +1223,20 @@ async function planTree(
       return;
     }
     if (st.isDirectory()) {
-      for (const name of readdirSync(abs).sort()) await walk(rel ? path.join(rel, name) : name);
+      let names: string[];
+      try {
+        names = readdirSync(abs).sort();
+      } catch (err) {
+        // The entry's own top folder failing is the entry failing (the caller
+        // warns and nothing propagates). One sub-folder that cannot be listed
+        // is a skip: `skipped` keeps its mirrored files from being removed, so
+        // the rest of the entry still mirrors.
+        if (!rel) throw err;
+        skipped.push(rel);
+        unreadable.push(`${rel} (${(err as NodeJS.ErrnoException)?.code ?? "read error"})`);
+        return;
+      }
+      for (const name of names) await walk(rel ? path.join(rel, name) : name);
       return;
     }
     if (!st.isFile()) {
@@ -1075,7 +1252,7 @@ async function planTree(
     files.push({ child: rel, abs, st });
   };
   await walk("");
-  return { files, skipped, truncated };
+  return { files, skipped, truncated, unreadable };
 }
 
 /**
@@ -1122,10 +1299,15 @@ async function mirrorFile(
       // the source's mtime, so after a crash between the two the next run
       // would see an unchanged file with no record, never own it, and neither
       // a primary deletion nor Restore would ever touch it. The pending row
-      // (no source stamp) is adopted by the equal-stamp branch below.
+      // (no source stamp) is adopted by the equal-stamp branch below. It
+      // carries the hash of the bytes about to be copied, so a primary
+      // deletion or a Restore that comes before that adoption still recognizes
+      // the file as the mirror's own; a source that changes during the copy
+      // reads as an edit, which keeps the file (the safe side).
       if (!accountAlive(ctx)) throw new Error("account deleted");
+      const intendedHash = await hashFile(from);
       putRow(ctx, {
-        scope: "file", path: rel, key: "", valueHash: null,
+        scope: "file", path: rel, key: "", valueHash: intendedHash,
         srcMtimeMs: null, srcSize: null, preexisted, backupRef,
       });
     }
@@ -1191,6 +1373,15 @@ async function mirrorFile(
   const preexisted = row ? row.preexisted || edited : true;
   let backupRef = row?.backupRef ?? null;
   if (!row || edited || (preexisted && !backupRef)) {
+    // The backup store holds originals up to its own limit. A larger one
+    // could not be saved, and an original is never overwritten unsaved, so
+    // the file is planned as a skip, which the preview reports the same way.
+    if (existing.size > MAX_BACKUP_BYTES) {
+      return {
+        outcome: "skipped",
+        reason: `this account's own copy is larger than the ${formatMegabytes(MAX_BACKUP_BYTES)} backup limit — not updated`,
+      };
+    }
     ctx.plan.backups.push(rel);
     if (!ctx.dry) {
       if (!accountAlive(ctx)) throw new Error("account deleted");
@@ -2595,8 +2786,15 @@ async function mergeCodexConfig(ctx: MirrorCtx): Promise<void> {
     if (primaryTopKeys.has(assignment.key) || removeTop.has(assignment.key)) continue;
     topParts.push(assignment.text.trimEnd());
   }
-  if (topParts.some((t) => t.trim().length > 0)) {
-    out.push(topParts.join("\n"));
+  // The file's header comment rides on its first assignment's text; removing
+  // that key must not take the header with it.
+  const firstBackupTop = backupTopAssignments[0];
+  const keptHeader = firstBackupTop !== undefined && removeTop.has(firstBackupTop.key)
+    ? fileHeaderOf(firstBackupTop.text)
+    : "";
+  const topText = [keptHeader, topParts.join("\n")].filter((t) => t.trim().length > 0).join("\n\n");
+  if (topText.trim().length > 0) {
+    out.push(topText);
   } else if (!primaryTopAssignments.length && removeTop.size === 0 && backupTopText.trim()) {
     // Primary has no top-level keys and nothing is being removed: keep the
     // backup's block as it is (a comment-only header). With a removal, the
@@ -3006,6 +3204,24 @@ export function splitTomlBlocks(text: string): TomlBlock[] {
   return blocks;
 }
 
+/**
+ * The file-header comment carried by a TOML file's first top-level assignment:
+ * the comment and blank lines above it, up to its last blank line. The comment
+ * lines right above a key, with no blank line between, are that key's own and
+ * go with it; a header is set off by a blank line. "" when there is none.
+ */
+function fileHeaderOf(firstAssignmentText: string): string {
+  const lines = firstAssignmentText.split(/\r?\n/);
+  let lastBlank = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!.trim();
+    if (line === "") lastBlank = i;
+    else if (!line.startsWith("#")) break;
+  }
+  const header = lastBlank < 0 ? "" : lines.slice(0, lastBlank).join("\n");
+  return header.trim() === "" ? "" : header.trimEnd();
+}
+
 export interface TomlAssignment {
   /** Normalized key (`a.b`, no whitespace) for matching across files. */
   key: string;
@@ -3113,9 +3329,13 @@ function replaceTomlKey(text: string, key: string, replacement: string | null): 
   if (replacement === null) {
     const topBlock = blocks.find((b) => b.header === "");
     if (!topBlock) return text;
-    const assignments = splitTopLevelAssignments(topBlock.text).assignments.filter((a) => a.key !== key);
+    const all = splitTopLevelAssignments(topBlock.text).assignments;
+    const assignments = all.filter((a) => a.key !== key);
+    // Removing the first key keeps the file's header comment (see `fileHeaderOf`).
+    const header = all[0]?.key === key ? fileHeaderOf(all[0].text) : "";
+    const top = [header, assignments.map((a) => a.text.trimEnd()).join("\n")].filter((t) => t.trim().length > 0).join("\n\n");
     const rest = blocks.filter((b) => b.header !== "").map((b) => b.text.trimEnd());
-    return `${[assignments.map((a) => a.text.trimEnd()).join("\n"), ...rest].filter(Boolean).join("\n\n")}\n`;
+    return `${[top, ...rest].filter(Boolean).join("\n\n")}\n`;
   }
   if (isHeaderText) return `${[...blocks.map((b) => b.text.trimEnd()), replacement.trimEnd()].filter(Boolean).join("\n\n")}\n`;
   const topBlock = blocks.find((b) => b.header === "");
@@ -3193,23 +3413,42 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
   }
   // The rows describe the folder the mirror wrote into. Restoring them into
   // any other folder would write saved originals into the wrong place and
-  // delete the records, so Restore refuses whenever the account now resolves
-  // elsewhere, whether or not the recorded folder still exists (when it is
-  // gone, or the account was re-pointed, the next mirror run drops the stale
-  // records).
+  // delete the records, so each recorded folder the account no longer
+  // resolves to is judged on its own (a Claude account records its config
+  // root and its `.claude.json` folder; the other one's rows still restore):
+  // - it still exists: its rows are refused and kept, so a Restore under the
+  //   environment that resolves the account there can still use them;
+  // - it is gone: nothing can ever be restored into it, and an account that
+  //   left its stack is never mirrored again to drop the records, so Restore
+  //   drops them, saved originals included, and says so.
+  const refusedLines = new Set<number>();
   const recorded = mirrorSources.get(harnessId);
   if (recorded !== null && recorded.backupRoot !== "") {
-    const moved = firstFolderDifference(recorded.backupRoot, folderSourceOf(harness, root).root);
-    if (moved) {
-      result.warnings.push(
-        recordedFolderExists(moved.was)
-          ? `restore refused: this account's ${moved.what} is now ${moved.now}, but the mirror wrote into ${moved.was}; restoring here would put its saved originals into the wrong folder. Start Agetor with the environment that resolves the account to ${moved.was} (or give the account that folder) and restore again`
-          : `restore refused: the mirror's record is for ${moved.was}, but this account's ${moved.what} is now ${moved.now}; its saved originals belong to that folder and are not restored here. The next mirror of this account drops that record`,
-      );
-      return result;
+    const moves = folderDifferences(recorded.backupRoot, folderSourceOf(harness, root).root)
+      .filter((d) => folderLinesOf(kind).includes(d.line));
+    const recordedRows = mirrorProvenance.list(harnessId);
+    const staleLines = new Set<number>();
+    for (const moved of moves) {
+      const hasRows = recordedRows.some((r) => folderLineOf(kind, r) === moved.line);
+      if (recordedFolderExists(moved.was)) {
+        refusedLines.add(moved.line);
+        if (hasRows) {
+          result.warnings.push(
+            `restore refused: this account's ${moved.what} is now ${moved.now}, but the mirror wrote into ${moved.was}; restoring here would put its saved originals into the wrong folder. Start Agetor with the environment that resolves the account to ${moved.was} (or give the account that folder) and restore again`,
+          );
+        }
+      } else {
+        staleLines.add(moved.line);
+        if (hasRows) {
+          result.warnings.push(
+            `the mirror's record is for ${moved.was}, which no longer exists (this account's ${moved.what} is now ${moved.now}); nothing was restored from it, and its records and saved originals were dropped`,
+          );
+        }
+      }
     }
+    if (staleLines.size > 0) await dropFolderState(harnessId, kind, staleLines);
   }
-  const rows = mirrorProvenance.list(harnessId);
+  const rows = mirrorProvenance.list(harnessId).filter((r) => !refusedLines.has(folderLineOf(kind, r)));
   const spec = MIRROR_SPECS[kind];
   let lastYield = Date.now();
   const yieldNow = async () => {
@@ -3356,7 +3595,19 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
       const outcome = rel === "config.toml"
         ? await restoreTomlKeys(harnessId, rel, fileRows, read.text, result, failed)
         : await restoreJsonKeys(harnessId, rel, fileRows, read.text, result, failed);
-      if (outcome.text !== null && outcome.text !== read.text) await atomicWriteFile(toPath, outcome.text, { root: base });
+      if (outcome.text !== null && outcome.text !== read.text) {
+        // A file the mirror created (every key it holds was added, none was
+        // the account's own) that Restore empties goes away, rather than
+        // staying behind as `{}` or a comment-only TOML file.
+        if (fileRows.every((r) => !r.preexisted) && isEmptyDocument(rel, outcome.text)) {
+          // `unlink` removes the leaf itself, never a link's target, and the
+          // folders above it were checked by `destinationState`.
+          unlinkSync(toPath);
+          result.removed.push(rel);
+        } else {
+          await atomicWriteFile(toPath, outcome.text, { root: base });
+        }
+      }
       // Only after the file is back in place do the handled rows go.
       for (const row of outcome.done) await finish(row);
     } catch (err) {
@@ -3371,6 +3622,14 @@ async function restoreOne(requestedId: string): Promise<MirrorRestoreResult> {
     mirrorSources.deleteForHarness(harnessId);
   }
   return result;
+}
+
+/** A merged file's text that holds nothing: a JSON object with no keys, or a
+ *  TOML file of blank and comment lines only. */
+function isEmptyDocument(rel: string, text: string): boolean {
+  if (rel === "config.toml") return text.split(/\r?\n/).every((l) => l.trim() === "" || l.trim().startsWith("#"));
+  const doc = parseJsonObject(text);
+  return doc !== null && Object.keys(doc).length === 0;
 }
 
 interface KeyRestore {

@@ -7734,11 +7734,13 @@ function signalSessionDeath(state: SessionState): void {
       ? `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`
       // Held-probe-driven death, no active turn: the main run already
       // resolved, so there's no handle for the orchestrator to flip to
-      // `blocked` — the task actually releases to `review`. Say so honestly
-      // instead of reusing the sentinel, which the orchestrator would
-      // otherwise pattern-match into a "blocked" breadcrumb that never
+      // `blocked`. A card held in `running` for the agents releases to
+      // `review`; a failed turn's card (already `blocked`) only has its agent
+      // rows ended. The probe can't tell the two apart, so the line covers
+      // both honestly instead of reusing the sentinel, which the orchestrator
+      // would otherwise pattern-match into a "blocked" breadcrumb that never
       // happens for this path.
-      : `tmux session ${state.sessionName} ended while background agents were running — releasing task`,
+      : `tmux session ${state.sessionName} ended while background agents were running — the background agents were ended (a card held open for them is released)`,
   );
   if (slot && slot.resolve) {
     state.turnQueue.shift();

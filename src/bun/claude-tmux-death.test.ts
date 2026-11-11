@@ -419,7 +419,7 @@ test(
       expect(sentinel).toBeUndefined();
       const heldDeath = rec.out.find(
         (c) => c.stream === "status"
-          && c.data.includes("ended while background agents were running — releasing task"),
+          && c.data.includes("ended while background agents were running — the background agents were ended (a card held open for them is released)"),
       );
       expect(heldDeath).toBeDefined();
 
@@ -497,7 +497,7 @@ test(
       expect(sentinel).toBeUndefined();
       const heldDeath = rec.out.find(
         (c) => c.stream === "status"
-          && c.data.includes("ended while background agents were running — releasing task"),
+          && c.data.includes("ended while background agents were running — the background agents were ended (a card held open for them is released)"),
       );
       expect(heldDeath).toBeDefined();
     } finally {
@@ -573,7 +573,7 @@ test(
       expect(sentinel).toBeUndefined();
       const heldDeath = rec.out.find(
         (c) => c.stream === "status"
-          && c.data.includes("ended while background agents were running — releasing task"),
+          && c.data.includes("ended while background agents were running — the background agents were ended (a card held open for them is released)"),
       );
       expect(heldDeath).toBeUndefined();
     } finally {

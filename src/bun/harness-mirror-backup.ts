@@ -32,8 +32,9 @@ import { READ_NOFOLLOW } from "./no-follow.ts";
 import { isSafePathSegment } from "../shared/harness-mirror.ts";
 
 /** Largest file a backup will hold (matches the mirror's own merged-file cap
- *  scaled up for a skill's bundled assets). */
-const MAX_BACKUP_BYTES = 64 * 1024 * 1024;
+ *  scaled up for a skill's bundled assets). The mirror plans a larger file it
+ *  would have to back up as a skip, so a preview and a run agree. */
+export const MAX_BACKUP_BYTES = 64 * 1024 * 1024;
 
 function backupsRoot(): string {
   return path.join(dataDir, "mirror-backups");
@@ -354,6 +355,59 @@ export async function removeMirrorBackups(harnessId: string): Promise<void> {
     // can be redirected; a spike lost outside files with all three
     // (docs/architecture/harness-stacks.md). It runs off the main thread.
     await rm(dir, { recursive: true, force: true });
+  } catch {
+    // Best effort: a leftover backup is inert (nothing reads it without a row).
+  }
+}
+
+/**
+ * Remove the saved originals of one of a Claude account's two folders, when
+ * only that folder moved: `"claude-json"` is the `.claude.json` key originals,
+ * `"config-root"` everything else (file, mode and link originals, and the key
+ * originals of `otherMergedFiles`, the account's other merged files). Codex
+ * has one folder, so a move there is {@link removeMirrorBackups}. The
+ * sub-folders are removed like {@link removeMirrorBackups} removes the
+ * account's folder (top folders `lstat`-checked, then the fd-relative `rm`);
+ * a key file goes through its recomputed ref, never a listed name. Never
+ * throws.
+ */
+export async function removeFolderBackups(
+  harnessId: string,
+  folder: "config-root" | "claude-json",
+  otherMergedFiles: readonly string[] = [],
+): Promise<void> {
+  try {
+    if (folder === "claude-json") {
+      await unlinkSafe(keyBackupRef(harnessId, ".claude.json"));
+      return;
+    }
+    const dir = harnessDir(harnessId);
+    const isPlain = async (p: string): Promise<boolean> => {
+      let st;
+      try {
+        st = await lstat(p);
+      } catch {
+        return false;
+      }
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        console.warn("[harness-mirror] mirror backup directory is a symlink or not a directory — not removed");
+        return false;
+      }
+      return true;
+    };
+    if (!(await isPlain(backupsRoot())) || !(await isPlain(dir))) return;
+    for (const sub of ["files", "modes", "links"]) {
+      const p = path.join(dir, sub);
+      if (!(await isPlain(p))) continue;
+      try {
+        await rm(p, { recursive: true, force: true });
+      } catch {
+        // Best effort, as in removeMirrorBackups.
+      }
+    }
+    for (const file of otherMergedFiles) {
+      if (file !== ".claude.json") await unlinkSafe(keyBackupRef(harnessId, file));
+    }
   } catch {
     // Best effort: a leftover backup is inert (nothing reads it without a row).
   }

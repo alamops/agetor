@@ -87,7 +87,11 @@ survives a stack delete. `harness_session_handoffs` cascades with the task; its
   row was, so existing cooldowns keep their meaning (the rows are copied with
   `model = ''`; the `exhausted_until_ms` index is recreated). It is safe to
   rebuild because nothing references it by FK, and it still has none.
-  `harnesses.delete` clears the account's rows explicitly.
+  `harnesses.delete` clears the account's rows explicitly. The rebuild is
+  **one-way**, like 072: an agetor build from before 087 upserts with
+  `ON CONFLICT(harness_id)`, which no longer matches a constraint, so its
+  cooldown writes fail against a migrated database. A rollback is a new
+  migration, never an edit to 087.
 - **`harness_swap_events`** (the per-stack swap history). Its **only FK is
   `stack_id REFERENCES harness_stacks(id) ON DELETE CASCADE`**; task and account
   ids are plain columns and the labels and task title are denormalized, so a row
@@ -128,19 +132,27 @@ records it.
 `backup_root` and `backup_config` to `harness_mirror_sources` (`TEXT NOT NULL
 DEFAULT ''`): the backup's own resolved folder(s) and settings fingerprint, so
 the same skip rule pins a backup whose folder comes from the environment, and
-Restore refuses while the account resolves elsewhere. `''` means not recorded
+Restore refuses the rows of a recorded folder the account no longer resolves
+to while that folder exists (and drops them once it is gone). `''` means not recorded
 yet: a row from before 090 counts as not recorded until the next real mirror
 run fills it. It also adds the partial index `runs_codex_session_id_idx` on
 `runs(codex_session_id) WHERE codex_session_id IS NOT NULL`, for the
 leftover-copy sweep's live-session check (`runs.taskIdsWithSession`); the
 `claude_session_id` column is already covered by 068's
-`runs_claude_session_id_idx`. 089 is never edited: databases already applied it.
+`runs_claude_session_id_idx`. 089's statements are never changed: databases
+already applied it (its header comment was corrected before it reached `main`;
+`_migrations` tracks ids only, so a comment edit changes nothing applied).
 
 `harness_orphaned_copies.created_at` is a monotonic stamp written by
 `harnessOrphanedCopies.add` (never below the wall clock, always above every
-earlier stamp and sweep mark, seeded from `MAX(created_at)` on first use); a
-sweep forgets only records stamped at or before the mark it took before
-listing ([harness-stacks.md](harness-stacks.md#leftover-handoff-copies)).
+earlier stamp and sweep mark, seeded on first use from the largest integer
+`created_at`, clamped to a day past the wall clock, so a planted REAL, TEXT or
+2^53-and-above value cannot freeze it); a sweep forgets only records stamped
+at or before the mark it took before listing
+([harness-stacks.md](harness-stacks.md#leftover-handoff-copies)). A
+`column_name` other than `claude_session_id`/`codex_session_id` is never
+returned by the store and is deleted by the next sweep
+(`forgetForeignColumns`).
 
 **A future `harness_stacks` rebuild must turn foreign keys off first.**
 `harness_swap_events` cascades on `harness_stacks`, so the documented SQLite

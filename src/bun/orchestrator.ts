@@ -629,8 +629,11 @@ setLagStallSink((stall) => {
 // Death-watch during a #92 hold: keep polling `tmux has-session` even though
 // no turn is in flight, so a session dying mid-hold is caught instead of
 // silently stranding the card in `running` until the next boot. Reuses the
-// existing DB-derived hold predicate — no new state to track.
-setHeldSessionProbe(isHeldByBackgroundAgents);
+// existing DB-derived hold predicate — no new state to track. A turn that
+// failed while its background agents kept running is watched too: if that
+// REPL dies, nothing else would ever settle their rows, and they would block
+// every account switch on the task (`backgroundAgentsHoldTask`) for good.
+setHeldSessionProbe(backgroundAgentsHoldTask);
 
 // Run association for `signalSubagentApiError` (#93): answers "what run id
 // is currently in flight for this task, per the orchestrator's OWN `active`
@@ -919,6 +922,27 @@ function isTaskHeldByBackgroundAgents(task: Task): boolean {
 export function isHeldByBackgroundAgents(taskId: string): boolean {
   const task = tasks.get(taskId);
   return task ? isTaskHeldByBackgroundAgents(task) : false;
+}
+
+/**
+ * Whether running background agents hold the task against an account move:
+ * a turn that succeeded and is held in `running` ({@link
+ * isHeldByBackgroundAgents}), or a turn that FAILED (an API error) while its
+ * background agents kept running, which is never held in `running` but whose
+ * REPL hosts those agents all the same. Moving accounts drops that REPL, so
+ * every account-switch path (the turn end, the release edge, a claim release,
+ * boot, "Switch to next account", a same-stack PATCH) asks this one question
+ * and treats both cases alike. A live turn is not "held": it owns the task,
+ * and its own end decides.
+ */
+export function backgroundAgentsHoldTask(taskId: string): boolean {
+  // Polled by the claude death watch on every tick of an idle session, so the
+  // common "no background agent" answer costs one indexed lookup.
+  const task = tasks.get(taskId);
+  if (!task) return false;
+  if (isTaskHeldByBackgroundAgents(task)) return true;
+  if (!subagents.hasRunning(taskId)) return false;
+  return !((task.runId != null && active.has(task.runId)) || runs.hasRunning(taskId));
 }
 
 /**
@@ -1903,7 +1927,15 @@ function releaseStartingClaim(taskId: string): void {
   // failed pre-flight, a failed spawn) must settle it here, or it would fire at
   // some unrelated later turn end.
   if (tasks.get(taskId)?.harnessState?.scheduledSwitch) {
-    queueMicrotask(() => settleWaitingScheduledSwitch(taskId, { stopped }));
+    // A throw here would surface as an uncaught microtask error, not reach the
+    // claim holder; log it like `endTurnSettle` does.
+    queueMicrotask(() => {
+      try {
+        settleWaitingScheduledSwitch(taskId, { stopped });
+      } catch (err) {
+        console.warn(`[agetor] settling a waiting account switch for ${taskId} failed:`, err);
+      }
+    });
   }
 }
 
@@ -3700,13 +3732,21 @@ export function claimTaskForAccountSwitch(taskId: string): boolean {
   if (startingTaskIds.has(taskId)) return false;
   // A freeze admits no new account move (the next owner's boot decides).
   if (launchesFrozenFlag) return false;
-  // A held task's REPL is still hosting background agents: the switch would
-  // drop it and abandon them (review N3). The PATCH route refuses with its
-  // own 409 first; this keeps every other caller out too.
-  if (isHeldByBackgroundAgents(taskId)) return false;
+  // A held task's REPL (or a failed turn's) is still hosting background
+  // agents: the switch would drop it and abandon them (review N3). The PATCH
+  // route refuses with its own 409 first; this keeps every other caller out too.
+  if (backgroundAgentsHoldTask(taskId)) return false;
   startingTaskIds.add(taskId);
   accountSwitchTaskIds.add(taskId);
   return true;
+}
+
+/** Whether an account switch (a PATCH, a "Switch to next account" move, a
+ *  scheduled one being applied, or a boot completion) is copying the task's
+ *  conversation right now. A Cancel then has nothing left to cancel: the
+ *  route answers 409 `busy` instead of a no-op. */
+export function isAccountSwitchUnderway(taskId: string): boolean {
+  return accountSwitchTaskIds.has(taskId);
 }
 
 /** Release a claim taken by {@link claimTaskForAccountSwitch}. Safe to call
@@ -3754,6 +3794,11 @@ export function beginManualAccountSwitch(
     },
     allExhausted: state?.allExhausted ?? null,
     lastMove: state?.lastMove ?? null,
+    // A scheduled "switch to next account" stays recorded until the move's
+    // final state write consumes it: a move that throws drops it with the
+    // error, and one a crash interrupts before the row changed accounts is
+    // retried by the boot reconcile instead of being lost.
+    ...(state?.scheduledSwitch ? { scheduledSwitch: state.scheduledSwitch } : {}),
   }));
   return true;
 }
@@ -3819,7 +3864,9 @@ async function moveTaskForSwitchNow(taskId: string, toId: string, trigger: "manu
   if (!before) return;
   switchNowTaskIds.add(taskId);
   beginManualAccountSwitch(taskId, before.agent, toId, { switchNow: trigger });
+  let threw = false;
   try {
+    scheduledSwitchTestHooks.afterIntent?.(taskId);
     const updated = tasks.update(taskId, { agent: toId });
     if (!updated) {
       clearManualAccountSwitch(taskId);
@@ -3827,12 +3874,17 @@ async function moveTaskForSwitchNow(taskId: string, toId: string, trigger: "manu
     }
     await reconcileTaskSession(taskId, before, updated, { switchNow: trigger });
   } catch (err) {
+    threw = true;
     clearManualAccountSwitch(taskId);
     throw err;
   } finally {
     // The final state write clears it; a path that bailed early must not
-    // leave a request nobody will honour.
-    if (tasks.get(taskId)?.harnessState?.scheduledSwitch) patchTaskState(taskId, { scheduledSwitch: null });
+    // leave a request nobody will honour. A scheduled move that threw keeps
+    // it for its caller, which drops it with the error
+    // (`applyScheduledSwitch`).
+    if (!(threw && trigger === "scheduled") && tasks.get(taskId)?.harnessState?.scheduledSwitch) {
+      patchTaskState(taskId, { scheduledSwitch: null });
+    }
   }
 }
 
@@ -3905,8 +3957,9 @@ export async function switchTaskAccountNow(taskId: string): Promise<SwitchAccoun
     });
   }
   // The same check the PATCH route makes: the switch drops the REPL that hosts
-  // the background agents.
-  if (isHeldByBackgroundAgents(taskId)) {
+  // the background agents, whether the turn that left them running succeeded
+  // or failed.
+  if (backgroundAgentsHoldTask(taskId)) {
     throw new SwitchAccountRefusedError({
       error: "stop the background agents before switching accounts",
       code: "background-agents",
@@ -4002,7 +4055,7 @@ async function applyScheduledSwitch(taskId: string, behindQueue = false): Promis
   // persisted and is applied when they finish (`maybeReleaseHeldTask`) or the
   // turn ends. `reconcileTaskSession` must never see a live run, or it would
   // take its "start fresh" branch.
-  if (isHeldByBackgroundAgents(taskId) || runs.hasRunning(taskId)) return;
+  if (backgroundAgentsHoldTask(taskId) || runs.hasRunning(taskId)) return;
   const plan = planManualSwitchTarget(task);
   if (plan.kind === "refused") {
     dropScheduledSwitch(
@@ -4046,7 +4099,7 @@ async function settleScheduledSwitchAtTurnEnd(
   // Another start holds the task: its run's turn end decides, or, when it ends
   // without a live run, the claim release does (`releaseStartingClaim`).
   if (startingTaskIds.has(taskId)) return;
-  if (isHeldByBackgroundAgents(taskId) || subagents.hasRunning(taskId)) {
+  if (backgroundAgentsHoldTask(taskId)) {
     // Dropping the REPL would abandon the background agents: wait for them
     // (`maybeReleaseHeldTask` applies it; a Stop drops it).
     const noteRunId = noteRunIdOf(taskId);
@@ -4066,6 +4119,7 @@ async function settleScheduledSwitchAtTurnEnd(
  * own end. Fire-and-forget.
  */
 function settleWaitingScheduledSwitch(taskId: string, opts: { stopped?: boolean } = {}): void {
+  scheduledSwitchTestHooks.waitingSettle?.(taskId);
   const task = tasks.get(taskId);
   const scheduled = task?.harnessState?.scheduledSwitch;
   if (!task || !scheduled) return;
@@ -4082,7 +4136,7 @@ function settleWaitingScheduledSwitch(taskId: string, opts: { stopped?: boolean 
     return;
   }
   if (launchesFrozenFlag) return;
-  if (accountSwitchMustWait(task) || isHeldByBackgroundAgents(taskId) || subagents.hasRunning(taskId)) return;
+  if (accountSwitchMustWait(task) || backgroundAgentsHoldTask(taskId)) return;
   void applyScheduledSwitch(taskId).catch((err) => {
     console.warn(`[agetor] deferred account switch for ${taskId} failed:`, err);
   });
@@ -4108,7 +4162,10 @@ async function reconcileScheduledSwitchesAtBoot(): Promise<void> {
       patchTaskState(task.id, { scheduledSwitch: null });
       continue;
     }
-    if (accountSwitchMustWait(task) || isHeldByBackgroundAgents(task.id)) continue;
+    // Background agents still running after the restart (the subagent
+    // watcher is re-armed at boot) hold the request whether the turn that
+    // left them succeeded or failed; their release edge applies it.
+    if (accountSwitchMustWait(task) || backgroundAgentsHoldTask(task.id)) continue;
     try {
       await applyScheduledSwitch(task.id);
     } catch (err) {
@@ -4131,6 +4188,32 @@ let turnSettlePumpHook: TurnSettlePumpHook | null = null;
 export function __setTurnSettlePumpHookForTest(hook: TurnSettlePumpHook | null): TurnSettlePumpHook | null {
   const prev = turnSettlePumpHook;
   turnSettlePumpHook = hook;
+  return prev;
+}
+
+/**
+ * Test seams for the scheduled-switch edges, all synchronous and all no-ops in
+ * production:
+ * - `afterIntent`: inside a switch-now move, right after the intent
+ *   (`pendingSwap`) is persisted and before the row changes accounts. A throw
+ *   there is a move that failed after its first write; the state read there is
+ *   what a crash would leave.
+ * - `waitingSettle`: at the top of `settleWaitingScheduledSwitch`.
+ * - `turnDrain`: in a done handler right after the turn-end switch decision,
+ *   before the follow-up drain (inside the settling window).
+ */
+interface ScheduledSwitchTestHooks {
+  afterIntent?: (taskId: string) => void;
+  waitingSettle?: (taskId: string) => void;
+  turnDrain?: (taskId: string, runId: string) => void;
+}
+let scheduledSwitchTestHooks: ScheduledSwitchTestHooks = {};
+
+/** Test-only: install/clear {@link scheduledSwitchTestHooks}. Returns the
+ *  previous hooks so a test can restore them. */
+export function __setScheduledSwitchHooksForTest(hooks: ScheduledSwitchTestHooks): ScheduledSwitchTestHooks {
+  const prev = scheduledSwitchTestHooks;
+  scheduledSwitchTestHooks = hooks;
   return prev;
 }
 
@@ -5835,6 +5918,7 @@ function attachDoneHandler(
       // A requested "switch to next account" runs BEFORE the queued follow-ups
       // drain, so they start on the new account.
       await settleScheduledSwitchAtTurnEnd(taskId, runId, newStatus, wasCancelled);
+      scheduledSwitchTestHooks.turnDrain?.(taskId, runId);
       await drainFollowUpQueues(taskId, runId, wasCancelled);
       await settleHarnessStateAndFollowUps(taskId, runId, newStatus, wasCancelled);
       if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
@@ -5910,6 +5994,7 @@ function attachDoneHandler(
       // A requested "switch to next account" runs BEFORE the queued follow-ups
       // drain, so they start on the new account.
       await settleScheduledSwitchAtTurnEnd(taskId, runId, newStatus, wasCancelled);
+      scheduledSwitchTestHooks.turnDrain?.(taskId, runId);
       await drainFollowUpQueues(taskId, runId, wasCancelled);
       await settleHarnessStateAndFollowUps(taskId, runId, newStatus, wasCancelled);
       if (wasOpencodeServerRun) retryDeferredOpencodeWake(taskId);
@@ -6193,7 +6278,7 @@ export async function reconcileTaskSession(
     const beforeStack = harnessStacks.getByMember(before.agent);
     const afterStack = harnessStacks.getByMember(after.agent);
     const sameStack = Boolean(beforeStack && afterStack && beforeStack.id === afterStack.id);
-    if (sameStack && isHeldByBackgroundAgents(taskId)) {
+    if (sameStack && backgroundAgentsHoldTask(taskId)) {
       // The REPL still hosts background agents: the switch would drop it and
       // abandon them mid-work (review N3). The PATCH route refuses this with a
       // 409 before writing; a direct caller that got here anyway is refused
@@ -7152,26 +7237,41 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
   const clear = () => {
     if (tasks.get(taskId)?.harnessState?.pendingSwap?.manual) patchTaskState(taskId, { pendingSwap: null });
   };
+  // Once the row has left the source account (every branch after the first),
+  // a scheduled "switch to next account" the intent carried is consumed by
+  // this move (the final state write below omits it) or by its failure, and
+  // never re-applied by the scheduled-switch reconcile that runs next.
+  const clearWithScheduled = () => {
+    clear();
+    if (tasks.get(taskId)?.harnessState?.scheduledSwitch) patchTaskState(taskId, { scheduledSwitch: null });
+  };
   if (task.agent === pending.from) {
     // The row update never landed; the task is still on the source account.
+    // A scheduled switch is still recorded (`beginManualAccountSwitch` carries
+    // it), and `reconcileScheduledSwitchesAtBoot` retries it right after.
     clear();
+    const stillScheduled = tasks.get(taskId)?.harnessState?.scheduledSwitch != null;
     saveStatusLineQuietly(
       pending.runId,
       taskId,
-      "the core restarted before the account switch started — run the task to switch",
+      pending.switchNow === "scheduled"
+        ? stillScheduled
+          ? "the core restarted before the scheduled account switch started — it stays scheduled"
+          : "the core restarted before the scheduled account switch started — switch again to move the task"
+        : "the core restarted before the account switch started — run the task to switch",
     );
     return;
   }
   if (task.agent !== pending.to) {
     // Edited to a third account before the restart; this intent is stale.
-    clear();
+    clearWithScheduled();
     return;
   }
   const fromHarness = resolveHarness(pending.from);
   const toHarness = resolveHarness(pending.to);
   const stack = harnessStacks.getByMember(pending.to);
   if (!fromHarness || !toHarness || !stack) {
-    clear();
+    clearWithScheduled();
     return;
   }
   const column = harnessSessionColumnFor(fromHarness.kind);
@@ -7201,7 +7301,7 @@ async function reconcileManualAccountSwitch(task: Task, pending: PendingSwapStat
   if (moved.kind !== "moved") {
     // The account changed but its conversation could not be copied. Surface
     // it exactly like the live fallback path does; never pretend continuity.
-    clear();
+    clearWithScheduled();
     const rowNow = tasks.get(taskId);
     if (rowNow) {
       recordHarnessSwapEvent({
@@ -7337,8 +7437,10 @@ async function fireHarnessAutoRetryInner(taskId: string): Promise<void> {
   const exhausted = task.harnessState?.allExhausted;
   if (!exhausted) return;
   if (exhausted.attempts >= HARNESS_STACK_RETRY_MAX) return;
-  if (runs.hasRunning(taskId) || isHeldByBackgroundAgents(taskId)) {
-    // A turn is live (an adopted continuation, a reattached run): never mint
+  if (runs.hasRunning(taskId) || backgroundAgentsHoldTask(taskId)) {
+    // A turn is live (an adopted continuation, a reattached run), or background
+    // agents (after a succeeded or a failed turn) still run in the REPL a
+    // retry on another account would drop: never mint
     // a second one, but do not consume the timer either — push it a short
     // backoff out so the countdown is still owned by a timer (review Q7). The
     // live run's own settle clears or re-plans the state.
@@ -7564,8 +7666,9 @@ setHarnessFailoverHooks({
   // short backoff instead, so a prepare that then fails cannot strand the
   // persisted countdown with no timer.
   canAutoRetry: (taskId) => !startingTaskIds.has(taskId) && !harnessRetriesInFlight.has(taskId),
-  // A held task's REPL is live; a manual prepare must not move it (Q6).
-  isTaskHeld: (taskId) => isHeldByBackgroundAgents(taskId),
+  // A REPL hosting background agents is live, whether the turn that left
+  // them succeeded or failed; a manual prepare must not move it (Q6).
+  isTaskHeld: (taskId) => backgroundAgentsHoldTask(taskId),
   onScheduledSwitchDropped: (taskId, line) => {
     const runId = noteRunIdOf(taskId);
     if (runId) saveStatusLineQuietly(runId, taskId, line);
@@ -7613,10 +7716,14 @@ export function rearmRetriesAfterCooldownClear(harnessId: string): number {
 }
 
 /**
- * Stop a task that's "held" (see `isHeldByBackgroundAgents`) — its terminal
- * run already succeeded but background agents are still running, so there's
- * no `active` handle to kill. Interrupt the live session and release the
- * hold. Shared by `cancelRun` (Stop button) and `archiveTask` (`stopRun`).
+ * Stop a task whose background agents still run with no turn in flight (see
+ * `backgroundAgentsHoldTask`): its terminal run succeeded (held in `running`)
+ * or failed (an API error left the card `blocked`/`ready`), so there's no
+ * `active` handle to kill. Interrupt the live session and orphan the agents'
+ * rows. Nothing here moves the card or touches the run: the settle hook's
+ * `maybeReleaseHeldTask` advances only a held `running` card to `review`, and
+ * a failed card stays where its turn end put it. Shared by `cancelRun` (Stop
+ * button) and `archiveTask` (`stopRun`).
  */
 async function stopHeldTask(taskId: string, reason: string): Promise<void> {
   stashSwapFollowUps(taskId);
@@ -7650,7 +7757,9 @@ export async function cancelRun(runId: string): Promise<boolean> {
     // in `running`. Its Stop button must still do something, or a background
     // agent that wedges without dying leaves the user no way out short of a
     // restart. Interrupt the live session and release the hold; the run itself
-    // already succeeded, so the card advances to `review`.
+    // already succeeded, so the card advances to `review`. A turn that FAILED
+    // with its background agents still running is stopped the same way (the
+    // card stays where its failure put it).
     const taskId = runs.get(runId)?.taskId;
     if (!taskId) return false;
     // This process is handing off (`freezeLaunches`) and the settlement
@@ -7689,11 +7798,17 @@ export async function cancelRun(runId: string): Promise<boolean> {
       cancelPendingForTask(taskId, "cancelled by user");
       return true;
     }
-    if (isHeldByBackgroundAgents(taskId)) {
+    if (backgroundAgentsHoldTask(taskId)) {
       // Before the interrupt: the runner queues its record of the stop
-      // ahead of the settle the hold's release triggers.
-      reportHeldStepStopped(taskId);
+      // ahead of the settle the hold's release triggers. Only a held
+      // SUCCEEDED step is still unsettled for the runner; a failed turn
+      // already settled its step.
+      if (isHeldByBackgroundAgents(taskId)) reportHeldStepStopped(taskId);
       await stopHeldTask(taskId, "cancelled by user");
+      // A failed turn can also have left an armed all-exhausted retry or an
+      // fx auto-resume: the Stop ends those too, as it would without agents.
+      if (hasPendingHarnessRetry(taskId) && !runs.hasRunning(taskId)) cancelHarnessRetryForTask(taskId);
+      if (fxAutoResumeTimers.has(taskId)) cancelFxAutoResume(taskId, "stopped");
       return true;
     }
     // A settled OpenCode turn may still be listening for its background
@@ -12611,7 +12726,7 @@ export async function archiveTask(
   clearFailoverState(taskId);
   if (task.runId && active.has(task.runId)) {
     stopActiveHandle(active.get(task.runId)!, "task archived");
-  } else if (opts?.stopRun && isHeldByBackgroundAgents(taskId)) {
+  } else if (opts?.stopRun && backgroundAgentsHoldTask(taskId)) {
     await stopHeldTask(taskId, "task archived");
   }
   // Idle archive (a restarted Cursor question, a done-column archive, a

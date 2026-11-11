@@ -457,3 +457,107 @@ describe("snapshotHarnessState covers the 088/089 tables (review N8)", () => {
     dbm.db.run(`DELETE FROM harness_mirror_sources WHERE harness_id = 'n8-kept'`);
   });
 });
+
+describe("harnessOrphanedCopies stamps and planted rows (review N3, S4)", () => {
+  const sid = "dddddddd-0000-4000-8000-000000000001";
+  const plant = (harnessId: string, column: string, p: string, createdAtSql: string) =>
+    dbm.db.run(
+      `INSERT INTO harness_orphaned_copies (harness_id, column_name, session_id, path, created_at)
+       VALUES (?, ?, ?, ?, ${createdAtSql})`,
+      [harnessId, column, sid, p],
+    );
+  const stampOf = (harnessId: string, p: string) =>
+    dbm.db
+      .query<{ created_at: number }, [string, string]>(
+        `SELECT created_at FROM harness_orphaned_copies WHERE harness_id = ? AND path = ?`,
+      )
+      .get(harnessId, p)?.created_at;
+  const rowsOf = (harnessId: string) =>
+    dbm.db
+      .query<{ path: string }, [string]>(`SELECT path FROM harness_orphaned_copies WHERE harness_id = ? ORDER BY path`)
+      .all(harnessId)
+      .map((r) => r.path);
+
+  // Each case seeds the stamp from the table afresh, and leaves no row behind
+  // for the next one (or the next file) to seed from.
+  function withPlanted(harnessId: string, createdAtSql: string, body: () => void): void {
+    plant(harnessId, "claude_session_id", `/planted/${sid}.jsonl`, createdAtSql);
+    dbm.resetOrphanStampForTests();
+    try {
+      body();
+    } finally {
+      dbm.harnessOrphanedCopies.deleteForHarness(harnessId);
+      dbm.resetOrphanStampForTests();
+    }
+  }
+
+  for (const [label, sql, h] of [
+    ["an integer at 2^53", "9007199254740993", "n3-freeze-int"],
+    ["a huge REAL", "1e300", "n3-freeze-real"],
+  ] as const) {
+    test(`a planted created_at (${label}) does not freeze later stamps`, () => {
+      withPlanted(h, sql, () => {
+        dbm.harnessOrphanedCopies.add(h, "claude_session_id", sid, [`/a/${sid}.jsonl`]);
+        dbm.harnessOrphanedCopies.add(h, "claude_session_id", sid, [`/b/${sid}.jsonl`]);
+        const a = stampOf(h, `/a/${sid}.jsonl`)!;
+        const b = stampOf(h, `/b/${sid}.jsonl`)!;
+        expect(b).toBeGreaterThan(a);
+        const mark = dbm.harnessOrphanedCopies.sweepMark();
+        expect(mark).toBeGreaterThanOrEqual(b);
+        // A record written after the mark stays strictly after it.
+        dbm.harnessOrphanedCopies.add(h, "claude_session_id", sid, [`/c/${sid}.jsonl`]);
+        expect(stampOf(h, `/c/${sid}.jsonl`)!).toBeGreaterThan(mark);
+        expect(Number.isSafeInteger(stampOf(h, `/c/${sid}.jsonl`)!)).toBe(true);
+      });
+    });
+  }
+
+  test("a seed far ahead of the clock is clamped to a day past it", () => {
+    const h = "n3-clamp";
+    const ahead = Date.now() + 10 * 24 * 60 * 60 * 1000;
+    withPlanted(h, String(ahead), () => {
+      dbm.harnessOrphanedCopies.add(h, "claude_session_id", sid, [`/a/${sid}.jsonl`]);
+      const a = stampOf(h, `/a/${sid}.jsonl`)!;
+      expect(a).toBeLessThanOrEqual(Date.now() + 24 * 60 * 60 * 1000 + 1);
+      // The planted row is past every sweep mark: a sweep never forgets it.
+      dbm.harnessOrphanedCopies.forget(h, "claude_session_id", sid, [`/planted/${sid}.jsonl`], {
+        notAfter: dbm.harnessOrphanedCopies.sweepMark(),
+      });
+      expect(rowsOf(h)).toContain(`/planted/${sid}.jsonl`);
+    });
+  });
+
+  test("forget without a mark removes a record whatever its planted stamp (past 2^53, REAL, TEXT)", () => {
+    const h = "n3-forget";
+    plant(h, "claude_session_id", `/i/${sid}.jsonl`, "9007199254740993");
+    plant(h, "claude_session_id", `/r/${sid}.jsonl`, "1e300");
+    plant(h, "claude_session_id", `/t/${sid}.jsonl`, "'not a number'");
+    try {
+      dbm.harnessOrphanedCopies.forget(h, "claude_session_id", sid, [`/i/${sid}.jsonl`, `/r/${sid}.jsonl`, `/t/${sid}.jsonl`]);
+      expect(rowsOf(h)).toEqual([]);
+    } finally {
+      dbm.harnessOrphanedCopies.deleteForHarness(h);
+      dbm.resetOrphanStampForTests();
+    }
+  });
+
+  test("a row under a column no handoff writes is never listed; forgetForeignColumns drops only those", () => {
+    const h = "s4-foreign";
+    plant(h, "cursor_session_id", `/x/${sid}.jsonl`, "1");
+    plant(h, "not_a_column", `/y/${sid}.jsonl`, "1");
+    plant(h, "codex_session_id", `/z/rollout-x-${sid}.jsonl`, "1");
+    try {
+      expect(dbm.harnessOrphanedCopies.list({ harnessId: h }).map((r) => r.path)).toEqual([`/z/rollout-x-${sid}.jsonl`]);
+      expect(dbm.harnessOrphanedCopies.list().filter((r) => r.harnessId === h).map((r) => r.columnName)).toEqual([
+        "codex_session_id",
+      ]);
+      // Scoped to another account: nothing of this one goes.
+      expect(dbm.harnessOrphanedCopies.forgetForeignColumns("s4-someone-else")).toBe(0);
+      expect(dbm.harnessOrphanedCopies.forgetForeignColumns(h)).toBe(2);
+      expect(rowsOf(h)).toEqual([`/z/rollout-x-${sid}.jsonl`]);
+    } finally {
+      dbm.harnessOrphanedCopies.deleteForHarness(h);
+      dbm.resetOrphanStampForTests();
+    }
+  });
+});
