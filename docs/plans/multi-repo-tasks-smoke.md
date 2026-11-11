@@ -185,6 +185,16 @@ must-fix, four should-fixes and three nits. All are closed with regressions:
 | Nit: `uniqueRepoSlugs` produced nested suffixes (`app-2-2`) | a colliding numeric base resumes its stem's sequence (`app-3`) | `src/shared/multi-repo.test.ts` |
 | Nit: the >10 warning counted pre-dedupe selections | counts the deduped selection (same predicate as the per-repo base-ref control) | `bun run typecheck` (`src/mainview/components/kanban/RepositoriesDialog.tsx`) |
 
+## Eighth review round
+
+At head `bf806e30` the re-review confirmed rounds 1–7 closed and opened one
+must-fix and one should-fix. Both are closed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Must-fix: a task-level `baseRef` was silently ignored for 2+ repositories — `agetor add --repo a --repo b --base-ref release/next` (and a direct `POST /tasks` body) pinned each repository's HEAD instead of the requested sha | the task-level ref is the default for every entry without its own `repositories[].baseRef` pin (`--repo <path>=<ref>` still wins); the pre-validation error path resolves the same effective ref, so a typo'd default names every repository it is missing from | `src/bun/orchestrator-multi-repo.test.ts` — "a task-level base ref is the default for unpinned multi-repository entries" |
+| Should-fix: the Worktrees delete confirm fetched every repository's git status with one unbounded `Promise.all` (N+1 subprocesses from one click), bypassing the page's `GIT_STATUS_CONCURRENCY` cap | the confirm batches its status reads at the same `GIT_STATUS_CONCURRENCY` (5) used by the list's own pass | `bun run typecheck` (`src/mainview/components/worktrees/WorktreesDialog.tsx`); the copy/classification itself stays covered by `worktree-delete-intent.test.ts` |
+
 ## Live harness smoke matrix
 
 Layout support is universal (the agent runs at the workspace root). Extra

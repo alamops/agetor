@@ -65,6 +65,13 @@ async function git(args: string[], cwd: string) {
   await proc.exited;
 }
 
+async function revParse(cwd: string, ref: string): Promise<string> {
+  const proc = Bun.spawn(["git", "rev-parse", ref], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const sha = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  return sha;
+}
+
 async function makeRepo(name = "repo", remote?: string): Promise<string> {
   const repo = mkdtempSync(path.join(tmpdir(), `agetor-${name}-`));
   await git(["init", "-b", "main"], repo);
@@ -279,6 +286,72 @@ test("a single repositories entry keeps its per-repository base ref", async () =
     expect(created.task.repositories?.[0]?.baseRef).toBe(sha);
   } finally {
     cleanup(a);
+  }
+});
+
+test("a task-level base ref is the default for unpinned multi-repository entries", async () => {
+  // Review M1: `agetor add --repo a --repo b --base-ref release/next` (and a
+  // direct POST /tasks with `baseRef`) resolved each entry's own pin or HEAD
+  // and silently discarded the task-level ref, so both repos branched from
+  // their HEAD instead of the requested sha.
+  const { createTask } = await load();
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  for (const repo of [a, b]) {
+    writeFileSync(path.join(repo, "next.txt"), "next\n");
+    await git(["checkout", "-b", "release/next"], repo);
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "next"], repo);
+    await git(["checkout", "main"], repo);
+  }
+  const aNext = await revParse(a, "release/next");
+  const bNext = await revParse(b, "release/next");
+  const bMain = await revParse(b, "main");
+  try {
+    const created = await createTask({
+      title: "auth across repos",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: a,
+      isolation: "worktree",
+      baseRef: "release/next",
+      // The entry-level pin must still win over the task-level default.
+      repositories: [{ path: a }, { path: b, baseRef: "main" }],
+    });
+    if ("error" in created) throw new Error(created.error);
+    expect(created.task.baseRef).toBeNull();
+    expect(created.task.repositories?.map((r) => r.baseRef)).toEqual([aNext, bMain]);
+    // The repos really do carry distinct shas on that branch, so the assertion
+    // above proves each entry resolved against its own refs.
+    expect(aNext).not.toBe(bNext);
+
+    const both = await createTask({
+      title: "auth across repos",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: a,
+      isolation: "worktree",
+      baseRef: "release/next",
+      repositories: [{ path: a }, { path: b }],
+    });
+    if ("error" in both) throw new Error(both.error);
+    expect(both.task.repositories?.map((r) => r.baseRef)).toEqual([aNext, bNext]);
+
+    const missing = await createTask({
+      title: "bad default base",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: a,
+      isolation: "worktree",
+      baseRef: "does-not-exist",
+      repositories: [{ path: a }, { path: b }],
+    });
+    expect("error" in missing).toBe(true);
+    if ("error" in missing) {
+      expect(missing.error).toContain('base ref "does-not-exist" not found in');
+    }
+  } finally {
+    cleanup(a, b);
   }
 });
 

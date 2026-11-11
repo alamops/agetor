@@ -52,7 +52,10 @@ interface TaskRepository {
    refs** (plus names other not-yet-started tasks hold), so a branch left
    behind by an archived task gets the per-repository `-N` fallback instead of
    being silently re-attached. Repositories share the desired name when it is
-   free everywhere.
+   free everywhere. An entry's own `repositories[].baseRef`
+   (`--repo <path>=<ref>`) wins; a task-level `baseRef` (CLI `--base-ref`) is
+   the default for entries without one; omitted both means that repository's
+   HEAD.
 5. Matches `issueUrl` against every repository's remote.
 6. Inserts `workdir = <dataDir>/worktrees/<task-id>` and the entries with
    `branch` pinned but `worktreePath` null.

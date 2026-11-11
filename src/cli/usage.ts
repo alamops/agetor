@@ -20,7 +20,8 @@ export const USAGE: Record<string, string> = {
     --title <s>        task title          --prompt <s> | --prompt-file <p>
     --agent <id>       harness id          --workdir <path>   git repo to run in
     --repo <path[=ref]>  another repository for this task (repeatable; 2+
-                        repos share one workspace and force worktree isolation)
+                        repos share one workspace and force worktree isolation;
+                        a repo without =ref starts from --base-ref, else HEAD)
     --isolation <m>    worktree | none     --base-ref <ref>   branch base (default HEAD)
     --model <id>   --mode <id>   --effort <id>
     --speed <s>        off | fast | ultrafast (what the model offers: cursor

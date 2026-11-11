@@ -11157,6 +11157,12 @@ export async function createTask(
   // first selected path (the ordinary single-repository layout). Only 2+ kept
   // entries make this a multi-repository task.
   const repoInputs: TaskRepositoryInput[] = Array.isArray(input.repositories) ? input.repositories : [];
+  // Task-level base ref (CLI `--base-ref`, or a direct `POST /tasks` body).
+  // It is the default for every selected repository without its own pin, so
+  // `agetor add --repo a --repo b --base-ref release/next` starts both from
+  // `release/next` instead of silently dropping the flag. A per-entry
+  // `repositories[].baseRef` (`--repo <path>=<ref>`) wins for that entry.
+  const defaultBaseRef = input.baseRef?.trim() || null;
   const resolvedSet = repoInputs.length > 0
     ? await resolveRepositorySet(repoInputs, { resolveRoot: repoRoot })
     : null;
@@ -11168,7 +11174,7 @@ export async function createTask(
       repoInputs.map((r) => [typeof r.path === "string" ? r.path.trim() : "", r.baseRef]),
     );
     for (const entry of resolvedSet.repositories) {
-      const requested = requestedByPath.get(entry.path)?.trim() || "HEAD";
+      const requested = requestedByPath.get(entry.path)?.trim() || defaultBaseRef || "HEAD";
       if (requested === "HEAD") continue;
       const sha = await resolveRef(entry.path, requested);
       if (!sha) errors.push(`base ref "${requested}" not found in ${entry.name} (${entry.path})`);
@@ -11217,16 +11223,17 @@ export async function createTask(
 
   if (multiRepo) {
     // Per-repository base refs resolved now, so a re-run starts from the same
-    // commit in every repository. The shared desired branch name is resolved
-    // per repository below (against each repository's own refs at create
-    // time), so a name an archived task left behind gets the `-N` fallback
-    // before anything is materialized.
+    // commit in every repository. An entry's own pin (`--repo <path>=<ref>`)
+    // wins; otherwise the task-level `baseRef` applies; otherwise HEAD. The
+    // shared desired branch name is resolved per repository below (against
+    // each repository's own refs at create time), so a name an archived task
+    // left behind gets the `-N` fallback before anything is materialized.
     const requestedByPath = new Map(
       repoInputs.map((r) => [typeof r.path === "string" ? r.path.trim() : "", r.baseRef]),
     );
     const errors: string[] = [];
     for (const entry of keptRepositories) {
-      const requested = requestedByPath.get(entry.path)?.trim() || "HEAD";
+      const requested = requestedByPath.get(entry.path)?.trim() || defaultBaseRef || "HEAD";
       const sha = await resolveRef(entry.path, requested);
       if (!sha && requested !== "HEAD") {
         errors.push(`base ref "${requested}" not found in ${entry.name} (${entry.path})`);

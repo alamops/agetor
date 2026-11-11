@@ -295,7 +295,10 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
     await withBusy([w.id, ...siblings.map((row) => row.id)], async () => {
       // Fetch the clicked row's status AND each sibling's, so a clean row
       // can't hide a dirty sibling whose uncommitted work is about to be
-      // discarded (issue #291 review).
+      // discarded (issue #291 review). Batched at GIT_STATUS_CONCURRENCY like
+      // the list's own status pass: a task may select 10+ repositories and
+      // each call is a git subprocess on the bun side, so an unbounded
+      // `Promise.all` here would fan out N+1 processes from one confirm.
       const fetchStatus = async (id: string): Promise<WorktreeGitStatus | null> => {
         try {
           return await api.getWorktreeGitStatus(id);
@@ -305,10 +308,16 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
           return null;
         }
       };
-      const [status, ...siblingStatuses] = await Promise.all([
-        fetchStatus(w.id),
-        ...siblings.map((row) => fetchStatus(row.id)),
-      ]);
+      const rows = [w, ...siblings];
+      const statuses: (WorktreeGitStatus | null)[] = [];
+      for (let i = 0; i < rows.length; i += GIT_STATUS_CONCURRENCY) {
+        statuses.push(
+          ...(await Promise.all(
+            rows.slice(i, i + GIT_STATUS_CONCURRENCY).map((row) => fetchStatus(row.id)),
+          )),
+        );
+      }
+      const [status, ...siblingStatuses] = statuses;
       const copy = buildDeleteConfirmCopy(
         w,
         status ?? null,
