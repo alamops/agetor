@@ -252,24 +252,73 @@ export function Dashboard({
     void (async () => {
       try {
         if (composeMulti) {
+          // Per-scope failure must not blank the whole listing: keep the other
+          // repositories' rows (and, for a failed one, the rows it last
+          // contributed to THIS task) exactly like the webview's
+          // `useProjectFileScopes` merge. A `Promise.all` over the raw calls
+          // rejected as soon as one repository failed, so a single flaky
+          // scope hid every healthy repository's files.
           const results = await Promise.all(
-            composeScopes.map(async (sc) => ({ sc, res: await client.listProjectFiles({ dir: sc.dir, ref: sc.ref }) })),
+            composeScopes.map(async (sc) => {
+              try {
+                const res = await client.listProjectFiles({ dir: sc.dir, ref: sc.ref });
+                return { sc, res, error: null as string | null };
+              } catch (e) {
+                return {
+                  sc,
+                  res: null,
+                  error: (e as Error).message || "file listing unavailable",
+                };
+              }
+            }),
           );
           if (!alive) return;
-          const merged = results.flatMap(({ sc, res }) => res.files.map((f) => `${sc.name}/${f}`));
-          const truncated = results.some(({ res }) => res.truncated);
+          const merged: string[] = [];
+          let truncated = false;
+          let anyError: string | null = null;
+          let contributed = false;
+          for (const { sc, res, error } of results) {
+            if (res) {
+              merged.push(...res.files.map((f) => `${sc.name}/${f}`));
+              if (res.truncated) truncated = true;
+              contributed = true;
+              continue;
+            }
+            anyError ??= error;
+            // Keep whatever this repository last contributed to this task's
+            // cached listing (entries are already `<name>/`-prefixed), so a
+            // transient failure doesn't make a repository that was listing
+            // fine a moment ago disappear from the popover.
+            const prefix = `${sc.name}/`;
+            for (const entry of cached?.entries ?? []) {
+              if (entry.path.startsWith(prefix)) merged.push(entry.path);
+            }
+            if (cached?.truncated) truncated = true;
+          }
+          if (merged.length > 0) contributed = true;
           // The merged listing only holds paths inside each repository, so a
           // repository with no files contributes nothing and a bare
           // `@<name>` (a real directory at the workspace root) had no row to
           // match. Add one root row per scope — same contract as the webview
-          // composer (`use-project-files.ts`).
-          const entries = addScopeRoots(
-            buildFileEntries(merged),
-            composeScopes.flatMap((sc) => (sc.name ? [sc.name] : [])),
-          );
-          fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch, truncated });
+          // composer (`use-project-files.ts`). When NOTHING could be listed
+          // (every repository failed and none had a cached answer), stay
+          // empty so the composer renders its "listing unavailable" notice
+          // instead of a misleading set of bare roots.
+          const entries = contributed
+            ? addScopeRoots(
+              buildFileEntries(merged),
+              composeScopes.flatMap((sc) => (sc.name ? [sc.name] : [])),
+            )
+            : [];
+          // Cache only a COMPLETE listing. A partial one is refetched the next
+          // time this scope opens (its cache entry stays absent/stale) instead
+          // of serving a repository-less listing for the rest of the column.
+          if (!anyError) {
+            fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch, truncated });
+          }
           setComposeFileEntries(entries);
           setComposeTruncated(truncated);
+          setComposeListingError(anyError);
           return;
         }
         const { files, truncated } = await client.listProjectFiles(composeScope);

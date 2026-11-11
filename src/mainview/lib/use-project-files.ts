@@ -192,6 +192,35 @@ export function resolveNamedScopePath(
 }
 
 /**
+ * Merge the per-scope cached listings for `scopes` into the prefixed shape the
+ * multi listing renders, or `null` when ANY scope has no cached entry yet.
+ * `useProjectFileScopes` uses the result to seed (or clear) its state the
+ * moment its scope key changes: without that, a RunPanel task switch kept the
+ * PREVIOUS task's `@` entries on screen until every repository answered.
+ * A partial cache is deliberately not returned either — showing only some
+ * repositories' files is not the new scope's listing, and `null` makes the
+ * caller clear instead of pretending otherwise.
+ *
+ * `lookup` is injectable so the merge/clear decision is unit-testable without
+ * a React harness; production passes the module-level listing cache.
+ */
+export function cachedMultiScopeListing(
+  scopes: readonly NamedFileScope[],
+  lookup: (scope: FileScope) => { files: string[]; truncated: boolean } | undefined = (scope) =>
+    cache.get(cacheKey(scope)),
+): { files: string[]; truncated: boolean } | null {
+  const files: string[] = [];
+  let truncated = false;
+  for (const scope of scopes) {
+    const cached = lookup({ dir: scope.dir, ref: scope.ref });
+    if (!cached) return null;
+    files.push(...cached.files.map((f) => `${scope.name}/${f}`));
+    if (cached.truncated) truncated = true;
+  }
+  return { files, truncated };
+}
+
+/**
  * Loads the union of several repository scopes for a multi-repository task's
  * `@` popover. Each scope keeps its own cache entry (so a single scope still
  * renders instantly from the shared cache); entries are prefixed with
@@ -208,23 +237,42 @@ export function useProjectFileScopes(scopes: NamedFileScope[] | null | undefined
 } {
   const multi = (scopes?.length ?? 0) > 1;
   const key = multi ? scopes!.map((s) => `${s.name}:${cacheKey(s)}`).join("|") : null;
-  const [files, setFiles] = useState<string[]>([]);
-  const [truncated, setTruncated] = useState(false);
+  // The listing is stamped with the scope key it was fetched/seeded for. A
+  // render for a NEW key must never show the previous key's rows — not even
+  // for the frame before this hook's effect runs — so unmatched state is
+  // replaced at render time by the new scope's cached rows (or nothing).
+  const [listing, setListing] = useState<{ key: string | null; files: string[]; truncated: boolean }>({
+    key: null,
+    files: [],
+    truncated: false,
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [gen, setGen] = useState(0);
   const requestIdRef = useRef(0);
 
+  const seeded = !multi || listing.key === key ? null : cachedMultiScopeListing(scopes ?? []);
+  const files = !multi ? [] : listing.key === key ? listing.files : seeded?.files ?? [];
+  const truncated = !multi ? false : listing.key === key ? listing.truncated : seeded?.truncated ?? false;
+
   useEffect(() => {
     if (!multi) {
-      setFiles([]);
-      setTruncated(false);
+      setListing({ key: null, files: [], truncated: false });
       setLoading(false);
       setError(null);
       return;
     }
     const list = scopes!;
     const requestId = ++requestIdRef.current;
+    // Reset to THIS scope's cached rows — or clear — BEFORE the refetch. The
+    // previous task's prefixed entries otherwise stayed on screen until every
+    // repository answered, so a RunPanel task switch briefly offered the old
+    // task's `@` entries (and a token picked in that window could be sent).
+    // All-cached scopes seed instantly (a repeat open of the same project
+    // set); a partial cache clears rather than show a misleading subset.
+    const cached = cachedMultiScopeListing(list);
+    setListing({ key, files: cached?.files ?? [], truncated: cached?.truncated ?? false });
+    setError(null);
     setLoading(true);
     void Promise.all(
       list.map(async (scope) => {
@@ -249,8 +297,7 @@ export function useProjectFileScopes(scopes: NamedFileScope[] | null | undefined
         merged.push(...entry.files.map((f) => `${scope.name}/${f}`));
         if (entry.truncated) anyTruncated = true;
       }
-      setFiles(merged);
-      setTruncated(anyTruncated);
+      setListing({ key, files: merged, truncated: anyTruncated });
       setError(anyError);
       setLoading(false);
     });

@@ -581,6 +581,22 @@ export async function resolveRef(dir: string, ref: string): Promise<string | nul
 }
 
 /**
+ * Whether `startTask` should lazily pin the task-level `baseRef` from the
+ * task's own `workdir` after preparing it. Multi-repository rows (issue #291)
+ * deliberately have no scalar `baseRef` — each entry pins its own — and their
+ * `worktreePath` is the non-git workspace root, so resolving HEAD there would
+ * spawn a `git rev-parse` that is guaranteed to fail and is then discarded on
+ * every start/retry. Extracted so the decision is unit-tested directly.
+ */
+export function shouldLazyPinBaseRef(
+  baseRef: string | null | undefined,
+  prepared: Pick<PreparedWorkdir, "worktreePath" | "repositories">,
+): boolean {
+  if ((prepared.repositories?.length ?? 0) > 1) return false;
+  return !baseRef && Boolean(prepared.worktreePath);
+}
+
+/**
  * Fill in any per-repository `baseRef` that was never pinned (a row created
  * before a path was a git repository, or a hand-edited/legacy row). The
  * single-repository lazy pin reads the task's own `workdir`; a multi row has

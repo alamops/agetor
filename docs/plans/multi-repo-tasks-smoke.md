@@ -247,6 +247,24 @@ must-fix and two should-fixes. All three are closed with regressions:
 | Should-fix R11-S1: `multiScopeStatTargets` used the prefixed token path as the stat key instead of the repo-relative path, so `@backend/.env` statted `<backend>/backend/.env` — the gitignored-file rescue was dead and valid prefixed tokens false-warned; the unit test asserted the inverted key | `paths` maps repo-local stat path → full token key (the warning layer's key): prefixed tokens use `splitNamedScopePath(...).path`; repository-root-only tokens are skipped | `at-scope-targets.test.ts` — `src/a.ts` and a prefixed `.env` map to the token, plus the root-only case |
 | Should-fix R11-S2: `agetor add --issue --repo` with an explicit `--workdir` matched the issue only against `--workdir`, which is not in the created repository set | the candidate list is the explicit `--workdir`, then every `--repo` in order, deduped, then cwd only when neither was given; the explicit workdir stays the task's workdir | `src/cli/commands/add.test.ts` — workdir-then-repo candidate order and created set |
 
+## Twelfth review round
+
+At head `2ce34556` the re-review confirmed round 11 closed and opened three
+should-fixes and two nits. All five are closed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Should-fix R12-S1: round 11's git-root keying resolved every distinct pinned path with an unbounded `Promise.all` on every create/start — a large board spawned one `git rev-parse` per path in a single burst | root lookups now run through a bounded worker pool (`PIN_ROOT_CONCURRENCY`, 4). Single-repository callers fold every pin value and never query by root, so they omit `resolveRoot` entirely (create and start), as does a single-repository pipeline parent; only the multi-repository lookups pay for root keys. | `src/bun/task-repos.test.ts` — "resolves distinct pinned paths through a bounded pool…" |
+| Should-fix R12-S2: `useProjectFileScopes` never cleared or seeded on a scope-key change, so a RunPanel task switch briefly showed the previous task's `@` entries | the listing is stamped with the scope key it belongs to and replaced at render time (cached rows when every scope is cached, otherwise empty) before the refetch; `cachedMultiScopeListing` is the shared seed-or-clear decision, and the effect reseeds/clears with it too | `src/mainview/lib/use-project-files.test.ts` — `cachedMultiScopeListing` merge/partial-cache/empty cases (the hook itself is DOM behavior, per house convention) |
+| Should-fix R12-S3: the TUI multi listing used one `Promise.all` over raw calls, so one repository's failure blanked every healthy repository's rows | each scope is fetched independently; successes are merged, a failed scope keeps what it last contributed to this task's cached listing, and a complete listing is the only one cached. When nothing could be listed, no bare root rows are synthesized so the "listing unavailable" notice renders. | `src/cli/tui/Dashboard.test.tsx` — healthy-repo-survives, and all-failed shows the notice |
+| Nit R12-N1: `agetor add --issue` with neither `--workdir` nor `--repo` reported the mismatch against `--repo` when the only candidate was cwd | the single-candidate message names the source actually tried — `--workdir`, `--repo`, or the current directory | `src/cli/commands/add.test.ts` — cwd mismatch names the current directory |
+| Nit R12-N2: multi start/retry ran a `git rev-parse` in the non-git workspace root and discarded the null on every run | the scalar lazy base-ref pin is gated by `shouldLazyPinBaseRef`, which is false for a multi-repository prepare; the per-repository `pinMissingRepositoryBaseRefs` remains the real pin | `src/bun/worktree.test.ts` — `shouldLazyPinBaseRef` |
+
+Round-12 verification: `bun run typecheck` green; the focused batch
+`task-repos`, `worktree`, `orchestrator-multi-repo`, `pipeline-runner`,
+`use-project-files`, `at-scope-targets`, `add` and `Dashboard` green (518
+tests across 8 files).
+
 ## Live harness smoke matrix
 
 Layout support is universal (the agent runs at the workspace root). Extra

@@ -272,7 +272,9 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
           candidateDirs.length === 1
             ? explicitWorkdir
               ? "--issue: that issue belongs to a different repository than --workdir"
-              : "--issue: that issue belongs to a different repository than --repo"
+              : repoDirs.length > 0
+                ? "--issue: that issue belongs to a different repository than --repo"
+                : "--issue: that issue belongs to a different repository than the current directory"
             : `--issue: that issue belongs to a different repository than any of the selected repositories (tried ${candidateDirs.join(", ")})`,
         );
       } catch (err) {

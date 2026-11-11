@@ -60,7 +60,10 @@ interface TaskRepository {
    `-N` variant instead of later attaching to that task's branch and commits.
    Every pin is keyed by both the selected path and its resolved git root, so
    two tasks that selected sibling subdirectories of one repository still
-   see each other's pins.
+   see each other's pins. Root lookups run through a bounded pool
+   (`PIN_ROOT_CONCURRENCY`) and only for the multi-repository lookups that
+   query by `[path, root]`; the single path folds every value and never
+   resolves a root.
    `GET /projects/branches` hides both kinds of pin. An entry's own
    `repositories[].baseRef`
    (`--repo <path>=<ref>`) wins; a task-level `baseRef` (CLI `--base-ref`) is

@@ -10,6 +10,7 @@ import { api } from "./api";
 import {
   SEARCH_CACHE_MAX,
   SEARCH_CACHE_TTL_MS,
+  cachedMultiScopeListing,
   clearSearchCacheForScope,
   resolveNamedScopePath,
   searchProjectFiles,
@@ -209,5 +210,39 @@ describe("multi-repository scopes", () => {
     expect(await searchProjectFileScopes(scopes, "frontend/src/a", 20)).toEqual([
       { path: "frontend/src/a.ts", isDirectory: false },
     ]);
+  });
+});
+
+describe("cachedMultiScopeListing", () => {
+  // Round-12 S2: the hook cleared/seeded nothing on a scope-key change, so a
+  // RunPanel task switch kept showing the PREVIOUS task's `@` entries until
+  // every repository answered. This helper is the seed-or-clear decision.
+  const scopes = [
+    { name: "frontend", dir: "/t/seed-front" },
+    { name: "backend", dir: "/t/seed-back", ref: "main" },
+  ];
+
+  test("merges every cached scope with its workspace prefix and ORs truncation", () => {
+    const merged = cachedMultiScopeListing(scopes, (scope) =>
+      scope.dir === "/t/seed-front"
+        ? { files: ["src/a.ts"], truncated: true }
+        : { files: ["src/b.ts", "src/"], truncated: false },
+    );
+    expect(merged).toEqual({
+      files: ["frontend/src/a.ts", "backend/src/b.ts", "backend/src/"],
+      truncated: true,
+    });
+  });
+
+  test("returns null when ANY scope has no cached listing, so the caller clears instead of showing a partial/previous scope", () => {
+    expect(
+      cachedMultiScopeListing(scopes, (scope) =>
+        scope.dir === "/t/seed-front" ? { files: ["src/a.ts"], truncated: false } : undefined,
+      ),
+    ).toBeNull();
+  });
+
+  test("an empty scope list merges to an empty listing (nothing to clear)", () => {
+    expect(cachedMultiScopeListing([], () => undefined)).toEqual({ files: [], truncated: false });
   });
 });

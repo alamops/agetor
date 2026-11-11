@@ -5,6 +5,7 @@ import {
   lexicallyInsideRoot,
   pinnedBranchesFor,
   resolveRepositorySet,
+  PIN_ROOT_CONCURRENCY,
 } from "./task-repos.ts";
 
 describe("resolveRepositorySet", () => {
@@ -137,6 +138,33 @@ describe("branchesPinnedByOtherTasks", () => {
       },
     });
     expect(map.get("/gone")).toEqual(new Set(["feature/x"]));
+  });
+
+  test("resolves distinct pinned paths through a bounded pool, not one subprocess per path at once", async () => {
+    // Round-12 S1: round 11's root keying resolved every distinct pinned path
+    // with an unbounded `Promise.all` on every create/start. A board with many
+    // tasks could spawn hundreds of `git rev-parse` processes in one burst.
+    const tasks = Array.from({ length: 12 }, (_, i) => ({
+      id: `t${i}`,
+      branch: `feature/${i}`,
+      workdir: `/repo/${i}`,
+      repositories: undefined,
+    }));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const map = await branchesPinnedByOtherTasks("self", tasks, {
+      resolveRoot: async (dir) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        inFlight--;
+        return dir; // root === path keeps the assertion below simple
+      },
+    });
+    expect(maxInFlight).toBe(PIN_ROOT_CONCURRENCY);
+    expect(inFlight).toBe(0);
+    expect(map.get("/repo/0")).toEqual(new Set(["feature/0"]));
+    expect(map.get("/repo/11")).toEqual(new Set(["feature/11"]));
   });
 });
 

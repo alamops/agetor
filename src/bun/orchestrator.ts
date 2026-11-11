@@ -271,6 +271,7 @@ import {
   prepareWorkdir,
   prepareTaskWorkdir,
   pinMissingRepositoryBaseRefs,
+  shouldLazyPinBaseRef,
   workspacePathFor,
   worktreeIdForRepo,
   resolveWorktreeRef,
@@ -2409,9 +2410,19 @@ async function startTaskInner(
 
   // Pass the branches other tasks have pinned. If materializing this task's
   // branch hits a create-time uniqueness race, the recovery re-pins to a name
-  // that's free of both existing refs AND those not-yet-started pins.
+  // that's free of both existing refs AND those not-yet-started pins. The
+  // git-root keys are only read by the multi-repository path
+  // (`prepareTaskWorkdir`'s per-repository `pinnedBranchesFor` lookups); a
+  // single-repository prepare folds every value into one flat set, so asking
+  // for root keys there would spawn a `git rev-parse` per pinned path for
+  // nothing.
+  const multiRepo = (task.repositories?.length ?? 0) > 1;
   const prepared = await prepareTaskWorkdir(task, {
-    takenBranches: await branchesPinnedByOtherTasks(taskId, tasks.list(), { resolveRoot: repoRoot }),
+    takenBranches: await branchesPinnedByOtherTasks(
+      taskId,
+      tasks.list(),
+      multiRepo ? { resolveRoot: repoRoot } : {},
+    ),
   });
   if ("error" in prepared) return { error: prepared.error };
 
@@ -2494,16 +2505,21 @@ async function startTaskInner(
   }
 
   // Lazy-pin baseRef: workdir wasn't a git repo when the task was created but
-  // is one now. Pin the sha actually used so re-runs stay reproducible.
-  if (!task.baseRef && prepared.worktreePath) {
+  // is one now. Pin the sha actually used so re-runs stay reproducible. A
+  // multi-repository task has no scalar baseRef (create stores null) and its
+  // `worktreePath` is the workspace root — not a git checkout — so this would
+  // spawn a doomed `git rev-parse` there and discard the result on every
+  // start/retry; the per-repository block below is the real pin.
+  const multiPrepared = Boolean(prepared.repositories && prepared.repositories.length > 1);
+  if (shouldLazyPinBaseRef(task.baseRef, prepared)) {
     const sha = await resolveRef(task.workdir, "HEAD");
     if (sha) tasks.update(taskId, { baseRef: sha });
   }
   // A multi-repository row has no scalar baseRef: pin every entry that is
   // missing one against its own repository, before the persist transaction
   // below writes them back.
-  if (prepared.repositories && prepared.repositories.length > 1) {
-    prepared.repositories = await pinMissingRepositoryBaseRefs(prepared.repositories);
+  if (multiPrepared) {
+    prepared.repositories = await pinMissingRepositoryBaseRefs(prepared.repositories!);
   }
 
   // A fresh `startTask` (as opposed to `resumeFxRecovery`'s continue-recovery
@@ -11477,9 +11493,12 @@ export async function createTask(
       // (or collided with) that task's commits. The map is flattened rather
       // than looked up by workdir so a task that selected a sibling
       // subdirectory of the same repo still counts — the pre-#291 behavior
-      // (a global set of every task's branch) is preserved.
+      // (a global set of every task's branch) is preserved. No `resolveRoot`:
+      // every value is folded into one set, so the git-root keys are unused
+      // and resolving them would spawn a `git rev-parse` per pinned path on
+      // every single-repository create.
       const taken = new Set<string>();
-      for (const set of (await branchesPinnedByOtherTasks(id, tasks.list(), { resolveRoot: repoRoot })).values()) {
+      for (const set of (await branchesPinnedByOtherTasks(id, tasks.list())).values()) {
         for (const b of set) taken.add(b);
       }
       plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);

@@ -564,6 +564,21 @@ test("cmdAdd: --issue whose thread points at a different repo throws, never call
   expect(createTaskCalls).toEqual([]);
 });
 
+test("cmdAdd: --issue with no --workdir/--repo names the current directory in the mismatch error", async () => {
+  // Round-12 N1: the sole candidate is cwd, but the error named --repo.
+  reset();
+  const thread = makeThread({
+    item: makeItem({ htmlUrl: "https://github.com/someone-else/other-repo/issues/7" }),
+  });
+  const { client, getIssueThreadCalls } = makeClient(thread);
+  currentClient = client;
+
+  await expect(
+    cmdAdd(["--issue", "https://github.com/acme/widgets/issues/7"], flags()),
+  ).rejects.toThrow(/different repository than the current directory/);
+  expect(getIssueThreadCalls).toEqual([{ path: path.resolve(process.cwd()), number: 7 }]);
+});
+
 test("cmdAdd: no --issue, no --title, non-TTY throws an error that mentions --issue as an option", async () => {
   reset();
   const thread = makeThread();

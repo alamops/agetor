@@ -2270,6 +2270,18 @@ test("pinMissingRepositoryBaseRefs resolves each unpinned entry against its own 
   }
 });
 
+test("shouldLazyPinBaseRef skips the doomed scalar pin for a multi-repository prepare", async () => {
+  // Round-12 N2: a multi row has no scalar baseRef and its worktreePath is the
+  // non-git workspace root, so start/retry ran a `git rev-parse` there and
+  // threw the null away on every single run.
+  const { shouldLazyPinBaseRef } = await import("./worktree.ts");
+  const repo = { path: "/src/a", name: "a" } as never;
+  expect(shouldLazyPinBaseRef(null, { worktreePath: "/wt/t", repositories: [repo, repo] })).toBe(false);
+  expect(shouldLazyPinBaseRef(null, { worktreePath: "/wt/t" })).toBe(true);
+  expect(shouldLazyPinBaseRef(null, { worktreePath: null })).toBe(false);
+  expect(shouldLazyPinBaseRef("abc1234", { worktreePath: "/wt/t" })).toBe(false);
+});
+
 test("prepareTaskWorkdir reuses existing per-repo worktrees without creating anything", async () => {
   const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
   const a = await makeRepo();

@@ -1097,6 +1097,90 @@ test("a multi-repository listing still offers the root row of a repository with 
   unmount();
 });
 
+test("a multi-repository listing keeps healthy repositories' rows when one fetch fails", async () => {
+  // Round-12 S3: the multi listing used one `Promise.all` over raw calls, so
+  // a single repository's failure rejected everything and blanked the popover
+  // for the repositories that were listing fine. Mirror the webview's
+  // per-scope merge: keep successes, report the failure.
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string }) => {
+      if (scope.dir.endsWith("/backend")) throw new Error("backend listing down");
+      return { files: ["README.md"], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the per-repository listing fetch
+  await wait(80);
+  stdin.write("@REA");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("frontend/README.md");
+  unmount();
+});
+
+test("a multi-repository listing whose every fetch fails shows the unavailable notice, not bare roots", async () => {
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async () => {
+      throw new Error("listing down");
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("@");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("file listing unavailable");
+  expect(frame).not.toContain("frontend/");
+  unmount();
+});
+
 test("a send whose reply carries unresolvedRefs surfaces a one-line warning after the ok status", async () => {
   const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
   const client = {

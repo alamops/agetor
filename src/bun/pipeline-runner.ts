@@ -990,8 +990,16 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
     return { parent };
   }
   const { branchesPinnedByOtherTasks } = await import("./task-repos.ts");
+  // Root keys are only read by the multi-repository prepare path; a single
+  // parent folds every value into one set, so skip the `git rev-parse`
+  // fan-out there (same rule as `startTask`).
+  const parentMulti = (parent.repositories?.length ?? 0) > 1;
   const prepared = await prepareTaskWorkdir(parent, {
-    takenBranches: await branchesPinnedByOtherTasks(parent.id, tasks.list(), { resolveRoot: repoRoot }),
+    takenBranches: await branchesPinnedByOtherTasks(
+      parent.id,
+      tasks.list(),
+      parentMulti ? { resolveRoot: repoRoot } : {},
+    ),
   });
   if ("error" in prepared) return { error: prepared.error };
   if (prepared.repositories && prepared.repositories.length > 1) {

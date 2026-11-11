@@ -97,6 +97,16 @@ export function lexicallyInsideRoot(root: string, candidate: string): boolean {
 }
 
 /**
+ * How many `resolveRoot` calls `branchesPinnedByOtherTasks` runs at once while
+ * adding git-root keys. A board with many pinned paths must not fan out one
+ * `git rev-parse` per path all at once — that is an unbounded subprocess burst
+ * on every create/start. Four matches the worktree engine's own
+ * `MULTI_REPO_CONCURRENCY` fan-out; this module can't import that constant
+ * (import cycle), so the number is kept local and asserted by the unit test.
+ */
+export const PIN_ROOT_CONCURRENCY = 4;
+
+/**
  * Branch names already pinned on tasks other than `taskId`, grouped by the
  * selected project path each one belongs to (`workdir` for a single-repository
  * row, `repositories[].path` for a multi row) AND by that path's git root.
@@ -113,6 +123,12 @@ export function lexicallyInsideRoot(root: string, candidate: string): boolean {
  * in production) to keep this module import-cycle free; once a branch exists
  * as a ref, `ensureUniqueBranch` remains the backstop for path aliases the
  * resolver can't see (e.g. a symlinked checkout).
+ *
+ * Callers that only need the *set* of pinned branch names (the single-
+ * repository paths fold every value and ignore the keys) must omit
+ * `resolveRoot`: resolving every pin's root there is pure wasted work on the
+ * hottest create/start path. Only the multi-repository lookups, which query by
+ * `[path, root]`, need the root keys.
  */
 export async function branchesPinnedByOtherTasks(
   taskId: string,
@@ -140,11 +156,24 @@ export async function branchesPinnedByOtherTasks(
   const rootByPath = new Map<string, string>();
   if (opts.resolveRoot) {
     const resolveRoot = opts.resolveRoot;
-    await Promise.all(
-      [...new Set(pins.map((pin) => pin.path))].map(async (dir) => {
+    // Deduped paths resolved through a bounded worker pool, not one
+    // unbounded Promise.all: a board with hundreds of pinned paths used to
+    // spawn a `git rev-parse` for every one of them at once on each
+    // create/start. `repoRoot` memoizes successes, so repeated calls only pay
+    // for paths that failed/are no longer repos — still bounded here.
+    const paths = [...new Set(pins.map((pin) => pin.path))];
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const i = next++;
+        const dir = paths[i];
+        if (dir === undefined) return;
         const root = await resolveRoot(dir).catch(() => null);
         if (root) rootByPath.set(dir, root);
-      }),
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(PIN_ROOT_CONCURRENCY, paths.length) }, worker),
     );
   }
 
