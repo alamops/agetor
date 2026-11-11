@@ -3,7 +3,8 @@ import { mkdtempSync, existsSync, rmSync, writeFileSync, mkdirSync } from "node:
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Task } from "../shared/types.ts";
+import type { BranchNamingConfig, Task } from "../shared/types.ts";
+import { DEFAULT_BRANCH_CONFIG } from "../shared/types.ts";
 import { uniqueRepoSlugs } from "../shared/multi-repo.ts";
 import { rmTestDataDir } from "./test-data-dir.ts";
 
@@ -22,6 +23,7 @@ type Mods = {
   unarchiveTask: typeof import("./orchestrator.ts").unarchiveTask;
   tasks: typeof import("./db.ts").tasks;
   db: typeof import("./db.ts").db;
+  projects: typeof import("./db.ts").projects;
   worktreePath: typeof import("./worktree.ts").worktreePath;
   WORKTREES_DIR: typeof import("./worktree.ts").WORKTREES_DIR;
 };
@@ -38,6 +40,7 @@ async function load(): Promise<Mods> {
     unarchiveTask: o.unarchiveTask,
     tasks: dbm.tasks,
     db: dbm.db,
+    projects: dbm.projects,
     worktreePath: wt.worktreePath,
     WORKTREES_DIR: wt.WORKTREES_DIR,
   };
@@ -127,6 +130,55 @@ test("createTask pins a workspace with one entry, branch and base per repository
     expect(t.repositories?.[0]?.branch).toBe(t.repositories?.[1]?.branch);
   } finally {
     cleanup(a, b);
+  }
+});
+
+test("createTask plans a multi task's branch from repositories[0] even when workdir isn't a git repo", async () => {
+  // Review round seven: with no git `--workdir` (an API caller, or
+  // `agetor add --repo` from a non-repo cwd) the branch plan was skipped
+  // entirely — the explicit `branch` override and the project's branch
+  // nomenclature were both silently ignored. Anchor on the first selected
+  // repository instead.
+  const { createTask, projects } = await load();
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  const notRepo = mkdtempSync(path.join(tmpdir(), "agetor-branch-cwd-"));
+  const config: BranchNamingConfig = {
+    ...DEFAULT_BRANCH_CONFIG,
+    rules: { ...DEFAULT_BRANCH_CONFIG.rules, task: { prefix: "proj/" } },
+  };
+  projects.upsert(a, "frontend");
+  projects.setBranchConfig(a, config);
+  try {
+    const fromConfig = await createTask({
+      title: "Implement auth",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: notRepo,
+      isolation: "worktree",
+      repositories: [{ path: a }, { path: b }],
+    });
+    if ("error" in fromConfig) throw new Error(fromConfig.error);
+    expect(fromConfig.task.repositories?.every((r) => r.branch?.startsWith("proj/"))).toBe(true);
+    expect(new Set(fromConfig.task.repositories?.map((r) => r.branch)).size).toBe(1);
+
+    const overridden = await createTask({
+      title: "Implement auth",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: notRepo,
+      isolation: "worktree",
+      branch: "feature/explicit",
+      repositories: [{ path: a }, { path: b }],
+    });
+    if ("error" in overridden) throw new Error(overridden.error);
+    expect(overridden.task.repositories?.map((r) => r.branch)).toEqual([
+      "feature/explicit",
+      "feature/explicit",
+    ]);
+  } finally {
+    projects.delete(a);
+    cleanup(notRepo, a, b);
   }
 });
 

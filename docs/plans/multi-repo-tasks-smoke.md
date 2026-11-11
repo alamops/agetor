@@ -169,6 +169,22 @@ must-fix, six should-fixes and five nits. All are closed with regressions:
 | Nit: a partial multi teardown toasted the clicked row's branch even when a sibling repository failed | `triageDeleteOutcome` names the failing `repositories[]` entry | `src/mainview/components/worktrees/worktree-delete-intent.test.ts` |
 | Nit: the reproduction test leaked its temp data dir | `afterAll` removes it | `src/bun/multi-repo-repro.test.ts` |
 
+## Seventh review round
+
+At head `48748711` the re-review confirmed rounds 1–6 closed and opened one
+must-fix, four should-fixes and three nits. All are closed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Must-fix: the Worktrees page's "Archive & delete" classified only the clicked repository row, then force-archived the whole task — a clean row click silently discarded a sibling repository's uncommitted work | the confirm now fetches every row of the task (all repos are marked busy during the flow) and the copy names each dirty/unknown checkout; per-checkout classification stays three-state (clean/dirty/unknown), while dirty and unknown siblings may legitimately co-exist | `src/mainview/components/worktrees/worktree-delete-intent.test.ts` — multi-repository siblings |
+| Multi create without a git `workdir` planned the branch from the daemon cwd, ignoring an explicit `branch` override (or reading another repo's config) | `branchScopeDir` anchors the plan on `repositories[0]`; uniqueness is resolved per repository in the existing loop (never twice against one root) | `src/bun/orchestrator-multi-repo.test.ts` — branch from repositories[0] |
+| `agetor shell` on a never-started multi task reported "directory no longer exists" | names the real state, and points at `--repo <name>` for a source-checkout shell | `src/cli/commands/shell.test.ts` |
+| `--repo <path>=<ref>` split on `=` even when the whole value was an existing path, silently targeting a different repo | `parseRepoSpec`: an existing path (resolved against cwd) wins; only otherwise is the last `=` the ref separator | `src/cli/commands/add.test.ts` — `parseRepoSpec` |
+| The TUI disabled full-depth `@` remote search for multi tasks (local-only ranking past the 20k cap) | searches every repository scope, routes `<repo>/…` queries to that scope with the prefix stripped, prefixes results, and round-robins them under the 5-row cap | `src/cli/tui/Dashboard.test.tsx` — truncated multi listing |
+| Nit: `RepositoriesDialog` rows used the non-unique basename as a test id | test ids come from `uniqueRepoSlugs` over the displayed paths | `bun run typecheck` (`src/mainview/components/kanban/RepositoriesDialog.tsx`) |
+| Nit: `uniqueRepoSlugs` produced nested suffixes (`app-2-2`) | a colliding numeric base resumes its stem's sequence (`app-3`) | `src/shared/multi-repo.test.ts` |
+| Nit: the >10 warning counted pre-dedupe selections | counts the deduped selection (same predicate as the per-repo base-ref control) | `bun run typecheck` (`src/mainview/components/kanban/RepositoriesDialog.tsx`) |
+
 ## Live harness smoke matrix
 
 Layout support is universal (the agent runs at the workspace root). Extra

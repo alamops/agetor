@@ -76,6 +76,18 @@ describe("uniqueRepoSlugs", () => {
     expect(uniqueRepoSlugs(["/a/app", "/b/app-2", "/c/app"])).toEqual(["app", "app-2", "app-3"]);
   });
 
+  test("resumes the stem's sequence instead of nesting a second suffix", () => {
+    // Before the fix this produced "app-2-2": a base that already ended in a
+    // number was suffixed again instead of continuing "app-3".
+    expect(uniqueRepoSlugs(["/a/app", "/b/app", "/c/app-2"])).toEqual(["app", "app-2", "app-3"]);
+    expect(uniqueRepoSlugs(["/a/app", "/b/app", "/c/app", "/d/app-2"])).toEqual([
+      "app",
+      "app-2",
+      "app-3",
+      "app-4",
+    ]);
+  });
+
   test("is deterministic across runs", () => {
     const input = ["/x/one", "/y/one"];
     expect(uniqueRepoSlugs(input)).toEqual(uniqueRepoSlugs(input));

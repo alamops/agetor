@@ -34,6 +34,7 @@ import { AnswerOverlay } from "./AnswerOverlay.tsx";
 import { runControl, resumableRunId } from "../run-logic.ts";
 import { Logo } from "./logo.tsx";
 import { fileScopeForTask, fileScopesForTask } from "./at-complete.ts";
+import { splitNamedScopePath } from "../../shared/file-scope.ts";
 import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 // `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
@@ -298,22 +299,60 @@ export function Dashboard({
   // object reference here is never a stale VALUE — same trick the file-
   // listing effect above already relies on to stay poll-stable.
   const composeRemoteSearch = useMemo(() => {
-    // A multi-repository listing spans several scopes; a single-scope remote
-    // search would rank only one repository, so local filtering (over the
-    // merged/prefixed set) is used instead.
-    if (composeMulti || !composeTruncated || !composeScope) return undefined;
-    const scope = composeScope;
+    if (!composeTruncated) return undefined;
+    // A multi-repository task's listing spans several scopes. One search per
+    // scope, prefixed with the workspace name (matching the merged local
+    // listing), keeps deep-tree matches available in every repository instead
+    // of falling back to local-only ranking.
+    const scopes: Array<{ name: string | null; dir: string; ref?: string | null }> = composeMulti
+      ? composeScopes
+      : composeScope
+        ? [{ name: null, ...composeScope }]
+        : [];
+    if (scopes.length === 0) return undefined;
+    const multi = scopes.length > 1;
     return async (q: string): Promise<FileEntry[] | null> => {
-      try {
-        const { files } = await client.listProjectFiles({ ...scope, q, limit: 5 });
-        return files.map((path) => ({ path, isDirectory: path.endsWith("/") }));
-      } catch {
-        // `null`, not `[]` — a request failure must not be indistinguishable
-        // from a genuine "zero matches" answer, or Composer.tsx would treat
-        // it as authoritative and blank the popover's local rows on a
-        // transient network hiccup (review finding, commit 720dffd).
-        return null;
+      // A `<repo>/…` query routes to that repository with the alias stripped
+      // (it is a client-side layout prefix, not part of the repo's tree); an
+      // unprefixed query searches every repository.
+      const named = multi ? splitNamedScopePath(scopes, q) : null;
+      const targets = named
+        ? [{ scope: named.scope, local: named.path }]
+        : scopes.map((scope) => ({ scope, local: q }));
+      if (targets.length === 0 || targets.some((t) => !t.local)) return [];
+      const results = await Promise.all(
+        targets.map(async ({ scope, local }) => {
+          try {
+            const { files } = await client.listProjectFiles({ dir: scope.dir, ref: scope.ref, q: local, limit: 5 });
+            return files.map((path) => (multi && scope.name ? `${scope.name}/${path}` : path));
+          } catch {
+            return null;
+          }
+        }),
+      );
+      // `null` only when EVERY request failed — a partial failure keeps the
+      // answers that did succeed. Otherwise Composer.tsx would treat a
+      // transient network hiccup as an authoritative "zero matches" and blank
+      // the popover's local rows (review finding, commit 720dffd).
+      if (results.every((r) => r === null)) return null;
+      const successes = results.filter((r): r is string[] => r !== null);
+      // Round-robin the per-repository rankings instead of concatenating:
+      // concatenation let the first repository's 5 rows hide every later
+      // repository's matches entirely. Same rationale as the webview's
+      // `searchProjectFileScopes`.
+      const out: FileEntry[] = [];
+      for (let i = 0; out.length < 5; i++) {
+        let added = false;
+        for (const rows of successes) {
+          const path = rows[i];
+          if (!path) continue;
+          out.push({ path, isDirectory: path.endsWith("/") });
+          added = true;
+          if (out.length >= 5) break;
+        }
+        if (!added) break;
       }
+      return out;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [composeTruncated, composeScopeKey, composeMulti, client]);

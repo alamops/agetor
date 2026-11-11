@@ -262,14 +262,19 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
   const anyFilterActive =
     query !== "" || projectFilter.length > 0 || statusFilter.length > 0 || staleFilter !== "all";
 
-  const withBusy = async (id: string, fn: () => Promise<void>) => {
-    setBusyIds((cur) => new Set(cur).add(id));
+  const withBusy = async (ids: string | string[], fn: () => Promise<void>) => {
+    const list = typeof ids === "string" ? [ids] : ids;
+    setBusyIds((cur) => {
+      const next = new Set(cur);
+      for (const id of list) next.add(id);
+      return next;
+    });
     try {
       await fn();
     } finally {
       setBusyIds((cur) => {
         const next = new Set(cur);
-        next.delete(id);
+        for (const id of list) next.delete(id);
         return next;
       });
     }
@@ -278,23 +283,41 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
   const deleteTaskBacked = async (w: WorktreeInfo) => {
     if (!w.taskId) return;
     const taskId = w.taskId;
+    // Archiving is task-scoped: from a multi-repository task's row it
+    // force-deletes EVERY repository checkout, not just the clicked one.
+    const siblings = worktrees.filter((row) => row.id !== w.id && row.taskId === taskId);
     // Busy spans fetch → confirm → archive as one continuous stretch so the
     // trash icon spins the whole time (rather than appearing frozen during
     // the status fetch) and a second click can never double-fire while the
-    // confirm dialog is up or the archive request is in flight.
-    await withBusy(w.id, async () => {
-      // The cached `gitStatus` map is only populated on open + manual
-      // Refresh — by the time the user clicks delete it's frequently
-      // "loading" or missing entirely, which would undersell what's about
-      // to be discarded. Fetch fresh; a failed check falls back to the
-      // no-warning copy rather than blocking the delete.
-      let status: WorktreeGitStatus | null = null;
-      try {
-        status = await api.getWorktreeGitStatus(w.id);
-      } catch {
-        status = null;
-      }
-      const copy = buildDeleteConfirmCopy(w, status);
+    // confirm dialog is up or the archive request is in flight. Every row of
+    // the task is marked busy: acting on a sibling would archive the same
+    // task underneath the open confirm.
+    await withBusy([w.id, ...siblings.map((row) => row.id)], async () => {
+      // Fetch the clicked row's status AND each sibling's, so a clean row
+      // can't hide a dirty sibling whose uncommitted work is about to be
+      // discarded (issue #291 review).
+      const fetchStatus = async (id: string): Promise<WorktreeGitStatus | null> => {
+        try {
+          return await api.getWorktreeGitStatus(id);
+        } catch {
+          // A failed check falls back to the no-warning copy rather than
+          // blocking the delete.
+          return null;
+        }
+      };
+      const [status, ...siblingStatuses] = await Promise.all([
+        fetchStatus(w.id),
+        ...siblings.map((row) => fetchStatus(row.id)),
+      ]);
+      const copy = buildDeleteConfirmCopy(
+        w,
+        status ?? null,
+        siblings.map((row, i) => ({
+          name: row.repoName ?? row.branch ?? row.id,
+          status: siblingStatuses[i] ?? null,
+        })),
+      );
+      const fmtCheckouts = (names: string[]) => names.map((n) => `"${n}"`).join(", ");
       const ok = await confirm({
         title: copy.title,
         description: (
@@ -302,26 +325,34 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
             {copy.alreadyArchived ? (
               <>
                 The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" is
-                already <strong>archived</strong>; its worktree directory will be removed. The git
-                branch and full AI history are preserved.
+                already <strong>archived</strong>;{" "}
+                {copy.multiRepo
+                  ? `all ${copy.checkoutCount} repository worktrees will be removed`
+                  : "its worktree directory will be removed"}
+                . The git branches and full AI history are preserved.
               </>
             ) : (
               <>
                 The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" will
-                be <strong>archived</strong> (hidden from the board, restorable via Unarchive) and its
-                worktree directory removed. The git branch and full AI history are preserved.
+                be <strong>archived</strong> (hidden from the board, restorable via Unarchive) and{" "}
+                {copy.multiRepo
+                  ? `all ${copy.checkoutCount} repository worktrees removed`
+                  : "its worktree directory removed"}
+                . The git branches and full AI history are preserved.
               </>
             )}
             {copy.showDirtyWarning && (
               <div className="mt-2 font-medium text-danger">
-                This worktree has uncommitted changes — they will be permanently discarded.
+                {copy.dirtyCheckouts.length === 1 && !copy.multiRepo
+                  ? "This worktree has uncommitted changes — they will be permanently discarded."
+                  : `${fmtCheckouts(copy.dirtyCheckouts)} ${copy.dirtyCheckouts.length === 1 ? "has" : "have"} uncommitted changes — they will be permanently discarded.`}
               </div>
             )}
             {copy.unknown && (
               <div className="mt-2 font-medium text-danger">
-                agetor couldn't check this worktree for uncommitted changes — its git
-                registration may be broken. Anything uncommitted will be permanently
-                discarded.
+                agetor couldn't check {fmtCheckouts(copy.unknownCheckouts)} for uncommitted changes —
+                {copy.unknownCheckouts.length === 1 ? " its" : " their"} git registration may be broken.
+                Anything uncommitted will be permanently discarded.
               </div>
             )}
             {(w.runActive || w.heldByBackgroundAgents) && " An agent is still working on this task — archiving will stop it."}

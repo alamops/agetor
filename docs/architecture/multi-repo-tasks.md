@@ -140,6 +140,12 @@ re-attaches onto the same branches. Branch teardown is planned per repository
 first; delete passes that plan to `removeWorktree`, so a branch a repository's
 checkout drifted onto is removed in the repository that owns it.
 
+The Worktrees page's "Archive & delete" is task-scoped even when opened from one
+repository row: it force-detaches every repository's checkout. Its confirm
+therefore fetches the git status of every row belonging to the task (not just
+the clicked one) and names each dirty or unreadable checkout, so a clean row
+can't silently discard a sibling repository's uncommitted work.
+
 A multi row's Worktrees id is `<taskId>__<repo-slug>`. Task ids are UUIDs and
 contain no underscore, so the first `__` is the boundary. `resolveWorktreeRef`
 is the single id-to-path guard for `DELETE /worktrees/:id` and

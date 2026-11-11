@@ -11200,11 +11200,20 @@ export async function createTask(
     : undefined;
   const requestedRef = input.baseRef?.trim() || singleRepoInput?.baseRef?.trim() || "HEAD";
 
+  // The directory whose git root the BRANCH PLAN is resolved against. For a
+  // multi-repository task `workdir` is still the daemon cwd (or an explicit
+  // `--workdir`) at this point — the real workspace root doesn't exist yet —
+  // so anchoring on it either ignored the caller's `branch` override entirely
+  // (cwd not a git repo) or read another repo's refs/branch config (cwd a git
+  // repo). The first selected repository is the workspace's anchor, which is
+  // also the path the per-repository loop below resolves each name against.
+  const branchScopeDir = multiRepo ? keptRepositories[0]!.path : workdir;
+  const workdirRoot = isolation === "worktree" ? await repoRoot(branchScopeDir) : null;
+
   let baseRef: string | null = null;
   let plannedBranch: string | null = null;
   let branchSource: Task["branchSource"] = "created";
   let repositories: TaskRepository[] = [];
-  const workdirRoot = isolation === "worktree" ? await repoRoot(workdir) : null;
 
   if (multiRepo) {
     // Per-repository base refs resolved now, so a re-run starts from the same
@@ -11423,7 +11432,7 @@ export async function createTask(
   if (!existingBranch && workdirRoot) {
     const override = typeof input.branch === "string" ? input.branch.trim() : "";
     const token = id.replace(/-/g, "").slice(0, 6);
-    const ctx = { title: input.title, projectName: basename(workdir), taskType, token, now: new Date() };
+    const ctx = { title: input.title, projectName: basename(branchScopeDir), taskType, token, now: new Date() };
     let desired: string;
     if (override) {
       const rendered = renderBranchTemplate(override, ctx);
@@ -11436,16 +11445,25 @@ export async function createTask(
       }
       desired = rendered;
     } else {
-      const config = projects.get(workdir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+      const config = projects.get(branchScopeDir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
       desired = renderBranchTemplate(branchPattern(config, taskType), ctx);
       // Defensive: a hand-edited/corrupt config shouldn't hard-fail task
       // creation — fall back to the legacy scheme if it produced an illegal name.
       if (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });
     }
-    const taken = new Set(
-      tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
-    );
-    plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
+    // Multi-repository tasks resolve uniqueness per repository in the loop
+    // below (each root's own refs differ); resolving it once here against the
+    // anchor repo would append `-N` for a name only that repo has, then the
+    // second `ensureUniqueBranch` would drift further. The desired name is
+    // still the caller's override (or the anchor project's nomenclature).
+    if (multiRepo) {
+      plannedBranch = desired;
+    } else {
+      const taken = new Set(
+        tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+      );
+      plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
+    }
   }
 
   // A multi-repository task's `workdir`/`worktreePath` are the per-task

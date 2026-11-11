@@ -108,6 +108,26 @@ test("an unknown --repo names the repositories the task actually has", async () 
   );
 });
 
+test("a multi task whose worktrees were never created says so instead of 'directory no longer exists'", async () => {
+  currentClient = fakeClient(makeTask({
+    workdir: "/nonexistent/agetor-workspace/task-1",
+    worktreePath: null,
+    branch: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: null, baseRef: "a", checkoutBranch: null, prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: null, baseRef: "b", checkoutBranch: null, prUrl: null },
+    ],
+  }));
+  let message = "";
+  try {
+    await cmdShell(["abcdefgh"], flags);
+  } catch (e) {
+    message = e instanceof Error ? e.message : String(e);
+  }
+  expect(message).toContain("has no worktrees yet — start the task first");
+  expect(message).not.toContain("directory no longer exists");
+});
+
 test("a missing positional is still a usage error", async () => {
   currentClient = fakeClient(makeTask({}));
   await expect(cmdShell(["--print"], flags)).rejects.toThrow(/usage: agetor shell/);

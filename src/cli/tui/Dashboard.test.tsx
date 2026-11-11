@@ -1244,6 +1244,55 @@ test("a truncated listing wires the composer's remoteSearch, which is invoked wi
   unmount();
 });
 
+test("a truncated multi-repository listing searches every repository's scope and prefixes the results", async () => {
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const seenQueries: Array<{ dir: string; q?: string | null; limit?: number }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+      if (scope.q !== undefined) {
+        seenQueries.push(scope);
+        const repoSide = scope.dir.endsWith("/frontend") ? "fe" : "be";
+        return { files: [`deep/${repoSide}-remote-match.ts`], truncated: true };
+      }
+      return { files: ["README.md"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the per-repository listing fetch
+  await wait(80);
+  stdin.write("@xy"); // clears Composer's MIN_REMOTE_QUERY_LEN floor
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire
+  const frame = lastFrame() ?? "";
+  expect(seenQueries.map((s) => s.dir).sort()).toEqual(["/wt/taskA/backend", "/wt/taskA/frontend"]);
+  expect(seenQueries.every((s) => s.q === "xy" && s.limit === 5)).toBe(true);
+  // Each hit keeps its workspace prefix, matching the merged local listing.
+  expect(frame).toContain("frontend/deep/fe-remote-match.ts");
+  expect(frame).toContain("backend/deep/be-remote-match.ts");
+  unmount();
+});
+
 test("a remote search failure keeps the local rows instead of blanking the popover", async () => {
   const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
   const client = {

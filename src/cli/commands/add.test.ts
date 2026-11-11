@@ -1,4 +1,6 @@
 import { test, expect, mock, afterAll, describe } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import type { Flags } from "../context.ts";
@@ -106,6 +108,7 @@ afterAll(() => {
 
 const {
   parseAdd,
+  parseRepoSpec,
   cmdAdd,
   wizard,
   chooseAddPath,
@@ -1515,6 +1518,29 @@ test("parseAdd: --repo is repeatable and splits an optional =ref", () => {
 
 test("parseAdd: no --repo leaves the list empty", () => {
   expect(parseAdd(["--title", "T", "--prompt", "P"]).repos).toEqual([]);
+});
+
+test("parseRepoSpec: an existing path containing '=' is not split into a different repo", () => {
+  // A real directory name may contain '='. Splitting on the last one silently
+  // targeted the parent path (or a sibling) with a bogus base ref.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-repo="));
+  try {
+    mkdirSync(path.join(dir, "work"), { recursive: true });
+    expect(parseRepoSpec(dir)).toEqual({ path: dir });
+    expect(parseRepoSpec(path.join(dir, "work"))).toEqual({ path: path.join(dir, "work") });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("parseRepoSpec: a non-existent <path>=<ref> still splits, and a bare path stays whole", () => {
+  expect(parseRepoSpec("/definitely/missing/app=main")).toEqual({
+    path: "/definitely/missing/app",
+    baseRef: "main",
+  });
+  expect(parseRepoSpec("/definitely/missing/app")).toEqual({ path: "/definitely/missing/app" });
+  // An empty ref after '=' is treated as "no ref" rather than an empty string.
+  expect(parseRepoSpec("/definitely/missing/app=")).toEqual({ path: "/definitely/missing/app" });
 });
 
 test("cmdAdd: --repo sends repositories and forces worktree isolation", async () => {

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import * as p from "@clack/prompts";
 import { getClient, type Flags } from "../context.ts";
@@ -90,6 +90,23 @@ export interface AddOpts {
   pipeline?: string;
 }
 
+/**
+ * Parse one repeatable `--repo <path[=ref]>` value.
+ *
+ * A path may legitimately contain `=` (`/tmp/repo=backup`), so blindly
+ * splitting on the last one silently turned the whole value into a different
+ * repository path plus a bogus base ref. When the value as typed names an
+ * existing file/directory (resolved against the CLI's cwd, matching
+ * `baseInput`), the whole value wins as the path; only otherwise is the last
+ * `=` read as the base-ref separator.
+ */
+export function parseRepoSpec(raw: string): { path: string; baseRef?: string } {
+  if (existsSync(path.resolve(raw))) return { path: raw };
+  const eq = raw.lastIndexOf("=");
+  if (eq > 0) return { path: raw.slice(0, eq), baseRef: raw.slice(eq + 1) || undefined };
+  return { path: raw };
+}
+
 export function parseAdd(args: string[]): AddOpts {
   const o: AddOpts = { refs: [], repos: [] };
   for (let i = 0; i < args.length; i++) {
@@ -110,16 +127,7 @@ export function parseAdd(args: string[]): AddOpts {
       case "--no-max-mode": o.maxMode = false; break;
       case "--opencode-server": o.opencodeServerIgnored = parseOpencodeServerFlag(val()); break;
       case "--workdir": o.workdir = val(); break;
-      case "--repo": {
-        const raw = val();
-        const eq = raw.lastIndexOf("=");
-        // `<path>=<ref>` — a path containing `=` still works when the suffix
-        // after the last `=` is a ref the server can resolve; ambiguous cases
-        // are the user's to quote differently.
-        if (eq > 0) o.repos.push({ path: raw.slice(0, eq), baseRef: raw.slice(eq + 1) || undefined });
-        else o.repos.push({ path: raw });
-        break;
-      }
+      case "--repo": o.repos.push(parseRepoSpec(val())); break;
       case "--isolation": o.isolation = val() === "none" ? "none" : "worktree"; break;
       case "--base-ref": o.baseRef = val(); break;
       case "--type": o.type = val(); break;

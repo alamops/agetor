@@ -2,14 +2,14 @@ import type { WorktreeGitStatus, WorktreeInfo, WorktreeTeardownResult } from "..
 
 /**
  * What the "Archive & delete" confirm dialog should say for a given row, given
- * its freshly-fetched git status. The copy is driven by a three-state dirty
- * classification crossed with whether the task is already archived (the
- * "will be archived" phrasing is simply wrong for a row that's already in
- * that state) — the two axes can co-occur, so this is a small cross-product
- * rather than a single flag.
+ * its freshly-fetched git status and those of any sibling repository rows. The
+ * copy is driven by a three-state dirty classification crossed with whether
+ * the task is already archived (the "will be archived" phrasing is simply
+ * wrong for a row that's already in that state) — the two axes can co-occur,
+ * so this is a small cross-product rather than a single flag.
  *
  * The dirty classification's three states are mutually exclusive and
- * exhaustive:
+ * exhaustive PER CHECKOUT:
  *  - confirmed-clean: `status` resolved and reports no uncommitted changes.
  *    No warning.
  *  - confirmed-dirty: `status` resolved and reports uncommitted changes.
@@ -28,16 +28,38 @@ import type { WorktreeGitStatus, WorktreeInfo, WorktreeTeardownResult } from "..
  */
 export interface DeleteConfirmCopy {
   title: string;
-  /** True only for confirmed-dirty: `status` resolved and reports real
-   *  uncommitted changes worth calling out. */
+  /** True when at least one checkout about to be force-deleted is confirmed
+   *  to have uncommitted changes worth calling out. */
   showDirtyWarning: boolean;
-  /** True for the unknown state: agetor could not determine whether the
-   *  checkout is dirty, but is still about to force-delete it. */
+  /** True when agetor could not determine whether at least one checkout
+   *  about to be force-deleted is dirty, but is still about to delete it. */
   unknown: boolean;
+  /** Labels (repository name when known, else branch/id) of every checkout
+   *  confirmed dirty. Empty when none. */
+  dirtyCheckouts: string[];
+  /** Labels of every checkout whose state couldn't be determined. Empty when
+   *  none. */
+  unknownCheckouts: string[];
+  /** True when the clicked row is one of several repository checkouts of a
+   *  multi-repository task — archiving removes all of them. */
+  multiRepo: boolean;
+  /** Total checkouts the confirm will force-delete (1 for a single-repo task). */
+  checkoutCount: number;
   /** True when the task is already archived — the body copy must not repeat
    *  "will be archived" for a ticket that already is. */
   alreadyArchived: boolean;
   confirmLabel: string;
+}
+
+/** Another repository's checkout belonging to the same task as the clicked
+ *  row. Archiving the task from any one row force-deletes every one of them,
+ *  so the confirm must consider their states too — a clean clicked row must
+ *  not silently discard a dirty sibling's uncommitted work. */
+export interface SiblingCheckout {
+  /** Workspace subdirectory / repository name, used to name it in the warning. */
+  name: string;
+  /** Freshly-fetched status, or null when the fetch failed. */
+  status: WorktreeGitStatus | null;
 }
 
 /**
@@ -45,19 +67,50 @@ export interface DeleteConfirmCopy {
  * component (which has no render tests in this app) so the branching itself
  * is unit-testable — see `github-dialog-view.ts` for the same idiom. The JSX
  * description itself still lives in the component (this module has no React
- * dependency); it reads `alreadyArchived`/`showDirtyWarning`/`unknown` off the
- * result.
+ * dependency); it reads the flags/name lists off the result.
+ *
+ * `siblings` are the task's OTHER repository checkouts. Archiving is
+ * task-scoped, so every one of them is force-deleted no matter which row the
+ * user clicked; classifying only the clicked row let a clean-looking row hide
+ * a sibling's uncommitted changes. Each checkout is classified independently
+ * (the three states are mutually exclusive per checkout, but across a
+ * multi-repository task a confirmed-dirty sibling and an unknown sibling can
+ * both exist, so both warnings can legitimately show at once).
  */
-export function buildDeleteConfirmCopy(w: WorktreeInfo, status: WorktreeGitStatus | null): DeleteConfirmCopy {
-  const unknown = status == null || status.ignored === true;
-  const dirty = !unknown && status!.dirty === true;
+export function buildDeleteConfirmCopy(
+  w: WorktreeInfo,
+  status: WorktreeGitStatus | null,
+  siblings: readonly SiblingCheckout[] = [],
+): DeleteConfirmCopy {
+  const ownLabel = w.repoName ?? w.branch ?? w.id;
+  const ownUnknown = status == null || status.ignored === true;
+  const ownDirty = !ownUnknown && status!.dirty === true;
+  const dirtyCheckouts = [
+    ...(ownDirty ? [ownLabel] : []),
+    ...siblings
+      .filter((s) => s.status != null && s.status.ignored !== true && s.status.dirty === true)
+      .map((s) => s.name),
+  ];
+  const unknownCheckouts = [
+    ...(ownUnknown ? [ownLabel] : []),
+    ...siblings
+      .filter((s) => s.status == null || s.status.ignored === true)
+      .map((s) => s.name),
+  ];
   const alreadyArchived = w.archivedAt != null;
   return {
     title: `Delete worktree "${w.branch ?? w.id}"?`,
-    showDirtyWarning: dirty,
-    unknown,
+    showDirtyWarning: dirtyCheckouts.length > 0,
+    unknown: unknownCheckouts.length > 0,
+    dirtyCheckouts,
+    unknownCheckouts,
+    multiRepo: siblings.length > 0,
+    checkoutCount: siblings.length + 1,
     alreadyArchived,
-    confirmLabel: dirty || unknown ? "Discard changes & delete" : "Archive & delete",
+    confirmLabel:
+      dirtyCheckouts.length > 0 || unknownCheckouts.length > 0
+        ? "Discard changes & delete"
+        : "Archive & delete",
   };
 }
 

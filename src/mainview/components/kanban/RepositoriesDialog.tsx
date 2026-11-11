@@ -11,6 +11,7 @@ import {
   tooManyRepositories,
   type RepoSelection,
 } from "@/lib/repo-selection";
+import { uniqueRepoSlugs } from "../../../shared/multi-repo.ts";
 import type { Project } from "../../../shared/types.ts";
 
 interface Props {
@@ -62,7 +63,20 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
   // entries under one git root collapse to a single-repository task on save
   // (`dedupeSelections`), so they must not offer a second base-ref control
   // either — the inline Branch picker owns that task's base ref.
-  const multiSelection = useMemo(() => dedupeSelections(draft).length > 1, [draft]);
+  const dedupedCount = useMemo(() => dedupeSelections(draft).length, [draft]);
+  const multiSelection = dedupedCount > 1;
+  // Rows rendered below: every registered project, then any extra draft paths
+  // (from "Add folder"), deduped by path. Test ids are derived from the whole
+  // displayed list so two projects sharing a basename (`/a/api`, `/b/api`) get
+  // distinct ids — `selectionName` alone gave both rows the same one.
+  const displayPaths = useMemo(() => {
+    const all = [
+      ...projects.map((p) => p.path),
+      ...draft.map((e) => e.path).filter((p) => !projects.some((x) => x.path === p)),
+    ];
+    return [...new Set(all)];
+  }, [projects, draft]);
+  const rowTestIds = useMemo(() => uniqueRepoSlugs(displayPaths), [displayPaths]);
 
   const toggle = (path: string) => {
     if (path === lockedPath) return;
@@ -147,10 +161,7 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
         {projects.length === 0 && draft.length === 0 ? (
           <p className="py-6 text-center text-xs text-muted-foreground">No projects yet — add a folder to begin.</p>
         ) : null}
-        {[
-          ...projects.map((p) => p.path),
-          ...draft.map((e) => e.path).filter((p) => !projects.some((x) => x.path === p)),
-        ].map((path) => {
+        {displayPaths.map((path, i) => {
           const selected = paths.has(path);
           const idx = draft.findIndex((e) => e.path === path);
           const entry = idx >= 0 ? draft[idx]! : null;
@@ -158,7 +169,7 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
             <div
               key={path}
               className="rounded-md border border-border/60 px-2 py-1.5"
-              data-testid={`repositories-row-${selectionName({ path })}`}
+              data-testid={`repositories-row-${rowTestIds[i]}`}
             >
               <label className="flex cursor-pointer items-center gap-2 text-xs">
                 <input
@@ -205,10 +216,10 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
         })}
       </div>
 
-      {tooManyRepositories(draft.length) ? (
+      {tooManyRepositories(dedupedCount) ? (
         <p className="mt-2 flex items-center gap-1.5 text-xs text-warning">
           <TriangleAlert className="h-3.5 w-3.5" />
-          {draft.length} repositories — preparation may be slow. There is no hard limit.
+          {dedupedCount} repositories — preparation may be slow. There is no hard limit.
         </p>
       ) : null}
 

@@ -42,21 +42,26 @@ export function repoNameForPath(projectPath: string): string {
 
 /**
  * Deterministic, collision-free workspace subdirectory names for a selection,
- * in input order. The first path for a name keeps it; later collisions get
- * `-2`, `-3`, …. Shared by the client (predicting the layout for the dialog
- * and `@` prefixes) and the server (`createTask`), so both always agree.
+ * in input order. The first path for a name keeps it; later collisions get a
+ * numeric suffix (`app-2`, `app-3`, …). A colliding base that already ends in
+ * a number resumes that stem's sequence instead of nesting a second suffix
+ * (`app-2` -> `app-3`, never `app-2-2`). Shared by the client (predicting the
+ * layout for the dialog and `@` prefixes) and the server (`createTask`), so
+ * both always agree.
  */
 export function uniqueRepoSlugs(paths: string[]): string[] {
-  const used = new Map<string, number>();
+  const used = new Set<string>();
   return paths.map((p) => {
     const base = repoNameForPath(p);
-    const seen = used.get(base) ?? 0;
-    used.set(base, seen + 1);
-    if (seen === 0) return base;
-    let n = seen + 1;
-    let candidate = `${base}-${n}`;
-    while (used.has(candidate)) candidate = `${base}-${++n}`;
-    used.set(candidate, 1);
+    let candidate = base;
+    if (used.has(candidate)) {
+      const suffixed = /^(.*)-(\d+)$/.exec(base);
+      const stem = suffixed ? suffixed[1]! : base;
+      let n = suffixed ? Number(suffixed[2]) + 1 : 2;
+      candidate = `${stem}-${n}`;
+      while (used.has(candidate)) candidate = `${stem}-${++n}`;
+    }
+    used.add(candidate);
     return candidate;
   });
 }

@@ -35,6 +35,18 @@ export async function cmdShell(args: string[], flags: Flags): Promise<void> {
     return;
   }
   if (!existsSync(dir)) {
+    // A multi-repository task's `workdir` is its workspace root, which agetor
+    // creates when the task first starts. Before that (or if every repository
+    // worktree was torn down) the root is simply absent — reporting "directory
+    // no longer exists" implied it had been deleted. Name the real state and
+    // the way to get a usable shell today.
+    const repos = task.repositories ?? [];
+    if (!repoFlag && repos.length > 1 && !repos.some((r) => r.worktreePath)) {
+      throw new Error(
+        "this multi-repository task has no worktrees yet — start the task first, "
+          + "or use --repo <name> to open one repository's source checkout",
+      );
+    }
     throw new Error(`directory no longer exists: ${dir}`);
   }
   if (!isTTY) {

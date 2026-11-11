@@ -158,6 +158,87 @@ describe("buildDeleteConfirmCopy", () => {
       expect(copy.title).toBe('Delete worktree "orphan-dir-1"?');
     });
   });
+
+  // Archiving is task-scoped: from a multi-repository row it force-deletes
+  // every repository's checkout, so classifying only the clicked row let a
+  // clean row silently discard a sibling's uncommitted work (issue #291
+  // round-seven review). These lock the sibling aggregation in place.
+  describe("multi-repository siblings", () => {
+    const clean = () => gitStatus({ dirty: false, ignored: false });
+    const dirty = () => gitStatus({ dirty: true, ignored: false });
+
+    test("a clean clicked row with a dirty sibling warns and names the sibling", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: dirty() },
+        { name: "infra", status: clean() },
+      ]);
+      expect(copy.showDirtyWarning).toBe(true);
+      expect(copy.unknown).toBe(false);
+      expect(copy.dirtyCheckouts).toEqual(["backend"]);
+      expect(copy.confirmLabel).toBe("Discard changes & delete");
+    });
+
+    test("a clean clicked row with an unknown sibling warns and names the sibling", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: null },
+      ]);
+      expect(copy.showDirtyWarning).toBe(false);
+      expect(copy.unknown).toBe(true);
+      expect(copy.unknownCheckouts).toEqual(["backend"]);
+      expect(copy.confirmLabel).toBe("Discard changes & delete");
+    });
+
+    test("a dirty clicked row and a dirty sibling are both named", () => {
+      const copy = buildDeleteConfirmCopy(
+        worktree({ repoName: "frontend", branch: "agetor/frontend" }),
+        dirty(),
+        [{ name: "backend", status: dirty() }],
+      );
+      expect(copy.dirtyCheckouts).toEqual(["frontend", "backend"]);
+    });
+
+    test("dirty and unknown siblings can co-exist — both warnings show, each names its own checkouts", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: dirty() },
+        { name: "infra", status: gitStatus({ ignored: true }) },
+      ]);
+      expect(copy.showDirtyWarning).toBe(true);
+      expect(copy.unknown).toBe(true);
+      expect(copy.dirtyCheckouts).toEqual(["backend"]);
+      expect(copy.unknownCheckouts).toEqual(["infra"]);
+    });
+
+    test("ignored:true on a sibling is unknown, never clean", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: gitStatus({ dirty: false, ignored: true }) },
+      ]);
+      expect(copy.unknown).toBe(true);
+      expect(copy.unknownCheckouts).toEqual(["backend"]);
+    });
+
+    test("all checkouts confirmed clean -> non-destructive label, no warnings", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: clean() },
+        { name: "infra", status: clean() },
+      ]);
+      expect(copy.showDirtyWarning).toBe(false);
+      expect(copy.unknown).toBe(false);
+      expect(copy.dirtyCheckouts).toEqual([]);
+      expect(copy.unknownCheckouts).toEqual([]);
+      expect(copy.confirmLabel).toBe("Archive & delete");
+    });
+
+    test("checkoutCount and multiRepo reflect the whole task, not just the clicked row", () => {
+      expect(buildDeleteConfirmCopy(worktree(), clean()).multiRepo).toBe(false);
+      expect(buildDeleteConfirmCopy(worktree(), clean()).checkoutCount).toBe(1);
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: clean() },
+        { name: "infra", status: clean() },
+      ]);
+      expect(copy.multiRepo).toBe(true);
+      expect(copy.checkoutCount).toBe(3);
+    });
+  });
 });
 
 describe("triageDeleteOutcome", () => {
