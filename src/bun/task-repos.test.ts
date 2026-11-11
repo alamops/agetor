@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   branchesPinnedByOtherTasks,
   lexicallyInsideRoot,
+  pinnedBranchesFor,
   resolveRepositorySet,
 } from "./task-repos.ts";
 
@@ -74,7 +75,7 @@ describe("lexicallyInsideRoot", () => {
 });
 
 describe("branchesPinnedByOtherTasks", () => {
-  test("groups branches by workdir and repository path, excluding the task itself", () => {
+  test("groups branches by workdir and repository path, excluding the task itself", async () => {
     const tasks = [
       { id: "self", branch: "feature/self", workdir: "/a" },
       {
@@ -87,9 +88,76 @@ describe("branchesPinnedByOtherTasks", () => {
         ] as never,
       },
     ];
-    const map = branchesPinnedByOtherTasks("self", tasks);
+    const map = await branchesPinnedByOtherTasks("self", tasks);
     expect(map.get("/a")).toEqual(new Set(["feature/a"]));
     expect(map.get("/b")).toEqual(new Set(["feature/b"]));
     expect(map.get("/wt/other")).toBeUndefined();
+  });
+
+  test("also keys every pin by its git root, so sibling subdirectories see it", async () => {
+    // Review R11-M1: pins are stored against the path the other task SELECTED
+    // (`/repo/sub1`), but the caller looks up the path THIS task selected
+    // (`/repo/sub2`). Without the shared root key the second task found no pin
+    // and attached to the first task's branch and commits.
+    const roots: Record<string, string> = {
+      "/repo/sub1": "/repo",
+      "/repo/sub2": "/repo",
+      "/other": "/other",
+    };
+    const resolveRoot = async (dir: string) => roots[dir] ?? null;
+    const tasks = [
+      {
+        id: "other",
+        branch: null,
+        workdir: "/wt/other",
+        repositories: [
+          { path: "/repo/sub1", name: "one", branch: "feature/shared" },
+          { path: "/other", name: "other", branch: "feature/other" },
+        ] as never,
+      },
+    ];
+
+    const map = await branchesPinnedByOtherTasks("self", tasks, { resolveRoot });
+
+    // The selected path still answers as before...
+    expect(map.get("/repo/sub1")).toEqual(new Set(["feature/shared"]));
+    // ...and the shared git root answers even when this task selected a
+    // sibling subdirectory of the same repository.
+    expect(map.get("/repo")).toEqual(new Set(["feature/shared"]));
+    expect(map.get("/other")).toEqual(new Set(["feature/other"]));
+  });
+
+  test("a resolver failure keeps the path pins instead of dropping them", async () => {
+    const tasks = [
+      { id: "other", branch: "feature/x", workdir: "/gone", repositories: undefined },
+    ];
+    const map = await branchesPinnedByOtherTasks("self", tasks, {
+      resolveRoot: async () => {
+        throw new Error("not a repo");
+      },
+    });
+    expect(map.get("/gone")).toEqual(new Set(["feature/x"]));
+  });
+});
+
+describe("pinnedBranchesFor", () => {
+  test("unions the selected-path and git-root sets instead of first-match", () => {
+    // Two other tasks selected sibling subdirectories of one repository, so
+    // their pins land in two path sets plus the shared root set. Looking up
+    // one path must still see the branch held by the task in the OTHER
+    // subdirectory.
+    const pins = new Map<string, Set<string>>([
+      ["/repo/sub-a", new Set(["feature/a"])],
+      ["/repo/sub-b", new Set(["feature/b"])],
+      ["/repo", new Set(["feature/a", "feature/b"])],
+    ]);
+    expect(pinnedBranchesFor(pins, ["/repo/sub-a", "/repo"])).toEqual(
+      new Set(["feature/a", "feature/b"]),
+    );
+    expect(pinnedBranchesFor(pins, ["/repo/sub-b", "/repo"])).toEqual(
+      new Set(["feature/a", "feature/b"]),
+    );
+    expect(pinnedBranchesFor(pins, ["/elsewhere", null, undefined])).toEqual(new Set());
+    expect(pinnedBranchesFor(undefined, ["/repo"])).toEqual(new Set());
   });
 });

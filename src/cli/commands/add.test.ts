@@ -399,6 +399,56 @@ test("cmdAdd: --issue with several --repo entries tries each until one matches",
   expect(createTaskCalls[0]!.repositories?.map((r) => r.path)).toEqual(["/tmp/a-repo", "/tmp/b-repo"]);
 });
 
+test("cmdAdd: --issue tries the --repo set after an explicit --workdir that doesn't match", async () => {
+  // Review R11-S2: an explicit --workdir replaced the --repo candidates
+  // entirely, so `--issue <url> --workdir <scratch> --repo <issue repo>`
+  // failed even though the issue lives in one of the selected repositories —
+  // a directory that isn't even in the created repository set.
+  reset();
+  const thread = makeThread();
+  const other = makeThread({ item: makeItem({ htmlUrl: "https://github.com/someone-else/other/issues/7" }) });
+  const getIssueThreadCalls: Array<{ path: string; number: number }> = [];
+  const createTaskCalls: CreateTaskInput[] = [];
+  currentClient = {
+    getIssueThread: async (dir: string, number: number) => {
+      getIssueThreadCalls.push({ path: dir, number });
+      return { ok: true as const, ...(dir === "/tmp/b-repo" ? thread : other) };
+    },
+    createTask: async (input: CreateTaskInput) => {
+      createTaskCalls.push(input);
+      return { id: "workdir-and-repo", title: input.title } as unknown as Task;
+    },
+  } as unknown as AgetorClient;
+
+  await cmdAdd(
+    [
+      "--issue",
+      thread.item.htmlUrl,
+      "--workdir",
+      "/tmp/elsewhere",
+      "--repo",
+      "/tmp/a-repo",
+      "--repo",
+      "/tmp/b-repo",
+    ],
+    flags({ json: true }),
+  );
+
+  expect(getIssueThreadCalls.map((c) => c.path)).toEqual([
+    "/tmp/elsewhere",
+    "/tmp/a-repo",
+    "/tmp/b-repo",
+  ]);
+  expect(createTaskCalls).toHaveLength(1);
+  // The explicit --workdir stays the task's workdir; the issue is attributed
+  // to the repository that matched, but creation still uses the given set.
+  expect(createTaskCalls[0]!.workdir).toBe("/tmp/elsewhere");
+  expect(createTaskCalls[0]!.repositories?.map((r) => r.path)).toEqual([
+    "/tmp/a-repo",
+    "/tmp/b-repo",
+  ]);
+});
+
 test("cmdAdd: --issue --workdir --start --json also starts the created task", async () => {
   reset();
   const thread = makeThread();

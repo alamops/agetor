@@ -236,6 +236,17 @@ green (285 tests); `e2e/multi-repo-task.spec.ts` 7 passed. A wide
 load-sensitive fake-codex queue timing failures; that file is 3/3 green when
 run alone, and none of the touched suites failed.
 
+## Eleventh review round
+
+At head `73040bf3` the re-review confirmed round 10 closed and opened one
+must-fix and two should-fixes. All three are closed with regressions:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Must-fix R11-M1: `branchesPinnedByOtherTasks` keyed pins only by the selected path, so two multi tasks that picked sibling subdirectories of one repository never saw each other's pins — the second start silently attached to the first task's branch and commits | every pin is keyed by both its selected path and its resolved git root (`resolveRoot` injected as `repoRoot`, memoized), and both key sets are unioned at each lookup, covering create-time `ensureUniqueBranch` and start-time `prepareTaskWorkdir`; per-repository `-N` renames are preserved | `task-repos.test.ts` — root keying, resolver-failure fallback, union lookup; `orchestrator-multi-repo.test.ts` — sibling-subdirectory create; `worktree.test.ts` — sibling pin re-pins instead of adopting |
+| Should-fix R11-S1: `multiScopeStatTargets` used the prefixed token path as the stat key instead of the repo-relative path, so `@backend/.env` statted `<backend>/backend/.env` — the gitignored-file rescue was dead and valid prefixed tokens false-warned; the unit test asserted the inverted key | `paths` maps repo-local stat path → full token key (the warning layer's key): prefixed tokens use `splitNamedScopePath(...).path`; repository-root-only tokens are skipped | `at-scope-targets.test.ts` — `src/a.ts` and a prefixed `.env` map to the token, plus the root-only case |
+| Should-fix R11-S2: `agetor add --issue --repo` with an explicit `--workdir` matched the issue only against `--workdir`, which is not in the created repository set | the candidate list is the explicit `--workdir`, then every `--repo` in order, deduped, then cwd only when neither was given; the explicit workdir stays the task's workdir | `src/cli/commands/add.test.ts` — workdir-then-repo candidate order and created set |
+
 ## Live harness smoke matrix
 
 Layout support is universal (the agent runs at the workspace root). Extra

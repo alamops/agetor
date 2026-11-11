@@ -271,6 +271,52 @@ test("a not-yet-started multi task's branch pins keep a later same-title single 
   }
 });
 
+test("sibling subdirectory selections of one repository see each other's branch pins", async () => {
+  // Review R11-M1: pins were keyed only by the selected path, so two multi
+  // tasks that picked sibling subdirectories of one repository never saw each
+  // other's pin. Both pinned the same name, and whichever started second
+  // attached to the other task's branch and commits.
+  const { createTask } = await load();
+  const mono = await makeRepo("mono");
+  const subA = path.join(mono, "app-one");
+  const subB = path.join(mono, "app-two");
+  mkdirSync(subA);
+  mkdirSync(subB);
+  const otherA = await makeRepo("other-a");
+  const otherB = await makeRepo("other-b");
+  try {
+    const first = await createTask({
+      title: "shared title",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: subA,
+      isolation: "worktree",
+      repositories: [{ path: subA }, { path: otherA }],
+    });
+    if ("error" in first) throw new Error(first.error);
+    const pinned = first.task.repositories!.find((r) => r.path === subA)!.branch;
+    expect(pinned).toBeTruthy();
+
+    const second = await createTask({
+      title: "shared title",
+      prompt: "p",
+      agent: "claude-code",
+      workdir: subB,
+      isolation: "worktree",
+      repositories: [{ path: subB }, { path: otherB }],
+    });
+    if ("error" in second) throw new Error(second.error);
+    const repinned = second.task.repositories!.find((r) => r.path === subB)!.branch;
+
+    expect(repinned).not.toBe(pinned);
+    expect(repinned).toBe(`${pinned}-2`);
+    // The unrelated repositories still share the desired name.
+    expect(second.task.repositories!.find((r) => r.path === otherB)!.branch).toBe(pinned);
+  } finally {
+    cleanup(mono, otherA, otherB);
+  }
+});
+
 test("two paths under one git root collapse to the single-repository layout", async () => {
   const { createTask } = await load();
   const a = await makeRepo("mono");

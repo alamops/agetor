@@ -10,7 +10,7 @@ import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, TaskRepository, WorktreeTeardownResult } from "../shared/types.ts";
 import { MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
-import { lexicallyInsideRoot } from "./task-repos.ts";
+import { lexicallyInsideRoot, pinnedBranchesFor } from "./task-repos.ts";
 
 export type { BranchInfo };
 
@@ -1593,10 +1593,10 @@ export async function prepareTaskWorkdir(
       branchSource: repo.branchSource ?? "created",
       baseRef: repo.baseRef,
       recordedCheckout: repo.checkoutBranch ?? null,
-      // Pins are keyed by the selected project path (`branchesPinnedByOtherTasks`);
-      // fall back to the git root so a row that selected a subdirectory of the
-      // same repository still sees the other task's pin.
-      takenBranches: opts?.takenBranches?.get(repo.path) ?? opts?.takenBranches?.get(root) ?? new Set(),
+      // `branchesPinnedByOtherTasks` keys every pin by both the selected
+      // project path and its git root; union both so a pin from a row that
+      // selected either this path or a sibling subdirectory is seen.
+      takenBranches: pinnedBranchesFor(opts?.takenBranches, [repo.path, root]),
       reattach: Boolean(repo.worktreePath),
       fetchExisting: false,
     });

@@ -8,10 +8,12 @@
 import { splitNamedScopePath } from "../../shared/file-scope.ts";
 import { isSafeClientRelPath } from "./at-highlight.ts";
 
-/** One `POST /refs/resolve` batch: a directory plus token-key → local path. */
+/** One `POST /refs/resolve` batch: a directory plus repo-local path → token key. */
 export interface AtScopeStatTarget {
   dir: string;
-  /** Token key (what the warning layer checks) → repo-local path. */
+  /** Repo-local path (what gets joined onto `dir` for the stat) → the full
+   *  token path the warning layer checks. Keying by the stat argument is what
+   *  lets the response be mapped back to the token that produced it. */
   paths: Map<string, string>;
 }
 
@@ -43,13 +45,17 @@ export function multiScopeStatTargets(
   const targets = new Map<string, AtScopeStatTarget>();
   const workspaceDir = workspaceRoot?.trim() ?? "";
 
-  const add = (key: string, dir: string, local: string): void => {
+  /** `tokenKey` is the full token path the warning layer checks; `local` is
+   *  the repo-relative path that is actually joined onto `dir`. Keeping them
+   *  distinct is what makes a prefixed token (`frontend/src/a.ts`) stat
+   *  `<frontend dir>/src/a.ts` instead of `<frontend dir>/frontend/src/a.ts`. */
+  const add = (key: string, dir: string, tokenKey: string, local: string): void => {
     let target = targets.get(key);
     if (!target) {
       target = { dir, paths: new Map() };
       targets.set(key, target);
     }
-    target.paths.set(local, local);
+    target.paths.set(local, tokenKey);
   };
 
   for (const token of tokens) {
@@ -57,13 +63,16 @@ export function multiScopeStatTargets(
     if (!local || !isSafeClientRelPath(local)) continue;
     const split = splitNamedScopePath(scopes, token.path);
     if (!split) {
-      if (workspaceDir) add(WORKSPACE_TARGET_KEY, workspaceDir, local);
+      if (workspaceDir) add(WORKSPACE_TARGET_KEY, workspaceDir, local, local);
       continue;
     }
     if ((split.scope.ref ?? "").trim()) continue;
     const dir = split.scope.dir.trim();
-    if (!dir) continue;
-    add(split.scope.name, dir, local);
+    const scopedLocal = split.path.replace(/\/+$/, "");
+    // A token that names only the repository (`@frontend/`) has no inner path
+    // to stat; the listing already offers the synthesized root row.
+    if (!dir || !scopedLocal || !isSafeClientRelPath(scopedLocal)) continue;
+    add(split.scope.name, dir, local, scopedLocal);
   }
 
   return [...targets.values()].filter((target) => target.paths.size > 0);

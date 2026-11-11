@@ -240,16 +240,21 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     // <url> --repo ~/src/widgets` used to resolve the thread against cwd (or
     // worse, a different checkout the user happened to be in) and fail with
     // "that issue belongs to a different repository". Try the explicit
-    // `--workdir` when given; otherwise every selected repository in order;
-    // otherwise cwd as before. For a multi-repository selection the issue may
-    // live in ANY of them — the server matches it against the whole set — so
-    // the first candidate whose remote matches wins.
+    // `--workdir` first, then every selected repository in order, and only
+    // fall back to cwd when neither was given. An explicit `--workdir` does
+    // not replace the `--repo` set: the task is created on the repositories,
+    // so the workdir alone is not a place the issue can be attributed to.
+    // The server matches the issue against the whole repository set, so the
+    // first candidate whose remote matches wins.
     const explicitWorkdir = o.workdir?.trim() ? path.resolve(o.workdir) : null;
-    const candidateDirs = explicitWorkdir
-      ? [explicitWorkdir]
-      : (o.repos.length > 0
-        ? o.repos.map((r) => path.resolve(r.path))
-        : [path.resolve(process.cwd())]);
+    const repoDirs = o.repos.map((r) => path.resolve(r.path));
+    const candidateDirs = [
+      ...new Set([
+        ...(explicitWorkdir ? [explicitWorkdir] : []),
+        ...repoDirs,
+        ...(!explicitWorkdir && repoDirs.length === 0 ? [path.resolve(process.cwd())] : []),
+      ]),
+    ];
     let thread: Awaited<ReturnType<AgetorClient["getIssueThread"]>> | null = null;
     let matchedDir: string | null = null;
     let lastError: unknown = null;
@@ -264,9 +269,11 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
         // Keep one successful-but-mismatched answer so the error below can
         // name what git actually found instead of pretending nothing loaded.
         lastError ??= new Error(
-          explicitWorkdir
-            ? "--issue: that issue belongs to a different repository than --workdir"
-            : `--issue: that issue belongs to a different repository than ${candidateDirs.length > 1 ? "any of the selected repositories" : "--repo"} (tried ${candidateDirs.join(", ")})`,
+          candidateDirs.length === 1
+            ? explicitWorkdir
+              ? "--issue: that issue belongs to a different repository than --workdir"
+              : "--issue: that issue belongs to a different repository than --repo"
+            : `--issue: that issue belongs to a different repository than any of the selected repositories (tried ${candidateDirs.join(", ")})`,
         );
       } catch (err) {
         // A repo with no matching forge remote (or a fetch failure) must not

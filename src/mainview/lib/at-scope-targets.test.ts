@@ -16,7 +16,7 @@ describe("multiScopeStatTargets", () => {
     expect(targets).toEqual([{ dir: "/wt/t1", paths: new Map([["notes.md", "notes.md"]]) }]);
   });
 
-  test("maps a prefixed token to its own repository scope and strips the prefix key", () => {
+  test("maps a prefixed token's repo-relative path to its token key", () => {
     const targets = multiScopeStatTargets(
       [{ path: "frontend/src/a.ts" }],
       scopes,
@@ -24,7 +24,25 @@ describe("multiScopeStatTargets", () => {
     );
     expect(targets).toHaveLength(1);
     expect(targets[0]!.dir).toBe("/wt/t1/frontend");
-    expect([...targets[0]!.paths.keys()]).toEqual(["frontend/src/a.ts"]);
+    // The stat request joins the KEY onto `dir` (so `<frontend>/src/a.ts`,
+    // never `<frontend>/frontend/src/a.ts`); the VALUE maps the answer back to
+    // the token the warning layer checks.
+    expect([...targets[0]!.paths.entries()]).toEqual([["src/a.ts", "frontend/src/a.ts"]]);
+  });
+
+  test("stats a gitignored prefixed file at its repo-relative path", () => {
+    const targets = multiScopeStatTargets(
+      [{ path: "frontend/.env" }],
+      scopes,
+      "/wt/t1",
+    );
+    expect(targets).toEqual([
+      { dir: "/wt/t1/frontend", paths: new Map([[".env", "frontend/.env"]]) },
+    ]);
+  });
+
+  test("a token naming only the repository root has nothing inner to stat", () => {
+    expect(multiScopeStatTargets([{ path: "frontend/" }], scopes, "/wt/t1")).toEqual([]);
   });
 
   test("skips a ref scope: its listing is exactly what the worktree will contain", () => {

@@ -65,7 +65,7 @@ import {
   subscribeGlobal,
 } from "./orchestrator.ts";
 import { cancelPendingForTask, listPendingForTask } from "./interactions.ts";
-import { prepareTaskWorkdir, recordableCheckout } from "./worktree.ts";
+import { prepareTaskWorkdir, recordableCheckout, repoRoot } from "./worktree.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
   attemptWindowStart,
@@ -991,7 +991,7 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   }
   const { branchesPinnedByOtherTasks } = await import("./task-repos.ts");
   const prepared = await prepareTaskWorkdir(parent, {
-    takenBranches: branchesPinnedByOtherTasks(parent.id, tasks.list()),
+    takenBranches: await branchesPinnedByOtherTasks(parent.id, tasks.list(), { resolveRoot: repoRoot }),
   });
   if ("error" in prepared) return { error: prepared.error };
   if (prepared.repositories && prepared.repositories.length > 1) {

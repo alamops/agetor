@@ -295,7 +295,7 @@ import {
   workspaceHasOnlyAgetorScratch,
   type PreparedWorkdir,
 } from "./worktree.ts";
-import { resolveRepositorySet, branchesPinnedByOtherTasks } from "./task-repos.ts";
+import { resolveRepositorySet, branchesPinnedByOtherTasks, pinnedBranchesFor } from "./task-repos.ts";
 import { formatRepositoriesPrompt } from "../shared/multi-repo.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -2411,7 +2411,7 @@ async function startTaskInner(
   // branch hits a create-time uniqueness race, the recovery re-pins to a name
   // that's free of both existing refs AND those not-yet-started pins.
   const prepared = await prepareTaskWorkdir(task, {
-    takenBranches: branchesPinnedByOtherTasks(taskId, tasks.list()),
+    takenBranches: await branchesPinnedByOtherTasks(taskId, tasks.list(), { resolveRoot: repoRoot }),
   });
   if ("error" in prepared) return { error: prepared.error };
 
@@ -11479,7 +11479,7 @@ export async function createTask(
       // subdirectory of the same repo still counts — the pre-#291 behavior
       // (a global set of every task's branch) is preserved.
       const taken = new Set<string>();
-      for (const set of branchesPinnedByOtherTasks(id, tasks.list()).values()) {
+      for (const set of (await branchesPinnedByOtherTasks(id, tasks.list(), { resolveRoot: repoRoot })).values()) {
         for (const b of set) taken.add(b);
       }
       plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
@@ -11501,10 +11501,10 @@ export async function createTask(
       repositories.map((r) => [r.path, resolvedSet && resolvedSet.ok ? (resolvedSet.repositoriesRoots.get(r.path) ?? r.path) : r.path]),
     );
     const desired = plannedBranch ?? branchName({ id, title: input.title });
-    const taken = branchesPinnedByOtherTasks(id, tasks.list());
+    const taken = await branchesPinnedByOtherTasks(id, tasks.list(), { resolveRoot: repoRoot });
     await Promise.all(repositories.map(async (r) => {
       const root = roots.get(r.path) ?? r.path;
-      const pinned = taken.get(r.path) ?? taken.get(root) ?? new Set<string>();
+      const pinned = pinnedBranchesFor(taken, [r.path, root]);
       r.branch = await ensureUniqueBranch(root, desired, pinned);
     }));
   }

@@ -2355,6 +2355,68 @@ test("prepareTaskWorkdir falls back to a unique branch when the shared name is h
   }
 });
 
+test("prepareTaskWorkdir sees a pin from a sibling subdirectory of the same repository", async () => {
+  // Review R11-M1: the pin map used to be keyed only by the path the OTHER
+  // task selected. Two multi tasks that picked sibling subdirectories of one
+  // repository shared no path key, so the second start found no pin, saw the
+  // branch already exists, and silently attached to the first task's commits.
+  const { prepareTaskWorkdir, repoRoot, WORKTREES_DIR } = await import("./worktree.ts");
+  const { branchesPinnedByOtherTasks } = await import("./task-repos.ts");
+  const { existsSync } = await import("node:fs");
+  const mono = await makeRepo();
+  const otherA = await makeRepo();
+  const otherB = await makeRepo();
+  const pkgA = path.join(mono, "pkg-a");
+  const pkgB = path.join(mono, "pkg-b");
+  mkdirSync(pkgA);
+  mkdirSync(pkgB);
+  const shaMono = await revParse(mono, "HEAD");
+  const shaA = await revParse(otherA, "HEAD");
+  const shaB = await revParse(otherB, "HEAD");
+  // Both rows pinned the same desired name, as a pre-fix create would.
+  const taskA = multiRepoTask(pkgA, [
+    { path: pkgA, name: "a", baseRef: shaMono },
+    { path: otherA, name: "other", baseRef: shaA },
+  ]);
+  const taskB = multiRepoTask(pkgB, [
+    { path: pkgB, name: "b", baseRef: shaMono },
+    { path: otherB, name: "other", baseRef: shaB },
+  ]);
+  const workspaceA = path.join(WORKTREES_DIR, taskA.id);
+  const workspaceB = path.join(WORKTREES_DIR, taskB.id);
+  try {
+    const first = await prepareTaskWorkdir(taskA);
+    if ("error" in first) throw new Error(first.error);
+    // Work that must never leak into the second task's checkout.
+    writeFileSync(path.join(workspaceA, "a", "marker.txt"), "task A work\n");
+    await git(["add", "."], path.join(workspaceA, "a"));
+    await git(["commit", "-m", "task A work"], path.join(workspaceA, "a"));
+
+    const taken = await branchesPinnedByOtherTasks(
+      taskB.id,
+      [{ id: taskA.id, branch: null, workdir: taskA.workdir, repositories: first.repositories! }],
+      { resolveRoot: repoRoot },
+    );
+    const second = await prepareTaskWorkdir(taskB, { takenBranches: taken });
+    if ("error" in second) throw new Error(second.error);
+
+    const monoEntry = second.repositories!.find((r) => r.name === "b")!;
+    // Re-pinned off the base instead of adopting A's branch and commit.
+    expect(monoEntry.branch).toBe("feature/auth-2");
+    expect(existsSync(path.join(workspaceB, "b", "marker.txt"))).toBe(false);
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], path.join(workspaceB, "b")))
+      .toBe("feature/auth-2");
+    // A repository without the pin keeps the shared name.
+    expect(second.repositories!.find((r) => r.name === "other")!.branch).toBe("feature/auth");
+  } finally {
+    rmSync(workspaceA, { recursive: true, force: true });
+    rmSync(workspaceB, { recursive: true, force: true });
+    rmSync(mono, { recursive: true, force: true });
+    rmSync(otherA, { recursive: true, force: true });
+    rmSync(otherB, { recursive: true, force: true });
+  }
+});
+
 test("getTaskDiff isolates each repository and the blob uses the requested one", async () => {
   const { getTaskDiff, getTaskDiffBlob, prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
   const a = await makeRepo();

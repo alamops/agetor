@@ -58,6 +58,9 @@ interface TaskRepository {
    map (every other task's `branch` and `repositories[].branch`), so a
    same-title single task created after a not-yet-started multi task gets the
    `-N` variant instead of later attaching to that task's branch and commits.
+   Every pin is keyed by both the selected path and its resolved git root, so
+   two tasks that selected sibling subdirectories of one repository still
+   see each other's pins.
    `GET /projects/branches` hides both kinds of pin. An entry's own
    `repositories[].baseRef`
    (`--repo <path>=<ref>`) wins; a task-level `baseRef` (CLI `--base-ref`) is
@@ -92,9 +95,9 @@ collected, worktrees/branches materialized in this attempt are rolled back
 (including an `rm` fallback when `git worktree remove` fails, mirroring
 `removeOneWorktree`; the branch is only deleted when this attempt minted it),
 reused ones are left alone, and the error names every failed repository. A repository that already holds the shared branch gets
-a per-repo `-N` fallback; `takenBranches` is keyed by the selected project path,
-and the per-repository lookup falls back to the git root so a subdirectory
-selection still sees the pin.
+a per-repo `-N` fallback; `takenBranches` is keyed by both the selected
+project path and the repository's git root, so a sibling-subdirectory
+selection (and the path lookup itself) sees the same pin.
 
 `startTask` spawns the agent with `cwd = workspace`, persists the materialized
 entries with `tasks.setRepositories`, and appends the launch block

@@ -99,30 +99,78 @@ export function lexicallyInsideRoot(root: string, candidate: string): boolean {
 /**
  * Branch names already pinned on tasks other than `taskId`, grouped by the
  * selected project path each one belongs to (`workdir` for a single-repository
- * row, `repositories[].path` for a multi row). Used by
- * `createTask`/`startTask` so a not-yet-started multi-repository task can't be
- * handed a branch another task is holding in the same repository.
+ * row, `repositories[].path` for a multi row) AND by that path's git root.
+ * Used by `createTask`/`startTask` so a not-yet-started task can't be handed a
+ * branch another task is holding in the same repository.
  *
- * Callers that know a repository's git root also probe the map with that root
- * (see `prepareTaskWorkdir`), so a row that selected a subdirectory of the
- * same repository still sees the pin. The git-root check inside
- * `ensureUniqueBranch` is the backstop for the remaining path aliases.
+ * The git-root keys are load-bearing for multi-repository rows. A pin is
+ * stored against the path the other task *selected*, which may be any
+ * subdirectory of the repository; the caller looks it up by the path THIS task
+ * selected. Two tasks that picked sibling subdirectories of one repository
+ * therefore share no path key at all — without also keying by the resolved
+ * root, the second start found no pin and silently attached to the first
+ * task's branch (and its commits). `resolveRoot` is injected (it is `repoRoot`
+ * in production) to keep this module import-cycle free; once a branch exists
+ * as a ref, `ensureUniqueBranch` remains the backstop for path aliases the
+ * resolver can't see (e.g. a symlinked checkout).
  */
-export function branchesPinnedByOtherTasks(
+export async function branchesPinnedByOtherTasks(
   taskId: string,
   tasks: { id: string; branch: string | null; workdir: string; repositories?: TaskRepository[] }[],
-): Map<string, Set<string>> {
-  const byWorkdir = new Map<string, Set<string>>();
+  opts: { resolveRoot?: (dir: string) => Promise<string | null> } = {},
+): Promise<Map<string, Set<string>>> {
+  const byKey = new Map<string, Set<string>>();
+  const add = (key: string, branch: string): void => {
+    const set = byKey.get(key) ?? new Set<string>();
+    set.add(branch);
+    byKey.set(key, set);
+  };
+
+  // Every non-null pin with the path it is stored against. Paths are resolved
+  // once per distinct value; `repoRoot` memoizes successful lookups, so a
+  // large board's repeated workdirs are cheap after the first call.
+  const pins: Array<{ path: string; branch: string }> = [];
   for (const t of tasks) {
     if (t.id === taskId) continue;
-    const add = (key: string, branch: string | null) => {
-      if (!branch) return;
-      const set = byWorkdir.get(key) ?? new Set<string>();
-      set.add(branch);
-      byWorkdir.set(key, set);
-    };
-    add(t.workdir, t.branch);
-    for (const repo of t.repositories ?? []) add(repo.path, repo.branch);
+    if (t.branch && t.workdir) pins.push({ path: t.workdir, branch: t.branch });
+    for (const repo of t.repositories ?? []) {
+      if (repo.branch && repo.path) pins.push({ path: repo.path, branch: repo.branch });
+    }
   }
-  return byWorkdir;
+  const rootByPath = new Map<string, string>();
+  if (opts.resolveRoot) {
+    const resolveRoot = opts.resolveRoot;
+    await Promise.all(
+      [...new Set(pins.map((pin) => pin.path))].map(async (dir) => {
+        const root = await resolveRoot(dir).catch(() => null);
+        if (root) rootByPath.set(dir, root);
+      }),
+    );
+  }
+
+  for (const pin of pins) {
+    add(pin.path, pin.branch);
+    const root = rootByPath.get(pin.path);
+    if (root) add(root, pin.branch);
+  }
+  return byKey;
+}
+
+/**
+ * Every branch name `pins` holds for any of `keys` — a repository's selected
+ * path and its git root, in that order. The sets are UNIONed, not first-match:
+ * two other tasks that selected different sibling subdirectories of one
+ * repository contribute separate path sets plus one shared root set, so taking
+ * only the first matching key would silently drop one task's pin.
+ */
+export function pinnedBranchesFor(
+  pins: Map<string, Set<string>> | undefined,
+  keys: readonly (string | null | undefined)[],
+): Set<string> {
+  const out = new Set<string>();
+  for (const key of keys) {
+    if (!key) continue;
+    for (const branch of pins?.get(key) ?? []) out.add(branch);
+  }
+  return out;
 }
