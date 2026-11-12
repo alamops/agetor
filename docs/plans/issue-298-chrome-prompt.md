@@ -395,6 +395,19 @@ Added by this plan (reasoning-based):
 
 **Full-suite note (environment).** The whole `bun test` suite (493 files in one process) could not complete on this shared worktree host — a 30-minute run and a 25-file chunked run both exceeded the wall clock, and the fake-bun-tmux files (`claude-tmux-askdrive`, `claude-tmux-local-command`'s `mirrorModelViaPicker` group) hit bun's 5 s default per-test timeout under load. That is not this change: `claude-tmux-askdrive` fails identically at base (13 timeouts at base vs the same class at HEAD), and one mirror test takes 5.5 s at base *and* at HEAD. With `--timeout 30000` both are fully green (42/42 and 11/11), and the first alphabetical 25-file chunk (831 tests) is green. The focused suites for every changed unit are green without a timeout override (429 tests), as are `claude-tmux-queue`, `claude-tmux`, `agents`, `core-spawn` and `claudemd-citations` (509 tests, `--timeout 30000`).
 
+### 8.5 Post-review evidence for the two open review questions (2026-11-12, claude 2.1.322)
+
+**Q1 — does the real Chrome pane match the reconstructed fixture?** The prompt can't be shown on demand: the 2.1.322 offer needs the extension present, the server-side `tengu_chrome_auto_enable` flag, and an unset `claudeInChromeDefaultEnabled` (the owner's config already has it set; forcing it would mean editing a live `~/.claude.json` other sessions write to). Instead:
+
+- **Binary.** `ChromeAutoEnableDialog` renders the shared `Dialog` (title, `color: "permission"`, `inputGuide` footer) around the confirm select with `hideIndexes: true, cancelFirst: true, focus: "cancel"`. `TrustDialog` passes the same props to the same two components.
+- **Live capture of the sibling.** The 2.1.322 trust dialog, captured on 80x24 and 120x40 detached panes in an untrusted temp directory and answered "No, exit" (no trust entry written): a full-width `────` rule, a 1-space body indent, ` ❯ No, exit` / `   Yes, I trust this folder`, and ` Enter to confirm · Esc to cancel` as the last line. No box border. `matchUnnumberedModal` parses it into two choices with cursor 0; before this change the chain carded it unparsable.
+- **Third-party pastes** of the real Chrome prompt (2.1.283 and 2.1.296, in two public GitHub issues) show the same rows and no border, and the footer `Enter to confirm · Esc to keep browser tools off`. The original fixture's `Esc keep …` (no "to") was corrected everywhere it was used; the matcher never depended on it.
+- **Tests.** `claude-tmux-scraper.test.ts` → `describe("issue #298 — live claude 2.1.322 evidence")` pins the captured trust dialog, the Chrome dialog's own strings laid into that captured chrome (`CHROME_2_1_322_PANE`, including a two-tick `scrapeOnce` registration), and the real `/theme` picker and `/effort` slider as negatives.
+
+**Q2 — does any claude modal draw its footer above a live input box?** No, on 2.1.322. A live probe opened 26 read-only slash-command pickers plus the rewind picker, the `?` help and the `/` suggestions (no prompts sent, hooks disabled) and ran agetor's own predicates on each capture. Every pane with a modal footer in its last three non-blank lines had no live prompt row: modals replace the composer and the status bar. The new idle gate changed the outcome for none of those panes. The idle composer itself is framed (`────` / `❯ …` / `────` / status bar), so a menu quoted above it can't put a footer in the last three non-blank lines even with the idle gate off (pinned by the same `describe`).
+
+**Side finding, out of scope.** The 2.1.322 `/effort` slider gained an Ultracode toggle row and the footer `←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel`; `matchSliderModal` no longer recognises it, so it falls to the unparsable card. This predates #298.
+
 ## 9. Completeness ledger
 
 | Item | Disposition | Task ID / reason / who deferred |

@@ -399,7 +399,7 @@ test("registerTmuxPrompt with hideKeys:true creates a request carrying the flag,
 
   const { req } = registerTmuxPrompt({
     taskId: "tHideKeys", runId: "rH",
-    paneText: "❯ No, keep browser tools off\n  Yes, use my browser\n\nEnter to confirm · Esc keep browser tools off",
+    paneText: "❯ No, keep browser tools off\n  Yes, use my browser\n\nEnter to confirm · Esc to keep browser tools off",
     choices: [{ key: "1", label: "No, keep browser tools off" }, { key: "2", label: "Yes, use my browser" }],
     fingerprint: "fp-hide-keys",
     hideKeys: true,

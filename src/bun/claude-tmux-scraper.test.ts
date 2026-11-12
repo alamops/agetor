@@ -459,7 +459,7 @@ test("matchNumberedModal — Chrome-extension startup prompt surfaces as an inte
 /* ── Issue #298: the UNNUMBERED "Claude in Chrome extension detected" prompt ──
    claude 2.1.322 renders it as an Ink `er` select with `hideIndexes` — two
    rows, no `N.` prefixes, cursor pre-focused on the "No" row, footer
-   `Enter to confirm · Esc keep browser tools off`. Reconstructed from the
+   `Enter to confirm · Esc to keep browser tools off`. Reconstructed from the
    issue screenshot + the 2.1.322 component props (docs/plans/
    issue-298-chrome-prompt-investigation.md §8.1). The numbered
    CHROME_EXTENSION_PANE above stays as coverage for older CLIs. */
@@ -476,7 +476,7 @@ with /chrome.
 ❯ No, keep browser tools off
   Yes, use my browser
 
-Enter to confirm · Esc keep browser tools off`;
+Enter to confirm · Esc to keep browser tools off`;
 
 test("matchUnnumberedModal — the 2.1.322 Chrome prompt parses into its two rows, cursor on 'No', keys hidden, never unparsable/high-confidence", () => {
   // Regression for #298's defect A: at base this pane fell through to
@@ -625,12 +625,12 @@ test("matchUnnumberedModal — an idle pane that QUOTES the menu keeps the compo
   // the unparsable footer arm from replacing it with a "can't read" card.
   const quotedAtIdle = `❯ No, keep browser tools off
   Yes, use my browser
-Enter to confirm · Esc keep browser tools off
+Enter to confirm · Esc to keep browser tools off
 ❯ 
   ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
   expect(paneShowsIdleInputBox(quotedAtIdle)).toBe(true);
   // Sanity: the shape IS what the matcher would otherwise accept.
-  expect(matchUnnumberedModal("❯ No, keep browser tools off\n  Yes, use my browser\n\nEnter to confirm · Esc keep browser tools off")).not.toBeNull();
+  expect(matchUnnumberedModal("❯ No, keep browser tools off\n  Yes, use my browser\n\nEnter to confirm · Esc to keep browser tools off")).not.toBeNull();
   expect(matchUnnumberedModal(quotedAtIdle)).not.toBeNull();
   expect(pickScrapeMatch(quotedAtIdle, {
     paneWorking: paneShowsClaudeWorking(quotedAtIdle),
@@ -775,7 +775,7 @@ test("scrapeOnce → no card — an idle composer that quotes the same menu neve
   // footer card that used to be the only outcome.
   const quotedAtIdle = `❯ No, keep browser tools off
   Yes, use my browser
-Enter to confirm · Esc keep browser tools off
+Enter to confirm · Esc to keep browser tools off
 ❯ 
   ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
   await withScrapeTask(quotedAtIdle, async ({ pending, tick }) => {
@@ -850,6 +850,212 @@ Enter to continue · Esc to cancel`;
     expect(UNNUMBERED_MAX_CHOICE_ROWS).toBe(9);
     expect(matchUnnumberedModal(`Pick one\n\n${rows(UNNUMBERED_MAX_CHOICE_ROWS)}\n\n${confirmFooter}`)).not.toBeNull();
     expect(matchUnnumberedModal(`Pick one\n\n${rows(UNNUMBERED_MAX_CHOICE_ROWS + 1)}\n\n${confirmFooter}`)).toBeNull();
+  });
+});
+
+/* ── Issue #298 evidence: LIVE claude 2.1.322 captures (2026-11-12) ──
+   The Chrome prompt itself can't be shown on demand (it needs the extension,
+   a server-side flag, and an unset `claudeInChromeDefaultEnabled`), so its
+   fixture above is a reconstruction. These pin it to real evidence instead:
+     - The 2.1.322 binary renders `ChromeAutoEnableDialog` as the shared
+       `Dialog` (title, `color: "permission"`, `inputGuide` footer) around the
+       confirm select with `hideIndexes: true, cancelFirst: true,
+       focus: "cancel"` — exactly the props `TrustDialog` passes to the same
+       two components. So a live capture of the trust dialog IS a capture of
+       the Chrome prompt's chrome: top rule, 1-space body indent,
+       ` ❯ <cancel>` / `   <confirm>` rows, footer last.
+     - Two independent third-party pastes of the real Chrome prompt (2.1.283 /
+       2.1.296) show the same shape and the footer wording
+       `Enter to confirm · Esc to keep browser tools off`.
+   Captured with `tmux capture-pane -p` on 80x24 detached panes; trailing
+   blanks trimmed; the trust dialog's workspace path is replaced by a
+   placeholder. `CHROME_2_1_322_PANE` is the Chrome dialog's own strings
+   (from the 2.1.322 binary) laid into the captured trust-dialog chrome. */
+
+const TRUST_2_1_322_PANE = `────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/agetor-spike/untrusted-31220
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel`;
+
+const CHROME_2_1_322_PANE = `────────────────────────────────────────────────────────────────────────────────
+ Claude in Chrome extension detected
+
+ Claude will use your Chrome browser by default — navigating sites, filling
+ forms, and capturing screenshots in your existing session.
+
+ This session is in Auto mode, which checks routine browser actions — you are
+ only prompted when it is unsure. Turn browser tools off for future sessions
+ with /chrome.
+
+ ❯ No, keep browser tools off
+   Yes, use my browser
+
+ Enter to confirm · Esc to keep browser tools off`;
+
+/** Live 2.1.322 `/theme` picker: unnumbered rows with a cursor, but an
+ *  `Enter to select` footer — not a confirm menu. */
+const THEME_PICKER_2_1_322_PANE = `❯ /effort
+  ⎿  Cancelled
+
+❯ /resume
+  ⎿  Resume cancelled
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
+   Theme
+
+   Choose the text style that looks best with your terminal
+
+       Auto (match terminal)
+   ❯ ✔ Dark mode
+       Light mode
+       Dark mode (colorblind-friendly)
+       Light mode (colorblind-friendly)
+       Dark mode (ANSI colors only)
+       Light mode (ANSI colors only)
+       New custom theme…
+
+   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+    1  function greet() {
+    2 -  console.log("Hello, World!");
+    2 +  console.log("Hello, Claude!");
+    3  }
+   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+    Syntax theme: Monokai Extended (ctrl+t to disable)
+
+   Enter to select · Esc to cancel`;
+
+/** Live 2.1.322 `/effort` slider (grew an Ultracode toggle row and a longer
+ *  footer since 2.1.245; `matchSliderModal` no longer recognises it — a
+ *  separate, pre-existing gap). Its footer contains `Enter to confirm`. */
+const EFFORT_SLIDER_2_1_322_PANE = ` ▐▛███▛█   Claude Code v2.1.322
+▝▜██████▀  Haiku 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/.agetor/worktrees/1c345ab1-d22f-4ee3-a67e-66d42d952b32/vendor/q298-probe
+
+
+❯ /model
+  ⎿  Kept model as Haiku 5.5
+
+
+
+
+
+
+
+
+
+
+
+ tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf for wheel scroll ▔
+   Effort
+
+                   Faster                             Smarter
+                   ──────────▲───────────────────────────────      Ultracode  off
+                   low     medium     high     xhigh      max      Tab to toggle
+
+                                  The default effort for this model
+
+
+   ←/→ to adjust · Enter to confirm · s for this session only · Esc to cancel`;
+
+/** Live 2.1.322 idle composer frame: hint row, rule, prompt row (with the
+ *  dim `Try "…"` placeholder, which plain text can't tell from typed text),
+ *  rule, status bar. */
+const IDLE_FRAME_2_1_322 = `                                                                                ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "fix lint errors"
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
+
+describe("issue #298 — live claude 2.1.322 evidence", () => {
+  const gates = (pane: string) => ({
+    paneWorking: paneShowsClaudeWorking(pane),
+    paneIdle: paneShowsIdleInputBox(pane),
+    watchdogArmed: false,
+  });
+
+  test("the real trust dialog (same Dialog + hideIndexes select as the Chrome prompt) becomes a two-choice card; before, only the unparsable fallback caught it", () => {
+    const m = pickScrapeMatch(TRUST_2_1_322_PANE, gates(TRUST_2_1_322_PANE))!;
+    expect(m).not.toBeNull();
+    expect(m.unparsable).toBeUndefined();
+    expect(m.hideKeys).toBe(true);
+    expect(m.choices.map((c) => c.label)).toEqual(["No, exit", "Yes, I trust this folder"]);
+    expect(m.cursorIndex).toBe(0);
+    expect(m.fingerprint).toBe(matchUnnumberedModal(TRUST_2_1_322_PANE)!.fingerprint);
+    // What the chain produced before the unnumbered arm existed:
+    expect(matchNumberedModal(TRUST_2_1_322_PANE)).toBeNull();
+    expect(matchUnparsableModal(TRUST_2_1_322_PANE, false)?.unparsable).toBe(true);
+    // The preview starts at the dialog's title, below its top rule.
+    expect(m.paneText.split("\n")[0]).toBe(" Accessing workspace:");
+    expect(m.paneText).not.toContain("────");
+    // The boot auto-confirmer still owns this dialog (it runs first).
+    const consent = matchStartupConsentDialog(TRUST_2_1_322_PANE)!;
+    expect(consent.name).toBe("trust-folder");
+    expect(consent.acceptIndex).toBe(1);
+  });
+
+  test("the Chrome prompt in the 2.1.322 dialog chrome becomes a two-choice card with its title, and is never auto-confirmed", () => {
+    const m = pickScrapeMatch(CHROME_2_1_322_PANE, gates(CHROME_2_1_322_PANE))!;
+    expect(m).not.toBeNull();
+    expect(m.unparsable).toBeUndefined();
+    expect(m.hideKeys).toBe(true);
+    expect(m.choices).toEqual([
+      { key: "1", label: "No, keep browser tools off" },
+      { key: "2", label: "Yes, use my browser" },
+    ]);
+    expect(m.cursorIndex).toBe(0);
+    const shown = cleanPromptPane(m.paneText);
+    expect(shown.split("\n")[0]).toBe(" Claude in Chrome extension detected");
+    expect(shown).not.toContain("Enter to confirm");
+    expect(matchStartupConsentDialog(CHROME_2_1_322_PANE)).toBeNull();
+    // Same answer on either the boot poller's or the runtime scraper's gates.
+    expect(paneShowsBlockingPrompt(CHROME_2_1_322_PANE)).toBe(true);
+  });
+
+  test("the real /theme picker (unnumbered rows, 'Enter to select') is not read as a confirm menu", () => {
+    expect(matchUnnumberedModal(THEME_PICKER_2_1_322_PANE)).toBeNull();
+    const m = pickScrapeMatch(THEME_PICKER_2_1_322_PANE, gates(THEME_PICKER_2_1_322_PANE));
+    expect(m?.hideKeys).toBeUndefined();
+  });
+
+  test("the real /effort slider (footer contains 'Enter to confirm') is not read as an unnumbered menu", () => {
+    expect(matchUnnumberedModal(EFFORT_SLIDER_2_1_322_PANE)).toBeNull();
+    const m = pickScrapeMatch(EFFORT_SLIDER_2_1_322_PANE, gates(EFFORT_SLIDER_2_1_322_PANE));
+    expect(m?.hideKeys).toBeUndefined();
+  });
+
+  test("the 2.1.322 composer is framed by rules, so a menu quoted above it can't put its footer in the last 3 non-blank lines — no card even with the idle gate OFF", () => {
+    const quoted = `${CHROME_2_1_322_PANE}\n\n${IDLE_FRAME_2_1_322}`;
+    const nonBlank = quoted.split("\n").filter((l) => l.trim().length > 0);
+    expect(nonBlank.slice(-3).some((l) => MODAL_FOOTER_RE.test(l))).toBe(false);
+    // Plain text can't see the dim placeholder, so this frame is NOT idle to
+    // the plain predicate — the geometry alone keeps both trailing arms quiet.
+    expect(paneShowsIdleInputBox(quoted)).toBe(false);
+    expect(pickScrapeMatch(quoted, { paneWorking: false, paneIdle: false, watchdogArmed: false })).toBeNull();
+  });
+
+  test("scrapeOnce registers one answerable card for the 2.1.322-chrome Chrome prompt after two stable ticks", async () => {
+    await withScrapeTask(CHROME_2_1_322_PANE, async ({ pending, tick }) => {
+      await tick();
+      expect(pending()).toHaveLength(0);
+      await tick();
+      const cards = pending();
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.hideKeys).toBe(true);
+      expect(cards[0]!.choices.map((c) => c.label)).toEqual(["No, keep browser tools off", "Yes, use my browser"]);
+      expect(cards[0]!.paneText.split("\n")[0]).toBe(" Claude in Chrome extension detected");
+    });
   });
 });
 

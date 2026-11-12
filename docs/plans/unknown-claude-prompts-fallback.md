@@ -216,7 +216,7 @@ which removes suggestions and the startup sample on fresh launches. See
 
 Issue #298's "Claude in Chrome extension detected" startup prompt (claude 2.1.322) is an
 Ink `er` select with `hideIndexes`: two rows, no `N.` prefixes, cursor pre-focused on the
-"No" row, and an `Enter to confirm · Esc keep browser tools off` footer. It failed every
+"No" row, and an `Enter to confirm · Esc to keep browser tools off` footer. It failed every
 older matcher, so the boot poller's footer arm carded it as `unparsable` — the
 "Claude is asking something Agetor can't read" card whose only action is **Open in
 Terminal** — and the task could not proceed.

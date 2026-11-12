@@ -5713,7 +5713,7 @@ function unnumberedPreview(lines: string[], firstRowAt: number): string {
  *   ❯ No, keep browser tools off
  *     Yes, use my browser
  *
- *   Enter to confirm · Esc keep browser tools off
+ *   Enter to confirm · Esc to keep browser tools off
  *
  * This matcher only *presents* the rows — it never answers one. Both of the
  * Chrome prompt's choices change a persistent claude setting ("Yes" connects
