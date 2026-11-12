@@ -140,6 +140,49 @@ test("createTask pins a workspace with one entry, branch and base per repository
   }
 });
 
+test("three repositories get three entries, three branches and three worktrees under one workspace", async () => {
+  // Acceptance criterion 1 (the issue's frontend/backend/infrastructure case):
+  // the two-repository scenarios elsewhere prove the multi path, but the
+  // reported shape is N repositories in one card. Also pins that the sanitized
+  // slugs stay distinct at N=3 and that every entry materializes its own
+  // branch instead of the first repo's name leaking to its siblings.
+  const { createTask, WORKTREES_DIR } = await load();
+  const { prepareTaskWorkdir, readCheckoutBranch } = await import("./worktree.ts");
+  const frontend = await makeRepo("frontend");
+  const backend = await makeRepo("backend");
+  const infra = await makeRepo("infrastructure");
+  const created = await createTask({
+    title: "three repos",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: frontend,
+    isolation: "worktree",
+    repositories: [{ path: frontend }, { path: backend }, { path: infra }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  const workspace = path.join(WORKTREES_DIR, id);
+  try {
+    const repos = created.task.repositories!;
+    expect(repos.map((r) => r.path)).toEqual([frontend, backend, infra]);
+    expect(new Set(repos.map((r) => r.name)).size).toBe(3);
+    expect(repos.every((r) => typeof r.branch === "string" && r.branch.length > 0)).toBe(true);
+
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    expect(prepared.cwd).toBe(workspace);
+    expect(prepared.repositories).toHaveLength(3);
+    for (const repo of prepared.repositories!) {
+      expect(repo.worktreePath).toBe(path.join(workspace, repo.name));
+      expect(existsSync(path.join(repo.worktreePath!, ".git"))).toBe(true);
+      const live = await readCheckoutBranch(repo.worktreePath!);
+      expect(live.ok && live.branch).toBe(repo.branch);
+    }
+  } finally {
+    cleanup(workspace, frontend, backend, infra);
+  }
+});
+
 test("createTask plans a multi task's branch from repositories[0] even when workdir isn't a git repo", async () => {
   // Review round seven: with no git `--workdir` (an API caller, or
   // `agetor add --repo` from a non-repo cwd) the branch plan was skipped
@@ -660,6 +703,105 @@ test("startTask materializes both worktrees, spawns at the workspace and appends
   }
 });
 
+test("a follow-up send restores a repository worktree that vanished from disk", async () => {
+  // T4 acceptance: `sendInput` restores a missing worktree before delivering.
+  // For a multi-repository task `workdirNeedsRestore` must consider EVERY
+  // entry, not just the (always-present) workspace root — a deleted secondary
+  // checkout otherwise starts the follow-up turn in a workspace where one
+  // repository silently cannot be read or modified.
+  const { createTask, startTask, tasks } = await load();
+  const { sendInput } = await import("./orchestrator.ts");
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  const created = await createTask({
+    title: "send restores multi",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  try {
+    const started = await startTask(id);
+    if ("error" in started) throw new Error(started.error);
+    await settleRun(id);
+    const before = tasks.get(id)!;
+    const missing = before.repositories![1]!;
+    expect(missing.worktreePath).toBeTruthy();
+    rmSync(missing.worktreePath!, { recursive: true, force: true });
+    expect(existsSync(missing.worktreePath!)).toBe(false);
+
+    const sent = await sendInput(started.runId, "continue after the restore");
+    if (!sent.delivered) throw new Error(sent.reason);
+    await settleRun(id);
+
+    const after = tasks.get(id)!.repositories!;
+    expect(existsSync(after[1]!.worktreePath!)).toBe(true);
+    expect(existsSync(path.join(after[1]!.worktreePath!, ".git"))).toBe(true);
+    // Still the same pinned branch, re-attached in place.
+    const { readCheckoutBranch } = await import("./worktree.ts");
+    const live = await readCheckoutBranch(after[1]!.worktreePath!);
+    expect(live.ok && live.branch).toBe(after[1]!.branch);
+  } finally {
+    cleanup((await load()).worktreePath({ id } as Task), a, b);
+  }
+});
+
+test("archive records every repository's live checkout and unarchive re-attaches onto it", async () => {
+  // T6 acceptance: the archive teardown reads each repository's worktree for
+  // its live branch — never the non-git workspace root — so a drifted checkout
+  // survives an archive/unarchive round trip instead of coming back on the
+  // stale task branch.
+  const { createTask, archiveTask, unarchiveTask, tasks } = await load();
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  const created = await createTask({
+    title: "checkout multi",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  try {
+    // Materialize without starting a run: the run-settled checkout recorder is
+    // fire-and-forget and could otherwise read the drifted branch, masking the
+    // archive-time per-repository read this test exists to pin.
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.setRepositories(id, prepared.repositories!);
+    tasks.update(id, { worktreePath: prepared.worktreePath, branch: prepared.branch });
+    const drifted = prepared.repositories![1]!;
+    await git(["checkout", "-b", "hotfix/live"], drifted.worktreePath!);
+
+    tasks.update(id, { column: "done" });
+    const archived = await archiveTask(id, { awaitTeardown: true, stopRun: true });
+    if ("error" in archived) throw new Error(archived.error);
+
+    const afterArchive = tasks.get(id)!;
+    // Per-repository recording: A kept its task branch, B its drifted checkout.
+    expect(afterArchive.repositories![0]!.checkoutBranch).toBe(afterArchive.repositories![0]!.branch);
+    expect(afterArchive.repositories![1]!.checkoutBranch).toBe("hotfix/live");
+    // The scalar never absorbed the workspace root (it is not a git checkout).
+    expect(afterArchive.checkoutBranch).toBeNull();
+
+    const unarchived = await unarchiveTask(id);
+    if ("error" in unarchived) throw new Error(unarchived.error);
+    const restored = tasks.get(id)!.repositories![1]!;
+    expect(existsSync(restored.worktreePath!)).toBe(true);
+    const { readCheckoutBranch } = await import("./worktree.ts");
+    const live = await readCheckoutBranch(restored.worktreePath!);
+    expect(live.ok && live.branch).toBe("hotfix/live");
+  } finally {
+    cleanup((await load()).worktreePath({ id } as Task), a, b);
+  }
+});
+
 test("archive detaches every clean repository and unarchive restores them", async () => {
   const { createTask, startTask, archiveTask, unarchiveTask, tasks, WORKTREES_DIR } = await load();
   const a = await makeRepo("frontend");
@@ -761,6 +903,66 @@ test("a retained multi workspace is listed and can be cleaned by a repeat archiv
     expect(listWorktrees().some((entry) => entry.id === id)).toBe(false);
   } finally {
     cleanup(workspace, a, b);
+  }
+});
+
+test("teardowns of two multi tasks sharing a repository serialize on that repository's FIFO key", async () => {
+  // T6 acceptance: a multi task's teardown acquires a FIFO key per selected
+  // repository, so two tasks that share one source repo never run `git
+  // worktree` teardown concurrently in it — and overlapping key SETS
+  // ([a,b] vs [b,c]) must not deadlock. The gate holds key b: both jobs park,
+  // then A (enqueued first) must finish before B's pendingTeardown resolves
+  // because B's tail on b is A's combined promise.
+  const { createTask, archiveTask, tasks } = await load();
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const { __enqueueTeardownForTest, pendingTeardown } = await import("./orchestrator.ts");
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  const c = await makeRepo("infra");
+  const makeTask = async (title: string, paths: string[]) => {
+    const created = await createTask({
+      title,
+      prompt: "p",
+      agent: "claude-code",
+      workdir: paths[0]!,
+      isolation: "worktree",
+      repositories: paths.map((p) => ({ path: p })),
+    });
+    if ("error" in created) throw new Error(created.error);
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.setRepositories(created.task.id, prepared.repositories!);
+    tasks.update(created.task.id, { worktreePath: prepared.worktreePath, column: "done" });
+    return { id: created.task.id, workspace: prepared.worktreePath! };
+  };
+
+  let gateRelease!: () => void;
+  const gate = new Promise<void>((resolve) => { gateRelease = resolve; });
+  try {
+    const A = await makeTask("fifo multi A", [a, b]);
+    const B = await makeTask("fifo multi B", [b, c]);
+    const held = __enqueueTeardownForTest("fifo-gate", b, () => gate);
+
+    const archivedA = await archiveTask(A.id);
+    if ("error" in archivedA) throw new Error(archivedA.error);
+    const archivedB = await archiveTask(B.id);
+    if ("error" in archivedB) throw new Error(archivedB.error);
+
+    // Both jobs are parked behind the gate: nothing has been detached yet.
+    expect(existsSync(A.workspace)).toBe(true);
+    expect(existsSync(B.workspace)).toBe(true);
+
+    gateRelease();
+    await held;
+    // Await only B: its shared-key tail is A's job, so this proves A finished.
+    await pendingTeardown(B.id);
+    expect(existsSync(A.workspace)).toBe(false);
+    expect(existsSync(B.workspace)).toBe(false);
+    expect(tasks.get(A.id)?.archivedAt).not.toBeNull();
+    expect(tasks.get(B.id)?.archivedAt).not.toBeNull();
+  } finally {
+    gateRelease();
+    cleanup(a, b, c);
   }
 });
 

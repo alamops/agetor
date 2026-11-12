@@ -82,6 +82,117 @@ test("POST /tasks accepts two repositories and returns the workspace shape", asy
   }
 });
 
+test("POST /tasks anchors workdir to the repository set over an explicit workdir", async () => {
+  // Review round thirteen (Q1): `agetor add --workdir A --repo B` used to send
+  // A as the task's workdir, and createTask silently replaced it with the
+  // selected repository. The CLI now sends that same anchor, but the route
+  // contract — the repository set owns `workdir` — is what makes the payload
+  // self-consistent. One kept entry keeps that path; 2+ use the per-task
+  // workspace root, never the caller's directory.
+  const a = await makeRepo("anchor-a");
+  const b = await makeRepo("anchor-b");
+  const elsewhere = mkdtempSync(path.join(tmpdir(), "agetor-srv-anchor-"));
+  try {
+    const single = await call("/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        title: "anchor one",
+        prompt: "p",
+        agent: "claude-code",
+        workdir: elsewhere,
+        isolation: "worktree",
+        repositories: [{ path: a }],
+      }),
+    });
+    expect(single.status).toBe(200);
+    const one = (await single.json()) as Task;
+    expect(one.workdir).toBe(a);
+    expect(one.repositories?.map((r) => r.path)).toEqual([a]);
+
+    const multi = await call("/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        title: "anchor two",
+        prompt: "p",
+        agent: "claude-code",
+        workdir: elsewhere,
+        isolation: "worktree",
+        repositories: [{ path: a }, { path: b }],
+      }),
+    });
+    expect(multi.status).toBe(200);
+    const two = (await multi.json()) as Task;
+    const { WORKTREES_DIR } = await import("./worktree.ts");
+    expect(two.workdir).toBe(path.join(WORKTREES_DIR, two.id));
+    expect(two.repositories?.map((r) => r.path)).toEqual([a, b]);
+  } finally {
+    rmSync(elsewhere, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("POST /tasks rebuilds the repository set from path+baseRef and ignores server-managed fields", async () => {
+  // Trust boundary: `POST /tasks` is CLI-reachable, so a caller can send the
+  // whole Task shape. `createTask` must never adopt a client-supplied
+  // worktreePath/checkoutBranch/prUrl/branchSource — those are materialized or
+  // stamped by the server, and a forged entry would make the Worktrees page
+  // (and teardown) operate on a path the task does not own.
+  const a = await makeRepo("trust-a");
+  const b = await makeRepo("trust-b");
+  try {
+    const res = await call("/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        title: "trust",
+        prompt: "p",
+        agent: "claude-code",
+        // Not a git repo, and not in the selected set: must not survive.
+        workdir: path.join(tmpdir(), "agetor-srv-not-a-repo"),
+        isolation: "worktree",
+        worktreePath: "/tmp/evil-workspace",
+        checkoutBranch: "evil-checkout",
+        prUrl: "https://evil.example/pr/1",
+        issueRepoPath: b,
+        repositories: [
+          {
+            path: a,
+            baseRef: "main",
+            branch: "evil-branch",
+            branchSource: "existing",
+            worktreePath: "/tmp/evil-a",
+            checkoutBranch: "evil-a",
+            prUrl: "https://evil.example/a",
+          },
+          {
+            path: b,
+            branch: "evil-branch",
+            worktreePath: "/tmp/evil-b",
+            prUrl: "https://evil.example/b",
+          },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const task = (await res.json()) as Task;
+    // Multi tasks mirror the workspace only; the scalars stay null.
+    expect(task.worktreePath).toBeNull();
+    expect(task.prUrl).toBeNull();
+    expect(task.checkoutBranch).toBeNull();
+    expect(task.issueRepoPath).toBeNull();
+    // Every server-managed entry field is rebuilt, never echoed.
+    expect(task.repositories?.map((r) => r.worktreePath)).toEqual([null, null]);
+    expect(task.repositories?.map((r) => r.checkoutBranch)).toEqual([null, null]);
+    expect(task.repositories?.map((r) => r.prUrl)).toEqual([null, null]);
+    expect(task.repositories?.map((r) => r.branchSource)).toEqual(["created", "created"]);
+    // The generated branch is derived from the title, not the forged override.
+    expect(task.repositories?.every((r) => typeof r.branch === "string" && r.branch !== "evil-branch")).toBe(true);
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
 test("POST /tasks rejects malformed repository payloads with 400", async () => {
   const a = await makeRepo("a");
   try {
@@ -190,6 +301,12 @@ test("GET /tasks/:id/diff routes by repo and 400s an unknown one", async () => {
     expect((await okRes.json()).repo).toBe(names[1]);
     const bad = await call(`/tasks/${task.id}/diff?repo=nope`);
     expect(bad.status).toBe(400);
+    // The blob route takes the same `repo` selector and rejects an unknown one
+    // before touching the filesystem (the binary kind gate comes first, so use
+    // a path that would be previewable).
+    const badBlob = await call(`/tasks/${task.id}/diff/blob?path=logo.png&side=new&repo=nope`);
+    expect(badBlob.status).toBe(400);
+    expect((await badBlob.json()).error).toContain("unknown repository");
   } finally {
     rmSync(a, { recursive: true, force: true });
     rmSync(b, { recursive: true, force: true });

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend } from "./fixtures";
 import { gotoApp } from "./helpers";
+import { startGitHubStub, type StubRequest } from "./github-stub";
 import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
 
 /**
@@ -33,6 +34,14 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *     and unarchive restores them.
  *  7. a later archive that finds one repository dirty leaves just that
  *     checkout and the workspace in place.
+ *  8. text search and the repo filter match any selected repository (never
+ *     the non-git workspace root alone).
+ *  9. the Worktrees page lists one row per repository, not the workspace root.
+ * 10. Create all PRs opens one PR per repository, stamps each entry, and adds
+ *     `Closes #N` only to the issue's repository.
+ * 11. Create all PRs is per-repository best effort: one repository's failure
+ *     does not block the others, and a reloaded retry opens only the failed
+ *     one.
  */
 
 test.describe.configure({ mode: "serial" });
@@ -66,6 +75,16 @@ interface TaskRow {
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
+}
+
+/** Remotes are shared by every worktree of one source repo, so a later
+ *  scenario re-points the throwaway `local` remote instead of adding it. */
+function setLocalRemote(cwd: string, url: string): void {
+  try {
+    git(cwd, ["remote", "set-url", "local", url]);
+  } catch {
+    git(cwd, ["remote", "add", "local", url]);
+  }
 }
 
 async function initRepo(name: string): Promise<string> {
@@ -106,6 +125,63 @@ async function awaitTask(
   return task!;
 }
 
+/**
+ * Create a multi-repository task through the real API, start it, push each
+ * worktree branch to a throwaway local bare remote (so the run panel's
+ * git-status poll reports `remoteSynced`), and return the row. Used by the
+ * Create-all-PRs scenarios; the GitHub-shaped `origin` comes from beforeAll.
+ */
+async function createPushedMultiTask(
+  request: APIRequestContext,
+  backend: E2EBackend,
+  opts: { title: string; issueUrl?: string },
+): Promise<{ taskId: string; task: TaskRow; bareDirs: string[] }> {
+  const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+  const bareA = await mkdtemp(path.join(tmpdir(), "agetor-e2e-bare-a-"));
+  const bareB = await mkdtemp(path.join(tmpdir(), "agetor-e2e-bare-b-"));
+  git(bareA, ["init", "-q", "--bare"]);
+  git(bareB, ["init", "-q", "--bare"]);
+  const created = await request.post(`${backend.apiBase}/tasks`, {
+    headers: auth,
+    data: {
+      title: opts.title,
+      prompt: "p",
+      agent: "claude-code",
+      isolation: "worktree",
+      repositories: [{ path: repoA }, { path: repoB }],
+      ...(opts.issueUrl ? { issueUrl: opts.issueUrl } : {}),
+    },
+  });
+  expect(created.ok()).toBe(true);
+  const taskId = ((await created.json()) as TaskRow).id;
+  const started = await request.post(`${backend.apiBase}/tasks/${taskId}/start`, { headers: auth });
+  expect(started.ok()).toBe(true);
+  await expect
+    .poll(async () => {
+      const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
+      const row = (await res.json()) as TaskRow;
+      return row.repositories.every((repo) => !!repo.worktreePath);
+    }, { timeout: CONVERGE_TIMEOUT })
+    .toBe(true);
+  const detail = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
+  const task = (await detail.json()) as TaskRow;
+  for (const repo of task.repositories) {
+    const bare = repo.path === repoA ? bareA : bareB;
+    setLocalRemote(repo.worktreePath!, bare);
+    git(repo.worktreePath!, ["push", "-q", "-u", "local", repo.branch!]);
+  }
+  // The Create-all-PRs chip is gated on the 5 s git-status poll reporting a
+  // synced upstream; wait on the same API the poll reads.
+  await expect
+    .poll(async () => {
+      const status = await request.get(`${backend.apiBase}/tasks/${taskId}/git-status`, { headers: auth });
+      const body = (await status.json()) as { repositories?: Array<{ remoteSynced: boolean }> };
+      return body.repositories?.every((r) => r.remoteSynced) ?? false;
+    }, { timeout: CONVERGE_TIMEOUT })
+    .toBe(true);
+  return { taskId, task, bareDirs: [bareA, bareB] };
+}
+
 test.beforeAll(async ({ backend, request }) => {
   repoA = await initRepo("frontend");
   repoB = await initRepo("backend");
@@ -115,6 +191,11 @@ test.beforeAll(async ({ backend, request }) => {
   repoSibling = path.join(repoA, "packages", "feature");
   await mkdir(repoSibling, { recursive: true });
   repoBHead = git(repoB, ["rev-parse", "HEAD"]);
+  // GitHub-shaped origins for the issue-sourced / Create-all-PRs scenario.
+  // Pushing uses a separate local bare remote, so nothing leaves the machine
+  // while `repoForDir`/`providerRepoForDir` still resolve a GitHub identity.
+  git(repoA, ["remote", "add", "origin", "https://github.com/agetor-e2e/frontend.git"]);
+  git(repoB, ["remote", "add", "origin", "https://github.com/agetor-e2e/backend.git"]);
   const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
   for (const p of [repoA, repoB, repoSibling]) {
     await request.post(`${backend.apiBase}/projects`, { headers: auth, data: { path: p } });
@@ -218,6 +299,43 @@ test("create via the real UI: the Repositories dialog sends both repos and start
   });
 });
 
+test("text search and the repo filter match any selected repository", async ({ backend, page }) => {
+  // Spec: "Repo filter and text search match any selected repo." A multi
+  // task's workdir is its non-git workspace root, so matching only that (the
+  // pre-#291 behavior) would hide the card for every repository name.
+  await gotoApp(page, backend.bootBase);
+  const search = page.getByLabel("Search tasks");
+  const secondName = path.basename(repoB);
+
+  // Text search: the second repository's basename appears in title/prompt/
+  // workdir nowhere, only in `repositories[]`.
+  await search.fill(secondName);
+  await expect(page.getByText("Multi repository e2e", { exact: true }).first()).toBeVisible({
+    timeout: CONVERGE_TIMEOUT,
+  });
+  await expect(page.getByText("Single repository e2e", { exact: true })).toHaveCount(0);
+  await search.fill("no-such-repository-xyz");
+  await expect(page.getByText("Multi repository e2e", { exact: true })).toHaveCount(0);
+  await search.fill("");
+
+  // Repo filter: selecting the second repository keeps the multi card and
+  // hides the single-repo one; a registered project the task never selected
+  // hides it.
+  await page.getByRole("button", { name: "All repos", exact: true }).click();
+  await page.getByText(repoB, { exact: true }).click();
+  await expect(page.getByText("Multi repository e2e", { exact: true }).first()).toBeVisible({
+    timeout: CONVERGE_TIMEOUT,
+  });
+  await expect(page.getByText("Single repository e2e", { exact: true })).toHaveCount(0);
+
+  // The popover stays open across toggles: deselect the second repository and
+  // select a registered project the task never picked (a sibling directory of
+  // repoA — the filter matches selected paths, not git roots).
+  await page.getByText(repoB, { exact: true }).click();
+  await page.getByText(repoSibling, { exact: true }).click();
+  await expect(page.getByText("Multi repository e2e", { exact: true })).toHaveCount(0);
+});
+
 test("the diff dialog has one tab per repository and loads each repository's changes", async ({ backend, page, request }) => {
   const auth = { authorization: `Bearer ${backend.apiToken}` };
   const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth });
@@ -272,6 +390,23 @@ test("the commit & push chip is offered when only a sibling repository changed",
   await expect(page.getByRole("button", { name: "Commit & push" })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 });
 
+test("the Worktrees page lists one row per repository of a multi task, not the workspace root", async ({ backend, page }) => {
+  // T13: `listWorktrees` emits `<taskId>__<slug>` rows (one per repository)
+  // and skips the non-git workspace root; the dialog badges each row with its
+  // repository name. A single workspace-root row here would mean nested ids
+  // were never parsed or the root leaked into the listing.
+  await gotoApp(page, backend.bootBase);
+  await page.getByRole("button", { name: "Worktrees", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Worktrees" });
+  await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  for (const name of uniqueRepoSlugs([repoA, repoB])) {
+    await expect(dialog.getByText(name, { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  }
+  // One row per repository, both attributed to the same task — not one row for
+  // the task's workspace root.
+  await expect(dialog.getByText("Multi repository e2e", { exact: true })).toHaveCount(2);
+});
+
 test("the terminal section defaults to the workspace and follows the repository tab", async ({ backend, page }) => {
   // Review M2 regression: TerminalView's repo state was never set, had no UI,
   // and always opened in repositories[0] instead of the documented workspace
@@ -316,6 +451,166 @@ test("the selected repository tab resets on a task switch (sibling of the allPrs
 
   await expect(firstTab).toHaveAttribute("aria-selected", "true", { timeout: CONVERGE_TIMEOUT });
   await expect(secondTab).toHaveAttribute("aria-selected", "false");
+});
+
+test("Create all PRs opens one PR per repository and adds Closes only to the issue repository", async ({
+  backend,
+  page,
+  request,
+}) => {
+  // Spec requirement 4: each repository's PR URL stamps its own entry and only
+  // the repository the issue came from prefills `Closes #N`. The whole walk is
+  // exercised through the real button → /github/pull-create → GitHub stub, so
+  // a per-repo loop that used the wrong repo identity or always appended the
+  // directive would fail here.
+  test.setTimeout(90_000);
+  const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+  const pullBodies: Array<{ body?: string }> = [];
+  const prTitle = "Multi repository PRs e2e";
+  const stub = await startGitHubStub(backend.githubStubPort, [
+    {
+      method: "POST",
+      path: /^\/repos\/agetor-e2e\/frontend\/pulls$/,
+      body: (req: StubRequest) => {
+        pullBodies.push(req.body as { body?: string });
+        return { number: 11, title: "frontend PR", state: "open", html_url: "https://github.com/agetor-e2e/frontend/pull/11" };
+      },
+    },
+    {
+      method: "POST",
+      path: /^\/repos\/agetor-e2e\/backend\/pulls$/,
+      body: (req: StubRequest) => {
+        pullBodies.push(req.body as { body?: string });
+        return { number: 12, title: "backend PR", state: "open", html_url: "https://github.com/agetor-e2e/backend/pull/12" };
+      },
+    },
+  ]);
+  let prTaskId: string | null = null;
+  let bareDirs: string[] = [];
+  try {
+    const prepared = await createPushedMultiTask(request, backend, {
+      title: prTitle,
+      issueUrl: "https://github.com/agetor-e2e/frontend/issues/291",
+    });
+    prTaskId = prepared.taskId;
+    bareDirs = prepared.bareDirs;
+    const task = prepared.task;
+
+    await gotoApp(page, backend.bootBase);
+    await page.getByText(prTitle, { exact: true }).first().click();
+    const button = page.getByTestId("create-all-prs");
+    await expect(button).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await button.click();
+
+    await expect.poll(() => pullBodies.length, { timeout: CONVERGE_TIMEOUT }).toBe(2);
+    const withCloses = pullBodies.filter((b) => (b.body ?? "").includes("Closes #291"));
+    expect(withCloses).toHaveLength(1);
+    // The directive belongs to the issue's repository (frontend), not the
+    // sibling.
+    expect(withCloses[0]).toBe(pullBodies[0]);
+
+    await expect
+      .poll(async () => {
+        const detail = await request.get(`${backend.apiBase}/tasks/${task.id}`, { headers: auth });
+        const t = (await detail.json()) as { prUrl: string | null; repositories: Array<{ prUrl: string | null }> };
+        return t.repositories.map((repo) => repo.prUrl);
+      }, { timeout: CONVERGE_TIMEOUT })
+      .toEqual([
+        "https://github.com/agetor-e2e/frontend/pull/11",
+        "https://github.com/agetor-e2e/backend/pull/12",
+      ]);
+    const detail = await request.get(`${backend.apiBase}/tasks/${task.id}`, { headers: auth });
+    expect(((await detail.json()) as { prUrl: string | null }).prUrl).toBeNull();
+  } finally {
+    if (prTaskId) await request.delete(`${backend.apiBase}/tasks/${prTaskId}`, { headers: auth }).catch(() => {});
+    await stub.close();
+    for (const dir of bareDirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("Create all PRs keeps going after one repository fails and retries only the failed one", async ({
+  backend,
+  page,
+  request,
+}) => {
+  // Spec: "A single Create all PRs action walks the repos with per-repo best
+  // effort: one repo's failure does not block the others; results and retries
+  // are per repo." The FIRST repository fails, so the second one's PR proves
+  // the loop kept going; a reloaded retry then opens only the failed one.
+  test.setTimeout(90_000);
+  const auth = { authorization: `Bearer ${backend.apiToken}`, "content-type": "application/json" };
+  const prTitle = "Multi repository PR retry e2e";
+  let frontendCalls = 0;
+  const stub = await startGitHubStub(backend.githubStubPort, [
+    {
+      method: "POST",
+      path: /^\/repos\/agetor-e2e\/frontend\/pulls$/,
+      body: () => {
+        frontendCalls += 1;
+        if (frontendCalls === 1) return { status: 500, body: { message: "stub: frontend pull failed" } };
+        return { number: 21, title: "frontend PR", state: "open", html_url: "https://github.com/agetor-e2e/frontend/pull/21" };
+      },
+    },
+    {
+      method: "POST",
+      path: /^\/repos\/agetor-e2e\/backend\/pulls$/,
+      body: { number: 22, title: "backend PR", state: "open", html_url: "https://github.com/agetor-e2e/backend/pull/22" },
+    },
+  ]);
+  let prTaskId: string | null = null;
+  let bareDirs: string[] = [];
+  try {
+    const prepared = await createPushedMultiTask(request, backend, { title: prTitle });
+    prTaskId = prepared.taskId;
+    bareDirs = prepared.bareDirs;
+
+    await gotoApp(page, backend.bootBase);
+    await page.getByText(prTitle, { exact: true }).first().click();
+    const button = page.getByTestId("create-all-prs");
+    await expect(button).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await button.click();
+
+    // First pass: frontend failed but the walk continued, so the backend PR
+    // exists; the action is offered again for the failed repository only.
+    await expect
+      .poll(async () => {
+        const detail = await request.get(`${backend.apiBase}/tasks/${prepared.taskId}`, { headers: auth });
+        const t = (await detail.json()) as { repositories: Array<{ prUrl: string | null }> };
+        return t.repositories.map((repo) => repo.prUrl);
+      }, { timeout: CONVERGE_TIMEOUT })
+      .toEqual([null, "https://github.com/agetor-e2e/backend/pull/22"]);
+    expect(frontendCalls).toBe(1);
+    // Reload before retrying: the board's `/tasks` snapshot is the source of
+    // `repositoriesNeedingPr`, and the stamp is deliberately not an
+    // `updated_at` bump, so a panel still holding the pre-stamp snapshot can
+    // re-attempt the successful sibling. A fresh load is the deterministic
+    // per-repository retry surface. (`page.reload()`, not a second gotoApp:
+    // navigating to the same URL is a same-document hash change.)
+    await page.reload();
+    await expect(page.getByText(prTitle, { exact: true }).first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await page.getByText(prTitle, { exact: true }).first().click();
+    await expect(button).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(button).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
+
+    await button.click();
+    await expect
+      .poll(async () => {
+        const detail = await request.get(`${backend.apiBase}/tasks/${prepared.taskId}`, { headers: auth });
+        const t = (await detail.json()) as { repositories: Array<{ prUrl: string | null }> };
+        return t.repositories.map((repo) => repo.prUrl);
+      }, { timeout: CONVERGE_TIMEOUT })
+      .toEqual([
+        "https://github.com/agetor-e2e/frontend/pull/21",
+        "https://github.com/agetor-e2e/backend/pull/22",
+      ]);
+    // The already-stamped backend was never re-opened on the retry.
+    expect(stub.callsMatching(/^\/repos\/agetor-e2e\/backend\/pulls$/, "POST")).toBe(1);
+    expect(frontendCalls).toBe(2);
+  } finally {
+    if (prTaskId) await request.delete(`${backend.apiBase}/tasks/${prTaskId}`, { headers: auth }).catch(() => {});
+    await stub.close();
+    for (const dir of bareDirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 });
 
 test("archive detaches every clean worktree (keeping the branches) and unarchive restores them", async ({ backend, request }) => {
