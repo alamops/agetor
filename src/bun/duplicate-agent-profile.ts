@@ -1,4 +1,5 @@
 import type { AgentProfile, Task } from "../shared/types.ts";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { agentProfiles, tasks, type AgentProfileInsertInput } from "./db.ts";
 import { createTask } from "./orchestrator.ts";
 
@@ -48,7 +49,11 @@ export async function duplicateAgentProfile(
       // A multi-repository task is copied repository-for-repository with each
       // entry's pinned base, so the copy starts from the same commits. The
       // workspace root is derived by `createTask` from the new task id.
-      const repos = t.repositories && t.repositories.length > 1
+      // A one-repository multi task (after a removal) is copied through the
+      // same path; `createTask` creates a one-entry selection as an ordinary
+      // single-repository task, so the copy never inherits the old workspace
+      // root as its `workdir`.
+      const repos = isMultiRepoTask(t) && t.repositories && t.repositories.length > 0
         ? t.repositories.map((r) => ({ path: r.path, ...(r.baseRef ? { baseRef: r.baseRef } : {}) }))
         : null;
       const res = await createTask({

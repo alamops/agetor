@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  AlertTriangle, Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Play, Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
@@ -32,14 +32,24 @@ import {
   openFolderUnavailableReason,
   repositoriesForPrBatch,
   resolveConflictsKey,
+  selectedRepositoryName,
   subscribePrBatches,
 } from "@/lib/multi-repo-ui";
+import {
+  removalMergeFields,
+  removeRepositoryBlockReason,
+  removeRepositoryConfirmCopy,
+  repositoryDetails,
+  repositoryProblem,
+} from "@/lib/repo-removal";
+import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
+import { useConfirm } from "@/components/ui/confirm";
 import { issueProjectPath } from "@/lib/repo-selection";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
-import { useProjectFiles, useProjectFileScopes, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
+import { multiScopesOrNull, useProjectFiles, useProjectFileScopes, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { fileScopeForTask, multiRepoFileScopes } from "../../../shared/file-scope.ts";
 import {
   emptyOpencodeDrafts,
@@ -140,6 +150,7 @@ import {
   type TaskFxRecovery,
   type TaskPlan,
   type TaskReference,
+  type TaskRepository,
   type ToolResultAttachment,
   type ToolResultRetention,
   retentionTrimNote,
@@ -2940,10 +2951,21 @@ function RunPanelBody({
   // reset on a task switch, so switching away and back mid-walk re-enabled
   // the button while the first walk was still opening PRs.
   const allPrsBusy = useSyncExternalStore(subscribePrBatches, () => isPrBatchRunning(task.id));
-  const multiRepo = (task.repositories?.length ?? 0) > 1;
+  // `isMultiRepoTask`, never a count: a multi task left with one repository
+  // (after a removal) keeps its tab, per-repo status/PR and workspace root.
+  const multiRepo = isMultiRepoTask(task);
+  const activeRepoName = selectedRepositoryName(task, repoTab);
   const activeRepo = multiRepo
-    ? (task.repositories!.find((r) => r.name === repoTab) ?? task.repositories![0]!)
+    ? ((task.repositories ?? []).find((r) => r.name === activeRepoName) ?? null)
     : null;
+  // A repository removed from the task takes its tab with it: drop the stale
+  // selection so the terminal cwd (which reads `repoTab`) and the header
+  // follow the first remaining repository again.
+  const repoNamesKey = (task.repositories ?? []).map((r) => r.name).join("\0");
+  useEffect(() => {
+    if (repoTab !== null && selectedRepositoryName(task, repoTab) !== repoTab) setRepoTab(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `repoNamesKey` stands in for `task.repositories`
+  }, [repoTab, repoNamesKey]);
   const activeGitStatus = multiRepo
     ? (gitStatus?.repositories?.find((r) => r.name === activeRepo?.name)
       ?? gitStatus?.repositories?.[0]
@@ -4042,7 +4064,7 @@ function RunPanelBody({
   // a task switch. A single scope never waits (see the hook's doc).
   const capabilities = useAgentCapabilities(
     task.agent,
-    multiRepoScopes && multiRepoScopes.length > 1 ? multiRepoScopes : fileScope,
+    multiScopesOrNull(multiRepoScopes) ?? fileScope,
     { awaitReady: () => awaitStreamReady(task.id) },
   );
   const savedPromptsState = useSavedPrompts();
@@ -4352,24 +4374,33 @@ function RunPanelBody({
           // Per-repository selector (issue #291): the diff tabs' sibling for
           // status, PR head/path and new terminal cwd.
           <div className="mt-1 flex flex-wrap gap-1" role="tablist" aria-label="Repositories">
-            {task.repositories!.map((r) => (
-              <button
-                key={r.name}
-                type="button"
-                role="tab"
-                aria-selected={(activeRepo?.name ?? null) === r.name}
-                data-testid={`run-repo-tab-${r.name}`}
-                onClick={() => setRepoTab(r.name)}
-                className={cn(
-                  "rounded px-1.5 py-0.5 font-mono text-[10px]",
-                  (activeRepo?.name ?? null) === r.name
-                    ? "bg-info/15 text-info"
-                    : "text-muted-foreground hover:bg-muted",
-                )}
-              >
-                {r.name}
-              </button>
-            ))}
+            {(task.repositories ?? []).map((r) => {
+              // A repository whose checkout or source can't be read (deleted,
+              // no longer a git repository) is marked so the user can find
+              // the one to remove from the task details.
+              const problem = repositoryProblem(r, gitStatusForRepo(r.name));
+              return (
+                <button
+                  key={r.name}
+                  type="button"
+                  role="tab"
+                  aria-selected={(activeRepo?.name ?? null) === r.name}
+                  data-testid={`run-repo-tab-${r.name}`}
+                  data-repo-problem={problem ? "" : undefined}
+                  title={problem ?? undefined}
+                  onClick={() => setRepoTab(r.name)}
+                  className={cn(
+                    "inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 font-mono text-[10px]",
+                    (activeRepo?.name ?? null) === r.name
+                      ? (problem ? "bg-warning/15 text-warning" : "bg-info/15 text-info")
+                      : (problem ? "text-warning hover:bg-muted" : "text-muted-foreground hover:bg-muted"),
+                  )}
+                >
+                  {problem && <AlertTriangle className="size-2.5" aria-hidden />}
+                  {r.name}
+                </button>
+              );
+            })}
           </div>
         )}
         <HarnessStackBanner task={task} stacks={stacks} harnesses={harnesses} onRunTask={onRunTask} />
@@ -4623,6 +4654,8 @@ function RunPanelBody({
         homeDir={homeDir}
         onTaskFieldsChanged={onTaskFieldsChanged}
         liveBranch={activeGitStatus?.branch ?? null}
+        repoStatusFor={gitStatusForRepo}
+        onViewPullRequest={onViewPullRequest}
         tmuxSession={latestRun?.tmuxSession ?? null}
         // "Has this task ever run" for the Agent-details dialog's status
         // line — the union of every signal in scope, since each is
@@ -5481,7 +5514,9 @@ function BacklogItemRow({
   // reference any repository instead of only the active tab's. Expansion
   // still happens server-side on send; this is the suggestion/validation
   // layer only, same as every other composer.
-  const multiScopes = (fileScopes?.length ?? 0) > 1 ? fileScopes : null;
+  // Named scopes are passed only for a multi task (one entry for a multi task
+  // left with one repository), so their presence, not a count, decides.
+  const multiScopes = multiScopesOrNull(fileScopes);
   const singleScopeFiles = useProjectFiles(editing && !readOnly ? (fileScope ?? null) : null);
   const multiScopeFiles = useProjectFileScopes(editing && !readOnly ? multiScopes : null);
   const projectFiles = multiScopes ? multiScopeFiles : singleScopeFiles;
@@ -6068,7 +6103,7 @@ function TerminalsSection({ task, awaitReady, activeRepo }: { task: Task; awaitR
           <TerminalView
             taskId={task.id}
             archived={task.archivedAt != null}
-            repositories={(task.repositories?.length ?? 0) > 1 ? task.repositories!.map((r) => r.name) : undefined}
+            repositories={isMultiRepoTask(task) ? (task.repositories ?? []).map((r) => r.name) : undefined}
             activeRepo={activeRepo ?? null}
           />
         )}
@@ -8039,6 +8074,8 @@ function TaskDetails({
   homeDir,
   onTaskFieldsChanged,
   liveBranch,
+  repoStatusFor,
+  onViewPullRequest,
   tmuxSession,
   hasRun,
 }: {
@@ -8070,6 +8107,12 @@ function TaskDetails({
    *  git-status poll), `null` when unknown/detached. When it differs from
    *  `task.branch` the Branch row splits into "Checked out" + "Task branch". */
   liveBranch: string | null;
+  /** One repository's live status from the panel's batched multi-repo git
+   *  status poll (`null` when unknown) — the Repositories rows read each
+   *  repository's live branch and whether its checkout is readable. */
+  repoStatusFor: (name: string) => TaskGitStatus | null;
+  /** The panel's in-app PR view (same handler as the header's PR button). */
+  onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
   /** Tmux session name from the latest run (claude-code only). `null` when
    *  no run has spawned a session yet — the Tmux row hides itself in that
    *  case rather than presenting an Attach button that's guaranteed to 404. */
@@ -8090,6 +8133,45 @@ function TaskDetails({
   const profileLock = task.agentProfileId != null;
   const editable = !runningLock && !profileLock;
   const [detaching, setDetaching] = useState(false);
+  // "Remove from task" for one repository of a multi-repository task (issue
+  // #291). The busy marker is stamped with the task id, so a switch to
+  // another task mid-request can't leave that task's buttons disabled
+  // (`TaskDetails` is not remounted per task).
+  const confirm = useConfirm();
+  const [removingRepo, setRemovingRepo] = useState<{ taskId: string; name: string } | null>(null);
+  const removingHere = removingRepo !== null && removingRepo.taskId === task.id;
+  const multiRepo = isMultiRepoTask(task);
+  const removeBlockReason = multiRepo ? removeRepositoryBlockReason(task) : null;
+  const removeRepository = async (repo: TaskRepository) => {
+    const taskId = task.id;
+    const copy = removeRepositoryConfirmCopy(repo);
+    const ok = await confirm({
+      title: copy.title,
+      description: (
+        <div className="space-y-1">
+          {copy.lines.map((line) => <p key={line}>{line}</p>)}
+        </div>
+      ),
+      confirmLabel: copy.confirmLabel,
+      variant: "destructive",
+    });
+    if (!ok) return;
+    setRemovingRepo({ taskId, name: repo.name });
+    try {
+      const updated = await api.removeTaskRepository(taskId, repo.name);
+      // Merge only what the removal changed, keyed by the task it was sent
+      // for (`onTaskFieldsChanged` merges by id, so a task switch mid-request
+      // is safe); the panel drops a tab that pointed at the removed repository.
+      onTaskFieldsChanged?.(taskId, removalMergeFields(updated));
+      toast.success(`Removed ${repo.name} from this task`, {
+        description: repo.branch ? `Branch ${repo.branch} was kept.` : undefined,
+      });
+    } catch (e) {
+      toast.error(`Couldn't remove ${repo.name}`, { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setRemovingRepo((cur) => (cur?.taskId === taskId && cur.name === repo.name ? null : cur));
+    }
+  };
   // Agent-details modal (plan D2), opened by clicking the chip in the Agent
   // row below. Closed defensively if the task becomes unbound while open —
   // Detach clears `task.agentProfileId`/`agentProfile` out from under it, and
@@ -8579,6 +8661,81 @@ function TaskDetails({
             <dd className="min-w-0 truncate font-mono" title={task.workdir}>
               {abbreviateHome(task.workdir, homeDir)}
             </dd>
+
+            {multiRepo && (
+              <>
+                <dt className="text-muted-foreground">Repositories</dt>
+                <dd className="min-w-0 space-y-1" data-testid="task-details-repositories">
+                  {repositoryDetails(task.repositories ?? [], repoStatusFor).map((d) => {
+                    const repo = (task.repositories ?? []).find((r) => r.name === d.name)!;
+                    const busy = removingHere && removingRepo!.name === d.name;
+                    return (
+                      <div
+                        key={d.name}
+                        data-testid={`task-details-repo-${d.name}`}
+                        data-repo-problem={d.problem ? "" : undefined}
+                        className={cn(
+                          "min-w-0 rounded border px-1.5 py-1",
+                          d.problem ? "border-warning/50 bg-warning/10" : "border-border/60",
+                        )}
+                      >
+                        <div className="flex min-w-0 items-center justify-between gap-2">
+                          <span className="min-w-0 truncate font-mono font-medium">{d.name}</span>
+                          <Tooltip align="end" label={removeBlockReason ?? "Detach this repository's checkout and drop it from the task"}>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-5 shrink-0 px-1.5 text-[10px] text-muted-foreground hover:text-danger"
+                              data-testid={`task-details-repo-remove-${d.name}`}
+                              disabled={removeBlockReason !== null || removingHere}
+                              onClick={() => { void removeRepository(repo); }}
+                            >
+                              {busy ? "Removing…" : "Remove from task"}
+                            </Button>
+                          </Tooltip>
+                        </div>
+                        {d.problem && (
+                          <div className="flex items-center gap-1 text-[10px] text-warning" data-testid={`task-details-repo-problem-${d.name}`}>
+                            <AlertTriangle className="size-3 shrink-0" aria-hidden /> {d.problem}
+                          </div>
+                        )}
+                        <div className="truncate font-mono text-muted-foreground" title={d.path}>
+                          {abbreviateHome(d.path, homeDir)}
+                        </div>
+                        <div className="truncate font-mono">
+                          <span className="text-muted-foreground">branch </span>
+                          <span className={d.drifted ? "text-warning" : undefined}>{d.branchText ?? "—"}</span>
+                          {d.base && <span className="text-muted-foreground"> · base {d.base}</span>}
+                        </div>
+                        <div className="truncate font-mono" title={d.checkoutCreated ? d.checkoutText : undefined}>
+                          <span className="text-muted-foreground">checkout </span>
+                          {d.checkoutCreated
+                            ? abbreviateHome(d.checkoutText, homeDir)
+                            : <span className="italic text-muted-foreground">{d.checkoutText}</span>}
+                        </div>
+                        {d.prUrl && (
+                          <button
+                            type="button"
+                            className="max-w-full truncate text-info underline-offset-2 hover:underline"
+                            title={d.prUrl}
+                            data-testid={`task-details-repo-pr-${d.name}`}
+                            onClick={() => {
+                              if (parsePullNumber(d.prUrl!) != null) {
+                                onViewPullRequest({ projectPath: repo.worktreePath ?? repo.path, prUrl: d.prUrl! });
+                              } else {
+                                void api.openExternal(d.prUrl!).catch(() => {});
+                              }
+                            }}
+                          >
+                            {d.prUrl}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </dd>
+              </>
+            )}
 
             <dt className="text-muted-foreground">Isolation</dt>
             <dd className="min-w-0">{task.isolation}</dd>

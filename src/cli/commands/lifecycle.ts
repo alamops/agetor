@@ -208,7 +208,7 @@ export async function cmdRm(args: string[], flags: Flags): Promise<void> {
       ? {
           deleted: task.id,
           branches: preview.branches,
-          ...(preview.repositories && preview.repositories.length > 1
+          ...(preview.repositories && preview.repositories.length > 0
             ? { repositories: preview.repositories.map((r) => ({ name: r.name, branches: r.branches })) }
             : {}),
         }
@@ -235,13 +235,15 @@ export function teardownPhrase(
   // Multi-repository rows: name each repository's own removals, so the preview
   // matches what delete actually does per repository (the top-level `branches`
   // union alone loses which repo owns which name).
+  // Present only for a multi task — also one left with a single repository
+  // (issue #291) — so presence, not a count, decides.
   const repos = preview.repositories;
-  if (repos && repos.length > 1) {
+  if (repos && repos.length > 0) {
     const parts = repos.map((r) => {
       const names = r.branches.map((b) => escapeControlChars(b));
       return `${r.name}: ${names.length > 0 ? names.join(", ") : "no branches"}`;
     });
-    return `its worktrees + per-repository branches (${parts.join("; ")})`;
+    return `its ${repos.length === 1 ? "worktree" : "worktrees"} + per-repository branches (${parts.join("; ")})`;
   }
   const names = preview.branches.map((b) => escapeControlChars(b));
   if (names.length === 0) return preview.source === "none" ? "no worktree or branches" : "its worktree (no branches)";

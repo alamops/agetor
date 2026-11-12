@@ -684,3 +684,20 @@ test("multi-repository task offers a View PR entry for every repository that ope
     expect(e.group).toBe(ACTION_GROUP[e.action]);
   }
 });
+
+test("a multi task left with one repository keeps its per-repository entries (round 15)", () => {
+  const task = makeTask({
+    branch: null,
+    worktreePath: "/wt/t1",
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/t1/backend", baseRef: null, checkoutBranch: "feature/x", prUrl: "https://github.com/o/backend/pull/4" },
+    ],
+  });
+  const entries = buildTaskContextMenu(task, { isOpen: false });
+  expect(entries.filter((e) => e.repoName === "backend").map((e) => e.action)).toEqual([
+    "view-repo-pr",
+    "copy-repo-branch",
+    "copy-repo-worktree",
+  ]);
+});

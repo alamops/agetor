@@ -1,6 +1,7 @@
 import type { Task } from "../../shared/types.ts";
 import { isTaskFxPaused } from "../../shared/fx-recovery.ts";
 import { importedSessionOf } from "../../shared/imported-session.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 
 /** Every action the task context menu can offer. A subset of App.tsx's
  *  existing card callbacks (`start`/`cancel`/`markDone`/`archive`/
@@ -146,7 +147,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   if (task.prUrl) {
     entries.push({ action: "view-pr", label: "View pull request", group: "inspect" });
   }
-  if ((task.repositories?.length ?? 0) > 1) {
+  if (isMultiRepoTask(task)) {
     // Per-repository PRs (issue #291): a multi row has no single `prUrl` —
     // each repository stamps its own — so name every repository that opened
     // one. The board handler resolves `repoName` back to that entry's URL and
@@ -177,7 +178,7 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   if (!task.unread && !ctx.isOpen && task.hasAssistantMessages === true) {
     entries.push({ action: "mark-unread", label: "Mark as unread", group: "utility" });
   }
-  if ((task.repositories?.length ?? 0) > 1) {
+  if (isMultiRepoTask(task)) {
     // Per-repository copy entries (issue #291): the multi row has no single
     // branch/worktree path, so name each repository.
     for (const repo of task.repositories!) {

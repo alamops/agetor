@@ -723,6 +723,18 @@ export const api = {
    *  404 unknown task, 409 archived. */
   detachTaskAgentProfile: (taskId: string) =>
     j<Task>(`/tasks/${encodeURIComponent(taskId)}/agent-profile`, { method: "DELETE" }),
+  /** Remove one repository from a multi-repository task (issue #291): its
+   *  clean checkout is detached, its branch is kept. 404 unknown task or
+   *  repository; 409 `{error, code}` when refused (`running`,
+   *  `last-repository`, `dirty`, `not-multi`, `pipeline-step`, `detach-failed`) — the
+   *  thrown `ApiError` carries the core's message. `retry: false`: a replay
+   *  after a lost answer would 404 on the repository it already removed. */
+  removeTaskRepository: async (taskId: string, name: string): Promise<Task> =>
+    (await j<{ task: Task }>(
+      `/tasks/${encodeURIComponent(taskId)}/repositories/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+      { retry: false },
+    )).task,
   listPipelines: () => j<Pipeline[]>("/pipelines"),
   getPipeline: (id: string) => j<Pipeline>(`/pipelines/${encodeURIComponent(id)}`),
   createPipeline: (input: PipelineInput) =>

@@ -6,6 +6,7 @@
 // Contract: docs/architecture/multi-repo-tasks.md.
 import type { Task, TaskRepository } from "../../shared/types.ts";
 import type { RepoSelection } from "./repo-selection.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 
 /** Trimmed base ref, or null when unset/blank (blank means "HEAD"). */
 function refOf(entry: Pick<RepoSelection, "baseRef">): string | null {
@@ -176,16 +177,27 @@ export function createSessionGuard(): {
  * (its derived entry's branch is already `task.branch`).
  */
 export function taskSearchText(
-  t: Pick<Task, "title" | "prompt" | "workdir" | "branch"> & { repositories?: readonly TaskRepository[] },
+  t: Pick<Task, "title" | "prompt" | "workdir" | "branch"> & {
+    repositories?: readonly TaskRepository[];
+    multiRepo?: boolean;
+  },
 ): string {
   const repos = t.repositories ?? [];
-  const multi = repos.length > 1;
+  const multi = isMultiRepoTask(t);
   const repoHay = repos
     .map((r) => (multi
       ? [r.name, r.path, r.branch ?? "", r.checkoutBranch ?? ""].join(" ")
       : `${r.name} ${r.path}`))
     .join("\n");
   return `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}\n${repoHay}`.toLowerCase();
+}
+
+/**
+ * "1 repository" / "3 repositories" — a multi-repository task can be left
+ * with one repository after a removal, and "1 repositories" read as a bug.
+ */
+export function repositoryCountLabel(count: number): string {
+  return `${count} ${count === 1 ? "repository" : "repositories"}`;
 }
 
 // ── Delete confirm fallback ────────────────────────────────────────────────
@@ -222,11 +234,30 @@ export function multiRepoDeleteFallback(repos: readonly TaskRepository[]): {
  * always return null — their behavior is unchanged.
  */
 export function openFolderUnavailableReason(
-  t: Pick<Task, "worktreePath"> & { repositories?: readonly unknown[] },
+  t: Pick<Task, "worktreePath"> & { repositories?: readonly unknown[]; multiRepo?: boolean },
 ): string | null {
-  if ((t.repositories?.length ?? 0) < 2) return null;
+  if (!isMultiRepoTask(t)) return null;
   if (t.worktreePath) return null;
   return "The workspace folder is created when the task first runs. Start the task to open it.";
+}
+
+// ── Repository tab selection (run panel, diff dialog) ─────────────────────
+
+/**
+ * The repository tab a multi-repository surface should show: the current
+ * selection while that repository is still on the task, else the first one
+ * (a removal can take the selected repository away), or null for a
+ * single-repository task — which has no tabs, even though its derived
+ * `repositories` carries one entry.
+ */
+export function selectedRepositoryName(
+  task: { multiRepo?: boolean; repositories?: readonly { name: string }[] },
+  current: string | null | undefined,
+): string | null {
+  if (!isMultiRepoTask(task)) return null;
+  const repos = task.repositories ?? [];
+  if (current && repos.some((r) => r.name === current)) return current;
+  return repos[0]?.name ?? null;
 }
 
 // ── Run panel: Resolve Conflicts confirmation ──────────────────────────────

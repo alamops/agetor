@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { iconForRef } from "@/lib/file-icons";
 import { cn } from "@/lib/utils";
-import { searchProjectFiles, searchProjectFileScopes, resolveNamedScopePath, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
+import { multiScopesOrNull, searchProjectFiles, searchProjectFileScopes, resolveNamedScopePath, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { findActiveAtQuery, formatAtToken, MAX_PROJECT_FILES } from "../../../shared/at-refs.ts";
 import { descendInto, filterFileEntries, fuzzyPathMatch, type FileEntry } from "../../../shared/at-file-filter.ts";
 
@@ -33,7 +33,7 @@ interface Props {
    *  footer. */
   fileScope?: FileScope | null;
   /** Every repository scope for a multi-repository listing (issue #291). When
-   *  2+ are present the truncated-mode search runs over those scopes instead
+   *  present (one or more) the truncated-mode search runs over those scopes instead
    *  of `fileScope`: a prefixed query (`backend/src/`) searches that
    *  repository with the prefix stripped, and an unprefixed query searches
    *  every repository, re-prefixing each row so the popover commits a token in
@@ -155,7 +155,7 @@ export function AtFileAutocomplete({ entries, truncated, value, onChange, textar
   // `searchProjectFileScopes`): one scope when the query carries a workspace
   // prefix, all of them otherwise, with every row re-prefixed so committing a
   // remote row still inserts a valid `<name>/…` token.
-  const multiScopes = (fileScopes?.length ?? 0) > 1 ? fileScopes! : null;
+  const multiScopes = multiScopesOrNull(fileScopes);
   const scopeKey = multiScopes
     ? multiScopes.map((s) => `${s.name}\0${s.dir}\0${s.ref ?? ""}`).join("\0")
     : fileScope

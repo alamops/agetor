@@ -1877,15 +1877,18 @@ export function branchCommitType(
 
 /**
  * One repository a task was created against (issue #291). A multi-repository
- * task stores two or more of these in `tasks.repositories` (migration 087);
+ * task stores two or more of these in `tasks.repositories` (migration 087) —
+ * one or more once repositories were removed (`Task.multiRepo` stays true);
  * a single-repository task stores `[]` and derives its one entry from the
  * scalar `workdir`/`branch`/`worktreePath`/`baseRef`/`checkoutBranch`/`prUrl`
  * columns, so those stay authoritative for every legacy row.
  *
  * Every entry is server-managed: `createTask` rebuilds it from
  * `TaskRepositoryInput` and never trusts a client-supplied `worktreePath`,
- * `checkoutBranch`, `prUrl` or `branchSource`. The set is fixed at creation;
- * `PATCH /tasks/:id` rejects `repositories`.
+ * `checkoutBranch`, `prUrl` or `branchSource`. The set is chosen at creation;
+ * the only later change is removing one repository
+ * (`DELETE /tasks/:id/repositories/:name`). `PATCH /tasks/:id` rejects
+ * `repositories`.
  */
 export interface TaskRepository {
   /**
@@ -2267,7 +2270,8 @@ export interface Task {
   checkoutBranch?: string | null;
   /**
    * Every repository this task works on, in selection order (issue #291). For
-   * a multi-repository task this is the source of truth: two or more entries,
+   * a multi-repository task (`multiRepo`) this is the source of truth: two or
+   * more entries at creation, at least one after `removeTaskRepository`;
    * `workdir`/`worktreePath` both point at the per-task workspace root
    * (`<dataDir>/worktrees/<task-id>`), and `branch`/`baseRef`/`prUrl`/
    * `checkoutBranch` are `null`. A single-repository row stores `[]` in the
@@ -2282,10 +2286,26 @@ export interface Task {
    */
   repositories?: TaskRepository[];
   /**
+   * Whether this is a multi-repository task (issue #291): true iff the row
+   * STORES its `repositories` set (only multi rows do; a single row stores
+   * `[]` and derives its one entry on read). A task created with two or more
+   * repositories stays multi after repositories are removed down to one, so
+   * "multi" can't be read off `repositories.length`; go through
+   * `isMultiRepoTask` (`src/shared/multi-repo.ts`), which falls back to the
+   * count for an older core's JSON that lacks this field.
+   *
+   * Derived in `db.ts`'s `toTask`, never stored in its own column, never
+   * patchable, never bumps `updated_at`. Optional at the type level for the
+   * same fixture-compatibility reason as `repositories`.
+   */
+  multiRepo?: boolean;
+  /**
    * The `repositories[].path` whose remote matches `issueUrl`, or null. Only
    * that repository's PR body gets `Closes #N`; every other repository gets a
-   * plain reference. Set only at create time (insert-only, never patchable).
-   * Optional for the same fixture-compatibility reason as `repositories`.
+   * plain reference. Set at create time; cleared (set to null) when that
+   * repository is removed from the task (`removeTaskRepository`). Never
+   * patchable. Optional for the same fixture-compatibility reason as
+   * `repositories`.
    */
   issueRepoPath?: string | null;
   /**
@@ -2480,8 +2500,13 @@ export interface WorktreeTeardownResult {
    * holds user/agent files outside the repositories, so the root — and the
    * Worktrees row that represents it — survives. It is NOT "already absent";
    * reporting it as success left the row silently present after a delete.
+   *
+   * `source-missing` is per-repository (multi-repository teardown): the
+   * repository's source is gone or no longer a git repository, so git can't
+   * vouch for its checkout, which is left on disk untouched; the other
+   * repositories tear down as usual.
    */
-  reason?: "dirty" | "no-worktree" | "already-absent" | "failed" | "workspace-not-empty";
+  reason?: "dirty" | "no-worktree" | "already-absent" | "failed" | "workspace-not-empty" | "source-missing";
   /**
    * Per-repository outcomes for a multi-repository task (issue #291). The
    * top-level fields mirror the aggregate: `removed` is true only when every
@@ -6503,10 +6528,14 @@ export interface ToolResultEventData {
  * 4-tick outer -> one <pre>; 3-tick outer -> two, split at the inner fence).
  */
 export function commitPushPrompt(
-  task: Pick<Task, "branch" | "taskType"> & Pick<Partial<Task>, "repositories" | "issueRepoPath">,
+  task: Pick<Task, "branch" | "taskType"> & Pick<Partial<Task>, "repositories" | "issueRepoPath" | "multiRepo">,
 ): string {
   const ccType = branchCommitType(task.branch, task.taskType);
-  const repos = task.repositories && task.repositories.length > 1 ? task.repositories : null;
+  // Same decision as `isMultiRepoTask` (src/shared/multi-repo.ts), inlined
+  // because that module imports this one's types: a one-repository multi task
+  // still gets the per-repository prompt (its cwd is the non-git workspace).
+  const multi = task.multiRepo ?? (task.repositories?.length ?? 0) > 1;
+  const repos = multi && task.repositories && task.repositories.length > 0 ? task.repositories : null;
   if (repos) {
     const repoLines = repos
       .map((r) => `- ${r.name}: branch ${r.branch ? `'${r.branch.replace(/'/g, "'\\''")}'` : "<branch>"}`)

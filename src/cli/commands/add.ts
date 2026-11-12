@@ -47,6 +47,7 @@ import {
 import { agentProfileSummary, asProfileError, matchAgentProfileRef } from "../../shared/agent-profile.ts";
 import { matchPipelineRef } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 
 export interface AddOpts {
   title?: string;
@@ -507,14 +508,16 @@ export function repositorySetOutcome(
   return task.repositories.length < requested ? "collapsed" : "ok";
 }
 
-function collapsedRepositoriesNote(
+export function collapsedRepositoriesNote(
   input: Pick<CreateTaskInput, "repositories">,
-  task: Pick<Task, "repositories">,
+  task: Pick<Task, "repositories" | "multiRepo">,
 ): string {
   const kept = task.repositories?.length ?? 0;
-  if (kept <= 1) return "the selected paths are in one git repository, so the task was created as a single-repository task";
+  // The core's own verdict (`multiRepo`), not the kept count: it decides
+  // whether a set that collapsed was made a single-repository task.
+  if (!isMultiRepoTask(task)) return "the selected paths are in one git repository, so the task was created as a single-repository task";
   const requested = input.repositories?.length ?? 0;
-  return `${requested - kept} selected path${requested - kept === 1 ? "" : "s"} shared a git repository with another selection; the task has ${kept} repositories`;
+  return `${requested - kept} selected path${requested - kept === 1 ? "" : "s"} shared a git repository with another selection; the task has ${kept} ${kept === 1 ? "repository" : "repositories"}`;
 }
 
 /** Pure decision of whether `agetor add` should run non-interactively (a

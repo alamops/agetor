@@ -41,7 +41,7 @@ Commands:
   ls [filters]        list tasks (--column/--agent/--type/--repo/--search/--archived/--all)
   ps                  list running / blocked tasks
   show <id>           task details, runs, pending interactions
-  edit <id> [flags]   change title/prompt/agent/workdir/model/mode/effort/type/column
+  edit <id> [flags]   change title/prompt/agent/workdir/model/mode/effort/type/column, remove a repository
   move <id> <column>  move a task between columns (mark done = move <id> done)
   start <id>          run a not-yet-run task
   send <id> <msg…>    message a task (--ref <path> attaches files/images)

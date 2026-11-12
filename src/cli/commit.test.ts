@@ -55,3 +55,9 @@ test("commitNote: an uninspectable repository beside clean ones can't be called 
   // The first repository unreadable no longer hides a dirty sibling.
   expect(commitNote({ ...clean, ignored: true, repositories: [{ ...clean, ignored: true }, { ...clean, hasChanges: true }] })).toBe("");
 });
+
+test("commitNote: a one-repository per-repo array still decides (round 15, multi task left with one repository)", () => {
+  // The top-level mirror says dirty, but the per-repository answer is
+  // authoritative for a multi task, whatever its count.
+  expect(commitNote({ hasChanges: true, repositories: [{ ...clean, ahead: 1 }] })).toBe(" (working tree clean — push only)");
+});

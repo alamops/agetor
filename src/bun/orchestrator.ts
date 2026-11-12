@@ -295,6 +295,8 @@ import {
   removeWorkspaceIfEmpty,
   workspaceHasOnlyAgetorScratch,
   MULTI_REPO_CONCURRENCY,
+  detachRepositoryForRemoval,
+  withTaskPrepareLock,
   type PreparedWorkdir,
 } from "./worktree.ts";
 import {
@@ -303,6 +305,7 @@ import {
   pinnedBranchesFor,
 } from "./task-repos.ts";
 import { composeRunPrompt } from "../shared/launch-prompt.ts";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
@@ -471,7 +474,7 @@ function enqueueTeardown(taskId: string, key: string, job: () => Promise<void>):
  */
 function teardownKeysForTask(task: Task): string[] {
   const repos = task.repositories ?? [];
-  if (repos.length > 1) return repos.map((r) => r.path);
+  if (isMultiRepoTask(task) && repos.length > 0) return repos.map((r) => r.path);
   return [task.workdir];
 }
 
@@ -513,7 +516,46 @@ function enqueueTeardownMany(taskId: string, keys: string[], job: () => Promise<
  * drain the queue deterministically.
  */
 export function pendingTeardown(taskId: string): Promise<void> {
-  return teardowns.get(taskId) ?? Promise.resolve();
+  const removal = repositoryRemovals.get(taskId);
+  const teardown = teardowns.get(taskId);
+  if (!removal) return teardown ?? Promise.resolve();
+  return Promise.all([teardown, removal]).then(() => undefined);
+}
+
+/**
+ * In-flight `removeTaskRepository` jobs, per task id. Kept apart from
+ * `teardowns` on purpose: `isTaskTearingDown` means "archive/delete is taking
+ * this task away", and a repository removal must not make a terminal open or
+ * a queued OpenCode/fx turn read as that. `pendingTeardown` awaits both, so
+ * every materializing path (start, follow-up, unarchive, terminal open) waits
+ * for a removal to settle before it reads the row's repository set.
+ */
+const repositoryRemovals = new Map<string, Promise<unknown>>();
+
+/**
+ * Run `job` after any teardown already queued on `keys` (the task's selected
+ * repository paths, the same FIFO `enqueueTeardownMany` uses) and after this
+ * task's own pending teardown/removal, and make it the tail of every key, so a
+ * later archive/delete teardown on those repositories waits for it. Unlike the
+ * teardown FIFO it hands the job's result back (the route answers with it),
+ * and its failure rejects only this call — the chain itself never rejects.
+ */
+function enqueueRepositoryRemoval<T>(taskId: string, keys: string[], job: () => Promise<T>): Promise<T> {
+  const unique = [...new Set(keys)].sort();
+  const waits = [
+    ...unique.map((k) => teardownTails.get(k) ?? Promise.resolve()),
+    teardowns.get(taskId) ?? Promise.resolve(),
+    repositoryRemovals.get(taskId) ?? Promise.resolve(),
+  ];
+  const result = Promise.all(waits).then(job);
+  const settled = result.then(() => undefined, () => undefined);
+  for (const k of unique) teardownTails.set(k, settled);
+  repositoryRemovals.set(taskId, settled);
+  settled.finally(() => {
+    for (const k of unique) if (teardownTails.get(k) === settled) teardownTails.delete(k);
+    if (repositoryRemovals.get(taskId) === settled) repositoryRemovals.delete(taskId);
+  });
+  return result;
 }
 
 /** Tasks whose `deleteTask` is in progress. A pipeline parent's delete awaits
@@ -1588,9 +1630,8 @@ export async function reconcileOrphans(): Promise<number> {
  */
 function stepCheckoutMissing(task: Task): boolean {
   if (!task.worktreePath || !existsSync(task.worktreePath)) return true;
-  const repos = task.repositories ?? [];
-  if (repos.length <= 1) return false;
-  return repos.some((r) => !r.worktreePath || !existsSync(r.worktreePath));
+  if (!isMultiRepoTask(task)) return false;
+  return (task.repositories ?? []).some((r) => !r.worktreePath || !existsSync(r.worktreePath));
 }
 
 /**
@@ -1609,16 +1650,24 @@ function stepCheckoutMissing(task: Task): boolean {
  *   pairs which external git dirs it may write (`gitWritableRoots`).
  *
  * Called from `spawnAgentOrFail`, so every spawn path (first launch,
- * follow-up, swap, retry) gets the same roots. A single-repository task gets
- * the very same `opts` object back, so its argv stays byte-identical.
+ * follow-up, swap, retry) gets the same roots. A checkout that isn't on disk
+ * at spawn time is left out of both. A multi task is decided by
+ * `isMultiRepoTask` (one repository left after removals included). A
+ * single-repository task gets the very same `opts` object back, so its argv
+ * stays byte-identical. Exported for its unit test.
  */
-function withTaskRepositoryRoots(
+export function withTaskRepositoryRoots(
   taskId: string,
   opts: SpawnAgentArgs["opts"],
 ): SpawnAgentArgs["opts"] {
-  const repos = tasks.get(taskId)?.repositories ?? [];
-  if (repos.length <= 1) return opts;
-  const materialized = repos.filter((r): r is TaskRepository & { worktreePath: string } => Boolean(r.worktreePath));
+  const task = tasks.get(taskId);
+  if (!task || !isMultiRepoTask(task)) return opts;
+  // Only checkouts that exist right now: a repository whose checkout is gone
+  // (its source repository was deleted, a hand-removed directory) would make
+  // `--add-dir` name a missing path, which some CLIs refuse outright.
+  const materialized = (task.repositories ?? []).filter(
+    (r): r is TaskRepository & { worktreePath: string } => Boolean(r.worktreePath) && existsSync(r.worktreePath!),
+  );
   if (materialized.length === 0) return opts;
   return {
     ...opts,
@@ -2205,7 +2254,8 @@ export async function startTask(
  */
 function worktreeDriftStatusLines(task: Task, prepared: PreparedWorkdir): string[] {
   const lines: string[] = [];
-  if (prepared.repositories && prepared.repositories.length > 1) {
+  // `prepared.repositories` is present exactly when the multi path ran.
+  if (prepared.repositories) {
     for (const repo of prepared.repositories) {
       if (repo.worktreePath && repo.branch && repo.checkoutBranch && repo.checkoutBranch !== repo.branch) {
         lines.push(`${repo.name}: worktree is on ${repo.checkoutBranch} (task branch ${repo.branch}) — running there`);
@@ -2254,6 +2304,11 @@ async function startTaskInner(
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
   // directory out from under the freshly-prepared one.
   await pendingTeardown(taskId);
+  // A multi task's repository set may have changed while that wait ran (a
+  // `removeTaskRepository` settles through the same wait), and the prepare
+  // below must not re-create a checkout that was just removed. A single
+  // task's row is used exactly as before.
+  if (isMultiRepoTask(task)) task = tasks.get(taskId) ?? task;
 
   // Starting an archived task auto-unarchives it — otherwise the card would
   // move through columns (running → review/ready) while hidden behind the
@@ -2455,7 +2510,7 @@ async function startTaskInner(
   // single-repository prepare folds every value into one flat set, so asking
   // for root keys there would spawn a `git rev-parse` per pinned path for
   // nothing.
-  const multiRepo = (task.repositories?.length ?? 0) > 1;
+  const multiRepo = isMultiRepoTask(task);
   const prepared = await prepareTaskWorkdir(task, {
     takenBranches: await branchesPinnedByOtherTasks(
       taskId,
@@ -2470,8 +2525,9 @@ async function startTaskInner(
   // budget refusal, a failing expansion) would otherwise leave checkouts on
   // disk that the row doesn't name, and delete/archive teardown only removes
   // the repositories the row records. `persist` writes them again, with the
-  // pinned base refs.
-  if (prepared.repositories && prepared.repositories.length > 1) {
+  // pinned base refs. (`prepared.repositories` is present exactly when the
+  // multi path ran, one entry included.)
+  if (prepared.repositories) {
     const checkouts = prepared.repositories;
     db.transaction(() => {
       tasks.setRepositories(taskId, checkouts);
@@ -2526,7 +2582,8 @@ async function startTaskInner(
   // before the references block, and a single-repository launch is
   // byte-identical to before because the block is null there. The pipeline
   // runner's step budget composes through the same shared helper.
-  const composeForRun = (text: string): string => composeRunPrompt(effective, text, prepared.repositories);
+  const composeForRun = (text: string): string =>
+    composeRunPrompt(effective, text, { multiRepo, repositories: prepared.repositories });
   const expandedOverage = promptByteOverage(
     harness.kind,
     appendReferences(composeForRun(expandedPrompt), task.references),
@@ -2558,7 +2615,7 @@ async function startTaskInner(
   // `worktreePath` is the workspace root — not a git checkout — so this would
   // spawn a doomed `git rev-parse` there and discard the result on every
   // start/retry; the per-repository block below is the real pin.
-  const multiPrepared = Boolean(prepared.repositories && prepared.repositories.length > 1);
+  const multiPrepared = Boolean(prepared.repositories);
   if (shouldLazyPinBaseRef(task.baseRef, prepared)) {
     const sha = await resolveRef(task.workdir, "HEAD");
     if (sha) tasks.update(taskId, { baseRef: sha });
@@ -2600,7 +2657,7 @@ async function startTaskInner(
     // Multi-repository materialization: persist every entry's worktree path,
     // branch (possibly a per-repo fallback) and last-seen checkout in the same
     // transaction as the workspace mirror above.
-    if (prepared.repositories && prepared.repositories.length > 1) {
+    if (prepared.repositories) {
       tasks.setRepositories(taskId, prepared.repositories);
       // The prepare's live reads are the freshest checkout values; record
       // them through the dedicated setter (see `setRepositories`' merge rule).
@@ -3730,7 +3787,7 @@ async function noteRunSettledCheckout(taskId: string): Promise<void> {
     const task = tasks.get(taskId);
     if (!task || task.isolation !== "worktree" || !task.worktreePath) return;
     const repos = task.repositories ?? [];
-    if (repos.length > 1) {
+    if (isMultiRepoTask(task)) {
       // Multi-repository: the scalar worktreePath is the non-git workspace
       // root, so a single read there always failed and every repository's
       // recorded checkout went stale after a turn that switched branches.
@@ -11700,6 +11757,9 @@ export async function createTask(
     issueUrl: validatedIssueUrl,
     issueRepoPath: multiRepo ? issueRepoPath : null,
     repositories: multiRepo ? repositories : [],
+    // Create time is the one place "multi" is a count (2+ repositories kept
+    // after dedupe); from here on the row's stored set decides (`toTask`).
+    multiRepo,
     mode: defaultsProfile ? defaultsProfile.mode : (input.mode ?? null),
     model,
     effort,
@@ -11875,7 +11935,7 @@ function enqueueArchiveTeardown(
     // the previously recorded value in place.
     if (!cur.pipelineParentId && cur.isolation === "worktree") {
       const repos = cur.repositories ?? [];
-      if (repos.length > 1) {
+      if (isMultiRepoTask(cur)) {
         // Multi-repository (issue #291): record every repo's live checkout
         // before any detach, so unarchive re-attaches onto the same branches.
         for (const repo of repos) {
@@ -12113,7 +12173,7 @@ export function recordPreparedRepositoryCheckouts(
  * is the one chance to say it.
  */
 export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): void {
-  if (prepared.repositories && prepared.repositories.length > 1) {
+  if (prepared.repositories) {
     // Persist the re-materialized per-repo paths/branches/checkouts.
     tasks.setRepositories(taskId, prepared.repositories);
     // `setRepositories` deliberately keeps a stored checkout (a concurrent
@@ -12142,7 +12202,7 @@ export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir):
  */
 function workdirNeedsRestore(task: Task): boolean {
   const repos = task.repositories ?? [];
-  if (repos.length > 1) {
+  if (isMultiRepoTask(task)) {
     if (repositoriesNeverMaterialized(task)) return false;
     return repos.some((r) => !r.worktreePath || !existsSync(r.worktreePath));
   }
@@ -12153,7 +12213,7 @@ function workdirNeedsRestore(task: Task): boolean {
  *  (no entry has a recorded worktree path). */
 function repositoriesNeverMaterialized(task: Task): boolean {
   const repos = task.repositories ?? [];
-  return repos.length > 1 && repos.every((r) => !r.worktreePath);
+  return isMultiRepoTask(task) && repos.every((r) => !r.worktreePath);
 }
 
 /**
@@ -12197,6 +12257,173 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
     }
   }
   return { task: updated };
+}
+
+/** Why `removeTaskRepository` refused (the route answers `409 {error, code}`). */
+export type RemoveTaskRepositoryCode =
+  | "running"
+  | "last-repository"
+  | "dirty"
+  | "not-multi"
+  | "pipeline-step"
+  | "detach-failed";
+
+export type RemoveTaskRepositoryResult =
+  | { task: Task }
+  | { error: string; status: 404 }
+  | { error: string; status: 409; code: RemoveTaskRepositoryCode };
+
+/**
+ * The refusals `removeTaskRepository` can decide from the row alone, or the
+ * entry to remove. Checked once before the job is queued (a fast answer) and
+ * again inside it, against the row as it stands once every earlier teardown,
+ * removal and prepare has settled.
+ */
+function repositoryRemovalRefusal(
+  task: Task,
+  name: string,
+): Exclude<RemoveTaskRepositoryResult, { task: Task }> | { entry: TaskRepository } {
+  if (task.pipelineParentId) {
+    return {
+      status: 409,
+      code: "pipeline-step",
+      error: "step task shares its pipeline's checkouts — remove the repository on the pipeline task",
+    };
+  }
+  if (!isMultiRepoTask(task)) {
+    return { status: 409, code: "not-multi", error: "task is not a multi-repository task" };
+  }
+  const repos = task.repositories ?? [];
+  const entry = repos.find((r) => r.name === name);
+  if (!entry) return { status: 404, error: `unknown repository "${name}"` };
+  const stepRunning = task.pipelineId != null && (
+    task.pipelineRun?.status === "running"
+    || tasks.stepsForParent(task.id).some((step) => step.column === "running" || isTaskRunLive(step.id))
+  );
+  if (task.column === "running" || isTaskRunLive(task.id) || stepRunning) {
+    return {
+      status: 409,
+      code: "running",
+      error: stepRunning
+        ? "a pipeline step is running — wait for it to finish, or stop it, before removing a repository"
+        : "task is running — wait for the run to finish, or stop it, before removing a repository",
+    };
+  }
+  if (repos.length <= 1) {
+    return {
+      status: 409,
+      code: "last-repository",
+      error: `"${name}" is the task's only repository — a task needs at least one`,
+    };
+  }
+  return { entry };
+}
+
+/**
+ * Remove one repository from a multi-repository task
+ * (docs/architecture/multi-repo-tasks.md) — the way out when a repository's
+ * source was deleted and every follow-up's restore failed on it. A task stays
+ * multi even when one repository is left (`multiRepo` is the stored set).
+ *
+ * Refuses (409) a pipeline step (`pipeline-step`, steps share the parent's
+ * checkouts), a single-repository task (`not-multi`), a task with a live or
+ * starting run or a pipeline parent with a running step (`running`), the
+ * task's last repository (`last-repository`), and a checkout with uncommitted
+ * changes (`dirty`). An unknown task or repository name is a 404.
+ *
+ * The checkout is detached through the archive machinery's owned-path checks
+ * when it exists, is clean and its source repository is still there; the
+ * branch is never deleted. A missing checkout or source repository just drops
+ * the entry. Then the remaining set is written (`tasks.setRepositories`, a
+ * server-managed targeted write, also onto every step row of a pipeline
+ * parent), `issueRepoPath` is cleared when it named the removed repository,
+ * and one status line goes on the task's event stream. Works on an archived
+ * task too.
+ *
+ * Serialized through `enqueueRepositoryRemoval` (behind any queued
+ * teardown on the task's repositories, and awaited by `pendingTeardown`, so a
+ * start/follow-up/unarchive/terminal open reads the new set) and the task's
+ * prepare lock (so no prepare is mid-flight on the checkout being removed).
+ */
+export async function removeTaskRepository(taskId: string, name: string): Promise<RemoveTaskRepositoryResult> {
+  const initial = tasks.get(taskId);
+  if (!initial) return { status: 404, error: "task not found" };
+  const early = repositoryRemovalRefusal(initial, name);
+  if (!("entry" in early)) return early;
+  return enqueueRepositoryRemoval(taskId, teardownKeysForTask(initial), () =>
+    withTaskPrepareLock(taskId, () => removeTaskRepositoryNow(taskId, name)),
+  );
+}
+
+async function removeTaskRepositoryNow(taskId: string, name: string): Promise<RemoveTaskRepositoryResult> {
+  const task = tasks.get(taskId);
+  if (!task) return { status: 404, error: "task not found" };
+  const checked = repositoryRemovalRefusal(task, name);
+  if (!("entry" in checked)) return checked;
+  const { entry } = checked;
+
+  const detached = await detachRepositoryForRemoval(task, entry);
+  if (detached.kind === "dirty") {
+    return {
+      status: 409,
+      code: "dirty",
+      error: `repository "${name}" has uncommitted changes (or its status couldn't be read) in ${detached.worktreePath} — commit or discard them, then remove it`,
+    };
+  }
+  if (detached.kind === "failed") {
+    return {
+      status: 409,
+      code: "detach-failed",
+      error: `couldn't remove repository "${name}"'s checkout at ${detached.worktreePath} — nothing was changed`,
+    };
+  }
+  // The detach awaited git; a start can't have begun meanwhile (it waits on
+  // this job through `pendingTeardown`), so the row read above still holds.
+  const remaining = (tasks.get(taskId)?.repositories ?? task.repositories ?? []).filter((r) => r.name !== name);
+  db.transaction(() => {
+    tasks.setRepositories(taskId, remaining);
+    if (task.issueRepoPath != null && task.issueRepoPath === entry.path) {
+      tasks.clearIssueRepoPath(taskId, entry.path);
+    }
+    // Step rows copy the parent's set (D2/M6) and check every entry's
+    // checkout before they launch; drop the entry there too, so a resumed or
+    // returned step doesn't refuse over a checkout that is gone on purpose.
+    if (task.pipelineId != null) {
+      for (const step of tasks.stepsForParent(taskId)) {
+        if (!isMultiRepoTask(step) || !(step.repositories ?? []).some((r) => r.name === name)) continue;
+        tasks.setRepositories(step.id, (step.repositories ?? []).filter((r) => r.name !== name));
+        if (step.issueRepoPath != null && step.issueRepoPath === entry.path) {
+          tasks.clearIssueRepoPath(step.id, entry.path);
+        }
+      }
+    }
+  })();
+
+  const line = entry.branch
+    ? `removed repository ${name} from this task (branch ${entry.branch} kept)`
+    : `removed repository ${name} from this task`;
+  noteRepositoryRemoved(task, line);
+  const updated = tasks.get(taskId);
+  return updated ? { task: updated } : { status: 404, error: "task not found" };
+}
+
+/** Put the removal's status line on the task's latest run — for a pipeline
+ *  parent (no runs of its own), its latest step's — or the console when
+ *  nothing has run yet (there is no event stream to write it to). */
+function noteRepositoryRemoved(task: Task, line: string): void {
+  let latest: { taskId: string; runId: string; startedAt: number } | null = null;
+  const own = runs.listForTask(task.id)[0];
+  if (own) latest = { taskId: task.id, runId: own.id, startedAt: own.startedAt };
+  if (!latest && task.pipelineId != null) {
+    for (const step of tasks.stepsForParent(task.id)) {
+      const run = runs.listForTask(step.id)[0];
+      if (run && (!latest || run.startedAt > latest.startedAt)) {
+        latest = { taskId: step.id, runId: run.id, startedAt: run.startedAt };
+      }
+    }
+  }
+  if (latest) appendRunStatusLine(latest.taskId, latest.runId, line);
+  else console.log(`[agetor] task ${task.id}: ${line}`);
 }
 
 /** One repository's branch-teardown plan (issue #291). */
@@ -12282,7 +12509,7 @@ async function branchesHeldByOtherTasks(
       if (r.branch) held.add(r.branch);
       if (r.checkoutBranch) held.add(r.checkoutBranch);
     }
-    if (otherRepos.length > 1) continue;
+    if (isMultiRepoTask(other)) continue;
     const workdirInThisRepo = other.workdir === sourcePath
       || (root != null && (await rootOf(other.workdir)) === root);
     if (!workdirInThisRepo) continue;
@@ -12340,12 +12567,26 @@ function memoAsync<T>(fn: (key: string) => Promise<T>): (key: string) => Promise
  */
 export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownPreview> {
   const repos = task.repositories ?? [];
-  if (repos.length > 1 && task.isolation === "worktree" && !task.pipelineParentId) {
+  if (isMultiRepoTask(task) && repos.length > 0 && task.isolation === "worktree" && !task.pipelineParentId) {
     const plans: RepoTeardownPlan[] = [];
     const allTasks = tasks.list();
     const rootOf = memoAsync(repoRoot);
     const defaultBranchOf = memoAsync(resolveDefaultBranchName);
     for (const repo of repos) {
+      // A repository whose source is gone plans nothing: delete leaves its
+      // checkout alone (git can't vouch for it) and no branch can be removed.
+      if (!(await rootOf(repo.path))) {
+        plans.push({
+          name: repo.name,
+          path: repo.path,
+          branches: [],
+          liveBranch: null,
+          taskBranch: repo.branch,
+          source: "none",
+          excluded: [],
+        });
+        continue;
+      }
       const plan = await planOneRepoTeardown(
         task,
         repo.path,
@@ -12583,12 +12824,13 @@ export function discardRefusedWorktree(
     // The workspace root counts as materialized whenever any nested checkout
     // was created; both detach/remove are idempotent when a child is gone.
     if (!existsSync(prepared.worktreePath)) return;
-    const multi = (prepared.repositories?.length ?? 0) > 1;
+    // `prepared.repositories` is present exactly when the multi path ran.
+    const multi = prepared.repositories !== undefined;
     const target: Task = {
       ...(cur ?? task),
       worktreePath: prepared.worktreePath,
       branch: prepared.branch,
-      ...(multi ? { repositories: prepared.repositories } : {}),
+      ...(multi ? { repositories: prepared.repositories, multiRepo: true } : {}),
     };
     if (cur) {
       await detachWorktree(target);
@@ -12634,7 +12876,7 @@ export function sweepArchivedTeardowns(): number {
     // per step just adds queue churn.
     if (task.pipelineParentId) continue;
     const repos = task.repositories ?? [];
-    const multi = repos.length > 1;
+    const multi = isMultiRepoTask(task);
     if (multi) {
       // Also enqueue when only the (non-git) workspace root is left — a
       // previous teardown may have removed every repository worktree but
@@ -12932,7 +13174,7 @@ export function listWorktrees(): WorktreeInfo[] {
 
     // A multi-repository task's workspace root is not itself a worktree: it
     // expands to one row per repository directory that exists on disk.
-    if (task && (task.repositories?.length ?? 0) > 1) {
+    if (task && isMultiRepoTask(task)) {
       let repoRows = 0;
       for (const repo of task.repositories!) {
         const repoDir = repo.worktreePath ?? join(dirPath, repo.name);

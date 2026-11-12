@@ -194,3 +194,22 @@ describe("pinPrimaryRepository", () => {
     expect(out.map((e) => e.path)).toEqual(["/repos/issue", "/repos/api"]);
   });
 });
+
+describe("multi task left with one repository (round 15)", () => {
+  // The workspace root is never a git repository, whatever the count.
+  const task = {
+    workdir: "/data/worktrees/t1",
+    multiRepo: true,
+    issueRepoPath: null,
+    repositories: [{ path: "/repos/backend" }],
+  };
+  test("taskProjectPath answers its remaining repository, not the workspace root", () => {
+    expect(taskProjectPath(task)).toBe("/repos/backend");
+  });
+  test("issueProjectPath falls back to the remaining repository", () => {
+    expect(issueProjectPath(task)).toBe("/repos/backend");
+  });
+  test("a single task's derived entry still answers its workdir", () => {
+    expect(taskProjectPath({ workdir: "/repo", multiRepo: false, repositories: [{ path: "/other" }] })).toBe("/repo");
+  });
+});

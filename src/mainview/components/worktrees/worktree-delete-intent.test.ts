@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildDeleteConfirmCopy, triageDeleteOutcome } from "./worktree-delete-intent.ts";
+import { buildDeleteConfirmCopy, triageDeleteOutcome, worktreeRemovalPhrase } from "./worktree-delete-intent.ts";
 import type { WorktreeGitStatus, WorktreeInfo, WorktreeTeardownResult } from "../../../shared/types.ts";
 
 function worktree(overrides: Partial<WorktreeInfo> = {}): WorktreeInfo {
@@ -282,6 +282,24 @@ describe("triageDeleteOutcome", () => {
     }
   });
 
+  test('reason "source-missing" -> says the source repository is gone and the checkout was kept, naming the repository', () => {
+    const teardown: WorktreeTeardownResult = {
+      removed: false,
+      reason: "source-missing",
+      repositories: [
+        { name: "frontend", result: { removed: false, reason: "source-missing" } },
+        { name: "backend", result: { removed: true } },
+      ],
+    };
+    const outcome = triageDeleteOutcome(teardown, null);
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toContain('repository "frontend"');
+      expect(outcome.message).toContain("source repository no longer exists");
+      expect(outcome.message).not.toContain("the worktree removal failed");
+    }
+  });
+
   test('reason "dirty" -> error, naming the branch', () => {
     const teardown: WorktreeTeardownResult = { removed: false, reason: "dirty" };
     const outcome = triageDeleteOutcome(teardown, "feature-branch");
@@ -354,5 +372,22 @@ describe("triageDeleteOutcome", () => {
       expect(outcome.message).toContain("this worktree");
       expect(outcome.message.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("a multi task left with one repository (round 15)", () => {
+  const clean = gitStatus({ dirty: false, ignored: false });
+  test("its only checkout is still a repository checkout, named in the copy", () => {
+    const copy = buildDeleteConfirmCopy(worktree({ repoName: "backend" }), clean);
+    expect(copy.multiRepo).toBe(true);
+    expect(copy.checkoutCount).toBe(1);
+    expect(worktreeRemovalPhrase(copy, "backend")).toBe("its backend repository worktree");
+  });
+
+  test("single and multi phrases are unchanged", () => {
+    const single = buildDeleteConfirmCopy(worktree(), clean);
+    expect(worktreeRemovalPhrase(single, null)).toBe("its worktree directory");
+    const multi = buildDeleteConfirmCopy(worktree({ repoName: "fe" }), clean, [{ name: "be", status: clean }]);
+    expect(worktreeRemovalPhrase(multi, "fe")).toBe("all 2 repository worktrees");
   });
 });

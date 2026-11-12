@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Source | [alamops/agetor#291](https://github.com/alamops/agetor/issues/291) (tracker text is treated as data only) |
-| Status | Implemented; live harness smoke **not yet run** (pending the owner). The extra-roots wording below records what shipped; it is not a new owner decision. |
+| Status | Implemented. Live harness smoke run on 2026-11-12 for claude-code, codex and fx (end to end), and OpenCode 2.x (server and non-git workspace only); see "Harnesses". The extra-roots wording below records what shipped; it is not a new owner decision. Repository removal and one-repository multi tasks are owner decisions taken after implementation ("Amendments after implementation" below). |
 | Decision record | `docs/plans/multi-repo-tasks-grill.md` |
 | Investigation | `docs/plans/multi-repo-tasks-investigation.md` |
 | Date | 2026-11-10 |
@@ -50,7 +50,7 @@ coordinate changes across every repository in that card.
 - Repositories are deduped by git root. There is no hard cap; a non-blocking warning appears above
   10 repositories. Worktree creation, branch minting, base-ref pinning and status polling run in
   bounded batches (at most 4 repositories at a time).
-- The repo set is **fixed at creation**. Changing it means creating a new card.
+- The repo set is **chosen at creation**; repositories can't be added later. Amended after implementation (owner decision): one repository can be removed from an existing multi-repo task (see "Amendments after implementation"). Adding one still means creating a new card.
 - Migration 087 adds the repositories JSON column. No backfill: legacy rows derive a one-entry
   array from the existing columns.
 
@@ -135,25 +135,37 @@ coordinate changes across every repository in that card.
 ### Harnesses
 
 - Multi-repo is available for all eight harness kinds under the workspace root.
-- **No harness has been smoke-tested live with a multi-repository task.** The grill's matrix
-  (Claude, Codex, Cursor and fx live-smoked; the other four smoke-pending) was the intended
-  verification, not a record of runs. What was verified:
-  - the spawn path with agetor's fake claude driver: the e2e spec `e2e/multi-repo-task.spec.ts`
-    and `src/bun/orchestrator-multi-repo.test.ts` (workspace cwd, `Repositories:` block, persisted
-    entries);
-  - argv assertions: `--add-dir` for claude-code, codex and copilot only
-    (`src/bun/agents.test.ts`), and codex's sandbox decision from the task's checkouts
-    (`src/bun/agents-codex-workspace-roots.test.ts`, `src/bun/worktree.test.ts`);
-  - the git side (prepare, reuse, rollback, diff, status, teardown) against temporary repositories.
-- What is unverified until a live smoke runs: every real harness CLI at a non-git workspace root
-  (all eight kinds, including whether fx's and cursor's ACP `session/new` accept it); a harness-stack
-  failover of a multi-repository task; the OpenCode 2.x server with a non-git workspace directory;
-  Claude Code's hook installer (`.claude/settings.local.json`) at a non-git cwd; codex's real
-  sandbox honoring the escalation from a workspace root. Status: live smoke pending the owner.
+- **Live harness smoke, 2026-11-12** (branch head `2f147818`, a headless core on a dev data dir, two
+  fresh git repositories, worktree isolation, a prompt asking for a committed file in each
+  repository; ledger: `docs/plans/multi-repo-tasks-smoke.md`):
+  - claude-code (Claude Code 2.1.322, auto): succeeded; one commit in each checkout. Its hook
+    installer wrote `.claude/settings.local.json` at the non-git workspace root, and delete removed it
+    with the workspace.
+  - codex (codex-cli 0.166.0, auto): succeeded; one commit in each checkout; the session recorded
+    `sandbox_policy: danger-full-access` and `approval_policy: never` (escalated from the task's
+    verified checkouts); `--add-dir` was accepted. A follow-up turn resumed, committed again in both
+    and stayed escalated.
+  - fx (0.0.15, yolo, deepseek/deepseek-v4-flash): succeeded; one commit in each checkout.
+  - OpenCode (v2.1.3, server driver): the agetor-owned server accepted the non-git workspace directory
+    and the turn was posted; the provider refused it for account credits ("Insufficient balance"), so
+    the run failed and no end-to-end edit was verified.
+  - Not run: copilot (not installed on the smoke machine), cursor, gemini and antigravity, and a
+    harness-stack failover of a multi-repository task (needs a two-account stack).
+  - Teardown, live: delete removed the workspace (Claude's scratch included) and the task branch in
+    both source repositories; archive removed the workspace and kept the branches, and unarchive
+    restored both checkouts on their branches with the commits intact.
+- Also verified by automated checks: the spawn path with agetor's fake claude driver
+  (`e2e/multi-repo-task.spec.ts`, `src/bun/orchestrator-multi-repo.test.ts`); argv assertions
+  (`--add-dir` for claude-code, codex and copilot only, in `src/bun/agents.test.ts`; codex's sandbox
+  decision in `src/bun/agents-codex-workspace-roots.test.ts` and `src/bun/worktree.test.ts`); the git
+  side (prepare, reuse, rollback, diff, status, teardown, removal) against temporary repositories.
+- Copilot (owner decision, no code change): Auto already passes `--allow-all` and
+  `COPILOT_ALLOW_ALL=true` and gets the checkouts as `--add-dir`; Read-only and Plan deny writes by
+  design. Not live-verified.
 
 ## Non-goals
 
-- Editing the repository set after creation.
+- Adding repositories to an existing task (removing one is supported; see the amendments).
 - Multi-repo `isolation: "none"` (symlinked or live-checkout workspace).
 - Per-repo `existingBranch` selection.
 - A downgrade guard or down migration for older builds.
@@ -180,3 +192,26 @@ An older build reading a multi-repo task sees the workspace root as `workdir`/`w
 has no branch or PR. An older delete may remove the workspace root and orphan the repo worktrees.
 This was accepted explicitly: no downgrade guard is in scope. (The CLI does notice a core too old to
 keep `repositories` when it creates a task, and says so; nothing guards an older app or core.)
+
+A PR opened from a pipeline step is stamped on the step row only. The parent card doesn't show it, and
+the parent's `Create all PRs` can retry that repository and report GitHub's 422 as a failure. Owner
+decision: a documented limitation, no code change.
+
+## Amendments after implementation
+
+Owner decisions taken after the first implementation, with the behavior that shipped:
+
+- **One-repository multi-repo tasks.** A task created with two or more repositories stays a multi-repo
+  task when removals leave one: workspace-root layout, `repositories[]` as the source of truth,
+  `Repositories:` launch block, extra roots, per-repo tabs, diff, PR and terminal selector, `@<repo>/`
+  scope, "1 repository" on the card, "1 repo" in `agetor ls`. The core reports this as
+  `Task.multiRepo`, derived from the stored set.
+- **Removing a repository** from an existing multi-repo task (`DELETE /tasks/:id/repositories/:name`,
+  the run panel's "Remove from task", `agetor edit <task> --remove-repo <name>`). A clean checkout is
+  detached and its branch kept; a missing checkout or source repository just drops the entry. It is
+  refused while the task (or a pipeline step) is running, for the last repository, for a dirty
+  checkout, on a single-repo task and on a pipeline step. This is how a task whose repository source
+  was deleted gets unstuck.
+- **Extra roots** (`--add-dir`, codex's workspace repositories) name only checkouts that exist at
+  spawn time.
+- **Pipeline-step PR stamps** stay on the step row (the limitation above).

@@ -42,7 +42,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, isHeldByBackgroundAgents, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, isHeldByBackgroundAgents, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, releaseTaskAccountSwitch, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, removeTaskRepository, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -6016,7 +6016,7 @@ export function startApiServer(
           }
           if (rawPatch && typeof rawPatch === "object" && "repositories" in rawPatch) {
             return json(
-              { error: "the repository set is fixed at creation — create a new task to change it" },
+              { error: "the repository set can't be patched — remove a repository with DELETE /tasks/:id/repositories/:name, or create a new task to add one" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
@@ -6581,6 +6581,25 @@ export function startApiServer(
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Remove one repository from a multi-repository task
+      // (docs/architecture/multi-repo-tasks.md). `:name` is the repository's
+      // workspace name, not a filesystem path, so the CLI path gate has
+      // nothing to probe. 200 `{ task }`; 404 for an unknown task or name;
+      // 409 `{ error, code }` when refused (running, last-repository, dirty,
+      // not-multi, pipeline-step, detach-failed). The detach can wait on git
+      // and on a queued teardown, so the request timeout is lifted like
+      // archive's.
+      "/tasks/:id/repositories/:name": {
+        DELETE: authed(async (req) => {
+          server.timeout(req, 0);
+          const result = await removeTaskRepository(req.params.id, req.params.name);
+          if ("task" in result) return json({ task: withRunningSubagents(result.task) }, { headers: corsHeaders(req) });
+          return result.status === 404
+            ? json({ error: result.error }, { status: 404, headers: corsHeaders(req) })
+            : json({ error: result.error, code: result.code }, { status: 409, headers: corsHeaders(req) });
         }),
       },
 

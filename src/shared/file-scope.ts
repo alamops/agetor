@@ -11,7 +11,7 @@
 // (`GET /agent-discovery`, whose `workdir`/`branch` params are exactly
 // `scope.dir`/`scope.ref`, via {@link discoveryParamsForTask}).
 import type { Task } from "./types.ts";
-import { repositoriesForTask } from "./multi-repo.ts";
+import { isMultiRepoTask, repositoriesForTask } from "./multi-repo.ts";
 import type { RepoSetShape } from "./multi-repo.ts";
 
 /**
@@ -86,8 +86,10 @@ export interface RepoFileScope {
  * so the client can prefix entries (`<name>/src/a.ts`).
  */
 export function fileScopesForTask(task: RepoSetShape): RepoFileScope[] {
+  // A one-repository multi task still lists through its named scope: its
+  // cwd is the non-git workspace root, so `<name>/…` is how `@` reaches it.
+  if (!isMultiRepoTask(task)) return [{ name: null, ...fileScopeForTask(task) }];
   const repos = repositoriesForTask(task);
-  if (repos.length <= 1) return [{ name: null, ...fileScopeForTask(task) }];
   return repos.map((repo) => {
     if (repo.worktreePath) return { name: repo.name, dir: repo.worktreePath };
     if (task.isolation === "worktree") {

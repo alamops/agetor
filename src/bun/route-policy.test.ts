@@ -256,6 +256,18 @@ const HEADLESS_501 = [
   "POST /window/focus",
 ].sort();
 
+describe("repository removal route (issue #291)", () => {
+  it("DELETE /tasks/:id/repositories/:name is app+cli with no path gate (`:name` is a workspace name, not a path)", () => {
+    const policy = policyFor("/tasks/:id/repositories/:name", "DELETE");
+    expect(policy?.callers).toBe("app+cli");
+    expect(policy?.pathParams).toBeUndefined();
+    expect(policy?.pathParamsExempt).toBeUndefined();
+    expect(SERVER_ROUTES.find((r) => r.key === "/tasks/:id/repositories/:name")?.handlers.DELETE).toContain(
+      "removeTaskRepository(",
+    );
+  });
+});
+
 describe("harness-stack routes", () => {
   it("are CLI-managed (the CLI creates/edits stacks, the app may read them)", () => {
     expect(ROUTE_POLICY["/harness-stacks"]).toEqual({ GET: CLI_POLICY, POST: CLI_POLICY });
@@ -526,6 +538,8 @@ describe("routes the CLI (and the daemon handoff) call", () => {
       "POST /background/start",
       "GET /remote-access",
       "DELETE /remote-access",
+      // `agetor` repository removal (AgetorClient.removeTaskRepository).
+      "DELETE /tasks/:id/repositories/:name",
     ]) {
       expect(seen.has(expected), expected).toBe(true);
     }

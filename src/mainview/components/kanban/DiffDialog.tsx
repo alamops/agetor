@@ -20,6 +20,8 @@ import {
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import { multiRepoFileScopes } from "../../../shared/file-scope.ts";
+import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
+import { selectedRepositoryName } from "@/lib/multi-repo-ui";
 import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
 
 interface Props {
@@ -412,6 +414,10 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
 
+  // The repository names as one stable string: a removal (issue #291) changes
+  // it, so the effect below re-validates a tab that pointed at the removed
+  // repository. The 2 s poll's fresh `task` object with the same names does not.
+  const repoNamesKey = (task?.repositories ?? []).map((r) => r.name).join("\0");
   useEffect(() => {
     // Reset selection + composer state on every dialog close/reopen and on
     // every diff refetch (this effect's deps are `[open, taskId, repo]`: the
@@ -432,10 +438,9 @@ export function DiffDialog({ open, task, onClose }: Props) {
     setDiffState(null);
     cancelDragRef.current();
     if (!open || !taskId) return;
-    const repos = task?.repositories ?? [];
-    const wanted = repos.length > 1
-      ? (repos.some((r) => r.name === repo) ? repo : repos[0]!.name)
-      : null;
+    // A one-repository multi task still has its tab (issue #291), and a
+    // removal re-validates the selection through `repoNamesKey` below.
+    const wanted = task ? selectedRepositoryName(task, repo) : null;
     if (wanted !== repo) {
       setRepo(wanted);
       return;
@@ -459,7 +464,8 @@ export function DiffDialog({ open, task, onClose }: Props) {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [open, taskId, repo]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `task` is read for its repository names only; `repoNamesKey` stands in for them
+  }, [open, taskId, repo, repoNamesKey]);
 
   const totals = useMemo(() => {
     const files = diff?.files ?? [];
@@ -539,11 +545,14 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const multiScopes = useMemo<NamedFileScope[] | null>(() => {
     if (!task) return null;
     // `multiRepoFileScopes` is the same derivation RunPanel uses (one named
-    // scope per repository, never the non-git workspace root); `[]`/one entry
+    // scope per repository, never the non-git workspace root); `[]`
     // means the single-repository path below stays in charge.
+    // A one-repository multi task keeps its one named scope: its cwd is the
+    // non-git workspace root, so `<name>/…` is how a reference reaches it.
+    if (!isMultiRepoTask(task)) return null;
     const scopes = multiRepoFileScopes(task);
-    return scopes.length > 1 ? scopes : null;
-  }, [task?.repositories, task?.worktreePath, task?.isolation]);
+    return scopes.length > 0 ? scopes : null;
+  }, [task?.repositories, task?.multiRepo, task?.worktreePath, task?.isolation]);
   const fileScope = useMemo<FileScope | null>(() => {
     if (!task) return null;
     if (multiScopes) {
@@ -564,7 +573,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const singleProjectFiles = useProjectFiles(open && composerVisible && !multiScopes ? fileScope : null);
   const multiProjectFiles = useProjectFileScopes(open && composerVisible ? multiScopes : null);
   const projectFiles = multiScopes ? multiProjectFiles : singleProjectFiles;
-  const hasFileScope = multiScopes ? multiScopes.length > 1 : !!(fileScope && fileScope.dir);
+  const hasFileScope = multiScopes ? multiScopes.length > 0 : !!(fileScope && fileScope.dir);
 
   // A new selection starting (composer reappearing) supersedes whatever hint
   // was left over from the last send/save — e.g. the "Sent to agent." success
@@ -718,7 +727,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
             {task?.title ?? "Task"}
             {diff?.base && <> · vs base <span className="font-mono">{diff.base}</span></>}
           </div>
-          {(task?.repositories?.length ?? 0) > 1 && (
+          {task && isMultiRepoTask(task) && (
             <div className="mt-1 flex flex-wrap gap-1" role="tablist" aria-label="Repositories">
               {task!.repositories!.map((r) => (
                 <button

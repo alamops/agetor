@@ -20,7 +20,7 @@ import {
   type WorktreeInfo,
   type WorktreeStaleReason,
 } from "../../../shared/types.ts";
-import { buildDeleteConfirmCopy, mapWithConcurrency, triageDeleteOutcome } from "./worktree-delete-intent.ts";
+import { buildDeleteConfirmCopy, mapWithConcurrency, triageDeleteOutcome, worktreeRemovalPhrase } from "./worktree-delete-intent.ts";
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 
 interface Props {
@@ -335,18 +335,14 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
               <>
                 The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" is
                 already <strong>archived</strong>;{" "}
-                {copy.multiRepo
-                  ? `all ${copy.checkoutCount} repository worktrees will be removed`
-                  : "its worktree directory will be removed"}
+                {`${worktreeRemovalPhrase(copy, w.repoName)} will be removed`}
                 . The git branches and full AI history are preserved.
               </>
             ) : (
               <>
                 The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" will
                 be <strong>archived</strong> (hidden from the board, restorable via Unarchive) and{" "}
-                {copy.multiRepo
-                  ? `all ${copy.checkoutCount} repository worktrees removed`
-                  : "its worktree directory removed"}
+                {`${worktreeRemovalPhrase(copy, w.repoName)} removed`}
                 . The git branches and full AI history are preserved.
               </>
             )}

@@ -194,6 +194,18 @@ export interface NamedFileScope extends FileScope {
 }
 
 /**
+ * The named scopes a composer lists through, or null for the single-scope
+ * path. Callers pass named scopes only for a multi-repository task, so their
+ * presence (not a count) decides: a multi task left with ONE repository
+ * (issue #291) still lists `<name>/…`, because its agent's cwd is the non-git
+ * workspace root. The one rule `PromptComposer`, `AtFileAutocomplete`, the run
+ * panel's draft editor and {@link useProjectFileScopes} share.
+ */
+export function multiScopesOrNull<T>(scopes: T[] | null | undefined): T[] | null {
+  return scopes && scopes.length > 0 ? scopes : null;
+}
+
+/**
  * Resolve a multi-repository `@` token/query to the repository scope it names.
  * A multi listing prefixes every entry with its workspace name
  * (`uniqueRepoSlugs`), so the first path segment must equal one of `scopes`'
@@ -322,8 +334,11 @@ export async function loadMultiScopeListing(
  * Loads the union of several repository scopes for a multi-repository task's
  * `@` popover. Each scope keeps its own cache entry (so a single scope still
  * renders instantly from the shared cache); entries are prefixed with
- * `<name>/` so `@frontend/src/a.ts` is unambiguous. A single scope (or none)
- * fetches nothing — callers pass the single scope to {@link useProjectFiles}.
+ * `<name>/` so `@frontend/src/a.ts` is unambiguous. `null`/`[]` fetches
+ * nothing — a single-repository caller passes its scope to
+ * {@link useProjectFiles}. One named scope is still listed here: it is a
+ * multi-repository task left with one repository (issue #291), whose agent
+ * reads `<name>/…` from the workspace root.
  *
  * `opts.awaitReady` gates the fetches on the caller's event stream (see
  * {@link loadMultiScopeListing}). `refresh({ maxAgeMs })` is the coalesced
@@ -342,7 +357,7 @@ export function useProjectFileScopes(
   error: string | null;
   refresh: (opts?: { maxAgeMs?: number }) => void;
 } {
-  const multi = (scopes?.length ?? 0) > 1;
+  const multi = multiScopesOrNull(scopes) !== null;
   const key = multi ? scopes!.map((s) => `${s.name}:${cacheKey(s)}`).join("|") : null;
   // The listing is stamped with the scope key it was fetched/seeded for. A
   // render for a NEW key must never show the previous key's rows — not even

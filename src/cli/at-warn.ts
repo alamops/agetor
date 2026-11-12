@@ -182,7 +182,7 @@ export async function verifyTokensViaSearch<T extends { path: string; isDirector
 type ScopeTask = Pick<
   Task,
   "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch"
-> & { repositories?: Task["repositories"] };
+> & { repositories?: Task["repositories"]; multiRepo?: boolean };
 
 /**
  * The CLI's advisory `@`-reference pre-check for a freshly created, not-yet-
@@ -211,7 +211,10 @@ export async function unresolvedRefsForTask(
   if (!prompt.includes("@")) return [];
 
   const scopes = fileScopesForTask(task);
-  const single = scopes.length === 1;
+  // A single task's one scope is unnamed; a multi task's scopes are all
+  // named — also the one scope of a multi task left with one repository,
+  // whose tokens still need their `<name>/` prefix (issue #291).
+  const single = scopes.length === 1 && scopes[0]!.name === null;
   const listings = await Promise.all(
     scopes.map(async (scope) => {
       if (!scope.dir?.trim()) return null;

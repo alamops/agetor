@@ -35,6 +35,7 @@ import { runControl, resumableRunId } from "../run-logic.ts";
 import { Logo } from "./logo.tsx";
 import { fileScopeForTask, fileScopesForTask } from "./at-complete.ts";
 import { splitNamedScopePath } from "../../shared/file-scope.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 import { addScopeRoots, buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 // `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
@@ -199,7 +200,9 @@ export function Dashboard({
   // prefixed with the workspace name. A single-repository task keeps exactly
   // today's `composeScope`/key.
   const composeScopes = target ? fileScopesForTask(target) : [];
-  const composeMulti = composeScopes.length > 1;
+  // `isMultiRepoTask`, not the scope count: a multi task left with one
+  // repository (issue #291) still lists through its one named scope.
+  const composeMulti = target ? isMultiRepoTask(target) : false;
   const composeScopeKey = composeMulti
     ? composeScopes.map((sc) => `${sc.name}:${sc.dir} ${sc.ref ?? ""}`).join("|")
     : composeScope ? `${composeScope.dir} ${composeScope.ref ?? ""}` : null;
@@ -367,7 +370,7 @@ export function Dashboard({
         ? [{ name: null, ...composeScope }]
         : [];
     if (scopes.length === 0) return undefined;
-    const multi = scopes.length > 1;
+    const multi = composeMulti;
     return async (q: string): Promise<FileEntry[] | null> => {
       // A `<repo>/…` query routes to that repository with the alias stripped
       // (it is a client-side layout prefix, not part of the repo's tree); an

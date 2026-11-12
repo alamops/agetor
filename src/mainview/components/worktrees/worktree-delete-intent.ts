@@ -40,8 +40,10 @@ export interface DeleteConfirmCopy {
   /** Labels of every checkout whose state couldn't be determined. Empty when
    *  none. */
   unknownCheckouts: string[];
-  /** True when the clicked row is one of several repository checkouts of a
-   *  multi-repository task — archiving removes all of them. */
+  /** True when the clicked row is a repository checkout of a
+   *  multi-repository task (it has siblings, or carries a `repoName` — a
+   *  multi task left with one repository has no siblings) — archiving
+   *  removes all of them. */
   multiRepo: boolean;
   /** Total checkouts the confirm will force-delete (1 for a single-repo task). */
   checkoutCount: number;
@@ -104,7 +106,7 @@ export function buildDeleteConfirmCopy(
     unknown: unknownCheckouts.length > 0,
     dirtyCheckouts,
     unknownCheckouts,
-    multiRepo: siblings.length > 0,
+    multiRepo: siblings.length > 0 || !!w.repoName,
     checkoutCount: siblings.length + 1,
     alreadyArchived,
     confirmLabel:
@@ -180,6 +182,15 @@ export function triageDeleteOutcome(teardown: WorktreeTeardownResult | undefined
           "Couldn't delete the task workspace: it still contains files outside its repositories. " +
           "Move or remove them, then try again.",
       };
+    case "source-missing":
+      // The repository this checkout came from no longer exists, so git can't
+      // vouch for the checkout and teardown deliberately leaves it on disk.
+      return {
+        kind: "error",
+        message:
+          `Kept ${name}: its source repository no longer exists, so its checkout was left on disk. ` +
+          "Remove the folder manually if you don't need it.",
+      };
     case "failed":
     default:
       return {
@@ -187,4 +198,21 @@ export function triageDeleteOutcome(teardown: WorktreeTeardownResult | undefined
         message: `Couldn't delete ${name}: the worktree removal failed. Try again or remove it manually.`,
       };
   }
+}
+
+/**
+ * The confirm body's "what gets removed" noun phrase: the single task's
+ * worktree directory, the one remaining checkout of a multi-repository task
+ * (named, never "all 1 repository worktrees"), or every checkout of a multi
+ * task.
+ */
+export function worktreeRemovalPhrase(
+  copy: Pick<DeleteConfirmCopy, "multiRepo" | "checkoutCount">,
+  repoName: string | null | undefined,
+): string {
+  if (!copy.multiRepo) return "its worktree directory";
+  if (copy.checkoutCount === 1) {
+    return repoName ? `its ${repoName} repository worktree` : "its repository worktree";
+  }
+  return `all ${copy.checkoutCount} repository worktrees`;
 }

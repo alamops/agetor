@@ -12,6 +12,7 @@ import {
   SEARCH_CACHE_TTL_MS,
   cachedMultiScopeListing,
   clearSearchCacheForScope,
+  multiScopesOrNull,
   resolveNamedScopePath,
   searchProjectFiles,
   searchProjectFileScopes,
@@ -244,5 +245,20 @@ describe("cachedMultiScopeListing", () => {
 
   test("an empty scope list merges to an empty listing (nothing to clear)", () => {
     expect(cachedMultiScopeListing([], () => undefined)).toEqual({ files: [], truncated: false });
+  });
+});
+
+describe("multiScopesOrNull (round 15)", () => {
+  test("one named scope is still the multi path — a multi task left with one repository", () => {
+    const one = [{ name: "fe", dir: "/ws/fe" }];
+    expect(multiScopesOrNull(one)).toBe(one);
+    const two = [{ name: "fe", dir: "/ws/fe" }, { name: "be", dir: "/ws/be" }];
+    expect(multiScopesOrNull(two)).toBe(two);
+  });
+
+  test("no named scopes is the single-scope path", () => {
+    expect(multiScopesOrNull([])).toBeNull();
+    expect(multiScopesOrNull(null)).toBeNull();
+    expect(multiScopesOrNull(undefined)).toBeNull();
   });
 });

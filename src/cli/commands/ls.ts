@@ -6,6 +6,7 @@ import { flagValue } from "../args.ts";
 import { fxAutoResumeCountdownText, isTaskFxPaused } from "../../shared/fx-recovery.ts";
 import { pipelineStepProgress } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -213,7 +214,11 @@ function needsCell(t: Task): string {
   if (t.pipelineParentId) parts.push(c.dim(`step of ${t.pipelineParentId.slice(0, 8)}`));
   // Multi-repository task (issue #291): the card has no single workdir line,
   // so name the count here.
-  if ((t.repositories?.length ?? 0) > 1) parts.push(c.dim(`${t.repositories!.length} repos`));
+  // A multi task left with one repository still says so ("1 repo").
+  if (isMultiRepoTask(t)) {
+    const n = t.repositories?.length ?? 0;
+    parts.push(c.dim(`${n} repo${n === 1 ? "" : "s"}`));
+  }
   // Worktree drifted off the task branch (last-seen checkout, recorded by the
   // core at run start/settle, terminal open and archive) — a hint here rather
   // than a branch column, which the table doesn't have.

@@ -276,3 +276,31 @@ test("cmdShow escapes repository paths and prints each repository's checkout dri
   // A repository still on its own branch prints no checkout line.
   expect(outputs.filter((l) => l.includes("checkout:"))).toHaveLength(1);
 });
+
+test("cmdShow prints the repositories block for a multi task left with one repository (round 15)", async () => {
+  const task = makeTask({
+    workdir: "/wt/task-1",
+    worktreePath: "/wt/task-1",
+    branch: null,
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  currentClient = fakeClient(task);
+  await cmdShow([task.id], flags);
+  expect(outputs).toContain("  repos: 1");
+  expect(outputs.join("\n")).toContain("backend: /src/backend (feature/x)");
+});
+
+test("cmdShow prints no repositories block for a single task's derived entry", async () => {
+  const task = makeTask({
+    multiRepo: false,
+    repositories: [
+      { path: "/repo", name: "repo", branch: null, branchSource: "created", worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null },
+    ],
+  });
+  currentClient = fakeClient(task);
+  await cmdShow([task.id], flags);
+  expect(outputs.some((l) => l.includes("repos"))).toBe(false);
+});

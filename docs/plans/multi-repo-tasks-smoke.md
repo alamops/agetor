@@ -21,23 +21,68 @@ create and that one worktree per repository exists under
 ```bash
 bun run typecheck
 bun test
-bun test src/bun/multi-repo-repro.test.ts src/bun/orchestrator-multi-repo.test.ts \
-  src/bun/server-multi-repo.test.ts src/bun/worktree.test.ts src/bun/task-repos.test.ts \
-  src/bun/db-repositories.test.ts src/bun/migrate.test.ts src/bun/route-policy.test.ts \
-  src/bun/pull-create-task-url.test.ts src/bun/worktrees-list.test.ts \
-  src/bun/worktree-git-status.test.ts src/bun/server-teardown-preview.test.ts \
-  src/bun/pipeline-runner.test.ts src/bun/terminals.test.ts src/bun/agents.test.ts \
-  src/shared/multi-repo.test.ts src/shared/file-scope.test.ts \
-  src/mainview/lib/repo-selection.test.ts src/mainview/lib/pr-proposal.test.ts \
-  src/mainview/lib/use-project-files.test.ts src/mainview/lib/diff-selection.test.ts \
-  src/mainview/lib/commit-push.test.ts src/mainview/lib/agent-capabilities.test.ts \
+bun test \
+  src/bun/multi-repo-repro.test.ts \
+  src/bun/orchestrator-multi-repo.test.ts \
+  src/bun/server-multi-repo.test.ts \
+  src/bun/worktree.test.ts \
+  src/bun/task-repos.test.ts \
+  src/bun/db-repositories.test.ts \
+  src/bun/migrate.test.ts \
+  src/bun/route-policy.test.ts \
+  src/bun/pull-create-task-url.test.ts \
+  src/bun/worktrees-list.test.ts \
+  src/bun/worktree-git-status.test.ts \
+  src/bun/server-teardown-preview.test.ts \
+  src/bun/pipeline-runner.test.ts \
+  src/bun/terminals.test.ts \
+  src/bun/agents.test.ts \
+  src/shared/multi-repo.test.ts \
+  src/shared/file-scope.test.ts \
+  src/mainview/lib/repo-selection.test.ts \
+  src/mainview/lib/pr-proposal.test.ts \
+  src/mainview/lib/use-project-files.test.ts \
+  src/mainview/lib/diff-selection.test.ts \
+  src/mainview/lib/commit-push.test.ts \
+  src/mainview/lib/agent-capabilities.test.ts \
   src/cli/commands/add.test.ts \
-  src/cli/commands/show.test.ts src/cli/commands/shell.test.ts \
-  src/cli/commands/rm.test.ts src/cli/commands/diff.test.ts src/cli/ls.test.ts \
-  src/cli/tui/at-complete.test.ts src/cli/at-warn.test.ts \
-  src/mainview/components/worktrees/worktree-delete-intent.test.ts
+  src/cli/commands/show.test.ts \
+  src/cli/commands/shell.test.ts \
+  src/cli/commands/rm.test.ts \
+  src/cli/commands/diff.test.ts \
+  src/cli/ls.test.ts \
+  src/cli/tui/at-complete.test.ts \
+  src/cli/at-warn.test.ts \
+  src/mainview/components/worktrees/worktree-delete-intent.test.ts \
+  src/bun/agents-codex-workspace-roots.test.ts \
+  src/bun/db-repositories-fixes.test.ts \
+  src/bun/orchestrator-multi-repo-fixes.test.ts \
+  src/bun/route-policy-endpoint.test.ts \
+  src/bun/server-multi-repo-fixes.test.ts \
+  src/bun/worktree-multi-repo-safety.test.ts \
+  src/cli/cli-scope-daemon.test.ts \
+  src/cli/commit.test.ts \
+  src/cli/discovery.test.ts \
+  src/cli/tui/Dashboard.test.tsx \
+  src/cli/usage.test.ts \
+  src/mainview/components/kanban/PromptComposer-discovery.test.ts \
+  src/mainview/lib/map-with-concurrency.test.ts \
+  src/mainview/lib/multi-repo-ui.test.ts \
+  src/mainview/lib/task-context-menu.test.ts \
+  src/mainview/lib/use-project-files-throttle.test.ts \
+  src/shared/agent-capabilities.test.ts \
+  src/shared/launch-prompt.test.ts \
+  src/bun/orchestrator-multi-repo-remove.test.ts \
+  src/cli/commands/edit-remove-repo.test.ts \
+  src/mainview/lib/api-remove-repository.test.ts \
+  src/mainview/lib/repo-removal.test.ts \
+  src/mainview/lib/at-scope-targets.test.ts
 bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
+bun node_modules/@playwright/test/cli.js test e2e/issue-task.spec.ts
 ```
+
+The focused list is every multi-repository test file through round 15 (the files the rounds 14–15
+changes touched or added included). Playwright runs one spec at a time on this machine.
 
 ## Results
 
@@ -281,34 +326,100 @@ Round-13 verification: `bun run typecheck` green; `add` (116), the full CLI
 suite (1,096), the mainview suite (2,105) and `orchestrator-multi-repo` (19)
 green.
 
+## Fourteenth review round
+
+The round-14 review (a security, CLI, test, reliability, webview and backend pass) opened must-fixes,
+should-fixes and nits; all are closed in commit `2f147818`. Must-fixes:
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Codex escalation from a planted checkout: `gitWritableRoots` scanned a non-git cwd's children, so an agent could plant a checkout whose `.git` lives anywhere and get full access next turn | no scan; only the task row's own checkouts (`codexWorkspaceRepos`), each verified against its source repository's common dir, escalate | `src/bun/agents-codex-workspace-roots.test.ts`, `src/bun/worktree.test.ts`, `src/bun/orchestrator-multi-repo-fixes.test.ts` (M1) |
+| Prepare could clear a `.git`-bearing checkout (uncommitted work lost) when the branch read failed or the selected repository was itself a linked/bare worktree | never clear a `.git`-bearing target; prove checkouts by git common dir; multi prepares serialized per task (`withTaskPrepareLock`); rollback survives a throwing worker | `src/bun/worktree-multi-repo-safety.test.ts` |
+| `DELETE /worktrees/:id` could `rm -rf` inside a live task through a nested or case-variant id | refuse any id whose task id has a row | `src/bun/orchestrator-multi-repo-fixes.test.ts` (M4) |
+| Single-repository teardown and `existingBranch` ignored multi rows' per-repository branches | `branchesHeldByOtherTasks` and the create-time collision count `repositories[].branch`/`checkoutBranch` | `src/bun/orchestrator-multi-repo-fixes.test.ts` (M5) |
+| Workspace scratch cleanup read and deleted in the core's own process (D25) | through task-dir-fs (`taskDirWorkspaceHasOnlyScratch`, `removeTaskDirWorkspaceIfOnlyScratch`) | `src/bun/worktree-multi-repo-safety.test.ts` |
+| Unbounded per-repository listing/search/discovery from the webview, not gated on the task stream | capped at 2 (`MULTI_SCOPE_CONCURRENCY`), gated on `awaitReady`, focus refresh coalesced, superseded searches aborted | `src/mainview/lib/use-project-files-throttle.test.ts`, `src/mainview/lib/map-with-concurrency.test.ts`, `src/mainview/components/kanban/PromptComposer-discovery.test.ts` |
+| The route-policy inventory didn't pin `repositories[].path` | pinned as `name[].field`, plus a direct CLI 403 test | `src/bun/route-policy.test.ts`, `src/bun/route-policy-endpoint.test.ts` |
+| Spec/grill/plan overstated live smoke | stated that none had run (since replaced by the live results below) | — |
+
+Should-fixes and nits closed in the same commit: PATCH `workdir` refused on multi rows, owned-path
+teardown checks, unpersisted-checkout recovery, unarchive of never-started tasks, bounded fan-out (no
+hard cap, grill #14), per-repository step guards, terminal repo validation, the
+`setRepositoryCheckout` parent mirror, the shared launch-prompt and capability-merge modules, New
+Task/issue base-ref carry, Repositories dialog cancel, per-task Create all PRs state, branch search,
+the CLI single-repo wire shape, `--isolation`/`--workdir` handling, old-core detection, per-repository
+commit/diff/show/shell, the TUI `@repo/` popover, stronger tests, and the subsystem docs.
+
+| Check | Result |
+| --- | --- |
+| `bun run typecheck` | green |
+| `bun test` (full) | 12,741 pass, 31 skip, 1 fail across 510 files: `src/bun/orchestrator-send-budget.test.ts` "late floor refusal on an archived task does not un-archive it", which fails identically at `e5e213ea` (before the round-14 changes) |
+| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | 11/11 passed |
+| Full Playwright suite | 442 passed, 3 failed, 13 did not run. The 3 (`e2e/at-file-truncated.spec.ts`, `e2e/issue-task.spec.ts` dialog path, `e2e/tagged-user-messages.spec.ts`) are load flakes: each passed 20/20 on an isolated rerun |
+
+## Fifteenth review round
+
+Owner decisions taken this round (recorded in the grill's "Owner decisions after implementation"):
+a task created with 2+ repositories stays multi down to one repository (`Task.multiRepo`, decided
+through `isMultiRepoTask` everywhere); one repository can be removed from a multi task
+(`DELETE /tasks/:id/repositories/:name`, the run panel's "Remove from task",
+`agetor edit <task> --remove-repo <name>`), which is how a task whose repository source was deleted
+gets unstuck; `--add-dir` and codex's workspace repositories skip checkouts missing at spawn;
+archive/delete skip a repository whose source is gone (`source-missing`) and tear down the rest;
+Copilot needs no escalation change; a pipeline step's PR stamp stays on the step (documented
+limitation). New tests: `src/bun/orchestrator-multi-repo-remove.test.ts`,
+`src/cli/commands/edit-remove-repo.test.ts`, `src/mainview/lib/repo-removal.test.ts`,
+`src/mainview/lib/api-remove-repository.test.ts`, plus extensions to the files in "Commands".
+
+| Check | Result |
+| --- | --- |
+| `bun run typecheck` | green |
+| Focused multi-repo suite (the `bun test` list in "Commands") | green — 1,741 tests across 55 files |
+| `bun test` (full) | 12,768 pass, 31 skip, 52 fail, 3 errors, 514 files, under a shared-machine load average of ~65–77 from unrelated VMs and jobs. Every failing file passed when rerun alone: pipeline-stop-queued-followups 5/5, claude-turn-routing 15/15, pipeline-runner 137/137, caller-fs 46/46, worktree 137/137, orchestrator-codex 3/3, orchestrator-multi-repo 25/25, task-dir-fs 44/44, Dashboard 77/77, AnswerOverlay 35/35, Composer 19/19, bundle 48/48. The 3 errors were late assertions of tests that had already hit the 5 s timeout. The round-14 `orchestrator-send-budget` failure did not recur. |
+| `bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts` | green (run together with issue-task: 23 passed) |
+| `bun node_modules/@playwright/test/cli.js test e2e/issue-task.spec.ts` | green (run together with multi-repo-task: 23 passed) |
+
 ## Live harness smoke matrix
 
-**No live harness smoke has been run.** No harness CLI was launched against a real account with a
-multi-repository task on this branch. The grill (decision 6) and plan (T17, A12) call for one; it is
-pending the owner. Every row below records what automated checks cover, not a live run.
+Run on 2026-11-12 at branch head `2f147818`, against a headless core on port 4319 with
+`AGETOR_DATA_DIR=~/.agetor-dev` (never the release data dir). Setup: two fresh git repositories
+(`alpha`, `beta`, one commit each on `main`) in a temporary directory. Each task used worktree
+isolation, `repositories: [alpha, beta]` and the prompt "create SMOKE.md with `smoke ok` in EACH
+repository and commit it there; reply DONE", started with `POST /tasks/:id/start`. This records what
+was run; it is not an owner sign-off.
 
 Layout support is universal (the agent runs at the workspace root). Extra per-repo roots
-(`--add-dir`) are added only for claude-code, codex and copilot.
+(`--add-dir`) are added only for claude-code, codex and copilot, and only for checkouts that exist at
+spawn time.
 
-| Harness | Binary present | `--add-dir` | What is verified | Live smoke |
-| --- | --- | --- | --- | --- |
-| claude-code | yes | yes | fake claude driver through the full spawn path (`e2e/multi-repo-task.spec.ts`, `orchestrator-multi-repo.test.ts`: workspace cwd, `Repositories:` block, persisted entries); `--add-dir` argv (`agents.test.ts`) | not run |
-| codex | yes | yes | `--add-dir` argv (`agents.test.ts`); sandbox escalation from the task's verified checkouts and none from a planted one (`agents-codex-workspace-roots.test.ts`, `worktree.test.ts`) | not run |
-| fx | yes | no | argv carries no `--add-dir` (`agents.test.ts`); whether fx's ACP `session/new` accepts a non-git cwd is **unverified** | not run |
-| opencode | yes | no | nothing multi-specific beyond the shared spawn path; OpenCode 2.x server with a non-git workspace directory is **unverified** | not run |
-| cursor | yes | no | argv carries no `--add-dir` (`agents.test.ts`); plan-limited account | not run |
-| gemini | no | no | nothing multi-specific; include-directories not used (plan A6) | not run (no binary) |
-| antigravity (`agy`) | no | no | nothing multi-specific | not run (no binary) |
-| copilot | no | yes (argv) | `--add-dir` argv (`agents.test.ts`) | not run (no binary) |
+| Harness | Version | Mode / model | `--add-dir` | Live result | Also covered by |
+| --- | --- | --- | --- | --- | --- |
+| claude-code | Claude Code 2.1.322 | auto / default | yes | succeeded (exit 0) in about 20 s; one `smoke` commit in each checkout; the hook installer wrote `.claude/settings.local.json` at the non-git workspace root | fake claude driver (`e2e/multi-repo-task.spec.ts`, `orchestrator-multi-repo.test.ts`); argv (`agents.test.ts`) |
+| codex | codex-cli 0.166.0 | auto / default | yes | succeeded; a commit in each checkout; the session recorded `sandbox_policy: danger-full-access` and `approval_policy: never` (escalated through the verified `codexWorkspaceRepos`); `--add-dir` accepted. A follow-up turn (`POST /runs/:id/input`) resumed, committed `smoke-2` in both and stayed escalated | `agents-codex-workspace-roots.test.ts`, `worktree.test.ts` |
+| fx | 0.0.15 | yolo / deepseek/deepseek-v4-flash | no | succeeded; a commit in each checkout (fx's ACP session accepted the non-git cwd) | argv (`agents.test.ts`) |
+| opencode | v2.1.3 (2.x server driver) | auto / OpenCode default | no | the agetor-owned server accepted the non-git workspace directory and the turn was posted; the provider refused it with "Insufficient balance" (account credits), so the run failed with exit 1. Server and non-git cwd verified; an end-to-end edit was **not** | — |
+| copilot | not installed | — | yes (argv) | not run. Analysis (owner decision, no code change): Auto already passes `--allow-all` + `COPILOT_ALLOW_ALL=true` (full access, including writes to `<repo>/.git/worktrees`) and gets the checkouts as `--add-dir`; Read-only/Plan deny writes by design. Needs a live run once installed | argv (`agents.test.ts`) |
+| cursor | present | — | no | not run (plan-limited account) | argv (`agents.test.ts`) |
+| gemini | not installed | — | no | not run; include-directories not used (plan A6) | — |
+| antigravity (`agy`) | not installed | — | no | not run | — |
+| harness failover (stack swap) | — | — | — | not run (needs a two-account stack) | — |
 
-Also unverified until a live run: a harness-stack failover of a multi-repository task, and Claude
-Code's hook installer (`.claude/settings.local.json`) at a non-git workspace cwd. The fake claude
-driver is the only automated proof of the spawn path; a credentialed live launch is the owner's
-manual step.
+Teardown, live:
+
+- `DELETE` of the claude task removed the workspace directory (Claude's `.claude` scratch included)
+  and deleted its branch from both source repositories.
+- Archive of the fx task (after moving it to Done) removed the workspace and kept the branches;
+  unarchive restored both checkouts on their branch with the commits intact.
+- All smoke tasks were deleted afterwards: both source repositories were back to `main` only, with no
+  worktrees left.
 
 ## Known limitations
 
-Create-only repository set; 2+ requires worktree isolation; no per-repo `existingBranch`; no hard cap
-on the repository count (a warning above 10; every per-repository fan-out runs in bounded batches); an older build sees the workspace and may orphan
-secondary worktrees (the CLI detects an older core at create time, nothing else does); Gemini's
-include-directories is not used; no live harness smoke yet.
+Repositories can't be added after creation (one can be removed, never the last); 2+ at creation
+requires worktree isolation; no per-repo `existingBranch`; no hard cap on the repository count (a
+warning above 10; every per-repository fan-out runs in bounded batches); an older build sees the
+workspace and may orphan secondary worktrees (the CLI detects an older core at create time, nothing
+else does); Gemini's include-directories is not used; a pipeline step's PR stamp stays on the step,
+so the parent's "Create all PRs" can retry that repository and show GitHub's 422; live smoke covered
+claude-code, codex and fx end to end and OpenCode's server only (copilot, cursor, gemini, antigravity
+and harness failover not run).

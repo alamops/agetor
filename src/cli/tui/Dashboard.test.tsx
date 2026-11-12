@@ -1097,6 +1097,45 @@ test("a multi-repository listing still offers the root row of a repository with 
   unmount();
 });
 
+test("a multi task left with one repository lists `<name>/`-prefixed rows (round 15)", async () => {
+  // The scope count is one, but the agent's cwd is the workspace root, so the
+  // popover must offer `backend/README.md`, never a bare `README.md`.
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async () => ({ files: ["README.md"], truncated: false }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("@READ");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("backend/README.md");
+  unmount();
+});
+
 test("a multi-repository listing keeps healthy repositories' rows when one fetch fails", async () => {
   // Round-12 S3: the multi listing used one `Promise.all` over raw calls, so
   // a single repository's failure rejected everything and blanked the popover

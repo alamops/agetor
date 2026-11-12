@@ -6,6 +6,7 @@ import { ApiError, type AgetorClient } from "../api-client.ts";
 import { defaultModeFor, type Run, type Task } from "../../shared/types.ts";
 import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 import { colorRunStatus } from "./pipeline.ts";
 import { profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
 
@@ -82,9 +83,12 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     out(`  ${label("failover")} ${c.yellow(escapeFreeText(text))}`);
   }
   out(`  ${label("workdir")} ${c.dim(escapeControlChars(task.workdir))}`);
-  if ((task.repositories?.length ?? 0) > 1) {
-    out(`  ${label("repos")} ${task.repositories!.length}`);
-    for (const repo of task.repositories!) {
+  // `isMultiRepoTask`, not a count: a multi task left with one repository
+  // (issue #291) still prints its repository block.
+  if (isMultiRepoTask(task)) {
+    const repos = task.repositories ?? [];
+    out(`  ${label("repos")} ${repos.length}`);
+    for (const repo of repos) {
       const branch = repo.branch ? ` (${escapeControlChars(repo.branch)})` : "";
       const wt = repo.worktreePath ? c.dim(` → ${escapeControlChars(repo.worktreePath)}`) : "";
       out(`    ${escapeControlChars(repo.name)}: ${c.dim(escapeControlChars(repo.path))}${branch}${wt}`);

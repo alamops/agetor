@@ -399,6 +399,8 @@ export const ROUTE_POLICY: Record<string, PolicyEntry> = {
   "/opencode-sessions/import": { POST: cli({ pathParamsExempt: EXEMPT_OPENCODE_SESSION_IMPORT }) },
   "/tasks/:id/archive": { POST: CLI },
   "/tasks/:id/unarchive": { POST: CLI },
+  // `:name` is a repository's workspace name, never a path: no pathParams.
+  "/tasks/:id/repositories/:name": { DELETE: CLI },
   "/tasks/:id/pipeline": { GET: CLI },
   "/tasks/:id/pipeline/advance": { POST: CLI },
   "/tasks/:id/pipeline/review": { POST: CLI },

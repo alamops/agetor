@@ -5,7 +5,7 @@ import { c, out, isTTY } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { flagValue } from "../args.ts";
 import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
-import { repositoriesForTask } from "../../shared/multi-repo.ts";
+import { isMultiRepoTask, repositoriesForTask } from "../../shared/multi-repo.ts";
 import type { Task } from "../../shared/types.ts";
 
 /**
@@ -38,7 +38,7 @@ export async function cmdShell(args: string[], flags: Flags): Promise<void> {
     // no longer exists" implied it had been deleted. Name the real state and
     // the way to get a usable shell today.
     const repos = task.repositories ?? [];
-    if (!repoFlag && repos.length > 1 && !repos.some((r) => r.worktreePath)) {
+    if (!repoFlag && isMultiRepoTask(task) && !repos.some((r) => r.worktreePath)) {
       throw new Error(
         "this multi-repository task has no worktrees yet — start the task first, "
           + "or use --repo <name> to open one repository's source checkout",

@@ -24,9 +24,9 @@ Confidence is **high** for every row because every row is the owner's direct ans
 | 1 | Architecture | What does a multi-repo task look like to the agent? | A per-task workspace root containing one subdirectory per repo; the agent's cwd is the workspace root; one conversation sees every repo. Single-repo tasks keep today's layout. | owner (round-1/answers.json#agent-architecture, accepted recommendation) | high |
 | 2 | Scope | Which of the issue's six bullets ships? | All six: selection, per-repo worktrees, one agent seeing them, shared context, per-repo diff/status, per-repo PRs. No separate bulk-PR flow beyond the aggregate one below. | owner (round-1/answers.json#v1-scope, accepted recommendation) | high |
 | 3 | Isolation | Must a multi-repo task use worktree isolation? | **Yes.** Multi-repo requires `isolation: "worktree"`; `none` stays single-repo. This reverses round 1's `support-none-live`, which contradicted the workspace-root cwd and the accepted create rejection. | owner (round-2/answers.json#isolation-none-final, accepted recommendation; supersedes round-1/answers.json#isolation-none) | high |
-| 4 | Repo set | When may the repository set change? | **Create-only.** The set is fixed at creation; changing it means a new card. This consciously narrows the issue's "creating or editing a card" to creation. | owner (round-1/answers.json#repo-set-editing; confirmed in round-2/answers.json#create-only-confirm) | high |
+| 4 | Repo set | When may the repository set change? | **Create-only.** The set is fixed at creation; changing it means a new card. This consciously narrows the issue's "creating or editing a card" to creation. **Amended after implementation (owner):** one repository can be removed from an existing multi-repo task; adding one still needs a new card. See "Owner decisions after implementation" below. | owner (round-1/answers.json#repo-set-editing; confirmed in round-2/answers.json#create-only-confirm) | high |
 | 5 | Failure | What happens when one repo's worktree cannot be created at start? | All-or-nothing: validate every repo, create all worktrees, then spawn. On failure remove the worktrees created in that attempt and return an error; the error must list every repo that failed. | owner (round-1/answers.json#partial-failure, accepted recommendation + note) | high |
-| 6 | Harnesses | Which harnesses get multi-repo? | All eight, with a smoke matrix: Claude/Codex/Cursor/fx live-smoked; Gemini/Copilot/Antigravity/OpenCode layout-supported but smoke-pending until accounts exist. **Status (post-implementation):** the live smoke this decision calls for has **not** been run for any harness. Verified so far: the fake claude driver's spawn path (e2e + `orchestrator-multi-repo.test.ts`) and argv assertions (`--add-dir`, codex sandbox roots). See "Amendments after implementation" below. | owner (round-1/answers.json#harness-scope, accepted recommendation) | high |
+| 6 | Harnesses | Which harnesses get multi-repo? | All eight, with a smoke matrix: Claude/Codex/Cursor/fx live-smoked; Gemini/Copilot/Antigravity/OpenCode layout-supported but smoke-pending until accounts exist. **Status (post-implementation):** live smoke run on 2026-11-12: Claude, Codex (first turn and a follow-up, escalated) and fx succeeded end to end; OpenCode 2.x's server accepted the non-git workspace, but the turn failed on account credits; Copilot was not installed; Cursor was not run; a harness-stack failover was not run. See "Amendments after implementation" below. | owner (round-1/answers.json#harness-scope, accepted recommendation) | high |
 | 7 | Prompt | How do the repo directories reach the agent? | A new machine-added `Repositories:` paragraph in the launch prompt. Exact shape in row 20. | owner (round-1/answers.json#prompt-context, override of the references-block recommendation) | high |
 | 8 | Branches | How are branch names and base refs chosen? | One shared branch name across repositories by default; a base ref per repo. If a repo's config/validation/git refuses the shared name, that repo falls back to its own derived name and the dialog shows it. | owner (round-1/answers.json#branch-base; fallback confirmed in round-2/answers.json#same-branch-fallback) | high |
 | 9 | Commit/PR | How do commit/push and PR creation work? | One aggregate commit/push prompt lists every repo and branch and asks for one PR proposal per repo. A single `Create all PRs` action walks the repos with per-repo best effort: one failure does not block the others; results and retries are per repo. | owner (round-1/answers.json#commit-pr; failure policy in round-2/answers.json#aggregate-result) | high |
@@ -61,9 +61,9 @@ Confidence is **high** for every row because every row is the owner's direct ans
 | Pipeline parent multi-repo + step copy + parent-owned teardown | in this change | round 1 #pipelines-issue |
 | Card worktree icon + count popover, diff tabs, filters/search, per-repo context menu | in this change | round 1 #ui-surfaces + note; round 2 #card-without-primary |
 | Full CLI/TUI parity | in this change | round 1 #cli-parity |
-| Harness support for all eight + smoke matrix for installed four | layout support in this change; **live smoke not run** (pending the owner) | round 1 #harness-scope; see "Amendments after implementation" |
+| Harness support for all eight + smoke matrix for installed four | layout support in this change; live smoke run for claude/codex/fx (end to end) and OpenCode (server + non-git workspace only, billing blocked the edit); cursor not run | round 1 #harness-scope; see "Amendments after implementation" |
 | Live smoke for Gemini/Copilot/Antigravity/OpenCode | out of scope for this change | round 1 #harness-scope accepted "layout-supported, smoke-pending"; no accounts on this machine |
-| Editing the repo set after creation | out of scope (owner-deferred) | round 1 #repo-set-editing + round 2 #create-only-confirm — conscious narrowing of the issue |
+| Editing the repo set after creation | removing one repository: in this change (owner decision after implementation); adding: out of scope (owner-deferred) | round 1 #repo-set-editing + round 2 #create-only-confirm; amended by the owner after implementation (see below) |
 | Multi-repo `isolation: none` (symlink/live/copy workspace) | out of scope | round 2 #isolation-none-final — worktree isolation is required |
 | Per-repo `existingBranch` selection | out of scope | round 2 #existing-branch-multi |
 | Downgrade guard / down migration for older builds | out of scope | round 2 #legacy-columns — older builds see the workspace and may orphan secondary worktrees; accepted |
@@ -101,18 +101,40 @@ These are facts about the shipped code and its verification, recorded so this fi
 overstate what was decided or done. None of them is an owner decision, and none has been approved
 by the owner.
 
-- **Live harness smoke has not been run (decision 6).** No harness — Claude, Codex, Cursor, fx or
-  the four smoke-pending kinds — has been launched live against a multi-repository task. What was
-  verified: agetor's fake claude driver through the full spawn path (`e2e/multi-repo-task.spec.ts`,
-  `src/bun/orchestrator-multi-repo.test.ts`: workspace cwd, `Repositories:` block, persisted
-  entries); argv assertions (`--add-dir` for claude-code, codex and copilot only, in
-  `src/bun/agents.test.ts`; codex sandbox roots in `src/bun/agents-codex-workspace-roots.test.ts`
-  and `src/bun/worktree.test.ts`); and the git side against temporary repositories. Unverified:
-  every real harness CLI at a non-git workspace root (including fx's and cursor's ACP
-  `session/new`), a harness-stack failover of a multi-repository task, the OpenCode 2.x server with
-  a non-git workspace directory, Claude Code's hook installer at a non-git cwd, and codex's real
-  sandbox honoring the escalation. Status: live smoke pending the owner. The ledger is
-  `docs/plans/multi-repo-tasks-smoke.md`.
+- **Live harness smoke (decision 6), 2026-11-12.** Run at branch head `2f147818` against two fresh
+  repositories with worktree isolation (ledger: `docs/plans/multi-repo-tasks-smoke.md`). Claude Code
+  2.1.322, codex-cli 0.166.0 and fx 0.0.15 each committed in both checkouts; codex ran with
+  `danger-full-access` escalated from the task's verified checkouts, accepted `--add-dir`, and a
+  follow-up turn resumed and stayed escalated; Claude's hook installer wrote its settings file at the
+  non-git workspace root, and delete removed it. OpenCode v2.1.3's agetor-owned server accepted the
+  non-git workspace directory and took the turn, but the provider refused it for account credits, so
+  no end-to-end edit was verified. Not run: Copilot (not installed), Cursor, Gemini, Antigravity, and a
+  harness-stack failover of a multi-repository task. Live teardown: delete removed the workspace and
+  the branches, archive kept the branches, unarchive restored both checkouts. This records what was
+  run, not an owner sign-off.
 - **Extra roots (decision 19).** "Include-directories where supported" shipped as `--add-dir` for
   claude-code, codex and copilot. Gemini's include-directories is not used (plan A6); cursor, fx,
   OpenCode, Antigravity and Gemini rely on the cwd.
+
+## Owner decisions after implementation
+
+Taken by the owner after the first implementation and review rounds; the shipped contract is in
+`docs/architecture/multi-repo-tasks.md`.
+
+- **One-repository multi tasks are allowed.** A task created with
+  two or more repositories stays multi-repo when repositories are removed down to one; "is this
+  multi-repo" is the derived `Task.multiRepo`, not `repositories.length > 1`.
+- **Remove a repository from an existing multi task (amends decision 4).**
+  `DELETE /tasks/:id/repositories/:name`, the run panel's "Remove from task" and
+  `agetor edit <task> --remove-repo <name>`. A clean checkout is detached and its branch kept; a
+  missing checkout or source just drops the entry; refused while running, for the last repository,
+  for a dirty checkout, on a single task and on a pipeline step. It is the fix for a task whose
+  repository source was deleted.
+- **Extra roots skip missing checkouts (amends decision 19).** `--add-dir` and codex's workspace
+  repositories name only checkouts that exist at spawn time.
+- **Copilot needs no escalation change.** Auto already passes `--allow-all` and
+  `COPILOT_ALLOW_ALL=true` and gets the checkouts as `--add-dir`; Read-only and Plan deny writes by
+  design. Not live-verified (Copilot not installed on the smoke machine).
+- **Pipeline-step PR stamps stay on the step.** The parent card doesn't show a step's PR, and the
+  parent's "Create all PRs" can retry that repository and show GitHub's 422 as a failure: a
+  documented limitation, no code change.

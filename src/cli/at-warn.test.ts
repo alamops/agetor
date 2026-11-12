@@ -231,7 +231,7 @@ test("existsInLiveScope: false for an empty path", () => {
 type ScopeTask = Pick<
   Task,
   "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch"
-> & { repositories?: Task["repositories"] };
+> & { repositories?: Task["repositories"]; multiRepo?: boolean };
 
 /** Defaults to a plain, non-isolated task (no worktree, no ref) — the
  *  simplest scope — with per-test overrides for the fields that drive
@@ -649,4 +649,43 @@ test("unresolvedRefsForTask: a listed directory ('src/') resolves like a file", 
   } as unknown as AgetorClient;
 
   expect(await unresolvedRefsForTask(client, singleRepoTask(), "look in @src/ please")).toEqual([]);
+});
+
+test("unresolvedRefsForTask: a multi task left with one repository still needs the `<name>/` prefix (round 15)", async () => {
+  const dirs: string[] = [];
+  const searches: string[] = [];
+  const client = {
+    listProjectFiles: async (scope: { dir: string; q?: string | null }) => {
+      if (scope.q) {
+        searches.push(scope.q);
+        return { files: ["src/deep.ts"], truncated: true };
+      }
+      dirs.push(scope.dir);
+      return { files: ["src/b.ts"], truncated: true };
+    },
+    agentDiscovery: async () => ({ commands: [], extensions: [] }),
+  } as unknown as AgetorClient;
+  const task = fakeTask({
+    workdir: "/wt/t1",
+    worktreePath: "/wt/t1",
+    isolation: "worktree",
+    multiRepo: true,
+    repositories: [{
+      path: "/src/backend",
+      name: "backend",
+      branch: "feature/auth",
+      branchSource: "created",
+      worktreePath: "/wt/t1/backend",
+      baseRef: "abc123",
+      checkoutBranch: "feature/auth",
+      prUrl: null,
+    }],
+  });
+  // The agent's cwd is the workspace root: only `backend/…` resolves there,
+  // and a truncated listing verifies the repo-local path (prefix stripped).
+  expect(await unresolvedRefsForTask(client, task, "@backend/src/b.ts @backend/src/deep.ts @src/b.ts")).toEqual([
+    "@src/b.ts",
+  ]);
+  expect(dirs).toEqual(["/wt/t1/backend"]);
+  expect(searches).toEqual(["src/deep.ts"]);
 });

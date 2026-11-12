@@ -5,6 +5,9 @@ gets its own linked git worktree and branch **inside one per-task workspace
 directory**; a single agent conversation runs at that workspace root and every
 surface (card, run panel, diff, terminals, Worktrees page, PRs, pipelines, CLI,
 TUI) carries the repository dimension. A single-repository task is unchanged.
+A task created with two or more repositories stays a multi-repository task
+when repositories are later removed, even down to one (see "Removing a
+repository").
 
 The subsystem docs hold the parts of this contract that belong to them:
 [security.md](security.md) (path gate, desktop-only route, workspace-root I/O,
@@ -35,8 +38,22 @@ interface TaskRepository {
 }
 ```
 
-- **Multi rows** (2+ entries) store the JSON in `tasks.repositories` (migration
-  087). `workdir` is the workspace root `<dataDir>/worktrees/<task-id>` from
+- **Multi or single is `Task.multiRepo`**, not the entry count. `toTask`
+  (`db.ts`) derives it: true exactly when the stored `repositories` column is
+  non-empty, because only a multi row stores its set. It has no column of its
+  own, is not patchable and never bumps `updated_at`; it is optional in the
+  type. Every multi/single decision goes through `isMultiRepoTask`
+  (`src/shared/multi-repo.ts`), which is `task.multiRepo ?? (count > 1)`; the
+  count fallback keeps an older core's JSON, which has no `multiRepo`, working.
+  A count is read directly only where a count is meant (the CLI's "2+
+  repositories requested" at create time).
+- **Multi rows** store the JSON in `tasks.repositories` (migration 087): two or
+  more entries at creation, and at least one after removals. A one-repository
+  multi task keeps the whole multi contract: the workspace-root layout, the
+  `Repositories:` launch block, the extra roots, the per-repository tabs, diff,
+  PR and terminal selector, the `@<repo>/` scope, "1 repository" on the card
+  and "1 repo" in `agetor ls`.
+  `workdir` is the workspace root `<dataDir>/worktrees/<task-id>` from
   creation. `worktreePath` is `null` until the first start materializes the
   workspace, and from then on is that same root. `branch`, `baseRef`, `prUrl`
   and the scalar `checkoutBranch` are `null`. `issue_repo_path` names the
@@ -46,12 +63,21 @@ interface TaskRepository {
   (`src/shared/multi-repo.ts`, the same derivation the webview and CLI use), so
   those columns stay authoritative as they update. No backfill.
 - `repositories`/`issue_repo_path` are server-managed: written by `createTask`,
-  `tasks.setRepositories`, `tasks.setRepositoryPrUrl` and
-  `tasks.setRepositoryCheckout`; skipped by the generic `tasks.update` SET
-  clause; never bump `updated_at`; not in the PATCH allow-list. The set is
-  fixed at creation (the owner deferred editing), and `PATCH /tasks/:id`
-  refuses any change to a multi row's `workdir` with a 400, even before the
-  first start (re-sending the same value is accepted).
+  `tasks.setRepositories`, `tasks.setRepositoryPrUrl`,
+  `tasks.setRepositoryCheckout` and `tasks.clearIssueRepoPath`; skipped by the
+  generic `tasks.update` SET clause; never bump `updated_at`; not in the PATCH
+  allow-list. Repositories are chosen at creation and can't be added later;
+  the only change afterwards is removing one
+  (`DELETE /tasks/:id/repositories/:name`, below). `PATCH /tasks/:id` refuses
+  `repositories` with a 400 that points at that route, and refuses any change
+  to a multi row's `workdir` with a 400, even before the first start
+  (re-sending the same value is accepted).
+- `tasks.setRepositories` never demotes a multi row and never regrows one: on
+  a multi row it keeps only incoming entries whose workspace name the row
+  still stores, so a prepare snapshot taken before a removal can't write the
+  removed entry back; any non-empty result is stored (one entry included) and
+  an empty one leaves the row untouched. On a single row a one-entry set
+  still stores `'[]'`.
 - `tasks.setRepositories` is called with a snapshot taken before awaits, so it
   keeps a stored `prUrl` and `checkoutBranch` over the incoming one. A fresh
   checkout reading is recorded separately through `setRepositoryCheckout`
@@ -115,7 +141,10 @@ path gate probes every selected path (`PathParam.itemField`,
 ## Preparation
 
 `prepareTaskWorkdir` (`src/bun/worktree.ts`) delegates to `prepareWorkdir`
-unchanged for ≤1 repository. For 2+:
+unchanged for a single-repository task. For a multi task (`isMultiRepoTask`,
+a one-repository multi task included), it prepares under the workspace root,
+and the result carries `repositories` exactly when this path ran (callers test
+its presence, never its length):
 
 - **Serialized per task.** Multi-repository prepares of one task id run one
   at a time (`withTaskPrepareLock`): start, `sendInput`'s restore, unarchive,
@@ -185,8 +214,11 @@ Repositories:
 - backend: /…/worktrees/<task-id>/backend (branch feature/auth)
 ```
 
-and then the references block. This block is the only machine-added text for a
-multi task; a single-repo launch prompt is byte-identical to before. The
+and then the references block. The block is decided by the task
+(`repositoriesPromptBlock({ multiRepo, repositories })`), not the entry count,
+so a one-repository multi task still gets it (its cwd is the workspace root).
+This block is the only machine-added text for a multi task; a single-repo
+launch prompt is byte-identical to before. The
 pipeline runner measures a step prompt with the same function
 (`stepLaunchPromptOverage`), so the budget it checks is the text that is sent.
 
@@ -194,12 +226,22 @@ Every checkout sits inside the workspace, so the agent can reach each one
 through its cwd. The workspace root is not a git repository, though, and some
 CLIs scope their working roots per git repository, so `spawnAgentOrFail` also
 names each materialized checkout (`withTaskRepositoryRoots`, on **every** spawn
-path: first launch, follow-up, swap, retry):
+path: first launch, follow-up, swap, retry). Only checkouts that exist on disk
+at spawn time are named: one whose directory is gone (its source repository
+was deleted, a hand-removed checkout) is left out of both lists below, because
+some CLIs refuse an `--add-dir` that names a missing path.
 
 - `extraDirectories` becomes `--add-dir <workspace>/<repo>` for claude-code,
   codex and copilot. Cursor, fx, OpenCode, Gemini and Antigravity get no extra
   flag and rely on the cwd. Gemini's `--include-directories` /
   `context.includeDirectories` is not used (see "Intentional limits").
+- Copilot needs no escalation of its own: in Auto it already runs with
+  `--allow-all` and `COPILOT_ALLOW_ALL=true` (full access, writes under each
+  source repository's `.git/worktrees` included) and gets every checkout as
+  `--add-dir`; Read-only and Plan deny writes by design, in any repository, the
+  same as for a single-repository task
+  ([harness-copilot.md](harness-copilot.md)). Not live-verified: copilot was
+  not installed on the smoke machine.
 - `codexWorkspaceRepos` pairs each checkout with its source repository for
   codex's sandbox decision. `gitWritableRoots` grants a checkout's git common
   dir only when the checkout is strictly inside the cwd, its toplevel is that
@@ -207,7 +249,8 @@ path: first launch, follow-up, swap, retry):
   discovered by scanning the workspace ([harness-codex.md](harness-codex.md)).
 
 A single-repository task gets its `opts` back untouched, so its argv is
-unchanged.
+unchanged. When no checkout exists at spawn time a multi task's `opts` are
+returned untouched too.
 
 Because `workdir` (and, once started, `worktreePath`) is the workspace, every
 existing `worktreePath ?? workdir` cwd site (terminals at the workspace root,
@@ -246,6 +289,12 @@ workspace root **and** every repository checkout to exist.
   stays null. The run panel's "Create all PRs" walks the repositories that have
   no PR yet and are pushed, best-effort, appending `Closes #N` only for
   `issueRepoPath` ([run-panel.md](run-panel.md) has the in-flight rules).
+- A PR opened from a pipeline step's panel is stamped on the **step** row only
+  (single and multi alike; `body.taskId` names the step). The parent card does
+  not show it, and the parent's "Create all PRs" still counts that repository
+  as having no PR, so it can try it again and show GitHub's 422 ("a pull
+  request already exists") as that repository's failure. Owner decision: a
+  documented limitation, no code change.
 - PR proposal prefill is repository-scoped: the single "Create PR" chip only
   accepts the active repository's `Repository:` block, and "Create all PRs"
   attributes an unlabeled proposal only when exactly one repository is being
@@ -257,6 +306,64 @@ workspace root **and** every repository checkout to exist.
   dirty repository means no note, "push only" when all are clean and one is
   ahead, "nothing to commit or push" only when every repository is clean and
   level; an uninspectable repository next to clean ones suppresses the note.
+
+## Removing a repository
+
+`DELETE /tasks/:id/repositories/:name` (`removeTaskRepository` in
+`orchestrator.ts`) removes one repository from a multi task. It is how a task
+gets unstuck when one repository's source was deleted: until then every
+follow-up's restore fails on that repository; once it is removed, the next
+follow-up or start prepares only what remains. `ROUTE_POLICY` makes it
+`app+cli` with no `pathParams` (`:name` is a workspace name, not a path).
+
+- **Answers.** `200 { task }` on success; `404 { error }` for an unknown task
+  or repository name; `409 { error, code }` when refused:
+  - `running`: the task has a live or starting run, or (pipeline parent) a
+    step is running or its pipeline run is `running`;
+  - `last-repository`: it is the task's only repository;
+  - `dirty`: the checkout exists and has uncommitted changes, or its status
+    can't be read; the message names the checkout, and nothing is touched;
+  - `not-multi`: the task is a single-repository task;
+  - `pipeline-step`: steps share the parent's checkouts, so remove it on the
+    pipeline task;
+  - `detach-failed`: the checkout was clean but is still on disk after the
+    removal; nothing on the row changed.
+- **Effect** (`detachRepositoryForRemoval`, `worktree.ts`). The checkout is
+  located with archive's owned-path checks (`locateRepositoryCheckout`). A
+  clean checkout whose source repository still exists is detached with
+  `git worktree remove --force` and `git worktree prune` (an owned-path `rm`
+  fallback after); the branch is **always kept**, since it may hold the
+  user's commits. A missing checkout drops the entry after a best-effort
+  `git worktree prune` in the source. A missing source repository (gone from
+  disk, or no longer a git repository) drops the entry and leaves the
+  directory alone, since git can't vouch for it; a stored path that is not
+  agetor's owned shape is likewise left alone and the entry dropped.
+- **Row writes**, in one transaction: the remaining set through
+  `tasks.setRepositories`; `tasks.clearIssueRepoPath` when `issueRepoPath`
+  named the removed repository (no remaining PR claims `Closes #N`); and, for
+  a pipeline parent, the same removal on every step row that still lists the
+  repository, so a resumed step doesn't refuse over a checkout that is gone on
+  purpose.
+- **Status line.** `removed repository <name> from this task (branch <branch>
+  kept)` (without the branch clause when the entry had none) goes on the
+  task's latest run; for a pipeline parent, on its latest step's run; to the
+  console when nothing has run yet.
+- **Serialization.** The job runs behind any teardown queued on the task's
+  repository paths (the same FIFO keys as `enqueueTeardownMany`) and the
+  task's own pending teardown or removal, becomes the tail of those keys, and
+  then takes the task's prepare lock (`withTaskPrepareLock`), so no prepare is
+  mid-flight on the checkout. `pendingTeardown` awaits in-flight removals too
+  (kept apart from `teardowns`, so a removal never reads as "archive/delete is
+  taking this task away"), and `startTask` re-reads a multi row after that
+  wait, so start, follow-up, unarchive and terminal open all see the new set.
+  Refusals are checked once up front and again inside the job.
+- **Archived tasks** can lose a repository too (there is usually nothing to
+  detach). Archive, delete and teardown later see only what remains.
+- **Copies.** When an agent profile is duplicated with its tasks
+  (`duplicateAgentProfile`), a one-repository multi task is copied through
+  `createTask` with its one remaining repository, which creates an ordinary
+  single-repository task (it never inherits the old workspace root as its
+  `workdir`).
 
 ## Teardown, Worktrees page and ids
 
@@ -274,6 +381,20 @@ unarchive re-attaches onto the same branches.
   that repository, delete skips it). An entry with no recorded path falls back
   to `<workspace>/<name>`, removed or detached only when git proves it is a
   checkout of that entry's repository.
+- **A repository whose source is gone.** `repoRoot` re-checks the disk on
+  every call (a source deleted after its first lookup drops its cached root
+  instead of answering from the cache; a git spawn in a missing cwd throws and
+  used to abort the whole teardown job). With no root, git can't vouch for the
+  checkout, which may hold the only copy of uncommitted work, so it is left on
+  disk and the other repositories tear down as usual: archive's per-repository
+  detach reports `{ removed: false, reason: "source-missing" }` for it, even
+  when forced from the Worktrees page; delete skips it; the delete preview
+  plans no branches for it. The workspace root then stays, since it is not
+  empty. `WorktreeTeardownResult.reason` carries `source-missing`, and the
+  Worktrees page says the source repository no longer exists and the checkout
+  was kept (`triageDeleteOutcome`,
+  `src/mainview/components/worktrees/worktree-delete-intent.ts`). To drop such
+  a repository from a live task instead, remove it ("Removing a repository").
 - **The workspace root** is never wiped recursively. `removeWorkspaceIfEmpty`
   removes agetor's own `.claude/settings.local.json` scratch, then the empty
   `.claude`, then the empty root, and keeps everything else. The check and the
@@ -356,7 +477,10 @@ subdirectory selections under one root are not serialized against each other.)
   summary and forces worktree isolation.
 - **`@` files** — client-side union over one `/files/index` per repository
   scope, entries prefixed `<name>/`, plus a `<name>/` root row per repository
-  so `@frontend` itself resolves. Listing, search and discovery requests run
+  so `@frontend` itself resolves. Named scopes are passed only for a multi
+  task, so their presence decides (`multiScopesOrNull`), never a count: a
+  multi task left with one repository still lists and inserts `<name>/…`.
+  Listing, search and discovery requests run
   at most `MULTI_SCOPE_CONCURRENCY` (2) at a time, the run panel holds the
   listing and discovery until the task's event stream is ready, a focus refresh skips repositories
   listed in the last `FOCUS_REFRESH_MIN_AGE_MS` (5 s), and a newer
@@ -370,7 +494,8 @@ subdirectory selections under one root are not serialized against each other.)
   (`mergeAgentCapabilities`, first occurrence of a command name / extension
   insert wins); the CLI/TUI `@`-warning exemption unions the extension names
   of every scope. The non-git workspace root is never a discovery scope.
-- **Card** — a worktree icon + repository count with a hover tooltip naming
+- **Card** — a worktree icon + repository count ("1 repository" /
+  "N repositories", `repositoryCountLabel`) with a hover tooltip naming
   every repository, instead of the single workdir/branch line. Board text
   search matches any repository's name, path, branch and last-seen checkout;
   the project filter matches any repository.
@@ -380,7 +505,22 @@ subdirectory selections under one root are not serialized against each other.)
   agent at the workspace root.
 - **Run panel** — repository tab selects the per-repo status, PR head, PR path
   and terminal cwd; commit & push uses the aggregate prompt
-  ([run-panel.md](run-panel.md)).
+  ([run-panel.md](run-panel.md)). The task details list gains a
+  **Repositories** row with one block per repository: name, selected path,
+  branch (with drift: `on <live> (drifted from <branch>)`, from the git-status
+  poll or the last-seen checkout), short base sha, checkout path or "not
+  created yet", and the PR link. Each block has **Remove from task**, which
+  confirms first ("Remove <name> from this task?": the checkout is detached,
+  the branch is kept in the source with its commits, uncommitted changes block
+  the removal, and it can't be undone from here) and toasts the core's message
+  on a refusal. It is disabled, with the reason as its tooltip, while the task
+  is running or blocked or has a run id, on a pipeline step, and when only one
+  repository is left (`removeRepositoryBlockReason`,
+  `src/mainview/lib/repo-removal.ts`); a dirty checkout or a running pipeline
+  step is only known to the core. A repository whose per-repository git status
+  comes back `ignored` (its checkout, or before the first run its source, is
+  missing or unreadable) is marked with a warning on its tab and its details
+  block (`repositoryProblem`), so the one to remove is easy to find.
 - **Pipelines** — a multi parent copies its set onto every step row and owns
   teardown; steps never detach a shared worktree ([pipelines.md](pipelines.md)).
 - **CLI/TUI** — `agetor add --repo <path[=ref]>` (repeatable) and the
@@ -399,13 +539,22 @@ subdirectory selections under one root are not serialized against each other.)
   `show` prints the repository block with per-repository checkout drift,
   `shell [--repo <name>]` (works on single tasks too, and names the entry's
   branch), `rm` names each repository's own branch removals (and `--json`
-  carries `repositories[]`), `ls` shows a count, and the TUI `@` listing
-  unions the scopes with prefixes. `agetor add` without `--start` runs the
-  advisory `@` pre-check against the same per-repository scopes.
+  carries `repositories[]`), `ls` shows a count ("1 repo" for a multi task
+  left with one), and the TUI `@` listing unions the scopes with prefixes
+  (multi decided by `isMultiRepoTask`, so one named scope still gets the
+  `<name>/` prefix). `agetor add` without `--start` runs the advisory `@`
+  pre-check against the same per-repository scopes.
+  `agetor edit <task> --remove-repo <name>` (repeatable) calls the removal
+  route once per name, in the order given, after `--detach-profile` and before
+  the PATCH of any other flag; each success prints
+  `✓ removed repository <name> from <short id> (branch <branch> kept)` (names
+  through `escapeControlChars`; `--json` prints only the final task), and the
+  first refusal fails the command with the core's message.
 
 ## Intentional limits
 
-- Create-only repository set; 2+ requires worktree isolation; no per-repo
+- Repositories can't be added after creation; one can be removed (above), the
+  last one never. 2+ at creation requires worktree isolation; no per-repo
   `existingBranch`; no per-repo branch configuration; one agent conversation,
   not one per repository.
 - No hard cap on the repository count: a non-blocking warning above 10, and
@@ -414,11 +563,22 @@ subdirectory selections under one root are not serialized against each other.)
 - An older build sees the workspace as `workdir`/`worktreePath` and may orphan
   secondary worktrees; the core has no downgrade guard. The CLI does detect an
   older core at create time (above), but an older app or core reading a
-  multi row is not guarded.
+  multi row is not guarded. An older core also decides multi by count, so it
+  reads a one-repository multi row as a single-repository task at the
+  workspace root.
 - Gemini gets no extra roots: its `--include-directories` /
   `context.includeDirectories` is not used, because the gemini CLI was not
   installed for this change and the flag's behavior under a non-git cwd is
   unverified. It runs through the workspace cwd only.
-- No harness has been smoke-tested live with a multi-repository task yet. What
-  was verified, and what was not, is listed in
+- A pipeline step's PR stamp stays on the step row; the parent's "Create all
+  PRs" can retry that repository and show GitHub's 422 (owner decision,
+  "Diff, status and PRs" above).
+- Live harness smoke (2026-11-12, two fresh repositories, worktree
+  isolation): claude-code, codex (first turn and a follow-up, both escalated
+  to full access from the task's checkouts) and fx ran end to end and
+  committed in each checkout; OpenCode 2.x's agetor-owned server accepted the
+  non-git workspace directory and took the turn, but the provider refused it
+  for account credits, so no end-to-end edit was verified. Copilot was not
+  installed, and a harness-stack failover of a multi task was not run. Cursor,
+  Gemini and Antigravity were not run. Details:
   `docs/plans/multi-repo-tasks-smoke.md` ("Live harness smoke matrix").

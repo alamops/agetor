@@ -33,7 +33,10 @@ export function shouldOfferCommitPush(status: TaskGitStatus | null): boolean {
 export function shouldOfferCommitPushForTask(status: TaskGitStatus | null): boolean {
   if (!status) return false;
   const repos = status.repositories;
-  if (repos && repos.length > 1) return repos.some((repo) => shouldOfferCommitPush(repo));
+  // The per-repository array is present only for a multi task (the core
+  // omits it for a single one), and a multi task left with one repository
+  // still answers per repository, so its presence (not a count) decides.
+  if (repos && repos.length > 0) return repos.some((repo) => shouldOfferCommitPush(repo));
   return shouldOfferCommitPush(status);
 }
 

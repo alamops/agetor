@@ -138,6 +138,23 @@ describe("multiRepoFileScopes", () => {
       { name: "backend", dir: "/src/backend", ref: "bbb" },
     ]);
   });
+
+  test("a one-repository multi task (after a removal) keeps its named scope", () => {
+    const t = task({
+      workdir: "/wt/t1",
+      worktreePath: "/wt/t1",
+      multiRepo: true,
+      repositories: [repo({ name: "frontend", worktreePath: "/wt/t1/frontend" })],
+    });
+    expect(multiRepoFileScopes(t)).toEqual([{ name: "frontend", dir: "/wt/t1/frontend" }]);
+    expect(fileScopesForTask(t)).toEqual([{ name: "frontend", dir: "/wt/t1/frontend" }]);
+    // Never the non-git workspace root.
+    expect(discoveryScopesForTask(t)).toEqual([{ workdir: "/wt/t1/frontend", branch: null }]);
+  });
+
+  test("multiRepo: false keeps a single task single even with a stray stored entry", () => {
+    expect(multiRepoFileScopes(task({ multiRepo: false, repositories: [repo({}), repo({ name: "b" })] }))).toEqual([]);
+  });
 });
 
 describe("splitNamedScopePath", () => {

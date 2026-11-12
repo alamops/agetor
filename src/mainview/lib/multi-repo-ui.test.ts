@@ -15,8 +15,10 @@ import {
   openFolderUnavailableReason,
   repositoriesForPrBatch,
   resetPrBatchesForTest,
+  repositoryCountLabel,
   resolveConflictsKey,
   seedRepositoriesDialogValue,
+  selectedRepositoryName,
   subscribePrBatches,
   taskSearchText,
 } from "./multi-repo-ui.ts";
@@ -174,6 +176,19 @@ describe("taskSearchText (S13)", () => {
     };
     expect(taskSearchText(t)).toBe("t\np\n/w\nb\nw /w");
   });
+
+  test("a multi task left with one repository still folds its branches in (round 15)", () => {
+    const text = taskSearchText({
+      title: "t",
+      prompt: "p",
+      workdir: "/ws",
+      branch: null,
+      multiRepo: true,
+      repositories: [repo({ name: "fe", branch: "feature/auth", checkoutBranch: "hotfix/Drift" })],
+    });
+    expect(text).toContain("feature/auth");
+    expect(text).toContain("hotfix/drift");
+  });
 });
 
 describe("multiRepoDeleteFallback (N6a)", () => {
@@ -203,6 +218,36 @@ describe("openFolderUnavailableReason (S11)", () => {
     expect(openFolderUnavailableReason({ worktreePath: "/ws", repositories: [{}, {}] })).toBeNull();
     expect(openFolderUnavailableReason({ worktreePath: null, repositories: [{}] })).toBeNull();
     expect(openFolderUnavailableReason({ worktreePath: null })).toBeNull();
+  });
+
+  test("a never-started multi task left with one repository has no folder yet either (round 15)", () => {
+    expect(openFolderUnavailableReason({ worktreePath: null, multiRepo: true, repositories: [{}] })).toContain("first runs");
+    expect(openFolderUnavailableReason({ worktreePath: null, multiRepo: false, repositories: [{}] })).toBeNull();
+  });
+});
+
+describe("selectedRepositoryName (round 15)", () => {
+  const two = { multiRepo: true, repositories: [{ name: "fe" }, { name: "be" }] };
+  test("keeps a selection that is still on the task, else the first repository", () => {
+    expect(selectedRepositoryName(two, "be")).toBe("be");
+    expect(selectedRepositoryName(two, null)).toBe("fe");
+    // The selected repository was removed from the task.
+    expect(selectedRepositoryName({ multiRepo: true, repositories: [{ name: "fe" }] }, "be")).toBe("fe");
+  });
+
+  test("a multi task left with one repository still has its tab; a single task has none", () => {
+    expect(selectedRepositoryName({ multiRepo: true, repositories: [{ name: "fe" }] }, null)).toBe("fe");
+    expect(selectedRepositoryName({ multiRepo: false, repositories: [{ name: "w" }] }, "w")).toBeNull();
+    // An older core's JSON (no `multiRepo`) still decides by the count.
+    expect(selectedRepositoryName({ repositories: [{ name: "w" }] }, null)).toBeNull();
+    expect(selectedRepositoryName({ repositories: [{ name: "a" }, { name: "b" }] }, null)).toBe("a");
+  });
+});
+
+describe("repositoryCountLabel (round 15)", () => {
+  test("is singular for one repository", () => {
+    expect(repositoryCountLabel(1)).toBe("1 repository");
+    expect(repositoryCountLabel(3)).toBe("3 repositories");
   });
 });
 

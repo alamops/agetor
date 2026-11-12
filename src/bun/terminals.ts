@@ -20,6 +20,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import type { Task, TerminalTab } from "../shared/types.ts";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { tasks } from "./db.ts";
 import { childEnv } from "./core-spawn.ts";
 // NOTE: worktree.ts is imported *dynamically* inside createTerminal, not at
@@ -195,7 +196,7 @@ export async function createTerminal(
     if ("error" in before) return before;
     const { task } = before;
 
-    const multiRepo = (task.repositories?.length ?? 0) > 1;
+    const multiRepo = isMultiRepoTask(task);
     // Every repository checkout of a multi row exists. A workspace root
     // without them is not a usable worktree: prepareWorkdir would re-create
     // the missing ones.

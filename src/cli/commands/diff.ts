@@ -3,7 +3,7 @@ import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { flagValue } from "../args.ts";
-import { repositoriesForTask } from "../../shared/multi-repo.ts";
+import { isMultiRepoTask, repositoriesForTask } from "../../shared/multi-repo.ts";
 import type { DiffFile, TaskDiff } from "../../shared/types.ts";
 import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
 
@@ -39,8 +39,10 @@ export async function cmdDiff(args: string[], flags: Flags): Promise<void> {
     );
   }
 
-  if (repos.length <= 1) {
-    // Byte-identical to the pre-multi output: one diff, one JSON object.
+  if (!isMultiRepoTask(task)) {
+    // Byte-identical to the pre-multi output: one diff, one JSON object. A
+    // multi task left with one repository keeps the labelled, per-repository
+    // form below (issue #291).
     const diff = await client.getDiff(task.id);
     if (flags.json) return printJson(diff);
     printDiff(diff);

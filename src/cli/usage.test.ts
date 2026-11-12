@@ -248,3 +248,8 @@ test("`agetor harness stack create --help` prints the create block, not the pare
     rmSync(dataDir, { recursive: true, force: true });
   }
 }, 30_000);
+
+test("edit documents --remove-repo and what it keeps (round 15)", () => {
+  expect(USAGE["edit"]).toContain("--remove-repo <name>");
+  expect(USAGE["edit"]).toMatch(/its branch\s+is kept/);
+});

@@ -172,3 +172,10 @@ test("repositoryPrHead: uses the live drifted branch once the repo is synced", (
   expect(repositoryPrHead(repo, status({ remoteSynced: true, branch: "main", isDefaultBranch: true })))
     .toBe("agetor/abc-thing");
 });
+
+test("shouldOfferCommitPushForTask: a one-repository per-repo array still decides (round 15)", () => {
+  // A multi task left with one repository answers per repository too; its
+  // array, not the top-level mirror, is authoritative.
+  const repo = { ...status({ hasChanges: true }), name: "backend", path: "/tmp/backend" };
+  expect(shouldOfferCommitPushForTask(status({ hasChanges: false, ahead: 0, repositories: [repo] }))).toBe(true);
+});

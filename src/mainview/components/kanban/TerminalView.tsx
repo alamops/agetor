@@ -336,20 +336,24 @@ export function TerminalView({
   archived?: boolean;
   /** Workspace names for a multi-repository task (issue #291) — the header
    *  then offers a cwd selector instead of always using the task workspace
-   *  root. */
+   *  root. Passed only for a multi task (`isMultiRepoTask`), so its presence
+   *  decides: a multi task left with one repository keeps the selector. */
   repositories?: string[];
   /** The run panel's selected repository tab, or `null` for the workspace
    *  root. A new terminal opens in this cwd; the local selector below can
    *  override it until the tab changes again. */
   activeRepo?: string | null;
 }) {
-  const multiRepo = (repositories?.length ?? 0) > 1;
+  const multiRepo = repositories !== undefined;
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   // `null` = the task workspace root, where the agent runs and every
   // repository is visible — the documented default (T5/T11). Selecting a
   // repository only changes where a NEW shell starts; existing tabs keep
   // their own cwd.
-  const [repo, setRepo] = useState<string | null>(activeRepo);
+  const [rawRepo, setRepo] = useState<string | null>(activeRepo);
+  // A repository removed from the task (issue #291) falls back to the
+  // workspace root instead of opening a shell in a checkout that is gone.
+  const repo = rawRepo && repositories?.includes(rawRepo) ? rawRepo : null;
   const [activeId, setActiveId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 

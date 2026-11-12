@@ -113,6 +113,7 @@ const {
   parseRepoSpec,
   normalizeRepoSelection,
   repositorySetOutcome,
+  collapsedRepositoriesNote,
   cmdAdd,
   wizard,
   chooseAddPath,
@@ -1789,6 +1790,20 @@ test("repositorySetOutcome: only a missing field on a 2+ request means an old co
   expect(repositorySetOutcome(two, {})).toBe("core-too-old");
   expect(repositorySetOutcome(two, { repositories: [] })).toBe("collapsed");
   expect(repositorySetOutcome(two, { repositories: [{} as never, {} as never] })).toBe("ok");
+});
+
+test("collapsedRepositoriesNote follows the core's multiRepo verdict, not the kept count (round 15)", () => {
+  const three = { repositories: [{ path: "/a" }, { path: "/b" }, { path: "/c" }] };
+  const one = [{ path: "/a", name: "a" } as never];
+  // The core kept one entry but made it a multi task: not "single-repository".
+  expect(collapsedRepositoriesNote(three, { repositories: one, multiRepo: true })).toBe(
+    "2 selected paths shared a git repository with another selection; the task has 1 repository",
+  );
+  expect(collapsedRepositoriesNote(three, { repositories: one, multiRepo: false })).toContain(
+    "created as a single-repository task",
+  );
+  // An older core's answer (no `multiRepo`) still decides by the count.
+  expect(collapsedRepositoriesNote(three, { repositories: one })).toContain("created as a single-repository task");
 });
 
 // ── add wizard: multi-select repositories (issue #291 review M1) ─────────

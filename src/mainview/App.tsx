@@ -82,6 +82,7 @@ import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
 import { issueProjectPath, taskProjectPath } from "@/lib/repo-selection";
 import { multiRepoDeleteFallback, openFolderUnavailableReason, taskSearchText } from "@/lib/multi-repo-ui";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { cn } from "@/lib/utils";
 import { autoEnabledToastText, opencodeSessionsFoundText } from "@/lib/import-sessions";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
@@ -2220,7 +2221,7 @@ function AppInner() {
     const maybeDrifted = t.checkoutBranch && t.checkoutBranch !== t.branch ? t.checkoutBranch : null;
     // A multi-repository row has no scalar branch: the fallback names each
     // repository's own branch (and drifted checkout) instead of an empty `()`.
-    const multiFallback = (t.repositories?.length ?? 0) > 1 ? multiRepoDeleteFallback(t.repositories!) : null;
+    const multiFallback = isMultiRepoTask(t) ? multiRepoDeleteFallback(t.repositories ?? []) : null;
     const ok = await confirm({
       title: `Delete "${t.title}"?`,
       description: (
@@ -2320,7 +2321,7 @@ function AppInner() {
       toast.info(unavailable);
       return;
     }
-    const multi = (t.repositories?.length ?? 0) > 1;
+    const multi = isMultiRepoTask(t);
     void api.openPath({ path: t.worktreePath ?? t.workdir, taskId: t.id }).catch((err: unknown) => {
       if (multi) toast.error(err instanceof Error ? err.message : "Could not open the workspace folder");
     });

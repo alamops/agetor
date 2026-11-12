@@ -11,6 +11,7 @@ import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, TaskRepository, WorktreeTeardownResult } from "../shared/types.ts";
 import { MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { lexicallyInsideRoot, pinnedBranchesFor } from "./task-repos.ts";
 
 export type { BranchInfo };
@@ -450,9 +451,19 @@ const repoRootCache = new Map<string, string>();
  * isn't a git working tree. We base worktrees off the root, not subdirectories.
  */
 export async function repoRoot(dir: string): Promise<string | null> {
+  // A repository deleted after its first lookup must not keep answering from
+  // the cache: every caller then runs git with that root as its cwd, and a
+  // spawn in a missing cwd throws (ENOENT) instead of failing, which aborted
+  // whole teardown jobs. Re-check the disk before trusting a cached root.
+  if (!existsSync(dir)) {
+    repoRootCache.delete(dir);
+    return null;
+  }
   const cached = repoRootCache.get(dir);
-  if (cached !== undefined) return cached;
-  if (!existsSync(dir)) return null;
+  if (cached !== undefined) {
+    if (existsSync(cached)) return cached;
+    repoRootCache.delete(dir);
+  }
   const res = await git(["rev-parse", "--show-toplevel"], dir);
   if (!res.ok) return null;
   repoRootCache.set(dir, res.stdout);
@@ -646,7 +657,9 @@ export function shouldLazyPinBaseRef(
   baseRef: string | null | undefined,
   prepared: Pick<PreparedWorkdir, "worktreePath" | "repositories">,
 ): boolean {
-  if ((prepared.repositories?.length ?? 0) > 1) return false;
+  // `prepared.repositories` is present exactly when the multi path ran (one
+  // entry included, for a multi task with repositories removed down to one).
+  if (prepared.repositories) return false;
   return !baseRef && Boolean(prepared.worktreePath);
 }
 
@@ -1614,7 +1627,7 @@ async function clearWorkspaceChild(target: string, root: string): Promise<string
  */
 const prepareChains = new Map<string, Promise<void>>();
 
-async function withTaskPrepareLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+export async function withTaskPrepareLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
   const prev = prepareChains.get(taskId) ?? Promise.resolve();
   let release!: () => void;
   const mine = new Promise<void>((resolve) => { release = resolve; });
@@ -1652,7 +1665,9 @@ export async function prepareTaskWorkdir(
   opts?: { takenBranches?: Map<string, Set<string>> },
 ): Promise<PrepareResult> {
   const repos = task.repositories ?? [];
-  if (repos.length <= 1) {
+  // `isMultiRepoTask`, never the count: a multi task whose repositories were
+  // removed down to one still prepares under its workspace root.
+  if (!isMultiRepoTask(task) || repos.length === 0) {
     // Preserve the single-repo contract exactly: `takenBranches` was a global
     // set before the repository dimension existed, so fold every root's set.
     const taken = new Set<string>();
@@ -1977,7 +1992,7 @@ export async function getTaskDiff(task: Task, repoName?: string | null): Promise
   let emptyNote: string;
   let repo: string | null = null;
 
-  if ((task.repositories?.length ?? 0) > 1) {
+  if (isMultiRepoTask(task) && (task.repositories?.length ?? 0) > 0) {
     const repos = task.repositories!;
     const entry = repoName ? repos.find((r) => r.name === repoName) : repos[0];
     if (!entry) {
@@ -2154,7 +2169,7 @@ export async function getTaskDiffBlob(
   let cwd: string;
   let base: string;
 
-  if ((task.repositories?.length ?? 0) > 1) {
+  if (isMultiRepoTask(task) && (task.repositories?.length ?? 0) > 0) {
     const repos = task.repositories!;
     const entry = repoName ? repos.find((r) => r.name === repoName) : repos[0];
     if (!entry) return { ok: false, error: "unknown repository", status: 400 };
@@ -2330,7 +2345,7 @@ export async function removeWorktree(
   },
 ): Promise<void> {
   const repos = task.repositories ?? [];
-  if (repos.length > 1) {
+  if (isMultiRepoTask(task) && repos.length > 0) {
     // Per repository: remove its checkout and the branches the per-repo plan
     // says agetor owns there. `branchSource: "existing"` never happens for a
     // multi task in v1, but the guard keeps a future per-repo PR head safe.
@@ -2339,6 +2354,10 @@ export async function removeWorktree(
     for (const repo of repos) {
       const located = await locateRepositoryCheckout(task, workspace, repo);
       if (!located.wt) continue;
+      // The source repository is gone: git can't vouch for the checkout (it
+      // may hold the only copy of uncommitted work), so it is left on disk
+      // and the other repositories tear down as usual.
+      if (!located.root) continue;
       const branches = planned.get(repo.name)
         ?? (repo.branch && repo.branchSource !== "existing" ? [repo.branch] : null);
       await removeOneWorktree(located.root, located.wt, branches);
@@ -2418,15 +2437,16 @@ async function detachOneWorktree(
   if (refused) return { removed: false, reason: "failed" };
   if (!wt) return { removed: false, reason: "no-worktree" };
   if (!existsSync(wt)) return { removed: false, reason: "already-absent" };
+  // The source repository is gone (or no longer a git repository): git can't
+  // vouch for the checkout, so even a forced detach leaves it alone.
+  if (!root) return { removed: false, reason: "source-missing" };
   if (!opts?.force) {
     const dirty = await hasUncommittedChanges(wt);
     if (dirty !== false) return { removed: false, reason: "dirty" };
   }
-  if (root) {
-    await git(["worktree", "remove", "--force", wt], root);
-    // Deliberately no `git branch -D` — the branch survives for a re-attach.
-    await git(["worktree", "prune"], root, 10_000);
-  }
+  await git(["worktree", "remove", "--force", wt], root);
+  // Deliberately no `git branch -D` — the branch survives for a re-attach.
+  await git(["worktree", "prune"], root, 10_000);
   // `wt` passed `isOwnedRepositoryCheckoutPath` (exact owned shape, no `..`).
   if (existsSync(wt)) {
     try { await rm(wt, { recursive: true, force: true }); }
@@ -2434,6 +2454,67 @@ async function detachOneWorktree(
   }
   const removed = !existsSync(wt);
   return removed ? { removed } : { removed, reason: "failed" };
+}
+
+/**
+ * What {@link detachRepositoryForRemoval} did with one repository's checkout.
+ * - `detached`: a clean checkout was removed (`git worktree remove`); its
+ *   branch is kept.
+ * - `absent`: no checkout on disk; the source's stale registration was pruned.
+ * - `source-missing`: the source repository is gone (or no longer a git
+ *   repository), so git can't vouch for anything — nothing was touched.
+ * - `refused`: the recorded path is not agetor's own checkout shape
+ *   (`isOwnedRepositoryCheckoutPath`) — nothing was touched.
+ * - `dirty`: the checkout has uncommitted changes, or its status couldn't be
+ *   read (can't confirm clean) — nothing was touched.
+ * - `failed`: the checkout was clean but is still on disk after the removal.
+ */
+export type RepositoryRemovalDetach =
+  | { kind: "detached"; worktreePath: string }
+  | { kind: "absent" }
+  | { kind: "source-missing" }
+  | { kind: "refused" }
+  | { kind: "dirty"; worktreePath: string }
+  | { kind: "failed"; worktreePath: string };
+
+/**
+ * Detach ONE repository's checkout of a multi-repository task before that
+ * repository is removed from the task (`removeTaskRepository`,
+ * docs/architecture/multi-repo-tasks.md). The same machinery as archive's
+ * per-repository detach (`locateRepositoryCheckout`'s owned-path checks, the
+ * dirty gate, `git worktree remove --force` + prune, an owned-path `rm`
+ * fallback), except that it never forces past a dirty checkout and reports a
+ * missing source repository instead of deleting a checkout git can no longer
+ * vouch for. Never deletes a branch. Never throws on a git failure.
+ */
+export async function detachRepositoryForRemoval(
+  task: Task,
+  repo: TaskRepository,
+): Promise<RepositoryRemovalDetach> {
+  const { wt, root, refused } = await locateRepositoryCheckout(task, workspacePathFor(task), repo);
+  if (refused) return { kind: "refused" };
+  // `repoRoot` caches per path, so a source deleted after its first lookup
+  // still has a cached root: check the disk too (a git spawn in a missing cwd
+  // throws instead of failing).
+  if (!root || !existsSync(root)) return { kind: "source-missing" };
+  if (!wt || !existsSync(wt)) {
+    // Best-effort: drop the source's registration of a checkout that's gone.
+    try { await git(["worktree", "prune"], root, 10_000); } catch { /* best-effort */ }
+    return { kind: "absent" };
+  }
+  const dirty = await hasUncommittedChanges(wt);
+  if (dirty !== false) return { kind: "dirty", worktreePath: wt };
+  try {
+    await git(["worktree", "remove", "--force", wt], root);
+    // Deliberately no `git branch -D` — the branch may hold the user's commits.
+    await git(["worktree", "prune"], root, 10_000);
+  } catch { /* the rm fallback below and the existence check decide */ }
+  // `wt` passed `isOwnedRepositoryCheckoutPath` (exact owned shape, no `..`).
+  if (existsSync(wt)) {
+    try { await rm(wt, { recursive: true, force: true }); }
+    catch { /* best-effort */ }
+  }
+  return existsSync(wt) ? { kind: "failed", worktreePath: wt } : { kind: "detached", worktreePath: wt };
 }
 
 /**
@@ -2472,7 +2553,7 @@ export async function detachWorktree(
   opts?: { force?: boolean },
 ): Promise<WorktreeTeardownResult> {
   const repos = task.repositories ?? [];
-  if (repos.length > 1) {
+  if (isMultiRepoTask(task) && repos.length > 0) {
     const outcomes: { name: string; result: WorktreeTeardownResult }[] = [];
     const workspace = workspacePathFor(task);
     for (const repo of repos) {

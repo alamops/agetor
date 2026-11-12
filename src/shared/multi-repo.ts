@@ -15,7 +15,7 @@ export type RepoTaskShape = Pick<
   | "checkoutBranch"
   | "prUrl"
   | "repositories"
->;
+> & Pick<Partial<Task>, "multiRepo">;
 
 /**
  * The subset {@link repositoriesForTask} and the `@`/discovery scope helpers
@@ -26,7 +26,7 @@ export type RepoTaskShape = Pick<
 export type RepoSetShape = Pick<
   Task,
   "workdir" | "isolation" | "branch" | "branchSource" | "worktreePath" | "baseRef"
-> & { repositories?: TaskRepository[] };
+> & { repositories?: TaskRepository[]; multiRepo?: boolean };
 
 /** Sanitized directory/branch-safe name from a project path's basename. */
 export function repoNameForPath(projectPath: string): string {
@@ -68,14 +68,15 @@ export function uniqueRepoSlugs(paths: string[]): string[] {
 
 /**
  * Every repository entry for a task, in selection order. Multi-repo tasks
- * carry their own array; a single-repo task (or a legacy row, whose column is
- * `[]`) derives one entry from the scalar columns so callers never branch on
- * `undefined`.
+ * ({@link isMultiRepoTask}, which includes a one-repository multi task left
+ * by a removal) carry their own array; a single-repo task (or a legacy row,
+ * whose column is `[]`) derives one entry from the scalar columns so callers
+ * never branch on `undefined`.
  */
 export function repositoriesForTask(
   task: RepoSetShape & Partial<Pick<Task, "checkoutBranch" | "prUrl">>,
 ): TaskRepository[] {
-  if (task.repositories && task.repositories.length > 1) return task.repositories;
+  if (task.repositories && task.repositories.length > 0 && isMultiRepoTask(task)) return task.repositories;
   return [
     {
       path: task.workdir,
@@ -90,14 +91,22 @@ export function repositoriesForTask(
   ];
 }
 
-/** True only for a task created against two or more repositories. */
-export function isMultiRepoTask(task: Pick<Task, "repositories">): boolean {
-  return (task.repositories?.length ?? 0) > 1;
+/**
+ * True for a multi-repository task: one created against two or more
+ * repositories, which stays multi (workspace-root layout, `Repositories:`
+ * block, per-repository everything) even after repositories are removed down
+ * to one. The core computes `multiRepo` from the stored column (`db.ts`'s
+ * `toTask`); the count fallback keeps an older core's JSON, which has no
+ * `multiRepo`, working. Every multi/single decision goes through this, never
+ * through `repositories.length`.
+ */
+export function isMultiRepoTask(task: { multiRepo?: boolean; repositories?: readonly unknown[] | null }): boolean {
+  return task.multiRepo ?? ((task.repositories?.length ?? 0) > 1);
 }
 
 /**
- * The `Repositories:` launch-prompt block (only appended for 2+ repos, so a
- * single-repo launch prompt stays byte-identical). Each line names the
+ * The `Repositories:` launch-prompt block (only appended for a multi task, so
+ * a single-repo launch prompt stays byte-identical). Each line names the
  * workspace subdirectory, its absolute path and the branch checked out there.
  */
 export function formatRepositoriesPrompt(

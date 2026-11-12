@@ -223,3 +223,17 @@ test("--repo naming the failing repository fails the command with its error", as
   } as unknown as AgetorClient;
   await expect(cmdDiff(["t1", "--repo", "frontend"], flags)).rejects.toThrow("worktree missing");
 });
+
+test("a multi task left with one repository keeps the labelled per-repository form (round 15)", async () => {
+  const calls: Array<string | undefined> = [];
+  currentClient = makeClient(task({ multiRepo: true, repositories: [repo("backend")] }), calls);
+
+  await cmdDiff(["t1"], flags);
+  // Asked by name: the workspace root itself is not a repository.
+  expect(calls).toEqual(["backend"]);
+  expect(outputs.join("\n")).toContain("── backend ──");
+
+  json.length = 0;
+  await cmdDiff(["t1"], { ...flags, json: true });
+  expect(Array.isArray(json[0])).toBe(true);
+});

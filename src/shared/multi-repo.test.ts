@@ -122,12 +122,24 @@ describe("repositoriesForTask", () => {
     });
   });
 
-  test("a one-entry stored array is treated as single-repo", () => {
+  test("a one-entry array with no multiRepo flag (an older core) is treated as single-repo", () => {
     const derived = repositoriesForTask(
       task({ repositories: [repo({ path: "/other", name: "other" })] }),
     );
     expect(derived).toHaveLength(1);
     expect(derived[0]!.path).toBe("/repos/app");
+  });
+
+  test("a one-repository multi task returns its stored entry, not a derived one", () => {
+    const only = repo({ path: "/other", name: "other" });
+    expect(repositoriesForTask(task({ multiRepo: true, repositories: [only] }))).toEqual([only]);
+  });
+
+  test("multiRepo: false derives from the scalars even with two entries", () => {
+    const derived = repositoriesForTask(
+      task({ multiRepo: false, repositories: [repo({ name: "a" }), repo({ name: "b" })] }),
+    );
+    expect(derived.map((r) => r.path)).toEqual(["/repos/app"]);
   });
 });
 
@@ -140,6 +152,11 @@ describe("isMultiRepoTask", () => {
 
   test("true for two or more", () => {
     expect(isMultiRepoTask({ repositories: [repo({}), repo({ name: "b" })] })).toBe(true);
+  });
+
+  test("the server-computed multiRepo flag wins over the count", () => {
+    expect(isMultiRepoTask({ multiRepo: true, repositories: [repo({})] })).toBe(true);
+    expect(isMultiRepoTask({ multiRepo: false, repositories: [repo({}), repo({ name: "b" })] })).toBe(false);
   });
 });
 
@@ -191,5 +208,21 @@ describe("commitPushPrompt", () => {
     expect(text).toContain("Repositories:\n- frontend: branch 'feature/auth'\n- backend: branch 'feature/auth-2'");
     expect(text).toContain('Repository: <name>');
     expect(text).toContain("four-backtick block");
+  });
+
+  test("a one-repository multi task keeps the per-repository prompt", () => {
+    const text = commitPushPrompt({
+      branch: null,
+      taskType: "task",
+      multiRepo: true,
+      repositories: [repo({ name: "frontend", branch: "feature/auth" })],
+    });
+    expect(text).toContain("Repositories:\n- frontend: branch 'feature/auth'");
+    expect(text).toContain("Repository: <name>");
+  });
+
+  test("multiRepo: false stays single with a one-entry derived set", () => {
+    const base = commitPushPrompt({ branch: "fix/x", taskType: "bug" });
+    expect(commitPushPrompt({ branch: "fix/x", taskType: "bug", multiRepo: false, repositories: [repo({})] })).toBe(base);
   });
 });

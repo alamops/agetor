@@ -7,6 +7,8 @@ import { ApiError, type PatchTaskInput } from "../api-client.ts";
 import { COLUMNS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
 import { parseOpencodeServerFlag, parseSpeedFlag, usageError, warnOpencodeServerFlagIgnored } from "../usage.ts";
+import { escapeControlChars } from "../../shared/terminal-text.ts";
+import type { Task } from "../../shared/types.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -16,6 +18,7 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   const patch: PatchTaskInput = {};
   let detachProfile = false;
   let opencodeServerIgnored = false;
+  const removeRepos: string[] = [];
   for (let i = 1; i < args.length; i++) {
     const a = args[i]!;
     const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
@@ -47,13 +50,14 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
       case "--type": patch.taskType = val(); break;
       case "--column": patch.column = val(); break;
       case "--detach-profile": detachProfile = true; break;
+      case "--remove-repo": removeRepos.push(val()); break;
       default: break;
     }
   }
-  const nothingToPatch = Object.keys(patch).length === 0 && !detachProfile;
+  const nothingToPatch = Object.keys(patch).length === 0 && !detachProfile && removeRepos.length === 0;
   if (nothingToPatch && !opencodeServerIgnored) {
     throw new Error(
-      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column/--detach-profile",
+      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--speed/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column/--detach-profile/--remove-repo",
     );
   }
   if (patch.column && !COLUMN_IDS.includes(patch.column as (typeof COLUMN_IDS)[number])) {
@@ -76,6 +80,15 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   // than change the server string, which the webview also reads verbatim.
   // Every other error this command can raise still propagates unmodified.
   let updated = detachProfile ? await client.detachTaskAgentProfile(task.id) : task;
+  // Repository removals (issue #291), in the order given, before any patch;
+  // the first refusal stops the command with the core's message (`running`,
+  // `dirty`, `last-repository`, `not-multi`, `pipeline-step`). Each success
+  // prints the escaped status line unless `--json`.
+  for (const name of removeRepos) {
+    const before = (updated.repositories ?? []).find((r) => r.name === name) ?? null;
+    updated = await client.removeTaskRepository(updated.id, name);
+    if (!flags.json) out(removedRepositoryLine(updated, name, before?.branch ?? null));
+  }
   if (Object.keys(patch).length > 0) {
     try {
       updated = await client.patchTask(updated.id, patch);
@@ -91,7 +104,15 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   // model/mode/effort changes are forwarded to a live claude session by the
   // server (reconcileTaskSession sends /model, /effort, cycles mode).
   const changed = [...(detachProfile ? ["detach-profile"] : []), ...Object.keys(patch)];
+  if (changed.length === 0) return; // only removals, each already reported
   out(`${c.green("✓")} updated ${c.dim(updated.id.slice(0, 8))} — ${changed.join(", ")}`);
+}
+
+/** The success line for one `--remove-repo`. Repository and branch names are
+ *  agent/user-controlled text, so both go through the identifier escaper. */
+export function removedRepositoryLine(task: Pick<Task, "id">, name: string, branch: string | null): string {
+  const kept = branch ? ` (branch ${escapeControlChars(branch)} kept)` : "";
+  return `${c.green("✓")} removed repository ${escapeControlChars(name)} from ${c.dim(task.id.slice(0, 8))}${kept}`;
 }
 
 export async function cmdMove(args: string[], flags: Flags): Promise<void> {

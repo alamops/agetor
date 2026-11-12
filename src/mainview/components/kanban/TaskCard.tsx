@@ -16,6 +16,8 @@ import { taskTypeMeta, type HarnessLimitState, type HarnessStack, type Task } fr
 import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { importedSessionOf } from "../../../shared/imported-session.ts";
+import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
+import { repositoryCountLabel } from "@/lib/multi-repo-ui";
 import { AgentIcon } from "./AgentIcon";
 import { PipelineBadge } from "@/components/pipelines";
 import { StackBadge } from "./StackBadge";
@@ -331,7 +333,7 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
       </CardHeader>
       <CardContent className="space-y-2">
         <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
-        {(task.repositories?.length ?? 0) > 1 ? (
+        {isMultiRepoTask(task) ? (
           // Multi-repository card (issue #291): one worktree icon + count with
           // a hover tooltip naming every repository, instead of a single
           // workdir and branch line (the workspace root is not a repository).
@@ -341,9 +343,9 @@ function TaskCardImpl({ task, homeDir, stacks = [], limitStates = [], onStart, o
             title={(task.repositories ?? []).map((r) => `${r.name}: ${r.worktreePath ?? r.path}`).join("\n")}
           >
             <GitFork className="size-3 shrink-0" />
-            <span className="shrink-0 font-medium">{task.repositories!.length} repositories</span>
+            <span className="shrink-0 font-medium">{repositoryCountLabel(task.repositories?.length ?? 0)}</span>
             <span className="truncate opacity-80">
-              · {task.repositories!.map((r) => r.name).join(", ")}
+              · {(task.repositories ?? []).map((r) => r.name).join(", ")}
             </span>
           </div>
         ) : (

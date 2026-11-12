@@ -292,6 +292,11 @@ const ROWS: Record<ClientMethod, Row> = {
     why: "task was never bound; detach is idempotent",
     call: () => client.detachTaskAgentProfile(fx.taskId),
   },
+  removeTaskRepository: {
+    expect: [409],
+    why: "the fixture is a single-repository task (`not-multi`); the CLI token reaches the handler",
+    call: () => client.removeTaskRepository(fx.taskId, "anything"),
+  },
 
   // ── run lifecycle (fake claude driver) ─────────────────────────────────────
   startTask: {

@@ -1,5 +1,5 @@
 // Client-side helpers for the multi-repository selector (issue #291).
-import { repoNameForPath, uniqueRepoSlugs } from "../../shared/multi-repo.ts";
+import { isMultiRepoTask, repoNameForPath, uniqueRepoSlugs } from "../../shared/multi-repo.ts";
 
 /** One selected repository in the dialog, before it becomes a create payload. */
 export interface RepoSelection {
@@ -81,8 +81,11 @@ export function repositoryFileScopes(
 export function taskProjectPath(task: {
   workdir: string;
   repositories?: { path: string }[];
+  multiRepo?: boolean;
 }): string {
-  return (task.repositories?.length ?? 0) > 1
+  // `isMultiRepoTask`, not a count: a multi task left with one repository
+  // still has the workspace root as its `workdir`.
+  return isMultiRepoTask(task)
     ? (task.repositories?.[0]?.path ?? task.workdir)
     : task.workdir;
 }
@@ -100,10 +103,11 @@ export function issueProjectPath(
     workdir: string;
     issueRepoPath?: string | null;
     repositories?: { path: string }[];
+    multiRepo?: boolean;
   },
   activeRepo?: { path: string } | null,
 ): string {
-  if ((task.repositories?.length ?? 0) > 1) {
+  if (isMultiRepoTask(task)) {
     return task.issueRepoPath ?? activeRepo?.path ?? taskProjectPath(task);
   }
   return task.workdir;

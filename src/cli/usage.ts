@@ -159,7 +159,11 @@ export const USAGE: Record<string, string> = {
     --speed <s>   off | fast | ultrafast; --fast = --speed fast, --no-fast =
                   --speed off — the later flag wins
     --max-mode | --no-max-mode   cursor Max Mode
-    --detach-profile   unbind from the task's agent profile (keeps its values)`,
+    --detach-profile   unbind from the task's agent profile (keeps its values)
+    --remove-repo <name>   remove a repository from a multi-repository task
+                  (repeatable). Its clean checkout is detached and its branch
+                  is kept; uncommitted changes, a running task, a pipeline step
+                  or its last repository refuse it. Not undoable from here.`,
 
   move: `usage: agetor move <task-id> <column>   (columns: ${COLUMN_IDS})
 

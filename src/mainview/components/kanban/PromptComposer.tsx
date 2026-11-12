@@ -23,6 +23,7 @@ import {
   resolveNamedScopePath,
   FOCUS_REFRESH_MIN_AGE_MS,
   MULTI_SCOPE_CONCURRENCY,
+  multiScopesOrNull,
   type FileScope,
   type NamedFileScope,
 } from "@/lib/use-project-files";
@@ -359,10 +360,10 @@ export interface PromptComposerProps {
    * no fetch is made for any of them.
    */
   fileScope?: FileScope | null;
-  /** Every repository scope for a multi-repository task (issue #291). When 2+
-   *  are present this replaces `fileScope` for the `@` listing, prefixing each
-   *  entry with its workspace name. A single entry is ignored (use
-   *  `fileScope`). */
+  /** Every repository scope for a multi-repository task (issue #291). When
+   *  present (non-empty) this replaces `fileScope` for the `@` listing,
+   *  prefixing each entry with its workspace name — also for ONE entry, a
+   *  multi task left with one repository. Pass `null` for a single task. */
   fileScopes?: NamedFileScope[] | null;
   /**
    * The multi-repository task's workspace root (issue #291). The agent's cwd
@@ -576,7 +577,7 @@ export function PromptComposer({
   // actually wants driving this render.
   const internalCapabilities = useAgentCapabilities(
     agent,
-    fileScopes && fileScopes.length > 1 ? fileScopes : fileScope ?? null,
+    multiScopesOrNull(fileScopes) ?? fileScope ?? null,
     { enabled: !capabilities, awaitReady },
   );
   const { commands, extensions } = capabilities ?? internalCapabilities;
@@ -591,7 +592,10 @@ export function PromptComposer({
   // A multi-repository composer lists through `useProjectFileScopes` only:
   // the single-scope hook gets `null` there, so it fetches nothing (it used
   // to list the active repository a second time, unused).
-  const multiScope = (fileScopes?.length ?? 0) > 1;
+  // Callers pass named `fileScopes` only for a multi-repository task — one
+  // entry for a multi task left with one repository, whose cwd is still the
+  // non-git workspace root — so presence, not a count, picks the multi path.
+  const multiScope = multiScopesOrNull(fileScopes) !== null;
   const singleScopeFiles = useProjectFiles(multiScope ? null : fileScope ?? null);
   const multiScopeFiles = useProjectFileScopes(fileScopes ?? null, { awaitReady });
   const projectFiles = multiScope ? multiScopeFiles : singleScopeFiles;

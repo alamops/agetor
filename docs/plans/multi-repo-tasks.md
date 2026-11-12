@@ -6,7 +6,7 @@
 | Source | `docs/specs/multi-repo-tasks.md` (decided spec), `docs/plans/multi-repo-tasks-grill.md` (2 rounds, 30/30 decisions), `docs/plans/multi-repo-tasks-investigation.md` (evidence P1–P10), [alamops/agetor#291](https://github.com/alamops/agetor/issues/291) |
 | Flags | none |
 | Gates | grilled + decided by the owner (round-1/answers.json, round-2/answers.json); spec committed at `8e308518`; plan self-approved for pipeline execution — owner review happens at the handoff before code lands |
-| Status | implemented; **live harness smoke pending the owner** — no harness has been run live against a multi-repository task (T17 below). Verification so far is fake-driver, unit/integration and argv only; see `docs/plans/multi-repo-tasks-smoke.md` |
+| Status | implemented; live harness smoke run 2026-11-12 (T17 below): claude-code, codex and fx end to end; OpenCode 2.x server + non-git workspace only (account credits blocked the edit); copilot not installed; cursor and harness failover not run. Repository removal and one-repository multi tasks were added after implementation by owner decision (§3.5). Ledger: `docs/plans/multi-repo-tasks-smoke.md` |
 | Branch | `feature/issue-291-feature-request-support-multip` |
 | Base SHA | `8e308518fd4db2630a1b866522548f786b4d80ec` (`8e308518`, decision record; `c45fd806` is main) |
 
@@ -201,7 +201,7 @@ export async function getTaskDiffBlob(task: Task, relPath: string, side: "old" |
 
 ### 3.5 What is intentionally not built
 
-- No repository editing after create (owner decision). `PATCH /tasks/:id` rejects `repositories` with a clear 400; the UI never exposes it.
+- No repository editing after create (owner decision). `PATCH /tasks/:id` rejects `repositories` with a clear 400; the UI never exposes it. **Amended after implementation (owner decision):** one repository can be removed from a multi task through `DELETE /tasks/:id/repositories/:name` (run panel "Remove from task", `agetor edit --remove-repo`), and a task created with 2+ repositories stays multi down to one (`Task.multiRepo`); adding a repository still needs a new task. The PATCH 400 now points at the removal route. Contract: `docs/architecture/multi-repo-tasks.md`.
 - No multi-repo `isolation: "none"`; no per-repo `existingBranch`; no hard cap; no downgrade guard; no per-repo branch config; no coordinator/child agents. These are recorded in §9 as out of scope with the owner decision.
 - No new server file-listing route. `@` and capability discovery stay client-side unions over one `/files/index` and one `/agent-discovery` call per repo scope. This preserves `listProjectFiles`'s git-repo contract and `resolveAtPath`'s workspace containment.
 
@@ -227,7 +227,7 @@ Assumption for ownership: each task owns the listed files exclusively within its
 | T14 | CLI/TUI parity | `src/cli/api-client.ts`, `src/cli/commands/add.ts`, `src/cli/commands/show.ts`, `src/cli/commands/shell.ts`, `src/cli/commands/lifecycle.ts`, `src/cli/commands/ls.ts`, `src/cli/at-warn.ts`, `src/cli/tui/at-complete.ts`, `src/cli/tui/Dashboard.tsx`, `src/cli/commands/add.test.ts`, `src/cli/commands/show.test.ts`, `src/cli/commands/shell.test.ts`, `src/cli/commands/rm.test.ts`, `src/cli/tui/at-complete.test.ts` | T1, T7 | `agetor add --repo path[=ref]` repeatable and the interactive wizard's repository multi-select (one optional base-ref prompt per repository when 2+ are picked; `--repo`/`--workdir` skip the picker) are the CLI's multi-repository surfaces; `show` prints the repo block; `shell <id>` and `shell --repo <name>`; `rm` preview per repo; `ls` shows a repo count; TUI multi-select and multi-scope `@` completion with prefixes; the pre-`--start` advisory `@` pre-check lists every repository scope, never the non-git workspace root | tests | CLI entry points / TUI |
 | T15 | Docs | `CLAUDE.md`, `docs/architecture/multi-repo-tasks.md` (new), `docs/architecture/task-lifecycle.md`, `docs/architecture/at-file-references.md`, `docs/architecture/pipelines.md`, `docs/architecture/prompt-composer.md`, `docs/architecture/security.md`, `docs/architecture/persistence.md`, `docs/architecture/issue-tasks.md`, `docs/architecture/run-panel.md`, `docs/architecture/task-context-menu.md`, `docs/architecture/testing-seams.md` | all behavior | Every doc names the new layout, data, prompt exception, gates, and teardown rules; topic map includes the new doc; no stale "one workdir" claim | tests | docs |
 | T16 | End-to-end spec | `e2e/multi-repo-task.spec.ts` (new) | T6, T7, T8, T10, T11, T12 | Create via the real New Task UI and its `Repositories` dialog (multi-select, per-repository base ref, same-git-root dedupe), fake-driver run, two worktrees/branches, per-repo diff tabs, aggregate commit chip with only a sibling dirty, archive keeps the branches. The issue dialog's locked repository is covered in `e2e/issue-task.spec.ts`. Per-repo PR stamping is covered by `pull-create-task-url.test.ts`, not e2e. | tests | Playwright |
-| T17 | Verification, smoke matrix, final status | `docs/plans/multi-repo-tasks.md` (status only), `docs/plans/multi-repo-tasks-smoke.md` (new) | all | `bun run typecheck` green; `bun test` green; e2e spec green; live smoke for installed/credentialed harnesses recorded with commands and versions; plan status updated; final commit includes `Fixes #291`. **Status: partly done.** Typecheck, focused suites and the fake-driver e2e are recorded in the smoke ledger; the live smoke is **not done** for any harness (only fake-driver runs and argv checks exist) and is pending the owner | tests | CI/commands |
+| T17 | Verification, smoke matrix, final status | `docs/plans/multi-repo-tasks.md` (status only), `docs/plans/multi-repo-tasks-smoke.md` (new) | all | `bun run typecheck` green; `bun test` green; e2e spec green; live smoke for installed/credentialed harnesses recorded with commands and versions; plan status updated; final commit includes `Fixes #291`. **Status:** typecheck, focused suites, the full suite and the e2e specs are recorded in the smoke ledger per review round. Live smoke run 2026-11-12: claude-code 2.1.322, codex-cli 0.166.0 (incl. a follow-up turn and the sandbox escalation) and fx 0.0.15 committed in each checkout; OpenCode v2.1.3's server accepted the non-git workspace but the provider refused the turn for account credits; copilot not installed; cursor, gemini, antigravity and a harness failover not run | tests | CI/commands |
 
 ### 4.1 Detailed acceptance for the four riskiest tasks
 
@@ -254,7 +254,7 @@ Assumption for ownership: each task owns the listed files exclusively within its
 **T7 — route gate.**
 - Given a CLI-token request to `POST /tasks` with `repositories: [{ path: "<protected path>" }]`, when the gate runs, then it answers 403 `path-not-accessible` before `createTask`; the app token is never gated.
 - Given `POST /tasks` with `repositories` not an array, or an entry missing `path`, then 400. There is no product cap on the array length (owner decision); creation uses bounded concurrency, and the client shows a non-blocking warning above 10.
-- Given `PATCH /tasks/:id` with `repositories`, then 400 "fixed at creation — create a new task".
+- Given `PATCH /tasks/:id` with `repositories`, then 400 "fixed at creation — create a new task". (As shipped after the removal amendment, the 400 points at `DELETE /tasks/:id/repositories/:name` instead.)
 - Given a multi task with a PR URL on `backend`, when `POST /github/pull-create` is called with `path = backend worktree`, then only the backend entry is stamped; `task.prUrl` stays null; a second call does not overwrite.
 
 ## 5. Work breakdown — test tasks
@@ -319,7 +319,7 @@ Each wave ends with a checkpoint commit and a green tree (typecheck + the focuse
 
 ### 7.1 Invariants and their single enforcement point
 
-- **The repository set is fixed at creation.** `createTask` is the only writer of `repositories` at creation; `tasks.setRepositories` is the only runtime writer; `PATCH /tasks/:id` rejects the field. Every path reads `task.repositories`.
+- **The repository set is fixed at creation, except for removals.** `createTask` is the only writer of `repositories` at creation; `tasks.setRepositories` is the only runtime writer (it never demotes a multi row nor re-adds a removed entry); `removeTaskRepository` is the only way to shrink the set; `PATCH /tasks/:id` rejects the field. Every path reads `task.repositories`, and every multi/single decision reads `isMultiRepoTask` (`Task.multiRepo`).
 - **No primary repository.** No code chooses a "main" repo; `repositories[0]` is only the default for a diff request that omits `repo` and for form display.
 - **One cwd per task.** For a multi-repo task the agent, terminals, `@` expansion, markdown/handoff resolution and the card's open-in-Finder all use `task.worktreePath ?? task.workdir` (the workspace). No code spawns at `repositories[].path`.
 - **Every worktree path is under `WORKTREES_DIR`.** `prepareTaskWorkdir` constructs `<WORKTREES_DIR>/<task-id>/<slug>` and `prepareRepoWorktree` receives it; `resolveWorktreeRef` is the only id-to-path guard for `DELETE /worktrees/:id` and `GET /worktrees/:id/git-status`.
@@ -327,7 +327,7 @@ Each wave ends with a checkpoint commit and a green tree (typecheck + the focuse
 - **All spawns go through `coreSpawn`/`coreSpawnSync`.** Worktree creation uses `git()`; no new raw spawn.
 - **Server-managed columns.** `repositories` and `issue_repo_path` are written by their targeted methods, skipped by `tasks.update`, and never bump `updated_at`.
 - **First-write-wins PR stamp.** `tasks.setRepositoryPrUrl` refuses to overwrite a non-null entry; `POST /github/pull-create` matches the task's repo by worktree path before stamping.
-- **Prompt rule.** A single-repo launch prompt is byte-identical; the `Repositories:` block exists only for 2+ repos and is the only new machine-added text, documented as an exception.
+- **Prompt rule.** A single-repo launch prompt is byte-identical; the `Repositories:` block exists only for a multi task (one repository left after removals included) and is the only new machine-added text, documented as an exception.
 - **All-or-nothing prepare, best-effort teardown.** `prepareTaskWorkdir` rolls back created worktrees on any failure; archive/delete never block the card on one repo.
 - **Bounded work.** Prepare and status run at concurrency 4 per task; one batched git-status response per poll; one `@` listing request per repo scope, not per keystroke.
 
@@ -374,9 +374,9 @@ Each wave ends with a checkpoint commit and a green tree (typecheck + the focuse
 | A9 | Prompt block | Only for 2+ repos; appended after the user prompt and before references; single-repo prompt byte-identical | Avoids touching every existing prompt and every transcript assertion | high |
 | A10 | Aggregate PR format | Agents print `Repository: <name>` before each proposal; the parser tolerates a missing label only when exactly one repo has a proposal | One parser, deterministic per-repo routing | medium |
 | A11 | No hard cap | Enforced only by the non-blocking >10 warning and bounded concurrency; a huge selection may be slow. The CLI path gate's existing 256-value safety limit still applies to a CLI request, which is a security bound, not a product cap. | Owner decision; a cap would be a follow-up | high |
-| A12 | Smoke matrix | Live-smoke claude/codex/fx/opencode where credentials allow; cursor is plan-limited; gemini/agy/copilot are absent. **Not done:** no live smoke was run for any harness | Available binaries checked 2026-11-10 | high |
+| A12 | Smoke matrix | Live-smoke claude/codex/fx/opencode where credentials allow; cursor is plan-limited; gemini/agy/copilot are absent. **Run 2026-11-12:** claude/codex/fx end to end; opencode server + non-git workspace only (account credits); copilot not installed; cursor not run | Available binaries checked 2026-11-10 | high |
 
-**Owner-visible limitations to state in the PR body.** Create-only (issue's "or editing" is narrowed; a new card is required to change the set); multi-repo requires worktree isolation; no per-repo `existingBranch`; an older build sees the workspace and may orphan secondary worktrees; no downgrade guard. If the owner rejects the `Repositories:` paragraph exception, the fallback is the existing references block, but that would contradict round 2 `prompt-block-format`.
+**Owner-visible limitations to state in the PR body.** Repositories can't be added after creation (a repository can be removed; adding one needs a new card); a PR opened from a pipeline step is stamped on the step only, so the parent's "Create all PRs" can retry it and show GitHub's 422; multi-repo requires worktree isolation; no per-repo `existingBranch`; an older build sees the workspace and may orphan secondary worktrees; no downgrade guard. If the owner rejects the `Repositories:` paragraph exception, the fallback is the existing references block, but that would contradict round 2 `prompt-block-format`.
 
 ## 9. Completeness ledger
 
@@ -394,7 +394,7 @@ Each wave ends with a checkpoint commit and a green tree (typecheck + the focuse
 | Pipeline parent multi-repo + step copy + parent-owned teardown | in this run | T5 |
 | Card worktree icon + count tooltip, diff tabs, filters/search, per-repo context menu | in this run | T10, T11 |
 | Full CLI/TUI parity | in this run | T14 |
-| Harness support for all eight + smoke matrix for installed/credentialed kinds | layout support in this run; live smoke **not run for any harness**, pending the owner | T5, T17; claude/codex/fx/opencode where credentialed, cursor plan-limited, gemini/agy/copilot absent |
+| Harness support for all eight + smoke matrix for installed/credentialed kinds | layout support in this run; live smoke run 2026-11-12 for claude/codex/fx (end to end) and opencode (server + non-git workspace; billing blocked the edit) | T5, T17; cursor plan-limited and not run, gemini/agy/copilot absent |
 | Docs updates | in this run | T15 |
 | `prepareWorkdir`'s five callers | in this run (dispatch) | T4, T5, T6 |
 | 25+ `worktreePath ?? workdir` cwd sites | in this run (no per-site edit; workspace mirror) | T4, T6, T17 |
@@ -404,15 +404,15 @@ Each wave ends with a checkpoint commit and a green tree (typecheck + the focuse
 | `tasks.insert/update/toTask` server-managed treatment | in this run | T2 |
 | `duplicateAgentProfile` copy | in this run | T4 |
 | `discardRefusedWorktree` / `sweepArchivedTeardowns` | in this run | T6 |
-| `hook-installer` workspace settings location | verify only (no code change) — **not yet verified** (no live claude run at a non-git cwd) | T17 smoke, pending; the workspace is Claude's cwd |
-| `harness-failover.ts` / `orchestrator-opencode-server.ts` cwd | verify only (workspace mirror) — **not yet verified** (no failover of a multi task, no OpenCode 2.x server with a non-git workspace dir) | T17 smoke, pending |
+| `hook-installer` workspace settings location | verify only (no code change) — verified live 2026-11-12: Claude Code wrote `.claude/settings.local.json` at the non-git workspace root, and delete removed it with the workspace | T17 smoke |
+| `harness-failover.ts` / `orchestrator-opencode-server.ts` cwd | verify only (workspace mirror) — OpenCode 2.x server accepted the non-git workspace directory live (2026-11-12; the turn then failed on account credits); a harness failover of a multi task is **not yet verified** (needs a two-account stack) | T17 smoke; failover pending |
 | `shortenTaskPaths` / `md-image` / handoff artifact roots | no change; verify | T17; the workspace is the fold/candidate root |
 | `listProjectFiles` non-git workspace listing | avoided | Per-repo scopes (A7); no server change |
 | `commands.ts` capability discovery | no server change; client union | T9 |
 | TUI `@` completion and dashboard compose scope | in this run | T14 |
 | E2E multi-repo spec | in this run | T16 |
 | Live smoke for gemini/copilot/antigravity | out of scope for this change | Owner accepted "layout-supported, smoke-pending" (round 1 #harness-scope); no binaries/accounts here |
-| Editing the repo set after creation | out of scope (owner-deferred) | Round 1 #repo-set-editing + round 2 #create-only-confirm |
+| Editing the repo set after creation | removing one repository: in this change (owner decision after implementation); adding one: out of scope (owner-deferred) | Round 1 #repo-set-editing + round 2 #create-only-confirm; amended by the owner |
 | Multi-repo `isolation: "none"` | out of scope | Round 2 #isolation-none-final |
 | Per-repo `existingBranch` | out of scope | Round 2 #existing-branch-multi |
 | Downgrade guard / down migration | out of scope | Round 2 #legacy-columns |

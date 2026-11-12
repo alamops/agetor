@@ -243,7 +243,7 @@ test("PATCH /tasks/:id rejects the repository set", async () => {
       body: JSON.stringify({ repositories: [{ path: a }] }),
     });
     expect(res.status).toBe(400);
-    expect((await res.json()).error).toContain("fixed at creation");
+    expect((await res.json()).error).toContain("can't be patched");
     const { tasks } = await import("./db.ts");
     expect(tasks.get(task.id)?.repositories).toHaveLength(2);
   } finally {
@@ -397,5 +397,66 @@ test("POST /tasks/:id/terminals rejects an unknown repo selector", async () => {
   } finally {
     rmSync(a, { recursive: true, force: true });
     rmSync(b, { recursive: true, force: true });
+  }
+});
+
+// ── DELETE /tasks/:id/repositories/:name (round 15) ─────────────────────
+
+test("DELETE /tasks/:id/repositories/:name removes one repository and answers { task } (CLI token allowed)", async () => {
+  const { task, a, b } = await createMulti();
+  const { CLI_TOKEN } = await import("./api-config.ts");
+  try {
+    const name = task.repositories![1]!.name;
+    // `:name` is URL-decoded by the router; the CLI encodes it.
+    const res = await fetch(`${BASE}/tasks/${task.id}/repositories/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CLI_TOKEN}` },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { task: Task };
+    expect(body.task.id).toBe(task.id);
+    expect(body.task.multiRepo).toBe(true);
+    expect(body.task.repositories!.map((r) => r.path)).toEqual([a]);
+    // The board read sees the same one-repository multi task.
+    const read = (await (await call(`/tasks/${task.id}`)).json()) as Task;
+    expect(read.multiRepo).toBe(true);
+    expect(read.repositories!.map((r) => r.path)).toEqual([a]);
+
+    // Removing the last one is refused with its code.
+    const last = await call(`/tasks/${task.id}/repositories/${encodeURIComponent(task.repositories![0]!.name)}`, { method: "DELETE" });
+    expect(last.status).toBe(409);
+    const refused = (await last.json()) as { error: string; code: string };
+    expect(refused.code).toBe("last-repository");
+    expect(refused.error.length).toBeGreaterThan(0);
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("DELETE /tasks/:id/repositories/:name: 404 for an unknown task or name, 409 not-multi for a single task", async () => {
+  const { task, a, b } = await createMulti();
+  const solo = await makeRepo("solo");
+  try {
+    const noTask = await call(`/tasks/00000000-0000-4000-8000-000000000000/repositories/x`, { method: "DELETE" });
+    expect(noTask.status).toBe(404);
+    expect(((await noTask.json()) as { error: string }).error).toBeTruthy();
+    const noName = await call(`/tasks/${task.id}/repositories/nope`, { method: "DELETE" });
+    expect(noName.status).toBe(404);
+    expect(((await noName.json()) as { error: string }).error).toContain("nope");
+
+    const created = await call("/tasks", {
+      method: "POST",
+      body: JSON.stringify({ title: "single", prompt: "p", agent: "claude-code", workdir: solo, isolation: "worktree" }),
+    });
+    const single = (await created.json()) as Task;
+    expect(single.multiRepo).toBe(false);
+    const res = await call(`/tasks/${single.id}/repositories/${encodeURIComponent(single.repositories![0]!.name)}`, { method: "DELETE" });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { code: string }).code).toBe("not-multi");
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+    rmSync(solo, { recursive: true, force: true });
   }
 });

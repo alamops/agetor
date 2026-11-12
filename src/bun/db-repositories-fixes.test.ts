@@ -180,17 +180,19 @@ describe("N8: a pipeline step's argv budget includes the Repositories: block", (
     const { stepLaunchPromptOverage } = await import("./pipeline-runner.ts");
     // Exactly at the cap on its own: no overage without the block.
     const prompt = "x".repeat(GEMINI_PROMPT_ARGV_MAX_BYTES);
-    expect(stepLaunchPromptOverage(profile, prompt, [], [repos[0]!])).toBeNull();
+    expect(stepLaunchPromptOverage(profile, prompt, [], { multiRepo: false, repositories: [repos[0]!] })).toBeNull();
     expect(stepLaunchPromptOverage(profile, prompt, [], undefined)).toBeNull();
-    const over = stepLaunchPromptOverage(profile, prompt, [], repos);
+    const over = stepLaunchPromptOverage(profile, prompt, [], { multiRepo: true, repositories: repos });
     expect(over).not.toBeNull();
     expect(over!.limit).toBe(GEMINI_PROMPT_ARGV_MAX_BYTES);
     expect(over!.bytes).toBeGreaterThan(GEMINI_PROMPT_ARGV_MAX_BYTES);
+    // A one-repository multi step carries the block too (decided by the task).
+    expect(stepLaunchPromptOverage(profile, prompt, [], { multiRepo: true, repositories: [repos[0]!] })).not.toBeNull();
   });
 
   test("an uncapped harness is never over budget", async () => {
     const { stepLaunchPromptOverage } = await import("./pipeline-runner.ts");
     const claude = { ...profile, harnessKind: "claude-code" } as AgentProfileSnapshot;
-    expect(stepLaunchPromptOverage(claude, "x".repeat(100_000), [], repos)).toBeNull();
+    expect(stepLaunchPromptOverage(claude, "x".repeat(100_000), [], { multiRepo: true, repositories: repos })).toBeNull();
   });
 });

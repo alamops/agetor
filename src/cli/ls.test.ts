@@ -602,3 +602,29 @@ test("--search matches a multi task's per-repository branch and checkout (review
   await cmdLs(["--search", "no-such-branch"], flags);
   expect(outputs).toEqual(["no matching tasks"]);
 });
+
+test("a multi task left with one repository still shows its repository count (round 15)", async () => {
+  const multi = task({
+    id: "multi003",
+    title: "Down to one",
+    workdir: "/data/worktrees/multi003",
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/a", branchSource: "created" as const, worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null },
+    ],
+  } as unknown as Partial<Task>);
+  const single = task({
+    id: "single01",
+    title: "Plain",
+    multiRepo: false,
+    repositories: [
+      { path: "/repo", name: "repo", branch: null, branchSource: "created" as const, worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null },
+    ],
+  } as unknown as Partial<Task>);
+  currentClient = makeClient([multi, single]);
+  await cmdLs([], flags);
+  const text = outputs.join("\n");
+  expect(text).toContain("1 repo");
+  expect(text).not.toContain("1 repos");
+  expect(outputs.filter((l) => l.includes(" repo")).length).toBe(1);
+});

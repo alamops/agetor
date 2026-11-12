@@ -196,3 +196,40 @@ test("branch names are escaped", async () => {
   expect(outputs[0]).toContain("evil\\u001b[2J");
   process.exitCode = 0;
 });
+
+test("a multi task left with one repository still gets the per-repository phrase (round 15)", () => {
+  const one: TaskTeardownPreview = {
+    branches: ["feature/b"],
+    liveBranch: "feature/b",
+    taskBranch: null,
+    source: "task-branch",
+    excluded: [],
+    repositories: [
+      { name: "backend", path: "/src/backend", branches: ["feature/b"], liveBranch: "feature/b", taskBranch: "feature/b", source: "task-branch", excluded: [] },
+    ],
+  };
+  expect(teardownPhrase(one, { branch: null, checkoutBranch: null })).toBe(
+    "its worktree + per-repository branches (backend: feature/b)",
+  );
+});
+
+test("--json carries the per-repository plan for a multi task left with one repository (round 15)", async () => {
+  const one: TaskTeardownPreview = {
+    branches: ["feature/b"],
+    liveBranch: "feature/b",
+    taskBranch: null,
+    source: "task-branch",
+    excluded: [],
+    repositories: [
+      { name: "backend", path: "/src/backend", branches: ["feature/b"], liveBranch: "feature/b", taskBranch: "feature/b", source: "task-branch", excluded: [] },
+    ],
+  };
+  currentClient = fakeClient(one);
+  jsonOutputs.length = 0;
+  await cmdRm(["abcdefgh"], jsonFlags);
+  expect(jsonOutputs).toEqual([{
+    deleted: task.id,
+    branches: ["feature/b"],
+    repositories: [{ name: "backend", branches: ["feature/b"] }],
+  }]);
+});

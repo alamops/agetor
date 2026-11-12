@@ -159,3 +159,29 @@ test("--repo on a multi task names that repository's branch, not the null task b
   // Without --repo it is the workspace root and the (null) task branch.
   expect(resolveShellTarget(task, null)).toEqual({ dir: "/wt/task-1", branch: null });
 });
+
+test("a not-yet-started multi task left with one repository names the real state too (round 15)", async () => {
+  currentClient = fakeClient(makeTask({
+    workdir: "/nonexistent/agetor-workspace/task-1",
+    worktreePath: null,
+    branch: null,
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: null, branchSource: "created", worktreePath: null, baseRef: "b", checkoutBranch: null, prUrl: null },
+    ],
+  }));
+  await expect(cmdShell(["abcdefgh"], flags)).rejects.toThrow(/has no worktrees yet — start the task first/);
+});
+
+test("--repo on a multi task left with one repository opens that repository", async () => {
+  const task = makeTask({
+    workdir: "/ws/task-1",
+    worktreePath: "/ws/task-1",
+    branch: null,
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/ws/task-1/backend", baseRef: "b", checkoutBranch: null, prUrl: null },
+    ],
+  });
+  expect(resolveShellTarget(task, "backend")).toEqual({ dir: "/ws/task-1/backend", branch: "feature/x" });
+});

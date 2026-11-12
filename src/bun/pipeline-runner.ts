@@ -94,7 +94,8 @@ import {
 } from "../shared/pipeline.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { appendReferences } from "../shared/refs.ts";
-import { composeRunPrompt } from "../shared/launch-prompt.ts";
+import { composeRunPrompt, type PromptRepositorySet } from "../shared/launch-prompt.ts";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import type {
   AgentProfileSnapshot,
   ColumnId,
@@ -114,7 +115,6 @@ import type {
   Run,
   Task,
   TaskReference,
-  TaskRepository,
 } from "../shared/types.ts";
 import { CONTINUATION_STATUS_TEXT, PIPELINE_LIMITS } from "../shared/types.ts";
 
@@ -985,8 +985,9 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   const anyLive = run.active.some((a) => isAnyRunOfTaskLive(a.taskId));
   if (anyLive) {
     const repos = parent.repositories ?? [];
-    const missingMulti = repos.length > 1 && repos.some((r) => !r.worktreePath || !existsSync(r.worktreePath));
-    if (parent.isolation === "worktree" && (missingMulti || (repos.length <= 1 && (!parent.worktreePath || !existsSync(parent.worktreePath))))) {
+    const multi = isMultiRepoTask(parent);
+    const missingMulti = multi && repos.some((r) => !r.worktreePath || !existsSync(r.worktreePath));
+    if (parent.isolation === "worktree" && (missingMulti || (!multi && (!parent.worktreePath || !existsSync(parent.worktreePath))))) {
       return { error: "the pipeline's worktree is missing while a step is still running — stop the run and retry" };
     }
     return { parent };
@@ -995,7 +996,7 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   // Root keys are only read by the multi-repository prepare path; a single
   // parent folds every value into one set, so skip the `git rev-parse`
   // fan-out there (same rule as `startTask`).
-  const parentMulti = (parent.repositories?.length ?? 0) > 1;
+  const parentMulti = isMultiRepoTask(parent);
   const prepared = await prepareTaskWorkdir(parent, {
     takenBranches: await branchesPinnedByOtherTasks(
       parent.id,
@@ -1004,7 +1005,8 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
     ),
   });
   if ("error" in prepared) return { error: prepared.error };
-  if (prepared.repositories && prepared.repositories.length > 1) {
+  // `prepared.repositories` is present exactly when the multi path ran.
+  if (prepared.repositories) {
     tasks.setRepositories(parent.id, prepared.repositories);
     // setRepositories keeps a stored checkout (a concurrent settle/archive
     // write wins over this snapshot); the live reads from THIS prepare are
@@ -1059,7 +1061,7 @@ function propagateWorktreeToActiveSteps(parent: Task, run: PipelineRunState): vo
     }
     // A multi-repository parent's step must carry the same repository set so
     // its own read paths (diff/status/prompt) see every repository.
-    if (step && parent.repositories && parent.repositories.length > 1) {
+    if (step && isMultiRepoTask(parent) && parent.repositories && parent.repositories.length > 0) {
       const stepNames = (step.repositories ?? []).map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
       const parentNames = parent.repositories.map((r) => `${r.name}:${r.worktreePath}:${r.branch}`).join("|");
       if (stepNames !== parentNames) tasks.setRepositories(a.taskId, parent.repositories);
@@ -1205,7 +1207,7 @@ export function stepLaunchPromptOverage(
   profile: AgentProfileSnapshot,
   prompt: string,
   references: TaskReference[],
-  repositories: TaskRepository[] | null | undefined,
+  repositories: PromptRepositorySet | null | undefined,
 ): { limit: number; bytes: number } | null {
   return promptByteOverage(
     profile.harnessKind,
@@ -1410,7 +1412,7 @@ async function launchStep(
   // with, not the raw step prompt on its own, since any wrapper can push a
   // borderline prompt over gemini's argv cap even when the unwrapped text
   // doesn't. See `stepLaunchPromptOverage`.
-  if (stepLaunchPromptOverage(profile, composed, references, parent.repositories)) {
+  if (stepLaunchPromptOverage(profile, composed, references, parent)) {
     composed = composeStepPrompt({ ...composeArgs, inlineHandoff: false });
   }
 
@@ -1433,6 +1435,8 @@ async function launchStep(
     // Step rows share the parent's workspace and repository set (D2/M6); the
     // parent owns teardown, so a step never tears a worktree down on its own.
     repositories: parent.repositories ?? [],
+    // A one-repository multi parent's step stays multi (it stores the entry).
+    multiRepo: isMultiRepoTask(parent),
     issueRepoPath: parent.issueRepoPath ?? null,
     prUrl: null,
     issueUrl: null,

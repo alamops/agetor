@@ -68,7 +68,9 @@ type CommitNoteStatus = { hasChanges: boolean; ahead?: number; ignored?: boolean
  *  can't be called clean, so it suppresses the note. */
 export function commitNote(git: CommitNoteStatus & { repositories?: CommitNoteStatus[] }): string {
   const repos = git.repositories;
-  if (repos && repos.length > 1) {
+  // The per-repository array is present only for a multi task — also one
+  // left with a single repository (issue #291) — so presence decides.
+  if (repos && repos.length > 0) {
     const readable = repos.filter((r) => !r.ignored);
     if (readable.length === 0) return " (not a git worktree)";
     if (readable.some((r) => r.hasChanges)) return "";
