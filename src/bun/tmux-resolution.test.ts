@@ -271,7 +271,7 @@ test("tmuxEnv: system tmux is byte-equal to childEnv(), adds no TERMINFO_DIRS, a
   }
 });
 
-test("tmuxEnv: bundled tmux gets a real terminfo search path, keeps the master token out, and APPENDS to an existing TERMINFO_DIRS", () => {
+test("tmuxEnv: bundled tmux gets a real terminfo search path, keeps the master token out, and keeps an existing TERMINFO_DIRS AFTER the bundled dirs (never replaced)", () => {
   delete process.env.TERMINFO_DIRS;
   process.env.AGETOR_API_TOKEN = "master-token-for-test";
   try {

@@ -111,6 +111,7 @@ import {
   type TmuxSource,
 } from "./tmux-resolution.ts";
 import { buildTmuxAttachCommand } from "./tmux-attach.ts";
+import { awaitTerminalLaunch, terminalLaunchErrorMessage } from "./terminal-launch.ts";
 import {
   dismissAskModalForMessage,
   dismissTmuxPrompt,
@@ -5776,31 +5777,16 @@ export function startApiServer(
           // as soon as Terminal accepts the command (it does NOT wait for the
           // shell command to finish), so this resolves in well under a second
           // on success and fails fast when Automation permission is denied.
-          // A 5s ceiling guards against a wedged osascript holding the
-          // response open.
-          const exit = await Promise.race([
-            proc.exited,
-            Bun.sleep(5000).then(() => "timeout" as const),
-          ]);
-          if (exit === "timeout") {
-            // Assume it's still coming up rather than reporting a false error.
-            // Kill the wedged child so it can't linger past the request; if it
-            // exited in the race's tail, kill() throws and there's nothing to do.
-            try { proc.kill(); } catch { /* already exited */ }
-            return json({ ok: true }, { headers: corsHeaders(req) });
-          }
-          if (exit !== 0) {
-            const detail = (await new Response(proc.stderr).text()).trim();
-            console.warn(
-              `[agetor] osascript exited ${exit} while opening a terminal for harness "${harness.id}": ${detail}`,
-            );
+          // Past the 5 s ceiling the route answers ok and leaves the child
+          // running: it is usually waiting on macOS's first-use "control
+          // Terminal" consent prompt, and killing it would mean the window
+          // never opens (`awaitTerminalLaunch` logs a late failure instead).
+          const launch = await awaitTerminalLaunch(proc, {
+            label: `opening a terminal for harness "${harness.id}"`,
+          });
+          if (launch.kind === "failed") {
             return json(
-              {
-                error:
-                  `Couldn't open Terminal (osascript exited ${exit}).` +
-                  (detail ? ` ${detail}` : "") +
-                  " Check System Settings → Privacy & Security → Automation.",
-              },
+              { error: terminalLaunchErrorMessage(launch) },
               { status: 502, headers: corsHeaders(req) },
             );
           }
@@ -7115,37 +7101,20 @@ export function startApiServer(
             stderr: "pipe",
             env: childEnv(),
           });
-          // Await the launch so the UI gets real feedback (same pattern as
-          // `/harnesses/:id/open-terminal` above). `do script` returns as soon
-          // as Terminal accepts the command — it does NOT wait for the attach
-          // itself — so this resolves quickly on success and fails fast when
-          // Automation permission is denied. A 5s ceiling guards against a
-          // wedged osascript holding the response open.
-          const exit = await Promise.race([
-            proc.exited,
-            Bun.sleep(5000).then(() => "timeout" as const),
-          ]);
-          if (exit === "timeout") {
-            // Assume the window is still coming up rather than reporting a
-            // false error — the in-shell fallback covers the attach itself.
-            // Kill the wedged child so it can't linger past the request; if it
-            // exited in the race's tail, kill() throws and there's nothing to do.
-            try { proc.kill(); } catch { /* already exited */ }
-            return json({ ok: true, sessionName }, { headers: corsHeaders(req) });
-          }
-          if (exit !== 0) {
-            const detail = (await new Response(proc.stderr).text()).trim();
-            console.warn(
-              `[agetor] osascript exited ${exit} while attaching to tmux session "${sessionName}": ${detail}`,
-            );
+          // Await the launch so the UI gets real feedback (same contract as
+          // `/harnesses/:id/open-terminal` above, shared through
+          // `awaitTerminalLaunch`). `do script` returns as soon as Terminal
+          // accepts the command — it does NOT wait for the attach itself — so
+          // this resolves quickly on success and fails fast when Automation
+          // permission is denied. Past the ceiling the child is left running
+          // (it is usually waiting on the first-use Automation consent prompt)
+          // and the route answers ok; the in-shell fallback covers the attach.
+          const launch = await awaitTerminalLaunch(proc, {
+            label: `attaching to tmux session "${sessionName}"`,
+          });
+          if (launch.kind === "failed") {
             return json(
-              {
-                error:
-                  `Couldn't open Terminal (osascript exited ${exit}).` +
-                  (detail ? ` ${detail}` : "") +
-                  " Check System Settings → Privacy & Security → Automation.",
-                sessionName,
-              },
+              { error: terminalLaunchErrorMessage(launch), sessionName },
               { status: 502, headers: corsHeaders(req) },
             );
           }

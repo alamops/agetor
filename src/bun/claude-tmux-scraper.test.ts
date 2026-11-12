@@ -16,6 +16,7 @@ const { __forTest } = await import("./claude-tmux.ts");
 import { detectAskModal } from "./claude-questions.ts";
 import { makeTask } from "../cli/test-fixtures.ts";
 import type { TmuxPromptRequest } from "./interactions.ts";
+import { cleanPromptPane } from "../mainview/lib/prompt-noise.ts";
 
 const {
   matchNumberedModal,
@@ -39,6 +40,7 @@ const {
   SLIDER_FOOTER_RE,
   matchUnnumberedModal,
   UNNUMBERED_MAX_CHOICE_ROWS,
+  UNNUMBERED_PREVIEW_CONTEXT_LINES,
   matchSlashConfirmModal,
   paneShowsIdleInputBox,
   STATUS_BAR_RE,
@@ -512,6 +514,48 @@ test("matchUnnumberedModal — the fingerprint is stable tick-to-tick and moves 
   expect(m2.fingerprint).not.toBe(a1.fingerprint);
 });
 
+test("matchUnnumberedModal — the card preview keeps the dialog's title (the user decides a persistent setting from it)", () => {
+  // Review finding: a fixed last-12-lines window cut the heading off this
+  // 13-line dialog, so the card showed two paragraphs and two buttons with no
+  // "Claude in Chrome extension detected" anywhere.
+  const m = matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!;
+  expect(m.paneText.split("\n")[0]).toBe("Claude in Chrome extension detected");
+  const shown = cleanPromptPane(m.paneText);
+  expect(shown.startsWith("Claude in Chrome extension detected\n")).toBe(true);
+  expect(shown).toContain("❯ No, keep browser tools off");
+  expect(shown).not.toContain("Enter to confirm");
+});
+
+test("matchUnnumberedModal — the preview starts below the dialog's top rule, so a banner or transcript above it is not shown", () => {
+  const banner = [
+    "╭─── Claude Code v2.1.322 ───────────────────────────╮",
+    "│                 Welcome back!                     │",
+    "╰───────────────────────────────────────────────────╯",
+    "",
+    "─".repeat(80),
+  ].join("\n");
+  const m = matchUnnumberedModal(`${banner}\n${CHROME_UNNUMBERED_PANE}`)!;
+  expect(m).not.toBeNull();
+  expect(m.paneText.split("\n")[0]).toBe("Claude in Chrome extension detected");
+  expect(m.paneText).not.toContain("Welcome back");
+  expect(m.paneText).not.toContain("─".repeat(80));
+  // Display-only: the preview window never changes card identity.
+  expect(m.fingerprint).toBe(matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!.fingerprint);
+});
+
+test(`matchUnnumberedModal — with no rule, the preview reaches at most ${UNNUMBERED_PREVIEW_CONTEXT_LINES} lines above the first choice row`, () => {
+  const body = Array.from({ length: 30 }, (_, i) => `body line ${i + 1}`).join("\n");
+  const pane = `${body}\n\n❯ No\n  Yes\n\nEnter to confirm · Esc to cancel`;
+  const m = matchUnnumberedModal(pane)!;
+  expect(m).not.toBeNull();
+  const shown = m.paneText.split("\n");
+  // 30 body lines + 1 blank sit above the rows; the window keeps the last 16
+  // of them (15 body lines + the blank).
+  expect(shown[0]).toBe("body line 16");
+  expect(m.paneText).not.toContain("body line 15\n");
+  expect(shown.slice(-4)).toEqual(["❯ No", "  Yes", "", "Enter to confirm · Esc to cancel"]);
+});
+
 test("pickScrapeMatch — the live Chrome prompt resolves to the unnumbered choice card", () => {
   const direct = matchUnnumberedModal(CHROME_UNNUMBERED_PANE)!;
   const dispatched = pickScrapeMatch(CHROME_UNNUMBERED_PANE, {
@@ -672,7 +716,7 @@ async function withScrapeTask(
   }
 }
 
-test("scrapeOnce → registerTmuxPrompt — two stable ticks on the captured Chrome prompt register one answerable card, hideKeys included", async () => {
+test("scrapeOnce → registerTmuxPrompt — two stable ticks on the reconstructed Chrome prompt register one answerable card, hideKeys included", async () => {
   await withScrapeTask(CHROME_UNNUMBERED_PANE, async ({ taskId, runId, pending, tick }) => {
     // The unnumbered matcher is NOT high-confidence, so the first sighting only
     // records the fingerprint (the shared two-tick stability gate).

@@ -262,9 +262,18 @@ async function vendorTerminfo(): Promise<void> {
 }
 
 /**
- * Prove the freshly copied DB actually resolves: `infocmp` reads terminfo via
- * the same ncurses lookup the bundled tmux uses, so a corrupt/partial copy
- * fails here instead of in a user's Terminal window.
+ * Prove the freshly copied DB actually resolves: every pinned entry must be
+ * found under `TERMINFO_DIRS=<vendor>/terminfo` in the hashed layout, so a
+ * missing, misplaced or corrupt copy fails the build here instead of in a
+ * user's Terminal window.
+ *
+ * Scope of this check: `/usr/bin/infocmp` links the SYSTEM ncurses, not the
+ * bundled `libncursesw`, so it proves the files are complete, well-formed and
+ * found by a `TERMINFO_DIRS` lookup — not that the bundled library reads them.
+ * That half rests on the files being byte copies of `/usr/share/terminfo`,
+ * which the bundled tmux was shown to read through `TERMINFO_DIRS`
+ * (docs/plans/issue-298-chrome-prompt-investigation.md, spike J), and on the
+ * manual attach smoke in docs/plans/issue-298-chrome-prompt.md §8.3.
  */
 async function verifyTerminfo(): Promise<void> {
   // A minimal, hermetic env: `infocmp` is invoked by absolute path, so no PATH

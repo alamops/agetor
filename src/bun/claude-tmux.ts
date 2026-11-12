@@ -5665,6 +5665,40 @@ const UNNUMBERED_MAX_CHOICE_ROWS = 9;
  *  mentions `[something]` is not swept up. */
 const CHECKBOX_ROW_RE = /^\[[ xX✔✓]?\]\s|(?:^|\s)\[[ xX✔✓]?\]$/;
 
+/** How many pane lines ABOVE the first choice row `unnumberedPreview` may
+ *  show. The card's preview is the user's only view of the dialog, and both
+ *  Chrome answers change a persistent claude setting, so the dialog's title
+ *  must survive: the fixed last-12-lines window the other matchers use cut
+ *  "Claude in Chrome extension detected" off a 13-line dialog. Sixteen covers
+ *  that dialog (9 lines above its rows) with room for a longer body. */
+const UNNUMBERED_PREVIEW_CONTEXT_LINES = 16;
+
+/** A full-width horizontal rule — claude draws one above its full-pane
+ *  dialogs (the captured workspace-trust fixture in claude-tmux-scraper.test.ts
+ *  starts with one), separating the dialog from the transcript or welcome
+ *  banner above it. */
+const DIALOG_RULE_RE = /^\s*[─━]{8,}\s*$/;
+
+/**
+ * The card preview for an unnumbered menu: from the top of the dialog to the
+ * end of the pane. Starts up to `UNNUMBERED_PREVIEW_CONTEXT_LINES` lines above
+ * the first choice row, then drops everything up to and including the last
+ * horizontal rule in that window (the dialog's own top edge), and any leading
+ * blank lines. Display-only: the fingerprint is the parser's, so a different
+ * preview window never changes card identity or the stability gate.
+ */
+function unnumberedPreview(lines: string[], firstRowAt: number): string {
+  let start = Math.max(0, firstRowAt - UNNUMBERED_PREVIEW_CONTEXT_LINES);
+  for (let i = firstRowAt - 1; i >= start; i--) {
+    if (DIALOG_RULE_RE.test(lines[i]!)) {
+      start = i + 1;
+      break;
+    }
+  }
+  while (start < firstRowAt && lines[start]!.trim() === "") start++;
+  return lines.slice(start).join("\n").trimEnd();
+}
+
 /**
  * Recognise a footer-terminated UNNUMBERED choice menu that none of the
  * numbered / yes-no / slider matchers parsed — today claude 2.1.322's
@@ -5733,7 +5767,7 @@ function matchUnnumberedModal(tail: string): ScrapeMatch | null {
   }
   if (parsed.choices.length > UNNUMBERED_MAX_CHOICE_ROWS) return null;
   return {
-    paneText: lines.slice(-12).join("\n").trimEnd(),
+    paneText: unnumberedPreview(lines, parsed.firstRowAt),
     choices: parsed.choices,
     cursorIndex: parsed.cursorIndex,
     fingerprint: parsed.fingerprint,
@@ -6211,6 +6245,9 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
  * 2+ spaces — and stopping at the first row that is neither. Requires at
  * least two choices and exactly one cursor row. Choices get 1-based keys like
  * the numbered path so the fingerprint/label plumbing stays identical.
+ * `firstRowAt` is the raw line index (into `pane.split("\n")`) of the top
+ * choice row, so a caller can show the dialog text above the menu
+ * (`unnumberedPreview`).
  *
  * Deliberately shape-only: it does NOT know whether the widget is live at the
  * bottom of the pane, nor which widget family a row belongs to. Every caller
@@ -6221,7 +6258,7 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
  */
 function parseUnnumberedChoices(
   pane: string,
-): { choices: TmuxPromptChoice[]; cursorIndex: number; fingerprint: string } | null {
+): { choices: TmuxPromptChoice[]; cursorIndex: number; fingerprint: string; firstRowAt: number } | null {
   const lines = pane.split("\n");
   let footerAt = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -6234,16 +6271,19 @@ function parseUnnumberedChoices(
   let i = footerAt - 1;
   while (i >= 0 && lines[i]!.trim() === "") i--;
   const rows: Array<{ label: string; cursor: boolean }> = [];
+  let firstRowAt = -1;
   for (; i >= 0; i--) {
     const raw = lines[i]!;
     const cur = raw.match(/^\s*[❯›]\s+(\S.*?)\s*$/);
     if (cur) {
       rows.unshift({ label: cur[1]!, cursor: true });
+      firstRowAt = i;
       continue;
     }
     const plain = raw.match(/^\s{2,}(\S.*?)\s*$/);
     if (plain) {
       rows.unshift({ label: plain[1]!, cursor: false });
+      firstRowAt = i;
       continue;
     }
     break;
@@ -6255,7 +6295,7 @@ function parseUnnumberedChoices(
   const fingerprint = sha1(
     `unnumbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}`,
   );
-  return { choices, cursorIndex, fingerprint };
+  return { choices, cursorIndex, fingerprint, firstRowAt };
 }
 
 /**
@@ -10949,6 +10989,7 @@ export const __forTest = {
    *  negative truth table can be asserted without a live tmux pane. */
   matchUnnumberedModal,
   UNNUMBERED_MAX_CHOICE_ROWS,
+  UNNUMBERED_PREVIEW_CONTEXT_LINES,
   /** Fallback matcher for prompts no real matcher parsed, plus its pure
    *  watchdog-arm decision and tuning constants — exposed so the scraper
    *  test suite can assert footer/watchdog firing and non-firing without a
