@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "formId": "harness-stacks-fix-round-grill-r3",
+  "title": "Grill round 3 — where stacks live in Settings",
+  "round": 3,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "98bd2523215bd00270f2d510c0cbe3582aa63f98931e2525388fd83767309c73",
+  "submittedAt": "2026-11-10T04:14:10.223Z",
+  "receivedAt": "2026-11-10T04:14:10.235Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 1,
+    "answered": 1,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 1,
+    "overrodeRecommendations": [],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "stacks-placement": {
+      "n": 1,
+      "title": "Where should stacks live in Settings?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "merge-grouped",
+      "display": "Merge into Harnesses: stacks render as groups of their accounts",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

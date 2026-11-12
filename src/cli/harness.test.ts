@@ -259,6 +259,7 @@ test("harness stack create/list/show/edit/rm drive the client and escape labels"
   currentClient = {
     listHarnessStacks: async () => ({ stacks: [stack], limitStates: [] }),
     getHarnessStack: async () => ({ stack, limitStates: [] }),
+    previewHarnessMirror: async () => ({ plans: [], overwrites: false }),
     createHarnessStack: async (input: unknown) => {
       calls.push(`create:${JSON.stringify(input)}`);
       return { stack, warnings: stack.warnings, mirror: { copied: [], warnings: [] } };
@@ -301,14 +302,14 @@ test("harness stack create/list/show/edit/rm drive the client and escape labels"
 
   outputs.length = 0;
   await cmdHarness(["stack", "edit", "stack-1", "--member", "h2", "--member", "h1", "--mirror", "safe"], flags);
-  expect(calls.at(-1)).toBe('patch:{"members":["h2","h1"],"mirrorMode":"safe"}');
+  expect(calls.at(-1)).toBe('patch:{"mirrorMode":"safe","members":["h2","h1"],"expectedUpdatedAt":1}');
   // A partially mirrored edit must not read as a clean success (R13-M2).
   expect(outputs.join("\n")).toContain("mirror:");
   expect(outputs.join("\n")).toContain("not a JSON object");
 
   // `--kind` is a real edit, not a silently ignored flag.
   await cmdHarness(["stack", "edit", "stack-1", "--kind", "codex"], flags);
-  expect(calls.at(-1)).toBe('patch:{"kind":"codex"}');
+  expect(calls.at(-1)).toBe('patch:{"kind":"codex","expectedUpdatedAt":1}');
 
   await expect(cmdHarness(["stack", "edit", "stack-1"], flags)).rejects.toThrow(/nothing to edit/);
 
@@ -328,6 +329,7 @@ test("harness stack show escapes a member's harness id (review N12)", async () =
     warnings: [],
   };
   currentClient = {
+    listHarnessStacks: async () => ({ stacks: [stack], limitStates: [] }),
     getHarnessStack: async () => ({ stack, limitStates: [] }),
   } as unknown as AgetorClient;
   await cmdHarness(["stack", "show", "stack-1"], flags);

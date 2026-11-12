@@ -1,10 +1,21 @@
 /**
- * Pure harness-stack editor mechanics (Settings → Stacks). Kept out of the
+ * Pure harness-stack editor mechanics (Settings → Harnesses, stack cards and the editor subpage). Kept out of the
  * React component so add/remove/reorder, blocker/warning classification and
  * the >20-row virtual window can be unit-tested without a DOM.
  * Model and rules: docs/architecture/harness-stacks.md.
  */
-import type { Harness, HarnessMirrorMode, HarnessStack, HarnessStackKind } from "../../shared/types.ts";
+import type {
+  Harness,
+  HarnessLimitState,
+  HarnessMirrorMode,
+  HarnessStack,
+  HarnessStackInput,
+  HarnessStackKind,
+  MirrorPlan,
+  MirrorPreview,
+  MirrorRestoreResult,
+} from "../../shared/types.ts";
+import { memberStateText } from "../../shared/harness-stack.ts";
 import {
   joinRootPath,
   nonBlankRootValue,
@@ -90,6 +101,162 @@ export function draftPatch(
   }
   if (draft.mirrorMode !== original.mirrorMode) patch.mirrorMode = draft.mirrorMode;
   return patch;
+}
+
+/** The PATCH body for a guarded edit: the changed fields plus
+ *  `expectedUpdatedAt` (the `updatedAt` the draft was based on), so a stack
+ *  edited elsewhere answers 409 instead of being overwritten. Empty when
+ *  nothing changed — the caller shows "No changes to save" and sends nothing. */
+export function guardedPatch(original: HarnessStack, draft: StackDraft): Partial<HarnessStackInput> {
+  const patch = draftPatch(original, draft);
+  if (Object.keys(patch).length === 0) return {};
+  return { ...patch, expectedUpdatedAt: original.updatedAt };
+}
+
+/** True when saving this draft would re-run the mirror: a new stack with a
+ *  backup, or an edit that changes members, their order, or the mirror mode
+ *  (kind cannot change on an edit). A rename is not mirror-relevant. */
+export function isMirrorRelevant(existing: HarnessStack | null | undefined, draft: StackDraft): boolean {
+  if (!existing) return draft.members.length >= 2;
+  if (draft.members.length < 2) return false;
+  const patch = draftPatch(existing, draft);
+  return patch.members !== undefined || patch.mirrorMode !== undefined;
+}
+
+/** The dry-run body for `POST /harness-stacks/mirror-preview`. */
+export function previewBody(
+  draft: StackDraft,
+  stackId: string | null,
+): { kind: HarnessStackKind; members: string[]; mirrorMode: HarnessMirrorMode; stackId?: string } {
+  return {
+    kind: draft.kind,
+    members: draft.members,
+    mirrorMode: draft.mirrorMode,
+    ...(stackId ? { stackId } : {}),
+  };
+}
+
+/** One backup account's slice of a preview, as the dialog lists it. Only the
+ *  accounts with something to say are returned. Names only — values never
+ *  reach the webview. */
+export interface PreviewSection {
+  harnessId: string;
+  label: string;
+  /** Files and keys the mirror will overwrite or remove. */
+  overwrites: string[];
+  /** Originals saved under the mirror backups first. */
+  backedUp: string[];
+  /** Items the account edited since the last mirror: left alone. */
+  kept: string[];
+  warnings: string[];
+}
+
+export function previewSections(preview: MirrorPreview): PreviewSection[] {
+  return preview.plans
+    .map((plan: MirrorPlan): PreviewSection => ({
+      harnessId: plan.harnessId,
+      label: plan.label,
+      overwrites: [
+        ...plan.files.update.map((f) => `${f} (overwritten)`),
+        ...plan.files.remove.map((f) => `${f} (removed)`),
+        ...plan.keys
+          .filter((k) => k.action === "update" || k.action === "remove")
+          .map((k) => `${k.file}: ${k.key} (${k.action === "update" ? "overwritten" : "removed"})`),
+      ],
+      backedUp: plan.backups,
+      kept: plan.kept,
+      warnings: plan.warnings,
+    }))
+    .filter((s) => s.overwrites.length + s.backedUp.length + s.kept.length + s.warnings.length > 0);
+}
+
+/** `HH:MM` for a cooldown's end; a different day adds the short date. */
+export function formatUntil(ms: number, now: number = Date.now()): string {
+  const d = new Date(ms);
+  const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const today = new Date(now);
+  const sameDay = d.getFullYear() === today.getFullYear()
+    && d.getMonth() === today.getMonth()
+    && d.getDate() === today.getDate();
+  return sameDay ? hhmm : `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${hhmm}`;
+}
+
+/** One cooldown chip on an account row. */
+export interface CooldownChip {
+  key: string;
+  /** Visible text: `usage limit · until 14:30` (+ ` · for <model>`). */
+  text: string;
+  ariaLabel: string;
+  model: string | null;
+  /** Provider text, third-party data: render as plain text only. */
+  message: string | null;
+}
+
+/** The active (not yet expired) cooldown rows of one account, soonest first.
+ *  An account can carry several: one whole-account row and per-model rows. */
+export function cooldownChips(
+  limitStates: readonly HarnessLimitState[],
+  harnessId: string,
+  now: number = Date.now(),
+): CooldownChip[] {
+  return limitStates
+    .filter((s) => s.harnessId === harnessId && s.exhaustedUntilMs > now)
+    .sort((a, b) => a.exhaustedUntilMs - b.exhaustedUntilMs)
+    .map((s) => {
+      const t = memberStateText(s);
+      const until = formatUntil(t.until, now);
+      const forModel = t.model ? ` for ${t.model}` : "";
+      return {
+        key: `${s.harnessId}:${s.model ?? ""}`,
+        text: `${t.reasonText} · until ${until}${t.model ? ` · for ${t.model}` : ""}`,
+        ariaLabel: `Cooling: ${t.reasonText}${forModel}, until ${until}`,
+        model: t.model,
+        message: t.message,
+      };
+    });
+}
+
+/** The toast for a finished Restore: counts plus the first warnings. */
+export function restoreSummary(result: MirrorRestoreResult): { empty: boolean; title: string; description: string } {
+  const empty = result.restored.length + result.removed.length + result.kept.length === 0;
+  if (empty && result.warnings.length === 0) {
+    return { empty: true, title: "Nothing to restore", description: "" };
+  }
+  const parts = [
+    `${result.restored.length} restored`,
+    `${result.removed.length} removed`,
+    `${result.kept.length} kept (edited on this account)`,
+  ];
+  const shown = result.warnings.slice(0, 3);
+  const more = result.warnings.length - shown.length;
+  const warnings = [...shown, ...(more > 0 ? [`…and ${more} more`] : [])];
+  return {
+    empty,
+    title: empty ? "Nothing to restore" : "Pre-stack config restored",
+    description: [parts.join(", "), ...warnings].join("; "),
+  };
+}
+
+/** Split the account list into one group per stack (members in stack order)
+ *  and the accounts that are in no stack. */
+export function groupHarnesses(
+  harnesses: readonly Harness[],
+  stacks: readonly HarnessStack[],
+): { stackGroups: Array<{ stack: HarnessStack; members: Harness[] }>; others: Harness[] } {
+  const byId = new Map(harnesses.map((h) => [h.id, h] as const));
+  const stacked = new Set<string>();
+  const stackGroups = stacks.map((stack) => {
+    const members: Harness[] = [];
+    for (const m of stack.members) {
+      const h = byId.get(m.harnessId);
+      if (h) {
+        members.push(h);
+        stacked.add(h.id);
+      }
+    }
+    return { stack, members };
+  });
+  return { stackGroups, others: harnesses.filter((h) => !stacked.has(h.id)) };
 }
 
 /** Blockers that prevent saving; mirrors the server's `validateInput`. */

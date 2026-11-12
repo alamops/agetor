@@ -151,27 +151,45 @@ describe("084 tables and tasks.harness_state", () => {
       copiedPaths: ["/tmp/y.jsonl"],
       createdAt: 20,
     });
-    // The session id is replaced but the cleanup allowlist is merged: the
-    // first transfer's file is still on disk and must stay removable.
+    // A different session re-keys the row: its list names only the new
+    // session's files, and the first transfer's file (still on disk) moves to
+    // the orphan store under the session it was copied for, so it stays
+    // removable (migration 088).
     expect(dbm.harnessSessionHandoffs.get(taskId, "claude-b", "claude_session_id")).toMatchObject({
       sessionId: "s-2",
-      copiedPaths: ["/tmp/x.jsonl", "/tmp/y.jsonl"],
+      copiedPaths: ["/tmp/y.jsonl"],
       createdAt: 20,
     });
-    // A repeat path is not duplicated.
+    const orphans = () =>
+      dbm.harnessOrphanedCopies.list({ harnessId: "claude-b" }).map((r) => [r.sessionId, r.path]);
+    expect(orphans()).toEqual([["s-1", "/tmp/x.jsonl"]]);
+    // The same session merges, and a repeat path is not duplicated.
     dbm.harnessSessionHandoffs.upsert({
       taskId,
       harnessId: "claude-b",
       columnName: "claude_session_id",
-      sessionId: "s-2b",
+      sessionId: "s-2",
       copiedPaths: ["/tmp/y.jsonl", "/tmp/z.jsonl"],
       createdAt: 25,
     });
     expect(dbm.harnessSessionHandoffs.get(taskId, "claude-b", "claude_session_id")?.copiedPaths).toEqual([
-      "/tmp/x.jsonl",
       "/tmp/y.jsonl",
       "/tmp/z.jsonl",
     ]);
+    // Putting the first session back whole reclaims its path from the store.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId,
+      harnessId: "claude-b",
+      columnName: "claude_session_id",
+      sessionId: "s-1",
+      copiedPaths: ["/tmp/x.jsonl"],
+      createdAt: 10,
+    });
+    expect(orphans()).toEqual([
+      ["s-2", "/tmp/y.jsonl"],
+      ["s-2", "/tmp/z.jsonl"],
+    ]);
+    dbm.harnessOrphanedCopies.deleteForHarness("claude-b");
     expect(dbm.harnessSessionHandoffs.listForTask(taskId)).toHaveLength(1);
     dbm.harnessSessionHandoffs.deleteOne(taskId, "claude-b", "claude_session_id");
     expect(dbm.harnessSessionHandoffs.listForTask(taskId)).toEqual([]);
@@ -243,25 +261,77 @@ describe("084 tables and tasks.harness_state", () => {
       { harness_id: ids[0]!, position: 0 },
       { harness_id: ids[2]!, position: 1 },
     ]);
+    // The membership change bumps the stack's updated_at (optimistic edits).
+    expect(
+      dbm.db.query<{ updated_at: number }, [string]>(`SELECT updated_at FROM harness_stacks WHERE id = ?`).get(stackId)!.updated_at,
+    ).toBeGreaterThan(1);
     dbm.db.run(`DELETE FROM harness_stacks WHERE id = ?`, [stackId]);
     for (const id of [ids[0]!, ids[2]!]) dbm.harnesses.delete(id);
   });
 
-  test("mainUserTexts/hasToolUse read the main run stream", () => {
+  test("mainUserRows/hasToolUse read the main run stream", () => {
     const taskId = seedTask();
     const runId = seedRun(taskId);
-    expect(dbm.runs.mainUserTexts(runId)).toEqual([]);
+    expect(dbm.runs.mainUserRows(runId).map((r) => r.data)).toEqual([]);
     expect(dbm.runs.hasToolUse(runId)).toBe(false);
     dbm.runs.appendEvent(runId, "user", "hello");
     dbm.runs.appendEvent(runId, "assistant", "hi");
-    expect(dbm.runs.mainUserTexts(runId)).toEqual(["hello"]);
+    expect(dbm.runs.mainUserRows(runId).map((r) => r.data)).toEqual(["hello"]);
     // A folded follow-up and a subagent's own user event: the retry needs the
     // ordered main-stream texts and must never pick up a subagent's.
     dbm.runs.appendEvent(runId, "user", "follow-up");
     dbm.runs.appendEvent(runId, "user", "subagent words", null, "agent-1");
-    expect(dbm.runs.mainUserTexts(runId)).toEqual(["hello", "follow-up"]);
+    expect(dbm.runs.mainUserRows(runId).map((r) => r.data)).toEqual(["hello", "follow-up"]);
     dbm.runs.appendEvent(runId, "tool_use", JSON.stringify({ id: "t1", name: "Bash" }));
     expect(dbm.runs.hasToolUse(runId)).toBe(true);
+  });
+
+  test("mainUserRows marks twin exactly on rows that carry a line_uuid", () => {
+    const taskId = seedTask();
+    const runId = seedRun(taskId);
+    dbm.runs.appendEvent(runId, "user", "typed, no twin");
+    dbm.runs.appendEvent(runId, "user", "from the jsonl", `uuid-${randomUUID()}`);
+    dbm.runs.appendEvent(runId, "user", "typed again");
+    dbm.runs.appendEvent(runId, "assistant", "ignored", `uuid-${randomUUID()}`);
+    expect(dbm.runs.mainUserRows(runId)).toEqual([
+      { data: "typed, no twin", twin: false },
+      { data: "from the jsonl", twin: true },
+      { data: "typed again", twin: false },
+    ]);
+  });
+
+  test("087: swap history survives a task delete and an account delete; limit and provenance rows go with the account", () => {
+    const tag = randomUUID().slice(0, 8);
+    const accountId = `hist-acct-${tag}`;
+    dbm.harnesses.insert({
+      id: accountId, kind: "claude-code", label: accountId,
+      home: mkdtempSync(path.join(tmpdir(), "agetor-hist-")), env: {},
+    } as never);
+    const stackId = `hist-stack-${tag}`;
+    dbm.db.run(`INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES (?, 'H', 'claude-code', 1, 1)`, [stackId]);
+    const taskId = seedTask();
+    dbm.db.run(
+      `INSERT INTO harness_swap_events (id, stack_id, task_id, task_title, from_harness_id, from_label, to_harness_id, to_label, trigger, at)
+       VALUES (?, ?, ?, 'Title', ?, 'From label', 'other', 'To label', 'limit', 5)`,
+      [`ev-${tag}`, stackId, taskId, accountId],
+    );
+    dbm.db.run(`INSERT INTO harness_limit_state (harness_id, model, reason, source, exhausted_until_ms, updated_at) VALUES (?, '', 'quota', 'claude-pane', 9, 1)`, [accountId]);
+    dbm.db.run(`INSERT INTO harness_limit_state (harness_id, model, reason, source, exhausted_until_ms, updated_at) VALUES (?, 'm1', 'quota', 'codex-error', 9, 1)`, [accountId]);
+    dbm.db.run(`INSERT INTO harness_mirror_provenance (harness_id, scope, path, updated_at) VALUES (?, 'file', '/p', 1)`, [accountId]);
+    const events = () =>
+      dbm.db.query<{ task_title: string; from_label: string }, [string]>(`SELECT task_title, from_label FROM harness_swap_events WHERE stack_id = ?`).all(stackId);
+
+    expect(dbm.db.query<{ foreign_keys: number }, []>(`PRAGMA foreign_keys`).get()!.foreign_keys).toBe(1);
+    dbm.db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    expect(events()).toEqual([{ task_title: "Title", from_label: "From label" }]);
+    dbm.harnesses.delete(accountId);
+    expect(events()).toEqual([{ task_title: "Title", from_label: "From label" }]);
+    for (const table of ["harness_limit_state", "harness_mirror_provenance"]) {
+      expect(dbm.db.query<{ n: number }, [string]>(`SELECT COUNT(*) AS n FROM ${table} WHERE harness_id = ?`).get(accountId)!.n).toBe(0);
+    }
+    // The cascade is on the stack only.
+    dbm.db.run(`DELETE FROM harness_stacks WHERE id = ?`, [stackId]);
+    expect(events()).toEqual([]);
   });
 
   test("lastUserEventId skips a hidden harness-stack continuation (live echo and pasted_content twin) but not prose mentioning the tag", () => {
@@ -300,5 +370,194 @@ describe("084 tables and tasks.harness_state", () => {
     expect(dbm.runs.hasRunning(taskId)).toBe(true);
     dbm.runs.update(newer, { status: "succeeded" });
     expect(older).toBeTruthy();
+  });
+});
+
+describe("boot normalization re-reads the row (088 review N1)", () => {
+  test("a row re-keyed after the pass listed it is never overwritten from the stale snapshot", () => {
+    const taskId = seedTask();
+    const s1 = "aaaaaaaa-0000-4000-8000-000000000001";
+    const s2 = "aaaaaaaa-0000-4000-8000-000000000002";
+    const s3 = "aaaaaaaa-0000-4000-8000-000000000003";
+    // A pre-088 row: session s2 still listing s1's transcript.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: "claude-n1", columnName: "claude_session_id", sessionId: s2,
+      copiedPaths: [`/r/projects/e/${s1}.jsonl`, `/r/projects/e/${s2}.jsonl`], createdAt: 5,
+    });
+    const snapshot = dbm.harnessSessionHandoffs.listAll().find((r) => r.taskId === taskId)!;
+    // A transfer re-keys it before the pass reaches it.
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: "claude-n1", columnName: "claude_session_id", sessionId: s3,
+      copiedPaths: [`/r/projects/e/${s3}.jsonl`], createdAt: 9,
+    });
+    expect(dbm.harnessSessionHandoffs.orphanMismatchedPaths(snapshot.taskId, snapshot.harnessId, snapshot.columnName)).toBe(0);
+    expect(dbm.harnessSessionHandoffs.get(taskId, "claude-n1", "claude_session_id")).toMatchObject({
+      sessionId: s3,
+      copiedPaths: [`/r/projects/e/${s3}.jsonl`],
+    });
+    // The re-key labelled each old path with the session it names.
+    expect(
+      dbm.harnessOrphanedCopies.list({ harnessId: "claude-n1" }).map((r) => [r.sessionId, r.path]).sort(),
+    ).toEqual([
+      [s1, `/r/projects/e/${s1}.jsonl`],
+      [s2, `/r/projects/e/${s2}.jsonl`],
+    ]);
+    dbm.harnessOrphanedCopies.deleteForHarness("claude-n1");
+  });
+
+  test("a row stamped 0 is left alone; a completed one is split atomically", () => {
+    const taskId = seedTask();
+    const s1 = "bbbbbbbb-0000-4000-8000-000000000001";
+    const s2 = "bbbbbbbb-0000-4000-8000-000000000002";
+    const mixed = [`/r/projects/e/${s1}.jsonl`, `/r/projects/e/${s2}.jsonl`];
+    dbm.harnessSessionHandoffs.upsert({
+      taskId, harnessId: "claude-n1b", columnName: "claude_session_id", sessionId: s2, copiedPaths: mixed, createdAt: 0,
+    });
+    expect(dbm.harnessSessionHandoffs.orphanMismatchedPaths(taskId, "claude-n1b", "claude_session_id")).toBe(0);
+    expect(dbm.harnessSessionHandoffs.get(taskId, "claude-n1b", "claude_session_id")?.copiedPaths).toEqual(mixed);
+    dbm.db.run(`UPDATE harness_session_handoffs SET created_at = 7 WHERE task_id = ?`, [taskId]);
+    expect(dbm.harnessSessionHandoffs.orphanMismatchedPaths(taskId, "claude-n1b", "claude_session_id")).toBe(1);
+    expect(dbm.harnessSessionHandoffs.get(taskId, "claude-n1b", "claude_session_id")?.copiedPaths).toEqual(mixed.slice(1));
+    expect(dbm.harnessOrphanedCopies.list({ harnessId: "claude-n1b" })).toEqual([
+      expect.objectContaining({ sessionId: s1, path: mixed[0] }),
+    ]);
+    dbm.harnessOrphanedCopies.deleteForHarness("claude-n1b");
+  });
+});
+
+describe("snapshotHarnessState covers the 088/089 tables (review N8)", () => {
+  test("orphaned copies and mirror sources a test adds are removed, and the snapshot's rows come back whole", async () => {
+    const { snapshotHarnessState } = await import("./test-harness-state.ts");
+    const sid = "cccccccc-0000-4000-8000-000000000001";
+    const sources = () =>
+      dbm.db.query("SELECT * FROM harness_mirror_sources WHERE harness_id LIKE 'n8-%' ORDER BY harness_id").all();
+    const orphans = () => dbm.harnessOrphanedCopies.list().filter((r) => r.harnessId.startsWith("n8-"));
+    // Rows that exist before the snapshot.
+    dbm.harnessOrphanedCopies.add("n8-kept", "claude_session_id", sid, [`/r/projects/e/${sid}.jsonl`]);
+    dbm.db.run(
+      `INSERT INTO harness_mirror_sources (harness_id, primary_id, primary_root, primary_config, updated_at)
+       VALUES ('n8-kept', 'n8-primary', '/kept/root', '/kept/root/.claude.json', 11)`,
+    );
+    const before = { orphans: orphans(), sources: sources() };
+    const restoreState = snapshotHarnessState();
+
+    // What a test file would leave behind.
+    dbm.harnessOrphanedCopies.deleteForHarness("n8-kept");
+    dbm.harnessOrphanedCopies.add("n8-leak", "codex_session_id", sid, [`/r/sessions/2026/11/10/rollout-x-${sid}.jsonl`]);
+    dbm.db.run(`UPDATE harness_mirror_sources SET primary_root = '/moved' WHERE harness_id = 'n8-kept'`);
+    dbm.db.run(
+      `INSERT INTO harness_mirror_sources (harness_id, primary_id, primary_root, primary_config, updated_at)
+       VALUES ('n8-leak', 'n8-primary', '/leak', '/leak/.claude.json', 12)`,
+    );
+
+    restoreState();
+    expect(orphans()).toEqual(before.orphans);
+    expect(sources()).toEqual(before.sources);
+    dbm.harnessOrphanedCopies.deleteForHarness("n8-kept");
+    dbm.db.run(`DELETE FROM harness_mirror_sources WHERE harness_id = 'n8-kept'`);
+  });
+});
+
+describe("harnessOrphanedCopies stamps and planted rows (review N3, S4)", () => {
+  const sid = "dddddddd-0000-4000-8000-000000000001";
+  const plant = (harnessId: string, column: string, p: string, createdAtSql: string) =>
+    dbm.db.run(
+      `INSERT INTO harness_orphaned_copies (harness_id, column_name, session_id, path, created_at)
+       VALUES (?, ?, ?, ?, ${createdAtSql})`,
+      [harnessId, column, sid, p],
+    );
+  const stampOf = (harnessId: string, p: string) =>
+    dbm.db
+      .query<{ created_at: number }, [string, string]>(
+        `SELECT created_at FROM harness_orphaned_copies WHERE harness_id = ? AND path = ?`,
+      )
+      .get(harnessId, p)?.created_at;
+  const rowsOf = (harnessId: string) =>
+    dbm.db
+      .query<{ path: string }, [string]>(`SELECT path FROM harness_orphaned_copies WHERE harness_id = ? ORDER BY path`)
+      .all(harnessId)
+      .map((r) => r.path);
+
+  // Each case seeds the stamp from the table afresh, and leaves no row behind
+  // for the next one (or the next file) to seed from.
+  function withPlanted(harnessId: string, createdAtSql: string, body: () => void): void {
+    plant(harnessId, "claude_session_id", `/planted/${sid}.jsonl`, createdAtSql);
+    dbm.resetOrphanStampForTests();
+    try {
+      body();
+    } finally {
+      dbm.harnessOrphanedCopies.deleteForHarness(harnessId);
+      dbm.resetOrphanStampForTests();
+    }
+  }
+
+  for (const [label, sql, h] of [
+    ["an integer at 2^53", "9007199254740993", "n3-freeze-int"],
+    ["a huge REAL", "1e300", "n3-freeze-real"],
+  ] as const) {
+    test(`a planted created_at (${label}) does not freeze later stamps`, () => {
+      withPlanted(h, sql, () => {
+        dbm.harnessOrphanedCopies.add(h, "claude_session_id", sid, [`/a/${sid}.jsonl`]);
+        dbm.harnessOrphanedCopies.add(h, "claude_session_id", sid, [`/b/${sid}.jsonl`]);
+        const a = stampOf(h, `/a/${sid}.jsonl`)!;
+        const b = stampOf(h, `/b/${sid}.jsonl`)!;
+        expect(b).toBeGreaterThan(a);
+        const mark = dbm.harnessOrphanedCopies.sweepMark();
+        expect(mark).toBeGreaterThanOrEqual(b);
+        // A record written after the mark stays strictly after it.
+        dbm.harnessOrphanedCopies.add(h, "claude_session_id", sid, [`/c/${sid}.jsonl`]);
+        expect(stampOf(h, `/c/${sid}.jsonl`)!).toBeGreaterThan(mark);
+        expect(Number.isSafeInteger(stampOf(h, `/c/${sid}.jsonl`)!)).toBe(true);
+      });
+    });
+  }
+
+  test("a seed far ahead of the clock is clamped to a day past it", () => {
+    const h = "n3-clamp";
+    const ahead = Date.now() + 10 * 24 * 60 * 60 * 1000;
+    withPlanted(h, String(ahead), () => {
+      dbm.harnessOrphanedCopies.add(h, "claude_session_id", sid, [`/a/${sid}.jsonl`]);
+      const a = stampOf(h, `/a/${sid}.jsonl`)!;
+      expect(a).toBeLessThanOrEqual(Date.now() + 24 * 60 * 60 * 1000 + 1);
+      // The planted row is past every sweep mark: a sweep never forgets it.
+      dbm.harnessOrphanedCopies.forget(h, "claude_session_id", sid, [`/planted/${sid}.jsonl`], {
+        notAfter: dbm.harnessOrphanedCopies.sweepMark(),
+      });
+      expect(rowsOf(h)).toContain(`/planted/${sid}.jsonl`);
+    });
+  });
+
+  test("forget without a mark removes a record whatever its planted stamp (past 2^53, REAL, TEXT)", () => {
+    const h = "n3-forget";
+    plant(h, "claude_session_id", `/i/${sid}.jsonl`, "9007199254740993");
+    plant(h, "claude_session_id", `/r/${sid}.jsonl`, "1e300");
+    plant(h, "claude_session_id", `/t/${sid}.jsonl`, "'not a number'");
+    try {
+      dbm.harnessOrphanedCopies.forget(h, "claude_session_id", sid, [`/i/${sid}.jsonl`, `/r/${sid}.jsonl`, `/t/${sid}.jsonl`]);
+      expect(rowsOf(h)).toEqual([]);
+    } finally {
+      dbm.harnessOrphanedCopies.deleteForHarness(h);
+      dbm.resetOrphanStampForTests();
+    }
+  });
+
+  test("a row under a column no handoff writes is never listed; forgetForeignColumns drops only those", () => {
+    const h = "s4-foreign";
+    plant(h, "cursor_session_id", `/x/${sid}.jsonl`, "1");
+    plant(h, "not_a_column", `/y/${sid}.jsonl`, "1");
+    plant(h, "codex_session_id", `/z/rollout-x-${sid}.jsonl`, "1");
+    try {
+      expect(dbm.harnessOrphanedCopies.list({ harnessId: h }).map((r) => r.path)).toEqual([`/z/rollout-x-${sid}.jsonl`]);
+      expect(dbm.harnessOrphanedCopies.list().filter((r) => r.harnessId === h).map((r) => r.columnName)).toEqual([
+        "codex_session_id",
+      ]);
+      // Scoped to another account: nothing of this one goes.
+      expect(dbm.harnessOrphanedCopies.forgetForeignColumns("s4-someone-else")).toBe(0);
+      expect(dbm.harnessOrphanedCopies.forgetForeignColumns(h)).toBe(2);
+      expect(rowsOf(h)).toEqual([`/z/rollout-x-${sid}.jsonl`]);
+    } finally {
+      dbm.harnessOrphanedCopies.deleteForHarness(h);
+      dbm.resetOrphanStampForTests();
+    }
   });
 });

@@ -1,7 +1,9 @@
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table } from "../output.ts";
-import type { Task } from "../../shared/types.ts";
+import type { HarnessLimitState, HarnessStack, Task } from "../../shared/types.ts";
 import { COLUMNS } from "../../shared/types.ts";
+import { stackPositionText } from "../../shared/harness-stack.ts";
+import { stackMarkers } from "../stack-display.ts";
 import { flagValue } from "../args.ts";
 import { fxAutoResumeCountdownText, isTaskFxPaused } from "../../shared/fx-recovery.ts";
 import { pipelineStepProgress } from "../../shared/pipeline.ts";
@@ -105,19 +107,16 @@ export async function cmdLs(
   const harnessPayload = stacksPayload ?? (typeof client.listHarnesses === "function"
     ? await client.listHarnesses().catch(() => null)
     : null);
-  const stackPositionByHarness = new Map<string, string>();
+  const stackByHarness = new Map<string, HarnessStack>();
   for (const stack of harnessPayload?.stacks ?? []) {
-    // A one-member stack has nothing to fail over to: no `· 1/1` suffix.
-    if (stack.members.length < 2) continue;
-    stack.members.forEach((m, i) => {
-      stackPositionByHarness.set(m.harnessId, `${i + 1}/${stack.members.length}`);
-    });
+    for (const m of stack.members) stackByHarness.set(m.harnessId, stack);
   }
+  const limitStates = harnessPayload?.limitStates ?? [];
   const rows = tasks.map((t) => [
     glyph(t),
     c.dim(t.id.slice(0, 8)),
     titleCell(t),
-    agentCell(t, stackPositionByHarness),
+    agentCell(t, stackByHarness, limitStates),
     profileCell(t),
     colorColumn(t.column),
     needsCell(t),
@@ -134,14 +133,32 @@ function titleCell(t: Task): string {
   return t.pipelineParentId ? `↳ ${escapeFreeText(truncateText(t.title, 42))}` : escapeFreeText(truncateText(t.title, 44));
 }
 
-/** Agent column: the raw harness id — always, regardless of whether the task
- *  is bound to an agent profile. The `--agent` filter above matches on the
- *  same `t.agent` field this renders; `· 2/3` is the account's position in
- *  its stack (only for a stack of two or more accounts). */
-function agentCell(t: Task, stackPositionByHarness: Map<string, string>): string {
+/** Agent column: the harness id — always, regardless of whether the task is
+ *  bound to an agent profile (escaped: the id is stored as typed). The
+ *  `--agent` filter above matches on the same `t.agent` field this renders;
+ *  `· 2/3` is the account's position in its stack (only for a stack of two or
+ *  more accounts, via the shared one-member rule). Markers:
+ *  `⏳` the current account is cooling for the task's model (or account-wide),
+ *  `out of quota` / `blocked: no usable account` once every account failed
+ *  (`retrying (attempt n/m)` while the retry run is live),
+ *  `⇄` a switch to the next account is scheduled for the end of the turn. */
+export function agentCell(
+  t: Task,
+  stackByHarness: Map<string, HarnessStack>,
+  limitStates: readonly HarnessLimitState[] = [],
+): string {
   const raw = t.agent ?? "";
-  const position = stackPositionByHarness.get(raw);
-  return position ? `${c.gray(raw)} ${c.dim(`· ${position}`)}` : c.gray(raw);
+  const stack = stackByHarness.get(raw);
+  const position = stack ? stackPositionText(stack, raw) : null;
+  let cell = position ? `${c.gray(escapeControlChars(raw))} ${c.dim(`· ${position}`)}` : c.gray(escapeControlChars(raw));
+  const m = stackMarkers(t, stack, limitStates);
+  if (m.exhausted) cell += ` ${c.yellow(m.exhausted)}`;
+  else {
+    if (m.retrying) cell += ` ${c.yellow(m.retrying)}`;
+    if (m.cooling) cell += ` ${c.yellow("⏳")}`;
+  }
+  if (m.scheduledSwitch) cell += ` ${c.cyan("⇄")}`;
+  return cell;
 }
 
 /** Profile column: the bound agent profile's name (from the task's own

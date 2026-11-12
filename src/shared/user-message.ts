@@ -1049,7 +1049,7 @@ export function canonicalizeUserText(text: string): string {
 
 /**
  * Rebuild the text a harness-stack clean retry should send on a fresh session
- * from a run's main-stream `user` events, oldest first (`runs.mainUserTexts`).
+ * from a run's main-stream `user` events, oldest first (`runs.mainUserRows`).
  *
  * One send can be stored twice — the orchestrator's live echo (plain) and the
  * CLI's JSONL twin (claude wraps a slash command in `<command-name>` XML and a
@@ -1060,9 +1060,12 @@ export function canonicalizeUserText(text: string): string {
  * reduced to the text the user recognizes (`canonicalizeUserText`), a
  * predecessor's hidden continuation wrapper is unwrapped to its body (so
  * re-wrapping cannot nest and stop being recognized), blank rows are skipped,
- * and duplicates collapse to their first occurrence. The surviving texts are
+ * and an echo/twin pair collapses to one. The surviving texts are
  * joined in order with a blank line, so the successor replays the whole
  * unanswered request.
+ *
+ * Tagged rows pair per send (see {@link cleanRetryParts}); plain strings
+ * de-duplicate globally, as before.
  *
  * `firstOnly` is for a sequential-turn harness (Codex): a message typed while
  * a turn is live is QUEUED there and delivered as its own later turn, so
@@ -1073,23 +1076,66 @@ export function canonicalizeUserText(text: string): string {
  * task prompt.
  */
 export function composeCleanRetryText(
-  raws: readonly string[],
+  raws: readonly (string | CleanRetryRow)[],
   opts: { firstOnly?: boolean } = {},
 ): string | null {
+  const parts = cleanRetryParts(raws, opts);
+  return parts.length > 0 ? parts.join("\n\n") : null;
+}
+
+/**
+ * The separate user messages a clean retry re-sends, in send order (what
+ * {@link composeCleanRetryText} joins). Tagged {@link CleanRetryRow}s get
+ * multiset echo<->twin pairing per canonical text: an echo and a twin of the
+ * same text are ONE send (whichever comes first becomes the send), so
+ * echo(P), echo(F1), twin(P), twin(F1) yields P then F1 while two separate
+ * sends of the same text both survive. Untagged strings carry no source, so
+ * they keep the global de-duplication of normalized text.
+ */
+export function cleanRetryParts(
+  rows: readonly (string | CleanRetryRow)[],
+  opts: { firstOnly?: boolean } = {},
+): string[] {
   const parts: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of raws) {
+  const pendingEcho = new Map<string, number>();
+  const pendingTwin = new Map<string, number>();
+  const seenUntagged = new Set<string>();
+  const take = (m: Map<string, number>, key: string): boolean => {
+    const n = m.get(key) ?? 0;
+    if (n <= 0) return false;
+    m.set(key, n - 1);
+    return true;
+  };
+  for (const row of rows) {
+    const raw = typeof row === "string" ? row : row?.data;
     if (typeof raw !== "string" || raw === "") continue;
     let text = canonicalizeUserText(raw.replace(/\r\n?/g, "\n")).trim();
     if (isHarnessStackContinuation(text)) {
       text = stripHarnessStackContinuation(text).trim();
     }
-    if (text === "" || seen.has(text)) continue;
-    seen.add(text);
+    if (text === "") continue;
+    if (typeof row === "string") {
+      if (seenUntagged.has(text)) continue;
+      seenUntagged.add(text);
+    } else {
+      const mine = row.twin ? pendingTwin : pendingEcho;
+      const theirs = row.twin ? pendingEcho : pendingTwin;
+      if (take(theirs, text)) continue;
+      mine.set(text, (mine.get(text) ?? 0) + 1);
+    }
     parts.push(text);
     if (opts.firstOnly) break;
   }
-  return parts.length > 0 ? parts.join("\n\n") : null;
+  return parts;
+}
+
+/** One persisted main-stream `user` row for {@link composeCleanRetryText}.
+ *  `twin` is true for the CLI's JSONL copy of a send (the row carries a
+ *  `line_uuid`) and false for the orchestrator's live echo. Plain strings are
+ *  accepted too (see the function for how they are classified). */
+export interface CleanRetryRow {
+  data: string;
+  twin: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -142,7 +142,7 @@ afterAll(async () => {
   }
   // Restore every mode-000 fixture a test left behind (a test that timed out
   // never reached its own `finally`), or the rm below fails with EACCES.
-  for (const name of ["locked", "locked-padded"]) {
+  for (const name of ["locked", "locked-padded", path.join("m1-locked", "acct")]) {
     try {
       chmodSync(path.join(SCRATCH, name), 0o700);
     } catch {
@@ -668,3 +668,104 @@ test("tmux_source: the CLI token can't set it through PUT /preferences/:key; the
     tmux.setTmuxSource(before === "bundled" ? "bundled" : "system");
   }
 });
+
+// ── harness-stack fix-round routes (TT-E) ───────────────────────────────────
+// Every route the fix round added is `app+cli`: no token is 401 in both modes,
+// the CLI token and the master both reach the handler (a handler answer, never
+// a desktop-only 403 or a headless 501), and `?token=` stays dead on them.
+
+const FIX_ROUND_ROUTES: Array<{ method: string; path: string; body?: unknown; expect: number }> = [
+  { method: "DELETE", path: "/harnesses/no-such-acct/limit-state", expect: 404 },
+  { method: "GET", path: "/harness-stacks/no-such-stack/history", expect: 404 },
+  { method: "POST", path: "/harness-stacks/mirror-preview", body: {}, expect: 400 },
+  { method: "POST", path: "/harnesses/no-such-acct/mirror-restore", body: {}, expect: 404 },
+  { method: "POST", path: "/tasks/no-such-task/switch-account", body: {}, expect: 404 },
+  { method: "DELETE", path: "/tasks/no-such-task/switch-account", expect: 404 },
+];
+
+function fixRoundCall(base: string, r: (typeof FIX_ROUND_ROUTES)[number], opts: { token?: string; query?: string } = {}) {
+  return fetch(`${base}${r.path}${opts.query ?? ""}`, {
+    method: r.method,
+    headers: {
+      ...(opts.token ? bearer(opts.token) : {}),
+      ...(r.body !== undefined ? { "content-type": "application/json" } : {}),
+    },
+    body: r.body !== undefined ? JSON.stringify(r.body) : undefined,
+  });
+}
+
+test("fix-round routes are app+cli in the real table", () => {
+  const table = mods.policy.ROUTE_POLICY as Record<string, Record<string, { callers: string; pathParams?: unknown; headless501?: boolean }>>;
+  for (const r of FIX_ROUND_ROUTES) {
+    const key = r.path
+      .replace("no-such-acct", ":id")
+      .replace("no-such-stack", ":id")
+      .replace("no-such-task", ":id");
+    const policy = table[key]?.[r.method];
+    expect(policy, `${r.method} ${key}`).toBeDefined();
+    expect(policy!.callers).toBe("app+cli");
+    // They take ids, not paths: the handler probes the roots itself.
+    expect(policy!.pathParams).toBeUndefined();
+    expect(policy!.headless501).toBeUndefined();
+  }
+});
+
+test("fix-round routes: no token -> 401; the CLI token and the master reach the handler in app and headless mode", async () => {
+  for (const base of [HEADLESS, APP]) {
+    for (const r of FIX_ROUND_ROUTES) {
+      const none = await fixRoundCall(base, r);
+      expect(none.status, `no token ${r.method} ${r.path} @ ${base}`).toBe(401);
+      await none.text();
+      for (const token of [cli, master]) {
+        const res = await fixRoundCall(base, r, { token });
+        expect(res.status, `${r.method} ${r.path} @ ${base}`).toBe(r.expect);
+        await res.text();
+      }
+    }
+  }
+});
+
+test("fix-round routes: ?token= (either token) is 401 on them — only the three legacy SSE GETs take it", async () => {
+  for (const r of FIX_ROUND_ROUTES) {
+    for (const token of [cli, master]) {
+      const res = await fixRoundCall(APP, r, { query: `?token=${token}` });
+      expect(res.status, `${r.method} ${r.path}`).toBe(401);
+      await res.text();
+    }
+  }
+});
+
+test.skipIf(asRoot)("security M1: mirror-preview is path-gated before validation in app and headless mode; the master is not gated", async () => {
+  const home = path.join(SCRATCH, "m1-home");
+  const parent = path.join(SCRATCH, "m1-locked");
+  mkdirSync(parent);
+  const target = path.join(parent, "acct");
+  mkdirSync(target);
+  chmodSync(target, 0o300);
+  const { symlinkSync } = await import("node:fs");
+  symlinkSync(target, home);
+  const id = "route-policy-ep-m1";
+  mods.db.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+  try {
+    for (const base of [APP, HEADLESS]) {
+      // A duplicate member is a validator 400 if validation ran first.
+      const body = JSON.stringify({ kind: "claude-code", members: [id, id] });
+      const post = (token: string) =>
+        fetch(`${base}/harness-stacks/mirror-preview`, { method: "POST", headers: { ...bearer(token), "content-type": "application/json" }, body });
+      const viaCli = await post(cli);
+      expect(viaCli.status, base).toBe(403);
+      expect(((await viaCli.json()) as { code: string }).code).toBe("path-not-accessible");
+      const viaMaster = await post(master);
+      expect(viaMaster.status, base).toBe(400);
+      await viaMaster.text();
+      // Restore shares the gate.
+      const restore = await fetch(`${base}/harnesses/${id}/mirror-restore`, { method: "POST", headers: bearer(cli) });
+      expect(restore.status, base).toBe(403);
+      await restore.text();
+    }
+  } finally {
+    chmodSync(target, 0o700);
+    mods.db.harnesses.delete(id);
+    rmSync(home, { force: true });
+  }
+}, 60_000);

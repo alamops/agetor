@@ -1,5 +1,6 @@
 import type { GlobalEvent } from "../shared/types.ts";
 import type { NotificationKind } from "../shared/os-notification.ts";
+import { escapeFreeText } from "../shared/terminal-text.ts";
 import { buildTaskNotifierPostArgs, resolveInstalledAppNotifier } from "../bun/notifier.ts";
 
 const BELL = String.fromCharCode(7);
@@ -43,8 +44,9 @@ export function notifyFor(
   if (e.kind === "harness-swap" && e.taskId === taskId) {
     return {
       title: "Agetor — account switched",
-      // No `(1/1)` for a one-member stack's same-account retry (review N1).
-      body: `${short} · ${e.fromLabel} → ${e.toLabel}${e.count < 2 ? "" : ` (${e.position}/${e.count})`}`,
+      // No `(n/m)` for a stack with fewer than two members (same rule as
+      // `stackPositionText`; a swap event carries the count, not the stack).
+      body: `${short} · ${escapeFreeText(e.fromLabel)} → ${escapeFreeText(e.toLabel)}${e.count < 2 ? "" : ` (${e.position}/${e.count})`}`,
       kind: "harness-swap",
     };
   }

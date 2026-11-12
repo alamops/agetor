@@ -11,6 +11,9 @@
  *   linked intermediate directory cannot redirect a read outside the account;
  * - writes go to a sibling temp file, are fsynced, then renamed — so a reader
  *   never sees a half-written credential or session;
+ * - a temp file an interrupted write left behind is removed, once it is an
+ *   hour old, the next time a write lands in its folder
+ *   (`sweepStaleTempFiles`);
  * - the mirror's tree copy preserves each file's mtime and skips a destination
  *   that already has the same size and mtime, so a repeat mirror rewrites only
  *   what changed;
@@ -20,7 +23,7 @@
  *   (`rootRedirectRefusal`, resolved with `lstat`/`readlink` only, never a
  *   stat inside the target);
  * - cleanup unlinks only regular files whose path has a handoff shape
- *   (`isHandoffCopyShape`), never recurses, and prunes only empty folders
+ *   (`isHandoffCopyShape`, tied to the recorded session id), never recurses, and prunes only empty folders
  *   inside that shape;
  * - every file is created 0600, every directory 0700;
  * - sizes and entry counts are capped, and both the walk and each individual
@@ -28,7 +31,6 @@
  *   shared Bun main thread (all tasks run on it).
  */
 import {
-  existsSync,
   lstatSync,
   mkdirSync,
   constants,
@@ -39,7 +41,6 @@ import {
   unlinkSync,
 } from "node:fs";
 import {
-  chmod,
   open,
   rename,
   unlink,
@@ -345,6 +346,77 @@ export function ensurePlainDirUnder(root: string, dir: string): void {
   }
 }
 
+/** A temp file this much older than now (by its last data OR inode change, so
+ *  a copy that just stamped the source's old mtime onto its temp file still
+ *  reads as fresh) was left by an interrupted write: no live write keeps a
+ *  temp file anywhere near this long. */
+const STALE_TEMP_MS = 60 * 60 * 1000;
+/** One sweep per directory per this interval; a tree copy writes many files
+ *  into one folder. */
+const TEMP_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+const TEMP_SWEEP_MEMO_MAX = 10_000;
+/** Exactly the names {@link atomicWriteFile}, {@link copyRegularFileDetailed}
+ *  and the mirror's link swaps create: `.agetor-tmp-<uuid>`. */
+const TEMP_NAME_RE = /^\.agetor-tmp-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const sweptDirs = new Map<string, number>();
+let staleTempAgeMs = STALE_TEMP_MS;
+
+/**
+ * Remove the `.agetor-tmp-*` leftovers of interrupted writes from `dir`. A crash
+ * (or a kill) between a temp file's creation and its rename leaves it behind,
+ * now of any size, and nothing else ever looks at it. Called wherever a write
+ * is about to land in a folder (so every mirror and session transfer sweeps
+ * the folders it writes into) and by the mirror for the destination folders it
+ * visits. Only a direct entry with the exact temp-name shape that is a regular
+ * file or a symlink (a link swap's temp) is removed, after an `lstat`: nothing
+ * is followed, `unlink` of a link removes the link itself, and a folder is
+ * never entered. `dir` must already be verified by the caller (a plain
+ * directory below its trusted root). Best effort, never throws; at most one
+ * sweep per folder per {@link TEMP_SWEEP_INTERVAL_MS}. Returns how many it
+ * removed.
+ */
+export function sweepStaleTempFiles(dir: string): number {
+  const key = path.resolve(dir);
+  const now = Date.now();
+  const last = sweptDirs.get(key);
+  if (last !== undefined && now - last < TEMP_SWEEP_INTERVAL_MS) return 0;
+  if (sweptDirs.size >= TEMP_SWEEP_MEMO_MAX) {
+    for (const [d, at] of sweptDirs) if (now - at >= TEMP_SWEEP_INTERVAL_MS) sweptDirs.delete(d);
+    if (sweptDirs.size >= TEMP_SWEEP_MEMO_MAX) sweptDirs.clear();
+  }
+  sweptDirs.set(key, now);
+  let names: string[];
+  try {
+    if (!lstatSync(key).isDirectory()) return 0;
+    names = readdirSync(key);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!TEMP_NAME_RE.test(name)) continue;
+    const p = path.join(key, name);
+    try {
+      const st = lstatSync(p);
+      if (!st.isFile() && !st.isSymbolicLink()) continue;
+      if (now - Math.max(st.mtimeMs, st.ctimeMs) < staleTempAgeMs) continue;
+      unlinkSync(p);
+      removed++;
+    } catch {
+      // Gone already, or not ours to remove: leave it.
+    }
+  }
+  return removed;
+}
+
+/** Tests only: treat temp files older than `ms` as stale (null restores the
+ *  default) and forget which folders were swept. `bun test` shares one
+ *  process, so restore it. */
+export function setStaleTempAgeForTests(ms: number | null): void {
+  staleTempAgeMs = ms ?? STALE_TEMP_MS;
+  sweptDirs.clear();
+}
+
 /**
  * Chunk size for reads and writes. Every task shares Bun's main thread, so a
  * 64 MB session copy must yield between chunks instead of issuing one
@@ -370,6 +442,7 @@ export async function atomicWriteFile(
   // historical recursive mkdir is fine.
   if (opts.root) ensurePlainDirUnder(opts.root, dir);
   else mkdirSync(dir, { recursive: true, mode: 0o700 });
+  sweepStaleTempFiles(dir);
   const tmp = path.join(dir, `.agetor-tmp-${randomUUID()}`);
   try {
     const handle = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
@@ -381,11 +454,13 @@ export async function atomicWriteFile(
         if (bytesWritten <= 0) throw new Error(`short write to ${tmp}`);
         written += bytesWritten;
       }
+      // On the open descriptor, never by path: the temp name sits in an
+      // agent-writable folder, and a link swapped in at it would be followed.
+      await handle.chmod(opts.mode ?? 0o600);
       await handle.sync();
     } finally {
       await handle.close();
     }
-    await chmod(tmp, opts.mode ?? 0o600);
     await rename(tmp, p);
   } catch (err) {
     try {
@@ -459,6 +534,7 @@ export async function copyRegularFileDetailed(
     const dir = path.dirname(dest);
     if (opts.root) ensurePlainDirUnder(opts.root, dir);
     else mkdirSync(dir, { recursive: true, mode: 0o700 });
+    sweepStaleTempFiles(dir);
     let created = false;
     try {
       const existing = lstatSync(dest);
@@ -496,11 +572,12 @@ export async function copyRegularFileDetailed(
         // The rename below keeps the inode's times, so the mirror's
         // unchanged-file check sees the source's mtime on the next run.
         if (opts.skipUnchanged) await target.utimes(st.atime, st.mtime);
+        // By descriptor, like the write itself (see `atomicWriteFile`).
+        await target.chmod(0o600);
         await target.sync();
       } finally {
         await target.close();
       }
-      await chmod(tmp, 0o600);
       await rename(tmp, dest);
     } catch (err) {
       try {
@@ -672,7 +749,7 @@ export async function copyTreeCooperative(
       // tree still mirrors. A real destination failure (permissions, disk)
       // must still reach the caller as a warning.
       const message = err instanceof Error ? err.message : String(err);
-      const benign = !existsSync(abs)
+      const benign = !isRegularFileNoFollow(abs)
         || message.startsWith("symlink refused")
         || message.startsWith("not a regular file")
         || message.startsWith("file too large");
@@ -693,6 +770,87 @@ export async function copyTreeCooperative(
 
   await walk("");
   return { copied, created, unchanged, skipped, truncated };
+}
+
+/**
+ * Whether `dest` (below the trusted `root`) is absent, present or unsafe to ask
+ * about. `lstat` refuses to follow only the LAST component; the kernel still
+ * follows a symlinked parent, which would stat inside a macOS-protected folder
+ * under Agetor's identity. So this walks from `root` one component at a time:
+ * a missing component means absent, a symlink or non-directory parent means
+ * unsafe, and only the leaf of a verified plain chain is `lstat`ed.
+ */
+export function destinationState(root: string, dest: string): "absent" | "present" | "unsafe" {
+  const resolvedRoot = path.resolve(root);
+  const rel = path.relative(resolvedRoot, path.resolve(dest));
+  if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return "unsafe";
+  const parts = rel.split(path.sep).filter(Boolean);
+  let cur = resolvedRoot;
+  for (let i = 0; i < parts.length; i++) {
+    cur = path.join(cur, parts[i]!);
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unsafe";
+    }
+    if (i === parts.length - 1) return "present";
+    if (st.isSymbolicLink() || !st.isDirectory()) return "unsafe";
+  }
+  return "present";
+}
+
+/**
+ * The destination files a {@link copyTreeCooperative} of `srcDir` into
+ * `destDir` would CREATE: every regular file the copy would visit whose
+ * destination does not exist yet (`lstat` ENOENT). A session handoff records
+ * these BEFORE copying, so a crash between the copy and the handoff row never
+ * leaves files nothing can clean up. It mirrors the copy's walk (same order,
+ * same entry budget, no symlinks, never-copy segments skipped) and is
+ * cooperative; every destination stat goes through {@link destinationState}
+ * (`opts.root` is the trusted destination account root). A destination path that is recorded but never created is
+ * harmless: cleanup skips a missing file.
+ */
+export async function planTreeDestinations(
+  srcDir: string,
+  destDir: string,
+  opts: { maxEntries?: number; root: string },
+): Promise<string[]> {
+  const maxEntries = opts.maxEntries ?? TRANSFER_MAX_ENTRIES;
+  const planned: string[] = [];
+  if (!isPlainDir(srcDir)) return planned;
+  let entries = 0;
+  let lastYield = Date.now();
+  const walk = async (rel: string): Promise<void> => {
+    if (rel) {
+      if (entries >= maxEntries) return;
+      entries++;
+      if (entries % YIELD_EVERY_FILES === 0 || Date.now() - lastYield >= YIELD_EVERY_MS) {
+        lastYield = Date.now();
+        await Bun.sleep(0);
+      }
+      if (rel.split(/[\\/]+/).some((segment) => isNeverCopySegment(segment))) return;
+    }
+    const abs = path.join(srcDir, rel);
+    let st;
+    try {
+      st = lstatSync(abs);
+    } catch {
+      return;
+    }
+    if (st.isSymbolicLink()) return;
+    if (st.isDirectory()) {
+      for (const name of requireSortedNames(abs)) await walk(rel ? path.join(rel, name) : name);
+      return;
+    }
+    if (!st.isFile()) return;
+    const target = path.join(destDir, rel);
+    // Only a destination provably absent behind a plain chain is intended.
+    if (destinationState(opts.root, target) === "absent") planned.push(target);
+  };
+  await walk("");
+  return planned;
 }
 
 function requireSortedNames(dir: string): string[] {
@@ -772,77 +930,159 @@ export function isPlainPathUnder(root: string, p: string): boolean {
   return true;
 }
 
+/** How {@link removeCopiedPathsDetailed} classified every recorded path. */
+export interface RemoveCopiesResult {
+  /** Files unlinked by this call. */
+  removed: string[];
+  /** Recorded paths that no longer exist (nothing left to remove). */
+  gone: string[];
+  /** Paths NOT touched that may still be ours to remove later: outside the
+   *  current root (the account's root changed), the root is refused, or the
+   *  unlink failed. A caller keeps its handoff row while this is non-empty. */
+  retained: string[];
+  /** Paths never ours to touch: garbage, wrong shape, a different session id,
+   *  a symlinked component, or not a regular file. Dropped from the row. */
+  rejected: string[];
+}
+
 /**
  * Remove recorded handoff copies. A path is unlinked only when ALL of these
  * hold, and nothing is ever removed recursively:
  * - it resolves strictly inside `root`;
- * - its root-relative shape is one a session handoff writes for `kind`
- *   (`isHandoffCopyShape`): Claude `projects/<enc>/<sid>.jsonl` or a file in
- *   that session's `subagents`/`tool-results`/`mcp-tasks` folder, Codex
- *   `sessions/YYYY/MM/DD/rollout-*.jsonl`;
+ * - its root-relative shape is one a session handoff writes for `kind` AND the
+ *   recorded `sessionId` (`isHandoffCopyShape`): Claude
+ *   `projects/<enc>/<sid>.jsonl`, a file in that session's
+ *   `subagents`/`tool-results`/`mcp-tasks` folder or `file-history/<sid>/`,
+ *   Codex `sessions/YYYY/MM/DD/rollout-*-<sid>.jsonl`;
  * - `root` itself does not resolve into a protected folder it was not saved
  *   under ({@link rootRedirectRefusal}; otherwise nothing is removed);
  * - every component below `root` is a real, non-symlink path
  *   ({@link isPlainPathUnder}) and the leaf is a regular file (a directory, a
  *   symlink or a special file at a recorded path is left alone).
- * The paths come from SQLite, which an agent can write, so the shape rule is
- * what keeps a planted row from deleting anything else in the account.
+ * The paths come from SQLite, which an agent can write, so the shape rule tied
+ * to the session id is what keeps a planted row from deleting anything else in
+ * the account (another session's transcript included).
  *
  * After each unlink the now-empty folders inside the shape are pruned
- * (`isHandoffPrunableDir`): a Claude session folder and its sidecar folders, or
- * Codex's date folders. Only plain, empty directories are removed, so a folder
- * still holding the backup's own files stays, and `projects/<enc>`,
- * `projects` and `sessions` are never pruned.
+ * (`isHandoffPrunableDir`): the session folder and its sidecar folders,
+ * `file-history/<sid>`, or Codex's date folders. Only plain, empty directories
+ * are removed, so a folder still holding the backup's own files stays, and
+ * `projects/<enc>`, `projects`, `file-history` and `sessions` are never pruned.
  *
  * Cooperative: it yields to the shared event loop every ~20 ms, because a
- * handoff with large sidecars can record thousands of files. Never throws.
+ * handoff with large sidecars can record thousands of files. `shouldStop` is
+ * asked before the first file and after every yield; once it says yes, the
+ * rest are `retained`. Never throws.
  */
+export async function removeCopiedPathsDetailed(
+  paths: readonly string[],
+  root: string,
+  kind: HarnessStackKind,
+  sessionId: string,
+  opts: { shouldStop?: () => boolean } = {},
+): Promise<RemoveCopiesResult> {
+  const resolvedRoot = path.resolve(root);
+  const out: RemoveCopiesResult = { removed: [], gone: [], retained: [], rejected: [] };
+  const valid = paths.filter((p): p is string => typeof p === "string" && p !== "" && !p.includes("\0"));
+  const validSet = new Set(valid);
+  for (const p of paths) if (!validSet.has(p)) out.rejected.push(String(p));
+  // Contract CR4: a root redirected into a protected folder is never touched.
+  if (rootRedirectRefusal(resolvedRoot, "the account's config directory")) {
+    out.retained.push(...valid);
+    return out;
+  }
+  let lastYield = Date.now();
+  // Nothing else runs between two yields, so `shouldStop` is asked before the
+  // first file and again after every yield: its answer cannot change in
+  // between, and each unlink follows a check with no await in between.
+  let mustCheck = true;
+  for (let i = 0; i < valid.length; i++) {
+    const p = valid[i]!;
+    if (Date.now() - lastYield >= YIELD_EVERY_MS) {
+      await Bun.sleep(0);
+      lastYield = Date.now();
+      mustCheck = true;
+    }
+    if (mustCheck && opts.shouldStop?.()) {
+      out.retained.push(...valid.slice(i));
+      break;
+    }
+    mustCheck = false;
+    const resolved = path.resolve(p);
+    const rel = path.relative(resolvedRoot, resolved);
+    if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+      // Not under the CURRENT root: the account's root may have been changed
+      // after the copy, so the file is still out there. Keep the record.
+      out.retained.push(p);
+      continue;
+    }
+    if (!isHandoffCopyShape(kind, rel.split(path.sep).join("/"), sessionId)) {
+      out.rejected.push(p);
+      continue;
+    }
+    // A symlinked directory anywhere between the root and the recorded file
+    // resolves outside the root. `path.resolve` cannot see that, so walk and
+    // `lstat` every component before touching the target.
+    if (!isPlainPathUnder(resolvedRoot, resolved)) {
+      // A missing component is "already gone"; a symlinked one is not ours.
+      if (!existsLexically(resolvedRoot, resolved)) out.gone.push(p);
+      else out.rejected.push(p);
+      continue;
+    }
+    try {
+      if (!lstatSync(resolved).isFile()) {
+        out.rejected.push(p);
+        continue;
+      }
+      unlinkSync(resolved);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") out.gone.push(p);
+      else out.retained.push(p);
+      continue;
+    }
+    out.removed.push(resolved);
+    pruneEmptyShapeDirs(resolvedRoot, path.dirname(resolved), kind, sessionId);
+  }
+  return out;
+}
+
+/** True when every component of `p` below `root` exists as an `lstat` entry
+ *  (symlinks are not followed). Used only to tell "already gone" from "behind a
+ *  symlink" after {@link isPlainPathUnder} refused a path. */
+function existsLexically(root: string, p: string): boolean {
+  let cur = root;
+  for (const part of path.relative(root, p).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    try {
+      const st = lstatSync(cur);
+      if (st.isSymbolicLink()) return true;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** {@link removeCopiedPathsDetailed} reduced to the unlinked files. */
 export async function removeCopiedPaths(
   paths: readonly string[],
   root: string,
   kind: HarnessStackKind,
+  sessionId: string,
 ): Promise<string[]> {
-  const resolvedRoot = path.resolve(root);
-  const removed: string[] = [];
-  // Contract CR4: a root redirected into a protected folder is never touched.
-  if (rootRedirectRefusal(resolvedRoot, "the account's config directory")) return removed;
-  let lastYield = Date.now();
-  for (const p of paths) {
-    if (Date.now() - lastYield >= YIELD_EVERY_MS) {
-      await Bun.sleep(0);
-      lastYield = Date.now();
-    }
-    if (typeof p !== "string" || !p || p.includes("\0")) continue;
-    const resolved = path.resolve(p);
-    const rel = path.relative(resolvedRoot, resolved);
-    if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) continue;
-    if (!isHandoffCopyShape(kind, rel.split(path.sep).join("/"))) continue;
-    // A symlinked directory anywhere between the root and the recorded file
-    // resolves outside the root. `path.resolve` cannot see that, so walk and
-    // `lstat` every component before touching the target.
-    if (!isPlainPathUnder(resolvedRoot, resolved)) continue;
-    try {
-      if (!lstatSync(resolved).isFile()) continue;
-      unlinkSync(resolved);
-    } catch {
-      continue;
-    }
-    removed.push(resolved);
-    pruneEmptyShapeDirs(resolvedRoot, path.dirname(resolved), kind);
-  }
-  return removed;
+  return (await removeCopiedPathsDetailed(paths, root, kind, sessionId)).removed;
 }
 
 /** Remove empty plain directories from `start` upwards while they are inside
  *  a handoff shape (`isHandoffPrunableDir`). Stops at the first non-empty,
  *  non-directory, symlinked or out-of-shape component, so a backup's own
  *  content and the account's own folders are never pruned. */
-function pruneEmptyShapeDirs(root: string, start: string, kind: HarnessStackKind): void {
+function pruneEmptyShapeDirs(root: string, start: string, kind: HarnessStackKind, sessionId: string): void {
   let cur = path.resolve(start);
   for (;;) {
     const rel = path.relative(root, cur);
     if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return;
-    if (!isHandoffPrunableDir(kind, rel.split(path.sep).join("/"))) return;
+    if (!isHandoffPrunableDir(kind, rel.split(path.sep).join("/"), sessionId)) return;
     let st;
     try {
       st = lstatSync(cur);

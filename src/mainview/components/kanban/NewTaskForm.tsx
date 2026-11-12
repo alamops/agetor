@@ -48,6 +48,7 @@ import { StackPositionChip } from "./StackBadge";
 import { AgentProfileCard } from "./AgentProfileCard";
 import { AgentProfilePicker } from "./AgentProfilePicker";
 import { HarnessAuthHint } from "./HarnessAuthHint";
+import { stackBackupCanServe } from "@/lib/stack-launch";
 import { PipelinePicker } from "@/components/pipelines";
 import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 import { ProjectPicker } from "./ProjectPicker";
@@ -407,6 +408,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   };
 
   const selectedStatus = agents.find((a) => a.harnessId === agent);
+  // The chosen account can't start on its own but its stack has a usable
+  // backup the core moves to: the launch pickers say so instead of showing a
+  // red "not installed" box next to an enabled Create button.
+  const stackFallback = stackBackupCanServe(agent, stacks, harnesses, agents);
   const { models: staticModels } = AGENT_OPTIONS[kind];
   // `auto` is only valid on models that support real `--permission-mode auto`
   // (all current claude models); other models would error at spawn. supportedModes
@@ -1142,7 +1147,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
 
               {/* Surfacing a missing-agent error inline so the user sees install
                   guidance before they hit Create and get a delayed failure. */}
-              {selectedStatus && !selectedStatus.available && (
+              {selectedStatus && !selectedStatus.available && !stackFallback && (
                 <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
                   <div className="font-medium">{selectedStatus.reason}</div>
                   {selectedStatus.installHint && (
@@ -1157,6 +1162,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                   reports the actionable error if the turn actually needs
                   credentials. This is a heads-up, not a disable. */}
               <HarnessAuthHint status={selectedStatus} />
+              {stackFallback && selectedStatus && (!selectedStatus.available || selectedStatus.loggedIn === false) && (
+                <p data-testid="launch-stack-fallback-hint" className="text-[11px] text-muted-foreground">
+                  This account can't start right now — the run starts on the next usable account in its stack.
+                </p>
+              )}
               </>
               )}
               </>

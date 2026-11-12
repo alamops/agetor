@@ -270,6 +270,107 @@ describe("harness-stack routes", () => {
   });
 });
 
+// Fix round (TT-E): every route the round added is classified app+cli, the three
+// that reach an account's config root probe it in the handler BEFORE doing
+// anything else, and the deny-by-default startup checks hold for them.
+describe("harness-stack fix-round routes", () => {
+  const NEW_ROUTES: Array<{ key: string; methods: string[] }> = [
+    { key: "/harness-stacks/:id/history", methods: ["GET"] },
+    { key: "/harness-stacks/mirror-preview", methods: ["POST"] },
+    { key: "/harnesses/:id/limit-state", methods: ["DELETE"] },
+    { key: "/harnesses/:id/mirror-restore", methods: ["POST"] },
+    { key: "/tasks/:id/switch-account", methods: ["POST", "DELETE"] },
+  ];
+  const scanned = (key: string) => {
+    const route = SERVER_ROUTES.find((r) => r.key === key);
+    expect(route, `server.ts has ${key}`).toBeDefined();
+    return route!;
+  };
+
+  it("each is registered in server.ts and classified app+cli (CLI token resolves to cli) with exactly its methods", () => {
+    for (const { key, methods } of NEW_ROUTES) {
+      expect(scanned(key).methods.sort()).toEqual([...methods].sort());
+      const entry = ROUTE_POLICY[key] as Record<string, RoutePolicy>;
+      expect(Object.keys(entry).sort()).toEqual([...methods].sort());
+      for (const m of methods) {
+        expect(entry[m]).toEqual(CLI_POLICY);
+        expect(resolveCaller(req(`http://x${key}`, { token: CLI_TOKEN }), entry[m]!)).toBe("cli");
+        expect(resolveCaller(req(`http://x${key}`, { token: API_TOKEN }), entry[m]!)).toBe("app");
+        expect(resolveCaller(req(`http://x${key}`), entry[m]!)).toBeNull();
+      }
+    }
+  });
+
+  it("no harness-stack, limit-state, mirror or switch-account route is desktop-only or carries a pathParams entry (they take ids; the handler gates the roots)", () => {
+    for (const { method, key, policy } of policyEntries()) {
+      if (!/harness-stacks|limit-state|mirror|switch-account/.test(key)) continue;
+      expect(policy.callers, `${method} ${key}`).toBe("app+cli");
+      expect(policy.pathParams, `${method} ${key}`).toBeUndefined();
+    }
+  });
+
+  it("preview, restore and switch-account probe the account roots in the handler for the CLI token", () => {
+    for (const [key, method] of [
+      ["/harness-stacks/mirror-preview", "POST"],
+      ["/harnesses/:id/mirror-restore", "POST"],
+      ["/tasks/:id/switch-account", "POST"],
+    ] as const) {
+      expect(scanned(key).handlers[method], `${method} ${key}`).toContain("gateStackMemberRoots(");
+    }
+    // The cooldown clear, history read and cancel touch no files.
+    for (const [key, method] of [
+      ["/harnesses/:id/limit-state", "DELETE"],
+      ["/harness-stacks/:id/history", "GET"],
+      ["/tasks/:id/switch-account", "DELETE"],
+    ] as const) {
+      expect(scanned(key).handlers[method], `${method} ${key}`).not.toContain("gateStackMemberRoots(");
+    }
+  });
+
+  it("security M1: the preview handler gates the roots BEFORE it validates the draft (validation realpaths account roots)", () => {
+    const src = scanned("/harness-stacks/mirror-preview").handlers.POST!;
+    const gate = src.indexOf("gateStackMemberRoots(");
+    const validate = src.indexOf("validateStackInput(");
+    expect(gate).toBeGreaterThan(-1);
+    expect(validate).toBeGreaterThan(-1);
+    expect(gate).toBeLessThan(validate);
+    // ...and before the dry run itself.
+    expect(gate).toBeLessThan(src.indexOf("previewMirror("));
+  });
+
+  it("startup validation still denies by default for them: a missing route, a missing method, an extra method and an unclassified sibling all throw", () => {
+    const standIn = (): Record<string, unknown> => {
+      const out: Record<string, unknown> = {};
+      for (const [key, entry] of Object.entries(ROUTE_POLICY)) {
+        if (typeof (entry as RoutePolicy).callers === "string") out[key] = ok(key);
+        else out[key] = Object.fromEntries(Object.keys(entry).map((m) => [m, ok(`${m} ${key}`)]));
+      }
+      return out;
+    };
+    const opts = {
+      headless: false,
+      cors: () => ({}),
+      gate: async () => null,
+      notAvailableHeadless: () => new Response(null, { status: 501 }),
+    };
+    expect(() => applyRoutePolicy(standIn(), opts)).not.toThrow();
+    for (const { key } of NEW_ROUTES) {
+      const without = standIn();
+      delete without[key];
+      expect(() => applyRoutePolicy(without, opts), `without ${key}`).toThrow(new RegExp(`policy entry ${key.replace(/[/:]/g, "\\$&")} has no route`));
+    }
+    const noDelete = standIn();
+    noDelete["/tasks/:id/switch-account"] = { POST: ok("p") };
+    expect(() => applyRoutePolicy(noDelete, opts)).toThrow(/route \/tasks\/:id\/switch-account handles \[POST\] but its policy entry lists \[DELETE, POST\]/);
+    const extra = standIn();
+    extra["/harnesses/:id/limit-state"] = { DELETE: ok("d"), POST: ok("p") };
+    expect(() => applyRoutePolicy(extra, opts)).toThrow(/limit-state handles \[DELETE, POST\]/);
+    const sibling = standIn();
+    sibling["/harness-stacks/:id/restore"] = { POST: ok("x") };
+    expect(() => applyRoutePolicy(sibling, opts)).toThrow(/route \/harness-stacks\/:id\/restore has no policy entry/);
+  });
+});
+
 describe("desktop-only set", () => {
   it("callers: app is exactly plan §3's set", () => {
     const actual = policyEntries()

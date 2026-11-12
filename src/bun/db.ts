@@ -8,7 +8,8 @@ import { mergeSentFiles as mergeSentFilesShared } from "../shared/sent-files.ts"
 import { parseTaskFxRecovery } from "../shared/fx-recovery.ts";
 import { HARNESS_STACK_CONTINUATION_TAG, parseTaskHarnessState, type TaskHarnessState } from "../shared/types.ts";
 import { isHarnessStackContinuation } from "../shared/harness-stack.ts";
-import { normalizeDeliveredUserText } from "../shared/user-message.ts";
+import { handoffCopySessionIdFromPath } from "../shared/harness-mirror.ts";
+import { normalizeDeliveredUserText, type CleanRetryRow } from "../shared/user-message.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
@@ -1335,7 +1336,12 @@ export const tasks = {
     return this.get(id) ?? next;
   },
   delete(id: string) {
-    db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+    // The handoff rows cascade with the task; any copies they still hold are
+    // orphaned first so a later sweep can remove them (migration 088).
+    db.transaction(() => {
+      harnessOrphanedCopies.adoptFromTask(id);
+      db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+    })();
   },
   /**
    * Mark a task's unread watermark caught-up-to-date: `last_seen_event_id`
@@ -2321,7 +2327,19 @@ export const harnesses = {
       db.run(`DELETE FROM harness_stack_members WHERE harness_id = ?`, [id]);
       db.run(`DELETE FROM harness_limit_state WHERE harness_id = ?`, [id]);
       harnessSessionHandoffs.deleteForHarness(id);
-      if (membership) renumberStackPositions(membership.stack_id);
+      harnessOrphanedCopies.deleteForHarness(id);
+      // Mirror provenance names the account by id with no FK (087); its store
+      // imports this module, so the delete is inline here. Swap-history rows
+      // are kept on purpose (denormalized labels).
+      db.run(`DELETE FROM harness_mirror_provenance WHERE harness_id = ?`, [id]);
+      db.run(`DELETE FROM harness_mirror_sources WHERE harness_id = ?`, [id]);
+      if (membership) {
+        renumberStackPositions(membership.stack_id);
+        // The membership changed, so the stack's `updated_at` must too or an
+        // editor's `expectedUpdatedAt` would not see it. Strictly increasing,
+        // like `harnessStacks.update`.
+        db.run(`UPDATE harness_stacks SET updated_at = MAX(?, updated_at + 1) WHERE id = ?`, [Date.now(), membership.stack_id]);
+      }
     })();
   },
   /**
@@ -2416,17 +2434,34 @@ export const harnessSessionHandoffs = {
   },
   /**
    * Record (or replace) the handoff for one (task, destination, column). The
-   * session id and timestamp are replaced, but `copiedPaths` is MERGED with
-   * the existing row's list (existing order first, duplicates dropped): a file
-   * an earlier transfer copied onto this account is still on disk, and
-   * dropping it from the allowlist would leak it past task delete, retention
-   * and harness delete (docs/architecture/harness-stacks.md). Read and write
-   * share one transaction so two upserts can't lose each other's paths.
+   * session id and timestamp are replaced. For the SAME session `copiedPaths`
+   * is MERGED with the existing row's list (existing order first, duplicates
+   * dropped): a file an earlier transfer copied onto this account is still on
+   * disk, and dropping it from the allowlist would leak it past task delete,
+   * retention and harness delete. For a DIFFERENT session the old paths move
+   * to `harnessOrphanedCopies` under the old session id, because cleanup only
+   * removes paths of the row's own session (docs/architecture/harness-stacks.md).
+   * Read and write share one transaction so two upserts can't lose each
+   * other's paths.
    */
   upsert(handoff: HarnessSessionHandoff): void {
     db.transaction(() => {
       const existing = this.get(handoff.taskId, handoff.harnessId, handoff.columnName);
-      const copiedPaths = [...new Set([...(existing?.copiedPaths ?? []), ...handoff.copiedPaths])];
+      let copiedPaths: string[];
+      if (existing && existing.sessionId !== handoff.sessionId) {
+        // Re-keyed to another session: cleanup removes a path only when its
+        // shape names the row's session, so the old session's copies could
+        // never be removed from here. They move to the orphan store under
+        // their own session id, where a sweep removes them.
+        const incoming = new Set(handoff.copiedPaths);
+        harnessOrphanedCopies.addLabelled(existing, existing.copiedPaths.filter((p) => !incoming.has(p)));
+        copiedPaths = [...incoming];
+      } else {
+        copiedPaths = [...new Set([...(existing?.copiedPaths ?? []), ...handoff.copiedPaths])];
+      }
+      // A path back on a live row (a failed transfer restoring the previous
+      // session) is no longer an orphan.
+      harnessOrphanedCopies.forget(handoff.harnessId, handoff.columnName, handoff.sessionId, copiedPaths);
       db.run(
         `INSERT INTO harness_session_handoffs
            (task_id, harness_id, column_name, session_id, copied_paths_json, created_at)
@@ -2455,6 +2490,70 @@ export const harnessSessionHandoffs = {
       [taskId, harnessId, column],
     );
   },
+  /** Drop a row whose files may still be on disk (a transfer that failed with
+   *  no earlier handoff to restore): its paths move to the orphan store first,
+   *  so a sweep can still remove whatever the copy created. */
+  abandon(taskId: string, harnessId: string, column: SessionIdColumn): void {
+    db.transaction(() => {
+      const row = this.get(taskId, harnessId, column);
+      if (!row) return;
+      harnessOrphanedCopies.add(row.harnessId, row.columnName, row.sessionId, row.copiedPaths);
+      this.deleteOne(taskId, harnessId, column);
+    })();
+  },
+  /**
+   * The boot normalization of one row (see `adoptMismatchedHandoffPaths`):
+   * paths whose shape names another session move to the orphan store under
+   * that session, the rest stay. The row is re-read inside the transaction, so
+   * a transfer that re-keyed or extended it since the caller listed it is
+   * never overwritten; a row stamped 0 (a transfer that never completed, whose
+   * old session is still the resumable one) is left alone. Returns the number
+   * of paths moved.
+   */
+  orphanMismatchedPaths(taskId: string, harnessId: string, column: SessionIdColumn): number {
+    return db.transaction(() => {
+      const row = this.get(taskId, harnessId, column);
+      if (!row || row.createdAt === 0) return 0;
+      const kind = column === "codex_session_id" ? "codex" : "claude-code";
+      const keep: string[] = [];
+      const bySession = new Map<string, string[]>();
+      for (const p of row.copiedPaths) {
+        const sid = handoffCopySessionIdFromPath(kind, path.resolve(p), row.sessionId);
+        if (sid !== null && sid !== row.sessionId) bySession.set(sid, [...(bySession.get(sid) ?? []), p]);
+        else keep.push(p);
+      }
+      if (bySession.size === 0) return 0;
+      let moved = 0;
+      for (const [sid, paths] of bySession) {
+        harnessOrphanedCopies.add(row.harnessId, row.columnName, sid, paths);
+        moved += paths.length;
+      }
+      db.run(
+        `UPDATE harness_session_handoffs SET copied_paths_json = ?
+          WHERE task_id = ? AND harness_id = ? AND column_name = ?`,
+        [JSON.stringify(keep), taskId, harnessId, column],
+      );
+      return moved;
+    })();
+  },
+  listAll(): HarnessSessionHandoff[] {
+    return db
+      .query<HandoffRow, []>(`SELECT * FROM harness_session_handoffs ORDER BY created_at ASC`)
+      .all()
+      .map(toHandoff);
+  },
+  /** True when a live row for this account and column names `sessionId`: its
+   *  files belong to a conversation that can still be resumed. */
+  hasLiveSession(harnessId: string, column: SessionIdColumn, sessionId: string): boolean {
+    return (
+      db
+        .query<{ n: number }, [string, string, string]>(
+          `SELECT COUNT(*) AS n FROM harness_session_handoffs
+            WHERE harness_id = ? AND column_name = ? AND session_id = ?`,
+        )
+        .get(harnessId, column, sessionId)?.n ?? 0
+    ) > 0;
+  },
   listForTask(taskId: string): HarnessSessionHandoff[] {
     return db
       .query<HandoffRow, [string]>(
@@ -2471,6 +2570,222 @@ export const harnessSessionHandoffs = {
       )
       .all(harnessId)
       .map(toHandoff);
+  },
+};
+
+type OrphanedCopyRow = {
+  harness_id: string;
+  column_name: string;
+  session_id: string;
+  path: string;
+  created_at: number;
+};
+
+export interface HarnessOrphanedCopy {
+  harnessId: string;
+  columnName: SessionIdColumn;
+  /** The session the file was copied for: its shape must name it. */
+  sessionId: string;
+  path: string;
+  createdAt: number;
+}
+
+/** The only columns a handoff copy is ever recorded under. The table is
+ *  agent-writable, so a row naming any other column is never returned and is
+ *  never acted on (`forgetForeignColumns` drops it). */
+const ORPHAN_COLUMNS: readonly SessionIdColumn[] = ["claude_session_id", "codex_session_id"];
+
+const toOrphanedCopy = (r: OrphanedCopyRow): HarnessOrphanedCopy | null => {
+  const columnName = ORPHAN_COLUMNS.find((c) => c === r.column_name);
+  if (!columnName) return null;
+  return {
+    harnessId: r.harness_id,
+    columnName,
+    sessionId: r.session_id,
+    path: r.path,
+    createdAt: r.created_at,
+  };
+};
+
+const isOrphanedCopy = (r: HarnessOrphanedCopy | null): r is HarnessOrphanedCopy => r !== null;
+
+/**
+ * The newest `created_at` this process has stamped on (or seen in)
+ * `harness_orphaned_copies`. Stamps only move forward, so a sweep can take a
+ * mark (`sweepMark`) and later forget only the records stamped at or before
+ * it: a record a transfer wrote while the sweep was running is always stamped
+ * after the mark, even within the same millisecond. Seeded from the table on
+ * first use, so a record from an earlier run whose clock was ahead is still
+ * at or below the first mark.
+ *
+ * The table is agent-writable, so the seed reads only integer stamps and is
+ * clamped to {@link ORPHAN_STAMP_SEED_MARGIN_MS} past the wall clock: a
+ * planted `created_at` at or above 2^53 (where `+ 1` no longer changes a
+ * double) or a huge REAL would otherwise freeze every later stamp at one value,
+ * and a sweep would then forget a record written mid-sweep. A row stamped
+ * past the clamp is simply never forgotten by a sweep (the safe side).
+ */
+let orphanStamp: number | null = null;
+
+/** How far ahead of the wall clock an earlier run's stamp may seed the next
+ *  one (a clock that was ahead, then corrected). */
+const ORPHAN_STAMP_SEED_MARGIN_MS = 24 * 60 * 60 * 1000;
+
+function currentOrphanStamp(): number {
+  if (orphanStamp === null) {
+    const max = db
+      .query<{ m: number | null }, []>(
+        `SELECT MAX(created_at) AS m FROM harness_orphaned_copies WHERE typeof(created_at) = 'integer'`,
+      )
+      .get()?.m;
+    const seed = typeof max === "number" && Number.isSafeInteger(max) ? max : 0;
+    orphanStamp = Math.min(seed, Date.now() + ORPHAN_STAMP_SEED_MARGIN_MS);
+  }
+  return orphanStamp;
+}
+
+/** Test seam: forget the seeded stamp, so the next stamp re-reads the table. */
+export function resetOrphanStampForTests(): void {
+  orphanStamp = null;
+}
+
+/** A stamp strictly after every earlier stamp and every mark. */
+function nextOrphanStamp(): number {
+  orphanStamp = Math.max(Date.now(), currentOrphanStamp() + 1);
+  return orphanStamp;
+}
+
+/**
+ * Handoff copies no handoff row can clean up any more (migration 088): the
+ * old session's files after a row was re-keyed, and the kept files of a
+ * deleted task. Each path carries the session it was copied for. The sweep in
+ * `harness-session-transfer.ts` removes them under the handoff cleanup rules;
+ * a path is never removed just because it is listed here.
+ */
+export const harnessOrphanedCopies = {
+  add(harnessId: string, column: SessionIdColumn, sessionId: string, paths: readonly string[]): void {
+    if (paths.length === 0) return;
+    db.transaction(() => {
+      const now = nextOrphanStamp();
+      for (const p of new Set(paths)) {
+        if (typeof p !== "string" || p === "") continue;
+        db.run(
+          `INSERT INTO harness_orphaned_copies (harness_id, column_name, session_id, path, created_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(harness_id, column_name, path) DO UPDATE SET
+             session_id = excluded.session_id,
+             created_at = excluded.created_at`,
+          [harnessId, column, sessionId, p, now],
+        );
+      }
+    })();
+  },
+  /**
+   * A mark for a sweep, taken before it lists the records: every record listed
+   * after it is stamped at or before the mark, and every record written later
+   * (a transfer of the same session recording its pending paths while the
+   * sweep yields) is stamped after it. Pass it to `forget` as `notAfter`.
+   */
+  sweepMark(): number {
+    orphanStamp = Math.max(Date.now(), currentOrphanStamp());
+    return orphanStamp;
+  },
+  /** Forget the listed paths of one session: they are on a live row again, or
+   *  a sweep removed them, found them gone or rejected them as never ours. The
+   *  session id is part of the match, so a path re-orphaned under another
+   *  session meanwhile is kept. With `notAfter` (a sweep's mark), a record
+   *  written after the mark is kept too: it is a newer transfer's pending
+   *  record of a file that transfer may be creating right now. Without it the
+   *  stamp is not compared at all, so a record with a planted `created_at`
+   *  (past 2^53, a REAL, a TEXT) is still forgotten. */
+  forget(
+    harnessId: string,
+    column: SessionIdColumn,
+    sessionId: string,
+    paths: readonly string[],
+    opts: { notAfter?: number } = {},
+  ): void {
+    if (paths.length === 0) return;
+    const notAfter = opts.notAfter;
+    db.transaction(() => {
+      for (const p of new Set(paths)) {
+        if (notAfter === undefined) {
+          db.run(
+            `DELETE FROM harness_orphaned_copies
+              WHERE harness_id = ? AND column_name = ? AND path = ? AND session_id = ?`,
+            [harnessId, column, p, sessionId],
+          );
+        } else {
+          db.run(
+            `DELETE FROM harness_orphaned_copies
+              WHERE harness_id = ? AND column_name = ? AND path = ? AND session_id = ?
+                AND created_at <= ?`,
+            [harnessId, column, p, sessionId, notAfter],
+          );
+        }
+      }
+    })();
+  },
+  /** Drop every record (of one account, when given) whose column is not a
+   *  handoff column. Nothing agetor writes has one, so such a row was planted;
+   *  it is never listed, and this removes it. Returns how many rows went. */
+  forgetForeignColumns(harnessId?: string): number {
+    const placeholders = ORPHAN_COLUMNS.map(() => "?").join(", ");
+    if (harnessId !== undefined) {
+      return db.run(
+        `DELETE FROM harness_orphaned_copies WHERE harness_id = ? AND column_name NOT IN (${placeholders})`,
+        [harnessId, ...ORPHAN_COLUMNS],
+      ).changes;
+    }
+    return db.run(
+      `DELETE FROM harness_orphaned_copies WHERE column_name NOT IN (${placeholders})`,
+      [...ORPHAN_COLUMNS],
+    ).changes;
+  },
+  list(filter: { harnessId?: string } = {}): HarnessOrphanedCopy[] {
+    if (filter.harnessId !== undefined) {
+      return db
+        .query<OrphanedCopyRow, [string]>(
+          `SELECT * FROM harness_orphaned_copies WHERE harness_id = ? ORDER BY created_at ASC, path ASC`,
+        )
+        .all(filter.harnessId)
+        .map(toOrphanedCopy)
+        .filter(isOrphanedCopy);
+    }
+    return db
+      .query<OrphanedCopyRow, []>(`SELECT * FROM harness_orphaned_copies ORDER BY created_at ASC, path ASC`)
+      .all()
+      .map(toOrphanedCopy)
+      .filter(isOrphanedCopy);
+  },
+  deleteForHarness(harnessId: string): void {
+    db.run(`DELETE FROM harness_orphaned_copies WHERE harness_id = ?`, [harnessId]);
+  },
+  /**
+   * Keep a task's remaining handoff copies before its rows cascade away. Task
+   * delete first runs the normal cleanup, which drops every row whose files
+   * are gone; whatever is still recorded here could not be removed (the
+   * account's root changed, an unlink failed), so it is orphaned instead of
+   * forgotten. Rows for an account that no longer exists are skipped: there is
+   * no root to resolve them against, as in handoff cleanup.
+   */
+  adoptFromTask(taskId: string): void {
+    for (const row of harnessSessionHandoffs.listForTask(taskId)) {
+      if (!harnesses.getByIdOrKind(row.harnessId)) continue;
+      this.addLabelled(row, row.copiedPaths);
+    }
+  },
+  /** Orphan some of a handoff row's paths, each labelled with the session its
+   *  shape names (a pre-088 re-keyed row can still list another session's
+   *  paths); the row's own session wins, and is the fallback. */
+  addLabelled(row: HarnessSessionHandoff, paths: readonly string[]): void {
+    const kind = row.columnName === "codex_session_id" ? "codex" : "claude-code";
+    const bySession = new Map<string, string[]>();
+    for (const p of paths) {
+      const sid = handoffCopySessionIdFromPath(kind, path.resolve(p), row.sessionId) ?? row.sessionId;
+      bySession.set(sid, [...(bySession.get(sid) ?? []), p]);
+    }
+    for (const [sid, list] of bySession) this.add(row.harnessId, row.columnName, sid, list);
   },
 };
 
@@ -3470,14 +3785,17 @@ export const runs = {
    * `composeCleanRetryText` (shared/user-message.ts) does the normalization
    * and de-duplication.
    */
-  mainUserTexts(runId: string): string[] {
+  // `twin` is set on a row that carries a `line_uuid` (the Claude JSONL twin
+  // of a live echo, which has none); `cleanRetryParts` pairs each echo with
+  // at most one twin.
+  mainUserRows(runId: string): CleanRetryRow[] {
     return db
-      .query<{ data: string }, [string]>(
-        `SELECT data FROM run_events INDEXED BY idx_run_events_run
+      .query<{ data: string; line_uuid: string | null }, [string]>(
+        `SELECT data, line_uuid FROM run_events INDEXED BY idx_run_events_run
          WHERE run_id = ? AND stream = 'user' AND subagent_id IS NULL ORDER BY id ASC`,
       )
       .all(runId)
-      .map((row) => row.data);
+      .map((row) => ({ data: row.data, twin: row.line_uuid != null }));
   },
   /**
    * Whether a run recorded ANY tool call (main stream or a subagent's — a
@@ -4089,6 +4407,22 @@ export const runs = {
          WHERE task_id = ? AND ${column} IS NOT NULL
          ORDER BY started_at DESC, rowid DESC`,
     ).all(taskId);
+  },
+  /**
+   * Every task with a run that recorded `sessionId` in `column`, of any agent.
+   * The orphaned-copy sweep asks each one whether the session is still the one
+   * it resumes on the swept account, so a planted orphan record naming a live
+   * conversation never deletes its transcript. Both columns are indexed
+   * (068's `runs_claude_session_id_idx`, 090's `runs_codex_session_id_idx`),
+   * and the sweep runs it once per orphan group, not per file.
+   */
+  taskIdsWithSession(column: SessionIdColumn, sessionId: string): string[] {
+    const col = SESSION_ID_COLUMNS.find((c) => c === column);
+    if (!col || !sessionId) return [];
+    return db
+      .query<{ task_id: string }, [string]>(`SELECT DISTINCT task_id FROM runs WHERE ${col} = ?`)
+      .all(sessionId)
+      .map((r) => r.task_id);
   },
   /** True when any run already records this Claude session id. Not a
    *  uniqueness check — several runs on one task share an id. */

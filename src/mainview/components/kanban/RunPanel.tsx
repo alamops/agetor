@@ -78,8 +78,8 @@ import {
 import { harnessStackBannerView } from "@/lib/harness-stack-banner";
 import { agentSwitchPatch } from "@/lib/agent-switch";
 import { groupStickySections, type StickyItem } from "@/lib/sticky-sections";
-import { stackPositionFor } from "@/lib/stack-badge";
-import { taskPatchFailureToast } from "@/lib/task-patch-failure";
+import { stackPickerOptions, stackPositionFor } from "@/lib/stack-badge";
+import { switchAccountFailureToast, taskPatchFailureToast } from "@/lib/task-patch-failure";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
@@ -105,6 +105,7 @@ import {
   type AgentProfile,
   type AgentStatus,
   type Harness,
+  type HarnessLimitState,
   type HarnessStack,
   type BacklogMessage,
   type FxRecoveryPayload,
@@ -258,10 +259,16 @@ interface Props {
   harnesses: Harness[];
   /** Harness account stacks, for the active-account line and switch notice. */
   stacks?: HarnessStack[];
+  /** Account cooldowns (one row per account and, for a per-model limit, per
+   *  model) — marks cooling members in the stacked account picker. */
+  limitStates?: HarnessLimitState[];
+  /** Opens Settings → Harnesses (the exhausted banner's "Open Harnesses"). */
+  onOpenSettingsHarnesses?: () => void;
   /** Start a Run for this task. Backs the all-exhausted banner's "Run now"
    *  action (a manual run forces a cooling account and resets the attempt
-   *  cap). Omitted in standalone/test renders. */
-  onRunTask?: (task: Task) => void;
+   *  cap). Omitted in standalone/test renders. A returned promise drives the
+   *  button's in-flight guard. */
+  onRunTask?: (task: Task) => void | Promise<void>;
   /** Saved agent profiles — resolves the header chip (`resolveTaskProfileDisplay`)
    *  and, in Task details, whether the agent/mode/model/effort(/fast/max)
    *  controls are locked (`task.agentProfileId != null`). `null` means the
@@ -413,7 +420,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, stickyUserMessages, agents, harnesses, stacks = [], profiles, onOpenSettingsAgents, onRunTask, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
+export function RunPanel({ task, stickyUserMessages, agents, harnesses, stacks = [], limitStates = [], onOpenSettingsHarnesses, profiles, onOpenSettingsAgents, onRunTask, agentModels, harnessModels, onRefreshModels, homeDir, onTaskFieldsChanged, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest, onViewIssue, onOpenPipeline = noOpOpenPipeline, focusSubagent = null, onFocusSubagentConsumed }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -624,6 +631,8 @@ export function RunPanel({ task, stickyUserMessages, agents, harnesses, stacks =
           agents={agents}
           harnesses={harnesses}
           stacks={stacks}
+          limitStates={limitStates}
+          onOpenSettingsHarnesses={onOpenSettingsHarnesses}
           onRunTask={onRunTask}
           profiles={profiles}
           onOpenSettingsAgents={onOpenSettingsAgents}
@@ -660,6 +669,8 @@ function RunPanelBody({
   agents,
   harnesses,
   stacks,
+  limitStates,
+  onOpenSettingsHarnesses,
   onRunTask,
   profiles,
   onOpenSettingsAgents,
@@ -686,7 +697,9 @@ function RunPanelBody({
   agents: AgentStatus[];
   harnesses: Harness[];
   stacks: HarnessStack[];
-  onRunTask?: (task: Task) => void;
+  limitStates: HarnessLimitState[];
+  onOpenSettingsHarnesses?: () => void;
+  onRunTask?: (task: Task) => void | Promise<void>;
   profiles: AgentProfile[] | null;
   onOpenSettingsAgents: (profileId?: string) => void;
   agentModels: AgentModelMap;
@@ -4145,7 +4158,13 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
-        <HarnessStackBanner task={task} stacks={stacks} harnesses={harnesses} onRunTask={onRunTask} />
+        <HarnessStackBanner
+          task={task}
+          stacks={stacks}
+          harnesses={harnesses}
+          onRunTask={onRunTask}
+          onOpenSettingsHarnesses={onOpenSettingsHarnesses}
+        />
         {importedSession && (
           <div
             className="mt-1 space-y-1 text-xs"
@@ -4231,6 +4250,12 @@ function RunPanelBody({
               <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
             )}
           </span>
+          <SwitchAccountControl
+            task={task}
+            stacks={stacks}
+            harnesses={harnesses}
+            onTaskFieldsChanged={onTaskFieldsChanged}
+          />
           {agentProfileDisplay && agentProfileForCard && (
             <span data-testid="task-agent-profile-chip" title={agentProfileDisplay.summary} className="shrink-0">
               <AgentProfileCard
@@ -4387,6 +4412,8 @@ function RunPanelBody({
         task={task}
         agents={agents}
         harnesses={harnesses}
+        stacks={stacks}
+        limitStates={limitStates}
         agentProfileDisplay={agentProfileDisplay}
         agentProfileForCard={agentProfileForCard}
         onOpenSettingsAgents={onOpenSettingsAgents}
@@ -6978,16 +7005,21 @@ function HarnessStackBanner({
   stacks,
   harnesses,
   onRunTask,
+  onOpenSettingsHarnesses,
 }: {
   task: Task;
   stacks: HarnessStack[];
   harnesses: Harness[];
-  onRunTask?: (task: Task) => void;
+  onRunTask?: (task: Task) => void | Promise<void>;
+  onOpenSettingsHarnesses?: () => void;
 }) {
   const target = task.harnessState?.allExhausted?.nextAttemptAt ?? null;
   // One shared ticking clock (also used by the fx countdown); reset per task
   // and per target so a previous task's time never paints on the next one.
   const now = useNowTicker(target != null && target > 0, `${task.id}:${target ?? ""}`);
+  // In-flight guard for "Run now", tagged with the task id so a switch to
+  // another task never inherits the previous task's disabled button.
+  const [runningNowFor, setRunningNowFor] = useState<string | null>(null);
   const labelOf = (id: string) =>
     stacks.flatMap((s) => s.members).find((m) => m.harnessId === id)?.label
       ?? harnesses.find((h) => h.id === id)?.label
@@ -7015,25 +7047,144 @@ function HarnessStackBanner({
       </div>
     );
   }
+  const runBusy = runningNowFor === task.id;
+  const runNow = () => {
+    if (!onRunTask || runBusy) return;
+    const id = task.id;
+    setRunningNowFor(id);
+    // App's start handler reports its own failures (toast); this only clears
+    // the in-flight guard, so a rejection is swallowed here, not left unhandled.
+    void Promise.resolve(onRunTask(task))
+      .catch(() => {})
+      .finally(() => {
+        setRunningNowFor((cur) => (cur === id ? null : cur));
+      });
+  };
   return (
-    <div
-      className="mt-1 flex flex-wrap items-center gap-2 text-xs text-warning"
-      data-testid="harness-stack-exhausted"
-    >
-      <span>{view.text}</span>
-      {onRunTask && view.runNow && (
+    <div className="mt-1 space-y-1 text-xs text-warning" data-testid="harness-stack-exhausted">
+      <div className="flex flex-wrap items-center gap-2">
+        <span>{view.text}</span>
+        {onRunTask && view.runNow && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 border-warning/40 px-2 text-[11px] text-warning hover:bg-warning/10"
+            data-testid="harness-stack-run-now"
+            title="Run now on a cooling account and reset the retry cap"
+            disabled={runBusy}
+            onClick={runNow}
+          >
+            <Play className="mr-1 size-3" /> {runBusy ? "Starting…" : "Run now"}
+          </Button>
+        )}
+        {onOpenSettingsHarnesses && view.openHarnesses && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 border-warning/40 px-2 text-[11px] text-warning hover:bg-warning/10"
+            data-testid="harness-stack-open-harnesses"
+            onClick={onOpenSettingsHarnesses}
+          >
+            Open Harnesses
+          </Button>
+        )}
+      </div>
+      {view.reasons.length > 0 && (
+        <ul className="list-disc space-y-0.5 pl-4 text-[11px]" data-testid="harness-stack-member-reasons">
+          {view.reasons.map((line, i) => (
+            <li key={`${i}:${line}`}>{line}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/**
+ * "Switch to next account" for a task in a stack of two or more accounts
+ * (D12), next to the account line. The core decides whether the move happens
+ * now (idle task) or when the live turn ends (`scheduled`); this only
+ * reflects the answer. The in-flight and scheduled flags live in the core's
+ * answer and `task.harnessState.scheduledSwitch`, so a reload or a CLI
+ * request shows the same state; the busy flag is tagged with the task id so
+ * switching tasks mid-request leaks nothing. An archived task offers no
+ * switch (the core refuses it); a switch still scheduled on one keeps its
+ * Cancel. Exported for its render test.
+ */
+export function SwitchAccountControl({
+  task,
+  stacks,
+  harnesses,
+  onTaskFieldsChanged,
+}: {
+  task: Task;
+  stacks: HarnessStack[];
+  harnesses: Harness[];
+  onTaskFieldsChanged?: (taskId: string, partial: Partial<Task>) => void;
+}) {
+  const [busy, setBusy] = useState<{ taskId: string; op: "switch" | "cancel" } | null>(null);
+  const scheduled = task.harnessState?.scheduledSwitch != null;
+  const offerSwitch = task.archivedAt == null && stackPositionFor(stacks, task.agent) !== null;
+  if (!offerSwitch && !scheduled) return null;
+  const taskBusy = busy?.taskId === task.id ? busy.op : null;
+  const mergeResult = (updated: Task) => {
+    onTaskFieldsChanged?.(task.id, { agent: updated.agent, harnessState: updated.harnessState });
+  };
+  const run = async (op: "switch" | "cancel") => {
+    if (busy?.taskId === task.id) return;
+    const id = task.id;
+    setBusy({ taskId: id, op });
+    try {
+      if (op === "cancel") {
+        const res = await api.cancelScheduledAccountSwitch(id);
+        mergeResult(res.task);
+      } else {
+        const res = await api.switchTaskAccount(id);
+        mergeResult(res.task);
+        if (res.status === "switched") {
+          const label = harnesses.find((h) => h.id === res.task.agent)?.label ?? res.task.agent;
+          toast.success(`Switched to ${label}`);
+        }
+      }
+    } catch (e) {
+      const failure = switchAccountFailureToast(e);
+      toast.error(failure.title, { description: failure.description });
+    } finally {
+      setBusy((cur) => (cur?.taskId === id ? null : cur));
+    }
+  };
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1.5" data-testid="switch-account-control">
+      {scheduled ? (
+        <>
+          <span className="text-info" data-testid="switch-account-scheduled">
+            Switch scheduled for the end of this turn
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-5 px-1.5 text-[10px]"
+            data-testid="switch-account-cancel"
+            disabled={taskBusy !== null}
+            onClick={() => void run("cancel")}
+          >
+            {taskBusy === "cancel" ? "Cancelling…" : "Cancel"}
+          </Button>
+        </>
+      ) : (
         <Button
           size="sm"
           variant="outline"
-          className="h-6 border-warning/40 px-2 text-[11px] text-warning hover:bg-warning/10"
-          data-testid="harness-stack-run-now"
-          title="Run now on a cooling account and reset the retry cap"
-          onClick={() => onRunTask(task)}
+          className="h-5 px-1.5 text-[10px]"
+          data-testid="switch-account-button"
+          title="Move this task to the next account in its stack, keeping the conversation"
+          disabled={taskBusy !== null}
+          onClick={() => void run("switch")}
         >
-          <Play className="mr-1 size-3" /> Run now
+          {taskBusy === "switch" ? "Switching…" : "Switch to next account"}
         </Button>
       )}
-    </div>
+    </span>
   );
 }
 
@@ -7739,6 +7890,8 @@ function TaskDetails({
   task,
   agents,
   harnesses,
+  stacks,
+  limitStates,
   agentProfileDisplay,
   agentProfileForCard,
   onOpenSettingsAgents,
@@ -7754,6 +7907,10 @@ function TaskDetails({
   task: Task;
   agents: AgentStatus[];
   harnesses: Harness[];
+  /** Stacks + cooldowns: a stacked task's account picker lists only its
+   *  stack's members, with position and a cooling mark (D18). */
+  stacks: HarnessStack[];
+  limitStates: HarnessLimitState[];
   /** Resolved agent-profile chip data for this task (`null` when the task
    *  was never bound to a profile) — see `RunPanelBody`'s own computation,
    *  reused here so the lock/hint/Detach affordances below and the header
@@ -7836,7 +7993,27 @@ function TaskDetails({
 
   const save = async (patch: Partial<Task>) => {
     try {
-      await api.updateTask(task.id, patch);
+      // An account switch is never replayed after a lost response: the core
+      // copies the transcript before answering, and `taskPatchFailureToast`
+      // tells the user the switch may have landed.
+      const updated = await api.updateTask(
+        task.id,
+        patch,
+        typeof patch.agent === "string" ? { retry: false } : undefined,
+      );
+      if (typeof patch.agent === "string") {
+        // Show the new account at once rather than the old one until the next
+        // 2 s poll (only the fields a switch owns, never the whole snapshot).
+        onTaskFieldsChanged?.(task.id, {
+          agent: updated.agent,
+          harnessState: updated.harnessState,
+          mode: updated.mode,
+          model: updated.model,
+          effort: updated.effort,
+          speed: updated.speed,
+          maxMode: updated.maxMode,
+        });
+      }
     } catch (e) {
       // A dropdown PATCH stays quiet: the parent's poll picks the row back up
       // on the next 2s tick and the dropdown reverts on its own. An account
@@ -7986,8 +8163,28 @@ function TaskDetails({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [maxModeAvailable, task.maxMode, task.agentProfileId, harnessKnown]);
 
+  // The account PATCH awaits the transcript copy (seconds on a long
+  // conversation): the picker is disabled and says "Switching…" meanwhile.
+  // Tagged with the task id so another task's panel never inherits it.
+  const [switchingAgentFor, setSwitchingAgentFor] = useState<string | null>(null);
+  const switchingAgent = switchingAgentFor === task.id;
+  // Cooling marks are time-based: a slow tick lets an expired cooldown drop
+  // off the picker without waiting for `limitStates` to change.
+  const [pickerNow, setPickerNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (limitStates.length === 0) return;
+    setPickerNow(Date.now());
+    const t = setInterval(() => setPickerNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, [limitStates]);
+  const pickerOptions = useMemo(
+    () => stackPickerOptions({ task, stacks, harnesses, agents, limitStates, now: pickerNow }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [task.agent, task.model, stacks, harnesses, agents, limitStates, pickerNow],
+  );
+
   const onAgentChange = (nextId: string) => {
-    if (nextId === task.agent) return;
+    if (nextId === task.agent || switchingAgent) return;
     // Switching to another KIND wipes the current mode / model / effort
     // context — those ids belong to the old harness's kind option set. Reset
     // to the new harness's kind defaults (DEFAULT_MODEL + DEFAULT_EFFORT) and
@@ -7995,12 +8192,16 @@ function TaskDetails({
     // switch sends only `{ agent }` (`agentSwitchPatch`). Sent as one PATCH
     // so the server-side reconcile only fires once.
     const nextHarness = harnesses.find((h) => h.id === nextId);
+    const id = task.id;
+    setSwitchingAgentFor(id);
     void save(agentSwitchPatch({
       nextId,
       currentKind: harnessKnown ? kind : null,
       nextKind: nextHarness?.kind ?? null,
       kindDefaults: () => kindDefaultsFor(nextId),
-    }));
+    })).finally(() => {
+      setSwitchingAgentFor((cur) => (cur === id ? null : cur));
+    });
   };
 
   const kindDefaultsFor = (nextId: string) => {
@@ -8169,15 +8370,27 @@ function TaskDetails({
             <dt className="text-muted-foreground">Harness</dt>
             <dd className="min-w-0">
               {editable ? (
-                <AgentSelect
-                  value={task.agent}
-                  harnesses={harnesses}
-                  agents={agents}
-                  onChange={onAgentChange}
-                />
+                <div className="flex items-center gap-2">
+                  <div className="min-w-0 flex-1">
+                    <AgentSelect
+                      value={task.agent}
+                      harnesses={harnesses}
+                      agents={agents}
+                      stackOptions={pickerOptions}
+                      disabled={switchingAgent}
+                      onChange={onAgentChange}
+                    />
+                  </div>
+                  {switchingAgent && (
+                    <span className="shrink-0 text-[10px] text-muted-foreground" data-testid="task-agent-switching">
+                      Switching…
+                    </span>
+                  )}
+                </div>
               ) : (
                 <span className="inline-flex items-center gap-1">
-                  <AgentIcon kind={kind} className="size-3" /> {task.agent}
+                  <AgentIcon kind={kind} className="size-3" />{" "}
+                  {harnesses.find((h) => h.id === task.agent)?.label ?? task.agent}
                 </span>
               )}
             </dd>
@@ -8472,21 +8685,32 @@ function AgentSelect({
   value,
   harnesses,
   agents,
+  stackOptions = null,
+  disabled = false,
   onChange,
 }: {
   /** Current harness id stored on the task. */
   value: string;
   harnesses: Harness[];
   agents: AgentStatus[];
+  /** A stacked task lists only its stack's members (`stackPickerOptions`,
+   *  already labelled with position / cooling / availability); null keeps the
+   *  full account list. */
+  stackOptions?: { id: string; label: string }[] | null;
+  disabled?: boolean;
   onChange: (next: string) => void;
 }) {
   return (
     <Select
       value={value}
       onChange={(e) => onChange(e.target.value)}
+      disabled={disabled}
+      aria-label="Harness account"
       className="h-6 text-[11px]"
     >
-      {harnesses.map((h) => {
+      {stackOptions
+        ? stackOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)
+        : harnesses.map((h) => {
         const status = agents.find((a) => a.harnessId === h.id);
         const available = status?.available ?? true;
         const loggedOut = available && status?.loggedIn === false;

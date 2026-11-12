@@ -1,0 +1,235 @@
+{
+  "version": 1,
+  "formId": "harness-stacks-fix-round-grill-r1",
+  "title": "Grill — harness stacks fix round + improvements",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "c485db624eaa3e67ccf6b673130d6f0cb68050ffa642fcc940b4ec825803e020",
+  "submittedAt": "2026-11-10T04:10:39.985Z",
+  "receivedAt": "2026-11-10T04:10:40.018Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 21,
+    "answered": 21,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 19,
+    "overrodeRecommendations": [
+      "switch-now-live",
+      "picker-outside"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [
+      "history-cap"
+    ],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "switch-now-live": {
+      "n": 1,
+      "title": "What should \"Switch to next account now\" do while the task's run is live?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "after-turn",
+      "display": "Switch after the current turn ends",
+      "acceptedRecommendation": false,
+      "recommended": "interrupt"
+    },
+    "history-lifetime": {
+      "n": 2,
+      "title": "How should the per-stack swap history be stored and how long is it kept?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "stack-scoped-capped",
+      "display": "Kept with the stack, capped per stack",
+      "acceptedRecommendation": true
+    },
+    "history-cap": {
+      "n": 3,
+      "title": "How many swap events to keep per stack before pruning the oldest?",
+      "type": "number",
+      "status": "answered",
+      "impact": "minor",
+      "value": 500,
+      "display": "500 events",
+      "acceptedRecommendation": true,
+      "note": "why having a cap?"
+    },
+    "history-events": {
+      "n": 4,
+      "title": "Which events go into the swap history?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "shape",
+      "value": [
+        "retry",
+        "blocked",
+        "boot-resume",
+        "unavailable",
+        "manual",
+        "limit"
+      ],
+      "display": "Automatic retries after a reset; Blocked outcomes; Swaps completed at boot; Moves off an unusable account; Manual switches; Limit swaps",
+      "acceptedRecommendation": true
+    },
+    "codex-per-model": {
+      "n": 5,
+      "title": "Codex \"You've hit your usage limit for <model>\" — how should a per-model limit be scoped?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "per-model-cooldown",
+      "display": "Cool the account for that model only",
+      "acceptedRecommendation": true
+    },
+    "mirror-backups": {
+      "n": 6,
+      "title": "Mirror provenance: what happens to a backup's own files and keys the mirror overwrites?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "backup-restore",
+      "display": "Back up everything overwritten + a Restore action",
+      "acceptedRecommendation": true
+    },
+    "mirror-preview": {
+      "n": 7,
+      "title": "When does the save-time mirror preview appear?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "overwrite-only",
+      "display": "Only when something on a backup would be overwritten or removed",
+      "acceptedRecommendation": true
+    },
+    "clear-cooldown": {
+      "n": 8,
+      "title": "What does \"Clear cooldown\" do?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "global",
+      "display": "Delete the account's cooldown for every task",
+      "acceptedRecommendation": true
+    },
+    "cooldown-message": {
+      "n": 9,
+      "title": "Show the provider's own limit message next to a cooling account?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "both",
+      "display": "Reason + message (message in a tooltip/detail line)",
+      "acceptedRecommendation": true
+    },
+    "retry-test-seam": {
+      "n": 10,
+      "title": "The automatic retry waits at least 10 s (hard-coded). May the e2e shorten it with an env override?",
+      "type": "single",
+      "status": "answered",
+      "impact": "minor",
+      "value": "seam",
+      "display": "Yes — `AGETOR_HARNESS_RETRY_MIN_MS`, honored only under NODE_ENV=test or the e2e backend flag",
+      "acceptedRecommendation": true
+    },
+    "delivery": {
+      "n": 11,
+      "title": "How should this ship?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "one-branch",
+      "display": "One branch, a commit per wave; you open the PR",
+      "acceptedRecommendation": true
+    },
+    "manual-no-cooldown": {
+      "n": 12,
+      "title": "A manual switch (picker, CLI, switch now) never cools the old account and never marks it tried",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Confirmed: only a provider limit cools an account; a manual move just picks the next usable member.",
+      "acceptedRecommendation": true
+    },
+    "switch-now-none": {
+      "n": 13,
+      "title": "Switch now with no other usable account is refused up front, before anything is stopped",
+      "type": "confirm",
+      "status": "answered",
+      "value": "409 with the per-member reasons (cooling until …, logged out, …); the live run keeps going.",
+      "acceptedRecommendation": true
+    },
+    "provenance-edited": {
+      "n": 14,
+      "title": "A file/key the mirror wrote and the backup later edited is never removed by deletion propagation",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Kept, with a warning naming it; provenance for it is dropped.",
+      "acceptedRecommendation": true
+    },
+    "safe-mode-unown": {
+      "n": 15,
+      "title": "Switching full → safe mirror stops owning hooks/permissions but leaves the backup's current values in place",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Provenance rows for keys safe mode no longer mirrors are dropped; nothing on the backup is deleted.",
+      "acceptedRecommendation": true
+    },
+    "stack-concurrency": {
+      "n": 16,
+      "title": "Stack edits carry the `updatedAt` they were based on; a mismatch answers 409",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Webview: toast \"This stack changed elsewhere — reloaded\", the editor reloads with the current stack. CLI: `stack edit` always sends the updatedAt it just fetched; a 409 says to re-run.",
+      "acceptedRecommendation": true
+    },
+    "cli-lookup": {
+      "n": 17,
+      "title": "CLI stack references resolve as exact id → exact label → unique id prefix",
+      "type": "confirm",
+      "status": "answered",
+      "value": "A label shared by two stacks is an error listing both ids, like an ambiguous task prefix.",
+      "acceptedRecommendation": true
+    },
+    "picker-outside": {
+      "n": 18,
+      "title": "The RunPanel account picker keeps outside-stack accounts selectable, grouped and labelled",
+      "type": "confirm",
+      "status": "answered",
+      "value": "we should not have this type of picker for out of the stack.",
+      "acceptedRecommendation": false,
+      "recommended": "Two groups: \"This stack — keeps the conversation\" (with n/m and cooling marks) and \"Other accounts — starts a fresh session\". The select shows a spinner and stays disabled while a switch copies."
+    },
+    "quota-display": {
+      "n": 19,
+      "title": "Per-member quota shows the stored snapshot with its age; past 20 minutes it's marked stale",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Webview: compact meter per member (5h / weekly), from the app's usage map. CLI `stack ls/show`: the same from GET /usage. No force refresh from the CLI.",
+      "acceptedRecommendation": true
+    },
+    "quota-exhausted-rule": {
+      "n": 20,
+      "title": "A quota snapshot counts as exhausted when any blocking window (Claude 5h/weekly, Codex session/weekly) is at 100% and no credits meter has headroom; its reset is the latest exhausted window's",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Confirmed (review item 8).",
+      "acceptedRecommendation": true
+    },
+    "cloud-env-evidence": {
+      "n": 21,
+      "title": "AWS/Azure/Vertex/Google credentials in the process env count as Claude login evidence only with a provider selector (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY), and then as \"unknown\"",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Confirmed (review item 10).",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

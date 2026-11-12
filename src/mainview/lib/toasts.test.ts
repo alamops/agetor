@@ -22,7 +22,7 @@ const realSonnerSnapshot = { ...realSonner };
 const realApiSnapshot = { ...realApi };
 
 interface SonnerCall {
-  method: "warning" | "error";
+  method: "warning" | "error" | "info";
   title: string;
   options: Record<string, unknown>;
 }
@@ -45,6 +45,10 @@ mock.module("sonner", () => ({
     },
     error: (title: string, options: Record<string, unknown>) => {
       calls.push({ method: "error", title, options });
+      return `toast-${++nextToastId}`;
+    },
+    info: (title: string, options: Record<string, unknown>) => {
+      calls.push({ method: "info", title, options });
       return `toast-${++nextToastId}`;
     },
     dismiss: (id?: string | number) => {
@@ -71,7 +75,7 @@ afterAll(() => {
   mock.module("./api", () => realApiSnapshot);
 });
 
-const { toastPipelineReview } = await import("./toasts.ts");
+const { toastHarnessSwap, toastPipelineReview } = await import("./toasts.ts");
 
 beforeEach(() => {
   calls.length = 0;
@@ -144,5 +148,24 @@ describe("toastPipelineReview", () => {
     expect(calls).toHaveLength(0);
     expect(posted).toEqual([]);
     expect(cleared).toEqual(["pipeline-parent-4"]);
+  });
+});
+
+describe("toastHarnessSwap position (22d)", () => {
+  const swap = (count: number, taskId: string) =>
+    toastHarnessSwap({ ...args({ taskId }), fromLabel: "Work", toLabel: "Personal", position: 2, count });
+
+  test("a stack of two or more names the n/m position", () => {
+    swap(3, "swap-multi");
+    const call = calls.find((c) => c.method === "info");
+    expect(call?.title).toBe("Account switched");
+    expect(description(call)).toBe("Work → Personal (2/3)");
+  });
+
+  test("a one-member stack prints no position", () => {
+    swap(1, "swap-single");
+    const call = calls.find((c) => c.method === "info");
+    expect(description(call)).toBe("Work → Personal");
+    expect(description(call)).not.toContain("/");
   });
 });

@@ -136,10 +136,12 @@ function pushCreditsMeter(meters: QuotaMeter[], credits: unknown): void {
   if (!credits || typeof credits !== "object") return;
   const c = credits as Record<string, unknown>;
   if (c.has_credits === true && c.unlimited !== true && c.balance !== null && c.balance !== undefined) {
+    const balance = typeof c.balance === "number" ? c.balance : typeof c.balance === "string" ? Number(c.balance) : NaN;
     meters.push({
       id: "credits",
       label: `Credits: ${c.balance}`,
-      usedPercent: 0,
+      // A zero (or negative) balance means no pay-as-you-go headroom is left.
+      usedPercent: c.balance !== "" && Number.isFinite(balance) && balance <= 0 ? 100 : 0,
       resetsAtMs: null,
     });
   }

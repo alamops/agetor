@@ -61,7 +61,7 @@ A new `run_events` method that isn't exercised by that test fails it by name.
 
 **Adding a migration** (numbered `.sql` files, the `migrations/index.ts` entry, never editing an applied one, and why the SQL is inlined at bundle time) is described once, in [CLAUDE.md § Persistence, in brief](../../CLAUDE.md#persistence-in-brief).
 
-## Harness stack tables (migrations 084, 085)
+## Harness stack tables (migrations 084, 085, 087, 088, 089, 090)
 
 `harness_stacks`, `harness_stack_members`, `harness_limit_state` and
 `harness_session_handoffs` are additive; `tasks.harness_state` is another
@@ -78,6 +78,105 @@ that FK (the cascade from `harness_stacks` stays), and `harnesses.delete`
 removes the account's membership row explicitly and re-packs the ranks.
 `harness_limit_state` has no FK on purpose: it is account-global and
 survives a stack delete. `harness_session_handoffs` cascades with the task; its
-`copied_paths_json` is the only allowlist cleanup may remove. Snapshot/restore
-for tests covers all three (`test-harness-state.ts`). Model:
+`copied_paths_json` is the only allowlist cleanup may remove.
+
+**Migration 087** (`087_harness_stacks_fix_round.sql`):
+
+- **`harness_limit_state` is rebuilt** with a `model` column and the primary key
+  `(harness_id, model)`; `model = ''` is the whole-account cooldown every earlier
+  row was, so existing cooldowns keep their meaning (the rows are copied with
+  `model = ''`; the `exhausted_until_ms` index is recreated). It is safe to
+  rebuild because nothing references it by FK, and it still has none.
+  `harnesses.delete` clears the account's rows explicitly. The rebuild is
+  **one-way**, like 072: an agetor build from before 087 upserts with
+  `ON CONFLICT(harness_id)`, which no longer matches a constraint, so its
+  cooldown writes fail against a migrated database. A rollback is a new
+  migration, never an edit to 087.
+- **`harness_swap_events`** (the per-stack swap history). Its **only FK is
+  `stack_id REFERENCES harness_stacks(id) ON DELETE CASCADE`**; task and account
+  ids are plain columns and the labels and task title are denormalized, so a row
+  outlives the task and the account. `trigger` has no `CHECK` (the set may grow
+  without a table rebuild; the store validates on insert and drops unknown
+  triggers on read), `continuation` is `CHECK`-ed to `transferred`/`restarted`
+  or `NULL`. The page index is `(stack_id, at DESC, id DESC)`. There is no cap
+  and no pruning.
+- **`harness_mirror_provenance`**, primary key `(harness_id, path, key)`, **no
+  FK** (the same 085 reasoning), `scope` `CHECK`-ed to `file`/`key`/`link`. A merged file the mirror created carries one extra `file` row keyed `(created by the mirror)` (no schema change).
+  `harnesses.delete` removes the account's rows inline in its transaction (the
+  store module imports `db.ts`, so it cannot be called from there).
+
+**Migration 088** (`088_harness_orphaned_copies.sql`) adds
+`harness_orphaned_copies`, primary key `(harness_id, column_name, path)`, with
+the session each copied file belongs to. **No FK** on purpose: rows must
+outlive the task whose handoff rows cascade away (`tasks.delete` adopts the
+task's remaining handoff paths into it in the same transaction), and an FK to
+`harnesses` would be wiped by a rebuild of that table; `harnesses.delete`
+removes the account's rows explicitly. Rows written before 088 need no SQL
+backfill: the boot sweep moves a re-keyed handoff row's old-session paths into
+the new table ([harness-stacks.md](harness-stacks.md#leftover-handoff-copies)).
+
+**Migration 089** (`089_harness_mirror_sources.sql`) adds
+`harness_mirror_sources`, one row per backup account (primary key
+`harness_id`): the primary id, its resolved folder(s) and a fingerprint of its
+root settings from the last real mirror run. When the same primary with the
+same settings resolves to another folder while the recorded one still exists,
+the mirror skips that backup's **whole run** (nothing copied, merged or
+removed), not only deletion propagation
+([harness-stacks.md](harness-stacks.md#mirror-provenance-backups-preview-and-restore),
+"The primary's and the backup's folders are pinned").
+**No FK** (the 085 reasoning); `harnesses.delete` removes the row inline and
+account cleanup removes it too. No backfill: the first run after upgrade
+records it.
+
+**Migration 090** (`090_harness_mirror_backup_folder.sql`) adds
+`backup_root` and `backup_config` to `harness_mirror_sources` (`TEXT NOT NULL
+DEFAULT ''`): the backup's own resolved folder(s) and settings fingerprint, so
+the same skip rule pins a backup whose folder comes from the environment, and
+Restore refuses the rows of a recorded folder the account no longer resolves
+to while that folder exists (and drops them once it is gone). `''` means not recorded
+yet: a row from before 090 counts as not recorded until the next real mirror
+run fills it. It also adds the partial index `runs_codex_session_id_idx` on
+`runs(codex_session_id) WHERE codex_session_id IS NOT NULL`, for the
+leftover-copy sweep's live-session check (`runs.taskIdsWithSession`); the
+`claude_session_id` column is already covered by 068's
+`runs_claude_session_id_idx`. 089's statements are never changed: databases
+already applied it (its header comment was corrected before it reached `main`;
+`_migrations` tracks ids only, so a comment edit changes nothing applied).
+
+`harness_orphaned_copies.created_at` is a monotonic stamp written by
+`harnessOrphanedCopies.add` (never below the wall clock, always above every
+earlier stamp and sweep mark, seeded on first use from the largest integer
+`created_at`, clamped to a day past the wall clock, so a planted REAL, TEXT or
+2^53-and-above value cannot freeze it); a sweep forgets only records stamped
+at or before the mark it took before listing
+([harness-stacks.md](harness-stacks.md#leftover-handoff-copies)). A
+`column_name` other than `claude_session_id`/`codex_session_id` is never
+returned by the store and is deleted by the next sweep
+(`forgetForeignColumns`).
+
+**A future `harness_stacks` rebuild must turn foreign keys off first.**
+`harness_swap_events` cascades on `harness_stacks`, so the documented SQLite
+rebuild (`DROP TABLE harness_stacks` is an implicit `DELETE` with foreign keys
+on, and `db.ts` turns them on before `migrate()`) would delete every stack's
+history, exactly as the 084 `harness_stack_members` FK would have deleted every
+membership on a `harnesses` rebuild. `harness_stack_members` also cascades on
+`harness_stacks`. Such a migration must run with foreign keys off, or copy the
+dependent tables out and back around the rebuild: the runner applies each file
+in one transaction, where `PRAGMA foreign_keys` is a no-op, so there is no hook
+for that today.
+
+`runs.mainUserRows(runId)` (`db.ts`) returns a run's main-stream `user` rows,
+oldest first, each tagged `twin` when the row carries a `line_uuid` (the Claude
+JSONL copy of a send). It is a `run_events` query (the old `mainUserTexts` is gone), pinned
+`INDEXED BY idx_run_events_run` and listed in `db-run-events-plans.test.ts`.
+Clean retries and the persisted `allExhausted.cleanRetryOf` chain read it.
+
+Snapshot/restore for tests (`test-harness-state.ts`) covers stacks, members,
+limit rows (with their `model`) and `harness_mirror_provenance`, and restores
+`harness_orphaned_copies` and `harness_mirror_sources` whole-row (every column
+SQLite reports, so a column a later migration adds round-trips too). It restores
+stacks with an upsert, not `INSERT OR REPLACE`, because REPLACE deletes the row
+first and would fire the `ON DELETE CASCADE` on `harness_swap_events` and the
+members. It does not snapshot `harness_swap_events` itself (a test that writes
+history should clean up after itself). Model:
 [harness-stacks.md](harness-stacks.md).

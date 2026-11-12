@@ -84,6 +84,13 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
         const rewritten = err.message.replace(/^task is bound to agent/, "task is bound to profile");
         throw new Error(`${rewritten} (agetor edit ${task.id.slice(0, 8)} --detach-profile)`);
       }
+      // A live run blocks an account switch. The core suggests nothing, so
+      // point at the command that waits for the end of the turn. Any other
+      // message (including the "may have gone through" transport wording)
+      // propagates unchanged.
+      if (patch.agent !== undefined && err instanceof ApiError && err.status === 409 && err.message.includes("stop the run before switching accounts")) {
+        throw new Error(`${err.message} — or run 'agetor switch-account ${task.id.slice(0, 8)}' to schedule the switch for the end of the turn`);
+      }
       throw err;
     }
   }

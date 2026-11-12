@@ -22,7 +22,7 @@
 // `$HOME` (Claude session scan, agent discovery) run under a throwaway HOME. All
 // workdirs are temp git repos with `isolation: "none"`.
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { rmTestDataDir } from "../bun/test-data-dir.ts";
@@ -457,6 +457,37 @@ const ROWS: Record<ClientMethod, Row> = {
       return client.getHarnessStack(scopeStackId);
     },
   },
+  getHarnessStackHistory: {
+    expect: [200],
+    why: "empty history page of the stack just created",
+    call: () => client.getHarnessStackHistory(scopeStackId, { limit: 5 }),
+  },
+  previewHarnessMirror: {
+    expect: [200],
+    why: "dry run of the one-member stack (nothing to mirror); the CLI path gate probes the account roots",
+    call: () => client.previewHarnessMirror({ kind: "claude-code", members: ["scope-claude"], stackId: scopeStackId }),
+  },
+  restoreHarnessMirror: {
+    expect: [200],
+    why: "nothing was backed up for the account, so the restore is an empty success",
+    call: () => client.restoreHarnessMirror("scope-claude"),
+  },
+  clearHarnessCooldown: {
+    expect: [200],
+    why: "no cooldown rows is still a success",
+    call: () => client.clearHarnessCooldown("scope-claude"),
+  },
+  getUsage: { expect: [200], why: "quota snapshots", call: () => client.getUsage() },
+  switchTaskAccount: {
+    expect: [409],
+    why: "the extra task is in no stack, so the switch is refused (route reached, not gated)",
+    call: () => client.switchTaskAccount(fx.extraTaskId),
+  },
+  cancelScheduledAccountSwitch: {
+    expect: [200],
+    why: "nothing scheduled on the extra task is a successful no-op",
+    call: () => client.cancelScheduledAccountSwitch(fx.extraTaskId),
+  },
   patchHarnessStack: {
     expect: [200],
     why: "label patch on the stack just created",
@@ -680,3 +711,84 @@ for (const sse of [
     }
   });
 }
+
+// ── TT-E: the fix-round stack calls end to end with the CLI token ───────────────
+// Rows above prove the routes are reachable; this drives them against real
+// accounts: a switch writes a history row the client can page, a cooldown clear
+// reports `rearmed`, and a CLI-token call against a protected account root is
+// refused 403 `path-not-accessible` (preview, restore and switch), not 401 or a
+// validator 400.
+
+const asRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+test.skipIf(asRoot)("CLI token: switch writes a pageable history row; preview/restore/switch against a protected account root are 403 path-not-accessible", async () => {
+  const { harnesses, tasks } = await import("../bun/db.ts");
+  const mkAccount = (tag: string): string => {
+    const id = `scope-tte-${tag}`;
+    const home = path.join(DATA_DIR, "homes", id);
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path.join(home, ".credentials.json"), "{}");
+    harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+    return id;
+  };
+  const a = mkAccount("a");
+  const b = mkAccount("b");
+  const lockedParent = mkdtempSync(path.join(tmpdir(), "agetor-scope-locked-"));
+  const target = path.join(lockedParent, "acct");
+  let stackId = "";
+  let taskId = "";
+  try {
+    stackId = (await client.createHarnessStack({ label: "tte", kind: "claude-code", members: [a, b], mirrorMode: "safe" })).stack.id;
+    taskId = (await client.createTask({ title: "tte", prompt: "p", agent: a, workdir: repo, isolation: "none" })).id;
+
+    const switched = await client.switchTaskAccount(taskId);
+    expect(switched.status).toBe("switched");
+    expect(switched.task.agent).toBe(b);
+    const page = await client.getHarnessStackHistory(stackId, { limit: 10 });
+    expect(page.events).toHaveLength(1);
+    expect(page.events[0]).toMatchObject({ trigger: "manual", fromHarnessId: a, toHarnessId: b, taskId });
+    expect(page.nextCursor).toBeNull();
+
+    const cleared = await client.clearHarnessCooldown(b, { accountWideOnly: true });
+    expect(cleared.cleared).toBe(true);
+    expect(cleared.rearmed).toBe(0);
+
+    // Protect b's root: every file-touching call is refused for the CLI token,
+    // and it is the gate's answer even for a draft the validator would reject.
+    mkdirSync(target);
+    chmodSync(target, 0o300);
+    rmSync(path.join(DATA_DIR, "homes", b), { recursive: true, force: true });
+    symlinkSync(target, path.join(DATA_DIR, "homes", b));
+    const refused = async (call: () => Promise<unknown>) => {
+      try {
+        await call();
+      } catch (e) {
+        expect(e).toBeInstanceOf(ApiError);
+        expect((e as ApiError).status).toBe(403);
+        expect(((e as ApiError).body as { code?: string }).code).toBe("path-not-accessible");
+        return;
+      }
+      throw new Error("expected a 403 path-not-accessible");
+    };
+    await refused(() => client.previewHarnessMirror({ kind: "claude-code", members: [b, b] }));
+    await refused(() => client.previewHarnessMirror({ kind: "claude-code", members: [a, b], stackId }));
+    await refused(() => client.restoreHarnessMirror(b));
+    await refused(() => client.switchTaskAccount(taskId));
+    expect(tasks.get(taskId)!.agent).toBe(b);
+    // The account-free calls still work for the CLI token.
+    expect((await client.cancelScheduledAccountSwitch(taskId)).task.id).toBe(taskId);
+    expect((await client.getHarnessStackHistory(stackId)).events).toHaveLength(1);
+  } finally {
+    try {
+      chmodSync(target, 0o700);
+    } catch {}
+    if (taskId) await client.deleteTask(taskId).catch(() => {});
+    if (stackId) await client.deleteHarnessStack(stackId).catch(() => {});
+    for (const id of [a, b]) {
+      try {
+        harnesses.delete(id);
+      } catch {}
+    }
+    rmSync(lockedParent, { recursive: true, force: true });
+  }
+}, 90_000);

@@ -12,15 +12,21 @@
  * the only bridge and keep this module import-cycle-free.
  */
 import {
+  DEFAULT_MODEL,
   MODEL_MIN_CLI_VERSION,
   type Harness,
   type HarnessLimitSignal,
+  type HarnessLimitState,
+  type HarnessMemberReason,
   type HarnessStack,
+  type HarnessStackMember,
+  type HarnessSwapEvent,
+  type HarnessSwapTrigger,
   type Task,
   type TaskHarnessState,
 } from "../shared/types.ts";
 import { pickNextMember, type NextMemberPlan } from "../shared/harness-stack.ts";
-import { harnessQuotaLooksExhausted, harnessQuotaResetAt } from "../shared/harness-limits.ts";
+import { HARNESS_QUOTA_STALE_MS, harnessQuotaLooksExhausted, harnessQuotaResetAt } from "../shared/harness-limits.ts";
 import { getHarnessDiscoveredModels } from "./agent-discovery.ts";
 import { peekCachedCliVersion } from "./agent-status.ts";
 import { cliVersionSatisfies } from "../shared/cli-version.ts";
@@ -28,12 +34,14 @@ import { harnesses, harnessUsage, runs, tasks, type SessionIdColumn } from "./db
 import { harnessStacks, loginEvidence, memberInstalled } from "./harness-stacks.ts";
 import { findSessionIdForHarness, sessionTransferAdapter } from "./harness-session-transfer.ts";
 import { mirrorForSwap } from "./harness-mirror.ts";
+import { harnessSwapEvents } from "./harness-swap-history.ts";
 
 export const HARNESS_STACK_RETRY_MAX = 3;
 export const HARNESS_STACK_RETRY_BACKOFF_MS = 10 * 60_000;
+/** Production floor for any retry wait. Tests/e2e can lower it through
+ *  `AGETOR_HARNESS_RETRY_MIN_MS` (see {@link retryMinMs}). */
 export const HARNESS_STACK_RETRY_MIN_MS = 10_000;
 export const HARNESS_STACK_RETRY_MAX_WAIT_MS = 24 * 60 * 60 * 1000;
-export const HARNESS_QUOTA_STALE_MS = 20 * 60_000;
 /** Boot stagger for overdue retries (same shape as `rearmFxAutoResumes`):
  *  `now + BASE + i * STEP`, so N tasks never mirror into one backup at once. */
 export const HARNESS_STACK_REARM_OVERDUE_BASE_MS = 5_000;
@@ -53,6 +61,10 @@ export interface FailoverHooks {
    *  live). A manual prepare must leave such a task alone exactly like a live
    *  run (review Q6). Omitted ⇒ never held. */
   isTaskHeld?(taskId: string): boolean;
+  /** A requested "switch to next account" was dropped by the engine (the
+   *  stack was cut to a single account); the orchestrator says why on the
+   *  task's latest run. Omitted ⇒ no status line. */
+  onScheduledSwitchDropped?(taskId: string, line: string): void;
 }
 
 let hooks: FailoverHooks | null = null;
@@ -106,21 +118,41 @@ export function patchTaskState(
 }
 
 /**
- * The ids of every task whose failover state belongs to `stackId`: the
- * recorded `stackId` OR the stack the task's account resolves to right now.
- * A stack delete must clear both — an account edited into this stack after the
- * task's last write still names the old train (review S10). Call BEFORE the
- * stack row is deleted (the resolution needs the membership).
+ * The ids of every task whose failover state belongs to `stackId`: the stack
+ * the task resolves to right now — its account's current stack, or, for an
+ * account that left every stack, the recorded one. A stack delete must clear
+ * those — an account edited into this stack after the task's last write still
+ * names the old train (review S10) — and nothing else: a task whose account
+ * has since moved into ANOTHER stack still names this one until its next
+ * write, but its retry and scheduled switch belong to the stack it is in now.
+ * Call BEFORE the stack row is deleted (the resolution needs the membership),
+ * together with {@link repointTaskStatesAwayFromStack}.
  */
 export function failoverTaskIdsForStack(stackId: string): string[] {
   const ids: string[] = [];
   for (const task of tasks.list()) {
-    if (task.harnessState?.stackId === stackId) {
-      ids.push(task.id);
-      continue;
-    }
     if (!task.harnessState && !retryTimers.has(task.id)) continue;
     if (harnessStacks.resolveForTask(task)?.stack.id === stackId) ids.push(task.id);
+  }
+  return ids;
+}
+
+/**
+ * Re-point the state of every task that still records `stackId` but whose
+ * account now belongs to another stack, so the stack delete (which clears
+ * every state recording the deleted id) leaves it alone. Call BEFORE the
+ * delete. Returns the re-pointed ids.
+ */
+export function repointTaskStatesAwayFromStack(stackId: string): string[] {
+  const ids: string[] = [];
+  for (const task of tasks.list()) {
+    if (task.harnessState?.stackId !== stackId) continue;
+    const resolved = harnessStacks.resolveForTask(task);
+    if (!resolved || resolved.stack.id === stackId) continue;
+    // An identity mutation: `updateTaskState` re-points the base at the
+    // stack the task resolves to now.
+    updateTaskState(task.id, (state) => state);
+    ids.push(task.id);
   }
   return ids;
 }
@@ -154,9 +186,26 @@ function stateBase(
   return { ...base, stackId, position, count };
 }
 
-/** Record the account-global cooldown for a limit signal. */
-export function recordLimitSignal(harnessId: string, signal: HarnessLimitSignal): void {
-  harnessStacks.setLimitState(harnessId, signal);
+/**
+ * The retry-wait floor. `AGETOR_HARNESS_RETRY_MIN_MS` (a positive integer in
+ * ms, at least 50) lowers it so a test or e2e run need not wait 10 s, but it
+ * is honored ONLY when `NODE_ENV === "test"` or `AGETOR_E2E_HARNESS_SEAMS ===
+ * "1"`; anywhere else it is ignored. Read at call time so a test can set and
+ * restore it.
+ */
+export function retryMinMs(): number {
+  const seamOn = process.env.NODE_ENV === "test" || process.env.AGETOR_E2E_HARNESS_SEAMS === "1";
+  if (!seamOn) return HARNESS_STACK_RETRY_MIN_MS;
+  const raw = process.env.AGETOR_HARNESS_RETRY_MIN_MS;
+  if (raw === undefined || !/^\d+$/.test(raw.trim())) return HARNESS_STACK_RETRY_MIN_MS;
+  const n = Number(raw.trim());
+  return Number.isSafeInteger(n) && n >= 50 ? n : HARNESS_STACK_RETRY_MIN_MS;
+}
+
+/** Record the cooldown for a limit signal: account-wide, or one model's row
+ *  when `signal.model` is set (the store keys the row on it). */
+export function recordLimitSignal(harnessId: string, signal: HarnessLimitSignal): HarnessLimitState {
+  return harnessStacks.setLimitState(harnessId, signal);
 }
 
 /** Mark an account as tried in the current lap. */
@@ -192,19 +241,31 @@ export function memberUnusableReason(member: { harnessId: string; enabled: boole
   const harness = harnesses.getByIdOrKind(member.harnessId);
   if (!harness) return "account no longer exists";
   if (!memberInstalled(harness)) return "CLI not installed";
-  if (loginEvidence(harness) === false) return "not logged in";
+  if (loginEvidence(harness) === false) return "logged out";
+  // The model the turn would really run: a default-model task (null) resolves
+  // exactly like `startTask` does, so a backup that cannot serve the default
+  // model is skipped too.
+  const model = task.model ?? DEFAULT_MODEL[harness.kind] ?? null;
   const catalog = getHarnessDiscoveredModels(harness.id);
-  if (catalog.length > 0 && task.model && !catalog.some((m) => m.id === task.model)) {
-    return `model ${task.model} is not offered`;
+  if (catalog.length > 0 && model && !catalog.some((m) => m.id === model)) {
+    return `model ${model} not offered`;
   }
-  const floor = MODEL_MIN_CLI_VERSION[harness.kind]?.[task.model ?? ""];
+  const floor = MODEL_MIN_CLI_VERSION[harness.kind]?.[model ?? ""];
   if (floor) {
     const version = peekCachedCliVersion(harness);
     if (version !== null && cliVersionSatisfies(version, floor) === false) {
-      return `CLI is older than ${floor}`;
+      return `CLI older than ${floor}`;
     }
   }
   return null;
+}
+
+/** The lower-cased model a task's turn would run on `harnessId`, which keys
+ *  per-model cooldown rows (`parseLimitedModel` also yields lower-case). */
+export function cooldownModelFor(task: Pick<Task, "model">, harnessId: string): string | null {
+  const harness = harnesses.getByIdOrKind(harnessId);
+  const model = task.model ?? (harness ? DEFAULT_MODEL[harness.kind] : null) ?? null;
+  return model ? model.toLowerCase() : null;
 }
 
 /**
@@ -232,7 +293,7 @@ export function planNextMember(
     currentId: current,
     tried: state?.tried ?? [],
     now,
-    cooling: (id) => (opts.force ? null : harnessStacks.isCooling(id, now)),
+    cooling: (id) => (opts.force ? null : harnessStacks.isCooling(id, now, cooldownModelFor(task, id))),
     exhaustedByQuota: (id) => (opts.force ? false : harnessQuotaLooksExhausted(harnessUsage.get(id), now, HARNESS_QUOTA_STALE_MS)),
     quotaResetAt: (id) => (opts.force ? null : harnessQuotaResetAt(harnessUsage.get(id), now, HARNESS_QUOTA_STALE_MS)),
     usable: (member) => memberUnusableReason(member, task),
@@ -261,7 +322,7 @@ export function planRetryMember(
   const currentMember = stack.members.find((m) => m.harnessId === current);
   const currentUsable = currentMember
     ? memberUnusableReason(currentMember, task) === null
-      && harnessStacks.isCooling(current, now) === null
+      && harnessStacks.isCooling(current, now, cooldownModelFor(task, current)) === null
       && !harnessQuotaLooksExhausted(harnessUsage.get(current), now, HARNESS_QUOTA_STALE_MS)
     : false;
   if (currentUsable) return { kind: "next", member: currentMember!, skipped: [] };
@@ -272,7 +333,7 @@ export function planRetryMember(
 }
 
 function clampWait(ms: number): number {
-  return Math.max(HARNESS_STACK_RETRY_MIN_MS, Math.min(HARNESS_STACK_RETRY_MAX_WAIT_MS, ms));
+  return Math.max(retryMinMs(), Math.min(HARNESS_STACK_RETRY_MAX_WAIT_MS, ms));
 }
 
 /**
@@ -287,11 +348,24 @@ export function planExhausted(
   taskId: string,
   plan: Extract<NextMemberPlan, { kind: "all-exhausted" | "none-usable" }>,
   now = Date.now(),
-  opts: { startedThisAttempt?: boolean } = {},
+  opts: {
+    startedThisAttempt?: boolean;
+    /** The limited run a CLEAN retry would replay (first turn, no tool call).
+     *  Persisted as `allExhausted.cleanRetryOf` only when a retry timer is
+     *  armed, so every path that ends the retry unrun can stash that run's
+     *  unread follow-ups. `undefined` carries the existing marker, `null`
+     *  clears it. */
+    cleanRetryOf?: string | null;
+  } = {},
 ): TaskHarnessState | null {
   return updateTaskState(taskId, (state, task) => {
     const resolved = harnessStacks.resolveForTask(task);
     const base = stateBase(state, resolved);
+    // Why each member could not take the task (banners, `agetor show`),
+    // including the account that was running it.
+    const memberReasons = resolved ? memberReasonsFor(resolved.stack, task, now, { includeCurrent: true }) : [];
+    const reasonsField = memberReasons.length > 0 ? { memberReasons } : {};
+    const cleanRetryOf = opts.cleanRetryOf === undefined ? base.allExhausted?.cleanRetryOf : opts.cleanRetryOf ?? undefined;
     const priorAttempts = base.allExhausted?.attempts ?? 0;
     const attempts = opts.startedThisAttempt === false ? priorAttempts : priorAttempts + 1;
     const capReached = attempts >= HARNESS_STACK_RETRY_MAX;
@@ -309,6 +383,7 @@ export function planExhausted(
           nextAttemptAt: 0,
           earliestResetAtMs: null,
           reason: "no-usable-member",
+          ...reasonsField,
         },
       };
     }
@@ -323,6 +398,7 @@ export function planExhausted(
           nextAttemptAt: 0,
           earliestResetAtMs: earliest,
           reason: plan.kind === "none-usable" ? "no-usable-member" : "quota",
+          ...reasonsField,
         },
       };
     }
@@ -338,6 +414,8 @@ export function planExhausted(
         nextAttemptAt,
         earliestResetAtMs: earliest,
         reason: plan.kind === "none-usable" ? "no-usable-member" : "quota",
+        ...(cleanRetryOf ? { cleanRetryOf } : {}),
+        ...reasonsField,
       },
     };
   });
@@ -355,7 +433,7 @@ function deferAutoRetry(taskId: string, firedAt: number): boolean {
   if (!persisted) return false;
   if (persisted.nextAttemptAt !== firedAt || persisted.inFlight) return false;
   if (persisted.attempts >= HARNESS_STACK_RETRY_MAX) return false;
-  const at = Date.now() + HARNESS_STACK_RETRY_MIN_MS;
+  const at = Date.now() + retryMinMs();
   patchTaskState(taskId, { allExhausted: { ...persisted, nextAttemptAt: at } });
   armAutoRetry(taskId, at);
   return true;
@@ -580,6 +658,11 @@ export interface MoveTaskToMemberArgs {
   /** The failover state written with the commit, through
    *  {@link updateTaskState} (re-pointed at the current stack). */
   state?: (current: TaskHarnessState | null, task: Task) => TaskHarnessState | null;
+  /** When set AND the move commits (`moved`), exactly one swap-history row is
+   *  recorded with the real from/to. Omitted ⇒ nothing is recorded (the
+   *  orchestrator records limit/retry/boot swaps itself, where both run ids
+   *  are known). */
+  history?: Omit<Parameters<typeof recordHarnessSwapEvent>[0], "task" | "stackId" | "fromHarnessId" | "toHarnessId">;
 }
 
 /** How many mirror warnings a status line carries (the rest are logged). */
@@ -646,6 +729,18 @@ export async function moveTaskToMember(args: MoveTaskToMemberArgs): Promise<Move
   }
   if (args.writeAgent !== false && tasks.get(taskId)?.agent !== to) tasks.update(taskId, { agent: to });
   if (args.state) updateTaskState(taskId, args.state);
+  if (args.history) {
+    const row = tasks.get(taskId);
+    if (row) {
+      recordHarnessSwapEvent({
+        ...args.history,
+        task: row,
+        stackId: stack.id,
+        fromHarnessId: from,
+        toHarnessId: to,
+      });
+    }
+  }
   return { kind: "moved", transferredSessionId, warnings };
 }
 
@@ -678,6 +773,19 @@ export async function prepareTaskHarness(
   if (!resolved) return { ok: true };
   if (runs.hasRunning(taskId) || hooks?.isTaskHeld?.(taskId)) return { ok: true };
   const { stack, current } = resolved;
+  // A stack of fewer than two accounts behaves exactly like a lone account:
+  // no failover state, and the normal pre-flight error (with its login help)
+  // is what the user sees.
+  if (stack.members.length < 2) {
+    // A stack cut down to one account may still carry a stale exhausted
+    // countdown and armed timer from when it had two: drop both.
+    const hadScheduledSwitch = Boolean(task.harnessState?.scheduledSwitch);
+    if (task.harnessState) clearFailoverState(taskId);
+    if (hadScheduledSwitch) {
+      hooks?.onScheduledSwitchDropped?.(taskId, "scheduled account switch dropped — the stack has fewer than two accounts");
+    }
+    return { ok: true };
+  }
   const member = stack.members.find((m) => m.harnessId === current);
   const unusable = opts.forceOffCurrent
     ? (opts.forceReason ?? "unavailable")
@@ -698,6 +806,8 @@ export async function prepareTaskHarness(
         pendingSwap: null,
         allExhausted: null,
         lastMove: state?.lastMove ?? null,
+        // A requested "switch to next account" is not part of the lap.
+        ...(state?.scheduledSwitch ? { scheduledSwitch: state.scheduledSwitch } : {}),
       }));
       cancelAutoRetry(taskId);
     }
@@ -734,6 +844,7 @@ export async function prepareTaskHarness(
     to,
     sessionId: latestSessionForAccount(task, fromHarness.kind, current),
     cwd: task.worktreePath ?? task.workdir,
+    history: { trigger: "unavailable", reason },
     state: () => ({
       stackId: stack.id,
       position: plan.member.position,
@@ -760,4 +871,131 @@ export async function prepareTaskHarness(
     moved: { from: current, to },
     ...(moved.warnings.length > 0 ? { warnings: moved.warnings } : {}),
   };
+}
+
+function formatClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * Why each member other than the task's current account cannot take the task
+ * right now, one entry per member ("available" when it can). Same rules and
+ * order as {@link pickNextMember}: disabled, cooling (model-aware), quota
+ * exhausted, then {@link memberUnusableReason}. Pure: reads only.
+ */
+export function memberReasonsFor(
+  stack: HarnessStack,
+  task: Task,
+  now = Date.now(),
+  opts: { includeCurrent?: boolean } = {},
+): HarnessMemberReason[] {
+  const current = harnessStacks.resolveForTask(task)?.current ?? task.agent;
+  const tried = task.harnessState?.tried ?? [];
+  const out: HarnessMemberReason[] = [];
+  for (const member of stack.members) {
+    const isCurrent = member.harnessId === current;
+    if (isCurrent && !opts.includeCurrent) continue;
+    const text = memberReasonFor(member, task, now, tried.includes(member.harnessId));
+    out.push({ harnessId: member.harnessId, label: member.label, reason: isCurrent ? `current — ${text}` : text });
+  }
+  return out;
+}
+
+function memberReasonFor(member: HarnessStackMember, task: Task, now: number, tried: boolean): string {
+  if (!member.enabled) return memberUnusableReason(member, task) ?? "disabled";
+  const cool = harnessStacks.isCooling(member.harnessId, now, cooldownModelFor(task, member.harnessId));
+  if (cool && cool.exhaustedUntilMs > now) {
+    return `cooling until ${formatClock(cool.exhaustedUntilMs)}${cool.model ? ` for ${cool.model}` : ""}`;
+  }
+  if (harnessQuotaLooksExhausted(harnessUsage.get(member.harnessId), now, HARNESS_QUOTA_STALE_MS)) {
+    const reset = harnessQuotaResetAt(harnessUsage.get(member.harnessId), now, HARNESS_QUOTA_STALE_MS);
+    return reset !== null && reset > now ? `quota exhausted until ${formatClock(reset)}` : "quota exhausted";
+  }
+  const unusable = memberUnusableReason(member, task);
+  if (unusable) return unusable;
+  return tried ? "tried this lap" : "available";
+}
+
+/**
+ * The target of a manual "Switch to next account": the next member after the
+ * task's current account (wrapping) that an automatic swap would also accept.
+ * A PURE planner: it ignores `tried` and never writes a cooldown, `tried` or
+ * any other state (invariant: a manual move never cools or marks tried).
+ */
+export function planManualSwitchTarget(
+  task: Task,
+  now = Date.now(),
+):
+  | { kind: "next"; stack: HarnessStack; member: HarnessStackMember }
+  | { kind: "refused"; code: "not-in-stack" | "no-usable-member"; reasons: HarnessMemberReason[] } {
+  const resolved = harnessStacks.resolveForTask(task);
+  // An account that left every stack still resolves to the stack it was in
+  // (`orphaned`), but it is not a member any more: a move from it is not a
+  // same-stack switch, so it would take the outside-stack reset path (no
+  // transfer, follow-ups dropped, no history row) while reporting success.
+  if (!resolved || resolved.orphaned || resolved.stack.members.length < 2) {
+    return { kind: "refused", code: "not-in-stack", reasons: [] };
+  }
+  const { stack, current } = resolved;
+  const plan = pickNextMember({
+    members: stack.members,
+    currentId: current,
+    // The wrap visits the current account last; counting it as tried keeps a
+    // switch from "landing" on the account the task is already on.
+    tried: [current],
+    now,
+    cooling: (id) => harnessStacks.isCooling(id, now, cooldownModelFor(task, id)),
+    exhaustedByQuota: (id) => harnessQuotaLooksExhausted(harnessUsage.get(id), now, HARNESS_QUOTA_STALE_MS),
+    quotaResetAt: (id) => harnessQuotaResetAt(harnessUsage.get(id), now, HARNESS_QUOTA_STALE_MS),
+    usable: (m) => memberUnusableReason(m, task),
+  });
+  if (plan.kind === "next" && plan.member.harnessId !== current) {
+    return { kind: "next", stack, member: plan.member };
+  }
+  return { kind: "refused", code: "no-usable-member", reasons: memberReasonsFor(stack, task, now) };
+}
+
+/**
+ * Append one row to the per-stack swap history. Labels fall back to the id,
+ * the task title is denormalized, and source/message/model/resetsAtMs come
+ * from `signal`. NEVER throws: a history write must not break a swap, so a
+ * failure is logged and null returned.
+ */
+export function recordHarnessSwapEvent(args: {
+  task: Task;
+  stackId: string;
+  trigger: HarnessSwapTrigger;
+  fromHarnessId: string | null;
+  toHarnessId: string | null;
+  reason?: HarnessSwapEvent["reason"];
+  signal?: HarnessLimitSignal | null;
+  fromRunId?: string | null;
+  toRunId?: string | null;
+  continuation?: HarnessSwapEvent["continuation"];
+}): HarnessSwapEvent | null {
+  try {
+    const label = (id: string | null) => (id === null ? null : harnesses.getByIdOrKind(id)?.label ?? id);
+    const signal = args.signal ?? null;
+    return harnessSwapEvents.insert({
+      stackId: args.stackId,
+      taskId: args.task.id,
+      taskTitle: args.task.title ?? null,
+      fromHarnessId: args.fromHarnessId,
+      fromLabel: label(args.fromHarnessId),
+      toHarnessId: args.toHarnessId,
+      toLabel: label(args.toHarnessId),
+      trigger: args.trigger,
+      reason: args.reason ?? signal?.reason ?? null,
+      source: signal?.source ?? null,
+      message: signal?.message ?? null,
+      model: signal?.model ?? null,
+      resetsAtMs: signal?.resetAtMs ?? null,
+      fromRunId: args.fromRunId ?? null,
+      toRunId: args.toRunId ?? null,
+      continuation: args.continuation ?? null,
+    });
+  } catch (err) {
+    console.warn(`[agetor] harness swap history write failed for task ${args.task.id}:`, err);
+    return null;
+  }
 }

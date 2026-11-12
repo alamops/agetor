@@ -47,6 +47,8 @@ describe("harnessStackBannerView", () => {
       kind: "exhausted",
       text: "Every account in this stack is out of quota — retrying in 1m 30s (attempt 1/3).",
       runNow: true,
+      reasons: [],
+      openHarnesses: true,
     });
   });
 
@@ -68,6 +70,8 @@ describe("harnessStackBannerView", () => {
       kind: "exhausted",
       text: "Retrying on the next available account (attempt 2/3)…",
       runNow: true,
+      reasons: [],
+      openHarnesses: true,
     });
   });
 
@@ -78,7 +82,68 @@ describe("harnessStackBannerView", () => {
 
   test("no usable member points at Settings", () => {
     const v = view("blocked", state({ allExhausted: exhausted({ nextAttemptAt: 0, reason: "no-usable-member" }) }));
-    expect(v?.text).toBe("No account in this stack can run this task — fix one in Settings → Stacks.");
+    expect(v?.text).toBe("No account in this stack can run this task — fix one in Settings → Harnesses.");
+  });
+
+  test("a switch-now move reads as a conversation-preserving switch", () => {
+    const v = view("review", state({ lastMove: { from: "a", to: "b", at: NOW - 1000, reason: "switch-now" } }));
+    expect(v).toEqual({ kind: "moved", text: "Switched to the next account — continuing this conversation." });
+  });
+
+  test("the earliest reset and one line per member reason are shown", () => {
+    const resetAt = NOW + 3_600_000;
+    const v = view("blocked", state({
+      allExhausted: exhausted({
+        earliestResetAtMs: resetAt,
+        memberReasons: [
+          { harnessId: "a", label: "Work", reason: "cooling until 15:00" },
+          { harnessId: "b", label: "Personal", reason: "logged out" },
+        ],
+      }),
+    }));
+    expect(v?.kind).toBe("exhausted");
+    if (v?.kind !== "exhausted") return;
+    expect(v.text).toContain("Next reset around");
+    expect(v.reasons).toEqual(["Work: cooling until 15:00", "Personal: logged out"]);
+    expect(v.openHarnesses).toBe(true);
+  });
+
+  test("no reset note when the reset is unknown or no member is usable", () => {
+    const v = view("blocked", state({ allExhausted: exhausted() }));
+    expect(v?.text).not.toContain("Next reset");
+    const n = view("blocked", state({
+      allExhausted: exhausted({ nextAttemptAt: 0, reason: "no-usable-member", earliestResetAtMs: NOW + 5000 }),
+    }));
+    expect(n?.text).not.toContain("Next reset");
+  });
+});
+
+describe("TT-A: countdown wording and precedence", () => {
+  test("no-usable-member with a timer says no account can run it, with attempt n/max", () => {
+    const v = view("blocked", state({ allExhausted: exhausted({ reason: "no-usable-member", nextAttemptAt: NOW + 90_000, attempts: 1 }) }));
+    expect(v?.kind).toBe("exhausted");
+    expect(v?.text).toBe("No account in this stack can run this task — retrying in 1m 30s (attempt 2/3).");
+  });
+
+  test("out-of-quota with a timer names the reset clock when known", () => {
+    const v = view("blocked", state({ allExhausted: exhausted({ earliestResetAtMs: NOW + 3_600_000 }) }));
+    expect(v?.text).toContain("Every account in this stack is out of quota — retrying in 1m 30s (attempt 1/3).");
+    expect(v?.text).toContain(" Next reset around ");
+  });
+
+  test("retry-running wording for a no-usable-member chain and attempt is capped at max", () => {
+    const v = view("running", state({ allExhausted: exhausted({ reason: "no-usable-member", attempts: 5, inFlight: true }) }));
+    expect(v).toEqual({ kind: "retry-running", text: "Running on Personal (attempt 3/3)." });
+  });
+
+  test("a pending swap hides a live exhausted marker", () => {
+    const v = view("blocked", state({ pendingSwap: { to: "a", at: 1 } as never, allExhausted: exhausted() }));
+    expect(v).toEqual({ kind: "pending", text: "Switching to Work…" });
+  });
+
+  test("members without recorded reasons yield an empty reasons list", () => {
+    const v = view("blocked", state({ allExhausted: exhausted() }));
+    expect(v?.kind === "exhausted" && v.reasons).toEqual([]);
   });
 });
 

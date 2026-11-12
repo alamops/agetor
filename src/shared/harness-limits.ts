@@ -109,6 +109,19 @@ const CODEX_MATCHERS: Matcher[] = [
   { re: /\b429\b/, reason: "rate_limit" },
 ];
 
+/**
+ * The model a provider scoped a limit to: Codex's "You've hit your usage
+ * limit for <model>. Switch to another model now…". Null for every other
+ * phrasing (an account-wide limit). The candidate must look like a model id
+ * (a digit or a hyphen) so "usage limit for your plan." never parses as one.
+ * The id is returned LOWER-CASED; selection compares lower-cased model ids.
+ */
+export function parseLimitedModel(text: string): string | null {
+  const m = /\busage limit for\s+([A-Za-z0-9][\w.:/-]{0,79}?)\.(?:\s|$)/i.exec(text);
+  const model = m?.[1] ?? null;
+  return model !== null && /[\d-]/.test(model) ? model.toLowerCase() : null;
+}
+
 /** Structured codes (normalized to snake_case) that decide the reason. */
 const LIMIT_CODES: Record<string, HarnessLimitReason> = {
   usage_limit_exceeded: "quota",
@@ -197,6 +210,7 @@ export function classifyHarnessLimitSignal(
         resetAtMs: trimmed ? parseClaudeResetNotice(trimmed, now) : null,
         message: sanitizeLimitMessage(trimmed || code),
         source,
+        model: trimmed ? parseLimitedModel(trimmed) : null,
       };
     }
   }
@@ -209,6 +223,7 @@ export function classifyHarnessLimitSignal(
       resetAtMs: parseClaudeResetNotice(trimmed, now),
       message: sanitizeLimitMessage(trimmed),
       source,
+      model: parseLimitedModel(trimmed),
     };
   }
   return null;
@@ -244,7 +259,8 @@ export function parseHarnessLimitSignal(value: unknown): HarnessLimitSignal | nu
   if (resetAtMs !== null && (typeof resetAtMs !== "number" || !Number.isFinite(resetAtMs))) return null;
   const message = o.message;
   if (typeof message !== "string") return null;
-  return { reason, resetAtMs, source, message: message.slice(0, 300) };
+  const model = typeof o.model === "string" && o.model.length > 0 && o.model.length <= 80 ? o.model : null;
+  return { reason, resetAtMs, source, message: message.slice(0, 300), ...(model !== null ? { model } : {}) };
 }
 
 const MONTH_SRC =
@@ -287,6 +303,10 @@ const WEEKDAY_INDEX: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, 
  *  longest window either provider prints); the caller falls back to its
  *  default backoff. A time-only reset is at most a day out by construction. */
 const MAX_RESET_AHEAD_MS = 31 * 24 * 60 * 60 * 1000;
+/** A time-only (or same-day weekday) reset that passed less than this ago is
+ *  a just-expired limit, not tomorrow's: the caller falls back to its short
+ *  cooldown instead of waiting a day (or a week). */
+const JUST_PASSED_MS = 60 * 60 * 1000;
 /** An explicit month/day without a year that already passed by more than
  *  this is read as next year's (a December notice seen across New Year);
  *  anything more recent is a stale notice, not a future reset. */
@@ -347,12 +367,15 @@ function resolveResetPhrase(phrase: string, now: number): number | null {
     const offset = (target - today.getDay() + 7) % 7;
     at = new Date(today.getFullYear(), today.getMonth(), today.getDate() + offset, time.hour, time.minute).getTime();
     if (at <= now) {
+      if (offset === 0 && now - at < JUST_PASSED_MS) return null;
       at = new Date(today.getFullYear(), today.getMonth(), today.getDate() + offset + 7, time.hour, time.minute).getTime();
     }
   } else {
-    // Time only: today, or the same wall-clock time on the next calendar day.
+    // Time only: today, or the same wall-clock time on the next calendar day
+    // (unless it passed under an hour ago: then null, see JUST_PASSED_MS).
     at = new Date(today.getFullYear(), today.getMonth(), today.getDate(), time.hour, time.minute).getTime();
     if (at <= now) {
+      if (now - at < JUST_PASSED_MS) return null;
       at = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1, time.hour, time.minute).getTime();
     }
   }
@@ -368,8 +391,9 @@ function resolveResetPhrase(phrase: string, now: number): number | null {
  *
  * - Time only: today, or the same wall-clock time tomorrow when it already
  *   passed (calendar increment, so a DST change doesn't shift it an hour).
+ *   Null when it passed less than an hour ago (a just-expired limit).
  * - Weekday: the next occurrence of that day at that time (today counts when
- *   the time is still ahead).
+ *   the time is still ahead; today's time passed under an hour ago is null).
  * - Month/day: that date (this year; next year only for a date months in the
  *   past, i.e. across New Year). A dated reset already in the past is stale
  *   and reads as null, as does anything more than 31 days out.
@@ -387,58 +411,75 @@ export function parseClaudeResetNotice(text: string, now: number): number | null
   return null;
 }
 
+/** Meter ids of the windows that BLOCK an account when full: Claude's 5 h
+ *  session and weekly meters (`src/bun/usage/claude-usage.ts`) and Codex's
+ *  session and weekly meters (`codex-usage.ts`). Model-scoped weeklies and
+ *  Claude's routines meter do not block the account, so they are not listed. */
+export const BLOCKING_METER_IDS: readonly string[] = ["five_hour", "session", "seven_day", "weekly", "weekly_all"];
+/** Meter ids that mean pay-as-you-go headroom exists: Claude's `extra_usage`
+ *  and Codex's `credits` balance. While one has headroom, a full window does
+ *  not stop the account. */
+export const CREDITS_METER_IDS: readonly string[] = ["extra_usage", "credits"];
+/** A quota snapshot older than this is not believed (fails open). */
+export const HARNESS_QUOTA_STALE_MS = 20 * 60_000;
+
 /**
- * The unscoped meters of a snapshot that *definitively* say the account is
- * exhausted, or null when the snapshot is stale/missing/scoped-only/not fully
- * used. Shared by {@link harnessQuotaLooksExhausted} and
- * {@link harnessQuotaResetAt} so the two cannot disagree about what "exhausted"
- * means.
+ * The blocking windows of a snapshot that *definitively* say the account is
+ * exhausted, or null when the snapshot is stale/missing/not ok, no blocking
+ * window is full, or a credits/extra-usage meter still has headroom. Shared by
+ * {@link harnessQuotaLooksExhausted} and {@link harnessQuotaResetAt} so the two
+ * cannot disagree about what "exhausted" means.
  */
-function exhaustedUnscopedMeters(
+function exhaustedBlockingMeters(
   quota: HarnessQuota | null | undefined,
   now: number,
   staleMs: number,
 ): QuotaMeter[] | null {
   if (!quota || quota.status !== "ok") return null;
   if (!Number.isFinite(quota.fetchedAtMs) || now - quota.fetchedAtMs > staleMs) return null;
-  const unscoped = quota.meters.filter((m) => !m.scope);
-  if (unscoped.length === 0) return null;
-  if (!unscoped.every((m) => m.usedPercent >= 100 && (m.resetsAtMs === null || m.resetsAtMs > now))) return null;
-  return unscoped;
+  if (quota.meters.some((m) => CREDITS_METER_IDS.includes(m.id) && !(m.usedPercent >= 100))) return null;
+  const full = quota.meters.filter(
+    (m) => !m.scope
+      && BLOCKING_METER_IDS.includes(m.id)
+      && m.usedPercent >= 100
+      && (m.resetsAtMs === null || m.resetsAtMs > now),
+  );
+  return full.length > 0 ? full : null;
 }
 
 /**
  * True only when a quota snapshot *definitively* says the account is
- * exhausted: `status === "ok"`, fresh enough, and every unscoped meter at
- * >= 100% with an unexpired reset. Used only to skip a member during an
- * automatic walk — a stale, missing or scoped-only snapshot fails open.
+ * exhausted: `status === "ok"`, fresh enough, ANY blocking window (5 h /
+ * weekly / Codex session / weekly) at >= 100% with an unexpired reset, and no
+ * credits meter with headroom. Used only to skip a member during an automatic
+ * walk — a stale, missing or scoped-only snapshot fails open.
  */
 export function harnessQuotaLooksExhausted(
   quota: HarnessQuota | null | undefined,
   now: number,
   staleMs: number,
 ): boolean {
-  return exhaustedUnscopedMeters(quota, now, staleMs) !== null;
+  return exhaustedBlockingMeters(quota, now, staleMs) !== null;
 }
 
 /**
- * The earliest known instant an exhausted account's quota frees up, or null
- * when the snapshot is not definitively exhausted or reports no future reset.
- * Feeding this into the all-exhausted plan arms the retry at the provider's
- * own reset instead of the generic backoff.
+ * The instant an exhausted account's quota frees up: the LATEST reset among
+ * its exhausted blocking windows (the account stays blocked until the last
+ * one resets), or null when the snapshot is not definitively exhausted or
+ * reports no future reset.
  */
 export function harnessQuotaResetAt(
   quota: HarnessQuota | null | undefined,
   now: number,
   staleMs: number,
 ): number | null {
-  const meters = exhaustedUnscopedMeters(quota, now, staleMs);
+  const meters = exhaustedBlockingMeters(quota, now, staleMs);
   if (!meters) return null;
-  let earliest: number | null = null;
+  let latest: number | null = null;
   for (const meter of meters) {
     const at = meter.resetsAtMs;
     if (at === null || !Number.isFinite(at) || at <= now) continue;
-    if (earliest === null || at < earliest) earliest = at;
+    if (latest === null || at > latest) latest = at;
   }
-  return earliest;
+  return latest;
 }

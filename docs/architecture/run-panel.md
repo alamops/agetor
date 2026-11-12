@@ -30,5 +30,38 @@ not open a section. A `status`
 event with the `harness-swap:` prefix renders as a divider carrying the exact
 notice plus `(2/3)`; a `user` event that is exactly the hidden
 `<harness-stack-continuation>` wrapper renders nothing. The panel takes an
-optional `stacks` prop; no extra fetch is made. See
+optional `stacks` prop and, new in the fix round, `limitStates` (cooldown rows,
+one per account and model) and `onOpenSettingsHarnesses`; no extra fetch is made
+(App's `reconcileById` keys cooldown rows by account **and** model). See
 [harness-stacks.md](harness-stacks.md).
+
+The fix round added three pieces of per-task state in the harness-stack
+children. None is cleared by the `[task.id]` reset effect: each is **tagged with
+the task id it belongs to** and only counts while `task.id` still matches, so
+switching tasks mid-request neither shows the previous task's disabled button
+nor loses the request:
+
+- `HarnessStackBanner`'s `runningNowFor` (the Run now in-flight guard: the
+  button is disabled and reads "Starting…" until `onRunTask`'s promise settles);
+- `SwitchAccountControl`'s `busy` (`{ taskId, op: "switch" | "cancel" }`, the
+  Switch to next account / Cancel guard; the scheduled state itself is not local,
+  it reads `task.harnessState.scheduledSwitch`, so a reload or a CLI request
+  shows the same thing; an archived task is offered no switch, but a switch
+  still scheduled on one keeps its Cancel; a Cancel that lands while the scheduled switch (or a "Switch to next
+  account" move) is being applied gets the core's 409 `busy` and toasts "Couldn't switch
+  account: the switch is already under way", through
+  `switchAccountFailureToast`; a Cancel while another switch, such as a
+  same-stack PATCH, holds the claim drops the request as usual);
+- `TaskDetails`'s `switchingAgentFor` (the account picker is disabled with a
+  "Switching…" note while the awaited same-stack PATCH copies the transcript;
+  `TaskDetails` is rendered by `RunPanelBody`).
+
+New per-task state in these children should follow the same tagging, or get a
+reset line. For a task in a stack of two or more accounts the account picker
+lists only the stack's members (`stackPickerOptions`); its cooling marks are
+recomputed on a 30 s `pickerNow` tick (`TaskDetails` state) (only while `limitStates` is non-empty,
+cleared on unmount), so an expired cooldown stops reading "cooling" without a
+new payload. The non-editable Harness row shows the account's label. A completed account PATCH or switch calls
+`onTaskFieldsChanged` with only the fields it owns (`agent`, `harnessState` and,
+for a PATCH, mode/model/effort/speed/Max mode), so the panel shows the new
+account before the next 2 s poll.

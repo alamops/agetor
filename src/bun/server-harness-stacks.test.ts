@@ -37,6 +37,8 @@ let token = "";
 let server: { stop: () => void } | null = null;
 let db: typeof import("./db.ts");
 let restore: () => void;
+/** Every `server.timeout(req, sec)` call the routes made (finding 19 seam). */
+const timeoutCalls: { method: string; path: string; sec: number }[] = [];
 
 beforeAll(async () => {
   const saved = new Map(PINNED_BIN_ENVS.map((key) => [key, process.env[key]] as const));
@@ -57,7 +59,24 @@ beforeAll(async () => {
     writeFileSync(path.join(home, ".credentials.json"), "{}");
     db.harnesses.insert({ id, kind, label: id, home, env: {} } as never);
   }
-  server = startApiServer() as unknown as { stop: () => void };
+  // Finding 19 seam: record every `server.timeout(req, sec)` call the routes
+  // make. The server object is created inside `startApiServer`, so wrap
+  // `Bun.serve` for exactly that call and put the real one back.
+  const realServe = Bun.serve;
+  (Bun as unknown as { serve: unknown }).serve = (opts: Parameters<typeof Bun.serve>[0]) => {
+    const s = realServe.call(Bun, opts) as unknown as { timeout: (req: Request, sec: number) => void };
+    const real = s.timeout.bind(s);
+    s.timeout = (req: Request, sec: number) => {
+      timeoutCalls.push({ method: req.method, path: new URL(req.url).pathname, sec });
+      return real(req, sec);
+    };
+    return s as never;
+  };
+  try {
+    server = startApiServer() as unknown as { stop: () => void };
+  } finally {
+    (Bun as unknown as { serve: unknown }).serve = realServe;
+  }
 });
 
 afterAll(() => {
@@ -380,6 +399,23 @@ describe("harness-stacks routes", () => {
       expect(db.tasks.get(taskId)?.agent).toBe("api-a");
       expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
       expect(db.harnessSessionHandoffs.get(taskId, "api-b", "claude_session_id")).toBeNull();
+
+      // A "Switch to next account" interrupted the same way keeps its label.
+      db.tasks.update(taskId, { agent: "api-b" });
+      db.tasks.setHarnessState(taskId, {
+        stackId,
+        position: 1,
+        count: 2,
+        tried: [],
+        pendingSwap: {
+          from: "api-a", to: "api-b", reason: "quota", runId, startedAt: Date.now(), manual: true, switchNow: "scheduled",
+        },
+        allExhausted: null,
+        lastMove: null,
+      });
+      await reconcileHarnessFailover();
+      expect(db.tasks.get(taskId)?.harnessState?.lastMove).toMatchObject({ from: "api-a", to: "api-b", reason: "switch-now" });
+      expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
     } finally {
       db.harnessSessionHandoffs.deleteOne(taskId, "api-b", "claude_session_id");
       db.runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: 1 });
@@ -462,6 +498,33 @@ describe("harness-stacks routes", () => {
       expect(db.harnesses.get(harnessId)).toBeNull();
     } finally {
       db.tasks.delete(taskId);
+      if (db.harnesses.get(harnessId)) db.harnesses.delete(harnessId);
+    }
+  }, 60_000);
+
+  test("an account edit that brings an orphaned handoff copy back into its root sweeps it (migration 088)", async () => {
+    const { mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+    const harnessId = `api-orph-${randomUUID().slice(0, 8)}`;
+    const home = path.join(db.dataDir, "homes", harnessId);
+    const elsewhere = path.join(db.dataDir, "homes", `${harnessId}-moved`);
+    mkdirSync(elsewhere, { recursive: true });
+    db.harnesses.insert({ id: harnessId, kind: "claude-code", label: harnessId, home: elsewhere, env: {} } as never);
+    const sid = "33333333-3333-4333-8333-333333333333";
+    const copied = path.join(home, "projects", "p", `${sid}.jsonl`);
+    mkdirSync(path.dirname(copied), { recursive: true });
+    writeFileSync(copied, "{}\n");
+    db.harnessOrphanedCopies.add(harnessId, "claude_session_id", sid, [copied]);
+    try {
+      const res = await call("PATCH", `/harnesses/${harnessId}`, { home });
+      expect(res.status).toBe(200);
+      const deadline = Date.now() + 10_000;
+      // The record is dropped after the unlink: wait for both.
+      while ((existsSync(copied) || db.harnessOrphanedCopies.list({ harnessId }).length > 0) && Date.now() < deadline) {
+        await Bun.sleep(20);
+      }
+      expect(existsSync(copied)).toBe(false);
+      expect(db.harnessOrphanedCopies.list({ harnessId })).toEqual([]);
+    } finally {
       if (db.harnesses.get(harnessId)) db.harnesses.delete(harnessId);
     }
   }, 60_000);
@@ -735,6 +798,58 @@ describe("PATCH /harnesses/:id on a stack member", () => {
   }, 60_000);
 });
 
+// An account edit that moves a backup away from the folder the config mirror
+// keeps records and saved originals for is refused until confirmed.
+// ---------------------------------------------------------------------------
+
+describe("PATCH /harnesses/:id that would drop the account's mirror records", () => {
+  test("refused 409 mirror-records without confirmMirrorDrop (nothing applied); saved with it; never asked when nothing would drop", async () => {
+    const ids = ["p", "b", "fresh"].map((x) => `api-md-${x}-${randomUUID().slice(0, 6)}`);
+    const homes = ids.map((id) => path.join(DATA_DIR, "homes", id));
+    ids.forEach((id, i) => {
+      mkdirSync(homes[i]!, { recursive: true });
+      db.harnesses.insert({ id, kind: "claude-code", label: `Label ${id}`, home: homes[i]!, env: {} } as never);
+    });
+    writeFileSync(path.join(homes[0]!, "CLAUDE.md"), "primary\n");
+    writeFileSync(path.join(homes[1]!, "CLAUDE.md"), "mine\n");
+    const created = await call("POST", "/harness-stacks", { label: "md", kind: "claude-code", members: [ids[0], ids[1]], mirrorMode: "full" });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    try {
+      const moved = path.join(DATA_DIR, "homes", `${ids[1]}-moved`);
+      mkdirSync(moved, { recursive: true });
+
+      const refused = await call("PATCH", `/harnesses/${ids[1]}`, { home: moved, enabled: false });
+      expect(refused.status).toBe(409);
+      expect(refused.body.code).toBe("mirror-records");
+      expect(String(refused.body.error)).toContain(`Label ${ids[1]}`);
+      expect(String(refused.body.error)).toContain("config folder");
+      expect(String(refused.body.error)).toContain(path.resolve(homes[1]!));
+      expect(refused.body.folders[0].what).toBe("config folder");
+      expect(refused.body.folders[0].savedOriginals).toBe(1);
+      // Nothing of the refused body was applied, the toggle included.
+      expect(db.harnesses.get(ids[1]!)?.home).toBe(homes[1]!);
+      expect(db.harnesses.get(ids[1]!)?.enabled).toBe(true);
+
+      // An edit that keeps the folders is never asked.
+      expect((await call("PATCH", `/harnesses/${ids[1]}`, { label: "renamed" })).status).toBe(200);
+      expect((await call("PATCH", `/harnesses/${ids[1]}`, { home: homes[1]! })).status).toBe(200);
+      expect((await call("PATCH", `/harnesses/${ids[1]}`, { home: moved, confirmMirrorDrop: "yes" })).status).toBe(400);
+
+      const confirmed = await call("PATCH", `/harnesses/${ids[1]}`, { home: moved, confirmMirrorDrop: true });
+      expect(confirmed.status).toBe(200);
+      expect(db.harnesses.get(ids[1]!)?.home).toBe(moved);
+
+      // An account with no mirror records re-points without a question.
+      const fresh = await call("PATCH", `/harnesses/${ids[2]}`, { home: path.join(DATA_DIR, "homes", `${ids[2]}-moved`) });
+      expect(fresh.status).toBe(200);
+    } finally {
+      await call("DELETE", `/harness-stacks/${stackId}`);
+      for (const id of ids) await call("DELETE", `/harnesses/${id}`);
+    }
+  }, 60_000);
+});
+
 // ---------------------------------------------------------------------------
 // M5 server part (contract C3): moving a card out of `blocked` cancels the
 // armed all-exhausted retry.
@@ -918,11 +1033,85 @@ describe("same-stack switch guards on PATCH /tasks/:id", () => {
       const refused = await call("PATCH", `/tasks/${taskId}`, { agent: "api-b" });
       expect(refused.status).toBe(409);
       expect(refused.body.error).toBe("stop the background agents before switching accounts");
+      expect(refused.body.code).toBe("background-agents");
       expect(db.tasks.get(taskId)?.agent).toBe("api-a");
       expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
     } finally {
       db.subagents.setStatus(subagentId, "completed", Date.now());
       db.tasks.delete(taskId);
+      await call("DELETE", `/harness-stacks/${stackId}`);
+    }
+  }, 60_000);
+
+  test("a FAILED turn whose background agents are still running refuses the switch exactly like a held one (Q1)", async () => {
+    const created = await call("POST", "/harness-stacks", { label: "failed-held", kind: "claude-code", members: ["api-a", "api-b"] });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    const runId = randomUUID();
+    // An API error ended the turn (card blocked) while a background agent
+    // kept running in the REPL.
+    const taskId = seedTaskRow({ column: "blocked", runId });
+    db.runs.insert({
+      id: runId, taskId, agent: "api-a", status: "failed",
+      startedAt: Date.now(), endedAt: Date.now(), exitCode: 1,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+    const subagentId = `failheld-${randomUUID().slice(0, 8)}`;
+    db.subagents.insertIfAbsent({
+      id: subagentId, taskId, runId, parentKind: "subagent", agentType: "Explore", description: "bg",
+      spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`), status: "running", startedAt: Date.now(), endedAt: null,
+    });
+    try {
+      const refused = await call("PATCH", `/tasks/${taskId}`, { agent: "api-b" });
+      expect(refused.status).toBe(409);
+      expect(refused.body.error).toBe("stop the background agents before switching accounts");
+      expect(refused.body.code).toBe("background-agents");
+      expect(db.tasks.get(taskId)?.agent).toBe("api-a");
+      expect(db.tasks.get(taskId)?.harnessState?.pendingSwap ?? null).toBeNull();
+    } finally {
+      db.subagents.setStatus(subagentId, "completed", Date.now());
+      db.tasks.delete(taskId);
+      await call("DELETE", `/harness-stacks/${stackId}`);
+    }
+  }, 60_000);
+
+  test("a running agent row on a card whose turn was STOPPED (or that moved on) does not refuse the switch (A1)", async () => {
+    const created = await call("POST", "/harness-stacks", { label: "stopped-row", kind: "claude-code", members: ["api-a", "api-b"] });
+    expect(created.status).toBe(201);
+    const stackId = created.body.stack.id as string;
+    // Stop leaves a background shell or a persistent monitor running, and a
+    // card the user moved on keeps such rows too. Neither card shows a Stop,
+    // so a refusal here would be a dead end.
+    const cases = [
+      { column: "ready", status: "cancelled" },
+      { column: "ready", status: "failed" },
+      { column: "review", status: "succeeded" },
+      { column: "done", status: "succeeded" },
+    ] as const;
+    try {
+      for (const { column, status } of cases) {
+        const runId = randomUUID();
+        const taskId = seedTaskRow({ column, runId });
+        db.runs.insert({
+          id: runId, taskId, agent: "api-a", status,
+          startedAt: Date.now(), endedAt: Date.now(), exitCode: status === "succeeded" ? 0 : 1,
+          tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+        });
+        const subagentId = `stopped-${randomUUID().slice(0, 8)}`;
+        db.subagents.insertIfAbsent({
+          id: subagentId, taskId, runId, parentKind: "subagent", agentType: "Bash", description: "npm run dev",
+          spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subagentId}.jsonl`), status: "running", startedAt: Date.now(), endedAt: null,
+        });
+        try {
+          const switched = await call("PATCH", `/tasks/${taskId}`, { agent: "api-b" });
+          expect({ column, status, code: switched.status }).toEqual({ column, status, code: 200 });
+          expect(db.tasks.get(taskId)?.agent).toBe("api-b");
+        } finally {
+          db.subagents.setStatus(subagentId, "completed", Date.now());
+          db.tasks.delete(taskId);
+        }
+      }
+    } finally {
       await call("DELETE", `/harness-stacks/${stackId}`);
     }
   }, 60_000);
@@ -1032,3 +1221,771 @@ describe("claude file readers follow claudeConfigDirFor", () => {
     }
   }, 30_000);
 });
+
+describe("fix-round routes: cooldown clear, history, preview, restore, switch, concurrency", () => {
+  test("DELETE /harnesses/:id/limit-state: 404 for an unknown account; clears all rows or one model's", async () => {
+    expect((await call("DELETE", "/harnesses/nope-acct/limit-state")).status).toBe(404);
+    const { harnessStacks } = await import("./harness-stacks.ts");
+    const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "limit", resetAtMs: Date.now() + 3_600_000 };
+    harnessStacks.setLimitState("api-x", base);
+    harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
+    const rows = (await call("GET", "/harnesses")).body.limitStates as { harnessId: string; model: string | null }[];
+    expect(rows.filter((r) => r.harnessId === "api-x").map((r) => r.model).sort()).toEqual([null, "gpt-x"].sort());
+
+    const one = await call("DELETE", "/harnesses/api-x/limit-state?model=%20GPT-X%20");
+    expect(one.status).toBe(200);
+    expect(one.body.cleared).toBe(true);
+    expect((one.body.limitStates as { harnessId: string }[]).filter((r) => r.harnessId === "api-x")).toHaveLength(1);
+
+    const all = await call("DELETE", "/harnesses/api-x/limit-state");
+    expect(all.status).toBe(200);
+    expect((all.body.limitStates as { harnessId: string }[]).some((r) => r.harnessId === "api-x")).toBe(false);
+  });
+
+  test("DELETE /harnesses/:id/limit-state?scope=account clears only the account-wide row; the response carries rearmed", async () => {
+    const { harnessStacks } = await import("./harness-stacks.ts");
+    const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "limit", resetAtMs: Date.now() + 3_600_000 };
+    harnessStacks.setLimitState("api-x", base);
+    harnessStacks.setLimitState("api-x", { ...base, model: "gpt-x" });
+    const res = await call("DELETE", "/harnesses/api-x/limit-state?scope=account");
+    expect(res.status).toBe(200);
+    expect(typeof res.body.rearmed).toBe("number");
+    const left = (res.body.limitStates as { harnessId: string; model: string | null }[]).filter((r) => r.harnessId === "api-x");
+    expect(left.map((r) => r.model)).toEqual(["gpt-x"]);
+    await call("DELETE", "/harnesses/api-x/limit-state");
+  });
+
+  test("GET /harnesses lists accounts with mirror records; deleting the account drops them", async () => {
+    const id = `api-mr-${randomUUID().slice(0, 6)}`;
+    const home = path.join(DATA_DIR, "homes", id);
+    mkdirSync(home, { recursive: true });
+    db.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+    db.db.run(
+      `INSERT INTO harness_mirror_provenance (harness_id, stack_id, scope, path, key, preexisted, updated_at)
+       VALUES (?, NULL, 'file', 'settings.json', '', 0, ?)`,
+      [id, Date.now()],
+    );
+    const listed = await call("GET", "/harnesses");
+    expect(listed.body.mirrorRestorable as string[]).toContain(id);
+    expect((await call("DELETE", `/harnesses/${id}`)).status).toBe(204);
+    const count = db.db.query("SELECT COUNT(*) AS n FROM harness_mirror_provenance WHERE harness_id = ?").get(id) as { n: number };
+    expect(count.n).toBe(0);
+    expect((await call("GET", "/harnesses")).body.mirrorRestorable as string[]).not.toContain(id);
+  }, 30_000);
+
+  test.skipIf(IS_ROOT)("a CLI-token mirror-preview is path-gated BEFORE validation: a protected root answers 403, not the validator's 400", async () => {
+    const cliToken = (await import("./api-config.ts")).CLI_TOKEN;
+    const id = `api-mp-${randomUUID().slice(0, 6)}`;
+    const home = path.join(DATA_DIR, "homes", id);
+    const lockedParent = mkdtempSync(path.join(tmpdir(), "agetor-mp-"));
+    const target = path.join(lockedParent, "acct");
+    mkdirSync(target);
+    chmodSync(target, 0o300);
+    symlinkSync(target, home);
+    db.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+    try {
+      // A duplicate member is a validator blocker (400) if validation ran first.
+      const res = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [id, id] }, cliToken);
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("path-not-accessible");
+      // The app caller is never gated and still gets the validator's answer.
+      const app = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [id, id] });
+      expect(app.status).toBe(400);
+    } finally {
+      chmodSync(target, 0o700);
+      db.harnesses.delete(id);
+    }
+  });
+
+  test("GET /harness-stacks/:id/history: 404 unknown, empty page for a fresh stack", async () => {
+    expect((await call("GET", "/harness-stacks/nope/history")).status).toBe(404);
+    const created = await call("POST", "/harness-stacks", { label: "History", kind: "claude-code", members: ["api-a", "api-b"], mirrorMode: "safe" });
+    const id = created.body.stack.id as string;
+    const page = await call("GET", `/harness-stacks/${id}/history?limit=9999&before=garbage`);
+    expect(page.status).toBe(200);
+    expect(page.body).toEqual({ events: [], nextCursor: null });
+    await call("DELETE", `/harness-stacks/${id}`);
+  }, 60_000);
+
+  test("POST /harness-stacks/mirror-preview validates the draft and answers a preview", async () => {
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "gemini", members: [] })).status).toBe(400);
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: "x" })).status).toBe(400);
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: ["api-a"], stackId: "nope" })).status).toBe(404);
+    const blocked = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: ["api-a", "api-a"] });
+    expect(blocked.status).toBe(400);
+    expect(Array.isArray(blocked.body.blockers)).toBe(true);
+    const ok = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: ["api-a", "api-b"], mirrorMode: "safe" });
+    expect(ok.status).toBe(200);
+    expect(Array.isArray(ok.body.plans)).toBe(true);
+    expect(typeof ok.body.overwrites).toBe("boolean");
+  }, 60_000);
+
+  test("POST /harnesses/:id/mirror-restore: 404 unknown, 200 with a result for a known account", async () => {
+    expect((await call("POST", "/harnesses/nope-acct/mirror-restore")).status).toBe(404);
+    const ok = await call("POST", "/harnesses/api-b/mirror-restore");
+    expect(ok.status).toBe(200);
+    expect(ok.body.harnessId).toBe("api-b");
+  }, 60_000);
+
+  test("POST/DELETE /tasks/:id/switch-account: 404 unknown, 409 archived", async () => {
+    expect((await call("POST", "/tasks/nope/switch-account")).status).toBe(404);
+    expect((await call("DELETE", "/tasks/nope/switch-account")).status).toBe(404);
+    const archived = seedTaskRow({ archivedAt: Date.now() });
+    const refused = await call("POST", `/tasks/${archived}/switch-account`);
+    expect(refused.status).toBe(409);
+    expect(refused.body).toEqual({ error: "this task is archived", code: "archived" });
+  });
+
+  test("PATCH /harness-stacks/:id with a stale expectedUpdatedAt answers 409 stack-changed with the stored stack", async () => {
+    const created = await call("POST", "/harness-stacks", { label: "Concurrent", kind: "claude-code", members: ["api-a", "api-b"], mirrorMode: "safe" });
+    const stack = created.body.stack as { id: string; updatedAt: number };
+    const fresh = await call("PATCH", `/harness-stacks/${stack.id}`, { label: "Concurrent 2", expectedUpdatedAt: stack.updatedAt });
+    expect(fresh.status).toBe(200);
+    const stale = await call("PATCH", `/harness-stacks/${stack.id}`, { label: "Concurrent 3", expectedUpdatedAt: stack.updatedAt });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe("stack-changed");
+    expect(stale.body.stack.label).toBe("Concurrent 2");
+    expect((await call("PATCH", `/harness-stacks/${stack.id}`, { expectedUpdatedAt: "x" })).status).toBe(400);
+    await call("DELETE", `/harness-stacks/${stack.id}`);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// TT-E (fix round, TT7): every new route's 404 / 409 / happy / CLI-gate shape,
+// the stack PATCH concurrency write-nothing guarantee, stack delete (22b),
+// harness-delete backups, the cooldown `rearmed` count and the finding-19
+// idle-timeout lift.
+// ---------------------------------------------------------------------------
+describe("TT-E: fix-round routes (shapes, gates, 22b, finding 19)", () => {
+  const cleanup: (() => void | Promise<void>)[] = [];
+  afterAll(async () => {
+    for (const fn of cleanup.reverse()) await fn();
+  });
+
+  /** A readable claude-code account with a login file. */
+  function makeAccount(tag: string): string {
+    const id = `tte-${tag}-${randomUUID().slice(0, 6)}`;
+    const home = path.join(DATA_DIR, "homes", id);
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path.join(home, ".credentials.json"), "{}");
+    writeFileSync(path.join(home, "settings.json"), JSON.stringify({ theme: "dark" }));
+    db.harnesses.insert({ id, kind: "claude-code", label: id, home, env: {} } as never);
+    cleanup.push(() => {
+      try {
+        db.harnesses.delete(id);
+      } catch {}
+    });
+    return id;
+  }
+
+  async function makeStack(members: string[], label = "tte"): Promise<string> {
+    const created = await call("POST", "/harness-stacks", { label, kind: "claude-code", members, mirrorMode: "safe" });
+    expect(created.status).toBe(201);
+    const id = created.body.stack.id as string;
+    cleanup.push(async () => {
+      await call("DELETE", `/harness-stacks/${id}`);
+    });
+    return id;
+  }
+
+  /** Re-point an account's home at a folder the disclaimed probe cannot read. */
+  function lockHome(id: string): () => void {
+    const home = path.join(DATA_DIR, "homes", id);
+    const parent = mkdtempSync(path.join(tmpdir(), "agetor-tte-"));
+    const target = path.join(parent, "acct");
+    mkdirSync(target);
+    chmodSync(target, 0o300);
+    rmSync(home, { recursive: true, force: true });
+    symlinkSync(target, home);
+    let done = false;
+    const unlock = () => {
+      if (done) return;
+      done = true;
+      chmodSync(target, 0o700);
+      rmSync(home, { force: true });
+      mkdirSync(home, { recursive: true });
+      writeFileSync(path.join(home, ".credentials.json"), "{}");
+      rmSync(parent, { recursive: true, force: true });
+    };
+    cleanup.push(unlock);
+    return unlock;
+  }
+
+  function seedRun(taskId: string, agent: string, status: "running" | "succeeded"): string {
+    const runId = randomUUID();
+    db.runs.insert({
+      id: runId, taskId, agent, status,
+      startedAt: Date.now(), endedAt: status === "running" ? null : Date.now(), exitCode: status === "running" ? null : 0,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+    return runId;
+  }
+
+  const statusLines = (runId: string) => db.runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+  const exhaustedState = (at: number) => ({ at, attempts: 0, max: 3, nextAttemptAt: at, earliestResetAtMs: null, reason: "quota" as const });
+  const baseState = (stackId: string) => ({ stackId, position: 0, count: 2, tried: [] as string[], pendingSwap: null, allExhausted: null, lastMove: null });
+
+  // ---- DELETE /harnesses/:id/limit-state ---------------------------------
+
+  test("limit-state: ?model wins over ?scope=account; mixed-case is normalised; an account-wide-only clear keeps the model row", async () => {
+    const id = makeAccount("ls");
+    const { harnessStacks } = await import("./harness-stacks.ts");
+    const base = { reason: "quota" as const, source: "claude-api-error" as const, message: "m", resetAtMs: Date.now() + 3_600_000 };
+    harnessStacks.setLimitState(id, base);
+    harnessStacks.setLimitState(id, { ...base, model: "sonnet-x" });
+    const res = await call("DELETE", `/harnesses/${id}/limit-state?scope=account&model=SONNET-X`);
+    expect(res.status).toBe(200);
+    const left = (res.body.limitStates as { harnessId: string; model: string | null }[]).filter((r) => r.harnessId === id);
+    // The model param took precedence: only the account-wide row is left.
+    expect(left.map((r) => r.model)).toEqual([null]);
+    await call("DELETE", `/harnesses/${id}/limit-state`);
+    // An unknown model clears nothing but still answers 200.
+    expect((await call("DELETE", `/harnesses/${id}/limit-state?model=nope`)).status).toBe(200);
+  });
+
+  test("limit-state: `rearmed` counts a blocked task waiting on the cleared account and pulls its retry in; others are untouched", async () => {
+    const [a, b, c, d] = ["a", "b", "c", "d"].map((x) => makeAccount(`rm${x}`)) as [string, string, string, string];
+    const stack = await makeStack([a, b], "rearm");
+    const other = await makeStack([c, d], "rearm-other");
+    const { harnessStacks } = await import("./harness-stacks.ts");
+    const failover = await import("./harness-failover.ts");
+    harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 36_000_000 });
+    const far = Date.now() + 36_000_000;
+
+    const waiting = seedTaskRow({ agent: a, column: "blocked" });
+    const noUsable = seedTaskRow({ agent: a, column: "blocked" });
+    const otherStack = seedTaskRow({ agent: c, column: "blocked" });
+    seedRun(waiting, a, "succeeded");
+    db.tasks.setHarnessState(waiting, { ...baseState(stack), allExhausted: exhaustedState(far) });
+    db.tasks.setHarnessState(noUsable, { ...baseState(stack), allExhausted: { ...exhaustedState(far), reason: "no-usable-member" as never } });
+    db.tasks.setHarnessState(otherStack, { ...baseState(other), allExhausted: exhaustedState(far) });
+    for (const t of [waiting, noUsable, otherStack]) failover.armAutoRetry(t, far);
+    try {
+      // A clear on a member of the OTHER stack re-arms only that stack's waiting task.
+      expect((await call("DELETE", `/harnesses/${d}/limit-state`)).body.rearmed).toBe(1);
+      expect((await call("DELETE", `/harnesses/${a}/limit-state`)).body.rearmed).toBe(1); // `waiting` only: noUsable is skipped
+      const res = await call("DELETE", `/harnesses/${b}/limit-state`);
+      expect(res.status).toBe(200);
+      expect(res.body.rearmed).toBe(1);
+      const after = db.tasks.get(waiting)!.harnessState!.allExhausted!;
+      expect(after.nextAttemptAt).toBeLessThan(far);
+      expect(after.attempts).toBe(0);
+      expect(failover.hasArmedAutoRetry(waiting)).toBe(true);
+      expect(db.tasks.get(noUsable)!.harnessState!.allExhausted!.nextAttemptAt).toBe(far);
+      expect(statusLines(db.runs.listForTask(waiting)[0]!.id).some((l) => l.includes("cooldown cleared on"))).toBe(true);
+      // A second clear with the waiting task already re-armed still counts it (idempotent re-arm).
+      expect((await call("DELETE", `/harnesses/${b}/limit-state`)).body.rearmed).toBe(1);
+    } finally {
+      for (const t of [waiting, noUsable, otherStack]) {
+        failover.cancelAutoRetry(t);
+        db.tasks.delete(t);
+      }
+    }
+  }, 60_000);
+
+  // ---- GET /harness-stacks/:id/history -----------------------------------
+
+  test("history: pages newest-first by cursor, clamps the limit, treats a bad cursor as the first page", async () => {
+    const a = makeAccount("ha");
+    const b = makeAccount("hb");
+    const stack = await makeStack([a, b], "history");
+    const { harnessSwapEvents, SWAP_HISTORY_MAX_LIMIT, SWAP_HISTORY_DEFAULT_LIMIT } = await import("./harness-swap-history.ts");
+    const t0 = Date.now() - 10_000;
+    const mk = (i: number) => harnessSwapEvents.insert({
+      stackId: stack, taskId: null, taskTitle: `t${i}`, fromHarnessId: a, fromLabel: "A", toHarnessId: b, toLabel: "B",
+      trigger: "manual", reason: "user", source: null, message: null, model: null, resetsAtMs: null,
+      fromRunId: null, toRunId: null, continuation: null, at: t0 + i,
+    });
+    for (let i = 0; i < 5; i++) mk(i);
+
+    const p1 = await call("GET", `/harness-stacks/${stack}/history?limit=2`);
+    expect(p1.status).toBe(200);
+    expect(p1.body.events.map((e: { taskTitle: string }) => e.taskTitle)).toEqual(["t4", "t3"]);
+    expect(typeof p1.body.nextCursor).toBe("string");
+    const p2 = await call("GET", `/harness-stacks/${stack}/history?limit=2&before=${encodeURIComponent(p1.body.nextCursor)}`);
+    expect(p2.body.events.map((e: { taskTitle: string }) => e.taskTitle)).toEqual(["t2", "t1"]);
+    const p3 = await call("GET", `/harness-stacks/${stack}/history?limit=2&before=${encodeURIComponent(p2.body.nextCursor)}`);
+    expect(p3.body.events.map((e: { taskTitle: string }) => e.taskTitle)).toEqual(["t0"]);
+    expect(p3.body.nextCursor).toBeNull();
+
+    // Bad, tampered and oversized cursors fall back to the first page.
+    for (const bad of ["garbage", Buffer.from("[1]").toString("base64url"), "A".repeat(600)]) {
+      const r = await call("GET", `/harness-stacks/${stack}/history?limit=2&before=${encodeURIComponent(bad)}`);
+      expect(r.status).toBe(200);
+      expect(r.body.events.map((e: { taskTitle: string }) => e.taskTitle)).toEqual(["t4", "t3"]);
+    }
+    // limit=0 / negative clamp up to 1; a non-number / blank falls back to the default.
+    expect((await call("GET", `/harness-stacks/${stack}/history?limit=0`)).body.events).toHaveLength(1);
+    expect((await call("GET", `/harness-stacks/${stack}/history?limit=-7`)).body.events).toHaveLength(1);
+    expect((await call("GET", `/harness-stacks/${stack}/history?limit=abc`)).body.events).toHaveLength(5);
+    expect((await call("GET", `/harness-stacks/${stack}/history?limit=`)).body.events).toHaveLength(5);
+
+    for (let i = 5; i < SWAP_HISTORY_MAX_LIMIT + 5; i++) mk(i);
+    const big = await call("GET", `/harness-stacks/${stack}/history?limit=999999`);
+    expect(big.body.events).toHaveLength(SWAP_HISTORY_MAX_LIMIT);
+    expect(big.body.nextCursor).not.toBeNull();
+    expect((await call("GET", `/harness-stacks/${stack}/history`)).body.events).toHaveLength(SWAP_HISTORY_DEFAULT_LIMIT);
+    // The history is per stack.
+    const c = makeAccount("hc");
+    const d = makeAccount("hd");
+    const stack2 = await makeStack([c, d], "history2");
+    expect((await call("GET", `/harness-stacks/${stack2}/history`)).body.events).toEqual([]);
+  }, 60_000);
+
+  // ---- stack PATCH (finding 21) ------------------------------------------
+
+  test("stack PATCH with a stale expectedUpdatedAt answers 409 {code, stack} and writes nothing (members, label, mirror, updatedAt)", async () => {
+    const a = makeAccount("ca");
+    const b = makeAccount("cb");
+    const stack = await makeStack([a, b], "conc");
+    const first = (await call("GET", `/harness-stacks/${stack}`)).body.stack as { updatedAt: number };
+    const bumped = await call("PATCH", `/harness-stacks/${stack}`, { label: "conc-2", expectedUpdatedAt: first.updatedAt });
+    expect(bumped.status).toBe(200);
+    // Make sure a rewrite would be visible as a changed timestamp.
+    await Bun.sleep(5);
+    const before = db.db.query("SELECT label, mirror_mode, updated_at FROM harness_stacks WHERE id = ?").get(stack);
+    const beforeMembers = db.db.query("SELECT harness_id, position FROM harness_stack_members WHERE stack_id = ? ORDER BY position").all(stack);
+
+    const stale = await call("PATCH", `/harness-stacks/${stack}`, {
+      label: "stale-write", members: [b, a], mirrorMode: "full", expectedUpdatedAt: first.updatedAt,
+    });
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe("stack-changed");
+    expect(stale.body.stack.label).toBe("conc-2");
+    expect(stale.body.stack.members.map((m: { harnessId: string }) => m.harnessId)).toEqual([a, b]);
+    expect(db.db.query("SELECT label, mirror_mode, updated_at FROM harness_stacks WHERE id = ?").get(stack)).toEqual(before as never);
+    expect(db.db.query("SELECT harness_id, position FROM harness_stack_members WHERE stack_id = ? ORDER BY position").all(stack)).toEqual(beforeMembers as never);
+
+    // The current timestamp still goes through; an absent one is unchecked.
+    const cur = (stale.body.stack as { updatedAt: number }).updatedAt;
+    expect((await call("PATCH", `/harness-stacks/${stack}`, { label: "conc-3", expectedUpdatedAt: cur })).status).toBe(200);
+    expect((await call("PATCH", `/harness-stacks/${stack}`, { label: "conc-4" })).status).toBe(200);
+    expect((await call("PATCH", "/harness-stacks/nope", { label: "x", expectedUpdatedAt: 1 })).status).toBe(404);
+  }, 60_000);
+
+  // ---- stack DELETE (22b) ------------------------------------------------
+
+  test("stack DELETE cancels an armed retry and a scheduled switch with status lines, and its history goes with it", async () => {
+    const a = makeAccount("da");
+    const b = makeAccount("db");
+    const stack = await makeStack([a, b], "del22b");
+    const failover = await import("./harness-failover.ts");
+    const { harnessSwapEvents } = await import("./harness-swap-history.ts");
+    const far = Date.now() + 36_000_000;
+
+    const retrying = seedTaskRow({ agent: a, column: "blocked" });
+    const retryRun = seedRun(retrying, a, "succeeded");
+    db.tasks.update(retrying, { runId: retryRun });
+    db.tasks.setHarnessState(retrying, { ...baseState(stack), allExhausted: exhaustedState(far) });
+    failover.armAutoRetry(retrying, far);
+
+    const scheduled = seedTaskRow({ agent: a, column: "running" });
+    const schedRun = seedRun(scheduled, a, "running");
+    db.tasks.update(scheduled, { runId: schedRun });
+    db.tasks.setHarnessState(scheduled, { ...baseState(stack), scheduledSwitch: { requestedAt: Date.now() } } as never);
+
+    harnessSwapEvents.insert({
+      stackId: stack, taskId: retrying, taskTitle: "x", fromHarnessId: a, fromLabel: "A", toHarnessId: b, toLabel: "B",
+      trigger: "limit", reason: "quota", source: null, message: null, model: null, resetsAtMs: null,
+      fromRunId: null, toRunId: null, continuation: null,
+    });
+    expect(harnessSwapEvents.countForStack(stack)).toBe(1);
+    try {
+      expect(failover.hasArmedAutoRetry(retrying)).toBe(true);
+      expect((await call("DELETE", `/harness-stacks/${stack}`)).status).toBe(200);
+      expect(failover.hasArmedAutoRetry(retrying)).toBe(false);
+      expect(db.tasks.get(retrying)!.harnessState ?? null).toBeNull();
+      expect(db.tasks.get(scheduled)!.harnessState ?? null).toBeNull();
+      expect(statusLines(retryRun).some((l) => l.includes("automatic account retry cancelled — the stack was deleted"))).toBe(true);
+      expect(statusLines(schedRun).some((l) => l.includes("scheduled account switch cancelled — the stack was deleted"))).toBe(true);
+      // The history cascades with the stack, and the route is a 404 now.
+      expect(harnessSwapEvents.countForStack(stack)).toBe(0);
+      expect((await call("GET", `/harness-stacks/${stack}/history`)).status).toBe(404);
+    } finally {
+      failover.cancelAutoRetry(retrying);
+      db.tasks.delete(retrying);
+      db.tasks.delete(scheduled);
+    }
+  }, 60_000);
+
+  test("stack DELETE leaves a task whose account has since moved into another stack alone (N5)", async () => {
+    const a = makeAccount("mva");
+    const b = makeAccount("mvb");
+    const c = makeAccount("mvc");
+    const old = await makeStack([a, b], "n5-old");
+    const fresh = await makeStack([c], "n5-new");
+    const scheduled = seedTaskRow({ agent: a, column: "running" });
+    const schedRun = seedRun(scheduled, a, "running");
+    db.tasks.update(scheduled, { runId: schedRun });
+    const requestedAt = Date.now();
+    db.tasks.setHarnessState(scheduled, { ...baseState(old), scheduledSwitch: { requestedAt } } as never);
+    try {
+      // The account moves to the other stack; the task's state still records
+      // the old stack id (nothing has written it since).
+      expect((await call("PATCH", `/harness-stacks/${old}`, { members: [b] })).status).toBe(200);
+      expect((await call("PATCH", `/harness-stacks/${fresh}`, { members: [c, a] })).status).toBe(200);
+      expect(db.tasks.get(scheduled)!.harnessState?.stackId).toBe(old);
+      expect((await call("DELETE", `/harness-stacks/${old}`)).status).toBe(200);
+      const state = db.tasks.get(scheduled)!.harnessState;
+      // Its scheduled switch now belongs to the stack it is in: kept, and the
+      // state re-pointed there instead of wiped with the deleted stack.
+      expect(state?.scheduledSwitch?.requestedAt).toBe(requestedAt);
+      expect(state?.stackId).toBe(fresh);
+      expect(statusLines(schedRun).some((l) => l.includes("the stack was deleted"))).toBe(false);
+    } finally {
+      db.runs.update(schedRun, { status: "failed", endedAt: Date.now(), exitCode: 1 });
+      db.tasks.delete(scheduled);
+    }
+  }, 60_000);
+
+  // ---- harness DELETE removes backups ------------------------------------
+
+  test("harness DELETE removes the account's mirror backups and provenance; `mirrorRestorable` stops listing it", async () => {
+    const id = makeAccount("bk");
+    // The backup store lives under the db singleton's data dir (the first
+    // test file to import db.ts wins in a full `bun test` run), not this
+    // file's DATA_DIR.
+    const dir = path.join(db.dataDir, "mirror-backups", id);
+    mkdirSync(path.join(dir, "files"), { recursive: true, mode: 0o700 });
+    writeFileSync(path.join(dir, "files", "settings.json"), "{}", { mode: 0o600 });
+    const keep = path.join(db.dataDir, "mirror-backups", `${id}-sibling`);
+    mkdirSync(keep, { recursive: true });
+    writeFileSync(path.join(keep, "x"), "1");
+    db.db.run(
+      `INSERT INTO harness_mirror_provenance (harness_id, stack_id, scope, path, key, preexisted, backup_ref, updated_at)
+       VALUES (?, NULL, 'file', 'settings.json', '', 1, ?, ?)`,
+      [id, `${id}/files/settings.json`, Date.now()],
+    );
+    cleanup.push(() => rmSync(keep, { recursive: true, force: true }));
+    expect((await call("GET", "/harnesses")).body.mirrorRestorable as string[]).toContain(id);
+    expect((await call("DELETE", `/harnesses/${id}`)).status).toBe(204);
+    expect(readdirSyncSafe(dir)).toBeNull();
+    // A sibling account's backups are untouched.
+    expect(readdirSync(keep)).toEqual(["x"]);
+    expect((await call("GET", "/harnesses")).body.mirrorRestorable as string[]).not.toContain(id);
+  }, 30_000);
+
+  // ---- mirror-preview / mirror-restore: scope + gates --------------------
+
+  test.skipIf(IS_ROOT)("mirror-preview: the gate runs before validation and before any stackId lookup that reads a root; the CLI token otherwise reaches the validator and the dry run", async () => {
+    const cliToken = (await import("./api-config.ts")).CLI_TOKEN;
+    const a = makeAccount("pa");
+    const b = makeAccount("pb");
+    const stack = await makeStack([a, b], "pv");
+    // Readable roots: the CLI token gets the same answers as the app.
+    const ok = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [a, b], mirrorMode: "safe", stackId: stack }, cliToken);
+    expect(ok.status).toBe(200);
+    expect(Array.isArray(ok.body.plans)).toBe(true);
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [a, a] }, cliToken)).status).toBe(400);
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [a], stackId: "nope" }, cliToken)).status).toBe(404);
+
+    const unlock = lockHome(b);
+    const before = db.db.query("SELECT COUNT(*) AS n FROM harness_mirror_provenance").get();
+    // A validator-invalid body (duplicate member, mixed kinds are 400s) must still be 403.
+    for (const members of [[a, b], [b, b], [b]]) {
+      const res = await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members }, cliToken);
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("path-not-accessible");
+    }
+    // The dry run wrote nothing.
+    expect(db.db.query("SELECT COUNT(*) AS n FROM harness_mirror_provenance").get()).toEqual(before as never);
+    // The app caller is never gated.
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [b, b] })).status).toBe(400);
+    unlock();
+  }, 60_000);
+
+  test.skipIf(IS_ROOT)("mirror-restore: 403 path-not-accessible for the CLI token on a protected root, nothing restored; the app is not gated; readable → 200", async () => {
+    const cliToken = (await import("./api-config.ts")).CLI_TOKEN;
+    const a = makeAccount("ra");
+    const unlock = lockHome(a);
+    const sentinel = path.join(db.dataDir, "mirror-backups", a);
+    const denied = await call("POST", `/harnesses/${a}/mirror-restore`, undefined, cliToken);
+    expect(denied.status).toBe(403);
+    expect(denied.body.code).toBe("path-not-accessible");
+    expect(readdirSyncSafe(sentinel)).toBeNull();
+    unlock();
+    const ok = await call("POST", `/harnesses/${a}/mirror-restore`, undefined, cliToken);
+    expect(ok.status).toBe(200);
+    expect(ok.body.harnessId).toBe(a);
+    // A kind-alias or label is resolved by getByIdOrKind; an unknown id is a 404 even for the CLI.
+    expect((await call("POST", "/harnesses/zzz-none/mirror-restore", undefined, cliToken)).status).toBe(404);
+  }, 60_000);
+
+  // ---- switch-account ----------------------------------------------------
+
+  test("switch-account: 409 shapes (not-in-stack, no-usable-member with reasons, background-agents, busy) and no state is written", async () => {
+    const a = makeAccount("sa");
+    const b = makeAccount("sb");
+    const stack = await makeStack([a, b], "sw409");
+    const { harnessStacks } = await import("./harness-stacks.ts");
+    const orch = await import("./orchestrator.ts");
+
+    // Outside any stack.
+    const lone = seedTaskRow({ agent: "api-x" });
+    const noStack = await call("POST", `/tasks/${lone}/switch-account`);
+    expect(noStack.status).toBe(409);
+    expect(noStack.body.code).toBe("not-in-stack");
+    expect(typeof noStack.body.error).toBe("string");
+
+    // Every other member cooling: refused up front with per-member reasons.
+    const t = seedTaskRow({ agent: a });
+    harnessStacks.setLimitState(b, { reason: "quota", source: "claude-api-error", message: "m", resetAtMs: Date.now() + 3_600_000 });
+    try {
+      const cooling = await call("POST", `/tasks/${t}/switch-account`);
+      expect(cooling.status).toBe(409);
+      expect(cooling.body.code).toBe("no-usable-member");
+      expect(Array.isArray(cooling.body.reasons)).toBe(true);
+      expect(cooling.body.reasons.length).toBeGreaterThan(0);
+      expect(JSON.stringify(cooling.body.reasons)).toContain(b);
+      expect(db.tasks.get(t)!.agent).toBe(a);
+      expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+    } finally {
+      harnessStacks.clearLimitState(b);
+    }
+
+    // Background agents hold the task.
+    const held = seedTaskRow({ agent: a, column: "running" });
+    const heldRun = seedRun(held, a, "succeeded");
+    db.tasks.update(held, { runId: heldRun });
+    const subId = `tte-${randomUUID().slice(0, 8)}`;
+    db.subagents.insertIfAbsent({
+      id: subId, taskId: held, runId: heldRun, parentKind: "subagent", agentType: "Explore", description: "bg",
+      spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subId}.jsonl`), status: "running", startedAt: Date.now(), endedAt: null,
+    });
+    const bg = await call("POST", `/tasks/${held}/switch-account`);
+    expect(bg.status).toBe(409);
+    expect(bg.body.code).toBe("background-agents");
+    expect(db.tasks.get(held)!.agent).toBe(a);
+    db.subagents.setStatus(subId, "completed", Date.now());
+
+    // Another switch already holds the claim.
+    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    try {
+      const busy = await call("POST", `/tasks/${t}/switch-account`);
+      expect(busy.status).toBe(409);
+      expect(busy.body.code).toBe("busy");
+    } finally {
+      orch.releaseTaskAccountSwitch(t);
+    }
+    for (const id of [lone, t, held]) db.tasks.delete(id);
+    expect(stack).toBeTruthy();
+  }, 60_000);
+
+  test("switch-account: a FAILED turn whose background agents still run is refused background-agents, like a held one (Q1)", async () => {
+    const a = makeAccount("fa");
+    const b = makeAccount("fb");
+    await makeStack([a, b], "swfail");
+    const t = seedTaskRow({ agent: a, column: "blocked" });
+    const runId = randomUUID();
+    db.runs.insert({
+      id: runId, taskId: t, agent: a, status: "failed",
+      startedAt: Date.now(), endedAt: Date.now(), exitCode: 1,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
+    });
+    db.tasks.update(t, { runId });
+    const subId = `tte-${randomUUID().slice(0, 8)}`;
+    db.subagents.insertIfAbsent({
+      id: subId, taskId: t, runId, parentKind: "subagent", agentType: "Explore", description: "bg",
+      spawnDepth: 1, sourcePath: path.join(DATA_DIR, `${subId}.jsonl`), status: "running", startedAt: Date.now(), endedAt: null,
+    });
+    try {
+      const bg = await call("POST", `/tasks/${t}/switch-account`);
+      expect(bg.status).toBe(409);
+      expect(bg.body.code).toBe("background-agents");
+      expect(db.tasks.get(t)!.agent).toBe(a);
+      expect(db.tasks.get(t)!.harnessState?.pendingSwap ?? null).toBeNull();
+      expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+    } finally {
+      db.subagents.setStatus(subId, "completed", Date.now());
+      db.tasks.delete(t);
+    }
+  }, 60_000);
+
+  test("switch-account: a Cancel while the scheduled switch is being applied answers 409 busy and leaves the request alone (N2)", async () => {
+    const a = makeAccount("ca");
+    const b = makeAccount("cb");
+    const stackId = await makeStack([a, b], "swbusy");
+    const orch = await import("./orchestrator.ts");
+    const t = seedTaskRow({ agent: a });
+    const runId = seedRun(t, a, "succeeded");
+    db.tasks.update(t, { runId });
+    db.tasks.setHarnessState(t, { ...baseState(stackId), scheduledSwitch: { requestedAt: Date.now() } });
+    // Hold the scheduled move right after its intent is written, with its
+    // account-switch claim held.
+    let reached = false;
+    let open = (): void => {};
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    const prev = orch.__setScheduledSwitchHooksForTest({
+      afterIntent: (id) => {
+        if (id !== t) return;
+        reached = true;
+        return gate;
+      },
+    });
+    try {
+      // A claim release is one of the edges that applies a waiting request.
+      expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+      orch.releaseTaskAccountSwitch(t);
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline && !reached) await Bun.sleep(10);
+      expect(reached).toBe(true);
+      expect(orch.isScheduledSwitchUnderway(t)).toBe(true);
+
+      const busy = await call("DELETE", `/tasks/${t}/switch-account`);
+      expect(busy.status).toBe(409);
+      expect(busy.body.code).toBe("busy");
+      expect(busy.body.error).toBe("the switch is already under way");
+      expect(db.tasks.get(t)!.harnessState?.scheduledSwitch).toBeTruthy();
+      expect(statusLines(runId).some((l) => l.includes("cancelled"))).toBe(false);
+    } finally {
+      open();
+      // Let the move finish before the row goes.
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline && db.tasks.get(t)?.harnessState?.scheduledSwitch) await Bun.sleep(15);
+      while (Date.now() < deadline && orch.isAccountSwitchUnderway(t)) await Bun.sleep(15);
+      orch.__setScheduledSwitchHooksForTest(prev);
+    }
+    expect(db.tasks.get(t)!.agent).toBe(b);
+    expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+    db.tasks.delete(t);
+  }, 60_000);
+
+  test("switch-account: a Cancel while another switch holds the claim (a same-stack PATCH) drops the request (A5)", async () => {
+    const a = makeAccount("pa");
+    const stackId = await makeStack([a, makeAccount("pb")], "swpatch");
+    const orch = await import("./orchestrator.ts");
+    const t = seedTaskRow({ agent: a });
+    const runId = seedRun(t, a, "succeeded");
+    db.tasks.update(t, { runId });
+    db.tasks.setHarnessState(t, { ...baseState(stackId), scheduledSwitch: { requestedAt: Date.now() } });
+    // The claim the PATCH route takes for a same-stack agent change. That
+    // PATCH may still be refused, which would leave the request behind.
+    expect(orch.claimTaskForAccountSwitch(t)).toBe(true);
+    try {
+      expect(orch.isAccountSwitchUnderway(t)).toBe(true);
+      expect(orch.isScheduledSwitchUnderway(t)).toBe(false);
+      const cancel = await call("DELETE", `/tasks/${t}/switch-account`);
+      expect(cancel.status).toBe(200);
+      expect(cancel.body.cancelled).toBe(true);
+      expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+      expect(statusLines(runId)).toContain("scheduled account switch cancelled");
+    } finally {
+      orch.releaseTaskAccountSwitch(t);
+    }
+    // The claim ends (the PATCH refused) with nothing left to apply.
+    await Bun.sleep(50);
+    expect(db.tasks.get(t)!.agent).toBe(a);
+    expect(orch.isAccountSwitchUnderway(t)).toBe(false);
+    db.tasks.delete(t);
+  }, 60_000);
+
+  test("switch-account: an idle task moves to the next member now; a live turn schedules it; DELETE cancels with a status line (and is a no-op when nothing is scheduled)", async () => {
+    const a = makeAccount("ia");
+    const b = makeAccount("ib");
+    await makeStack([a, b], "swok");
+
+    const idle = seedTaskRow({ agent: a });
+    const moved = await call("POST", `/tasks/${idle}/switch-account`);
+    expect(moved.status).toBe(200);
+    expect(moved.body.status).toBe("switched");
+    expect(moved.body.task.agent).toBe(b);
+    expect(db.tasks.get(idle)!.agent).toBe(b);
+
+    const live = seedTaskRow({ agent: a, column: "running" });
+    const liveRun = seedRun(live, a, "running");
+    db.tasks.update(live, { runId: liveRun });
+    const sched = await call("POST", `/tasks/${live}/switch-account`);
+    expect(sched.status).toBe(200);
+    expect(sched.body.status).toBe("scheduled");
+    expect(sched.body.task.harnessState.scheduledSwitch.requestedAt).toBeGreaterThan(0);
+    expect(db.tasks.get(live)!.agent).toBe(a);
+    // A repeat request does not stack a second schedule.
+    const again = await call("POST", `/tasks/${live}/switch-account`);
+    expect(again.body.status).toBe("scheduled");
+    expect(statusLines(liveRun).filter((l) => l.includes("scheduled for the end of this turn"))).toHaveLength(1);
+
+    const cancelled = await call("DELETE", `/tasks/${live}/switch-account`);
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.body.cancelled).toBe(true);
+    expect(cancelled.body.task.harnessState?.scheduledSwitch ?? null).toBeNull();
+    expect(statusLines(liveRun).some((l) => l.includes("scheduled account switch cancelled"))).toBe(true);
+    const noop = await call("DELETE", `/tasks/${live}/switch-account`);
+    expect(noop.status).toBe(200);
+    expect(noop.body.cancelled).toBe(false);
+    expect(statusLines(liveRun).filter((l) => l.includes("scheduled account switch cancelled"))).toHaveLength(1);
+    for (const id of [idle, live]) db.tasks.delete(id);
+  }, 60_000);
+
+  test.skipIf(IS_ROOT)("switch-account: the CLI token is path-gated on the task's account AND every other member (403 path-not-accessible, nothing moved); DELETE touches no files and is not gated", async () => {
+    const cliToken = (await import("./api-config.ts")).CLI_TOKEN;
+    const a = makeAccount("ga");
+    const b = makeAccount("gb");
+    await makeStack([a, b], "swgate");
+    const unlock = lockHome(b);
+    const t = seedTaskRow({ agent: a });
+    try {
+      const denied = await call("POST", `/tasks/${t}/switch-account`, undefined, cliToken);
+      expect(denied.status).toBe(403);
+      expect(denied.body.code).toBe("path-not-accessible");
+      expect(db.tasks.get(t)!.agent).toBe(a);
+      expect(db.tasks.get(t)!.harnessState?.scheduledSwitch ?? null).toBeNull();
+      // Refusals that need no file (archived) come before the gate; the cancel route has no gate.
+      expect((await call("DELETE", `/tasks/${t}/switch-account`, undefined, cliToken)).status).toBe(200);
+      // A task OUTSIDE the stack whose own root is locked is gated on that root.
+      const loneId = (() => {
+        const id = makeAccount("gl");
+        lockHome(id);
+        return id;
+      })();
+      const lone = seedTaskRow({ agent: loneId });
+      const loneDenied = await call("POST", `/tasks/${lone}/switch-account`, undefined, cliToken);
+      expect(loneDenied.status).toBe(403);
+      db.tasks.delete(lone);
+      unlock();
+      const ok = await call("POST", `/tasks/${t}/switch-account`, undefined, cliToken);
+      expect(ok.status).toBe(200);
+      expect(ok.body.status).toBe("switched");
+    } finally {
+      db.tasks.delete(t);
+    }
+  }, 60_000);
+
+  // ---- finding 19: the idle timeout is lifted -----------------------------
+
+  test("finding 19: a same-stack PATCH, switch-account, preview and restore lift the idle timeout (timeout(req, 0)); a plain PATCH does not", async () => {
+    const a = makeAccount("ta");
+    const b = makeAccount("tb");
+    const stack = await makeStack([a, b], "timeouts");
+    const hits = (method: string, p: string) => timeoutCalls.filter((c) => c.method === method && c.path === p);
+
+    const t = seedTaskRow({ agent: a });
+    const patchPath = `/tasks/${t}`;
+    // A plain PATCH never reaches the lift.
+    expect((await call("PATCH", patchPath, { title: "renamed" })).status).toBe(200);
+    expect(hits("PATCH", patchPath)).toHaveLength(0);
+    // The same-stack switch does, and with 0 (no idle cap).
+    const sw = await call("PATCH", patchPath, { agent: b });
+    expect(sw.status).toBe(200);
+    expect(db.tasks.get(t)!.agent).toBe(b);
+    expect(hits("PATCH", patchPath).map((c) => c.sec)).toEqual([0]);
+
+    const t2 = seedTaskRow({ agent: a });
+    expect((await call("POST", `/tasks/${t2}/switch-account`)).status).toBe(200);
+    expect(hits("POST", `/tasks/${t2}/switch-account`).map((c) => c.sec)).toEqual([0]);
+
+    expect((await call("POST", "/harness-stacks/mirror-preview", { kind: "claude-code", members: [a, b], stackId: stack })).status).toBe(200);
+    expect(hits("POST", "/harness-stacks/mirror-preview").map((c) => c.sec)).toContain(0);
+    expect((await call("POST", `/harnesses/${a}/mirror-restore`)).status).toBe(200);
+    expect(hits("POST", `/harnesses/${a}/mirror-restore`).map((c) => c.sec)).toEqual([0]);
+    for (const id of [t, t2]) db.tasks.delete(id);
+  }, 60_000);
+});
+
+/** `readdirSync`, or null when the directory is absent. */
+function readdirSyncSafe(dir: string): string[] | null {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return null;
+  }
+}

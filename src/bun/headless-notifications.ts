@@ -240,7 +240,9 @@ export function headlessNotificationFor(
     case "harness-swap": {
       return {
         title: "Account switched",
-        body: `${describe} — ${ev.fromLabel} → ${ev.toLabel} (${ev.position}/${ev.count})`,
+        // Same rule as `stackPositionText`: no position for a stack with
+        // fewer than two accounts.
+        body: `${describe} — ${ev.fromLabel} → ${ev.toLabel}${ev.count >= 2 ? ` (${ev.position}/${ev.count})` : ""}`,
         taskId,
         kind: "harness-swap",
       };

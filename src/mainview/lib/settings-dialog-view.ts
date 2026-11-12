@@ -4,20 +4,30 @@ import type { HarnessTemplate } from "../../shared/types.ts";
 export const SETTINGS_SECTIONS = [
   { id: "general", label: "General" },
   { id: "harnesses", label: "Harnesses" },
-  { id: "stacks", label: "Stacks" },
   { id: "agents", label: "Agents" },
   { id: "pipelines", label: "Pipelines" },
   { id: "git", label: "Git Integration" },
   { id: "prompts", label: "Saved Prompts" },
 ] as const;
 
-export type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
+/**
+ * `"stacks"` is no longer a sidebar entry: stacks live on the Harnesses page
+ * (owner decision D19). The id stays accepted as a deep link and
+ * `openSection` maps it to Harnesses.
+ */
+export type SidebarSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
+export type SettingsSectionId = SidebarSectionId | "stacks";
+
+/** The sidebar section a (possibly legacy) section id lands on. */
+export function resolveSectionId(section: SettingsSectionId): SidebarSectionId {
+  return section === "stacks" ? "harnesses" : section;
+}
 
 /**
  * Discriminated-union view state for the Settings dialog's content pane,
  * mirroring `GitHubDialogView` in `github-dialog-view.ts` — "section" is one
  * of the sidebar sections (General/Harnesses/Agents/Git Integration/Saved
- * Prompts — see `SETTINGS_SECTIONS`), "templates" is the Add-harness
+ * Prompts — see `SETTINGS_SECTIONS`; stacks are cards on Harnesses), "templates" is the Add-harness
  * template picker, "editor" is the harness create/edit form, and
  * "agent-editor" is the agent-profile create/edit form (`profileId` is null
  * when creating; a null `profileId` with a `duplicateFromId` means "create
@@ -27,11 +37,12 @@ export type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
  * replacement.
  */
 export type SettingsView =
-  | { kind: "section"; section: SettingsSectionId }
+  | { kind: "section"; section: SidebarSectionId }
   | { kind: "templates" }
   | { kind: "editor"; harnessId: string | null; template: HarnessTemplate }
   | { kind: "agent-editor"; profileId: string | null; duplicateFromId: string | null }
-  | { kind: "stack-editor"; stackId: string | null };
+  | { kind: "stack-editor"; stackId: string | null }
+  | { kind: "stack-history"; stackId: string };
 
 /** The view shown every time the dialog opens — always General, no persistence. */
 export function initialView(): SettingsView {
@@ -40,7 +51,7 @@ export function initialView(): SettingsView {
 
 /** Navigate to a sidebar section. */
 export function openSection(section: SettingsSectionId): SettingsView {
-  return { kind: "section", section };
+  return { kind: "section", section: resolveSectionId(section) };
 }
 
 /** Navigate to the Add-harness template picker. */
@@ -56,6 +67,11 @@ export function openEditor(harnessId: string | null, template: HarnessTemplate):
 /** Navigate to the stack editor — `stackId` is null when creating. */
 export function openStackEditor(stackId: string | null): SettingsView {
   return { kind: "stack-editor", stackId };
+}
+
+/** Navigate to one stack's swap history. */
+export function openStackHistory(stackId: string): SettingsView {
+  return { kind: "stack-history", stackId };
 }
 
 /**
@@ -91,7 +107,8 @@ export function backFromSubview(view: SettingsView): SettingsView {
     case "agent-editor":
       return { kind: "section", section: "agents" };
     case "stack-editor":
-      return { kind: "section", section: "stacks" };
+    case "stack-history":
+      return { kind: "section", section: "harnesses" };
     default: {
       const _exhaustive: never = view;
       return _exhaustive;
@@ -104,7 +121,7 @@ export function backFromSubview(view: SettingsView): SettingsView {
  * subviews have no sidebar entry of their own, so they highlight the section
  * they are reached from: templates/editor → Harnesses, agent-editor → Agents.
  */
-export function activeSection(view: SettingsView): SettingsSectionId {
+export function activeSection(view: SettingsView): SidebarSectionId {
   switch (view.kind) {
     case "section":
       return view.section;
@@ -114,7 +131,8 @@ export function activeSection(view: SettingsView): SettingsSectionId {
     case "agent-editor":
       return "agents";
     case "stack-editor":
-      return "stacks";
+    case "stack-history":
+      return "harnesses";
     default: {
       const _exhaustive: never = view;
       return _exhaustive;
@@ -136,6 +154,7 @@ export function resolveEscape(view: SettingsView): "pop" | "close" {
     case "editor":
     case "agent-editor":
     case "stack-editor":
+    case "stack-history":
       return "pop";
     default: {
       const _exhaustive: never = view;
@@ -158,6 +177,7 @@ export function isFormSubpage(view: SettingsView): boolean {
       return true;
     case "section":
     case "templates":
+    case "stack-history":
       return false;
     default: {
       const _exhaustive: never = view;

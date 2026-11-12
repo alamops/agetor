@@ -1,9 +1,9 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
-import type { Task, RunEvent, HarnessStack } from "../../shared/types.ts";
+import type { Task, RunEvent, HarnessLimitState, HarnessStack } from "../../shared/types.ts";
 import { FX_RECOVERY_STATUS_PREFIX, HARNESS_SWAP_STATUS_PREFIX, commitPushPrompt, isInternalStatusSentinel } from "../../shared/types.ts";
-import { formatHarnessSwapNotice, parseHarnessSwapNotice } from "../../shared/harness-stack.ts";
+import { formatHarnessSwapNotice, parseHarnessSwapNotice, stackPositionText } from "../../shared/harness-stack.ts";
 import {
   fxAutoResumeCountdownText,
   fxRecoveryNoticeText,
@@ -26,6 +26,7 @@ import {
 } from "../../shared/sent-files.ts";
 import { useTasks } from "./useTasks.ts";
 import { useHarnessStacks } from "./useHarnessStacks.ts";
+import { stackMarkers } from "../stack-display.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
 import { useGlobalEvents, type Toast } from "./useGlobalEvents.ts";
@@ -100,8 +101,8 @@ export function activeAccountLine(
   const index = stack.members.findIndex((m) => m.harnessId === task.agent);
   if (index < 0) return null;
   const member = stack.members[index]!;
-  if (stack.members.length < 2) return member.label;
-  return `${member.label} · ${index + 1}/${stack.members.length}`;
+  const position = stackPositionText(stack, task.agent);
+  return position === null ? member.label : `${member.label} · ${position}`;
 }
 
 export function Dashboard({
@@ -115,7 +116,7 @@ export function Dashboard({
 }) {
   const { exit } = useApp();
   const tasks = useTasks(client);
-  const stacks = useHarnessStacks(client);
+  const { stacks, limitStates } = useHarnessStacks(client);
   // Pipeline parents whose step rows are currently shown inline (`p`
   // toggles) — hidden by default, same as the board and `agetor ls`, since
   // steps are an implementation detail of the parent (D11); expanding one
@@ -542,6 +543,7 @@ export function Dashboard({
               now={now}
               expanded={expandedParents.has(selected.id)}
               stacks={stacks}
+              limitStates={limitStates}
             />
           ) : (
             <Box flexDirection="column">
@@ -687,6 +689,7 @@ function Detail({
   now,
   expanded,
   stacks,
+  limitStates,
 }: {
   task: Task;
   events: RunEvent[];
@@ -695,6 +698,8 @@ function Detail({
   expanded: boolean;
   /** Harness-account stacks for the active-account line (`label · 2/3`). */
   stacks: readonly HarnessStack[];
+  /** Cooldown rows for the header's cooling marker. */
+  limitStates: readonly HarnessLimitState[];
 }) {
   // One pass over the visible window pairs every `SendUserFile` tool_use
   // with its (possibly not-yet-arrived) tool_result and formats the result
@@ -735,12 +740,23 @@ function Detail({
   const showResumeHint = isTaskFxPaused(task);
   const autoResume = task.fxRecovery?.autoResume;
   const account = activeAccountLine(task, stacks);
+  const markers = stackMarkers(
+    task,
+    stacks.find((st) => st.members.some((m) => m.harnessId === task.agent)),
+    limitStates,
+  );
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">
         <Text bold>{escapeFreeText(task.title)}</Text> <Text dimColor>{task.id.slice(0, 8)}</Text>{" "}
         <Text color={columnColor(task.column)}>{task.column}</Text>
         {account ? <Text dimColor> · {escapeControlChars(account)}</Text> : null}
+        {markers.exhausted ? <Text color="yellow"> · {markers.exhausted}</Text> : null}
+        {markers.retrying ? <Text color="yellow"> · {markers.retrying}</Text> : null}
+        {markers.cooling ? <Text color="yellow"> · ⏳ cooling</Text> : null}
+        {markers.scheduledSwitch ? (
+          <Text color="cyan"> · ⇄ switching to the next account at the end of this turn</Text>
+        ) : null}
         {task.pendingInteractionCount > 0 ? (
           <Text color="yellow"> · ! press g to answer</Text>
         ) : null}

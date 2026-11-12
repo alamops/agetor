@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { AgetorClient } from "../api-client.ts";
-import type { HarnessStack } from "../../shared/types.ts";
+import type { HarnessLimitState, HarnessStack } from "../../shared/types.ts";
 
 /**
  * Poll the harness-account stacks for the TUI's active-account line. Stacks
@@ -11,8 +11,11 @@ import type { HarnessStack } from "../../shared/types.ts";
  * Optional by design: older daemons have no stacks route and a partial test
  * client may not implement it, in which case the line simply stays off.
  */
-export function useHarnessStacks(client: AgetorClient, intervalMs = 10_000): HarnessStack[] {
-  const [stacks, setStacks] = useState<HarnessStack[]>([]);
+export function useHarnessStacks(
+  client: AgetorClient,
+  intervalMs = 10_000,
+): { stacks: HarnessStack[]; limitStates: HarnessLimitState[] } {
+  const [data, setData] = useState<{ stacks: HarnessStack[]; limitStates: HarnessLimitState[] }>({ stacks: [], limitStates: [] });
   useEffect(() => {
     let alive = true;
     // Single-flight: a slow route must not stack overlapping polls (the
@@ -26,7 +29,7 @@ export function useHarnessStacks(client: AgetorClient, intervalMs = 10_000): Har
       inFlight = true;
       try {
         const payload = await list.call(client);
-        if (alive) setStacks(payload?.stacks ?? []);
+        if (alive) setData({ stacks: payload?.stacks ?? [], limitStates: payload?.limitStates ?? [] });
       } catch {
         /* transient — keep the last good list */
       } finally {
@@ -40,5 +43,5 @@ export function useHarnessStacks(client: AgetorClient, intervalMs = 10_000): Har
       clearInterval(id);
     };
   }, [client, intervalMs]);
-  return stacks;
+  return data;
 }

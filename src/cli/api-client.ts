@@ -15,6 +15,11 @@ import type {
   HarnessStack,
   HarnessStackInput,
   HarnessStackWarning,
+  HarnessQuota,
+  HarnessSwapHistoryPage,
+  MirrorPreview,
+  MirrorRestoreResult,
+  SwitchAccountResult,
   AgentKind,
   AgentProfile,
   BranchInfo,
@@ -169,6 +174,20 @@ export async function discoverCore(dataDir?: string): Promise<CoreInfo | null> {
   return (await probeLiveCore(creds)) ? creds : null;
 }
 
+/** A switch whose answer never arrived may still have happened on the core
+ *  (the transcript copy outlives the connection), so say so rather than let
+ *  the caller blindly retry. Other errors pass through unchanged. */
+function switchMayHaveLanded(e: unknown, taskId: string): unknown {
+  if (e instanceof ApiError && e.status === 0) {
+    return new ApiError(
+      0,
+      e.body,
+      `${e.message} — the switch may have gone through; check 'agetor show ${taskId}' before retrying`,
+    );
+  }
+  return e;
+}
+
 /** Thin typed client over the localhost HTTP API. One per discovered core. */
 export class AgetorClient {
   readonly base: string;
@@ -228,18 +247,45 @@ export class AgetorClient {
     return this.req("GET", "/tasks");
   }
   getTask(id: string): Promise<Task> {
-    return this.req("GET", `/tasks/${id}`);
+    return this.req("GET", `/tasks/${encodeURIComponent(id)}`);
   }
   // POST/PATCH/archive return the bare Task on success; errors come back as
   // 4xx and surface as a thrown ApiError from `req`.
   createTask(input: CreateTaskInput): Promise<Task> {
     return this.req("POST", "/tasks", input);
   }
-  patchTask(id: string, patch: PatchTaskInput): Promise<Task> {
-    return this.req("PATCH", `/tasks/${id}`, patch);
+  /** An `agent` change may be a same-stack account switch, which mirrors
+   *  config and copies the transcript inline with the server's idle timeout
+   *  off: it gets {@link HARNESS_STACK_MIRROR_TIMEOUT_MS}, and a transport
+   *  failure may land after the switch, so the error says to check the task. */
+  async patchTask(id: string, patch: PatchTaskInput): Promise<Task> {
+    const path = `/tasks/${encodeURIComponent(id)}`;
+    if (patch.agent === undefined) return this.req("PATCH", path, patch);
+    try {
+      return await this.req<Task>("PATCH", path, patch, HARNESS_STACK_MIRROR_TIMEOUT_MS);
+    } catch (e) {
+      throw switchMayHaveLanded(e, id);
+    }
+  }
+  /** `POST /tasks/:id/switch-account` — next account now (idle) or after the
+   *  turn (live run). A 409 refusal carries a `SwitchAccountRefusal` body. */
+  async switchTaskAccount(taskId: string): Promise<SwitchAccountResult> {
+    try {
+      return await this.req<SwitchAccountResult>(
+        "POST",
+        `/tasks/${encodeURIComponent(taskId)}/switch-account`,
+        undefined,
+        HARNESS_STACK_MIRROR_TIMEOUT_MS,
+      );
+    } catch (e) {
+      throw switchMayHaveLanded(e, taskId);
+    }
+  }
+  cancelScheduledAccountSwitch(taskId: string): Promise<{ task: Task; cancelled?: boolean }> {
+    return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/switch-account`);
   }
   deleteTask(id: string): Promise<void> {
-    return this.req("DELETE", `/tasks/${id}`);
+    return this.req("DELETE", `/tasks/${encodeURIComponent(id)}`);
   }
   /** Which branches `deleteTask` would remove (`task.branch`, plus the branch a
    *  drifted worktree is actually on, after the default-branch / PR-head /
@@ -261,7 +307,7 @@ export class AgetorClient {
   startTask(
     id: string,
   ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true }> {
-    return this.req("POST", `/tasks/${id}/start`, undefined, START_TIMEOUT_MS);
+    return this.req("POST", `/tasks/${encodeURIComponent(id)}/start`, undefined, START_TIMEOUT_MS);
   }
   listClaudeSessions(): Promise<ClaudeSessionSummaryList> {
     return this.req("GET", "/claude-sessions", undefined, CLAUDE_SESSIONS_TIMEOUT_MS);
@@ -295,19 +341,19 @@ export class AgetorClient {
     return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/opencode-session/retry`, undefined, CLONE_TIMEOUT_MS);
   }
   archiveTask(id: string): Promise<Task> {
-    return this.req("POST", `/tasks/${id}/archive`);
+    return this.req("POST", `/tasks/${encodeURIComponent(id)}/archive`);
   }
   unarchiveTask(id: string): Promise<Task> {
-    return this.req("POST", `/tasks/${id}/unarchive`);
+    return this.req("POST", `/tasks/${encodeURIComponent(id)}/unarchive`);
   }
   getRuns(id: string): Promise<Run[]> {
-    return this.req("GET", `/tasks/${id}/runs`);
+    return this.req("GET", `/tasks/${encodeURIComponent(id)}/runs`);
   }
   getDiff(id: string): Promise<TaskDiff> {
-    return this.req("GET", `/tasks/${id}/diff`);
+    return this.req("GET", `/tasks/${encodeURIComponent(id)}/diff`);
   }
   getGitStatus(id: string): Promise<TaskGitStatus> {
-    return this.req("GET", `/tasks/${id}/git-status`);
+    return this.req("GET", `/tasks/${encodeURIComponent(id)}/git-status`);
   }
 
   // ── runs ─────────────────────────────────────────────────────────────────
@@ -325,18 +371,18 @@ export class AgetorClient {
     unresolvedRefs?: string[];
     pending?: true;
   }> {
-    return this.req("POST", `/runs/${runId}/input`, { line });
+    return this.req("POST", `/runs/${encodeURIComponent(runId)}/input`, { line });
   }
   cancelRun(runId: string): Promise<{ ok?: boolean; cancelled?: boolean }> {
-    return this.req("POST", `/runs/${runId}/cancel`);
+    return this.req("POST", `/runs/${encodeURIComponent(runId)}/cancel`);
   }
   rebuildEvents(runId: string): Promise<{ events: RunEvent[]; reason?: string }> {
-    return this.req("GET", `/runs/${runId}/rebuild-events`);
+    return this.req("GET", `/runs/${encodeURIComponent(runId)}/rebuild-events`);
   }
 
   // ── interactions (needs-answer) ────────────────────────────────────────────
   pendingInteractions(taskId: string): Promise<AnyRequest[]> {
-    return this.req("GET", `/tasks/${taskId}/interactions/pending`);
+    return this.req("GET", `/tasks/${encodeURIComponent(taskId)}/interactions/pending`);
   }
   /** `{ skip: true }` skips the card. `message` is the reason an OpenCode
    *  skip may carry (the core refuses it elsewhere); omitted ⇒ none. */
@@ -345,18 +391,18 @@ export class AgetorClient {
     answers: AskQuestionsAnswer["answers"] | { skip: true; message?: string },
   ): Promise<{ ok: boolean; error?: string }> {
     if (!Array.isArray(answers)) {
-      return this.req("POST", `/ask-questions/${id}/answer`, {
+      return this.req("POST", `/ask-questions/${encodeURIComponent(id)}/answer`, {
         skip: true,
         ...(answers.message !== undefined ? { message: answers.message } : {}),
       });
     }
-    return this.req("POST", `/ask-questions/${id}/answer`, { answers });
+    return this.req("POST", `/ask-questions/${encodeURIComponent(id)}/answer`, { answers });
   }
   answerTmuxPrompt(
     id: string,
     body: { key?: string; reject?: boolean },
   ): Promise<{ ok: boolean; error?: string }> {
-    return this.req("POST", `/tmux-prompts/${id}/answer`, body);
+    return this.req("POST", `/tmux-prompts/${encodeURIComponent(id)}/answer`, body);
   }
   /** `message` is the reason an OpenCode card's `reject` may carry; the core
    *  refuses it with any other option and on any other harness's card. */
@@ -364,7 +410,7 @@ export class AgetorClient {
     id: string,
     body: { optionId: string; message?: string } | { cancel: true },
   ): Promise<{ ok: boolean }> {
-    return this.req("POST", `/fx-permissions/${id}/answer`, body);
+    return this.req("POST", `/fx-permissions/${encodeURIComponent(id)}/answer`, body);
   }
   /** Continue an fx response a Vercel AI Gateway rate limit (or another
    *  recoverable provider error) paused mid-turn — `docs/plans/
@@ -571,7 +617,7 @@ export class AgetorClient {
     return this.req("GET", "/harness-stacks");
   }
   getHarnessStack(id: string): Promise<{ stack: HarnessStack; limitStates: HarnessLimitState[] }> {
-    return this.req("GET", `/harness-stacks/${id}`);
+    return this.req("GET", `/harness-stacks/${encodeURIComponent(id)}`);
   }
   /** Saves the stack, then mirrors the primary's config inline — see
    *  {@link HARNESS_STACK_MIRROR_TIMEOUT_MS}. A transport failure (no answer
@@ -582,7 +628,7 @@ export class AgetorClient {
   }
   /** Same budget and transport-failure wording as {@link createHarnessStack}. */
   patchHarnessStack(id: string, patch: Partial<HarnessStackInput>): Promise<{ stack: HarnessStack; warnings: HarnessStackWarning[]; mirror: { copied: string[]; warnings: string[] } }> {
-    return this.stackWrite("PATCH", `/harness-stacks/${id}`, patch);
+    return this.stackWrite("PATCH", `/harness-stacks/${encodeURIComponent(id)}`, patch);
   }
   private async stackWrite<T>(method: "POST" | "PATCH", path: string, body: unknown): Promise<T> {
     try {
@@ -598,23 +644,79 @@ export class AgetorClient {
       throw e;
     }
   }
+  /** One page of a stack's swap history, newest first; `before` is the
+   *  previous page's `nextCursor`. */
+  getHarnessStackHistory(
+    id: string,
+    opts: { limit?: number; before?: string | null } = {},
+  ): Promise<HarnessSwapHistoryPage> {
+    const qs = new URLSearchParams();
+    if (opts.limit !== undefined) qs.set("limit", String(opts.limit));
+    if (opts.before) qs.set("before", opts.before);
+    const q = qs.toString();
+    return this.req("GET", `/harness-stacks/${encodeURIComponent(id)}/history` + (q ? `?${q}` : ""));
+  }
+  /** Dry run of a stack save. Walks the primary's config tree, so it gets the
+   *  long mirror budget. */
+  previewHarnessMirror(draft: {
+    kind: HarnessStackInput["kind"];
+    members: string[];
+    mirrorMode?: HarnessStackInput["mirrorMode"];
+    stackId?: string;
+  }): Promise<MirrorPreview> {
+    return this.req("POST", "/harness-stacks/mirror-preview", draft, HARNESS_STACK_MIRROR_TIMEOUT_MS);
+  }
+  /** Put an account's mirror backups back. */
+  async restoreHarnessMirror(id: string): Promise<MirrorRestoreResult> {
+    try {
+      return await this.req<MirrorRestoreResult>(
+        "POST",
+        `/harnesses/${encodeURIComponent(id)}/mirror-restore`,
+        undefined,
+        HARNESS_STACK_MIRROR_TIMEOUT_MS,
+      );
+    } catch (e) {
+      // A restore whose answer never arrived may still have run on the core.
+      if (e instanceof ApiError && e.status === 0) {
+        throw new ApiError(
+          0,
+          e.body,
+          `${e.message} — the restore may have gone through; re-running it is safe (restored items are skipped)`,
+        );
+      }
+      throw e;
+    }
+  }
+  /** Clear an account's cooldown rows (all, or only `model`'s). */
+  clearHarnessCooldown(
+    id: string,
+    opts?: { model?: string | null; accountWideOnly?: boolean } | string,
+  ): Promise<{ cleared: true; rearmed?: number; limitStates: HarnessLimitState[] }> {
+    const o = typeof opts === "string" ? { model: opts } : opts ?? {};
+    const qs = o.model ? `?model=${encodeURIComponent(o.model)}` : o.accountWideOnly ? "?scope=account" : "";
+    return this.req("DELETE", `/harnesses/${encodeURIComponent(id)}/limit-state${qs}`);
+  }
+  /** `GET /usage` — the latest quota snapshot per account. */
+  getUsage(): Promise<HarnessQuota[]> {
+    return this.req("GET", "/usage");
+  }
   deleteHarnessStack(id: string): Promise<{ removed: true }> {
-    return this.req("DELETE", `/harness-stacks/${id}`);
+    return this.req("DELETE", `/harness-stacks/${encodeURIComponent(id)}`);
   }
   createHarness(input: CreateHarnessInput): Promise<Harness> {
     return this.req("POST", "/harnesses", input);
   }
   patchHarness(id: string, patch: HarnessPatchInput): Promise<Harness> {
-    return this.req("PATCH", `/harnesses/${id}`, patch);
+    return this.req("PATCH", `/harnesses/${encodeURIComponent(id)}`, patch);
   }
   deleteHarness(id: string): Promise<void> {
-    return this.req("DELETE", `/harnesses/${id}`);
+    return this.req("DELETE", `/harnesses/${encodeURIComponent(id)}`);
   }
   harnessUsage(id: string): Promise<HarnessUsage> {
-    return this.req("GET", `/harnesses/${id}/usage`);
+    return this.req("GET", `/harnesses/${encodeURIComponent(id)}/usage`);
   }
   harnessShellEnv(id: string): Promise<HarnessShellEnv> {
-    return this.req("GET", `/harnesses/${id}/shell-env`);
+    return this.req("GET", `/harnesses/${encodeURIComponent(id)}/shell-env`);
   }
   info(): Promise<{ version: string }> {
     return this.req("GET", "/info");
@@ -1018,6 +1120,9 @@ export interface HarnessPatchInput {
   enabled?: boolean;
   /** fx only: the "Load profile MCP servers" toggle. */
   profileMcpServers?: boolean;
+  /** Save a `home`/`env` edit even though it drops the account's
+   *  config-mirror records (otherwise 409 `mirror-records`). */
+  confirmMirrorDrop?: boolean;
 }
 
 function safeJson(text: string): unknown {

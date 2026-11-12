@@ -7,6 +7,14 @@ import {
   draftPatch,
   draftWarnings,
   emptyDraft,
+  cooldownChips,
+  formatUntil,
+  groupHarnesses,
+  guardedPatch,
+  isMirrorRelevant,
+  previewBody,
+  previewSections,
+  restoreSummary,
   memberPickerOptions,
   MIRROR_MODE_COPY,
   moveMember,
@@ -16,7 +24,7 @@ import {
 } from "./stack-editor.ts";
 import { ApiError } from "./api.ts";
 import { ApiTransitError } from "./net-retry.ts";
-import type { Harness, HarnessStack } from "../../shared/types.ts";
+import type { Harness, HarnessLimitState, HarnessStack, MirrorPreview } from "../../shared/types.ts";
 
 const harness = (id: string, kind: Harness["kind"] = "claude-code", enabled = true): Harness => ({
   id,
@@ -291,5 +299,149 @@ describe("stackSaveFailure (S21)", () => {
       reload: false,
     });
     expect(stackSaveFailure("boom")).toEqual({ message: "boom", reload: false });
+  });
+});
+
+const stack3: HarnessStack = {
+  id: "s",
+  label: "L",
+  kind: "claude-code",
+  mirrorMode: "safe",
+  members: ["a", "b"].map((id, position) => ({ harnessId: id, position, label: id, kind: "claude-code", enabled: true })),
+  createdAt: 1,
+  updatedAt: 42,
+  warnings: [],
+};
+
+describe("guardedPatch and isMirrorRelevant (D16, D10)", () => {
+  test("a changed field carries expectedUpdatedAt; no change is empty", () => {
+    const draft = draftFromStack(stack3);
+    expect(guardedPatch(stack3, { ...draft, label: "N" })).toEqual({ label: "N", expectedUpdatedAt: 42 });
+    expect(guardedPatch(stack3, draft)).toEqual({});
+  });
+
+  test("order, members and mirror mode are mirror-relevant; a rename is not", () => {
+    const draft = draftFromStack(stack3);
+    expect(isMirrorRelevant(stack3, { ...draft, label: "N" })).toBe(false);
+    expect(isMirrorRelevant(stack3, { ...draft, members: ["b", "a"] })).toBe(true);
+    expect(isMirrorRelevant(stack3, { ...draft, mirrorMode: "full" })).toBe(true);
+    expect(isMirrorRelevant(stack3, { ...draft, members: ["a"] })).toBe(false);
+  });
+
+  test("a new stack is relevant only with a backup", () => {
+    expect(isMirrorRelevant(null, { ...emptyDraft(), members: ["a"] })).toBe(false);
+    expect(isMirrorRelevant(null, { ...emptyDraft(), members: ["a", "b"] })).toBe(true);
+  });
+
+  test("previewBody carries the stack id only on an edit", () => {
+    const draft = { ...draftFromStack(stack3) };
+    expect(previewBody(draft, "s")).toEqual({ kind: "claude-code", members: ["a", "b"], mirrorMode: "safe", stackId: "s" });
+    expect(previewBody(draft, null)).not.toHaveProperty("stackId");
+  });
+});
+
+describe("previewSections", () => {
+  const preview: MirrorPreview = {
+    overwrites: true,
+    plans: [
+      {
+        harnessId: "b",
+        label: "B",
+        files: { add: ["new.md"], update: ["settings.json"], remove: ["old.md"] },
+        keys: [
+          { file: ".claude.json", key: "mcpServers.x", action: "update" },
+          { file: ".claude.json", key: "mcpServers.y", action: "add" },
+          { file: ".claude.json", key: "mcpServers.z", action: "remove" },
+        ],
+        backups: ["settings.json"],
+        kept: ["mine.md"],
+        warnings: ["w"],
+      },
+      { harnessId: "c", label: "C", files: { add: ["a"], update: [], remove: [] }, keys: [], backups: [], kept: [], warnings: [] },
+    ],
+  };
+
+  test("lists overwrites and removals only, plus backups, kept and warnings", () => {
+    const sections = previewSections(preview);
+    expect(sections).toHaveLength(1);
+    expect(sections[0]).toEqual({
+      harnessId: "b",
+      label: "B",
+      overwrites: [
+        "settings.json (overwritten)",
+        "old.md (removed)",
+        ".claude.json: mcpServers.x (overwritten)",
+        ".claude.json: mcpServers.z (removed)",
+      ],
+      backedUp: ["settings.json"],
+      kept: ["mine.md"],
+      warnings: ["w"],
+    });
+  });
+});
+
+describe("cooldownChips (D13, D14)", () => {
+  const now = new Date(2026, 10, 10, 12, 0).getTime();
+  const row = (over: Partial<HarnessLimitState>): HarnessLimitState => ({
+    harnessId: "a",
+    reason: "quota",
+    source: "claude-pane",
+    message: "You've hit your limit",
+    exhaustedUntilMs: new Date(2026, 10, 10, 14, 30).getTime(),
+    updatedAt: now,
+    model: null,
+    ...over,
+  });
+
+  test("one chip per active row, soonest first, with the model and the provider message", () => {
+    const chips = cooldownChips(
+      [
+        row({ model: "gpt-5", reason: "rate_limit", exhaustedUntilMs: new Date(2026, 10, 10, 15, 0).getTime() }),
+        row({}),
+        row({ harnessId: "b" }),
+        row({ exhaustedUntilMs: now - 1, model: "old" }),
+      ],
+      "a",
+      now,
+    );
+    expect(chips.map((c) => c.text)).toEqual([
+      "usage limit · until 14:30",
+      "rate limit · until 15:00 · for gpt-5",
+    ]);
+    expect(chips[0]!.message).toBe("You've hit your limit");
+    expect(chips[1]!.model).toBe("gpt-5");
+    expect(chips[1]!.ariaLabel).toBe("Cooling: rate limit for gpt-5, until 15:00");
+  });
+
+  test("a later day carries the date", () => {
+    expect(formatUntil(new Date(2026, 10, 12, 9, 5).getTime(), now)).toMatch(/09:05$/);
+    expect(formatUntil(new Date(2026, 10, 12, 9, 5).getTime(), now).length).toBeGreaterThan("09:05".length);
+  });
+});
+
+describe("restoreSummary (D9)", () => {
+  test("nothing to restore", () => {
+    expect(restoreSummary({ harnessId: "a", restored: [], removed: [], kept: [], warnings: [] }))
+      .toEqual({ empty: true, title: "Nothing to restore", description: "" });
+  });
+
+  test("counts and the first warnings", () => {
+    const r = restoreSummary({
+      harnessId: "a",
+      restored: ["x", "y"],
+      removed: ["z"],
+      kept: [],
+      warnings: ["w1", "w2", "w3", "w4"],
+    });
+    expect(r.empty).toBe(false);
+    expect(r.description).toBe("2 restored, 1 removed, 0 kept (edited on this account); w1; w2; w3; …and 1 more");
+  });
+});
+
+describe("groupHarnesses (D19)", () => {
+  test("stack members in stack order, then the accounts in no stack", () => {
+    const g = groupHarnesses(HARNESSES, [{ ...stack3, members: stack3.members.slice().reverse() }]);
+    expect(g.stackGroups[0]!.members.map((h) => h.id)).toEqual(["b", "a"]);
+    expect(g.others.map((h) => h.id)).toEqual(["c", "x", "off"]);
   });
 });

@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { BarChart3, ChevronLeft, Loader2, Minus, Monitor, Moon, Plus, Sun, Terminal, Trash2, X } from "lucide-react";
+import { ChevronLeft, Loader2, Minus, Monitor, Moon, Plus, Sun, X } from "lucide-react";
 import { toast } from "sonner";
-import { ApiError, api, type AccountUsageDay, type HarnessesPayload, type HarnessInput } from "@/lib/api";
+import { ApiError, api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -13,7 +13,10 @@ import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { AgentProfileForm } from "@/components/kanban/AgentProfileFormDialog";
 import { AgentProfilesSection } from "@/components/settings/AgentProfilesSection";
-import { HarnessStacksSection } from "@/components/settings/HarnessStacksSection";
+import { StackEditor } from "@/components/settings/StackEditor";
+import { HarnessesPage } from "@/components/settings/HarnessesPage";
+import { isExperimentalKind } from "@/components/settings/HarnessAccountRow";
+import { StackHistory } from "@/components/settings/StackHistory";
 import { BackgroundSection } from "@/components/settings/BackgroundSection";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { PipelinesSection } from "@/components/settings/PipelinesSection";
@@ -33,10 +36,11 @@ import {
   retentionOptionLabel,
   retentionSelectOptions,
 } from "@/lib/retention-prefs";
-import { abbreviateHome, cn, formatTokens } from "@/lib/utils";
+import { abbreviateHome, cn } from "@/lib/utils";
 import { resolveTemplateInitialHome } from "@/lib/harness-template";
 import { harnessEditorDirty } from "@/lib/harness-editor-dirty";
-import { stackPositionFor } from "@/lib/stack-badge";
+import { saveConfirmingMirrorDrop } from "@/lib/harness-edit-confirm";
+import { restoreSummary } from "@/lib/stack-editor";
 import {
   SETTINGS_SECTIONS,
   activeSection,
@@ -47,6 +51,7 @@ import {
   openEditor,
   openSection,
   openStackEditor,
+  openStackHistory,
   openTemplates,
   resolveEscape,
   type SettingsSectionId,
@@ -65,6 +70,8 @@ import {
   type DbStats,
   type DiscoveredAccount,
   type Harness,
+  type HarnessQuota,
+  type HarnessStack,
   type HarnessTemplate,
   type ThemePreference,
   CLAUDE_SESSIONS_LAUNCH_SCAN_PREF,
@@ -86,6 +93,8 @@ const THEME_PREFERENCE_ICON: Record<ThemePreference, typeof Monitor> = {
   dark: Moon,
   light: Sun,
 };
+
+const NO_USAGE: Record<string, HarnessQuota> = {};
 
 interface Props {
   open: boolean;
@@ -118,6 +127,9 @@ interface Props {
    *  `PipelinesSection`'s `onOpenPipelines` prop. The caller closes this
    *  dialog in the same callback. */
   onOpenPipelines: (id: string | null, editing: boolean) => void;
+  /** Per-harness quota snapshots, kept live by the app's `harness_usage`
+   *  event; shown as the stack members' quota meters. Never fetched here. */
+  usage?: Record<string, HarnessQuota>;
 }
 
 /**
@@ -140,13 +152,6 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
     env[k] = v;
   }
   return { env, ignored };
-}
-
-/** Kinds still marked "experimental" in the UI — surfaced with the warning
- *  badge everywhere a harness/template kind is shown. Extend this list (not
- *  the individual call sites) as a kind graduates out of experimental. */
-function isExperimentalKind(kind: AgentKind): boolean {
-  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "antigravity" || kind === "fx" || kind === "opencode" || kind === "copilot";
 }
 
 function stringifyEnv(env: Record<string, string>): string {
@@ -284,6 +289,26 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
   return `In use by ${segments.join(" and ")}`;
 }
 
+/** The view after a subpage's async save lands: back from `saved` while it is
+ *  still the view on screen, else unchanged. Compared by identity, because
+ *  every navigation makes a new view object, so a reopened editor on the same
+ *  stack is not the one that saved. */
+export function viewAfterSave(current: SettingsView, saved: SettingsView): SettingsView {
+  return current === saved ? backFromSubview(saved) : current;
+}
+
+/** StackEditor's `onSaved` for the editor rendered as `viewAtRender`. The save
+ *  may land after the user left this editor (rail click, Escape-pop, the
+ *  History subpage), so it pops only while this editor's own view is still the
+ *  one showing: the decision reads the CURRENT view through the state updater,
+ *  never the render-time one. */
+export function stackSavedHandler(
+  viewAtRender: SettingsView,
+  setView: (update: (current: SettingsView) => SettingsView) => void,
+): () => void {
+  return () => setView((current) => viewAfterSave(current, viewAtRender));
+}
+
 /** The view the modal opens on: a deep-linked agent's edit subpage, else the
  *  requested section, else General. */
 function entryView(
@@ -295,7 +320,7 @@ function entryView(
   return initialView();
 }
 
-export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection, initialAgentProfileId, onOpenPipelines }: Props) {
+export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUserMessagesChange, fxAutoResume, onFxAutoResumeChange, onChange, homeDir, dataDir, initialSection, initialAgentProfileId, onOpenPipelines, usage = NO_USAGE }: Props) {
   const [version, setVersion] = useState<string>("");
   const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
@@ -478,6 +503,93 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     }
   };
 
+  const [deletingStackId, setDeletingStackId] = useState<string | null>(null);
+
+  const onDeleteStack = async (stack: HarnessStack) => {
+    const ok = await confirm({
+      title: `Delete stack "${stack.label}"?`,
+      description:
+        "Tasks keep their current account; automatic failover stops immediately. Copied session files stay with their accounts until retention removes them. Its account-switch history is deleted too.",
+      confirmLabel: "Delete",
+      variant: "destructive",
+    });
+    if (!ok) return;
+    setDeletingStackId(stack.id);
+    try {
+      await api.deleteHarnessStack(stack.id);
+      toast.success("Stack deleted");
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      toast.error("Couldn't delete the stack", {
+        description: e instanceof Error ? e.message : String(e),
+        duration: Infinity,
+      });
+    } finally {
+      setDeletingStackId(null);
+    }
+  };
+
+  const onClearCooldown = async (h: Harness, model: string | null) => {
+    const ok = await confirm({
+      title: model
+        ? `Clear the ${model} cooldown on ${h.label}?`
+        : `Clear the account-wide cooldown on ${h.label}?`,
+      description: "The provider may still refuse until its own reset.",
+      confirmLabel: "Clear",
+    });
+    if (!ok) return;
+    try {
+      // The account-wide chip clears only the account-wide row; a per-model
+      // chip clears only that model's row.
+      const result = await api.clearHarnessCooldown(h.id, model ? { model } : { accountWideOnly: true });
+      toast.success(`Cleared the cooldown on ${h.label}`);
+      if ((result.rearmed ?? 0) > 0) toast.info("Retrying the waiting task(s) soon");
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      toast.error(`Couldn't clear the cooldown on "${h.label}"`, {
+        description: e instanceof Error ? e.message : String(e),
+        duration: Infinity,
+      });
+    }
+  };
+
+  const onRestoreMirror = async (h: Harness) => {
+    // A current backup of a real stack gets re-mirrored on the next stack
+    // save or swap, so say so before undoing it.
+    const asBackup = (payload.stacks ?? []).some(
+      (st) => st.members.length >= 2 && st.members.some((m, i) => i > 0 && m.harnessId === h.id),
+    );
+    const ok = await confirm({
+      title: `Restore pre-stack config on ${h.label}?`,
+      description: asBackup
+        ? "Puts back the files and settings the stack mirror replaced on this account, and removes what it added. This account is a backup in a stack, so the next mirror will re-apply the primary's config."
+        : "Puts back the files and settings the stack mirror replaced on this account, and removes what it added.",
+      confirmLabel: "Restore",
+      variant: "destructive",
+    });
+    if (!ok) return;
+    try {
+      const result = await api.restoreHarnessMirror(h.id);
+      const summary = restoreSummary(result);
+      if (result.warnings.length > 0) {
+        toast.warning(summary.title, { description: summary.description, duration: Infinity });
+      } else if (summary.empty) {
+        toast.info(summary.title);
+      } else {
+        toast.success(summary.title, { description: summary.description });
+      }
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      toast.error(`Couldn't restore "${h.label}"`, {
+        description: e instanceof Error ? e.message : String(e),
+        duration: Infinity,
+      });
+    }
+  };
+
   const onOpenTerminal = async (h: Harness) => {
     try {
       await api.openHarnessTerminal(h.id);
@@ -611,7 +723,9 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
           description:
             current.kind === "agent-editor"
               ? "Your edits to this agent will be lost."
-              : "Your edits to this harness will be lost.",
+              : current.kind === "stack-editor"
+                ? "Your edits to this stack will be lost."
+                : "Your edits to this harness will be lost.",
           confirmLabel: "Discard",
           variant: "destructive",
         });
@@ -659,6 +773,7 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
             {view.kind === "editor" && (view.harnessId ? "Edit harness" : "Add harness")}
             {view.kind === "agent-editor" && (view.profileId ? "Edit agent" : view.duplicateFromId ? "Duplicate agent" : "Add agent")}
             {view.kind === "stack-editor" && (view.stackId ? "Edit stack" : "New stack")}
+            {view.kind === "stack-history" && "Stack history"}
           </h2>
         </div>
         <div className="flex items-center gap-2">
@@ -720,12 +835,18 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                   );
                 case "harnesses":
                   return (
-                    <HarnessesSection
+                    <HarnessesPage
                       payload={payload}
                       statusByHarness={statusByHarness}
                       homeDir={homeDir}
                       canAdd={!!dataDir}
+                      usage={usage}
                       onAdd={() => setView(openTemplates())}
+                      onNewStack={() => setView(openStackEditor(null))}
+                      onEditStack={(id) => setView(openStackEditor(id))}
+                      onStackHistory={(id) => setView(openStackHistory(id))}
+                      onDeleteStack={onDeleteStack}
+                      deletingStackId={deletingStackId}
                       onEdit={(h) =>
                         showEditor(h.id, {
                           id: "__edit",
@@ -744,20 +865,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       pendingToggle={pendingToggle}
                       onToggleProfileMcp={onToggleProfileMcp}
                       pendingProfileMcp={pendingProfileMcp}
-                    />
-                  );
-                case "stacks":
-                  return (
-                    <HarnessStacksSection
-                      stacks={payload.stacks ?? []}
-                      limitStates={payload.limitStates ?? []}
-                      harnesses={payload.harnesses}
-                      onEdit={(id) => setView(openStackEditor(id))}
-                      onNew={() => setView(openStackEditor(null))}
-                      onChange={() => {
-                        void refresh();
-                        onChange?.();
-                      }}
+                      onClearCooldown={onClearCooldown}
+                      onRestore={onRestoreMirror}
                     />
                   );
                 case "agents":
@@ -872,22 +981,28 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
           )}
 
           {view.kind === "stack-editor" && (
-            <HarnessStacksSection
-              mode="editor"
+            <StackEditor
+              key={`${openCount}:${view.stackId ?? "new"}`}
               stackId={view.stackId}
               stacks={payload.stacks ?? []}
               limitStates={payload.limitStates ?? []}
               harnesses={payload.harnesses}
-              onEdit={(id) => setView(openStackEditor(id))}
-              onNew={() => setView(openStackEditor(null))}
               onChange={() => {
                 void refresh();
                 onChange?.();
               }}
-              onSaved={() => setView(backFromSubview(viewRef.current))}
+              onSaved={stackSavedHandler(view, setView)}
               onDirtyChange={(dirty) => {
                 subpageDirtyRef.current = dirty;
               }}
+            />
+          )}
+
+          {view.kind === "stack-history" && (
+            <StackHistory
+              key={`${openCount}:${view.stackId}`}
+              stackId={view.stackId}
+              stackLabel={(payload.stacks ?? []).find((st) => st.id === view.stackId)?.label ?? "this stack"}
             />
           )}
 
@@ -916,12 +1031,27 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                 setFormError(null);
                 try {
                   if (view.harnessId) {
-                    await api.updateHarness(view.harnessId, {
-                      label: input.label,
-                      home: input.home,
-                      bin: input.bin,
-                      env: input.env,
-                    });
+                    const harnessId = view.harnessId;
+                    const outcome = await saveConfirmingMirrorDrop(
+                      (confirmMirrorDrop) =>
+                        api.updateHarness(harnessId, {
+                          label: input.label,
+                          home: input.home,
+                          bin: input.bin,
+                          env: input.env,
+                          ...(confirmMirrorDrop ? { confirmMirrorDrop: true } : {}),
+                        }),
+                      (refusal) =>
+                        confirm({
+                          title: "Drop this account's mirror records?",
+                          description: refusal.error,
+                          confirmLabel: "Save anyway",
+                          variant: "destructive",
+                        }),
+                    );
+                    // Cancelled: nothing was saved; the editor stays open
+                    // with the draft as typed.
+                    if (outcome === "cancelled") return;
                   } else {
                     await api.createHarness(input);
                   }
@@ -1467,302 +1597,6 @@ function GeneralSection({
           Bring back the onboarding checklist.
         </p>
       </section>
-    </div>
-  );
-}
-
-function HarnessesSection({
-  payload,
-  statusByHarness,
-  homeDir,
-  canAdd,
-  onAdd,
-  onEdit,
-  onDelete,
-  onToggleEnabled,
-  onOpenTerminal,
-  pendingToggle,
-  onToggleProfileMcp,
-  pendingProfileMcp,
-}: {
-  payload: HarnessesPayload;
-  statusByHarness: Map<string, HarnessesPayload["statuses"][number]>;
-  homeDir: string;
-  /** False while `dataDir` is still loading from `GET /defaults`. Adding a
-   *  harness with an unresolved data dir would persist a broken HOME path
-   *  (`/harnesses/claude-2` instead of `<dataDir>/harnesses/claude-2`). */
-  canAdd: boolean;
-  onAdd: () => void;
-  onEdit: (h: Harness) => void;
-  onDelete: (h: Harness) => void;
-  onToggleEnabled: (h: Harness) => void;
-  /** Open a new Terminal.app window with this harness's env loaded so the
-   *  user can authenticate or inspect it (e.g. `claude /login`). */
-  onOpenTerminal: (h: Harness) => void;
-  /** Optimistic toggle state — keyed by harness id, value is what the user
-   *  clicked toward. Lets the Switch animate before the confirm/round-trip
-   *  resolves. Missing keys mean "use the server's `h.enabled`". */
-  pendingToggle: Record<string, boolean>;
-  /** fx only: flip `profileMcpServers` (PATCH, optimistic). */
-  onToggleProfileMcp: (h: Harness, next: boolean) => void;
-  /** Optimistic `profileMcpServers` values, keyed by harness id. Missing keys
-   *  mean "use the server's value" (absent ⇒ on). */
-  pendingProfileMcp: Record<string, boolean>;
-}) {
-  // Which harness's account-usage panel is expanded (at most one at a time).
-  // Local to this section: the table fetches on expand, and the scan behind
-  // it stats every transcript file — never fetched with the list.
-  const [usageOpenFor, setUsageOpenFor] = useState<string | null>(null);
-  // The `n/m` chip per account. `stackPositionFor` owns the "fewer than two
-  // members → no chip" rule (via the shared `stackPositionText`): a
-  // one-account stack cannot fail over, so it gets no `1/1` chip.
-  const stacks = payload.stacks ?? [];
-  const coolingByHarness = new Map((payload.limitStates ?? []).map((s) => [s.harnessId, s] as const));
-  return (
-    <div className="space-y-4 pt-3 text-sm">
-      <section className="space-y-2">
-        <div className="flex items-center justify-between">
-          <label className="text-xs text-muted-foreground">Harnesses</label>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onAdd}
-            disabled={!canAdd}
-            title={canAdd ? undefined : "Loading defaults…"}
-          >
-            <Plus className="mr-1 size-3.5" /> Add harness
-          </Button>
-        </div>
-        <div className="space-y-1.5">
-          {payload.harnesses.map((h) => {
-            const status = statusByHarness.get(h.id);
-            const available = status?.available ?? false;
-            const stackAt = stackPositionFor(stacks, h.id);
-            return (
-              <div
-                key={h.id}
-                className={cn(
-                  "space-y-1.5 rounded-md border border-border/60 px-3 py-2",
-                  !h.enabled && "opacity-60",
-                )}
-              >
-              <div className="flex items-center gap-2">
-                <AgentIcon kind={h.kind} className="size-4 shrink-0" />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate font-medium">{h.label}</span>
-                    {h.isBuiltin && (
-                      <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
-                        built-in
-                      </span>
-                    )}
-                    {!h.enabled && (
-                      <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
-                        disabled
-                      </span>
-                    )}
-                    {isExperimentalKind(h.kind) && (
-                      <span className="rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning">
-                        experimental
-                      </span>
-                    )}
-                    {status?.loggedIn === false && (
-                      <span
-                        className="rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning"
-                        title={status.authHelp ?? "Not logged in"}
-                      >
-                        not logged in
-                      </span>
-                    )}
-                    {stackAt && (
-                      <span
-                        data-testid="harness-stack-chip"
-                        className="rounded border border-info/40 px-1.5 py-0.5 text-[10px] font-medium text-info"
-                        title="Harness account stack — fails over to the next account at its limit"
-                      >
-                        {stackAt.text}
-                      </span>
-                    )}
-                    {coolingByHarness.has(h.id) && (
-                      <span
-                        data-testid="harness-cooling-chip"
-                        className="rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning"
-                        title={`Cooling until ${new Date(coolingByHarness.get(h.id)!.exhaustedUntilMs).toLocaleString()}`}
-                      >
-                        cooling
-                      </span>
-                    )}
-                    <span
-                      className={cn(
-                        "inline-block size-1.5 rounded-full",
-                        available ? "bg-success-solid" : "bg-danger-solid",
-                      )}
-                      title={status?.reason ?? status?.path ?? ""}
-                    />
-                  </div>
-                  <div className="truncate text-[11px] text-muted-foreground">
-                    {h.id} · {h.kind}
-                    {h.home && <> · HOME={abbreviateHome(h.home, homeDir)}</>}
-                    {status?.version && <> · {status.version}</>}
-                  </div>
-                  {status?.loggedIn === false && status.authHelp && (
-                    <div className="truncate text-[11px] text-warning" title={status.authHelp}>
-                      {status.authHelp}
-                    </div>
-                  )}
-                  {/* Neutral, non-blocking lines (D-16): a missing login or
-                      an available upgrade never stops a run. */}
-                  {status?.notices?.map((notice) => (
-                    <div
-                      key={notice}
-                      data-testid="harness-status-notice"
-                      className="text-[11px] text-muted-foreground"
-                    >
-                      {notice}
-                    </div>
-                  ))}
-                </div>
-                <Switch
-                  checked={pendingToggle[h.id] ?? h.enabled}
-                  onCheckedChange={() => onToggleEnabled(h)}
-                  aria-label={h.enabled ? `Disable ${h.label}` : `Enable ${h.label}`}
-                />
-                {/* claude-code only: no other kind has a local usage source
-                    wired yet, and the route 400s for them. */}
-                {h.kind === "claude-code" && (
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    onClick={() => setUsageOpenFor((cur) => (cur === h.id ? null : h.id))}
-                    aria-label={`${usageOpenFor === h.id ? "Hide" : "Show"} token usage for ${h.label}`}
-                    aria-expanded={usageOpenFor === h.id}
-                    title="Token usage — this account's local 30-day rollup"
-                  >
-                    <BarChart3 className="size-4" />
-                  </Button>
-                )}
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  onClick={() => onOpenTerminal(h)}
-                  aria-label={`Open ${h.label} in Terminal`}
-                  title="Open in Terminal — load this harness's env to log in or inspect it"
-                >
-                  <Terminal className="size-4" />
-                </Button>
-                {!h.isBuiltin && (
-                  <>
-                    <Button size="sm" variant="ghost" onClick={() => onEdit(h)}>
-                      Edit
-                    </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      onClick={() => onDelete(h)}
-                      aria-label={`Delete ${h.label}`}
-                    >
-                      <Trash2 className="size-4" />
-                    </Button>
-                  </>
-                )}
-              </div>
-              {h.kind === "fx" && (
-                <div className="flex items-start gap-2 pl-6">
-                  <div className="min-w-0 flex-1">
-                    <div className="text-xs">Load profile MCP servers</div>
-                    <div className="text-[11px] text-muted-foreground">
-                      Loads the MCP servers from your own fx profile into each
-                      task's session (fx 0.0.13 or later).
-                    </div>
-                  </div>
-                  <Switch
-                    data-testid="harness-profile-mcp-toggle"
-                    checked={pendingProfileMcp[h.id] ?? h.profileMcpServers !== false}
-                    onCheckedChange={(next) => onToggleProfileMcp(h, next)}
-                    aria-label={`Load profile MCP servers for ${h.label}`}
-                  />
-                </div>
-              )}
-              {h.kind === "fx" && status?.fxProfilePermissionMode === "ask" && (
-                <div
-                  data-testid="harness-fx-ask-hint"
-                  className="pl-6 text-[11px] text-muted-foreground"
-                >
-                  fx's own profile starts in Ask mode. Agetor sets each task's
-                  mode itself; to change fx's default, run{" "}
-                  <code className="rounded bg-muted px-1">/permissions</code> inside fx.
-                </div>
-              )}
-              {usageOpenFor === h.id && <AccountUsageTable harnessId={h.id} />}
-              </div>
-            );
-          })}
-        </div>
-      </section>
-    </div>
-  );
-}
-
-/**
- * Per-day, per-model token rollup for one harness's account — fetched on
- * expand, not with the list, since the scan behind it stats every transcript
- * file. Numbers come from the account's local JSONL history, so they include
- * CLI sessions outside agetor (the budget shown is the account's).
- */
-function AccountUsageTable({ harnessId }: { harnessId: string }) {
-  const [days, setDays] = useState<AccountUsageDay[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    setDays(null);
-    setError(null);
-    api.getAccountUsage(harnessId)
-      .then((p) => { if (!cancelled) setDays(p.days); })
-      .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)); });
-    return () => { cancelled = true; };
-  }, [harnessId]);
-
-  if (error) {
-    return <p className="px-1 text-[11px] text-danger">{error}</p>;
-  }
-  if (days === null) {
-    return <p className="px-1 text-[11px] text-muted-foreground">Loading usage…</p>;
-  }
-  if (days.length === 0) {
-    return (
-      <p className="px-1 text-[11px] text-muted-foreground">
-        No local usage history for this account (last 30 days).
-      </p>
-    );
-  }
-  return (
-    <div className="max-h-48 overflow-auto rounded-md border border-border/40 bg-muted/20">
-      <table className="w-full text-[11px]">
-        <thead className="sticky top-0 bg-muted/80 text-muted-foreground">
-          <tr>
-            <th className="px-2 py-1 text-left font-medium">Day</th>
-            <th className="px-2 py-1 text-left font-medium">Model</th>
-            <th className="px-2 py-1 text-right font-medium">In</th>
-            <th className="px-2 py-1 text-right font-medium">Out</th>
-            <th className="px-2 py-1 text-right font-medium">Cache w/r</th>
-            <th className="px-2 py-1 text-right font-medium">Msgs</th>
-          </tr>
-        </thead>
-        <tbody>
-          {days.map((d) => (
-            <tr key={`${d.day}:${d.model}`} className="border-t border-border/30">
-              <td className="px-2 py-1 font-mono">{d.day}</td>
-              <td className="max-w-40 truncate px-2 py-1">{d.model}</td>
-              <td className="px-2 py-1 text-right font-mono">{formatTokens(d.inputTokens)}</td>
-              <td className="px-2 py-1 text-right font-mono">{formatTokens(d.outputTokens)}</td>
-              <td className="px-2 py-1 text-right font-mono">
-                {formatTokens(d.cacheWriteTokens)}/{formatTokens(d.cacheReadTokens)}
-              </td>
-              <td className="px-2 py-1 text-right font-mono">{d.messageCount}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
     </div>
   );
 }
