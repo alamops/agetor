@@ -79,10 +79,16 @@ bun test \
   src/mainview/lib/at-scope-targets.test.ts
 bun node_modules/@playwright/test/cli.js test e2e/multi-repo-task.spec.ts
 bun node_modules/@playwright/test/cli.js test e2e/issue-task.spec.ts
+# opt-in: the real GitHub Copilot binary against an in-process fake provider (BYOK; no auth,
+# network or billing); skipped unless AGETOR_COPILOT_REAL_BIN names a copilot binary
+AGETOR_COPILOT_REAL_BIN=/path/to/copilot bun test src/bun/copilot-real-binary.test.ts
 ```
 
 The focused list is every multi-repository test file through round 15 (the files the rounds 14–15
-changes touched or added included). Playwright runs one spec at a time on this machine.
+changes touched or added included). Playwright runs one spec at a time on this machine. The
+opt-in Copilot real-binary run includes the multi-repository case added after round 15 (see
+"Post-round-15 verification"); it is not part of the focused list because it needs a downloaded
+binary.
 
 ## Results
 
@@ -397,8 +403,8 @@ spawn time.
 | claude-code | Claude Code 2.1.322 | auto / default | yes | succeeded (exit 0) in about 20 s; one `smoke` commit in each checkout; the hook installer wrote `.claude/settings.local.json` at the non-git workspace root | fake claude driver (`e2e/multi-repo-task.spec.ts`, `orchestrator-multi-repo.test.ts`); argv (`agents.test.ts`) |
 | codex | codex-cli 0.166.0 | auto / default | yes | succeeded; a commit in each checkout; the session recorded `sandbox_policy: danger-full-access` and `approval_policy: never` (escalated through the verified `codexWorkspaceRepos`); `--add-dir` accepted. A follow-up turn (`POST /runs/:id/input`) resumed, committed `smoke-2` in both and stayed escalated | `agents-codex-workspace-roots.test.ts`, `worktree.test.ts` |
 | fx | 0.0.15 | yolo / deepseek/deepseek-v4-flash | no | succeeded; a commit in each checkout (fx's ACP session accepted the non-git cwd) | argv (`agents.test.ts`) |
-| opencode | v2.1.3 (2.x server driver) | auto / OpenCode default | no | the agetor-owned server accepted the non-git workspace directory and the turn was posted; the provider refused it with "Insufficient balance" (account credits), so the run failed with exit 1. Server and non-git cwd verified; an end-to-end edit was **not** | — |
-| copilot | not installed | — | yes (argv) | not run. Analysis (owner decision, no code change): Auto already passes `--allow-all` + `COPILOT_ALLOW_ALL=true` (full access, including writes to `<repo>/.git/worktrees`) and gets the checkouts as `--add-dir`; Read-only/Plan deny writes by design. Needs a live run once installed | argv (`agents.test.ts`) |
+| opencode | v2.1.3 (2.x server driver) | auto / `opencode-go/deepseek-v4.1-flash` (re-run) | no | first attempt (Zen provider `opencode/…`, pay-as-you-go balance empty) was refused with "Insufficient balance", exit 1. Re-run with an OpenCode Go subscription model: succeeded (exit 0) in about 25 s, one `smoke` commit in each checkout; a follow-up turn through the same server session committed `smoke-2` in both; delete removed the workspace and both branches. See "Post-round-15 verification" | — |
+| copilot | 1.0.109 (downloaded from npm for `--help` only; no GitHub Copilot login) | — | yes (argv) | not run live. Confirmed from GitHub Copilot CLI 1.0.109's own `--help` and GitHub's CLI command reference: Auto's `--allow-all` includes `--allow-all-paths` (path verification off), so a commit's writes under the source repository's `.git` are allowed; Read-only/Plan pass no allow flags and deny writes by design. Opt-in real-binary case added, pending a run. See "Post-round-15 verification" | argv (`agents.test.ts`); `copilot-real-binary.test.ts` (opt-in, not yet run) |
 | cursor | present | — | no | not run (plan-limited account) | argv (`agents.test.ts`) |
 | gemini | not installed | — | no | not run; include-directories not used (plan A6) | — |
 | antigravity (`agy`) | not installed | — | no | not run | — |
@@ -413,6 +419,50 @@ Teardown, live:
 - All smoke tasks were deleted afterwards: both source repositories were back to `main` only, with no
   worktrees left.
 
+## Post-round-15 verification
+
+Two follow-ups to the live smoke matrix, on 2026-11-12. This records what was run; it is not an
+owner sign-off.
+
+**OpenCode, live.** Same setup as the matrix above (headless core, `AGETOR_DATA_DIR=~/.agetor-dev`,
+two fresh repositories `alpha` and `beta`, worktree isolation, non-git workspace root). The earlier
+failure was the provider, not agetor: the default model was on Zen (`opencode/…`), whose
+pay-as-you-go balance was empty. Re-run on OpenCode v2.1.3 (2.x server driver) with an OpenCode Go
+subscription model, `opencode-go/deepseek-v4.1-flash`:
+
+- the run succeeded (exit 0) in about 25 s, with one `smoke` commit in each checkout;
+- a follow-up turn through the same server session committed `smoke-2` in both checkouts;
+- `DELETE` of the task removed the workspace and the branch in both source repositories.
+
+OpenCode is now verified end to end live. A harness failover of a multi-repository task is still
+not run.
+
+**Copilot, not live** (no GitHub Copilot login on the machine). Confirmed two ways:
+
+1. The published GitHub Copilot CLI 1.0.109 binary's own `--help` (npm
+   `@github/copilot-darwin-arm64@1.0.109`, run with an isolated `HOME`) and GitHub's CLI command
+   reference (https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)
+   agree: `--allow-all` is "Enable all permissions (equivalent to --allow-all-tools --allow-all-paths
+   --allow-all-urls)"; `--allow-all-paths` is "Disable file path verification and allow access to any
+   path"; `--add-dir <directory>` allows file access to a directory and can be used multiple times;
+   `--disallow-temp-dir` prevents automatic access to the system temporary directory. So Auto (agetor
+   passes `--allow-all` and `COPILOT_ALLOW_ALL=true`) runs with path verification off, which covers
+   the writes a `git commit` in a checkout makes under the source repository's `.git` (outside the
+   workspace and every `--add-dir`). Read-only and Plan pass no allow flags and deny writes by design.
+   No code change.
+2. A new opt-in real-binary case, `src/bun/copilot-real-binary.test.ts` "multi-repo workspace: Auto
+   commits in a checkout whose git dir is outside the workspace; Read-only is denied", runs the real
+   Copilot binary through agetor's `buildCommand` + tmux driver against the in-process fake
+   OpenAI-compatible provider (BYOK; no GitHub auth, network or billing). Source repositories live
+   outside the workspace, the checkouts are passed as `--add-dir`, and `AGETOR_COPILOT_ARGS` adds
+   `--disallow-temp-dir`, so only `--allow-all-paths` can let the commit through. It asserts Auto
+   commits in `alpha` and Read-only's tool results are all errors with no commit in `beta`, and
+   records (does not assert) a control with `--allow-all-tools` but path verification on. The fake
+   provider gained a `SHELLCMD<<<cmd>>>` marker
+   (`src/bun/test-support/copilot-fake-provider.ts`) to run an exact shell command. **Added, pending
+   a run**: running the downloaded binary needs the owner's go-ahead. Command (also in "Commands"):
+   `AGETOR_COPILOT_REAL_BIN=/path/to/copilot bun test src/bun/copilot-real-binary.test.ts`.
+
 ## Known limitations
 
 Repositories can't be added after creation (one can be removed, never the last); 2+ at creation
@@ -421,5 +471,6 @@ warning above 10; every per-repository fan-out runs in bounded batches); an olde
 workspace and may orphan secondary worktrees (the CLI detects an older core at create time, nothing
 else does); Gemini's include-directories is not used; a pipeline step's PR stamp stays on the step,
 so the parent's "Create all PRs" can retry that repository and show GitHub's 422; live smoke covered
-claude-code, codex and fx end to end and OpenCode's server only (copilot, cursor, gemini, antigravity
-and harness failover not run).
+claude-code, codex, fx and OpenCode (2.x server, Go subscription model) end to end; copilot was not
+run live (no login; its permission flags were confirmed from the CLI's `--help`, and the opt-in
+real-binary case is pending a run); cursor, gemini, antigravity and harness failover not run.

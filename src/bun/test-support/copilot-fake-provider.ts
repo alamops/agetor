@@ -10,6 +10,8 @@
  *   TOOLCALL  answer with one call to the shell tool (`echo hi-from-tool`),
  *             then "The command printed hi. All done." after the tool result
  *   WRITECMD  same, but the shell command creates `spike-created.txt`
+ *   SHELLCMD<<<cmd>>>  same, but the shell command is exactly `cmd` (lets a
+ *             test choose the command, e.g. a `git commit` in a checkout)
  *   FAIL500   answer HTTP 500 (Copilot retries ~5x, ~16 s, then session.error)
  *   SLOW      hold the response for `slowMs` (default 20 s; released on abort)
  *   REASON    stream a reasoning delta (`reasoning_content` AND `reasoning`)
@@ -74,6 +76,16 @@ function lastUserText(messages: Msg[]): string {
 }
 
 type ToolDef = { function?: { name?: string; parameters?: { properties?: Record<string, { type?: string }>; required?: string[] } } };
+
+const SHELLCMD_RE = /SHELLCMD<<<([\s\S]*?)>>>/;
+
+/** The shell command a tool-mode turn asks Copilot to run. */
+function toolCommandFor(user: string): string {
+  const custom = SHELLCMD_RE.exec(user);
+  if (custom) return custom[1]!;
+  if (user.includes("WRITECMD")) return "rm -f spike-created.txt && touch spike-created.txt && echo made";
+  return "echo hi-from-tool";
+}
 
 /** Minimal args satisfying the tool's required schema. */
 function argsFor(tool: ToolDef, command: string): Record<string, unknown> {
@@ -141,7 +153,7 @@ export function startFakeCopilotProvider(options: FakeProviderOptions = {}): Fak
       if (!afterTool) {
         if (user.includes("FAIL500")) mode = "fail500";
         else if (user.includes("SLOW")) mode = "slow";
-        else if (user.includes("TOOLCALL") || user.includes("WRITECMD")) mode = "tool";
+        else if (user.includes("TOOLCALL") || user.includes("WRITECMD") || SHELLCMD_RE.test(user)) mode = "tool";
         else if (user.includes("REASON")) mode = "reason";
       }
 
@@ -169,11 +181,9 @@ export function startFakeCopilotProvider(options: FakeProviderOptions = {}): Fak
 
       const shell = tools.find((t) => /^(bash|shell|powershell)$/.test(t.function?.name ?? ""));
       const wantTool = mode === "tool" && shell !== undefined;
+      const command = toolCommandFor(user);
       let parts: string[];
       if (wantTool) {
-        const command = user.includes("WRITECMD")
-          ? "rm -f spike-created.txt && touch spike-created.txt && echo made"
-          : "echo hi-from-tool";
         parts = [
           sse({ role: "assistant", content: "Running a command." }, null),
           sse({ tool_calls: [{ index: 0, id: `call_${id}`, type: "function", function: { name: shell!.function!.name, arguments: JSON.stringify(argsFor(shell!, command)) } }] }, null),
@@ -199,7 +209,7 @@ export function startFakeCopilotProvider(options: FakeProviderOptions = {}): Fak
       const content = wantTool ? "Running a command." : afterTool ? "The command printed hi. All done." : `Hello from the fake provider (req ${id}).`;
       const message: Record<string, unknown> = { role: "assistant", content };
       if (wantTool) {
-        message.tool_calls = [{ id: `call_${id}`, type: "function", function: { name: shell!.function!.name, arguments: JSON.stringify(argsFor(shell!, "echo hi-from-tool")) } }];
+        message.tool_calls = [{ id: `call_${id}`, type: "function", function: { name: shell!.function!.name, arguments: JSON.stringify(argsFor(shell!, command)) } }];
       }
       return Response.json({
         id: "chatcmpl-fake",

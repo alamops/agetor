@@ -240,8 +240,12 @@ some CLIs refuse an `--add-dir` that names a missing path.
   source repository's `.git/worktrees` included) and gets every checkout as
   `--add-dir`; Read-only and Plan deny writes by design, in any repository, the
   same as for a single-repository task
-  ([harness-copilot.md](harness-copilot.md)). Not live-verified: copilot was
-  not installed on the smoke machine.
+  ([harness-copilot.md](harness-copilot.md)). Copilot CLI 1.0.109's `--help`
+  confirms `--allow-all` includes `--allow-all-paths` (file path verification
+  off), which is what lets a commit write under the source repository's `.git`,
+  outside the workspace and every `--add-dir`. Not run live (no GitHub Copilot
+  login on the smoke machine); the opt-in real-binary case in
+  `src/bun/copilot-real-binary.test.ts` covers it and is pending a run.
 - `codexWorkspaceRepos` pairs each checkout with its source repository for
   codex's sandbox decision. `gitWritableRoots` grants a checkout's git common
   dir only when the checkout is strictly inside the cwd, its toplevel is that
@@ -576,9 +580,11 @@ subdirectory selections under one root are not serialized against each other.)
 - Live harness smoke (2026-11-12, two fresh repositories, worktree
   isolation): claude-code, codex (first turn and a follow-up, both escalated
   to full access from the task's checkouts) and fx ran end to end and
-  committed in each checkout; OpenCode 2.x's agetor-owned server accepted the
-  non-git workspace directory and took the turn, but the provider refused it
-  for account credits, so no end-to-end edit was verified. Copilot was not
-  installed, and a harness-stack failover of a multi task was not run. Cursor,
-  Gemini and Antigravity were not run. Details:
+  committed in each checkout; OpenCode 2.x (agetor-owned server, an OpenCode
+  Go subscription model, after a first attempt hit an empty Zen balance) ran
+  end to end at the non-git workspace directory, committed in each checkout and
+  again on a follow-up turn through the same server session. Copilot was not
+  run live (no login; its Auto flags were confirmed from the CLI's `--help`, and
+  an opt-in real-binary case is pending a run), and a harness-stack failover of
+  a multi task was not run. Cursor, Gemini and Antigravity were not run. Details:
   `docs/plans/multi-repo-tasks-smoke.md` ("Live harness smoke matrix").

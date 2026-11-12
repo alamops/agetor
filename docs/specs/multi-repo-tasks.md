@@ -146,11 +146,14 @@ coordinate changes across every repository in that card.
     verified checkouts); `--add-dir` was accepted. A follow-up turn resumed, committed again in both
     and stayed escalated.
   - fx (0.0.15, yolo, deepseek/deepseek-v4-flash): succeeded; one commit in each checkout.
-  - OpenCode (v2.1.3, server driver): the agetor-owned server accepted the non-git workspace directory
-    and the turn was posted; the provider refused it for account credits ("Insufficient balance"), so
-    the run failed and no end-to-end edit was verified.
-  - Not run: copilot (not installed on the smoke machine), cursor, gemini and antigravity, and a
-    harness-stack failover of a multi-repository task (needs a two-account stack).
+  - OpenCode (v2.1.3, server driver): the first attempt used a Zen model (`opencode/…`) and the
+    provider refused it for an empty pay-as-you-go balance ("Insufficient balance"). A re-run with an
+    OpenCode Go subscription model (`opencode-go/deepseek-v4.1-flash`) succeeded (exit 0, about
+    25 s): one commit in each checkout, and a follow-up turn through the same server session
+    committed again in both. Delete removed the workspace and both branches.
+  - Not run live: copilot (no GitHub Copilot login on the smoke machine; see the Copilot item below),
+    cursor, gemini and antigravity, and a harness-stack failover of a multi-repository task (needs a
+    two-account stack).
   - Teardown, live: delete removed the workspace (Claude's scratch included) and the task branch in
     both source repositories; archive removed the workspace and kept the branches, and unarchive
     restored both checkouts on their branches with the commits intact.
@@ -161,7 +164,12 @@ coordinate changes across every repository in that card.
   side (prepare, reuse, rollback, diff, status, teardown, removal) against temporary repositories.
 - Copilot (owner decision, no code change): Auto already passes `--allow-all` and
   `COPILOT_ALLOW_ALL=true` and gets the checkouts as `--add-dir`; Read-only and Plan deny writes by
-  design. Not live-verified.
+  design. Not run live (no login). Confirmed from Copilot CLI 1.0.109's own `--help` and GitHub's
+  CLI command reference: `--allow-all` is equivalent to `--allow-all-tools --allow-all-paths
+  --allow-all-urls`, and `--allow-all-paths` disables file path verification, which covers a commit's
+  writes under the source repository's `.git` (outside the workspace and every `--add-dir`). An
+  opt-in real-binary case in `src/bun/copilot-real-binary.test.ts` (real binary, fake BYOK provider,
+  `--disallow-temp-dir`) was added and is pending a run.
 
 ## Non-goals
 

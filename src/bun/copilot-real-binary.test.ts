@@ -119,6 +119,8 @@ suite(`copilot real binary (${binVersion.trim().split("\n")[0] ?? ""})`, () => {
     harnessEnv?: Record<string, string>;
     /** Extra pane env layered over the built command's (e.g. an isolated HOME). */
     paneEnv?: Record<string, string>;
+    /** Multi-repository checkouts, passed as `--add-dir` like the orchestrator does. */
+    extraDirectories?: string[];
   }
 
   function startTurn(t: TurnInput) {
@@ -144,6 +146,7 @@ suite(`copilot real binary (${binVersion.trim().split("\n")[0] ?? ""})`, () => {
       mode,
       runId,
       ...(t.resume ? { resumeSessionId: sessionId } : { sessionId }),
+      ...(t.extraDirectories ? { extraDirectories: t.extraDirectories } : {}),
     });
     const chunks: Chunk[] = [];
     const agentP = spawnCopilotViaTmux({
@@ -225,6 +228,80 @@ suite(`copilot real binary (${binVersion.trim().split("\n")[0] ?? ""})`, () => {
     expect(bRes.map((x) => flat(x.content)).join("\n")).toMatch(/Permission denied/);
     expect(existsSync(path.join(ask.cwd, "spike-created.txt"))).toBe(false);
   }, TURN_T * 2);
+
+  // Multi-repository task (docs/architecture/multi-repo-tasks.md): the cwd is
+  // a NON-git workspace root holding one linked worktree per repository, so a
+  // `git commit` inside a checkout writes the source repository's `.git`
+  // (objects, refs, `.git/worktrees/<id>`), which is outside the cwd and
+  // outside every `--add-dir`. Copilot also grants the system temp dir by
+  // default and this scratch lives there, so `--disallow-temp-dir` is added:
+  // only `--allow-all-paths` (part of Auto's `--allow-all`) can then let the
+  // commit through.
+  test("multi-repo workspace: Auto commits in a checkout whose git dir is outside the workspace; Read-only is denied", async () => {
+    const git = (cwd: string, ...args: string[]) => {
+      const res = Bun.spawnSync(["git", "-c", "user.email=tt8@example.invalid", "-c", "user.name=tt8", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+      if (res.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${res.stderr.toString()}`);
+      return res.stdout.toString();
+    };
+    const multiWorkspace = () => {
+      const home = mkdtempSync(path.join(scratch, "chome-"));
+      const sources = mkdtempSync(path.join(scratch, "sources-"));
+      const cwd = mkdtempSync(path.join(scratch, "workspace-"));
+      for (const name of ["alpha", "beta"]) {
+        const src = path.join(sources, name);
+        mkdirSync(src);
+        git(src, "init", "-q", "-b", "main");
+        writeFileSync(path.join(src, "README.md"), `# ${name}\n`);
+        git(src, "add", "README.md");
+        git(src, "commit", "-qm", "init");
+        git(src, "worktree", "add", "-q", "-b", `feat-${name}`, path.join(cwd, name));
+      }
+      return { home, cwd, sources, dirs: [path.join(cwd, "alpha"), path.join(cwd, "beta")] };
+    };
+    const commitIn = (repo: string) =>
+      `SHELLCMD<<<cd ${repo} && echo ok > MULTI.md && git add MULTI.md && git -c user.email=tt8@example.invalid -c user.name=tt8 commit -qm multi-commit && echo committed-${repo}>>>`;
+    const branchLog = (sources: string, repo: string) => git(path.join(sources, repo), "log", "--format=%s", `feat-${repo}`);
+
+    const prevArgs = process.env.AGETOR_COPILOT_ARGS;
+    process.env.AGETOR_COPILOT_ARGS = "--disallow-temp-dir";
+    try {
+      const auto = multiWorkspace();
+      provider.reset();
+      const a = await runTurn({ prompt: commitIn("alpha"), mode: "auto", home: auto.home, cwd: auto.cwd, extraDirectories: auto.dirs });
+      expect(a.cmd.cmd).toContain("--allow-all");
+      expect(a.cmd.cmd.filter((x) => x === "--add-dir")).toHaveLength(2);
+      expect(a.code).toBe(0);
+      const aRes = toolResults(a.chunks);
+      record("multi-repo auto tool results", aRes.map((x) => ({ isError: x.isError, content: flat(x.content).slice(0, 300) })));
+      expect(aRes.length).toBeGreaterThan(0);
+      expect(aRes.every((x) => x.isError === false)).toBe(true);
+      expect(branchLog(auto.sources, "alpha")).toContain("multi-commit");
+
+      const ask = multiWorkspace();
+      const b = await runTurn({ prompt: commitIn("beta"), mode: "ask", home: ask.home, cwd: ask.cwd, extraDirectories: ask.dirs });
+      expect(b.cmd.cmd).not.toContain("--allow-all");
+      const bRes = toolResults(b.chunks);
+      expect(bRes.length).toBeGreaterThan(0);
+      expect(bRes.every((x) => x.isError === true)).toBe(true);
+      expect(branchLog(ask.sources, "beta")).not.toContain("multi-commit");
+
+      // Control, recorded not asserted: tools allowed but path verification
+      // left on (no --allow-all-paths). Shows whether Copilot's path check
+      // alone would stop a commit into the outside `.git` — i.e. whether
+      // Auto's --allow-all-paths is what makes multi-repo commits work.
+      process.env.AGETOR_COPILOT_ARGS = "--disallow-temp-dir --allow-all-tools";
+      const ctl = multiWorkspace();
+      const c = await runTurn({ prompt: commitIn("alpha"), mode: "ask", home: ctl.home, cwd: ctl.cwd, extraDirectories: ctl.dirs });
+      record("multi-repo control (allow-all-tools, path verification on)", {
+        code: c.code,
+        committed: branchLog(ctl.sources, "alpha").includes("multi-commit"),
+        results: toolResults(c.chunks).map((x) => ({ isError: x.isError, content: flat(x.content).slice(0, 300) })),
+      });
+    } finally {
+      if (prevArgs === undefined) delete process.env.AGETOR_COPILOT_ARGS;
+      else process.env.AGETOR_COPILOT_ARGS = prevArgs;
+    }
+  }, TURN_T * 3);
 
   test("a second turn with the same session id resumes (provider sees the prior user message)", async () => {
     const ws = newWorkspace();
