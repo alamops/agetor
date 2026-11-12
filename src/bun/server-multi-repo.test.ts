@@ -6,15 +6,17 @@ import type { Task } from "../shared/types.ts";
 import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import. Port unique among
-// *.test.ts files (see draft-endpoint.test.ts's convention).
+// *.test.ts files (see draft-endpoint.test.ts's convention) — 4620–4622 are
+// claimed by server-db-routes.test.ts's blocking-route arms, so reusing one
+// here steals its /test/block-event-loop route and fails that file.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-server-multi-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
-process.env.AGETOR_API_PORT = "4621";
+process.env.AGETOR_API_PORT = "4689";
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
-const BASE = "http://127.0.0.1:4621";
+const BASE = "http://127.0.0.1:4689";
 let server: { stop: () => void } | null = null;
 let token: string;
 
