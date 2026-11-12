@@ -18,7 +18,7 @@ import {
 import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer, tmuxEnv } from "./tmux-resolution.ts";
 import { SCRUBBED_ENV_KEYS, childEnv, coreSpawn, coreSpawnSync } from "./core-spawn.ts";
 import { openReadNoFollow } from "./no-follow.ts";
 import {
@@ -550,15 +550,24 @@ interface BoundedResult {
 
 /** Run `argv` to completion within `timeoutMs`. On expiry the child is killed
  *  (SIGKILL) and the call reports `timedOut` with a null code; the output is not
- *  waited for, because a wedged client may never close its pipes. Never throws. */
-async function runBounded(argv: string[], timeoutMs: number): Promise<BoundedResult> {
+ *  waited for, because a wedged client may never close its pipes. Never throws.
+ *
+ *  `env` defaults to `childEnv()` (scrubbed live env) for non-tmux callers
+ *  such as `ps`; the tmux callers pass `tmuxEnv(bin)`, which is the same env
+ *  plus the vendored terminfo search path when the binary is the bundled one
+ *  (issue #298). */
+async function runBounded(
+  argv: string[],
+  timeoutMs: number,
+  env: Record<string, string | undefined> = childEnv(),
+): Promise<BoundedResult> {
   let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
   try {
     proc = coreSpawn(argv, {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: childEnv(),
+      env,
     }) as Bun.Subprocess<"ignore", "pipe", "pipe">;
   } catch (e) {
     return { code: null, stdout: "", stderr: (e as Error).message, timedOut: false };
@@ -591,7 +600,8 @@ async function runBounded(argv: string[], timeoutMs: number): Promise<BoundedRes
 }
 
 async function tmuxQuery(args: string[]): Promise<BoundedResult> {
-  return runBounded([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], tmuxTimeoutMs);
+  const bin = resolveTmuxBin();
+  return runBounded([bin, ...tmuxSocketArgs(), ...args], tmuxTimeoutMs, tmuxEnv(bin));
 }
 
 /** `tmux new-session` (the server launch), bounded and killable. The shared
@@ -618,7 +628,8 @@ async function tmuxNewSession(args: string[]): Promise<{ status: number | null; 
   }
   const left = deadline - Date.now();
   if (left <= 0) return { status: null, stderr: "tmux new-session timed out (disclaimed server not ready)" };
-  const res = await runBounded([resolveTmuxBin(), ...args], left);
+  const bin = resolveTmuxBin();
+  const res = await runBounded([bin, ...args], left, tmuxEnv(bin));
   return { status: res.code, stderr: res.stderr };
 }
 
@@ -1417,9 +1428,10 @@ export async function opencodeIdleSweep(now: number, isBusy: (harnessId: string)
 /** One bounded synchronous tmux call on the instance socket. `code` is null
  *  when it could not run or timed out (never proof of anything). */
 function tmuxSync(args: string[]): { code: number | null; stdout: string; stderr: string } {
-  const res = coreSpawnSync(resolveTmuxBin(), [...tmuxSocketArgs(), ...args], {
+  const bin = resolveTmuxBin();
+  const res = coreSpawnSync(bin, [...tmuxSocketArgs(), ...args], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: childEnv(),
+    env: tmuxEnv(bin),
     timeout: syncTmuxTimeoutMs,
     encoding: "utf8",
   });

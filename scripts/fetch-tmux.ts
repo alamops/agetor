@@ -10,11 +10,20 @@
 // Homebrew cellar path. This produces a self-contained bundle that runs on
 // machines without Homebrew, without depending on any single fixed URL.
 //
+// It also vendors a terminfo database beside the binary. The bundled
+// libncursesw carries the BUILD MACHINE's compiled-in Cellar path
+// (/opt/homebrew/Cellar/ncurses/<version>/share/terminfo); without a sibling
+// DB, a tty attach (`tmux attach` from Terminal.app) prints "can't find
+// terminfo database" and exits (issue #298). Five entries copied from the
+// macOS system DB cover Terminal.app's default profile plus the tmux/screen
+// clients; the runtime search path is <bundle>/bin/terminfo first and
+// /usr/share/terminfo second. See scripts/terminfo/README.md.
+//
 // Idempotent: if the vendored files already exist and aren't older than the
 // system tmux, the script is a fast no-op.
 
 import { existsSync, statSync } from "node:fs";
-import { copyFile, mkdir, readdir, chmod, writeFile, readFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, chmod, writeFile, readFile, rm, rename } from "node:fs/promises";
 import path from "node:path";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
@@ -25,13 +34,43 @@ const REPO_ROOT = path.resolve(import.meta.dir, "..");
 const ARCH = "arm64";
 const VENDOR_DIR = path.join(REPO_ROOT, "vendor", "tmux", ARCH);
 
+/** macOS system terminfo database — present on every supported macOS. */
+const TERMINFO_SOURCE = "/usr/share/terminfo";
+/** Destination for the vendored DB: a SIBLING of the tmux binary, which is
+ *  exactly the first entry of the runtime `TERMINFO_DIRS` (see
+ *  `terminfoDirsFor` in src/bun/tmux-resolution.ts). */
+const TERMINFO_DIR = path.join(VENDOR_DIR, "terminfo");
+/** The entries `terminfoDirsFor` relies on: Terminal.app's default profile
+ *  (xterm-256color), its fallbacks, and the tmux/screen client names. Pinned
+ *  so a future run can't silently shrink the set. */
+const TERMINFO_ENTRIES = [
+  "xterm-256color",
+  "xterm",
+  "screen",
+  "screen-256color",
+  "tmux-256color",
+] as const;
+/** Tracked inputs (license + provenance note) copied beside the DB. */
+const TERMINFO_NOTICE_DIR = path.join(REPO_ROOT, "scripts", "terminfo");
+const TERMINFO_LICENSE = path.join(TERMINFO_NOTICE_DIR, "LICENSE-ncurses.txt");
+const TERMINFO_README = path.join(TERMINFO_NOTICE_DIR, "README.md");
+/** Written on every vendor run; its presence is part of the cache check. */
+const TERMINFO_PROVENANCE = path.join(TERMINFO_DIR, "PROVENANCE.txt");
+
 function fail(msg: string): never {
   console.error(`[fetch-tmux] ${msg}`);
   process.exit(1);
 }
 
-async function run(cmd: string[], opts: { silent?: boolean } = {}): Promise<string> {
-  const p = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+async function run(
+  cmd: string[],
+  opts: { silent?: boolean; env?: Record<string, string | undefined> } = {},
+): Promise<string> {
+  const p = Bun.spawn(cmd, {
+    stdout: "pipe",
+    stderr: "pipe",
+    ...(opts.env ? { env: opts.env } : {}),
+  });
   const [out, err] = await Promise.all([
     new Response(p.stdout).text(),
     new Response(p.stderr).text(),
@@ -117,6 +156,133 @@ async function rewriteLoadCommands(target: string): Promise<void> {
   }
 }
 
+/**
+ * Locate `entry` inside the system terminfo database, whose layout is
+ * hashed (two hex chars per subdirectory, e.g. `78/xterm-256color`), without
+ * assuming which hash the host uses. Returns the path RELATIVE to
+ * `TERMINFO_SOURCE` (so the destination mirrors the source layout exactly),
+ * or null.
+ */
+async function findTerminfoEntry(entry: string): Promise<string | null> {
+  let dirs: string[];
+  try {
+    dirs = await readdir(TERMINFO_SOURCE);
+  } catch {
+    return null;
+  }
+  for (const dir of dirs) {
+    const rel = path.join(dir, entry);
+    if (existsSync(path.join(TERMINFO_SOURCE, rel))) return rel;
+  }
+  return null;
+}
+
+/**
+ * Copy the pinned terminfo entries (plus the tracked ncurses license and
+ * provenance note) into `<vendor>/terminfo`, mirroring the source's hashed
+ * layout. Every entry and both notice files are resolved BEFORE anything is
+ * written, so a host missing one leaves no partial tree behind — the packaged
+ * app must either ship a complete DB or fail the build loudly.
+ *
+ * The write itself is staged: the tree is built under a sibling
+ * `<terminfo>.staging-<pid>` directory and only swapped into place once every
+ * file is on disk. A mid-copy failure (disk full, an unreadable entry) would
+ * otherwise leave a partial `terminfo/` behind, and the cache check only tests
+ * for the directory + `PROVENANCE.txt` — so the next build would happily ship
+ * the truncated DB. On failure the staging tree is removed and the previous
+ * DB (if any) is left untouched.
+ */
+async function vendorTerminfo(): Promise<void> {
+  const resolved: Array<{ entry: string; rel: string }> = [];
+  const missing: string[] = [];
+  for (const entry of TERMINFO_ENTRIES) {
+    const rel = await findTerminfoEntry(entry);
+    if (rel === null) missing.push(entry);
+    else resolved.push({ entry, rel });
+  }
+  if (missing.length) {
+    fail(
+      `terminfo ${missing.length === 1 ? "entry" : "entries"} missing from ${TERMINFO_SOURCE}: ${missing.join(", ")}\n` +
+        `  The bundled tmux would fail to attach from a terminal ("can't find terminfo database"). ` +
+        `Fix the build host's terminfo database, or change TERMINFO_ENTRIES deliberately.`,
+    );
+  }
+  for (const notice of [TERMINFO_LICENSE, TERMINFO_README]) {
+    if (!existsSync(notice)) {
+      fail(
+        `missing tracked notice ${path.relative(REPO_ROOT, notice)} — refusing to vendor the terminfo database without its license/provenance note`,
+      );
+    }
+  }
+
+  const staging = `${TERMINFO_DIR}.staging-${process.pid}`;
+  const backup = `${TERMINFO_DIR}.old-${process.pid}`;
+  await rm(staging, { recursive: true, force: true });
+  await rm(backup, { recursive: true, force: true });
+  try {
+    for (const { rel } of resolved) {
+      const dst = path.join(staging, rel);
+      await mkdir(path.dirname(dst), { recursive: true });
+      await copyFile(path.join(TERMINFO_SOURCE, rel), dst);
+      await chmod(dst, 0o644);
+    }
+    await copyFile(TERMINFO_LICENSE, path.join(staging, "LICENSE-ncurses.txt"));
+    await copyFile(TERMINFO_README, path.join(staging, "README.md"));
+    const provenance = [
+      "Agetor bundled tmux — terminfo database",
+      `source: ${TERMINFO_SOURCE}`,
+      `generated: ${new Date().toISOString()}`,
+      "entries:",
+      ...resolved.map(({ entry, rel }) => `  ${entry}  (${rel})`),
+      "license: LICENSE-ncurses.txt (ncurses, verbatim from the ncurses distribution)",
+      "",
+    ].join("\n");
+    await writeFile(path.join(staging, "PROVENANCE.txt"), provenance);
+
+    // Publish atomically-ish: move the previous tree aside, rename the complete
+    // staging tree into place, then drop the backup. If the publish rename
+    // fails the old DB is restored, so a failed run never leaves a half tree
+    // at the path the cache check trusts.
+    const hadPrevious = existsSync(TERMINFO_DIR);
+    if (hadPrevious) await rename(TERMINFO_DIR, backup);
+    try {
+      await rename(staging, TERMINFO_DIR);
+    } catch (e) {
+      if (hadPrevious) await rename(backup, TERMINFO_DIR);
+      throw e;
+    }
+    if (hadPrevious) await rm(backup, { recursive: true, force: true });
+  } catch (e) {
+    await rm(staging, { recursive: true, force: true });
+    throw e;
+  }
+  console.log(
+    `[fetch-tmux] vendored ${resolved.length} terminfo entries → ${path.relative(REPO_ROOT, TERMINFO_DIR)}/`,
+  );
+}
+
+/**
+ * Prove the freshly copied DB actually resolves: `infocmp` reads terminfo via
+ * the same ncurses lookup the bundled tmux uses, so a corrupt/partial copy
+ * fails here instead of in a user's Terminal window.
+ */
+async function verifyTerminfo(): Promise<void> {
+  // A minimal, hermetic env: `infocmp` is invoked by absolute path, so no PATH
+  // is needed, and dropping TERMINFO (a single directory, which wins over
+  // TERMINFO_DIRS by ncurses semantics) makes this measure THIS database.
+  const env: Record<string, string | undefined> = { TERMINFO_DIRS: TERMINFO_DIR };
+  for (const entry of TERMINFO_ENTRIES) {
+    try {
+      await run(["/usr/bin/infocmp", entry], { env, silent: true });
+    } catch {
+      fail(
+        `vendored terminfo entry "${entry}" does not resolve from ${path.relative(REPO_ROOT, TERMINFO_DIR)} (TERMINFO_DIRS) — the bundle would ship a broken database`,
+      );
+    }
+  }
+  console.log(`[fetch-tmux] ✓ TERMINFO_DIRS resolves all ${TERMINFO_ENTRIES.length} entries`);
+}
+
 async function main() {
   if (process.platform !== "darwin") {
     // electrobun's dev watcher fs.watch()es every `copy` source dir in
@@ -152,7 +318,18 @@ async function main() {
     const sourceMtime = statSync(tmuxBin).mtimeMs;
     const stamp = (await readFile(stampPath, "utf8")).trim();
     if (vendoredMtime >= sourceMtime && stamp === desiredIdentity) {
-      console.log(`[fetch-tmux] cached at ${path.relative(REPO_ROOT, VENDOR_DIR)}/ — skipping`);
+      // A tree vendored by an older build has the binary but no DB. Add just
+      // the DB rather than re-copying/re-signing the binary — but never
+      // report a cache hit for a tree that is missing it, or the packaged app
+      // would keep shipping the broken attach this change exists to fix.
+      if (existsSync(TERMINFO_DIR) && existsSync(TERMINFO_PROVENANCE)) {
+        console.log(`[fetch-tmux] cached at ${path.relative(REPO_ROOT, VENDOR_DIR)}/ — skipping`);
+        await verifyTerminfo();
+        return;
+      }
+      console.log("[fetch-tmux] vendored tmux is cached but its terminfo database is missing — adding it");
+      await vendorTerminfo();
+      await verifyTerminfo();
       return;
     }
   }
@@ -215,9 +392,14 @@ async function main() {
     fail(`load commands still reference Homebrew paths after rewrite:\n  ${leaked.join("\n  ")}`);
   }
 
-  // 5. Sanity-run the vendored binary.
+  // 5. Vendor the terminfo database beside the binary, then prove it resolves.
+  await vendorTerminfo();
+  await verifyTerminfo();
+
+  // 6. Sanity-run the vendored binary.
   const version = await run([targetTmux, "-V"]);
-  console.log(`[fetch-tmux] ✓ ${version} (${entries.length} files in ${path.relative(REPO_ROOT, VENDOR_DIR)}/)`);
+  const finalEntries = await readdir(VENDOR_DIR);
+  console.log(`[fetch-tmux] ✓ ${version} (${finalEntries.length} files in ${path.relative(REPO_ROOT, VENDOR_DIR)}/)`);
 }
 
 main().catch((e) => {

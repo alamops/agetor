@@ -1,0 +1,162 @@
+{
+  "version": 1,
+  "formId": "issue-298-chrome-prompt-grill-r1",
+  "title": "Grill — Issue #298: Chrome browser prompt + bundled-tmux terminal",
+  "round": 1,
+  "mode": "served",
+  "specFile": "questions.json",
+  "specSha256": "e8b52e1254ed5772df536e4e495ee3c3edda097982ea1ec8800a0681b94a3af3",
+  "submittedAt": "2026-11-12T06:19:53.248Z",
+  "receivedAt": "2026-11-12T06:19:53.253Z",
+  "answeredBy": null,
+  "summary": {
+    "total": 13,
+    "answered": 13,
+    "skipped": 0,
+    "unanswered": 0,
+    "optionalLeftBlank": 0,
+    "notApplicable": 0,
+    "acceptedRecommendations": 11,
+    "overrodeRecommendations": [
+      "terminfo-source",
+      "card-presentation"
+    ],
+    "oneWayDoorsNotAnswered": [],
+    "withNotes": [],
+    "needsAnswer": [],
+    "complete": true
+  },
+  "answers": {
+    "scope": {
+      "n": 1,
+      "title": "Which halves of issue #298 does this change fix?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "both-one-commit",
+      "display": "Both, one local commit",
+      "acceptedRecommendation": true
+    },
+    "matcher-breadth": {
+      "n": 2,
+      "title": "How broad should the new unnumbered-menu matcher be?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "generic-strict",
+      "display": "Generic matcher with strict guards",
+      "acceptedRecommendation": true
+    },
+    "chrome-policy": {
+      "n": 3,
+      "title": "Should Agetor ever answer the Chrome browser-tools prompt for the user?",
+      "type": "single",
+      "status": "answered",
+      "oneWayDoor": true,
+      "impact": "blocking",
+      "value": "card-only",
+      "display": "Always show the card; never auto-answer",
+      "acceptedRecommendation": true
+    },
+    "terminfo-source": {
+      "n": 4,
+      "title": "Where should the bundled tmux get its terminfo database?",
+      "type": "single",
+      "status": "answered",
+      "impact": "blocking",
+      "value": "vendor-db",
+      "display": "Vendor a terminfo database",
+      "acceptedRecommendation": false,
+      "recommended": "system-db"
+    },
+    "terminfo-scope": {
+      "n": 5,
+      "title": "Which tmux surfaces should get the terminfo override?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "attach-bundled",
+      "display": "The attach + every bundled-tmux spawn",
+      "acceptedRecommendation": true
+    },
+    "failure-feedback": {
+      "n": 6,
+      "title": "How much failure feedback should Open in Terminal give?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "await-502-stay-open",
+      "display": "Await + keep the window open on failure",
+      "acceptedRecommendation": true
+    },
+    "card-presentation": {
+      "n": 7,
+      "title": "How should the choice card present an unnumbered menu?",
+      "type": "multi",
+      "status": "answered",
+      "impact": "minor",
+      "value": [
+        "keep-keys",
+        "hide-keys"
+      ],
+      "display": "Keep the numbered-button convention; Hide the synthetic keys for unnumbered menus",
+      "acceptedRecommendation": false,
+      "recommended": [
+        "keep-keys"
+      ]
+    },
+    "dismiss": {
+      "n": 8,
+      "title": "Should the choice card gain a Dismiss (Esc) action?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "no-dismiss",
+      "display": "Keep no dismiss",
+      "acceptedRecommendation": true
+    },
+    "acceptance": {
+      "n": 9,
+      "title": "What counts as done for this change?",
+      "type": "single",
+      "status": "answered",
+      "impact": "shape",
+      "value": "units-manual",
+      "display": "Units + typecheck + a manual Terminal smoke",
+      "acceptedRecommendation": true
+    },
+    "docs": {
+      "n": 10,
+      "title": "Update the docs that describe this behavior",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Yes — update `docs/architecture/harness-claude-code.md` (matcher chain + attach env), the `docs/plans/unknown-claude-prompts-fallback.md` addendum, and the manual QA row `docs/qa/master-token-agent-read-qa.md:53-54`.",
+      "acceptedRecommendation": true
+    },
+    "commit": {
+      "n": 11,
+      "title": "Local commit shape",
+      "type": "confirm",
+      "status": "answered",
+      "value": "One local commit, not pushed, message `fix: answer the unnumbered Claude Chrome prompt and repair bundled-tmux attach (Fixes #298)`.",
+      "acceptedRecommendation": true
+    },
+    "unparsable-stays": {
+      "n": 12,
+      "title": "Keep the unparsable card as the final fallback",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Yes — genuinely unknown prompts still get the `unparsable` card with its Open in Terminal action.",
+      "acceptedRecommendation": true
+    },
+    "cross-agent": {
+      "n": 13,
+      "title": "No cross-agent Chrome arbitration",
+      "type": "confirm",
+      "status": "answered",
+      "value": "Yes — this change only makes the Claude startup prompt answerable; it does not coordinate Chrome between Codex, Claude Desktop, and Agetor.",
+      "acceptedRecommendation": true
+    }
+  },
+  "generalNotes": null
+}

@@ -70,6 +70,7 @@ import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
+import { tmuxChoiceLabel } from "@/lib/tmux-prompt";
 import {
   formatHarnessSwapNotice,
   isHarnessStackContinuation,
@@ -9308,7 +9309,7 @@ function TmuxPromptCard({
               variant={isNegative ? "outline" : "secondary"}
               disabled={submitting !== null}
             >
-              {submitting === c.key ? "Sending…" : `${c.key}. ${c.label}`}
+              {submitting === c.key ? "Sending…" : tmuxChoiceLabel(c, req.hideKeys)}
             </Button>
           );
         })}

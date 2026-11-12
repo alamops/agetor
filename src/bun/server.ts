@@ -102,12 +102,15 @@ import {
   bundledTmuxAvailable,
   bundledTmuxPath,
   getTmuxSource,
+  isBundledTmuxBin,
   resolveTmuxBin,
   setTmuxSource,
+  terminfoDirsFor,
   TMUX_SOURCE_KEY,
   tmuxSocketArgs,
   type TmuxSource,
 } from "./tmux-resolution.ts";
+import { buildTmuxAttachCommand } from "./tmux-attach.ts";
 import {
   dismissAskModalForMessage,
   dismissTmuxPrompt,
@@ -5781,6 +5784,9 @@ export function startApiServer(
           ]);
           if (exit === "timeout") {
             // Assume it's still coming up rather than reporting a false error.
+            // Kill the wedged child so it can't linger past the request; if it
+            // exited in the race's tail, kill() throws and there's nothing to do.
+            try { proc.kill(); } catch { /* already exited */ }
             return json({ ok: true }, { headers: corsHeaders(req) });
           }
           if (exit !== 0) {
@@ -7090,40 +7096,59 @@ export function startApiServer(
           // `assumeAlive`: `sessionExists(task.id)` was just checked above, so
           // skip the internal probe's duplicate round-trip.
           void healWindowSize(task.id, { assumeAlive: true });
-          // AppleScript `do script` runs the string through `/bin/bash`, so
-          // we escape anything bash would interpret inside double-quotes:
-          // backslash, dollar, backtick, and the double-quote itself. Without
-          // this, a tmux bin path containing `$` (legal but unusual) would
-          // silently misbehave. Session names are server-generated and only
-          // contain `agetor-<hex>` so they don't strictly need escaping, but
-          // we apply the same helper for symmetry.
-          const shellEscape = (s: string) => s.replace(/(["\\$`])/g, "\\$1");
-          // Honor an active non-default socket (test isolation / a future
-          // dedicated production socket) so "Open in Terminal" attaches to
-          // the same server the session actually lives on, not whatever the
-          // default socket happens to be. Empty in production today.
-          const socketArgsStr = tmuxSocketArgs()
-            .map((a) => `\\"${shellEscape(a)}\\"`)
-            .join(" ");
-          const script =
-            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\"${socketArgsStr ? " " + socketArgsStr : ""} attach -t \\"${shellEscape(sessionName)}\\""\n` +
-            `activate application "Terminal"`;
+          // Build the attach command through the pure builder so the exact
+          // string is unit-tested (src/bun/tmux-attach.test.ts): POSIX quoting
+          // for every interpolated value, an optional TERMINFO_DIRS prefix for
+          // the BUNDLED binary only, and a stay-open fallback instead of
+          // `exec` — a failed attach must not close the window (issue #298).
+          const terminfoDirs = isBundledTmuxBin(tmuxPath) ? terminfoDirsFor(tmuxPath) : null;
+          const command = buildTmuxAttachCommand({
+            tmuxPath,
+            socketArgs: tmuxSocketArgs(),
+            sessionName,
+            terminfoDirs,
+          });
+          const script = toTerminalAppleScript(command);
           // spawn-exempt(osascript): Terminal.app automation is Agetor's own Automation grant; /usr/bin/osascript is SIP-protected and spawned by absolute path so PATH can't swap it.
           const proc = Bun.spawn(["/usr/bin/osascript", "-e", script], {
             stdout: "ignore",
-            stderr: "ignore",
+            stderr: "pipe",
             env: childEnv(),
           });
-          // Don't block on the AppleScript — Terminal.app opening shouldn't
-          // hold the HTTP response open. Log non-zero exits so users with
-          // Automation permissions revoked have a breadcrumb in the console.
-          void proc.exited.then((code) => {
-            if (code !== 0) {
-              console.warn(
-                `[agetor] osascript exited ${code} while attaching to tmux session "${sessionName}" — check System Settings → Privacy & Security → Automation`,
-              );
-            }
-          });
+          // Await the launch so the UI gets real feedback (same pattern as
+          // `/harnesses/:id/open-terminal` above). `do script` returns as soon
+          // as Terminal accepts the command — it does NOT wait for the attach
+          // itself — so this resolves quickly on success and fails fast when
+          // Automation permission is denied. A 5s ceiling guards against a
+          // wedged osascript holding the response open.
+          const exit = await Promise.race([
+            proc.exited,
+            Bun.sleep(5000).then(() => "timeout" as const),
+          ]);
+          if (exit === "timeout") {
+            // Assume the window is still coming up rather than reporting a
+            // false error — the in-shell fallback covers the attach itself.
+            // Kill the wedged child so it can't linger past the request; if it
+            // exited in the race's tail, kill() throws and there's nothing to do.
+            try { proc.kill(); } catch { /* already exited */ }
+            return json({ ok: true, sessionName }, { headers: corsHeaders(req) });
+          }
+          if (exit !== 0) {
+            const detail = (await new Response(proc.stderr).text()).trim();
+            console.warn(
+              `[agetor] osascript exited ${exit} while attaching to tmux session "${sessionName}": ${detail}`,
+            );
+            return json(
+              {
+                error:
+                  `Couldn't open Terminal (osascript exited ${exit}).` +
+                  (detail ? ` ${detail}` : "") +
+                  " Check System Settings → Privacy & Security → Automation.",
+                sessionName,
+              },
+              { status: 502, headers: corsHeaders(req) },
+            );
+          }
           return json({ ok: true, sessionName }, { headers: corsHeaders(req) });
         }),
       },

@@ -51,7 +51,7 @@ Have one small git project ready (call it `<repo>`), and one more inside `~/Docu
 | # | Step | Expected | Result |
 | --- | --- | --- | --- |
 | C1 | Settings > Harnesses: **Open terminal** for a harness. | Terminal.app opens running the harness command. On first use macOS may ask to let Agetor control Terminal; allow it. No prompt names `osascript` or another binary. | |
-| C2 | In a task with a live claude session, **Open tmux**. | Terminal.app opens attached to the task's tmux session. | |
+| C2 | In a task with a live claude session, **Open tmux**. | Terminal.app opens attached to the task's tmux session. With the bundled tmux it works via the vendored terminfo database (`<bundle>/bin/terminfo` + `/usr/share/terminfo`), so no `can't find terminfo database`; a failed attach keeps the window open with an error and "Press Enter", and a launch failure (Automation denied) shows a 502 message in the card. | |
 | C3 | Click **Reveal in Finder** on a sent-file tile and on the app's data folder entry, if present. | Finder opens with the item selected. In `ps` during the click the command is `.../disclaim /usr/bin/open -R ...`. | |
 | C4 | Trigger a notification (finish a run with the window unfocused). | The banner is branded Agetor. If notifications were never granted for the dev build, the one-time prompt names Agetor. | |
 | C5 | Open a second task's panel and click the notification for the first. | The first task's panel opens (notifier registration and click path intact). | |

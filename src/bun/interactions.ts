@@ -239,6 +239,14 @@ export interface TmuxPromptRequest {
    *  `__external__` / `__cancelled__` since there are no real choices to
    *  validate against. */
   unparsable?: boolean;
+  /** DISPLAY-ONLY: the pane's widget renders its rows without `N.` prefixes,
+   *  so the card must hide the synthetic keys too (set by
+   *  `matchUnnumberedModal` — issue #298's Chrome startup prompt). The
+   *  `choices[].key` values themselves stay 1-based and are what the answer
+   *  route validates and `dismissTmuxPrompt` navigates with; this flag never
+   *  reaches a keystroke or a fingerprint. Consumed in the webview through
+   *  `tmuxChoiceLabel` (src/mainview/lib/tmux-prompt.ts). */
+  hideKeys?: boolean;
 }
 
 export interface TmuxPromptAnswer {
@@ -769,6 +777,9 @@ export function registerTmuxPrompt(args: {
   fingerprint: string;
   unparsable?: boolean;
   confirmKey?: string;
+  /** Display-only: hide the synthetic `N. ` prefixes on the card. See
+   *  `TmuxPromptRequest.hideKeys`. */
+  hideKeys?: boolean;
 }): { id: string; req: TmuxPromptRequest; answer: Promise<TmuxPromptAnswer> } {
   // Defend the reserved-key namespace — `__external__` / `__cancelled__`
   // must be unambiguously sentinels, not legitimate user keystrokes.
@@ -806,6 +817,7 @@ export function registerTmuxPrompt(args: {
     createdAt: Date.now(),
     unparsable: args.unparsable,
     confirmKey: args.confirmKey,
+    hideKeys: args.hideKeys,
   };
   const answer = new Promise<TmuxPromptAnswer>((resolve) => {
     tmuxPrompts.set(id, { req, resolve });
