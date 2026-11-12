@@ -253,3 +253,26 @@ test("cmdShow prints a repositories block for a multi-repository task", async ()
   expect(text).toContain("backend: /src/backend");
   expect(text).toContain("/wt/task-1/frontend");
 });
+
+test("cmdShow escapes repository paths and prints each repository's checkout drift (review N1)", async () => {
+  const task = makeTask({
+    workdir: "/wt/task-1",
+    worktreePath: "/wt/task-1",
+    branch: null,
+    checkoutBranch: null,
+    repositories: [
+      { path: "/src/front\u001b[31mend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/front\u0007end", baseRef: "a", checkoutBranch: "implement/y", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  currentClient = fakeClient(task);
+  await cmdShow([task.id], flags);
+  const text = outputs.join("\n");
+  expect(text).not.toContain("\u001b");
+  expect(text).not.toContain("\u0007");
+  expect(text).toContain("frontend: /src/front\\u001b[31mend");
+  expect(text).toContain("→ /wt/task-1/front\\u0007end");
+  expect(outputs).toContain("      checkout: implement/y (drifted from repository branch)");
+  // A repository still on its own branch prints no checkout line.
+  expect(outputs.filter((l) => l.includes("checkout:"))).toHaveLength(1);
+});

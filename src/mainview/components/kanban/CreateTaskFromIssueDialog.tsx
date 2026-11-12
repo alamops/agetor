@@ -18,6 +18,7 @@ import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaun
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
 import { RepositoriesDialog } from "./RepositoriesDialog";
 import { pinPrimaryRepository, repositoryFileScopes, selectionName, type RepoSelection } from "@/lib/repo-selection";
+import { applyRepositoriesSave, seedRepositoriesDialogValue } from "@/lib/multi-repo-ui";
 import { PromptComposer } from "./PromptComposer";
 import { TaskTypePicker } from "./TaskTypePicker";
 
@@ -427,14 +428,24 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
                 <RepositoriesDialog
                   open={repositoriesOpen}
                   onClose={() => setRepositoriesOpen(false)}
-                  value={repos}
+                  // The inline Branch picker's base ref belongs to the issue's
+                  // repository while it is the only one; seeding it into that
+                  // entry keeps it when an extra repository is added (the
+                  // multi payload reads only `repositories[].baseRef`).
+                  value={seedRepositoriesDialogValue(repos, context.path, wt.baseRef)}
                   lockedPath={context.path}
                   onSave={(next) => {
                     if (!context) {
                       setRepos(next);
                       return;
                     }
-                    setRepos((cur) => pinPrimaryRepository(context.path, next, cur));
+                    // The issue's repository is always first, so this never
+                    // promotes another project; collapsing back to it alone
+                    // hands its per-entry base ref to the inline picker.
+                    const pinned = pinPrimaryRepository(context.path, next, repos);
+                    const applied = applyRepositoriesSave(pinned, { primaryPath: context.path, inlineBaseRef: wt.baseRef });
+                    setRepos(applied.repos);
+                    if (applied.inlineBaseRef.kind === "set") wt.setBaseRef(applied.inlineBaseRef.value);
                   }}
                 />
               </div>

@@ -3,6 +3,7 @@ import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { discoveryScopesForTask } from "../../shared/file-scope.ts";
+import { mergeAgentCapabilities } from "../../shared/agent-capabilities.ts";
 
 /**
  * List the slash commands and MCP/skill extensions available to a task's agent
@@ -31,16 +32,8 @@ export async function cmdCommands(args: string[], flags: Flags): Promise<void> {
     const first = settled.find((s) => s.status === "rejected");
     throw first && first.status === "rejected" ? first.reason : new Error("agent discovery failed");
   }
-  const byCommand = new Map<string, (typeof results)[number]["commands"][number]>();
-  const byExtension = new Map<string, (typeof results)[number]["extensions"][number]>();
-  for (const result of results) {
-    for (const command of result.commands) if (!byCommand.has(command.name)) byCommand.set(command.name, command);
-    for (const extension of result.extensions) {
-      if (!byExtension.has(extension.insert)) byExtension.set(extension.insert, extension);
-    }
-  }
-  const commands = [...byCommand.values()];
-  const extensions = [...byExtension.values()];
+  // The same union the app composer shows (scope order, first occurrence wins).
+  const { commands, extensions } = mergeAgentCapabilities(results);
 
   if (flags.json) return printJson({ commands, extensions });
   if (commands.length === 0 && extensions.length === 0) {

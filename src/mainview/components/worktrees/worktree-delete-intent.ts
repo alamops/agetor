@@ -121,33 +121,13 @@ export function buildDeleteConfirmCopy(
 export type DeleteOutcome = { kind: "silent" } | { kind: "error"; message: string };
 
 /**
- * `Promise.all` with a bounded number of calls in flight, preserving input
- * order in the results. The Worktrees delete confirm fetches one git status
- * per checkout of a task (each is a `git` subprocess on the bun side), so an
- * unbounded `Promise.all` over a 10+ repository task fans out that many
- * processes from one click. Kept here, next to the confirm's decision logic,
- * so the cap itself has a permanent unit test (the component has no render
- * tests in this app). A `limit` below 1 is treated as 1.
+ * The Worktrees delete confirm fetches one git status per checkout of a task
+ * (each is a `git` subprocess on the bun side), so it bounds that fan-out
+ * with the shared `mapWithConcurrency` helper. Re-exported here so the
+ * dialog keeps importing its decision helpers from one module; the helper
+ * and its unit tests live in `src/mainview/lib/map-with-concurrency.ts`.
  */
-export async function mapWithConcurrency<T, R>(
-  items: readonly T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  const width = Math.max(1, Math.min(Math.floor(limit) || 1, items.length));
-  if (items.length === 0) return results;
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (true) {
-      const i = next++;
-      if (i >= items.length) return;
-      results[i] = await fn(items[i]!, i);
-    }
-  };
-  await Promise.all(Array.from({ length: width }, worker));
-  return results;
-}
+export { mapWithConcurrency } from "../../lib/map-with-concurrency.ts";
 
 /**
  * Decide whether an archive's `teardown` result is a success or a failure

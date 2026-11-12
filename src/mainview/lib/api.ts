@@ -1651,13 +1651,14 @@ export const api = {
    *  returns up to `limit` (server default 50) matches; `truncated` then
    *  reports the internal 250k scan cap instead of the 20k display cap. See
    *  `searchProjectFiles` (`use-project-files.ts`), the `@` popover's
-   *  consumer of this mode. */
-  listProjectFiles: (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+   *  consumer of this mode. `signal` lets a superseded per-keystroke search
+   *  release its connection (`searchProjectFileScopes`). */
+  listProjectFiles: (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }, signal?: AbortSignal) => {
     const params = new URLSearchParams({ dir: scope.dir });
     if (scope.ref) params.set("ref", scope.ref);
     if (scope.q != null) params.set("q", scope.q);
     if (scope.limit != null) params.set("limit", String(scope.limit));
-    return j<{ files: string[]; truncated: boolean }>(`/files/index?${params.toString()}`);
+    return j<{ files: string[]; truncated: boolean }>(`/files/index?${params.toString()}`, signal ? { signal } : undefined);
   },
   listTasks: () => j<Task[]>("/tasks"),
   /** Single task by id, fresh from the server (bypasses the 2s board poll's

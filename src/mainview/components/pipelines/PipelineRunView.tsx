@@ -74,6 +74,7 @@ import { StepNode } from "./StepNode";
 import { SubagentDetailsDialog } from "./SubagentDetailsDialog";
 import { SubagentEdge } from "./SubagentEdge";
 import { SubagentNode } from "./SubagentNode";
+import { mapWithConcurrency } from "@/lib/map-with-concurrency";
 
 const NODE_TYPES = { step: StepNode, subagent: SubagentNode };
 const EDGE_TYPES = { step: StepEdge, subagent: SubagentEdge };
@@ -97,22 +98,6 @@ function liveSubagentsSignature(map: Map<string, Subagent[]>): string {
  *  task's `/tasks/:id/events`), so a fan-out with N active steps must not
  *  fire N parallel listings every 2s — that starved the stream itself. */
 const SUBAGENT_LIST_CONCURRENCY = 2;
-
-/** `Promise.all` with at most `limit` `fn` calls in flight; results keep
- *  input order. */
-async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  async function worker(): Promise<void> {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await fn(items[index]!);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
-  return results;
-}
 
 /** Keyboard activation of a focused React Flow node: Enter/Space on the
  *  focused `.react-flow__node` (React Flow gives every node `tabIndex=0`

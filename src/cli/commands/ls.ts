@@ -100,7 +100,9 @@ export async function cmdLs(
   if (f.search) {
     const q = f.search.toLowerCase();
     tasks = tasks.filter((t) =>
-      `${t.title} ${t.prompt} ${t.workdir} ${t.branch ?? ""} ${t.checkoutBranch ?? ""} ${(t.repositories ?? []).map((r) => `${r.name} ${r.path}`).join(" ")}`.toLowerCase().includes(q),
+      // A multi-repository task's scalar `branch`/`checkoutBranch` are null;
+      // its branches live on each repository entry.
+      `${t.title} ${t.prompt} ${t.workdir} ${t.branch ?? ""} ${t.checkoutBranch ?? ""} ${(t.repositories ?? []).map((r) => `${r.name} ${r.path} ${r.branch ?? ""} ${r.checkoutBranch ?? ""}`).join(" ")}`.toLowerCase().includes(q),
     );
   }
   if (flags.json) return printJson(tasks);

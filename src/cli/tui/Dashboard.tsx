@@ -373,10 +373,17 @@ export function Dashboard({
       // (it is a client-side layout prefix, not part of the repo's tree); an
       // unprefixed query searches every repository.
       const named = multi ? splitNamedScopePath(scopes, q) : null;
-      const targets = named
+      // Trailing slashes are directory syntax the server's path search
+      // doesn't index (`frontend/src/` → `src`).
+      const targets = (named
         ? [{ scope: named.scope, local: named.path }]
-        : scopes.map((scope) => ({ scope, local: q }));
-      if (targets.length === 0 || targets.some((t) => !t.local)) return [];
+        : scopes.map((scope) => ({ scope, local: q }))
+      ).map((t) => ({ ...t, local: t.local.replace(/\/+$/, "") }));
+      // Nothing left to search (`@frontend/` alone): answer `null`, which the
+      // composer treats as "no remote answer" and keeps the local rows (the
+      // repository's root row and its first entries). `[]` would read as an
+      // authoritative zero matches and blank the popover.
+      if (targets.length === 0 || targets.some((t) => !t.local)) return null;
       const results = await Promise.all(
         targets.map(async ({ scope, local }) => {
           try {

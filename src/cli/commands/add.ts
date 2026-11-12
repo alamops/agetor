@@ -35,6 +35,7 @@ import {
   type AgentProfile,
   type Pipeline,
   type Speed,
+  type Task,
 } from "../../shared/types.ts";
 import { isSpeed, supportedSpeeds, SPEED_OPTIONS } from "../../shared/speed.ts";
 import {
@@ -139,7 +140,46 @@ export function parseAdd(args: string[]): AddOpts {
       default: break;
     }
   }
+  o.repos = normalizeRepoSelection(o.workdir, o.repos);
   return o;
+}
+
+/**
+ * The repository set an `agetor add` names, in order.
+ *
+ * With `--repo` present, `--workdir` is the first repository rather than a
+ * value the repository set silently overrides (`--workdir W --repo b` used to
+ * drop W). Entries are deduped by resolved path, keeping the first position;
+ * a duplicate's `=ref` fills in a ref the kept entry didn't carry, so
+ * `--workdir W --repo W=main` keeps W first and pins `main`. With no `--repo`
+ * the list stays empty and `--workdir` keeps its single-repository meaning.
+ */
+export function normalizeRepoSelection(
+  workdir: string | undefined,
+  repos: { path: string; baseRef?: string }[],
+): { path: string; baseRef?: string }[] {
+  if (repos.length === 0) return [];
+  const ordered = workdir?.trim() ? [{ path: workdir }, ...repos] : repos;
+  const kept = new Map<string, { path: string; baseRef?: string }>();
+  for (const entry of ordered) {
+    const key = path.resolve(entry.path);
+    const existing = kept.get(key);
+    if (!existing) kept.set(key, { ...entry });
+    else if (!existing.baseRef && entry.baseRef) existing.baseRef = entry.baseRef;
+  }
+  return [...kept.values()];
+}
+
+/** Multi-repository tasks need worktree isolation (each repository gets its
+ *  own linked worktree in the task workspace), so `--isolation none` with two
+ *  or more repositories is a usage error rather than something to override
+ *  silently. One repository is an ordinary task and keeps `--isolation none`. */
+export function assertRepoIsolationCombo(o: Pick<AddOpts, "repos" | "isolation">): void {
+  if (o.repos.length > 1 && o.isolation === "none") {
+    throw new Error(
+      "--isolation none cannot be used with two or more repositories (multi-repository tasks need worktree isolation)",
+    );
+  }
 }
 
 /** Whether any of the manual harness/model/mode/effort/speed/maxMode flags
@@ -189,6 +229,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   const o = parseAdd(args);
   assertProfileFlagCombo(o);
   assertPipelineFlagCombo(o);
+  assertRepoIsolationCombo(o);
   if (o.opencodeServerIgnored) warnOpencodeServerFlagIgnored();
   let prompt = o.prompt;
   if (o.promptFile) {
@@ -229,6 +270,9 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   // print, matching the dialog/form's non-blocking treatment of the same
   // signal.
   let issueWarning: string | undefined;
+  // The directory an `--issue` was matched against when it came from cwd
+  // (no `--workdir`/`--repo`); the wizard keeps it as the first repository.
+  let issueRepoDir: string | undefined;
   if (o.issue) {
     const parsed = parseIssueUrl(o.issue);
     if (!parsed) throw new Error("--issue: not a recognized GitHub/GitLab/Bitbucket issue URL");
@@ -241,11 +285,10 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     // worse, a different checkout the user happened to be in) and fail with
     // "that issue belongs to a different repository". Try the explicit
     // `--workdir` first, then every selected repository in order, and only
-    // fall back to cwd when neither was given. An explicit `--workdir` does
-    // not replace the `--repo` set: the task is created on the repositories,
-    // so the workdir alone is not a place the issue can be attributed to.
-    // The server matches the issue against the whole repository set, so the
-    // first candidate whose remote matches wins.
+    // fall back to cwd when neither was given. With `--repo`, `parseAdd`
+    // already made `--workdir` the first repository, so every candidate is
+    // part of the created set. The server matches the issue against the
+    // whole repository set, so the first candidate whose remote matches wins.
     const explicitWorkdir = o.workdir?.trim() ? path.resolve(o.workdir) : null;
     const repoDirs = o.repos.map((r) => path.resolve(r.path));
     const candidateDirs = [
@@ -291,10 +334,12 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     // Preserve the historical single-project behavior: with no repository set,
     // the task's workdir is the directory the issue matched (an explicit
     // `--workdir`, or cwd). With `--repo`, the repository set owns the
-    // workdir (baseInput sends its first entry), so leave `o.workdir` alone
-    // rather than arbitrarily pinning one candidate — a `--workdir` here only
-    // widened the issue-attribution search above.
+    // workdir (baseInput sends its first entry), so leave `o.workdir` alone.
     if (candidateDirs.length === 1 && o.repos.length === 0) o.workdir = matchedDir!;
+    // Neither `--workdir` nor `--repo` named the project, so the issue was
+    // matched against cwd: the wizard keeps that repository and offers to
+    // add more, the same multi-select a plain `agetor add` gets.
+    if (!explicitWorkdir && repoDirs.length === 0) issueRepoDir = matchedDir!;
     o.title ??= issueTaskTitle(thread.item);
     prompt ??= buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
     // An explicit `--type` stays authoritative; only fill it from the
@@ -340,7 +385,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     }
     input = baseInput(o, o.title, prompt, profileId, pipelineId);
   } else {
-    input = await wizard(client, o, prompt);
+    input = await wizard(client, o, prompt, { issueRepoDir });
   }
   if (!input) {
     out("cancelled");
@@ -356,6 +401,17 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   if (o.start) input.column = "ready";
 
   const task = await client.createTask(input);
+  // Checked before `--start`: a task an older core flattened to one
+  // repository must not be launched as if it were the requested set.
+  const repoOutcome = repositorySetOutcome(input, task);
+  if (repoOutcome === "core-too-old") {
+    const short = task.id.slice(0, 8);
+    throw new Error(
+      `the running core is too old for multi-repository tasks: it ignored --repo and created ${short} ` +
+        `as a single-repository task on ${task.workdir}. Remove it (agetor rm ${short}), update the app, and retry.`,
+    );
+  }
+  const collapsedNote = repoOutcome === "collapsed" ? collapsedRepositoriesNote(input, task) : null;
 
   // `restrictTo` matches the `--start`/pre-check paths below: an `--issue`
   // task's composed prompt quotes issue text full of `@octocat`-style
@@ -412,7 +468,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   }
 
   if (flags.json) {
-    const warnings = [issueWarning, unresolvedWarningLine(unresolvedRefsWarning), startError].filter(
+    const warnings = [issueWarning, collapsedNote, unresolvedWarningLine(unresolvedRefsWarning), startError].filter(
       (w): w is string => Boolean(w),
     );
     return printJson(warnings.length ? { task, started, warnings } : { task, started });
@@ -421,9 +477,44 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${escapeFreeText(task.title)}` +
       (started ? c.cyan("  ▸ started") : ""),
   );
+  if (collapsedNote) out(c.dim(`  note: ${collapsedNote}`));
   if (startError) out(c.yellow(`  ! ${escapeFreeText(startError)}`));
   warnUnresolvedRefs(unresolvedRefsWarning);
   if (!started) out(c.dim(`  start it: agetor start ${task.id.slice(0, 8)}`));
+}
+
+/**
+ * Did the core create the repository set this add asked for?
+ *
+ * - `"ok"`: one repository (or none) was requested, or every requested
+ *   repository came back.
+ * - `"core-too-old"`: 2+ were requested and the task carries no
+ *   `repositories` field at all. Every core that understands the field
+ *   returns it on every task (a single row derives one entry), so its absence
+ *   means a core from before multi-repository tasks silently dropped the
+ *   unknown field and made a single-repository task on the first path.
+ * - `"collapsed"`: the field is there but shorter — the core deduped
+ *   selections that resolve to the same git root, which is the documented
+ *   contract (docs/architecture/multi-repo-tasks.md), not an error.
+ */
+export function repositorySetOutcome(
+  input: Pick<CreateTaskInput, "repositories">,
+  task: Pick<Task, "repositories">,
+): "ok" | "core-too-old" | "collapsed" {
+  const requested = input.repositories?.length ?? 0;
+  if (requested < 2) return "ok";
+  if (!Array.isArray(task.repositories)) return "core-too-old";
+  return task.repositories.length < requested ? "collapsed" : "ok";
+}
+
+function collapsedRepositoriesNote(
+  input: Pick<CreateTaskInput, "repositories">,
+  task: Pick<Task, "repositories">,
+): string {
+  const kept = task.repositories?.length ?? 0;
+  if (kept <= 1) return "the selected paths are in one git repository, so the task was created as a single-repository task";
+  const requested = input.repositories?.length ?? 0;
+  return `${requested - kept} selected path${requested - kept === 1 ? "" : "s"} shared a git repository with another selection; the task has ${kept} repositories`;
 }
 
 /** Pure decision of whether `agetor add` should run non-interactively (a
@@ -499,39 +590,51 @@ function baseInput(
   profileId?: string,
   pipelineId?: string,
 ): CreateTaskInput {
+  // Wizard picks reach here without passing through `cmdAdd`'s up-front check.
+  assertRepoIsolationCombo(o);
+  // Resolve relative to the CLI's cwd (not the daemon's — it may be a
+  // long-lived detached process with a stale/unrelated cwd) so a typed or
+  // `--workdir`-flagged relative path lands on disk where the user meant,
+  // matching `projects add`'s path.resolve(target).
+  const repos = normalizeRepoSelection(undefined, o.repos);
+  let placement: Pick<CreateTaskInput, "workdir" | "isolation" | "baseRef" | "repositories">;
+  if (repos.length > 1) {
+    // The server derives a multi task's workdir (the per-task workspace) from
+    // the set; sending the first entry keeps the payload self-consistent.
+    placement = {
+      workdir: path.resolve(repos[0]!.path),
+      repositories: repos.map((r) => ({
+        path: path.resolve(r.path),
+        ...(r.baseRef ? { baseRef: r.baseRef } : {}),
+      })),
+      isolation: "worktree",
+      baseRef: o.baseRef,
+    };
+  } else if (repos.length === 1) {
+    // One repository is an ordinary task: send it the pre-multi-repository
+    // way (workdir + base ref, no `repositories`). The server validates a
+    // `repositories` entry as a git repo, which would refuse a plain folder
+    // that `--isolation none` has always accepted. The entry's own `=ref`
+    // wins over `--base-ref`, the same precedence the server applies.
+    placement = {
+      workdir: path.resolve(repos[0]!.path),
+      isolation: o.isolation,
+      baseRef: repos[0]!.baseRef ?? o.baseRef,
+    };
+  } else {
+    placement = {
+      workdir: o.workdir ? path.resolve(o.workdir) : o.workdir,
+      isolation: o.isolation,
+      baseRef: o.baseRef,
+    };
+  }
   const input: CreateTaskInput = {
     title,
     prompt,
-    // Resolve relative to the CLI's cwd (not the daemon's — it may be a
-    // long-lived detached process with a stale/unrelated cwd) so a typed or
-    // `--workdir`-flagged relative path lands on disk where the user meant,
-    // matching `projects add`'s path.resolve(target).
-    //
-    // The repository set owns the task's workdir: the server derives it from
-    // the selected entries (first kept path for a selection that collapses to
-    // one, the per-task workspace root for 2+), so an explicit `--workdir`
-    // alongside `--repo` must not be sent as the task's workdir — it would be
-    // silently overwritten server-side. Send the same anchor the server will
-    // use, keeping the payload self-consistent (a `--workdir` given only for
-    // `--issue` attribution has already done its job in `cmdAdd`).
-    workdir: o.repos.length > 0
-      ? path.resolve(o.repos[0]!.path)
-      : o.workdir
-        ? path.resolve(o.workdir)
-        : o.workdir,
-    ...(o.repos.length > 0
-      ? {
-          repositories: o.repos.map((r) => ({
-            path: path.resolve(r.path),
-            ...(r.baseRef ? { baseRef: r.baseRef } : {}),
-          })),
-          // Multi-repository tasks require worktree isolation; 2+ repos force
-          // it so a `--isolation none` combination can't reach the server's
-          // 400.
-          isolation: o.repos.length > 1 ? ("worktree" as const) : o.isolation,
-        }
-      : { isolation: o.isolation }),
-    baseRef: o.baseRef,
+    workdir: placement.workdir,
+    ...(placement.repositories ? { repositories: placement.repositories } : {}),
+    isolation: placement.isolation,
+    baseRef: placement.baseRef,
     taskType: o.type,
     references: resolveRefs(o.refs),
   };
@@ -583,6 +686,7 @@ export async function wizard(
   client: AgetorClient,
   o: AddOpts,
   prefilledPrompt: string | undefined,
+  extra: { issueRepoDir?: string } = {},
 ): Promise<CreateTaskInput | null> {
   p.intro(c.cyan("New Agetor task"));
 
@@ -805,17 +909,28 @@ export async function wizard(
   }
 
   let workdir = o.workdir;
+  // An `--issue` matched against cwd (no `--workdir`/`--repo`) arrives with
+  // `o.workdir` already set to that repository. It stays the first
+  // repository, and the user can add more — the same multi-select a plain
+  // add gets, minus the choice of dropping the issue's own repository.
+  // `--isolation none` allows only one repository, so there is nothing to add.
+  const issueRepoDir =
+    extra.issueRepoDir && o.repos.length === 0 && workdir === extra.issueRepoDir && o.isolation !== "none"
+      ? extra.issueRepoDir
+      : undefined;
   if (!workdir && o.repos.length > 0) {
     // `--repo` already defines the set; don't ask again. The first selected
     // repository is the form's workdir, matching the server's create contract
     // (the workspace root is derived from it).
     workdir = o.repos[0]!.path;
-  } else if (!workdir) {
+  } else if (!workdir || issueRepoDir) {
     const projects = (await client.listProjects().catch(() => [])) as Array<{
       path: string;
       name?: string;
     }>;
-    if (projects.length > 0) {
+    const fixed = issueRepoDir ? path.resolve(issueRepoDir) : null;
+    const offered = fixed ? projects.filter((pr) => path.resolve(pr.path) !== fixed) : projects;
+    if (offered.length > 0) {
       // Multi-select is the CLI/TUI half of the owner's full-parity decision
       // (issue #291): one repository keeps today's single-pick flow, 2+ send
       // the whole set. Clack has no per-row editor, so multi selections are
@@ -823,20 +938,22 @@ export async function wizard(
       // fields the webview's `RepositoriesDialog` exposes.
       const OTHER = "__other__";
       const picked = await p.multiselect<string>({
-        message: "Repositories (space to select, enter to confirm)",
+        message: fixed
+          ? `Also work in (optional — the issue's repository ${escapeControlChars(path.basename(fixed) || fixed)} is always included)`
+          : "Repositories (space to select, enter to confirm)",
         options: [
-          ...projects.map((pr) => ({
+          ...offered.map((pr) => ({
             value: pr.path,
-            label: pr.name ?? (path.basename(pr.path) || pr.path),
-            hint: pr.path,
+            label: escapeControlChars(pr.name ?? (path.basename(pr.path) || pr.path)),
+            hint: escapeControlChars(pr.path),
           })),
           { value: OTHER, label: "Other (type a path)…" },
         ],
-        initialValues: [projects[0]!.path],
-        required: true,
+        initialValues: fixed ? [] : [offered[0]!.path],
+        required: !fixed,
       });
       if (p.isCancel(picked)) return cancelled();
-      const selections: Array<{ path: string; baseRef?: string }> = [];
+      const selections: Array<{ path: string; baseRef?: string }> = fixed ? [{ path: fixed }] : [];
       for (const value of picked) {
         if (value === OTHER) {
           const typed = await p.text({ message: "Path", placeholder: process.cwd() });
@@ -846,22 +963,30 @@ export async function wizard(
           selections.push({ path: value });
         }
       }
-      if (selections.length === 0) return cancelled();
-      if (selections.length > 1) {
-        for (const selection of selections) {
+      const unique = normalizeRepoSelection(undefined, selections);
+      if (unique.length === 0) return cancelled();
+      if (unique.length > 1) {
+        // Checked before the per-repository prompts so the user isn't asked
+        // for base refs a refused combination would throw away.
+        assertRepoIsolationCombo({ repos: unique, isolation: o.isolation });
+        // The default an empty answer falls back to: `--base-ref` when given
+        // (the task-level default for every entry), else that repository's HEAD.
+        const placeholder = o.baseRef ? `default (${escapeControlChars(o.baseRef)})` : "default (HEAD)";
+        for (const selection of unique) {
           const name = path.basename(selection.path.replace(/\/+$/, "")) || selection.path;
           const ref = await p.text({
-            message: `Base ref for ${name}`,
-            placeholder: "default (HEAD)",
+            message: `Base ref for ${escapeControlChars(name)}`,
+            placeholder,
           });
           if (p.isCancel(ref)) return cancelled();
           const trimmed = ref.trim();
           if (trimmed) selection.baseRef = trimmed;
         }
       }
-      o.repos = selections;
-      workdir = selections[0]!.path;
-    } else {
+      // `baseInput` sends one repository the single-repository way.
+      o.repos = unique;
+      workdir = unique[0]!.path;
+    } else if (!workdir) {
       const typed = await p.text({ message: "Path", placeholder: process.cwd() });
       if (p.isCancel(typed)) return cancelled();
       workdir = typed.trim() || process.cwd();

@@ -488,6 +488,8 @@ async function refsFromPathsForCaller(rawPaths: unknown[], caller: ApiCaller | n
  * selection". Any entry that isn't an object with an absolute non-empty
  * `path` 400s the whole request — unlike `references`, a silently dropped
  * repository would create a task that doesn't touch the repo the user picked.
+ * There is deliberately no hard cap on the count (owner decision, grill #14):
+ * every per-repository fan-out downstream runs in bounded batches instead.
  */
 function parseRepositoryInputs(
   raw: unknown,
@@ -2129,7 +2131,8 @@ export function startApiServer(
 
       // Resolve the git top-level for a selected project path (issue #291).
       // The Repositories dialog uses it to dedupe a selection by repository
-      // root before the task exists; the CLI path gate probes `?path=`.
+      // root before the task exists. Only the webview calls it, so it is
+      // desktop-only in ROUTE_POLICY (no CLI path gate needed).
       "/projects/repo-root": {
         GET: authed(async (req) => {
           const dir = new URL(req.url).searchParams.get("path");
@@ -6117,6 +6120,18 @@ export function startApiServer(
               { status: 400, headers: corsHeaders(req) },
             );
           }
+          // A multi-repository task's workdir is its per-task workspace root,
+          // derived from the repository set at create time
+          // (docs/architecture/multi-repo-tasks.md). Its worktreePath stays
+          // null until the first start, so the guard above never fired for a
+          // never-started row; re-pointing that root would detach it from
+          // `repositories[]`, whose checkouts are prepared beneath it.
+          if ("workdir" in patch && patch.workdir !== before.workdir && isMultiRepoTask(before)) {
+            return json(
+              { error: "workdir cannot be changed on a multi-repository task — it is the task's workspace root" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
           // Validate `agent` resolves to a real harness — otherwise the
           // kanban shows a stuck row whose AgentSelect can't reflect its
           // own value and whose startTask fails downstream with the same
@@ -9101,7 +9116,10 @@ export function startApiServer(
       "/tasks/:id/terminals": {
         GET: authed((req) => json(listTerminals(req.params.id), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { repo?: unknown };
+          // A `null` (or other non-object) JSON body reads as an empty one:
+          // `body.repo` on null used to throw and answer 500.
+          const parsed: unknown = await req.json().catch(() => null);
+          const body = parsed !== null && typeof parsed === "object" ? (parsed as { repo?: unknown }) : {};
           const repo = typeof body.repo === "string" && body.repo ? body.repo : null;
           const result = await createTerminal(req.params.id, { repo });
           if ("error" in result) {

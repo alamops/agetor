@@ -16,7 +16,17 @@ import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
-import { useProjectFiles, useProjectFileScopes, searchProjectFiles, resolveNamedScopePath, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
+import {
+  useProjectFiles,
+  useProjectFileScopes,
+  searchProjectFiles,
+  resolveNamedScopePath,
+  FOCUS_REFRESH_MIN_AGE_MS,
+  MULTI_SCOPE_CONCURRENCY,
+  type FileScope,
+  type NamedFileScope,
+} from "@/lib/use-project-files";
+import { mapWithConcurrency } from "@/lib/map-with-concurrency";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { unresolvedAtTokens, isSafeClientRelPath, isListedPath } from "@/lib/at-highlight";
 import { multiScopeStatTargets } from "@/lib/at-scope-targets";
@@ -106,15 +116,23 @@ const EMPTY_PATH_SET: ReadonlySet<string> = new Set();
  * `PromptComposerProps.capabilities`'s doc for why that hoisting exists.
  * `enabled: false` never fetches and reports back `{ commands: [],
  * extensions: [] }`.
+ *
+ * `opts.awaitReady` gates a multi-repository discovery (one request per
+ * repository) on the caller's event stream — see
+ * {@link discoverAgentCapabilities}. A single scope never waits.
  */
 export function useAgentCapabilities(
   agent: string,
   scope: FileScope | FileScope[] | null | undefined,
-  opts?: { enabled?: boolean },
+  opts?: { enabled?: boolean; awaitReady?: (() => Promise<void>) | null },
 ): { commands: AvailableCommand[]; extensions: AvailableExtension[] } {
   const enabled = opts?.enabled ?? true;
   const [commands, setCommands] = useState<AvailableCommand[]>([]);
   const [extensions, setExtensions] = useState<AvailableExtension[]>([]);
+  // A fresh closure every parent render in RunPanel (it binds the task id);
+  // read through a ref so it never re-arms the effect below.
+  const awaitReadyRef = useRef(opts?.awaitReady ?? null);
+  awaitReadyRef.current = opts?.awaitReady ?? null;
   // One scope for a single-repository task; one per repository for a multi
   // task (issue #291). The workspace root is not a git repo, so discovery
   // there would find nothing from any selected repository.
@@ -125,24 +143,11 @@ export function useAgentCapabilities(
     const targets = scopes.filter((s) => !!s.dir?.trim());
     if (!enabled || targets.length === 0) { setCommands([]); setExtensions([]); return; }
     let cancelled = false;
-    // Pass the harness id (not just the kind) so aliased multi-account
-    // harnesses read their own per-harness commands/skills — the server
-    // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
-    // honored unchanged.
-    Promise.all(
-      targets.map((s) =>
-        api
-          .listAgentCapabilities({ agent, workdir: s.dir.trim(), branch: s.ref?.trim() || undefined })
-          .catch(() => null),
-      ),
-    ).then((results) => {
-      if (cancelled) return;
-      // Union in scope order, first occurrence wins (a name declared in two
-      // repositories appears once). A failed scope contributes nothing; an
-      // all-failed discovery still settles to empty lists, exactly like the
-      // single-scope contract. The merge itself is the tested pure helper in
-      // `src/mainview/lib/agent-capabilities.ts`.
-      const merged = mergeAgentCapabilities(results);
+    void discoverAgentCapabilities(agent, targets, {
+      awaitReady: awaitReadyRef.current,
+      isCurrent: () => !cancelled,
+    }).then((merged) => {
+      if (cancelled || !merged) return;
       setCommands(merged.commands);
       setExtensions(merged.extensions);
     });
@@ -154,6 +159,49 @@ export function useAgentCapabilities(
   }, [agent, scopeKey, enabled]);
 
   return { commands, extensions };
+}
+
+/**
+ * The request half of {@link useAgentCapabilities}, kept outside the hook so
+ * its request pattern is unit-testable without a React harness. One
+ * `GET /agent-discovery` per scope, merged in scope order.
+ *
+ * A multi-repository discovery (2+ scopes) waits on `awaitReady` (RunPanel's
+ * stream-ready gate) and keeps at most `MULTI_SCOPE_CONCURRENCY` requests in
+ * flight, so opening a task never queues its event stream behind one
+ * discovery per repository; `isCurrent` is re-checked before each request
+ * and a superseded call resolves `null` having fetched nothing more. A
+ * single scope fetches at once, unchanged.
+ */
+export async function discoverAgentCapabilities(
+  agent: string,
+  targets: readonly FileScope[],
+  opts: { awaitReady?: (() => Promise<void>) | null; isCurrent?: () => boolean } = {},
+): Promise<{ commands: AvailableCommand[]; extensions: AvailableExtension[] } | null> {
+  const isCurrent = opts.isCurrent ?? (() => true);
+  const multi = targets.length > 1;
+  if (multi && opts.awaitReady) {
+    await opts.awaitReady();
+    if (!isCurrent()) return null;
+  }
+  // Pass the harness id (not just the kind) so aliased multi-account
+  // harnesses read their own per-harness commands/skills — the server
+  // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
+  // honored unchanged.
+  const results = await mapWithConcurrency(targets, multi ? MULTI_SCOPE_CONCURRENCY : targets.length, (s) =>
+    !isCurrent()
+      ? Promise.resolve(null)
+      : api
+        .listAgentCapabilities({ agent, workdir: s.dir.trim(), branch: s.ref?.trim() || undefined })
+        .catch(() => null),
+  );
+  if (!isCurrent()) return null;
+  // Union in scope order, first occurrence wins (a name declared in two
+  // repositories appears once). A failed scope contributes nothing; an
+  // all-failed discovery still settles to empty lists, exactly like the
+  // single-scope contract. The merge itself is the tested pure helper in
+  // `src/mainview/lib/agent-capabilities.ts`.
+  return mergeAgentCapabilities(results);
 }
 
 /**
@@ -334,6 +382,16 @@ export interface PromptComposerProps {
    *  without run state simply omit it (undefined never fires). */
   fileScopeRefreshToken?: unknown;
   /**
+   * Resolves once the caller's event stream is ready (RunPanel passes its
+   * stream-ready gate bound to the open task's id). A multi-repository
+   * composer waits on it before its first per-repository listing and
+   * discovery requests, so opening a task never puts one request per
+   * repository ahead of the task's own event stream in the webview's
+   * per-host connection budget. Absent (the New Task form and dialogs, which
+   * have no stream) means no wait. A single-repository composer ignores it.
+   */
+  awaitReady?: () => Promise<void>;
+  /**
    * Functional-updater-capable references setter for `usePromptCapture`'s
    * internal instance (see the `capture` prop doc). When the caller already
    * tracks `references` via `useState` it can pass that setter directly and
@@ -479,6 +537,7 @@ export function PromptComposer({
   fileScopes,
   workspaceRoot,
   fileScopeRefreshToken,
+  awaitReady,
   textareaRef,
   capture,
   capabilities,
@@ -518,7 +577,7 @@ export function PromptComposer({
   const internalCapabilities = useAgentCapabilities(
     agent,
     fileScopes && fileScopes.length > 1 ? fileScopes : fileScope ?? null,
-    { enabled: !capabilities },
+    { enabled: !capabilities, awaitReady },
   );
   const { commands, extensions } = capabilities ?? internalCapabilities;
   const internalSavedPrompts = useSavedPrompts({ enabled: !savedPromptsProp });
@@ -529,9 +588,12 @@ export function PromptComposer({
   // `projectFiles.error` (a failed listing's message) is intentionally
   // unused here — no error UI in this pass; it's available for a future
   // inline hint if that's ever wanted.
-  const singleScopeFiles = useProjectFiles(fileScope ?? null);
-  const multiScopeFiles = useProjectFileScopes(fileScopes ?? null);
+  // A multi-repository composer lists through `useProjectFileScopes` only:
+  // the single-scope hook gets `null` there, so it fetches nothing (it used
+  // to list the active repository a second time, unused).
   const multiScope = (fileScopes?.length ?? 0) > 1;
+  const singleScopeFiles = useProjectFiles(multiScope ? null : fileScope ?? null);
+  const multiScopeFiles = useProjectFileScopes(fileScopes ?? null, { awaitReady });
   const projectFiles = multiScope ? multiScopeFiles : singleScopeFiles;
 
   // Fire `refresh()` when the caller's run-settle token changes — never on
@@ -712,7 +774,11 @@ export function PromptComposer({
     const timer = setTimeout(async () => {
       try {
         const found = new Set<string>();
-        await Promise.all(liveStatTargets.map(async (target) => {
+        // One target per repository (plus the workspace root) on a multi
+        // task: bounded like every other per-repository fan-out.
+        await mapWithConcurrency(liveStatTargets, MULTI_SCOPE_CONCURRENCY, async (target) => {
+          // Superseded while queued behind the cap: don't spend a request.
+          if (cancelled) return;
           const refs = await api.resolveRefs([...target.paths.keys()].map((p) => `${target.dir}/${p}`));
           if (cancelled) return;
           for (const r of refs) {
@@ -721,7 +787,7 @@ export function PromptComposer({
             const tokenKey = target.paths.get(local);
             if (tokenKey) found.add(tokenKey);
           }
-        }));
+        });
         if (!cancelled) setExistsOnDisk(found);
       } catch {
         // Stat unavailable — keep the listing verdict. Worst case is an
@@ -798,7 +864,11 @@ export function PromptComposer({
       const listed = new Set<string>();
       const entryPaths = new Set<string>();
       const missing = new Set<string>();
-      await Promise.all([...byKey.entries()].map(async ([key, token]) => {
+      // Bounded on a multi task, where each token is a request against one of
+      // possibly many repositories; a single-repository draft keeps its one
+      // unbounded round (at most 8 tokens, see above).
+      const candidates = [...byKey.entries()];
+      await mapWithConcurrency(candidates, multiScope ? MULTI_SCOPE_CONCURRENCY : candidates.length, async ([key, token]) => {
         // Multi-repository listing: the token must name its workspace first
         // (`backend/src/a.ts`). Search THAT repository for the repo-local
         // path — searching the single active repo with the prefixed path
@@ -821,6 +891,8 @@ export function PromptComposer({
           missing.add(key);
           return;
         }
+        // Superseded while queued behind the cap: don't spend a request.
+        if (cancelled) return;
         const results = await searchProjectFiles(scope, query, 20);
         if (cancelled) return;
         // `null` means the REQUEST failed (network/server error) — NOT that
@@ -843,7 +915,7 @@ export function PromptComposer({
         } else {
           missing.add(key);
         }
-      }));
+      });
       if (cancelled) return;
       setVerifiedListed(listed);
       setVerifiedEntryPaths(entryPaths);
@@ -901,9 +973,17 @@ export function PromptComposer({
         // Settings, or a file created by the agent/user since the last open,
         // shouldn't linger stale in the `/`/`@` autocompletes indefinitely.
         // `useProjectFiles.refresh()` dedupes in-flight requests, so this is
-        // cheap even when nothing changed. The caller's own `onFocus` (if
-        // any) fires after both.
-        onFocus={() => { reload(); projectFiles.refresh(); onFocus?.(); }}
+        // cheap even when nothing changed. A multi-repository listing is one
+        // request per repository, so its focus refresh is coalesced: only
+        // repositories listed more than FOCUS_REFRESH_MIN_AGE_MS ago are
+        // refetched (the run-settle refresh above still forces all). The
+        // caller's own `onFocus` (if any) fires after both.
+        onFocus={() => {
+          reload();
+          if (multiScope) multiScopeFiles.refresh({ maxAgeMs: FOCUS_REFRESH_MIN_AGE_MS });
+          else singleScopeFiles.refresh();
+          onFocus?.();
+        }}
         onKeyDown={onKeyDown}
         rows={rows}
         className={cn("relative resize-none", textareaClassName)}

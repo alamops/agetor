@@ -322,8 +322,8 @@ test("pull-create stamps only the matching multi-repository entry, first write w
     repositories: [repo("frontend", frontendDir), repo("backend", backendDir)],
   }));
 
-  const create = async (p: string) => {
-    fetchMock = mockPullCreateRoute("https://github.com/o/be/pull/5");
+  const create = async (p: string, htmlUrl: string) => {
+    fetchMock = mockPullCreateRoute(htmlUrl);
     try {
       const res = await realFetch(url("/github/pull-create"), {
         method: "POST",
@@ -337,19 +337,24 @@ test("pull-create stamps only the matching multi-repository entry, first write w
     }
   };
 
-  await create(backendDir);
+  await create(backendDir, "https://github.com/o/be/pull/5");
   let reread = tasks.get(task.id)!;
   expect(reread.prUrl).toBeNull();
   expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
   expect(reread.repositories?.find((r) => r.name === "frontend")?.prUrl).toBeNull();
 
-  // A second create for the same repository must not overwrite the link.
-  await create(backendDir);
+  // A second create for the same repository returns a DIFFERENT url; the
+  // first stamp must survive (a last-write-wins regression would land #6).
+  await create(backendDir, "https://github.com/o/be/pull/6");
   reread = tasks.get(task.id)!;
   expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
+  expect(reread.repositories?.find((r) => r.name === "frontend")?.prUrl).toBeNull();
+  expect(reread.prUrl).toBeNull();
 
   // A create from an unowned directory stamps nothing.
-  await create(otherDir);
+  await create(otherDir, "https://github.com/o/other/pull/7");
   reread = tasks.get(task.id)!;
   expect(reread.repositories?.find((r) => r.name === "frontend")?.prUrl).toBeNull();
+  expect(reread.repositories?.find((r) => r.name === "backend")?.prUrl).toBe("https://github.com/o/be/pull/5");
+  expect(reread.prUrl).toBeNull();
 });

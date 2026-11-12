@@ -1421,6 +1421,61 @@ test("a truncated multi-repository listing searches every repository's scope and
   unmount();
 });
 
+test("a truncated multi-repository listing keeps the local rows for a bare `@<repo>/` (review S19)", async () => {
+  // `@frontend/` leaves nothing to search inside the repository. The remote
+  // search used to answer `[]` — an authoritative "zero matches" — which
+  // blanked the popover's local rows for that repository.
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const seenQueries: Array<{ dir: string; q?: string | null }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+      if (scope.q !== undefined) {
+        seenQueries.push(scope);
+        return { files: ["src/deep-match.ts"], truncated: true };
+      }
+      return { files: ["README.md", "src/"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the per-repository listing fetch
+  await wait(80);
+  stdin.write("@frontend/");
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("frontend/README.md");
+  // Nothing was left to search, so no request went out at all.
+  expect(seenQueries).toEqual([]);
+
+  // A trailing slash on a deeper path is directory syntax, not part of the
+  // query the server ranks.
+  stdin.write("src/");
+  await wait(300);
+  expect(seenQueries.map((q) => [q.dir, q.q])).toEqual([["/wt/taskA/frontend", "src"]]);
+  unmount();
+});
+
 test("a remote search failure keeps the local rows instead of blanking the popover", async () => {
   const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
   const client = {

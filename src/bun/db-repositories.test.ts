@@ -135,11 +135,38 @@ test("malformed JSON falls back to the derived single entry instead of throwing"
 });
 
 test("the generic tasks.update never touches repositories or issue_repo_path", () => {
-  const t = makeTask({ repositories: [repo("a"), repo("b")], issueRepoPath: "/tmp/b" });
+  const t = makeTask({ repositories: [repo("a"), repo("b")], issueRepoPath: "/tmp/b", updatedAt: 1000 });
   tasks.insert(t);
-  tasks.update(t.id, { title: "renamed" });
-  expect(tasks.get(t.id)?.repositories?.map((r) => r.name)).toEqual(["a", "b"]);
-  expect(tasks.get(t.id)?.issueRepoPath).toBe("/tmp/b");
+  const raw = () =>
+    db
+      .query<{ repositories: string; issue_repo_path: string | null; updated_at: number }, [string]>(
+        `SELECT repositories, issue_repo_path, updated_at FROM tasks WHERE id = ?`,
+      )
+      .get(t.id)!;
+  const before = raw();
+  expect(before.updated_at).toBe(1000);
+  // A caller carrying a (stale or hostile) repositories/issueRepoPath value
+  // through the generic patch must not land it: the SET clause skips both
+  // server-managed columns, so only the title changes.
+  const patched = tasks.update(t.id, {
+    title: "renamed",
+    repositories: [repo("x", { prUrl: "https://gh/pr/evil" })],
+    issueRepoPath: "/tmp/x",
+  })!;
+  const after = raw();
+  expect(after.repositories).toBe(before.repositories);
+  expect(after.issue_repo_path).toBe("/tmp/b");
+  expect(patched.title).toBe("renamed");
+  expect(patched.repositories?.map((r) => r.name)).toEqual(["a", "b"]);
+  expect(patched.repositories?.every((r) => r.prUrl === null)).toBe(true);
+  expect(patched.issueRepoPath).toBe("/tmp/b");
+  // updated_at semantics: the generic update still bumps it for the title
+  // edit it did apply (only the targeted writers leave it alone).
+  expect(after.updated_at).toBeGreaterThan(1000);
+  // A patch of ONLY the server-managed fields changes neither column.
+  tasks.update(t.id, { repositories: [], issueRepoPath: null });
+  expect(raw().repositories).toBe(before.repositories);
+  expect(raw().issue_repo_path).toBe("/tmp/b");
   tasks.delete(t.id);
 });
 

@@ -576,3 +576,29 @@ test("--repo matches a multi task's selected repositories, not just its workspac
   await cmdLs(["--repo", "nope"], flags);
   expect(outputs).toEqual(["no matching tasks"]);
 });
+
+test("--search matches a multi task's per-repository branch and checkout (review S13)", async () => {
+  const multi = task({
+    id: "multi002",
+    title: "Cross-repo search",
+    workdir: "/data/worktrees/multi002",
+    branch: null,
+    checkoutBranch: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/auth-ui", branchSource: "created" as const, worktreePath: null, baseRef: null, checkoutBranch: "implement/drift", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/auth-api", branchSource: "created" as const, worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null },
+    ],
+  } as unknown as Partial<Task>);
+  currentClient = makeClient([multi]);
+
+  await cmdLs(["--search", "auth-api"], flags);
+  expect(dataRowLine()).toContain("Cross-repo search");
+
+  outputs.length = 0;
+  await cmdLs(["--search", "implement/drift"], flags);
+  expect(dataRowLine()).toContain("Cross-repo search");
+
+  outputs.length = 0;
+  await cmdLs(["--search", "no-such-branch"], flags);
+  expect(outputs).toEqual(["no matching tasks"]);
+});

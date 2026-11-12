@@ -19,13 +19,13 @@ export const USAGE: Record<string, string> = {
   Create a task.
     --title <s>        task title          --prompt <s> | --prompt-file <p>
     --agent <id>       harness id          --workdir <path>   git repo to run in
-    --repo <path[=ref]>  another repository for this task (repeatable; 2+
-                        repos share one workspace and force worktree isolation;
-                        a repo without =ref starts from --base-ref, else HEAD;
-                        the repository set owns the task's workdir — its first
-                        entry when one is kept, the shared workspace for 2+ —
-                        so a bare --workdir alongside --repo only widens the
-                        --issue match)
+    --repo <path[=ref]>  a repository for this task (repeatable). With
+                        --workdir, that path is the first repository and each
+                        --repo adds one more; a path named twice counts once.
+                        One repository is an ordinary task on that path. Two
+                        or more share one workspace and need worktree
+                        isolation (--isolation none is refused). A repo
+                        without =ref starts from --base-ref, else its HEAD.
     --isolation <m>    worktree | none     --base-ref <ref>   branch base (default HEAD)
     --model <id>   --mode <id>   --effort <id>
     --speed <s>        off | fast | ultrafast (what the model offers: cursor

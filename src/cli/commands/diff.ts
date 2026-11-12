@@ -5,6 +5,7 @@ import { usageError } from "../usage.ts";
 import { flagValue } from "../args.ts";
 import { repositoriesForTask } from "../../shared/multi-repo.ts";
 import type { DiffFile, TaskDiff } from "../../shared/types.ts";
+import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
 
 /**
  * `agetor diff <task-id> [--repo <name>]`.
@@ -13,8 +14,10 @@ import type { DiffFile, TaskDiff } from "../../shared/types.ts";
  * multi-repository task has no single worktree — its `workdir` is the
  * non-git workspace root — so printing `repositories[0]` alone hid every
  * sibling repository's changes. Without `--repo` it now prints one labelled
- * section per repository (JSON: an array of the per-repo `TaskDiff`s);
- * `--repo <name>` narrows it to one and keeps the single-object shape.
+ * section per repository (JSON: an array of the per-repo `TaskDiff`s, with a
+ * `{ repo, error }` entry for a repository whose diff failed — the command
+ * then exits non-zero); `--repo <name>` narrows it to one and keeps the
+ * single-object shape.
  */
 export async function cmdDiff(args: string[], flags: Flags): Promise<void> {
   // `--repo` takes a value that must not be mistaken for the positional task
@@ -44,15 +47,38 @@ export async function cmdDiff(args: string[], flags: Flags): Promise<void> {
     return;
   }
 
-  const selected = repoFlag ? repos.filter((r) => r.name === repoFlag) : repos;
-  const diffs = await Promise.all(selected.map((repo) => client.getDiff(task.id, repo.name)));
-
-  if (flags.json) return printJson(repoFlag ? diffs[0]! : diffs);
-  diffs.forEach((diff, i) => {
-    if (i > 0) out("");
-    if (!repoFlag) out(c.dim(`── ${selected[i]!.name} ──`));
+  if (repoFlag) {
+    // One repository: its error is the command's error, as for a single task.
+    const diff = await client.getDiff(task.id, repoFlag);
+    if (flags.json) return printJson(diff);
     printDiff(diff);
+    return;
+  }
+
+  // Settled, not `Promise.all`: one repository whose diff fails (a removed
+  // worktree, a git error) must not hide every sibling's changes. Its section
+  // names the error instead, and the command still exits non-zero.
+  const results = await Promise.allSettled(repos.map((repo) => client.getDiff(task.id, repo.name)));
+  const failed = results.some((r) => r.status === "rejected");
+  if (failed) process.exitCode = 1;
+
+  if (flags.json) {
+    return printJson(
+      results.map((r, i) =>
+        r.status === "fulfilled" ? r.value : { repo: repos[i]!.name, error: errorMessage(r.reason) },
+      ),
+    );
+  }
+  results.forEach((r, i) => {
+    if (i > 0) out("");
+    out(c.dim(`── ${escapeControlChars(repos[i]!.name)} ──`));
+    if (r.status === "fulfilled") printDiff(r.value);
+    else out(c.red(`! diff failed: ${escapeFreeText(errorMessage(r.reason))}`));
   });
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function printDiff(diff: TaskDiff): void {

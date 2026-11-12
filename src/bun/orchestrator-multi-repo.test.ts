@@ -906,13 +906,21 @@ test("a retained multi workspace is listed and can be cleaned by a repeat archiv
   }
 });
 
-test("teardowns of two multi tasks sharing a repository serialize on that repository's FIFO key", async () => {
-  // T6 acceptance: a multi task's teardown acquires a FIFO key per selected
-  // repository, so two tasks that share one source repo never run `git
-  // worktree` teardown concurrently in it — and overlapping key SETS
-  // ([a,b] vs [b,c]) must not deadlock. The gate holds key b: both jobs park,
-  // then A (enqueued first) must finish before B's pendingTeardown resolves
-  // because B's tail on b is A's combined promise.
+/**
+ * Fixture for the multi-repository teardown FIFO tests: two prepared multi
+ * tasks, A = [frontend, backend] and B = [backend, infra], sharing the backend
+ * repository, plus a controllable gate per repository key.
+ *
+ * "Parked" is checked without timing. Every key is held while the tasks are
+ * archived, so no job can start yet; then, while a task's job must stay
+ * parked, its row's `archivedAt` is cleared: the archive job re-reads the row
+ * first and
+ * bails synchronously when it is not archived, so a job that ran too early
+ * settles within the microtask queue, and one `setImmediate` turn (which runs
+ * only after every microtask) is enough to see it. The real `archivedAt` is
+ * restored before that task's last gate opens, so the real teardown runs.
+ */
+async function fifoFixture(label: string) {
   const { createTask, archiveTask, tasks } = await load();
   const { prepareTaskWorkdir } = await import("./worktree.ts");
   const { __enqueueTeardownForTest, pendingTeardown } = await import("./orchestrator.ts");
@@ -933,36 +941,211 @@ test("teardowns of two multi tasks sharing a repository serialize on that reposi
     if ("error" in prepared) throw new Error(prepared.error);
     tasks.setRepositories(created.task.id, prepared.repositories!);
     tasks.update(created.task.id, { worktreePath: prepared.worktreePath, column: "done" });
-    return { id: created.task.id, workspace: prepared.worktreePath! };
+    const row = tasks.get(created.task.id)!;
+    return {
+      id: row.id,
+      workspace: prepared.worktreePath!,
+      // The FIFO keys are the stored selected paths, sorted (enqueueTeardownMany).
+      keys: row.repositories!.map((r) => r.path).sort(),
+    };
   };
+  const A = await makeTask(`fifo ${label} A`, [a, b]);
+  const B = await makeTask(`fifo ${label} B`, [b, c]);
+  const [ka, kb, kc] = tasks.get(A.id)!.repositories!.map((r) => r.path).concat(
+    tasks.get(B.id)!.repositories![1]!.path,
+  );
+  // Precondition the scenarios rely on: the shared key sorts FIRST in both
+  // tasks' key sets, so "held only the shared key" exercises each task's
+  // first key and "held only the other key" exercises its second.
+  expect(A.keys).toEqual([kb!, ka!]);
+  expect(B.keys).toEqual([kb!, kc!]);
 
-  let gateRelease!: () => void;
-  const gate = new Promise<void>((resolve) => { gateRelease = resolve; });
+  const gates = new Map<string, { release: () => void; held: Promise<void> }>();
+  const hold = (key: string) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const held = __enqueueTeardownForTest(`fifo-gate-${label}-${key}`, key, () => gate);
+    gates.set(key, { release, held });
+  };
+  const open = async (key: string) => {
+    const g = gates.get(key)!;
+    g.release();
+    await g.held;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
+  const settled: string[] = [];
+  const archive = async (t: { id: string }, name: string) => {
+    const res = await archiveTask(t.id);
+    if ("error" in res) throw new Error(res.error);
+    void pendingTeardown(t.id).then(() => settled.push(name));
+    return res.task.archivedAt!;
+  };
+  /** Queue a probe behind whatever job is the current tail of `key`; it
+   *  records which workspaces were already torn down when it got to run. */
+  const probe = (key: string) => {
+    let seen: { aGone: boolean; bGone: boolean } | null = null;
+    const done = __enqueueTeardownForTest(`fifo-probe-${label}-${key}`, key, async () => {
+      seen = { aGone: !existsSync(A.workspace), bGone: !existsSync(B.workspace) };
+    }).then(() => seen!);
+    return done;
+  };
+  const releaseAll = () => { for (const g of gates.values()) g.release(); };
+  return { a, b, c, A, B, ka: ka!, kb: kb!, kc: kc!, hold, open, archive, probe, settled, releaseAll, pendingTeardown, tasks };
+}
+
+test("multi teardown parks on its FIRST key: holding the shared repository parks both tasks, then A runs before B", async () => {
+  // T6 acceptance: a multi task's teardown acquires a FIFO key per selected
+  // repository, so two tasks that share one source repo never run `git
+  // worktree` teardown concurrently in it, and overlapping key SETS
+  // ([a,b] vs [b,c]) must not deadlock.
+  const f = await fifoFixture("first");
   try {
-    const A = await makeTask("fifo multi A", [a, b]);
-    const B = await makeTask("fifo multi B", [b, c]);
-    const held = __enqueueTeardownForTest("fifo-gate", b, () => gate);
+    for (const key of [f.ka, f.kb, f.kc]) f.hold(key);
+    const archivedA = await f.archive(f.A, "A");
+    const archivedB = await f.archive(f.B, "B");
+    f.tasks.update(f.A.id, { archivedAt: null });
+    f.tasks.update(f.B.id, { archivedAt: null });
 
-    const archivedA = await archiveTask(A.id);
-    if ("error" in archivedA) throw new Error(archivedA.error);
-    const archivedB = await archiveTask(B.id);
-    if ("error" in archivedB) throw new Error(archivedB.error);
+    // Open every gate except the shared key (each task's first sorted key).
+    await f.open(f.ka);
+    await f.open(f.kc);
+    // A "waits on its last key only" regression would have run (and bailed).
+    expect(f.settled).toEqual([]);
+    expect(existsSync(f.A.workspace)).toBe(true);
+    expect(existsSync(f.B.workspace)).toBe(true);
 
-    // Both jobs are parked behind the gate: nothing has been detached yet.
-    expect(existsSync(A.workspace)).toBe(true);
-    expect(existsSync(B.workspace)).toBe(true);
-
-    gateRelease();
-    await held;
-    // Await only B: its shared-key tail is A's job, so this proves A finished.
-    await pendingTeardown(B.id);
-    expect(existsSync(A.workspace)).toBe(false);
-    expect(existsSync(B.workspace)).toBe(false);
-    expect(tasks.get(A.id)?.archivedAt).not.toBeNull();
-    expect(tasks.get(B.id)?.archivedAt).not.toBeNull();
+    f.tasks.update(f.A.id, { archivedAt: archivedA });
+    f.tasks.update(f.B.id, { archivedAt: archivedB });
+    // Each task must be the tail of EVERY key it holds: a probe queued on a
+    // key runs only after the job that last claimed it. A job that claimed
+    // only one key would let the probe on its other key run while it is
+    // still parked, and that probe would see the workspace present.
+    const probes = [f.probe(f.ka), f.probe(f.kb), f.probe(f.kc)];
+    await f.open(f.kb);
+    const [onA, onShared, onC] = await Promise.all(probes);
+    expect(onA?.aGone).toBe(true);
+    expect(onShared).toEqual({ aGone: true, bGone: true });
+    expect(onC?.bGone).toBe(true);
+    await f.pendingTeardown(f.B.id);
+    // B's tail on the shared key is A's job, so A always settles first.
+    expect(f.settled).toEqual(["A", "B"]);
+    expect(existsSync(f.A.workspace)).toBe(false);
+    expect(existsSync(f.B.workspace)).toBe(false);
+    expect(f.tasks.get(f.A.id)?.archivedAt).toBe(archivedA);
+    expect(f.tasks.get(f.B.id)?.archivedAt).toBe(archivedB);
   } finally {
-    gateRelease();
-    cleanup(a, b, c);
+    f.releaseAll();
+    cleanup(f.a, f.b, f.c);
+  }
+});
+
+test("multi teardown parks on its SECOND key too: each task waits for its non-shared repository", async () => {
+  // Companion to the test above: a "first sorted key only" regression passes
+  // it, because the shared key sorts first in both tasks. Here the shared key
+  // is opened first and only each task's second key stays held.
+  const f = await fifoFixture("second");
+  try {
+    // Every key starts held so no job can start before its row's archivedAt
+    // is cleared; the shared key is then opened, which frees each task's
+    // first key.
+    for (const key of [f.ka, f.kb, f.kc]) f.hold(key);
+    const archivedA = await f.archive(f.A, "A");
+    const archivedB = await f.archive(f.B, "B");
+    f.tasks.update(f.A.id, { archivedAt: null });
+    f.tasks.update(f.B.id, { archivedAt: null });
+    await f.open(f.kb);
+    // A's first key (shared) is free; it must still wait for its second.
+    expect(f.settled).toEqual([]);
+    expect(existsSync(f.A.workspace)).toBe(true);
+
+    // Let A tear down for real, then prove B still waits on ITS second key
+    // even though its shared-key tail (A's job) has finished.
+    f.tasks.update(f.A.id, { archivedAt: archivedA });
+    await f.open(f.ka);
+    await f.pendingTeardown(f.A.id);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(f.settled).toEqual(["A"]);
+    expect(existsSync(f.A.workspace)).toBe(false);
+    expect(existsSync(f.B.workspace)).toBe(true);
+
+    f.tasks.update(f.B.id, { archivedAt: archivedB });
+    const probes = [f.probe(f.kb), f.probe(f.kc)];
+    await f.open(f.kc);
+    const [onShared, onC] = await Promise.all(probes);
+    expect(onShared).toEqual({ aGone: true, bGone: true });
+    expect(onC).toEqual({ aGone: true, bGone: true });
+    await f.pendingTeardown(f.B.id);
+    expect(f.settled).toEqual(["A", "B"]);
+    expect(existsSync(f.B.workspace)).toBe(false);
+    expect(f.tasks.get(f.B.id)?.archivedAt).toBe(archivedB);
+  } finally {
+    f.releaseAll();
+    cleanup(f.a, f.b, f.c);
+  }
+});
+
+test("archiving a multi task with one dirty repository archives it and keeps that checkout intact", async () => {
+  // Contract (docs/architecture/multi-repo-tasks.md, Teardown): archive is per
+  // repository and best-effort — a dirty checkout is kept with its branch and
+  // the workspace, clean ones are detached, and the task is archived anyway.
+  const { createTask, archiveTask, tasks } = await load();
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const a = await makeRepo("frontend");
+  const b = await makeRepo("backend");
+  const created = await createTask({
+    title: "dirty archive multi",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  let workspace: string | undefined;
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    workspace = prepared.worktreePath!;
+    tasks.setRepositories(id, prepared.repositories!);
+    tasks.update(id, { worktreePath: prepared.worktreePath, column: "done" });
+    const [clean, dirty] = prepared.repositories!;
+    // An uncommitted edit to a tracked file plus an untracked file: neither is
+    // on the branch, so detaching this checkout would lose them for good.
+    writeFileSync(path.join(dirty!.worktreePath!, "README"), "edited, not committed\n");
+    writeFileSync(path.join(dirty!.worktreePath!, "scratch.txt"), "untracked work\n");
+
+    const archived = await archiveTask(id, { awaitTeardown: true, stopRun: true });
+    if ("error" in archived) throw new Error(archived.error);
+    expect(archived.task.archivedAt).not.toBeNull();
+    expect(tasks.get(id)?.archivedAt).not.toBeNull();
+    expect(archived.teardown?.removed).toBe(false);
+    expect(archived.teardown?.reason).toBe("dirty");
+    expect(archived.teardown?.repositories?.map((r) => [r.name, r.result.removed, r.result.reason ?? null])).toEqual([
+      [clean!.name, true, null],
+      [dirty!.name, false, "dirty"],
+    ]);
+
+    // The clean repository was detached; its branch survives for unarchive.
+    expect(existsSync(clean!.worktreePath!)).toBe(false);
+    const branchExists = async (repo: string, branch: string) =>
+      (await Bun.spawn(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], {
+        cwd: repo, stdout: "pipe", stderr: "pipe",
+      }).exited) === 0;
+    expect(await branchExists(a, clean!.branch!)).toBe(true);
+
+    // The dirty checkout, its uncommitted changes, its branch and the
+    // workspace holding it are all still there.
+    expect(existsSync(workspace)).toBe(true);
+    expect(existsSync(path.join(dirty!.worktreePath!, ".git"))).toBe(true);
+    expect(await Bun.file(path.join(dirty!.worktreePath!, "README")).text()).toBe("edited, not committed\n");
+    expect(await Bun.file(path.join(dirty!.worktreePath!, "scratch.txt")).text()).toBe("untracked work\n");
+    expect(await branchExists(b, dirty!.branch!)).toBe(true);
+    const { readCheckoutBranch } = await import("./worktree.ts");
+    const live = await readCheckoutBranch(dirty!.worktreePath!);
+    expect(live.ok && live.branch).toBe(dirty!.branch);
+  } finally {
+    cleanup(workspace, a, b);
   }
 });
 
@@ -987,11 +1170,20 @@ test("deleteTask removes every repository worktree and branch", async () => {
     if ("error" in res) throw new Error(res.error);
     await settleRun(id);
     seedClaudeScratch(workspace);
+    const [repoA, repoB] = tasks.get(id)!.repositories!;
+    const exists = async (repo: string, branch: string) =>
+      (await Bun.spawn(["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], {
+        cwd: repo, stdout: "pipe", stderr: "pipe",
+      }).exited) === 0;
+    // Both branches exist before the delete, so their absence afterwards is
+    // the delete's doing (each repository's own branch, in its own repo).
+    expect(await exists(a, repoA!.branch!)).toBe(true);
+    expect(await exists(b, repoB!.branch!)).toBe(true);
     await deleteTask(id);
     expect(existsSync(workspace)).toBe(false);
     expect(tasks.get(id)).toBeNull();
-    const branch = (await Bun.spawn(["git", "rev-parse", "--verify", "--quiet", "refs/heads/" + created.task.repositories![0]!.branch], { cwd: a, stdout: "pipe", stderr: "pipe" }).exited) !== 0;
-    expect(branch).toBe(true);
+    expect(await exists(a, repoA!.branch!)).toBe(false);
+    expect(await exists(b, repoB!.branch!)).toBe(false);
   } finally {
     cleanup(workspace, a, b);
   }

@@ -53,6 +53,7 @@ import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import { RepositoriesDialog } from "./RepositoriesDialog";
 import { collapseToProject, repositoryFileScopes, selectionName, type RepoSelection } from "@/lib/repo-selection";
+import { applyRepositoriesSave, seedRepositoriesDialogValue } from "@/lib/multi-repo-ui";
 import { TaskTypePicker } from "./TaskTypePicker";
 import { captureDroppedOrPastedItems } from "./ReferencesPicker";
 import { PromptComposer, usePromptCapture } from "./PromptComposer";
@@ -906,19 +907,23 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                 <RepositoriesDialog
                   open={repositoriesOpen}
                   onClose={() => setRepositoriesOpen(false)}
-                  value={repos.length > 0 ? repos : workdir ? [{ path: workdir, root: null }] : []}
+                  // While single, the inline Branch picker's base ref is the
+                  // first repository's: seeding it here means adding a second
+                  // repository keeps it (editable in that row) instead of the
+                  // multi payload silently branching from HEAD.
+                  value={seedRepositoriesDialogValue(repos, workdir, wt.baseRef)}
                   onSave={(next) => {
-                    setRepos(next);
                     // Saving can promote the second repository (or collapse the
                     // selection back to a different first one), which changes
-                    // the task's project exactly like the ProjectPicker does.
-                    // Drop the base ref picked for the old project rather than
+                    // the task's project exactly like the ProjectPicker does:
+                    // the old project's base ref is dropped rather than
                     // silently branching the new one from a ref that may not
-                    // exist there.
-                    if (next[0] && next[0].path !== workdir) {
-                      setWorkdir(next[0].path);
-                      wt.resetBaseRef();
-                    }
+                    // exist there. A selection saved back down to one entry
+                    // hands that entry's base ref to the inline picker.
+                    const applied = applyRepositoriesSave(next, { primaryPath: workdir, inlineBaseRef: wt.baseRef });
+                    setRepos(applied.repos);
+                    if (applied.primaryPath !== workdir) setWorkdir(applied.primaryPath);
+                    if (applied.inlineBaseRef.kind === "set") wt.setBaseRef(applied.inlineBaseRef.value);
                   }}
                 />
               </div>

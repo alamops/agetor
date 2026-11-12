@@ -301,13 +301,22 @@ test("worktreeGitStatus resolves a nested multi-repository id to that repo's wor
     if ("error" in prepared) throw new Error(prepared.error);
     tasks.setRepositories(taskId, prepared.repositories!);
     const names = uniqueRepoSlugs([a, b]);
-    for (const name of names) {
-      const status = await worktreeGitStatus(`${taskId}__${name}`);
-      if ("error" in status) throw new Error(status.error);
-      expect(status.ignored).toBe(false);
-      expect(status.dirty).toBe(false);
-      expect(status.branch).toBe(prepared.repositories?.[names.indexOf(name)]?.branch ?? null);
-    }
+    const [entryA, entryB] = prepared.repositories!;
+    expect([entryA?.name, entryB?.name]).toEqual(names);
+    // Make the two checkouts differ so a resolver that answered every nested
+    // id with repository 0's (or the workspace root's) status would fail:
+    // A is clean with one commit ahead of its base, B is dirty and not ahead.
+    writeFileSync(path.join(entryA!.worktreePath!, "a-only.txt"), "a\n");
+    await git(["add", "."], entryA!.worktreePath!);
+    await git(["commit", "-m", "a-only commit"], entryA!.worktreePath!);
+    writeFileSync(path.join(entryB!.worktreePath!, "b-untracked.txt"), "b\n");
+
+    const statusA = await worktreeGitStatus(`${taskId}__${names[0]}`);
+    const statusB = await worktreeGitStatus(`${taskId}__${names[1]}`);
+    if ("error" in statusA) throw new Error(statusA.error);
+    if ("error" in statusB) throw new Error(statusB.error);
+    expect(statusA).toEqual({ dirty: false, ahead: 1, merged: false, ignored: false, branch: entryA!.branch });
+    expect(statusB).toEqual({ dirty: true, ahead: 0, merged: true, ignored: false, branch: entryB!.branch });
     // Traversal ids are refused by the shared guard.
     expect("error" in (await worktreeGitStatus(`${taskId}__..`))).toBe(true);
   } finally {

@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -6,6 +6,7 @@ import { dataDir } from "./db.ts";
 import { coreSpawn } from "./core-spawn.ts";
 import { readTextNoFollow } from "./no-follow.ts";
 import { readFileBytes } from "./core-file-read.ts";
+import { removeTaskDirWorkspaceIfOnlyScratch, taskDirLexists, taskDirWorkspaceHasOnlyScratch } from "./task-dir-fs.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, TaskRepository, WorktreeTeardownResult } from "../shared/types.ts";
@@ -478,15 +479,18 @@ export async function repoRoot(dir: string): Promise<string | null> {
  * writable cwd, or when `cwd` isn't a git repo / git is unavailable
  * (non-throwing — callers just get no extra roots).
  *
- * Multi-repository workspaces (issue #291): the agent's cwd is the task
+ * Multi-repository workspaces (issue #291,
+ * docs/architecture/multi-repo-tasks.md): the agent's cwd is the task
  * workspace root, which is NOT itself a git checkout — it holds one linked
- * worktree per repository. A bare `git rev-parse` there fails, so the old
- * implementation returned `[]` and codex's sandbox stayed on
- * `workspace-write`, blocking every `git add`/`git commit` in the children
- * because their shared `.git` lives in each source repo (outside the
- * workspace). When `cwd` isn't a checkout, resolve every direct child that
- * carries a `.git` pointer file the same way and union the roots. Non-git
- * child directories (a scratch dir an agent created) contribute nothing.
+ * worktree per repository, whose shared `.git` lives in each source repo. A
+ * bare `git rev-parse` there fails, so the caller passes the task's own
+ * repository checkouts (`workspaceRepos`, from the task row, never from the
+ * disk). A checkout's common dir is granted only when it is exactly the
+ * common dir of the source repository the entry names; nothing is discovered
+ * by scanning the cwd. Scanning let an agent plant a child checkout whose
+ * `.git` lives anywhere (`git init --separate-git-dir`, a `git worktree add`
+ * of some other repo) and get full access on its next turn, and it read the
+ * workspace in-process (D25). No `workspaceRepos` on a non-git cwd → `[]`.
  *
  * Async, via the file's shared `git()` helper (`Bun.spawn` + its own 5s
  * timeout here) rather than a sync `child_process.spawnSync` — the codex
@@ -502,15 +506,27 @@ export async function repoRoot(dir: string): Promise<string | null> {
  * the reported common dir against a non-canonical `cwd` would otherwise flag an
  * ordinary `.git`-inside-cwd checkout as "outside" and add a redundant root.
  */
-export async function gitWritableRoots(cwd: string): Promise<string[]> {
+export async function gitWritableRoots(
+  cwd: string,
+  workspaceRepos?: ReadonlyArray<{ worktreePath: string; repoPath: string }>,
+): Promise<string[]> {
   const self = await gitCommonDirOutside(cwd);
   if (self !== null) return self ? [self] : [];
-  // Not a git checkout itself. A multi-repository task workspace is exactly
-  // this shape: linked worktrees as direct children. Only children with a
-  // `.git` POINTER file can be linked worktrees (an ordinary nested checkout
-  // would have a `.git` directory, which is already inside the writable cwd,
-  // so it needs no root either).
-  return await linkedWorktreeChildRoots(cwd);
+  if (!workspaceRepos || workspaceRepos.length === 0) return [];
+  const found = await mapBounded([...workspaceRepos], MULTI_REPO_CONCURRENCY, async (entry) => {
+    // Only the task's own checkouts under its own workspace qualify.
+    if (!entry.worktreePath || !entry.repoPath) return null;
+    if (path.resolve(entry.worktreePath) === path.resolve(cwd)) return null;
+    if (!lexicallyInsideRoot(cwd, entry.worktreePath)) return null;
+    let root: string | null = null;
+    try { root = await repoRoot(entry.repoPath); } catch { root = null; }
+    if (!root) return null;
+    const source = await gitCommonDirOf(root);
+    if (!source) return null;
+    const checkout = await checkoutCommonDir(entry.worktreePath);
+    return checkout !== null && checkout === source ? source : null;
+  });
+  return [...new Set(found.filter((r): r is string => r !== null))];
 }
 
 /**
@@ -541,32 +557,70 @@ async function gitCommonDirOutside(cwd: string): Promise<string | "" | null> {
   return insideCwd ? "" : commonDir;
 }
 
-/** Union of external git common dirs for the linked worktrees directly under
- *  a multi-repository workspace root (`<workspace>/<repo-slug>/.git` files). */
-async function linkedWorktreeChildRoots(workspace: string): Promise<string[]> {
-  let children: string[];
+/**
+ * The absolute git common dir of the repository at `dir`, as git reports it
+ * (`--path-format=absolute` canonicalizes symlinks, so two answers compare as
+ * plain strings). `null` when `dir` isn't a repository or git failed. Never
+ * throws.
+ */
+async function gitCommonDirOf(dir: string): Promise<string | null> {
   try {
-    children = readdirSync(workspace, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && !d.name.startsWith("."))
-      .map((d) => d.name);
+    const res = await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], dir, 5_000);
+    if (!res.ok || !res.stdout || res.stdout.includes("\n")) return null;
+    return path.resolve(dir, res.stdout);
   } catch {
-    return [];
+    return null;
   }
-  const roots = new Set<string>();
-  for (const child of children) {
-    const childPath = path.join(workspace, child);
-    // Cheap fs gate before spawning git: only a linked worktree has `.git`
-    // as a file. A nested ordinary checkout's `.git` is inside the writable
-    // workspace root already.
-    try {
-      if (!lstatSync(path.join(childPath, ".git")).isFile()) continue;
-    } catch {
-      continue;
-    }
-    const common = await gitCommonDirOutside(childPath);
-    if (common) roots.add(common);
+}
+
+/**
+ * The canonical form of a path under `WORKTREES_DIR`, built from the
+ * realpath of `WORKTREES_DIR` (agetor's own directory) plus the lexical tail,
+ * so nothing inside a task's directory is resolved in-process (D25). Paths
+ * outside `WORKTREES_DIR` (tests, legacy rows) fall back to a best-effort
+ * realpath.
+ */
+function canonicalCheckoutPath(dir: string): string {
+  const abs = path.resolve(dir);
+  if (lexicallyInsideRoot(WORKTREES_DIR, abs)) {
+    let base = WORKTREES_DIR;
+    try { base = realpathSync(WORKTREES_DIR); } catch { /* not created yet */ }
+    return path.join(base, path.relative(path.resolve(WORKTREES_DIR), abs));
   }
-  return [...roots];
+  try { return realpathSync(abs); } catch { return abs; }
+}
+
+/**
+ * The git common dir of the checkout whose top level is exactly `dir`, or
+ * `null` when `dir` is not the top of a readable checkout (not a repo, a
+ * subdirectory of some other checkout, a symlink to one, a broken or
+ * unreadable `.git`, git failing). Git runs in a child (`git()` → `coreSpawn`),
+ * so the checkout's own `.git` pointer is never read in-process.
+ *
+ * Used to prove a directory is a checkout OF a given repository by comparing
+ * this against {@link gitCommonDirOf} of that repository: a linked worktree, a
+ * worktree of a bare repository and a checkout whose repository is itself a
+ * linked worktree all share their source's common dir, which a parse of the
+ * `.git` pointer's path shape cannot tell apart. Never throws.
+ */
+async function checkoutCommonDir(dir: string): Promise<string | null> {
+  let res: GitResult;
+  try {
+    res = await git(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], dir, 5_000);
+  } catch {
+    return null;
+  }
+  if (!res.ok) return null;
+  const lines = res.stdout.split("\n");
+  if (lines.length !== 2 || !lines[0] || !lines[1]) return null;
+  if (path.resolve(lines[0]) !== canonicalCheckoutPath(dir)) return null;
+  return path.resolve(dir, lines[1]);
+}
+
+/** True when `dir` is the top of a checkout of the repository whose common dir is `sourceCommonDir`. */
+async function isCheckoutOfRepo(dir: string, sourceCommonDir: string | null): Promise<boolean> {
+  if (!sourceCommonDir) return false;
+  return (await checkoutCommonDir(dir)) === sourceCommonDir;
 }
 
 /**
@@ -610,7 +664,9 @@ export function shouldLazyPinBaseRef(
 export async function pinMissingRepositoryBaseRefs(
   repos: TaskRepository[],
 ): Promise<TaskRepository[]> {
-  return Promise.all(repos.map(async (repo) => {
+  // Bounded like every other per-repository fan-out: one `git rev-parse` per
+  // unpinned entry, at most MULTI_REPO_CONCURRENCY at once.
+  return mapBounded(repos, MULTI_REPO_CONCURRENCY, async (repo) => {
     if (repo.baseRef) return repo;
     let sha: string | null = null;
     try {
@@ -620,7 +676,7 @@ export async function pinMissingRepositoryBaseRefs(
       // pin like the single-repository lazy pin does.
     }
     return sha ? { ...repo, baseRef: sha } : repo;
-  }));
+  });
 }
 
 /**
@@ -955,8 +1011,9 @@ export function worktreePath(task: Task): string {
  * reuse that path instead of deriving a fresh `<WORKTREES_DIR>/<step-id>` from
  * its own id (that would materialize a second, empty workspace and strand the
  * parent's repositories). Falls back to the canonical per-task path when the
- * mirrored path is absent or outside `WORKTREES_DIR` (a hand-edited/corrupt
- * row must never widen the ownership boundary).
+ * mirrored path is absent or is not exactly `<WORKTREES_DIR>/<task.id>` or
+ * `<WORKTREES_DIR>/<task.pipelineParentId>` (a hand-edited/corrupt row must
+ * never widen the ownership boundary).
  */
 export function workspacePathFor(task: Task): string {
   const mirrored = task.worktreePath ?? task.workdir;
@@ -964,14 +1021,52 @@ export function workspacePathFor(task: Task): string {
   // adopted as a workspace (a hand-edited/corrupt row pointing at
   // `WORKTREES_DIR` would make teardown rmdir the whole managed directory and
   // preparation mkdir it). Deeper descendants are equally invalid — every
-  // workspace is exactly `<WORKTREES_DIR>/<task-id>`.
-  if (
-    mirrored
-    && path.dirname(path.resolve(mirrored)) === path.resolve(WORKTREES_DIR)
-  ) {
-    return mirrored;
+  // workspace is exactly `<WORKTREES_DIR>/<task-id>`. And the folder must be
+  // this task's own or its pipeline parent's: `workdir` is PATCHable, and
+  // trusting any direct child let a task pointed at another task's workspace
+  // adopt (and on teardown delete) that task's checkouts.
+  if (mirrored) {
+    const resolved = path.resolve(mirrored);
+    const owner = path.basename(resolved);
+    if (
+      path.dirname(resolved) === path.resolve(WORKTREES_DIR)
+      && (owner === task.id || (task.pipelineParentId != null && owner === task.pipelineParentId))
+    ) {
+      return mirrored;
+    }
   }
   return worktreePath(task);
+}
+
+/**
+ * The ids whose workspace a task may own: its own and, for a pipeline step,
+ * its pipeline parent's (the step runs in the parent's workspace).
+ */
+function workspaceOwnerIds(task: Pick<Task, "id" | "pipelineParentId">): string[] {
+  return task.pipelineParentId ? [task.id, task.pipelineParentId] : [task.id];
+}
+
+/**
+ * Whether `wt` is exactly `<WORKTREES_DIR>/<owner>/<name>` for one of the
+ * task's owner ids (see {@link workspaceOwnerIds}) — the only shape a
+ * multi-repository checkout ever has. Teardown refuses anything else, so a
+ * `..`-bearing or hand-edited path stored on the row can never point a
+ * recursive delete outside the task's own workspace.
+ */
+export function isOwnedRepositoryCheckoutPath(
+  task: Pick<Task, "id" | "pipelineParentId">,
+  name: string,
+  wt: string,
+): boolean {
+  if (!isSafeSegment(name) || !wt || wt.includes("\0")) return false;
+  if (!lexicallyInsideRoot(WORKTREES_DIR, wt)) return false;
+  const resolved = path.resolve(wt);
+  // A lexically normalized path that differs from the stored one carried
+  // `.`/`..`/doubled separators — refuse rather than normalize.
+  if (resolved !== wt) return false;
+  return workspaceOwnerIds(task).some(
+    (owner) => isSafeSegment(owner) && resolved === path.join(path.resolve(WORKTREES_DIR), owner, name),
+  );
 }
 
 /** The `GET /worktrees` row id for one repository of a multi-repo task. */
@@ -1119,6 +1214,14 @@ export interface PreparedWorkdir {
    * single-repository task.
    */
   repositories?: TaskRepository[];
+  /**
+   * Multi-repository only: names of the `repositories` entries whose live
+   * branch read failed on the reuse path. Their `checkoutBranch` is the input
+   * snapshot, not a reading, so a caller recording last-seen checkouts must
+   * skip them (the multi-repository counterpart of `checkoutKnown: false`).
+   * Absent when every read succeeded.
+   */
+  unknownCheckouts?: string[];
 }
 
 /**
@@ -1455,19 +1558,13 @@ async function mapBounded<T, R>(items: T[], limit: number, fn: (item: T, index: 
 }
 
 /**
- * True when `dir` is a linked worktree whose `.git` pointer names `root` as
- * its source repository. Used to distinguish a recorded worktree whose
- * `symbolic-ref` read transiently failed (keep it!) from a stale directory a
- * crash left at the same path (safe to clear).
+ * Whether `dir` holds a `.git` entry of any kind (directory, pointer file,
+ * symlink — dangling included), checked through task-dir-fs (D25). A failed
+ * check reads as "yes": the caller only ever uses `false` to decide that a
+ * directory is NOT a checkout and may be cleared.
  */
-function isLinkedWorktreeOf(dir: string, root: string): boolean {
-  const source = parseWorktreeGitPointer(dir);
-  if (!source) return false;
-  try {
-    return realpathSync(source) === realpathSync(root);
-  } catch {
-    return source === root;
-  }
+async function hasGitEntry(dir: string): Promise<boolean> {
+  return (await taskDirLexists(path.join(dir, ".git"))) !== false;
 }
 
 /**
@@ -1480,20 +1577,56 @@ function isLinkedWorktreeOf(dir: string, root: string): boolean {
  * fails (its `rm` fallback is best-effort). `git worktree add` refuses a
  * non-empty destination and the branch-collision recovery deliberately does
  * not treat "already exists" as a name collision, so without this the task
- * could never start again. The path is confined to agetor's own workspace and
- * the branch (with every commit on it) lives in the source repo, so removing
- * the checkout loses nothing. Never recursive-deletes outside `WORKTREES_DIR`.
+ * could never start again.
+ *
+ * Only a directory with NO `.git` entry is ever cleared — that is provably not
+ * a checkout, so no uncommitted work can be lost. Anything carrying a `.git`
+ * (a checkout of this repository was already adopted by the caller; any other
+ * checkout, a broken pointer, an unreadable one) is refused with an error
+ * instead: a failed or timed-out read must never turn into `git worktree
+ * remove --force` + `rm -rf` of a live checkout. Never recursive-deletes
+ * outside `WORKTREES_DIR`.
  */
-async function clearWorkspaceChild(target: string, root: string): Promise<void> {
-  if (!existsSync(target)) return;
+async function clearWorkspaceChild(target: string, root: string): Promise<string | null> {
+  if (!existsSync(target)) return null;
   const resolved = path.resolve(target);
-  if (resolved === path.resolve(WORKTREES_DIR) || !lexicallyInsideRoot(WORKTREES_DIR, target)) return;
-  const removed = await git(["worktree", "remove", "--force", target], root);
-  if (!removed.ok && existsSync(target)) {
-    try { await rm(target, { recursive: true, force: true }); }
-    catch { /* best-effort — the add below reports the real failure */ }
+  if (resolved === path.resolve(WORKTREES_DIR) || !lexicallyInsideRoot(WORKTREES_DIR, target)) {
+    return `${target} is outside the managed worktrees directory`;
   }
+  if (await hasGitEntry(target)) {
+    return `${target} already holds a git checkout that is not a readable worktree of ${root} — move or remove it, then start the task again`;
+  }
+  try { await rm(target, { recursive: true, force: true }); }
+  catch { /* best-effort — the add below reports the real failure */ }
   await git(["worktree", "prune"], root, 10_000);
+  return null;
+}
+
+/**
+ * One in-flight `prepareTaskWorkdir` per task id. Terminal open, start,
+ * `sendInput`, unarchive and the pipeline runner can all prepare the same
+ * task at once; two overlapping multi-repository prepares would both create
+ * checkouts and the loser's all-or-nothing rollback would then remove a
+ * checkout (and branch) the winner had just adopted and returned. A later
+ * caller waits for the earlier one to settle and then takes the reuse path.
+ * The entry is dropped once the last caller in the chain settles, so the map
+ * never outgrows the set of tasks being prepared right now.
+ */
+const prepareChains = new Map<string, Promise<void>>();
+
+async function withTaskPrepareLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = prepareChains.get(taskId) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => { release = resolve; });
+  const tail = prev.then(() => mine);
+  prepareChains.set(taskId, tail);
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+    if (prepareChains.get(taskId) === tail) prepareChains.delete(taskId);
+  }
 }
 
 /**
@@ -1510,6 +1643,9 @@ async function clearWorkspaceChild(target: string, root: string): Promise<void> 
  * removed (a reused-and-still-present one is left alone), any branch minted in
  * this attempt is deleted, and the returned error names every failed
  * repository. `takenBranches` is keyed by source git root.
+ *
+ * Multi-repository calls for one task id are serialized (see
+ * `withTaskPrepareLock`); the single-repository path is untouched.
  */
 export async function prepareTaskWorkdir(
   task: Task,
@@ -1523,6 +1659,14 @@ export async function prepareTaskWorkdir(
     for (const set of opts?.takenBranches?.values() ?? []) for (const b of set) taken.add(b);
     return prepareWorkdir(task, { takenBranches: taken });
   }
+  return withTaskPrepareLock(task.id, () => prepareMultiRepoWorkdir(task, repos, opts));
+}
+
+async function prepareMultiRepoWorkdir(
+  task: Task,
+  repos: TaskRepository[],
+  opts?: { takenBranches?: Map<string, Set<string>> },
+): Promise<PrepareResult> {
   if (task.isolation !== "worktree") {
     return { error: "multi-repository tasks require worktree isolation" };
   }
@@ -1532,18 +1676,51 @@ export async function prepareTaskWorkdir(
 
   interface Attempt {
     repo: TaskRepository;
-    createdHere: boolean;
+    /**
+     * This attempt may have put a checkout at `target`, so a rollback owns
+     * whatever is there. `"done"`: materialized (or failed) normally;
+     * `"threw"`: the worker threw after it started materializing, so the
+     * rollback must check what is actually on disk.
+     */
+    createdHere: false | "done" | "threw";
     result: PreparedRepoWorktree | PrepareError;
     root: string | null;
+    target: string | null;
   }
 
   const attempts = await mapBounded(repos, MULTI_REPO_CONCURRENCY, async (repo): Promise<Attempt> => {
+    // A throw anywhere in here (git missing, a malformed row) must become a
+    // failed attempt, not a rejected `mapBounded`: the rollback below only
+    // runs when every worker settled, and skipping it would strand the
+    // checkouts the other workers made.
+    let root: string | null = null;
+    let target: string | null = null;
+    let materializing = false;
+    try {
+      return await prepareOneRepository(repo, (r, t) => { root = r; target = t; }, () => { materializing = true; });
+    } catch (err) {
+      return {
+        repo,
+        createdHere: materializing ? "threw" : false,
+        root,
+        target,
+        result: { error: err instanceof Error ? err.message : String(err) },
+      };
+    }
+  });
+
+  async function prepareOneRepository(
+    repo: TaskRepository,
+    located: (root: string, target: string) => void,
+    startMaterializing: () => void,
+  ): Promise<Attempt> {
     const root = await repoRoot(repo.path);
     if (!root) {
       return {
         repo,
         createdHere: false,
         root: null,
+        target: null,
         result: { error: `"${repo.path}" is not inside a git repository` },
       };
     }
@@ -1553,41 +1730,65 @@ export async function prepareTaskWorkdir(
         repo,
         createdHere: false,
         root,
+        target: null,
         result: { error: `invalid workspace name "${repo.name}"` },
       };
     }
+    located(root, target);
     const branch = repo.branch ?? task.branch ?? branchName(task);
+    const fail = (error: string): Attempt => ({ repo, createdHere: false, root, target, result: { error } });
 
-    // Reuse an existing worktree exactly like the single-repo path: report the
-    // live checkout, never check out or create anything. A recorded path that
-    // is no longer a linked worktree of this repository (a crash left a plain
-    // directory there) is NOT reused — doing so started the agent in a broken
-    // cwd forever — and falls through to the creation path, which clears it.
-    // A checkout still sitting at the deterministic target is adopted when the
-    // row lost its recorded path; it may hold uncommitted work, so deleting
-    // it as "stale" would be wrong.
-    let reusable: { dir: string; live: Awaited<ReturnType<typeof readCheckoutBranch>> } | null = null;
+    // Reuse an existing checkout exactly like the single-repo path: report the
+    // live checkout, never check out or create anything. Whether a directory
+    // is a checkout OF this repository is proved by comparing git common dirs
+    // (`isCheckoutOfRepo`), which also holds when the selected repository is
+    // itself a linked worktree, a worktree of a bare repository, or reached
+    // through a symlink. A directory that holds a `.git` but can't be proved
+    // to be ours is never cleared — the user gets an error naming it.
+    const sourceCommon = await gitCommonDirOf(root);
+    let reusable: {
+      dir: string;
+      live: Awaited<ReturnType<typeof readCheckoutBranch>>;
+      adopted: boolean;
+    } | null = null;
     if (repo.worktreePath && existsSync(repo.worktreePath)) {
       const live = await readCheckoutBranch(repo.worktreePath);
-      if (live.ok || isLinkedWorktreeOf(repo.worktreePath, root)) reusable = { dir: repo.worktreePath, live };
-    } else if (existsSync(target) && isLinkedWorktreeOf(target, root)) {
-      reusable = { dir: target, live: await readCheckoutBranch(target) };
+      if (live.ok || (await isCheckoutOfRepo(repo.worktreePath, sourceCommon))) {
+        reusable = { dir: repo.worktreePath, live, adopted: false };
+      } else if (await hasGitEntry(repo.worktreePath)) {
+        // The recorded checkout is there but git can't read it right now (a
+        // timeout, a lock, an edited `.git`). It may hold uncommitted work:
+        // fail this repository instead of clearing it.
+        return fail(`could not read the recorded checkout at ${repo.worktreePath} (${live.error}) — it was left untouched; fix or remove it, then start the task again`);
+      }
+      // No `.git` at all: provably not a checkout. Fall through to the
+      // deterministic target, which is cleared and re-created below.
+    }
+    if (!reusable && existsSync(target) && (await isCheckoutOfRepo(target, sourceCommon))) {
+      // The row lost its recorded path (a prepare that materialized but was
+      // never persisted). The checkout may hold uncommitted work; adopt it.
+      reusable = { dir: target, live: await readCheckoutBranch(target), adopted: true };
     }
     if (reusable) {
-      const { dir, live } = reusable;
+      const { dir, live, adopted } = reusable;
       const checkoutBranch = live.ok ? live.branch : null;
+      // An adopted checkout was never recorded, so its branch is whatever the
+      // unrecorded prepare actually created (a `-N` collision variant, say),
+      // not the create-time pin: record the live one.
+      const recordedBranch = adopted && checkoutBranch ? checkoutBranch : branch;
       let where: string;
-      if (!live.ok) where = `on ${branch}`;
-      else if (checkoutBranch === null) where = `(detached HEAD; task branch ${branch})`;
-      else if (checkoutBranch !== branch) where = `on ${checkoutBranch} (task branch ${branch})`;
-      else where = `on ${branch}`;
+      if (!live.ok) where = `on ${recordedBranch}`;
+      else if (checkoutBranch === null) where = `(detached HEAD; task branch ${recordedBranch})`;
+      else if (checkoutBranch !== recordedBranch) where = `on ${checkoutBranch} (task branch ${recordedBranch})`;
+      else where = `on ${recordedBranch}`;
       return {
         repo,
         createdHere: false,
         root,
+        target,
         result: {
           cwd: dir,
-          branch,
+          branch: recordedBranch,
           worktreePath: dir,
           note: `reusing worktree at ${dir} ${where}`,
           checkoutBranch,
@@ -1597,11 +1798,13 @@ export async function prepareTaskWorkdir(
       };
     }
 
-    // Not reusable. Clear a stale checkout left at the deterministic target
-    // before `git worktree add` (see `clearWorkspaceChild`), then materialize
-    // it — so this attempt owns whatever now sits at `target`, including the
-    // re-attach case where the recorded directory had vanished.
-    await clearWorkspaceChild(target, root);
+    // Not reusable. Clear a leftover with no `.git` at the deterministic
+    // target before `git worktree add` (see `clearWorkspaceChild`), then
+    // materialize it — so this attempt owns whatever now sits at `target`,
+    // including the re-attach case where the recorded directory had vanished.
+    const blocked = await clearWorkspaceChild(target, root);
+    if (blocked) return fail(blocked);
+    startMaterializing();
     const result = await prepareRepoWorktree({
       root,
       worktreePath: target,
@@ -1619,8 +1822,8 @@ export async function prepareTaskWorkdir(
     // This branch always materializes `target` (a recorded-but-absent
     // directory is re-attached here too), so it is owned by this attempt for
     // rollback purposes. The branch itself is only deleted when WE minted it.
-    return { repo, createdHere: true, root, result };
-  });
+    return { repo, createdHere: "done", root, target, result };
+  }
 
   const failures = attempts.filter((a) => "error" in a.result);
   if (failures.length > 0) {
@@ -1632,18 +1835,35 @@ export async function prepareTaskWorkdir(
     // `removeOneWorktree`'s rm fallback so a half-built child can't survive
     // and permanently block the next start.
     await mapBounded(attempts, MULTI_REPO_CONCURRENCY, async (a) => {
-      if (!a.createdHere || !a.root || "error" in a.result) return;
-      const wt = a.result.worktreePath ?? path.join(workspace, a.repo.name);
-      const branch = a.result.createdBranch ? a.result.branch : null;
-      await git(["worktree", "remove", "--force", wt], a.root);
-      if (branch) await git(["branch", "-D", branch], a.root);
-      await git(["worktree", "prune"], a.root, 10_000);
-      if (existsSync(wt) && lexicallyInsideRoot(WORKTREES_DIR, wt)) {
-        try { await rm(wt, { recursive: true, force: true }); }
-        catch { /* best-effort — the boot sweep still lists the leftover */ }
+      try {
+        if (!a.createdHere || !a.root) return;
+        let wt: string;
+        let branch: string | null = null;
+        if (a.createdHere === "threw") {
+          // The worker threw mid-materialization: whatever sits at the target
+          // came from this attempt (the target was empty or cleared first).
+          // Remove only a checkout of this repository; the branch may or may
+          // not have been minted, so it is kept (a re-run re-attaches it).
+          if (!a.target || !existsSync(a.target)) return;
+          if (!(await isCheckoutOfRepo(a.target, await gitCommonDirOf(a.root)))) return;
+          wt = a.target;
+        } else {
+          if ("error" in a.result) return;
+          wt = a.result.worktreePath ?? path.join(workspace, a.repo.name);
+          branch = a.result.createdBranch ? a.result.branch : null;
+        }
+        await git(["worktree", "remove", "--force", wt], a.root);
+        if (branch) await git(["branch", "-D", branch], a.root);
+        await git(["worktree", "prune"], a.root, 10_000);
+        if (existsSync(wt) && lexicallyInsideRoot(WORKTREES_DIR, wt)) {
+          try { await rm(wt, { recursive: true, force: true }); }
+          catch { /* best-effort — the boot sweep still lists the leftover */ }
+        }
+      } catch {
+        /* best-effort per repository — one failure must not skip the rest */
       }
     });
-    removeWorkspaceIfEmpty(workspace);
+    await removeWorkspaceIfEmpty(workspace);
     return {
       error: `could not prepare ${failures.length} of ${repos.length} repositories:\n${failures
         .map((f) => `- ${f.repo.name} (${f.repo.path}): ${("error" in f.result && f.result.error) || "unknown error"}`)
@@ -1662,8 +1882,18 @@ export async function prepareTaskWorkdir(
       };
     }),
   ];
+  // Repositories whose live read failed: their `checkoutBranch` above is the
+  // INPUT snapshot, not a reading, so callers must not write it back.
+  const unknownCheckouts = attempts
+    .filter((a) => !(a.result as PreparedRepoWorktree).checkoutKnown)
+    .map((a) => a.repo.name);
+  // Each warning names its repository: a multi row's run log otherwise can't
+  // say which checkout came back on a different branch.
   const warnings = attempts
-    .map((a) => (a.result as PreparedRepoWorktree).warning)
+    .map((a) => {
+      const w = (a.result as PreparedRepoWorktree).warning;
+      return w ? `${a.repo.name}: ${w}` : null;
+    })
     .filter((w): w is string => Boolean(w));
   const notes = attempts.map((a) => (a.result as PreparedRepoWorktree).note);
   return {
@@ -1674,80 +1904,51 @@ export async function prepareTaskWorkdir(
     checkoutBranch: null,
     checkoutKnown: false,
     repositories: preparedEntries,
+    ...(unknownCheckouts.length > 0 ? { unknownCheckouts } : {}),
     ...(warnings.length > 0 ? { warning: warnings.join("; ") } : {}),
   };
 }
 
 /**
- * Remove the agetor-owned scratch dirs a claude session leaves in a task
- * workspace root, so the root can be removed once its repository worktrees
- * are gone. `ensureInstalledForCwd` writes `<workspace>/.claude/settings.local.json`
- * on every claude spawn (cwd is the workspace root for a multi-repository
- * task); `git worktree remove` can't clear that because the root is not
- * itself a worktree. Only agetor's own settings file is touched — anything
- * else in `.claude` (or the root) is agent/user data and keeps the directory
- * alive, exactly like the non-recursive contract below. `.claude` is removed
- * only once it is empty.
- */
-function pruneWorkspaceScratch(dir: string): void {
-  const claudeDir = path.join(dir, ".claude");
-  try {
-    if (!lstatSync(claudeDir).isDirectory()) return;
-    const settings = path.join(claudeDir, "settings.local.json");
-    if (lstatSync(settings).isFile()) rmSync(settings, { force: true });
-    if (readdirSync(claudeDir).length === 0) rmdirSync(claudeDir);
-  } catch {
-    /* best-effort — missing dir/file, permissions, ... */
-  }
-}
-
-/**
  * True when a task workspace holds nothing but agetor's own scratch: no
- * entries at all, or only a `.claude` directory containing just
+ * entries, or only a `.claude` directory containing just
  * `settings.local.json`. `false` for any agent/user artifact (including any
- * other file or directory inside `.claude`), a missing/unreadable root, or a
- * `.claude` that isn't a directory.
+ * other file or directory inside `.claude`), a missing/unreadable root, a
+ * symlink on the way, or a failed check.
  *
  * The boot sweep uses this to decide whether a teardown job would still have
  * something to do. Checking only for the `.claude` entry itself treated a
  * workspace left with real agent content inside `.claude` as reclaimable and
  * re-enqueued a no-op teardown on every boot.
+ *
+ * The workspace root is the agent's cwd, so the check runs through
+ * task-dir-fs (D25, docs/architecture/security.md) and never follows a symlink.
  */
-export function workspaceHasOnlyAgetorScratch(dir: string): boolean {
-  let entries: string[];
-  try {
-    if (!lstatSync(dir).isDirectory()) return false;
-    entries = readdirSync(dir);
-  } catch {
-    return false; // missing or unreadable — nothing to reclaim
-  }
-  if (entries.length === 0) return true;
-  if (entries.some((entry) => entry !== ".claude")) return false;
-  try {
-    const claudeDir = path.join(dir, ".claude");
-    if (!lstatSync(claudeDir).isDirectory()) return false;
-    return readdirSync(claudeDir).every((entry) => entry === "settings.local.json");
-  } catch {
-    return false;
-  }
+export async function workspaceHasOnlyAgetorScratch(dir: string): Promise<boolean> {
+  return taskDirWorkspaceHasOnlyScratch(dir);
 }
 
 /**
  * Remove a multi-repository workspace root only when nothing else is left in
  * it (never a recursive wipe — an agent may have written notes or artifacts
  * the user still wants). Agetor's own `.claude/settings.local.json` scratch
- * is pruned first so a completed teardown doesn't strand
- * `<WORKTREES_DIR>/<task-id>` forever.
+ * (written by `ensureInstalledForCwd` on every claude spawn, since the
+ * workspace root is the cwd; `git worktree remove` can't clear it because the
+ * root is not itself a worktree) is removed first so a completed teardown
+ * doesn't strand `<WORKTREES_DIR>/<task-id>` forever. Anything else in
+ * `.claude` (or the root) is agent/user data and keeps the directory.
+ *
+ * The delete runs through task-dir-fs (D25): a child pinned to the verified
+ * directory, so a symlinked `.claude` (or one swapped in mid-way) can never
+ * redirect it outside the workspace. Never throws.
  *
  * Exported because the Worktrees page's orphan cleanup
  * (`deleteOrphanWorktree` in orchestrator.ts) removes the same nested root
  * after its last repository child is deleted.
  */
-export function removeWorkspaceIfEmpty(dir: string): void {
-  if (!workspaceHasOnlyAgetorScratch(dir)) return;
-  pruneWorkspaceScratch(dir);
+export async function removeWorkspaceIfEmpty(dir: string): Promise<void> {
   try {
-    if (readdirSync(dir).length === 0) rmdirSync(dir);
+    await removeTaskDirWorkspaceIfOnlyScratch(dir);
   } catch {
     /* best-effort */
   }
@@ -2097,7 +2298,15 @@ async function removeOneWorktree(root: string | null, wt: string, branches: stri
     await git(["worktree", "prune"], root, 10_000);
   }
   const ownedPrefix = WORKTREES_DIR + path.sep;
-  if (wt.startsWith(ownedPrefix) && existsSync(wt)) {
+  // `startsWith` alone accepted `<WORKTREES_DIR>/../anything`; the lexical
+  // check normalizes first. (Multi-repository callers have already required
+  // the exact owned shape — see `locateRepositoryCheckout`.)
+  if (
+    wt.startsWith(ownedPrefix)
+    && lexicallyInsideRoot(WORKTREES_DIR, wt)
+    && path.resolve(wt) !== path.resolve(WORKTREES_DIR)
+    && existsSync(wt)
+  ) {
     // Async on purpose: a synchronous rmSync over a large worktree (e.g. one
     // with node_modules) would block the event loop for seconds, starving
     // every other HTTP connection and SSE stream.
@@ -2126,16 +2335,17 @@ export async function removeWorktree(
     // says agetor owns there. `branchSource: "existing"` never happens for a
     // multi task in v1, but the guard keeps a future per-repo PR head safe.
     const planned = new Map((opts?.repositories ?? []).map((p) => [p.name, p.branches]));
+    const workspace = workspacePathFor(task);
     for (const repo of repos) {
-      if (!repo.worktreePath) continue;
-      const root = await repoRoot(repo.path);
+      const located = await locateRepositoryCheckout(task, workspace, repo);
+      if (!located.wt) continue;
       const branches = planned.get(repo.name)
         ?? (repo.branch && repo.branchSource !== "existing" ? [repo.branch] : null);
-      await removeOneWorktree(root, repo.worktreePath, branches);
+      await removeOneWorktree(located.root, located.wt, branches);
     }
     // Each nested directory is its own worktree; only the now-empty workspace
     // root is ours to delete (never recursively).
-    removeWorkspaceIfEmpty(workspacePathFor(task));
+    await removeWorkspaceIfEmpty(workspace);
     return;
   }
   if (!task.worktreePath) return;
@@ -2161,26 +2371,64 @@ export async function pruneWorktrees(root: string): Promise<void> {
   await git(["worktree", "prune"], root, 10_000);
 }
 
+/**
+ * Which checkout teardown should act on for one repository entry of a
+ * multi-repository task (docs/architecture/multi-repo-tasks.md).
+ *
+ * - A recorded `worktreePath` is used only when it is exactly
+ *   `<WORKTREES_DIR>/<task-id or pipeline-parent-id>/<entry name>`
+ *   ({@link isOwnedRepositoryCheckoutPath}); anything else on the row (a
+ *   `..`-bearing or hand-edited path) is `refused` and never touched.
+ * - With no recorded path, a prepare may still have materialized the checkout
+ *   without the row ever being updated (a crash, an archive racing the
+ *   start). `<workspace>/<entry name>` is then torn down too, but only when
+ *   git proves it is a checkout of that entry's repository — otherwise the
+ *   directory is left alone.
+ */
+async function locateRepositoryCheckout(
+  task: Task,
+  workspace: string,
+  repo: TaskRepository,
+): Promise<{ wt: string | null; root: string | null; refused: boolean }> {
+  let root: string | null = null;
+  try { root = await repoRoot(repo.path); } catch { root = null; }
+  if (repo.worktreePath) {
+    if (!isOwnedRepositoryCheckoutPath(task, repo.name, repo.worktreePath)) {
+      return { wt: null, root, refused: true };
+    }
+    return { wt: repo.worktreePath, root, refused: false };
+  }
+  if (!root || !isSafeSegment(repo.name)) return { wt: null, root, refused: false };
+  const candidate = path.join(workspace, repo.name);
+  if (!isOwnedRepositoryCheckoutPath(task, repo.name, candidate) || !existsSync(candidate)) {
+    return { wt: null, root, refused: false };
+  }
+  const proved = await isCheckoutOfRepo(candidate, await gitCommonDirOf(root));
+  return { wt: proved ? candidate : null, root, refused: false };
+}
+
 /** Detach one repository's worktree, keeping its branch and refusing a dirty checkout. */
 async function detachOneWorktree(
-  sourcePath: string,
-  wt: string | null,
+  task: Task,
+  workspace: string,
+  repo: TaskRepository,
   opts?: { force?: boolean },
 ): Promise<WorktreeTeardownResult> {
+  const { wt, root, refused } = await locateRepositoryCheckout(task, workspace, repo);
+  if (refused) return { removed: false, reason: "failed" };
   if (!wt) return { removed: false, reason: "no-worktree" };
   if (!existsSync(wt)) return { removed: false, reason: "already-absent" };
   if (!opts?.force) {
     const dirty = await hasUncommittedChanges(wt);
     if (dirty !== false) return { removed: false, reason: "dirty" };
   }
-  const root = await repoRoot(sourcePath);
   if (root) {
     await git(["worktree", "remove", "--force", wt], root);
     // Deliberately no `git branch -D` — the branch survives for a re-attach.
     await git(["worktree", "prune"], root, 10_000);
   }
-  const ownedPrefix = WORKTREES_DIR + path.sep;
-  if (wt.startsWith(ownedPrefix) && existsSync(wt)) {
+  // `wt` passed `isOwnedRepositoryCheckoutPath` (exact owned shape, no `..`).
+  if (existsSync(wt)) {
     try { await rm(wt, { recursive: true, force: true }); }
     catch { /* best-effort */ }
   }
@@ -2226,13 +2474,13 @@ export async function detachWorktree(
   const repos = task.repositories ?? [];
   if (repos.length > 1) {
     const outcomes: { name: string; result: WorktreeTeardownResult }[] = [];
+    const workspace = workspacePathFor(task);
     for (const repo of repos) {
-      outcomes.push({ name: repo.name, result: await detachOneWorktree(repo.path, repo.worktreePath, opts) });
+      outcomes.push({ name: repo.name, result: await detachOneWorktree(task, workspace, repo, opts) });
     }
     // Only the empty workspace root is removed; a dirty repository's checkout
     // (and the workspace holding it) stays put.
-    const workspace = workspacePathFor(task);
-    removeWorkspaceIfEmpty(workspace);
+    await removeWorkspaceIfEmpty(workspace);
     // A real per-repository failure (dirty checkout, failed removal) is the
     // reason to report — it is what blocks the delete.
     const failed = outcomes.find(

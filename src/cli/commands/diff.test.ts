@@ -181,3 +181,45 @@ test("an unknown --repo name fails with the available repository names", async (
     'no repository "nope" on this task (have: frontend, backend)',
   );
 });
+
+test("one repository's failing diff doesn't hide its siblings; the command exits non-zero (review N3)", async () => {
+  const before = process.exitCode;
+  try {
+    currentClient = {
+      listTasks: async () => [task({ repositories: [repo("frontend"), repo("backend")] })],
+      getDiff: async (_id: string, repoName?: string | null) => {
+        if (repoName === "frontend") throw new Error("worktree missing\u001b[2J");
+        return diff(repoName ?? null, `${repoName}.txt`);
+      },
+    } as unknown as AgetorClient;
+
+    process.exitCode = 0;
+    await cmdDiff(["t1"], flags);
+    const text = outputs.join("\n");
+    expect(text).toContain("── frontend ──");
+    expect(text).toContain("! diff failed: worktree missing\\u001b[2J");
+    expect(text).toContain("── backend ──");
+    expect(text).toContain("backend.txt");
+    expect(process.exitCode).toBe(1);
+
+    process.exitCode = 0;
+    await cmdDiff(["t1"], { ...flags, json: true });
+    expect(json[0]).toEqual([
+      { repo: "frontend", error: "worktree missing\u001b[2J" },
+      diff("backend", "backend.txt"),
+    ]);
+    expect(process.exitCode).toBe(1);
+  } finally {
+    process.exitCode = before;
+  }
+});
+
+test("--repo naming the failing repository fails the command with its error", async () => {
+  currentClient = {
+    listTasks: async () => [task({ repositories: [repo("frontend"), repo("backend")] })],
+    getDiff: async () => {
+      throw new Error("worktree missing");
+    },
+  } as unknown as AgetorClient;
+  await expect(cmdDiff(["t1", "--repo", "frontend"], flags)).rejects.toThrow("worktree missing");
+});

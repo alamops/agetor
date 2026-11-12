@@ -673,11 +673,21 @@ test("archive leaves a dirty repository's checkout and the workspace in place", 
   });
   expect(res.ok()).toBe(true);
   const body = (await res.json()) as {
-    teardown?: { removed: boolean; repositories?: { name: string; result: { removed: boolean } }[] };
+    archivedAt: number | null;
+    teardown?: { removed: boolean; reason?: string; repositories?: { name: string; result: { removed: boolean } }[] };
   };
+  // Acceptance #5: one dirty repository never blocks the archive itself.
+  expect(body.archivedAt).not.toBeNull();
+  const reread = (await (await request.get(`${backend.apiBase}/tasks/${taskId}`, { headers: auth })).json()) as {
+    archivedAt: number | null;
+  };
+  expect(reread.archivedAt).not.toBeNull();
   expect(body.teardown?.removed).toBe(false);
+  expect(body.teardown?.reason).toBe("dirty");
   expect(body.teardown?.repositories?.map((r) => r.result.removed)).toEqual([true, false]);
   expect(existsSync(before.repositories[0]!.worktreePath)).toBe(false);
   expect(existsSync(before.repositories[1]!.worktreePath)).toBe(true);
   expect(existsSync(before.worktreePath)).toBe(true);
+  // The kept checkout still holds the uncommitted work.
+  expect(git(before.repositories[1]!.worktreePath, ["status", "--porcelain"])).toContain("dirty.txt");
 });

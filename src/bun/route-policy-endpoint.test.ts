@@ -142,7 +142,7 @@ afterAll(async () => {
   }
   // Restore every mode-000 fixture a test left behind (a test that timed out
   // never reached its own `finally`), or the rm below fails with EACCES.
-  for (const name of ["locked", "locked-padded"]) {
+  for (const name of ["locked", "locked-padded", "locked-repository"]) {
     try {
       chmodSync(path.join(SCRATCH, name), 0o700);
     } catch {
@@ -642,6 +642,35 @@ test.skipIf(asRoot)("path gate: a whitespace-padded spelling of an unreadable pa
   // gate probes the raw AND trimmed value in disclaimed child processes —
   // ~2–3 s alone, well past the 5 s default under a full-suite load.
 }, 60_000);
+
+// The table-driven test above builds its body FROM the policy, so it can't
+// notice a param losing its `itemField`: it would then send a plain string,
+// which the gate still refuses. This body is the real `POST /tasks` shape,
+// written out by hand: `repositories` is an array of `{ path }` objects, and
+// the locked path is the second entry, so every entry must be probed.
+test.skipIf(asRoot)("path gate: POST /tasks refuses a locked repositories[].path for the CLI token", async () => {
+  const locked = path.join(SCRATCH, "locked-repository");
+  mkdirSync(locked);
+  chmodSync(locked, 0o000);
+  try {
+    const res = await fetch(`${APP}/tasks`, {
+      method: "POST",
+      headers: { ...bearer(cli), "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "multi",
+        prompt: "p",
+        agent: "codex",
+        workdir: SCRATCH,
+        isolation: "worktree",
+        repositories: [{ path: SCRATCH }, { path: locked }],
+      }),
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { code?: string }).code).toBe("path-not-accessible");
+  } finally {
+    chmodSync(locked, 0o700);
+  }
+});
 
 // `tmux_source` belongs to the desktop-only POST /tmux-source; the generic
 // preference route must not let the CLI token set it either.

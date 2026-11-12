@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FolderPlus, GitFork, Loader2, Trash2, TriangleAlert } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import {
   tooManyRepositories,
   type RepoSelection,
 } from "@/lib/repo-selection";
+import { createSessionGuard, describeRootConflict, mergeSelectionsByRoot, type RootConflict } from "@/lib/multi-repo-ui";
 import { uniqueRepoSlugs } from "../../../shared/multi-repo.ts";
 import type { Project } from "../../../shared/types.ts";
 
@@ -40,15 +41,37 @@ interface Props {
  * (two or more entries after git-root dedupe). A single-repository task keeps
  * the historical inline `WorktreeOptions` base ref, and the create payload
  * never carries `repositories[]` for it — offering a second, ignored base-ref
- * input here silently discarded whatever the user typed.
+ * input here silently discarded whatever the user typed. The parent seeds the
+ * first entry with that inline base ref (`seedRepositoriesDialogValue`), so it
+ * shows in the first row's input as soon as a second repository is added, and
+ * a selection saved back down to one entry hands that entry's base ref back
+ * (`applyRepositoriesSave`).
+ *
+ * Save resolves git roots before it applies. Closing the dialog (Cancel,
+ * Escape) while that lookup is in flight abandons it: the result is dropped,
+ * never applied after the user walked away. Entries that collapse onto one
+ * root keep the base ref set on any of them; two different base refs on one
+ * root block the save with a message naming both.
  */
 export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [draft, setDraft] = useState<RepoSelection[]>(value);
   const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Base-ref conflicts found by the last save (two entries under one git root
+  // pinned to different refs). Shown as an error; their inputs stay visible
+  // so the user can settle them even when the set collapses to one root.
+  const [conflicts, setConflicts] = useState<RootConflict[]>([]);
+  // Invalidated on every open, close and save attempt. A save's root lookup
+  // only applies while its own session is still current, so a Cancel/Escape
+  // during the lookup (or a reopen) drops the stale result instead of
+  // applying it.
+  const sessionRef = useRef(createSessionGuard());
 
   useEffect(() => {
+    sessionRef.current.invalidate();
+    setBusy(false);
+    setConflicts([]);
     if (!open) return;
     setDraft(value);
     void api.listProjects().then(setProjects).catch(() => setProjects([]));
@@ -65,6 +88,10 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
   // either — the inline Branch picker owns that task's base ref.
   const dedupedCount = useMemo(() => dedupeSelections(draft).length, [draft]);
   const multiSelection = dedupedCount > 1;
+  const conflictPaths = useMemo(
+    () => new Set(conflicts.flatMap((c) => c.entries.map((e) => e.path))),
+    [conflicts],
+  );
   // Rows rendered below: every registered project, then any extra draft paths
   // (from "Add folder"), deduped by path. Test ids are derived from the whole
   // displayed list so two projects sharing a basename (`/a/api`, `/b/api`) get
@@ -78,8 +105,15 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
   }, [projects, draft]);
   const rowTestIds = useMemo(() => uniqueRepoSlugs(displayPaths), [displayPaths]);
 
+  const close = () => {
+    sessionRef.current.invalidate();
+    setBusy(false);
+    onClose();
+  };
+
   const toggle = (path: string) => {
     if (path === lockedPath) return;
+    setConflicts([]);
     setDraft((cur) =>
       cur.some((e) => e.path === path)
         ? cur.filter((e) => e.path !== path)
@@ -105,11 +139,14 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
   };
 
   const setBaseRef = (path: string, baseRef: string) => {
+    setConflicts([]);
     setDraft((cur) => cur.map((e) => (e.path === path ? { ...e, baseRef } : e)));
   };
 
   const save = async () => {
+    const session = sessionRef.current.begin();
     setBusy(true);
+    setConflicts([]);
     try {
       // Resolve git roots so two paths under one repository collapse to the
       // first selected path. A failure leaves the root unknown (kept).
@@ -124,24 +161,28 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
           }
         }),
       );
-      const final = dedupeSelections(resolved);
-      // A single-repository selection has no per-repository base ref: the
-      // task's inline Branch picker owns it. Drop any value left over from an
-      // earlier multi selection so it can't resurface (and silently apply) if
-      // the user later adds a second repository.
-      onSave(
-        final.length > 1
-          ? final
-          : final.map((entry) => ({ path: entry.path, root: entry.root })),
-      );
+      // Cancelled, closed or reopened while the lookup ran: not ours to apply.
+      if (!sessionRef.current.isCurrent(session)) return;
+      const merged = mergeSelectionsByRoot(resolved);
+      if (merged.conflicts.length > 0) {
+        // Keep the dialog open on the resolved roots (so the "share a git
+        // root" hint shows) and let the user pick which base ref wins.
+        setDraft(resolved);
+        setConflicts(merged.conflicts);
+        return;
+      }
+      // A single kept entry still carries its base ref: the parent hands it
+      // back to the inline Branch picker (`applyRepositoriesSave`) and stores
+      // the entry without it, so it can't resurface from here later.
+      onSave(merged.kept);
       onClose();
     } finally {
-      setBusy(false);
+      if (sessionRef.current.isCurrent(session)) setBusy(false);
     }
   };
 
   return (
-    <Dialog open={open} onClose={onClose} labelledBy="repositories-dialog-title" className="w-[32rem] max-w-[92vw]">
+    <Dialog open={open} onClose={close} labelledBy="repositories-dialog-title" className="w-[32rem] max-w-[92vw]">
       <div className="flex items-start justify-between gap-3">
         <div>
           <h2 id="repositories-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
@@ -185,7 +226,7 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
               </label>
               {entry ? (
                 <div className="mt-1 flex items-center gap-2 pl-6">
-                  {multiSelection ? (
+                  {multiSelection || conflictPaths.has(path) ? (
                     <Input
                       value={entry.baseRef ?? ""}
                       onChange={(e) => setBaseRef(path, e.target.value)}
@@ -223,12 +264,19 @@ export function RepositoriesDialog({ open, onClose, value, onSave, lockedPath }:
         </p>
       ) : null}
 
+      {conflicts.length > 0 ? (
+        <p className="mt-2 flex items-start gap-1.5 text-xs text-danger" role="alert" data-testid="repositories-save-error">
+          <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          {conflicts.map(describeRootConflict).join(" ")}
+        </p>
+      ) : null}
+
       <div className="mt-3 flex items-center justify-between">
         <span className="text-xs text-muted-foreground">
           {draft.length} selected{draft.length !== dedupeSelections(draft).length ? " (some share a git root)" : ""}
         </span>
         <div className="flex gap-2">
-          <Button size="sm" variant="outline" onClick={onClose}>
+          <Button size="sm" variant="outline" onClick={close}>
             Cancel
           </Button>
           <Button size="sm" onClick={() => void save()} disabled={busy || draft.length === 0}>

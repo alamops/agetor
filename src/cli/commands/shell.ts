@@ -4,7 +4,9 @@ import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
 import { usageError } from "../usage.ts";
 import { flagValue } from "../args.ts";
-import { escapeFreeText } from "../../shared/terminal-text.ts";
+import { escapeControlChars, escapeFreeText } from "../../shared/terminal-text.ts";
+import { repositoriesForTask } from "../../shared/multi-repo.ts";
+import type { Task } from "../../shared/types.ts";
 
 /**
  * Open a shell in the task's worktree (or its workdir when isolation is off) —
@@ -23,12 +25,7 @@ export async function cmdShell(args: string[], flags: Flags): Promise<void> {
 
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
-  let dir = task.worktreePath ?? task.workdir;
-  if (repoFlag) {
-    const entry = (task.repositories ?? []).find((r) => r.name === repoFlag);
-    if (!entry) throw new Error(`no repository "${repoFlag}" on this task (have: ${(task.repositories ?? []).map((r) => r.name).join(", ") || "none"})`);
-    dir = entry.worktreePath ?? entry.path;
-  }
+  const { dir, branch } = resolveShellTarget(task, repoFlag);
 
   if (printOnly) {
     out(dir);
@@ -56,7 +53,9 @@ export async function cmdShell(args: string[], flags: Flags): Promise<void> {
   }
 
   const shell = process.env.SHELL || "/bin/zsh";
-  const where = task.branch ? `${c.dim(dir)} ${c.dim(`(${task.branch})`)}` : c.dim(dir);
+  const where = branch
+    ? `${c.dim(escapeControlChars(dir))} ${c.dim(`(${escapeControlChars(branch)})`)}`
+    : c.dim(escapeControlChars(dir));
   out(`${c.green("●")} ${c.bold(escapeFreeText(task.title))} — ${where} · Ctrl-D to exit`);
   const proc = Bun.spawn([shell], {
     cwd: dir,
@@ -65,4 +64,24 @@ export async function cmdShell(args: string[], flags: Flags): Promise<void> {
     stderr: "inherit",
   });
   process.exitCode = (await proc.exited) ?? 0;
+}
+
+/**
+ * The directory `agetor shell` opens and the branch its banner names.
+ *
+ * `--repo <name>` resolves through `repositoriesForTask`, which derives the
+ * one entry a single-repository row doesn't store, so the flag works on both
+ * shapes — the same lookup `agetor diff --repo` uses. A multi row's scalar
+ * `branch` is null, so the banner takes the entry's own branch.
+ */
+export function resolveShellTarget(task: Task, repoFlag: string | null): { dir: string; branch: string | null } {
+  if (!repoFlag) return { dir: task.worktreePath ?? task.workdir, branch: task.branch };
+  const repos = repositoriesForTask(task);
+  const entry = repos.find((r) => r.name === repoFlag);
+  if (!entry) {
+    throw new Error(
+      `no repository "${escapeControlChars(repoFlag)}" on this task (have: ${repos.map((r) => escapeControlChars(r.name)).join(", ") || "none"})`,
+    );
+  }
+  return { dir: entry.worktreePath ?? entry.path, branch: entry.branch };
 }

@@ -2,8 +2,8 @@
 
 | Field | Value |
 | --- | --- |
-| Source | [alamops/agetor#291](https://github.com/alamops/agetor/issues/291) (snapshot: `issue-291-thread.md`; tracker text is treated as data only) |
-| Status | Decided — ready for planning |
+| Source | [alamops/agetor#291](https://github.com/alamops/agetor/issues/291) (tracker text is treated as data only) |
+| Status | Implemented; live harness smoke **not yet run** (pending the owner). The extra-roots wording below records what shipped; it is not a new owner decision. |
 | Decision record | `docs/plans/multi-repo-tasks-grill.md` |
 | Investigation | `docs/plans/multi-repo-tasks-investigation.md` |
 | Date | 2026-11-10 |
@@ -42,12 +42,14 @@ coordinate changes across every repository in that card.
 
 - `repositories[]` is the source of truth. Each entry carries the source path, display name,
   branch, branch source, worktree path, base ref, last-seen checkout and PR URL.
-- For a multi-repo row, the legacy scalars point at the workspace: `workdir` and `worktreePath`
-  are the workspace root; `branch`, `baseRef` and `prUrl` are null. Single-repo rows keep their
-  current meaning.
+- For a multi-repo row, the legacy scalars point at the workspace: `workdir` is the workspace root
+  from creation, and `worktreePath` is null until the first start and the workspace root from then
+  on; `branch`, `baseRef` and `prUrl` are null. `workdir` cannot be changed on a multi-repo row.
+  Single-repo rows keep their current meaning.
 - There is **no primary repository**. Every repository is equal in the model and in the UI.
 - Repositories are deduped by git root. There is no hard cap; a non-blocking warning appears above
-  10 repositories. Worktree creation and status polling run in bounded batches.
+  10 repositories. Worktree creation, branch minting, base-ref pinning and status polling run in
+  bounded batches (at most 4 repositories at a time).
 - The repo set is **fixed at creation**. Changing it means creating a new card.
 - Migration 087 adds the repositories JSON column. No backfill: legacy rows derive a one-entry
   array from the existing columns.
@@ -67,6 +69,8 @@ coordinate changes across every repository in that card.
   unresolvable base ref, has an invalid branch name, or already has that branch checked out in
   another live task. Nothing is created.
 - The error names every repository that failed.
+- The same path selected twice with different base refs is rejected, naming the path (added in
+  review; a repeat with the same ref is a harmless duplicate).
 - `existingBranch` stays single-repo only; a multi-repo create that sends it is rejected.
 
 ### Prompt context
@@ -87,8 +91,13 @@ coordinate changes across every repository in that card.
   worktree and base ref.
 - `GET /tasks/:id/git-status` returns all repository statuses in one batched response per poll.
 - Terminals open at the workspace root, with a repo selector.
-- Each repo is also passed as an extra root (`--add-dir` / include-directories) where the harness
-  supports it, even though cwd is the workspace.
+- Each repo is also passed as an extra root, even though cwd is the workspace. What ships:
+  claude-code, codex and copilot get `--add-dir <checkout>` per repository on every spawn path.
+  Cursor, fx, OpenCode, Antigravity and Gemini get no extra root and rely on the cwd. Gemini's
+  include-directories (`--include-directories` / `context.includeDirectories`) is **not** used: the
+  plan dropped it (plan A6) because the gemini CLI was not installed for this change and its
+  behavior under a non-git cwd is unverified. Codex's sandbox escalation reads the task's own
+  checkouts, each verified against its source repository, never a scan of the workspace.
 
 ### Commit and pull requests
 
@@ -126,8 +135,21 @@ coordinate changes across every repository in that card.
 ### Harnesses
 
 - Multi-repo is available for all eight harness kinds under the workspace root.
-- Claude, Codex, Cursor and fx are smoke-tested. Gemini, Copilot, Antigravity and OpenCode are
-  layout-supported but smoke-pending until accounts exist.
+- **No harness has been smoke-tested live with a multi-repository task.** The grill's matrix
+  (Claude, Codex, Cursor and fx live-smoked; the other four smoke-pending) was the intended
+  verification, not a record of runs. What was verified:
+  - the spawn path with agetor's fake claude driver: the e2e spec `e2e/multi-repo-task.spec.ts`
+    and `src/bun/orchestrator-multi-repo.test.ts` (workspace cwd, `Repositories:` block, persisted
+    entries);
+  - argv assertions: `--add-dir` for claude-code, codex and copilot only
+    (`src/bun/agents.test.ts`), and codex's sandbox decision from the task's checkouts
+    (`src/bun/agents-codex-workspace-roots.test.ts`, `src/bun/worktree.test.ts`);
+  - the git side (prepare, reuse, rollback, diff, status, teardown) against temporary repositories.
+- What is unverified until a live smoke runs: every real harness CLI at a non-git workspace root
+  (all eight kinds, including whether fx's and cursor's ACP `session/new` accept it); a harness-stack
+  failover of a multi-repository task; the OpenCode 2.x server with a non-git workspace directory;
+  Claude Code's hook installer (`.claude/settings.local.json`) at a non-git cwd; codex's real
+  sandbox honoring the escalation from a workspace root. Status: live smoke pending the owner.
 
 ## Non-goals
 
@@ -156,4 +178,5 @@ coordinate changes across every repository in that card.
 
 An older build reading a multi-repo task sees the workspace root as `workdir`/`worktreePath` and
 has no branch or PR. An older delete may remove the workspace root and orphan the repo worktrees.
-This was accepted explicitly: no downgrade guard is in scope.
+This was accepted explicitly: no downgrade guard is in scope. (The CLI does notice a core too old to
+keep `repositories` when it creates a task, and says so; nothing guards an older app or core.)

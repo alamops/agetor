@@ -66,7 +66,7 @@ import {
 } from "./orchestrator.ts";
 import { cancelPendingForTask, listPendingForTask } from "./interactions.ts";
 import { prepareTaskWorkdir, recordableCheckout, repoRoot } from "./worktree.ts";
-import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
+import { snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
   attemptWindowStart,
   classifyStepResponse,
@@ -94,6 +94,7 @@ import {
 } from "../shared/pipeline.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { appendReferences } from "../shared/refs.ts";
+import { composeRunPrompt } from "../shared/launch-prompt.ts";
 import type {
   AgentProfileSnapshot,
   ColumnId,
@@ -113,6 +114,7 @@ import type {
   Run,
   Task,
   TaskReference,
+  TaskRepository,
 } from "../shared/types.ts";
 import { CONTINUATION_STATUS_TEXT, PIPELINE_LIMITS } from "../shared/types.ts";
 
@@ -1008,7 +1010,7 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
     // write wins over this snapshot); the live reads from THIS prepare are
     // authoritative for the parent row, which is the pipeline's last-seen
     // checkout (D14).
-    recordPreparedRepositoryCheckouts(parent.id, prepared.repositories);
+    recordPreparedRepositoryCheckouts(parent.id, prepared.repositories, prepared.unknownCheckouts);
   }
   // The parent carries the pipeline's last-seen checkout (D14); steps mirror
   // it. `setCheckoutBranch` is compare-then-write, so an unchanged value
@@ -1187,6 +1189,28 @@ function enterHumanGate(
   });
   persist(parentId, run);
   return { ok: true, runId: null };
+}
+
+/**
+ * Whether a step prompt, wrapped exactly as `startTaskInner` will launch it,
+ * is over the step harness's argv budget (gemini today; null for an uncapped
+ * kind). The wrapping is `composeRunPrompt` — the profile's
+ * instructions/skills preamble, then the `Repositories:` block a
+ * multi-repository task adds (the step shares the parent's repository set,
+ * D2/M6) — and then `appendReferences`. Measuring without the repository
+ * block would let a multi-repository step fit here and then fail at spawn.
+ * See docs/architecture/pipelines.md and docs/architecture/multi-repo-tasks.md.
+ */
+export function stepLaunchPromptOverage(
+  profile: AgentProfileSnapshot,
+  prompt: string,
+  references: TaskReference[],
+  repositories: TaskRepository[] | null | undefined,
+): { limit: number; bytes: number } | null {
+  return promptByteOverage(
+    profile.harnessKind,
+    appendReferences(composeRunPrompt(profile, prompt, repositories), references),
+  );
 }
 
 /**
@@ -1383,15 +1407,11 @@ async function launchStep(
 
   let composed = composeStepPrompt({ ...composeArgs, inlineHandoff: true });
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
-  // with — `composeLaunchPrompt` (the profile's instructions/skills
-  // preamble) then `appendReferences` (the references block) — not the raw
-  // step prompt on its own, since either wrapper can push a borderline
-  // prompt over gemini's argv cap even when the unwrapped text doesn't.
-  if (profile.harnessKind === "gemini") {
-    const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
-    if (promptByteOverage("gemini", fullPrompt)) {
-      composed = composeStepPrompt({ ...composeArgs, inlineHandoff: false });
-    }
+  // with, not the raw step prompt on its own, since any wrapper can push a
+  // borderline prompt over gemini's argv cap even when the unwrapped text
+  // doesn't. See `stepLaunchPromptOverage`.
+  if (stepLaunchPromptOverage(profile, composed, references, parent.repositories)) {
+    composed = composeStepPrompt({ ...composeArgs, inlineHandoff: false });
   }
 
   const now = Date.now();

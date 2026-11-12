@@ -318,17 +318,31 @@ test("GET /tasks/:id/diff routes by repo and 400s an unknown one", async () => {
 test("GET /tasks/:id/git-status returns every repository in one response", async () => {
   const { task, a, b } = await createMulti();
   try {
+    // Make the two repositories differ so a handler that answered every entry
+    // with repository 0's status (or the workspace root's) would fail: A gets
+    // an uncommitted file, B a commit past the base sha createTask pinned.
+    // The task is not started, so each entry's dir is its selected path.
+    writeFileSync(path.join(a, "dirty.txt"), "uncommitted\n");
+    writeFileSync(path.join(b, "more.txt"), "more\n");
+    await git(["add", "."], b);
+    await git(["commit", "-m", "ahead of base"], b);
+
     const res = await call(`/tasks/${task.id}/git-status`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
-      repositories?: { name: string; path: string; ignored: boolean }[];
+      repositories?: { name: string; path: string; ignored: boolean; hasChanges: boolean; ahead: number; branch: string | null }[];
       name?: string;
+      path?: string;
+      hasChanges?: boolean;
+      ahead?: number;
     };
     expect(body.repositories).toHaveLength(2);
-    expect(body.repositories?.map((r) => r.name)).toEqual(task.repositories?.map((r) => r.name));
-    expect(body.repositories?.every((r) => r.ignored === false)).toBe(true);
+    const names = task.repositories!.map((r) => r.name);
+    expect(body.repositories?.map((r) => r.name)).toEqual(names);
+    expect(body.repositories?.[0]).toMatchObject({ name: names[0], path: a, ignored: false, hasChanges: true, ahead: 0, branch: "main" });
+    expect(body.repositories?.[1]).toMatchObject({ name: names[1], path: b, ignored: false, hasChanges: false, ahead: 1, branch: "main" });
     // Top-level mirrors the first repository for old clients.
-    expect(body.name).toBe(task.repositories?.[0]?.name);
+    expect(body).toMatchObject({ name: names[0], path: a, hasChanges: true, ahead: 0 });
   } finally {
     rmSync(a, { recursive: true, force: true });
     rmSync(b, { recursive: true, force: true });
@@ -338,6 +352,7 @@ test("GET /tasks/:id/git-status returns every repository in one response", async
 test("GET /projects/repo-root resolves a subdirectory to its git root", async () => {
   const a = await makeRepo("root");
   const sub = path.join(a, "nested", "dir");
+  const cleanup: string[] = [];
   try {
     const { mkdirSync } = await import("node:fs");
     mkdirSync(sub, { recursive: true });
@@ -347,12 +362,26 @@ test("GET /projects/repo-root resolves a subdirectory to its git root", async ()
       const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], { cwd: a, stdout: "pipe" });
       return (await new Response(proc.stdout).text()).trim();
     })());
-    const notRepo = await call(`/projects/repo-root?path=${encodeURIComponent(tmpdir())}`);
-    // tmpdir may itself be inside a repo on some machines; only assert the
-    // missing-parameter 400 which is deterministic.
-    expect(notRepo.status === 200 || notRepo.status === 400).toBe(true);
-    expect((await call("/projects/repo-root")).status).toBe(400);
+    // A fresh empty directory is not a git repository: `repoRoot` returns
+    // null and the handler answers exactly 400 "not a git repository". The
+    // precondition pins that the temp dir really sits outside any repo, so a
+    // failure here names the environment rather than a wrong status.
+    const plain = mkdtempSync(path.join(tmpdir(), "agetor-srv-plain-"));
+    cleanup.push(plain);
+    const probe = Bun.spawn(["git", "rev-parse", "--show-toplevel"], { cwd: plain, stdout: "pipe", stderr: "pipe" });
+    expect(await probe.exited).not.toBe(0);
+    const notRepo = await call(`/projects/repo-root?path=${encodeURIComponent(plain)}`);
+    expect(notRepo.status).toBe(400);
+    expect((await notRepo.json()).error).toBe("not a git repository");
+    // A path that does not exist takes the same 400.
+    const missing = await call(`/projects/repo-root?path=${encodeURIComponent(path.join(plain, "missing"))}`);
+    expect(missing.status).toBe(400);
+    expect((await missing.json()).error).toBe("not a git repository");
+    const noParam = await call("/projects/repo-root");
+    expect(noParam.status).toBe(400);
+    expect((await noParam.json()).error).toBe("path required");
   } finally {
+    for (const dir of cleanup) rmSync(dir, { recursive: true, force: true });
     rmSync(a, { recursive: true, force: true });
   }
 });

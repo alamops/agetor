@@ -81,6 +81,7 @@ import { parsePullNumber } from "@/lib/pr-url";
 import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
 import { issueProjectPath, taskProjectPath } from "@/lib/repo-selection";
+import { multiRepoDeleteFallback, openFolderUnavailableReason, taskSearchText } from "@/lib/multi-repo-ui";
 import { cn } from "@/lib/utils";
 import { autoEnabledToastText, opencodeSessionsFoundText } from "@/lib/import-sessions";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
@@ -1916,9 +1917,9 @@ function AppInner() {
       // effect and `GET /tasks/:id/pipeline` both need the full list/row).
       if (t.pipelineParentId != null) return false;
       if (q) {
-        const repoHay = (t.repositories ?? []).map((r) => `${r.name} ${r.path}`).join("\n");
-        const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}\n${repoHay}`.toLowerCase();
-        if (!hay.includes(q)) return false;
+        // A multi-repository task's branches live on its repositories
+        // (`task.branch` is null), so the haystack folds them in.
+        if (!taskSearchText(t).includes(q)) return false;
       }
       if (repoFilter.length > 0) {
         // A multi-repository task's workdir is its workspace root, so match
@@ -2217,6 +2218,9 @@ function AppInner() {
       ? await api.getTaskTeardownPreview(t.id).catch(() => null)
       : null;
     const maybeDrifted = t.checkoutBranch && t.checkoutBranch !== t.branch ? t.checkoutBranch : null;
+    // A multi-repository row has no scalar branch: the fallback names each
+    // repository's own branch (and drifted checkout) instead of an empty `()`.
+    const multiFallback = (t.repositories?.length ?? 0) > 1 ? multiRepoDeleteFallback(t.repositories!) : null;
     const ok = await confirm({
       title: `Delete "${t.title}"?`,
       description: (
@@ -2239,7 +2243,26 @@ function AppInner() {
           {t.worktreePath && preview && preview.branches.length === 0 && (
             <> Its git worktree will be torn down; no branches will be deleted.</>
           )}
-          {t.worktreePath && !preview && (
+          {t.worktreePath && !preview && multiFallback && (
+            <>
+              {" "}Its git worktrees
+              {multiFallback.branches && (
+                <>
+                  {" "}(
+                  <span data-testid="delete-confirm-repo-branches" className="font-mono text-foreground/80">{multiFallback.branches}</span>
+                  )
+                </>
+              )}{" "}will also be torn down
+              {multiFallback.maybeDrifted ? (
+                <>
+                  , and possibly the branches they were last on (
+                  <span data-testid="delete-confirm-maybe-branch" className="font-mono text-foreground/80">{multiFallback.maybeDrifted}</span>
+                  ).
+                </>
+              ) : "."}
+            </>
+          )}
+          {t.worktreePath && !preview && !multiFallback && (
             <>
               {" "}Its git worktree (
               <span className="font-mono text-foreground/80">{t.branch}</span>
@@ -2286,8 +2309,21 @@ function AppInner() {
   // RunPanel's own Open button (`RunPanel.tsx`'s `api.openPath` call): a
   // failure here has no useful recovery, so it's swallowed rather than
   // routed through `surfaceError`.
+  //
+  // A multi-repository task's workspace doesn't exist until its first run,
+  // so opening it would 404 and do nothing: say why instead
+  // (`openFolderUnavailableReason`), and surface a later failure for it too.
+  // Single-repository tasks keep the silent best-effort behavior.
   const openInFinder = useCallback((t: Task) => {
-    void api.openPath({ path: t.worktreePath ?? t.workdir, taskId: t.id }).catch(() => { /* best-effort */ });
+    const unavailable = openFolderUnavailableReason(t);
+    if (unavailable) {
+      toast.info(unavailable);
+      return;
+    }
+    const multi = (t.repositories?.length ?? 0) > 1;
+    void api.openPath({ path: t.worktreePath ?? t.workdir, taskId: t.id }).catch((err: unknown) => {
+      if (multi) toast.error(err instanceof Error ? err.message : "Could not open the workspace folder");
+    });
   }, []);
 
   // Shared by RunPanel's `onViewPullRequest` prop and the task context

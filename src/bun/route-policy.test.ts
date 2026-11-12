@@ -211,6 +211,7 @@ const DESKTOP_ONLY = [
   "POST /harnesses/:id/usage/refresh",
   "POST /open-external",
   "POST /open-path",
+  "GET /projects/repo-root",
   "POST /projects/pick",
   "POST /refs/drag",
   "POST /refs/pick",
@@ -630,18 +631,19 @@ describe("path-valued fields (D24)", () => {
 
   // The handlers below take their path through shapes the source scan above
   // can't see (`Partial<Task>` + a rest spread, a shared `dir` variable…), so
-  // they are pinned here by name. Full list of declared gates:
+  // they are pinned here by name. Full list of declared gates. An `itemField`
+  // param renders as `name[].field`: without the field the walker reads the
+  // array of objects as no strings at all, so dropping it must change this list.
   it("pins the declared pathParams", () => {
     const declared = policyEntries()
       .filter((e) => e.policy.pathParams)
-      .map((e) => `${e.method} ${e.key}: ${e.policy.pathParams!.map((p: PathParam) => `${p.in}.${p.name}(${p.mode})`).join(", ")}`)
+      .map((e) => `${e.method} ${e.key}: ${e.policy.pathParams!.map((p: PathParam) => `${p.in}.${p.name}${p.itemField ? `[].${p.itemField}` : ""}(${p.mode})`).join(", ")}`)
       .sort();
     const nonGithub = declared.filter((d) => !d.includes(" /github/"));
     expect([...nonGithub].sort()).toEqual([
       "GET /agent-discovery: query.workdir(exists)",
       "GET /files/index: query.dir(exists)",
       "GET /projects/branches: query.path(exists)",
-      "GET /projects/repo-root: query.path(exists)",
       "PATCH /harnesses/:id: body.home(nearest-ancestor), body.bin(exists)",
       "PATCH /tasks/:id: body.workdir(exists)",
       "POST /harnesses: body.home(nearest-ancestor), body.bin(exists)",
@@ -650,7 +652,7 @@ describe("path-valued fields (D24)", () => {
       "POST /projects/fetch: body.path(exists)",
       "POST /projects/pull: body.path(exists)",
       "POST /projects/push: body.path(exists)",
-      "POST /tasks: body.workdir(exists), body.repositories(exists)",
+      "POST /tasks: body.workdir(exists), body.repositories[].path(exists)",
     ].sort());
     // Every /github/* route except the token store takes a repo directory.
     const github = declared.filter((d) => d.includes(" /github/"));

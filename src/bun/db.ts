@@ -11,7 +11,7 @@ import { isHarnessStackContinuation } from "../shared/harness-stack.ts";
 import { normalizeDeliveredUserText } from "../shared/user-message.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
-import { repoNameForPath } from "../shared/multi-repo.ts";
+import { repositoriesForTask } from "../shared/multi-repo.ts";
 import type { TaskRepository } from "../shared/types.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
@@ -1046,17 +1046,49 @@ const parseTaskRepositories = (raw: unknown): TaskRepository[] => {
   return out;
 };
 
-/** The one-entry repository array a single-repository row derives. */
-const derivedRepository = (r: TaskRow): TaskRepository => ({
-  path: r.workdir,
-  name: repoNameForPath(r.workdir),
-  branch: r.branch,
-  branchSource: r.branch_source === "existing" ? "existing" : "created",
-  worktreePath: r.worktree_path,
-  baseRef: r.base_ref,
-  checkoutBranch: r.checkout_branch ?? null,
-  prUrl: r.pr_url,
-});
+/**
+ * The one-entry repository array a single-repository row derives, through the
+ * same `repositoriesForTask` every other process uses (so the core and the
+ * webview/CLI can't derive it differently). `branchSource` is normalized here
+ * because the column is free text; the shared helper trusts its input.
+ */
+const derivedRepositories = (r: TaskRow): TaskRepository[] =>
+  repositoriesForTask({
+    workdir: r.workdir,
+    isolation: r.isolation as Task["isolation"],
+    branch: r.branch,
+    branchSource: r.branch_source === "existing" ? "existing" : "created",
+    worktreePath: r.worktree_path,
+    baseRef: r.base_ref,
+    checkoutBranch: r.checkout_branch ?? null,
+    prUrl: r.pr_url,
+    repositories: [],
+  });
+
+/**
+ * Compare-then-write one entry's `checkoutBranch` in a stored multi-repository
+ * set (`tasks.setRepositoryCheckout`). A stored set of one or fewer entries is
+ * a single-repository row, whose checkout lives in the scalar
+ * `checkout_branch` column instead, so it is left alone. Never bumps
+ * `updated_at`: the column is server-managed
+ * (docs/architecture/persistence.md).
+ */
+function writeRepositoryCheckout(
+  taskId: string,
+  storedRepositories: string | null,
+  repoName: string,
+  value: string | null,
+): void {
+  const repos = parseTaskRepositories(storedRepositories);
+  if (repos.length <= 1) return;
+  let changed = false;
+  const next = repos.map((r) => {
+    if (r.name !== repoName || r.checkoutBranch === value) return r;
+    changed = true;
+    return { ...r, checkoutBranch: value };
+  });
+  if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(next), taskId]);
+}
 
 const toTask = (r: TaskRow, counts?: TaskCounts): Task => {
   const storedRepositories = parseTaskRepositories(r.repositories);
@@ -1106,7 +1138,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => {
   // Multi-repository rows keep their stored set; every single-repository row
   // (and every legacy row, whose column is `'[]'`) derives exactly one entry
   // from the scalar columns so callers never branch on `undefined`.
-  repositories: storedRepositories.length > 1 ? storedRepositories : [derivedRepository(r)],
+  repositories: storedRepositories.length > 1 ? storedRepositories : derivedRepositories(r),
   issueRepoPath: r.issue_repo_path ?? null,
   importedClaude: parseImportedClaude(r.imported_claude),
   importedOpencode: parseImportedOpencode(r.imported_opencode),
@@ -1780,20 +1812,34 @@ export const tasks = {
    * worktree (`tasks.repositories[].checkoutBranch`), by workspace name.
    * Same targeted-UPDATE, no-`updated_at` contract as `setCheckoutBranch`;
    * compare-then-write so an unchanged observation never churns the row.
+   *
+   * Like `setCheckoutBranch`, a write on a pipeline step row is mirrored to
+   * its parent in the same transaction: the steps share the parent's
+   * worktrees, and the parent row is the pipeline's last-seen checkout (D14)
+   * that the next step launch re-attaches to, so a drift a step observed must
+   * not stay on the step alone. The parent's entry is matched by the same
+   * workspace name; a parent without that entry (or without a multi set) is
+   * left untouched.
    */
   setRepositoryCheckout(taskId: string, repoName: string, value: string | null): Task | null {
-    const cur = this.get(taskId);
-    if (!cur) return null;
-    const repos = cur.repositories ?? [];
-    if (repos.length <= 1) return cur;
-    let changed = false;
-    const next = repos.map((r) => {
-      if (r.name !== repoName || r.checkoutBranch === value) return r;
-      changed = true;
-      return { ...r, checkoutBranch: value };
-    });
-    if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(next), taskId]);
-    return this.get(taskId) ?? cur;
+    let found = false;
+    db.transaction(() => {
+      const row = db
+        .query<{ repositories: string | null; pipeline_parent_id: string | null }, [string]>(
+          `SELECT repositories, pipeline_parent_id FROM tasks WHERE id = ?`,
+        )
+        .get(taskId);
+      if (!row) return;
+      found = true;
+      writeRepositoryCheckout(taskId, row.repositories, repoName, value);
+      if (row.pipeline_parent_id) {
+        const parent = db
+          .query<{ repositories: string | null }, [string]>(`SELECT repositories FROM tasks WHERE id = ?`)
+          .get(row.pipeline_parent_id);
+        if (parent) writeRepositoryCheckout(row.pipeline_parent_id, parent.repositories, repoName, value);
+      }
+    })();
+    return found ? this.get(taskId) : null;
   },
   /**
    * Bind (or detach, when both arguments are `null`) a task's agent profile

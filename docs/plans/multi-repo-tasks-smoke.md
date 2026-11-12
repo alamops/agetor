@@ -102,7 +102,7 @@ all on this branch) plus the should-fixes below:
 
 | Finding | Fix | Test |
 | --- | --- | --- |
-| A codex multi-repository run could not `git add`/`git commit`: the workspace root is not a git checkout, so `gitWritableRoots` returned `[]` and the sandbox stayed on `workspace-write` while each child's shared `.git` lives in its source repo | `gitWritableRoots` now falls back to the direct children with a `.git` pointer file and unions their common dirs; `buildCodexCommand` escalates as it already did for a single linked worktree | `worktree.test.ts` — "finds every linked worktree's common dir…" and "buildCodexCommand escalates from a multi-repository workspace root" |
+| A codex multi-repository run could not `git add`/`git commit`: the workspace root is not a git checkout, so `gitWritableRoots` returned `[]` and the sandbox stayed on `workspace-write` while each child's shared `.git` lives in its source repo | `gitWritableRoots` now falls back to the direct children with a `.git` pointer file and unions their common dirs (superseded by a later review fix: the scan let a planted checkout widen the sandbox, so the roots now come only from the task row's own checkouts, each verified against its source repository — `codexWorkspaceRepos`, `src/bun/agents-codex-workspace-roots.test.ts`); `buildCodexCommand` escalates as it already did for a single linked worktree | `worktree.test.ts` — "finds every linked worktree's common dir…" and "buildCodexCommand escalates from a multi-repository workspace root" |
 | The per-repository terminal selector was unwired: `TerminalView`'s repo state was never set, defaulted to `repositories[0]` (not the documented workspace root), and had no UI; the run panel tab never reached it | `TerminalView` defaults to `null` (workspace), grows a `Workspace`/repository `<select>` for new shells, shows each tab's repository, and follows the run-panel repository tab; `RunPanelBody` passes `repoTab` down | `e2e/multi-repo-task.spec.ts` — "the terminal section defaults to the workspace and follows the repository tab" |
 | `repoTab`/`allPrsBusy` were not reset in `RunPanelBody`'s `[task.id]` effect | both reset with the rest of the per-task state (documented rule in `run-panel.md`) | `docs/architecture/run-panel.md` |
 | Archiving/deleting a Claude multi task left `<worktrees>/<task-id>` forever: `ensureInstalledForCwd` writes `.claude/settings.local.json` into the non-git workspace root, so the non-recursive `removeDirIfEmpty` refused | `removeWorkspaceIfEmpty` prunes only agetor's own `.claude/settings.local.json` (and the `.claude` dir once empty) before the non-recursive rmdir; the boot sweep also enqueues when only that root is left; orphan deletion reuses the same helper | `orchestrator-multi-repo.test.ts` — archive/delete tests seed the scratch and assert the workspace is gone |
@@ -275,7 +275,7 @@ question about `--workdir` precedence. All three are closed:
 | --- | --- | --- |
 | Nit R13-N1: `DiffDialog`'s fetched payload was stamped with the repository tab only, so opening the diff on task B while task A's active tab had the same repo name painted A's file list for one frame (the component stays mounted across close/open) | the payload is stamped with `{ taskId, repo }` and the derived `diff` requires both to match; the reset effect also clears it on close, so a reopen never holds the previous task's data | no component test (DOM behavior, per house convention); `bun run typecheck` plus the mainview suite |
 | Nit R13-N2: the fetch effect's comment still described deps as `[open, taskId]` when they are `[open, taskId, repo]` | the comment now names the repository tab as its own refetch trigger and explains why `task` itself is not a dep | — |
-| Q1 R13-Q1 (owner decision): `agetor add --workdir A --repo B` sent A as the task's workdir, but `createTask` always derives it from the repository set, so A was silently dropped — the R11-S2 note claimed A survived | the repository set owns `workdir`: `baseInput` sends the first `--repo` entry (the same anchor the server uses) instead of a conflicting `--workdir`; a `--workdir` alongside `--repo` remains an `--issue` attribution candidate only, and `usage.ts` plus the architecture doc state the rule | `src/cli/commands/add.test.ts` — conflicting `--workdir`/`--repo` payload; `src/bun/orchestrator-multi-repo.test.ts` — one kept entry vs 2+ anchors |
+| Q1 R13-Q1 (owner decision): `agetor add --workdir A --repo B` sent A as the task's workdir, but `createTask` always derives it from the repository set, so A was silently dropped — the R11-S2 note claimed A survived | the repository set owns `workdir`: `baseInput` sends the first `--repo` entry (the same anchor the server uses) instead of a conflicting `--workdir`; a `--workdir` alongside `--repo` remains an `--issue` attribution candidate only, and `usage.ts` plus the architecture doc state the rule (superseded by a later review fix: with `--repo` present, `--workdir` is now the first repository — `normalizeRepoSelection` in `src/cli/commands/add.ts`) | `src/cli/commands/add.test.ts` — conflicting `--workdir`/`--repo` payload; `src/bun/orchestrator-multi-repo.test.ts` — one kept entry vs 2+ anchors |
 
 Round-13 verification: `bun run typecheck` green; `add` (116), the full CLI
 suite (1,096), the mainview suite (2,105) and `orchestrator-multi-repo` (19)
@@ -283,27 +283,32 @@ green.
 
 ## Live harness smoke matrix
 
-Layout support is universal (the agent runs at the workspace root). Extra
-per-repo roots (`--add-dir`) are added only for flag-capable kinds.
+**No live harness smoke has been run.** No harness CLI was launched against a real account with a
+multi-repository task on this branch. The grill (decision 6) and plan (T17, A12) call for one; it is
+pending the owner. Every row below records what automated checks cover, not a live run.
 
-| Harness | Binary present | `--add-dir` | Status |
-| --- | --- | --- | --- |
-| claude-code | yes | yes | layout + extra roots supported; fake-driver integration test drives the spawn (`orchestrator-multi-repo.test.ts`) |
-| codex | yes | yes | layout + extra roots supported (argv assertion in `agents.test.ts` families) |
-| fx | yes | no | layout only (cwd); ACP `session/new` accepts the non-git workspace |
-| opencode | yes | no | layout only (cwd) |
-| cursor | yes | no | layout only (cwd); plan-limited account, not launched here |
-| gemini | no | no | layout-supported, smoke-pending (owner accepted) |
-| antigravity (`agy`) | no | no | layout-supported, smoke-pending |
-| copilot | no | yes (argv) | layout + flag supported, smoke-pending |
+Layout support is universal (the agent runs at the workspace root). Extra per-repo roots
+(`--add-dir`) are added only for claude-code, codex and copilot.
 
-The e2e fixture's fake claude driver is the automated proof of the spawn path
-(prompt block, workspace cwd, persisted entries); a credentialed live launch is
-the reviewer's manual step.
+| Harness | Binary present | `--add-dir` | What is verified | Live smoke |
+| --- | --- | --- | --- | --- |
+| claude-code | yes | yes | fake claude driver through the full spawn path (`e2e/multi-repo-task.spec.ts`, `orchestrator-multi-repo.test.ts`: workspace cwd, `Repositories:` block, persisted entries); `--add-dir` argv (`agents.test.ts`) | not run |
+| codex | yes | yes | `--add-dir` argv (`agents.test.ts`); sandbox escalation from the task's verified checkouts and none from a planted one (`agents-codex-workspace-roots.test.ts`, `worktree.test.ts`) | not run |
+| fx | yes | no | argv carries no `--add-dir` (`agents.test.ts`); whether fx's ACP `session/new` accepts a non-git cwd is **unverified** | not run |
+| opencode | yes | no | nothing multi-specific beyond the shared spawn path; OpenCode 2.x server with a non-git workspace directory is **unverified** | not run |
+| cursor | yes | no | argv carries no `--add-dir` (`agents.test.ts`); plan-limited account | not run |
+| gemini | no | no | nothing multi-specific; include-directories not used (plan A6) | not run (no binary) |
+| antigravity (`agy`) | no | no | nothing multi-specific | not run (no binary) |
+| copilot | no | yes (argv) | `--add-dir` argv (`agents.test.ts`) | not run (no binary) |
+
+Also unverified until a live run: a harness-stack failover of a multi-repository task, and Claude
+Code's hook installer (`.claude/settings.local.json`) at a non-git workspace cwd. The fake claude
+driver is the only automated proof of the spawn path; a credentialed live launch is the owner's
+manual step.
 
 ## Known limitations
 
-Create-only repository set; 2+ requires worktree isolation; no per-repo
-`existingBranch`; no hard cap (warning above 10); an older build sees the
-workspace and may orphan secondary worktrees; Gemini's
-`context.includeDirectories` write is not performed.
+Create-only repository set; 2+ requires worktree isolation; no per-repo `existingBranch`; no hard cap
+on the repository count (a warning above 10; every per-repository fan-out runs in bounded batches); an older build sees the workspace and may orphan
+secondary worktrees (the CLI detects an older core at create time, nothing else does); Gemini's
+include-directories is not used; no live harness smoke yet.

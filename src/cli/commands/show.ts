@@ -81,13 +81,21 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
     const text = failoverText(task, stack?.members.find((m) => m.harnessId === task.agent)?.label ?? null);
     out(`  ${label("failover")} ${c.yellow(escapeFreeText(text))}`);
   }
-  out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
+  out(`  ${label("workdir")} ${c.dim(escapeControlChars(task.workdir))}`);
   if ((task.repositories?.length ?? 0) > 1) {
     out(`  ${label("repos")} ${task.repositories!.length}`);
     for (const repo of task.repositories!) {
       const branch = repo.branch ? ` (${escapeControlChars(repo.branch)})` : "";
-      const wt = repo.worktreePath ? c.dim(` → ${repo.worktreePath}`) : "";
-      out(`    ${escapeControlChars(repo.name)}: ${c.dim(repo.path)}${branch}${wt}`);
+      const wt = repo.worktreePath ? c.dim(` → ${escapeControlChars(repo.worktreePath)}`) : "";
+      out(`    ${escapeControlChars(repo.name)}: ${c.dim(escapeControlChars(repo.path))}${branch}${wt}`);
+      // Each repository records its own last-seen checkout (the scalar
+      // `checkoutBranch` is null on a multi row), so drift is per repository.
+      if (repo.checkoutBranch && repo.checkoutBranch !== repo.branch) {
+        out(
+          `      ${label("checkout")} ${escapeControlChars(repo.checkoutBranch)}` +
+            (repo.branch != null ? c.yellow(" (drifted from repository branch)") : ""),
+        );
+      }
     }
   }
   if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);

@@ -9,6 +9,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { addScopeRoots, buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 import { splitNamedScopePath } from "../../shared/file-scope.ts";
+import { mapWithConcurrency } from "./map-with-concurrency.ts";
+
+/** Per-repository requests a multi-repository listing or search keeps in
+ *  flight at once. WKWebView allows about six HTTP/1.1 connections per host
+ *  and two are permanent SSE channels; a 16-repository task opened with one
+ *  unbounded `Promise.all` queued the task's own event stream behind its
+ *  listing requests (see docs/architecture/multi-repo-tasks.md). */
+export const MULTI_SCOPE_CONCURRENCY = 2;
+
+/** A focus-triggered multi-repository refresh skips every repository whose
+ *  listing was fetched (or is being fetched) within this window, so tabbing
+ *  in and out of the composer doesn't re-list every repository each time. A
+ *  forced refresh (the run-settle `fileScopeRefreshToken`) ignores it. */
+export const FOCUS_REFRESH_MIN_AGE_MS = 5000;
 
 /** The project scope a listing is fetched against — mirrors `GET
  *  /files/index`'s two query params. `ref` given selects the `git ls-tree`
@@ -45,6 +59,9 @@ function cacheKey(scope: { dir: string; ref?: string | null }): string {
 // a scope change is deduped across every mounted consumer sharing that key.
 const cache = new Map<string, CacheEntry>();
 const inflight = new Map<string, Promise<FetchResult>>();
+// When each scope's listing last came back successfully — the freshness test
+// for a coalesced (focus) refresh of a multi-repository listing.
+const fetchedAt = new Map<string, number>();
 
 /** Never throws into a render and never populates `cache` on failure — a
  *  down server or a bad `ref` must not coerce into a cached `{files: [],
@@ -58,7 +75,10 @@ function fetchEntry(scope: { dir: string; ref?: string | null }): Promise<FetchR
   const existing = inflight.get(key);
   if (existing) return existing;
   const promise = api.listProjectFiles(scope)
-    .then((entry): FetchResult => ({ entry, error: null }))
+    .then((entry): FetchResult => {
+      fetchedAt.set(key, Date.now());
+      return { entry, error: null };
+    })
     .catch((e: unknown): FetchResult => {
       console.warn("[agetor] listProjectFiles failed", e);
       const message = e instanceof Error ? e.message : String(e);
@@ -221,19 +241,106 @@ export function cachedMultiScopeListing(
 }
 
 /**
+ * Whether every scope's listing is fresh enough that a coalesced refresh can
+ * skip it: cached and fetched within `maxAgeMs`, or already in flight (the
+ * in-flight request is about to deliver exactly what a refetch would).
+ * `now` is injectable for tests.
+ */
+export function scopeListingIsFresh(scope: FileScope, maxAgeMs: number, now: number = Date.now()): boolean {
+  const key = cacheKey(scope);
+  if (inflight.has(key)) return true;
+  const at = fetchedAt.get(key);
+  return cache.has(key) && at !== undefined && now - at < maxAgeMs;
+}
+
+/**
+ * Fetch and merge a multi-repository listing: the module-level half of
+ * {@link useProjectFileScopes}, kept outside the hook so its request pattern
+ * is unit-testable without a React harness.
+ *
+ * - `awaitReady` (RunPanel's stream-ready gate) is awaited before the first
+ *   request, so opening a task never queues its own event stream behind one
+ *   listing per repository. Absent → no wait (the New Task form has no stream).
+ * - At most {@link MULTI_SCOPE_CONCURRENCY} repository listings are in flight.
+ * - `maxAgeMs` (a coalesced focus refresh) serves a repository from cache
+ *   instead of refetching when {@link scopeListingIsFresh} says so.
+ * - `isCurrent` is re-checked after the gate and before each request; once it
+ *   reports false (scope switched, newer refresh) nothing further is fetched
+ *   and the call resolves `null`.
+ *
+ * A successful repository listing is written to the shared cache, so a later
+ * open of the same repository set seeds instantly
+ * (`cachedMultiScopeListing`). A failed one is never cached, and the merge
+ * keeps whatever that repository last cached so a transient failure doesn't
+ * blank it.
+ */
+export async function loadMultiScopeListing(
+  scopes: readonly NamedFileScope[],
+  opts: {
+    awaitReady?: (() => Promise<void>) | null;
+    isCurrent?: () => boolean;
+    maxAgeMs?: number | null;
+  } = {},
+): Promise<{ files: string[]; truncated: boolean; error: string | null } | null> {
+  const isCurrent = opts.isCurrent ?? (() => true);
+  if (opts.awaitReady) await opts.awaitReady();
+  if (!isCurrent()) return null;
+  const maxAgeMs = opts.maxAgeMs ?? null;
+  const results = await mapWithConcurrency(scopes, MULTI_SCOPE_CONCURRENCY, async (scope) => {
+    const thisScope = { dir: scope.dir, ref: scope.ref };
+    const key = cacheKey(thisScope);
+    if (!isCurrent()) return { scope, entry: null, error: null };
+    const cached = cache.get(key);
+    if (maxAgeMs !== null && cached && !inflight.has(key) && scopeListingIsFresh(thisScope, maxAgeMs)) {
+      return { scope, entry: cached, error: null };
+    }
+    const result = await fetchEntry(thisScope);
+    if (!result.error) cache.set(key, result.entry);
+    return { scope, entry: result.error ? null : result.entry, error: result.error };
+  });
+  if (!isCurrent()) return null;
+  const merged: string[] = [];
+  let anyError: string | null = null;
+  let anyTruncated = false;
+  for (const { scope, entry, error: err } of results) {
+    if (err || !entry) {
+      if (err) anyError ??= err;
+      // Keep whatever this scope last cached so a transient failure doesn't
+      // blank a repository that was listing fine a moment ago.
+      const cached = cache.get(cacheKey(scope));
+      if (cached) merged.push(...cached.files.map((f) => `${scope.name}/${f}`));
+      if (cached?.truncated) anyTruncated = true;
+      continue;
+    }
+    merged.push(...entry.files.map((f) => `${scope.name}/${f}`));
+    if (entry.truncated) anyTruncated = true;
+  }
+  return { files: merged, truncated: anyTruncated, error: anyError };
+}
+
+/**
  * Loads the union of several repository scopes for a multi-repository task's
  * `@` popover. Each scope keeps its own cache entry (so a single scope still
  * renders instantly from the shared cache); entries are prefixed with
- * `<name>/` so `@frontend/src/a.ts` is unambiguous. A single scope returns
- * exactly what {@link useProjectFiles} would, byte-identical.
+ * `<name>/` so `@frontend/src/a.ts` is unambiguous. A single scope (or none)
+ * fetches nothing — callers pass the single scope to {@link useProjectFiles}.
+ *
+ * `opts.awaitReady` gates the fetches on the caller's event stream (see
+ * {@link loadMultiScopeListing}). `refresh({ maxAgeMs })` is the coalesced
+ * form the composer's focus handler uses: it refetches only repositories
+ * whose listing is older than `maxAgeMs`, and does nothing when none is.
+ * `refresh()` with no argument forces every repository, as before.
  */
-export function useProjectFileScopes(scopes: NamedFileScope[] | null | undefined): {
+export function useProjectFileScopes(
+  scopes: NamedFileScope[] | null | undefined,
+  opts?: { awaitReady?: (() => Promise<void>) | null },
+): {
   entries: FileEntry[];
   validPaths: Set<string>;
   truncated: boolean;
   loading: boolean;
   error: string | null;
-  refresh: () => void;
+  refresh: (opts?: { maxAgeMs?: number }) => void;
 } {
   const multi = (scopes?.length ?? 0) > 1;
   const key = multi ? scopes!.map((s) => `${s.name}:${cacheKey(s)}`).join("|") : null;
@@ -250,6 +357,14 @@ export function useProjectFileScopes(scopes: NamedFileScope[] | null | undefined
   const [error, setError] = useState<string | null>(null);
   const [gen, setGen] = useState(0);
   const requestIdRef = useRef(0);
+  // The gate is usually a fresh closure every parent render (RunPanel binds
+  // its task id into it); read through a ref so it never re-arms the effect.
+  const awaitReadyRef = useRef(opts?.awaitReady ?? null);
+  awaitReadyRef.current = opts?.awaitReady ?? null;
+  // Set by a coalesced `refresh({ maxAgeMs })` for the effect run it
+  // triggers; consumed (reset to null) by that run, and honored only when the
+  // scope key is still the one the refresh was asked for.
+  const pendingMaxAgeRef = useRef<{ key: string; maxAgeMs: number } | null>(null);
 
   const seeded = !multi || listing.key === key ? null : cachedMultiScopeListing(scopes ?? []);
   const files = !multi ? [] : listing.key === key ? listing.files : seeded?.files ?? [];
@@ -257,6 +372,7 @@ export function useProjectFileScopes(scopes: NamedFileScope[] | null | undefined
 
   useEffect(() => {
     if (!multi) {
+      pendingMaxAgeRef.current = null;
       setListing({ key: null, files: [], truncated: false });
       setLoading(false);
       setError(null);
@@ -264,50 +380,49 @@ export function useProjectFileScopes(scopes: NamedFileScope[] | null | undefined
     }
     const list = scopes!;
     const requestId = ++requestIdRef.current;
-    // Reset to THIS scope's cached rows — or clear — BEFORE the refetch. The
-    // previous task's prefixed entries otherwise stayed on screen until every
-    // repository answered, so a RunPanel task switch briefly offered the old
-    // task's `@` entries (and a token picked in that window could be sent).
-    // All-cached scopes seed instantly (a repeat open of the same project
-    // set); a partial cache clears rather than show a misleading subset.
-    const cached = cachedMultiScopeListing(list);
-    setListing({ key, files: cached?.files ?? [], truncated: cached?.truncated ?? false });
-    setError(null);
+    const pending = pendingMaxAgeRef.current;
+    pendingMaxAgeRef.current = null;
+    const maxAgeMs = pending && pending.key === key ? pending.maxAgeMs : null;
+    if (maxAgeMs === null) {
+      // Reset to THIS scope's cached rows — or clear — BEFORE the refetch.
+      // The previous task's prefixed entries otherwise stayed on screen until
+      // every repository answered, so a RunPanel task switch briefly offered
+      // the old task's `@` entries (and a token picked in that window could be
+      // sent). All-cached scopes seed instantly (a repeat open of the same
+      // project set); a partial cache clears rather than show a misleading
+      // subset. A coalesced refresh keeps the rows already on screen.
+      const cached = cachedMultiScopeListing(list);
+      setListing({ key, files: cached?.files ?? [], truncated: cached?.truncated ?? false });
+      setError(null);
+    }
     setLoading(true);
-    void Promise.all(
-      list.map(async (scope) => {
-        const result = await fetchEntry({ dir: scope.dir, ref: scope.ref });
-        return { scope, ...result };
-      }),
-    ).then((results) => {
-      if (requestIdRef.current !== requestId) return;
-      const merged: string[] = [];
-      let anyError: string | null = null;
-      let anyTruncated = false;
-      for (const { scope, entry, error: err } of results) {
-        if (err) {
-          anyError ??= err;
-          // Keep whatever this scope last cached so a transient failure
-          // doesn't blank a repository that was listing fine a moment ago.
-          const cached = cache.get(cacheKey(scope));
-          if (cached) merged.push(...cached.files.map((f) => `${scope.name}/${f}`));
-          if (cached?.truncated) anyTruncated = true;
-          continue;
-        }
-        merged.push(...entry.files.map((f) => `${scope.name}/${f}`));
-        if (entry.truncated) anyTruncated = true;
-      }
-      setListing({ key, files: merged, truncated: anyTruncated });
-      setError(anyError);
+    void loadMultiScopeListing(list, {
+      awaitReady: awaitReadyRef.current,
+      isCurrent: () => requestIdRef.current === requestId,
+      maxAgeMs,
+    }).then((result) => {
+      if (!result || requestIdRef.current !== requestId) return;
+      setListing({ key, files: result.files, truncated: result.truncated });
+      setError(result.error);
       setLoading(false);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, gen]);
 
-  const refresh = useCallback(() => {
+  const refresh = useCallback((refreshOpts?: { maxAgeMs?: number }) => {
     if (!multi) return;
-    for (const scope of scopes!) clearSearchCacheForScope({ dir: scope.dir, ref: scope.ref });
+    const maxAgeMs = refreshOpts?.maxAgeMs;
+    if (maxAgeMs !== undefined) {
+      const stale = scopes!.filter((scope) => !scopeListingIsFresh(scope, maxAgeMs));
+      if (stale.length === 0) return;
+      for (const scope of stale) clearSearchCacheForScope({ dir: scope.dir, ref: scope.ref });
+      pendingMaxAgeRef.current = { key: key!, maxAgeMs };
+    } else {
+      for (const scope of scopes!) clearSearchCacheForScope({ dir: scope.dir, ref: scope.ref });
+      pendingMaxAgeRef.current = null;
+    }
     setGen((g) => g + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- key encodes scopes
   }, [multi, key]);
 
   const entries = useMemo(() => {
@@ -424,20 +539,32 @@ const searchWarnedScopes = new Set<string>();
  * against that same scope succeeds, and — unlike a success — is never
  * written to `searchCache`: caching a transient failure would make it
  * durably "not found" for up to `SEARCH_CACHE_TTL_MS`.
+ *
+ * `opts.signal` cancels the request; an aborted search resolves `null`
+ * ("unknown") without warning — it was superseded, not failed.
  */
-export async function searchProjectFiles(scope: FileScope, q: string, limit = 50): Promise<FileEntry[] | null> {
+export async function searchProjectFiles(
+  scope: FileScope,
+  q: string,
+  limit = 50,
+  opts?: { signal?: AbortSignal },
+): Promise<FileEntry[] | null> {
   if (!scope || !scope.dir) return [];
   const scopeWarnKey = cacheKey(scope);
   const resultKey = searchCacheKey(scope, q, limit);
   const cached = searchCache.get(resultKey);
   if (cached && Date.now() - cached.at < SEARCH_CACHE_TTL_MS) return cached.rows;
+  const signal = opts?.signal;
+  if (signal?.aborted) return null;
   try {
-    const { files } = await api.listProjectFiles({ dir: scope.dir, ref: scope.ref, q, limit });
+    const params = { dir: scope.dir, ref: scope.ref, q, limit };
+    const { files } = await (signal ? api.listProjectFiles(params, signal) : api.listProjectFiles(params));
     const entries: FileEntry[] = files.map((path) => ({ path, isDirectory: path.endsWith("/") }));
     setSearchCacheEntry(resultKey, entries);
     searchWarnedScopes.delete(scopeWarnKey);
     return entries;
   } catch (e) {
+    if (signal?.aborted) return null;
     if (!searchWarnedScopes.has(scopeWarnKey)) {
       searchWarnedScopes.add(scopeWarnKey);
       console.warn("[agetor] searchProjectFiles failed", e);
@@ -445,6 +572,9 @@ export async function searchProjectFiles(scope: FileScope, q: string, limit = 50
     return null;
   }
 }
+
+// The live `searchProjectFileScopes` call's controller; a newer call aborts it.
+let activeScopesSearch: AbortController | null = null;
 
 /**
  * {@link searchProjectFiles} for a multi-repository listing. A query that
@@ -454,17 +584,28 @@ export async function searchProjectFiles(scope: FileScope, q: string, limit = 50
  * searches every repository; each result is re-prefixed with its workspace
  * name so remote rows keep the exact shape of the merged client listing.
  *
- * Resolves to `null` only when EVERY targeted request failed (the caller must
+ * Resolves to `null` when EVERY targeted request failed (the caller must
  * keep "unproven" distinct from "confirmed missing"); a partial failure keeps
  * the answers that did succeed. A named query with nothing after the prefix
  * resolves to `[]` — the client already has every entry under that prefix, so
  * a full-listing search would have nothing to narrow.
+ *
+ * The per-repository requests run at most {@link MULTI_SCOPE_CONCURRENCY} at
+ * a time, and only the latest call is live: this is the popover's
+ * per-keystroke search, so starting a new one aborts the previous call's
+ * in-flight requests and skips the ones it had not started. A superseded
+ * call (or one whose `opts.signal` aborts) resolves `null`, which every
+ * caller already reads as "no answer" and drops. Without this, a fast typer
+ * on a 16-repository task queued 16 searches per pause behind each other.
  */
 export async function searchProjectFileScopes(
   scopes: readonly NamedFileScope[] | null | undefined,
   q: string,
   limit = 50,
+  opts?: { signal?: AbortSignal },
 ): Promise<FileEntry[] | null> {
+  activeScopesSearch?.abort();
+  activeScopesSearch = null;
   const list = scopes ?? [];
   if (list.length === 0) return [];
   const named = resolveNamedScopePath(list, q);
@@ -472,9 +613,24 @@ export async function searchProjectFileScopes(
     ? [{ scope: named.scope, local: named.path.replace(/\/+$/, "") }]
     : list.map((scope) => ({ scope, local: q }));
   if (targets.length === 0 || targets.some((t) => !t.local)) return [];
-  const results = await Promise.all(
-    targets.map(async (t) => ({ ...t, rows: await searchProjectFiles(t.scope, t.local, limit) })),
-  );
+  const controller = new AbortController();
+  activeScopesSearch = controller;
+  const onCallerAbort = () => controller.abort();
+  opts?.signal?.addEventListener("abort", onCallerAbort, { once: true });
+  if (opts?.signal?.aborted) controller.abort();
+  let results: Array<{ scope: NamedFileScope; local: string; rows: FileEntry[] | null }>;
+  try {
+    results = await mapWithConcurrency(targets, MULTI_SCOPE_CONCURRENCY, async (t) => ({
+      ...t,
+      rows: controller.signal.aborted
+        ? null
+        : await searchProjectFiles(t.scope, t.local, limit, { signal: controller.signal }),
+    }));
+  } finally {
+    opts?.signal?.removeEventListener("abort", onCallerAbort);
+    if (activeScopesSearch === controller) activeScopesSearch = null;
+  }
+  if (controller.signal.aborted) return null;
   if (results.every((r) => r.rows === null)) return null;
   // Interleave the per-repository rankings instead of concatenating them:
   // concatenation let the first repository's `limit` rows hide every later

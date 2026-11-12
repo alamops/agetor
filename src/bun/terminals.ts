@@ -195,22 +195,43 @@ export async function createTerminal(
     if ("error" in before) return before;
     const { task } = before;
 
+    const multiRepo = (task.repositories?.length ?? 0) > 1;
+    // Every repository checkout of a multi row exists. A workspace root
+    // without them is not a usable worktree: prepareWorkdir would re-create
+    // the missing ones.
+    const allRepositoryCheckoutsExist = multiRepo
+      && task.repositories!.every((r) => !!r.worktreePath && existsSync(r.worktreePath));
+
+    // Refuse an unknown `repo` before anything is prepared: a typo must not
+    // materialize every worktree of the task first. Repository names are fixed
+    // at create time, so the row's own names are the ones the prepared set
+    // will carry. A single-repository task has no per-repository terminals and
+    // ignores `repo`, as it always has.
+    if (multiRepo && opts?.repo && !task.repositories!.some((r) => r.name === opts.repo)) {
+      return { error: `unknown repository "${opts.repo}"` };
+    }
+
     // A worktree-isolated pipeline step shares its parent's worktree (D2):
     // re-materializing a missing one here would give this ONE step a private
     // checkout at its own path. Same refusal as startTask / sendInput — only
-    // the pipeline task's own Run/Retry restores the shared worktree.
+    // the pipeline task's own Run/Retry restores the shared worktree. For a
+    // multi-repository step the shared worktree is the workspace root AND
+    // every repository checkout beneath it.
     if (
       task.pipelineParentId
       && task.isolation === "worktree"
-      && (!task.worktreePath || !existsSync(task.worktreePath))
+      && (
+        !task.worktreePath
+        || !existsSync(task.worktreePath)
+        || (multiRepo && !allRepositoryCheckoutsExist)
+      )
     ) {
       return { error: "step task's worktree is missing — run the pipeline task instead" };
     }
     // Same reuse condition as prepareWorkdir's: anything else materializes
     // (creates or re-attaches) the worktree in this call.
-    const multiRepo = (task.repositories?.length ?? 0) > 1;
     const hadWorktree = multiRepo
-      ? task.repositories!.every((r) => !!r.worktreePath && existsSync(r.worktreePath))
+      ? allRepositoryCheckoutsExist
       : !!task.worktreePath && !!task.branch && existsSync(task.worktreePath);
     const prepared = await prepareTaskWorkdir(task);
     if ("error" in prepared) return { error: prepared.error };

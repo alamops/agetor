@@ -2534,9 +2534,12 @@ export interface TaskTeardownPreview {
    *  a pull request's head branch, or a branch another task still holds. */
   excluded: { branch: string; reason: "default-branch" | "pr-head" | "held-by-task" }[];
   /**
-   * Per-repository plans for a multi-repository task (issue #291); the
-   * top-level fields above mirror `repositories[0]` for old clients.
-   * Absent for a single-repository task.
+   * Per-repository plans for a multi-repository task (issue #291). The
+   * top-level fields above then summarize every plan for old clients:
+   * `branches` is the deduplicated union of every repository's branches and
+   * `excluded` concatenates every repository's exclusions, while `liveBranch`
+   * and `source` are `repositories[0]`'s and `taskBranch` is null (there is
+   * no single task branch). Absent for a single-repository task.
    */
   repositories?: RepoTeardownPlan[];
 }

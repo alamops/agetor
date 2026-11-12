@@ -6,7 +6,7 @@
 | Source | `docs/specs/multi-repo-tasks.md` (decided spec), `docs/plans/multi-repo-tasks-grill.md` (2 rounds, 30/30 decisions), `docs/plans/multi-repo-tasks-investigation.md` (evidence P1–P10), [alamops/agetor#291](https://github.com/alamops/agetor/issues/291) |
 | Flags | none |
 | Gates | grilled + decided by the owner (round-1/answers.json, round-2/answers.json); spec committed at `8e308518`; plan self-approved for pipeline execution — owner review happens at the handoff before code lands |
-| Status | implemented — see `docs/plans/multi-repo-tasks-smoke.md` for verification evidence |
+| Status | implemented; **live harness smoke pending the owner** — no harness has been run live against a multi-repository task (T17 below). Verification so far is fake-driver, unit/integration and argv only; see `docs/plans/multi-repo-tasks-smoke.md` |
 | Branch | `feature/issue-291-feature-request-support-multip` |
 | Base SHA | `8e308518fd4db2630a1b866522548f786b4d80ec` (`8e308518`, decision record; `c45fd806` is main) |
 
@@ -94,7 +94,7 @@ All anchors verified at `8e308518`.
 
 ### 3.1 The workspace is the task's cwd and its legacy mirror
 
-For a multi-repo task, `workdir` and `worktreePath` both point at `<WORKTREES_DIR>/<task-id>` (the workspace root), and `branch`, `baseRef`, `prUrl`, `checkoutBranch` are null. `repositories[]` is the source of truth. This is the owner's round-2 decision and it has a deliberate payoff: every existing `task.worktreePath ?? task.workdir` cwd site (25+ in `orchestrator.ts`, plus `terminals.ts`, `pipeline-runner.ts`, `hook-installer.ts`, `shortenTaskPaths`, markdown/handoff resolution) already resolves to the workspace root without an edit. Only the paths that treat `workdir` as a *source repository* must change (prepare, teardown, repo status), and they now iterate `repositories[]`.
+For a multi-repo task, `workdir` and (once the task has started; it is null before) `worktreePath` both point at `<WORKTREES_DIR>/<task-id>` (the workspace root), and `branch`, `baseRef`, `prUrl`, `checkoutBranch` are null. `repositories[]` is the source of truth. This is the owner's round-2 decision and it has a deliberate payoff: every existing `task.worktreePath ?? task.workdir` cwd site (25+ in `orchestrator.ts`, plus `terminals.ts`, `pipeline-runner.ts`, `hook-installer.ts`, `shortenTaskPaths`, markdown/handoff resolution) already resolves to the workspace root without an edit. Only the paths that treat `workdir` as a *source repository* must change (prepare, teardown, repo status), and they now iterate `repositories[]`.
 
 Alternatives rejected:
 
@@ -227,7 +227,7 @@ Assumption for ownership: each task owns the listed files exclusively within its
 | T14 | CLI/TUI parity | `src/cli/api-client.ts`, `src/cli/commands/add.ts`, `src/cli/commands/show.ts`, `src/cli/commands/shell.ts`, `src/cli/commands/lifecycle.ts`, `src/cli/commands/ls.ts`, `src/cli/at-warn.ts`, `src/cli/tui/at-complete.ts`, `src/cli/tui/Dashboard.tsx`, `src/cli/commands/add.test.ts`, `src/cli/commands/show.test.ts`, `src/cli/commands/shell.test.ts`, `src/cli/commands/rm.test.ts`, `src/cli/tui/at-complete.test.ts` | T1, T7 | `agetor add --repo path[=ref]` repeatable and the interactive wizard's repository multi-select (one optional base-ref prompt per repository when 2+ are picked; `--repo`/`--workdir` skip the picker) are the CLI's multi-repository surfaces; `show` prints the repo block; `shell <id>` and `shell --repo <name>`; `rm` preview per repo; `ls` shows a repo count; TUI multi-select and multi-scope `@` completion with prefixes; the pre-`--start` advisory `@` pre-check lists every repository scope, never the non-git workspace root | tests | CLI entry points / TUI |
 | T15 | Docs | `CLAUDE.md`, `docs/architecture/multi-repo-tasks.md` (new), `docs/architecture/task-lifecycle.md`, `docs/architecture/at-file-references.md`, `docs/architecture/pipelines.md`, `docs/architecture/prompt-composer.md`, `docs/architecture/security.md`, `docs/architecture/persistence.md`, `docs/architecture/issue-tasks.md`, `docs/architecture/run-panel.md`, `docs/architecture/task-context-menu.md`, `docs/architecture/testing-seams.md` | all behavior | Every doc names the new layout, data, prompt exception, gates, and teardown rules; topic map includes the new doc; no stale "one workdir" claim | tests | docs |
 | T16 | End-to-end spec | `e2e/multi-repo-task.spec.ts` (new) | T6, T7, T8, T10, T11, T12 | Create via the real New Task UI and its `Repositories` dialog (multi-select, per-repository base ref, same-git-root dedupe), fake-driver run, two worktrees/branches, per-repo diff tabs, aggregate commit chip with only a sibling dirty, archive keeps the branches. The issue dialog's locked repository is covered in `e2e/issue-task.spec.ts`. Per-repo PR stamping is covered by `pull-create-task-url.test.ts`, not e2e. | tests | Playwright |
-| T17 | Verification, smoke matrix, final status | `docs/plans/multi-repo-tasks.md` (status only), `docs/plans/multi-repo-tasks-smoke.md` (new) | all | `bun run typecheck` green; `bun test` green; e2e spec green; live smoke for installed/credentialed harnesses recorded with commands and versions; plan status updated; final commit includes `Fixes #291` | tests | CI/commands |
+| T17 | Verification, smoke matrix, final status | `docs/plans/multi-repo-tasks.md` (status only), `docs/plans/multi-repo-tasks-smoke.md` (new) | all | `bun run typecheck` green; `bun test` green; e2e spec green; live smoke for installed/credentialed harnesses recorded with commands and versions; plan status updated; final commit includes `Fixes #291`. **Status: partly done.** Typecheck, focused suites and the fake-driver e2e are recorded in the smoke ledger; the live smoke is **not done** for any harness (only fake-driver runs and argv checks exist) and is pending the owner | tests | CI/commands |
 
 ### 4.1 Detailed acceptance for the four riskiest tasks
 
@@ -373,8 +373,8 @@ Each wave ends with a checkpoint commit and a green tree (typecheck + the focuse
 | A8 | Branch fallback visibility | The form's shared branch field is a request; actual per-repo names come back in the create response and are shown in the card/run panel/Repositories dialog | The server is authoritative; a pre-create preview would need a second validation endpoint | medium |
 | A9 | Prompt block | Only for 2+ repos; appended after the user prompt and before references; single-repo prompt byte-identical | Avoids touching every existing prompt and every transcript assertion | high |
 | A10 | Aggregate PR format | Agents print `Repository: <name>` before each proposal; the parser tolerates a missing label only when exactly one repo has a proposal | One parser, deterministic per-repo routing | medium |
-| A11 | No hard cap | Enforced only by the non-blocking >10 warning and bounded concurrency; a huge selection may be slow. The CLI path gate's existing 256-value safety limit still applies to a CLI request, which is a security bound, not a product cap | Owner decision; a cap would be a follow-up | high |
-| A12 | Smoke matrix | Live-smoke claude/codex/fx/opencode where credentials allow; cursor is plan-limited; gemini/agy/copilot are absent | Available binaries checked 2026-11-10 | high |
+| A11 | No hard cap | Enforced only by the non-blocking >10 warning and bounded concurrency; a huge selection may be slow. The CLI path gate's existing 256-value safety limit still applies to a CLI request, which is a security bound, not a product cap. | Owner decision; a cap would be a follow-up | high |
+| A12 | Smoke matrix | Live-smoke claude/codex/fx/opencode where credentials allow; cursor is plan-limited; gemini/agy/copilot are absent. **Not done:** no live smoke was run for any harness | Available binaries checked 2026-11-10 | high |
 
 **Owner-visible limitations to state in the PR body.** Create-only (issue's "or editing" is narrowed; a new card is required to change the set); multi-repo requires worktree isolation; no per-repo `existingBranch`; an older build sees the workspace and may orphan secondary worktrees; no downgrade guard. If the owner rejects the `Repositories:` paragraph exception, the fallback is the existing references block, but that would contradict round 2 `prompt-block-format`.
 
@@ -394,7 +394,7 @@ Each wave ends with a checkpoint commit and a green tree (typecheck + the focuse
 | Pipeline parent multi-repo + step copy + parent-owned teardown | in this run | T5 |
 | Card worktree icon + count tooltip, diff tabs, filters/search, per-repo context menu | in this run | T10, T11 |
 | Full CLI/TUI parity | in this run | T14 |
-| Harness support for all eight + smoke matrix for installed/credentialed kinds | in this run / smoke-pending | T5, T17; claude/codex/fx/opencode where credentialed, cursor plan-limited, gemini/agy/copilot absent |
+| Harness support for all eight + smoke matrix for installed/credentialed kinds | layout support in this run; live smoke **not run for any harness**, pending the owner | T5, T17; claude/codex/fx/opencode where credentialed, cursor plan-limited, gemini/agy/copilot absent |
 | Docs updates | in this run | T15 |
 | `prepareWorkdir`'s five callers | in this run (dispatch) | T4, T5, T6 |
 | 25+ `worktreePath ?? workdir` cwd sites | in this run (no per-site edit; workspace mirror) | T4, T6, T17 |
@@ -404,8 +404,8 @@ Each wave ends with a checkpoint commit and a green tree (typecheck + the focuse
 | `tasks.insert/update/toTask` server-managed treatment | in this run | T2 |
 | `duplicateAgentProfile` copy | in this run | T4 |
 | `discardRefusedWorktree` / `sweepArchivedTeardowns` | in this run | T6 |
-| `hook-installer` workspace settings location | verify only (no code change) | T17 smoke; the workspace is Claude's cwd |
-| `harness-failover.ts` / `orchestrator-opencode-server.ts` cwd | verify only (workspace mirror) | T17 smoke |
+| `hook-installer` workspace settings location | verify only (no code change) — **not yet verified** (no live claude run at a non-git cwd) | T17 smoke, pending; the workspace is Claude's cwd |
+| `harness-failover.ts` / `orchestrator-opencode-server.ts` cwd | verify only (workspace mirror) — **not yet verified** (no failover of a multi task, no OpenCode 2.x server with a non-git workspace dir) | T17 smoke, pending |
 | `shortenTaskPaths` / `md-image` / handoff artifact roots | no change; verify | T17; the workspace is the fold/candidate root |
 | `listProjectFiles` non-git workspace listing | avoided | Per-repo scopes (A7); no server change |
 | `commands.ts` capability discovery | no server change; client union | T9 |

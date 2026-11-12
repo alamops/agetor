@@ -334,9 +334,11 @@ test("gitWritableRoots returns [] for a non-git directory", async () => {
 
 test("gitWritableRoots finds every linked worktree's common dir from a multi-repository workspace root", async () => {
   // Issue #291 / review M1: the workspace root is NOT a git checkout; the
-  // repositories are direct children. Without walking them, codex's sandbox
+  // repositories are direct children. Without their roots, codex's sandbox
   // never escalated and every git commit inside a child was blocked because
-  // the shared .git lives in the source repo.
+  // the shared .git lives in the source repo. The checkouts now come from the
+  // task row (`workspaceRepos`), not from scanning the workspace (a later
+  // review: scanning let a planted child escalate the sandbox).
   const { prepareTaskWorkdir, gitWritableRoots } = await import("./worktree.ts");
   const a = await makeRepo();
   const b = await makeRepo();
@@ -351,7 +353,9 @@ test("gitWritableRoots finds every linked worktree's common dir from a multi-rep
   const prepared = await prepareTaskWorkdir(task);
   if ("error" in prepared) throw new Error(prepared.error);
 
-  const roots = await gitWritableRoots(prepared.cwd);
+  const workspaceRepos = prepared.repositories!.map((r) => ({ worktreePath: r.worktreePath!, repoPath: r.path }));
+  expect(await gitWritableRoots(prepared.cwd)).toEqual([]);
+  const roots = await gitWritableRoots(prepared.cwd, workspaceRepos);
   expect(roots).toHaveLength(2);
   expect(new Set(roots)).toEqual(new Set([
     realpathSync(path.join(a, ".git")),
@@ -438,7 +442,8 @@ test("buildCodexCommand escalates from a multi-repository workspace root (not it
   }));
   if ("error" in prepared) throw new Error(prepared.error);
 
-  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts }, prepared.cwd);
+  const codexWorkspaceRepos = prepared.repositories!.map((r) => ({ worktreePath: r.worktreePath!, repoPath: r.path }));
+  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts, codexWorkspaceRepos }, prepared.cwd);
   expect(cmd).toContain("danger-full-access");
   expect(cmd).not.toContain("workspace-write");
   expect(cmd).toContain("approval_policy=never");
@@ -2537,9 +2542,10 @@ test("workspacePathFor only adopts a strict direct child of WORKTREES_DIR", asyn
   expect(workspacePathFor(fakeTask({ id, workdir: WORKTREES_DIR, worktreePath: WORKTREES_DIR }))).toBe(canonical);
   const deep = path.join(WORKTREES_DIR, "parent", "child");
   expect(workspacePathFor(fakeTask({ id, workdir: deep, worktreePath: deep }))).toBe(canonical);
-  // A pipeline step's mirrored parent workspace is a direct child and is kept.
+  // A pipeline step's mirrored parent workspace is a direct child and is kept
+  // — but only for the step's own pipeline parent (review S1).
   const mirrored = path.join(WORKTREES_DIR, "parent-id");
-  expect(workspacePathFor(fakeTask({ id, workdir: mirrored, worktreePath: mirrored }))).toBe(mirrored);
+  expect(workspacePathFor(fakeTask({ id, workdir: mirrored, worktreePath: mirrored, pipelineParentId: "parent-id" }))).toBe(mirrored);
 });
 
 test("prepareTaskWorkdir clears a stale non-worktree child so it can start again", async () => {
@@ -2658,12 +2664,12 @@ describe("workspaceHasOnlyAgetorScratch", () => {
     const hasOnlyScratch = await scratch();
     const dir = mkdtempSync(path.join(tmpdir(), "agetor-ws-scratch-"));
     try {
-      expect(hasOnlyScratch(path.join(dir, "missing"))).toBe(false);
-      expect(hasOnlyScratch(dir)).toBe(true);
+      expect(await hasOnlyScratch(path.join(dir, "missing"))).toBe(false);
+      expect(await hasOnlyScratch(dir)).toBe(true);
       mkdirSync(path.join(dir, ".claude"));
-      expect(hasOnlyScratch(dir)).toBe(true);
+      expect(await hasOnlyScratch(dir)).toBe(true);
       writeFileSync(path.join(dir, ".claude", "settings.local.json"), "{}\n");
-      expect(hasOnlyScratch(dir)).toBe(true);
+      expect(await hasOnlyScratch(dir)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2674,7 +2680,7 @@ describe("workspaceHasOnlyAgetorScratch", () => {
     const root = mkdtempSync(path.join(tmpdir(), "agetor-ws-content-"));
     try {
       writeFileSync(path.join(root, "notes.md"), "keep me\n");
-      expect(hasOnlyScratch(root)).toBe(false);
+      expect(await hasOnlyScratch(root)).toBe(false);
 
       // The review nit: a `.claude` holding more than agetor's own settings
       // file is agent/user data, so the boot sweep must not enqueue a no-op
@@ -2684,7 +2690,7 @@ describe("workspaceHasOnlyAgetorScratch", () => {
         mkdirSync(path.join(onlyClaude, ".claude"));
         writeFileSync(path.join(onlyClaude, ".claude", "settings.local.json"), "{}\n");
         writeFileSync(path.join(onlyClaude, ".claude", "history.jsonl"), "{}\n");
-        expect(hasOnlyScratch(onlyClaude)).toBe(false);
+        expect(await hasOnlyScratch(onlyClaude)).toBe(false);
       } finally {
         rmSync(onlyClaude, { recursive: true, force: true });
       }

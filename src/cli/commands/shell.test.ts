@@ -46,7 +46,7 @@ afterAll(() => {
   mock.module("../output.ts", () => realOutputSnapshot);
 });
 
-const { cmdShell } = await import("./shell.ts");
+const { cmdShell, resolveShellTarget } = await import("./shell.ts");
 
 const flags = { json: false, plain: true, noDaemon: true } as unknown as Parameters<typeof cmdShell>[1];
 
@@ -131,4 +131,31 @@ test("a multi task whose worktrees were never created says so instead of 'direct
 test("a missing positional is still a usage error", async () => {
   currentClient = fakeClient(makeTask({}));
   await expect(cmdShell(["--print"], flags)).rejects.toThrow(/usage: agetor shell/);
+});
+
+test("--repo works on a single-repository task too, like diff --repo (review N2)", async () => {
+  // A single row stores no `repositories`; its one entry is derived.
+  currentClient = fakeClient(makeTask({
+    workdir: "/src/widgets",
+    worktreePath: "/wt/task-1",
+    isolation: "worktree",
+    branch: "agetor/abc-fix",
+  }));
+  await cmdShell(["abcdefgh", "--repo", "widgets", "--print"], flags);
+  expect(outputs).toEqual(["/wt/task-1"]);
+});
+
+test("--repo on a multi task names that repository's branch, not the null task branch (review N2)", () => {
+  const task = makeTask({
+    workdir: "/wt/task-1",
+    worktreePath: "/wt/task-1",
+    branch: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/y", branchSource: "created", worktreePath: "/wt/task-1/backend", baseRef: "b", checkoutBranch: "feature/y", prUrl: null },
+    ],
+  });
+  expect(resolveShellTarget(task, "backend")).toEqual({ dir: "/wt/task-1/backend", branch: "feature/y" });
+  // Without --repo it is the workspace root and the (null) task branch.
+  expect(resolveShellTarget(task, null)).toEqual({ dir: "/wt/task-1", branch: null });
 });

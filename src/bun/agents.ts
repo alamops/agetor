@@ -178,11 +178,20 @@ export interface AgentRunOptions {
    * workdir). When this is non-empty, a `git commit`'s objects/refs must reach
    * a dir the cwd-scoped `workspace-write` sandbox doesn't cover, so the codex
    * `auto` run is escalated to `--sandbox danger-full-access` (see
-   * `buildCommand`). Resolved by `await gitWritableRoots(cwd)` and only set on the
-   * codex spawn path; ignored by claude-code and by codex's read-only ("ask")
-   * sandbox (which can't write anything regardless).
+   * `buildCommand`). Resolved by `await gitWritableRoots(cwd, codexWorkspaceRepos)`
+   * and only set on the codex spawn path; ignored by claude-code and by codex's
+   * read-only ("ask") sandbox (which can't write anything regardless).
    */
   codexExternalGitDirs?: string[];
+  /**
+   * Multi-repository tasks only: the task's own repository checkouts under its
+   * (non-git) workspace root, each paired with the source repository it was
+   * created from. `gitWritableRoots` accepts a checkout's git common dir as a
+   * writable root only when it is exactly that source repository's common dir;
+   * nothing is discovered by scanning the cwd. Set by the orchestrator's single
+   * spawn choke point; absent for single-repository tasks.
+   */
+  codexWorkspaceRepos?: Array<{ worktreePath: string; repoPath: string }>;
   /**
    * The run row id, threaded into `buildCommand` ONLY for fx: fx's argv
    * embeds a deterministic `--log-file <dataDir>/fx-logs/<runId>.log` path
@@ -1171,6 +1180,13 @@ export function buildCommand(
  * is the seam `spawnAgent` uses — kept separate from the pure `buildCommand` so
  * the cwd→sandbox wiring is unit-testable without standing up tmux.
  *
+ * A multi-repository task's cwd is its non-git workspace root; its
+ * repositories' source `.git` dirs are found only through
+ * `opts.codexWorkspaceRepos` (the task row's own checkouts, each verified
+ * against its source repository by `gitWritableRoots`), never by scanning the
+ * cwd — a checkout an agent planted there must not escalate the sandbox
+ * (docs/architecture/harness-codex.md).
+ *
  * Async because `gitWritableRoots` now spawns `git` via the async `git()`
  * helper (see worktree.ts) instead of `child_process.spawnSync` — this is the
  * only reason `buildCodexCommand` differs from the otherwise-synchronous
@@ -1186,7 +1202,7 @@ export async function buildCodexCommand(
 ): Promise<AgentCommand> {
   return buildCommand(harness, prompt, {
     ...opts,
-    codexExternalGitDirs: await gitWritableRoots(cwd),
+    codexExternalGitDirs: await gitWritableRoots(cwd, opts.codexWorkspaceRepos),
   });
 }
 
@@ -4493,9 +4509,11 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     // worktree) so a codex `auto` run that has to write there escalates its
     // sandbox to full access. Computed here — the single choke point every codex
     // spawn path funnels through — rather than at each orchestrator call site.
-    // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
-    // there. `buildCodexCommand` is the testable seam for this wiring (async —
-    // it awaits `gitWritableRoots`, which now shells out via `Bun.spawn`).
+    // No-op for an ordinary checkout or a non-git cwd (a multi-repository
+    // workspace root contributes only the verified `opts.codexWorkspaceRepos`),
+    // so the argv is unchanged there. `buildCodexCommand` is the testable seam
+    // for this wiring (async — it awaits `gitWritableRoots`, which now shells
+    // out via `Bun.spawn`).
     const built = await buildCodexCommand(harness, prompt, opts, cwd);
     return await spawnCodexViaTmux({
       taskId,
