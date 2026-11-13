@@ -313,7 +313,7 @@ All 15 tasks and every unit/e2e test group in §5 were implemented on `fix/ageto
 | T9 | Base-ref carry helpers + tests deleted; `describeRootConflict` copy now points at the Branch rows. |
 | T10 | Collapse/pin helpers + tests deleted. |
 | T11 | `ProjectPicker.tsx` / `RepositoriesDialog.tsx` deleted; stale comments retargeted (`BranchPicker`, `CloneProjectDialog`, CLI `add.ts`). |
-| T12 | `e2e/select-projects.spec.ts` — 8 scenarios (one, two, dedupe, dismissal, search, zero, persistence, non-git folder). |
+| T12 | `e2e/select-projects.spec.ts` — 10 scenarios (one, two, collapse 2→1, dedupe, dismissal, search, zero draft, persistence, non-git folder, form-side at-least-one guard). |
 | T13a-c | `identifier-inputs`, `issue-task`, `resolve-conflicts`, `multi-repo-task` + the seven harness specs / two clone specs moved to the shared control and helpers. |
 | T14 | Spec and architecture docs (`multi-repo-tasks`, `prompt-composer`, `issue-tasks`, `security`, `clone-repository`, `session-import`), `CLAUDE.md` topic map and `README.md` quick start updated. |
 | T15 | This record; verification below. |
@@ -323,10 +323,21 @@ All 15 tasks and every unit/e2e test group in §5 were implemented on `fix/ageto
 - `bun run typecheck` → clean, final tree.
 - `bun test src/mainview/lib/repo-selection.test.ts src/mainview/lib/multi-repo-ui.test.ts src/mainview/lib/worktree-payload.test.ts` → 67 pass / 0 fail.
 - Red proofs (temporarily broken helper, then restored): UT1 red when the label counts before dedupe; UT2 red when the single case emits `repositories[]` (and the isolate-off case breaks); UT3 red when the root merge drops a collapsed entry's ref.
-- `bun node_modules/@playwright/test/cli.js test e2e/select-projects.spec.ts` → 8/8 pass.
-- `… test e2e/multi-repo-task.spec.ts e2e/issue-task.spec.ts e2e/resolve-conflicts.spec.ts e2e/identifier-inputs.spec.ts` → 35/35 pass.
+- `bun node_modules/@playwright/test/cli.js test e2e/select-projects.spec.ts` → 10/10 pass (includes the collapse-to-one and form-side guard cases added in the review round).
+- `… test e2e/multi-repo-task.spec.ts e2e/issue-task.spec.ts e2e/resolve-conflicts.spec.ts e2e/identifier-inputs.spec.ts` → 35/35 pass as one parallel batch on the final tree.
 - `… test e2e/clone-project.spec.ts e2e/clone-providers.spec.ts e2e/cursor-stream.spec.ts e2e/copilot-harness.spec.ts e2e/copilot-harness-availability.spec.ts e2e/speed-picker.spec.ts e2e/fx-interactions.spec.ts e2e/opencode-harness.spec.ts` → all pass (one fx-recovery countdown test timed out once under the full batch, then passed 15/15 on its own — a load flake, not the selection UI).
 - `… test e2e/at-file-autocomplete.spec.ts e2e/branch-scoped-capabilities.spec.ts e2e/agent-profiles-dialogs.spec.ts` → 21/21 pass (no edits needed).
 - Full `bun test` → 13,375 pass / 32 skip / 2 fail; both failures were `beforeEach`/`afterEach` hook timeouts in `orchestrator-hold-scope-claim.test.ts` and `orchestrator-harness-switch-now.test.ts`, and both files pass 46/46 when run alone. Known flake, unrelated to this change (no orchestrator code touched).
 - `rg` sweep: no live reference to `ProjectPicker`, `RepositoriesDialog`, `Use multiple repositories`, `collapseToProject`, `pinPrimaryRepository`, `seedRepositoriesDialogValue`, `applyRepositoriesSave`, `wt.payload`, `variant="multi"` or `new-task-repositories`/`issue-repositories` outside `docs/plans` history. `Search projects…` survives only as the Select Projects dialog's search placeholder (and two unrelated filter bars).
 - `quality_gates.py wiring --worktree` → 10 new exports, 0 not reached; `hygiene --worktree` → no leads after restructuring two floating-promise call sites.
+
+### 10.1 Review-round fixes (2026-11-13)
+
+The code review of `459f2c27` found no behavior defect; these follow-ups landed on top of it:
+
+- **Committed the planning record.** `select-projects-combined-grill.md`, its two `round-*/answers.json` files and `select-projects-combined-investigation.md` were untracked although §2.1 cites them as committed; all three are in the commit now.
+- **Missing coverage added to `e2e/select-projects.spec.ts`.** A collapse test (2 projects → Isolate checked+disabled → save back to 1 → still checked, enabled, editable, branch-name field follows) and a form-side guard test on a test-scoped `freshBackend` with zero projects (title+prompt filled, `Select projects…` + hint shown, To backlog and Run task both disabled).
+- **Stale pointers retired.** `api.ts`, `route-policy.ts`, `server.ts` and `multi-repo-ui.test.ts` say Select Projects instead of the deleted Repositories dialog; `issue-task.spec.ts` says `refDirty`; the `identifier-inputs` test title/comment names the Select Projects search box.
+- **Add folder starts at the current project.** `SelectProjectsDialog` passes the first selected path to `api.pickProject`, matching the retired picker's `value` behavior.
+- **Stale per-path ref markers pruned.** `useProjectSelection` drops `userRefPaths` entries whose project left the selection, so remove-then-re-add can't read as dirty on a fresh ref.
+- **Core-four batch re-run on the final tree** → 35/35 in one parallel batch under `retries: 0` (the earlier 35/35 claim was retracted and is now backed by this run); typecheck clean and focused unit 67/67 re-run after the fixes.

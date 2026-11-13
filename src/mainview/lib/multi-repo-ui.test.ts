@@ -1,5 +1,5 @@
 // Multi-repository webview rules (issue #291) that the New Task form, the
-// issue dialog, the Repositories dialog, the board and the run panel delegate
+// issue dialog, the Select Projects dialog, the board and the run panel delegate
 // to. See docs/architecture/multi-repo-tasks.md.
 import { afterEach, describe, expect, test } from "bun:test";
 import {

@@ -1369,7 +1369,7 @@ test.describe("task from a Git issue", () => {
     // Wait for BranchPicker's automatic "preselect the current branch" seed
     // (`main`) to land BEFORE opening Manage: that seed must not count as a
     // user edit, or a pristine draft would ask "Discard…?" here (execution
-    // note 1: `baseRefDirty` split from the auto-selected `baseRef`).
+    // note 1: `refDirty` split from the auto-selected base ref).
     await expect(
       issueTaskDialog.getByTestId("worktree-options").getByTitle(BRANCH_PICKER_TITLE),
     ).toContainText("main", { timeout: CONVERGE_TIMEOUT });

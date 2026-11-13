@@ -87,6 +87,19 @@ export function useProjectSelection({
 
   const resetRefDirty = () => setUserRefPaths(new Set());
 
+  // Drop user-pick markers for projects that are no longer selected. Without
+  // this, removing a project (e.g. through the dialog's Save) and later adding
+  // it back would resurrect the old marker and read as dirty even though the
+  // re-added entry starts with a fresh automatic ref.
+  useEffect(() => {
+    setUserRefPaths((cur) => {
+      if (cur.size === 0) return cur;
+      const selected = new Set(repos.map((entry) => entry.path));
+      const next = new Set([...cur].filter((path) => selected.has(path)));
+      return next.size === cur.size ? cur : next;
+    });
+  }, [repos]);
+
   const workdir = repos[0]?.path ?? "";
   const multiRepo = useMemo(() => dedupeSelections(repos).length > 1, [repos]);
   const label = useMemo(() => projectSelectionLabel(repos), [repos]);

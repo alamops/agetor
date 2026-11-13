@@ -215,6 +215,36 @@ test("two projects: count label, forced Isolate, per-project refs in repositorie
   expect(created.repositories.map((r) => r.baseRef)).toEqual([branchShaA, branchShaB]);
 });
 
+test("collapsing two projects back to one leaves Isolate checked and editable", async ({ page, backend }) => {
+  await gotoApp(page, backend.bootBase);
+  const form = newTaskForm(page);
+
+  await chooseProjects(page, form, [repoA, repoB]);
+  const isolate = form.getByTestId("isolate-toggle");
+  await expect(isolate).toBeChecked();
+  await expect(isolate).toBeDisabled();
+
+  // Save a selection that drops back to a single project.
+  const dialog = await openSelectProjects(page, form);
+  await dialog.getByLabel(`Select ${repoB}`, { exact: true }).uncheck();
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(dialog).toBeHidden();
+
+  await expect(form.getByTestId("select-projects-button")).toContainText(path.basename(repoA));
+  await expect(form.getByTestId("select-projects-button")).not.toContainText("projects selected");
+  await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(1);
+
+  // The forced state is gone but the toggle stays checked (owner decision),
+  // and it is a normal editable checkbox again.
+  await expect(isolate).toBeChecked();
+  await expect(isolate).toBeEnabled();
+  await expect(form.getByTestId("branch-name-input")).toBeVisible();
+
+  await isolate.uncheck();
+  await expect(isolate).not.toBeChecked();
+  await expect(form.getByTestId("branch-name-input")).toHaveCount(0);
+});
+
 test("a repo plus its own subdirectory dedupes to one project", async ({ page, request, backend }) => {
   await gotoApp(page, backend.bootBase);
   const form = newTaskForm(page);
@@ -318,4 +348,19 @@ test("a non-git folder with Isolate off creates with workdir and isolation none"
   expect(created.baseRef).toBeNull();
   expect(created.multiRepo ?? false).toBe(false);
   expect(created.repositories.map((r) => r.path)).toEqual([repoPlain]);
+});
+
+test("with no project selected the form cannot create a task", async ({ page, freshBackend }) => {
+  // `freshBackend` (test-scoped) starts with zero registered projects, so the
+  // form's auto-select has nothing to promote — the one state where the
+  // form-side "at least one project" guard is observable.
+  await gotoApp(page, freshBackend.bootBase);
+  const form = newTaskForm(page);
+  await form.getByPlaceholder("Short description").fill("no project selected");
+  await form.getByTestId("prompt-textarea").fill("this must not be submittable");
+
+  await expect(form.getByTestId("select-projects-button")).toContainText("Select projects…");
+  await expect(form.getByTestId("select-projects-empty")).toBeVisible();
+  await expect(form.getByRole("button", { name: "To backlog", exact: true })).toBeDisabled();
+  await expect(form.getByRole("button", { name: "Run task", exact: true })).toBeDisabled();
 });

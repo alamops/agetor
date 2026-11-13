@@ -101,7 +101,7 @@ async function expectIdentifierInputNoAutocomplete(locator: Locator): Promise<vo
 const EXTENSIONS_TEST_PROJECT_NAME = "e2e-identifier-inputs-project";
 
 test.describe("identifier inputs opt out of autocorrect", () => {
-  test("New Task panel: Project picker, Branch picker, and branch-name input all carry the opt-out set", async ({
+  test("New Task panel: Select Projects search, Branch picker, and branch-name input all carry the opt-out set", async ({
     page,
     backend,
   }) => {
@@ -164,8 +164,9 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     // "All harnesses" is the MultiSearchSelect trigger's empty-state label
     // (KanbanFilters.tsx) — a plain <button>, not inside the New Task panel,
     // so no extra scoping is needed. The New Task panel's own placeholder
-    // "Search projects…" collides with the filter bar's repo filter, which
-    // is why this spec never asserts on that placeholder unscoped.
+    // "Search projects…" is the Select Projects dialog's own search box; the
+    // Kanban filter bar has a repo filter with the same placeholder, which is
+    // why this spec never asserts on that placeholder unscoped.
     const harnessTrigger = page.getByRole("button", { name: "All harnesses", exact: true });
     await harnessTrigger.click();
     const harnessSearch = page.getByPlaceholder("Search harnesses…");

@@ -140,7 +140,11 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
   const addFolder = async () => {
     setPicking(true);
     try {
-      const picked = await api.pickProject();
+      // Start the native panel at the current selection, like the retired
+      // single-project picker did with its own value. The first selected
+      // project is the closest equivalent (and empty when nothing is picked
+      // yet).
+      const picked = await api.pickProject(draft[0]?.path);
       if (!picked.project) return;
       const path = picked.project.path;
       if (!paths.has(path)) setDraft((cur) => [...cur, { path, root: null }]);
