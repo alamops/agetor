@@ -249,7 +249,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated, onMa
                 )}
               />
 
-              <WorktreeOptions locked={{ branch: context.headRef }} />
+              <WorktreeOptions locked={{ branch: context.headRef, projectPath: context.path }} />
 
               <TaskLaunchPickers
                 launch={launch}

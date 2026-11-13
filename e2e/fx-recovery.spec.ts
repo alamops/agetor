@@ -12,7 +12,7 @@ import {
   type Locator,
   type Page,
 } from "./fixtures";
-import { gotoApp, getPreferences, openSettingsGeneral } from "./helpers";
+import { gotoApp, getPreferences, openSettingsGeneral, selectProject } from "./helpers";
 // Pure constants/types only (no bun/node runtime imports — see
 // `src/shared/types.ts`'s own "Keep it free of runtime imports" rule), same
 // established pattern as `e2e/fx-models.spec.ts`'s `AGENT_OPTIONS` import —
@@ -414,7 +414,7 @@ async function selectHarness(page: Page, label: string): Promise<void> {
 }
 
 /** Registers a fresh directory under `backend.dataDir` as a project under a
- *  distinctive name, so the New Task form's ProjectPicker has something to
+ *  distinctive name, so the New Task form's project selection has something to
  *  select without touching the native folder dialog (unavailable in this
  *  headless harness) — the form's `workdir` starts empty and "Run task"
  *  stays disabled until one is chosen, regardless of the isolate toggle.
@@ -427,9 +427,8 @@ async function selectHarness(page: Page, label: string): Promise<void> {
  *  spec's name silently lose ("No matches.") whenever a sibling ran first. */
 async function registerDataDirProject(backend: E2EBackend, name: string): Promise<void> {
   // Under `dataDir`, so the `backend` fixture's own teardown removes it.
-  // Named by a hash of the project name, never the name itself: the
-  // ProjectPicker trigger labels the auto-selected project by its path's
-  // basename, which would then also match `selectProject`'s row locator.
+  // Project rows are matched by path, but keep the directory name distinct so
+  // a name-based lookup can never collide with `selectProject`'s search.
   const dir = path.join(backend.dataDir, "e2e-projects", createHash("sha1").update(name).digest("hex").slice(0, 12));
   mkdirSync(dir, { recursive: true });
   const res = await fetch(`${backend.apiBase}/projects`, {
@@ -440,22 +439,6 @@ async function registerDataDirProject(backend: E2EBackend, name: string): Promis
   if (!res.ok) {
     throw new Error(`POST /projects -> ${res.status}: ${await res.text()}`);
   }
-}
-
-/** Selects `projectName` (registered via {@link registerDataDirProject}) in
- *  the New Task form's ProjectPicker. Mirrors
- *  `e2e/fx-interactions.spec.ts`'s identical helper. */
-async function selectProject(form: Locator, projectName: string): Promise<void> {
-  const trigger = form.getByTitle(
-    "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.",
-  );
-  await trigger.click();
-  const search = form.getByPlaceholder("Search projects…");
-  await expect(search).toBeVisible();
-  await search.fill(projectName);
-  const row = form.getByRole("button", { name: projectName });
-  await expect(row).toBeVisible();
-  await row.click();
 }
 
 test.describe("fx recovery", () => {
@@ -1020,7 +1003,7 @@ test.describe("fx recovery", () => {
     const modeTrigger = modeLabel.locator("xpath=following-sibling::div[2]//button").first();
     await expect(modeTrigger).toHaveText("Full access");
 
-    await selectProject(form, projectName);
+    await selectProject(page, form, projectName);
 
     // --- Create + start without ever touching the mode picker, then
     // confirm the persisted id is "yolo" — proves the *value*, not just the

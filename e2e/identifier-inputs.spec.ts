@@ -1,8 +1,13 @@
-import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { test, expect, type Locator } from "./fixtures";
-import { gotoApp, openSettingsGeneral } from "./helpers";
+import {
+  gotoApp,
+  openSelectProjects,
+  openSettingsGeneral,
+  selectProject,
+  selectProjectsDialog,
+} from "./helpers";
 
 /**
  * E2E coverage for `IDENTIFIER_INPUT_PROPS` (docs/plans/remove-autocorrect-
@@ -28,7 +33,7 @@ import { gotoApp, openSettingsGeneral } from "./helpers";
  *
  * Covers, all inside the New Task left panel (`<aside>`, expanded by
  * default in a fresh browser context) unless noted:
- *  1. Project picker search box (`SearchSelect`, via `ProjectPicker`).
+ *  1. Select Projects dialog search box (the combined picker's search input).
  *  2. Branch picker search box (`SearchSelect`, via `BranchPicker` inside
  *     `WorktreeOptions`).
  *  3. The branch-name input (`branch-name-input`, visible because Isolate
@@ -57,10 +62,6 @@ import { gotoApp, openSettingsGeneral } from "./helpers";
 // e2e/issue-task.spec.ts's identical constant.
 const BRANCH_PICKER_TITLE =
   "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start.";
-
-// Tooltip ProjectPicker's trigger carries, set by NewTaskForm.tsx.
-const PROJECT_PICKER_TITLE =
-  "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.";
 
 // Generous but bounded convergence timeout for popovers to render — mirrors
 // issue-task.spec.ts's identical constant.
@@ -92,11 +93,11 @@ async function expectIdentifierInputNoAutocomplete(locator: Locator): Promise<vo
 }
 
 // Distinctive, worker-unique project name for the Extensions-picker test
-// below — searched for and clicked explicitly rather than relying on
-// ProjectPicker's `autoSelectFirst`, since the `backend` fixture is
-// worker-scoped and other spec files sharing this worker may have already
-// registered their own projects (see e2e/issue-task.spec.ts's file header
-// for the identical concern around `openGitDialog`).
+// below — searched for and clicked explicitly rather than relying on the
+// form's auto-selected project, since the `backend` fixture is worker-scoped
+// and other spec files sharing this worker may have already registered their
+// own projects (see e2e/issue-task.spec.ts's file header for the identical
+// concern around `openGitDialog`).
 const EXTENSIONS_TEST_PROJECT_NAME = "e2e-identifier-inputs-project";
 
 test.describe("identifier inputs opt out of autocorrect", () => {
@@ -113,14 +114,26 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     const newTaskPanel = page.locator("aside").filter({ hasText: "New task" });
     await expect(newTaskPanel).toBeVisible();
 
-    // 1. Project picker search box.
-    const projectTrigger = newTaskPanel.getByTitle(PROJECT_PICKER_TITLE);
-    await projectTrigger.click();
-    const projectSearch = newTaskPanel.getByPlaceholder("Search projects…");
+    // 1. Select Projects dialog search box.
+    const dialog = await openSelectProjects(page, newTaskPanel);
+    const projectSearch = dialog.getByTestId("select-projects-search");
     await expect(projectSearch).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expectIdentifierInput(projectSearch);
     await page.keyboard.press("Escape");
-    await expect(projectSearch).toBeHidden();
+    await expect(selectProjectsDialog(page)).toBeHidden();
+
+    // A branch row only exists once a project is selected (an empty selection
+    // shows the "select a project" hint instead of a picker). Register this
+    // test's own directory so the shared worker backend can't decide it.
+    const branchProjectName = "e2e-identifier-inputs-branch-project";
+    const branchProjectDir = path.join(backend.dataDir, "e2e-projects", branchProjectName);
+    mkdirSync(branchProjectDir, { recursive: true });
+    const branchProjectRes = await page.request.post(`${backend.apiBase}/projects`, {
+      headers: { authorization: `Bearer ${backend.apiToken}` },
+      data: { path: branchProjectDir, name: branchProjectName },
+    });
+    expect(branchProjectRes.ok()).toBeTruthy();
+    await selectProject(page, newTaskPanel, branchProjectName);
 
     // 2. Branch picker search box, inside worktree-options.
     const worktreeOptions = newTaskPanel.getByTestId("worktree-options");
@@ -171,15 +184,10 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     // worktree — this test never starts a task. Its own subdirectory, not
     // `dataDir` itself: `projects.upsert` keeps the FIRST name a path was
     // registered under, and sibling specs sharing this worker's backend
-    // (fx-interactions, fx-recovery) register paths too.
-    // (Named by a hash, not the project name itself: the picker trigger
-    // labels the auto-selected project by its path's basename, which would
-    // then also match the row locator below.)
-    const projectDir = path.join(
-      backend.dataDir,
-      "e2e-projects",
-      createHash("sha1").update(EXTENSIONS_TEST_PROJECT_NAME).digest("hex").slice(0, 12),
-    );
+    // (fx-interactions, fx-recovery) register paths too. The directory's
+    // basename is the project name so the Select Projects control (which
+    // labels rows by their path's basename) can address it.
+    const projectDir = path.join(backend.dataDir, "e2e-projects", EXTENSIONS_TEST_PROJECT_NAME);
     mkdirSync(projectDir, { recursive: true });
     const projectRes = await page.request.post(`${backend.apiBase}/projects`, {
       headers: { authorization: `Bearer ${backend.apiToken}` },
@@ -192,18 +200,11 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     const newTaskPanel = page.locator("aside").filter({ hasText: "New task" });
     await expect(newTaskPanel).toBeVisible();
 
-    // Pick this test's project explicitly rather than relying on
-    // ProjectPicker's `autoSelectFirst` (most-recently-used project) — see
-    // EXTENSIONS_TEST_PROJECT_NAME's doc comment above.
-    const projectTrigger = newTaskPanel.getByTitle(PROJECT_PICKER_TITLE);
-    await projectTrigger.click();
-    const projectSearch = newTaskPanel.getByPlaceholder("Search projects…");
-    await expect(projectSearch).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await projectSearch.fill(EXTENSIONS_TEST_PROJECT_NAME);
-    const projectRow = newTaskPanel.locator("button").filter({ hasText: EXTENSIONS_TEST_PROJECT_NAME });
-    await expect(projectRow).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await projectRow.click();
-    await expect(projectSearch).toBeHidden();
+    // Pick this test's project explicitly rather than relying on the form's
+    // auto-selected project — see EXTENSIONS_TEST_PROJECT_NAME's doc comment
+    // above.
+    await selectProject(page, newTaskPanel, EXTENSIONS_TEST_PROJECT_NAME);
+    await expect(selectProjectsDialog(page)).toBeHidden();
 
     // 6. Extensions picker search box. Its trigger label is "MCP · Skills ·
     // Plugins · Agents · Prompts" (ExtensionPicker.tsx) — the test id is more

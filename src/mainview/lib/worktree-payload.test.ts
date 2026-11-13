@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { worktreePayload, type WorktreePayloadInput } from "./worktree-payload.ts";
+import { selectionPayload, worktreePayload, type WorktreePayloadInput } from "./worktree-payload.ts";
 
 function input(overrides: Partial<WorktreePayloadInput> = {}): WorktreePayloadInput {
   return {
@@ -86,5 +86,109 @@ describe("worktreePayload — isolate off", () => {
   test("whitespace-only baseRef while isolate is off: still undefined (not gated on the trim check alone)", () => {
     const payload = worktreePayload({ isolate: false, baseRef: "   ", branchSubmitValue: "" });
     expect(payload.baseRef).toBeUndefined();
+  });
+});
+
+describe("selectionPayload — zero selection", () => {
+  test("is inert: empty workdir, no isolation, no refs", () => {
+    expect(selectionPayload({ repos: [], isolate: true, branchSubmitValue: "feature/x" })).toEqual({
+      workdir: "",
+      isolation: "none",
+    });
+  });
+});
+
+describe("selectionPayload — exactly one project", () => {
+  test("isolate on keeps the historical single-repository shape (no repositories[])", () => {
+    const payload = selectionPayload({
+      repos: [{ path: "/repos/frontend", root: "/repos/frontend", baseRef: "  release/1.2  " }],
+      isolate: true,
+      branchSubmitValue: "fix/thing",
+    });
+    expect(payload).toEqual({
+      workdir: "/repos/frontend",
+      isolation: "worktree",
+      baseRef: "release/1.2",
+      branch: "fix/thing",
+    });
+    expect(payload.repositories).toBeUndefined();
+  });
+
+  test("isolate off sends isolation none and no refs, so a plain non-git folder is valid", () => {
+    expect(
+      selectionPayload({
+        repos: [{ path: "/plain/folder", root: null, baseRef: "main" }],
+        isolate: false,
+        branchSubmitValue: "feature/x",
+      }),
+    ).toEqual({ workdir: "/plain/folder", isolation: "none", baseRef: undefined, branch: undefined });
+  });
+
+  test("a blank base ref is omitted", () => {
+    expect(
+      selectionPayload({
+        repos: [{ path: "/repos/fe", root: "/repos/fe", baseRef: "   " }],
+        isolate: true,
+        branchSubmitValue: "",
+      }),
+    ).toEqual({ workdir: "/repos/fe", isolation: "worktree", baseRef: undefined, branch: undefined });
+  });
+});
+
+describe("selectionPayload — 2+ projects", () => {
+  test("forces worktree isolation even when the raw toggle is off, with per-entry refs and no top-level baseRef", () => {
+    const payload = selectionPayload({
+      repos: [
+        { path: "/repos/frontend", root: "/repos/frontend", baseRef: " release/1.2 " },
+        { path: "/repos/backend", root: "/repos/backend", baseRef: "   " },
+      ],
+      isolate: false,
+      branchSubmitValue: "feature/together",
+    });
+    expect(payload).toEqual({
+      workdir: "/repos/frontend",
+      isolation: "worktree",
+      branch: "feature/together",
+      repositories: [{ path: "/repos/frontend", baseRef: "release/1.2" }, { path: "/repos/backend" }],
+    });
+    expect(payload.baseRef).toBeUndefined();
+  });
+
+  test("two paths under one known root collapse to the single shape and the first path wins", () => {
+    const payload = selectionPayload({
+      repos: [
+        { path: "/repo/packages/a", root: "/repo", baseRef: "main" },
+        { path: "/repo/packages/b", root: "/repo" },
+      ],
+      isolate: false,
+      branchSubmitValue: "",
+    });
+    expect(payload).toEqual({ workdir: "/repo/packages/a", isolation: "none", baseRef: undefined, branch: undefined });
+    expect(payload.repositories).toBeUndefined();
+  });
+
+  test("unknown roots are kept as separate repositories", () => {
+    expect(
+      selectionPayload({
+        repos: [
+          { path: "/a", root: null, baseRef: "main" },
+          { path: "/b", root: null },
+        ],
+        isolate: true,
+        branchSubmitValue: "",
+      }).repositories,
+    ).toEqual([{ path: "/a", baseRef: "main" }, { path: "/b" }]);
+  });
+
+  test("an empty branch name is omitted rather than sent as an empty string", () => {
+    const payload = selectionPayload({
+      repos: [
+        { path: "/a", root: "/a" },
+        { path: "/b", root: "/b" },
+      ],
+      isolate: true,
+      branchSubmitValue: "",
+    });
+    expect(payload.branch).toBeUndefined();
   });
 });

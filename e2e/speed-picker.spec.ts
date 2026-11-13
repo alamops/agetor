@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, selectProject } from "./helpers";
 
 /**
  * E2E coverage for docs/plans/fx-0.0.14-and-cursor-updates.md E2 (D33 flow
@@ -158,20 +158,6 @@ async function registerProject(backend: E2EBackend, name: string): Promise<void>
   if (!res.ok) throw new Error(`POST /projects -> ${res.status}: ${await res.text()}`);
 }
 
-async function selectProject(form: Locator, projectName: string): Promise<void> {
-  await form
-    .getByTitle(
-      "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.",
-    )
-    .click();
-  const search = form.getByPlaceholder("Search projects…");
-  await expect(search).toBeVisible();
-  await search.fill(projectName);
-  const row = form.getByRole("button", { name: projectName });
-  await expect(row).toBeVisible();
-  await row.click();
-}
-
 /** The task-details Model `<select>` — see e2e/fx-models.spec.ts's identical
  *  helper: the `<dd>` right after the `<dt>` holding the ↻ button. */
 function detailsModelSelect(panel: Locator): Locator {
@@ -305,7 +291,7 @@ test.describe("speed picker", () => {
     await gotoApp(page, backend.bootBase);
     const form = newTaskFormPanel(page);
     await selectHarness(page, SPEED_HARNESS.label);
-    await selectProject(form, projectName);
+    await selectProject(page, form, projectName);
 
     const modelSelect = newTaskModelSelect(page);
     // This harness's own catalog, curated order (the catalogOnly Sol row is

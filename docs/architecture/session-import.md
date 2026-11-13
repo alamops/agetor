@@ -23,7 +23,7 @@ A home-less claude-code harness launches with this process's `CLAUDE_CONFIG_DIR`
 
 ## OpenCode sessions
 
-Same product surface as the Claude import above (one dialog, `ImportSessionsDialog`, reached from the Projects picker's "Import sessions…", the header import button, and `agetor sessions [ls | import [id…]] [--kind claude|opencode] [--harness <id>]`), but every part is OpenCode's own (`docs/plans/add-opencode-harness.md` D-13, amendments A7/A8).
+Same product surface as the Claude import above (one dialog, `ImportSessionsDialog`, reached from the Select Projects dialog's "Import sessions…", the header import button, and `agetor sessions [ls | import [id…]] [--kind claude|opencode] [--harness <id>]`), but every part is OpenCode's own (`docs/plans/add-opencode-harness.md` D-13, amendments A7/A8).
 `GET /opencode-sessions` (`scanOpencodeSessions`, `src/bun/opencode-session-scan.ts`) runs `opencode session list` **per enabled opencode harness × per existing project dir** (`resolveBin`/`harnessEnv`, `cwd` = the project, `--standalone` on v2 via the major from `cachedCliVersion`), each call bounded by `LIST_TIMEOUT_MS` (5 s), at most `SCAN_CONCURRENCY` (4) in flight, results cached per (harness, dir) for `SCAN_CACHE_TTL_MS` (10 s, failures cached too); `POST /opencode-sessions/recheck` forces a re-scan.
 Rows are filtered fresh after the cache: an id Agetor owns (`hiddenOpencodeSessionIds` = ids on any run's `opencode_session_id` ∪ import claims) is hidden, a folder that no longer exists is listed with `blockedReason: "missing-folder"`, and duplicates are deduped per (harness, session).
 

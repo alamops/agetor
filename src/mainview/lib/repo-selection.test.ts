@@ -1,15 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
   MANY_REPOSITORIES,
-  collapseToProject,
   dedupeSelections,
   issueProjectPath,
-  pinPrimaryRepository,
+  projectDisplayName,
+  projectRowLabels,
+  projectSelectionLabel,
   repositoryFileScopes,
   selectionName,
   selectionNames,
   taskProjectPath,
   tooManyRepositories,
+  updateSelectionBaseRef,
 } from "./repo-selection.ts";
 
 describe("dedupeSelections", () => {
@@ -129,69 +131,77 @@ describe("issueProjectPath", () => {
   });
 });
 
-describe("collapseToProject", () => {
-  test("collapses a selection to the chosen project", () => {
-    const prev = [
-      { path: "/a", root: "/a" },
-      { path: "/b", root: "/b" },
-    ];
-    expect(collapseToProject("/b", prev)).toEqual([{ path: "/b", root: "/b" }]);
-    expect(collapseToProject("/c", prev)).toEqual([{ path: "/c", root: null }]);
-    expect(collapseToProject("", prev)).toEqual([]);
+describe("project selection label", () => {
+  test("zero selection prompts, one shows the project's name, 2+ shows the count", () => {
+    expect(projectSelectionLabel([])).toBe("Select projects…");
+    expect(projectSelectionLabel([{ path: "/repos/frontend", root: "/repos/frontend" }])).toBe("frontend");
+    expect(
+      projectSelectionLabel([
+        { path: "/repos/frontend", root: "/repos/frontend" },
+        { path: "/repos/backend", root: "/repos/backend" },
+      ]),
+    ).toBe("2 projects selected");
+  });
+
+  test("the count is post-dedupe: subdirectories of one repository read as one project", () => {
+    expect(
+      projectSelectionLabel([
+        { path: "/repo/packages/a", root: "/repo" },
+        { path: "/repo/packages/b", root: "/repo" },
+      ]),
+    ).toBe("a");
+  });
+
+  test("unknown roots are never silently collapsed", () => {
+    expect(
+      projectSelectionLabel([
+        { path: "/a", root: null },
+        { path: "/b", root: null },
+      ]),
+    ).toBe("2 projects selected");
   });
 });
 
-describe("pinPrimaryRepository", () => {
-  test("keeps the fixed primary first and appends the dialog's extras", () => {
-    expect(pinPrimaryRepository("/repos/issue", [
-      { path: "/repos/issue", root: "/repos/issue" },
-      { path: "/repos/api", root: "/repos/api" },
-    ])).toEqual([
-      { path: "/repos/issue", root: "/repos/issue" },
-      { path: "/repos/api", root: "/repos/api" },
+describe("projectRowLabels", () => {
+  test("uses the raw basename, appending the full path only on a collision", () => {
+    expect(projectRowLabels(["/x/App One", "/y/Backend"])).toEqual(["App One", "Backend"]);
+    expect(projectRowLabels(["/a/api", "/b/api", "/c/db"])).toEqual([
+      "api — /a/api",
+      "api — /b/api",
+      "db",
     ]);
   });
 
-  test("preserves a base ref chosen for the primary in the dialog round", () => {
-    // Review S1: rebuilding the issue entry from only its path silently
-    // dropped the user's pinned base, so the issue's repo always used HEAD.
-    const next = [
-      { path: "/repos/issue", root: "/repos/issue", baseRef: "release/1.2" },
-      { path: "/repos/api", root: "/repos/api", baseRef: "main" },
-    ];
-    expect(pinPrimaryRepository("/repos/issue", next, [])).toEqual([
-      { path: "/repos/issue", root: "/repos/issue", baseRef: "release/1.2" },
-      { path: "/repos/api", root: "/repos/api", baseRef: "main" },
+  test("a trailing slash does not produce an empty name", () => {
+    expect(projectDisplayName("/repos/frontend/")).toBe("frontend");
+    expect(projectDisplayName("")).toBe("");
+  });
+});
+
+describe("updateSelectionBaseRef", () => {
+  const entries = [
+    { path: "/fe", root: "/fe", baseRef: "main" },
+    { path: "/be", root: "/be" },
+  ];
+
+  test("replaces only the target entry and preserves order, roots and other refs", () => {
+    expect(updateSelectionBaseRef(entries, "/be", "release/1.2")).toEqual([
+      { path: "/fe", root: "/fe", baseRef: "main" },
+      { path: "/be", root: "/be", baseRef: "release/1.2" },
+    ]);
+    // The input is not mutated.
+    expect(entries[1]).toEqual({ path: "/be", root: "/be" });
+  });
+
+  test("a blank ref drops the key instead of storing an empty string", () => {
+    expect(updateSelectionBaseRef(entries, "/fe", "  ")).toEqual([
+      { path: "/fe", root: "/fe" },
+      { path: "/be", root: "/be" },
     ]);
   });
 
-  test("falls back to the previously stored base ref when the dialog omits it", () => {
-    const previous = [{ path: "/repos/issue", root: "/repos/issue", baseRef: "develop" }];
-    expect(pinPrimaryRepository("/repos/issue", [{ path: "/repos/api", root: "/repos/api" }], previous)).toEqual([
-      { path: "/repos/issue", root: "/repos/issue", baseRef: "develop" },
-      { path: "/repos/api", root: "/repos/api" },
-    ]);
-  });
-
-  test("never duplicates the primary when the dialog also returns it", () => {
-    const out = pinPrimaryRepository("/repos/issue", [
-      { path: "/repos/api", root: "/repos/api" },
-      { path: "/repos/issue", root: "/repos/issue" },
-    ]);
-    expect(out.map((e) => e.path)).toEqual(["/repos/issue", "/repos/api"]);
-  });
-
-  test("collapses a same-root sibling added while the primary was selected", () => {
-    // Review S2: the issue dialog let its fixed primary be unchecked, then
-    // re-added it without the dialog's git-root dedupe — a subdirectory of the
-    // issue repo made the client show two repositories while the server
-    // deduped to one and created a single-repository task.
-    const out = pinPrimaryRepository("/repos/issue", [
-      { path: "/repos/issue", root: "/repos/issue" },
-      { path: "/repos/issue/packages/app", root: "/repos/issue" },
-      { path: "/repos/api", root: "/repos/api" },
-    ]);
-    expect(out.map((e) => e.path)).toEqual(["/repos/issue", "/repos/api"]);
+  test("an unknown path is a no-op", () => {
+    expect(updateSelectionBaseRef(entries, "/gone", "dev")).toEqual(entries);
   });
 });
 

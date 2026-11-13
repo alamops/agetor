@@ -4,7 +4,13 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend } from "./fixtures";
-import { gotoApp } from "./helpers";
+import {
+  branchRow,
+  chooseProjects,
+  gotoApp,
+  selectBaseBranch,
+  selectProjectsDialog,
+} from "./helpers";
 import { startGitHubStub, type StubRequest } from "./github-stub";
 import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
 
@@ -13,12 +19,13 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *
  * Arrange: two throwaway git repos, registered through the real
  * `POST /projects`. The FIRST scenario creates the multi-repository task
- * through the real New Task form and its `Repositories` dialog (select the
- * second repository, pin its base ref, save), then "Run task" starts it — so
- * `RepositoriesDialog`'s multi-select, per-repository base ref and the
- * create payload are exercised end to end, not just through `POST /tasks`.
- * The worker backend already runs the fake claude driver, so the start
- * materializes one worktree per repository without a real CLI.
+ * through the real New Task form's combined Select Projects control (pick
+ * both repositories, then a non-current base ref in each project's own inline
+ * Branch row), then "Run task" starts it — so the multi selection, the
+ * per-project refs and the create payload are exercised end to end, not just
+ * through `POST /tasks`. The worker backend already runs the fake claude
+ * driver, so the start materializes one worktree per repository without a real
+ * CLI.
  *
  * Scenarios:
  *  1. create via the real UI + start: both worktrees exist, the card shows
@@ -52,7 +59,12 @@ const TITLE = "Multi repository e2e";
 let repoA: string;
 let repoB: string;
 let repoSibling: string;
-let repoBHead: string;
+/** A non-current branch created in both repos: a row wired to nothing would
+ *  still show the current branch, so only a different ref proves the per-project
+ *  picker reaches the create payload. */
+const TOPIC_BRANCH = "topic";
+let topicShaA: string;
+let topicShaB: string;
 let taskId: string;
 let singleTaskId: string;
 
@@ -190,7 +202,10 @@ test.beforeAll(async ({ backend, request }) => {
   // first scenario asserts by still creating a two-repository task.
   repoSibling = path.join(repoA, "packages", "feature");
   await mkdir(repoSibling, { recursive: true });
-  repoBHead = git(repoB, ["rev-parse", "HEAD"]);
+  git(repoA, ["branch", TOPIC_BRANCH]);
+  git(repoB, ["branch", TOPIC_BRANCH]);
+  topicShaA = git(repoA, ["rev-parse", TOPIC_BRANCH]);
+  topicShaB = git(repoB, ["rev-parse", TOPIC_BRANCH]);
   // GitHub-shaped origins for the issue-sourced / Create-all-PRs scenario.
   // Pushing uses a separate local bare remote, so nothing leaves the machine
   // while `repoForDir`/`providerRepoForDir` still resolve a GitHub identity.
@@ -229,41 +244,36 @@ test.afterAll(async ({ backend, request }) => {
   }
 });
 
-test("create via the real UI: the Repositories dialog sends both repos and start materializes both worktrees", async ({ backend, page, request }) => {
+test("create via the real UI: Select Projects sends both repos and start materializes both worktrees", async ({ backend, page, request }) => {
   await gotoApp(page, backend.bootBase);
   const form = page.locator("aside").first();
 
   await form.getByPlaceholder("Short description").fill(TITLE);
   await form.getByTestId("prompt-textarea").fill("make the change");
 
-  // Pin the form's single project first (the worker backend is shared across
-  // spec files, so `autoSelectFirst` is not a stable choice). Wait for that
-  // one-shot auto-selection to land before overriding it — otherwise it can
-  // fire after this pick and swap the project back. Then add the second
-  // repository through the dialog. This is the `RepositoriesDialog` path the
-  // plan's T16 names — multi-select, per-repository base ref, dedupe, save.
-  const projectTrigger = form.getByTitle(/Pick the working directory/);
-  await expect(projectTrigger).not.toContainText("Select project", { timeout: CONVERGE_TIMEOUT });
-  await projectTrigger.click();
-  await form.getByText(repoA, { exact: true }).click();
-  await expect(projectTrigger).toContainText(path.basename(repoA));
+  // The combined control is the only project surface. `chooseProjects` clears
+  // every row the auto-select may have checked, then checks the requested set
+  // in order (the first path wins a same-git-root dedupe), so the resulting
+  // selection is deterministic across the shared worker backend.
+  await chooseProjects(page, form, [repoA, repoB, repoSibling]);
+  const button = form.getByTestId("select-projects-button");
+  await expect(button).toContainText("2 projects selected");
+  const dialog = selectProjectsDialog(page);
 
-  await form.getByRole("button", { name: "Use multiple repositories…" }).click();
-  const reposDialog = page.getByRole("dialog", { name: "Repositories" });
-  await expect(reposDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-  await expect(reposDialog.getByLabel(`Select ${repoA}`, { exact: true })).toBeChecked();
-  // A single-repository selection keeps the inline Branch field's base ref:
-  // no per-repository input may be offered, or whatever the user typed there
-  // was silently discarded at create time (review round six).
-  await expect(reposDialog.getByLabel(`Base ref for ${repoA}`, { exact: true })).toHaveCount(0);
-  await reposDialog.getByLabel(`Select ${repoB}`, { exact: true }).check();
-  await expect(reposDialog.getByLabel(`Base ref for ${repoA}`, { exact: true })).toBeVisible();
-  await reposDialog.getByLabel(`Base ref for ${repoB}`, { exact: true }).fill("main");
-  // A same-git-root sibling is selectable but must dedupe away on save.
-  await reposDialog.getByLabel(`Select ${repoSibling}`, { exact: true }).check();
-  await reposDialog.getByRole("button", { name: "Save", exact: true }).click();
-  await expect(reposDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
-  await expect(form.getByTestId("new-task-repositories")).toContainText("2 repositories");
+  // Selection lives in the dialog; base refs live in the form's inline rows,
+  // so no per-repository input may be offered here any more.
+  await expect(dialog).toBeHidden();
+  const names = uniqueRepoSlugs([repoA, repoB]);
+  await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(2);
+  await selectBaseBranch(page, form, names[0]!, TOPIC_BRANCH);
+  await selectBaseBranch(page, form, names[1]!, TOPIC_BRANCH);
+  await expect(branchRow(form, names[0]!)).toContainText(TOPIC_BRANCH);
+  await expect(branchRow(form, names[1]!)).toContainText(TOPIC_BRANCH);
+
+  // 2+ projects force and disable Isolate.
+  const isolate = form.getByTestId("isolate-toggle");
+  await expect(isolate).toBeChecked();
+  await expect(isolate).toBeDisabled();
 
   const runButton = form.getByRole("button", { name: "Run task", exact: true });
   await expect(runButton).toBeEnabled({ timeout: CONVERGE_TIMEOUT });
@@ -272,7 +282,7 @@ test("create via the real UI: the Repositories dialog sends both repos and start
   const created = await awaitTask(request, backend, TITLE);
   taskId = created.id;
   expect(created.repositories.map((r) => r.path)).toEqual([repoA, repoB]);
-  expect(created.repositories[1]!.baseRef).toBe(repoBHead);
+  expect(created.repositories.map((r) => r.baseRef)).toEqual([topicShaA, topicShaB]);
 
   await expect
     .poll(async () => {
@@ -289,7 +299,6 @@ test("create via the real UI: the Repositories dialog sends both repos and start
   });
   const task = (await res.json()) as TaskRow;
   expect(task.worktreePath).toBe(task.workdir);
-  const names = uniqueRepoSlugs([repoA, repoB]);
   for (const name of names) {
     expect(existsSync(path.join(task.worktreePath!, name))).toBe(true);
   }
@@ -399,8 +408,12 @@ test("the Worktrees page lists one row per repository of a multi task, not the w
   await page.getByRole("button", { name: "Worktrees", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Worktrees" });
   await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+  // One badge per repository row. Address the badge directly: the row also
+  // renders the repository's project label (the same basename here), so a
+  // plain text lookup is ambiguous by design.
+  const repoBadges = dialog.getByTitle("Repository in this task's workspace");
   for (const name of uniqueRepoSlugs([repoA, repoB])) {
-    await expect(dialog.getByText(name, { exact: true })).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+    await expect(repoBadges.filter({ hasText: name })).toHaveCount(1, { timeout: CONVERGE_TIMEOUT });
   }
   // One row per repository, both attributed to the same task — not one row for
   // the task's workspace root.

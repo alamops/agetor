@@ -12,9 +12,9 @@ interface Props {
   /**
    * Called instead of `onChange` for the automatic "pre-select the current
    * branch" seed when branches first arrive. Lets a caller distinguish a
-   * programmatic seed from a real user pick — `WorktreeOptions` uses it so a
-   * dialog's unsaved-draft check doesn't count the auto-selected current
-   * branch as a user change. Defaults to `onChange`.
+   * programmatic seed from a real user pick — the shared worktree block uses
+   * it so a dialog's unsaved-draft check doesn't count the auto-selected
+   * current branch as a user change. Defaults to `onChange`.
    */
   onAutoSelect?: (next: string) => void;
   className?: string;

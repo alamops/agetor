@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, selectProject } from "./helpers";
 
 /**
  * E2E failure states of the GitHub Copilot harness's availability probe
@@ -66,20 +66,6 @@ async function registerProject(backend: E2EBackend, name: string): Promise<void>
   if (!res.ok) throw new Error(`POST /projects -> ${res.status}: ${await res.text()}`);
 }
 
-async function selectProject(form: Locator, projectName: string): Promise<void> {
-  await form
-    .getByTitle(
-      "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.",
-    )
-    .click();
-  const search = form.getByPlaceholder("Search projects…");
-  await expect(search).toBeVisible();
-  await search.fill(projectName);
-  const row = form.getByRole("button", { name: projectName });
-  await expect(row).toBeVisible();
-  await row.click();
-}
-
 async function openSettingsHarnesses(page: Page): Promise<Locator> {
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   const dialog = page.getByRole("dialog");
@@ -139,7 +125,7 @@ async function expectRunRefused(
   // The harness button's own status dot is red too.
   await expect(copilotButton.locator("span.bg-danger-solid")).toBeVisible({ timeout: 15_000 });
   await copilotButton.click();
-  await selectProject(form, projectName);
+  await selectProject(page, form, projectName);
 
   const unavailable = form.locator("div.border-destructive\\/40").filter({ hasText: CASK_HINT });
   await expect(unavailable).toBeVisible({ timeout: 15_000 });

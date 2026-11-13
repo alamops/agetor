@@ -738,7 +738,7 @@ test.describe("task from a Git issue", () => {
     createdTaskIds.splice(createdTaskIds.indexOf(taskId), 1);
   });
 
-  test("repositories dialog: the issue's repository is locked and an extra repo is added", async ({
+  test("select projects: the issue's repository is locked and an extra repo is added", async ({
     page,
     request,
     backend,
@@ -747,8 +747,11 @@ test.describe("task from a Git issue", () => {
     await gotoApp(page, backend.bootBase);
     const issueTaskDialog = await openIssueTaskDialog(page);
 
-    await issueTaskDialog.getByTestId("issue-repositories").getByRole("button", { name: "Manage" }).click();
-    const reposDialog = page.getByRole("dialog", { name: "Repositories" });
+    // The old separate "Repositories / Manage" control is gone: the same
+    // full-width Select Projects button New Task uses is the only surface.
+    await expect(issueTaskDialog.getByRole("button", { name: "Manage", exact: true })).toHaveCount(0);
+    await issueTaskDialog.getByTestId("select-projects-button").click();
+    const reposDialog = page.getByRole("dialog", { name: "Select projects" });
     await expect(reposDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
 
     // The issue's own repository is pinned by `lockedPath`: it starts
@@ -763,6 +766,10 @@ test.describe("task from a Git issue", () => {
     await reposDialog.getByLabel(`Select ${extraRepoDir}`, { exact: true }).check();
     await reposDialog.getByRole("button", { name: "Save", exact: true }).click();
     await expect(reposDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+    await expect(issueTaskDialog.getByTestId("select-projects-button")).toContainText("2 projects selected");
+    // Two projects force (and disable) worktree isolation.
+    await expect(issueTaskDialog.getByTestId("isolate-toggle")).toBeChecked();
+    await expect(issueTaskDialog.getByTestId("isolate-toggle")).toBeDisabled();
 
     await expect(issueTaskDialog.getByTestId("issue-task-submit")).toBeEnabled({
       timeout: CONVERGE_TIMEOUT,

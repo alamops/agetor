@@ -17,6 +17,13 @@ interface DialogProps {
    * stacked open()s, the dialog re-applies focus.
    */
   initialFocusRef?: React.RefObject<HTMLElement | null>;
+  /**
+   * Whether a click outside the panel closes the dialog. Defaults to `true`
+   * (every existing caller's behavior). Pass `false` for a Save-based editor
+   * whose in-progress draft must not be discarded by a stray click; Escape and
+   * the dialog's own Cancel button still close it.
+   */
+  closeOnBackdrop?: boolean;
 }
 
 const FOCUSABLE_SELECTOR = [
@@ -71,6 +78,7 @@ export function Dialog({
   labelledBy,
   describedBy,
   initialFocusRef,
+  closeOnBackdrop = true,
 }: DialogProps) {
   const panelRef = React.useRef<HTMLDivElement>(null);
   const onCloseRef = React.useRef(onClose);
@@ -208,7 +216,9 @@ export function Dialog({
       aria-labelledby={labelledBy}
       aria-describedby={describedBy}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-      onClick={() => onCloseRef.current()}
+      onClick={() => {
+        if (closeOnBackdrop) onCloseRef.current();
+      }}
     >
       <div
         ref={panelRef}

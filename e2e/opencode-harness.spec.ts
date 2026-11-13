@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Locator, type Page } from "./fixtures";
-import { gotoApp } from "./helpers";
+import { gotoApp, selectProject } from "./helpers";
 
 /**
  * E2E coverage for the OpenCode harness (docs/plans/add-opencode-harness.md
@@ -181,20 +181,6 @@ async function selectHarness(page: Page, label: string): Promise<void> {
   await button.click();
 }
 
-async function selectProject(form: Locator, projectName: string): Promise<void> {
-  await form
-    .getByTitle(
-      "Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list.",
-    )
-    .click();
-  const search = form.getByPlaceholder("Search projects…");
-  await expect(search).toBeVisible();
-  await search.fill(projectName);
-  const row = form.getByRole("button", { name: projectName });
-  await expect(row).toBeVisible();
-  await row.click();
-}
-
 /** The New Task form's Model `<select>` (see e2e/fx-models.spec.ts). */
 function newTaskModelSelect(page: Page): Locator {
   return newTaskFormPanel(page).getByTestId("refresh-models").locator("xpath=../..").locator("select");
@@ -271,7 +257,7 @@ test.describe("OpenCode harness (fake driver + stub CLI)", () => {
     await expect(modelSelect.locator("option:checked")).toHaveText("OpenCode default");
     await expectNoServerPicker(form);
 
-    await selectProject(form, projectName);
+    await selectProject(page, form, projectName);
     formTaskTitle = `opencode-e2e ${suffix}`;
     const prompt = `list the files ${suffix}`;
     await form.getByPlaceholder("Short description").fill(formTaskTitle);

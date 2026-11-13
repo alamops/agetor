@@ -175,7 +175,7 @@ The installer verifies a SHA-256 checksum and installs a single `agetor` binary 
 ## Quick start
 
 1. Click **New task** in the left rail.
-2. Pick a project folder. If it's a git repository, the task gets its own worktree automatically.
+2. Select one or more projects (the last one you used is preselected). Each project gets its own branch row, and picking two or more turns on worktree isolation. If a project is a git repository, the task gets its own worktree automatically.
 3. Choose an Agent, or pick a harness, model and mode yourself, then write your prompt.
 4. Click **Run task** to start now, or **To backlog** to queue it.
 

@@ -453,6 +453,12 @@ test.describe("Resolve with Agetor dialog", () => {
 
     // --- Locked worktree row ---
     await expect(dlg.getByTestId("worktree-options-locked")).toBeVisible();
+    // The same combined Select Projects control, locked to the PR's repo:
+    // visible, disabled, and showing the repository's own name.
+    const lockedProjects = dlg.getByTestId("select-projects-button");
+    await expect(lockedProjects).toBeVisible();
+    await expect(lockedProjects).toBeDisabled();
+    await expect(lockedProjects).toContainText(path.basename(projectDir));
     const isolateToggle = dlg.getByTestId("isolate-toggle");
     await expect(isolateToggle).toBeChecked();
     await expect(isolateToggle).toBeDisabled();

@@ -5,7 +5,12 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { branchFieldState, type BranchFieldState } from "@/lib/branch-field";
-import { worktreePayload, type WorktreePayload } from "@/lib/worktree-payload";
+import {
+  projectDisplayName,
+  projectSelectionLabel,
+  selectionNames,
+  type RepoSelection,
+} from "@/lib/repo-selection";
 import {
   DEFAULT_BRANCH_CONFIG,
   branchPattern,
@@ -15,28 +20,30 @@ import {
 } from "../../../shared/types.ts";
 import { BranchNamingDialog } from "@/components/settings/BranchNamingDialog";
 import { BranchPicker } from "./BranchPicker";
+import { SelectProjectsButton } from "./ProjectSelection";
+import { SelectProjectsDialog } from "./SelectProjectsDialog";
 
 /**
- * The shared worktree row: the Branch (base ref) picker, the "Isolate
- * (worktree)" checkbox, and — while isolated — the editable branch-name
- * field with its settings gear and `BranchNamingDialog`. Lifted verbatim out
- * of `NewTaskForm.tsx` (its original home) so it can be reused by
- * `CreateTaskFromIssueDialog` (same live behavior) and by
- * `ResolveConflictsDialog` (a read-only `locked` variant — a PR's head
- * branch is always checked out as-is, in its own worktree). All three
- * consumers — `NewTaskForm`, `CreateTaskFromIssueDialog`, and
- * `ResolveConflictsDialog` — are on this module now; there is no separate
- * copy left to keep in lockstep.
+ * The shared worktree block: the full-width **Select Projects** control, one
+ * inline `Branch · <project>` row (picker + Pull + Fetch) per selected
+ * project, the "Isolate (worktree)" checkbox, and — while isolated — the
+ * shared editable branch-name field with its settings gear and
+ * `BranchNamingDialog`.
+ *
+ * One control serves one project and many: the old split (a single project
+ * trigger plus a separate multi-repository dialog, with a different branch UI
+ * per mode) is gone. Selection lives in `repos` (owned by
+ * `useProjectSelection` in the forms); every per-project base ref rides that
+ * same entry. With 2+ projects isolation is forced: the checkbox is checked
+ * and disabled, and `effectiveIsolate` (not the raw toggle) drives the
+ * branch-name field, `valid` and the create payload.
  *
  * The branch-name field follows the clean/dirty model documented in
- * `src/mainview/lib/branch-field.ts`: while clean, it live-renders this
- * project's branch-naming pattern against the current title/type/config on
- * every render; once the user edits it, their literal text wins and is sent
- * to the server verbatim. `src/mainview/lib/worktree-payload.ts`'s
- * `worktreePayload` is the single source of truth for turning this state
- * into the `isolation` / `baseRef` / `branch` fields of a task-create
- * payload — every consumer of this component reads that mapping from
- * `WorktreeOptionsState.payload()` rather than re-deriving it.
+ * `src/mainview/lib/branch-field.ts`. `src/mainview/lib/worktree-payload.ts`'s
+ * `selectionPayload` is the single source of truth for turning the selection +
+ * this state into the `workdir` / `isolation` / `baseRef` / `branch` /
+ * `repositories` fields of a task-create payload — every consumer spreads its
+ * result rather than re-deriving the mapping.
  */
 
 /** Short unique token seeding the `<slug>`/`<token>` fallback in the
@@ -46,18 +53,18 @@ import { BranchPicker } from "./BranchPicker";
 const newBranchToken = () => crypto.randomUUID().replace(/-/g, "").slice(0, 6);
 
 export interface WorktreeOptionsState {
+  /** The raw user toggle. Read the checkbox's `checked` from
+   *  {@link effectiveIsolate}, never this. */
   isolate: boolean;
   setIsolate: Dispatch<SetStateAction<boolean>>;
-  baseRef: string;
-  setBaseRef: (next: string) => void;
-  /** The current branch was pre-selected by `BranchPicker` when the branch
-   *  list arrived — not a user change. `resetForOpen()` clears it. */
-  setBaseRefAuto: (next: string) => void;
-  /** `true` once the user has picked a base ref themselves (any non-empty
-   *  pick). The dialogs' "discard this draft?" check uses this rather than
-   *  `baseRef !== ""`, because `BranchPicker` legitimately auto-selects the
-   *  current branch on load. */
-  baseRefDirty: boolean;
+  /** True for a 2+ (deduped) project selection: isolation is required and the
+   *  checkbox is disabled. */
+  forceIsolate: boolean;
+  /** `forceIsolate || isolate` — the one derived state that drives the
+   *  checkbox, branch-name visibility, `valid` and the payload. Using one
+   *  derivation (rather than an effect that flips the raw toggle) means no
+   *  render can show a value the create path ignores. */
+  effectiveIsolate: boolean;
   branchConfig: BranchNamingConfig;
   branchOverride: string;
   setBranchOverride: Dispatch<SetStateAction<string>>;
@@ -68,16 +75,12 @@ export interface WorktreeOptionsState {
   setBranchSettingsOpen: Dispatch<SetStateAction<boolean>>;
   branchField: BranchFieldState;
   branchValidation: { ok: true } | { ok: false; reason: string };
-  /** `!isolate || branchValidation.ok` — the worktree half of `canSubmit`. */
+  /** `!effectiveIsolate || branchValidation.ok` — the worktree half of
+   *  `canSubmit`. */
   valid: boolean;
-  /** The `isolation`/`baseRef`/`branch` fields of a task-create payload. */
-  payload: () => WorktreePayload;
-  /** ProjectPicker's onChange handler calls this: the previously-picked base
-   *  ref likely doesn't exist on the newly-picked project, so drop back to
-   *  HEAD. */
-  resetBaseRef: () => void;
   /** Post-submit reset: re-derive the branch field from the (now empty)
-   *  title and get a fresh unique token; drop any manual override. */
+   *  title and get a fresh unique token; drop any manual override. The project
+   *  selection and its per-project refs deliberately survive. */
   resetAfterSubmit: () => void;
   /** Fresh-open reset: `resetAfterSubmit()` plus re-arming `isolate` to its
    *  default (`true`). Dialogs (`CreateTaskFromIssueDialog`,
@@ -88,45 +91,58 @@ export interface WorktreeOptionsState {
    *  instead. */
   resetForOpen: () => void;
   onBranchConfigSaved: Dispatch<SetStateAction<BranchNamingConfig>>;
-  /** Echoed back from the hook's own inputs — the component needs both for
-   *  the branch-name field's settings gear and its `BranchNamingDialog`. */
+  /** Echoed back from the hook's own inputs — the component needs it for the
+   *  branch-name field's settings gear and its `BranchNamingDialog`. */
   workdir: string;
   taskType: TaskType;
 }
 
 /**
- * Owns all state/effects/derivations behind the worktree row: the isolate
- * toggle, the base-ref picker's value, the per-project branch-naming config
- * fetch, and the clean/dirty branch-name field. Mirrors `TaskLaunchPickers`'s
- * `useTaskLaunch` house style — state hook + component + helper in one file.
+ * Owns the state/effects/derivations behind the worktree block: the isolate
+ * toggle (plus the forced state for 2+ projects), the per-project branch-naming
+ * config fetch, and the clean/dirty branch-name field. The selection and every
+ * base ref are owned by `useProjectSelection` — this hook never sees them.
  */
-export function useWorktreeOptions({ workdir, title, taskType, enabled = true }: { workdir: string; title: string; taskType: TaskType; enabled?: boolean }): WorktreeOptionsState {
+export function useWorktreeOptions({
+  workdir,
+  title,
+  taskType,
+  enabled = true,
+  forceIsolate = false,
+}: {
+  workdir: string;
+  title: string;
+  taskType: TaskType;
+  enabled?: boolean;
+  forceIsolate?: boolean;
+}): WorktreeOptionsState {
   const [isolate, setIsolate] = useState(true);
-  const [baseRef, setBaseRefState] = useState("");
-  // The user's own base-ref pick, distinct from `BranchPicker`'s automatic
-  // "preselect the current branch" seed — see `baseRefDirty`'s doc comment.
-  const [baseRefDirty, setBaseRefDirty] = useState(false);
-  const setBaseRef = (next: string) => {
-    setBaseRefState(next);
-    setBaseRefDirty(next.trim().length > 0);
-  };
-  const setBaseRefAuto = (next: string) => {
-    setBaseRefState(next);
-  };
-  // Branch nomenclature for the selected project (loaded from the server;
-  // falls back to the built-in defaults). While clean (`!branchDirty`), the
-  // field DERIVES its display from the tag-visible PATTERN (e.g.
-  // `feature/<slug>`) rendered live against the current title/type/config —
-  // realtime by construction, no seeding effect required. Once the user edits
-  // it (`branchDirty`), `branchOverride` holds their literal text, sent to the
-  // server verbatim — tags and all, the server resolves them authoritatively
-  // at create time. `branchToken` seeds the client-side preview/validation
-  // fallback (used when `<slug>` would otherwise render empty).
+  // Branch nomenclature for the first selected project (loaded from the
+  // server; falls back to the built-in defaults — the server anchors a
+  // multi-repository task's shared name on its first kept repository, so the
+  // preview matches what will actually be created). While clean
+  // (`!branchDirty`), the field DERIVES its display from the tag-visible
+  // PATTERN (e.g. `feature/<slug>`) rendered live against the current
+  // title/type/config — realtime by construction, no seeding effect required.
+  // Once the user edits it (`branchDirty`), `branchOverride` holds their
+  // literal text, sent to the server verbatim — tags and all, the server
+  // resolves them authoritatively at create time. `branchToken` seeds the
+  // client-side preview/validation fallback.
   const [branchConfig, setBranchConfig] = useState<BranchNamingConfig>(DEFAULT_BRANCH_CONFIG);
   const [branchOverride, setBranchOverride] = useState("");
   const [branchDirty, setBranchDirty] = useState(false);
   const [branchToken, setBranchToken] = useState(newBranchToken);
   const [branchSettingsOpen, setBranchSettingsOpen] = useState(false);
+
+  // Keep the raw toggle sticky at true once isolation is forced, so collapsing
+  // back to one project leaves it checked (the owner's decision) rather than
+  // silently unchecking the task's layout. One contained effect — every
+  // read path above still uses the derived `effectiveIsolate`.
+  useEffect(() => {
+    if (forceIsolate) setIsolate(true);
+  }, [forceIsolate]);
+
+  const effectiveIsolate = forceIsolate || isolate;
 
   // Load the selected project's branch nomenclature. Empty workdir → defaults.
   // `enabled` (default true) lets a caller mounted unconditionally but not
@@ -184,16 +200,12 @@ export function useWorktreeOptions({ workdir, title, taskType, enabled = true }:
     [branchField.resolved],
   );
 
-  const valid = !isolate || branchValidation.ok;
-
-  const payload = () => worktreePayload({ isolate, baseRef, branchSubmitValue: branchField.submitValue });
-
-  const resetBaseRef = () => setBaseRef("");
+  const valid = !effectiveIsolate || branchValidation.ok;
 
   const resetAfterSubmit = () => {
-    setBaseRef("");
     // Reset the branch field so the next task re-derives from its (now empty)
-    // title and gets a fresh unique token; drop any manual override.
+    // title and gets a fresh unique token; drop any manual override. The
+    // project selection and every per-project ref stay for the next task.
     setBranchDirty(false);
     setBranchToken(newBranchToken());
   };
@@ -206,10 +218,8 @@ export function useWorktreeOptions({ workdir, title, taskType, enabled = true }:
   return {
     isolate,
     setIsolate,
-    baseRef,
-    setBaseRef,
-    setBaseRefAuto,
-    baseRefDirty,
+    forceIsolate,
+    effectiveIsolate,
     branchConfig,
     branchOverride,
     setBranchOverride,
@@ -221,8 +231,6 @@ export function useWorktreeOptions({ workdir, title, taskType, enabled = true }:
     branchField,
     branchValidation,
     valid,
-    payload,
-    resetBaseRef,
     resetAfterSubmit,
     resetForOpen,
     onBranchConfigSaved: setBranchConfig,
@@ -235,37 +243,49 @@ const isolateTitle =
   "Runs the agent on a dedicated branch off the chosen base, so parallel tasks "
   + "on the same repo don't collide. No-op when the workdir isn't a git repo.";
 
+const forcedIsolateTitle =
+  "Two or more projects always use worktree isolation: each project gets its own worktree and branch.";
+
+const baseRefTitle =
+  "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start.";
+
+const baseRefOffTitle =
+  "Isolation is off — the value is recorded but the agent will run directly in the project workdir.";
+
 type Props =
   | {
       state: WorktreeOptionsState;
-      /**
-       * `"multi"` for a 2+ repository task: isolation is forced on and each
-       * repository's base ref comes from the Repositories dialog, so the
-       * single-project branch picker and the isolate toggle are hidden (they
-       * would show values the server ignores) while the shared branch-name
-       * field stays editable.
-       */
-      variant?: "default" | "multi";
+      /** The selected projects (its first entry is the primary). */
+      repos: RepoSelection[];
+      onReposChange: Dispatch<SetStateAction<RepoSelection[]>>;
+      /** A user-picked base ref for one project. */
+      onBaseRefChange: (path: string, baseRef: string) => void;
+      /** `BranchPicker`'s automatic "preselect the current branch" seed. */
+      onBaseRefAuto: (path: string, baseRef: string) => void;
+      /** A project that must stay selected (the issue dialog's own repo). */
+      lockedPath?: string | null;
     }
-  | { locked: { branch: string } };
+  | { locked: { branch: string; projectPath?: string } };
 
 /**
- * Renders the worktree row. Live variant (`{ state }`): the Branch picker,
- * the isolate checkbox, and — while isolated — the editable branch-name
- * field + `BranchNamingDialog`, byte-identical to `NewTaskForm`'s original
- * JSX. `variant: "multi"` hides the single-project picker and isolate toggle
- * (2+ repos force isolation and take per-repo base refs from the Repositories
- * dialog) while keeping the shared branch-name field. Locked variant
- * (`{ locked: { branch } }`): a read-only row for
- * `existingBranch` tasks (the PR-conflicts modal), where the PR's head
- * branch is always checked out as-is in its own worktree — no base-ref
- * picker, no editable name, no dialog.
+ * Renders the worktree block. Live variant (`{ state, repos, … }`): Select
+ * Projects → one Branch row per project → Isolate → (while isolated) the
+ * branch-name field + `BranchNamingDialog`. Locked variant (`{ locked }`): the
+ * PR-conflicts modal, where the PR's head branch is checked out as-is in its
+ * own worktree — a disabled Select Projects control showing the PR's repo, a
+ * read-only branch row, and a checked/disabled isolate checkbox.
  */
 export function WorktreeOptions(props: Props) {
   if ("locked" in props) {
-    const { branch } = props.locked;
+    const { branch, projectPath } = props.locked;
     return (
       <div data-testid="worktree-options-locked" className="space-y-3">
+        <SelectProjectsButton
+          label={projectPath ? projectDisplayName(projectPath) : "Project"}
+          onClick={() => {}}
+          locked
+        />
+
         <div className="min-w-0 space-y-1">
           <label className="text-muted-foreground">Branch</label>
           <Input
@@ -289,14 +309,22 @@ export function WorktreeOptions(props: Props) {
     );
   }
 
-  const { state, variant = "default" } = props;
-  const multi = variant === "multi";
+  return <LiveWorktreeOptions {...props} />;
+}
+
+function LiveWorktreeOptions({
+  state,
+  repos,
+  onReposChange,
+  onBaseRefChange,
+  onBaseRefAuto,
+  lockedPath,
+}: Extract<Props, { state: WorktreeOptionsState }>) {
+  const [selectOpen, setSelectOpen] = useState(false);
   const {
-    isolate,
     setIsolate,
-    baseRef,
-    setBaseRef,
-    setBaseRefAuto,
+    forceIsolate,
+    effectiveIsolate,
     workdir,
     taskType,
     branchOverride,
@@ -310,49 +338,66 @@ export function WorktreeOptions(props: Props) {
     onBranchConfigSaved,
   } = state;
 
+  // Workspace names, in order — the same slugs the server uses, so a row's
+  // test id/label maps to the actual subdirectory for a multi task.
+  const names = useMemo(() => selectionNames(repos), [repos]);
+
   return (
     <div data-testid="worktree-options" className="space-y-3">
-      {!multi && (
-        <BranchPicker
-          label="Branch"
-          workdir={workdir}
-          value={baseRef}
-          onChange={setBaseRef}
-          onAutoSelect={setBaseRefAuto}
-          placement="bottom"
-          title={
-            isolate
-              ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
-              : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
-          }
-        />
+      <SelectProjectsButton label={projectSelectionLabel(repos)} onClick={() => setSelectOpen(true)} />
+      <SelectProjectsDialog
+        open={selectOpen}
+        onClose={() => setSelectOpen(false)}
+        value={repos}
+        onSave={onReposChange}
+        lockedPath={lockedPath}
+      />
+
+      {repos.length === 0 ? (
+        <p data-testid="select-projects-empty" className="text-[11px] text-muted-foreground">
+          Select a project to choose its branch and worktree options.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {repos.map((repo, i) => (
+            <div key={repo.path} data-testid={`branch-row-${names[i]}`}>
+              <BranchPicker
+                label={`Branch · ${names[i]}`}
+                workdir={repo.path}
+                value={repo.baseRef ?? ""}
+                onChange={(next) => onBaseRefChange(repo.path, next)}
+                onAutoSelect={(next) => onBaseRefAuto(repo.path, next)}
+                placement="bottom"
+                title={effectiveIsolate ? baseRefTitle : baseRefOffTitle}
+              />
+            </div>
+          ))}
+        </div>
       )}
 
-      {!multi && (
+      <div className="space-y-1">
         <label
-          className="flex cursor-pointer items-center gap-1.5"
-          title={isolateTitle}
+          className={cn("flex items-center gap-1.5", forceIsolate ? "cursor-default" : "cursor-pointer")}
+          title={forceIsolate ? forcedIsolateTitle : isolateTitle}
         >
           <input
             type="checkbox"
-            checked={isolate}
+            checked={effectiveIsolate}
+            disabled={forceIsolate}
             onChange={(e) => setIsolate(e.target.checked)}
             data-testid="isolate-toggle"
           />
           <GitBranch className="size-3" />
           <span>Isolate (worktree)</span>
         </label>
-      )}
+        {forceIsolate ? (
+          <p className="pl-5 text-[10px] text-muted-foreground">
+            Always on when more than one project is selected.
+          </p>
+        ) : null}
+      </div>
 
-      {multi && (
-        <p className="text-[11px] text-muted-foreground">
-          Worktree isolation is always on. Each repository branches from its own base
-          ref (set in the Repositories dialog); this name is used in every repository,
-          with a `-N` fallback where it is already taken.
-        </p>
-      )}
-
-      {(multi || isolate) && (
+      {effectiveIsolate && (
         <div className="space-y-1">
           <label className="text-muted-foreground">Branch name</label>
           <div className="relative">
@@ -398,6 +443,11 @@ export function WorktreeOptions(props: Props) {
               Reset to pattern
             </button>
           )}
+          {repos.length > 1 ? (
+            <p className="text-[10px] text-muted-foreground">
+              This name is used in every project, with a `-N` fallback where it is already taken.
+            </p>
+          ) : null}
         </div>
       )}
 

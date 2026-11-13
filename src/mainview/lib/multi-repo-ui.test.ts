@@ -3,7 +3,6 @@
 // to. See docs/architecture/multi-repo-tasks.md.
 import { afterEach, describe, expect, test } from "bun:test";
 import {
-  applyRepositoriesSave,
   beginPrBatch,
   createSessionGuard,
   describeRootConflict,
@@ -17,7 +16,6 @@ import {
   resetPrBatchesForTest,
   repositoryCountLabel,
   resolveConflictsKey,
-  seedRepositoriesDialogValue,
   selectedRepositoryName,
   subscribePrBatches,
   taskSearchText,
@@ -36,81 +34,6 @@ function repo(over: Partial<TaskRepository> & { name: string }): TaskRepository 
     ...over,
   };
 }
-
-describe("seedRepositoriesDialogValue (S9)", () => {
-  test("a single selection carries the inline base ref into its entry", () => {
-    expect(seedRepositoriesDialogValue([{ path: "/fe", root: null }], "/fe", "release/1.2")).toEqual([
-      { path: "/fe", root: null, baseRef: "release/1.2" },
-    ]);
-  });
-
-  test("an empty selection seeds the primary path with the inline base ref", () => {
-    expect(seedRepositoriesDialogValue([], "/fe", " release/1.2 ")).toEqual([
-      { path: "/fe", root: null, baseRef: "release/1.2" },
-    ]);
-    expect(seedRepositoriesDialogValue([], "", "main")).toEqual([]);
-  });
-
-  test("the inline value wins over a stale per-entry pin, and blank means no pin", () => {
-    expect(seedRepositoriesDialogValue([{ path: "/fe", root: null, baseRef: "old" }], "/fe", "")).toEqual([
-      { path: "/fe", root: null },
-    ]);
-  });
-
-  test("a multi selection is per-entry and passes through unchanged", () => {
-    const multi = [
-      { path: "/fe", root: null, baseRef: "a" },
-      { path: "/be", root: null },
-    ];
-    expect(seedRepositoriesDialogValue(multi, "/fe", "release/1.2")).toEqual(multi);
-  });
-});
-
-describe("applyRepositoriesSave (S9)", () => {
-  test("going multi keeps the first entry's carried base ref in the payload set", () => {
-    const seeded = seedRepositoriesDialogValue([{ path: "/fe", root: null }], "/fe", "release/1.2");
-    const next = [...seeded, { path: "/be", root: "/be" }];
-    const applied = applyRepositoriesSave(next, { primaryPath: "/fe", inlineBaseRef: "release/1.2" });
-    expect(applied.repos[0]).toEqual({ path: "/fe", root: null, baseRef: "release/1.2" });
-    expect(applied.primaryPath).toBe("/fe");
-    expect(applied.inlineBaseRef).toEqual({ kind: "keep" });
-  });
-
-  test("promoting a different first repository resets the inline base ref", () => {
-    const applied = applyRepositoriesSave(
-      [{ path: "/be", root: null }, { path: "/x", root: null }],
-      { primaryPath: "/fe", inlineBaseRef: "release/1.2" },
-    );
-    expect(applied.primaryPath).toBe("/be");
-    expect(applied.inlineBaseRef).toEqual({ kind: "set", value: "" });
-  });
-
-  test("collapsing back to the same repository hands its edited pin to the inline picker", () => {
-    const applied = applyRepositoriesSave(
-      [{ path: "/fe", root: "/fe", baseRef: "release/1.3" }],
-      { primaryPath: "/fe", inlineBaseRef: "release/1.2" },
-    );
-    expect(applied.repos).toEqual([{ path: "/fe", root: "/fe" }]);
-    expect(applied.inlineBaseRef).toEqual({ kind: "set", value: "release/1.3" });
-  });
-
-  test("an unchanged single save keeps the inline value", () => {
-    const applied = applyRepositoriesSave(
-      [{ path: "/fe", root: "/fe", baseRef: "main" }],
-      { primaryPath: "/fe", inlineBaseRef: "main" },
-    );
-    expect(applied.inlineBaseRef).toEqual({ kind: "keep" });
-  });
-
-  test("collapsing to a different repository takes that entry's own pin", () => {
-    const applied = applyRepositoriesSave(
-      [{ path: "/be", root: "/be", baseRef: "v2" }],
-      { primaryPath: "/fe", inlineBaseRef: "release/1.2" },
-    );
-    expect(applied.primaryPath).toBe("/be");
-    expect(applied.inlineBaseRef).toEqual({ kind: "set", value: "v2" });
-  });
-});
 
 describe("mergeSelectionsByRoot (W5)", () => {
   test("a base ref set on a collapsed duplicate survives on the kept entry", () => {
