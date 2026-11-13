@@ -369,3 +369,20 @@ The write-tests step added coverage for behavior that the implementation rounds 
 | e2e | `e2e/issue-task.spec.ts` | A user-picked base ref in the issue dialog's inline row makes the draft dirty (`refDirty`), so “Manage pipelines…” asks before discarding; cancelling keeps the pick. The existing clean-draft case already pins the automatic current-branch seed as *not* dirty. |
 
 **Verification:** `bun run typecheck` clean; focused unit 81/81 across the five files; `e2e/select-projects.spec.ts` 16/16 with `--retries=0`; the new `issue-task` scenario passes on its own. Red proofs (mutation, then restored): slug-labelled rows and a non-disabled locked button each turn the new unit tests red; a hard-coded 2-project label turns the 3+ case red; a collapsed recheck that rebuilds `{path, root:null}`, a row wired to `repos[0]`, a checkbox that ignores `busy`, `pickProject()` without the starting folder, a removed re-seed, and `refDirty` forced to `false` each turn their e2e scenario red. `quality_gates.py hygiene --worktree` → 0 leads.
+
+### 10.4 Test-loop verification (2026-11-13)
+
+Full-suite run of the whole tree at `755b2c71`. **No product or test defect was found; no code or test was changed in this round.**
+
+| Layer / gate | Command | Result |
+| --- | --- | --- |
+| Typecheck | `bun run typecheck` | clean |
+| Focused unit | `bun test ProjectSelection.test.tsx WorktreeOptions.test.tsx repo-selection.test.ts multi-repo-ui.test.ts worktree-payload.test.ts` | **81 pass / 0 fail** |
+| Full unit | `bun test --reporter=junit` | **13,390 pass / 32 skip / 1 fail** of 13,423 in 529 files; the one failure is the `orchestrator-hold-scope-claim.test.ts` **afterAll** hook hitting Bun's 5 s hook timeout (its single test passed). The file passes 1/1 alone, `src/bun` is untouched apart from comments, and the same hook timeout is the pre-existing full-suite flake recorded in §10 — environment load, not behavior. The 32 skips are the existing real-binary/`AGETOR_REAL_*` gates, unchanged from the base run. |
+| Full e2e | `bun node_modules/@playwright/test/cli.js test --workers=3` | **492 passed / 0 failed** (14.0 min, `retries: 0`) |
+| Affected e2e batch | `… select-projects multi-repo-task issue-task resolve-conflicts identifier-inputs --workers=2` | **52/52 pass** (1.8 min) |
+| Adjacent e2e batch | `… at-file-autocomplete branch-scoped-capabilities clone-project clone-providers agent-profiles-dialogs cursor-stream copilot-harness copilot-harness-availability speed-picker fx-recovery fx-interactions opencode-harness --workers=2` | **86/87 pass**; the one failure was `speed-picker` "Task details (cursor)…" timing out under a machine-load spike (load avg 40+ from unrelated processes), re-ran green alone (7.1 s) and the whole file green **13/13**. |
+| Flake re-runs | `… multi-repo-task.spec.ts --workers=1`; `… speed-picker.spec.ts --workers=1` | **11/11** and **13/13** — both files that failed during the load spike pass on a clean re-run. Two earlier full-suite attempts under load average 35–59 produced only worker-starvation timeouts (whole files at exactly their per-test timeout); the low-load run above is the reported result. |
+| Static gates | `quality_gates.py wiring --worktree` / `hygiene --worktree` | 10 new exports, **0 not reached**; **0 hygiene leads** |
+
+No flaky *product* path surfaced: every rerun of the feature's own specs (`select-projects`, `multi-repo-task`, `issue-task`, `resolve-conflicts`, `identifier-inputs`) was green under `retries: 0`.
