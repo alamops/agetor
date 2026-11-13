@@ -52,12 +52,31 @@ export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
   out(`${c.green("→")} commit & push requested for ${c.dim(short)}${c.dim(note)}`);
 }
 
+type CommitNoteStatus = { hasChanges: boolean; ahead?: number; ignored?: boolean };
+
 /** The best-effort heads-up appended to the success line. Empty in the normal
  *  case (uncommitted changes present); `ignored` (not a git repo) wins over a
  *  clean tree. A clean tree with nothing ahead of upstream means there's
  *  nothing for the prompt to do at all. Pure so the note contract can be
- *  unit-tested. */
-export function commitNote(git: { hasChanges: boolean; ahead?: number; ignored?: boolean }): string {
+ *  unit-tested.
+ *
+ *  A multi-repository task's top-level fields mirror only its first
+ *  repository, so with `repositories` present the note is computed over every
+ *  repository: any dirty one means there is work to commit, any one ahead
+ *  means a push; only when every inspectable repository is clean and level
+ *  is there nothing to do. An uninspectable repository next to clean ones
+ *  can't be called clean, so it suppresses the note. */
+export function commitNote(git: CommitNoteStatus & { repositories?: CommitNoteStatus[] }): string {
+  const repos = git.repositories;
+  // The per-repository array is present only for a multi task — also one
+  // left with a single repository (issue #291) — so presence decides.
+  if (repos && repos.length > 0) {
+    const readable = repos.filter((r) => !r.ignored);
+    if (readable.length === 0) return " (not a git worktree)";
+    if (readable.some((r) => r.hasChanges)) return "";
+    if (readable.length < repos.length) return "";
+    return readable.some((r) => (r.ahead ?? 0) > 0) ? " (working tree clean — push only)" : " (nothing to commit or push)";
+  }
   if (git.ignored) return " (not a git worktree)";
   if (!git.hasChanges) {
     return (git.ahead ?? 0) > 0 ? " (working tree clean — push only)" : " (nothing to commit or push)";

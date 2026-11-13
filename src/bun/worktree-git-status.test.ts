@@ -277,3 +277,50 @@ test("deleteOrphanWorktree: two back-to-back orphan deletes in the same source r
   expect(existsSync(dirA)).toBe(false);
   expect(existsSync(dirB)).toBe(false);
 });
+
+test("worktreeGitStatus resolves a nested multi-repository id to that repo's worktree", async () => {
+  const { createTask, worktreeGitStatus } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const { tasks, db } = await import("./db.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi status",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.setRepositories(taskId, prepared.repositories!);
+    const names = uniqueRepoSlugs([a, b]);
+    const [entryA, entryB] = prepared.repositories!;
+    expect([entryA?.name, entryB?.name]).toEqual(names);
+    // Make the two checkouts differ so a resolver that answered every nested
+    // id with repository 0's (or the workspace root's) status would fail:
+    // A is clean with one commit ahead of its base, B is dirty and not ahead.
+    writeFileSync(path.join(entryA!.worktreePath!, "a-only.txt"), "a\n");
+    await git(["add", "."], entryA!.worktreePath!);
+    await git(["commit", "-m", "a-only commit"], entryA!.worktreePath!);
+    writeFileSync(path.join(entryB!.worktreePath!, "b-untracked.txt"), "b\n");
+
+    const statusA = await worktreeGitStatus(`${taskId}__${names[0]}`);
+    const statusB = await worktreeGitStatus(`${taskId}__${names[1]}`);
+    if ("error" in statusA) throw new Error(statusA.error);
+    if ("error" in statusB) throw new Error(statusB.error);
+    expect(statusA).toEqual({ dirty: false, ahead: 1, merged: false, ignored: false, branch: entryA!.branch });
+    expect(statusB).toEqual({ dirty: true, ahead: 0, merged: true, ignored: false, branch: entryB!.branch });
+    // Traversal ids are refused by the shared guard.
+    expect("error" in (await worktreeGitStatus(`${taskId}__..`))).toBe(true);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    rmSync(path.join((await import("./worktree.ts")).WORKTREES_DIR, taskId), { recursive: true, force: true });
+  }
+});

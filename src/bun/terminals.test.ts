@@ -387,13 +387,16 @@ test("createTerminal waits out a queued teardown before reusing the worktree", a
 });
 
 /** Open a terminal on `taskId`, running `during` right after the real
- *  `prepareWorkdir` returns — the window between terminal open's teardown
- *  wait and its spawn, where a delete or archive can land. */
+ *  `prepareTaskWorkdir` returns — the window between terminal open's teardown
+ *  wait and its spawn, where a delete or archive can land. `createTerminal`
+ *  goes through `prepareTaskWorkdir` for both layouts (it delegates to
+ *  `prepareWorkdir` for a single repository), so spying there covers multi
+ *  tasks too. */
 async function openWithPrepareHook<T>(taskId: string, during: () => T | Promise<T>) {
   const worktree = await import("./worktree.ts");
-  const real = worktree.prepareWorkdir;
+  const real = worktree.prepareTaskWorkdir;
   let produced: T | undefined;
-  const spy = spyOn(worktree, "prepareWorkdir").mockImplementation(async (t, opts) => {
+  const spy = spyOn(worktree, "prepareTaskWorkdir").mockImplementation(async (t, opts) => {
     const res = await real(t, opts);
     produced = await during();
     return res;
@@ -466,6 +469,41 @@ test("createTerminal refused by an archive during prepareWorkdir detaches the wo
   expect(branchExists(repo, "agetor/archive-during-open")).toBe(true);
 });
 
+test("createTerminal refused by an archive during prepareTaskWorkdir cleans up every materialized repository", async () => {
+  const { createTask, archiveTask, pendingTeardown } = await import("./orchestrator.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi terminal archive race",
+    prompt: "p",
+    agent: "codex",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  const workspace = created.task.workdir;
+  const names = uniqueRepoSlugs([a, b]);
+  const branches = created.task.repositories!.map((r) => r.branch!);
+  // Archive only acts on a `done` task (the existing single-repo test does the
+  // same via makeTask).
+  tasks.update(id, { column: "done" });
+
+  const { result } = await openWithPrepareHook(id, () => archiveTask(id));
+  expect(result).toEqual({ error: ARCHIVED_TERMINAL_ERROR });
+  await pendingTeardown(id);
+
+  expect(countTerminals(id)).toBe(0);
+  // Neither the nested checkouts nor the now-empty workspace outlived the
+  // archive; every repository's branch survives for unarchive.
+  for (const name of names) expect(existsSync(path.join(workspace, name))).toBe(false);
+  expect(existsSync(workspace)).toBe(false);
+  expect(branchExists(a, branches[0]!)).toBe(true);
+  expect(branchExists(b, branches[1]!)).toBe(true);
+});
+
 test("createTerminal refuses a pipeline task while its delete awaits the step cascade", async () => {
   const { deleteTask, isTaskTearingDown } = await import("./orchestrator.ts");
   const { withPipelineLock } = await import("./pipeline-runner.ts");
@@ -515,3 +553,47 @@ test("a shell that exits is auto-removed from the manager", async () => {
   expect(gone).toBe(true);
   expect(tasks.get(task.id)!.openTerminalCount).toBe(0);
 }, SHELL_READY_MS + 10_000);
+
+test("createTerminal opens at the workspace by default and inside a selected repository", async () => {
+  const { createTask, deleteTask } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir, worktreePath } = await import("./worktree.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi terminal",
+    prompt: "p",
+    agent: "codex",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const id = created.task.id;
+  const opened: string[] = [];
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(id, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(id, prepared.repositories!);
+    const names = uniqueRepoSlugs([a, b]);
+
+    const atRoot = await createTerminal(id);
+    if ("error" in atRoot) throw new Error(atRoot.error);
+    opened.push(atRoot.id);
+    expect(atRoot.cwd).toBe(worktreePath(created.task));
+    expect(atRoot.repoName).toBeUndefined();
+
+    const inRepo = await createTerminal(id, { repo: names[1]! });
+    if ("error" in inRepo) throw new Error(inRepo.error);
+    opened.push(inRepo.id);
+    expect(inRepo.cwd).toBe(prepared.repositories![1]!.worktreePath ?? "");
+    expect(inRepo.repoName).toBe(names[1]);
+
+    const bad = await createTerminal(id, { repo: "nope" });
+    expect("error" in bad && /unknown repository/.test(bad.error)).toBe(true);
+  } finally {
+    for (const tid of opened) closeTerminal(tid);
+    await deleteTask(id);
+  }
+});

@@ -2117,7 +2117,7 @@ test("086 on the real schema: cursor Fable 5.2/5.1 variants fold to a base id th
        ('lastModel:fx', 'claude-fable-5-2-high', 7)`,
   );
 
-  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
 
   type TaskRow = {
     id: string;
@@ -2280,7 +2280,7 @@ test("082 adds opencode_stopped_children (no foreign key) and the partial OpenCo
     INSERT INTO subagents (id, task_id, parent_kind, source_path, status, started_at, ended_at)
       VALUES ('opencode-ses_1', 't1', 'opencode_subagent', 'opencode-session:ses_1', 'orphaned', 1, 2);
   `);
-  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["082_opencode_child_bookkeeping", "083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
   expect(columnNames(db, "opencode_stopped_children")).toEqual(["child_session_id", "task_id", "stopped_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_stopped_children)`).all()).toEqual([]);
   // A note for a task id that doesn't exist (or no longer does) is accepted.
@@ -2311,8 +2311,19 @@ test("084 (harness stacks) follows 083 (opencode watch tombstones)", () => {
   expect(migrations[at]?.sql).toContain("ALTER TABLE tasks ADD COLUMN harness_state");
 });
 
-test("086 (normalize cursor fable 5.2) follows 085 (stack members without the harnesses FK)", () => {
+test("091 (task repositories) is the last registered migration, after 090 (harness mirror backup folder)", () => {
+  const at = migrations.findIndex((m) => m.id === "091_task_repositories");
+  expect(at).toBe(migrations.length - 1);
+  expect(migrations[at - 1]?.id).toBe("090_harness_mirror_backup_folder");
+  expect(migrations[at]?.aliases).toEqual(["087_task_repositories"]);
+  expect(migrations[at]?.sql).toContain("ALTER TABLE tasks ADD COLUMN repositories");
+  expect(migrations[at]?.sql).toContain("ALTER TABLE tasks ADD COLUMN issue_repo_path");
+  expect(migrations[at]?.sql).toContain("DEFAULT '[]'");
+});
+
+test("086 (normalize cursor fable 5.2) follows 085, before 087, and folds both families", () => {
   const at = migrations.findIndex((m) => m.id === "086_normalize_cursor_fable_5_2");
+  expect(at).toBeGreaterThan(0);
   expect(migrations[at + 1]?.id).toBe("087_harness_stacks_fix_round");
   expect(migrations[at - 1]?.id).toBe("085_harness_stack_members_no_harness_fk");
   expect(migrations[at]?.aliases).toBeUndefined();
@@ -2329,7 +2340,7 @@ test("083 adds opencode_watch_tombstones (no foreign key, session id primary key
   const db = new Database(":memory:");
   migrateThrough(db, "082_opencode_child_bookkeeping");
   db.exec(`INSERT INTO tasks (id, title, prompt, "column", agent, workdir, created_at, updated_at) VALUES ('t1', 't', 'p', 'backlog', 'opencode', '/w', 1, 1)`);
-  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["083_opencode_watch_tombstones", "084_harness_stacks", "085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
   expect(columnNames(db, "opencode_watch_tombstones")).toEqual(["session_id", "harness_id", "task_id", "expires_at"]);
   expect(db.query<unknown, []>(`PRAGMA foreign_key_list(opencode_watch_tombstones)`).all()).toEqual([]);
   // A tombstone outlives its task: a task id that doesn't exist is accepted.
@@ -2392,6 +2403,7 @@ test("078-080 on a 077-era DB keep every harnesses row and column, seed a disabl
     "088_harness_orphaned_copies",
     "089_harness_mirror_sources",
     "090_harness_mirror_backup_folder",
+    "091_task_repositories",
   ]);
   expect(db.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cursor_asks'`).get()).toBeTruthy();
 
@@ -2488,7 +2500,7 @@ test("085 rebuilds harness_stack_members without the harnesses FK, keeping rows,
     INSERT INTO harness_stacks (id, label, kind, created_at, updated_at) VALUES ('s1', 'Claude', 'claude-code', 1, 1);
     INSERT INTO harness_stack_members (stack_id, harness_id, position) VALUES ('s1', 'claude-code', 0), ('s1', 'cc-b', 1);
   `);
-  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["085_harness_stack_members_no_harness_fk", "086_normalize_cursor_fable_5_2", "087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
   expect(columnNames(db, "harness_stack_members")).toEqual(["stack_id", "harness_id", "position"]);
   const fks = db.query<{ table: string; on_delete: string }, []>(`PRAGMA foreign_key_list(harness_stack_members)`).all();
   expect(fks.map((f) => [f.table, f.on_delete])).toEqual([["harness_stacks", "CASCADE"]]);
@@ -2548,7 +2560,7 @@ test("087 keeps cooldown rows as whole-account (model ''), keys by (harness, mod
   migrateThrough(db, "086_normalize_cursor_fable_5_2");
   db.exec(`INSERT INTO harness_limit_state (harness_id, reason, source, message, exhausted_until_ms, updated_at)
            VALUES ('cc-a', 'quota', 'claude-pane', 'usage limit', 9000, 100)`);
-  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
   expect(columnNames(db, "harness_limit_state")).toEqual(
     ["harness_id", "model", "reason", "source", "message", "exhausted_until_ms", "updated_at"],
   );
@@ -2588,7 +2600,7 @@ test("087 N-1: several real cooldown rows survive byte-for-byte as whole-account
       [id, reason, source, message, until, at],
     );
   }
-  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["087_harness_stacks_fix_round", "088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
   const rows = db.query(`SELECT * FROM harness_limit_state ORDER BY harness_id`).all();
   expect(rows).toEqual(
     seeded.map(([harness_id, reason, source, message, exhausted_until_ms, updated_at]) => ({
@@ -2634,7 +2646,7 @@ test("088 adds harness_orphaned_copies (no foreign key, (harness, column, path) 
      VALUES ('t1', 'cc-b', 'claude_session_id', 's-new', '["/r/projects/e/s-old.jsonl","/r/projects/e/s-new.jsonl"]', 5)`,
   );
   const before = db.query(`SELECT * FROM harness_session_handoffs`).all();
-  expect(migrate(db, migrations)).toEqual(["088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["088_harness_orphaned_copies", "089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
   expect(db.query(`SELECT * FROM harness_session_handoffs`).all()).toEqual(before);
   expect(columnNames(db, "harness_orphaned_copies")).toEqual(["harness_id", "column_name", "session_id", "path", "created_at"]);
   expect(db.query<{ name: string }, []>(`PRAGMA foreign_key_list(harness_orphaned_copies)`).all()).toEqual([]);
@@ -2652,7 +2664,7 @@ test("088 adds harness_orphaned_copies (no foreign key, (harness, column, path) 
 test("089 adds harness_mirror_sources (one row per backup account, no foreign key) on an 088 DB", () => {
   const db = new Database(":memory:");
   migrateThrough(db, "088_harness_orphaned_copies");
-  expect(migrate(db, migrations)).toEqual(["089_harness_mirror_sources", "090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["089_harness_mirror_sources", "090_harness_mirror_backup_folder", "091_task_repositories"]);
   expect(columnNames(db, "harness_mirror_sources")).toEqual([
     "harness_id", "primary_id", "primary_root", "primary_config", "updated_at", "backup_root", "backup_config",
   ]);
@@ -2667,7 +2679,7 @@ test("090 adds the backup's own folder and fingerprint to harness_mirror_sources
   const db = new Database(":memory:");
   migrateThrough(db, "089_harness_mirror_sources");
   db.run(`INSERT INTO harness_mirror_sources VALUES ('backup', 'primary', '/a', '{"home":null,"env":{}}', 7)`);
-  expect(migrate(db, migrations)).toEqual(["090_harness_mirror_backup_folder"]);
+  expect(migrate(db, migrations)).toEqual(["090_harness_mirror_backup_folder", "091_task_repositories"]);
   expect(columnNames(db, "harness_mirror_sources")).toEqual([
     "harness_id", "primary_id", "primary_root", "primary_config", "updated_at", "backup_root", "backup_config",
   ]);

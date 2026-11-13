@@ -8,6 +8,7 @@ import { pipelineStepProgress, stepNameById } from "../../shared/pipeline.ts";
 import { harnessMoveNote, harnessStackBannerMode, memberReasonText, memberStateText, stackPositionText } from "../../shared/harness-stack.ts";
 import { coolingText, limitRowsForModel } from "../stack-display.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 import { colorRunStatus } from "./pipeline.ts";
 import { profileHarnessContext, type ProfileHarnessContext } from "./agent-profile.ts";
 
@@ -110,7 +111,26 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   if (hs?.lastMove?.reason === "switch-now" && harnessStackBannerMode(hs) === "moved") {
     out(`  ${label("switch")} ${escapeFreeText(harnessMoveNote(hs.lastMove, task.agent))} ${c.dim(`(${new Date(hs.lastMove.at).toLocaleString()})`)}`);
   }
-  out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
+  out(`  ${label("workdir")} ${c.dim(escapeControlChars(task.workdir))}`);
+  // `isMultiRepoTask`, not a count: a multi task left with one repository
+  // (issue #291) still prints its repository block.
+  if (isMultiRepoTask(task)) {
+    const repos = task.repositories ?? [];
+    out(`  ${label("repos")} ${repos.length}`);
+    for (const repo of repos) {
+      const branch = repo.branch ? ` (${escapeControlChars(repo.branch)})` : "";
+      const wt = repo.worktreePath ? c.dim(` → ${escapeControlChars(repo.worktreePath)}`) : "";
+      out(`    ${escapeControlChars(repo.name)}: ${c.dim(escapeControlChars(repo.path))}${branch}${wt}`);
+      // Each repository records its own last-seen checkout (the scalar
+      // `checkoutBranch` is null on a multi row), so drift is per repository.
+      if (repo.checkoutBranch && repo.checkoutBranch !== repo.branch) {
+        out(
+          `      ${label("checkout")} ${escapeControlChars(repo.checkoutBranch)}` +
+            (repo.branch != null ? c.yellow(" (drifted from repository branch)") : ""),
+        );
+      }
+    }
+  }
   if (task.branch) out(`  ${label("branch")} ${escapeControlChars(task.branch)}`);
   // Last-seen worktree checkout (recorded at run start/settle, terminal open,
   // archive). Drift off the task branch is tolerated, so say where it is.

@@ -8,17 +8,20 @@ import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
+import { useProjectFiles, useProjectFileScopes, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
 import { api, type PendingInteraction } from "@/lib/api";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import {
   addRangeToSelection, composeDiffMessage, groupSelectedRows, isRowInDragRange, isSelectableKind,
-  type DiffDragRange, type DiffSelectionBlock,
+  prefixDiffSelectionPaths, type DiffDragRange, type DiffSelectionBlock,
 } from "@/lib/diff-selection";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
+import { multiRepoFileScopes } from "../../../shared/file-scope.ts";
+import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
+import { selectedRepositoryName } from "@/lib/multi-repo-ui";
 import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
 
 interface Props {
@@ -87,7 +90,20 @@ function lastSelectableIndex(rows: DiffRow[]): number {
  */
 export function DiffDialog({ open, task, onClose }: Props) {
   const taskId = task?.id ?? null;
-  const [diff, setDiff] = useState<TaskDiff | null>(null);
+  // The fetched diff is stamped with both the task and the repository it
+  // belongs to, so neither a tab switch nor opening another task can paint the
+  // previous payload for a frame: the derived `diff` below is null until the
+  // matching response lands (the effect's own `setDiffState(null)` only runs
+  // after paint). Stamping `taskId` matters because this component stays
+  // mounted across close/open — switching from task A to task B whose active
+  // repository tab has the same name would otherwise leave A's file list
+  // visible for one frame.
+  const [diffState, setDiffState] = useState<
+    { taskId: string; repo: string | null; data: TaskDiff } | null
+  >(null);
+  // Selected repository tab for a multi-repository task (issue #291).
+  const [repo, setRepo] = useState<string | null>(null);
+  const diff = diffState && diffState.taskId === taskId && diffState.repo === repo ? diffState.data : null;
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [openFiles, setOpenFiles] = useState<Set<string>>(new Set());
@@ -398,29 +414,45 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
 
+  // The repository names as one stable string: a removal (issue #291) changes
+  // it, so the effect below re-validates a tab that pointed at the removed
+  // repository. The 2 s poll's fresh `task` object with the same names does not.
+  const repoNamesKey = (task?.repositories ?? []).map((r) => r.name).join("\0");
   useEffect(() => {
     // Reset selection + composer state on every dialog close/reopen and on
-    // every diff refetch (this effect's deps mirror the fetch below), and
-    // abandon any drag that was still in flight (e.g. the dialog was closed
-    // mid-drag). Reads `cancelDrag` through the ref rather than depending on
-    // it directly — this effect also owns the diff fetch, so a dependency on
-    // the drag-callback chain would risk a refetch loop on future dep churn
-    // there; the ref keeps this effect's deps to just `[open, taskId]`.
+    // every diff refetch (this effect's deps are `[open, taskId, repo]`: the
+    // repository tab is its own refetch trigger, and `taskId` is the only task
+    // field that matters — the parent polls /tasks every 2s, so `task` itself
+    // would refetch on every poll tick), and abandon any drag that was still in
+    // flight (e.g. the dialog was closed mid-drag). Reads `cancelDrag` through
+    // the ref rather than depending on it directly — a dependency on the
+    // drag-callback chain would risk a refetch loop on future dep churn there.
     setSelected(new Map());
     updateLastClicked(null);
     setDraft("");
     setHint(null);
+    // Drop the stale payload on close/task switch too, not just before a
+    // refetch: a closed dialog still holds the last diff, and the stamp in
+    // `diff` is only a one-frame paint guard. Clearing here means reopening
+    // never briefly shows the previous task's file list.
+    setDiffState(null);
     cancelDragRef.current();
     if (!open || !taskId) return;
+    // A one-repository multi task still has its tab (issue #291), and a
+    // removal re-validates the selection through `repoNamesKey` below.
+    const wanted = task ? selectedRepositoryName(task, repo) : null;
+    if (wanted !== repo) {
+      setRepo(wanted);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
-    setDiff(null);
     api
-      .getTaskDiff(taskId)
+      .getTaskDiff(taskId, wanted)
       .then((d) => {
         if (cancelled) return;
-        setDiff(d);
+        setDiffState({ taskId, repo: wanted, data: d });
         // Expand everything by default for small change sets; keep large ones
         // collapsed so the dialog stays responsive.
         setOpenFiles(d.files.length <= 8 ? new Set(d.files.map((f) => f.path)) : new Set());
@@ -432,10 +464,8 @@ export function DiffDialog({ open, task, onClose }: Props) {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-    // Key on task?.id, not `task` itself — the parent polls /tasks every 2s,
-    // so a new `task` object identity arrives constantly and would otherwise
-    // refetch the diff on every poll tick.
-  }, [open, taskId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `task` is read for its repository names only; `repoNamesKey` stands in for them
+  }, [open, taskId, repo, repoNamesKey]);
 
   const totals = useMemo(() => {
     const files = diff?.files ?? [];
@@ -503,14 +533,32 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const composerVisible = totalSelected > 0;
 
   // `@` popover + highlight for the compose-from-diff box — the same scope
-  // table as RunPanel's composer (docs/architecture/at-file-references.md): the live worktree once it
-  // exists; a not-yet-started isolated task previews its pinned base ref
-  // (existing-branch tasks their branch); else the plain workdir. Gated on
-  // the composer actually showing so an open dialog with no selection
-  // fetches nothing. Expansion stays server-side in sendInput.
+  // table as RunPanel's composer (docs/architecture/at-file-references.md).
+  // A multi-repository task lists every repository's worktree (entries
+  // prefixed `<name>/`) because the agent reads this message at the workspace
+  // root; the single-repository path is the live worktree once it exists, a
+  // not-yet-started isolated task previews its pinned base ref (existing-
+  // branch tasks their branch), else the plain workdir. Gated on the
+  // composer actually showing so an open dialog with no selection fetches
+  // nothing. Expansion stays server-side in sendInput.
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const multiScopes = useMemo<NamedFileScope[] | null>(() => {
+    if (!task) return null;
+    // `multiRepoFileScopes` is the same derivation RunPanel uses (one named
+    // scope per repository, never the non-git workspace root); `[]`
+    // means the single-repository path below stays in charge.
+    // A one-repository multi task keeps its one named scope: its cwd is the
+    // non-git workspace root, so `<name>/…` is how a reference reaches it.
+    if (!isMultiRepoTask(task)) return null;
+    const scopes = multiRepoFileScopes(task);
+    return scopes.length > 0 ? scopes : null;
+  }, [task?.repositories, task?.multiRepo, task?.worktreePath, task?.isolation]);
   const fileScope = useMemo<FileScope | null>(() => {
     if (!task) return null;
+    if (multiScopes) {
+      const entry = multiScopes.find((s) => s.name === repo) ?? multiScopes[0];
+      return entry ? { dir: entry.dir, ref: entry.ref } : null;
+    }
     if (task.worktreePath) return { dir: task.worktreePath };
     if (task.isolation === "worktree") {
       return {
@@ -519,8 +567,13 @@ export function DiffDialog({ open, task, onClose }: Props) {
       };
     }
     return { dir: task.workdir };
-  }, [task?.worktreePath, task?.isolation, task?.workdir, task?.baseRef, task?.branchSource, task?.branch]);
-  const projectFiles = useProjectFiles(open && composerVisible ? fileScope : null);
+  }, [task?.worktreePath, task?.isolation, task?.workdir, task?.baseRef, task?.branchSource, task?.branch, multiScopes, repo]);
+  // Both hooks are called unconditionally (rules of hooks); only the one that
+  // applies to this task type fetches, because the other receives null.
+  const singleProjectFiles = useProjectFiles(open && composerVisible && !multiScopes ? fileScope : null);
+  const multiProjectFiles = useProjectFileScopes(open && composerVisible ? multiScopes : null);
+  const projectFiles = multiScopes ? multiProjectFiles : singleProjectFiles;
+  const hasFileScope = multiScopes ? multiScopes.length > 0 : !!(fileScope && fileScope.dir);
 
   // A new selection starting (composer reappearing) supersedes whatever hint
   // was left over from the last send/save — e.g. the "Sent to agent." success
@@ -585,6 +638,13 @@ export function DiffDialog({ open, task, onClose }: Props) {
     }
     return result;
   }, [diff, selected]);
+  // Multi-repository tasks: label the selected lines with the workspace
+  // directory (`frontend/src/a.ts`) because the agent reads the message at the
+  // workspace root, not inside the repository's worktree (plan T11).
+  const messageBlocks = useMemo(
+    () => (multiScopes ? prefixDiffSelectionPaths(blocks, repo ?? multiScopes[0]?.name ?? null) : blocks),
+    [blocks, multiScopes, repo],
+  );
 
   const clearSelection = () => {
     setSelected(new Map());
@@ -606,7 +666,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
         setHint("A prompt is waiting for a response — answer it, or Save for later instead.");
         return;
       }
-      const composed = composeDiffMessage(draft.trim(), blocks);
+      const composed = composeDiffMessage(draft.trim(), messageBlocks);
       const res = await api.sendRunInput(resumableRunId, composed);
       if (!res.delivered && res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the paste was withheld and the server
@@ -639,7 +699,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
     setBusy(true);
     setHint(null);
     try {
-      const composed = composeDiffMessage(draft.trim(), blocks);
+      const composed = composeDiffMessage(draft.trim(), messageBlocks);
       await api.addBacklogItem(task.id, { text: composed, references: [] });
       clearSelection();
       setHint("Saved to backlog.");
@@ -667,6 +727,26 @@ export function DiffDialog({ open, task, onClose }: Props) {
             {task?.title ?? "Task"}
             {diff?.base && <> · vs base <span className="font-mono">{diff.base}</span></>}
           </div>
+          {task && isMultiRepoTask(task) && (
+            <div className="mt-1 flex flex-wrap gap-1" role="tablist" aria-label="Repositories">
+              {task!.repositories!.map((r) => (
+                <button
+                  key={r.name}
+                  type="button"
+                  role="tab"
+                  aria-selected={repo === r.name}
+                  data-testid={`diff-repo-tab-${r.name}`}
+                  onClick={() => setRepo(r.name)}
+                  className={cn(
+                    "rounded px-1.5 py-0.5 font-mono text-[10px]",
+                    repo === r.name ? "bg-info/15 text-info" : "text-muted-foreground hover:bg-muted",
+                  )}
+                >
+                  {r.name}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {diff && diff.files.length > 0 && (
@@ -722,6 +802,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
               <FileBlock
                 key={f.path}
                 taskId={taskId}
+                repo={repo}
                 file={f}
                 open={openFiles.has(f.path)}
                 onToggle={() => toggle(f.path)}
@@ -750,7 +831,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
                 </Button>
               </div>
               <div className="relative">
-              {fileScope && (
+              {hasFileScope && (
                 <AtHighlightBackdrop textareaRef={composerRef} value={draft} validPaths={projectFiles.validPaths} />
               )}
               <Textarea
@@ -777,7 +858,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
                 disabled={busy}
                 className="relative h-16 min-h-0 w-full resize-none text-xs"
               />
-              {fileScope && (
+              {hasFileScope && (
                 <AtFileAutocomplete
                   entries={projectFiles.entries}
                   truncated={projectFiles.truncated}
@@ -786,7 +867,8 @@ export function DiffDialog({ open, task, onClose }: Props) {
                   onChange={setDraft}
                   textareaRef={composerRef}
                   placement="above"
-                  fileScope={fileScope}
+                  fileScope={multiScopes ? null : fileScope}
+                  fileScopes={multiScopes}
                 />
               )}
               </div>
@@ -851,6 +933,7 @@ type RowMouseDownHandler = (
 
 function FileBlock({
   taskId,
+  repo,
   file,
   open,
   onToggle,
@@ -861,6 +944,7 @@ function FileBlock({
   registerBody,
 }: {
   taskId: string | null;
+  repo?: string | null;
   file: DiffFile;
   open: boolean;
   onToggle: () => void;
@@ -891,7 +975,7 @@ function FileBlock({
       </button>
       {open && (
         file.binary ? (
-          <BinaryDiffPreview taskId={taskId} file={file} />
+          <BinaryDiffPreview taskId={taskId} repo={repo} file={file} />
         ) : (
           <>
             <DiffBody
@@ -921,12 +1005,12 @@ function FileBlock({
  *  the file's NEW-state path (per `DiffFile`'s doc comment), so it's already
  *  the right side to classify for a rename. Deliberately outside `DiffBody`'s
  *  row machinery — no `data-diff-path`/`data-diff-index`, no selection. */
-function BinaryDiffPreview({ taskId, file }: { taskId: string | null; file: DiffFile }) {
+function BinaryDiffPreview({ taskId, repo, file }: { taskId: string | null; repo?: string | null; file: DiffFile }) {
   const kind = binaryPreviewKind(file.path);
   if (kind === null || !taskId) {
     return <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>;
   }
-  const { oldUrl, newUrl } = binaryPreviewSides(file, (path, side) => api.taskDiffBlobUrl(taskId, path, side));
+  const { oldUrl, newUrl } = binaryPreviewSides(file, (path, side) => api.taskDiffBlobUrl(taskId, path, side, repo));
   return (
     <div className="px-3 py-2">
       <BinaryFilePreview

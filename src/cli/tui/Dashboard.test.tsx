@@ -1053,6 +1053,173 @@ test("opening the composer fetches the task's project-file listing and feeds the
   unmount();
 });
 
+test("a multi-repository listing still offers the root row of a repository with no files", async () => {
+  // Round-9 nit: the TUI merged listing only carried paths INSIDE each repo,
+  // so an empty repository contributed no rows and a bare `@empty-repo` — a
+  // real directory at the workspace root — was missing from the popover
+  // (the webview already adds these roots via `addScopeRoots`).
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/empty", name: "empty-repo", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/empty-repo", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string }) => ({
+      files: scope.dir.endsWith("/frontend") ? ["README.md"] : [],
+      truncated: false,
+    }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the per-repository listing fetch
+  await wait(80);
+  stdin.write("@emp");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("empty-repo/");
+  unmount();
+});
+
+test("a multi task left with one repository lists `<name>/`-prefixed rows (round 15)", async () => {
+  // The scope count is one, but the agent's cwd is the workspace root, so the
+  // popover must offer `backend/README.md`, never a bare `README.md`.
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async () => ({ files: ["README.md"], truncated: false }),
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("@READ");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("backend/README.md");
+  unmount();
+});
+
+test("a multi-repository listing keeps healthy repositories' rows when one fetch fails", async () => {
+  // Round-12 S3: the multi listing used one `Promise.all` over raw calls, so
+  // a single repository's failure rejected everything and blanked the popover
+  // for the repositories that were listing fine. Mirror the webview's
+  // per-scope merge: keep successes, report the failure.
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string }) => {
+      if (scope.dir.endsWith("/backend")) throw new Error("backend listing down");
+      return { files: ["README.md"], truncated: false };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the per-repository listing fetch
+  await wait(80);
+  stdin.write("@REA");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("frontend/README.md");
+  unmount();
+});
+
+test("a multi-repository listing whose every fetch fails shows the unavailable notice, not bare roots", async () => {
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async () => {
+      throw new Error("listing down");
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m");
+  await wait(80);
+  stdin.write("@");
+  await wait(80);
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("file listing unavailable");
+  expect(frame).not.toContain("frontend/");
+  unmount();
+});
+
 test("a send whose reply carries unresolvedRefs surfaces a one-line warning after the ok status", async () => {
   const taskA = task({ id: "taskA", column: "review", runId: "runA", title: "A" });
   const client = {
@@ -1241,6 +1408,110 @@ test("a truncated listing wires the composer's remoteSearch, which is invoked wi
   expect(seenQueries[0]!.q).toBe("xy");
   expect(seenQueries[0]!.limit).toBe(5);
   expect(frame).toContain("deep/remote-match.ts");
+  unmount();
+});
+
+test("a truncated multi-repository listing searches every repository's scope and prefixes the results", async () => {
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const seenQueries: Array<{ dir: string; q?: string | null; limit?: number }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+      if (scope.q !== undefined) {
+        seenQueries.push(scope);
+        const repoSide = scope.dir.endsWith("/frontend") ? "fe" : "be";
+        return { files: [`deep/${repoSide}-remote-match.ts`], truncated: true };
+      }
+      return { files: ["README.md"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the per-repository listing fetch
+  await wait(80);
+  stdin.write("@xy"); // clears Composer's MIN_REMOTE_QUERY_LEN floor
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire
+  const frame = lastFrame() ?? "";
+  expect(seenQueries.map((s) => s.dir).sort()).toEqual(["/wt/taskA/backend", "/wt/taskA/frontend"]);
+  expect(seenQueries.every((s) => s.q === "xy" && s.limit === 5)).toBe(true);
+  // Each hit keeps its workspace prefix, matching the merged local listing.
+  expect(frame).toContain("frontend/deep/fe-remote-match.ts");
+  expect(frame).toContain("backend/deep/be-remote-match.ts");
+  unmount();
+});
+
+test("a truncated multi-repository listing keeps the local rows for a bare `@<repo>/` (review S19)", async () => {
+  // `@frontend/` leaves nothing to search inside the repository. The remote
+  // search used to answer `[]` — an authoritative "zero matches" — which
+  // blanked the popover's local rows for that repository.
+  const taskA = task({
+    id: "taskA",
+    column: "review",
+    runId: "runA",
+    title: "A",
+    workdir: "/wt/taskA",
+    isolation: "worktree",
+    worktreePath: "/wt/taskA",
+    branch: null,
+    branchSource: "created",
+    baseRef: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/taskA/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  const seenQueries: Array<{ dir: string; q?: string | null }> = [];
+  const client = {
+    listTasks: async () => [taskA],
+    getRuns: async () => [],
+    sendInput: async () => ({ delivered: true }),
+    listProjectFiles: async (scope: { dir: string; ref?: string | null; q?: string | null; limit?: number }) => {
+      if (scope.q !== undefined) {
+        seenQueries.push(scope);
+        return { files: ["src/deep-match.ts"], truncated: true };
+      }
+      return { files: ["README.md", "src/"], truncated: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, lastFrame, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("m"); // enter compose — fires the per-repository listing fetch
+  await wait(80);
+  stdin.write("@frontend/");
+  await wait(300); // let the composer's 200ms remoteSearch debounce fire
+  const frame = lastFrame() ?? "";
+  expect(frame).toContain("frontend/README.md");
+  // Nothing was left to search, so no request went out at all.
+  expect(seenQueries).toEqual([]);
+
+  // A trailing slash on a deeper path is directory syntax, not part of the
+  // query the server ranks.
+  stdin.write("src/");
+  await wait(300);
+  expect(seenQueries.map((q) => [q.dir, q.q])).toEqual([["/wt/taskA/frontend", "src"]]);
   unmount();
 });
 

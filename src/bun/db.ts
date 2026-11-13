@@ -12,6 +12,8 @@ import { handoffCopySessionIdFromPath } from "../shared/harness-mirror.ts";
 import { normalizeDeliveredUserText, type CleanRetryRow } from "../shared/user-message.ts";
 import { isSpeed, speedFromFast } from "../shared/speed.ts";
 import { OPENCODE_SERVER_INPUT_ERROR } from "../shared/opencode.ts";
+import { isMultiRepoTask, repositoriesForTask } from "../shared/multi-repo.ts";
+import type { TaskRepository } from "../shared/types.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
 import { decideForwardResume, type ForwardResumeSnapshotReason } from "./event-resume.ts";
@@ -144,6 +146,14 @@ type TaskRow = {
   // `tasks.setCheckoutBranch`'s targeted UPDATE, never by the generic
   // `update` SET clause below — same rationale as `sent_files`/`fx_recovery`.
   checkout_branch: string | null;
+  // Multi-repository task support (migration 091, issue #291):
+  // `repositories` is `TaskRepository[]` JSON — `'[]'` for a single-repo row,
+  // whose one entry `toTask` derives from the scalar columns. Written by
+  // `tasks.insert` (create time) and `tasks.setRepositories` (after worktree
+  // preparation) only; skipped by the generic `update` SET clause.
+  // `issue_repo_path` names the repository whose remote matches `issue_url`.
+  repositories: string;
+  issue_repo_path: string | null;
   // Provenance for a Claude Code session imported from outside Agetor
   // (migration 068). Written exclusively by `tasks.setImportedClaude`, never
   // by `tasks.insert` (new rows stay NULL) or the generic `update` SET
@@ -1000,7 +1010,92 @@ function parseImportedOpencode(raw: string | null | undefined): ImportedOpencode
 const readOpencodeServer = (raw: unknown): OpencodeServerMode =>
   (OPENCODE_SERVER_MODES as readonly unknown[]).includes(raw) ? (raw as OpencodeServerMode) : "shared";
 
-const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
+/**
+ * Parse a `tasks.repositories` column into a validated `TaskRepository[]`.
+ * Anything malformed (not JSON, not an array, an entry missing `path`) reads
+ * as `[]` — the caller then derives the single-repository entry from the
+ * scalar columns, so a corrupted column can never crash a board poll. Values
+ * are re-read defensively because this column is server-managed but still
+ * lives in a user-editable SQLite file.
+ */
+const parseTaskRepositories = (raw: unknown): TaskRepository[] => {
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: TaskRepository[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object") continue;
+    const o = entry as Record<string, unknown>;
+    if (typeof o.path !== "string" || o.path.length === 0) continue;
+    if (typeof o.name !== "string" || o.name.length === 0) continue;
+    out.push({
+      path: o.path,
+      name: o.name,
+      branch: typeof o.branch === "string" ? o.branch : null,
+      branchSource: o.branchSource === "existing" ? "existing" : "created",
+      worktreePath: typeof o.worktreePath === "string" ? o.worktreePath : null,
+      baseRef: typeof o.baseRef === "string" ? o.baseRef : null,
+      checkoutBranch: typeof o.checkoutBranch === "string" ? o.checkoutBranch : null,
+      prUrl: typeof o.prUrl === "string" ? o.prUrl : null,
+    });
+  }
+  return out;
+};
+
+/**
+ * The one-entry repository array a single-repository row derives, through the
+ * same `repositoriesForTask` every other process uses (so the core and the
+ * webview/CLI can't derive it differently). `branchSource` is normalized here
+ * because the column is free text; the shared helper trusts its input.
+ */
+const derivedRepositories = (r: TaskRow): TaskRepository[] =>
+  repositoriesForTask({
+    workdir: r.workdir,
+    isolation: r.isolation as Task["isolation"],
+    branch: r.branch,
+    branchSource: r.branch_source === "existing" ? "existing" : "created",
+    worktreePath: r.worktree_path,
+    baseRef: r.base_ref,
+    checkoutBranch: r.checkout_branch ?? null,
+    prUrl: r.pr_url,
+    repositories: [],
+  });
+
+/**
+ * Compare-then-write one entry's `checkoutBranch` in a stored multi-repository
+ * set (`tasks.setRepositoryCheckout`). An empty stored set is a
+ * single-repository row, whose checkout lives in the scalar `checkout_branch`
+ * column instead, so it is left alone. A stored set of ONE entry is a
+ * multi-repository row whose other repositories were removed
+ * (`removeTaskRepository`), so it is written like any multi row. Never bumps
+ * `updated_at`: the column is server-managed
+ * (docs/architecture/persistence.md).
+ */
+function writeRepositoryCheckout(
+  taskId: string,
+  storedRepositories: string | null,
+  repoName: string,
+  value: string | null,
+): void {
+  const repos = parseTaskRepositories(storedRepositories);
+  if (repos.length === 0) return;
+  let changed = false;
+  const next = repos.map((r) => {
+    if (r.name !== repoName || r.checkoutBranch === value) return r;
+    changed = true;
+    return { ...r, checkoutBranch: value };
+  });
+  if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(next), taskId]);
+}
+
+const toTask = (r: TaskRow, counts?: TaskCounts): Task => {
+  const storedRepositories = parseTaskRepositories(r.repositories);
+  return {
   id: r.id,
   title: r.title,
   prompt: r.prompt,
@@ -1043,6 +1138,16 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   pipelineStepId: r.pipeline_step_id ?? null,
   harnessState: parseTaskHarnessState(r.harness_state),
   checkoutBranch: r.checkout_branch ?? null,
+  // Multi-repository rows keep their stored set — one entry included, once
+  // repositories were removed down to one; every single-repository row (and
+  // every legacy row, whose column is `'[]'`) derives exactly one entry from
+  // the scalar columns so callers never branch on `undefined`.
+  repositories: storedRepositories.length > 0 ? storedRepositories : derivedRepositories(r),
+  // Derived, never stored in its own column: only a multi row stores its set
+  // (see `tasks.insert`/`setRepositories`). Every multi/single decision reads
+  // this through `isMultiRepoTask`, never the entry count.
+  multiRepo: storedRepositories.length > 0,
+  issueRepoPath: r.issue_repo_path ?? null,
   importedClaude: parseImportedClaude(r.imported_claude),
   importedOpencode: parseImportedOpencode(r.imported_opencode),
   // Derived, never stored: a monotonic-id watermark comparison, race-free by
@@ -1057,7 +1162,8 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
-});
+  };
+};
 
 /** Send and Retry use this when another task holds the session claim.
  *  A duplicate import's losing row still has `importedClaude` after the
@@ -1213,9 +1319,10 @@ export const tasks = {
           agent_profile_id, agent_profile,
           pipeline_id, pipeline_run, pipeline_parent_id, pipeline_step_id,
           checkout_branch,
+          repositories, issue_repo_path,
           last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -1233,6 +1340,12 @@ export const tasks = {
         t.pipelineParentId ?? null,
         t.pipelineStepId ?? null,
         t.checkoutBranch ?? null,
+        // Multi-repo rows store their set; single-repo rows store '[]' and
+        // `toTask` derives the one entry from the scalar columns above. A
+        // pipeline step copying a one-repository multi parent passes
+        // `multiRepo: true`, so it stores its one entry and stays multi.
+        JSON.stringify(isMultiRepoTask(t) && t.repositories && t.repositories.length > 0 ? t.repositories : []),
+        t.issueRepoPath ?? null,
         // A brand-new task has never had an assistant event or a mark-seen
         // — both start NULL, which `toTask` reads as `unread: false`.
         null, null,
@@ -1242,7 +1355,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, opencodeServer: readOpencodeServer(t.opencodeServer), importedClaude: null, importedOpencode: null, unread: false, hasAssistantMessages: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, sentFiles: null, fxRecovery: null, agentProfileId: t.agentProfileId ?? null, agentProfile: t.agentProfile ?? null, pipelineId: t.pipelineId ?? null, pipelineRun: t.pipelineRun ?? null, pipelineParentId: t.pipelineParentId ?? null, pipelineStepId: t.pipelineStepId ?? null, checkoutBranch: t.checkoutBranch ?? null, repositories: t.repositories ?? [], multiRepo: isMultiRepoTask(t), issueRepoPath: t.issueRepoPath ?? null, opencodeServer: readOpencodeServer(t.opencodeServer), importedClaude: null, importedOpencode: null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   /** `fast` is excluded from the patch type: it is only the derived echo of
    *  `speed` (the column migration 072 dropped), so a caller changes the tier
@@ -1649,6 +1762,121 @@ export const tasks = {
         );
       }
     })();
+  },
+  /**
+   * Replace a task's pinned repository set (migration 087, issue #291) in one
+   * targeted `UPDATE` — same pattern as `setCheckoutBranch` above: no
+   * `updated_at` bump (the set is server-managed state) and it bypasses the
+   * generic `update`'s SET clause entirely. Used at create time and after
+   * worktree preparation to persist the materialized paths/branches. On a
+   * single-repository row (nothing stored) a set of one entry stores `'[]'` on
+   * purpose, so the row keeps deriving its entry from the scalar columns
+   * (which the caller updates separately). A multi-repository row (something
+   * stored) is never demoted, and never regrows: only incoming entries whose
+   * workspace name the row still stores are kept (names are fixed at creation
+   * and the only later change is `removeTaskRepository`, so a stale snapshot
+   * a prepare took before a removal can't resurrect the removed entry), any
+   * non-empty result is stored, one entry included, and an empty one leaves
+   * the row untouched. An unknown id matches zero rows.
+   *
+   * The caller's array is a *snapshot* taken before one or more awaits
+   * (`prepareTaskWorkdir` can take seconds), so it must not clobber fields
+   * another writer stamped meanwhile. `prUrl` (first-write-wins, stamped by
+   * `setRepositoryPrUrl`) and `checkoutBranch` (last-seen drift, written by
+   * the dedicated `setRepositoryCheckout` compare-then-write at every refresh
+   * point) are therefore merged from the CURRENT row: a stored value wins, and
+   * the incoming value is only used when nothing is stored yet (first
+   * materialization). Callers that genuinely observed a new checkout record it
+   * through `setRepositoryCheckout` after this call.
+   */
+  setRepositories(taskId: string, repos: TaskRepository[]): Task | null {
+    const cur = this.get(taskId);
+    const byName = new Map((cur?.repositories ?? []).map((r) => [r.name, r]));
+    let stored: TaskRepository[];
+    if (cur?.multiRepo) {
+      stored = repos.filter((r) => byName.has(r.name));
+      if (stored.length === 0) return cur;
+    } else {
+      stored = repos.length > 1 ? repos : [];
+    }
+    const merged = stored.map((r) => {
+      const prev = byName.get(r.name);
+      if (!prev) return r;
+      return {
+        ...r,
+        prUrl: prev.prUrl ?? r.prUrl,
+        checkoutBranch: prev.checkoutBranch ?? r.checkoutBranch,
+      };
+    });
+    db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(merged), taskId]);
+    return this.get(taskId);
+  },
+  /**
+   * Stamp one multi-repository task's entry with the PR URL opened for it.
+   * First write wins: an entry that already has a `prUrl` is never
+   * overwritten, so a second "Create PR" click can't lose the durable link.
+   * `selector` matches by workspace name, selected path or worktree path.
+   * No-op (returns the current row) for a single-repository task — its
+   * `prUrl` scalar is written by the ordinary path. Never bumps `updated_at`.
+   */
+  setRepositoryPrUrl(taskId: string, selector: string, prUrl: string): Task | null {
+    const cur = this.get(taskId);
+    if (!cur) return null;
+    if (!cur.multiRepo) return cur;
+    const repos = cur.repositories ?? [];
+    let changed = false;
+    const next = repos.map((r) => {
+      const matches = r.name === selector || r.path === selector || r.worktreePath === selector;
+      if (!matches || r.prUrl) return r;
+      changed = true;
+      return { ...r, prUrl };
+    });
+    if (changed) db.run(`UPDATE tasks SET repositories = ? WHERE id = ?`, [JSON.stringify(next), taskId]);
+    return this.get(taskId) ?? cur;
+  },
+  /**
+   * Clear `issue_repo_path` when it still names `repoPath` — the repository
+   * just removed from the task (`removeTaskRepository`), so no remaining
+   * repository's PR claims `Closes #N` for an issue whose repository is gone.
+   * Compare-then-write, targeted, never bumps `updated_at` (server-managed,
+   * docs/architecture/persistence.md).
+   */
+  clearIssueRepoPath(taskId: string, repoPath: string): void {
+    db.run(`UPDATE tasks SET issue_repo_path = NULL WHERE id = ? AND issue_repo_path = ?`, [taskId, repoPath]);
+  },
+  /**
+   * Record the branch last observed checked out in one multi-repository
+   * worktree (`tasks.repositories[].checkoutBranch`), by workspace name.
+   * Same targeted-UPDATE, no-`updated_at` contract as `setCheckoutBranch`;
+   * compare-then-write so an unchanged observation never churns the row.
+   *
+   * Like `setCheckoutBranch`, a write on a pipeline step row is mirrored to
+   * its parent in the same transaction: the steps share the parent's
+   * worktrees, and the parent row is the pipeline's last-seen checkout (D14)
+   * that the next step launch re-attaches to, so a drift a step observed must
+   * not stay on the step alone. The parent's entry is matched by the same
+   * workspace name; a parent without that entry (or without a multi set) is
+   * left untouched.
+   */
+  setRepositoryCheckout(taskId: string, repoName: string, value: string | null): Task | null {
+    let found = false;
+    db.transaction(() => {
+      const row = db
+        .query<{ repositories: string | null; pipeline_parent_id: string | null }, [string]>(
+          `SELECT repositories, pipeline_parent_id FROM tasks WHERE id = ?`,
+        )
+        .get(taskId);
+      if (!row) return;
+      found = true;
+      writeRepositoryCheckout(taskId, row.repositories, repoName, value);
+      if (row.pipeline_parent_id) {
+        const parent = db
+          .query<{ repositories: string | null }, [string]>(`SELECT repositories FROM tasks WHERE id = ?`)
+          .get(row.pipeline_parent_id);
+        if (parent) writeRepositoryCheckout(row.pipeline_parent_id, parent.repositories, repoName, value);
+      }
+    })();
+    return found ? this.get(taskId) : null;
   },
   /**
    * Bind (or detach, when both arguments are `null`) a task's agent profile

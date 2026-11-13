@@ -204,7 +204,15 @@ export async function cmdRm(args: string[], flags: Flags): Promise<void> {
   }
   await client.deleteTask(task.id);
   if (flags.json) {
-    return printJson(preview ? { deleted: task.id, branches: preview.branches } : { deleted: task.id });
+    return printJson(preview
+      ? {
+          deleted: task.id,
+          branches: preview.branches,
+          ...(preview.repositories && preview.repositories.length > 0
+            ? { repositories: preview.repositories.map((r) => ({ name: r.name, branches: r.branches })) }
+            : {}),
+        }
+      : { deleted: task.id });
   }
   const removed = preview && preview.branches.length > 0 ? ` and ${teardownPhrase(preview, task)}` : "";
   out(`${c.red("✗")} deleted ${c.dim(task.id.slice(0, 8))}${removed}`);
@@ -223,6 +231,19 @@ export function teardownPhrase(
     const drifted = task.checkoutBranch && task.checkoutBranch !== task.branch ? task.checkoutBranch : null;
     const base = task.branch ? `its worktree + branch ${escapeControlChars(task.branch)}` : "its worktree + branch";
     return drifted ? `${base} (and possibly ${escapeControlChars(drifted)}, the branch it was last on)` : base;
+  }
+  // Multi-repository rows: name each repository's own removals, so the preview
+  // matches what delete actually does per repository (the top-level `branches`
+  // union alone loses which repo owns which name).
+  // Present only for a multi task — also one left with a single repository
+  // (issue #291) — so presence, not a count, decides.
+  const repos = preview.repositories;
+  if (repos && repos.length > 0) {
+    const parts = repos.map((r) => {
+      const names = r.branches.map((b) => escapeControlChars(b));
+      return `${r.name}: ${names.length > 0 ? names.join(", ") : "no branches"}`;
+    });
+    return `its ${repos.length === 1 ? "worktree" : "worktrees"} + per-repository branches (${parts.join("; ")})`;
   }
   const names = preview.branches.map((b) => escapeControlChars(b));
   if (names.length === 0) return preview.source === "none" ? "no worktree or branches" : "its worktree (no branches)";

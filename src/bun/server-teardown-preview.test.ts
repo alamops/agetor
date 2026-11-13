@@ -100,3 +100,118 @@ test("PATCH /tasks/:id ignores checkoutBranch (server-managed)", async () => {
   expect(after.title).toBe("renamed");
   expect(after.checkoutBranch).toBe("implement/x");
 });
+
+test("teardown-preview names every repository's branches for a multi-repo task", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi preview",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const task = created.task;
+  try {
+    const prepared = await prepareTaskWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(task.id, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(task.id, prepared.repositories!);
+    const res = await authed(`/tasks/${task.id}/teardown-preview`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as TaskTeardownPreview;
+    const names = uniqueRepoSlugs([a, b]);
+    expect(body.taskBranch).toBeNull();
+    expect(body.repositories?.map((r) => r.name)).toEqual(names);
+    expect(body.repositories?.map((r) => r.taskBranch)).toEqual(prepared.repositories?.map((r) => r.branch));
+    // The top-level list is the union for old callers.
+    for (const plan of body.repositories ?? []) {
+      for (const branch of plan.branches) expect(body.branches).toContain(branch);
+    }
+  } finally {
+    await import("./orchestrator.ts").then((m) => m.deleteTask(task.id)).catch(() => {});
+  }
+});
+
+test("a sharing task's other repository does not protect this repository's branch", async () => {
+  // Review should-fix: `heldByOthers` used to union EVERY branch of any task
+  // that shared the repository, so a sibling repository's same-named branch
+  // (frontend/backend commonly share a branch name) shielded this repo's
+  // branch from delete. Only the sharing task's entries for THIS repository
+  // may protect a name.
+  const { createTask, deleteTask, teardownBranchesForTask } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const base = { prompt: "p", agent: "claude-code", workdir: a, isolation: "worktree" as const, repositories: [{ path: a }, { path: b }] };
+  const victim = await createTask({ title: "victim task", ...base });
+  if ("error" in victim) throw new Error(victim.error);
+  const other = await createTask({ title: "other task", ...base });
+  if ("error" in other) throw new Error(other.error);
+  try {
+    const victimBranch = victim.task.repositories![0]!.branch!;
+    const prepared = await prepareTaskWorkdir(victim.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(victim.task.id, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(victim.task.id, prepared.repositories!);
+
+    const otherEntries = other.task.repositories!;
+    // Shares repo A, but the victim's branch name is held only in repo B.
+    tasks.setRepositories(other.task.id, [
+      { ...otherEntries[0]!, branch: "feature/other-a" },
+      { ...otherEntries[1]!, branch: victimBranch },
+    ]);
+    let preview = await teardownBranchesForTask(tasks.get(victim.task.id)!);
+    let planA = preview.repositories![0]!;
+    expect(planA.branches).toContain(victimBranch);
+    expect(planA.excluded.map((e) => e.branch)).not.toContain(victimBranch);
+
+    // The same name held in repo A really is protected.
+    tasks.setRepositories(other.task.id, [
+      { ...otherEntries[0]!, branch: victimBranch },
+      { ...otherEntries[1]!, branch: victimBranch },
+    ]);
+    preview = await teardownBranchesForTask(tasks.get(victim.task.id)!);
+    planA = preview.repositories![0]!;
+    expect(planA.branches).not.toContain(victimBranch);
+    expect(planA.excluded).toContainEqual({ branch: victimBranch, reason: "held-by-task" });
+  } finally {
+    await deleteTask(victim.task.id).catch(() => {});
+    await deleteTask(other.task.id).catch(() => {});
+  }
+});
+
+test("teardown-preview promises no branches for repositories delete never materialized", async () => {
+  // Review should-fix: create pins each repository's branch, but a task that
+  // is archived/deleted before it starts has no worktree. Delete skips those
+  // entries; the preview used to name their pinned branches anyway, so the
+  // confirm promised removals that never happened.
+  const { createTask, deleteTask, teardownBranchesForTask } = await import("./orchestrator.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "never started multi",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const task = created.task;
+  try {
+    // Branches were pinned at create, but no checkout exists yet.
+    expect(task.repositories?.every((r) => r.branch && r.worktreePath === null)).toBe(true);
+    const preview = await teardownBranchesForTask(task);
+    expect(preview.branches).toEqual([]);
+    expect(preview.repositories?.map((r) => r.branches)).toEqual([[], []]);
+    expect(preview.repositories?.map((r) => r.source)).toEqual(["none", "none"]);
+  } finally {
+    await deleteTask(task.id).catch(() => {});
+  }
+});

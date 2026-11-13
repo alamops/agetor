@@ -234,3 +234,73 @@ test("harnessNoticeLines: one escaped line per notice, none when absent", async 
   expect(harnessShellLoginHint("claude-code", "claude")).toBe("run claude /login to authenticate");
   expect(harnessShellLoginHint("gemini", "gemini")).toBe("log in to gemini here");
 });
+
+test("cmdShow prints a repositories block for a multi-repository task", async () => {
+  const task = makeTask({
+    workdir: "/wt/task-1",
+    worktreePath: "/wt/task-1",
+    branch: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  currentClient = fakeClient(task);
+  await cmdShow([task.id], flags);
+  const text = outputs.join("\n");
+  expect(text).toContain("repos");
+  expect(text).toContain("frontend: /src/frontend");
+  expect(text).toContain("backend: /src/backend");
+  expect(text).toContain("/wt/task-1/frontend");
+});
+
+test("cmdShow escapes repository paths and prints each repository's checkout drift (review N1)", async () => {
+  const task = makeTask({
+    workdir: "/wt/task-1",
+    worktreePath: "/wt/task-1",
+    branch: null,
+    checkoutBranch: null,
+    repositories: [
+      { path: "/src/front\u001b[31mend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/front\u0007end", baseRef: "a", checkoutBranch: "implement/y", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  currentClient = fakeClient(task);
+  await cmdShow([task.id], flags);
+  const text = outputs.join("\n");
+  expect(text).not.toContain("\u001b");
+  expect(text).not.toContain("\u0007");
+  expect(text).toContain("frontend: /src/front\\u001b[31mend");
+  expect(text).toContain("→ /wt/task-1/front\\u0007end");
+  expect(outputs).toContain("      checkout: implement/y (drifted from repository branch)");
+  // A repository still on its own branch prints no checkout line.
+  expect(outputs.filter((l) => l.includes("checkout:"))).toHaveLength(1);
+});
+
+test("cmdShow prints the repositories block for a multi task left with one repository (round 15)", async () => {
+  const task = makeTask({
+    workdir: "/wt/task-1",
+    worktreePath: "/wt/task-1",
+    branch: null,
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  currentClient = fakeClient(task);
+  await cmdShow([task.id], flags);
+  expect(outputs).toContain("  repos: 1");
+  expect(outputs.join("\n")).toContain("backend: /src/backend (feature/x)");
+});
+
+test("cmdShow prints no repositories block for a single task's derived entry", async () => {
+  const task = makeTask({
+    multiRepo: false,
+    repositories: [
+      { path: "/repo", name: "repo", branch: null, branchSource: "created", worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null },
+    ],
+  });
+  currentClient = fakeClient(task);
+  await cmdShow([task.id], flags);
+  expect(outputs.some((l) => l.includes("repos"))).toBe(false);
+});

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, ReactNode, RefObject, SetStateAction } from "react";
 import { api, type AvailableCommand, type AvailableExtension } from "@/lib/api";
+import { mergeAgentCapabilities } from "@/lib/agent-capabilities";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import type { SavedPrompt, TaskReference } from "../../../shared/types.ts";
@@ -15,9 +16,21 @@ import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { AtFileAutocomplete } from "./AtFileAutocomplete";
 import { AtHighlightBackdrop } from "./AtHighlightBackdrop";
-import { useProjectFiles, searchProjectFiles, type FileScope } from "@/lib/use-project-files";
+import {
+  useProjectFiles,
+  useProjectFileScopes,
+  searchProjectFiles,
+  resolveNamedScopePath,
+  FOCUS_REFRESH_MIN_AGE_MS,
+  MULTI_SCOPE_CONCURRENCY,
+  multiScopesOrNull,
+  type FileScope,
+  type NamedFileScope,
+} from "@/lib/use-project-files";
+import { mapWithConcurrency } from "@/lib/map-with-concurrency";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { unresolvedAtTokens, isSafeClientRelPath, isListedPath } from "@/lib/at-highlight";
+import { multiScopeStatTargets } from "@/lib/at-scope-targets";
 
 /** Stable empty set so clearing the on-disk override doesn't churn state
  *  identity (and thus the warning memo) on every effect pass. */
@@ -104,39 +117,92 @@ const EMPTY_PATH_SET: ReadonlySet<string> = new Set();
  * `PromptComposerProps.capabilities`'s doc for why that hoisting exists.
  * `enabled: false` never fetches and reports back `{ commands: [],
  * extensions: [] }`.
+ *
+ * `opts.awaitReady` gates a multi-repository discovery (one request per
+ * repository) on the caller's event stream — see
+ * {@link discoverAgentCapabilities}. A single scope never waits.
  */
 export function useAgentCapabilities(
   agent: string,
-  scope: FileScope | null | undefined,
-  opts?: { enabled?: boolean },
+  scope: FileScope | FileScope[] | null | undefined,
+  opts?: { enabled?: boolean; awaitReady?: (() => Promise<void>) | null },
 ): { commands: AvailableCommand[]; extensions: AvailableExtension[] } {
   const enabled = opts?.enabled ?? true;
   const [commands, setCommands] = useState<AvailableCommand[]>([]);
   const [extensions, setExtensions] = useState<AvailableExtension[]>([]);
-  const dir = scope?.dir;
-  const ref = scope?.ref;
+  // A fresh closure every parent render in RunPanel (it binds the task id);
+  // read through a ref so it never re-arms the effect below.
+  const awaitReadyRef = useRef(opts?.awaitReady ?? null);
+  awaitReadyRef.current = opts?.awaitReady ?? null;
+  // One scope for a single-repository task; one per repository for a multi
+  // task (issue #291). The workspace root is not a git repo, so discovery
+  // there would find nothing from any selected repository.
+  const scopes: FileScope[] = !scope ? [] : Array.isArray(scope) ? scope : [scope];
+  const scopeKey = scopes.map((s) => `${s.dir}\0${s.ref ?? ""}`).join("\0");
 
   useEffect(() => {
-    if (!enabled || !dir || !dir.trim()) { setCommands([]); setExtensions([]); return; }
+    const targets = scopes.filter((s) => !!s.dir?.trim());
+    if (!enabled || targets.length === 0) { setCommands([]); setExtensions([]); return; }
     let cancelled = false;
-    // Pass the harness id (not just the kind) so aliased multi-account
-    // harnesses read their own per-harness commands/skills — the server
-    // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
-    // honored unchanged.
-    api
-      .listAgentCapabilities({ agent, workdir: dir.trim(), branch: ref?.trim() || undefined })
-      .then(({ commands, extensions }) => {
-        if (cancelled) return;
-        setCommands(commands);
-        setExtensions(extensions);
-      })
-      .catch(() => { if (!cancelled) { setCommands([]); setExtensions([]); } });
+    void discoverAgentCapabilities(agent, targets, {
+      awaitReady: awaitReadyRef.current,
+      isCurrent: () => !cancelled,
+    }).then((merged) => {
+      if (cancelled || !merged) return;
+      setCommands(merged.commands);
+      setExtensions(merged.extensions);
+    });
     return () => { cancelled = true; };
-    // Deps are primitives (dir/ref strings), not the `scope` object, so a
-    // fresh-identity scope with equal fields never refetches.
-  }, [agent, dir, ref, enabled]);
+    // Deps are primitives (scopeKey aggregates dir/ref strings), not the
+    // `scope` object, so a fresh-identity scope with equal fields never
+    // refetches.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent, scopeKey, enabled]);
 
   return { commands, extensions };
+}
+
+/**
+ * The request half of {@link useAgentCapabilities}, kept outside the hook so
+ * its request pattern is unit-testable without a React harness. One
+ * `GET /agent-discovery` per scope, merged in scope order.
+ *
+ * A multi-repository discovery (2+ scopes) waits on `awaitReady` (RunPanel's
+ * stream-ready gate) and keeps at most `MULTI_SCOPE_CONCURRENCY` requests in
+ * flight, so opening a task never queues its event stream behind one
+ * discovery per repository; `isCurrent` is re-checked before each request
+ * and a superseded call resolves `null` having fetched nothing more. A
+ * single scope fetches at once, unchanged.
+ */
+export async function discoverAgentCapabilities(
+  agent: string,
+  targets: readonly FileScope[],
+  opts: { awaitReady?: (() => Promise<void>) | null; isCurrent?: () => boolean } = {},
+): Promise<{ commands: AvailableCommand[]; extensions: AvailableExtension[] } | null> {
+  const isCurrent = opts.isCurrent ?? (() => true);
+  const multi = targets.length > 1;
+  if (multi && opts.awaitReady) {
+    await opts.awaitReady();
+    if (!isCurrent()) return null;
+  }
+  // Pass the harness id (not just the kind) so aliased multi-account
+  // harnesses read their own per-harness commands/skills — the server
+  // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
+  // honored unchanged.
+  const results = await mapWithConcurrency(targets, multi ? MULTI_SCOPE_CONCURRENCY : targets.length, (s) =>
+    !isCurrent()
+      ? Promise.resolve(null)
+      : api
+        .listAgentCapabilities({ agent, workdir: s.dir.trim(), branch: s.ref?.trim() || undefined })
+        .catch(() => null),
+  );
+  if (!isCurrent()) return null;
+  // Union in scope order, first occurrence wins (a name declared in two
+  // repositories appears once). A failed scope contributes nothing; an
+  // all-failed discovery still settles to empty lists, exactly like the
+  // single-scope contract. The merge itself is the tested pure helper in
+  // `src/mainview/lib/agent-capabilities.ts`.
+  return mergeAgentCapabilities(results);
 }
 
 /**
@@ -294,6 +360,21 @@ export interface PromptComposerProps {
    * no fetch is made for any of them.
    */
   fileScope?: FileScope | null;
+  /** Every repository scope for a multi-repository task (issue #291). When
+   *  present (non-empty) this replaces `fileScope` for the `@` listing,
+   *  prefixing each entry with its workspace name — also for ONE entry, a
+   *  multi task left with one repository. Pass `null` for a single task. */
+  fileScopes?: NamedFileScope[] | null;
+  /**
+   * The multi-repository task's workspace root (issue #291). The agent's cwd
+   * is this directory, not a repository, so `@records.md` (a file the agent
+   * left at the root) DOES expand at send time even though no repository
+   * listing contains it. Used only to stat unprefixed tokens before warning
+   * that they won't resolve; ignored unless `fileScopes` is multi. `null`
+   * leaves the listing-only verdict in place (a not-yet-started workspace
+   * doesn't exist, so an unprefixed path genuinely cannot resolve there).
+   */
+  workspaceRoot?: string | null;
   /** Opaque token whose CHANGE triggers a listing `refresh()` — RunPanel
    *  passes `task.column`, so a run settling (running → review/ready/blocked)
    *  re-lists the tree the agent may have just written files into. The
@@ -301,6 +382,16 @@ export interface PromptComposerProps {
    *  the composer when the run ends, so no blur/focus ever fires. Consumers
    *  without run state simply omit it (undefined never fires). */
   fileScopeRefreshToken?: unknown;
+  /**
+   * Resolves once the caller's event stream is ready (RunPanel passes its
+   * stream-ready gate bound to the open task's id). A multi-repository
+   * composer waits on it before its first per-repository listing and
+   * discovery requests, so opening a task never puts one request per
+   * repository ahead of the task's own event stream in the webview's
+   * per-host connection budget. Absent (the New Task form and dialogs, which
+   * have no stream) means no wait. A single-repository composer ignores it.
+   */
+  awaitReady?: () => Promise<void>;
   /**
    * Functional-updater-capable references setter for `usePromptCapture`'s
    * internal instance (see the `capture` prop doc). When the caller already
@@ -444,7 +535,10 @@ export function PromptComposer({
   onReferencesChange,
   setReferences,
   fileScope,
+  fileScopes,
+  workspaceRoot,
   fileScopeRefreshToken,
+  awaitReady,
   textareaRef,
   capture,
   capabilities,
@@ -481,7 +575,11 @@ export function PromptComposer({
   // `capabilities`/`savedPrompts` (see those props' docs for why a caller
   // would hoist them). `?? internal` below picks whichever the caller
   // actually wants driving this render.
-  const internalCapabilities = useAgentCapabilities(agent, fileScope ?? null, { enabled: !capabilities });
+  const internalCapabilities = useAgentCapabilities(
+    agent,
+    multiScopesOrNull(fileScopes) ?? fileScope ?? null,
+    { enabled: !capabilities, awaitReady },
+  );
   const { commands, extensions } = capabilities ?? internalCapabilities;
   const internalSavedPrompts = useSavedPrompts({ enabled: !savedPromptsProp });
   const { savedPrompts, reload } = savedPromptsProp ?? internalSavedPrompts;
@@ -491,7 +589,16 @@ export function PromptComposer({
   // `projectFiles.error` (a failed listing's message) is intentionally
   // unused here — no error UI in this pass; it's available for a future
   // inline hint if that's ever wanted.
-  const projectFiles = useProjectFiles(fileScope ?? null);
+  // A multi-repository composer lists through `useProjectFileScopes` only:
+  // the single-scope hook gets `null` there, so it fetches nothing (it used
+  // to list the active repository a second time, unused).
+  // Callers pass named `fileScopes` only for a multi-repository task — one
+  // entry for a multi task left with one repository, whose cwd is still the
+  // non-git workspace root — so presence, not a count, picks the multi path.
+  const multiScope = multiScopesOrNull(fileScopes) !== null;
+  const singleScopeFiles = useProjectFiles(multiScope ? null : fileScope ?? null);
+  const multiScopeFiles = useProjectFileScopes(fileScopes ?? null, { awaitReady });
+  const projectFiles = multiScope ? multiScopeFiles : singleScopeFiles;
 
   // Fire `refresh()` when the caller's run-settle token changes — never on
   // mount (the hook's own scope-change fetch covers that). Guarded by a ref
@@ -574,7 +681,9 @@ export function PromptComposer({
   // mounting them at all is what actually removes their per-keystroke work
   // (see AtHighlightBackdrop's/AtFileAutocomplete's own layout-effect and
   // memo costs).
-  const hasFileScope = !!(fileScope && fileScope.dir);
+  const hasFileScope = multiScope
+    ? (fileScopes ?? []).every((s) => !!s.dir)
+    : !!(fileScope && fileScope.dir);
 
   // --- Unresolved `@` reference warning -----------------------------------
   // Send-time expansion (orchestrator `startTask`/`sendInput`) silently
@@ -623,13 +732,43 @@ export function PromptComposer({
   // fresh array per keystroke, but an unchanged token set must not re-arm
   // the debounce timer.
   const unlistedKey = unlistedTokens.map((t) => t.path).join("\u0000");
-  useEffect(() => {
+  // Stable identity for the repository scopes, so a fresh-but-equal array
+  // from a parent render never re-arms the effects below.
+  const multiScopesKey = (fileScopes ?? []).map((s) => `${s.name}\0${s.dir}\0${s.ref ?? ""}`).join("\0");
+  // The live scope(s) each unlisted token may exist in on disk, keyed by the
+  // token path (trailing "/" stripped) the warning layer checks. A single live
+  // scope maps plain token paths; a multi task maps each prefixed token to its
+  // own repository scope and strips the workspace prefix — `<dir>/frontend/src/a`
+  // is not a path inside any repository, so the old single-scope stat could
+  // never rescue a gitignored file in a multi-repository task.
+  //
+  // An UNPREFIXED token on a multi task is checked against the workspace root
+  // (the agent's actual cwd), not skipped. The merged listing only contains
+  // paths inside each repository, so a root-level file the agent created
+  // (`@notes.md`) looked unresolved even though send-time expansion resolves it
+  // from the workspace root. When no workspace root is supplied (a
+  // not-yet-started task) the listing verdict stands. A ref scope still lists
+  // exactly what the worktree will contain, so it is skipped.
+  const liveStatTargets = useMemo(() => {
+    if (!hasFileScope) return [];
+    if (multiScope) {
+      return multiScopeStatTargets(unlistedTokens, fileScopes, workspaceRoot);
+    }
     const dir = fileScope?.dir?.trim();
-    const live = !!dir && !(fileScope?.ref ?? "").trim();
-    const candidates = live
-      ? [...new Set(unlistedTokens.map((t) => t.path.replace(/\/+$/, "")).filter(isSafeClientRelPath))]
-      : [];
-    if (candidates.length === 0) {
+    if (!dir || (fileScope?.ref ?? "").trim()) return [];
+    const paths = new Map<string, string>();
+    for (const t of unlistedTokens) {
+      const local = t.path.replace(/\/+$/, "");
+      if (local && isSafeClientRelPath(local)) paths.set(local, local);
+    }
+    return paths.size > 0 ? [{ dir, paths }] : [];
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKey/multiScopesKey stand in for the arrays
+  }, [hasFileScope, multiScope, unlistedKey, multiScopesKey, fileScope?.dir, fileScope?.ref, workspaceRoot]);
+  const liveStatKey = liveStatTargets
+    .map((t) => `${t.dir}\0${[...t.paths.keys()].join("\0")}`)
+    .join("\u0001");
+  useEffect(() => {
+    if (liveStatTargets.length === 0) {
       setExistsOnDisk((prev) => (prev.size ? EMPTY_PATH_SET : prev));
       return;
     }
@@ -638,13 +777,22 @@ export function PromptComposer({
     // unlisted tokens (rare) — this is not a per-keystroke request.
     const timer = setTimeout(async () => {
       try {
-        const refs = await api.resolveRefs(candidates.map((p) => `${dir}/${p}`));
-        if (cancelled) return;
         const found = new Set<string>();
-        for (const r of refs) {
-          if (r.path.startsWith(`${dir}/`)) found.add(r.path.slice(dir!.length + 1).replace(/\/+$/, ""));
-        }
-        setExistsOnDisk(found);
+        // One target per repository (plus the workspace root) on a multi
+        // task: bounded like every other per-repository fan-out.
+        await mapWithConcurrency(liveStatTargets, MULTI_SCOPE_CONCURRENCY, async (target) => {
+          // Superseded while queued behind the cap: don't spend a request.
+          if (cancelled) return;
+          const refs = await api.resolveRefs([...target.paths.keys()].map((p) => `${target.dir}/${p}`));
+          if (cancelled) return;
+          for (const r of refs) {
+            if (!r.path.startsWith(`${target.dir}/`)) continue;
+            const local = r.path.slice(target.dir.length + 1).replace(/\/+$/, "");
+            const tokenKey = target.paths.get(local);
+            if (tokenKey) found.add(tokenKey);
+          }
+        });
+        if (!cancelled) setExistsOnDisk(found);
       } catch {
         // Stat unavailable — keep the listing verdict. Worst case is an
         // over-warn on a gitignored path until the next successful check;
@@ -652,8 +800,8 @@ export function PromptComposer({
       }
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKey stands in for unlistedTokens (see above)
-  }, [unlistedKey, fileScope?.dir, fileScope?.ref]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- liveStatKey stands in for liveStatTargets (see above)
+  }, [liveStatKey]);
 
   // --- Truncated-scope verification: per-token server-side search ---------
   // Only relevant once `projectFiles.truncated` is true — a capped listing
@@ -691,7 +839,6 @@ export function PromptComposer({
       clear();
       return;
     }
-    const scope = fileScope!;
     // De-dupe by stripped path (a bare-typed and a slash-typed token for the
     // same path shouldn't cost two round-trips) and cap at 8 so a draft with
     // a pile of unresolved tokens can't fan out unboundedly. Deliberate
@@ -721,8 +868,36 @@ export function PromptComposer({
       const listed = new Set<string>();
       const entryPaths = new Set<string>();
       const missing = new Set<string>();
-      await Promise.all([...byKey.entries()].map(async ([key, token]) => {
-        const results = await searchProjectFiles(scope, key, 20);
+      // Bounded on a multi task, where each token is a request against one of
+      // possibly many repositories; a single-repository draft keeps its one
+      // unbounded round (at most 8 tokens, see above).
+      const candidates = [...byKey.entries()];
+      await mapWithConcurrency(candidates, multiScope ? MULTI_SCOPE_CONCURRENCY : candidates.length, async ([key, token]) => {
+        // Multi-repository listing: the token must name its workspace first
+        // (`backend/src/a.ts`). Search THAT repository for the repo-local
+        // path — searching the single active repo with the prefixed path
+        // could never match, so every valid prefixed token was falsely
+        // confirmed missing.
+        //
+        // An unprefixed token is NOT confirmed missing here: it resolves
+        // against the multi task's workspace root at send time (the agent's
+        // cwd), and no repository's full-depth search covers that directory.
+        // It is rescued by the live-root stat above when it exists there;
+        // otherwise it stays unproven, which the warning layer already treats
+        // as "never warn" in truncated mode. Confirming it missing made
+        // `@notes.md` (a root file the agent wrote) flash a false warning.
+        const named = multiScope ? resolveNamedScopePath(fileScopes, token.path) : null;
+        if (multiScope && !named) return;
+        const lookupPath = named ? named.path : token.path;
+        const query = lookupPath.replace(/\/+$/, "");
+        const scope = named?.scope ?? fileScope;
+        if (!scope || !query) {
+          missing.add(key);
+          return;
+        }
+        // Superseded while queued behind the cap: don't spend a request.
+        if (cancelled) return;
+        const results = await searchProjectFiles(scope, query, 20);
         if (cancelled) return;
         // `null` means the REQUEST failed (network/server error) — NOT that
         // the server looked and found nothing (see `searchProjectFiles`'s
@@ -732,24 +907,27 @@ export function PromptComposer({
         // missing" and warned on.
         if (results === null) return;
         const rowPaths = new Set(results.map((r) => r.path));
-        if (isListedPath(rowPaths, token.path, token.isDirectory)) {
+        if (isListedPath(rowPaths, lookupPath, token.isDirectory)) {
           listed.add(key);
-          // The exact entry that matched: the token's own path when it hit
-          // directly, else (only possible when the token wasn't typed as a
-          // directory) the listing's slash-suffixed form of it.
-          entryPaths.add(rowPaths.has(token.path) ? token.path : `${key}/`);
+          // The exact listing entry that matched: the token's own path when
+          // it hit directly, else (only possible when the token wasn't typed
+          // as a directory) the listing's slash-suffixed form of it. Re-add
+          // the workspace prefix so `verifiedEntryPaths` stays in the same
+          // `<name>/…` shape as `projectFiles.validPaths`.
+          const matched = rowPaths.has(lookupPath) ? lookupPath : `${query}/`;
+          entryPaths.add(named ? `${named.scope.name}/${matched}` : matched);
         } else {
           missing.add(key);
         }
-      }));
+      });
       if (cancelled) return;
       setVerifiedListed(listed);
       setVerifiedEntryPaths(entryPaths);
       setCheckedMissing(missing);
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKeyForVerify stands in for unlistedTokens; fileScope read via closure, keyed by dir/ref below
-  }, [projectFiles.truncated, hasFileScope, unlistedKeyForVerify, fileScope?.dir, fileScope?.ref]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- unlistedKeyForVerify/multiScopesKey stand in for the arrays; fileScope/fileScopes read via closure, keyed below
+  }, [projectFiles.truncated, hasFileScope, unlistedKeyForVerify, multiScopesKey, multiScope, fileScope?.dir, fileScope?.ref]);
 
   const unresolvedWarning = useMemo(() => {
     const seen = new Set<string>();
@@ -799,9 +977,17 @@ export function PromptComposer({
         // Settings, or a file created by the agent/user since the last open,
         // shouldn't linger stale in the `/`/`@` autocompletes indefinitely.
         // `useProjectFiles.refresh()` dedupes in-flight requests, so this is
-        // cheap even when nothing changed. The caller's own `onFocus` (if
-        // any) fires after both.
-        onFocus={() => { reload(); projectFiles.refresh(); onFocus?.(); }}
+        // cheap even when nothing changed. A multi-repository listing is one
+        // request per repository, so its focus refresh is coalesced: only
+        // repositories listed more than FOCUS_REFRESH_MIN_AGE_MS ago are
+        // refetched (the run-settle refresh above still forces all). The
+        // caller's own `onFocus` (if any) fires after both.
+        onFocus={() => {
+          reload();
+          if (multiScope) multiScopeFiles.refresh({ maxAgeMs: FOCUS_REFRESH_MIN_AGE_MS });
+          else singleScopeFiles.refresh();
+          onFocus?.();
+        }}
         onKeyDown={onKeyDown}
         rows={rows}
         className={cn("relative resize-none", textareaClassName)}
@@ -825,6 +1011,7 @@ export function PromptComposer({
           textareaRef={ref}
           placement={placement}
           fileScope={fileScope}
+          fileScopes={multiScope ? fileScopes : null}
         />
       )}
       {inputAdornment}

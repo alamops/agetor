@@ -1,6 +1,7 @@
 import type { Task } from "../../shared/types.ts";
 import { isTaskFxPaused } from "../../shared/fx-recovery.ts";
 import { importedSessionOf } from "../../shared/imported-session.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 
 /** Every action the task context menu can offer. A subset of App.tsx's
  *  existing card callbacks (`start`/`cancel`/`markDone`/`archive`/
@@ -22,11 +23,14 @@ export type TaskMenuAction =
   | "diff"
   | "open-in-finder"
   | "view-pr"
+  | "view-repo-pr"
   | "view-issue"
   | "mark-read"
   | "mark-unread"
   | "copy-branch"
   | "copy-worktree-path"
+  | "copy-repo-branch"
+  | "copy-repo-worktree"
   | "delete";
 
 /** Visual/semantic grouping — T3 inserts a separator between consecutive
@@ -44,6 +48,9 @@ export interface TaskMenuEntry {
   group: TaskMenuGroup;
   /** Danger-styled entry (destructive text color). Only `delete` sets this. */
   danger?: boolean;
+  /** For `copy-repo-*` / `view-repo-pr` on a multi-repository task: which
+   *  repository entry the action targets. */
+  repoName?: string;
 }
 
 /**
@@ -140,6 +147,22 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   if (task.prUrl) {
     entries.push({ action: "view-pr", label: "View pull request", group: "inspect" });
   }
+  if (isMultiRepoTask(task)) {
+    // Per-repository PRs (issue #291): a multi row has no single `prUrl` —
+    // each repository stamps its own — so name every repository that opened
+    // one. The board handler resolves `repoName` back to that entry's URL and
+    // worktree path.
+    for (const repo of task.repositories!) {
+      if (repo.prUrl) {
+        entries.push({
+          action: "view-repo-pr",
+          label: `View ${repo.name} pull request`,
+          group: "inspect",
+          repoName: repo.name,
+        });
+      }
+    }
+  }
   if (task.issueUrl) {
     entries.push({ action: "view-issue", label: "View issue", group: "inspect" });
   }
@@ -155,11 +178,34 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   if (!task.unread && !ctx.isOpen && task.hasAssistantMessages === true) {
     entries.push({ action: "mark-unread", label: "Mark as unread", group: "utility" });
   }
-  if (task.branch) {
-    entries.push({ action: "copy-branch", label: "Copy branch name", group: "utility" });
-  }
-  if (task.worktreePath) {
-    entries.push({ action: "copy-worktree-path", label: "Copy worktree path", group: "utility" });
+  if (isMultiRepoTask(task)) {
+    // Per-repository copy entries (issue #291): the multi row has no single
+    // branch/worktree path, so name each repository.
+    for (const repo of task.repositories!) {
+      if (repo.branch) {
+        entries.push({
+          action: "copy-repo-branch",
+          label: `Copy ${repo.name} branch`,
+          group: "utility",
+          repoName: repo.name,
+        });
+      }
+      if (repo.worktreePath) {
+        entries.push({
+          action: "copy-repo-worktree",
+          label: `Copy ${repo.name} worktree path`,
+          group: "utility",
+          repoName: repo.name,
+        });
+      }
+    }
+  } else {
+    if (task.branch) {
+      entries.push({ action: "copy-branch", label: "Copy branch name", group: "utility" });
+    }
+    if (task.worktreePath) {
+      entries.push({ action: "copy-worktree-path", label: "Copy worktree path", group: "utility" });
+    }
   }
 
   // danger — always last. A step task can't be deleted individually — the

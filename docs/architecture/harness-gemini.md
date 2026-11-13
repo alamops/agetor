@@ -14,7 +14,7 @@ Structured output comes from tailing gemini's `stream-json` NDJSON log (`dataDir
 
 **`--skip-trust` is mandatory** regardless of mode — gemini's headless mode refuses to run tool calls in an untrusted directory (exit 55) even under `--yolo`, and every agetor task runs in a fresh worktree path that's inherently untrusted on first run.
 
-**No sandbox flag** — gemini's `--sandbox` is a heavyweight opt-in (backed by Docker on this machine; pulling the image alone took 30s+ with no output) unsuitable for agetor's default `auto` mode, and unlike codex there's nothing to escalate: default (no `-s`) already gives unrestricted filesystem access, confirmed by a real `write_file` tool call succeeding with no sandbox flag — so `gitWritableRootsSync`'s external-git escalation logic has no gemini analog.
+**No sandbox flag** — gemini's `--sandbox` is a heavyweight opt-in (backed by Docker on this machine; pulling the image alone took 30s+ with no output) unsuitable for agetor's default `auto` mode, and unlike codex there's nothing to escalate: default (no `-s`) already gives unrestricted filesystem access, confirmed by a real `write_file` tool call succeeding with no sandbox flag — so `gitWritableRoots`'s external-git escalation logic has no gemini analog.
 
 **Never pass gemini's own `-w/--worktree` flag** — agetor already manages worktrees; it would create a second, agetor-unaware worktree nested inside agetor's.
 Config-dir override uses `GEMINI_CLI_HOME` (verified in the bundled CLI source: `homedir()` returns `process.env.GEMINI_CLI_HOME || os.homedir()`), a dedicated env var — unlike codex there's no need to also touch the real `HOME`.

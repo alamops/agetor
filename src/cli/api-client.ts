@@ -349,8 +349,9 @@ export class AgetorClient {
   getRuns(id: string): Promise<Run[]> {
     return this.req("GET", `/tasks/${encodeURIComponent(id)}/runs`);
   }
-  getDiff(id: string): Promise<TaskDiff> {
-    return this.req("GET", `/tasks/${encodeURIComponent(id)}/diff`);
+  getDiff(id: string, repo?: string | null): Promise<TaskDiff> {
+    const query = repo ? `?repo=${encodeURIComponent(repo)}` : "";
+    return this.req("GET", `/tasks/${encodeURIComponent(id)}/diff${query}`);
   }
   getGitStatus(id: string): Promise<TaskGitStatus> {
     return this.req("GET", `/tasks/${encodeURIComponent(id)}/git-status`);
@@ -779,6 +780,20 @@ export class AgetorClient {
     return this.req("DELETE", `/tasks/${encodeURIComponent(taskId)}/agent-profile`);
   }
 
+  /** `DELETE /tasks/:id/repositories/:name` — remove one repository from a
+   *  multi-repository task (issue #291): a clean checkout is detached, the
+   *  repository's branch is kept. Returns the updated `Task`; 404 unknown
+   *  task or repository, 409 `{error, code}` when refused (`running`,
+   *  `last-repository`, `dirty`, `not-multi`, `pipeline-step`, `detach-failed`) — the thrown
+   *  `ApiError` carries the core's message. */
+  async removeTaskRepository(taskId: string, name: string): Promise<Task> {
+    const res = await this.req<{ task: Task }>(
+      "DELETE",
+      `/tasks/${encodeURIComponent(taskId)}/repositories/${encodeURIComponent(name)}`,
+    );
+    return res.task;
+  }
+
   // ── pipelines ────────────────────────────────────────────────────────────
   /** `GET /pipelines` — every pipeline, name ASC, with `taskCount`. */
   listPipelines(): Promise<Pipeline[]> {
@@ -1013,6 +1028,9 @@ export interface CreateTaskInput {
   prompt: string;
   agent?: string;
   workdir?: string;
+  /** Selected repositories (issue #291): 2+ makes it a multi-repository task
+   *  (requires worktree isolation). `baseRef` is per repository. */
+  repositories?: { path: string; baseRef?: string }[];
   isolation?: "worktree" | "none";
   mode?: string | null;
   model?: string | null;

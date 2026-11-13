@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -289,6 +289,40 @@ test("listWorktrees flags an orphan dir (no task row) as \"orphaned\"", async ()
   }
 });
 
+test("a legacy orphan worktree with a submodule is not split into repository rows", async () => {
+  // Review should-fix: the orphan expansion treated ANY child directory with a
+  // `.git` as a linked worktree. A submodule checked out INSIDE a linked
+  // worktree points at `<repo>/.git/worktrees/<wt>/modules/<sub>` (git 2.54),
+  // which contains the same `.git/worktrees/` marker the parser keys on — so
+  // a legacy single-repository worktree that vendors one must still stay ONE
+  // row. This uses the real pointer shape, not the main-checkout
+  // `.git/modules/<sub>` form (which never occurs here).
+  const { listWorktrees } = await import("./orchestrator.ts");
+  const { WORKTREES_DIR } = await import("./worktree.ts");
+
+  const orphanId = `orphan-${randomUUID()}`;
+  const orphanDir = path.join(WORKTREES_DIR, orphanId);
+  const submoduleDir = path.join(orphanDir, "vendor-lib");
+  mkdirSync(submoduleDir, { recursive: true });
+  writeFileSync(
+    path.join(orphanDir, ".git"),
+    `gitdir: /tmp/source-repo/.git/worktrees/${orphanId}\n`,
+  );
+  writeFileSync(
+    path.join(submoduleDir, ".git"),
+    `gitdir: /tmp/source-repo/.git/worktrees/${orphanId}/modules/vendor-lib\n`,
+  );
+
+  try {
+    const rows = listWorktrees().filter((e) => e.id === orphanId || e.id.startsWith(`${orphanId}__`));
+    expect(rows.map((r) => r.id)).toEqual([orphanId]);
+    expect(rows[0]?.repoName).toBeUndefined();
+    expect(rows[0]?.workdir).toBe("/tmp/source-repo");
+  } finally {
+    rmSync(orphanDir, { recursive: true, force: true });
+  }
+});
+
 test("archiveTask force bypasses the done-only column gate", async () => {
   const { createTask, archiveTask, pendingTeardown } = await import("./orchestrator.ts");
   const { prepareWorkdir } = await import("./worktree.ts");
@@ -445,5 +479,174 @@ test("deleteOrphanWorktree confines deletions to a direct child of WORKTREES_DIR
     expect(existsSync(WORKTREES_DIR)).toBe(true);
   } finally {
     rmSync(sentinelDir, { recursive: true, force: true });
+  }
+});
+
+// ── multi-repository tasks (issue #291) ────────────────────────────────────
+
+test("listWorktrees emits one row per repository and skips the workspace root", async () => {
+  const { createTask, listWorktrees } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi list",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(taskId, prepared.repositories!);
+    const names = uniqueRepoSlugs([a, b]);
+    const rows = listWorktrees().filter((e) => e.taskId === taskId);
+    expect(rows.map((r) => r.id)).toEqual(names.map((n) => `${taskId}__${n}`));
+    expect(rows.map((r) => r.repoName)).toEqual(names);
+    expect(rows.map((r) => r.workdir)).toEqual([a, b]);
+    expect(rows.every((r) => r.branch && r.path.includes(r.repoName!))).toBe(true);
+    expect(listWorktrees().some((e) => e.id === taskId)).toBe(false);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    rmSync((await import("./worktree.ts")).worktreePath(created.task), { recursive: true, force: true });
+  }
+});
+
+test("listWorktrees surfaces a retained workspace root with no repository checkouts left", async () => {
+  // Review S1 (round 9): teardown keeps a multi workspace root that holds
+  // agent files (it never recursively wipes user content). With every
+  // repository checkout gone, the per-repository expansion emitted zero rows,
+  // so that retained root was invisible on the Worktrees page and could never
+  // be cleaned from there. It must surface as one task-backed row.
+  const { createTask, listWorktrees } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir, worktreePath } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "retained workspace",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const workspace = prepared.worktreePath!;
+    tasks.update(taskId, { worktreePath: prepared.worktreePath });
+    tasks.setRepositories(taskId, prepared.repositories!);
+    // Simulate a completed teardown that stopped short of the non-empty root:
+    // every repository checkout is gone, an agent artifact remains.
+    for (const repo of prepared.repositories!) {
+      rmSync(repo.worktreePath!, { recursive: true, force: true });
+    }
+    writeFileSync(path.join(workspace, "notes.md"), "keep me\n");
+    tasks.update(taskId, { archivedAt: Date.now() });
+
+    const rows = listWorktrees().filter((e) => e.taskId === taskId);
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.id).toBe(taskId);
+    expect(row.repoName).toBeUndefined();
+    expect(row.path).toBe(workspace);
+    expect(row.taskTitle).toBe("retained workspace");
+    expect(row.stale).toBe(true);
+    expect(row.staleReasons).toContain("archived");
+    // The retained artifact is still there — surfacing the row must not wipe
+    // the workspace.
+    expect(existsSync(path.join(workspace, "notes.md"))).toBe(true);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    rmSync(worktreePath(created.task), { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("deleteOrphanWorktree removes one nested repo dir and the workspace only when empty", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir, worktreePath, WORKTREES_DIR } = await import("./worktree.ts");
+  const { deleteOrphanWorktree } = await import("./orchestrator.ts");
+  const { db, tasks } = await import("./db.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "multi orphan",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  const workspace = worktreePath(created.task);
+  const [nameA, nameB] = uniqueRepoSlugs([a, b]);
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { worktreePath: workspace });
+    tasks.setRepositories(taskId, prepared.repositories!);
+    // Orphan the workspace by removing the row directly (no teardown).
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+
+    expect(await deleteOrphanWorktree(`${taskId}__${nameA}`)).toEqual({ ok: true });
+    expect(existsSync(path.join(workspace, nameA!))).toBe(false);
+    expect(existsSync(path.join(workspace, nameB!))).toBe(true);
+    expect(existsSync(workspace)).toBe(true);
+
+    expect(await deleteOrphanWorktree(`${taskId}__${nameB}`)).toEqual({ ok: true });
+    expect(existsSync(workspace)).toBe(false);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("deleteOrphanWorktree refuses a traversal id and an owned nested repo", async () => {
+  const { createTask, deleteOrphanWorktree } = await import("./orchestrator.ts");
+  const { prepareTaskWorkdir, worktreePath } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+  const { uniqueRepoSlugs } = await import("../shared/multi-repo.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const created = await createTask({
+    title: "owned nested",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: a,
+    isolation: "worktree",
+    repositories: [{ path: a }, { path: b }],
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  try {
+    const prepared = await prepareTaskWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.setRepositories(taskId, prepared.repositories!);
+    const name = uniqueRepoSlugs([a, b])[0]!;
+    const res = await deleteOrphanWorktree(`${taskId}__${name}`);
+    expect("error" in res && /owned by an active task/.test(res.error)).toBe(true);
+    for (const bad of [`${taskId}__..`, `${taskId}__${name}/../x`, `${taskId}__`]) {
+      expect("error" in (await deleteOrphanWorktree(bad))).toBe(true);
+    }
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    rmSync(worktreePath(created.task), { recursive: true, force: true });
   }
 });

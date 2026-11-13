@@ -52,6 +52,9 @@ import { stackBackupCanServe } from "@/lib/stack-launch";
 import { PipelinePicker } from "@/components/pipelines";
 import { showsSpeedPicker, SpeedPicker } from "./SpeedPicker";
 import { ProjectPicker } from "./ProjectPicker";
+import { RepositoriesDialog } from "./RepositoriesDialog";
+import { collapseToProject, repositoryFileScopes, selectionName, type RepoSelection } from "@/lib/repo-selection";
+import { applyRepositoriesSave, seedRepositoriesDialogValue } from "@/lib/multi-repo-ui";
 import { TaskTypePicker } from "./TaskTypePicker";
 import { captureDroppedOrPastedItems } from "./ReferencesPicker";
 import { PromptComposer, usePromptCapture } from "./PromptComposer";
@@ -242,11 +245,29 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   // ProjectPicker will auto-select the most-recently-used project from the
   // persisted list.
   const [workdir, setWorkdir] = useState("");
+  // Repository selection (issue #291). `repos` always contains the current
+  // ProjectPicker choice; 2+ entries make the task multi-repository.
+  const [repos, setRepos] = useState<RepoSelection[]>([]);
+  const [repositoriesOpen, setRepositoriesOpen] = useState(false);
+  const multiRepo = repos.length > 1;
+  // Keep the selection in sync with a workdir restored from preferences or
+  // typed by another surface: an empty selection becomes that one project.
+  useEffect(() => {
+    if (workdir && repos.length === 0) setRepos([{ path: workdir, root: null }]);
+  }, [workdir, repos.length]);
   // Owns the isolate toggle, base-ref, and branch-name field state/derivations
   // — see `WorktreeOptions.tsx`. Declared here (before the mode/model state)
   // since `wt.isolate`/`wt.baseRef` are read further down by the `fileScope`
   // memo passed to `<PromptComposer fileScope={…}>`.
   const wt = useWorktreeOptions({ workdir, title, taskType });
+  // A 2+ repository selection forces worktree isolation server-side. Force the
+  // same state here so the branch-name field (which only renders while
+  // isolated) stays visible and the `@` scopes keep their pinned refs, even
+  // when the user had unchecked the toggle for a single-project selection.
+  const { isolate: wtIsolate, setIsolate: setWtIsolate } = wt;
+  useEffect(() => {
+    if (multiRepo && !wtIsolate) setWtIsolate(true);
+  }, [multiRepo, wtIsolate, setWtIsolate]);
   const [mode, setMode] = useState<string>(initialMode("claude-code"));
   const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
   // `null` is reserved for the Haiku-style "model doesn't accept effort" case.
@@ -299,6 +320,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
   const fileScope = useMemo(
     () => (workdir.trim() ? { dir: workdir.trim(), ref: wt.isolate ? (wt.baseRef.trim() || "HEAD") : null } : null),
     [workdir, wt.isolate, wt.baseRef],
+  );
+  // Multi-repository `@` scopes: each selected repo lists at its own path and
+  // pinned/HEAD ref; entries are prefixed with the workspace name.
+  const fileScopes = useMemo(
+    () => (multiRepo ? repositoryFileScopes(repos, wt.isolate) : null),
+    [multiRepo, repos, wt.isolate],
   );
   // Drag/paste-to-attach wiring for the prompt textarea, shared with the
   // aside-wide drop zone below (`onAsideDrop`) — see `PromptComposer.tsx`'s
@@ -617,7 +644,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
       : promptByteOverage(overageKind, composeLaunchPrompt(selectedProfile, prompt));
 
   const canSubmit =
-    title.trim() && prompt.trim() && workdir.trim() && wt.valid
+    title.trim() && prompt.trim() && workdir.trim() && repos.length > 0 && wt.valid
     && promptOverage == null;
 
   const submit = ({ start }: { start: boolean }) => {
@@ -635,8 +662,18 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
         workdir: workdir.trim(),
         // The branch is only meaningful under worktree isolation — see
         // `worktreePayload` for the isolation/baseRef/branch mapping this
-        // spreads in.
-        ...wt.payload(),
+        // spreads in. A multi-repository task forces worktree isolation and
+        // sends the full set; its per-repo base refs come from the dialog.
+        ...(multiRepo
+          ? {
+              isolation: "worktree" as const,
+              branch: wt.payload().branch,
+              repositories: repos.map((r) => ({
+                path: r.path,
+                ...(r.baseRef?.trim() ? { baseRef: r.baseRef.trim() } : {}),
+              })),
+            }
+          : wt.payload()),
         // model is always an explicit option id. effort is too, except for
         // the Haiku-style "model doesn't accept effort" case which sends null.
         mode: selectedProfile ? selectedProfile.mode : mode,
@@ -809,6 +846,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                 references={references}
                 onReferencesChange={setReferences}
                 fileScope={fileScope}
+                fileScopes={fileScopes}
                 textareaRef={promptRef}
                 capture={capture}
                 startingFolder={workdir || undefined}
@@ -830,6 +868,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                   value={workdir}
                   onChange={(p) => {
                     setWorkdir(p);
+                    // Changing the project collapses a multi selection back to
+                    // that one repository (issue #291).
+                    setRepos((cur) => collapseToProject(p, cur));
                     // The previously-picked branch likely doesn't exist on the new
                     // project — drop back to HEAD so the picker shows a valid default.
                     wt.resetBaseRef();
@@ -839,7 +880,58 @@ export function NewTaskForm({ onSubmit, agents, harnesses, stacks = [], profiles
                   title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
                 />
               </div>
-              <WorktreeOptions state={wt} />
+              <WorktreeOptions state={wt} variant={multiRepo ? "multi" : "default"} />
+              <div className="min-w-0 space-y-1" data-testid="new-task-repositories">
+                <label className="text-muted-foreground">Repositories</label>
+                {multiRepo ? (
+                  <div className="space-y-1 rounded-md border border-border/60 p-2 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-medium">{repos.length} repositories</span>
+                      <Button size="sm" variant="outline" onClick={() => setRepositoriesOpen(true)}>
+                        Manage
+                      </Button>
+                    </div>
+                    <p className="text-muted-foreground">
+                      {repos.map((r) => selectionName(r)).join(", ")}
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Each repository gets its own worktree and branch in one workspace; worktree isolation is required.
+                    </p>
+                  </div>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="w-full justify-start"
+                    onClick={() => setRepositoriesOpen(true)}
+                    disabled={!workdir.trim()}
+                  >
+                    Use multiple repositories…
+                  </Button>
+                )}
+                <RepositoriesDialog
+                  open={repositoriesOpen}
+                  onClose={() => setRepositoriesOpen(false)}
+                  // While single, the inline Branch picker's base ref is the
+                  // first repository's: seeding it here means adding a second
+                  // repository keeps it (editable in that row) instead of the
+                  // multi payload silently branching from HEAD.
+                  value={seedRepositoriesDialogValue(repos, workdir, wt.baseRef)}
+                  onSave={(next) => {
+                    // Saving can promote the second repository (or collapse the
+                    // selection back to a different first one), which changes
+                    // the task's project exactly like the ProjectPicker does:
+                    // the old project's base ref is dropped rather than
+                    // silently branching the new one from a ref that may not
+                    // exist there. A selection saved back down to one entry
+                    // hands that entry's base ref to the inline picker.
+                    const applied = applyRepositoriesSave(next, { primaryPath: workdir, inlineBaseRef: wt.baseRef });
+                    setRepos(applied.repos);
+                    if (applied.primaryPath !== workdir) setWorkdir(applied.primaryPath);
+                    if (applied.inlineBaseRef.kind === "set") wt.setBaseRef(applied.inlineBaseRef.value);
+                  }}
+                />
+              </div>
 
               {/* "One selection" (plan D1/D5): a picked pipeline replaces
                   the Agent picker AND the entire manual harness/mode/model/

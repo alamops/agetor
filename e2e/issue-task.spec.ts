@@ -108,6 +108,7 @@ const CONVERGE_TIMEOUT = 30_000;
 
 let stub: GitHubStub;
 let projectDir: string;
+let extraRepoDir: string;
 const createdTaskIds: string[] = [];
 
 function git(cwd: string, args: string[]): void {
@@ -381,7 +382,9 @@ async function openIssueTaskDialog(page: Page): Promise<Locator> {
 
 test.beforeAll(async ({ backend }) => {
   projectDir = await initRepo();
+  extraRepoDir = await initRepo();
   await registerProject(backend.apiBase, backend.apiToken, projectDir);
+  await registerProject(backend.apiBase, backend.apiToken, extraRepoDir);
   stub = await startGitHubStub(backend.githubStubPort, issueRoutes());
 });
 
@@ -419,6 +422,7 @@ test.afterAll(async ({ backend }) => {
   }
   await stub.close();
   await rm(projectDir, { recursive: true, force: true });
+  await rm(extraRepoDir, { recursive: true, force: true });
 });
 
 /** DELETE /tasks/:id via the `request` fixture — the per-test cleanup call.
@@ -448,6 +452,7 @@ async function findTaskByTitle(
   pipelineId: string | null;
   agentProfileId: string | null;
   pipelineRun: { status: string } | null;
+  repositories?: { path: string; name: string }[];
 } | null> {
   const res = await request.get(`${backend.apiBase}/tasks`, {
     headers: { authorization: `Bearer ${backend.apiToken}` },
@@ -468,6 +473,7 @@ async function findTaskByTitle(
     pipelineId?: string | null;
     agentProfileId?: string | null;
     pipelineRun?: { status: string } | null;
+    repositories?: { path: string; name: string }[];
   }>;
   const row = rows.find((r) => r.title === title);
   if (!row) return null;
@@ -730,6 +736,61 @@ test.describe("task from a Git issue", () => {
 
     await deleteTask(request, backend, taskId);
     createdTaskIds.splice(createdTaskIds.indexOf(taskId), 1);
+  });
+
+  test("repositories dialog: the issue's repository is locked and an extra repo is added", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    test.setTimeout(90_000);
+    await gotoApp(page, backend.bootBase);
+    const issueTaskDialog = await openIssueTaskDialog(page);
+
+    await issueTaskDialog.getByTestId("issue-repositories").getByRole("button", { name: "Manage" }).click();
+    const reposDialog = page.getByRole("dialog", { name: "Repositories" });
+    await expect(reposDialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
+
+    // The issue's own repository is pinned by `lockedPath`: it starts
+    // checked, can't be unchecked, and its remove button is disabled.
+    const locked = reposDialog.getByLabel(`Select ${projectDir}`, { exact: true });
+    await expect(locked).toBeChecked();
+    await expect(locked).toBeDisabled();
+    await expect(reposDialog.getByLabel(`Remove ${projectDir}`, { exact: true })).toBeDisabled();
+    await locked.click({ force: true }).catch(() => {});
+    await expect(locked).toBeChecked();
+
+    await reposDialog.getByLabel(`Select ${extraRepoDir}`, { exact: true }).check();
+    await reposDialog.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(reposDialog).toBeHidden({ timeout: CONVERGE_TIMEOUT });
+
+    await expect(issueTaskDialog.getByTestId("issue-task-submit")).toBeEnabled({
+      timeout: CONVERGE_TIMEOUT,
+    });
+    await issueTaskDialog.getByTestId("issue-task-submit").click();
+
+    // Poll for THIS task (the baseline scenario shares its title): the set
+    // must stay issue-repo-first and include the extra repository.
+    let taskId: string | null = null;
+    await expect(async () => {
+      const res = await request.get(`${backend.apiBase}/tasks`, {
+        headers: { authorization: `Bearer ${backend.apiToken}` },
+      });
+      expect(res.ok()).toBeTruthy();
+      const rows = (await res.json()) as Array<{ id: string; repositories?: { path: string }[] }>;
+      taskId = rows.find((r) => r.repositories?.some((repo) => repo.path === extraRepoDir))?.id ?? null;
+      expect(taskId).not.toBeNull();
+    }).toPass({ timeout: CONVERGE_TIMEOUT });
+
+    const res = await request.get(`${backend.apiBase}/tasks/${taskId}`, {
+      headers: { authorization: `Bearer ${backend.apiToken}` },
+    });
+    const task = (await res.json()) as { repositories?: { path: string }[] };
+    expect(task.repositories?.map((repo) => repo.path)).toEqual([projectDir, extraRepoDir]);
+
+    createdTaskIds.push(taskId!);
+    await deleteTask(request, backend, taskId!);
+    createdTaskIds.splice(createdTaskIds.indexOf(taskId!), 1);
   });
 
   test("isolate off: unchecking Isolate creates a task with no worktree", async ({ page, request, backend }) => {

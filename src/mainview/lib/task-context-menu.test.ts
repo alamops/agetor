@@ -58,11 +58,14 @@ const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   diff: "inspect",
   "open-in-finder": "inspect",
   "view-pr": "inspect",
+  "view-repo-pr": "inspect",
   "view-issue": "inspect",
   "mark-read": "utility",
   "mark-unread": "utility",
   "copy-branch": "utility",
   "copy-worktree-path": "utility",
+  "copy-repo-branch": "utility",
+  "copy-repo-worktree": "utility",
   delete: "danger",
 };
 
@@ -627,4 +630,74 @@ describe("an imported OpenCode session does not offer Run", () => {
     const entries = buildTaskContextMenu(makeTask({ agent: "opencode", importedOpencode: null }), { isOpen: false });
     expect(actions(entries)).toContain("start");
   });
+});
+
+test("multi-repository task offers per-repository copy entries", () => {
+  const task = makeTask({
+    branch: null,
+    worktreePath: "/wt/t1",
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/t1/frontend", baseRef: null, checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x-2", branchSource: "created", worktreePath: "/wt/t1/backend", baseRef: null, checkoutBranch: "feature/x-2", prUrl: null },
+    ],
+  });
+  const entries = buildTaskContextMenu(task, { isOpen: false });
+  const copies = entries.filter((e) => e.action === "copy-repo-branch" || e.action === "copy-repo-worktree");
+  expect(copies.map((e) => `${e.action}:${e.repoName}`)).toEqual([
+    "copy-repo-branch:frontend",
+    "copy-repo-worktree:frontend",
+    "copy-repo-branch:backend",
+    "copy-repo-worktree:backend",
+  ]);
+  expect(entries.some((e) => e.action === "copy-branch")).toBe(false);
+  expect(entries.some((e) => e.action === "copy-worktree-path")).toBe(false);
+});
+
+test("multi-repository task offers a View PR entry for every repository that opened one", () => {
+  const repo = (name: string, prUrl: string | null) => ({
+    path: `/src/${name}`,
+    name,
+    branch: "feature/x",
+    branchSource: "created" as const,
+    worktreePath: `/wt/t1/${name}`,
+    baseRef: null,
+    checkoutBranch: "feature/x",
+    prUrl,
+  });
+  const task = makeTask({
+    branch: null,
+    worktreePath: "/wt/t1",
+    repositories: [
+      repo("frontend", "https://github.com/o/frontend/pull/1"),
+      repo("backend", null),
+      repo("infra", "https://github.com/o/infra/pull/2"),
+    ],
+  });
+  const entries = buildTaskContextMenu(task, { isOpen: false });
+  expect(entries.filter((e) => e.action === "view-repo-pr").map((e) => `${e.repoName}:${e.label}`)).toEqual([
+    "frontend:View frontend pull request",
+    "infra:View infra pull request",
+  ]);
+  // A multi task has no aggregate `prUrl`, so the single-repo entry never shows.
+  expect(entries.some((e) => e.action === "view-pr")).toBe(false);
+  for (const e of entries) {
+    expect(e.group).toBe(ACTION_GROUP[e.action]);
+  }
+});
+
+test("a multi task left with one repository keeps its per-repository entries (round 15)", () => {
+  const task = makeTask({
+    branch: null,
+    worktreePath: "/wt/t1",
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/t1/backend", baseRef: null, checkoutBranch: "feature/x", prUrl: "https://github.com/o/backend/pull/4" },
+    ],
+  });
+  const entries = buildTaskContextMenu(task, { isOpen: false });
+  expect(entries.filter((e) => e.repoName === "backend").map((e) => e.action)).toEqual([
+    "view-repo-pr",
+    "copy-repo-branch",
+    "copy-repo-worktree",
+  ]);
 });

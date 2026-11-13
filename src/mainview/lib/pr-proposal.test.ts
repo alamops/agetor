@@ -466,3 +466,184 @@ describe("review-fix regressions", () => {
     expect(parsePrProposal(text)).toMatchObject({ title: "Heading style", description: "desc" });
   });
 });
+
+describe("multi-repository proposals", () => {
+  const labeled = [
+    "Repository: frontend",
+    LINK,
+    "PR title:",
+    "```",
+    "Add login UI",
+    "```",
+    "PR description:",
+    "````",
+    "Frontend body.",
+    "````",
+    "",
+    "Repository: backend",
+    "https://github.com/acme/backend/pull/new/feature/add-login",
+    "PR title:",
+    "```",
+    "Add login API",
+    "```",
+    "PR description:",
+    "````",
+    "Backend body.",
+    "````",
+  ].join("\n");
+
+  test("parses one proposal per Repository label", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const map = parseRepositoryProposals(labeled);
+    expect([...map.keys()]).toEqual(["frontend", "backend"]);
+    expect(map.get("frontend")?.title).toBe("Add login UI");
+    expect(map.get("frontend")?.description).toBe("Frontend body.");
+    expect(map.get("backend")?.link).toBe("https://github.com/acme/backend/pull/new/feature/add-login");
+  });
+
+  test("repository names containing underscores are not truncated", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const text = [
+      "Repository: agetor_api",
+      LINK,
+      "PR title:",
+      "```",
+      "Add API",
+      "```",
+      "PR description:",
+      "````",
+      "Body.",
+      "````",
+    ].join("\n");
+    const map = parseRepositoryProposals(text);
+    expect([...map.keys()]).toEqual(["agetor_api"]);
+    expect(map.get("agetor_api")?.title).toBe("Add API");
+  });
+
+  test("repository names ending or starting with an underscore survive", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const block = (name: string) => [
+      `Repository: ${name}`,
+      LINK,
+      "PR title:",
+      "```",
+      `Add ${name}`,
+      "```",
+      "PR description:",
+      "````",
+      "Body.",
+      "````",
+    ].join("\n");
+    const map = parseRepositoryProposals([block("api_"), block("_worker")].join("\n\n"));
+    // A lone edge underscore is part of the slug — `repoNameForPath` keeps it,
+    // so the label must too (only a *balanced* pair is emphasis).
+    expect([...map.keys()]).toEqual(["api_", "_worker"]);
+  });
+
+  test("markdown emphasis around the label and value is stripped", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const text = [
+      "**Repository:** **frontend**",
+      LINK,
+      "PR title:",
+      "```",
+      "UI",
+      "```",
+      "PR description:",
+      "````",
+      "Frontend body.",
+      "````",
+      "",
+      "### _Repository:_ agetor_api",
+      LINK,
+      "PR title:",
+      "```",
+      "API",
+      "```",
+      "PR description:",
+      "````",
+      "API body.",
+      "````",
+    ].join("\n");
+    const map = parseRepositoryProposals(text);
+    expect([...map.keys()]).toEqual(["frontend", "agetor_api"]);
+    expect(map.get("frontend")?.title).toBe("UI");
+    expect(map.get("agetor_api")?.title).toBe("API");
+  });
+
+  test("inline-code-wrapped labels keep their proposal (backticks and nested emphasis)", () => {
+    const { parseRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const block = (label: string, title: string) => [
+      label,
+      LINK,
+      "PR title:",
+      "```",
+      title,
+      "```",
+      "PR description:",
+      "````",
+      "Body.",
+      "````",
+    ].join("\n");
+    const map = parseRepositoryProposals([
+      block("Repository: `frontend`", "UI"),
+      block("**Repository: `backend`**", "API"),
+      block("Repository: **`infra`**", "Infra"),
+    ].join("\n\n"));
+    expect([...map.keys()]).toEqual(["frontend", "backend", "infra"]);
+    expect(map.get("backend")?.title).toBe("API");
+    expect(map.get("infra")?.title).toBe("Infra");
+  });
+
+  test("tolerates a missing label only when exactly one proposal exists", () => {
+    const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const events = [ev({ data: canonicalText() })];
+    expect([...latestRepositoryProposals(events).keys()]).toEqual([]);
+    expect(latestRepositoryProposals(events, "frontend").get("frontend")?.title).toBe("Add login flow");
+  });
+
+  test("repositoriesNeedingPr skips already-stamped repositories", () => {
+    const { repositoriesNeedingPr } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const repos = [
+      { name: "frontend", prUrl: "https://github.com/acme/frontend/pull/1" },
+      { name: "backend", prUrl: null },
+      { name: "infra", prUrl: null },
+    ];
+    expect(repositoriesNeedingPr(repos).map((r) => r.name)).toEqual(["backend", "infra"]);
+    expect(repositoriesNeedingPr(repos.map((r) => ({ ...r, prUrl: "x" })))).toEqual([]);
+  });
+
+  test("latestProposalForRepository never returns another repository's labeled block", () => {
+    const { latestProposalForRepository, latestPrProposal } =
+      require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const events = [ev({ data: labeled })];
+    // `latestPrProposal` takes the LAST PR title label (backend) regardless of
+    // which repository the user is acting on — the bug this helper closes.
+    expect(latestPrProposal(events)?.title).toBe("Add login API");
+    expect(latestProposalForRepository(events, "frontend")?.title).toBe("Add login UI");
+    expect(latestProposalForRepository(events, "backend")?.title).toBe("Add login API");
+    expect(latestProposalForRepository(events, "infra")).toBeNull();
+  });
+
+  test("latestProposalsForTargets attributes an unlabeled proposal only when there is one target", () => {
+    const { latestProposalsForTargets } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const events = [ev({ data: canonicalText() })];
+    // Several PR targets: an unlabeled block could belong to any of them, so
+    // it is not stamped onto the first one.
+    expect([...latestProposalsForTargets(events, ["frontend", "backend"]).keys()]).toEqual([]);
+    expect(latestProposalsForTargets(events, ["frontend"]).get("frontend")?.title).toBe("Add login flow");
+    // Duplicates collapse before the one-target rule.
+    expect(latestProposalsForTargets(events, ["frontend", "frontend"]).get("frontend")?.title)
+      .toBe("Add login flow");
+  });
+
+  test("newest run wins and subagent streams are ignored", () => {
+    const { latestRepositoryProposals } = require("./pr-proposal.ts") as typeof import("./pr-proposal.ts");
+    const events = [
+      ev({ runId: "old", data: labeled }),
+      ev({ runId: "new", data: "Repository: frontend\nPR title:\n```\nNewer\n```\nPR description:\n````\nNew body.\n````" }),
+      ev({ runId: "new", subagentId: "s1", data: labeled }),
+    ];
+    expect(latestRepositoryProposals(events).get("frontend")?.title).toBe("Newer");
+  });
+});

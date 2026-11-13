@@ -27,7 +27,7 @@ const MAX_SUGGESTIONS = 5;
  * capability discovery) — re-exported here since `Dashboard.tsx` and
  * `commands/add.ts` still import it from this module.
  */
-export { fileScopeForTask } from "../../shared/file-scope.ts";
+export { fileScopeForTask, fileScopesForTask } from "../../shared/file-scope.ts";
 
 /** The active `@`-query slice at the end of `text`, plus its top suggestion
  *  rows. `null` when there's no active query (no `@`, or the token already

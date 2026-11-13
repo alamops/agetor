@@ -1,7 +1,8 @@
 import { test, expect } from "bun:test";
 import { buildFileEntries } from "../../shared/at-file-filter.ts";
 import type { Task } from "../../shared/types.ts";
-import { acceptSuggestion, fileScopeForTask, suggestAtEntries } from "./at-complete.ts";
+import { acceptSuggestion, fileScopeForTask, fileScopesForTask, suggestAtEntries } from "./at-complete.ts";
+import { makeTask } from "../test-fixtures.ts";
 
 // ── fileScopeForTask ─────────────────────────────────────────────────────
 
@@ -62,6 +63,22 @@ test("fileScopeForTask: existing branchSource but no branch string falls back to
 
 test("fileScopeForTask: isolation off is just the plain workdir, no ref", () => {
   expect(fileScopeForTask(scopeTask({ isolation: "none", baseRef: "main" }))).toEqual({ dir: "/repo" });
+});
+
+test("fileScopesForTask is re-exported for the Dashboard's multi-scope @ listing", () => {
+  const task = makeTask({
+    workdir: "/wt/task-1",
+    worktreePath: "/wt/task-1",
+    isolation: "worktree",
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/frontend", baseRef: "a", checkoutBranch: "feature/x", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/x", branchSource: "created", worktreePath: "/wt/task-1/backend", baseRef: "b", checkoutBranch: "feature/x", prUrl: null },
+    ],
+  });
+  expect(fileScopesForTask(task)).toEqual([
+    { name: "frontend", dir: "/wt/task-1/frontend" },
+    { name: "backend", dir: "/wt/task-1/backend" },
+  ]);
 });
 
 // ── suggestAtEntries ─────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildDeleteConfirmCopy, triageDeleteOutcome } from "./worktree-delete-intent.ts";
+import { buildDeleteConfirmCopy, triageDeleteOutcome, worktreeRemovalPhrase } from "./worktree-delete-intent.ts";
 import type { WorktreeGitStatus, WorktreeInfo, WorktreeTeardownResult } from "../../../shared/types.ts";
 
 function worktree(overrides: Partial<WorktreeInfo> = {}): WorktreeInfo {
@@ -158,6 +158,87 @@ describe("buildDeleteConfirmCopy", () => {
       expect(copy.title).toBe('Delete worktree "orphan-dir-1"?');
     });
   });
+
+  // Archiving is task-scoped: from a multi-repository row it force-deletes
+  // every repository's checkout, so classifying only the clicked row let a
+  // clean row silently discard a sibling's uncommitted work (issue #291
+  // round-seven review). These lock the sibling aggregation in place.
+  describe("multi-repository siblings", () => {
+    const clean = () => gitStatus({ dirty: false, ignored: false });
+    const dirty = () => gitStatus({ dirty: true, ignored: false });
+
+    test("a clean clicked row with a dirty sibling warns and names the sibling", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: dirty() },
+        { name: "infra", status: clean() },
+      ]);
+      expect(copy.showDirtyWarning).toBe(true);
+      expect(copy.unknown).toBe(false);
+      expect(copy.dirtyCheckouts).toEqual(["backend"]);
+      expect(copy.confirmLabel).toBe("Discard changes & delete");
+    });
+
+    test("a clean clicked row with an unknown sibling warns and names the sibling", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: null },
+      ]);
+      expect(copy.showDirtyWarning).toBe(false);
+      expect(copy.unknown).toBe(true);
+      expect(copy.unknownCheckouts).toEqual(["backend"]);
+      expect(copy.confirmLabel).toBe("Discard changes & delete");
+    });
+
+    test("a dirty clicked row and a dirty sibling are both named", () => {
+      const copy = buildDeleteConfirmCopy(
+        worktree({ repoName: "frontend", branch: "agetor/frontend" }),
+        dirty(),
+        [{ name: "backend", status: dirty() }],
+      );
+      expect(copy.dirtyCheckouts).toEqual(["frontend", "backend"]);
+    });
+
+    test("dirty and unknown siblings can co-exist — both warnings show, each names its own checkouts", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: dirty() },
+        { name: "infra", status: gitStatus({ ignored: true }) },
+      ]);
+      expect(copy.showDirtyWarning).toBe(true);
+      expect(copy.unknown).toBe(true);
+      expect(copy.dirtyCheckouts).toEqual(["backend"]);
+      expect(copy.unknownCheckouts).toEqual(["infra"]);
+    });
+
+    test("ignored:true on a sibling is unknown, never clean", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: gitStatus({ dirty: false, ignored: true }) },
+      ]);
+      expect(copy.unknown).toBe(true);
+      expect(copy.unknownCheckouts).toEqual(["backend"]);
+    });
+
+    test("all checkouts confirmed clean -> non-destructive label, no warnings", () => {
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: clean() },
+        { name: "infra", status: clean() },
+      ]);
+      expect(copy.showDirtyWarning).toBe(false);
+      expect(copy.unknown).toBe(false);
+      expect(copy.dirtyCheckouts).toEqual([]);
+      expect(copy.unknownCheckouts).toEqual([]);
+      expect(copy.confirmLabel).toBe("Archive & delete");
+    });
+
+    test("checkoutCount and multiRepo reflect the whole task, not just the clicked row", () => {
+      expect(buildDeleteConfirmCopy(worktree(), clean()).multiRepo).toBe(false);
+      expect(buildDeleteConfirmCopy(worktree(), clean()).checkoutCount).toBe(1);
+      const copy = buildDeleteConfirmCopy(worktree(), clean(), [
+        { name: "backend", status: clean() },
+        { name: "infra", status: clean() },
+      ]);
+      expect(copy.multiRepo).toBe(true);
+      expect(copy.checkoutCount).toBe(3);
+    });
+  });
 });
 
 describe("triageDeleteOutcome", () => {
@@ -178,6 +259,45 @@ describe("triageDeleteOutcome", () => {
   test('reason "already-absent" -> silent, NOT an error: nothing left to remove is success, not failure', () => {
     const teardown: WorktreeTeardownResult = { removed: false, reason: "already-absent" };
     expect(triageDeleteOutcome(teardown, "feature-branch")).toEqual({ kind: "silent" });
+  });
+
+  test('reason "workspace-not-empty" -> error explaining the retained workspace root, NOT silent success', () => {
+    // Every repository checkout was removed but the multi task's workspace
+    // root survives on files outside them. The Worktrees row represents that
+    // root, so silence made the delete look like it worked while the row
+    // stayed put.
+    const teardown: WorktreeTeardownResult = {
+      removed: false,
+      reason: "workspace-not-empty",
+      repositories: [
+        { name: "frontend", result: { removed: true } },
+        { name: "backend", result: { removed: false, reason: "already-absent" } },
+      ],
+    };
+    const outcome = triageDeleteOutcome(teardown, null);
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toContain("files outside its repositories");
+      expect(outcome.message).toContain("try again");
+    }
+  });
+
+  test('reason "source-missing" -> says the source repository is gone and the checkout was kept, naming the repository', () => {
+    const teardown: WorktreeTeardownResult = {
+      removed: false,
+      reason: "source-missing",
+      repositories: [
+        { name: "frontend", result: { removed: false, reason: "source-missing" } },
+        { name: "backend", result: { removed: true } },
+      ],
+    };
+    const outcome = triageDeleteOutcome(teardown, null);
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toContain('repository "frontend"');
+      expect(outcome.message).toContain("source repository no longer exists");
+      expect(outcome.message).not.toContain("the worktree removal failed");
+    }
   });
 
   test('reason "dirty" -> error, naming the branch', () => {
@@ -212,6 +332,38 @@ describe("triageDeleteOutcome", () => {
     }
   });
 
+  test("multi-repository partial teardown names the failing repository, not the clicked row's branch", () => {
+    // Deleting any repository row archives the WHOLE task: the dirty sibling
+    // is the failure, while the clicked row may have been removed cleanly.
+    const teardown: WorktreeTeardownResult = {
+      removed: false,
+      reason: "dirty",
+      repositories: [
+        { name: "frontend", result: { removed: true } },
+        { name: "backend", result: { removed: false, reason: "dirty" } },
+      ],
+    };
+    const outcome = triageDeleteOutcome(teardown, "agetor/frontend-branch");
+    expect(outcome.kind).toBe("error");
+    if (outcome.kind === "error") {
+      expect(outcome.message).toContain('repository "backend"');
+      expect(outcome.message).not.toContain("frontend");
+      expect(outcome.message).toContain("uncommitted");
+    }
+  });
+
+  test("multi-repository teardown where only no-op entries failed is silent", () => {
+    const teardown: WorktreeTeardownResult = {
+      removed: false,
+      reason: "already-absent",
+      repositories: [
+        { name: "frontend", result: { removed: false, reason: "already-absent" } },
+        { name: "backend", result: { removed: false, reason: "no-worktree" } },
+      ],
+    };
+    expect(triageDeleteOutcome(teardown, "branch")).toEqual({ kind: "silent" });
+  });
+
   test("error messages fall back sensibly when branch is null", () => {
     const teardown: WorktreeTeardownResult = { removed: false, reason: "failed" };
     const outcome = triageDeleteOutcome(teardown, null);
@@ -220,5 +372,22 @@ describe("triageDeleteOutcome", () => {
       expect(outcome.message).toContain("this worktree");
       expect(outcome.message.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("a multi task left with one repository (round 15)", () => {
+  const clean = gitStatus({ dirty: false, ignored: false });
+  test("its only checkout is still a repository checkout, named in the copy", () => {
+    const copy = buildDeleteConfirmCopy(worktree({ repoName: "backend" }), clean);
+    expect(copy.multiRepo).toBe(true);
+    expect(copy.checkoutCount).toBe(1);
+    expect(worktreeRemovalPhrase(copy, "backend")).toBe("its backend repository worktree");
+  });
+
+  test("single and multi phrases are unchanged", () => {
+    const single = buildDeleteConfirmCopy(worktree(), clean);
+    expect(worktreeRemovalPhrase(single, null)).toBe("its worktree directory");
+    const multi = buildDeleteConfirmCopy(worktree({ repoName: "fe" }), clean, [{ name: "be", status: clean }]);
+    expect(worktreeRemovalPhrase(multi, "fe")).toBe("all 2 repository worktrees");
   });
 });

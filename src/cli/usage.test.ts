@@ -249,6 +249,11 @@ test("`agetor harness stack create --help` prints the create block, not the pare
   }
 }, 30_000);
 
+test("edit documents --remove-repo and what it keeps (round 15)", () => {
+  expect(USAGE["edit"]).toContain("--remove-repo <name>");
+  expect(USAGE["edit"]).toMatch(/its branch\s+is kept/);
+});
+
 test("fix-round help: switch-account, stack history/preview, cooldown and restore have blocks; harness help lists them", () => {
   expect(helpFor("switch-account", undefined)!.split("\n", 1)[0]).toStartWith("usage: agetor switch-account <task-id> [--cancel]");
   expect(helpFor("harness", "stack", "history")!).toContain("--before <cursor>");

@@ -140,6 +140,50 @@ test("teardownPhrase escapes branch names in the no-preview fallback", () => {
   expect(teardownPhrase(null, { branch: "x", checkoutBranch: "x" })).toBe("its worktree + branch x");
 });
 
+test("a multi-repository preview names each repository's own branches", async () => {
+  const multi: TaskTeardownPreview = {
+    branches: ["feature/a", "drift", "feature/b"],
+    liveBranch: "drift",
+    taskBranch: null,
+    source: "live",
+    excluded: [],
+    repositories: [
+      { name: "frontend", path: "/src/frontend", branches: ["feature/a", "drift"], liveBranch: "drift", taskBranch: "feature/a", source: "live", excluded: [] },
+      { name: "backend", path: "/src/backend", branches: ["feature/b"], liveBranch: "feature/b", taskBranch: "feature/b", source: "task-branch", excluded: [] },
+    ],
+  };
+  currentClient = fakeClient(multi);
+  await cmdRm(["abcdefgh"], flags);
+  expect(outputs[0]).toContain(
+    "and its worktrees + per-repository branches (frontend: feature/a, drift; backend: feature/b).",
+  );
+  process.exitCode = 0;
+});
+
+test("--json carries the per-repository plan for a multi-repository task", async () => {
+  const multi: TaskTeardownPreview = {
+    branches: ["feature/a", "feature/b"],
+    liveBranch: "feature/a",
+    taskBranch: null,
+    source: "live",
+    excluded: [],
+    repositories: [
+      { name: "frontend", path: "/src/frontend", branches: ["feature/a"], liveBranch: "feature/a", taskBranch: "feature/a", source: "task-branch", excluded: [] },
+      { name: "backend", path: "/src/backend", branches: ["feature/b"], liveBranch: "feature/b", taskBranch: "feature/b", source: "task-branch", excluded: [] },
+    ],
+  };
+  currentClient = fakeClient(multi);
+  await cmdRm(["abcdefgh"], jsonFlags);
+  expect(jsonOutputs).toEqual([{
+    deleted: task.id,
+    branches: ["feature/a", "feature/b"],
+    repositories: [
+      { name: "frontend", branches: ["feature/a"] },
+      { name: "backend", branches: ["feature/b"] },
+    ],
+  }]);
+});
+
 test("--json carries the deleted branches", async () => {
   currentClient = fakeClient(both);
   await cmdRm(["abcdefgh"], jsonFlags);
@@ -151,4 +195,41 @@ test("branch names are escaped", async () => {
   await cmdRm(["abcdefgh"], flags);
   expect(outputs[0]).toContain("evil\\u001b[2J");
   process.exitCode = 0;
+});
+
+test("a multi task left with one repository still gets the per-repository phrase (round 15)", () => {
+  const one: TaskTeardownPreview = {
+    branches: ["feature/b"],
+    liveBranch: "feature/b",
+    taskBranch: null,
+    source: "task-branch",
+    excluded: [],
+    repositories: [
+      { name: "backend", path: "/src/backend", branches: ["feature/b"], liveBranch: "feature/b", taskBranch: "feature/b", source: "task-branch", excluded: [] },
+    ],
+  };
+  expect(teardownPhrase(one, { branch: null, checkoutBranch: null })).toBe(
+    "its worktree + per-repository branches (backend: feature/b)",
+  );
+});
+
+test("--json carries the per-repository plan for a multi task left with one repository (round 15)", async () => {
+  const one: TaskTeardownPreview = {
+    branches: ["feature/b"],
+    liveBranch: "feature/b",
+    taskBranch: null,
+    source: "task-branch",
+    excluded: [],
+    repositories: [
+      { name: "backend", path: "/src/backend", branches: ["feature/b"], liveBranch: "feature/b", taskBranch: "feature/b", source: "task-branch", excluded: [] },
+    ],
+  };
+  currentClient = fakeClient(one);
+  jsonOutputs.length = 0;
+  await cmdRm(["abcdefgh"], jsonFlags);
+  expect(jsonOutputs).toEqual([{
+    deleted: task.id,
+    branches: ["feature/b"],
+    repositories: [{ name: "backend", branches: ["feature/b"] }],
+  }]);
 });

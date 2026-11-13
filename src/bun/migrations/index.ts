@@ -120,6 +120,10 @@ import m087 from "./087_harness_stacks_fix_round.sql" with { type: "text" };
 import m088 from "./088_harness_orphaned_copies.sql" with { type: "text" };
 import m089 from "./089_harness_mirror_sources.sql" with { type: "text" };
 import m090 from "./090_harness_mirror_backup_folder.sql" with { type: "text" };
+// Authored as 087 on its own branch; main's harness-stacks fix round took
+// 087-090 first, so this one landed as 091 on merge (original id kept as an
+// alias so a dev DB that already applied it is not re-migrated).
+import m091 from "./091_task_repositories.sql" with { type: "text" };
 
 
 import type { Migration } from "../migrate.ts";
@@ -228,4 +232,5 @@ export const migrations: Migration[] = [
   { id: "088_harness_orphaned_copies", sql: m088 },
   { id: "089_harness_mirror_sources", sql: m089 },
   { id: "090_harness_mirror_backup_folder", sql: m090 },
+  { id: "091_task_repositories", sql: m091, aliases: ["087_task_repositories"] },
 ];

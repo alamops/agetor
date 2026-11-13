@@ -8,6 +8,7 @@ import { flagValue } from "../args.ts";
 import { fxAutoResumeCountdownText, isTaskFxPaused } from "../../shared/fx-recovery.ts";
 import { pipelineStepProgress } from "../../shared/pipeline.ts";
 import { escapeControlChars, escapeFreeText, truncateText } from "../../shared/terminal-text.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -51,6 +52,19 @@ function parseLsFilters(args: string[]): LsFilters {
   return f;
 }
 
+/**
+ * `--repo`/`--workdir` match: the task's own `workdir`, or — for a
+ * multi-repository task, whose `workdir` is the non-git workspace root — any
+ * selected repository's path or workspace name. Without the repository arm a
+ * multi task could never match the repo it actually works in.
+ */
+function matchesRepoFilter(task: Task, needle: string): boolean {
+  if (task.workdir.toLowerCase().includes(needle)) return true;
+  return (task.repositories ?? []).some(
+    (repo) => repo.path.toLowerCase().includes(needle) || repo.name.toLowerCase().includes(needle),
+  );
+}
+
 export async function cmdLs(
   args: string[],
   flags: Flags,
@@ -84,12 +98,14 @@ export async function cmdLs(
   if (f.type) tasks = tasks.filter((t) => t.taskType === f.type);
   if (f.repo) {
     const r = f.repo.toLowerCase();
-    tasks = tasks.filter((t) => t.workdir.toLowerCase().includes(r));
+    tasks = tasks.filter((t) => matchesRepoFilter(t, r));
   }
   if (f.search) {
     const q = f.search.toLowerCase();
     tasks = tasks.filter((t) =>
-      `${t.title} ${t.prompt} ${t.workdir} ${t.branch ?? ""} ${t.checkoutBranch ?? ""}`.toLowerCase().includes(q),
+      // A multi-repository task's scalar `branch`/`checkoutBranch` are null;
+      // its branches live on each repository entry.
+      `${t.title} ${t.prompt} ${t.workdir} ${t.branch ?? ""} ${t.checkoutBranch ?? ""} ${(t.repositories ?? []).map((r) => `${r.name} ${r.path} ${r.branch ?? ""} ${r.checkoutBranch ?? ""}`).join(" ")}`.toLowerCase().includes(q),
     );
   }
   if (flags.json) return printJson(tasks);
@@ -213,6 +229,13 @@ function needsCell(t: Task): string {
   // A step task (listed only under `--steps`) names its parent here so the
   // row is actionable — `agetor pipeline status <parent>` / `agetor show`.
   if (t.pipelineParentId) parts.push(c.dim(`step of ${t.pipelineParentId.slice(0, 8)}`));
+  // Multi-repository task (issue #291): the card has no single workdir line,
+  // so name the count here.
+  // A multi task left with one repository still says so ("1 repo").
+  if (isMultiRepoTask(t)) {
+    const n = t.repositories?.length ?? 0;
+    parts.push(c.dim(`${n} repo${n === 1 ? "" : "s"}`));
+  }
   // Worktree drifted off the task branch (last-seen checkout, recorded by the
   // core at run start/settle, terminal open and archive) — a hint here rather
   // than a branch column, which the table doesn't have.

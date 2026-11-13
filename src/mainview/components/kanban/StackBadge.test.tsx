@@ -107,6 +107,13 @@ describe("StackBadge", () => {
   test("a one-account stack whose account is cooling says so without a position", () => {
     const markup = html({ state: { position: 0, count: 1 }, coolingUntilMs: Date.now() + 60_000 });
     expect(markup).toContain("cooling");
+    // Assert the rendered LABEL, not a bare "1/1" substring: the hourglass
+    // marker shares the text node with the label (`⏳ cooling`), so a leaked
+    // position label would render as `⏳ 1/1` — never as `>1/1<`. The
+    // localized date in `title` can itself contain "1/1" (e.g. 11/10), so a
+    // whole-markup substring check can't distinguish the two either.
+    expect(markup).toMatch(/⏳\s*cooling<\/span>/);
+    expect(markup).not.toMatch(/⏳\s*1\/1/);
     expect(markup).not.toContain(">1/1<");
     expect(markup).not.toContain("Account 1 of 1");
   });

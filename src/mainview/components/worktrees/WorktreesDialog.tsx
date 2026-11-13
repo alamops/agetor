@@ -20,7 +20,7 @@ import {
   type WorktreeInfo,
   type WorktreeStaleReason,
 } from "../../../shared/types.ts";
-import { buildDeleteConfirmCopy, triageDeleteOutcome } from "./worktree-delete-intent.ts";
+import { buildDeleteConfirmCopy, mapWithConcurrency, triageDeleteOutcome, worktreeRemovalPhrase } from "./worktree-delete-intent.ts";
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 
 interface Props {
@@ -220,7 +220,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
     const q = query.trim().toLowerCase();
     return worktrees.filter((w) => {
       if (q) {
-        const hay = `${w.taskTitle ?? ""}\n${w.branch ?? ""}\n${projectLabel(w)}\n${w.path}`.toLowerCase();
+        const hay = `${w.taskTitle ?? ""}\n${w.branch ?? ""}\n${w.repoName ?? ""}\n${projectLabel(w)}\n${w.path}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       if (projectFilter.length > 0 && !projectFilter.includes(projectValue(w))) return false;
@@ -236,8 +236,16 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
     const arr = [...filtered];
     arr.sort((a, b) => {
       switch (sortField) {
-        case "updated":
-          return ((a.taskUpdatedAt ?? 0) - (b.taskUpdatedAt ?? 0)) * dir;
+        case "updated": {
+          const byTime = ((a.taskUpdatedAt ?? 0) - (b.taskUpdatedAt ?? 0)) * dir;
+          if (byTime !== 0) return byTime;
+          // Tie-break by task, then repository: a multi-repository task's
+          // rows (issue #291) stay grouped together instead of interleaving
+          // with other tasks that share the same `updated_at`.
+          const byTask = (a.taskId ?? "").localeCompare(b.taskId ?? "") * dir;
+          if (byTask !== 0) return byTask;
+          return (a.repoName ?? "").localeCompare(b.repoName ?? "");
+        }
         case "project":
           return projectLabel(a).localeCompare(projectLabel(b)) * dir;
         case "status":
@@ -254,14 +262,19 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
   const anyFilterActive =
     query !== "" || projectFilter.length > 0 || statusFilter.length > 0 || staleFilter !== "all";
 
-  const withBusy = async (id: string, fn: () => Promise<void>) => {
-    setBusyIds((cur) => new Set(cur).add(id));
+  const withBusy = async (ids: string | string[], fn: () => Promise<void>) => {
+    const list = typeof ids === "string" ? [ids] : ids;
+    setBusyIds((cur) => {
+      const next = new Set(cur);
+      for (const id of list) next.add(id);
+      return next;
+    });
     try {
       await fn();
     } finally {
       setBusyIds((cur) => {
         const next = new Set(cur);
-        next.delete(id);
+        for (const id of list) next.delete(id);
         return next;
       });
     }
@@ -270,23 +283,50 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
   const deleteTaskBacked = async (w: WorktreeInfo) => {
     if (!w.taskId) return;
     const taskId = w.taskId;
+    // Archiving is task-scoped: from a multi-repository task's row it
+    // force-deletes EVERY repository checkout, not just the clicked one.
+    const siblings = worktrees.filter((row) => row.id !== w.id && row.taskId === taskId);
     // Busy spans fetch → confirm → archive as one continuous stretch so the
     // trash icon spins the whole time (rather than appearing frozen during
     // the status fetch) and a second click can never double-fire while the
-    // confirm dialog is up or the archive request is in flight.
-    await withBusy(w.id, async () => {
-      // The cached `gitStatus` map is only populated on open + manual
-      // Refresh — by the time the user clicks delete it's frequently
-      // "loading" or missing entirely, which would undersell what's about
-      // to be discarded. Fetch fresh; a failed check falls back to the
-      // no-warning copy rather than blocking the delete.
-      let status: WorktreeGitStatus | null = null;
-      try {
-        status = await api.getWorktreeGitStatus(w.id);
-      } catch {
-        status = null;
-      }
-      const copy = buildDeleteConfirmCopy(w, status);
+    // confirm dialog is up or the archive request is in flight. Every row of
+    // the task is marked busy: acting on a sibling would archive the same
+    // task underneath the open confirm.
+    await withBusy([w.id, ...siblings.map((row) => row.id)], async () => {
+      // Fetch the clicked row's status AND each sibling's, so a clean row
+      // can't hide a dirty sibling whose uncommitted work is about to be
+      // discarded (issue #291 review). Batched at GIT_STATUS_CONCURRENCY like
+      // the list's own status pass: a task may select 10+ repositories and
+      // each call is a git subprocess on the bun side, so an unbounded
+      // `Promise.all` here would fan out N+1 processes from one confirm.
+      const fetchStatus = async (id: string): Promise<WorktreeGitStatus | null> => {
+        try {
+          return await api.getWorktreeGitStatus(id);
+        } catch {
+          // A failed check falls back to the no-warning copy rather than
+          // blocking the delete.
+          return null;
+        }
+      };
+      const rows = [w, ...siblings];
+      // Bounded by GIT_STATUS_CONCURRENCY: a task may select 10+ repositories
+      // and each call is a git subprocess on the bun side, so an unbounded
+      // `Promise.all` would fan out N+1 processes from one confirm.
+      const statuses = await mapWithConcurrency<WorktreeInfo, WorktreeGitStatus | null>(
+        rows,
+        GIT_STATUS_CONCURRENCY,
+        (row) => fetchStatus(row.id),
+      );
+      const [status, ...siblingStatuses] = statuses;
+      const copy = buildDeleteConfirmCopy(
+        w,
+        status ?? null,
+        siblings.map((row, i) => ({
+          name: row.repoName ?? row.branch ?? row.id,
+          status: siblingStatuses[i] ?? null,
+        })),
+      );
+      const fmtCheckouts = (names: string[]) => names.map((n) => `"${n}"`).join(", ");
       const ok = await confirm({
         title: copy.title,
         description: (
@@ -294,26 +334,30 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
             {copy.alreadyArchived ? (
               <>
                 The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" is
-                already <strong>archived</strong>; its worktree directory will be removed. The git
-                branch and full AI history are preserved.
+                already <strong>archived</strong>;{" "}
+                {`${worktreeRemovalPhrase(copy, w.repoName)} will be removed`}
+                . The git branches and full AI history are preserved.
               </>
             ) : (
               <>
                 The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" will
-                be <strong>archived</strong> (hidden from the board, restorable via Unarchive) and its
-                worktree directory removed. The git branch and full AI history are preserved.
+                be <strong>archived</strong> (hidden from the board, restorable via Unarchive) and{" "}
+                {`${worktreeRemovalPhrase(copy, w.repoName)} removed`}
+                . The git branches and full AI history are preserved.
               </>
             )}
             {copy.showDirtyWarning && (
               <div className="mt-2 font-medium text-danger">
-                This worktree has uncommitted changes — they will be permanently discarded.
+                {copy.dirtyCheckouts.length === 1 && !copy.multiRepo
+                  ? "This worktree has uncommitted changes — they will be permanently discarded."
+                  : `${fmtCheckouts(copy.dirtyCheckouts)} ${copy.dirtyCheckouts.length === 1 ? "has" : "have"} uncommitted changes — they will be permanently discarded.`}
               </div>
             )}
             {copy.unknown && (
               <div className="mt-2 font-medium text-danger">
-                agetor couldn't check this worktree for uncommitted changes — its git
-                registration may be broken. Anything uncommitted will be permanently
-                discarded.
+                agetor couldn't check {fmtCheckouts(copy.unknownCheckouts)} for uncommitted changes —
+                {copy.unknownCheckouts.length === 1 ? " its" : " their"} git registration may be broken.
+                Anything uncommitted will be permanently discarded.
               </div>
             )}
             {(w.runActive || w.heldByBackgroundAgents) && " An agent is still working on this task — archiving will stop it."}
@@ -524,6 +568,11 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                       ) : (
                         <span className="text-sm text-muted-foreground">no ticket</span>
                       )}
+                      {w.repoName ? (
+                        <Badge variant="outline" className="font-mono" title="Repository in this task's workspace">
+                          {w.repoName}
+                        </Badge>
+                      ) : null}
                       {w.column != null && (
                         <Badge variant="outline">{statusLabel(w)}</Badge>
                       )}

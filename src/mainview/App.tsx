@@ -80,6 +80,9 @@ import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
 import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
+import { issueProjectPath, taskProjectPath } from "@/lib/repo-selection";
+import { multiRepoDeleteFallback, openFolderUnavailableReason, taskSearchText } from "@/lib/multi-repo-ui";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { cn } from "@/lib/utils";
 import { autoEnabledToastText, opencodeSessionsFoundText } from "@/lib/import-sessions";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
@@ -194,11 +197,14 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   diff: GitCompare,
   "open-in-finder": Folder,
   "view-pr": GitPullRequest,
+  "view-repo-pr": GitPullRequest,
   "view-issue": CircleDot,
   "mark-read": MailOpen,
   "mark-unread": Mail,
   "copy-branch": GitBranch,
   "copy-worktree-path": Copy,
+  "copy-repo-branch": GitBranch,
+  "copy-repo-worktree": Copy,
   delete: Trash2,
 };
 
@@ -1912,10 +1918,16 @@ function AppInner() {
       // effect and `GET /tasks/:id/pipeline` both need the full list/row).
       if (t.pipelineParentId != null) return false;
       if (q) {
-        const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}`.toLowerCase();
-        if (!hay.includes(q)) return false;
+        // A multi-repository task's branches live on its repositories
+        // (`task.branch` is null), so the haystack folds them in.
+        if (!taskSearchText(t).includes(q)) return false;
       }
-      if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
+      if (repoFilter.length > 0) {
+        // A multi-repository task's workdir is its workspace root, so match
+        // the filter against any selected repository path (issue #291).
+        const paths = (t.repositories ?? []).map((r) => r.path);
+        if (!repoFilter.some((f) => t.workdir === f || paths.includes(f))) return false;
+      }
       if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
       if (typeFilter.length > 0 && !typeFilter.includes(t.taskType)) return false;
       if (archivedView === "active" && t.archivedAt != null) return false;
@@ -2207,6 +2219,9 @@ function AppInner() {
       ? await api.getTaskTeardownPreview(t.id).catch(() => null)
       : null;
     const maybeDrifted = t.checkoutBranch && t.checkoutBranch !== t.branch ? t.checkoutBranch : null;
+    // A multi-repository row has no scalar branch: the fallback names each
+    // repository's own branch (and drifted checkout) instead of an empty `()`.
+    const multiFallback = isMultiRepoTask(t) ? multiRepoDeleteFallback(t.repositories ?? []) : null;
     const ok = await confirm({
       title: `Delete "${t.title}"?`,
       description: (
@@ -2229,7 +2244,26 @@ function AppInner() {
           {t.worktreePath && preview && preview.branches.length === 0 && (
             <> Its git worktree will be torn down; no branches will be deleted.</>
           )}
-          {t.worktreePath && !preview && (
+          {t.worktreePath && !preview && multiFallback && (
+            <>
+              {" "}Its git worktrees
+              {multiFallback.branches && (
+                <>
+                  {" "}(
+                  <span data-testid="delete-confirm-repo-branches" className="font-mono text-foreground/80">{multiFallback.branches}</span>
+                  )
+                </>
+              )}{" "}will also be torn down
+              {multiFallback.maybeDrifted ? (
+                <>
+                  , and possibly the branches they were last on (
+                  <span data-testid="delete-confirm-maybe-branch" className="font-mono text-foreground/80">{multiFallback.maybeDrifted}</span>
+                  ).
+                </>
+              ) : "."}
+            </>
+          )}
+          {t.worktreePath && !preview && !multiFallback && (
             <>
               {" "}Its git worktree (
               <span className="font-mono text-foreground/80">{t.branch}</span>
@@ -2276,8 +2310,21 @@ function AppInner() {
   // RunPanel's own Open button (`RunPanel.tsx`'s `api.openPath` call): a
   // failure here has no useful recovery, so it's swallowed rather than
   // routed through `surfaceError`.
+  //
+  // A multi-repository task's workspace doesn't exist until its first run,
+  // so opening it would 404 and do nothing: say why instead
+  // (`openFolderUnavailableReason`), and surface a later failure for it too.
+  // Single-repository tasks keep the silent best-effort behavior.
   const openInFinder = useCallback((t: Task) => {
-    void api.openPath({ path: t.worktreePath ?? t.workdir, taskId: t.id }).catch(() => { /* best-effort */ });
+    const unavailable = openFolderUnavailableReason(t);
+    if (unavailable) {
+      toast.info(unavailable);
+      return;
+    }
+    const multi = isMultiRepoTask(t);
+    void api.openPath({ path: t.worktreePath ?? t.workdir, taskId: t.id }).catch((err: unknown) => {
+      if (multi) toast.error(err instanceof Error ? err.message : "Could not open the workspace folder");
+    });
   }, []);
 
   // Shared by RunPanel's `onViewPullRequest` prop and the task context
@@ -2397,7 +2444,7 @@ function AppInner() {
   // (`view-pr` / `copy-*`) read the field from the SNAPSHOT the entry was
   // gated on, falling back to the live task — the live value can't be
   // trusted to still be set, and a `!` would only hide that.
-const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) => {
+const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task, repoName?: string) => {
     const t = tasksRef.current.find((x) => x.id === snapshot.id) ?? snapshot;
     switch (action) {
       case "open":
@@ -2451,10 +2498,23 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         if (prUrl) viewPullRequest({ projectPath: t.workdir, prUrl });
         break;
       }
+      case "view-repo-pr": {
+        // Per-repository sibling of "view-pr" (issue #291): a multi task has
+        // no aggregate PR, so resolve the named repository from the snapshot
+        // the entry was gated on and open its own URL against its own
+        // worktree checkout (the provider remote lives there, never at the
+        // non-git workspace root).
+        const repo = (snapshot.repositories ?? []).find((r) => r.name === repoName)
+          ?? (t.repositories ?? []).find((r) => r.name === repoName);
+        if (repo?.prUrl) viewPullRequest({ projectPath: repo.worktreePath ?? repo.path, prUrl: repo.prUrl });
+        break;
+      }
       case "view-issue": {
-        // Same snapshot-first rationale as "view-pr" above.
+        // Same snapshot-first rationale as "view-pr" above. The project path
+        // must be a real repository: a multi task's `workdir` is the non-git
+        // workspace root, so the issue-thread fetch 400s.
         const issueUrl = snapshot.issueUrl ?? t.issueUrl;
-        if (issueUrl) viewIssue({ projectPath: t.workdir, issueUrl });
+        if (issueUrl) viewIssue({ projectPath: issueProjectPath(t), issueUrl });
         break;
       }
       case "mark-read":
@@ -2470,6 +2530,17 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       }
       case "copy-worktree-path": {
         const worktreePath = snapshot.worktreePath ?? t.worktreePath;
+        if (worktreePath) void copyToClipboard(worktreePath, "worktree path");
+        break;
+      }
+      case "copy-repo-branch": {
+        const repo = (t.repositories ?? []).find((r) => r.name === repoName);
+        if (repo?.branch) void copyToClipboard(repo.branch, "branch name");
+        break;
+      }
+      case "copy-repo-worktree": {
+        const repo = (t.repositories ?? []).find((r) => r.name === repoName);
+        const worktreePath = repo?.worktreePath ?? repo?.path;
         if (worktreePath) void copyToClipboard(worktreePath, "worktree path");
         break;
       }
@@ -2503,7 +2574,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         label: entry.label,
         danger: entry.danger,
         icon: ICON_BY_ACTION[entry.action],
-        onSelect: () => runTaskMenuAction(entry.action, taskMenu.task),
+        onSelect: () => runTaskMenuAction(entry.action, taskMenu.task, entry.repoName),
       });
       prevGroup = entry.group;
     }
@@ -2982,7 +3053,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       <GitHubDialog
         open={githubOpen}
         projects={projects}
-        initialProjectPath={githubItemDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        initialProjectPath={githubItemDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? (selected ? taskProjectPath(selected) : tasks[0] ? taskProjectPath(tasks[0]) : null)}
         pullPrefill={githubPullPrefill}
         itemDetailPrefill={githubItemDetailPrefill}
         onClose={closeGithubDialog}

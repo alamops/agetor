@@ -19,6 +19,13 @@ export const USAGE: Record<string, string> = {
   Create a task.
     --title <s>        task title          --prompt <s> | --prompt-file <p>
     --agent <id>       harness id          --workdir <path>   git repo to run in
+    --repo <path[=ref]>  a repository for this task (repeatable). With
+                        --workdir, that path is the first repository and each
+                        --repo adds one more; a path named twice counts once.
+                        One repository is an ordinary task on that path. Two
+                        or more share one workspace and need worktree
+                        isolation (--isolation none is refused). A repo
+                        without =ref starts from --base-ref, else its HEAD.
     --isolation <m>    worktree | none     --base-ref <ref>   branch base (default HEAD)
     --model <id>   --mode <id>   --effort <id>
     --speed <s>        off | fast | ultrafast (what the model offers: cursor
@@ -35,7 +42,8 @@ export const USAGE: Record<string, string> = {
     --type <t>         task | subtask | epic | feature | bug | spike
     --ref <path>       attach a file/folder reference (repeatable)
     --issue <url>      seed title/prompt from a GitHub/GitLab issue + its thread
-                        (needs --workdir or cwd inside the repo; --title/--prompt optional)
+                        (needs --workdir, --repo, or cwd inside the repo;
+                        --title/--prompt optional)
     --start            run immediately (creates in 'ready', not 'backlog')`,
 
   ls: `usage: agetor ls [filters]
@@ -132,11 +140,13 @@ export const USAGE: Record<string, string> = {
   fx, cursor and an OpenCode 2.x turn (it runs on the agetor-managed OpenCode
   server) have none. Detach with Ctrl-b d.`,
 
-  shell: `usage: agetor shell <task-id> [--print]
+  shell: `usage: agetor shell <task-id> [--repo <name>] [--print]
 
   Open a shell in the task's worktree (or its workdir when isolation is off) —
-  the terminal version of the app's worktree terminal. --print / -p just echoes
-  the directory, e.g. cd "$(agetor shell -p <id>)".`,
+  the terminal version of the app's worktree terminal. For a multi-repository
+  task the shell opens at the workspace root; --repo <name> opens it inside one
+  repository's worktree instead. --print / -p just echoes the directory, e.g.
+  cd "$(agetor shell -p <id>)".`,
 
   edit: `usage: agetor edit <task-id> [flags]   (at least one flag)
 
@@ -150,6 +160,11 @@ export const USAGE: Record<string, string> = {
                   --speed off — the later flag wins
     --max-mode | --no-max-mode   cursor Max Mode
     --detach-profile   unbind from the task's agent profile (keeps its values)
+    --remove-repo <name>   remove a repository from a multi-repository task
+                  (repeatable). Its clean checkout is detached and its branch
+                  is kept; uncommitted changes, a running task, a pipeline step
+                  or its last repository refuse it. Not undoable from here.
+
   Changing --agent to another account in the task's stack needs the run
   stopped; 'agetor switch-account <id>' instead waits for the end of the turn.`,
 
@@ -165,9 +180,10 @@ export const USAGE: Record<string, string> = {
 
   Restore an archived task.`,
 
-  diff: `usage: agetor diff <task-id>
+  diff: `usage: agetor diff <task-id> [--repo <name>]
 
-  Show the task's git diff (worktree vs its pinned base ref).`,
+  Show the task's git diff (worktree vs its pinned base ref). A
+  multi-repository task prints every repository by default; --repo picks one.`,
 
   rm: `usage: agetor rm <task-id> [--yes]
 

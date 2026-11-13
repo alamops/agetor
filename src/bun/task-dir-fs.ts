@@ -1,7 +1,9 @@
 // Filesystem access inside a TASK's directory (the worktree or workdir an agent
 // runs in), done on behalf of the core: `@`-mention resolution, the
-// `.claude/settings.local.json` cleanup, the cursor plan-file write and the
-// "does the worktree still exist" check (D25).
+// `.claude/settings.local.json` cleanup (hook-installer.ts, and the
+// multi-repository workspace-root teardown), the cursor plan-file write, the
+// "does the worktree still exist" check and the "is there a `.git` entry"
+// check before a workspace child is cleared (D25).
 //
 // Why this module exists. A task's directory can sit under a macOS-protected
 // folder (Documents, Desktop, a cloud drive, ...) that the user granted to the
@@ -15,7 +17,7 @@
 // own. So whenever the disclaim switch is on (`disclaimEnabled()`), every
 // touch runs in a short-lived DISCLAIMED child of Apple system tools
 // (`/bin/sh`, `/usr/bin/stat`, `/bin/realpath`, `/bin/cat`, `/bin/mkdir`,
-// `/bin/mv`, `/bin/rm`). That child is responsible for itself, so it has
+// `/bin/mv`, `/bin/rm`, `/bin/rmdir`). That child is responsible for itself, so it has
 // exactly the access any self-responsible process has, which is what the
 // agent can already get by running the disclaim helper itself. When disclaim is
 // off or unavailable (non-darwin, no helper, the user turned it off) the same
@@ -39,7 +41,7 @@
 // semantics (project-files.ts) are reproduced exactly by the disclaimed one.
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { childEnv, coreSpawn } from "./core-spawn.ts";
 import { disclaimEnabled } from "./disclaim.ts";
@@ -490,4 +492,155 @@ export async function writeTaskDirFileAtomic(
   });
   if (r.completed && r.code === 0) return;
   throw new Error(describeFailure(r, `write ${file}`));
+}
+
+// ---------------------------------------------------------------------------
+// lexists (no-follow)
+// ---------------------------------------------------------------------------
+
+// `-e` follows a final symlink and `-L` catches a dangling one, so together
+// they answer "is there an entry with this name" without needing its target.
+const LEXISTS_SCRIPT = `
+if [ -e "$1" ] || [ -L "$1" ]; then echo Y; else echo N; fi
+`;
+
+/**
+ * Whether an entry named `p` exists, NOT following a final symlink (a dangling
+ * link counts as present). `null` when the check itself failed (timeout,
+ * missing helper), so a caller deciding whether a directory holds a git
+ * checkout can treat "can't tell" as "yes" and leave it alone.
+ */
+export async function taskDirLexists(p: string): Promise<boolean | null> {
+  if (!p || p.includes("\0")) return null;
+  if (!disclaimEnabled()) {
+    try {
+      lstatSync(p);
+      return true;
+    } catch (err) {
+      return isMissingCode((err as NodeJS.ErrnoException)?.code) ? false : null;
+    }
+  }
+  const r = await runScript(LEXISTS_SCRIPT, [path.resolve(p)], { maxStdout: 16 });
+  if (!r.completed || r.code !== 0) return null;
+  const tok = new TextDecoder().decode(r.stdout).trim();
+  return tok === "Y" ? true : tok === "N" ? false : null;
+}
+
+// ---------------------------------------------------------------------------
+// multi-repository workspace root: agetor's own scratch
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared prelude for the two workspace-root scripts. `$1` is the absolute
+ * workspace root. It `cd`s into the root and then into `.claude` with
+ * `cd -P`, and after each step checks that `pwd -P` is exactly the physical
+ * parent plus the expected name. A symlink anywhere on the way (the root
+ * itself, `.claude`), or one swapped in between a check and the `cd`, makes
+ * that comparison fail and the script answers `C` ("content": leave it
+ * alone). Once the shell's cwd IS the verified directory, a later swap of the
+ * name can no longer redirect anything: every remaining operation is
+ * relative to the cwd, `rm` never follows its final component, and `rmdir`
+ * refuses a symlink.
+ *
+ * Classification (the `st` variable): `M` the root is missing or not a real
+ * directory, `E` it holds nothing but agetor's scratch (no entries, or only a
+ * real `.claude` directory holding at most a regular `settings.local.json`),
+ * `C` anything else. Names are only ever compared, never printed.
+ */
+const WORKSPACE_SCRATCH_PRELUDE = `
+ws=$1
+st=C
+case "$ws" in /?*) ;; *) echo M; exit 0 ;; esac
+ws=\${ws%/}
+base=\${ws##*/}
+parent=\${ws%/*}
+[ -n "$parent" ] || parent=/
+cd -P "$parent" 2>/dev/null || { echo M; exit 0; }
+pp=$(pwd -P)
+if [ -L "./$base" ] || [ ! -d "./$base" ]; then echo M; exit 0; fi
+cd -P "./$base" 2>/dev/null || { echo M; exit 0; }
+wsp=$(pwd -P)
+[ "$wsp" = "\${pp%/}/$base" ] || { echo C; exit 0; }
+only=1
+for e in * .[!.]* ..?*; do
+  if [ ! -e "$e" ] && [ ! -L "$e" ]; then continue; fi
+  [ "$e" = .claude ] || { only=0; break; }
+done
+if [ "$only" = 1 ]; then
+  if [ ! -e .claude ] && [ ! -L .claude ]; then
+    st=E
+  elif [ ! -L .claude ] && [ -d .claude ]; then
+    st=$(
+      cd -P ./.claude 2>/dev/null || { echo C; exit 0; }
+      [ "$(pwd -P)" = "$wsp/.claude" ] || { echo C; exit 0; }
+      for e in * .[!.]* ..?*; do
+        if [ ! -e "$e" ] && [ ! -L "$e" ]; then continue; fi
+        [ "$e" = settings.local.json ] || { echo C; exit 0; }
+        if [ -L "$e" ] || [ ! -f "$e" ]; then echo C; exit 0; fi
+      done
+      echo E
+    )
+  fi
+fi
+`;
+
+const WORKSPACE_SCRATCH_STATE_SCRIPT = `${WORKSPACE_SCRATCH_PRELUDE}
+echo "$st"
+`;
+
+/**
+ * Removes the scratch (from inside the verified `.claude`), then `.claude`
+ * and the root with `rmdir` (empty directories only; a symlink is refused).
+ * `R` when the root is gone afterwards, `K` when it was kept.
+ */
+const WORKSPACE_SCRATCH_REMOVE_SCRIPT = `${WORKSPACE_SCRATCH_PRELUDE}
+if [ "$st" != E ]; then echo K; exit 0; fi
+if [ -d .claude ] && [ ! -L .claude ]; then
+  (
+    cd -P ./.claude 2>/dev/null || exit 0
+    [ "$(pwd -P)" = "$wsp/.claude" ] || exit 0
+    if [ -f settings.local.json ] && [ ! -L settings.local.json ]; then
+      /bin/rm -f ./settings.local.json
+    fi
+  )
+  /bin/rmdir ./.claude 2>/dev/null
+fi
+cd -P "$pp" 2>/dev/null || { echo K; exit 0; }
+/bin/rmdir "./$base" 2>/dev/null
+if [ -e "./$base" ] || [ -L "./$base" ]; then echo K; else echo R; fi
+`;
+
+/**
+ * True when a multi-repository task's workspace root (docs/architecture/multi-repo-tasks.md)
+ * holds nothing but agetor's own scratch: no entries at all, or only a
+ * `.claude` directory containing at most a regular `settings.local.json`.
+ * `false` for any agent/user artifact, a missing root, a symlink on the way,
+ * or a failed check.
+ *
+ * Always a child process, unlike the read helpers above: the answer feeds a
+ * delete, and only a shell whose cwd is pinned to the verified directory can
+ * act on it without following a symlink swapped in after the check (Node has
+ * no `unlinkat`). The disclaim switch still decides whether that child is
+ * disclaimed (`coreSpawn`), so with the switch off it runs under the core's
+ * own identity, same as the in-process paths.
+ */
+export async function taskDirWorkspaceHasOnlyScratch(dir: string): Promise<boolean> {
+  if (!dir || dir.includes("\0")) return false;
+  const r = await runScript(WORKSPACE_SCRATCH_STATE_SCRIPT, [path.resolve(dir)], { maxStdout: 16 });
+  if (!r.completed || r.code !== 0) return false;
+  return new TextDecoder().decode(r.stdout).trim() === "E";
+}
+
+/**
+ * Remove a workspace root that holds only agetor's scratch: the scratch
+ * `settings.local.json`, then the empty `.claude`, then the empty root. Never
+ * recursive, never follows a symlink (see the prelude above). Returns whether
+ * the root is gone afterwards; any failure leaves it in place and returns
+ * false. Never throws.
+ */
+export async function removeTaskDirWorkspaceIfOnlyScratch(dir: string): Promise<boolean> {
+  if (!dir || dir.includes("\0")) return false;
+  const r = await runScript(WORKSPACE_SCRATCH_REMOVE_SCRIPT, [path.resolve(dir)], { maxStdout: 16 });
+  if (!r.completed || r.code !== 0) return false;
+  return new TextDecoder().decode(r.stdout).trim() === "R";
 }

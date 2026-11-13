@@ -42,7 +42,7 @@ import { beginLagLabel } from "./event-loop-lag.ts";
 import { resolveResumeCursor } from "./event-resume.ts";
 import { isNotificationKind, UNBLOCKED_REMOVAL_KINDS, type NotificationKind, type TaskNotificationRemoval } from "../shared/os-notification.ts";
 import { notificationTargetTaskId } from "./notification-hooks.ts";
-import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, backgroundAgentsHoldTask, isScheduledSwitchUnderway, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, rearmRetriesAfterCooldownClear, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { HIDDEN_CONTINUATION_REFUSAL, activeRunCount, backgroundAgentsHoldTask, isScheduledSwitchUnderway, appendRunStatusLine, archiveTask, beginManualAccountSwitch, cancelFxAutoResume, cancelHarnessRetryForTask, cancelScheduledAccountSwitch, claimTaskForAccountSwitch, clearManualAccountSwitch, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, rearmRetriesAfterCooldownClear, releaseTaskAccountSwitch, startTask, switchTaskAccountNow, SwitchAccountRefusedError, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, teardownBranchesForTask, unarchiveTask, removeTaskRepository, worktreeGitStatus } from "./orchestrator.ts";
 import { checkoutSessionBranch, importClaudeSessions, retryImport } from "./claude-session-import.ts";
 import { scanOpencodeSessions } from "./opencode-session-scan.ts";
 import { importOpencodeSessions, retryOpencodeImport } from "./opencode-session-import.ts";
@@ -124,6 +124,7 @@ import {
 import { formatAnswersMessage, planAskAnswers } from "./claude-questions.ts";
 import { CURSOR_ASK_SKIP_FOLLOWUP, cursorAskAnswersFromLabels, formatCursorAskFollowup } from "../shared/cursor-ask.ts";
 import {
+  MULTI_REPO_CONCURRENCY,
   getAheadCount,
   getTaskDiff,
   getTaskDiffBlob,
@@ -134,7 +135,9 @@ import {
   headBranchState,
   listBranches,
   remoteSyncState,
+  repoRoot,
 } from "./worktree.ts";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import {
   attachSocket,
   closeTerminal,
@@ -281,8 +284,10 @@ import type {
   Task,
   TaskEventsReplayMeta,
   TaskGitStatus,
+  TaskRepoGitStatus,
   TaskTeardownPreview,
   TaskReference,
+  TaskRepositoryInput,
   HarnessEditMirrorRefusal,
   HarnessStackChanged,
   HarnessSwapHistoryPage,
@@ -398,6 +403,45 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
 // end in a space. `/refs/pick` re-joins the native panel's comma-split answer
 // first (`pickedPaths`, ./native-pick.ts); any piece that still doesn't exist
 // on disk falls out here rather than reaching the prompt as a broken ref.
+/**
+ * The live git status of one directory — `GET /tasks/:id/git-status`'s body,
+ * extracted so a multi-repository task can compute one entry per repository
+ * and the single-repository path stays byte-identical (issue #291).
+ */
+async function taskGitStatusForDir(
+  dir: string,
+  baseRef: string | null,
+): Promise<TaskGitStatus> {
+  const [result, syncState, headState] = await Promise.all([
+    hasUncommittedChanges(dir),
+    remoteSyncState(dir),
+    headBranchState(dir),
+  ]);
+  if (result === null) {
+    return {
+      hasChanges: false,
+      ahead: 0,
+      ignored: true,
+      hasUpstream: false,
+      remoteSynced: false,
+      branch: null,
+      isDefaultBranch: false,
+    };
+  }
+  const ahead = syncState.hasUpstream && syncState.ahead !== null
+    ? syncState.ahead
+    : (await getAheadCount(dir, baseRef)) ?? 0;
+  return {
+    hasChanges: result,
+    ahead,
+    ignored: false,
+    hasUpstream: syncState.hasUpstream,
+    remoteSynced: syncState.hasUpstream && syncState.ahead === 0,
+    branch: headState.branch,
+    isDefaultBranch: headState.isDefaultBranch,
+  };
+}
+
 function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
   const refs: TaskReference[] = [];
   const seen = new Set<string>();
@@ -457,6 +501,45 @@ async function refsFromPathsForCaller(rawPaths: unknown[], caller: ApiCaller | n
 // mangled. Uniquification against what's already on disk happens at write
 // time (see `writeAttachmentAtomic` below), not here — an existsSync probe
 // here would leave a TOCTOU gap for concurrent same-name uploads.
+/**
+ * Parse the create-time `repositories[]` body into the only fields
+ * `createTask` reads (issue #291). A missing/null value means "no explicit
+ * selection". Any entry that isn't an object with an absolute non-empty
+ * `path` 400s the whole request — unlike `references`, a silently dropped
+ * repository would create a task that doesn't touch the repo the user picked.
+ * There is deliberately no hard cap on the count (owner decision, grill #14):
+ * every per-repository fan-out downstream runs in bounded batches instead.
+ */
+function parseRepositoryInputs(
+  raw: unknown,
+): { ok: true; value?: TaskRepositoryInput[] } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true };
+  if (!Array.isArray(raw)) return { ok: false, error: "repositories must be an array" };
+  const out: TaskRepositoryInput[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") {
+      return { ok: false, error: "each repository must be an object with a path" };
+    }
+    const p = (entry as { path?: unknown }).path;
+    if (typeof p !== "string" || p.trim().length === 0) {
+      return { ok: false, error: "each repository needs a non-empty path" };
+    }
+    const trimmed = p.trim();
+    if (!path.isAbsolute(trimmed)) {
+      return { ok: false, error: `repository path must be absolute: ${trimmed}` };
+    }
+    const b = (entry as { baseRef?: unknown }).baseRef;
+    if (b !== undefined && b !== null && typeof b !== "string") {
+      return { ok: false, error: "repository baseRef must be a string" };
+    }
+    out.push({
+      path: trimmed,
+      ...(typeof b === "string" && b.trim() ? { baseRef: b.trim() } : {}),
+    });
+  }
+  return { ok: true, value: out };
+}
+
 function sanitizeAttachmentBasename(rawName: string): { stem: string; ext: string } {
   const cleaned = rawName
     .replace(/\0/g, "")
@@ -2078,6 +2161,20 @@ export function startApiServer(
         // and the CLI); /projects/pick is the native add-picker only.
       },
 
+      // Resolve the git top-level for a selected project path (issue #291).
+      // The Repositories dialog uses it to dedupe a selection by repository
+      // root before the task exists. Only the webview calls it, so it is
+      // desktop-only in ROUTE_POLICY (no CLI path gate needed).
+      "/projects/repo-root": {
+        GET: authed(async (req) => {
+          const dir = new URL(req.url).searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const root = await repoRoot(dir);
+          if (!root) return json({ error: "not a git repository" }, { status: 400, headers: corsHeaders(req) });
+          return json({ root }, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/projects/branches": {
         GET: authed(async (req) => {
           const url = new URL(req.url);
@@ -2087,9 +2184,16 @@ export function startApiServer(
           // the base-ref picker. The legacy `agetor/` prefix is filtered inside
           // listBranches; custom-prefixed branches (feature/…, fix/…) are only
           // recognizable via the pinned names on task rows, so pass those too.
-          const managed = new Set(
-            tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
-          );
+          // A multi-repository task pins its branches on `repositories[]`, not
+          // the scalar column (that is null by design) — omitting them left
+          // every task branch of a multi task visible here.
+          const managed = new Set<string>();
+          for (const t of tasks.list()) {
+            if (t.branch) managed.add(t.branch);
+            for (const repo of t.repositories ?? []) {
+              if (repo.branch) managed.add(repo.branch);
+            }
+          }
           return json(await listBranches(dir, { exclude: managed }), { headers: corsHeaders(req) });
         }),
       },
@@ -3287,14 +3391,21 @@ export function startApiServer(
               // task must actually belong to the project the PR was created
               // from — a stale/mistargeted taskId must not stamp an unrelated
               // task.
-              if (
-                task &&
-                task.archivedAt == null &&
-                !task.prUrl &&
-                task.workdir === dir &&
-                result.item?.htmlUrl
-              ) {
-                tasks.update(task.id, { prUrl: result.item.htmlUrl });
+              if (task && task.archivedAt == null && result.item?.htmlUrl) {
+                if (isMultiRepoTask(task)) {
+                  // Multi-repository (issue #291): stamp only the entry whose
+                  // worktree/selected path is the PR's `dir`, matched by
+                  // worktree path before name. First write wins per entry;
+                  // `task.prUrl` stays null (there is no single PR).
+                  const entry = (task.repositories ?? []).find(
+                    (r) => r.worktreePath === dir || r.path === dir,
+                  );
+                  if (entry && !entry.prUrl) {
+                    tasks.setRepositoryPrUrl(task.id, entry.name, result.item.htmlUrl);
+                  }
+                } else if (!task.prUrl && task.workdir === dir) {
+                  tasks.update(task.id, { prUrl: result.item.htmlUrl });
+                }
               }
             } catch (err) {
               console.warn(`[agetor] failed to persist pr_url for task ${body.taskId}:`, err);
@@ -6061,7 +6172,11 @@ export function startApiServer(
                   return [{ path: p, isDirectory: Boolean(r.isDirectory) }];
                 })
             : [];
-          const { fast: _legacyFast, speed: _rawSpeed, opencodeServer: _rawOpencodeServer, ...rest } = body;
+          const repositories = parseRepositoryInputs((body as { repositories?: unknown }).repositories);
+          if (!repositories.ok) {
+            return json({ error: repositories.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const { fast: _legacyFast, speed: _rawSpeed, opencodeServer: _rawOpencodeServer, repositories: _rawRepositories, issueRepoPath: _rawIssueRepoPath, ...rest } = body;
           const result = await createTask({
             ...rest,
             ...(speedInput.speed !== undefined ? { speed: speedInput.speed } : {}),
@@ -6069,6 +6184,7 @@ export function startApiServer(
             title: body.title,
             prompt: body.prompt,
             references,
+            ...(repositories.value ? { repositories: repositories.value } : {}),
           });
           if ("error" in result) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
@@ -6091,7 +6207,42 @@ export function startApiServer(
           // persist) can land during the parse and move the column; a
           // snapshot taken beforehand would still treat the run as `done`
           // and write `column: "done"` onto a run that is no longer finished.
-          const filtered = filterPatch(await req.json());
+          //
+          // A malformed non-empty body is a 400, not an empty patch: the old
+          // `req.json().catch(() => ({})))` silently turned junk into "PATCH
+          // nothing" and returned 200, so a client with a serialization bug
+          // saw success while its edit never landed. An absent body stays a
+          // no-op (an empty patch is harmless).
+          let rawPatch: Record<string, unknown> | null = {};
+          const rawBody = await req.text().catch(() => "");
+          if (rawBody.trim() !== "") {
+            try {
+              rawPatch = JSON.parse(rawBody) as Record<string, unknown> | null;
+            } catch {
+              return json({ error: "invalid JSON body" }, { status: 400, headers: corsHeaders(req) });
+            }
+          }
+          // Valid JSON that isn't an object (`"hi"`, `42`, `null`, `[]`) used
+          // to fall through `filterPatch`'s non-object guard and answer 200
+          // with nothing applied — the same false-success the unparseable-body
+          // check above closes. An array is accepted as an empty patch by
+          // `typeof`, so exclude it explicitly.
+          if (
+            rawBody.trim() !== ""
+            && (rawPatch === null || typeof rawPatch !== "object" || Array.isArray(rawPatch))
+          ) {
+            return json(
+              { error: "JSON body must be an object" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (rawPatch && typeof rawPatch === "object" && "repositories" in rawPatch) {
+            return json(
+              { error: "the repository set can't be patched — remove a repository with DELETE /tasks/:id/repositories/:name, or create a new task to add one" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const filtered = filterPatch(rawPatch);
           if ("error" in filtered) {
             return json({ error: filtered.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -6188,6 +6339,18 @@ export function startApiServer(
           if ("workdir" in patch && patch.workdir !== before.workdir && before.worktreePath !== null) {
             return json(
               { error: "workdir cannot be changed once a worktree exists — delete the task to start fresh with a new workdir" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // A multi-repository task's workdir is its per-task workspace root,
+          // derived from the repository set at create time
+          // (docs/architecture/multi-repo-tasks.md). Its worktreePath stays
+          // null until the first start, so the guard above never fired for a
+          // never-started row; re-pointing that root would detach it from
+          // `repositories[]`, whose checkouts are prepared beneath it.
+          if ("workdir" in patch && patch.workdir !== before.workdir && isMultiRepoTask(before)) {
+            return json(
+              { error: "workdir cannot be changed on a multi-repository task — it is the task's workspace root" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
@@ -6707,6 +6870,25 @@ export function startApiServer(
         }),
       },
 
+      // Remove one repository from a multi-repository task
+      // (docs/architecture/multi-repo-tasks.md). `:name` is the repository's
+      // workspace name, not a filesystem path, so the CLI path gate has
+      // nothing to probe. 200 `{ task }`; 404 for an unknown task or name;
+      // 409 `{ error, code }` when refused (running, last-repository, dirty,
+      // not-multi, pipeline-step, detach-failed). The detach can wait on git
+      // and on a queued teardown, so the request timeout is lifted like
+      // archive's.
+      "/tasks/:id/repositories/:name": {
+        DELETE: authed(async (req) => {
+          server.timeout(req, 0);
+          const result = await removeTaskRepository(req.params.id, req.params.name);
+          if ("task" in result) return json({ task: withRunningSubagents(result.task) }, { headers: corsHeaders(req) });
+          return result.status === 404
+            ? json({ error: result.error }, { status: 404, headers: corsHeaders(req) })
+            : json({ error: result.error, code: result.code }, { status: 409, headers: corsHeaders(req) });
+        }),
+      },
+
       // A pipeline task's parent + its hidden step tasks, enriched the same
       // way `GET /tasks`/`GET /tasks/:id` are (`withRunningSubagents`), so
       // the run view can render step nodes with the same "N background
@@ -6965,7 +7147,11 @@ export function startApiServer(
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);
           if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
-          return json(await getTaskDiff(t), { headers: corsHeaders(req) });
+          const repo = new URL(req.url).searchParams.get("repo");
+          if (repo && !(t.repositories ?? []).some((r) => r.name === repo)) {
+            return json({ error: `unknown repository "${repo}"` }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(await getTaskDiff(t, repo), { headers: corsHeaders(req) });
         }),
       },
 
@@ -7002,7 +7188,11 @@ export function startApiServer(
             );
           }
 
-          const result = await getTaskDiffBlob(t, relPath, side);
+          const repo = url.searchParams.get("repo");
+          if (repo && !(t.repositories ?? []).some((r) => r.name === repo)) {
+            return json({ error: `unknown repository "${repo}"` }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getTaskDiffBlob(t, relPath, side, repo);
           if (!result.ok) {
             return json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
           }
@@ -7159,38 +7349,48 @@ export function startApiServer(
           if (!t) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
-          const dir = t.worktreePath ?? t.workdir;
-          const [result, syncState, headState] = await Promise.all([
-            hasUncommittedChanges(dir),
-            remoteSyncState(dir),
-            headBranchState(dir),
-          ]);
-          if (result === null) {
+          if (isMultiRepoTask(t)) {
+            // One batched response for every repository (issue #291) — the
+            // webview polls this once per 5 s, never once per repo. Bounded at
+            // the same concurrency as worktree preparation
+            // (`MULTI_REPO_CONCURRENCY`) so N repos can't fan out 3N git
+            // spawns at once on the shared main thread.
+            const repos = (t.repositories ?? []).map((repo) => ({
+              name: repo.name,
+              path: repo.path,
+              dir: repo.worktreePath ?? repo.path,
+              baseRef: repo.baseRef,
+            }));
+            const perRepo: TaskRepoGitStatus[] = [];
+            for (let i = 0; i < repos.length; i += MULTI_REPO_CONCURRENCY) {
+              perRepo.push(
+                ...(await Promise.all(
+                  repos.slice(i, i + MULTI_REPO_CONCURRENCY).map(async (repo) => ({
+                    ...(await taskGitStatusForDir(repo.dir, repo.baseRef)),
+                    name: repo.name,
+                    path: repo.path,
+                  })),
+                )),
+              );
+            }
+            const first = perRepo[0] ?? {
+              hasChanges: false,
+              ahead: 0,
+              ignored: true,
+              hasUpstream: false,
+              remoteSynced: false,
+              branch: null,
+              isDefaultBranch: false,
+            };
             return json(
-              {
-                hasChanges: false,
-                ahead: 0,
-                ignored: true,
-                hasUpstream: false,
-                remoteSynced: false,
-                branch: null,
-                isDefaultBranch: false,
-              } satisfies TaskGitStatus,
+              { ...first, repositories: perRepo } satisfies TaskGitStatus,
               { headers: corsHeaders(req) },
             );
           }
-          const ahead = syncState.hasUpstream && syncState.ahead !== null
-            ? syncState.ahead
-            : (await getAheadCount(dir, t.baseRef ?? null)) ?? 0;
+          const dir = t.worktreePath ?? t.workdir;
+          const status = await taskGitStatusForDir(dir, t.baseRef);
           return json(
-            {
-              hasChanges: result,
-              ahead,
-              ignored: false,
-              hasUpstream: syncState.hasUpstream,
-              remoteSynced: syncState.hasUpstream && syncState.ahead === 0,
-              branch: headState.branch,
-              isDefaultBranch: headState.isDefaultBranch,
+            { ...status,
             } satisfies TaskGitStatus,
             { headers: corsHeaders(req) },
           );
@@ -9221,7 +9421,12 @@ export function startApiServer(
       "/tasks/:id/terminals": {
         GET: authed((req) => json(listTerminals(req.params.id), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
-          const result = await createTerminal(req.params.id);
+          // A `null` (or other non-object) JSON body reads as an empty one:
+          // `body.repo` on null used to throw and answer 500.
+          const parsed: unknown = await req.json().catch(() => null);
+          const body = parsed !== null && typeof parsed === "object" ? (parsed as { repo?: unknown }) : {};
+          const repo = typeof body.repo === "string" && body.repo ? body.repo : null;
+          const result = await createTerminal(req.params.id, { repo });
           if ("error" in result) {
             return json(
               { error: result.error },

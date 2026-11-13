@@ -16,6 +16,9 @@ import { composeLaunchPrompt } from "../../../shared/agent-profile.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
 import { useWorktreeOptions, WorktreeOptions } from "./WorktreeOptions";
+import { RepositoriesDialog } from "./RepositoriesDialog";
+import { pinPrimaryRepository, repositoryFileScopes, selectionName, type RepoSelection } from "@/lib/repo-selection";
+import { applyRepositoriesSave, seedRepositoriesDialogValue } from "@/lib/multi-repo-ui";
 import { PromptComposer } from "./PromptComposer";
 import { TaskTypePicker } from "./TaskTypePicker";
 
@@ -87,6 +90,18 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     enabled: open,
   });
 
+  // Extra repositories beyond the issue's own (issue #291). The issue repo is
+  // always first and cannot be removed; extras are added in the shared dialog.
+  const [repos, setRepos] = useState<RepoSelection[]>([]);
+  const [repositoriesOpen, setRepositoriesOpen] = useState(false);
+  const multiRepo = repos.length > 1;
+  // 2+ repositories force worktree isolation server-side; mirror that here so
+  // the shared branch-name field stays visible and the base-ref/isolate
+  // controls the server ignores are not shown (same as New Task).
+  const { isolate: wtIsolate, setIsolate: setWtIsolate } = wt;
+  useEffect(() => {
+    if (multiRepo && !wtIsolate) setWtIsolate(true);
+  }, [multiRepo, wtIsolate, setWtIsolate]);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -98,6 +113,15 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
   const fileScope = useMemo(
     () => (open ? { dir: context?.path ?? "", ref: wt.isolate ? (wt.baseRef.trim() || "HEAD") : null } : null),
     [open, context?.path, wt.isolate, wt.baseRef],
+  );
+  // Multi-repository `@` scopes (issue #291): the same union New Task builds —
+  // each selected repository lists at its own path and pinned/HEAD ref, and
+  // entries are prefixed with its workspace name. Without this the flagship
+  // issue flow could only `@` files in the issue's own repository, and a
+  // valid `@backend/...` token was flagged unresolved.
+  const fileScopes = useMemo(
+    () => (multiRepo ? repositoryFileScopes(repos, wt.isolate) : null),
+    [multiRepo, repos, wt.isolate],
   );
 
   // Reset per-open transient state, then fetch the thread this dialog was
@@ -122,6 +146,8 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
     setReferences([]);
     setTaskType(DEFAULT_TASK_TYPE);
     setTypeDirty(false);
+    setRepos(context?.path ? [{ path: context.path, root: null }] : []);
+    setRepositoriesOpen(false);
     launch.setPipelineId(null);
     if (!open || !context) return;
     setThreadLoading(true);
@@ -226,7 +252,16 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
         // own harness otherwise; else the manual pick (finding F2-3).
         agent: launch.effectiveAgent,
         workdir: context.path,
-        ...wt.payload(),
+        ...(repos.length > 1
+          ? {
+              isolation: "worktree" as const,
+              branch: wt.payload().branch,
+              repositories: repos.map((r) => ({
+                path: r.path,
+                ...(r.baseRef?.trim() ? { baseRef: r.baseRef.trim() } : {}),
+              })),
+            }
+          : wt.payload()),
         mode: launch.mode,
         model: launch.model,
         effort: launch.effort,
@@ -364,6 +399,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
                 onReferencesChange={setReferences}
                 setReferences={setReferences}
                 fileScope={fileScope}
+                fileScopes={fileScopes}
                 startingFolder={context.path}
                 rows={12}
                 footer={overage && (
@@ -375,7 +411,44 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated, o
                 )}
               />
 
-              <WorktreeOptions state={wt} />
+              <WorktreeOptions state={wt} variant={multiRepo ? "multi" : "default"} />
+              <div className="space-y-1" data-testid="issue-repositories">
+                <label className="text-muted-foreground">Repositories</label>
+                <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 px-2 py-1.5 text-xs">
+                  <span className="min-w-0 truncate">
+                    {repos.map((r) => selectionName(r)).join(", ") || "issue repository"}
+                  </span>
+                  <Button size="sm" variant="outline" onClick={() => setRepositoriesOpen(true)}>
+                    Manage
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  The issue's repository is always included; extras each get their own worktree and branch.
+                </p>
+                <RepositoriesDialog
+                  open={repositoriesOpen}
+                  onClose={() => setRepositoriesOpen(false)}
+                  // The inline Branch picker's base ref belongs to the issue's
+                  // repository while it is the only one; seeding it into that
+                  // entry keeps it when an extra repository is added (the
+                  // multi payload reads only `repositories[].baseRef`).
+                  value={seedRepositoriesDialogValue(repos, context.path, wt.baseRef)}
+                  lockedPath={context.path}
+                  onSave={(next) => {
+                    if (!context) {
+                      setRepos(next);
+                      return;
+                    }
+                    // The issue's repository is always first, so this never
+                    // promotes another project; collapsing back to it alone
+                    // hands its per-entry base ref to the inline picker.
+                    const pinned = pinPrimaryRepository(context.path, next, repos);
+                    const applied = applyRepositoriesSave(pinned, { primaryPath: context.path, inlineBaseRef: wt.baseRef });
+                    setRepos(applied.repos);
+                    if (applied.inlineBaseRef.kind === "set") wt.setBaseRef(applied.inlineBaseRef.value);
+                  }}
+                />
+              </div>
 
               <TaskLaunchPickers
                 launch={launch}

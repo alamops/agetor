@@ -72,6 +72,9 @@ import {
   type HarnessStatus,
   type OpencodeServerMode,
   type TaskType,
+  type TaskRepository,
+  type RepoTeardownPlan,
+  type TaskRepositoryInput,
 } from "../shared/types.ts";
 import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
 import {
@@ -276,6 +279,12 @@ import {
 } from "./claude-subagents.ts";
 import {
   prepareWorkdir,
+  prepareTaskWorkdir,
+  pinMissingRepositoryBaseRefs,
+  shouldLazyPinBaseRef,
+  workspacePathFor,
+  worktreeIdForRepo,
+  resolveWorktreeRef,
   removeWorktree,
   detachWorktree,
   repoRoot,
@@ -293,8 +302,20 @@ import {
   recordableCheckout,
   planTeardownBranches,
   resolveDefaultBranchName,
+  removeWorkspaceIfEmpty,
+  workspaceHasOnlyAgetorScratch,
+  MULTI_REPO_CONCURRENCY,
+  detachRepositoryForRemoval,
+  withTaskPrepareLock,
   type PreparedWorkdir,
 } from "./worktree.ts";
+import {
+  resolveRepositorySet,
+  branchesPinnedByOtherTasks,
+  pinnedBranchesFor,
+} from "./task-repos.ts";
+import { composeRunPrompt } from "../shared/launch-prompt.ts";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
@@ -332,7 +353,7 @@ import { appendReferences } from "../shared/refs.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { expandAtReferencesDetailedAsync } from "./project-files.ts";
 import { resolveAtPathsInTaskDir } from "./task-dir-fs.ts";
-import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
+import { snapshotFromProfile } from "../shared/agent-profile.ts";
 import { isSpeed } from "../shared/speed.ts";
 
 type Listener = (e: RunEvent) => void;
@@ -460,6 +481,48 @@ function enqueueTeardown(taskId: string, key: string, job: () => Promise<void>):
 }
 
 /**
+ * The teardown-FIFO keys a task's teardown must acquire: the source repo of a
+ * single-repository task, or every selected repository's path for a
+ * multi-repository task (issue #291). The workspace root itself is unique per
+ * task, so it needs no FIFO key.
+ */
+function teardownKeysForTask(task: Task): string[] {
+  const repos = task.repositories ?? [];
+  if (isMultiRepoTask(task) && repos.length > 0) return repos.map((r) => r.path);
+  return [task.workdir];
+}
+
+/**
+ * Chain `job` onto the teardown FIFO for EVERY key at once — the multi-repo
+ * counterpart of {@link enqueueTeardown}. Keys are acquired in sorted order so
+ * two jobs with overlapping key sets can never deadlock; the combined promise
+ * becomes the tail of each key, so a later single-key job on any of those
+ * repositories waits for this whole job to finish. A job only ever touches
+ * its own repositories, so serializing it behind another task's job in the
+ * same repo is exactly what prevents concurrent `git worktree` lock
+ * contention.
+ */
+function enqueueTeardownMany(taskId: string, keys: string[], job: () => Promise<void>): Promise<void> {
+  const unique = [...new Set(keys)].sort();
+  if (unique.length <= 1) return enqueueTeardown(taskId, unique[0] ?? taskId, job);
+  const tails = unique.map((k) => teardownTails.get(k) ?? Promise.resolve());
+  const p = Promise.all(tails)
+    .then(job)
+    .catch((err) => {
+      console.warn(`[agetor] deferred teardown failed for task ${taskId}:`, err);
+    });
+  for (const k of unique) teardownTails.set(k, p);
+  p.finally(() => {
+    for (const k of unique) if (teardownTails.get(k) === p) teardownTails.delete(k);
+  });
+  teardowns.set(taskId, p);
+  p.finally(() => {
+    if (teardowns.get(taskId) === p) teardowns.delete(taskId);
+  });
+  return p;
+}
+
+/**
  * Await any deferred teardown currently in flight (or queued) for `taskId`.
  * Resolves immediately when nothing is pending. Exported so `unarchiveTask`,
  * `startTask`, terminal open (`createTerminal`), and the boot-time sweep can serialize against a still-running
@@ -467,7 +530,46 @@ function enqueueTeardown(taskId: string, key: string, job: () => Promise<void>):
  * drain the queue deterministically.
  */
 export function pendingTeardown(taskId: string): Promise<void> {
-  return teardowns.get(taskId) ?? Promise.resolve();
+  const removal = repositoryRemovals.get(taskId);
+  const teardown = teardowns.get(taskId);
+  if (!removal) return teardown ?? Promise.resolve();
+  return Promise.all([teardown, removal]).then(() => undefined);
+}
+
+/**
+ * In-flight `removeTaskRepository` jobs, per task id. Kept apart from
+ * `teardowns` on purpose: `isTaskTearingDown` means "archive/delete is taking
+ * this task away", and a repository removal must not make a terminal open or
+ * a queued OpenCode/fx turn read as that. `pendingTeardown` awaits both, so
+ * every materializing path (start, follow-up, unarchive, terminal open) waits
+ * for a removal to settle before it reads the row's repository set.
+ */
+const repositoryRemovals = new Map<string, Promise<unknown>>();
+
+/**
+ * Run `job` after any teardown already queued on `keys` (the task's selected
+ * repository paths, the same FIFO `enqueueTeardownMany` uses) and after this
+ * task's own pending teardown/removal, and make it the tail of every key, so a
+ * later archive/delete teardown on those repositories waits for it. Unlike the
+ * teardown FIFO it hands the job's result back (the route answers with it),
+ * and its failure rejects only this call — the chain itself never rejects.
+ */
+function enqueueRepositoryRemoval<T>(taskId: string, keys: string[], job: () => Promise<T>): Promise<T> {
+  const unique = [...new Set(keys)].sort();
+  const waits = [
+    ...unique.map((k) => teardownTails.get(k) ?? Promise.resolve()),
+    teardowns.get(taskId) ?? Promise.resolve(),
+    repositoryRemovals.get(taskId) ?? Promise.resolve(),
+  ];
+  const result = Promise.all(waits).then(job);
+  const settled = result.then(() => undefined, () => undefined);
+  for (const k of unique) teardownTails.set(k, settled);
+  repositoryRemovals.set(taskId, settled);
+  settled.finally(() => {
+    for (const k of unique) if (teardownTails.get(k) === settled) teardownTails.delete(k);
+    if (repositoryRemovals.get(taskId) === settled) repositoryRemovals.delete(taskId);
+  });
+  return result;
 }
 
 /** Tasks whose `deleteTask` is in progress. A pipeline parent's delete awaits
@@ -1598,6 +1700,63 @@ export async function reconcileOrphans(): Promise<number> {
 }
 
 /**
+ * Whether a worktree-isolated pipeline step row is missing any checkout it
+ * shares with its parent (docs/architecture/pipelines.md,
+ * docs/architecture/multi-repo-tasks.md). A step never materializes its own:
+ * the prepare would re-create the parent's checkout and record it only on the
+ * step row. For a multi-repository step the workspace root existing is not
+ * enough, since one repository's checkout can be gone while the root stays;
+ * every entry's checkout must be there too.
+ */
+function stepCheckoutMissing(task: Task): boolean {
+  if (!task.worktreePath || !existsSync(task.worktreePath)) return true;
+  if (!isMultiRepoTask(task)) return false;
+  return (task.repositories ?? []).some((r) => !r.worktreePath || !existsSync(r.worktreePath));
+}
+
+/**
+ * Adds a multi-repository task's repository checkouts to a spawn's options
+ * (docs/architecture/multi-repo-tasks.md). The agent's cwd is the workspace
+ * root, and every checkout sits inside it, so the agent can already reach
+ * each one. But the workspace root itself is not a git repository, and some
+ * CLIs scope their working roots per git repository rather than per
+ * directory tree, so each checkout is also named explicitly:
+ *
+ * - `extraDirectories` becomes `--add-dir <checkout>` for the kinds whose CLI
+ *   takes it (claude-code, codex, copilot); the rest ignore it.
+ * - `codexWorkspaceRepos` pairs each checkout with the source repository it
+ *   was created from. A checkout's commits land in that source repository's
+ *   `.git`, outside the workspace, and codex's sandbox decides from these
+ *   pairs which external git dirs it may write (`gitWritableRoots`).
+ *
+ * Called from `spawnAgentOrFail`, so every spawn path (first launch,
+ * follow-up, swap, retry) gets the same roots. A checkout that isn't on disk
+ * at spawn time is left out of both. A multi task is decided by
+ * `isMultiRepoTask` (one repository left after removals included). A
+ * single-repository task gets the very same `opts` object back, so its argv
+ * stays byte-identical. Exported for its unit test.
+ */
+export function withTaskRepositoryRoots(
+  taskId: string,
+  opts: SpawnAgentArgs["opts"],
+): SpawnAgentArgs["opts"] {
+  const task = tasks.get(taskId);
+  if (!task || !isMultiRepoTask(task)) return opts;
+  // Only checkouts that exist right now: a repository whose checkout is gone
+  // (its source repository was deleted, a hand-removed directory) would make
+  // `--add-dir` name a missing path, which some CLIs refuse outright.
+  const materialized = (task.repositories ?? []).filter(
+    (r): r is TaskRepository & { worktreePath: string } => Boolean(r.worktreePath) && existsSync(r.worktreePath!),
+  );
+  if (materialized.length === 0) return opts;
+  return {
+    ...opts,
+    extraDirectories: materialized.map((r) => r.worktreePath),
+    codexWorkspaceRepos: materialized.map((r) => ({ worktreePath: r.worktreePath, repoPath: r.path })),
+  };
+}
+
+/**
  * Wraps `spawnAgent` so a failure inside it — either a *synchronous* throw
  * before a process is ever spawned (`buildCommand` can throw on gemini's
  * argv-size cap, "model is required", …) or an *async rejection* partway
@@ -1638,6 +1797,7 @@ async function spawnAgentOrFail(
   opts: SpawnAgentOrFailOptions = {},
 ): Promise<{ agent: SpawnedAgent; message?: undefined } | { agent: null; message: string }> {
   try {
+    const baseOpts = withTaskRepositoryRoots(args.taskId, args.opts);
     // Claude's pane usage-limit notice only settles a turn when the task is
     // on a stack WITH a backup; a lone account keeps claude's own
     // auto-continue (plan §2.2). One central injection keeps every spawn path
@@ -1645,9 +1805,9 @@ async function spawnAgentOrFail(
     const spawnArgs: SpawnAgentArgs = args.harness.kind === "claude-code"
       ? {
           ...args,
-          opts: { ...args.opts, harnessFailover: harnessFailoverEnabledFor(tasks.get(args.taskId)) },
+          opts: { ...baseOpts, harnessFailover: harnessFailoverEnabledFor(tasks.get(args.taskId)) },
         }
-      : args;
+      : { ...args, opts: baseOpts };
     return { agent: await spawnAgent(spawnArgs) };
   } catch (err) {
     const { runId, taskId, onChunk } = args;
@@ -2190,6 +2350,16 @@ export async function startTask(
  */
 function worktreeDriftStatusLines(task: Task, prepared: PreparedWorkdir): string[] {
   const lines: string[] = [];
+  // `prepared.repositories` is present exactly when the multi path ran.
+  if (prepared.repositories) {
+    for (const repo of prepared.repositories) {
+      if (repo.worktreePath && repo.branch && repo.checkoutBranch && repo.checkoutBranch !== repo.branch) {
+        lines.push(`${repo.name}: worktree is on ${repo.checkoutBranch} (task branch ${repo.branch}) — running there`);
+      }
+    }
+    if (prepared.warning) lines.push(prepared.warning);
+    return lines;
+  }
   const live = prepared.checkoutBranch;
   if (prepared.worktreePath && prepared.branch && live && live !== prepared.branch) {
     lines.push(
@@ -2230,6 +2400,11 @@ async function startTaskInner(
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
   // directory out from under the freshly-prepared one.
   await pendingTeardown(taskId);
+  // A multi task's repository set may have changed while that wait ran (a
+  // `removeTaskRepository` settles through the same wait), and the prepare
+  // below must not re-create a checkout that was just removed. A single
+  // task's row is used exactly as before.
+  if (isMultiRepoTask(task)) task = tasks.get(taskId) ?? task;
 
   // Starting an archived task auto-unarchives it — otherwise the card would
   // move through columns (running → review/ready) while hidden behind the
@@ -2419,26 +2594,42 @@ async function startTaskInner(
   // forever (copied from an equally `null` parent) and `prepareWorkdir`
   // never reaches the worktree-creation branch for it at all — that's not
   // a missing worktree, it's the correct shape for that isolation mode.
-  if (
-    task.pipelineParentId
-    && task.isolation === "worktree"
-    && (!task.worktreePath || !existsSync(task.worktreePath))
-  ) {
+  if (task.pipelineParentId && task.isolation === "worktree" && stepCheckoutMissing(task)) {
     return { error: "step task's worktree is missing — run the pipeline task instead" };
   }
 
   // Pass the branches other tasks have pinned. If materializing this task's
   // branch hits a create-time uniqueness race, the recovery re-pins to a name
-  // that's free of both existing refs AND those not-yet-started pins.
-  const prepared = await prepareWorkdir(task, {
-    takenBranches: new Set(
-      tasks.list()
-        .filter((t) => t.id !== taskId)
-        .map((t) => t.branch)
-        .filter((b): b is string => Boolean(b)),
+  // that's free of both existing refs AND those not-yet-started pins. The
+  // git-root keys are only read by the multi-repository path
+  // (`prepareTaskWorkdir`'s per-repository `pinnedBranchesFor` lookups); a
+  // single-repository prepare folds every value into one flat set, so asking
+  // for root keys there would spawn a `git rev-parse` per pinned path for
+  // nothing.
+  const multiRepo = isMultiRepoTask(task);
+  const prepared = await prepareTaskWorkdir(task, {
+    takenBranches: await branchesPinnedByOtherTasks(
+      taskId,
+      tasks.list(),
+      multiRepo ? { resolveRoot: repoRoot } : {},
     ),
   });
   if ("error" in prepared) return { error: prepared.error };
+  // A multi-repository prepare has just created (or re-attached) a checkout
+  // per repository. Record them now, not only in the `persist` transaction
+  // below: every return or throw between here and there (the @-expansion
+  // budget refusal, a failing expansion) would otherwise leave checkouts on
+  // disk that the row doesn't name, and delete/archive teardown only removes
+  // the repositories the row records. `persist` writes them again, with the
+  // pinned base refs. (`prepared.repositories` is present exactly when the
+  // multi path ran, one entry included.)
+  if (prepared.repositories) {
+    const checkouts = prepared.repositories;
+    db.transaction(() => {
+      tasks.setRepositories(taskId, checkouts);
+      recordPreparedRepositoryCheckouts(taskId, checkouts, prepared.unknownCheckouts);
+    })();
+  }
 
   // Expand `@`-tokens into absolute paths now, right after `prepareWorkdir`
   // returns — this is the EARLIEST point in the whole flow that knows the
@@ -2482,9 +2673,16 @@ async function startTaskInner(
   // and — since it's added identically to both sides — the
   // `expandedOverage && !rawOverage` semantics (only the @-expansion itself
   // pushed things over) are unchanged either way.
+  // The `Repositories:` block is the only machine-added text for a
+  // multi-repository task (issue #291). It sits after the user prompt and
+  // before the references block, and a single-repository launch is
+  // byte-identical to before because the block is null there. The pipeline
+  // runner's step budget composes through the same shared helper.
+  const composeForRun = (text: string): string =>
+    composeRunPrompt(effective, text, { multiRepo, repositories: prepared.repositories });
   const expandedOverage = promptByteOverage(
     harness.kind,
-    appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references),
+    appendReferences(composeForRun(expandedPrompt), task.references),
   );
   // Skip re-encoding the same text twice (R19, code review) when expansion
   // was a no-op — a prompt with no `@` tokens at all (or none that resolved)
@@ -2496,7 +2694,7 @@ async function startTaskInner(
     ? expandedOverage
     : promptByteOverage(
       harness.kind,
-      appendReferences(composeLaunchPrompt(effective, task.prompt), task.references),
+      appendReferences(composeForRun(task.prompt), task.references),
     );
   if (expandedOverage && !rawOverage) {
     return {
@@ -2508,10 +2706,21 @@ async function startTaskInner(
   }
 
   // Lazy-pin baseRef: workdir wasn't a git repo when the task was created but
-  // is one now. Pin the sha actually used so re-runs stay reproducible.
-  if (!task.baseRef && prepared.worktreePath) {
+  // is one now. Pin the sha actually used so re-runs stay reproducible. A
+  // multi-repository task has no scalar baseRef (create stores null) and its
+  // `worktreePath` is the workspace root — not a git checkout — so this would
+  // spawn a doomed `git rev-parse` there and discard the result on every
+  // start/retry; the per-repository block below is the real pin.
+  const multiPrepared = Boolean(prepared.repositories);
+  if (shouldLazyPinBaseRef(task.baseRef, prepared)) {
     const sha = await resolveRef(task.workdir, "HEAD");
     if (sha) tasks.update(taskId, { baseRef: sha });
+  }
+  // A multi-repository row has no scalar baseRef: pin every entry that is
+  // missing one against its own repository, before the persist transaction
+  // below writes them back.
+  if (multiPrepared) {
+    prepared.repositories = await pinMissingRepositoryBaseRefs(prepared.repositories!);
   }
 
   // A fresh `startTask` (as opposed to `resumeFxRecovery`'s continue-recovery
@@ -2541,6 +2750,15 @@ async function startTaskInner(
       worktreePath: prepared.worktreePath,
       runId,
     });
+    // Multi-repository materialization: persist every entry's worktree path,
+    // branch (possibly a per-repo fallback) and last-seen checkout in the same
+    // transaction as the workspace mirror above.
+    if (prepared.repositories) {
+      tasks.setRepositories(taskId, prepared.repositories);
+      // The prepare's live reads are the freshest checkout values; record
+      // them through the dedicated setter (see `setRepositories`' merge rule).
+      recordPreparedRepositoryCheckouts(taskId, prepared.repositories, prepared.unknownCheckouts);
+    }
     // Run start is one of the four last-seen-checkout refresh points (start,
     // settle, terminal open, archive). Isolation "none", or a reuse whose
     // branch read failed, has nothing to record — keep whatever was recorded
@@ -2589,7 +2807,7 @@ async function startTaskInner(
   // D3/D11). `composeLaunchPrompt` is a no-op passthrough when `effective` is
   // null, so an unbound task's launch prompt is byte-identical to before this
   // feature.
-  const promptWithRefs = appendReferences(composeLaunchPrompt(effective, expandedPrompt), task.references);
+  const promptWithRefs = appendReferences(composeForRun(expandedPrompt), task.references);
 
   const onChunk = makeChunkHandler(runId, taskId, harness.kind, task.mode);
   // Echo the initial prompt as a "user" event so the panel renders a
@@ -3668,6 +3886,20 @@ async function noteRunSettledCheckout(taskId: string): Promise<void> {
   try {
     const task = tasks.get(taskId);
     if (!task || task.isolation !== "worktree" || !task.worktreePath) return;
+    const repos = task.repositories ?? [];
+    if (isMultiRepoTask(task)) {
+      // Multi-repository: the scalar worktreePath is the non-git workspace
+      // root, so a single read there always failed and every repository's
+      // recorded checkout went stale after a turn that switched branches.
+      // Refresh each entry compare-then-write (an unreadable child leaves its
+      // stored value alone, same contract as the single path).
+      for (const repo of repos) {
+        if (!repo.worktreePath || !existsSync(repo.worktreePath)) continue;
+        const live = await readCheckoutBranch(repo.worktreePath);
+        if (live.ok) tasks.setRepositoryCheckout(taskId, repo.name, live.branch);
+      }
+      return;
+    }
     if (!existsSync(task.worktreePath)) return;
     const live = await readCheckoutBranch(task.worktreePath);
     if (live.ok) tasks.setCheckoutBranch(taskId, live.branch);
@@ -8378,21 +8610,21 @@ async function sendInputInner(
   // from a follow-up send would hand this ONE step a private checkout
   // (`prepareWorkdir`'s materialize branch) instead of the shared one; only
   // the pipeline task's own Run/Retry re-materializes it.
-  if (
-    task.pipelineParentId
-    && task.isolation === "worktree"
-    && (!task.worktreePath || !existsSync(task.worktreePath))
-  ) {
+  if (task.pipelineParentId && task.isolation === "worktree" && stepCheckoutMissing(task)) {
     return { delivered: false, reason: "step task's worktree is missing — run the pipeline task instead" };
   }
 
-  if (task.worktreePath && !existsSync(task.worktreePath)) {
+  // A follow-up only reaches a task that already has a run, so its
+  // repositories are expected on disk: unlike unarchive, a multi task with
+  // no recorded checkout is restored here too rather than spawned into a
+  // workspace that doesn't exist.
+  if (workdirNeedsRestore(task) || repositoriesNeverMaterialized(task)) {
     // Re-fetch so the restore sees the just-cleared archivedAt (prepareWorkdir
     // doesn't care about it, but keeping the object fresh avoids acting on a
     // stale snapshot).
     const fresh = tasks.get(row.task_id) ?? task;
     try {
-      const restored = await prepareWorkdir(fresh);
+      const restored = await prepareTaskWorkdir(fresh);
       if ("error" in restored) {
         return { delivered: false, reason: `worktree restore failed: ${restored.error}` };
       }
@@ -12086,9 +12318,19 @@ async function spawnResumedSessionInner(
 }
 
 
-export interface CreateTaskInput extends Partial<Task> {
+export interface CreateTaskInput extends Omit<Partial<Task>, "repositories" | "issueRepoPath"> {
   title: string;
   prompt: string;
+  /**
+   * The repositories this task works on (issue #291). Two or more make it a
+   * multi-repository task: each gets its own worktree/branch inside a
+   * per-task workspace root, and the agent runs at that root. One entry (or
+   * two paths deduped to one git root) uses the ordinary single-repository
+   * layout. Requires `isolation: "worktree"` for 2+ and is incompatible with
+   * `existingBranch`. Only `path` and `baseRef` are read — every
+   * server-managed field is recomputed.
+   */
+  repositories?: TaskRepositoryInput[];
   /** Optional ref name (branch / tag / sha). Defaults to "HEAD". Resolved to a sha at create time. */
   baseRef?: string;
   /**
@@ -12212,17 +12454,130 @@ export async function createTask(
   // callers don't break, but we DON'T register that fallback as a project —
   // the projects list should only contain folders the user actually chose.
   const explicitWorkdir = input.workdir?.trim() ? input.workdir.trim() : null;
-  const workdir = explicitWorkdir ?? process.cwd();
+  let workdir = explicitWorkdir ?? process.cwd();
   const isolation = input.isolation ?? "worktree";
-  const requestedRef = input.baseRef?.trim() || "HEAD";
   const existingBranch = input.existingBranch?.trim() || null;
+
+  // Repository set (issue #291). Validated before any side effect: every bad
+  // entry is named at once, and two paths under one git root collapse to the
+  // first selected path (the ordinary single-repository layout). Only 2+ kept
+  // entries make this a multi-repository task.
+  const repoInputs: TaskRepositoryInput[] = Array.isArray(input.repositories) ? input.repositories : [];
+  // Task-level base ref (CLI `--base-ref`, or a direct `POST /tasks` body).
+  // It is the default for every selected repository without its own pin, so
+  // `agetor add --repo a --repo b --base-ref release/next` starts both from
+  // `release/next` instead of silently dropping the flag. A per-entry
+  // `repositories[].baseRef` (`--repo <path>=<ref>`) wins for that entry.
+  const defaultBaseRef = input.baseRef?.trim() || null;
+  // The same path twice with different base refs is ambiguous: the set keeps
+  // the first entry, while a path → ref lookup would take the last one, so the
+  // task could start from neither ref the caller meant. Refuse it, naming the
+  // path. A repeat that resolves to the same ref (its own, else the task-level
+  // default, else HEAD) is a harmless duplicate.
+  {
+    const refByPath = new Map<string, string>();
+    const conflicting = new Set<string>();
+    for (const r of repoInputs) {
+      const p = typeof r?.path === "string" ? r.path.trim() : "";
+      if (!p) continue;
+      const ref = (typeof r?.baseRef === "string" ? r.baseRef.trim() : "") || defaultBaseRef || "HEAD";
+      if (!refByPath.has(p)) refByPath.set(p, ref);
+      else if (refByPath.get(p) !== ref) conflicting.add(p);
+    }
+    if (conflicting.size > 0) {
+      return {
+        error: [...conflicting]
+          .map((p) => `repository ${p} is selected more than once with different base refs — pick one`)
+          .join("\n"),
+      };
+    }
+  }
+  const resolvedSet = repoInputs.length > 0
+    ? await resolveRepositorySet(repoInputs, { resolveRoot: repoRoot })
+    : null;
+  if (resolvedSet && !resolvedSet.ok) {
+    // Keep validating the entries that did resolve, so one response names
+    // every problem (a non-git path AND a bad base ref in another repo).
+    const errors = [...resolvedSet.errors];
+    const requestedByPath = new Map(
+      repoInputs.map((r) => [typeof r.path === "string" ? r.path.trim() : "", r.baseRef]),
+    );
+    for (const entry of resolvedSet.repositories) {
+      const requested = requestedByPath.get(entry.path)?.trim() || defaultBaseRef || "HEAD";
+      if (requested === "HEAD") continue;
+      const sha = await resolveRef(entry.path, requested);
+      if (!sha) errors.push(`base ref "${requested}" not found in ${entry.name} (${entry.path})`);
+    }
+    return { error: errors.join("\n") };
+  }
+  const keptRepositories = resolvedSet && resolvedSet.ok ? resolvedSet.repositories : [];
+  const multiRepo = keptRepositories.length > 1;
+  if (multiRepo && isolation !== "worktree") {
+    return { error: `multi-repository tasks require worktree isolation — isolation is "${isolation}"` };
+  }
+  if (multiRepo && existingBranch) {
+    return { error: "existingBranch isn't supported with multiple repositories — create the task on a fresh branch" };
+  }
+  if (keptRepositories.length === 1) {
+    // Dedupe collapsed the selection (or the caller sent one path): use that
+    // path as the task's workdir, matching what the user selected. This is the
+    // documented precedence — the repository set owns `workdir`, so an
+    // `input.workdir` alongside `repositories` never survives (the CLI sends
+    // this same anchor). For 2+ the workspace root is assigned further below.
+    workdir = keptRepositories[0]!.path;
+  }
+
+  // A `repositories` selection that collapses to one entry (a single path, or
+  // two paths under one git root) is created through the ordinary
+  // single-repository path, so it must still honor that entry's per-repository
+  // base ref: the CLI's `--repo <path>=<ref>` puts its ref there, not in the
+  // top-level `baseRef`, and ignoring it silently branched from HEAD. The
+  // precedence matches the multi path and the documented rule: an entry pin
+  // wins, then the task-level default, then HEAD. (Top-level-wins here would
+  // make `--repo <path>=<ref>` silently override `--base-ref` only when the
+  // selection happened to collapse.)
+  const singleRepoInput = keptRepositories.length === 1
+    ? repoInputs.find((r) => typeof r.path === "string" && r.path.trim() === keptRepositories[0]!.path)
+    : undefined;
+  const requestedRef = singleRepoInput?.baseRef?.trim() || defaultBaseRef || "HEAD";
+
+  // The directory whose git root the BRANCH PLAN is resolved against. For a
+  // multi-repository task `workdir` is still the daemon cwd (or an explicit
+  // `--workdir`) at this point — the real workspace root doesn't exist yet —
+  // so anchoring on it either ignored the caller's `branch` override entirely
+  // (cwd not a git repo) or read another repo's refs/branch config (cwd a git
+  // repo). The first selected repository is the workspace's anchor, which is
+  // also the path the per-repository loop below resolves each name against.
+  const branchScopeDir = multiRepo ? keptRepositories[0]!.path : workdir;
+  const workdirRoot = isolation === "worktree" ? await repoRoot(branchScopeDir) : null;
 
   let baseRef: string | null = null;
   let plannedBranch: string | null = null;
   let branchSource: Task["branchSource"] = "created";
-  const workdirRoot = isolation === "worktree" ? await repoRoot(workdir) : null;
+  let repositories: TaskRepository[] = [];
 
-  if (existingBranch) {
+  if (multiRepo) {
+    // Per-repository base refs resolved now, so a re-run starts from the same
+    // commit in every repository. An entry's own pin (`--repo <path>=<ref>`)
+    // wins; otherwise the task-level `baseRef` applies; otherwise HEAD. The
+    // shared desired branch name is resolved per repository below (against
+    // each repository's own refs at create time), so a name an archived task
+    // left behind gets the `-N` fallback before anything is materialized.
+    const requestedByPath = new Map(
+      repoInputs.map((r) => [typeof r.path === "string" ? r.path.trim() : "", r.baseRef]),
+    );
+    const errors: string[] = [];
+    for (const entry of keptRepositories) {
+      const requested = requestedByPath.get(entry.path)?.trim() || defaultBaseRef || "HEAD";
+      const sha = await resolveRef(entry.path, requested);
+      if (!sha && requested !== "HEAD") {
+        errors.push(`base ref "${requested}" not found in ${entry.name} (${entry.path})`);
+        continue;
+      }
+      repositories.push({ ...entry, baseRef: sha ?? null });
+    }
+    if (errors.length > 0) return { error: errors.join("\n") };
+  } else if (existingBranch) {
     if (isolation !== "worktree" || !workdirRoot) {
       return {
         error: `existingBranch requires worktree isolation and a git repo — "${workdir}" isn't one, or isolation is "${isolation}"`,
@@ -12235,9 +12590,26 @@ export async function createTask(
     if (!validated.ok) {
       return { error: `invalid branch name "${existingBranch}": ${validated.reason}` };
     }
-    const collision = tasks.list().some(
-      (t) => !t.archivedAt && t.workdir === workdir && t.branch === existingBranch,
-    );
+    // A multi-repository row keeps its branches in `repositories[]` (its
+    // scalar `branch` is null and its `workdir` is the workspace root), so an
+    // entry in this repository holding the branch is a collision too.
+    const entryRootOf = memoAsync(repoRoot);
+    let collision = false;
+    for (const t of tasks.list()) {
+      if (t.archivedAt) continue;
+      if (t.workdir === workdir && t.branch === existingBranch) {
+        collision = true;
+        break;
+      }
+      for (const r of t.repositories ?? []) {
+        if (r.branch !== existingBranch) continue;
+        if (r.path === workdir || (await entryRootOf(r.path)) === workdirRoot) {
+          collision = true;
+          break;
+        }
+      }
+      if (collision) break;
+    }
     if (collision) {
       return { error: `another task already has "${existingBranch}" checked out in ${workdir}` };
     }
@@ -12419,7 +12791,7 @@ export async function createTask(
   if (!existingBranch && workdirRoot) {
     const override = typeof input.branch === "string" ? input.branch.trim() : "";
     const token = id.replace(/-/g, "").slice(0, 6);
-    const ctx = { title: input.title, projectName: basename(workdir), taskType, token, now: new Date() };
+    const ctx = { title: input.title, projectName: basename(branchScopeDir), taskType, token, now: new Date() };
     let desired: string;
     if (override) {
       const rendered = renderBranchTemplate(override, ctx);
@@ -12432,16 +12804,64 @@ export async function createTask(
       }
       desired = rendered;
     } else {
-      const config = projects.get(workdir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+      const config = projects.get(branchScopeDir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
       desired = renderBranchTemplate(branchPattern(config, taskType), ctx);
       // Defensive: a hand-edited/corrupt config shouldn't hard-fail task
       // creation — fall back to the legacy scheme if it produced an illegal name.
       if (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });
     }
-    const taken = new Set(
-      tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+    // Multi-repository tasks resolve uniqueness per repository in the loop
+    // below (each root's own refs differ); resolving it once here against the
+    // anchor repo would append `-N` for a name only that repo has, then the
+    // second `ensureUniqueBranch` would drift further. The desired name is
+    // still the caller's override (or the anchor project's nomenclature).
+    if (multiRepo) {
+      plannedBranch = desired;
+    } else {
+      // Fold EVERY pin from the other rows, exactly like
+      // `prepareTaskWorkdir`'s single-repository path does. Reading only
+      // `t.branch` missed a not-yet-started multi task's `repositories[].branch`
+      // pins: a multi task created first could hold this name with no git ref
+      // yet, so this single task pinned the same branch and later attached to
+      // (or collided with) that task's commits. The map is flattened rather
+      // than looked up by workdir so a task that selected a sibling
+      // subdirectory of the same repo still counts — the pre-#291 behavior
+      // (a global set of every task's branch) is preserved. No `resolveRoot`:
+      // every value is folded into one set, so the git-root keys are unused
+      // and resolving them would spawn a `git rev-parse` per pinned path on
+      // every single-repository create.
+      const taken = new Set<string>();
+      for (const set of (await branchesPinnedByOtherTasks(id, tasks.list())).values()) {
+        for (const b of set) taken.add(b);
+      }
+      plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
+    }
+  }
+
+  // A multi-repository task's `workdir`/`worktreePath` are the per-task
+  // workspace root (`<WORKTREES_DIR>/<task-id>`) — the one cwd every agent,
+  // terminal and `@` expansion uses. Single-repository tasks are unchanged.
+  if (multiRepo) {
+    workdir = join(WORKTREES_DIR, id);
+    // Every repository attempts the same shared name. Each one is resolved
+    // through `ensureUniqueBranch` against its OWN root, so a name that still
+    // exists there as a ref — e.g. the branch an archived task left behind —
+    // gets the per-repository `-N` fallback instead of silently re-attaching
+    // the new task to that old work. `taken` covers names another
+    // not-yet-started task has pinned but not materialized (no ref yet).
+    const roots = new Map(
+      repositories.map((r) => [r.path, resolvedSet && resolvedSet.ok ? (resolvedSet.repositoriesRoots.get(r.path) ?? r.path) : r.path]),
     );
-    plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
+    const desired = plannedBranch ?? branchName({ id, title: input.title });
+    const taken = await branchesPinnedByOtherTasks(id, tasks.list(), { resolveRoot: repoRoot });
+    // Bounded like the worktree engine's own per-repository fan-out: each
+    // `ensureUniqueBranch` spawns git, and N repositories must not start N
+    // at once.
+    await forEachBounded(repositories, MULTI_REPO_CONCURRENCY, async (r) => {
+      const root = roots.get(r.path) ?? r.path;
+      const pinned = pinnedBranchesFor(taken, [r.path, root]);
+      r.branch = await ensureUniqueBranch(root, desired, pinned);
+    });
   }
 
   // Issue provenance (docs/plans/new-task-from-git-issue.md): validated once,
@@ -12454,19 +12874,41 @@ export async function createTask(
   // canonical and directly comparable via `normalizeIssueUrl`/`sameIssueUrl`
   // elsewhere, regardless of which slug/query the user happened to paste.
   let validatedIssueUrl: string | null = null;
+  let issueRepoPath: string | null = null;
   let parsedIssue: ReturnType<typeof parseIssueUrl> = null;
   const rawIssueUrl = input.issueUrl?.trim() || "";
   if (rawIssueUrl) {
     parsedIssue = parseIssueUrl(rawIssueUrl);
     if (!parsedIssue) return { error: "issueUrl is not a recognized issue URL" };
-    const repoInfo = await providerRepoForDir(workdir);
-    if (!repoInfo) return { error: `${workdir} has no ${parsedIssue.provider} remote for that issue` };
-    const sameRepo = repoInfo.provider === parsedIssue.provider
-      && `${repoInfo.owner}/${repoInfo.name}`.toLowerCase() === `${parsedIssue.owner}/${parsedIssue.repo}`.toLowerCase();
-    if (!sameRepo) {
-      return {
-        error: `issue URL points at ${parsedIssue.owner}/${parsedIssue.repo}, but the project's remote is ${repoInfo.owner}/${repoInfo.name}`,
-      };
+    if (multiRepo) {
+      // Match the issue against EVERY selected repository; only the matching
+      // one's PR gets `Closes #N`. No match fails the create (View issue and
+      // the PR-body prefill both trust this).
+      for (const repo of repositories) {
+        const info = await providerRepoForDir(repo.path);
+        const sameRepo = info != null
+          && info.provider === parsedIssue.provider
+          && `${info.owner}/${info.name}`.toLowerCase() === `${parsedIssue.owner}/${parsedIssue.repo}`.toLowerCase();
+        if (sameRepo) {
+          issueRepoPath = repo.path;
+          break;
+        }
+      }
+      if (!issueRepoPath) {
+        return {
+          error: `issue URL points at ${parsedIssue.owner}/${parsedIssue.repo}, but none of the selected repositories has a matching remote`,
+        };
+      }
+    } else {
+      const repoInfo = await providerRepoForDir(workdir);
+      if (!repoInfo) return { error: `${workdir} has no ${parsedIssue.provider} remote for that issue` };
+      const sameRepo = repoInfo.provider === parsedIssue.provider
+        && `${repoInfo.owner}/${repoInfo.name}`.toLowerCase() === `${parsedIssue.owner}/${parsedIssue.repo}`.toLowerCase();
+      if (!sameRepo) {
+        return {
+          error: `issue URL points at ${parsedIssue.owner}/${parsedIssue.repo}, but the project's remote is ${repoInfo.owner}/${repoInfo.name}`,
+        };
+      }
     }
     validatedIssueUrl = normalizeIssueUrl(rawIssueUrl);
   }
@@ -12489,13 +12931,20 @@ export async function createTask(
     workdir,
     isolation,
     taskType,
-    branch: plannedBranch,
-    branchSource,
+    // A multi-repository task has no primary branch/baseRef: `repositories[]`
+    // is the source of truth and the scalars mirror the workspace only.
+    branch: multiRepo ? null : plannedBranch,
+    branchSource: multiRepo ? "created" : branchSource,
     worktreePath: null,
-    baseRef,
+    baseRef: multiRepo ? null : baseRef,
     // No PR exists for a brand-new task; set server-side by pull-create.
     prUrl: null,
     issueUrl: validatedIssueUrl,
+    issueRepoPath: multiRepo ? issueRepoPath : null,
+    repositories: multiRepo ? repositories : [],
+    // Create time is the one place "multi" is a count (2+ repositories kept
+    // after dedupe); from here on the row's stored set decides (`toTask`).
+    multiRepo,
     mode: defaultsProfile ? defaultsProfile.mode : (input.mode ?? null),
     model,
     effort,
@@ -12598,7 +13047,7 @@ function enqueueArchiveTeardown(
 ): { promise: Promise<void>; result: () => WorktreeTeardownResult | undefined } {
   const kind = resolveHarness(task.agent)?.kind;
   let result: WorktreeTeardownResult | undefined;
-  const promise = enqueueTeardown(task.id, task.workdir, async () => {
+  const promise = enqueueTeardownMany(task.id, teardownKeysForTask(task), async () => {
     // `enqueueTeardown` only guarantees this job runs after everything already
     // queued for `task.workdir` — it can sit behind other jobs for seconds,
     // and `task` was captured at ENQUEUE time by every call site (fresh
@@ -12669,9 +13118,20 @@ function enqueueArchiveTeardown(
     // (D6) so unarchive re-attaches onto the same branch and a later delete
     // of the archived task can still name it. An unreadable checkout leaves
     // the previously recorded value in place.
-    if (!cur.pipelineParentId && cur.isolation === "worktree" && cur.worktreePath && existsSync(cur.worktreePath)) {
-      const live = await readCheckoutBranch(cur.worktreePath);
-      if (live.ok) tasks.setCheckoutBranch(cur.id, live.branch);
+    if (!cur.pipelineParentId && cur.isolation === "worktree") {
+      const repos = cur.repositories ?? [];
+      if (isMultiRepoTask(cur)) {
+        // Multi-repository (issue #291): record every repo's live checkout
+        // before any detach, so unarchive re-attaches onto the same branches.
+        for (const repo of repos) {
+          if (!repo.worktreePath || !existsSync(repo.worktreePath)) continue;
+          const live = await readCheckoutBranch(repo.worktreePath);
+          if (live.ok) tasks.setRepositoryCheckout(cur.id, repo.name, live.branch);
+        }
+      } else if (cur.worktreePath && existsSync(cur.worktreePath)) {
+        const live = await readCheckoutBranch(cur.worktreePath);
+        if (live.ok) tasks.setCheckoutBranch(cur.id, live.branch);
+      }
     }
     result = cur.pipelineParentId
       ? { removed: false, reason: "no-worktree" }
@@ -12865,6 +13325,29 @@ export async function archiveTask(
 }
 
 /**
+ * Record each materialized repository's last-seen checkout through the
+ * dedicated compare-then-write setter. Used after `setRepositories`, which
+ * intentionally never overwrites a stored checkout from a possibly-stale
+ * snapshot (issue #291 review): the live read captured by the prepare is the
+ * freshest value here. Entries without a worktree (never materialized) are
+ * skipped; a `null` checkout is a real detached-HEAD reading and is recorded.
+ * `unknown` names the entries whose live read failed
+ * (`PreparedWorkdir.unknownCheckouts`): their checkout is only the input
+ * snapshot, not a reading, so the stored value is kept.
+ */
+export function recordPreparedRepositoryCheckouts(
+  taskId: string,
+  repos: TaskRepository[],
+  unknown: readonly string[] = [],
+): void {
+  for (const repo of repos) {
+    if (!repo.worktreePath) continue;
+    if (unknown.includes(repo.name)) continue;
+    tasks.setRepositoryCheckout(taskId, repo.name, repo.checkoutBranch ?? null);
+  }
+}
+
+/**
  * After a `prepareWorkdir` outside a run start (unarchive, `sendInput`'s
  * missing-worktree branch, a terminal open) record the branch the worktree is
  * on, and surface `prepareWorkdir`'s `warning` — a re-attach couldn't bring
@@ -12875,12 +13358,47 @@ export async function archiveTask(
  * is the one chance to say it.
  */
 export function noteRestoredCheckout(taskId: string, prepared: PreparedWorkdir): void {
-  const checkout = recordableCheckout(prepared);
-  if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
+  if (prepared.repositories) {
+    // Persist the re-materialized per-repo paths/branches/checkouts.
+    tasks.setRepositories(taskId, prepared.repositories);
+    // `setRepositories` deliberately keeps a stored checkout (a concurrent
+    // settle/archive write must win over this older snapshot); a live read
+    // from THIS prepare is the freshest value at this point, so record it via
+    // the dedicated compare-then-write setter.
+    recordPreparedRepositoryCheckouts(taskId, prepared.repositories, prepared.unknownCheckouts);
+  } else {
+    const checkout = recordableCheckout(prepared);
+    if (checkout !== undefined) tasks.setCheckoutBranch(taskId, checkout);
+  }
   if (!prepared.warning) return;
   const latest = runs.listForTask(taskId)[0];
   if (latest) appendRunStatusLine(taskId, latest.id, prepared.warning);
   else console.warn(`[agetor] task ${taskId}: ${prepared.warning}`);
+}
+
+/**
+ * Whether a task's working directory needs re-materializing. A
+ * single-repository task needs it when its recorded worktree is missing. A
+ * multi-repository task needs it when any repository's checkout is missing
+ * or was never materialized, but only once the task has materialized at
+ * least one: like a single-repository task with no recorded worktree, a
+ * multi task that never started has nothing to restore, and unarchiving it
+ * must not create its worktrees and branches.
+ */
+function workdirNeedsRestore(task: Task): boolean {
+  const repos = task.repositories ?? [];
+  if (isMultiRepoTask(task)) {
+    if (repositoriesNeverMaterialized(task)) return false;
+    return repos.some((r) => !r.worktreePath || !existsSync(r.worktreePath));
+  }
+  return Boolean(task.worktreePath && !existsSync(task.worktreePath));
+}
+
+/** A multi-repository task none of whose repositories was ever checked out
+ *  (no entry has a recorded worktree path). */
+function repositoriesNeverMaterialized(task: Task): boolean {
+  const repos = task.repositories ?? [];
+  return isMultiRepoTask(task) && repos.every((r) => !r.worktreePath);
 }
 
 /**
@@ -12911,9 +13429,9 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
   // it here (were a step row ever unarchived on its own, which the normal
   // UI never does) would be redundant at best and racy at worst against the
   // parent's own restore; only the parent's own worktree is materialized.
-  if (updated.worktreePath && updated.branch && !updated.pipelineParentId && !existsSync(updated.worktreePath)) {
+  if (!updated.pipelineParentId && workdirNeedsRestore(updated)) {
     try {
-      const restored = await prepareWorkdir(updated);
+      const restored = await prepareTaskWorkdir(updated);
       if ("error" in restored) {
         console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}: ${restored.error}`);
       } else {
@@ -12924,6 +13442,296 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
     }
   }
   return { task: updated };
+}
+
+/** Why `removeTaskRepository` refused (the route answers `409 {error, code}`). */
+export type RemoveTaskRepositoryCode =
+  | "running"
+  | "last-repository"
+  | "dirty"
+  | "not-multi"
+  | "pipeline-step"
+  | "detach-failed";
+
+export type RemoveTaskRepositoryResult =
+  | { task: Task }
+  | { error: string; status: 404 }
+  | { error: string; status: 409; code: RemoveTaskRepositoryCode };
+
+/**
+ * The refusals `removeTaskRepository` can decide from the row alone, or the
+ * entry to remove. Checked once before the job is queued (a fast answer) and
+ * again inside it, against the row as it stands once every earlier teardown,
+ * removal and prepare has settled.
+ */
+function repositoryRemovalRefusal(
+  task: Task,
+  name: string,
+): Exclude<RemoveTaskRepositoryResult, { task: Task }> | { entry: TaskRepository } {
+  if (task.pipelineParentId) {
+    return {
+      status: 409,
+      code: "pipeline-step",
+      error: "step task shares its pipeline's checkouts — remove the repository on the pipeline task",
+    };
+  }
+  if (!isMultiRepoTask(task)) {
+    return { status: 409, code: "not-multi", error: "task is not a multi-repository task" };
+  }
+  const repos = task.repositories ?? [];
+  const entry = repos.find((r) => r.name === name);
+  if (!entry) return { status: 404, error: `unknown repository "${name}"` };
+  const stepRunning = task.pipelineId != null && (
+    task.pipelineRun?.status === "running"
+    || tasks.stepsForParent(task.id).some((step) => step.column === "running" || isTaskRunLive(step.id))
+  );
+  if (task.column === "running" || isTaskRunLive(task.id) || stepRunning) {
+    return {
+      status: 409,
+      code: "running",
+      error: stepRunning
+        ? "a pipeline step is running — wait for it to finish, or stop it, before removing a repository"
+        : "task is running — wait for the run to finish, or stop it, before removing a repository",
+    };
+  }
+  if (repos.length <= 1) {
+    return {
+      status: 409,
+      code: "last-repository",
+      error: `"${name}" is the task's only repository — a task needs at least one`,
+    };
+  }
+  return { entry };
+}
+
+/**
+ * Remove one repository from a multi-repository task
+ * (docs/architecture/multi-repo-tasks.md) — the way out when a repository's
+ * source was deleted and every follow-up's restore failed on it. A task stays
+ * multi even when one repository is left (`multiRepo` is the stored set).
+ *
+ * Refuses (409) a pipeline step (`pipeline-step`, steps share the parent's
+ * checkouts), a single-repository task (`not-multi`), a task with a live or
+ * starting run or a pipeline parent with a running step (`running`), the
+ * task's last repository (`last-repository`), and a checkout with uncommitted
+ * changes (`dirty`). An unknown task or repository name is a 404.
+ *
+ * The checkout is detached through the archive machinery's owned-path checks
+ * when it exists, is clean and its source repository is still there; the
+ * branch is never deleted. A missing checkout or source repository just drops
+ * the entry. Then the remaining set is written (`tasks.setRepositories`, a
+ * server-managed targeted write, also onto every step row of a pipeline
+ * parent), `issueRepoPath` is cleared when it named the removed repository,
+ * and one status line goes on the task's event stream. Works on an archived
+ * task too.
+ *
+ * Serialized through `enqueueRepositoryRemoval` (behind any queued
+ * teardown on the task's repositories, and awaited by `pendingTeardown`, so a
+ * start/follow-up/unarchive/terminal open reads the new set) and the task's
+ * prepare lock (so no prepare is mid-flight on the checkout being removed).
+ */
+export async function removeTaskRepository(taskId: string, name: string): Promise<RemoveTaskRepositoryResult> {
+  const initial = tasks.get(taskId);
+  if (!initial) return { status: 404, error: "task not found" };
+  const early = repositoryRemovalRefusal(initial, name);
+  if (!("entry" in early)) return early;
+  return enqueueRepositoryRemoval(taskId, teardownKeysForTask(initial), () =>
+    withTaskPrepareLock(taskId, () => removeTaskRepositoryNow(taskId, name)),
+  );
+}
+
+async function removeTaskRepositoryNow(taskId: string, name: string): Promise<RemoveTaskRepositoryResult> {
+  const task = tasks.get(taskId);
+  if (!task) return { status: 404, error: "task not found" };
+  const checked = repositoryRemovalRefusal(task, name);
+  if (!("entry" in checked)) return checked;
+  const { entry } = checked;
+
+  const detached = await detachRepositoryForRemoval(task, entry);
+  if (detached.kind === "dirty") {
+    return {
+      status: 409,
+      code: "dirty",
+      error: `repository "${name}" has uncommitted changes (or its status couldn't be read) in ${detached.worktreePath} — commit or discard them, then remove it`,
+    };
+  }
+  if (detached.kind === "failed") {
+    return {
+      status: 409,
+      code: "detach-failed",
+      error: `couldn't remove repository "${name}"'s checkout at ${detached.worktreePath} — nothing was changed`,
+    };
+  }
+  // The detach awaited git; a start can't have begun meanwhile (it waits on
+  // this job through `pendingTeardown`), so the row read above still holds.
+  const remaining = (tasks.get(taskId)?.repositories ?? task.repositories ?? []).filter((r) => r.name !== name);
+  db.transaction(() => {
+    tasks.setRepositories(taskId, remaining);
+    if (task.issueRepoPath != null && task.issueRepoPath === entry.path) {
+      tasks.clearIssueRepoPath(taskId, entry.path);
+    }
+    // Step rows copy the parent's set (D2/M6) and check every entry's
+    // checkout before they launch; drop the entry there too, so a resumed or
+    // returned step doesn't refuse over a checkout that is gone on purpose.
+    if (task.pipelineId != null) {
+      for (const step of tasks.stepsForParent(taskId)) {
+        if (!isMultiRepoTask(step) || !(step.repositories ?? []).some((r) => r.name === name)) continue;
+        tasks.setRepositories(step.id, (step.repositories ?? []).filter((r) => r.name !== name));
+        if (step.issueRepoPath != null && step.issueRepoPath === entry.path) {
+          tasks.clearIssueRepoPath(step.id, entry.path);
+        }
+      }
+    }
+  })();
+
+  const line = entry.branch
+    ? `removed repository ${name} from this task (branch ${entry.branch} kept)`
+    : `removed repository ${name} from this task`;
+  noteRepositoryRemoved(task, line);
+  const updated = tasks.get(taskId);
+  return updated ? { task: updated } : { status: 404, error: "task not found" };
+}
+
+/** Put the removal's status line on the task's latest run — for a pipeline
+ *  parent (no runs of its own), its latest step's — or the console when
+ *  nothing has run yet (there is no event stream to write it to). */
+function noteRepositoryRemoved(task: Task, line: string): void {
+  let latest: { taskId: string; runId: string; startedAt: number } | null = null;
+  const own = runs.listForTask(task.id)[0];
+  if (own) latest = { taskId: task.id, runId: own.id, startedAt: own.startedAt };
+  if (!latest && task.pipelineId != null) {
+    for (const step of tasks.stepsForParent(task.id)) {
+      const run = runs.listForTask(step.id)[0];
+      if (run && (!latest || run.startedAt > latest.startedAt)) {
+        latest = { taskId: step.id, runId: run.id, startedAt: run.startedAt };
+      }
+    }
+  }
+  if (latest) appendRunStatusLine(latest.taskId, latest.runId, line);
+  else console.log(`[agetor] task ${task.id}: ${line}`);
+}
+
+/** One repository's branch-teardown plan (issue #291). */
+async function planOneRepoTeardown(
+  task: Task,
+  sourcePath: string,
+  worktreePath: string | null,
+  taskBranch: string | null,
+  branchSource: Task["branchSource"],
+  lastSeenCheckout: string | null,
+  /** The full row list, fetched once per preview — not one `tasks.list()` per
+   *  repository. */
+  allTasks: Task[],
+  /** Per-preview memoized `repoRoot`, so one delete confirm against a
+   *  multi-repository task doesn't spawn a `git rev-parse` per (repo, other
+   *  task) pair (and never repeats a failed lookup). */
+  rootOf: (dir: string) => Promise<string | null>,
+  /** Per-preview memoized default-branch lookup (keyed by root) — one git
+   *  resolution per repository instead of one per repository per plan pass. */
+  defaultBranchOf: (root: string) => Promise<string | null>,
+): Promise<Omit<RepoTeardownPlan, "name" | "path">> {
+  // A repository that was never materialized (create pinned its branch, but
+  // the task was archived/deleted before it started) has no checkout to
+  // remove, and `removeWorktree` skips it. Planning a branch here anyway made
+  // the delete confirm and `agetor rm` promise a removal the delete does not
+  // perform — keep the entry (the UI still lists the repository) with an
+  // empty plan so preview and delete agree.
+  if (!worktreePath) {
+    return { branches: [], liveBranch: null, taskBranch, source: "none", excluded: [] };
+  }
+  let liveBranch: string | null = null;
+  let liveKnown = false;
+  if (existsSync(worktreePath)) {
+    const live = await readCheckoutBranch(worktreePath);
+    if (live.ok) {
+      liveBranch = live.branch;
+      liveKnown = true;
+    }
+  }
+  const root = await rootOf(sourcePath);
+  const defaultBranch = root ? await defaultBranchOf(root) : null;
+  const heldByOthers = await branchesHeldByOtherTasks(task.id, sourcePath, root, allTasks, rootOf);
+  const plan = planTeardownBranches({
+    taskBranch,
+    branchSource,
+    liveBranch,
+    lastSeen: liveKnown ? null : lastSeenCheckout,
+    defaultBranch,
+    heldByOthers,
+  });
+  return { ...plan, liveBranch, taskBranch };
+}
+
+/**
+ * Every branch another task holds in the repository at `sourcePath` (git root
+ * `root`), so a teardown never deletes it. A single-repository row holds its
+ * `branch` and last-seen `checkoutBranch` when its `workdir` is in this
+ * repository. A multi-repository row holds the `branch` and `checkoutBranch`
+ * of each `repositories[]` entry in this repository, and only those: a
+ * sharing task's entries in OTHER repositories must not shield this
+ * repository's branch just because they use the same name. Archived rows
+ * count; pipeline step rows don't (they mirror their parent's names and would
+ * otherwise shadow the parent's own delete).
+ *
+ * A multi row's `workdir` is its workspace root, which is never a git
+ * repository, so it is not resolved at all: `repoRoot` caches only
+ * successes, and asking anyway spawned a failing `git rev-parse` per live
+ * multi task on every delete preview.
+ */
+async function branchesHeldByOtherTasks(
+  taskId: string,
+  sourcePath: string,
+  root: string | null,
+  allTasks: Task[],
+  rootOf: (dir: string) => Promise<string | null>,
+): Promise<Set<string>> {
+  const held = new Set<string>();
+  for (const other of allTasks) {
+    if (other.id === taskId || other.pipelineParentId) continue;
+    const otherRepos = other.repositories ?? [];
+    for (const r of otherRepos) {
+      if (r.path !== sourcePath && (root == null || (await rootOf(r.path)) !== root)) continue;
+      if (r.branch) held.add(r.branch);
+      if (r.checkoutBranch) held.add(r.checkoutBranch);
+    }
+    if (isMultiRepoTask(other)) continue;
+    const workdirInThisRepo = other.workdir === sourcePath
+      || (root != null && (await rootOf(other.workdir)) === root);
+    if (!workdirInThisRepo) continue;
+    if (other.branch) held.add(other.branch);
+    if (other.checkoutBranch) held.add(other.checkoutBranch);
+  }
+  return held;
+}
+
+/** Run `fn` over `items` with at most `limit` calls in flight at once. */
+async function forEachBounded<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      await fn(items[i]!);
+    }
+  });
+  await Promise.all(workers);
+}
+
+/** Memoize an async key → value lookup for one teardown-preview pass. A fresh
+ *  map per call keeps the values honest (a repo's default branch can change
+ *  between previews) while collapsing the per-repository-per-task repeats.
+ *  Used for both `repoRoot` and the default-branch lookup, which is where the
+ *  delete-preview N+1 lived. */
+function memoAsync<T>(fn: (key: string) => Promise<T>): (key: string) => Promise<T> {
+  const cache = new Map<string, Promise<T>>();
+  return (key) => {
+    let pending = cache.get(key);
+    if (!pending) {
+      pending = fn(key);
+      cache.set(key, pending);
+    }
+    return pending;
+  };
 }
 
 /**
@@ -12943,6 +13751,52 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
  * pipeline step whose worktree is the parent's) deletes nothing. Read-only.
  */
 export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownPreview> {
+  const repos = task.repositories ?? [];
+  if (isMultiRepoTask(task) && repos.length > 0 && task.isolation === "worktree" && !task.pipelineParentId) {
+    const plans: RepoTeardownPlan[] = [];
+    const allTasks = tasks.list();
+    const rootOf = memoAsync(repoRoot);
+    const defaultBranchOf = memoAsync(resolveDefaultBranchName);
+    for (const repo of repos) {
+      // A repository whose source is gone plans nothing: delete leaves its
+      // checkout alone (git can't vouch for it) and no branch can be removed.
+      if (!(await rootOf(repo.path))) {
+        plans.push({
+          name: repo.name,
+          path: repo.path,
+          branches: [],
+          liveBranch: null,
+          taskBranch: repo.branch,
+          source: "none",
+          excluded: [],
+        });
+        continue;
+      }
+      const plan = await planOneRepoTeardown(
+        task,
+        repo.path,
+        repo.worktreePath,
+        repo.branch,
+        repo.branchSource,
+        repo.checkoutBranch,
+        allTasks,
+        rootOf,
+        defaultBranchOf,
+      );
+      plans.push({ name: repo.name, path: repo.path, ...plan });
+    }
+    const first = plans[0];
+    return {
+      branches: [...new Set(plans.flatMap((p) => p.branches))],
+      liveBranch: first?.liveBranch ?? null,
+      // A multi-repository task has no single task branch; per-repo names are
+      // in `repositories`.
+      taskBranch: null,
+      source: first?.source ?? "none",
+      excluded: plans.flatMap((p) => p.excluded),
+      repositories: plans,
+    };
+  }
   const taskBranch = task.branch ?? null;
   if (task.isolation !== "worktree" || !task.worktreePath || task.pipelineParentId) {
     return { branches: [], liveBranch: null, taskBranch, source: "none", excluded: [] };
@@ -12962,13 +13816,9 @@ export async function teardownBranchesForTask(task: Task): Promise<TaskTeardownP
   }
   const root = await repoRoot(task.workdir);
   const defaultBranch = root ? await resolveDefaultBranchName(root) : null;
-  const heldByOthers = new Set<string>();
-  for (const other of tasks.list()) {
-    if (other.id === task.id || other.pipelineParentId) continue;
-    if (other.workdir !== task.workdir && (!root || (await repoRoot(other.workdir)) !== root)) continue;
-    if (other.branch) heldByOthers.add(other.branch);
-    if (other.checkoutBranch) heldByOthers.add(other.checkoutBranch);
-  }
+  // The same walk the multi-repository path uses: an archived multi task in
+  // this repository holds its entries' branches here too.
+  const heldByOthers = await branchesHeldByOtherTasks(task.id, task.workdir, root, tasks.list(), memoAsync(repoRoot));
   const plan = planTeardownBranches({
     taskBranch,
     branchSource: task.branchSource,
@@ -13064,7 +13914,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   // flight for another task in the SAME source workdir, so two `git worktree
   // remove`/`prune` calls against the same repo never contend on git's locks
   // at the same time. A delete against an unrelated workdir is unaffected.
-  await enqueueTeardown(taskId, task.workdir, async () => {
+  await enqueueTeardownMany(taskId, teardownKeysForTask(task), async () => {
     // Terminals → sessions → worktree. Terminal tabs hold only PTYs rooted
     // in the worktree dir, not a tmux session, so they can die independently
     // of (and sooner than) the drop*Session awaits below — kill them first,
@@ -13096,7 +13946,10 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     if (!task.pipelineParentId) {
       const cur = tasks.get(taskId) ?? task;
       const plan = await teardownBranchesForTask(cur);
-      await removeWorktree(cur, { branches: plan.branches });
+      // Multi-repository rows carry one plan per repository; pass it through
+      // so a checkout that drifted onto another branch is removed too (the
+      // top-level `branches` union alone can't say which repo owns which name).
+      await removeWorktree(cur, { branches: plan.branches, repositories: plan.repositories });
     }
   });
   // Refs are otherwise path-only — agetor never copies anything to disk for
@@ -13142,23 +13995,36 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
  * that failed) owns the worktree through its persisted path, so nothing is
  * done; an archived row gets the archive's branch-preserving detach; a deleted
  * task gets the delete's removal, branches planned exactly as delete plans
- * them. Best-effort, never throws.
+ * them. A multi-repository task passes the whole materialized entry list so
+ * each repository is detached/removed in its own repo (the workspace root is
+ * not itself a git checkout). Best-effort, never throws.
  */
 export function discardRefusedWorktree(
   task: Task,
-  prepared: { worktreePath: string; branch: string | null },
+  prepared: { worktreePath: string; branch: string | null; repositories?: TaskRepository[] },
 ): Promise<void> {
-  return enqueueTeardown(task.id, task.workdir, async () => {
+  return enqueueTeardownMany(task.id, teardownKeysForTask(task), async () => {
     const cur = tasks.get(task.id);
     if (cur && cur.archivedAt == null) return;
+    // The workspace root counts as materialized whenever any nested checkout
+    // was created; both detach/remove are idempotent when a child is gone.
     if (!existsSync(prepared.worktreePath)) return;
-    const target: Task = { ...(cur ?? task), worktreePath: prepared.worktreePath, branch: prepared.branch };
+    // `prepared.repositories` is present exactly when the multi path ran.
+    const multi = prepared.repositories !== undefined;
+    const target: Task = {
+      ...(cur ?? task),
+      worktreePath: prepared.worktreePath,
+      branch: prepared.branch,
+      ...(multi ? { repositories: prepared.repositories, multiRepo: true } : {}),
+    };
     if (cur) {
       await detachWorktree(target);
       return;
     }
     const plan = await teardownBranchesForTask(target);
-    await removeWorktree(target, { branches: plan.branches });
+    // Same per-repository plan delete passes: a multi task's branch ownership
+    // can't be recovered from the top-level union alone.
+    await removeWorktree(target, { branches: plan.branches, repositories: plan.repositories });
   });
 }
 
@@ -13194,8 +14060,37 @@ export function sweepArchivedTeardowns(): number {
     // what actually owns and tears it down; enqueuing a redundant no-op job
     // per step just adds queue churn.
     if (task.pipelineParentId) continue;
-    if (!task.worktreePath) continue;
-    if (!existsSync(task.worktreePath)) continue;
+    const repos = task.repositories ?? [];
+    const multi = isMultiRepoTask(task);
+    if (multi) {
+      // Also enqueue when only the (non-git) workspace root is left — a
+      // previous teardown may have removed every repository worktree but
+      // failed to clear agetor's `.claude` scratch from the root. The job's
+      // per-repo detach is idempotent and `removeWorkspaceIfEmpty` then
+      // reclaims the root. Anything else in the root (agent artifacts —
+      // including anything besides agetor's own settings file inside
+      // `.claude`) means the workspace is intentionally retained, so skip it
+      // rather than enqueueing a no-op job every boot.
+      if (!repos.some((r) => r.worktreePath && existsSync(r.worktreePath))) {
+        // The scratch check reads inside the workspace root, the agent's cwd,
+        // so it runs through task-dir-fs (D25, docs/architecture/security.md)
+        // and is async. Enqueue once it answers; this sweep stays synchronous
+        // for its boot caller, and such a job is not in the returned count.
+        void workspaceHasOnlyAgetorScratch(workspacePathFor(task))
+          .then((onlyScratchLeft) => {
+            if (!onlyScratchLeft) return;
+            const cur = tasks.get(task.id);
+            if (!cur || cur.archivedAt == null) return;
+            if (cur.runId && active.has(cur.runId)) return;
+            enqueueArchiveTeardown(cur);
+          })
+          .catch(() => { /* no workspace root */ });
+        continue;
+      }
+    } else {
+      if (!task.worktreePath) continue;
+      if (!existsSync(task.worktreePath)) continue;
+    }
     // Defensive: an archived task shouldn't have a live run (archiveTask
     // refuses to archive one), but mirror that guard here too rather than
     // risk tearing down a worktree out from under an in-flight run.
@@ -13416,70 +14311,141 @@ export function listWorktrees(): WorktreeInfo[] {
     if (!isDir) continue;
 
     const task = taskById.get(name);
-    const staleReasons: WorktreeStaleReason[] = [];
-    // Same active-run check archiveTask uses for its defence-in-depth guard.
-    const runActive = !!(task?.runId && active.has(task.runId));
-    // Background agents/workflows (subagent rows) still writing to the
-    // worktree must hold off the "inactive" flag even though the main run's
-    // own `active` slot is long gone. Sourced from the grouped map above, so
-    // this is a lookup, not a query — always `false` for an orphan (no task).
-    const heldByBackgroundAgents = !!task && (runningByTask.get(task.id) ?? 0) > 0;
+
+    /** Build one row, applying the same staleness rules to single and
+     *  per-repository rows. */
+    const makeRow = (
+      rowId: string,
+      rowPath: string,
+      owner: Task | undefined,
+      repoName: string | null,
+      branch: string | null,
+      workdir: string | null,
+    ): WorktreeInfo => {
+      const staleReasons: WorktreeStaleReason[] = [];
+      // Same active-run check archiveTask uses for its defence-in-depth guard.
+      const runActive = !!(owner?.runId && active.has(owner.runId));
+      // Background agents/workflows still writing must hold off "inactive".
+      const heldByBackgroundAgents = !!owner && (runningByTask.get(owner.id) ?? 0) > 0;
+      if (!owner) {
+        staleReasons.push("orphaned");
+      } else {
+        if (owner.archivedAt != null) staleReasons.push("archived");
+        if (
+          !runActive
+          && Date.now() - owner.updatedAt > WORKTREE_STALE_AFTER_MS
+          && !heldByBackgroundAgents
+        ) {
+          staleReasons.push("inactive");
+        }
+      }
+      return {
+        id: rowId,
+        path: rowPath,
+        taskId: owner?.id ?? null,
+        taskTitle: owner?.title ?? null,
+        column: owner?.column ?? null,
+        archivedAt: owner?.archivedAt ?? null,
+        taskUpdatedAt: owner?.updatedAt ?? null,
+        branch,
+        workdir,
+        runActive,
+        heldByBackgroundAgents,
+        stale: staleReasons.length > 0,
+        staleReasons,
+        ...(repoName ? { repoName } : {}),
+      };
+    };
+
+    // A multi-repository task's workspace root is not itself a worktree: it
+    // expands to one row per repository directory that exists on disk.
+    if (task && isMultiRepoTask(task)) {
+      let repoRows = 0;
+      for (const repo of task.repositories!) {
+        const repoDir = repo.worktreePath ?? join(dirPath, repo.name);
+        let repoIsDir = false;
+        try {
+          repoIsDir = statSync(repoDir).isDirectory();
+        } catch {
+          continue;
+        }
+        if (!repoIsDir) continue;
+        repoRows += 1;
+        out.push(makeRow(
+          worktreeIdForRepo(name, repo.name),
+          repoDir,
+          task,
+          repo.name,
+          repo.branch,
+          repo.path,
+        ));
+      }
+      // Every repository checkout is gone but the workspace root survives
+      // because an agent left files in it (teardown never recursively wipes
+      // user content — see `removeWorkspaceIfEmpty`). The root has no
+      // repository row to represent it, so without this fallback it was
+      // invisible on the Worktrees page and could never be cleaned from there.
+      // Emit it as a task-backed row (id = task id) so the page's normal
+      // Archive & delete action can retry the teardown once the agent files
+      // are gone.
+      if (repoRows === 0) {
+        out.push(makeRow(name, dirPath, task, null, null, task.workdir ?? dirPath));
+      }
+      continue;
+    }
+
+    // An orphaned workspace directory (crash/failed teardown, no task row)
+    // whose children are linked worktrees expands the same way.
     if (!task) {
-      // No owning row — nothing else applies (can't be archived or idle-by-age).
-      staleReasons.push("orphaned");
-    } else {
-      // A worktree can carry both reasons at once (archived AND past the
-      // inactivity threshold), so these are independent checks, not a chain.
-      if (task.archivedAt != null) staleReasons.push("archived");
-      if (
-        !runActive
-        && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS
-        && !heldByBackgroundAgents
-      ) {
-        staleReasons.push("inactive");
+      let childDirs: string[] = [];
+      try {
+        childDirs = readdirSync(dirPath, { withFileTypes: true })
+          .filter((d) => d.isDirectory() && !d.name.startsWith("."))
+          .map((d) => d.name);
+      } catch {
+        childDirs = [];
+      }
+      // Only a linked worktree's `.git` POINTER file (gitdir under
+      // `.git/worktrees/`) identifies a repository child. A legacy
+      // single-repository worktree can contain a submodule whose `.git` is a
+      // file/dir too; treating that as a nested workspace would split one
+      // worktree into bogus per-repository rows.
+      const gitChildDirs = childDirs.filter((child) => parseWorktreeGitPointer(join(dirPath, child)) !== null);
+      if (gitChildDirs.length > 0) {
+        for (const child of gitChildDirs) {
+          const childPath = join(dirPath, child);
+          out.push(makeRow(
+            worktreeIdForRepo(name, child),
+            childPath,
+            undefined,
+            child,
+            null,
+            parseWorktreeGitPointer(childPath),
+          ));
+        }
+        continue;
       }
     }
 
-    out.push({
-      id: name,
-      path: dirPath,
-      taskId: task?.id ?? null,
-      taskTitle: task?.title ?? null,
-      column: task?.column ?? null,
-      archivedAt: task?.archivedAt ?? null,
-      taskUpdatedAt: task?.updatedAt ?? null,
-      branch: task?.branch ?? null,
+    out.push(makeRow(
+      name,
+      dirPath,
+      task,
+      null,
+      task?.branch ?? null,
       // Owned worktree: the task's own workdir. Orphan: best-effort parse of
       // the `.git` pointer file — plain fs, no git subprocess.
-      workdir: task?.workdir ?? parseWorktreeGitPointer(dirPath),
-      runActive,
-      heldByBackgroundAgents,
-      stale: staleReasons.length > 0,
-      staleReasons,
-    });
+      task?.workdir ?? parseWorktreeGitPointer(dirPath),
+    ));
   }
   return out;
 }
 
-/**
- * Resolve a worktree id (a directory basename under `WORKTREES_DIR`) to its
- * absolute path, with the confinement checks shared by every worktree-id
- * endpoint: no `/`, `\`, `..`, or empty string, and the resolved path must
- * be a direct child of `WORKTREES_DIR`, never the directory itself (guards
- * against ids like `"."` that pass the substring checks but normalize to
- * `WORKTREES_DIR` — an `rm -rf` there would delete every task's worktree).
- * Factored out of `deleteOrphanWorktree` so `worktreeGitStatus` shares the
- * exact same guard rather than a hand-copied one that could drift.
- */
-function resolveWorktreeDir(id: string): { dir: string } | { error: string } {
-  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
-    return { error: "invalid worktree id" };
-  }
-  const dirPath = join(WORKTREES_DIR, id);
-  if (basename(dirPath) !== id) {
-    return { error: "invalid worktree id" };
-  }
-  return { dir: dirPath };
+/** Remove a nested multi-repository workspace root only when it is empty
+ *  (agetor's own `.claude` scratch is pruned first — see
+ *  `removeWorkspaceIfEmpty`). */
+async function removeEmptyWorkspace(dir: string): Promise<void> {
+  await removeWorkspaceIfEmpty(dir);
 }
 
 /**
@@ -13490,7 +14456,7 @@ function resolveWorktreeDir(id: string): { dir: string } | { error: string } {
  * Refuses (rather than silently no-oping) when a task row for `id` still
  * exists — that worktree is owned, and the caller should archive the task
  * instead, which routes through the normal teardown path. `id` is validated
- * via `resolveWorktreeDir` so the resolved path can never escape
+ * via `resolveWorktreeRef` so the resolved path can never escape
  * `WORKTREES_DIR`.
  *
  * Awaits `pendingTeardown(id)` before touching the directory — the fleet
@@ -13500,9 +14466,11 @@ function resolveWorktreeDir(id: string): { dir: string } | { error: string } {
  * enumerate-and-kill of `agetor-*` sessions on the shared tmux socket.
  */
 export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | { error: string }> {
-  const resolved = resolveWorktreeDir(id);
-  if ("error" in resolved) return resolved;
-  const dirPath = resolved.dir;
+  const resolved = resolveWorktreeRef(id);
+  if (!resolved.ok) return resolved;
+  const dirPath = resolved.value.path;
+  const owningTaskId = resolved.value.taskId;
+  const repoName = resolved.value.repoName;
 
   let isDir = false;
   try {
@@ -13511,11 +14479,17 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
     return { error: "worktree not found" };
   }
   if (!isDir) return { error: "worktree not found" };
-  if (tasks.get(id)) {
+  // Any id under a task that still has a row is owned, nested or not. Matching
+  // the nested name against the task's registered repository names is not
+  // enough: `<single-task>__<subdir>` resolves to a folder INSIDE a live
+  // single-repository worktree, and on a case-insensitive volume `<task>__API`
+  // is the live `api` checkout under another spelling. Only the task's own
+  // archive/delete teardown may remove anything under its directory.
+  if (tasks.get(owningTaskId)) {
     return { error: "this worktree is owned by an active task — archive the task instead" };
   }
 
-  await pendingTeardown(id);
+  await pendingTeardown(owningTaskId);
 
   // Best-effort: find the source repo before the dir is gone so we can prune
   // its stale `.git/worktrees/<id>` registration afterwards.
@@ -13541,7 +14515,7 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
   // (a lost lock just skips one prune; the next worktree op in that repo clears
   // the stale registration), so not worth resolving the root to reconcile keys.
   let result: { ok: true } | { error: string } = { ok: true };
-  await enqueueTeardown(id, sourceRoot ?? dirPath, async () => {
+  await enqueueTeardown(owningTaskId, sourceRoot ?? dirPath, async () => {
     try {
       await rm(dirPath, { recursive: true, force: true });
     } catch (err) {
@@ -13549,6 +14523,8 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
       return; // don't prune if the removal failed
     }
     if (sourceRoot) await pruneWorktrees(sourceRoot);
+    // A nested orphan: only the empty parent workspace is ours to remove.
+    if (repoName) await removeEmptyWorkspace(join(WORKTREES_DIR, owningTaskId));
   });
 
   return result;
@@ -13561,7 +14537,7 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
  * DB only, safe to poll): each of these spawns a git subprocess, so this is
  * fetched per row on demand instead. Backs `GET /worktrees/:id/git-status`.
  *
- * Shares `resolveWorktreeDir`'s confinement with `deleteOrphanWorktree`, but
+ * Shares `resolveWorktreeRef`'s confinement with `deleteOrphanWorktree`, but
  * — unlike delete — does not refuse task-owned ids: git status is useful for
  * both orphan and task-backed worktrees, so callers can check staleness
  * before deciding whether to archive.
@@ -13573,12 +14549,22 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
  * case, same contract as everywhere else `baseRef` may be null.
  */
 export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus | { error: string }> {
-  const resolved = resolveWorktreeDir(id);
-  if ("error" in resolved) return resolved;
+  const resolved = resolveWorktreeRef(id);
+  if (!resolved.ok) return resolved;
 
-  const task = tasks.get(id);
-  const dir = task ? task.worktreePath ?? task.workdir : resolved.dir;
-  const baseRef = task ? task.baseRef ?? null : null;
+  const owningTask = tasks.get(resolved.value.taskId);
+  let dir: string;
+  let baseRef: string | null;
+  if (resolved.value.repoName) {
+    // A nested multi-repository row: its own worktree and pinned base.
+    const entry = (owningTask?.repositories ?? []).find((r) => r.name === resolved.value.repoName);
+    dir = entry?.worktreePath ?? resolved.value.path;
+    baseRef = entry?.baseRef ?? null;
+  } else {
+    const task = owningTask;
+    dir = task ? task.worktreePath ?? task.workdir : resolved.value.path;
+    baseRef = task ? task.baseRef ?? null : null;
+  }
 
   const dirty0 = await hasUncommittedChanges(dir);
   if (dirty0 === null) {

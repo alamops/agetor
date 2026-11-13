@@ -34,8 +34,10 @@ import { Composer } from "./Composer.tsx";
 import { AnswerOverlay } from "./AnswerOverlay.tsx";
 import { runControl, resumableRunId } from "../run-logic.ts";
 import { Logo } from "./logo.tsx";
-import { fileScopeForTask } from "./at-complete.ts";
-import { buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
+import { fileScopeForTask, fileScopesForTask } from "./at-complete.ts";
+import { splitNamedScopePath } from "../../shared/file-scope.ts";
+import { isMultiRepoTask } from "../../shared/multi-repo.ts";
+import { addScopeRoots, buildFileEntries, type FileEntry } from "../../shared/at-file-filter.ts";
 // `../at-warn.ts` is owned by a sibling — import its pure exports only, never edit the file.
 import { discoveredExtensionNames, filterUnresolvedRefs } from "../at-warn.ts";
 import { trimmedResultNote } from "../commands/logs.ts";
@@ -195,7 +197,16 @@ export function Dashboard({
   // `target` is resolved by id (see above) so this stays valid even though
   // `sorted` reshuffles every 1.5s poll.
   const composeScope = target ? fileScopeForTask(target) : null;
-  const composeScopeKey = composeScope ? `${composeScope.dir} ${composeScope.ref ?? ""}` : null;
+  // Multi-repository tasks (issue #291): one scope per repository, entries
+  // prefixed with the workspace name. A single-repository task keeps exactly
+  // today's `composeScope`/key.
+  const composeScopes = target ? fileScopesForTask(target) : [];
+  // `isMultiRepoTask`, not the scope count: a multi task left with one
+  // repository (issue #291) still lists through its one named scope.
+  const composeMulti = target ? isMultiRepoTask(target) : false;
+  const composeScopeKey = composeMulti
+    ? composeScopes.map((sc) => `${sc.name}:${sc.dir} ${sc.ref ?? ""}`).join("|")
+    : composeScope ? `${composeScope.dir} ${composeScope.ref ?? ""}` : null;
   // Stable string (unlike `target`'s per-poll identity) — its CHANGE is the
   // run-settle signal that invalidates the listing cache below.
   const composeColumn = target ? target.column : null;
@@ -244,6 +255,76 @@ export function Dashboard({
     const columnAtFetch = composeColumn ?? "";
     void (async () => {
       try {
+        if (composeMulti) {
+          // Per-scope failure must not blank the whole listing: keep the other
+          // repositories' rows (and, for a failed one, the rows it last
+          // contributed to THIS task) exactly like the webview's
+          // `useProjectFileScopes` merge. A `Promise.all` over the raw calls
+          // rejected as soon as one repository failed, so a single flaky
+          // scope hid every healthy repository's files.
+          const results = await Promise.all(
+            composeScopes.map(async (sc) => {
+              try {
+                const res = await client.listProjectFiles({ dir: sc.dir, ref: sc.ref });
+                return { sc, res, error: null as string | null };
+              } catch (e) {
+                return {
+                  sc,
+                  res: null,
+                  error: (e as Error).message || "file listing unavailable",
+                };
+              }
+            }),
+          );
+          if (!alive) return;
+          const merged: string[] = [];
+          let truncated = false;
+          let anyError: string | null = null;
+          let contributed = false;
+          for (const { sc, res, error } of results) {
+            if (res) {
+              merged.push(...res.files.map((f) => `${sc.name}/${f}`));
+              if (res.truncated) truncated = true;
+              contributed = true;
+              continue;
+            }
+            anyError ??= error;
+            // Keep whatever this repository last contributed to this task's
+            // cached listing (entries are already `<name>/`-prefixed), so a
+            // transient failure doesn't make a repository that was listing
+            // fine a moment ago disappear from the popover.
+            const prefix = `${sc.name}/`;
+            for (const entry of cached?.entries ?? []) {
+              if (entry.path.startsWith(prefix)) merged.push(entry.path);
+            }
+            if (cached?.truncated) truncated = true;
+          }
+          if (merged.length > 0) contributed = true;
+          // The merged listing only holds paths inside each repository, so a
+          // repository with no files contributes nothing and a bare
+          // `@<name>` (a real directory at the workspace root) had no row to
+          // match. Add one root row per scope — same contract as the webview
+          // composer (`use-project-files.ts`). When NOTHING could be listed
+          // (every repository failed and none had a cached answer), stay
+          // empty so the composer renders its "listing unavailable" notice
+          // instead of a misleading set of bare roots.
+          const entries = contributed
+            ? addScopeRoots(
+              buildFileEntries(merged),
+              composeScopes.flatMap((sc) => (sc.name ? [sc.name] : [])),
+            )
+            : [];
+          // Cache only a COMPLETE listing. A partial one is refetched the next
+          // time this scope opens (its cache entry stays absent/stale) instead
+          // of serving a repository-less listing for the rest of the column.
+          if (!anyError) {
+            fileEntriesCache.current.set(composeScopeKey, { entries, column: columnAtFetch, truncated });
+          }
+          setComposeFileEntries(entries);
+          setComposeTruncated(truncated);
+          setComposeListingError(anyError);
+          return;
+        }
         const { files, truncated } = await client.listProjectFiles(composeScope);
         if (!alive) return;
         const entries = buildFileEntries(files);
@@ -279,22 +360,70 @@ export function Dashboard({
   // object reference here is never a stale VALUE — same trick the file-
   // listing effect above already relies on to stay poll-stable.
   const composeRemoteSearch = useMemo(() => {
-    if (!composeTruncated || !composeScope) return undefined;
-    const scope = composeScope;
+    if (!composeTruncated) return undefined;
+    // A multi-repository task's listing spans several scopes. One search per
+    // scope, prefixed with the workspace name (matching the merged local
+    // listing), keeps deep-tree matches available in every repository instead
+    // of falling back to local-only ranking.
+    const scopes: Array<{ name: string | null; dir: string; ref?: string | null }> = composeMulti
+      ? composeScopes
+      : composeScope
+        ? [{ name: null, ...composeScope }]
+        : [];
+    if (scopes.length === 0) return undefined;
+    const multi = composeMulti;
     return async (q: string): Promise<FileEntry[] | null> => {
-      try {
-        const { files } = await client.listProjectFiles({ ...scope, q, limit: 5 });
-        return files.map((path) => ({ path, isDirectory: path.endsWith("/") }));
-      } catch {
-        // `null`, not `[]` — a request failure must not be indistinguishable
-        // from a genuine "zero matches" answer, or Composer.tsx would treat
-        // it as authoritative and blank the popover's local rows on a
-        // transient network hiccup (review finding, commit 720dffd).
-        return null;
+      // A `<repo>/…` query routes to that repository with the alias stripped
+      // (it is a client-side layout prefix, not part of the repo's tree); an
+      // unprefixed query searches every repository.
+      const named = multi ? splitNamedScopePath(scopes, q) : null;
+      // Trailing slashes are directory syntax the server's path search
+      // doesn't index (`frontend/src/` → `src`).
+      const targets = (named
+        ? [{ scope: named.scope, local: named.path }]
+        : scopes.map((scope) => ({ scope, local: q }))
+      ).map((t) => ({ ...t, local: t.local.replace(/\/+$/, "") }));
+      // Nothing left to search (`@frontend/` alone): answer `null`, which the
+      // composer treats as "no remote answer" and keeps the local rows (the
+      // repository's root row and its first entries). `[]` would read as an
+      // authoritative zero matches and blank the popover.
+      if (targets.length === 0 || targets.some((t) => !t.local)) return null;
+      const results = await Promise.all(
+        targets.map(async ({ scope, local }) => {
+          try {
+            const { files } = await client.listProjectFiles({ dir: scope.dir, ref: scope.ref, q: local, limit: 5 });
+            return files.map((path) => (multi && scope.name ? `${scope.name}/${path}` : path));
+          } catch {
+            return null;
+          }
+        }),
+      );
+      // `null` only when EVERY request failed — a partial failure keeps the
+      // answers that did succeed. Otherwise Composer.tsx would treat a
+      // transient network hiccup as an authoritative "zero matches" and blank
+      // the popover's local rows (review finding, commit 720dffd).
+      if (results.every((r) => r === null)) return null;
+      const successes = results.filter((r): r is string[] => r !== null);
+      // Round-robin the per-repository rankings instead of concatenating:
+      // concatenation let the first repository's 5 rows hide every later
+      // repository's matches entirely. Same rationale as the webview's
+      // `searchProjectFileScopes`.
+      const out: FileEntry[] = [];
+      for (let i = 0; out.length < 5; i++) {
+        let added = false;
+        for (const rows of successes) {
+          const path = rows[i];
+          if (!path) continue;
+          out.push({ path, isDirectory: path.endsWith("/") });
+          added = true;
+          if (out.length >= 5) break;
+        }
+        if (!added) break;
       }
+      return out;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [composeTruncated, composeScopeKey, client]);
+  }, [composeTruncated, composeScopeKey, composeMulti, client]);
 
   const sendMessage = (task: Task, text: string, okLabel = "→ sent") => {
     if (task.pendingInteractionCount > 0) {

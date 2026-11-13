@@ -24,6 +24,23 @@ export function shouldOfferCommitPush(status: TaskGitStatus | null): boolean {
 }
 
 /**
+ * The "Commit & push" gate for a whole task. On a multi-repository task the
+ * prompt is aggregate ("commit all changes in every repository"), so the chip
+ * must appear when ANY repository has something to commit or push — gating on
+ * the selected tab alone hid it exactly when another repository was dirty.
+ * The single-repository path is the plain {@link shouldOfferCommitPush} check.
+ */
+export function shouldOfferCommitPushForTask(status: TaskGitStatus | null): boolean {
+  if (!status) return false;
+  const repos = status.repositories;
+  // The per-repository array is present only for a multi task (the core
+  // omits it for a single one), and a multi task left with one repository
+  // still answers per repository, so its presence (not a count) decides.
+  if (repos && repos.length > 0) return repos.some((repo) => shouldOfferCommitPush(repo));
+  return shouldOfferCommitPush(status);
+}
+
+/**
  * Whether the "Open PR" chip should be offered. Git-state-only, like its
  * sibling above — `prUrl`/read-only gating happens at the call site (a task
  * that already has a PR shows "View PR" instead, regardless of this result).
@@ -69,4 +86,23 @@ export function prHeadBranch(
   const live = status && !status.ignored && status.branch && !status.isDefaultBranch ? status.branch : null;
   if (taskBranch) return live && live !== taskBranch ? live : taskBranch;
   return live;
+}
+
+/**
+ * PR head for ONE repository of a multi-repository task, and its
+ * git-state gate (issue #291 review). Mirrors the single-repository chip:
+ * the branch must be pushed and synced ({@link shouldOfferOpenPr}) before a
+ * pull request is offered, and drift wins over the pinned entry branch —
+ * the commits the agent pushed live on the branch actually checked out
+ * ({@link prHeadBranch}). `status` is that repository's entry from the
+ * batched `GET /tasks/:id/git-status` response; `null` (not polled yet, or
+ * the repo's status failed) hides the affordance rather than opening a PR
+ * from a stale stored branch.
+ */
+export function repositoryPrHead(
+  repo: { branch: string | null; branchSource?: "created" | "existing" | null },
+  status: TaskGitStatus | null,
+): string | null {
+  if (!shouldOfferOpenPr(status)) return null;
+  return prHeadBranch(repo.branch, status, repo.branchSource ?? undefined);
 }

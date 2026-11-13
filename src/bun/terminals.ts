@@ -20,6 +20,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import type { Task, TerminalTab } from "../shared/types.ts";
+import { isMultiRepoTask } from "../shared/multi-repo.ts";
 import { tasks } from "./db.ts";
 import { childEnv } from "./core-spawn.ts";
 // NOTE: worktree.ts is imported *dynamically* inside createTerminal, not at
@@ -72,6 +73,8 @@ interface TerminalEntry {
   sockets: Set<TerminalWebSocket>;
   exited: boolean;
   exitCode: number | null;
+  /** Workspace subdirectory this shell sits in (multi-repo tasks only). */
+  repoName?: string | null;
 }
 
 const terminals = new Map<string, TerminalEntry>();
@@ -85,7 +88,14 @@ const inFlight = new Map<string, number>();
 const labelSeq = new Map<string, number>();
 
 function toTab(e: TerminalEntry): TerminalTab {
-  return { id: e.id, taskId: e.taskId, title: e.title, cwd: e.cwd, createdAt: e.createdAt };
+  return {
+    id: e.id,
+    taskId: e.taskId,
+    title: e.title,
+    cwd: e.cwd,
+    createdAt: e.createdAt,
+    ...(e.repoName ? { repoName: e.repoName } : {}),
+  };
 }
 
 function appendToBuffer(e: TerminalEntry, chunk: Uint8Array): void {
@@ -149,6 +159,7 @@ function notifyExit(e: TerminalEntry): void {
  */
 export async function createTerminal(
   taskId: string,
+  opts?: { repo?: string | null },
 ): Promise<TerminalTab | { error: string; notFound?: boolean }> {
   if (!tasks.get(taskId)) return { error: "task not found", notFound: true };
 
@@ -163,7 +174,7 @@ export async function createTerminal(
   try {
     // Dynamic imports — see the top-of-file note on the db.ts ↔ worktree.ts
     // cycle; orchestrator.ts imports this module statically.
-    const { prepareWorkdir, resolveRef } = await import("./worktree.ts");
+    const { prepareTaskWorkdir, pinMissingRepositoryBaseRefs, resolveRef } = await import("./worktree.ts");
     const {
       discardRefusedWorktree,
       isTaskTearingDown,
@@ -185,34 +196,77 @@ export async function createTerminal(
     if ("error" in before) return before;
     const { task } = before;
 
+    const multiRepo = isMultiRepoTask(task);
+    // Every repository checkout of a multi row exists. A workspace root
+    // without them is not a usable worktree: prepareWorkdir would re-create
+    // the missing ones.
+    const allRepositoryCheckoutsExist = multiRepo
+      && task.repositories!.every((r) => !!r.worktreePath && existsSync(r.worktreePath));
+
+    // Refuse an unknown `repo` before anything is prepared: a typo must not
+    // materialize every worktree of the task first. Repository names are fixed
+    // at create time, so the row's own names are the ones the prepared set
+    // will carry. A single-repository task has no per-repository terminals and
+    // ignores `repo`, as it always has.
+    if (multiRepo && opts?.repo && !task.repositories!.some((r) => r.name === opts.repo)) {
+      return { error: `unknown repository "${opts.repo}"` };
+    }
+
     // A worktree-isolated pipeline step shares its parent's worktree (D2):
     // re-materializing a missing one here would give this ONE step a private
     // checkout at its own path. Same refusal as startTask / sendInput — only
-    // the pipeline task's own Run/Retry restores the shared worktree.
+    // the pipeline task's own Run/Retry restores the shared worktree. For a
+    // multi-repository step the shared worktree is the workspace root AND
+    // every repository checkout beneath it.
     if (
       task.pipelineParentId
       && task.isolation === "worktree"
-      && (!task.worktreePath || !existsSync(task.worktreePath))
+      && (
+        !task.worktreePath
+        || !existsSync(task.worktreePath)
+        || (multiRepo && !allRepositoryCheckoutsExist)
+      )
     ) {
       return { error: "step task's worktree is missing — run the pipeline task instead" };
     }
     // Same reuse condition as prepareWorkdir's: anything else materializes
     // (creates or re-attaches) the worktree in this call.
-    const hadWorktree = !!task.worktreePath && !!task.branch && existsSync(task.worktreePath);
-    const prepared = await prepareWorkdir(task);
+    const hadWorktree = multiRepo
+      ? allRepositoryCheckoutsExist
+      : !!task.worktreePath && !!task.branch && existsSync(task.worktreePath);
+    const prepared = await prepareTaskWorkdir(task);
     if ("error" in prepared) return { error: prepared.error };
 
     // Lazy-pin baseRef and persist worktree fields, exactly as startTask does,
     // so the terminal and any future agent run share one branch/worktree.
-    if (!task.baseRef && prepared.worktreePath) {
+    // A multi row has no scalar baseRef: pin each missing entry against its
+    // own repository before persisting the materialized set.
+    if (!multiRepo && !task.baseRef && prepared.worktreePath) {
       const sha = await resolveRef(task.workdir, "HEAD");
       if (sha) tasks.update(taskId, { baseRef: sha });
+    }
+    if (multiRepo && prepared.repositories) {
+      prepared.repositories = await pinMissingRepositoryBaseRefs(prepared.repositories);
     }
     if (
       prepared.worktreePath
       && (task.worktreePath !== prepared.worktreePath || task.branch !== prepared.branch)
     ) {
       tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+    }
+    if (multiRepo && prepared.repositories) {
+      tasks.setRepositories(taskId, prepared.repositories);
+    }
+
+    // Default cwd is the workspace root; `repo` opens the shell inside one
+    // repository's worktree instead.
+    let spawnCwd = prepared.cwd;
+    let repoName: string | null = null;
+    if (multiRepo && opts?.repo) {
+      const entry = prepared.repositories?.find((r) => r.name === opts.repo);
+      if (!entry?.worktreePath) return { error: `unknown repository "${opts.repo}"` };
+      spawnCwd = entry.worktreePath;
+      repoName = entry.name;
     }
     // An archive or delete can land while `prepareWorkdir` runs (both start
     // synchronously — a delete's teardown is queued, or marked in progress,
@@ -229,7 +283,14 @@ export async function createTerminal(
     const after = current();
     if ("error" in after) {
       if (!hadWorktree && prepared.worktreePath) {
-        void discardRefusedWorktree(task, { worktreePath: prepared.worktreePath, branch: prepared.branch });
+        void discardRefusedWorktree(task, {
+          worktreePath: prepared.worktreePath,
+          branch: prepared.branch,
+          // A multi task's workspace root is not itself a git checkout; hand
+          // over every materialized entry so each repository is cleaned up in
+          // its own repo (branch plan included).
+          ...(multiRepo && prepared.repositories ? { repositories: prepared.repositories } : {}),
+        });
       }
       return after;
     }
@@ -249,7 +310,8 @@ export async function createTerminal(
       id,
       taskId,
       title: `Terminal ${seq}`,
-      cwd: prepared.cwd,
+      cwd: spawnCwd,
+      ...(repoName ? { repoName } : {}),
       createdAt: Date.now(),
       // proc/term filled in immediately after spawn below.
       proc: undefined as unknown as Bun.Subprocess,
@@ -265,7 +327,7 @@ export async function createTerminal(
 
     // spawn-exempt(terminal-tab): the user's own interactive shell stays on Agetor's TCC identity (owner decision D8); it still gets a scrubbed env.
     const proc = Bun.spawn([shell, "-l"], {
-      cwd: prepared.cwd,
+      cwd: spawnCwd,
       // Inherit the user's env (minus the master API token); force a sane TERM
       // so colors/cursor work in xterm.
       env: childEnv({ TERM: "xterm-256color" }),

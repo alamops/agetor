@@ -545,3 +545,86 @@ test("needs column: a plain (non-pipeline) task's null pipelineId never shows a 
   const row = dataRowLine();
   expect(row).not.toContain("pipeline");
 });
+
+test("--repo matches a multi task's selected repositories, not just its workspace workdir", async () => {
+  const multi = task({
+    id: "multi001",
+    title: "Cross-repo",
+    // The workspace root is what `workdir` holds — it names neither repo.
+    workdir: "/data/worktrees/multi001",
+    repositories: [
+      "/src/frontend",
+      "/src/backend",
+    ].map((p) => ({
+      path: p,
+      name: p.split("/").pop()!,
+      branch: "feature/auth",
+      branchSource: "created" as const,
+      worktreePath: null,
+      baseRef: null,
+      checkoutBranch: null,
+      prUrl: null,
+    })),
+  } as unknown as Partial<Task>);
+  currentClient = makeClient([multi]);
+
+  await cmdLs(["--repo", "backend"], flags);
+  expect(dataRowLine()).toContain("Cross-repo");
+  expect(outputs[0]).toContain("2 repos");
+
+  outputs.length = 0;
+  await cmdLs(["--repo", "nope"], flags);
+  expect(outputs).toEqual(["no matching tasks"]);
+});
+
+test("--search matches a multi task's per-repository branch and checkout (review S13)", async () => {
+  const multi = task({
+    id: "multi002",
+    title: "Cross-repo search",
+    workdir: "/data/worktrees/multi002",
+    branch: null,
+    checkoutBranch: null,
+    repositories: [
+      { path: "/src/frontend", name: "frontend", branch: "feature/auth-ui", branchSource: "created" as const, worktreePath: null, baseRef: null, checkoutBranch: "implement/drift", prUrl: null },
+      { path: "/src/backend", name: "backend", branch: "feature/auth-api", branchSource: "created" as const, worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null },
+    ],
+  } as unknown as Partial<Task>);
+  currentClient = makeClient([multi]);
+
+  await cmdLs(["--search", "auth-api"], flags);
+  expect(dataRowLine()).toContain("Cross-repo search");
+
+  outputs.length = 0;
+  await cmdLs(["--search", "implement/drift"], flags);
+  expect(dataRowLine()).toContain("Cross-repo search");
+
+  outputs.length = 0;
+  await cmdLs(["--search", "no-such-branch"], flags);
+  expect(outputs).toEqual(["no matching tasks"]);
+});
+
+test("a multi task left with one repository still shows its repository count (round 15)", async () => {
+  const multi = task({
+    id: "multi003",
+    title: "Down to one",
+    workdir: "/data/worktrees/multi003",
+    multiRepo: true,
+    repositories: [
+      { path: "/src/backend", name: "backend", branch: "feature/a", branchSource: "created" as const, worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null },
+    ],
+  } as unknown as Partial<Task>);
+  const single = task({
+    id: "single01",
+    title: "Plain",
+    multiRepo: false,
+    repositories: [
+      { path: "/repo", name: "repo", branch: null, branchSource: "created" as const, worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null },
+    ],
+  } as unknown as Partial<Task>);
+  currentClient = makeClient([multi, single]);
+  await cmdLs([], flags);
+  const text = outputs.join("\n");
+  expect(text).toContain("1 repo");
+  expect(text).not.toContain("1 repos");
+  expect(outputs.filter((l) => l.includes(" repo")).length).toBe(1);
+});

@@ -1,15 +1,15 @@
-import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type ComponentType } from "react";
+import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ComponentProps, type ComponentType } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  AlertTriangle, Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Paperclip, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Play, Sparkles, Square, Terminal, Trash2, Workflow, Wrench, X,
 } from "lucide-react";
 import { api, ApiError, commitPushPrompt, type AgentModelMap, type PendingInteraction } from "@/lib/api";
 import { resolveTaskProfileDisplay, type TaskProfileDisplay } from "@/lib/agent-profiles";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
-import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { prHeadBranch, repositoryPrHead, shouldOfferCommitPushForTask, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { driftOf, driftTitle } from "@/lib/branch-drift";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
@@ -18,13 +18,39 @@ import { EXPAND_EVENT } from "@/lib/expand-on-jump";
 import { publishHandoffSearchSession } from "@/lib/handoff-search-hint";
 import { contentSignature, reuseIfSameContent, type Signed } from "@/lib/pipeline-run-signature";
 import { useExpandOnJump } from "@/lib/use-expand-on-jump";
-import { latestPrProposal } from "@/lib/pr-proposal";
+import {
+  latestPrProposal,
+  latestProposalForRepository,
+  latestProposalsForTargets,
+  repositoriesNeedingPr,
+} from "@/lib/pr-proposal";
+import {
+  beginPrBatch,
+  endPrBatch,
+  isPrBatchRunning,
+  markRepositoryPrOpened,
+  openFolderUnavailableReason,
+  repositoriesForPrBatch,
+  resolveConflictsKey,
+  selectedRepositoryName,
+  subscribePrBatches,
+} from "@/lib/multi-repo-ui";
+import {
+  removalMergeFields,
+  removeRepositoryBlockReason,
+  removeRepositoryConfirmCopy,
+  repositoryDetails,
+  repositoryProblem,
+} from "@/lib/repo-removal";
+import { isMultiRepoTask } from "../../../shared/multi-repo.ts";
+import { useConfirm } from "@/components/ui/confirm";
+import { issueProjectPath } from "@/lib/repo-selection";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import { appendQuote } from "@/lib/quote-selection";
-import { useProjectFiles, type FileScope } from "@/lib/use-project-files";
-import { fileScopeForTask } from "../../../shared/file-scope.ts";
+import { multiScopesOrNull, useProjectFiles, useProjectFileScopes, type FileScope, type NamedFileScope } from "@/lib/use-project-files";
+import { fileScopeForTask, multiRepoFileScopes } from "../../../shared/file-scope.ts";
 import {
   emptyOpencodeDrafts,
   opencodeAnswerBody,
@@ -125,6 +151,7 @@ import {
   type TaskFxRecovery,
   type TaskPlan,
   type TaskReference,
+  type TaskRepository,
   type ToolResultAttachment,
   type ToolResultRetention,
   retentionTrimNote,
@@ -1056,7 +1083,7 @@ function RunPanelBody({
     // prStatusSeqRef.current` staleness check (it captured the pre-bump
     // value) and write task A's mergeability into task B's `prStatus`.
     prStatusSeqRef.current++;
-    setResolveConflictsSent(false);
+    setResolveConflictsSentKey(null);
     setResolvingConflicts(false);
     setSending(false);
     setSendHint(null);
@@ -1072,6 +1099,13 @@ function RunPanelBody({
     setImportRetryOk(false);
     setImportedBranchBusy(false);
     setImportedBranchError(null);
+    // Per-repository UI state (issue #291): the tab selection belongs to the
+    // old task and must not leak into the new panel (the repo list is
+    // re-derived from the next task's row, but the tab is local state). The
+    // "Create all PRs" in-flight flag needs no reset: it is read from a
+    // module-level registry keyed by task id (`isPrBatchRunning`), so a
+    // switch away and back still shows the walk that is running for it.
+    setRepoTab(null);
     // `editingId` (the backlog tray's inline-editor state) lives inside the
     // `BacklogTray` child component, not here — it's reset by keying that
     // component on `task.id` at its call site below instead (a fresh mount
@@ -2913,7 +2947,8 @@ function RunPanelBody({
   }, [planDialogId, plans]);
   // The task's live git status (uncommitted changes / unpushed commits).
   // Drives the "Commit & push" action chip above the textarea via
-  // `shouldOfferCommitPush`. Deliberately independent of run status —
+  // `shouldOfferCommitPushForTask` (aggregate across a multi task's repos).
+  // Deliberately independent of run status —
   // background agents can dirty the worktree (or add unpushed commits)
   // while the latest run is still `running`, so the chip must be able to
   // surface then too, not just after a run succeeds. `null` means unknown
@@ -2921,6 +2956,47 @@ function RunPanelBody({
   // polling effect keeps this in sync with the actual git state for as
   // long as the panel is mounted.
   const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
+  // Selected repository tab for a multi-repository task (issue #291). The
+  // default is the first entry, so every existing single-repo surface below
+  // keeps using the top-level fields.
+  const [repoTab, setRepoTab] = useState<string | null>(null);
+  // Keyed by task id, outside this long-lived component: a per-panel flag was
+  // reset on a task switch, so switching away and back mid-walk re-enabled
+  // the button while the first walk was still opening PRs.
+  const allPrsBusy = useSyncExternalStore(subscribePrBatches, () => isPrBatchRunning(task.id));
+  // `isMultiRepoTask`, never a count: a multi task left with one repository
+  // (after a removal) keeps its tab, per-repo status/PR and workspace root.
+  const multiRepo = isMultiRepoTask(task);
+  const activeRepoName = selectedRepositoryName(task, repoTab);
+  const activeRepo = multiRepo
+    ? ((task.repositories ?? []).find((r) => r.name === activeRepoName) ?? null)
+    : null;
+  // A repository removed from the task takes its tab with it: drop the stale
+  // selection so the terminal cwd (which reads `repoTab`) and the header
+  // follow the first remaining repository again.
+  const repoNamesKey = (task.repositories ?? []).map((r) => r.name).join("\0");
+  useEffect(() => {
+    if (repoTab !== null && selectedRepositoryName(task, repoTab) !== repoTab) setRepoTab(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `repoNamesKey` stands in for `task.repositories`
+  }, [repoTab, repoNamesKey]);
+  const activeGitStatus = multiRepo
+    ? (gitStatus?.repositories?.find((r) => r.name === activeRepo?.name)
+      ?? gitStatus?.repositories?.[0]
+      ?? null)
+    : gitStatus;
+  /** One repository's live status inside the batched multi-repo response. */
+  const gitStatusForRepo = (name: string): TaskGitStatus | null =>
+    gitStatus?.repositories?.find((r) => r.name === name) ?? null;
+  // The PR the header/mergeability surfaces follow: each repository stamps
+  // its own entry, so a multi task follows the selected tab's PR (task.prUrl
+  // stays null by design). The status fetch also needs that repository's path
+  // to resolve its provider remote.
+  const headerPrUrl = multiRepo ? (activeRepo?.prUrl ?? null) : task.prUrl;
+  // A multi task's workspace only exists after its first run (issue #291).
+  const openFolderUnavailable = openFolderUnavailableReason(task);
+  const prStatusPath = multiRepo
+    ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)
+    : task.workdir;
   const [importedBranchBusy, setImportedBranchBusy] = useState(false);
   const [importedBranchError, setImportedBranchError] = useState<string | null>(null);
   const [importRetryBusy, setImportRetryBusy] = useState(false);
@@ -3193,9 +3269,10 @@ function RunPanelBody({
   }, [task.id, task.pipelineParentId]);
 
   // PR mergeability for the composer-row "Resolve Conflicts" button. `parsedPrUrl`
-  // is derived once per `task.prUrl` change and reused for both the fetch
-  // effect and the render-time gate (`canOfferResolveConflicts`).
-  const parsedPrUrl = useMemo(() => parsePrUrl(task.prUrl), [task.prUrl]);
+  // is derived once per PR-URL change (the selected repository's for a multi
+  // task) and reused for both the fetch effect and the render-time gate
+  // (`canOfferResolveConflicts`).
+  const parsedPrUrl = useMemo(() => parsePrUrl(headerPrUrl), [headerPrUrl]);
   const [prStatus, setPrStatus] = useState<GitHubPullMergeability | null>(null);
   const [prStatusLoading, setPrStatusLoading] = useState(false);
   const [prStatusError, setPrStatusError] = useState<string | null>(null);
@@ -3273,7 +3350,7 @@ function RunPanelBody({
   // landing between the await and the fetch — `fetchPrStatus` itself would
   // otherwise fire for a task this effect instance no longer represents.
   useEffect(() => {
-    const parsed = parsePrUrl(task.prUrl);
+    const parsed = parsePrUrl(headerPrUrl);
     if (!parsed) {
       prStatusSeqRef.current++; // invalidate any in-flight fetch/retry
       prStatusRetriesRef.current = 0;
@@ -3286,11 +3363,11 @@ function RunPanelBody({
     prStatusRetriesRef.current = 0;
     void awaitStreamReady().then(() => {
       if (cancelled) return;
-      fetchPrStatus(task.workdir, parsed.number);
+      fetchPrStatus(prStatusPath, parsed.number);
     });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [task.id, task.prUrl]);
+  }, [task.id, headerPrUrl, prStatusPath]);
 
   // Re-check mergeability at turn-end: track whether the task was "running"
   // on the previous render and refetch once it transitions away from
@@ -3305,16 +3382,16 @@ function RunPanelBody({
     const wasRunning = wasRunningForPrStatusRef.current;
     wasRunningForPrStatusRef.current = task.column === "running";
     if (!wasRunning || task.column === "running") return;
-    const parsed = parsePrUrl(task.prUrl);
+    const parsed = parsePrUrl(headerPrUrl);
     if (!parsed) return;
     prStatusRetriesRef.current = 0;
-    fetchPrStatus(task.workdir, parsed.number);
-  }, [task.column, task.prUrl, task.workdir, fetchPrStatus]);
+    fetchPrStatus(prStatusPath, parsed.number);
+  }, [task.column, headerPrUrl, prStatusPath, fetchPrStatus]);
 
   const refreshPrStatus = () => {
     if (!parsedPrUrl) return;
     prStatusRetriesRef.current = 0;
-    fetchPrStatus(task.workdir, parsedPrUrl.number);
+    fetchPrStatus(prStatusPath, parsedPrUrl.number);
   };
 
   const send = async () => {
@@ -3686,7 +3763,11 @@ function RunPanelBody({
   // flag (rather than reusing `sending`) so the button's own disabled state
   // and "Sent to agent" confirmation don't get tangled up with the composer's.
   const [resolvingConflicts, setResolvingConflicts] = useState(false);
-  const [resolveConflictsSent, setResolveConflictsSent] = useState(false);
+  // The "Sent to agent" confirmation belongs to the repository tab it was
+  // sent from (a multi task has one PR per repository): switching tabs must
+  // not show it, or lock out, another repository's Resolve Conflicts. Null
+  // when nothing was sent; reset on task switch.
+  const [resolveConflictsSentKey, setResolveConflictsSentKey] = useState<string | null>(null);
   // Offer survives `!canSend` (e.g. an orphan-reconciled run) — the button
   // then renders disabled with its "start the task" tooltip instead of
   // vanishing from the row.
@@ -3694,14 +3775,109 @@ function RunPanelBody({
   // Head branch a "Create PR" would open from — agetor's worktree branch, or
   // the workdir's live non-default branch for an isolation:"none" task. `null`
   // means "nothing sensible to PR from", which is also the chip's gate.
-  const prHead = prHeadBranch(task.branch ?? null, gitStatus, task.branchSource);
-  // Live checkout vs the branch agetor created (5 s git-status poll). Drift is
-  // tolerated, never corrected — the header and details say where it is.
-  const branchDrift = driftOf(task.branch ?? null, gitStatus?.branch);
+  /**
+   * "Create all PRs" (issue #291): open one pull request per repository,
+   * best-effort, stamping each through the ordinary `/github/pull-create`
+   * route (which matches the repository by worktree path). `Closes #N` is
+   * appended only for the repository the issue came from.
+   */
+  const createAllPrs = async () => {
+    if (!multiRepo) return;
+    const taskId = task.id;
+    const repos = task.repositories ?? [];
+    // Only repositories that don't have a PR yet. This is what makes the
+    // action safe to press again after a partial failure (the stamped entries
+    // are skipped) and stops a second press from opening duplicate PRs —
+    // including one made before the 2 s board poll delivers the stamps of a
+    // walk that just finished (`repositoriesForPrBatch` remembers them).
+    // Each candidate also has to be pushed/synced, and its PR head is the
+    // branch actually checked out (drift is tolerated, never corrected) —
+    // same rules as the single-repository "Open PR" chip.
+    const needing = repositoriesForPrBatch(taskId, repos);
+    const todo = needing.filter((repo) => repositoryPrHead(repo, gitStatusForRepo(repo.name)) !== null);
+    if (todo.length === 0) {
+      toast(
+        needing.length === 0
+          ? "Every repository already has a pull request"
+          : "No repository is ready for a pull request yet",
+      );
+      return;
+    }
+    // One walk per task, whichever panel instance (or task switch) started it.
+    if (!beginPrBatch(taskId)) return;
+    const failures: string[] = [];
+    let opened = 0;
+    // Attribute an unlabeled proposal only when there is exactly one PR
+    // target; with several it could belong to any repository, and the old
+    // `repos[0]` fallback stamped the wrong repo's title/description.
+    const proposals = latestProposalsForTargets(events, todo.map((repo) => repo.name));
+    try {
+      for (const repo of todo) {
+        const head = repositoryPrHead(repo, gitStatusForRepo(repo.name));
+        if (!head) {
+          failures.push(`${repo.name}: branch is not pushed yet`);
+          continue;
+        }
+        const projectPath = repo.worktreePath ?? repo.path;
+        const proposal = proposals.get(repo.name);
+        try {
+          const defaults = await api.getGitHubPullDefaults({ path: projectPath });
+          await api.createGitHubPull({
+            path: projectPath,
+            title: proposal?.title || task.title,
+            head,
+            base: defaults.base,
+            body: appendIssueCloseDirective(
+              proposal?.description ?? "",
+              repo.path === task.issueRepoPath ? task.issueUrl : null,
+            ),
+            taskId,
+          });
+          markRepositoryPrOpened(taskId, repo.name);
+          opened += 1;
+        } catch (e) {
+          failures.push(`${repo.name}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (failures.length === 0) {
+        toast.success(
+          opened === repos.length
+            ? "Pull requests created for every repository"
+            : `Pull requests created for ${opened} of ${repos.length} repositories`,
+        );
+      } else toast.error(`Could not open ${failures.length} pull request(s): ${failures.join("; ")}`);
+    } finally {
+      endPrBatch(taskId);
+    }
+    // Pull the stamped `prUrl`s now rather than waiting for the board poll,
+    // so the per-repository PR links (and the button's gate) update at once.
+    // `onTaskFieldsChanged` merges by id, so it is safe after a task switch.
+    try {
+      const fresh = await api.getTask(taskId);
+      onTaskFieldsChanged?.(taskId, { repositories: fresh.repositories });
+    } catch {
+      // The 2 s poll reconciles.
+    }
+  };
+
+  const prHead = multiRepo
+    ? (activeRepo ? repositoryPrHead(activeRepo, activeGitStatus) : null)
+    : prHeadBranch(task.branch ?? null, gitStatus, task.branchSource);
+  // The branch agetor created for the SELECTED repository (single: the task's
+  // own). Live checkout vs that branch, read from the 5 s git-status poll —
+  // for a multi task `repositories[].checkoutBranch` is only the last-seen
+  // recorded value, so the banner must compare against the live branch the
+  // same way the single-repository path does. Drift is tolerated, never
+  // corrected — the header and details say where it is.
+  const activeTaskBranch = multiRepo ? (activeRepo?.branch ?? null) : (task.branch ?? null);
+  const activeBranchSource = multiRepo ? (activeRepo?.branchSource ?? "created") : task.branchSource;
+  const branchDrift = multiRepo
+    ? driftOf(activeTaskBranch, activeGitStatus && !activeGitStatus.ignored ? activeGitStatus.branch : null)
+    : driftOf(activeTaskBranch, gitStatus?.branch);
   // Claude-only: an OpenCode import carries no transcript branch, so the
   // "Switch to <branch>" banner never shows for one.
   const importedGitBranch = importedSession?.kind === "claude-code" ? (task.importedClaude?.gitBranch ?? null) : null;
-  const folderBranch = gitStatus && !gitStatus.ignored ? gitStatus.branch : null;
+  const folderBranch = activeGitStatus && !activeGitStatus.ignored ? activeGitStatus.branch : null;
   // The import-time branch is only a hint until the session continues here.
   // After an Agetor turn the folder's branch is whatever that turn left, so
   // the banner would keep naming a branch the session has moved past.
@@ -3712,6 +3888,8 @@ function RunPanelBody({
     && !!folderBranch
     && importedGitBranch !== folderBranch;
   const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resolveConflictsSent = resolveConflictsSentKey !== null
+    && resolveConflictsSentKey === resolveConflictsKey(multiRepo, activeRepo?.name);
   useEffect(() => () => {
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
   }, []);
@@ -3773,15 +3951,24 @@ function RunPanelBody({
     // sync with the current task's PR, refuse to send unless it still
     // matches the PR the button is currently showing.
     if (!parsedPrUrl || !prStatus || prStatus.pullNumber !== parsedPrUrl.number) return;
+    // A multi-repository task runs at the workspace root, which is not a git
+    // repository: the prompt has to name this PR repository's checkout
+    // explicitly or every git command lands in the wrong place. The active
+    // tab is the one whose `prUrl` produced `parsedPrUrl`/`prStatus`.
+    const resolveRepo = multiRepo ? activeRepo : null;
     const prompt = buildResolveConflictsPrompt({
       repo: prStatus.repo,
       number: prStatus.pullNumber,
       title: null,
       headRef: prStatus.headRef,
       baseRef: prStatus.baseRef,
+      repositoryPath: resolveRepo ? (resolveRepo.worktreePath ?? resolveRepo.path) : null,
+      repositoryName: resolveRepo?.name ?? null,
     });
     // Captured before the first await — see `currentTaskIdRef`'s doc comment.
     const sentTaskId = task.id;
+    // The repository tab this prompt is for, so its confirmation stays there.
+    const sentKey = resolveConflictsKey(multiRepo, activeRepo?.name);
     setResolvingConflicts(true);
     setSendHint(null);
     try {
@@ -3802,8 +3989,8 @@ function RunPanelBody({
             logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
           });
           if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
-          setResolveConflictsSent(true);
-          resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+          setResolveConflictsSentKey(sentKey);
+          resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSentKey(null), 5_000);
         }
       } else if (res.withheld && res.savedToBacklog) {
         // Claude is showing a modal — the merge/resolve-conflicts prompt was
@@ -3861,10 +4048,21 @@ function RunPanelBody({
   // the same scope, so project-level skill/command/MCP discovery reads
   // exactly this tree too, never a stale `task.branch`-against-the-source-repo
   // scope.
+  // Multi-repository `@` scopes: the workspace root is not a git repo, so a
+  // multi task lists each repository's worktree instead (issue #291). The
+  // single-repository path is unchanged.
+  const multiRepoScopes = useMemo(
+    () => (multiRepo ? multiRepoFileScopes(task) : null),
+    [multiRepo, task.worktreePath, task.repositories, task.isolation],
+  );
   const fileScope = useMemo<FileScope>(() => {
+    if (multiRepoScopes && multiRepoScopes.length > 0) {
+      const active = multiRepoScopes.find((sc) => sc.name === activeRepo?.name) ?? multiRepoScopes[0]!;
+      return active.ref ? { dir: active.dir, ref: active.ref } : { dir: active.dir };
+    }
     const scope = fileScopeForTask(task);
     return scope.ref ? { dir: scope.dir, ref: scope.ref } : { dir: scope.dir };
-  }, [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch]);
+  }, [task.worktreePath, task.isolation, task.workdir, task.baseRef, task.branchSource, task.branch, multiRepoScopes, activeRepo?.name]);
   // Hoisted above the composer's own internal calls (passed down via
   // `capabilities`/`savedPrompts` below) so the dock's Main ↔ subagent tab
   // switches and the archived-without-canSend swap — which unmount and
@@ -3872,7 +4070,16 @@ function RunPanelBody({
   // the saved-prompts fetch on every round trip. See the comment above
   // `sendRef`. Scoped by `fileScope` (the same `{dir, ref?}` pair the `@`
   // popover uses), not a separate workdir/branch pair — see that memo above.
-  const capabilities = useAgentCapabilities(task.agent, fileScope);
+  // A multi-repository discovery is one request per repository: hold it until
+  // THIS task's event stream is ready (bound to `task.id`, like the composer's
+  // `awaitReady` and `TerminalsSection`), so the per-repository burst doesn't
+  // compete with the SSE subscription for the webview's connection budget on
+  // a task switch. A single scope never waits (see the hook's doc).
+  const capabilities = useAgentCapabilities(
+    task.agent,
+    multiScopesOrNull(multiRepoScopes) ?? fileScope,
+    { awaitReady: () => awaitStreamReady(task.id) },
+  );
   const savedPromptsState = useSavedPrompts();
   // Stable identity for RunEventList/UserMessageBlock's display-only path
   // shortening (see the `pathRoots` prop doc) — both are memoized, so a
@@ -3981,11 +4188,10 @@ function RunPanelBody({
     capture.handleResult(result);
   };
 
-  // Captured as a local const (not read via `task.prUrl` inline) so its
-  // narrowing to non-null survives into the onClick closure below — TS
-  // drops narrowing on a mutable property access once it's referenced
-  // inside a nested function expression.
-  const prUrl = task.prUrl;
+  // Captured as a local const (not read inline) so its narrowing to non-null
+  // survives into the onClick closure below — TS drops narrowing on a mutable
+  // property access once it's referenced inside a nested function expression.
+  const prUrl = headerPrUrl;
   // Same capture rationale as `prUrl` above, for the "View issue" header
   // affordance.
   const issueUrl = task.issueUrl;
@@ -4006,7 +4212,12 @@ function RunPanelBody({
                 <Button
                   size="icon"
                   variant="outline"
-                  onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
+                  onClick={() => onViewPullRequest({
+                    projectPath: multiRepo
+                      ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)
+                      : task.workdir,
+                    prUrl,
+                  })}
                   aria-label="View PR"
                 >
                   <GitPullRequest className="size-4" />
@@ -4032,7 +4243,7 @@ function RunPanelBody({
                 <Button
                   size="icon"
                   variant="outline"
-                  onClick={() => onViewIssue({ projectPath: task.workdir, issueUrl })}
+                  onClick={() => onViewIssue({ projectPath: issueProjectPath(task, activeRepo), issueUrl })}
                   aria-label="View issue"
                   data-testid="view-issue"
                 >
@@ -4078,20 +4289,34 @@ function RunPanelBody({
           <Tooltip
             align="end"
             label={
-              task.worktreePath
-                ? `Open the worktree in your file manager: ${task.worktreePath}`
-                : `Open the project workdir in your file manager: ${task.workdir}`
+              openFolderUnavailable
+                ?? (task.worktreePath
+                  ? `Open the worktree in your file manager: ${task.worktreePath}`
+                  : `Open the project workdir in your file manager: ${task.workdir}`)
             }
           >
             <Button
               size="icon"
               variant="outline"
-              onClick={() =>
+              // Not `disabled`: a disabled button gets no hover, and the
+              // tooltip is what explains why a never-started multi task has
+              // no folder yet. The click says so too.
+              aria-disabled={openFolderUnavailable ? true : undefined}
+              className={openFolderUnavailable ? "opacity-50" : undefined}
+              onClick={() => {
+                if (openFolderUnavailable) {
+                  toast.info(openFolderUnavailable);
+                  return;
+                }
                 void api.openPath({
                   path: task.worktreePath ?? task.workdir,
                   taskId: task.id,
-                }).catch(() => { /* swallowed — openPath failures are best-effort */ })
-              }
+                }).catch((err: unknown) => {
+                  // Single tasks stay best-effort and silent; a multi task's
+                  // workspace failing to open is worth saying out loud.
+                  if (multiRepo) toast.error(err instanceof Error ? err.message : "Could not open the workspace folder");
+                });
+              }}
               aria-label="Open working folder"
             >
               <FolderOpen className="size-4" />
@@ -4158,6 +4383,39 @@ function RunPanelBody({
           </Tooltip>
         </div>
         <div className="mt-2 truncate text-sm font-semibold">{task.title}</div>
+        {multiRepo && (
+          // Per-repository selector (issue #291): the diff tabs' sibling for
+          // status, PR head/path and new terminal cwd.
+          <div className="mt-1 flex flex-wrap gap-1" role="tablist" aria-label="Repositories">
+            {(task.repositories ?? []).map((r) => {
+              // A repository whose checkout or source can't be read (deleted,
+              // no longer a git repository) is marked so the user can find
+              // the one to remove from the task details.
+              const problem = repositoryProblem(r, gitStatusForRepo(r.name));
+              return (
+                <button
+                  key={r.name}
+                  type="button"
+                  role="tab"
+                  aria-selected={(activeRepo?.name ?? null) === r.name}
+                  data-testid={`run-repo-tab-${r.name}`}
+                  data-repo-problem={problem ? "" : undefined}
+                  title={problem ?? undefined}
+                  onClick={() => setRepoTab(r.name)}
+                  className={cn(
+                    "inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 font-mono text-[10px]",
+                    (activeRepo?.name ?? null) === r.name
+                      ? (problem ? "bg-warning/15 text-warning" : "bg-info/15 text-info")
+                      : (problem ? "text-warning hover:bg-muted" : "text-muted-foreground hover:bg-muted"),
+                  )}
+                >
+                  {problem && <AlertTriangle className="size-2.5" aria-hidden />}
+                  {r.name}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <HarnessStackBanner
           task={task}
           stacks={stacks}
@@ -4229,25 +4487,25 @@ function RunPanelBody({
               return <span className="text-info"> · {at.text}</span>;
             })()}
             {" · "}{task.column}
-            {task.branch && !branchDrift.drifted && <> · <span className="font-mono">{task.branch}</span></>}
+            {activeTaskBranch && !branchDrift.drifted && <> · <span className="font-mono">{activeTaskBranch}</span></>}
             {branchDrift.drifted && (
               <>
                 {" · "}
-                <span className="font-mono" title={driftTitle(task.branch ?? null)}>{branchDrift.live}</span>{" "}
+                <span className="font-mono" title={driftTitle(activeTaskBranch)}>{branchDrift.live}</span>{" "}
                 <span
                   data-testid="run-panel-branch-drift"
-                  title={driftTitle(task.branch ?? null)}
+                  title={driftTitle(activeTaskBranch)}
                   className={cn(
                     "rounded px-1 py-px text-[10px] font-medium",
-                    task.branchSource === "existing" ? "bg-warning/15 text-warning" : "bg-info/15 text-info",
+                    activeBranchSource === "existing" ? "bg-warning/15 text-warning" : "bg-info/15 text-info",
                   )}
                 >
-                  {task.branchSource === "existing" ? "not on PR head" : "drifted"}
+                  {activeBranchSource === "existing" ? "not on PR head" : "drifted"}
                 </span>
               </>
             )}
-            {task.baseRef && (
-              <> · <span className="font-mono opacity-70">base {task.baseRef.slice(0, 7)}</span></>
+            {(multiRepo ? activeRepo?.baseRef : task.baseRef) && (
+              <> · <span className="font-mono opacity-70">base {(multiRepo ? activeRepo?.baseRef : task.baseRef)!.slice(0, 7)}</span></>
             )}
           </span>
           <SwitchAccountControl
@@ -4422,7 +4680,9 @@ function RunPanelBody({
         onRefreshModels={onRefreshModels}
         homeDir={homeDir}
         onTaskFieldsChanged={onTaskFieldsChanged}
-        liveBranch={gitStatus?.branch ?? null}
+        liveBranch={activeGitStatus?.branch ?? null}
+        repoStatusFor={gitStatusForRepo}
+        onViewPullRequest={onViewPullRequest}
         tmuxSession={latestRun?.tmuxSession ?? null}
         // "Has this task ever run" for the Agent-details dialog's status
         // line — the union of every signal in scope, since each is
@@ -4465,7 +4725,7 @@ function RunPanelBody({
           rule for this fragment: every keyed child carries its component's
           name in the key (`PlanDialog` below is the third one). See
           docs/plans/terminal-section-duplication.md. */}
-      <TerminalsSection key={`terminals-${task.id}`} task={task} awaitReady={awaitStreamReady} />
+      <TerminalsSection key={`terminals-${task.id}`} task={task} awaitReady={awaitStreamReady} activeRepo={multiRepo ? repoTab : null} />
 
       {showSubagentTabs && (
         <SubagentTabs
@@ -4651,6 +4911,7 @@ function RunPanelBody({
           // one key make React leak the earlier one on every re-render.
           key={`backlog-${task.id}`}
           fileScope={fileScope}
+          fileScopes={multiRepoScopes}
           items={backlogItems}
           canSend={canSend && !modalPending}
           busy={sending || backlogBusy}
@@ -4724,10 +4985,20 @@ function RunPanelBody({
             textareaRef={sendRef}
             capture={capture}
             fileScope={fileScope}
+            fileScopes={multiRepoScopes}
+            // Unprefixed `@tokens` resolve at the workspace root (the agent's
+            // cwd), which the per-repository listing can't see — stat that
+            // root before warning they won't resolve.
+            workspaceRoot={multiRepo ? (task.worktreePath ?? task.workdir) : null}
             // A column transition = a run settled (or started): the agent may
             // have just written files while focus never left the composer —
             // retrigger the listing fetch (see the prop's doc).
             fileScopeRefreshToken={task.column}
+            // A multi-repository listing is one request per repository: hold
+            // it until THIS task's event stream is ready. Bound to `task.id`
+            // because the composer's effects run before this body's reset
+            // effect on a switch (same reason as `TerminalsSection`).
+            awaitReady={() => awaitStreamReady(task.id)}
             // Pass the hoisted results down (see the comment above
             // `capabilities`'s declaration) so this dock's remounts don't
             // refire the composer's own internal fetches.
@@ -4766,11 +5037,14 @@ function RunPanelBody({
                   </Button>
                 )}
                 {/* Commit & push keys on live git state (uncommitted changes or
-                    unpushed commits), not run status — see `shouldOfferCommitPush`.
+                    unpushed commits), not run status — see
+                    `shouldOfferCommitPushForTask`. For a multi task the prompt
+                    is aggregate, so ANY repository having work offers the chip
+                    (gating on the selected tab hid it when a sibling was dirty).
                     Can surface even mid-run (a background agent dirtied the tree).
                     Hidden while `!canSend` — e.g. an imported session still
                     importing, or whose import failed — since the send would be refused. */}
-                {canSend && shouldOfferCommitPush(gitStatus) && !sending && (
+                {canSend && shouldOfferCommitPushForTask(gitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"
@@ -4791,17 +5065,42 @@ function RunPanelBody({
                     "View PR" link lives in the panel header). The proposal
                     parse runs on click, not per event flush — the stream can
                     be long. */}
-                {!task.prUrl && prHead != null && shouldOfferOpenPr(gitStatus) && !sending && (
+                {multiRepo && canSend && !sending && repositoriesNeedingPr(task.repositories ?? []).some((repo) => repositoryPrHead(repo, gitStatusForRepo(repo.name)) !== null) && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void createAllPrs()}
+                    disabled={allPrsBusy}
+                    title="Open one pull request per repository that doesn't have one yet, prefilled from the agent's labeled proposals"
+                    data-testid="create-all-prs"
+                  >
+                    <GitPullRequest className="mr-1 size-3" /> {allPrsBusy ? "Creating PRs…" : "Create all PRs"}
+                  </Button>
+                )}
+                {!headerPrUrl && prHead != null && shouldOfferOpenPr(activeGitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"
                     onClick={() => {
-                      const proposal = latestPrProposal(events);
+                      // A multi task's reply carries one labeled block per
+                      // repository; only THIS repository's block may prefill
+                      // the chip's composer. Falling back to the newest
+                      // unlabeled/last block attributed a sibling's proposal
+                      // to the active repository. Single tasks are unchanged.
+                      const proposal = multiRepo && activeRepo
+                        ? latestProposalForRepository(events, activeRepo.name)
+                        : latestPrProposal(events);
                       onOpenPullRequest({
-                        projectPath: task.workdir,
+                        projectPath: multiRepo
+                          ? (activeRepo?.worktreePath ?? activeRepo?.path ?? task.workdir)
+                          : task.workdir,
                         head: prHead,
                         title: proposal?.title ?? "",
-                        body: appendIssueCloseDirective(proposal?.description ?? "", task.issueUrl),
+                        // Only the repository the issue came from may close it.
+                        body: appendIssueCloseDirective(
+                          proposal?.description ?? "",
+                          !multiRepo || activeRepo?.path === task.issueRepoPath ? task.issueUrl : null,
+                        ),
                         taskId: task.id,
                       });
                     }}
@@ -5033,6 +5332,7 @@ const BACKLOG_ICON_BTN =
  */
 function BacklogTray({
   fileScope,
+  fileScopes,
   items,
   canSend,
   busy,
@@ -5047,6 +5347,10 @@ function BacklogTray({
    *  threaded into each row's inline editor for popover + highlight parity.
    *  Display/suggestion layer only; expansion stays server-side. */
   fileScope?: FileScope | null;
+  /** Every repository scope for a multi-repository task (issue #291) —
+   *  mirrors the send composer's merged, `<name>/…`-prefixed listing so a
+   *  saved draft's `@` editor sees the same files it will send. */
+  fileScopes?: NamedFileScope[] | null;
   items: BacklogMessage[];
   /** Whether "Send now" is available (task has a resumable run and no pending prompt). */
   canSend: boolean;
@@ -5169,6 +5473,7 @@ function BacklogTray({
               readOnly={readOnly}
               editing={editorVisible && editingId === item.id}
               fileScope={fileScope}
+              fileScopes={fileScopes}
               startingFolder={startingFolder}
               onStartEdit={() => setEditingId(item.id)}
               onCancelEdit={() => setEditingId(null)}
@@ -5191,6 +5496,7 @@ function BacklogTray({
  *  (textarea + references picker) when `editing` is true. */
 function BacklogItemRow({
   fileScope,
+  fileScopes,
   item,
   index,
   total,
@@ -5207,6 +5513,7 @@ function BacklogItemRow({
   onMove,
 }: {
   fileScope?: FileScope | null;
+  fileScopes?: NamedFileScope[] | null;
   item: BacklogMessage;
   index: number;
   total: number;
@@ -5229,9 +5536,20 @@ function BacklogItemRow({
   // `@` popover + highlight for the inline editor — scope gated on `editing`
   // so a tray full of closed rows fetches nothing (the module-level cache is
   // shared with the send composer anyway, so entering edit mode is a cache
-  // hit in practice). Expansion still happens server-side on send; this is
-  // the suggestion/validation layer only, same as every other composer.
-  const projectFiles = useProjectFiles(editing && !readOnly ? (fileScope ?? null) : null);
+  // hit in practice). Multi-repository tasks use the same merged, prefixed
+  // listing as the send composer (issue #291), so a draft's `@` editor can
+  // reference any repository instead of only the active tab's. Expansion
+  // still happens server-side on send; this is the suggestion/validation
+  // layer only, same as every other composer.
+  // Named scopes are passed only for a multi task (one entry for a multi task
+  // left with one repository), so their presence, not a count, decides.
+  const multiScopes = multiScopesOrNull(fileScopes);
+  const singleScopeFiles = useProjectFiles(editing && !readOnly ? (fileScope ?? null) : null);
+  const multiScopeFiles = useProjectFileScopes(editing && !readOnly ? multiScopes : null);
+  const projectFiles = multiScopes ? multiScopeFiles : singleScopeFiles;
+  const hasFileScope = multiScopes
+    ? multiScopes.every((s) => !!s.dir)
+    : !!fileScope?.dir;
   // Re-seed the edit form only when we *enter* edit mode. We deliberately do
   // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
   // `task.backlog` into fresh objects (new array references) on every tick, so
@@ -5262,7 +5580,7 @@ function BacklogItemRow({
             paint, see AtHighlightBackdrop's doc. Popover anchors above (the
             tray sits at the panel's bottom edge). */}
         <div className="relative">
-          {fileScope && (
+          {hasFileScope && (
             <AtHighlightBackdrop textareaRef={editorRef} value={draft} validPaths={projectFiles.validPaths} />
           )}
           <Textarea
@@ -5273,7 +5591,7 @@ function BacklogItemRow({
             autoFocus
             className="relative min-h-0 w-full resize-none text-xs"
           />
-          {fileScope && (
+          {hasFileScope && (
             <AtFileAutocomplete
               entries={projectFiles.entries}
               truncated={projectFiles.truncated}
@@ -5283,6 +5601,7 @@ function BacklogItemRow({
               textareaRef={editorRef}
               placement="above"
               fileScope={fileScope}
+              fileScopes={multiScopes}
             />
           )}
         </div>
@@ -5754,7 +6073,7 @@ function RunsList({
  * themselves live on the bun side and survive the panel closing entirely.
  * Defaults open when the task already has terminals (`openTerminalCount`).
  */
-function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTaskId: string) => Promise<void> }) {
+function TerminalsSection({ task, awaitReady, activeRepo }: { task: Task; awaitReady: (forTaskId: string) => Promise<void>; activeRepo?: string | null }) {
   const count = task.openTerminalCount;
   // Seed open from the count at mount, then let the user own the toggle —
   // binding `open` to the polled count would re-expand the section whenever
@@ -5807,7 +6126,14 @@ function TerminalsSection({ task, awaitReady }: { task: Task; awaitReady: (forTa
         </span>
       </summary>
       <div className="h-80 border-t border-border/60">
-        {ready && <TerminalView taskId={task.id} archived={task.archivedAt != null} />}
+        {ready && (
+          <TerminalView
+            taskId={task.id}
+            archived={task.archivedAt != null}
+            repositories={isMultiRepoTask(task) ? (task.repositories ?? []).map((r) => r.name) : undefined}
+            activeRepo={activeRepo ?? null}
+          />
+        )}
       </div>
     </details>
   );
@@ -7901,6 +8227,8 @@ function TaskDetails({
   homeDir,
   onTaskFieldsChanged,
   liveBranch,
+  repoStatusFor,
+  onViewPullRequest,
   tmuxSession,
   hasRun,
 }: {
@@ -7936,6 +8264,12 @@ function TaskDetails({
    *  git-status poll), `null` when unknown/detached. When it differs from
    *  `task.branch` the Branch row splits into "Checked out" + "Task branch". */
   liveBranch: string | null;
+  /** One repository's live status from the panel's batched multi-repo git
+   *  status poll (`null` when unknown) — the Repositories rows read each
+   *  repository's live branch and whether its checkout is readable. */
+  repoStatusFor: (name: string) => TaskGitStatus | null;
+  /** The panel's in-app PR view (same handler as the header's PR button). */
+  onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
   /** Tmux session name from the latest run (claude-code only). `null` when
    *  no run has spawned a session yet — the Tmux row hides itself in that
    *  case rather than presenting an Attach button that's guaranteed to 404. */
@@ -7956,6 +8290,45 @@ function TaskDetails({
   const profileLock = task.agentProfileId != null;
   const editable = !runningLock && !profileLock;
   const [detaching, setDetaching] = useState(false);
+  // "Remove from task" for one repository of a multi-repository task (issue
+  // #291). The busy marker is stamped with the task id, so a switch to
+  // another task mid-request can't leave that task's buttons disabled
+  // (`TaskDetails` is not remounted per task).
+  const confirm = useConfirm();
+  const [removingRepo, setRemovingRepo] = useState<{ taskId: string; name: string } | null>(null);
+  const removingHere = removingRepo !== null && removingRepo.taskId === task.id;
+  const multiRepo = isMultiRepoTask(task);
+  const removeBlockReason = multiRepo ? removeRepositoryBlockReason(task) : null;
+  const removeRepository = async (repo: TaskRepository) => {
+    const taskId = task.id;
+    const copy = removeRepositoryConfirmCopy(repo);
+    const ok = await confirm({
+      title: copy.title,
+      description: (
+        <div className="space-y-1">
+          {copy.lines.map((line) => <p key={line}>{line}</p>)}
+        </div>
+      ),
+      confirmLabel: copy.confirmLabel,
+      variant: "destructive",
+    });
+    if (!ok) return;
+    setRemovingRepo({ taskId, name: repo.name });
+    try {
+      const updated = await api.removeTaskRepository(taskId, repo.name);
+      // Merge only what the removal changed, keyed by the task it was sent
+      // for (`onTaskFieldsChanged` merges by id, so a task switch mid-request
+      // is safe); the panel drops a tab that pointed at the removed repository.
+      onTaskFieldsChanged?.(taskId, removalMergeFields(updated));
+      toast.success(`Removed ${repo.name} from this task`, {
+        description: repo.branch ? `Branch ${repo.branch} was kept.` : undefined,
+      });
+    } catch (e) {
+      toast.error(`Couldn't remove ${repo.name}`, { description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setRemovingRepo((cur) => (cur?.taskId === taskId && cur.name === repo.name ? null : cur));
+    }
+  };
   // Agent-details modal (plan D2), opened by clicking the chip in the Agent
   // row below. Closed defensively if the task becomes unbound while open —
   // Detach clears `task.agentProfileId`/`agentProfile` out from under it, and
@@ -8501,6 +8874,81 @@ function TaskDetails({
             <dd className="min-w-0 truncate font-mono" title={task.workdir}>
               {abbreviateHome(task.workdir, homeDir)}
             </dd>
+
+            {multiRepo && (
+              <>
+                <dt className="text-muted-foreground">Repositories</dt>
+                <dd className="min-w-0 space-y-1" data-testid="task-details-repositories">
+                  {repositoryDetails(task.repositories ?? [], repoStatusFor).map((d) => {
+                    const repo = (task.repositories ?? []).find((r) => r.name === d.name)!;
+                    const busy = removingHere && removingRepo!.name === d.name;
+                    return (
+                      <div
+                        key={d.name}
+                        data-testid={`task-details-repo-${d.name}`}
+                        data-repo-problem={d.problem ? "" : undefined}
+                        className={cn(
+                          "min-w-0 rounded border px-1.5 py-1",
+                          d.problem ? "border-warning/50 bg-warning/10" : "border-border/60",
+                        )}
+                      >
+                        <div className="flex min-w-0 items-center justify-between gap-2">
+                          <span className="min-w-0 truncate font-mono font-medium">{d.name}</span>
+                          <Tooltip align="end" label={removeBlockReason ?? "Detach this repository's checkout and drop it from the task"}>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-5 shrink-0 px-1.5 text-[10px] text-muted-foreground hover:text-danger"
+                              data-testid={`task-details-repo-remove-${d.name}`}
+                              disabled={removeBlockReason !== null || removingHere}
+                              onClick={() => { void removeRepository(repo); }}
+                            >
+                              {busy ? "Removing…" : "Remove from task"}
+                            </Button>
+                          </Tooltip>
+                        </div>
+                        {d.problem && (
+                          <div className="flex items-center gap-1 text-[10px] text-warning" data-testid={`task-details-repo-problem-${d.name}`}>
+                            <AlertTriangle className="size-3 shrink-0" aria-hidden /> {d.problem}
+                          </div>
+                        )}
+                        <div className="truncate font-mono text-muted-foreground" title={d.path}>
+                          {abbreviateHome(d.path, homeDir)}
+                        </div>
+                        <div className="truncate font-mono">
+                          <span className="text-muted-foreground">branch </span>
+                          <span className={d.drifted ? "text-warning" : undefined}>{d.branchText ?? "—"}</span>
+                          {d.base && <span className="text-muted-foreground"> · base {d.base}</span>}
+                        </div>
+                        <div className="truncate font-mono" title={d.checkoutCreated ? d.checkoutText : undefined}>
+                          <span className="text-muted-foreground">checkout </span>
+                          {d.checkoutCreated
+                            ? abbreviateHome(d.checkoutText, homeDir)
+                            : <span className="italic text-muted-foreground">{d.checkoutText}</span>}
+                        </div>
+                        {d.prUrl && (
+                          <button
+                            type="button"
+                            className="max-w-full truncate text-info underline-offset-2 hover:underline"
+                            title={d.prUrl}
+                            data-testid={`task-details-repo-pr-${d.name}`}
+                            onClick={() => {
+                              if (parsePullNumber(d.prUrl!) != null) {
+                                onViewPullRequest({ projectPath: repo.worktreePath ?? repo.path, prUrl: d.prUrl! });
+                              } else {
+                                void api.openExternal(d.prUrl!).catch(() => {});
+                              }
+                            }}
+                          >
+                            {d.prUrl}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </dd>
+              </>
+            )}
 
             <dt className="text-muted-foreground">Isolation</dt>
             <dd className="min-w-0">{task.isolation}</dd>

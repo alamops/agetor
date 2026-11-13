@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -176,6 +176,27 @@ test("prepareWorkdir re-pins a unique branch when the pinned name is already che
   expect(existsSync(rb.worktreePath!)).toBe(true);
 });
 
+test("prepareWorkdir re-pins instead of attaching to another task's existing pinned branch", async () => {
+  // Review R-M1 backstop: the ref exists (e.g. the other task already
+  // started) but is not checked out anywhere, so `git worktree add wt X`
+  // would SUCCEED and silently adopt that task's commits. `takenBranches`
+  // names the owner, so the never-materialized task must get a fresh variant.
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  await git(["checkout", "-b", "feature/shared"], repo);
+  writeFileSync(path.join(repo, "other-task.txt"), "someone else's work\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "other task"], repo);
+  await git(["checkout", "main"], repo);
+
+  const task = fakeTask({ workdir: repo, branch: "feature/shared" });
+  const r = await prepareWorkdir(task, { takenBranches: new Set(["feature/shared"]) });
+  if ("error" in r) throw new Error(r.error);
+  expect(r.branch).not.toBe("feature/shared");
+  expect(r.branch!.startsWith("feature/shared")).toBe(true);
+  expect(existsSync(path.join(r.cwd, "other-task.txt"))).toBe(false);
+});
+
 test("prepareWorkdir re-pin never steals a branch another task has pinned but not started", async () => {
   const { prepareWorkdir } = await import("./worktree.ts");
   const repo = await makeRepo();
@@ -311,6 +332,41 @@ test("gitWritableRoots returns [] for a non-git directory", async () => {
   expect(await gitWritableRoots(dir)).toEqual([]);
 });
 
+test("gitWritableRoots finds every linked worktree's common dir from a multi-repository workspace root", async () => {
+  // Issue #291 / review M1: the workspace root is NOT a git checkout; the
+  // repositories are direct children. Without their roots, codex's sandbox
+  // never escalated and every git commit inside a child was blocked because
+  // the shared .git lives in the source repo. The checkouts now come from the
+  // task row (`workspaceRepos`), not from scanning the workspace (a later
+  // review: scanning let a planted child escalate the sandbox).
+  const { prepareTaskWorkdir, gitWritableRoots } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const entry = (repoPath: string, name: string) => ({
+    path: repoPath, name, branch: null, branchSource: "created" as const,
+    worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null,
+  });
+  const task = fakeTask({
+    workdir: a,
+    repositories: [entry(a, "frontend"), entry(b, "backend")],
+  });
+  const prepared = await prepareTaskWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  const workspaceRepos = prepared.repositories!.map((r) => ({ worktreePath: r.worktreePath!, repoPath: r.path }));
+  expect(await gitWritableRoots(prepared.cwd)).toEqual([]);
+  const roots = await gitWritableRoots(prepared.cwd, workspaceRepos);
+  expect(roots).toHaveLength(2);
+  expect(new Set(roots)).toEqual(new Set([
+    realpathSync(path.join(a, ".git")),
+    realpathSync(path.join(b, ".git")),
+  ]));
+  for (const root of roots) {
+    expect(root.startsWith(prepared.cwd + path.sep)).toBe(false);
+    expect(existsSync(path.join(root, "HEAD"))).toBe(true);
+  }
+});
+
 // Async-conversion regression guard (gitWritableRootsSync -> gitWritableRoots):
 // prove several calls can genuinely be in flight together and each still
 // resolves with its own correct, independent result — rather than requiring
@@ -366,6 +422,31 @@ test("buildCodexCommand keeps workspace-write for an ordinary in-repo checkout",
   const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts }, repo);
   expect(cmd).toContain("workspace-write");
   expect(cmd).not.toContain("danger-full-access");
+});
+
+test("buildCodexCommand escalates from a multi-repository workspace root (not itself a git checkout)", async () => {
+  // Review M1 regression: cwd is the non-git workspace root, so resolving its
+  // own git dir returned [] and the sandbox stayed on workspace-write — codex
+  // could not git add/commit in any child worktree.
+  const { prepareTaskWorkdir } = await import("./worktree.ts");
+  const { buildCodexCommand } = await import("./agents.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const entry = (repoPath: string, name: string) => ({
+    path: repoPath, name, branch: null, branchSource: "created" as const,
+    worktreePath: null, baseRef: null, checkoutBranch: null, prUrl: null,
+  });
+  const prepared = await prepareTaskWorkdir(fakeTask({
+    workdir: a,
+    repositories: [entry(a, "frontend"), entry(b, "backend")],
+  }));
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  const codexWorkspaceRepos = prepared.repositories!.map((r) => ({ worktreePath: r.worktreePath!, repoPath: r.path }));
+  const { cmd } = await buildCodexCommand(codexHarness, "hi", { ...codexOpts, codexWorkspaceRepos }, prepared.cwd);
+  expect(cmd).toContain("danger-full-access");
+  expect(cmd).not.toContain("workspace-write");
+  expect(cmd).toContain("approval_policy=never");
 });
 
 test("prepareWorkdir is idempotent: second call reuses the recorded worktree", async () => {
@@ -2074,6 +2155,545 @@ describe("parseWorktreeGitPointer", () => {
       mkdirSync(big);
       writeFileSync(path.join(big, ".git"), pointer + " ".repeat(64 * 1024));
       expect(parseWorktreeGitPointer(big)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a submodule inside a linked worktree is not itself a linked worktree", async () => {
+    const { parseWorktreeGitPointer } = await import("./worktree.ts");
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-wt-submodule-"));
+    try {
+      // Real shape git writes for a submodule checked out in a linked
+      // worktree: `<repo>/.git/worktrees/<wt>/modules/<sub>` (verified with
+      // git 2.54). It carries the `.git/worktrees/` marker but has a deeper
+      // tail, so it must NOT parse as a worktree of `<repo>`.
+      const submodule = path.join(root, "vendor-lib");
+      mkdirSync(submodule);
+      writeFileSync(
+        path.join(submodule, ".git"),
+        "gitdir: /src/repo/.git/worktrees/wt-1/modules/vendor-lib\n",
+      );
+      expect(parseWorktreeGitPointer(submodule)).toBeNull();
+
+      // The linked worktree's own pointer (one segment after the marker) does.
+      const worktree = path.join(root, "wt");
+      mkdirSync(worktree);
+      writeFileSync(path.join(worktree, ".git"), "gitdir: /src/repo/.git/worktrees/wt-1\n");
+      expect(parseWorktreeGitPointer(worktree)).toBe("/src/repo");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── multi-repository tasks (issue #291) ───────────────────────────────────
+
+function multiRepoTask(
+  workdir: string,
+  repos: { path: string; name: string; baseRef: string | null }[],
+  overrides: Partial<Task> = {},
+): Task {
+  return fakeTask({
+    workdir,
+    isolation: "worktree",
+    branch: "feature/auth",
+    repositories: repos.map((r) => ({
+      path: r.path,
+      name: r.name,
+      branch: null,
+      branchSource: "created" as const,
+      worktreePath: null,
+      baseRef: r.baseRef,
+      checkoutBranch: null,
+      prUrl: null,
+    })),
+    ...overrides,
+  });
+}
+
+test("prepareTaskWorkdir creates one worktree and branch per repository under the workspace", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR, worktreePath } = await import("./worktree.ts");
+  const { existsSync } = await import("node:fs");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const r = await prepareTaskWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.cwd).toBe(workspace);
+    expect(r.worktreePath).toBe(workspace);
+    expect(r.branch).toBeNull();
+    expect(r.repositories).toHaveLength(2);
+    for (const [repo, expectedBranch] of [[a, "feature/auth"], [b, "feature/auth"]] as const) {
+      const dir = path.join(workspace, repo === a ? "frontend" : "backend");
+      expect(existsSync(path.join(dir, ".git"))).toBe(true);
+      expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], dir)).toBe(expectedBranch);
+      expect(await runCapture(["rev-parse", "HEAD"], dir)).toBe(repo === a ? shaA : shaB);
+    }
+    expect(r.repositories?.map((x) => x.worktreePath)).toEqual([
+      path.join(workspace, "frontend"),
+      path.join(workspace, "backend"),
+    ]);
+    expect(r.repositories?.map((x) => x.branch)).toEqual(["feature/auth", "feature/auth"]);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("pinMissingRepositoryBaseRefs resolves each unpinned entry against its own repository", async () => {
+  const { pinMissingRepositoryBaseRefs } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  // A second commit in b proves the lookup runs in b, not in the first repo.
+  writeFileSync(path.join(b, "README"), "b2\n");
+  await git(["add", "."], b);
+  await git(["commit", "-m", "second"], b);
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: null },
+  ]);
+  try {
+    const pinned = await pinMissingRepositoryBaseRefs(task.repositories!);
+    expect(pinned.map((r) => r.baseRef)).toEqual([shaA, shaB]);
+    // An unknown path keeps its null pin rather than failing the caller.
+    const unknown = await pinMissingRepositoryBaseRefs([{ ...task.repositories![1]!, path: path.join(b, "missing") }]);
+    expect(unknown[0]!.baseRef).toBeNull();
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("shouldLazyPinBaseRef skips the doomed scalar pin for a multi-repository prepare", async () => {
+  // Round-12 N2: a multi row has no scalar baseRef and its worktreePath is the
+  // non-git workspace root, so start/retry ran a `git rev-parse` there and
+  // threw the null away on every single run.
+  const { shouldLazyPinBaseRef } = await import("./worktree.ts");
+  const repo = { path: "/src/a", name: "a" } as never;
+  expect(shouldLazyPinBaseRef(null, { worktreePath: "/wt/t", repositories: [repo, repo] })).toBe(false);
+  expect(shouldLazyPinBaseRef(null, { worktreePath: "/wt/t" })).toBe(true);
+  expect(shouldLazyPinBaseRef(null, { worktreePath: null })).toBe(false);
+  expect(shouldLazyPinBaseRef("abc1234", { worktreePath: "/wt/t" })).toBe(false);
+});
+
+test("prepareTaskWorkdir reuses existing per-repo worktrees without creating anything", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const first = await prepareTaskWorkdir(task);
+    if ("error" in first) throw new Error(first.error);
+    const recorded = { ...task, repositories: first.repositories!, worktreePath: workspace };
+    const headBefore = await runCapture(["rev-parse", "HEAD"], path.join(workspace, "frontend"));
+    const second = await prepareTaskWorkdir(recorded);
+    if ("error" in second) throw new Error(second.error);
+    expect(second.repositories?.map((x) => x.branch)).toEqual(["feature/auth", "feature/auth"]);
+    expect(await runCapture(["rev-parse", "HEAD"], path.join(workspace, "frontend"))).toBe(headBefore);
+    expect(second.note).toContain("reusing worktree");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("prepareTaskWorkdir is all-or-nothing: rolls back the good repo and names every failed one", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const good = await makeRepo();
+  const badBase = await makeRepo();
+  const notARepo = mkdtempSync(path.join(tmpdir(), "agetor-wt-notrepo-"));
+  const goodSha = await revParse(good, "HEAD");
+  const task = multiRepoTask(good, [
+    { path: good, name: "frontend", baseRef: goodSha },
+    { path: notARepo, name: "backend", baseRef: null },
+    { path: badBase, name: "infra", baseRef: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const r = await prepareTaskWorkdir(task);
+    expect("error" in r).toBe(true);
+    if (!("error" in r)) return;
+    expect(r.error).toContain("backend");
+    expect(r.error).toContain("infra");
+    expect(existsSync(workspace)).toBe(false);
+    expect(existsSync(path.join(good, ".git"))).toBe(true);
+    // The branch minted in the rolled-back attempt is gone too.
+    expect(await runCapture(["rev-parse", "--verify", "--quiet", "refs/heads/feature/auth"], good)).toBe("");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(good, { recursive: true, force: true });
+    rmSync(badBase, { recursive: true, force: true });
+    rmSync(notARepo, { recursive: true, force: true });
+  }
+});
+
+test("prepareTaskWorkdir falls back to a unique branch when the shared name is held in one repo only", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  // Repo B already has the shared branch checked out in its main worktree.
+  await git(["checkout", "-b", "feature/auth"], b);
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const r = await prepareTaskWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.repositories?.[0]?.branch).toBe("feature/auth");
+    expect(r.repositories?.[1]?.branch).toBe("feature/auth-2");
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], path.join(workspace, "backend"))).toBe("feature/auth-2");
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], path.join(workspace, "frontend"))).toBe("feature/auth");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("prepareTaskWorkdir sees a pin from a sibling subdirectory of the same repository", async () => {
+  // Review R11-M1: the pin map used to be keyed only by the path the OTHER
+  // task selected. Two multi tasks that picked sibling subdirectories of one
+  // repository shared no path key, so the second start found no pin, saw the
+  // branch already exists, and silently attached to the first task's commits.
+  const { prepareTaskWorkdir, repoRoot, WORKTREES_DIR } = await import("./worktree.ts");
+  const { branchesPinnedByOtherTasks } = await import("./task-repos.ts");
+  const { existsSync } = await import("node:fs");
+  const mono = await makeRepo();
+  const otherA = await makeRepo();
+  const otherB = await makeRepo();
+  const pkgA = path.join(mono, "pkg-a");
+  const pkgB = path.join(mono, "pkg-b");
+  mkdirSync(pkgA);
+  mkdirSync(pkgB);
+  const shaMono = await revParse(mono, "HEAD");
+  const shaA = await revParse(otherA, "HEAD");
+  const shaB = await revParse(otherB, "HEAD");
+  // Both rows pinned the same desired name, as a pre-fix create would.
+  const taskA = multiRepoTask(pkgA, [
+    { path: pkgA, name: "a", baseRef: shaMono },
+    { path: otherA, name: "other", baseRef: shaA },
+  ]);
+  const taskB = multiRepoTask(pkgB, [
+    { path: pkgB, name: "b", baseRef: shaMono },
+    { path: otherB, name: "other", baseRef: shaB },
+  ]);
+  const workspaceA = path.join(WORKTREES_DIR, taskA.id);
+  const workspaceB = path.join(WORKTREES_DIR, taskB.id);
+  try {
+    const first = await prepareTaskWorkdir(taskA);
+    if ("error" in first) throw new Error(first.error);
+    // Work that must never leak into the second task's checkout.
+    writeFileSync(path.join(workspaceA, "a", "marker.txt"), "task A work\n");
+    await git(["add", "."], path.join(workspaceA, "a"));
+    await git(["commit", "-m", "task A work"], path.join(workspaceA, "a"));
+
+    const taken = await branchesPinnedByOtherTasks(
+      taskB.id,
+      [{ id: taskA.id, branch: null, workdir: taskA.workdir, repositories: first.repositories! }],
+      { resolveRoot: repoRoot },
+    );
+    const second = await prepareTaskWorkdir(taskB, { takenBranches: taken });
+    if ("error" in second) throw new Error(second.error);
+
+    const monoEntry = second.repositories!.find((r) => r.name === "b")!;
+    // Re-pinned off the base instead of adopting A's branch and commit.
+    expect(monoEntry.branch).toBe("feature/auth-2");
+    expect(existsSync(path.join(workspaceB, "b", "marker.txt"))).toBe(false);
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], path.join(workspaceB, "b")))
+      .toBe("feature/auth-2");
+    // A repository without the pin keeps the shared name.
+    expect(second.repositories!.find((r) => r.name === "other")!.branch).toBe("feature/auth");
+  } finally {
+    rmSync(workspaceA, { recursive: true, force: true });
+    rmSync(workspaceB, { recursive: true, force: true });
+    rmSync(mono, { recursive: true, force: true });
+    rmSync(otherA, { recursive: true, force: true });
+    rmSync(otherB, { recursive: true, force: true });
+  }
+});
+
+test("getTaskDiff isolates each repository and the blob uses the requested one", async () => {
+  const { getTaskDiff, getTaskDiffBlob, prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const prepared = await prepareTaskWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const started = { ...task, worktreePath: workspace, repositories: prepared.repositories! };
+    writeFileSync(path.join(workspace, "frontend", "front.txt"), "front change\n");
+    writeFileSync(path.join(workspace, "backend", "back.txt"), "back change\n");
+    const front = await getTaskDiff(started, "frontend");
+    expect(front.repo).toBe("frontend");
+    expect(front.files.map((f) => f.path)).toEqual(["front.txt"]);
+    const back = await getTaskDiff(started, "backend");
+    expect(back.repo).toBe("backend");
+    expect(back.files.map((f) => f.path)).toEqual(["back.txt"]);
+    const fallback = await getTaskDiff(started);
+    expect(fallback.repo).toBe("frontend");
+    const unknown = await getTaskDiff(started, "nope");
+    expect(unknown.files).toEqual([]);
+    expect(unknown.note).toContain("Unknown repository");
+    const blob = await getTaskDiffBlob(started, "back.txt", "new", "backend");
+    expect(blob.ok).toBe(true);
+    if (blob.ok) expect(new TextDecoder().decode(blob.bytes)).toBe("back change\n");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("detachWorktree detaches clean repos, keeps a dirty one and its branch", async () => {
+  const { detachWorktree, prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const { existsSync } = await import("node:fs");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const prepared = await prepareTaskWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const started = { ...task, worktreePath: workspace, repositories: prepared.repositories! };
+    writeFileSync(path.join(workspace, "backend", "dirty.txt"), "x\n");
+    const result = await detachWorktree(started);
+    expect(result.removed).toBe(false);
+    expect(result.reason).toBe("dirty");
+    expect(result.repositories?.find((r) => r.name === "frontend")?.result.removed).toBe(true);
+    expect(result.repositories?.find((r) => r.name === "backend")?.result.reason).toBe("dirty");
+    expect(existsSync(path.join(workspace, "frontend"))).toBe(false);
+    expect(existsSync(path.join(workspace, "backend"))).toBe(true);
+    // Both branches survive a detach.
+    expect(await runCapture(["rev-parse", "--verify", "refs/heads/feature/auth"], a)).not.toBe("");
+    expect(await runCapture(["rev-parse", "--verify", "refs/heads/feature/auth"], b)).not.toBe("");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("removeWorktree deletes every repository worktree and branch plus the empty workspace", async () => {
+  const { removeWorktree, prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const { existsSync } = await import("node:fs");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const shaB = await revParse(b, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: shaB },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  try {
+    const prepared = await prepareTaskWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const started = { ...task, worktreePath: workspace, repositories: prepared.repositories! };
+    await removeWorktree(started);
+    expect(existsSync(workspace)).toBe(false);
+    expect(await runCapture(["rev-parse", "--verify", "--quiet", "refs/heads/feature/auth"], a)).toBe("");
+    expect(await runCapture(["rev-parse", "--verify", "--quiet", "refs/heads/feature/auth"], b)).toBe("");
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("workspacePathFor only adopts a strict direct child of WORKTREES_DIR", async () => {
+  const { workspacePathFor, WORKTREES_DIR, worktreePath } = await import("./worktree.ts");
+  const id = randomUUID();
+  const canonical = worktreePath(fakeTask({ id, workdir: WORKTREES_DIR }));
+  // The root itself must never become a workspace (teardown would rmdir the
+  // whole managed directory); a deeper/nested path is equally invalid.
+  expect(workspacePathFor(fakeTask({ id, workdir: WORKTREES_DIR, worktreePath: WORKTREES_DIR }))).toBe(canonical);
+  const deep = path.join(WORKTREES_DIR, "parent", "child");
+  expect(workspacePathFor(fakeTask({ id, workdir: deep, worktreePath: deep }))).toBe(canonical);
+  // A pipeline step's mirrored parent workspace is a direct child and is kept
+  // — but only for the step's own pipeline parent (review S1).
+  const mirrored = path.join(WORKTREES_DIR, "parent-id");
+  expect(workspacePathFor(fakeTask({ id, workdir: mirrored, worktreePath: mirrored, pipelineParentId: "parent-id" }))).toBe(mirrored);
+});
+
+test("prepareTaskWorkdir clears a stale non-worktree child so it can start again", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: await revParse(a, "HEAD") },
+    { path: b, name: "backend", baseRef: await revParse(b, "HEAD") },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  const stale = path.join(workspace, "frontend");
+  // A failed `git worktree add` / teardown can leave a plain directory here;
+  // `git worktree add` refuses non-empty destinations, which used to block the
+  // task forever.
+  mkdirSync(stale, { recursive: true });
+  writeFileSync(path.join(stale, "leftover.txt"), "half-built\n");
+  try {
+    const r = await prepareTaskWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(existsSync(path.join(stale, "leftover.txt"))).toBe(false);
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "HEAD"], stale)).toBe("feature/auth");
+    expect(existsSync(path.join(workspace, "backend", ".git"))).toBe(true);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("prepareTaskWorkdir adopts a real checkout left at the target instead of discarding its work", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const b = await makeRepo();
+  const shaA = await revParse(a, "HEAD");
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: shaA },
+    { path: b, name: "backend", baseRef: await revParse(b, "HEAD") },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  const frontend = path.join(workspace, "frontend");
+  mkdirSync(workspace, { recursive: true });
+  // The row lost its recorded path, but the checkout (with uncommitted work)
+  // is real — adopting it must not delete that work.
+  await git(["worktree", "add", "-b", "feature/auth", frontend, shaA], a);
+  writeFileSync(path.join(frontend, "wip.txt"), "wip\n");
+  try {
+    const r = await prepareTaskWorkdir(task);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.repositories?.[0]?.worktreePath).toBe(frontend);
+    expect(r.note).toContain("reusing worktree");
+    expect(existsSync(path.join(frontend, "wip.txt"))).toBe(true);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+  }
+});
+
+test("a failed prepare rolls back a re-attached worktree it materialized", async () => {
+  const { prepareTaskWorkdir, WORKTREES_DIR } = await import("./worktree.ts");
+  const a = await makeRepo();
+  const notARepo = mkdtempSync(path.join(tmpdir(), "agetor-wt-repo-notrepo-"));
+  await git(["branch", "feature/auth"], a);
+  const task = multiRepoTask(a, [
+    { path: a, name: "frontend", baseRef: null },
+    { path: notARepo, name: "backend", baseRef: null },
+  ]);
+  const workspace = path.join(WORKTREES_DIR, task.id);
+  // The frontend materialized before (recorded path) but its directory is
+  // gone — this attempt re-attaches it, so it is this attempt's to roll back.
+  task.repositories![0]!.worktreePath = path.join(workspace, "frontend");
+  task.worktreePath = workspace;
+  task.workdir = workspace;
+  try {
+    const r = await prepareTaskWorkdir(task);
+    expect("error" in r).toBe(true);
+    if (!("error" in r)) return;
+    expect(r.error).toContain("backend");
+    expect(existsSync(path.join(workspace, "frontend"))).toBe(false);
+    expect(existsSync(workspace)).toBe(false);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true });
+    rmSync(notARepo, { recursive: true, force: true });
+  }
+});
+
+test("resolveWorktreeRef accepts direct and nested ids and refuses traversal", async () => {
+  const { resolveWorktreeRef, WORKTREES_DIR } = await import("./worktree.ts");
+  const direct = resolveWorktreeRef("abc-123");
+  expect(direct.ok).toBe(true);
+  if (direct.ok) {
+    expect(direct.value.path).toBe(path.join(WORKTREES_DIR, "abc-123"));
+    expect(direct.value.repoName).toBeNull();
+  }
+  const nested = resolveWorktreeRef("abc-123__frontend");
+  expect(nested.ok).toBe(true);
+  if (nested.ok) {
+    expect(nested.value.path).toBe(path.join(WORKTREES_DIR, "abc-123", "frontend"));
+    expect(nested.value.taskId).toBe("abc-123");
+    expect(nested.value.repoName).toBe("frontend");
+  }
+  for (const bad of ["", ".", "..", "../x", "a/b", "a\\b", "abc__", "__x", "abc__..", "abc__x/../../y"]) {
+    expect(resolveWorktreeRef(bad).ok).toBe(false);
+  }
+});
+
+describe("workspaceHasOnlyAgetorScratch", () => {
+  const scratch = async () => {
+    const { workspaceHasOnlyAgetorScratch } = await import("./worktree.ts");
+    return workspaceHasOnlyAgetorScratch;
+  };
+
+  test("missing, empty, and settings-only workspaces are reclaimable", async () => {
+    const hasOnlyScratch = await scratch();
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-ws-scratch-"));
+    try {
+      expect(await hasOnlyScratch(path.join(dir, "missing"))).toBe(false);
+      expect(await hasOnlyScratch(dir)).toBe(true);
+      mkdirSync(path.join(dir, ".claude"));
+      expect(await hasOnlyScratch(dir)).toBe(true);
+      writeFileSync(path.join(dir, ".claude", "settings.local.json"), "{}\n");
+      expect(await hasOnlyScratch(dir)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("any real content keeps the workspace (including inside .claude)", async () => {
+    const hasOnlyScratch = await scratch();
+    const root = mkdtempSync(path.join(tmpdir(), "agetor-ws-content-"));
+    try {
+      writeFileSync(path.join(root, "notes.md"), "keep me\n");
+      expect(await hasOnlyScratch(root)).toBe(false);
+
+      // The review nit: a `.claude` holding more than agetor's own settings
+      // file is agent/user data, so the boot sweep must not enqueue a no-op
+      // teardown for it on every boot.
+      const onlyClaude = mkdtempSync(path.join(tmpdir(), "agetor-ws-claude-"));
+      try {
+        mkdirSync(path.join(onlyClaude, ".claude"));
+        writeFileSync(path.join(onlyClaude, ".claude", "settings.local.json"), "{}\n");
+        writeFileSync(path.join(onlyClaude, ".claude", "history.jsonl"), "{}\n");
+        expect(await hasOnlyScratch(onlyClaude)).toBe(false);
+      } finally {
+        rmSync(onlyClaude, { recursive: true, force: true });
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

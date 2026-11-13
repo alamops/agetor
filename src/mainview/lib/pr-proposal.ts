@@ -165,3 +165,165 @@ export function latestPrProposal(events: RunEvent[]): PrProposal | null {
   }
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Multi-repository proposals (issue #291)
+// ---------------------------------------------------------------------------
+
+/** A `Repository: <name>` label line the multi-repo commit prompt asks for. */
+const REPO_LABEL_RE = /^\s*#{0,6}\s*[*_]{0,2}\s*repository\s*:\s*(.*?)\s*$/i;
+
+/**
+ * Strip the markdown emphasis an agent may wrap around a label value
+ * (`**Repository:** agetor_api`, `Repository: **agetor_api**`) without
+ * touching underscores INSIDE the name — `agetor_api` is a real repository
+ * name, so the old `[^\n*_]` capture dropped everything from the underscore
+ * on and the proposal never matched its repository.
+ *
+ * Underscores are only stripped as a *balanced* emphasis pair. A single
+ * leading/trailing underscore is a legal part of a slug
+ * (`repoNameForPath` preserves it), so stripping it unconditionally dropped
+ * the proposal for a directory like `api_`. Asterisks can never appear in a
+ * slug (`repoNameForPath` replaces them), so any leftover asterisks are
+ * still safe to remove. Agents also commonly render the name as an inline
+ * code span (`` Repository: `backend` ``), sometimes nested inside emphasis
+ * (`` **`backend`** ``), so a balanced backtick pair is stripped too — on
+ * repeat, until neither wrapper remains.
+ */
+function repositoryLabelValue(raw: string): string {
+  let value = raw.trim();
+  // The label's own emphasis close can leak into the captured value
+  // (`### _Repository:_ agetor_api` captures `_ agetor_api`). A slug can never
+  // contain a space, so an underscore/asterisk immediately followed by
+  // whitespace is emphasis residue, not part of the name.
+  value = value.replace(/^[*_]+\s+/, "").trim();
+  // Wrappers can nest (`**`backend`**`, `` `**backend**` ``); peel one layer
+  // per pass until nothing changes. Bounded so pathological input can't loop.
+  for (let pass = 0; pass < 4; pass++) {
+    const before = value;
+    for (const marker of ["**", "__", "*", "_"]) {
+      if (value.length >= marker.length * 2 && value.startsWith(marker) && value.endsWith(marker)) {
+        value = value.slice(marker.length, -marker.length).trim();
+        break;
+      }
+    }
+    if (value.length >= 2 && value.startsWith("`") && value.endsWith("`")) {
+      value = value.slice(1, -1).trim();
+    }
+    value = value.replace(/^\*+|\*+$/g, "").trim();
+    if (value === before) break;
+  }
+  return value;
+}
+
+/**
+ * Parse one labeled proposal per repository out of an agent's Commit & Push
+ * reply. Each `Repository: <name>` label starts a block; the block is parsed
+ * with the same tolerant {@link parsePrProposal}. A missing label is only
+ * tolerated when the whole reply contains exactly one proposal-shaped block:
+ * the caller maps that to the single repository it asked about.
+ */
+export function parseRepositoryProposals(text: string): Map<string, PrProposal> {
+  const normalized = text.replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  const out = new Map<string, PrProposal>();
+  let currentName: string | null = null;
+  let block: string[] = [];
+
+  const flush = () => {
+    if (!currentName) return;
+    const proposal = parsePrProposal(block.join("\n"));
+    if (proposal) out.set(currentName, proposal);
+  };
+
+  for (const line of lines) {
+    const label = REPO_LABEL_RE.exec(line);
+    if (label) {
+      flush();
+      currentName = repositoryLabelValue(label[1]!);
+      if (!currentName) {
+        currentName = null;
+        block = [];
+        continue;
+      }
+      block = [];
+      continue;
+    }
+    if (currentName) block.push(line);
+  }
+  flush();
+  return out;
+}
+
+/**
+ * The repositories that still need a pull request — those whose `prUrl` is
+ * unset. "Create all PRs" uses this so a second press never opens duplicate
+ * PRs and a retry after a partial failure only retries the missing ones.
+ */
+export function repositoriesNeedingPr<T extends { prUrl: string | null }>(repos: T[]): T[] {
+  return repos.filter((r) => !r.prUrl);
+}
+
+/**
+ * The newest run's labeled proposal for ONE repository. Unlike
+ * {@link latestPrProposal}, a proposal labeled for a different repository is
+ * never returned — a multi task's Commit & push reply carries one labeled
+ * block per repository, and using the last block blindly prefilled the wrong
+ * repository's title/description.
+ */
+export function latestProposalForRepository(
+  events: RunEvent[],
+  repositoryName: string,
+): PrProposal | null {
+  return latestRepositoryProposals(events).get(repositoryName) ?? null;
+}
+
+/**
+ * Proposals for the repositories a PR action is about to target. An
+ * unlabeled proposal is only attributable when there is EXACTLY one target —
+ * with several, any attribution would be a guess (and the old
+ * `repos[0]` fallback handed the first repository's identity to a proposal
+ * from any of them). Missing entries simply fall back to the task title.
+ */
+export function latestProposalsForTargets(
+  events: RunEvent[],
+  targetNames: readonly string[],
+): Map<string, PrProposal> {
+  const unique = [...new Set(targetNames.filter((n) => n.length > 0))];
+  return latestRepositoryProposals(events, unique.length === 1 ? unique[0] : undefined);
+}
+
+/**
+ * The newest run's per-repository proposals. Mirrors {@link latestPrProposal}
+ * (newest run wins, subagent streams ignored) but returns every labeled
+ * block, and falls back to a single unlabeled proposal under `fallbackName`.
+ */
+export function latestRepositoryProposals(
+  events: RunEvent[],
+  fallbackName?: string,
+): Map<string, PrProposal> {
+  const textByRun = new Map<string, string[]>();
+  const runOrder: string[] = [];
+  for (const e of events) {
+    if (e.stream !== "assistant" || e.subagentId) continue;
+    let chunks = textByRun.get(e.runId);
+    if (!chunks) {
+      chunks = [];
+      textByRun.set(e.runId, chunks);
+      runOrder.push(e.runId);
+    }
+    chunks.push(e.data ?? "");
+  }
+  for (let i = runOrder.length - 1; i >= 0; i--) {
+    const runId = runOrder[i];
+    if (runId === undefined) continue;
+    const chunks = textByRun.get(runId);
+    if (!chunks) continue;
+    const text = chunks.join("\n\n");
+    const labeled = parseRepositoryProposals(text);
+    if (labeled.size > 0) return labeled;
+    const single = parsePrProposal(text);
+    if (single && fallbackName) return new Map([[fallbackName, single]]);
+  }
+  return new Map();
+}

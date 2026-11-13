@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { c, errln } from "./output.ts";
-import { findAtTokens, isListedPath } from "../shared/at-refs.ts";
-import { discoveryParamsForTask } from "../shared/file-scope.ts";
+import { findAtTokens, isListedPath, unresolvedAtTokens } from "../shared/at-refs.ts";
+import { buildFileEntries } from "../shared/at-file-filter.ts";
+import { discoveryScopesForTask, fileScopesForTask, splitNamedScopePath, type RepoFileScope } from "../shared/file-scope.ts";
 import type { AgetorClient } from "./api-client.ts";
 import type { Task } from "../shared/types.ts";
 
@@ -147,7 +148,7 @@ const MAX_VERIFY_CANDIDATES = 8;
  * no need to re-correlate by path afterward.
  */
 export async function verifyTokensViaSearch<T extends { path: string; isDirectory: boolean }>(
-  client: AgetorClient,
+  client: Pick<AgetorClient, "listProjectFiles">,
   scope: { dir: string; ref?: string | null },
   tokens: T[],
 ): Promise<T[]> {
@@ -175,31 +176,189 @@ export async function verifyTokensViaSearch<T extends { path: string; isDirector
   return missing;
 }
 
+/** The subset of `Task` fields the scope derivation reads — mirrors the
+ *  `discoveredExtensionNames` parameter so both CLI helpers accept the same
+ *  shape. */
+type ScopeTask = Pick<
+  Task,
+  "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch"
+> & { repositories?: Task["repositories"]; multiRepo?: boolean };
+
+/**
+ * The CLI's advisory `@`-reference pre-check for a freshly created, not-yet-
+ * started task (`agetor add` without `--start`). Mirrors the webview's
+ * composer warning: list each repository scope, merge the entries with their
+ * `<name>/` workspace prefixes, and report only tokens PROVEN unresolved.
+ *
+ * A single-repository task is byte-identical to the pre-multi pre-check: one
+ * listing, one valid-path set, a live-scope on-disk rescue for `--isolation
+ * none`, and full-depth search verification when the listing was truncated.
+ * A multi-repository task cannot list the workspace root — it is not a git
+ * repository and would silently skip the whole check — so it unions every
+ * repository's listing (issue #291 review S4). An unprefixed token cannot
+ * resolve from the multi workspace root and is reported missing without a
+ * round trip; a truncated scope verifies only its own repo-local path.
+ *
+ * Never throws for a listing failure: a scope that errors (or comes back
+ * empty) cannot prove anything and contributes no warning.
+ */
+export async function unresolvedRefsForTask(
+  client: Pick<AgetorClient, "listProjectFiles" | "agentDiscovery">,
+  task: ScopeTask,
+  prompt: string,
+  opts: { restrictTo?: string | null } = {},
+): Promise<string[]> {
+  if (!prompt.includes("@")) return [];
+
+  const scopes = fileScopesForTask(task);
+  // A single task's one scope is unnamed; a multi task's scopes are all
+  // named — also the one scope of a multi task left with one repository,
+  // whose tokens still need their `<name>/` prefix (issue #291).
+  const single = scopes.length === 1 && scopes[0]!.name === null;
+  const listings = await Promise.all(
+    scopes.map(async (scope) => {
+      if (!scope.dir?.trim()) return null;
+      try {
+        return { scope, ...(await client.listProjectFiles(scope)) };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const loaded = listings.filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+  // An empty/errored listing can't prove a token unresolved (the pre-multi
+  // contract) — only a non-empty listing is authoritative.
+  const authoritative = loaded.filter((entry) => entry.files.length > 0);
+  if (authoritative.length === 0) return [];
+
+  const validPaths = new Set<string>();
+  for (const entry of authoritative) {
+    const prefix = entry.scope.name ? `${entry.scope.name}/` : "";
+    // `buildFileEntries` synthesizes the implied directory rows (`src/`), so
+    // a directory token resolves exactly like it did before the multi-scope
+    // rewrite.
+    for (const file of buildFileEntries(entry.files)) validPaths.add(prefix + file.path);
+  }
+  // The merged listing only contains paths *inside* each repository, but a
+  // repository's own root is a real directory at the workspace root — the
+  // agent can `@frontend` / `@frontend/` it and send-time expansion resolves
+  // it. Add the root for every multi scope (an empty or failed listing still
+  // does not make the repository itself suspect) or the advisory pre-check
+  // falsely warned about a valid reference.
+  for (const scope of scopes) {
+    if (scope.name) validPaths.add(`${scope.name}/`);
+  }
+
+  let unresolved = unresolvedAtTokens(prompt, validPaths);
+  // A LIVE scope (`--isolation none`) runs on this same machine, so mirror
+  // the server's real oracle: a gitignored-but-present path (e.g. `@.env`)
+  // is not in the listing but DOES exist on disk and will resolve at send
+  // time — never warn about it.
+  if (single && !scopes[0]!.ref) {
+    unresolved = unresolved.filter((token) => !existsInLiveScope(scopes[0]!.dir, token.path));
+  }
+  if (unresolved.length === 0) return [];
+
+  const extensionNames = await discoveredExtensionNames(client, task);
+  const keep = new Set(
+    filterUnresolvedRefs(unresolved.map((token) => token.raw), {
+      extensionNames,
+      restrictTo: opts.restrictTo ?? null,
+    }),
+  );
+
+  const proven = new Set<string>();
+  const seenVerify = new Set<string>();
+  const verify: Array<{ raw: string; scope: RepoFileScope; path: string; isDirectory: boolean }> = [];
+  for (const token of unresolved) {
+    if (!keep.has(token.raw)) continue;
+    let scope: RepoFileScope = scopes[0]!;
+    let localPath = token.path;
+    if (!single) {
+      const split = splitNamedScopePath(scopes, token.path);
+      if (!split) {
+        // The merged listing always prefixes; an unprefixed path cannot
+        // resolve from the workspace root.
+        proven.add(token.raw);
+        continue;
+      }
+      scope = split.scope;
+      localPath = split.path;
+    }
+    const entry = loaded.find((candidate) => candidate.scope === scope);
+    if (!entry || entry.files.length === 0) continue; // unprovable
+    if (!entry.truncated) {
+      proven.add(token.raw);
+      continue;
+    }
+    // A prompt may repeat the same token; each raw token costs one full-depth
+    // search below, so count it against the verification budget once.
+    if (seenVerify.has(token.raw)) continue;
+    seenVerify.add(token.raw);
+    verify.push({ raw: token.raw, scope, path: localPath, isDirectory: token.isDirectory });
+  }
+
+  // A truncated scope's capped listing can't tell "missing" from "past the
+  // cap"; verify those candidates against the server's full-depth search
+  // (same cap as the webview's truncated-mode verification).
+  await Promise.all(
+    verify.slice(0, MAX_VERIFY_CANDIDATES).map(async (candidate) => {
+      const missing = await verifyTokensViaSearch(client, candidate.scope, [
+        { raw: candidate.raw, path: candidate.path, isDirectory: candidate.isDirectory },
+      ]);
+      if (missing.length > 0) proven.add(candidate.raw);
+    }),
+  );
+
+  // Report each distinct reference once: a prompt that repeats the same
+  // unresolved token should not read as "9 @ references won't resolve".
+  const warned: string[] = [];
+  const seenWarned = new Set<string>();
+  for (const token of unresolved) {
+    if (!proven.has(token.raw) || seenWarned.has(token.raw)) continue;
+    seenWarned.add(token.raw);
+    warned.push(token.raw);
+  }
+  return warned;
+}
+
 /** `agentDiscovery`'s extension names, as the set `filterUnresolvedRefs`
  *  exempts from the "won't resolve" warning (the ExtensionPicker's own
  *  `@name` mention syntax — e.g. `@github` — is never a file reference).
  *  Shared by `add.ts` (`cmdAdd`'s pre-check and `--start`) and
  *  `lifecycle.ts` (`cmdSend`, `cmdStart`) so there's one copy of this
  *  fail-open lookup rather than one per caller. Discovery params come from
- *  `discoveryParamsForTask` (`src/shared/file-scope.ts`) — the same
+ *  `discoveryScopesForTask` (`src/shared/file-scope.ts`) — the same
  *  worktree-vs-committed-ref rule the webview's `RunPanel`/the TUI/the `@`
  *  file listing use (docs/architecture/at-file-references.md), not the raw `task.workdir`/`branch`
  *  pair, so a materialized worktree reads its own live tree instead of the
- *  source repo's committed ref. A discovery failure must not block or fail
- *  the caller's own operation: falls back to an empty set (over-warn rather
- *  than crash) — the network call itself is the only non-injectable part,
- *  reached through the passed-in `client` so a test can swap in a fake
- *  `agentDiscovery` that throws or returns a controlled list without a real
- *  server. */
+ *  source repo's committed ref. A multi-repository task unions every
+ *  repository's scope (the workspace root is not a git repo). A discovery
+ *  failure must not block or fail the caller's own operation: a failed scope
+ *  is skipped (successful ones still contribute) and all failures fall back
+ *  to an empty set (over-warn rather than crash) — the network call itself is
+ *  the only non-injectable part, reached through the passed-in `client` so a
+ *  test can swap in a fake `agentDiscovery` that throws or returns a
+ *  controlled list without a real server. */
 export async function discoveredExtensionNames(
-  client: AgetorClient,
-  task: Pick<Task, "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch">,
+  client: Pick<AgetorClient, "agentDiscovery">,
+  task: Pick<Task, "agent" | "workdir" | "worktreePath" | "isolation" | "baseRef" | "branchSource" | "branch"> & {
+    repositories?: Task["repositories"];
+  },
 ): Promise<Set<string>> {
-  try {
-    const { workdir, branch } = discoveryParamsForTask(task);
-    const { extensions } = await client.agentDiscovery(task.agent, workdir, branch);
-    return new Set(extensions.map((e) => (e.insert.startsWith("@") ? e.insert.slice(1) : e.name)));
-  } catch {
-    return new Set();
+  const names = new Set<string>();
+  const results = await Promise.all(
+    discoveryScopesForTask(task).map(async ({ workdir, branch }) => {
+      try {
+        return await client.agentDiscovery(task.agent, workdir, branch);
+      } catch {
+        return null;
+      }
+    }),
+  );
+  for (const result of results) {
+    if (!result) continue;
+    for (const e of result.extensions) names.add(e.insert.startsWith("@") ? e.insert.slice(1) : e.name);
   }
+  return names;
 }
