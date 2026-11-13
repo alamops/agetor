@@ -4,7 +4,6 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
   dedupeSelections,
-  projectSelectionLabel,
   updateSelectionBaseRef,
   type RepoSelection,
 } from "@/lib/repo-selection";
@@ -25,8 +24,6 @@ export interface ProjectSelectionState {
   /** True when 2+ *deduped* projects are selected. Feeds the forced isolate
    *  state and the `@` multi-scope list — never the raw checkbox count. */
   multiRepo: boolean;
-  /** The Select Projects button's label: name / `N projects selected`. */
-  label: string;
   /** A user-picked base ref for one project (marks the draft dirty). */
   setBaseRef: (path: string, baseRef: string) => void;
   /** `BranchPicker`'s "preselect the current branch" seed — not a user pick. */
@@ -102,7 +99,6 @@ export function useProjectSelection({
 
   const workdir = repos[0]?.path ?? "";
   const multiRepo = useMemo(() => dedupeSelections(repos).length > 1, [repos]);
-  const label = useMemo(() => projectSelectionLabel(repos), [repos]);
   const refDirty = useMemo(
     () => repos.some((entry) => userRefPaths.has(entry.path) && !!entry.baseRef?.trim()),
     [repos, userRefPaths],
@@ -113,7 +109,6 @@ export function useProjectSelection({
     setRepos,
     workdir,
     multiRepo,
-    label,
     setBaseRef,
     setBaseRefAuto,
     refDirty,

@@ -68,6 +68,9 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
   // Invalidated on every open, close and save attempt. A save's root lookup
   // only applies while its own session is current.
   const sessionRef = useRef(createSessionGuard());
+  // Opened with the cursor in the search box: the list can be long, and the
+  // first thing a user does here is narrow it.
+  const searchRef = useRef<HTMLInputElement>(null);
 
   const refreshProjects = async () => {
     try { setProjects(await api.listProjects()); }
@@ -128,7 +131,10 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
   };
 
   const toggle = (path: string) => {
-    if (path === lockedPath) return;
+    // While a Save's root lookup is in flight its resolved list (captured at
+    // click time) is what would be applied; ignore and disable late edits so a
+    // selection change can't be silently overwritten.
+    if (path === lockedPath || busy) return;
     setConflicts([]);
     setDraft((cur) => {
       if (cur.some((entry) => entry.path === path)) return cur.filter((entry) => entry.path !== path);
@@ -138,6 +144,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
   };
 
   const addFolder = async () => {
+    if (busy) return;
     setPicking(true);
     try {
       // Start the native panel at the current selection, like the retired
@@ -159,7 +166,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
   };
 
   const save = async () => {
-    if (draft.length === 0) return;
+    if (draft.length === 0 || busy) return;
     const session = sessionRef.current.begin();
     setBusy(true);
     setConflicts([]);
@@ -201,6 +208,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
         onClose={close}
         labelledBy="select-projects-dialog-title"
         closeOnBackdrop={false}
+        initialFocusRef={searchRef}
         className="w-[32rem] max-w-[92vw]"
       >
         <div className="flex items-start justify-between gap-3">
@@ -213,7 +221,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
               two or more use worktree isolation.
             </p>
           </div>
-          <Button size="sm" variant="outline" onClick={() => void addFolder()} disabled={picking}>
+          <Button size="sm" variant="outline" onClick={() => void addFolder()} disabled={picking || busy}>
             {picking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderPlus className="h-3.5 w-3.5" />}
             Add folder
           </Button>
@@ -222,6 +230,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
         <div className="mt-3 flex items-center gap-2 rounded-md border border-border/60 px-2 py-1">
           <Search className="size-3.5 shrink-0 opacity-60" aria-hidden />
           <Input
+            ref={searchRef}
             data-testid="select-projects-search"
             {...IDENTIFIER_INPUT_PROPS}
             value={query}
@@ -244,7 +253,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
                   variant="outline"
                   className="mt-2"
                   onClick={() => void addFolder()}
-                  disabled={picking}
+                  disabled={picking || busy}
                 >
                   <FolderPlus className="h-3.5 w-3.5" /> Add folder
                 </Button>
@@ -265,7 +274,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
                   <input
                     type="checkbox"
                     checked={selected}
-                    disabled={lockedRow}
+                    disabled={lockedRow || busy}
                     onChange={() => toggle(path)}
                     aria-label={`Select ${path}`}
                   />
@@ -285,7 +294,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
                       variant="ghost"
                       className="h-7 w-7"
                       aria-label={`Remove ${path}`}
-                      disabled={lockedRow}
+                      disabled={lockedRow || busy}
                       title={lockedRow ? "The issue's repository is always included" : undefined}
                       onClick={() => toggle(path)}
                     >
@@ -326,7 +335,8 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
               type="button"
               data-testid="project-clone-open"
               onClick={() => setCloneOpen(true)}
-              className="inline-flex items-center gap-1 rounded px-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+              disabled={busy}
+              className="inline-flex items-center gap-1 rounded px-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               <GitBranch className="size-3.5" aria-hidden />
               Clone repository…
@@ -335,7 +345,8 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
               type="button"
               data-testid="project-import-sessions-open"
               onClick={() => setImportOpen(true)}
-              className="inline-flex items-center gap-1 rounded px-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+              disabled={busy}
+              className="inline-flex items-center gap-1 rounded px-1 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Import className="size-3.5" aria-hidden />
               Import sessions…
@@ -347,7 +358,7 @@ export function SelectProjectsDialog({ open, onClose, value, onSave, lockedPath 
           <Button size="sm" variant="outline" onClick={close}>
             Cancel
           </Button>
-          <Button size="sm" onClick={() => void save()} disabled={busy || draft.length === 0}>
+          <Button size="sm" onClick={() => void save()} disabled={busy || picking || draft.length === 0}>
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
             Save
           </Button>

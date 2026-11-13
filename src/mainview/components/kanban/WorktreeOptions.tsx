@@ -7,6 +7,7 @@ import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import { branchFieldState, type BranchFieldState } from "@/lib/branch-field";
 import {
   projectDisplayName,
+  projectRowLabels,
   projectSelectionLabel,
   selectionNames,
   type RepoSelection,
@@ -338,9 +339,13 @@ function LiveWorktreeOptions({
     onBranchConfigSaved,
   } = state;
 
-  // Workspace names, in order — the same slugs the server uses, so a row's
-  // test id/label maps to the actual subdirectory for a multi task.
+  // Workspace names, in order — the same slugs the server uses. They key the
+  // rows' test ids (stable, sanitized, unique) but are NOT user-facing: the
+  // label is the project's own name, with the full path appended when two
+  // selected projects share a basename (grill decision 11), so the user can
+  // tell which repository a row belongs to.
   const names = useMemo(() => selectionNames(repos), [repos]);
+  const labels = useMemo(() => projectRowLabels(repos.map((repo) => repo.path)), [repos]);
 
   return (
     <div data-testid="worktree-options" className="space-y-3">
@@ -362,7 +367,7 @@ function LiveWorktreeOptions({
           {repos.map((repo, i) => (
             <div key={repo.path} data-testid={`branch-row-${names[i]}`}>
               <BranchPicker
-                label={`Branch · ${names[i]}`}
+                label={`Branch · ${labels[i]}`}
                 workdir={repo.path}
                 value={repo.baseRef ?? ""}
                 onChange={(next) => onBaseRefChange(repo.path, next)}

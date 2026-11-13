@@ -29,12 +29,17 @@ import { uniqueRepoSlugs } from "../src/shared/multi-repo.ts";
  *     project's own non-current ref lands in `repositories[].baseRef`;
  *  c. a repo plus its own subdirectory dedupes to one project (button label,
  *     Isolate editable, single-repository task);
+ *  c2. two repositories sharing a basename keep path-disambiguated row labels
+ *      and distinct workspace test ids;
+ *  c3. Isolate unchecked on one project → 2+ forces it on → collapsing back to
+ *      one leaves it checked and editable (the load-bearing forced-on effect);
  *  d. outside clicks leave the dialog open; Escape and Cancel close it;
- *  e. search filters the rows;
+ *  e. search filters the rows (and the box is focused on open);
  *  f. a zero draft disables Save and shows the hint;
  *  g. a submit keeps the selection and its refs while the branch name resets;
  *  h. a plain non-git folder alone with Isolate off creates with
- *     `workdir` + `isolation:"none"` (never a `repositories[]` payload).
+ *     `workdir` + `isolation:"none"` (never a `repositories[]` payload);
+ *  i. with no project registered the form cannot create a task.
  *
  * Non-current branch names are mandatory: a picker wired to nothing still
  * shows the current branch, so only a different ref proves the row reaches the
@@ -67,6 +72,8 @@ let repoA: string;
 let repoB: string;
 let repoChild: string;
 let repoPlain: string;
+let repoDupA: string;
+let repoDupB: string;
 let branchShaA: string;
 let branchShaB: string;
 
@@ -74,8 +81,8 @@ function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
 }
 
-async function initRepo(name: string): Promise<string> {
-  const dir = await mkdtemp(path.join(tmpdir(), `agetor-e2e-select-${name}-`));
+async function initRepoAt(dir: string, name: string): Promise<string> {
+  await mkdir(dir, { recursive: true });
   git(dir, ["init", "-q", "-b", "main"]);
   git(dir, ["config", "user.email", "e2e@example.com"]);
   git(dir, ["config", "user.name", "e2e"]);
@@ -84,6 +91,10 @@ async function initRepo(name: string): Promise<string> {
   git(dir, ["add", "."]);
   git(dir, ["commit", "-q", "-m", "init"]);
   return dir;
+}
+
+async function initRepo(name: string): Promise<string> {
+  return initRepoAt(await mkdtemp(path.join(tmpdir(), `agetor-e2e-select-${name}-`)), name);
 }
 
 async function registerProject(
@@ -149,6 +160,14 @@ test.beforeAll(async ({ request, backend }) => {
   repoPlain = await mkdtemp(path.join(tmpdir(), "agetor-e2e-select-plain-"));
   await writeFile(path.join(repoPlain, "notes.txt"), "not a repo\n");
 
+  // Two different repositories whose basename collides. The collision test
+  // registers them on its own fresh backend, so the shared worker's project
+  // list (and its auto-selected project) stays as the other specs expect.
+  repoDupA = path.join(await mkdtemp(path.join(tmpdir(), "agetor-e2e-select-dup-a-")), "api");
+  repoDupB = path.join(await mkdtemp(path.join(tmpdir(), "agetor-e2e-select-dup-b-")), "api");
+  await initRepoAt(repoDupA, "dup-a");
+  await initRepoAt(repoDupB, "dup-b");
+
   await registerProject(request, backend, repoA, path.basename(repoA));
   await registerProject(request, backend, repoB, path.basename(repoB));
   await registerProject(request, backend, repoChild, path.basename(repoChild));
@@ -165,6 +184,7 @@ test("one project: name label, enabled Isolate, one Branch row, single-repo payl
   const button = form.getByTestId("select-projects-button");
   await expect(button).toContainText(path.basename(repoA));
   await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(1);
+  await expect(branchRow(form, slugFor(repoA))).toContainText(`Branch · ${path.basename(repoA)}`);
 
   const isolate = form.getByTestId("isolate-toggle");
   await expect(isolate).toBeChecked();
@@ -192,11 +212,23 @@ test("two projects: count label, forced Isolate, per-project refs in repositorie
   await expect(form.getByTestId("select-projects-button")).toContainText("2 projects selected");
   await expect(form.locator('[data-testid^="branch-row-"]')).toHaveCount(2);
 
+  // Every selected project gets the same row affordances the single project
+  // had: its own Pull and Fetch act on its own workdir.
+  for (const repo of [repoA, repoB]) {
+    const row = branchRow(form, slugFor(repo));
+    await expect(row.getByRole("button", { name: "Pull", exact: true })).toBeVisible();
+    await expect(row.getByRole("button", { name: "Fetch", exact: true })).toBeVisible();
+  }
+
   // Base refs live in the inline Branch rows, never in the dialog.
   await form.getByTestId("select-projects-button").click();
   const dialog = selectProjectsDialog(page);
   await expect(dialog).toBeVisible({ timeout: CONVERGE_TIMEOUT });
   await expect(dialog.getByLabel(/^Base ref for /)).toHaveCount(0);
+  // The dialog hosts every management entry the spec promises.
+  await expect(dialog.getByRole("button", { name: "Add folder", exact: true })).toBeVisible();
+  await expect(dialog.getByTestId("project-clone-open")).toBeVisible();
+  await expect(dialog.getByTestId("project-import-sessions-open")).toBeVisible();
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   await expect(dialog).toBeHidden();
 
@@ -215,12 +247,25 @@ test("two projects: count label, forced Isolate, per-project refs in repositorie
   expect(created.repositories.map((r) => r.baseRef)).toEqual([branchShaA, branchShaB]);
 });
 
-test("collapsing two projects back to one leaves Isolate checked and editable", async ({ page, backend }) => {
+test("unchecking Isolate, going multi, then collapsing keeps it checked", async ({ page, backend }) => {
   await gotoApp(page, backend.bootBase);
   const form = newTaskForm(page);
-
-  await chooseProjects(page, form, [repoA, repoB]);
   const isolate = form.getByTestId("isolate-toggle");
+
+  // Start from the one state that makes the forced-on effect load-bearing: a
+  // single project whose Isolate the user turned OFF. Without the
+  // `forceIsolate → setIsolate(true)` effect the raw toggle stays false through
+  // the 2+ detour, so the collapse assertion below goes red.
+  await chooseProjects(page, form, [repoA]);
+  await expect(isolate).toBeChecked();
+  await expect(isolate).toBeEnabled();
+  await isolate.uncheck();
+  await expect(isolate).not.toBeChecked();
+  await expect(form.getByTestId("branch-name-input")).toHaveCount(0);
+
+  // 2+ projects force isolation: checked and disabled.
+  await chooseProjects(page, form, [repoA, repoB]);
+  await expect(form.getByTestId("select-projects-button")).toContainText("2 projects selected");
   await expect(isolate).toBeChecked();
   await expect(isolate).toBeDisabled();
 
@@ -265,6 +310,31 @@ test("a repo plus its own subdirectory dedupes to one project", async ({ page, r
   expect(created.repositories.map((r) => r.path)).toEqual([repoA]);
 });
 
+test("projects sharing a basename keep distinct labeled rows and test ids", async ({ page, request, freshBackend }) => {
+  // A test-scoped backend keeps these two colliding project names away from
+  // the shared worker's list (whose most recently added project is what the
+  // New Task form auto-selects).
+  await registerProject(request, freshBackend, repoDupA, "dup-a");
+  await registerProject(request, freshBackend, repoDupB, "dup-b");
+  await gotoApp(page, freshBackend.bootBase);
+  const form = newTaskForm(page);
+  await chooseProjects(page, form, [repoDupA, repoDupB]);
+
+  const [slugA, slugB] = uniqueRepoSlugs([repoDupA, repoDupB]);
+  expect(slugA).toBe("api");
+  expect(slugB).toBe("api-2");
+
+  await expect(form.getByTestId("select-projects-button")).toContainText("2 projects selected");
+  // Rows are labelled with the project name, disambiguated by the full path
+  // when two names collide — never by the sanitized workspace slug alone.
+  await expect(branchRow(form, slugA!)).toContainText(`Branch · api — ${repoDupA}`);
+  await expect(branchRow(form, slugB!)).toContainText(`Branch · api — ${repoDupB}`);
+
+  const isolate = form.getByTestId("isolate-toggle");
+  await expect(isolate).toBeChecked();
+  await expect(isolate).toBeDisabled();
+});
+
 test("outside clicks leave the dialog open; Escape and Cancel close it", async ({ page, backend }) => {
   await gotoApp(page, backend.bootBase);
   const form = newTaskForm(page);
@@ -287,6 +357,8 @@ test("search filters project rows", async ({ page, backend }) => {
   const dialog = await openSelectProjects(page, form);
 
   const search = dialog.getByTestId("select-projects-search");
+  // The dialog opens with the cursor in the search box.
+  await expect(search).toBeFocused();
   await search.fill(path.basename(repoB));
   await expect(dialog.getByLabel(`Select ${repoB}`, { exact: true })).toBeVisible();
   await expect(dialog.getByLabel(`Select ${repoA}`, { exact: true })).toBeHidden();
